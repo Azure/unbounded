@@ -3,19 +3,23 @@
 //! All shared mutations are synchronous. No guard escapes into Fill or a future;
 //! wakers are invoked only after releasing the mutex. Live handles, including
 //! completed responses, retain capacity until consumed or dropped.
-use crate::{
-    error::{Error, Result},
-    memory::{CiphertextPage, page::CiphertextCopy},
-    model::{
-        MAX_FIELD_BYTES, MembershipVersion, NodeId, ObjectMetadata, ObjectVersion, PageId,
-        PageNumber,
-    },
-};
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    task::{Context, Poll, Waker},
-};
+use crate::error::Error;
+use crate::error::Result;
+use crate::memory::CiphertextPage;
+use crate::memory::page::CiphertextCopy;
+use crate::model::MAX_FIELD_BYTES;
+use crate::model::MembershipVersion;
+use crate::model::NodeId;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::PageId;
+use crate::model::PageNumber;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
 pub const MAX_DEMAND_INTERVALS: usize = 64;
 
@@ -238,7 +242,8 @@ impl Subscriptions {
         placement: &crate::topology::Placement,
         scope: &crate::runtime::deadline::RequestScope,
     ) -> Result<Selection> {
-        use crate::peer::protocol::{encode_deadline, millis};
+        use crate::peer::protocol::encode_deadline;
+        use crate::peer::protocol::millis;
         let now = || millis(uring_runtime::environment::wall_now());
         scope.check()?;
         let object = subscription.version.object.clone();
@@ -809,7 +814,10 @@ fn include_page(intervals: &[PageInterval], page: u64) -> Vec<PageInterval> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CacheId, CacheKey, ObjectId, StrongEtag};
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::ObjectId;
+    use crate::model::StrongEtag;
 
     fn subscription(id: u8, start: u64, end: u64) -> Subscription {
         Subscription {
@@ -1112,12 +1120,15 @@ mod tests {
     }
     #[test]
     fn successful_fanout_shares_allocation_and_charges_each_receiver_once() {
-        use crate::{
-            memory::BufferPool,
-            model::{ExpiresAt, KeyId, Nonce, PageEnvelope, ResourceClass},
-            runtime::admission::AdmissionPolicy,
-        };
-        use std::{rc::Rc, time::UNIX_EPOCH};
+        use crate::memory::BufferPool;
+        use crate::model::ExpiresAt;
+        use crate::model::KeyId;
+        use crate::model::Nonce;
+        use crate::model::PageEnvelope;
+        use crate::model::ResourceClass;
+        use crate::runtime::admission::AdmissionPolicy;
+        use std::rc::Rc;
+        use std::time::UNIX_EPOCH;
         let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
         let Selection::Leader {
             work,

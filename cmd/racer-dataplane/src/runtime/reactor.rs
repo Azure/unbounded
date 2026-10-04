@@ -44,20 +44,24 @@
 //!     let _ = r.recv(fd, page, (), scope);
 //! }
 //! ```
-use super::{
-    admission::{AdmissionExt, AdmissionPolicy, ConnectionReservation},
-    deadline::RequestScope,
-};
-use crate::{
-    error::{Error, Operation, Result},
-    model::{RequestId, ResourceClass},
-};
+use super::admission::AdmissionExt;
+use super::admission::AdmissionPolicy;
+use super::admission::ConnectionReservation;
+use super::deadline::RequestScope;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::RequestId;
+use crate::model::ResourceClass;
 use std::ops::Deref;
 use std::rc::Rc;
-use uring_runtime::reactor::{ReactorWake, SUBMISSION_BYTES, SubmissionCapacity};
+use uring_runtime::reactor::ReactorWake;
+use uring_runtime::reactor::SUBMISSION_BYTES;
+use uring_runtime::reactor::SubmissionCapacity;
 pub mod filesystem {
     //! Racer filesystem buffer error boundary.
-    use crate::error::{Error, Result};
+    use crate::error::Error;
+    use crate::error::Result;
     use uring_runtime::reactor::IoBuffer;
     pub struct Buffer(pub(super) uring_runtime::reactor::filesystem::Buffer);
     // SAFETY: the runtime owner retains its private stable allocation and charge.
@@ -182,11 +186,11 @@ impl Reactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        os::unix::net::UnixStream,
-        task::{Context, Poll},
-        time::{Duration, Instant},
-    };
+    use std::os::unix::net::UnixStream;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Duration;
+    use std::time::Instant;
     use uring_runtime::reactor::Descriptor;
     use uring_runtime::reactor::IoBuffer;
     use uring_runtime::reactor::SocketAddress;
@@ -194,7 +198,9 @@ mod tests {
 
     #[test]
     fn movable_production_buffers_preserve_subrange_through_completion() {
-        use crate::{http::OwnedBuffer, memory::BufferPool, peer::transport::WireBuffer};
+        use crate::http::OwnedBuffer;
+        use crate::memory::BufferPool;
+        use crate::peer::transport::WireBuffer;
         use http1::connection::BufferRange;
         fn check<B: IoBuffer>(buffer: B)
         where
@@ -502,14 +508,23 @@ mod tests {
 #[cfg(test)]
 mod simulation_tests {
     use super::Reactor;
-    use super::tests::{drive, poll, scope};
+    use super::tests::drive;
+    use super::tests::poll;
+    use super::tests::scope;
     use crate::error::Error;
     use crate::error::Result;
     use crate::model::ResourceClass;
     use crate::runtime::admission::AdmissionPolicy;
     use crate::runtime::deadline::RequestScope;
-    use std::{cell::Cell, ffi::CString, path::Path, rc::Rc, time::Duration};
-    use uring_runtime::reactor::simulation::{DiskState, Environment, Fault, Simulation};
+    use std::cell::Cell;
+    use std::ffi::CString;
+    use std::path::Path;
+    use std::rc::Rc;
+    use std::time::Duration;
+    use uring_runtime::reactor::simulation::DiskState;
+    use uring_runtime::reactor::simulation::Environment;
+    use uring_runtime::reactor::simulation::Fault;
+    use uring_runtime::reactor::simulation::Simulation;
     fn reactor() -> Reactor {
         Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -543,7 +558,8 @@ mod simulation_tests {
     }
     #[test]
     fn direct_io_faults_check_address_offset_and_length_independently() {
-        use page_alloc::{AlignedBuffer, Alignment};
+        use page_alloc::AlignedBuffer;
+        use page_alloc::Alignment;
         use uring_runtime::reactor::IoBuffer;
         struct View {
             buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
@@ -694,9 +710,12 @@ mod simulation_tests {
     }
     #[test]
     fn immutable_ciphertext_send_shares_backing_and_retains_it_through_cancel_fences() {
-        use crate::model::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag, VersionMetadata,
-        };
+        use crate::model::CacheId;
+        use crate::model::CacheKey;
+        use crate::model::ObjectId;
+        use crate::model::ObjectVersion;
+        use crate::model::StrongEtag;
+        use crate::model::VersionMetadata;
         for cancel_first in [false, true] {
             let sim = Simulation::new();
             sim.set_cancel_first(cancel_first);
@@ -756,14 +775,14 @@ mod simulation_tests {
             "/slabs/worker-0-slab-0.dat".into(),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
+            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
         );
         assert!(slabs.open_now().is_ok());
         let other = Slab::<flow_control::Charge<AdmissionPolicy>>::new(
             "/slabs/worker-0-slab-0.dat".into(),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
+            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
         );
         assert_eq!(
             other.open_now().map_err(Error::from),

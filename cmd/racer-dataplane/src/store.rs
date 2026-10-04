@@ -1,29 +1,46 @@
 //! Worker-local encrypted slab storage. No HTTP, plaintext, or origin credentials.
-pub mod catalog;
-pub mod checkpoint;
-pub mod format;
-
-use self::catalog::{Index, IndexedPage, RecordLocation, SegmentClock};
+//! Versioned little-endian records protect framing with header SHA-256. The stored
+//! CRC is checked before AEAD at the fill boundary; padding is never returned.
+use self::catalog::Index;
+use self::catalog::IndexedPage;
+use self::catalog::RecordLocation;
+use self::catalog::SegmentClock;
+use crate::runtime::collections::HashMap;
+use crate::runtime::reactor::Reactor;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::BufferPool;
 use crate::memory::page::CiphertextCopy;
 use crate::model::CacheId;
+use crate::model::CacheKey;
+use crate::model::KeyId;
+use crate::model::Nonce;
+use crate::model::ObjectId;
 use crate::model::ObjectVersion;
+use crate::model::PageEnvelope;
 use crate::model::PageId;
+use crate::model::PageNumber;
 use crate::model::ResourceClass;
+use crate::model::StrongEtag;
 use crate::model::VersionMetadata;
 use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::collections::HashMap;
 use crate::runtime::deadline::RequestScope;
-use crate::runtime::reactor::Reactor;
-use page_alloc::{Alignment, SegmentLease, Segments, Slab};
-use std::{
-    cell::{Cell, RefCell},
-    collections::VecDeque,
-    rc::Rc,
-};
+use page_alloc::AlignedBuffer;
+use page_alloc::Alignment;
+use page_alloc::Extent;
+use page_alloc::Generation;
+use page_alloc::SegmentLease;
+use page_alloc::Segments;
+use page_alloc::Slab;
+use sha2::Digest;
+use sha2::Sha256;
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+pub mod catalog;
+pub mod checkpoint;
 
 pub struct Store {
     pub reader: Rc<StoreReader>,
@@ -117,7 +134,9 @@ impl StoreReader {
         self
     }
     fn corrupt_miss(&self) {
-        self.metrics.record(crate::telemetry::Event::CorruptMiss, 1);
+        let _ = self
+            .metrics
+            .record(crate::telemetry::Event::CorruptMiss, 1);
     }
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
         self.index.remove_if_matches(&token.page, &token.location);
@@ -215,7 +234,7 @@ impl StoreReader {
                 }
                 Err(e) => return Err(e),
             };
-            let decoded = match format::parse(&buffer, entry.location.extent) {
+            let decoded = match parse(&buffer, entry.location.extent) {
                 Ok(d) => d,
                 Err(_) => {
                     self.corrupt_miss();
@@ -418,12 +437,12 @@ impl StoreWriter {
             self.index
                 .preflight_capacity(&page.ciphertext.envelope().page)?;
         }
-        let logical = format::logical_length(&page)?;
+        let logical = logical_length(&page)?;
         if !matches!(dirty.class(), ResourceClass::DirtyCiphertext)
             || !self.admission.owns(&dirty)
             || dirty.key() != Some(&page.metadata.version.object.cache)
             || dirty.amount() < page.ciphertext.bytes().len()
-            || logical > crate::model::PAGE_BYTES as usize + format::MAX_HEADER_BYTES + 16
+            || logical > crate::model::PAGE_BYTES as usize + MAX_HEADER_BYTES + 16
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -504,7 +523,8 @@ impl StoreWriter {
         self.discarded.get()
     }
     fn note_discard(&self, count: usize) {
-        self.metrics
+        let _ = self
+            .metrics
             .record(crate::telemetry::Event::DirtyDiscard, count as u64);
         self.discarded
             .set(self.discarded.get().saturating_add(count as u64));
@@ -597,7 +617,8 @@ impl StoreWriter {
             }
             *self.active_scope.borrow_mut() = Some(scope.clone());
             let _busy = Busy(self);
-            use futures::{StreamExt, stream::FuturesUnordered};
+            use futures::StreamExt;
+            use futures::stream::FuturesUnordered;
             let mut writes = FuturesUnordered::new();
             for _ in 0..budget {
                 if scope.check().is_err() {
@@ -672,7 +693,7 @@ impl StoreWriter {
         // Capacity is owned across the await, including invalidation/replacement.
         let index_ticket = self.index.reserve_page(self.clock.borrow().is_some())?;
         let alignment = self.slabs.alignment()?;
-        let disk_bytes = alignment.extent(0, format::logical_length(page)?)?.length();
+        let disk_bytes = alignment.extent(0, logical_length(page)?)?.length();
         let (staging, dirty, ticket) = {
             let mut pending = self.pending.borrow_mut();
             let entry = pending.get_mut(id).ok_or(Error::Unavailable)?;
@@ -703,7 +724,7 @@ impl StoreWriter {
             extent,
         };
         let _publication_lease = self.segments.lease(location.segment, location.generation)?;
-        let encoded = format::encode_at(
+        let encoded = encode_at(
             page,
             location.generation,
             alignment,
@@ -733,7 +754,7 @@ impl StoreWriter {
                 },
             )?;
             self.metrics
-                .record(crate::telemetry::Event::DiskPublication, 1);
+                .record(crate::telemetry::Event::DiskPublication, 1)?;
         } else if self.pending.borrow().contains_key(id) {
             self.note_discard(1);
         }
@@ -818,5 +839,279 @@ impl Drop for DirtyCleanup<'_> {
         }
     }
 }
+// Version 4 is the sole format: mandatory CRC-64/XZ plus optional content type.
+pub const FORMAT_VERSION: u32 = 4;
+pub const MAX_ID_BYTES: usize = 4096;
+pub const MAX_ETAG_BYTES: usize = 8192;
+pub const MAX_HEADER_BYTES: usize = 16384;
+const MAGIC: &[u8; 8] = b"RCRPAGE1";
+const HEADER_PREFIX_BYTES: usize = 128;
+const HEADER_DIGEST_BYTES: usize = 32;
+#[derive(Clone, Debug)]
+pub struct RecordHeader {
+    pub format_version: u32,
+    pub generation: Generation,
+    pub envelope: PageEnvelope,
+    pub metadata: VersionMetadata,
+    pub logical_bytes: u64,
+    pub extent: Extent,
+}
+pub struct EncodedRecord {
+    pub header: RecordHeader,
+    pub buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+}
+pub struct DecodedRecord {
+    pub header: RecordHeader,
+    pub ciphertext: std::ops::Range<usize>,
+    pub checksum: u64,
+}
+struct RecordLayout {
+    header_bytes: usize,
+    logical_bytes: usize,
+}
+fn layout(page: &CiphertextCopy, generation: Generation) -> Result<RecordLayout> {
+    let envelope = page.ciphertext.envelope();
+    let metadata = page.metadata.immutable();
+    metadata.validate_page(envelope)?;
+    if generation.0 == 0 || page.ciphertext.bytes().len() != envelope.ciphertext_length as usize {
+        return Err(Error::CorruptRecord);
+    }
+    let cache = envelope.page.version.object.cache.0.as_bytes();
+    let etag = envelope.page.version.etag.as_bytes();
+    if cache.is_empty()
+        || cache.len() > MAX_ID_BYTES
+        || etag.is_empty()
+        || etag.len() > MAX_ETAG_BYTES
+    {
+        return Err(Error::CorruptRecord);
+    }
+    let header_bytes = HEADER_PREFIX_BYTES
+        .checked_add(8)
+        .ok_or(Error::CorruptRecord)?
+        .checked_add(cache.len())
+        .and_then(|len| len.checked_add(etag.len()))
+        .and_then(|len| {
+            len.checked_add(
+                metadata
+                    .content_type
+                    .as_ref()
+                    .map_or(4, |v| 4 + v.as_bytes().len()),
+            )
+        })
+        .and_then(|len| len.checked_add(HEADER_DIGEST_BYTES))
+        .filter(|&len| len <= MAX_HEADER_BYTES)
+        .ok_or(Error::CorruptRecord)?;
+    let logical_bytes = header_bytes
+        .checked_add(page.ciphertext.bytes().len())
+        .ok_or(Error::CorruptRecord)?;
+    Ok(RecordLayout {
+        header_bytes,
+        logical_bytes,
+    })
+}
+fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLayout) -> Vec<u8> {
+    let envelope = page.ciphertext.envelope();
+    let cache = envelope.page.version.object.cache.0.as_bytes();
+    let etag = envelope.page.version.etag.as_bytes();
+    let mut out = Vec::with_capacity(layout.header_bytes);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&(layout.header_bytes as u32).to_le_bytes());
+    out.extend_from_slice(&generation.0.to_le_bytes());
+    out.extend_from_slice(&page.metadata.length.to_le_bytes());
+    out.extend_from_slice(&envelope.page.number.0.to_le_bytes());
+    out.extend_from_slice(&envelope.plaintext_length.to_le_bytes());
+    out.extend_from_slice(&envelope.ciphertext_length.to_le_bytes());
+    out.extend_from_slice(&envelope.key_id.0);
+    out.extend_from_slice(&envelope.nonce.0);
+    out.extend_from_slice(&envelope.page.version.object.key.0);
+    out.extend_from_slice(&(cache.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
+    out.extend_from_slice(cache);
+    out.extend_from_slice(etag);
+    out.extend_from_slice(&page.ciphertext.checksum().to_le_bytes());
+    out.extend_from_slice(
+        &(page
+            .metadata
+            .content_type
+            .as_ref()
+            .map_or(0, |v| v.as_bytes().len()) as u32)
+            .to_le_bytes(),
+    );
+    if let Some(content_type) = &page.metadata.content_type {
+        out.extend_from_slice(content_type.as_bytes());
+    }
+    debug_assert_eq!(out.len() + HEADER_DIGEST_BYTES, layout.header_bytes);
+    let digest = Sha256::digest(&out);
+    out.extend_from_slice(&digest);
+    out
+}
+pub fn logical_length(page: &CiphertextCopy) -> Result<usize> {
+    Ok(layout(page, Generation(1))?.logical_bytes)
+}
+pub fn encode(
+    page: &CiphertextCopy,
+    generation: Generation,
+    alignment: Alignment,
+    buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+) -> Result<EncodedRecord> {
+    encode_at(page, generation, alignment, 0, buffer)
+}
+pub fn encode_at(
+    page: &CiphertextCopy,
+    generation: Generation,
+    alignment: Alignment,
+    offset: u64,
+    mut buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+) -> Result<EncodedRecord> {
+    let layout = layout(page, generation)?;
+    let logical_bytes = layout.logical_bytes;
+    let extent = alignment.extent(offset, logical_bytes)?;
+    alignment.check(extent, &buffer)?;
+    let header = header_bytes(page, generation, &layout);
+    let bytes = buffer.bytes_mut()?;
+    bytes[..header.len()].copy_from_slice(&header);
+    bytes[header.len()..logical_bytes].copy_from_slice(page.ciphertext.bytes());
+    bytes[logical_bytes..].fill(0);
+    Ok(EncodedRecord {
+        header: RecordHeader {
+            format_version: FORMAT_VERSION,
+            generation,
+            envelope: page.ciphertext.envelope().clone(),
+            metadata: page.metadata.immutable(),
+            logical_bytes: logical_bytes as u64,
+            extent,
+        },
+        buffer,
+    })
+}
+pub fn parse(
+    buffer: &AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+    extent: Extent,
+) -> Result<DecodedRecord> {
+    parse_bytes(buffer.bytes()?, extent)
+}
+pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
+    if bytes.len() != extent.length() {
+        return Err(Error::CorruptRecord);
+    }
+    let mut r = Decoder(bytes);
+    if r.take(8)? != MAGIC {
+        return Err(Error::CorruptRecord);
+    }
+    let format_version = r.u32()?;
+    if format_version != FORMAT_VERSION {
+        return Err(Error::CorruptRecord);
+    }
+    let header_len = r.u32()? as usize;
+    if !(160..=MAX_HEADER_BYTES).contains(&header_len) || header_len > bytes.len() {
+        return Err(Error::CorruptRecord);
+    }
+    let digest = Sha256::digest(&bytes[..header_len - 32]);
+    if digest[..] != bytes[header_len - 32..header_len] {
+        return Err(Error::CorruptRecord);
+    }
+    r.0 = &bytes[16..header_len - 32];
+    let generation = Generation(r.u64()?);
+    let length = r.u64()?;
+    let number = PageNumber(r.u64()?);
+    let plaintext_length = r.u32()?;
+    let ciphertext_length = r.u32()?;
+    let key_id = KeyId(r.array()?);
+    let nonce = Nonce(r.array()?);
+    let key = CacheKey(r.array()?);
+    let cache_len = r.u32()? as usize;
+    let etag_len = r.u32()? as usize;
+    if cache_len == 0 || cache_len > MAX_ID_BYTES || etag_len == 0 || etag_len > MAX_ETAG_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    let cache = CacheId(
+        std::str::from_utf8(r.take(cache_len)?)
+            .map_err(|_| Error::CorruptRecord)?
+            .to_owned(),
+    );
+    let etag = StrongEtag::parse(r.take(etag_len)?).map_err(|_| Error::CorruptRecord)?;
+    let checksum = r.u64()?;
+    let content_type_length = r.u32()? as usize;
+    let content_type = if content_type_length == 0 {
+        None
+    } else {
+        Some(
+            crate::model::ContentType::parse(r.take(content_type_length)?)
+                .map_err(|_| Error::CorruptRecord)?,
+        )
+    };
+    if !r.0.is_empty() || generation.0 == 0 {
+        return Err(Error::CorruptRecord);
+    }
+    let version = ObjectVersion {
+        object: ObjectId { cache, key },
+        etag,
+    };
+    let metadata = VersionMetadata {
+        content_type,
+        version: version.clone(),
+        length,
+    };
+    let envelope = PageEnvelope {
+        page: PageId { version, number },
+        key_id,
+        nonce,
+        plaintext_length,
+        ciphertext_length,
+    };
+    metadata.validate_page(&envelope)?;
+    let logical_bytes = header_len
+        .checked_add(ciphertext_length as usize)
+        .ok_or(Error::CorruptRecord)?;
+    if logical_bytes > bytes.len() {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(DecodedRecord {
+        header: RecordHeader {
+            format_version,
+            generation,
+            envelope,
+            metadata,
+            logical_bytes: logical_bytes as u64,
+            extent,
+        },
+        ciphertext: header_len..logical_bytes,
+        checksum,
+    })
+}
+pub fn decode(
+    buffer: &AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+    expected: &RecordHeader,
+) -> Result<PageEnvelope> {
+    let actual = parse(buffer, expected.extent)?.header;
+    if actual.format_version != expected.format_version
+        || actual.generation != expected.generation
+        || actual.envelope != expected.envelope
+        || actual.metadata != expected.metadata
+        || actual.logical_bytes != expected.logical_bytes
+    {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(actual.envelope)
+}
+pub(super) struct Decoder<'a>(pub(super) &'a [u8]);
+impl<'a> Decoder<'a> {
+    pub(super) fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let (value, rest) = self.0.split_at_checked(len).ok_or(Error::CorruptRecord)?;
+        self.0 = rest;
+        Ok(value)
+    }
+    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        self.take(N)?.try_into().map_err(|_| Error::CorruptRecord)
+    }
+    pub(super) fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.array()?))
+    }
+    pub(super) fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
+}
+
 #[cfg(test)]
 mod tests;

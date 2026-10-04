@@ -2,6 +2,7 @@
 //! Dirty Fill and crypto checks below cover production contracts against explicit
 //! Bundle owner traces, not the simulator's event scheduling or completion timing.
 use super::*;
+use crate::read::dispatch::WorkerMap;
 use crate::error::Operation;
 use crate::memory::BufferPool;
 use crate::memory::VerifiedBytes;
@@ -37,7 +38,6 @@ use crate::runtime::deadline::RequestScope;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::worker::CryptoRuntime;
 use crate::runtime::worker::CryptoService;
-use crate::runtime::worker::WorkerMap;
 use crate::security::aead::PageCrypto;
 use crate::security::aead::PageCryptoEngine;
 use crate::security::credentials::CredentialCrypto;
@@ -48,12 +48,12 @@ use crate::store::catalog::SegmentClock;
 use crate::topology::Member;
 use crate::topology::Membership;
 use crate::topology::Placement;
-use std::{
-    num::{NonZeroU32, NonZeroUsize},
-    rc::Rc,
-    task::Context,
-    time::{Duration, Instant},
-};
+use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
+use std::rc::Rc;
+use std::task::Context;
+use std::time::Duration;
+use std::time::Instant;
 
 // The abstract side owns no payload. Production pages put the same non-cloneable
 // charges inside Arc<VerifiedBytes>/Arc<CiphertextBytes> (memory/pool.rs:41-58).
@@ -532,7 +532,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
             .join("target/contention-fidelity-unopened/worker-0-slab-0.dat"),
         128 * 1024 * 1024,
         64 * 1024 * 1024,
-        crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
+        crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
     ));
     let disk = Rc::new(StoreReader::new(
         Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),

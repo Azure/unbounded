@@ -4,13 +4,16 @@
 //! encrypt origin data once. Publish only verified whole pages, with original
 //! ciphertext queued asynchronously on candidates. Disk failure may discard dirty
 //! bytes. Origin 412 does not prove old copies absent from other permitted caches.
-use super::{
-    candidates::{CandidatePolicy, CandidateResolution},
-    flight::{
-        AcquisitionBudget, AcquisitionEvent, AcquisitionFailure, AcquisitionWaiter, FlightLeader,
-        Flights, JoinedCopy, JoinedFlight,
-    },
-};
+use super::candidates::CandidatePolicy;
+use super::candidates::CandidateResolution;
+use super::flight::AcquisitionBudget;
+use super::flight::AcquisitionEvent;
+use super::flight::AcquisitionFailure;
+use super::flight::AcquisitionWaiter;
+use super::flight::FlightLeader;
+use super::flight::Flights;
+use super::flight::JoinedCopy;
+use super::flight::JoinedFlight;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -41,7 +44,12 @@ use crate::telemetry::Event;
 use crate::telemetry::Gauge;
 use crate::telemetry::LookupTier;
 use crate::telemetry::Metrics;
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::sync::Arc;
+use uring_runtime::reactor::IoBuffer;
 
 #[derive(Clone)]
 pub struct FillDependencies {
@@ -82,7 +90,7 @@ impl DecryptSource {
     fn observe(self, metrics: &Metrics, result: Result<PageResult>) -> Result<PageResult> {
         result.inspect_err(|error| {
             if *error == Error::CorruptRecord {
-                metrics.record(
+                let _ = metrics.record(
                     match self {
                         Self::Disk => Event::FillDecryptDiskCorrupt,
                         Self::Retained => Event::FillDecryptRetainedCorrupt,
@@ -96,7 +104,7 @@ impl DecryptSource {
 }
 impl Fill {
     #[cfg(test)]
-    pub(crate) fn hedge_owner(&self) -> Option<&std::sync::Arc<super::hedge::Hedges>> {
+    pub(crate) fn hedge_owner(&self) -> Option<&std::sync::Arc<super::candidates::Hedges>> {
         self.dependencies.candidates.hedge_owner()
     }
     pub(crate) fn cached_page(
@@ -110,7 +118,7 @@ impl Fill {
             .lookup(LookupTier::Plaintext, self.dependencies.memory.get(page))?;
         if let Some(result) = &result {
             result.validate_for(page)?;
-            self.metrics.record(Event::MemoryHit, 1);
+            self.metrics.record(Event::MemoryHit, 1)?;
         }
         Ok(result)
     }
@@ -228,7 +236,7 @@ impl Fill {
         self.publish(result.clone(), None, scope).await?;
         // Selected subscription pages bypass acquire_inner's source accounting.
         // Count only authenticated, published reception on the stable owner.
-        self.metrics.record(Event::PeerHit, 1);
+        self.metrics.record(Event::PeerHit, 1)?;
         Ok(result)
     }
     pub(crate) fn observe_peer_error(
@@ -244,9 +252,6 @@ impl Fill {
                 .request(scope)
                 .attempt(attempt),
         );
-    }
-    pub(crate) fn record_peer_bootstrap(&self) {
-        self.metrics.record(Event::PeerBootstrap, 1);
     }
     pub(super) fn reserve_with_reclamation(
         &self,
@@ -481,7 +486,7 @@ impl Fill {
                 .lookup(LookupTier::Plaintext, self.dependencies.memory.get(&page))?
             {
                 result.validate_for(&page)?;
-                self.metrics.record(Event::MemoryHit, 1);
+                self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(result.into());
             }
             let mut waiter = match self.dependencies.flights.join_for(
@@ -682,7 +687,8 @@ impl Fill {
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }
-        use crate::model::{PAGE_BYTES, ResourceClass};
+        use crate::model::PAGE_BYTES;
+        use crate::model::ResourceClass;
         if origin.plaintext.bytes()?.len()
             != origin.metadata.immutable().page_length(page)? as usize
         {
@@ -722,7 +728,7 @@ impl Fill {
         };
         result.validate_for(page)?;
         self.publish(result.clone(), dirty, scope).await?;
-        self.metrics.record(Event::OriginFill, 1);
+        self.metrics.record(Event::OriginFill, 1)?;
         Ok(result)
     }
     /// Strictly local completed/pending copy or join of existing work; never starts
@@ -740,7 +746,7 @@ impl Fill {
                 self.dependencies.memory.ciphertext(page),
             )? {
                 validate_copy(&copy, page)?;
-                self.metrics.record(Event::MemoryHit, 1);
+                self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
             if let Some(copy) = self.metrics.lookup(
@@ -748,7 +754,7 @@ impl Fill {
                 self.dependencies.writer.copy_only(page),
             )? {
                 validate_copy(&copy, page)?;
-                self.metrics.record(Event::MemoryHit, 1);
+                self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
             // Copy-only forbids new acquisition, not reclamation of idle local
@@ -758,7 +764,7 @@ impl Fill {
                     return Ok(Some((copy.metadata, copy.ciphertext)));
                 }
                 Err(Error::CorruptRecord) => {
-                    self.metrics.record(Event::CorruptMiss, 1);
+                    self.metrics.record(Event::CorruptMiss, 1)?;
                 }
                 Ok(None) | Err(Error::MissingKey | Error::Io) => {}
                 Err(error) => return Err(error),
@@ -848,7 +854,7 @@ impl Fill {
                         | Err(Error::Overloaded | Error::MissingKey | Error::Unavailable) => {}
                         Err(error) => return Err(error),
                     }
-                    fill.metrics.record(Event::DiskHit, 1);
+                    fill.metrics.record(Event::DiskHit, 1)?;
                     Ok(Some(copy))
                 }
                 .await;
@@ -909,7 +915,7 @@ impl Fill {
                     match self.validate_disk_copy(&copy, page, token, scope).await {
                         Ok(()) => {}
                         Err(Error::CorruptRecord) => {
-                            self.metrics.record(Event::CorruptMiss, 1);
+                            self.metrics.record(Event::CorruptMiss, 1)?;
                             return Ok(None);
                         }
                         Err(Error::MissingKey) => return Ok(None),
@@ -925,7 +931,7 @@ impl Fill {
                         Event::MemoryHit
                     },
                     1,
-                );
+                )?;
                 return Ok(Some(AcquiredPage::Ciphertext(UnverifiedPage {
                     copy,
                     disk_token: token,
@@ -952,12 +958,12 @@ impl Fill {
                             Event::MemoryHit
                         },
                         1,
-                    );
+                    )?;
                     return Ok(Some(result.into()));
                 }
                 Err(error @ (Error::CorruptRecord | Error::MissingKey)) => {
                     if error == Error::CorruptRecord {
-                        self.metrics.record(Event::CorruptMiss, 1);
+                        self.metrics.record(Event::CorruptMiss, 1)?;
                     }
                     if let Some(token) = &token {
                         self.dependencies.disk.invalidate(token)?;
@@ -1076,7 +1082,7 @@ impl Fill {
                 result.validate_for(page)?;
                 scope.check()?;
                 self.publish(result.clone(), dirty, scope).await?;
-                self.metrics.record(Event::PeerHit, 1);
+                self.metrics.record(Event::PeerHit, 1)?;
                 return Ok(result.into());
             }
         }
@@ -1185,7 +1191,7 @@ impl Fill {
             // that evidence even when the supplier requested only ciphertext.
             self.publish(page.clone(), dirty, scope).await?;
         }
-        self.metrics.record(source, 1);
+        self.metrics.record(source, 1)?;
         Ok(result)
     }
 
@@ -1226,7 +1232,7 @@ impl Fill {
         scope.check()?;
         let copy = response_copy(response.response(), page).inspect_err(|error| {
             if *error == Error::CorruptRecord {
-                self.metrics.record(Event::CorruptMiss, 1);
+                let _ = self.metrics.record(Event::CorruptMiss, 1);
             }
         })?;
         let reservation = match reservation {
@@ -1237,7 +1243,7 @@ impl Fill {
             .await
             .inspect_err(|error| {
                 if *error == Error::CorruptRecord {
-                    self.metrics.record(Event::CorruptMiss, 1);
+                    let _ = self.metrics.record(Event::CorruptMiss, 1);
                 }
             })
     }
@@ -1256,7 +1262,7 @@ impl Fill {
         let result = async {
             validate_copy(&copy, page)?;
             // Keep the original immutable ciphertext lease across crypto submission.
-            self.metrics.record(Event::PageDecrypt, 1);
+            self.metrics.record(Event::PageDecrypt, 1)?;
             let plaintext = self
                 .dependencies
                 .crypto
@@ -1378,7 +1384,11 @@ fn merge_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag};
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::ObjectId;
+    use crate::model::ObjectVersion;
+    use crate::model::StrongEtag;
     #[test]
     fn decrypt_source_counters_preserve_results_and_ignore_non_corruption() {
         let metrics = Metrics::default();
@@ -1462,4 +1472,3 @@ mod tests {
         );
     }
 }
-use uring_runtime::reactor::IoBuffer;

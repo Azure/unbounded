@@ -1,8 +1,9 @@
 //! Authenticate, replay-check, authorize, and admit before local dispatch or relay.
-use super::{
-    Relay,
-    protocol::{PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
-};
+use super::Relay;
+use super::protocol::PeerResponse;
+use super::protocol::SignedRequest;
+use super::protocol::SignedResponse;
+use super::protocol::VerifiedRequest;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::model::ResourceClass;
@@ -10,10 +11,9 @@ use crate::runtime::admission::AdmissionExt;
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::RequestScope;
 use crate::security::forwarding::Forwarding;
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::rc::Rc;
+use std::time::Duration;
+use std::time::Instant;
 /// Implemented by the existing read coordinator, never a second acquisition graph.
 /// Ingress must be verified; the local result is unsigned until the server signs
 /// it with a retained clone of the request binding.
@@ -201,7 +201,8 @@ impl PeerServer {
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
         Box::pin(async move {
-            use futures::{StreamExt, stream::FuturesUnordered};
+            use futures::StreamExt;
+            use futures::stream::FuturesUnordered;
             scope.check()?;
             let reactor = self.io.reactor();
             let fd = Rc::new(uring_runtime::reactor::Descriptor::tcp_listener(address)?);
@@ -333,7 +334,8 @@ impl PeerServer {
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::http::ConnectionLease> {
         Box::pin(async move {
-            use super::protocol::{decode_envelope, encode_envelope};
+            use super::protocol::decode_envelope;
+            use super::protocol::encode_envelope;
             scope.check()?;
             let codec = &self.wire;
             // One fixed budget for handshake reads, verification, signing, writes,
@@ -735,7 +737,8 @@ impl PeerServer {
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
             use super::subscriptions::Selection;
-            use crate::peer::protocol::{encode_deadline, millis};
+            use crate::peer::protocol::encode_deadline;
+            use crate::peer::protocol::millis;
             let super::protocol::Operation::Subscribe { subscription, mode } =
                 &request.request().operation
             else {
@@ -853,7 +856,8 @@ where
     A: std::future::Future<Output = crate::error::Result<uring_runtime::reactor::Descriptor>>,
     C: std::future::Future,
 {
-    use futures::{FutureExt, StreamExt};
+    use futures::FutureExt;
+    use futures::StreamExt;
     let accept = accept.fuse();
     futures::pin_mut!(accept);
     loop {
@@ -940,8 +944,10 @@ fn header_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::RequestId, test_support::clock::Clock};
-    use futures::{channel::oneshot, stream::FuturesUnordered};
+    use crate::model::RequestId;
+    use crate::test_support::clock::Clock;
+    use futures::channel::oneshot;
+    use futures::stream::FuturesUnordered;
     use std::cell::Cell;
     use std::future::Future;
     use std::io::Read;
@@ -1004,11 +1010,12 @@ mod tests {
 
     #[test]
     fn materialized_transit_fin_and_parent_cancel_fence_head_and_body() {
-        use crate::{
-            http::{Codec, HttpIo},
-            runtime::reactor::Reactor,
-        };
-        use std::net::{Shutdown, TcpListener, TcpStream};
+        use crate::http::Codec;
+        use crate::http::HttpIo;
+        use crate::runtime::reactor::Reactor;
+        use std::net::Shutdown;
+        use std::net::TcpListener;
+        use std::net::TcpStream;
 
         for body in [false, true] {
             for cancel_parent in [false, true] {
@@ -1121,10 +1128,9 @@ mod tests {
 
     #[test]
     fn materialized_transit_success_fences_watch_before_keepalive() {
-        use crate::{
-            http::{Codec, HttpIo},
-            runtime::reactor::Reactor,
-        };
+        use crate::http::Codec;
+        use crate::http::HttpIo;
+        use crate::runtime::reactor::Reactor;
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -1313,7 +1319,8 @@ mod tests {
     #[test]
     fn real_accept_retains_socket_and_fences_cancellation_and_abandonment() {
         use crate::runtime::reactor::Reactor;
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
+        use std::net::TcpStream;
 
         for ready in [false, true] {
             for end in ["consume", "cancel", "drop"] {

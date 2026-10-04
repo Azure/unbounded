@@ -2,7 +2,8 @@ use super::*;
 mod materialized_pairing {
     //! Distinct bodies make cross-exchange substitution visible across relay reuse.
     use super::*;
-    use crate::{error::Result, memory::CiphertextPage};
+    use crate::error::Result;
+    use crate::memory::CiphertextPage;
     use std::net::Shutdown;
 
     pub(super) async fn until(condition: impl Fn() -> bool) {
@@ -373,7 +374,10 @@ mod safety {
     use crate::security::aead::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
-    use racer_control_wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState};
+    use racer_control_wire::CacheEncryptionKey;
+    use racer_control_wire::CacheKeyPurpose;
+    use racer_control_wire::CacheKeyRef;
+    use racer_control_wire::CacheKeyState;
     use std::cell::RefCell;
     use std::net::Shutdown;
 
@@ -802,11 +806,11 @@ use crate::topology::Membership;
 use crate::topology::Paths;
 use http1::connection::BufferRange;
 use racer_crypto::aead;
-use std::{
-    cell::Cell,
-    net::{TcpListener, TcpStream},
-    task::{Context, Poll},
-};
+use std::cell::Cell;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::task::Context;
+use std::task::Poll;
 
 // These opaque-transport fixtures intentionally use empty AAD, not page AAD.
 fn seal_fixture(nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8> {
@@ -1478,7 +1482,8 @@ fn opaque_relay_benchmark() {
 
 #[test]
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
-    use crate::{peer::protocol, security::forwarding::ForwardedHead};
+    use crate::peer::protocol;
+    use crate::security::forwarding::ForwardedHead;
     fn copy(head: &http1::MessageHead) -> http1::MessageHead {
         let codec = Codec::new(crate::peer::protocol::MAX_SIGNED_HEAD);
         let mut head = codec

@@ -1,10 +1,14 @@
 //! Bounded node-local handoffs. Only owned commands and immutable results cross
 //! threads; the coordinator, futures, delivery leases, and streams stay local.
-use super::{Coordinator, flight::AcquisitionBudget};
+//! Stable local page assignment is independent of cluster placement. Drain flights
+//! before changing the worker map; no live remapping is implied.
+use super::Coordinator;
+use super::flight::AcquisitionBudget;
+use crate::memory::page::PageResult;
+use crate::runtime::collections::HashMap;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::memory::page::PageResult;
 use crate::model::AttemptId;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
@@ -18,22 +22,25 @@ use crate::model::WorkerId;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::protocol::VerifiedRequest;
 use crate::peer::server::LocalPageService;
-use crate::runtime::collections::HashMap;
 use crate::runtime::deadline::Cancellation;
 use crate::runtime::deadline::RequestScope;
-use crate::runtime::worker::WorkerMap;
-use std::{
-    cell::RefCell,
-    collections::VecDeque,
-    future::Future,
-    pin::Pin,
-    rc::{Rc, Weak},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    task::{Context, Poll, Waker},
-};
+
+use sha2::Digest;
+use sha2::Sha256;
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::rc::Weak;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
 thread_local! {
     // Installed only on the owning I/O thread. No Rc enters the shared directory.
@@ -71,16 +78,8 @@ enum Work {
     ),
     Selected(crate::memory::page::CiphertextCopy),
     Cached(PageId),
-    Resolve(
-        MetadataSelector,
-        std::sync::Arc<crate::topology::Membership>,
-        PeerOriginContext,
-    ),
-    Acquire(
-        PageId,
-        std::sync::Arc<crate::topology::Membership>,
-        PeerOriginContext,
-    ),
+    Resolve(MetadataSelector, std::sync::Arc<crate::topology::Membership>, PeerOriginContext),
+    Acquire(PageId, std::sync::Arc<crate::topology::Membership>, PeerOriginContext),
     Ordered(
         PageId,
         std::sync::Arc<crate::topology::Membership>,
@@ -941,7 +940,8 @@ async fn execute(
     }
 }
 
-impl LocalPageService for WorkerDirectory {
+// PeerServer owns local services through Rc; retain the node-wide directory Arc.
+impl LocalPageService for Arc<WorkerDirectory> {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
@@ -952,23 +952,87 @@ impl LocalPageService for WorkerDirectory {
     }
 }
 
-// PeerServer owns local services through Rc; retain the node-wide directory Arc.
-impl LocalPageService for Arc<WorkerDirectory> {
-    fn serve_peer<'a>(
-        &'a self,
-        request: VerifiedRequest,
-        membership: std::sync::Arc<crate::topology::Membership>,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, PeerResponse> {
-        self.as_ref().serve_peer(request, membership, scope)
+pub struct WorkerMap {
+    workers: Vec<WorkerId>,
+}
+impl WorkerMap {
+    /// Canonical worker order makes assignment independent of discovery order.
+    /// Changing this set requires draining all flights first.
+    pub fn new(mut workers: Vec<WorkerId>) -> Result<Self> {
+        workers.sort_by_key(|worker| worker.0);
+        if workers.is_empty() || workers.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(Self { workers })
+    }
+
+    /// Same owner as this object's page zero, without needing an ETag first.
+    pub fn metadata_owner(&self, object: &ObjectId) -> Result<WorkerId> {
+        self.select(object, 0)
+    }
+    pub fn owner(&self, page: &PageId) -> Result<WorkerId> {
+        self.select(&page.version.object, page.number.0)
+    }
+
+    fn select(&self, object: &ObjectId, page: u64) -> Result<WorkerId> {
+        if self.workers.is_empty() {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"racer.local-worker.v1\0");
+        hash.update((object.cache.0.len() as u64).to_be_bytes());
+        hash.update(object.cache.0.as_bytes());
+        hash.update(object.key.0);
+        hash.update(page.to_be_bytes());
+        let digest = hash.finalize();
+        let index = u64::from_be_bytes(digest[..8].try_into().expect("eight digest bytes"))
+            % self.workers.len() as u64;
+        Ok(self.workers[index as usize])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CacheId, CacheKey, RequestId, StrongEtag};
-    use std::time::{Duration, Instant};
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::RequestId;
+    use crate::model::StrongEtag;
+    use std::time::Duration;
+    use std::time::Instant;
+    #[test]
+    fn stable_assignment_ignores_etag_and_worker_input_order() {
+        use crate::model::CacheId;
+        use crate::model::CacheKey;
+        use crate::model::ObjectVersion;
+        use crate::model::PageNumber;
+        use crate::model::StrongEtag;
+        let map = WorkerMap::new(vec![WorkerId(9), WorkerId(3), WorkerId(1)]).unwrap();
+        let ordered = WorkerMap::new(vec![WorkerId(1), WorkerId(3), WorkerId(9)]).unwrap();
+        let object = ObjectId {
+            cache: CacheId("cache".into()),
+            key: CacheKey([7; 32]),
+        };
+        let mut page = PageId {
+            version: ObjectVersion {
+                object: object.clone(),
+                etag: StrongEtag::test_value("a"),
+            },
+            number: PageNumber(0),
+        };
+        assert_eq!(map.owner(&page), map.metadata_owner(&object));
+        for number in 0..100 {
+            page.number = PageNumber(number);
+            let owner = map.owner(&page);
+            assert_eq!(owner, ordered.owner(&page));
+            page.version.etag = StrongEtag::test_value("different");
+            assert_eq!(owner, map.owner(&page));
+        }
+        assert!(WorkerMap::new(vec![]).is_err());
+        assert!(WorkerMap::new(vec![WorkerId(1), WorkerId(1)]).is_err());
+        // SHA-256 encoding vector, independent of std's randomized hasher.
+        assert_eq!(map.metadata_owner(&object).unwrap(), WorkerId(1));
+    }
 
     fn directory(capacity: usize) -> WorkerDirectory {
         let workers = vec![WorkerId(0), WorkerId(1)];

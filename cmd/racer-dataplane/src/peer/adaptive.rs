@@ -9,11 +9,11 @@ use crate::model::NodeId;
 use crate::telemetry::Event;
 use crate::telemetry::Gauge;
 use crate::telemetry::Metrics;
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Clone, Copy)]
 pub struct Config {

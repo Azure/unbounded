@@ -1,15 +1,16 @@
 //! Single-node production graph validation. Only control publication, origin data,
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
 use base64::Engine;
-use racer_control_wire as wire;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::Publication;
+use racer_control_wire::self as wire;
 use racer_control_wire::PublicationSequence;
-use racer_control_wire::canonical_socket_paths;
+use racer_dataplane::read::dispatch::WorkerMap;
 use racer_dataplane::client::RequestParser;
 use racer_dataplane::client::response::Responses;
+use racer_control_wire::Publication;
+use racer_control_wire::CacheDefinition;
 use racer_dataplane::control::PublishedState;
 use racer_dataplane::control::SnapshotStore;
+use racer_control_wire::canonical_socket_paths;
 use racer_dataplane::error::Error;
 use racer_dataplane::error::Operation;
 use racer_dataplane::error::Result;
@@ -50,7 +51,6 @@ use racer_dataplane::runtime::deadline::RequestScope;
 use racer_dataplane::runtime::reactor::Reactor;
 use racer_dataplane::runtime::worker::CryptoRuntime;
 use racer_dataplane::runtime::worker::CryptoService;
-use racer_dataplane::runtime::worker::WorkerMap;
 use racer_dataplane::security::aead::PageCrypto;
 use racer_dataplane::security::aead::PageCryptoEngine;
 use racer_dataplane::security::connection::Signatures;
@@ -61,31 +61,40 @@ use racer_dataplane::store::StoreWriter;
 use racer_dataplane::store::catalog::Index;
 use racer_dataplane::store::catalog::SegmentClock;
 use racer_dataplane::topology::LinkHealth;
-use racer_dataplane::topology::Paths;
+use racer_dataplane::topology::Member;
+
 use racer_dataplane::topology::Placement;
+use racer_dataplane::topology::Paths;
 use racer_dataplane::topology::RouteBudget;
-use racer_identity::{Certificates, KeyEpochs, Keyring, PendingIdentity};
-use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    fs,
-    future::Future,
-    io::{Read, Write},
-    num::{NonZeroU32, NonZeroUsize},
-    os::{
-        fd::AsRawFd,
-        unix::net::{UnixListener, UnixStream},
-    },
-    path::PathBuf,
-    rc::Rc,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    task::{Context, Poll},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use racer_identity::Certificates;
+use racer_identity::KeyEpochs;
+use racer_identity::Keyring;
+use racer_identity::PendingIdentity;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::fs;
+use std::future::Future;
+use std::io::Read;
+use std::io::Write;
+use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 const P: u64 = PAGE_BYTES;
 const CACHE: &str = "44444444-4444-4444-8444-444444444444";
@@ -99,7 +108,8 @@ use racer_dataplane as dataplane;
 #[path = "support/enrollment.rs"]
 #[allow(dead_code)]
 mod fixture_io;
-use fixture_io::{fields, read_head};
+use fixture_io::fields;
+use fixture_io::read_head;
 
 fn scope() -> RequestScope {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
@@ -739,7 +749,7 @@ struct Bootstrap {
     receiver: Rc<Forwarding>,
     credentials: CredentialCrypto,
     coordinator: Rc<Coordinator>,
-    membership: std::sync::Arc<dataplane::topology::Membership>,
+    membership: std::sync::Arc<racer_dataplane::topology::Membership>,
 }
 
 fn open_fixture_storage(
@@ -758,9 +768,7 @@ fn open_fixture_storage(
         path.join(format!("worker-{}-slab-0.dat", worker.0)),
         slab_bytes,
         64 * 1024 * 1024,
-        racer_dataplane::model::PAGE_BYTES as usize
-            + racer_dataplane::store::format::MAX_HEADER_BYTES
-            + 16,
+        racer_dataplane::model::PAGE_BYTES as usize + racer_dataplane::store::MAX_HEADER_BYTES + 16,
     ));
     let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
     let disk = Rc::new(StoreReader::new(
@@ -794,7 +802,7 @@ fn fixture_publication() -> Publication {
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        members: vec![racer_control_wire::Member {
+        members: vec![Member {
             node: NodeId(NODE.into()),
             shares: NonZeroU32::new(4).unwrap(),
             peer_endpoint: "127.0.0.1:8000".into(),
@@ -877,7 +885,7 @@ impl Bootstrap {
         receiver: Rc<Forwarding>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         coordinator: Rc<Coordinator>,
-        membership: std::sync::Arc<dataplane::topology::Membership>,
+        membership: std::sync::Arc<racer_dataplane::topology::Membership>,
     ) -> Self {
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), sender.clone()));
         Self {

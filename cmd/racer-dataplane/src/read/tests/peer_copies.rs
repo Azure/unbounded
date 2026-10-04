@@ -1,14 +1,12 @@
 //! Real AEAD and signed peer responses, with deterministic ranked source scripts.
 use super::fill::*;
-use crate::{
-    memory::page::CiphertextCopy,
-    model::NodeId,
-    peer::protocol::{PeerRequest, VerifiedResponse},
-    security::{
-        forwarding::Forwarding,
-        test_support::{network, node},
-    },
-};
+use crate::memory::page::CiphertextCopy;
+use crate::model::NodeId;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::VerifiedResponse;
+use crate::security::forwarding::Forwarding;
+use crate::security::test_support::network;
+use crate::security::test_support::node;
 use std::collections::VecDeque;
 
 enum Reply {
@@ -352,11 +350,11 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
         let (peers, ordered) = install_peers(&mut f, None);
         peers.hedge.set(reason != "route");
         let metrics = crate::telemetry::Metrics::default();
-        let hedges = crate::read::hedge::Hedges::new(
-            crate::read::hedge::Config {
+        let hedges = crate::read::candidates::Hedges::new(
+            crate::read::candidates::HedgeConfig {
                 delay: Duration::from_millis(1),
                 slots: 1,
-                bytes: crate::read::hedge::DUPLICATE_BYTES,
+                bytes: crate::read::candidates::DUPLICATE_BYTES,
             },
             metrics.clone(),
         )
@@ -666,11 +664,11 @@ fn known_copy_full_page_still_requires_full_plaintext_admission() {
 fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry::Metrics {
     peers.hedge.set(true);
     let metrics = crate::telemetry::Metrics::default();
-    let hedges = crate::read::hedge::Hedges::new(
-        crate::read::hedge::Config {
+    let hedges = crate::read::candidates::Hedges::new(
+        crate::read::candidates::HedgeConfig {
             delay: Duration::from_nanos(1),
             slots: 1,
-            bytes: crate::read::hedge::DUPLICATE_BYTES,
+            bytes: crate::read::candidates::DUPLICATE_BYTES,
         },
         metrics.clone(),
     )
@@ -880,7 +878,8 @@ fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
 fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    use crate::{peer::server::LocalPageService, read::Coordinator};
+    use crate::peer::server::LocalPageService;
+    use crate::read::Coordinator;
     struct Mesh {
         signing: Vec<Forwarding>,
         nodes: RefCell<Vec<Rc<Coordinator>>>,
@@ -893,11 +892,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         local: usize,
     }
     impl Peer {
-        fn direct_hedge_available(
-            &self,
-            _: &std::sync::Arc<crate::topology::Membership>,
-            _: &NodeId,
-        ) -> bool {
+        fn direct_hedge_available(&self, _: &std::sync::Arc<crate::topology::Membership>, _: &NodeId) -> bool {
             true
         }
         fn request_direct<'a>(
@@ -1021,11 +1016,11 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
             );
             if i == source {
                 policy = policy.with_hedges(
-                    crate::read::hedge::Hedges::new(
-                        crate::read::hedge::Config {
+                    crate::read::candidates::Hedges::new(
+                        crate::read::candidates::HedgeConfig {
                             slots: 1,
                             delay: Duration::from_nanos(1),
-                            bytes: crate::read::hedge::DUPLICATE_BYTES,
+                            bytes: crate::read::candidates::DUPLICATE_BYTES,
                         },
                         hedge_metrics.clone(),
                     )

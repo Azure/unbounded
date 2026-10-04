@@ -14,11 +14,10 @@ use crate::topology::LinkHealth;
 use crate::topology::Member;
 use crate::topology::Membership;
 use crate::topology::Paths;
-use std::{
-    cell::Cell,
-    task::{Context, Poll},
-    time::UNIX_EPOCH,
-};
+use std::cell::Cell;
+use std::task::Context;
+use std::task::Poll;
+use std::time::UNIX_EPOCH;
 
 fn subscribe(
     admission: &flow_control::Quotas<AdmissionPolicy>,
@@ -754,4 +753,6 @@ fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
             .is_err()
     );
 }
-use racer_control_wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION};
+use racer_control_wire::BundleGeneration;
+use racer_control_wire::KeyringBundle;
+use racer_control_wire::SCHEMA_VERSION;

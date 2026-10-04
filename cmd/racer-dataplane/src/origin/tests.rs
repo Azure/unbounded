@@ -13,20 +13,21 @@ use crate::model::StrongEtag;
 use crate::runtime::admission::AdmissionExt;
 use crate::runtime::reactor::Reactor;
 use futures::executor::block_on;
-use std::{
-    future::Future,
-    io::{Read, Write},
-    num::NonZeroUsize,
-    os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    task::{Context, Poll},
-    thread,
-    time::{Duration, Instant},
-};
+use std::future::Future;
+use std::io::Read;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 fn context() -> OriginContext {
     OriginContext {
@@ -93,7 +94,8 @@ fn credentials(
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 ) -> Rc<crate::security::credentials::CredentialCrypto> {
     use crate::security::credentials::CredentialCrypto;
-    use racer_identity::{KeyEpochs, Keyring};
+    use racer_identity::KeyEpochs;
+    use racer_identity::Keyring;
     Rc::new(CredentialCrypto::new(
         Rc::new(Keyring::new(
             ClusterId("cluster".into()),
@@ -387,10 +389,11 @@ fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
 
 #[test]
 fn shared_adapter_controls_real_head_bootstrap_pin_and_rejection() {
-    use crate::{
-        model::{ExpiresAt, ObjectMetadata, ObjectVersion},
-        test_support::origin::{AdapterOrigin, RequestKind},
-    };
+    use crate::model::ExpiresAt;
+    use crate::model::ObjectMetadata;
+    use crate::model::ObjectVersion;
+    use crate::test_support::origin::AdapterOrigin;
+    use crate::test_support::origin::RequestKind;
     let (client, admission, reactor, snapshot) = published_client();
     let mut context = context();
     context.object.cache = snapshot.caches[0].id.clone();

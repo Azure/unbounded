@@ -1,4 +1,8 @@
 //! Candidate policy exercised through real signing, handshake, TCP, and Requester.
+use crate::read::candidates::CandidatePolicy;
+use crate::read::candidates::CandidateResolution;
+use crate::read::dispatch::WorkerMap;
+use crate::read::flight::AcquisitionBudget;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::http::Codec;
@@ -20,8 +24,6 @@ use crate::peer::protocol::VerifiedRequest;
 use crate::peer::server::LocalPageService;
 use crate::peer::server::PeerServer;
 use crate::peer::transport::Transfers;
-use crate::read::candidates::{CandidatePolicy, CandidateResolution};
-use crate::read::flight::AcquisitionBudget;
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::RequestScope;
 use crate::runtime::reactor::Reactor;
@@ -34,16 +36,18 @@ use crate::topology::Member;
 use crate::topology::Membership;
 use crate::topology::Paths;
 use crate::topology::Placement;
-use racer_control_wire::{PublicationSequence, SCHEMA_VERSION};
+use racer_control_wire::PublicationSequence;
+use racer_control_wire::SCHEMA_VERSION;
 use racer_identity::Keyring;
-use std::{
-    cell::{Cell, RefCell},
-    net::TcpListener,
-    rc::Rc,
-    sync::Arc,
-    task::{Context, Poll},
-    time::{Duration, Instant},
-};
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::net::TcpListener;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
+use std::time::Instant;
 
 const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 const CACHE: &str = "33333333-3333-4333-8333-333333333333";
@@ -272,9 +276,9 @@ fn live_read_routes_after_cache_only_publication_and_membership_update() {
 fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn: bool) {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
+    use racer_control_wire::Publication;
     use crate::control::PublishedState;
     use crate::control::SnapshotStore;
-    use racer_control_wire::Publication;
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
         key: CacheKey([3; 32]),
@@ -297,7 +301,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             origin_socket: "/run/racer/remote/origin/socket".into(),
         }],
         members: (0..4)
-            .map(|i| racer_control_wire::Member {
+            .map(|i| Member {
                 node: node(i),
                 shares: std::num::NonZeroU32::new(4).unwrap(),
                 peer_endpoint: address.clone(),
@@ -527,7 +531,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         drop(membership);
         let read = async {
             if let Some((coordinator, _endpoint)) = &ingress {
-                use crate::client::{ClientRequest, ReadKind};
+                use crate::client::ClientRequest;
+                use crate::client::ReadKind;
                 let result = coordinator
                     .read(
                         ClientRequest {
@@ -884,6 +889,7 @@ fn metadata_coordinator_with_newer_publication(
     adapter: Rc<AdapterOrigin>,
     newer_publication: bool,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
+    use racer_control_wire::Publication;
     use crate::control::PublishedState;
     use crate::control::SnapshotStore;
     use crate::memory::cache::MemoryCache;
@@ -891,13 +897,11 @@ fn metadata_coordinator_with_newer_publication(
     use crate::memory::new_pipe_pool;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
-    use crate::runtime::worker::WorkerMap;
     use crate::security::aead::PageCrypto;
     use crate::store::StoreReader;
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;
     use crate::store::catalog::SegmentClock;
-    use racer_control_wire::Publication;
     let published = Arc::new(PublishedState::default());
     let availability = Rc::new(crate::control::Availability::new(
         published.clone(),
@@ -909,12 +913,7 @@ fn metadata_coordinator_with_newer_publication(
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: membership.version,
-        members: membership
-            .members()
-            .iter()
-            .cloned()
-            .map(Into::into)
-            .collect(),
+        members: membership.members().to_vec(),
         caches: vec![racer_control_wire::CacheDefinition {
             id: CacheId(CACHE.into()),
             name: "remote".into(),
@@ -938,7 +937,7 @@ fn metadata_coordinator_with_newer_publication(
         "unused/absence-slabs/worker-0-slab-0.dat".into(),
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
-        crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
+        crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
     ));
     let disk = Rc::new(StoreReader::new(
         Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),

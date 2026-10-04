@@ -1,6 +1,7 @@
 //! Client socket scenarios: ownership, publication, HTTP delivery, and retirement.
 use super::*;
-use super::{listener::*, response::Responses};
+use super::listener::*;
+use super::response::Responses;
 use crate::http::HttpIo;
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::Cancellation;
@@ -9,23 +10,24 @@ use crate::test_support::ReadWorker;
 use crate::test_support::origin::RequestKind;
 use racer_control_wire::CacheDefinition;
 use std::time::Instant;
-use std::{
-    cell::{Cell, RefCell},
-    ffi::CString,
-    fs::{self, File, OpenOptions},
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-            net::UnixListener,
-        },
-    },
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::ffi::CString;
+use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
+use std::path::Path;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
 mod acquisition {
     use super::*;
 
@@ -318,7 +320,8 @@ mod recovery {
 
     #[test]
     fn sigkill_restart_recovers_committed_and_prepared_endpoints() {
-        use std::process::{Command, Stdio};
+        use std::process::Command;
+        use std::process::Stdio;
         struct Child(std::process::Child);
         impl Drop for Child {
             fn drop(&mut self) {
@@ -523,7 +526,9 @@ mod recovery {
 
 #[test]
 fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() {
-    use crate::{model::WorkerId, runtime::ingress::Ingress, test_support::WakeCounter};
+    use crate::model::WorkerId;
+    use crate::runtime::ingress::Ingress;
+    use crate::test_support::WakeCounter;
     use std::task::Waker;
 
     for distributed in [false, true] {
@@ -612,10 +617,9 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
 
 #[test]
 fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
-    use crate::{
-        model::{ResourceClass, WorkerId},
-        runtime::ingress::Ingress,
-    };
+    use crate::model::ResourceClass;
+    use crate::model::WorkerId;
+    use crate::runtime::ingress::Ingress;
 
     for stop_receiver in [false, true] {
         let mut acceptor = Fixture::new();
@@ -661,7 +665,8 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
 
 #[test]
 fn simulated_listener_preparation_rollback_and_real_http_exchange() {
-    use uring_runtime::reactor::{SocketAddress, simulation::Simulation};
+    use uring_runtime::reactor::SocketAddress;
+    use uring_runtime::reactor::simulation::Simulation;
     let sim = Simulation::new();
     let _environment = sim.enter();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits())));
@@ -745,20 +750,23 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     drop(reactor);
     assert_eq!(sim.live_handles(), 0);
 }
-use crate::{
-    http::Codec,
-    memory::{delivery::Delivery, new_pipe_pool},
-    model::{ExpiresAt, Limits, ObjectMetadata, ObjectVersion, StrongEtag},
-    read::ReadResponse,
-    runtime::reactor::Reactor,
-};
-use std::{
-    io::{Read, Write},
-    num::NonZeroUsize,
-    os::unix::net::UnixStream,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::UNIX_EPOCH,
-};
+use crate::http::Codec;
+use crate::memory::delivery::Delivery;
+use crate::memory::new_pipe_pool;
+use crate::model::ExpiresAt;
+use crate::model::Limits;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::StrongEtag;
+use crate::read::ReadResponse;
+use crate::runtime::reactor::Reactor;
+use std::io::Read;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::UNIX_EPOCH;
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 struct Root(PathBuf);
@@ -822,7 +830,8 @@ struct Fixture {
 }
 impl Fixture {
     fn install_handoff(&self, ingress: &crate::runtime::ingress::Ingress) {
-        use crate::{model::WorkerId, runtime::ingress::Kind};
+        use crate::model::WorkerId;
+        use crate::runtime::ingress::Kind;
         let [accepted] = ingress
             .pop_batch::<1>(WorkerId(1), futures::task::noop_waker_ref(), 1)
             .unwrap();

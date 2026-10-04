@@ -3,17 +3,23 @@
 //! Eviction releases idle leases; retirement hides entries without revoking owners.
 pub mod cache;
 pub mod delivery;
-use crate::{
-    error::{Error, Operation, Result},
-    model::{CacheId, PAGE_BYTES, PageEnvelope, PageId, ResourceClass},
-    runtime::admission::{AdmissionExt, AdmissionPolicy},
-    runtime::deadline::RequestScope,
-};
-use flow_control::{
-    Quotas,
-    pipe::{PipeLease, PipePool},
-};
-use std::{rc::Rc, sync::Arc, task::Waker};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::CacheId;
+use crate::model::PAGE_BYTES;
+use crate::model::PageEnvelope;
+use crate::model::PageId;
+use crate::model::ResourceClass;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
+use flow_control::Quotas;
+use flow_control::pipe::PipeLease;
+use flow_control::pipe::PipePool;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Waker;
 
 #[derive(Clone)]
 pub struct BufferPool {
@@ -264,7 +270,9 @@ unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::{Nonce, PageNumber, VersionMetadata};
+    use crate::model::Nonce;
+    use crate::model::PageNumber;
+    use crate::model::VersionMetadata;
 
     pub(in crate::memory) fn admission(
         entries: usize,
@@ -277,7 +285,10 @@ pub(crate) mod tests {
         admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         version: &str,
     ) -> super::page::PageResult {
-        use crate::model::{CacheKey, ObjectId, ObjectVersion, StrongEtag};
+        use crate::model::CacheKey;
+        use crate::model::ObjectId;
+        use crate::model::ObjectVersion;
+        use crate::model::StrongEtag;
         bundle_for(
             admission,
             VersionMetadata {
@@ -412,7 +423,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn aead_fingerprints_reuse_crc_and_separate_body_from_identity() {
-        use crate::{model::RequestId, security::aead::capture_aead_failure};
+        use crate::model::RequestId;
+        use crate::security::aead::capture_aead_failure;
         let admission = admission(8);
         let mut page = bundle(&admission, "sensitive-etag");
         let request = RequestId([9; 16]);
@@ -633,7 +645,8 @@ use uring_runtime::reactor::IoBuffer;
 
 /// Credential-free page results shared by fills, memory, and flight completion.
 pub mod page {
-    use super::{CiphertextPage, VerifiedPage};
+    use super::CiphertextPage;
+    use super::VerifiedPage;
     use crate::model::ObjectMetadata;
 
     /// Retain all three values for the same version until the last reader releases
@@ -868,10 +881,10 @@ mod pipe_tests {
     #[test]
     fn immediate_acquisition_does_not_subscribe_to_cancellation() {
         use crate::model::RequestId;
-        use std::{
-            task::{Context, Poll},
-            time::{Duration, Instant},
-        };
+        use std::task::Context;
+        use std::task::Poll;
+        use std::time::Duration;
+        use std::time::Instant;
         let admission = admission(1);
         let pool = new_pipe_pool(admission.clone());
         let scope =
@@ -907,11 +920,11 @@ mod pipe_tests {
     fn scheduled_wait_cancellation_deadline_stop_and_abandonment_release_admission() {
         use crate::model::RequestId;
         use crate::test_support::WakeCounter;
-        use std::{
-            sync::Arc,
-            task::{Context, Poll},
-            time::{Duration, Instant},
-        };
+        use std::sync::Arc;
+        use std::task::Context;
+        use std::task::Poll;
+        use std::time::Duration;
+        use std::time::Instant;
         for failure in [
             Some(Error::Cancelled),
             Some(Error::DeadlineExceeded),

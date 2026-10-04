@@ -16,15 +16,23 @@ use crate::security::aead::PageCryptoEngine;
 use crate::security::connection::VerifiedHead;
 use crate::topology::FAILURE_LINKS;
 use crate::topology::Route;
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use racer_control_wire::RailId;
 use racer_control_wire::RailMapping;
 use racer_identity::VerifiedPeer;
-use rdma_verbs::{
-    DeviceHandle, Endpoint, IoPort, NativePort, NativeService, PortInfo, QueuePairHandle, Region,
-    Ticket, Window,
-};
-use sha2::{Digest, Sha256};
+use rdma_verbs::DeviceHandle;
+use rdma_verbs::Endpoint;
+use rdma_verbs::IoPort;
+use rdma_verbs::NativePort;
+use rdma_verbs::NativeService;
+use rdma_verbs::PortInfo;
+use rdma_verbs::QueuePairHandle;
+use rdma_verbs::Region;
+use rdma_verbs::Ticket;
+use rdma_verbs::Window;
+use sha2::Digest;
+use sha2::Sha256;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -1471,16 +1479,21 @@ pub(crate) mod tests {
         use super::*;
         #[test]
         fn real_signed_setup_rejects_tampering_and_replay() {
-            use crate::{
-                model::ClusterId,
-                security::{
-                    connection::{Signatures, SignedHead},
-                    test_support::{CLUSTER, NODE, issued},
-                },
-            };
-            use http1::{Header, MessageHead, StartLine};
-            use racer_control_wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION};
-            use racer_identity::{Certificates, KeyEpochs, Keyring};
+            use crate::model::ClusterId;
+            use crate::security::connection::Signatures;
+            use crate::security::connection::SignedHead;
+            use crate::security::test_support::CLUSTER;
+            use crate::security::test_support::NODE;
+            use crate::security::test_support::issued;
+            use http1::Header;
+            use http1::MessageHead;
+            use http1::StartLine;
+            use racer_control_wire::BundleGeneration;
+            use racer_control_wire::KeyringBundle;
+            use racer_control_wire::SCHEMA_VERSION;
+            use racer_identity::Certificates;
+            use racer_identity::KeyEpochs;
+            use racer_identity::Keyring;
             use std::sync::Arc;
             let (pending, chain, roots) = issued();
             let cluster = ClusterId(CLUSTER.into());

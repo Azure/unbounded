@@ -1,19 +1,22 @@
 //! Central status mapping and streaming body delivery, including late truncation.
 use super::ReadKind;
 use crate::telemetry::Observer;
-use crate::{
-    error::{Error, Operation, Result},
-    http::{ConnectionLease, HttpIo},
-    memory::delivery::Delivery,
-    model::{ObjectMetadata, ResolvedRange},
-    read::ReadResponse,
-    runtime::deadline::RequestScope,
-};
-use http1::{Header, MessageHead, StartLine};
-use std::{
-    rc::Rc,
-    time::{Duration, UNIX_EPOCH},
-};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::http::ConnectionLease;
+use crate::http::HttpIo;
+use crate::memory::delivery::Delivery;
+use crate::model::ObjectMetadata;
+use crate::model::ResolvedRange;
+use crate::read::ReadResponse;
+use crate::runtime::deadline::RequestScope;
+use http1::Header;
+use http1::MessageHead;
+use http1::StartLine;
+use std::rc::Rc;
+use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 pub struct Responses {
     observer: Observer,
@@ -22,21 +25,28 @@ pub struct Responses {
 }
 mod subscription {
     //! Duplex subscription framing. Delivered leases stay pinned until exact release.
-    use super::{Responses, header};
-    use crate::{
-        error::{Error, Operation, Result},
-        http::{ConnectionLease, HttpIo, OwnedBuffer},
-        memory::delivery::ReaderLease,
-        model::{ObjectMetadata, PAGE_BYTES, PageNumber, ResolvedRange},
-        read::{ReadResponse, range_stream::RangeStream},
-        runtime::deadline::RequestScope,
-    };
-    use http1::{MessageHead, StartLine};
-    use std::{
-        collections::BTreeMap,
-        task::{Context, Poll},
-        time::Duration,
-    };
+    use super::Responses;
+    use super::header;
+    use crate::error::Error;
+    use crate::error::Operation;
+    use crate::error::Result;
+    use crate::http::ConnectionLease;
+    use crate::http::HttpIo;
+    use crate::http::OwnedBuffer;
+    use crate::memory::delivery::ReaderLease;
+    use crate::model::ObjectMetadata;
+    use crate::model::PAGE_BYTES;
+    use crate::model::PageNumber;
+    use crate::model::ResolvedRange;
+    use crate::read::ReadResponse;
+    use crate::read::range_stream::RangeStream;
+    use crate::runtime::deadline::RequestScope;
+    use http1::MessageHead;
+    use http1::StartLine;
+    use std::collections::BTreeMap;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Duration;
     use uring_runtime::reactor::IoBuffer;
 
     pub(super) fn success_head(
@@ -418,11 +428,12 @@ mod subscription {
         use super::*;
         #[test]
         fn ready_slice_precedes_auxiliary_overload() {
-            use crate::{
-                memory::{delivery::Delivery, new_pipe_pool},
-                model::{PageNumber, PageSlice},
-                runtime::{admission::AdmissionPolicy, reactor::Reactor},
-            };
+            use crate::memory::delivery::Delivery;
+            use crate::memory::new_pipe_pool;
+            use crate::model::PageNumber;
+            use crate::model::PageSlice;
+            use crate::runtime::admission::AdmissionPolicy;
+            use crate::runtime::reactor::Reactor;
             use std::rc::Rc;
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
@@ -510,10 +521,9 @@ mod subscription {
         }
         #[test]
         fn pending_slice_readiness_wakes_once_and_pending_does_not_spin() {
-            use std::sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-            };
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicUsize;
+            use std::sync::atomic::Ordering;
             #[derive(Default)]
             struct Wakes(AtomicUsize);
             impl futures::task::ArcWake for Wakes {
@@ -778,9 +788,13 @@ fn success_head(metadata: &ObjectMetadata, range: Option<ResolvedRange>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        ByteRange, CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, StrongEtag,
-    };
+    use crate::model::ByteRange;
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::ExpiresAt;
+    use crate::model::ObjectId;
+    use crate::model::ObjectVersion;
+    use crate::model::StrongEtag;
     use std::time::Duration;
 
     pub(super) fn metadata(length: u64) -> ObjectMetadata {

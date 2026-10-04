@@ -6,34 +6,42 @@
 mod throughput;
 
 use racer_dataplane as dataplane;
-use racer_dataplane::{model::PAGE_BYTES, store::checkpoint};
+use racer_dataplane::model::PAGE_BYTES;
+use racer_dataplane::store::checkpoint;
 #[path = "support/enrollment.rs"]
 #[allow(dead_code)]
 mod enrollment_io;
-use enrollment_io::{fields, read_head};
-use std::{
-    collections::BTreeMap,
-    ffi::CString,
-    fs,
-    io::{self, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::MetadataExt,
-            net::{UnixListener, UnixStream},
-            process::{CommandExt, ExitStatusExt},
-        },
-    },
-    path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    thread,
-    time::{Duration, Instant},
-};
+use enrollment_io::fields;
+use enrollment_io::read_head;
+use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::fs;
+use std::io;
+use std::io::Read;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Child;
+use std::process::Command;
+use std::process::ExitStatus;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 const NODE: &str = "22222222-2222-4222-8222-222222222222";
@@ -49,11 +57,12 @@ mod control;
 mod measurement {
     //! Client-side completion oracle. Partial bodies never contribute to goodput.
     use serde::Serialize;
-    use std::{
-        collections::BTreeMap,
-        io::{self, BufReader, Read, Write},
-        time::Duration,
-    };
+    use std::collections::BTreeMap;
+    use std::io;
+    use std::io::BufReader;
+    use std::io::Read;
+    use std::io::Write;
+    use std::time::Duration;
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum Failure {
@@ -642,7 +651,8 @@ fn profile_thread_cap(io_shards: usize) -> usize {
 }
 
 fn profile_plan(io_shards: usize) -> racer_dataplane::runtime::affinity::AffinityPlan {
-    use racer_dataplane::{config::Config, runtime::affinity::AffinityPlan};
+    use racer_dataplane::config::Config;
+    use racer_dataplane::runtime::affinity::AffinityPlan;
     let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
@@ -663,7 +673,8 @@ fn profile_plan(io_shards: usize) -> racer_dataplane::runtime::affinity::Affinit
 
 #[test]
 fn capped_profiles_count_io_shards_and_unique_crypto_threads() {
-    use racer_dataplane::{config::Config, runtime::affinity::AffinityPlan};
+    use racer_dataplane::config::Config;
+    use racer_dataplane::runtime::affinity::AffinityPlan;
     let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
@@ -1433,4 +1444,5 @@ fn periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss() {
     );
     assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
 }
-use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
+use uring_runtime::affinity::CpuLocation;
+use uring_runtime::affinity::EffectiveTopology;

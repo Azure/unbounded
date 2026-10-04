@@ -34,18 +34,27 @@
 //!     }
 //! }
 //! ```
-use super::aead::{field, fresh_nonce};
-use crate::{
-    error::{Error, Result},
-    model::{
-        AttemptId, Authorization, EncryptedAuthorization, KeyId, ObjectId, OpaqueMetadata,
-        OriginContext, PeerOriginContext, RequestId, ResourceClass,
-    },
-    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
-};
+use super::aead::field;
+use super::aead::fresh_nonce;
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::AttemptId;
+use crate::model::Authorization;
+use crate::model::EncryptedAuthorization;
+use crate::model::KeyId;
+use crate::model::ObjectId;
+use crate::model::OpaqueMetadata;
+use crate::model::OriginContext;
+use crate::model::PeerOriginContext;
+use crate::model::RequestId;
+use crate::model::ResourceClass;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
 use racer_crypto::aead;
-use racer_identity::{KeyPurpose, Keyring};
-use std::{ops::Deref, rc::Rc};
+use racer_identity::KeyPurpose;
+use racer_identity::Keyring;
+use std::ops::Deref;
+use std::rc::Rc;
 use zeroize::Zeroizing;
 /// Decrypted context remains charged for the complete local origin operation.
 pub struct ChargedOriginContext {
@@ -332,7 +341,8 @@ mod tests {
         );
     }
     use super::*;
-    use crate::model::{CacheId, CacheKey};
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
     fn scope() -> RequestScope {
         RequestScope::new(
             RequestId([1; 16]),

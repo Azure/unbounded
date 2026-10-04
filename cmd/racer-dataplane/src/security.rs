@@ -19,18 +19,27 @@ impl From<racer_identity::Error> for crate::error::Error {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::connection::{Signatures, SignedHead};
-    use crate::{
-        http::Codec,
-        model::{CacheId, ClusterId, NodeId},
-        peer::protocol,
-    };
-    use racer_control_wire::{
-        BundleGeneration, CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState,
-        KeyringBundle, SCHEMA_VERSION,
-    };
-    use racer_identity::{Certificates, KeyEpochs, KeyLease, Keyring, PendingIdentity};
-    use std::{rc::Rc, sync::Arc};
+    use super::connection::Signatures;
+    use super::connection::SignedHead;
+    use crate::http::Codec;
+    use crate::model::CacheId;
+    use crate::model::ClusterId;
+    use crate::model::NodeId;
+    use crate::peer::protocol;
+    use racer_control_wire::BundleGeneration;
+    use racer_control_wire::CacheEncryptionKey;
+    use racer_control_wire::CacheKeyPurpose;
+    use racer_control_wire::CacheKeyRef;
+    use racer_control_wire::CacheKeyState;
+    use racer_control_wire::KeyringBundle;
+    use racer_control_wire::SCHEMA_VERSION;
+    use racer_identity::Certificates;
+    use racer_identity::KeyEpochs;
+    use racer_identity::KeyLease;
+    use racer_identity::Keyring;
+    use racer_identity::PendingIdentity;
+    use std::rc::Rc;
+    use std::sync::Arc;
     pub struct Identity {
         pub keys: Rc<Keyring>,
         pub certificates: Rc<Certificates>,

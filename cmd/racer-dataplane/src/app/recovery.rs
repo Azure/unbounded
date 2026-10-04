@@ -4,7 +4,8 @@
 //! sequence. The worker lifecycle decides when to poll or finish a cut; its writer
 //! gating and shutdown drain predicates remain in app.rs.
 use super::*;
-use crate::runtime::collections::{HashMap, HashSet};
+use crate::runtime::collections::HashMap;
+use crate::runtime::collections::HashSet;
 use crate::store::checkpoint::CheckpointImage;
 
 #[derive(Default)]
@@ -403,8 +404,10 @@ fn validate_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{catalog::IndexSnapshot, checkpoint::CHECKPOINT_VERSION};
-    use page_alloc::{Alignment, Segments};
+    use crate::store::catalog::IndexSnapshot;
+    use crate::store::checkpoint::CHECKPOINT_VERSION;
+    use page_alloc::Alignment;
+    use page_alloc::Segments;
     fn geometry() -> CheckpointGeometry {
         CheckpointGeometry::new(8192, 4096, 2, Alignment::new(4096, 4096, 4096).unwrap()).unwrap()
     }
@@ -517,11 +520,11 @@ mod tests {
     #[test]
     fn old_checkpoints_filter_removed_uids_unavailable_keys_and_standalone_metadata_before_install()
     {
-        use crate::model::{VersionMetadata, *};
-        use crate::store::{
-            catalog::{IndexedPage, RecordLocation},
-            checkpoint,
-        };
+        use crate::model::VersionMetadata;
+        use crate::model::*;
+        use crate::store::catalog::IndexedPage;
+        use crate::store::catalog::RecordLocation;
+        use crate::store::checkpoint;
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
         let keys = crate::security::test_support::keys();
         let caches = caches();
@@ -651,9 +654,12 @@ mod tests {
 
     #[test]
     fn ownership_and_capacity_are_checked_on_every_worker() {
-        use crate::model::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag, VersionMetadata,
-        };
+        use crate::model::CacheId;
+        use crate::model::CacheKey;
+        use crate::model::ObjectId;
+        use crate::model::ObjectVersion;
+        use crate::model::StrongEtag;
+        use crate::model::VersionMetadata;
         let node = NodeState::default();
         let keys = crate::security::test_support::keys();
         let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
@@ -697,7 +703,9 @@ mod tests {
 
     #[test]
     fn configured_tiny_recovery_budget_starts_cold_and_completes_installation() {
-        use crate::app::tests::{ControlFixture, local_worker, publication};
+        use crate::app::tests::ControlFixture;
+        use crate::app::tests::local_worker;
+        use crate::app::tests::publication;
         for budget in [1, 64 * 1024 * 1024] {
             let mut fixture = ControlFixture::new();
             let mut config = fixture.config.take().unwrap();

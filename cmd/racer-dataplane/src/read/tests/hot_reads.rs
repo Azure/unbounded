@@ -1,13 +1,37 @@
 //! Production coordinator/range/selection/Fill graph across authenticated nodes.
+use super::fill::*;
+use crate::client::ClientRequest;
+use crate::client::ReadKind;
+use crate::control::PublishedState;
+use crate::http::Codec;
+use crate::http::HttpIo;
+use crate::memory::delivery::Delivery;
+use crate::memory::new_pipe_pool;
+use crate::model::ByteRange;
+use crate::model::MembershipVersion;
+use crate::peer::PeerNetwork;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::VerifiedResponse;
+use crate::peer::server::LocalPageService;
+use crate::peer::server::PeerServer;
+use crate::read::Coordinator;
+use crate::security::connection::Signatures;
+use crate::security::forwarding::Forwarding;
+use crate::security::test_support::network;
+use crate::security::test_support::node;
+use crate::topology::LinkHealth;
+use crate::topology::Paths;
 mod duplex_release {
     //! Exercise release credit through the real duplex response, not release_page.
     use super::*;
     use crate::client::response::Responses;
-    use std::io::{Read, Write};
+    use std::io::Read;
+    use std::io::Write;
 
     #[test]
     fn duplex_exact_release_before_final_send_cqe_is_provisional() {
-        use uring_runtime::reactor::simulation::{Fault, Simulation};
+        use uring_runtime::reactor::simulation::Fault;
+        use uring_runtime::reactor::simulation::Simulation;
         for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
             let sim = Simulation::new();
             let _sim = sim.enter();
@@ -534,39 +558,13 @@ mod duplex_release {
         endpoint.uninstall().unwrap();
     }
 }
-use super::fill::*;
-use crate::client::ClientRequest;
-use crate::client::ReadKind;
-use crate::control::PublishedState;
-use crate::http::Codec;
-use crate::http::HttpIo;
-use crate::memory::delivery::Delivery;
-use crate::memory::new_pipe_pool;
-use crate::model::ByteRange;
-use crate::model::MembershipVersion;
-use crate::peer::PeerNetwork;
-use crate::peer::protocol::PeerRequest;
-use crate::peer::protocol::VerifiedResponse;
-use crate::peer::server::LocalPageService;
-use crate::peer::server::PeerServer;
-use crate::read::Coordinator;
-use crate::security::connection::Signatures;
-use crate::security::forwarding::Forwarding;
-use crate::security::test_support::network;
-use crate::security::test_support::node;
-use crate::topology::LinkHealth;
-use crate::topology::Paths;
 
 struct Link {
     client: Rc<Requester>,
     demands: Rc<RefCell<Vec<u64>>>,
 }
 impl Link {
-    fn direct_hedge_available(
-        &self,
-        _: &std::sync::Arc<crate::topology::Membership>,
-        _: &crate::model::NodeId,
-    ) -> bool {
+    fn direct_hedge_available(&self, _: &std::sync::Arc<crate::topology::Membership>, _: &crate::model::NodeId) -> bool {
         false
     }
     fn request_direct<'a>(

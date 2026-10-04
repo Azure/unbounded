@@ -6,18 +6,18 @@
 //! reconnect per request. Focused harness checks are not new performance results;
 //! historical paired-worker measurements do not characterize this shared policy.
 use super::*;
-use racer_dataplane::{
-    config::{Config, DEFAULT_MAX_THREADS},
-    runtime::{
-        affinity::AffinityPlan,
-        worker::{WorkerFactory, WorkerGroup, WorkerRuntime, WorkerService},
-    },
-};
-use std::{
-    collections::VecDeque,
-    io::BufReader,
-    sync::{Barrier, mpsc},
-};
+use racer_dataplane::read::dispatch::WorkerMap;
+use racer_dataplane::config::Config;
+use racer_dataplane::config::DEFAULT_MAX_THREADS;
+use racer_dataplane::runtime::affinity::AffinityPlan;
+use racer_dataplane::runtime::worker::WorkerFactory;
+use racer_dataplane::runtime::worker::WorkerGroup;
+use racer_dataplane::runtime::worker::WorkerRuntime;
+use racer_dataplane::runtime::worker::WorkerService;
+use std::collections::VecDeque;
+use std::io::BufReader;
+use std::sync::Barrier;
+use std::sync::mpsc;
 
 const REQUESTS: usize = 128;
 const SWEEPS: usize = 4;

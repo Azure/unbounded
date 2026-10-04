@@ -2,17 +2,19 @@
 use super::*;
 mod body_progress {
     use super::*;
-    use crate::{
-        http::{Codec, Endpoint, HttpIo, HttpPool},
-        model::{ExpiresAt, ObjectMetadata, PageEnvelope},
-        runtime::reactor::Reactor,
-        telemetry::Telemetry,
-    };
-    use std::{
-        cell::Cell,
-        net::TcpListener,
-        task::{Context, Poll},
-    };
+    use crate::http::Codec;
+    use crate::http::Endpoint;
+    use crate::http::HttpIo;
+    use crate::http::HttpPool;
+    use crate::model::ExpiresAt;
+    use crate::model::ObjectMetadata;
+    use crate::model::PageEnvelope;
+    use crate::runtime::reactor::Reactor;
+    use crate::telemetry::Telemetry;
+    use std::cell::Cell;
+    use std::net::TcpListener;
+    use std::task::Context;
+    use std::task::Poll;
 
     #[test]
     fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
@@ -483,12 +485,13 @@ mod destination_disconnect {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    use std::{
-        cell::Cell,
-        future::Future,
-        net::{Shutdown, TcpListener, TcpStream},
-        task::{Context, Poll},
-    };
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::net::Shutdown;
+    use std::net::TcpListener;
+    use std::net::TcpStream;
+    use std::task::Context;
+    use std::task::Poll;
 
     struct PendingPage {
         flights: Rc<Flights>,
@@ -572,10 +575,13 @@ mod destination_disconnect {
         admission: &flow_control::Quotas<AdmissionPolicy>,
         page: &PageId,
     ) -> crate::memory::page::PageResult {
-        use crate::{
-            memory::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
-            model::{ExpiresAt, ObjectMetadata, PageEnvelope},
-        };
+        use crate::memory::CiphertextBytes;
+        use crate::memory::CiphertextPage;
+        use crate::memory::VerifiedBytes;
+        use crate::memory::VerifiedPage;
+        use crate::model::ExpiresAt;
+        use crate::model::ObjectMetadata;
+        use crate::model::PageEnvelope;
         crate::memory::page::PageResult {
             metadata: ObjectMetadata {
                 content_type: None,
@@ -986,14 +992,16 @@ mod encrypted_http {
     use crate::security::aead::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
-    use racer_control_wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState};
-    use std::{
-        cell::Cell,
-        future::Future,
-        net::TcpListener,
-        task::{Context, Poll},
-        time::SystemTime,
-    };
+    use racer_control_wire::CacheEncryptionKey;
+    use racer_control_wire::CacheKeyPurpose;
+    use racer_control_wire::CacheKeyRef;
+    use racer_control_wire::CacheKeyState;
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::net::TcpListener;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::SystemTime;
 
     fn drive<T>(
         future: impl Future<Output = T>,
@@ -1357,11 +1365,11 @@ mod requester_safety {
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
-    use std::{
-        sync::Arc,
-        task::{Context, Poll},
-        time::{Duration, Instant},
-    };
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Duration;
+    use std::time::Instant;
 
     #[test]
     fn attached_requester_verification_and_opaque_outcome_gate_real_probe_recovery() {
@@ -1786,7 +1794,8 @@ mod timing {
 
     #[test]
     fn page_timing_pending_future_drop_counts_once_without_partial_samples() {
-        use std::task::{Context, Poll};
+        use std::task::Context;
+        use std::task::Poll;
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -1865,10 +1874,9 @@ mod timing {
         use crate::topology::Member;
         use crate::topology::Membership;
         use crate::topology::Paths;
-        use std::{
-            net::TcpListener,
-            task::{Context, Poll},
-        };
+        use std::net::TcpListener;
+        use std::task::Context;
+        use std::task::Poll;
         let signers = signers();
         let fixture = SocketFixture::new(1);
         let transfers = fixture.transfers(signers[0].clone());
@@ -2037,12 +2045,12 @@ use crate::runtime::deadline::RequestScope;
 use crate::security::connection::Signatures;
 use crate::security::forwarding::Forwarding;
 use crate::topology::RouteBudget;
-use racer_identity::{Certificates, Keyring};
-use std::{
-    rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use racer_identity::Certificates;
+use racer_identity::Keyring;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 const A: &str = "00000001-1111-4111-8111-111111111111";
 const B: &str = "00000002-1111-4111-8111-111111111111";
@@ -2213,4 +2221,5 @@ impl Drop for NoOutbound {
         );
     }
 }
-use uring_runtime::{environment::SimulationClock, reactor::IoBuffer};
+use uring_runtime::environment::SimulationClock;
+use uring_runtime::reactor::IoBuffer;

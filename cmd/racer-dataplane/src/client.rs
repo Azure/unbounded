@@ -6,16 +6,24 @@ pub mod listener;
 pub mod response;
 
 use crate::runtime::collections::HashSet;
-use crate::{
-    error::{Error, Result},
-    model::{
-        Authorization, ByteRange, CacheId, CacheKey, ObjectId, OpaqueMetadata, OriginContext,
-        PAGE_BYTES, StrongEtag,
-    },
-};
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::Authorization;
+use crate::model::ByteRange;
+use crate::model::CacheId;
+use crate::model::CacheKey;
+use crate::model::ObjectId;
+use crate::model::OpaqueMetadata;
+use crate::model::OriginContext;
+use crate::model::PAGE_BYTES;
+use crate::model::StrongEtag;
 
-pub use crate::{http::MAX_HEAD_BYTES, model::MAX_FIELD_BYTES};
-use http1::{MessageHead, StartLine, is_token, trim_ows};
+pub use crate::http::MAX_HEAD_BYTES;
+pub use crate::model::MAX_FIELD_BYTES;
+use http1::MessageHead;
+use http1::StartLine;
+use http1::is_token;
+use http1::trim_ows;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadKind {

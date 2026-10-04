@@ -1,8 +1,11 @@
 //! Production executable gates, deliberately separate from custom hotpath graphs.
 use super::*;
-use measurement::{Expected, Failure, Measurements};
+use measurement::Expected;
+use measurement::Failure;
+use measurement::Measurements;
 use serde_json::json;
-use std::{io::BufReader, sync::Barrier};
+use std::io::BufReader;
+use std::sync::Barrier;
 
 #[derive(Clone)]
 pub struct Profile {
@@ -725,12 +728,15 @@ fn production_blocked_control_progress() {
 }
 
 fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
-    use racer_dataplane::{
-        model::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag, WorkerId,
-        },
-        runtime::worker::WorkerMap,
-    };
+    use racer_dataplane::model::CacheId;
+    use racer_dataplane::model::CacheKey;
+    use racer_dataplane::model::ObjectId;
+    use racer_dataplane::model::ObjectVersion;
+    use racer_dataplane::model::PageId;
+    use racer_dataplane::model::PageNumber;
+    use racer_dataplane::model::StrongEtag;
+    use racer_dataplane::model::WorkerId;
+    use racer_dataplane::read::dispatch::WorkerMap;
     let map = WorkerMap::new((0..4).map(WorkerId).collect()).unwrap();
     (0..10000)
         .find(|key| {

@@ -13,11 +13,16 @@ use crate::runtime::deadline::RequestScope;
 use crate::runtime::reactor::Reactor;
 use ::telemetry::Ring;
 use ::telemetry::metrics;
-use ::telemetry::server::{self, Handler, Response, Server};
-pub use server::{
-    CONNECTION_TIMEOUT, CONTROL_SLOTS, MAX_CONNECTIONS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-    RESERVED_BYTES,
-};
+use ::telemetry::server;
+use ::telemetry::server::Handler;
+use ::telemetry::server::Response;
+use ::telemetry::server::Server;
+pub use server::CONNECTION_TIMEOUT;
+pub use server::CONTROL_SLOTS;
+pub use server::MAX_CONNECTIONS;
+pub use server::MAX_REQUEST_BYTES;
+pub use server::MAX_RESPONSE_BYTES;
+pub use server::RESERVED_BYTES;
 use std::cell::OnceCell;
 use std::fmt::Write;
 use std::net::SocketAddr;
@@ -29,7 +34,8 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 #[cfg(test)]
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 use uring_runtime::environment;
 use uring_runtime::reactor::Descriptor;
 

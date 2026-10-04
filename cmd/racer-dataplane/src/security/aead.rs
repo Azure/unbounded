@@ -28,12 +28,12 @@ use crate::telemetry::AeadFailure;
 use crate::telemetry::Failure;
 use crate::telemetry::Stage;
 use racer_crypto::aead;
-use racer_identity::{KeyPurpose, Keyring};
-use std::{
-    rc::Rc,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use racer_identity::KeyPurpose;
+use racer_identity::Keyring;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 use zeroize::Zeroizing;
 
 pub(crate) fn fresh_nonce() -> Result<Nonce> {
@@ -74,7 +74,8 @@ pub(crate) fn capture_aead_failure(
     aad: &[u8],
     request: RequestId,
 ) -> AeadFailure {
-    use sha2::{Digest, Sha256};
+    use sha2::Digest;
+    use sha2::Sha256;
     let envelope = ciphertext.envelope();
     let mut hash = Sha256::new();
     hash.update(b"racer/diagnostic/page/v1\0");
@@ -532,7 +533,8 @@ impl CryptoService for PageCryptoEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{KeyId, *};
+    use crate::model::KeyId;
+    use crate::model::*;
     fn envelope() -> PageEnvelope {
         PageEnvelope {
             page: PageId {
@@ -623,14 +625,12 @@ mod tests {
     }
     #[test]
     fn libsodium_boundary_and_full_page_detached_vectors() {
-        use crate::{
-            memory::BufferPool,
-            runtime::{
-                admission::AdmissionPolicy,
-                crypto::{CryptoId, pair},
-            },
-        };
-        use sha2::{Digest, Sha256};
+        use crate::memory::BufferPool;
+        use crate::runtime::admission::AdmissionPolicy;
+        use crate::runtime::crypto::CryptoId;
+        use crate::runtime::crypto::pair;
+        use sha2::Digest;
+        use sha2::Sha256;
 
         // SHA-256 of the complete ciphertext plus detached tag, independently
         // generated with libsodium 1.0.18. Reproduce with aead_vectors.py.
@@ -820,13 +820,10 @@ mod tests {
     }
     #[test]
     fn engine_preserves_failed_inputs_and_completion_capacity() {
-        use crate::{
-            memory::BufferPool,
-            runtime::{
-                admission::AdmissionPolicy,
-                crypto::{CryptoId, pair},
-            },
-        };
+        use crate::memory::BufferPool;
+        use crate::runtime::admission::AdmissionPolicy;
+        use crate::runtime::crypto::CryptoId;
+        use crate::runtime::crypto::pair;
         let keys = crate::security::test_support::keys();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -946,13 +943,10 @@ mod tests {
     }
     #[test]
     fn encryption_preserves_staging_and_charges_on_failure() {
-        use crate::{
-            memory::BufferPool,
-            runtime::{
-                admission::AdmissionPolicy,
-                crypto::{CryptoId, pair},
-            },
-        };
+        use crate::memory::BufferPool;
+        use crate::runtime::admission::AdmissionPolicy;
+        use crate::runtime::crypto::CryptoId;
+        use crate::runtime::crypto::pair;
         let keys = crate::security::test_support::keys();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -1070,13 +1064,10 @@ mod tests {
     }
     #[test]
     fn engine_encrypts_and_returns_original_staging_on_failure() {
-        use crate::{
-            memory::BufferPool,
-            runtime::{
-                admission::AdmissionPolicy,
-                crypto::{CryptoId, pair},
-            },
-        };
+        use crate::memory::BufferPool;
+        use crate::runtime::admission::AdmissionPolicy;
+        use crate::runtime::crypto::CryptoId;
+        use crate::runtime::crypto::pair;
         let keys = crate::security::test_support::keys();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -1196,11 +1187,11 @@ mod tests {
     }
     #[test]
     fn drain_reschedules_after_a_full_quantum() {
-        use crate::runtime::{
-            admission::AdmissionPolicy,
-            crypto::{CryptoId, pair},
-        };
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::runtime::admission::AdmissionPolicy;
+        use crate::runtime::crypto::CryptoId;
+        use crate::runtime::crypto::pair;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
         struct WakeCount(AtomicUsize);
         impl std::task::Wake for WakeCount {
             fn wake(self: Arc<Self>) {

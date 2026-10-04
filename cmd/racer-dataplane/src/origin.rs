@@ -24,13 +24,14 @@ use crate::model::ResourceClass;
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::RequestScope;
-use http1::{Header, MessageHead, StartLine};
+use http1::Header;
+use http1::MessageHead;
+use http1::StartLine;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::canonical_socket_paths;
-use std::{
-    path::{Path, PathBuf},
-    rc::Rc,
-};
+use std::path::Path;
+use std::path::PathBuf;
+use std::rc::Rc;
 /// OriginClient is the shipping adapter implementation. Scripted implementations
 /// remain for poll-exact cancellation, wake ordering, and reservation-fence tests;
 /// ordinary adapter scenarios should use the shared test_support UDS fixture.
@@ -492,8 +493,10 @@ pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<Object
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
-    use crate::model::{CacheId, CacheKey};
-    use std::time::{Duration, UNIX_EPOCH};
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use std::time::Duration;
+    use std::time::UNIX_EPOCH;
 
     pub(super) fn object() -> ObjectId {
         ObjectId {
@@ -679,7 +682,12 @@ fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetada
 #[cfg(test)]
 mod page_tests {
     use super::*;
-    use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag};
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::ObjectId;
+    use crate::model::ObjectVersion;
+    use crate::model::PageNumber;
+    use crate::model::StrongEtag;
 
     fn page() -> PageId {
         PageId {
@@ -741,11 +749,15 @@ mod page_tests {
 
 /// SDK wire rules shared by HEAD and whole-page responses.
 mod protocol {
-    use crate::{
-        error::{Error, Result},
-        model::{ExpiresAt, ObjectId, ObjectMetadata, ObjectVersion, StrongEtag},
-    };
-    use http1::{MessageHead, StartLine};
+    use crate::error::Error;
+    use crate::error::Result;
+    use crate::model::ExpiresAt;
+    use crate::model::ObjectId;
+    use crate::model::ObjectMetadata;
+    use crate::model::ObjectVersion;
+    use crate::model::StrongEtag;
+    use http1::MessageHead;
+    use http1::StartLine;
 
     pub(super) fn field<'a>(head: &'a MessageHead, name: &str) -> Result<Option<&'a [u8]>> {
         let mut values = head
@@ -1001,10 +1013,9 @@ mod protocol {
 
         #[test]
         fn numeric_headers_reject_padding_before_any_normalization() {
-            use crate::{
-                http::Codec,
-                model::{CacheId, CacheKey},
-            };
+            use crate::http::Codec;
+            use crate::model::CacheId;
+            use crate::model::CacheKey;
             let object = ObjectId {
                 cache: CacheId("cache".into()),
                 key: CacheKey([0; 32]),
@@ -1122,4 +1133,5 @@ mod protocol {
         }
     }
 }
-use uring_runtime::reactor::{Completion, IoBuffer};
+use uring_runtime::reactor::Completion;
+use uring_runtime::reactor::IoBuffer;

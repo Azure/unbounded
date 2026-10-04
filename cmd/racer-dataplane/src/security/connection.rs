@@ -3,21 +3,29 @@
 //!
 //! A verified proof establishes identity and provenance, not replay admission.
 //! Only the carrying connection session admits a fresh immediate-hop message.
-use crate::peer::protocol::{self as p, field, number, push, push_binary};
-use crate::{
-    error::{Error, Result},
-    http::{Codec, ConnectionLease, HttpIo},
-    model::NodeId,
-    runtime::deadline::RequestScope,
-};
-use http1::{MessageHead, StartLine};
-use racer_identity::{Certificates, Keyring, VerifiedPeer};
-use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeSet,
-    rc::Rc,
-    time::{Duration, UNIX_EPOCH},
-};
+use crate::peer::protocol::self as p;
+use crate::peer::protocol::field;
+use crate::peer::protocol::number;
+use crate::peer::protocol::push;
+use crate::peer::protocol::push_binary;
+use crate::error::Error;
+use crate::error::Result;
+use crate::http::Codec;
+use crate::http::ConnectionLease;
+use crate::http::HttpIo;
+use crate::model::NodeId;
+use crate::runtime::deadline::RequestScope;
+use http1::MessageHead;
+use http1::StartLine;
+use racer_identity::Certificates;
+use racer_identity::Keyring;
+use racer_identity::VerifiedPeer;
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::BTreeSet;
+use std::rc::Rc;
+use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 pub struct Signatures {
     keys: Rc<Keyring>,
@@ -637,7 +645,10 @@ pub async fn accept(
 mod signature_tests {
     use super::p as protocol;
     use super::*;
-    use crate::security::test_support::{clone_head, mac_test_keys, network, node};
+    use crate::security::test_support::clone_head;
+    use crate::security::test_support::mac_test_keys;
+    use crate::security::test_support::network;
+    use crate::security::test_support::node;
     use std::time::SystemTime;
 
     fn head(receiver: usize) -> MessageHead {
@@ -737,7 +748,8 @@ mod signature_tests {
     #[test]
     #[ignore = "release-only canonical signature-base construction benchmark, no cryptography"]
     fn signature_base_benchmark() {
-        use std::{hint::black_box, time::Instant};
+        use std::hint::black_box;
+        use std::time::Instant;
         assert!(!cfg!(debug_assertions), "run with --release");
         for (label, fields, value_bytes) in
             [("small", 0, 0), ("fields", 24, 64), ("envelope", 24, 4096)]
@@ -938,16 +950,17 @@ mod signature_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{
-        http::{Codec, Endpoint, HttpPool},
-        model::{RequestId, ResourceClass},
-        runtime::{admission::AdmissionPolicy, reactor::Reactor},
-    };
-    use std::{
-        future::Future,
-        task::{Context, Poll},
-        time::Instant,
-    };
+    use crate::http::Codec;
+    use crate::http::Endpoint;
+    use crate::http::HttpPool;
+    use crate::model::RequestId;
+    use crate::model::ResourceClass;
+    use crate::runtime::admission::AdmissionPolicy;
+    use crate::runtime::reactor::Reactor;
+    use std::future::Future;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Instant;
 
     fn frame() -> MessageHead {
         MessageHead {

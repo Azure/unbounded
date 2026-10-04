@@ -45,7 +45,8 @@ pub(crate) mod collections {
     #[cfg(test)]
     #[test]
     fn simulation_replays_collection_iteration_without_consuming_nonce_entropy() {
-        use uring_runtime::environment::{SimulationClock, fill_random};
+        use uring_runtime::environment::SimulationClock;
+        use uring_runtime::environment::fill_random;
         fn sample(seed: u64) -> (Vec<u64>, [u8; 32]) {
             let clock = SimulationClock::new(seed);
             let _role = clock.environment(9).enter();
@@ -84,7 +85,9 @@ pub fn unix_time() -> rustls::pki_types::UnixTime {
 
 #[cfg(test)]
 mod environment_tests {
-    use crate::{error::Error, model::RequestId, runtime::deadline::RequestScope};
+    use crate::error::Error;
+    use crate::model::RequestId;
+    use crate::runtime::deadline::RequestScope;
     use std::time::Duration;
     use uring_runtime::environment::*;
 
@@ -126,17 +129,19 @@ mod environment_tests {
 }
 pub(crate) mod ingress {
     //! Bounded pre-session socket handoff. No submitted operation crosses reactors.
-    use super::admission::{AdmissionPolicy, ConnectionReservation, SharedAdmissionExt};
-    use crate::{
-        error::{Error, Result},
-        model::{CacheId, WorkerId},
-    };
-    use std::{
-        collections::VecDeque,
-        os::fd::OwnedFd,
-        sync::{Arc, Mutex, atomic::AtomicBool},
-        task::Waker,
-    };
+    use super::admission::AdmissionPolicy;
+    use super::admission::ConnectionReservation;
+    use super::admission::SharedAdmissionExt;
+    use crate::error::Error;
+    use crate::error::Result;
+    use crate::model::CacheId;
+    use crate::model::WorkerId;
+    use std::collections::VecDeque;
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::task::Waker;
 
     pub(crate) enum Kind {
         Client(CacheId, Arc<AtomicBool>),
@@ -413,15 +418,19 @@ pub(crate) mod ingress {
 }
 #[cfg(test)]
 mod listener_tests {
-    use super::{deadline::RequestScope, retry_listener as retry};
-    use crate::{error::Error, model::RequestId, test_support::WakeCounter};
-    use std::{
-        cell::Cell,
-        sync::Arc,
-        task::{Context, Poll, Waker},
-        time::Duration,
-    };
-    use uring_runtime::environment::{self, SimulationClock};
+    use super::deadline::RequestScope;
+    use super::retry_listener as retry;
+    use crate::error::Error;
+    use crate::model::RequestId;
+    use crate::test_support::WakeCounter;
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
+    use std::time::Duration;
+    use uring_runtime::environment;
+    use uring_runtime::environment::SimulationClock;
 
     #[test]
     fn repeated_pressure_is_rate_limited_without_self_wakes() {
@@ -498,7 +507,8 @@ mod listener_tests {
     }
     #[test]
     fn submitted_listener_cancellation_waits_for_cqe_fence() {
-        use crate::runtime::{admission::AdmissionPolicy, reactor::Reactor};
+        use crate::runtime::admission::AdmissionPolicy;
+        use crate::runtime::reactor::Reactor;
         use std::rc::Rc;
         use uring_runtime::reactor::simulation::Simulation;
         let sim = Simulation::new();

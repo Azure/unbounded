@@ -1,7 +1,10 @@
 //! Transport-neutral ciphertext lifecycle, selecting HTTP or authenticated RDMA.
-use super::protocol::{
-    PeerResponse, SecurityCodec, SignedRequest, SignedResponse, decode_envelope, encode_envelope,
-};
+use super::protocol::PeerResponse;
+use super::protocol::SecurityCodec;
+use super::protocol::SignedRequest;
+use super::protocol::SignedResponse;
+use super::protocol::decode_envelope;
+use super::protocol::encode_envelope;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -33,9 +36,13 @@ use crate::telemetry::Detail;
 use crate::telemetry::Failure;
 use crate::telemetry::Stage;
 use crate::telemetry::timestamp;
-use http1::{Header, MessageHead, StartLine};
+use http1::Header;
+use http1::MessageHead;
+use http1::StartLine;
 use racer_control_wire::RailId;
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(test)]
 mod native_control_tests {
@@ -65,7 +72,8 @@ mod native_control_tests {
     }
     #[test]
     fn session_admitted_setup_grant_completion_still_require_exact_transfer_and_phase() {
-        use crate::security::connection::tests::{pair, signer};
+        use crate::security::connection::tests::pair;
+        use crate::security::connection::tests::signer;
         let (mut sender, mut receiver) = pair();
         let a = signer(&sender);
         let b = signer(&receiver);
@@ -224,22 +232,29 @@ mod native_control_tests {
 mod native_exchange_tests {
     //! Signed native offer/fallback exchanges over real sockets and optional hardware.
     use super::*;
-    use crate::{
-        http::{Codec, HttpIo, HttpPool},
-        memory::BufferPool,
-        model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
-        peer::protocol as p,
-        rdma::{Devices, Sessions},
-        runtime::reactor::Reactor,
-        security::connection::Signatures,
-    };
-    use std::{
-        os::unix::net::UnixStream,
-        rc::Rc,
-        sync::Arc,
-        task::{Context, Poll},
-        time::{Duration, Instant},
-    };
+    use crate::http::Codec;
+    use crate::http::HttpIo;
+    use crate::http::HttpPool;
+    use crate::memory::BufferPool;
+    use crate::model::ExpiresAt;
+    use crate::model::KeyId;
+    use crate::model::Nonce;
+    use crate::model::ObjectMetadata;
+    use crate::model::PageEnvelope;
+    use crate::model::ResourceClass;
+    use crate::model::*;
+    use crate::peer::protocol as p;
+    use crate::rdma::Devices;
+    use crate::rdma::Sessions;
+    use crate::runtime::reactor::Reactor;
+    use crate::security::connection::Signatures;
+    use std::os::unix::net::UnixStream;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Duration;
+    use std::time::Instant;
 
     fn transfers(
         signatures: Rc<Signatures>,
@@ -654,7 +669,8 @@ mod native_exchange_tests {
         use crate::topology::Membership;
         use racer_control_wire::RailId;
         use racer_control_wire::RailMapping;
-        use rdma_verbs::{NativeService, pair};
+        use rdma_verbs::NativeService;
+        use rdma_verbs::pair;
         let device = if simulated {
             "sim-rnic".into()
         } else {
@@ -1194,7 +1210,8 @@ impl Binding {
 }
 /// Bind all original/hop signatures using security's canonical digest, never bodies.
 fn envelope_digest(auth: &ForwardedHead) -> Result<[u8; 32]> {
-    use sha2::{Digest, Sha256};
+    use sha2::Digest;
+    use sha2::Sha256;
     let mut hash = Sha256::new();
     hash.update(b"racer-peer-v1/payload-envelope\0");
     hash.update((auth.hops.len() as u64).to_be_bytes());
@@ -2618,7 +2635,8 @@ mod tests {
     #[test]
     #[ignore = "opt-in same-workload wire buffer checkout benchmark"]
     fn wire_checkout_benchmark() {
-        use std::{hint::black_box, time::Instant};
+        use std::hint::black_box;
+        use std::time::Instant;
         const ITERATIONS: usize = 128;
         for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
             for reserved in [false, true] {

@@ -1,13 +1,16 @@
 //! Shared compact subscription demand with independently leased page slices.
 //! A stream pins its version and length once. A late error terminates that stream;
 //! it cannot replace headers or reopen against a newer version.
-use super::{dispatch::WorkerDirectory, flight::AcquisitionBudget};
+use super::dispatch::WorkerDirectory;
+use super::flight::AcquisitionBudget;
+use crate::memory::page::PageResult;
+#[cfg(test)]
+use crate::read::dispatch::WorkerMap;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::delivery::Delivery;
 use crate::memory::delivery::ReaderLease;
-use crate::memory::page::PageResult;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::OriginContext;
@@ -17,670 +20,19 @@ use crate::model::PageNumber;
 use crate::model::ResolvedRange;
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::RequestScope;
-use flow_control::Window;
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    future::poll_fn,
-    rc::Rc,
-    sync::{Arc, Mutex},
-    task::{Context, Poll},
-    time::{Duration, Instant},
-};
 
-#[cfg(test)]
-mod subscription_tests {
-    use super::*;
-    use crate::{
-        model::{ByteRange, CacheId, CacheKey, ObjectId, StrongEtag},
-        runtime::admission::AdmissionPolicy,
-    };
-    use flow_control::Quotas;
-    use std::task::{Context, Poll};
-    fn version() -> ObjectVersion {
-        ObjectVersion {
-            object: ObjectId {
-                cache: CacheId("cache".into()),
-                key: CacheKey([1; 32]),
-            },
-            etag: StrongEtag::test_value("v1"),
-        }
-    }
-    pub(crate) fn ordered(reader: &mut DemandLease) -> Option<PageNumber> {
-        match reader.poll_ordered(&mut Context::from_waker(futures::task::noop_waker_ref())) {
-            Poll::Ready(Ok(Some((page, guard)))) => {
-                drop(guard);
-                Some(page)
-            }
-            Poll::Ready(Ok(None)) | Poll::Pending => None,
-            Poll::Ready(Err(error)) => panic!("ordered assignment: {error:?}"),
-        }
-    }
-    pub(crate) fn selection(reader: &mut DemandLease) -> Selection {
-        match reader.poll_next(&mut Context::from_waker(futures::task::noop_waker_ref())) {
-            Poll::Ready(Ok(Next::Select(selection))) => selection,
-            _ => panic!("expected provider selection"),
-        }
-    }
-    pub(crate) fn selected(reader: &mut DemandLease) -> Option<PageNumber> {
-        match reader.poll_next(&mut Context::from_waker(futures::task::noop_waker_ref())) {
-            Poll::Ready(Ok(Next::Page(page))) => Some(page.plaintext.page().number),
-            Poll::Pending | Poll::Ready(Ok(Next::End)) => None,
-            _ => panic!("expected completed provider page"),
-        }
-    }
-    fn complete(selection: Selection, number: u64, length: u64) {
-        let metadata = crate::model::ObjectMetadata {
-            version: selection.version.clone(),
-            length,
-            content_type: None,
-            expires_at: crate::model::ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
-        };
-        let admission: Quotas<AdmissionPolicy> = Quotas::new(AdmissionPolicy::new(
-            crate::test_support::cluster::config(false).limits,
-        ));
-        selection
-            .complete(super::tests::page_result(&admission, &metadata, number))
-            .unwrap();
-    }
-    #[test]
-    fn mixed_gate_tickets_bound_turns_under_sustained_ordered_demand() {
-        use std::task::Poll;
-        let scheduler = Scheduler::new(4);
-        let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
-        let mut a = scheduler
-            .register(version(), range, 2, 2 * PAGE_BYTES, true)
-            .unwrap();
-        let mut b = scheduler
-            .register(version(), range, 2, 2 * PAGE_BYTES, true)
-            .unwrap();
-        let mut unordered = scheduler
-            .register(version(), range, 1, PAGE_BYTES, false)
-            .unwrap();
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        for _ in 0..32 {
-            let Poll::Ready(Ok(Some((pa, ga)))) = a.poll_ordered(&mut cx) else {
-                panic!("ordered resumes")
-            };
-            let Poll::Ready(Ok(Some((pb, gb)))) = b.poll_ordered(&mut cx) else {
-                panic!("concurrent ordered resumes")
-            };
-            assert!(unordered.poll_next(&mut cx).is_pending());
-            let mut newcomer = scheduler
-                .register(version(), range, 1, PAGE_BYTES, true)
-                .unwrap();
-            assert!(
-                newcomer.poll_ordered(&mut cx).is_pending(),
-                "new readers cannot bypass a waiting selection"
-            );
-            drop(newcomer);
-            // Keep both ordered readers capacity-bearing, and poll them first
-            // at every boundary. Neither can refill ahead of the waiting ticket.
-            assert!(a.poll_ordered(&mut cx).is_pending());
-            assert!(b.poll_ordered(&mut cx).is_pending());
-            drop(ga);
-            a.issued(pa).unwrap();
-            a.release(pa, PAGE_BYTES as u32).unwrap();
-            assert!(a.poll_ordered(&mut cx).is_pending());
-            assert!(
-                unordered.poll_next(&mut cx).is_pending(),
-                "last fence still live"
-            );
-            drop(gb);
-            b.issued(pb).unwrap();
-            b.release(pb, PAGE_BYTES as u32).unwrap();
-            for _ in 0..8 {
-                assert!(a.poll_ordered(&mut cx).is_pending());
-                assert!(b.poll_ordered(&mut cx).is_pending());
-            }
-            let Poll::Ready(Ok(Next::Select(selection))) = unordered.poll_next(&mut cx) else {
-                panic!("selection gets the very next turn after two fences")
-            };
-            assert!(a.poll_ordered(&mut cx).is_pending());
-            // Simulate an unsuccessful selection. Even immediate retries cannot
-            // starve the ordered tickets queued during the preceding batch.
-            drop(selection);
-            assert!(unordered.poll_next(&mut cx).is_pending());
-        }
-        drop((a, b, unordered));
-        let state = scheduler.state.lock().unwrap();
-        assert!(state.fixed.is_empty());
-        assert!(state.selecting.is_empty());
-        assert!(state.demands.is_empty());
-    }
-    #[test]
-    fn canceled_gate_waiter_wakes_successor_without_releasing_live_fences() {
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::atomic::Ordering;
-        use std::task::Poll;
-        #[derive(Default)]
-        struct Wakes(AtomicUsize);
-        impl futures::task::ArcWake for Wakes {
-            fn wake_by_ref(this: &Arc<Self>) {
-                this.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        let wakes = Arc::new(Wakes::default());
-        let waker = futures::task::waker(wakes.clone());
-        let mut cx = std::task::Context::from_waker(&waker);
-        let scheduler = Scheduler::new(3);
-        let range = ByteRange::From(0).resolve(100 * PAGE_BYTES).unwrap();
-        let mut ordered = scheduler
-            .register(version(), range, 4, 4 * PAGE_BYTES, true)
-            .unwrap();
-        let mut canceled = scheduler
-            .register(version(), range, 1, PAGE_BYTES, false)
-            .unwrap();
-        let Poll::Ready(Ok(Some((_, first)))) = ordered.poll_ordered(&mut cx) else {
-            panic!()
-        };
-        assert!(canceled.poll_next(&mut cx).is_pending());
-        assert!(ordered.poll_ordered(&mut cx).is_pending());
-        let before = wakes.0.load(Ordering::Relaxed);
-        drop(canceled);
-        assert!(wakes.0.load(Ordering::Relaxed) > before);
-        let Poll::Ready(Ok(Some((_, second)))) = ordered.poll_ordered(&mut cx) else {
-            panic!("canceled selection no longer blocks refill")
-        };
-        let mut successor = scheduler
-            .register(version(), range, 1, PAGE_BYTES, false)
-            .unwrap();
-        assert!(successor.poll_next(&mut cx).is_pending());
-        assert!(ordered.poll_ordered(&mut cx).is_pending());
-        drop(ordered);
-        assert!(successor.poll_next(&mut cx).is_pending());
-        drop(first);
-        assert!(successor.poll_next(&mut cx).is_pending());
-        let before = wakes.0.load(Ordering::Relaxed);
-        drop(second);
-        assert!(wakes.0.load(Ordering::Relaxed) > before);
-        assert!(matches!(
-            successor.poll_next(&mut cx),
-            Poll::Ready(Ok(Next::Select(_)))
-        ));
-        drop(successor);
-        let state = scheduler.state.lock().unwrap();
-        assert!(state.demands.is_empty());
-        assert!(state.fixed.is_empty());
-        assert!(state.selecting.is_empty());
-    }
-    #[test]
-    fn ordered_reservations_are_exact_and_mixed_exclusion_outlives_demand() {
-        let scheduler = Scheduler::new(3);
-        let range = ByteRange::From(PAGE_BYTES - 3)
-            .resolve(2 * PAGE_BYTES + 5)
-            .unwrap();
-        let mut ordered = scheduler
-            .register(version(), range, 2, PAGE_BYTES, true)
-            .unwrap();
-        let mut unordered = scheduler
-            .register(version(), range, 1, PAGE_BYTES, false)
-            .unwrap();
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        let std::task::Poll::Ready(Ok(Next::Select(selection))) = unordered.poll_next(&mut cx)
-        else {
-            panic!()
-        };
-        assert!(ordered.poll_ordered(&mut cx).is_pending());
-        drop(selection);
-        let std::task::Poll::Ready(Ok(Some((number, guard)))) = ordered.poll_ordered(&mut cx)
-        else {
-            panic!()
-        };
-        assert_eq!(number, PageNumber(0));
-        {
-            let state = scheduler.state.lock().unwrap();
-            let credits = &state.demands[&ordered.id].credits;
-            assert!(credits.can_reserve(PAGE_BYTES - 3));
-            assert!(!credits.can_reserve(PAGE_BYTES - 2));
-        }
-        assert!(
-            ordered.poll_ordered(&mut cx).is_pending(),
-            "byte credit reserved before work"
-        );
-        assert!(unordered.poll_next(&mut cx).is_pending());
-        drop(ordered);
-        assert!(
-            unordered.poll_next(&mut cx).is_pending(),
-            "worker still owns exclusion"
-        );
-        drop(guard);
-        assert!(matches!(
-            unordered.poll_next(&mut cx),
-            std::task::Poll::Ready(Ok(Next::Select(_)))
-        ));
-        drop(unordered);
-        let state = scheduler.state.lock().unwrap();
-        assert!(state.fixed.is_empty());
-        assert!(state.selecting.is_empty());
-        assert!(state.demands.is_empty());
-    }
-    #[test]
-    fn production_aggregate_is_compact_exclusive_and_contracts_never_refill() {
-        use crate::{
-            model::{MembershipVersion, NodeId},
-            peer::subscriptions::PageInterval,
-        };
-        let scheduler = Scheduler::new(4);
-        let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
-        let mut first = scheduler
-            .register(version(), range, 1, PAGE_BYTES, false)
-            .unwrap();
-        let mut second = scheduler
-            .register(
-                version(),
-                ByteRange::From(900_000 * PAGE_BYTES)
-                    .resolve(range.end())
-                    .unwrap(),
-                1,
-                PAGE_BYTES,
-                false,
-            )
-            .unwrap();
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        let std::task::Poll::Ready(Ok(Next::Select(selection))) = first.poll_next(&mut cx) else {
-            panic!()
-        };
-        assert_eq!(
-            selection.demand.intervals(),
-            &[PageInterval { start: 0, end: 1 }]
-        );
-        assert!(second.poll_next(&mut cx).is_pending());
-        let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
-        let (one, _) = scheduler
-            .contract(
-                version(),
-                MembershipVersion(1),
-                NodeId("provider".into()),
-                selection.demand.clone(),
-                deadline,
-            )
-            .unwrap();
-        let (two, expires) = scheduler
-            .contract(
-                version(),
-                MembershipVersion(1),
-                NodeId("provider".into()),
-                selection.demand.clone(),
-                deadline + std::time::Duration::from_secs(30),
-            )
-            .unwrap();
-        assert_eq!(one.id, two.id);
-        assert_eq!(two.sequence, one.sequence + 1);
-        assert_eq!(two.page_budget + 1, one.page_budget);
-        assert_eq!(two.byte_budget + PAGE_BYTES + 16, one.byte_budget);
-        assert_eq!(expires, deadline);
-        drop(first);
-        assert!(
-            second.poll_next(&mut cx).is_pending(),
-            "detached consumer cannot release owned work"
-        );
-        drop(selection);
-        assert!(matches!(
-            second.poll_next(&mut cx),
-            std::task::Poll::Ready(Ok(Next::Select(_)))
-        ));
-    }
-    #[test]
-    fn production_ticket_cannot_be_spent_on_rotating_disjoint_low_readers() {
-        use std::task::Poll;
-        let scheduler = Scheduler::new(3);
-        let length = 1000 * PAGE_BYTES;
-        let mut high = scheduler
-            .register(
-                version(),
-                ByteRange::From(900 * PAGE_BYTES).resolve(length).unwrap(),
-                1,
-                PAGE_BYTES,
-                false,
-            )
-            .unwrap();
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        for low_page in 0..32 {
-            let mut low = scheduler
-                .register(
-                    version(),
-                    ByteRange::Closed {
-                        first: low_page * PAGE_BYTES,
-                        last: (low_page + 1) * PAGE_BYTES - 1,
-                    }
-                    .resolve(length)
-                    .unwrap(),
-                    1,
-                    PAGE_BYTES,
-                    false,
-                )
-                .unwrap();
-            let Poll::Ready(Ok(Next::Select(selection))) = low.poll_next(&mut cx) else {
-                panic!()
-            };
-            assert!(high.poll_next(&mut cx).is_pending());
-            drop(selection);
-            assert!(low.poll_next(&mut cx).is_pending());
-            let Poll::Ready(Ok(Next::Select(selection))) = high.poll_next(&mut cx) else {
-                panic!("oldest ticket must run")
-            };
-            assert_eq!(
-                selection.demand.intervals(),
-                &[crate::peer::subscriptions::PageInterval {
-                    start: 900,
-                    end: 901
-                }]
-            );
-            assert!(!selection.demand.contains(low_page));
-            drop((selection, low));
-        }
-    }
-    #[test]
-    fn production_selection_advertises_only_credit_eligible_slices() {
-        let scheduler = Scheduler::new(1);
-        let range = ByteRange::From(PAGE_BYTES - 1)
-            .resolve(3 * PAGE_BYTES + 2)
-            .unwrap();
-        let mut reader = scheduler
-            .register(version(), range, 2, PAGE_BYTES, false)
-            .unwrap();
-        {
-            let mut state = scheduler.state.lock().unwrap();
-            let demand = state.demands.get_mut(&reader.id).unwrap();
-            demand.turn = true;
-            demand
-                .credits
-                .reserve(PageNumber(99), PAGE_BYTES - 2)
-                .unwrap();
-        }
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        let std::task::Poll::Ready(Ok(Next::Select(selection))) = reader.poll_next(&mut cx) else {
-            panic!()
-        };
-        assert!(selection.demand.contains(0));
-        assert!(selection.demand.contains(3));
-        assert!(!selection.demand.contains(1));
-        assert!(!selection.demand.contains(2));
-    }
-    #[test]
-    fn pending_and_delivered_share_exact_once_credit() {
-        let mut credits = Window::new(2, 2 * PAGE_BYTES, PAGE_BYTES).unwrap();
-        credits.reserve(PageNumber(0), PAGE_BYTES).unwrap();
-        assert_eq!(
-            credits.release(PageNumber(0), PAGE_BYTES),
-            Err(flow_control::Error::InvalidInput)
-        );
-        credits.reserve(PageNumber(1), PAGE_BYTES).unwrap();
-        assert!(!credits.can_reserve(PAGE_BYTES));
-        assert_eq!(
-            credits.reserve(PageNumber(2), 1),
-            Err(flow_control::Error::Overloaded)
-        );
-        credits.issued(PageNumber(0)).unwrap();
-        assert_eq!(
-            credits.release(PageNumber(0), 1),
-            Err(flow_control::Error::InvalidInput)
-        );
-        credits.release(PageNumber(0), PAGE_BYTES).unwrap();
-        assert_eq!(
-            credits.release(PageNumber(0), PAGE_BYTES),
-            Err(flow_control::Error::InvalidInput)
-        );
-        assert!(credits.can_reserve(PAGE_BYTES));
-    }
-    #[test]
-    fn scheduler_is_compact_bounded_and_preserves_ordered_head() {
-        let scheduler = Scheduler::new(2);
-        let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
-        let mut first = scheduler
-            .register(version(), range, 2, 2 * PAGE_BYTES, true)
-            .unwrap();
-        let mut second = scheduler
-            .register(version(), range, 2, 2 * PAGE_BYTES, true)
-            .unwrap();
-        assert!(matches!(
-            scheduler.register(version(), range, 2, 2 * PAGE_BYTES, true),
-            Err(Error::Overloaded)
-        ));
-        assert_eq!(ordered(&mut first), Some(PageNumber(0)));
-        assert_eq!(ordered(&mut first), Some(PageNumber(1)));
-        assert_eq!(ordered(&mut second), Some(PageNumber(0)));
-        assert_eq!(ordered(&mut second), Some(PageNumber(1)));
-        let state = scheduler.state.lock().unwrap();
-        assert_eq!(state.demands.len(), 2);
-        assert!(
-            state
-                .demands
-                .values()
-                .all(|demand| demand.selected.is_empty())
-        );
-        drop(state);
-        drop(first);
-        drop(second);
-        let state = scheduler.state.lock().unwrap();
-        assert!(state.demands.is_empty());
-        assert!(state.fixed.is_empty());
-    }
-    #[test]
-    fn unordered_provider_can_select_distant_pages_but_alternates_head_progress() {
-        let scheduler = Scheduler::new(2);
-        let range = ByteRange::From(0).resolve(100 * PAGE_BYTES).unwrap();
-        let mut reader = scheduler
-            .register(version(), range, 3, 3 * PAGE_BYTES, false)
-            .unwrap();
-        for number in [0, 5, 1] {
-            let choice = selection(&mut reader);
-            assert!(choice.demand.contains(number));
-            if number != 5 {
-                assert_eq!(choice.demand.page_count(), 1);
-            }
-            complete(choice, number, range.end());
-            assert_eq!(selected(&mut reader), Some(PageNumber(number)));
-        }
-    }
-    #[test]
-    fn whole_demand_hot_assignment_fans_out_without_slow_reader_backpressure() {
-        let scheduler = Scheduler::new(4);
-        let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
-        let mut first = scheduler
-            .register(version(), range, 2, 2 * PAGE_BYTES, false)
-            .unwrap();
-        let mut second = scheduler
-            .register(version(), range, 2, 2 * PAGE_BYTES, false)
-            .unwrap();
-        let mut slow = scheduler
-            .register(version(), range, 1, PAGE_BYTES, false)
-            .unwrap();
-        let mut other_version = version();
-        other_version.etag = StrongEtag::test_value("v2");
-        let other = scheduler
-            .register(other_version, range, 2, 2 * PAGE_BYTES, false)
-            .unwrap();
-        complete(selection(&mut first), 0, range.end());
-        assert_eq!(selected(&mut first), Some(PageNumber(0)));
-        complete(selection(&mut first), 900_000, range.end());
-        assert_eq!(selected(&mut first), Some(PageNumber(900_000)));
-        assert_eq!(selected(&mut second), Some(PageNumber(0)));
-        assert_eq!(selected(&mut second), Some(PageNumber(900_000)));
-        assert_eq!(selected(&mut slow), Some(PageNumber(0)));
-        assert_eq!(selected(&mut slow), None);
-        assert!(!slow.exhausted());
-        assert!(
-            scheduler.state.lock().unwrap().demands[&other.id]
-                .results
-                .is_empty()
-        );
-        first.issued(PageNumber(0)).unwrap();
-        first.release(PageNumber(0), PAGE_BYTES as u32).unwrap();
-        let choice = selection(&mut first);
-        assert_eq!(
-            choice.demand.intervals(),
-            &[crate::peer::subscriptions::PageInterval { start: 1, end: 2 }]
-        );
-        complete(choice, 1, range.end());
-        assert_eq!(selected(&mut first), Some(PageNumber(1)));
-        assert_eq!(
-            selected(&mut slow),
-            None,
-            "slow subscriber reserves no additional work"
-        );
-        drop((first, second, slow, other));
-        assert!(scheduler.state.lock().unwrap().demands.is_empty());
-    }
-    #[test]
-    fn bounded_holes_and_credit_state_survive_adversarial_hot_pages() {
-        let scheduler = Scheduler::new(1);
-        let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
-        let mut reader = scheduler
-            .register(version(), range, 1, PAGE_BYTES, false)
-            .unwrap();
-        let mut seen = BTreeSet::new();
-        for turn in 0..1000 {
-            let choice = selection(&mut reader);
-            let hot = 900_000 + turn;
-            let number = if choice.demand.contains(hot) {
-                hot
-            } else {
-                choice.demand.intervals()[0].start
-            };
-            complete(choice, number, range.end());
-            let number = selected(&mut reader).unwrap();
-            assert!(seen.insert(number));
-            reader.issued(number).unwrap();
-            reader.release(number, PAGE_BYTES as u32).unwrap();
-            let state = scheduler.state.lock().unwrap();
-            let demand = &state.demands[&reader.id];
-            assert!(demand.selected.len() <= 64);
-            assert!(demand.results.is_empty());
-            assert!(demand.credits.is_empty());
-            assert!(state.selecting.is_empty());
-        }
-        assert!(scheduler.state.lock().unwrap().demands[&reader.id].next >= 500);
-    }
-    #[test]
-    fn partial_final_page_uses_exact_bytes_and_completion_does_not_require_release() {
-        let scheduler = Scheduler::new(1);
-        let range = ByteRange::From(PAGE_BYTES - 3)
-            .resolve(PAGE_BYTES + 5)
-            .unwrap();
-        let mut reader = scheduler
-            .register(version(), range, 2, PAGE_BYTES, true)
-            .unwrap();
-        assert_eq!(ordered(&mut reader), Some(PageNumber(0)));
-        assert_eq!(ordered(&mut reader), Some(PageNumber(1)));
-        assert!(reader.exhausted());
-        assert_eq!(ordered(&mut reader), None);
-        assert!(
-            !scheduler.state.lock().unwrap().demands[&reader.id]
-                .credits
-                .is_empty()
-        );
-        reader.issued(PageNumber(0)).unwrap();
-        assert_eq!(reader.release(PageNumber(0), 5), Err(Error::InvalidRequest));
-        reader.release(PageNumber(0), 3).unwrap();
-        assert_eq!(reader.release(PageNumber(0), 3), Err(Error::InvalidRequest));
-        reader.issued(PageNumber(1)).unwrap();
-        assert_eq!(reader.release(PageNumber(1), 3), Err(Error::InvalidRequest));
-        reader.release(PageNumber(1), 5).unwrap();
-        assert!(
-            scheduler.state.lock().unwrap().demands[&reader.id]
-                .credits
-                .is_empty()
-        );
-        drop(reader);
-        assert!(scheduler.state.lock().unwrap().demands.is_empty());
-    }
-    #[test]
-    fn inflight_page_outside_prefix_is_shared_and_drop_preserves_other_subscriber() {
-        let scheduler = Scheduler::new(2);
-        let length = 1_000_000 * PAGE_BYTES;
-        let range = ByteRange::From(0).resolve(length).unwrap();
-        let mut supplier = scheduler
-            .register(
-                version(),
-                ByteRange::From(800_000 * PAGE_BYTES)
-                    .resolve(length)
-                    .unwrap(),
-                1,
-                PAGE_BYTES,
-                false,
-            )
-            .unwrap();
-        let pending = selection(&mut supplier);
-        let mut reader = scheduler
-            .register(version(), range, 2, 2 * PAGE_BYTES, false)
-            .unwrap();
-        assert_eq!(selected(&mut reader), None);
-        complete(pending, 800_000, length);
-        assert_eq!(selected(&mut supplier), Some(PageNumber(800_000)));
-        complete(selection(&mut reader), 0, length);
-        assert_eq!(selected(&mut reader), Some(PageNumber(0)));
-        complete(selection(&mut reader), 800_000, length);
-        assert_eq!(selected(&mut reader), Some(PageNumber(800_000)));
-        let page = PageId {
-            version: version(),
-            number: PageNumber(800_000),
-        };
-        assert_eq!(scheduler.state.lock().unwrap().demands.len(), 2);
-        drop(supplier);
-        assert_eq!(scheduler.state.lock().unwrap().demands.len(), 1);
-        reader.issued(page.number).unwrap();
-        reader.release(page.number, PAGE_BYTES as u32).unwrap();
-        complete(selection(&mut reader), 1, length);
-        assert_eq!(selected(&mut reader), Some(PageNumber(1)));
-    }
-    #[test]
-    fn credit_boundaries_and_invalid_transitions_preserve_request_errors() {
-        let scheduler = Scheduler::new(1);
-        let range = ByteRange::From(0).resolve(PAGE_BYTES).unwrap();
-        for (pages, bytes) in [(1, PAGE_BYTES), (64, 64 * PAGE_BYTES)] {
-            let mut reader = scheduler
-                .register(version(), range, pages, bytes, true)
-                .unwrap();
-            assert!(reader.ordered());
-            assert_eq!(reader.issued(PageNumber(0)), Err(Error::InvalidRequest));
-            assert_eq!(ordered(&mut reader), Some(PageNumber(0)));
-            assert_eq!(
-                reader.release(PageNumber(0), PAGE_BYTES as u32),
-                Err(Error::InvalidRequest)
-            );
-            reader.issued(PageNumber(0)).unwrap();
-            assert_eq!(reader.issued(PageNumber(0)), Err(Error::InvalidRequest));
-            reader.release(PageNumber(0), PAGE_BYTES as u32).unwrap();
-            assert_eq!(
-                reader.release(PageNumber(0), PAGE_BYTES as u32),
-                Err(Error::InvalidRequest)
-            );
-        }
-    }
-    #[test]
-    fn invalid_credit_contracts_never_admit_demand() {
-        let scheduler = Scheduler::new(1);
-        let range = ByteRange::From(0).resolve(1).unwrap();
-        for (pages, bytes) in [
-            (0, PAGE_BYTES),
-            (65, PAGE_BYTES),
-            (1, 0),
-            (1, PAGE_BYTES - 1),
-            (1, 64 * PAGE_BYTES + 1),
-            (1, 65 * PAGE_BYTES),
-        ] {
-            assert!(matches!(
-                scheduler.register(version(), range, pages, bytes, false),
-                Err(Error::InvalidRequest)
-            ));
-        }
-        assert!(scheduler.state.lock().unwrap().demands.is_empty());
-        let mut credits = Window::new(1, PAGE_BYTES, PAGE_BYTES).unwrap();
-        assert_eq!(
-            credits.reserve(PageNumber(0), 0),
-            Err(flow_control::Error::InvalidInput)
-        );
-        assert_eq!(
-            credits.reserve(PageNumber(0), PAGE_BYTES + 1),
-            Err(flow_control::Error::InvalidInput)
-        );
-        assert_eq!(
-            credits.issued(PageNumber(0)),
-            Err(flow_control::Error::InvalidInput)
-        );
-    }
-}
+use flow_control::Window;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
+use std::future::poll_fn;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
+use std::time::Instant;
 
 // Compact, bounded node-wide subscription demand and page-credit accounting.
 struct Demand {
@@ -926,7 +278,8 @@ impl DemandLease {
         ))))
     }
     pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Result<Next>> {
-        use crate::peer::subscriptions::{Demand as WireDemand, PageInterval};
+        use crate::peer::subscriptions::Demand as WireDemand;
+        use crate::peer::subscriptions::PageInterval;
         let mut state = self.scheduler.state.lock().unwrap();
         let demand = state.demands.get_mut(&self.id).ok_or(Error::Cancelled)?;
         if let Some(page) = demand.results.pop_front() {
@@ -1638,22 +991,21 @@ fn validate_pin(expected: &ObjectMetadata, actual: &ObjectMetadata) -> Result<()
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::memory::new_pipe_pool;
     use crate::model::ByteRange;
     use crate::model::CacheId;
     use crate::model::CacheKey;
     use crate::model::ExpiresAt;
-    use crate::model::MembershipVersion;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
     use crate::model::PAGE_BYTES;
+    use crate::model::StrongEtag;
+    use crate::memory::new_pipe_pool;
+    use crate::model::MembershipVersion;
     use crate::model::RequestId;
     use crate::model::ResourceClass;
-    use crate::model::StrongEtag;
     use crate::model::WorkerId;
     use crate::runtime::admission::AdmissionPolicy;
     use crate::runtime::reactor::Reactor;
-    use crate::runtime::worker::WorkerMap;
     use crate::topology::Membership;
 
     struct Fixture {
@@ -1723,10 +1075,13 @@ pub(super) mod tests {
         metadata: &ObjectMetadata,
         number: u64,
     ) -> PageResult {
-        use crate::{
-            memory::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
-            model::{Nonce, PageEnvelope, ResourceClass},
-        };
+        use crate::memory::CiphertextBytes;
+        use crate::memory::CiphertextPage;
+        use crate::memory::VerifiedBytes;
+        use crate::memory::VerifiedPage;
+        use crate::model::Nonce;
+        use crate::model::PageEnvelope;
+        use crate::model::ResourceClass;
         let length = (metadata.length - number * PAGE_BYTES).min(PAGE_BYTES) as usize;
         let page = PageId {
             version: metadata.version.clone(),
@@ -1789,10 +1144,7 @@ pub(super) mod tests {
         // Injected ready pages still need the scheduler's exact credit reservations.
         let demand = stream.subscription.as_mut().unwrap();
         for number in 0..2 {
-            assert_eq!(
-                super::subscription_tests::ordered(demand),
-                Some(PageNumber(number))
-            );
+            assert_eq!(subscriptions::ordered(demand), Some(PageNumber(number)));
         }
         for number in 0..2 {
             let reader = futures::executor::block_on(stream.next_slice())
@@ -1862,18 +1214,12 @@ pub(super) mod tests {
                 let demand = stream.subscription.as_mut().unwrap();
                 for number in 0..2 {
                     if ordered {
-                        assert_eq!(
-                            super::subscription_tests::ordered(demand),
-                            Some(PageNumber(number))
-                        );
+                        assert_eq!(subscriptions::ordered(demand), Some(PageNumber(number)));
                     } else {
-                        super::subscription_tests::selection(demand)
+                        subscriptions::selection(demand)
                             .complete(page_result(&admission, &metadata, number))
                             .unwrap();
-                        assert_eq!(
-                            super::subscription_tests::selected(demand),
-                            Some(PageNumber(number))
-                        );
+                        assert_eq!(subscriptions::selected(demand), Some(PageNumber(number)));
                     }
                 }
                 if !ordered {
@@ -1963,13 +1309,10 @@ pub(super) mod tests {
         stream.configure_subscription(1, PAGE_BYTES, false).unwrap();
         // Model a delivered page still owned by a slow caller.
         let demand = stream.subscription.as_mut().unwrap();
-        super::subscription_tests::selection(demand)
+        subscriptions::selection(demand)
             .complete(page_result(&admission, &metadata, 0))
             .unwrap();
-        assert_eq!(
-            super::subscription_tests::selected(demand),
-            Some(PageNumber(0))
-        );
+        assert_eq!(subscriptions::selected(demand), Some(PageNumber(0)));
         demand.issued(PageNumber(0)).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
@@ -2056,7 +1399,8 @@ pub(super) mod tests {
     }
     #[test]
     fn pending_client_window_never_restarts_failed_pages_and_honors_original_deadline() {
-        use std::{cell::Cell, time::Duration};
+        use std::cell::Cell;
+        use std::time::Duration;
         for expire in [false, true] {
             let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
             let mut metadata = metadata();
@@ -2152,10 +1496,9 @@ pub(super) mod tests {
     }
     #[test]
     fn out_of_order_completion_waits_for_front_and_returns_only_unused_credits() {
-        use std::{
-            cell::Cell,
-            time::{Duration, Instant},
-        };
+        use std::cell::Cell;
+        use std::time::Duration;
+        use std::time::Instant;
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut budget = AcquisitionBudget::new(deadline, 6, 8);
         let mut first_budget = budget.partition(3, 4).unwrap();
@@ -2218,7 +1561,8 @@ pub(super) mod tests {
     }
     #[test]
     fn abandoning_window_drops_waiters_without_refunding_outstanding_spends() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
+        use std::time::Instant;
         struct Dropped(Rc<std::cell::Cell<bool>>);
         impl Drop for Dropped {
             fn drop(&mut self) {
@@ -2278,19 +1622,18 @@ pub(super) mod tests {
 
     #[test]
     fn responses_stream_more_than_three_pages_only_with_client_sized_http_framing() {
-        use crate::{
-            client::response::Responses,
-            http::{Codec, HttpIo},
-            memory::new_pipe_pool,
-            model::{RequestId, ResourceClass},
-            read::ReadResponse,
-            runtime::reactor::Reactor,
-        };
-        use std::{
-            io::{Read, Write},
-            os::unix::net::UnixStream,
-            time::Duration,
-        };
+        use crate::client::response::Responses;
+        use crate::http::Codec;
+        use crate::http::HttpIo;
+        use crate::memory::new_pipe_pool;
+        use crate::model::RequestId;
+        use crate::model::ResourceClass;
+        use crate::read::ReadResponse;
+        use crate::runtime::reactor::Reactor;
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
         for (capped, progressing) in [(true, false), (false, true), (false, false)] {
@@ -2524,5 +1867,664 @@ pub(super) mod tests {
             stalled.begin_attempt(uring_runtime::environment::now(), stalled.deadline()),
             Err(Error::DeadlineExceeded)
         );
+    }
+
+    mod subscriptions {
+        use super::*;
+        use crate::model::ByteRange;
+        use crate::model::CacheId;
+        use crate::model::CacheKey;
+        use crate::model::ObjectId;
+        use crate::model::StrongEtag;
+        use crate::runtime::admission::AdmissionPolicy;
+        use flow_control::Quotas;
+        use std::task::Context;
+        use std::task::Poll;
+        fn version() -> ObjectVersion {
+            ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId("cache".into()),
+                    key: CacheKey([1; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            }
+        }
+        pub(crate) fn ordered(reader: &mut DemandLease) -> Option<PageNumber> {
+            match reader.poll_ordered(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+                Poll::Ready(Ok(Some((page, guard)))) => {
+                    drop(guard);
+                    Some(page)
+                }
+                Poll::Ready(Ok(None)) | Poll::Pending => None,
+                Poll::Ready(Err(error)) => panic!("ordered assignment: {error:?}"),
+            }
+        }
+        pub(crate) fn selection(reader: &mut DemandLease) -> Selection {
+            match reader.poll_next(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+                Poll::Ready(Ok(Next::Select(selection))) => selection,
+                _ => panic!("expected provider selection"),
+            }
+        }
+        pub(crate) fn selected(reader: &mut DemandLease) -> Option<PageNumber> {
+            match reader.poll_next(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+                Poll::Ready(Ok(Next::Page(page))) => Some(page.plaintext.page().number),
+                Poll::Pending | Poll::Ready(Ok(Next::End)) => None,
+                _ => panic!("expected completed provider page"),
+            }
+        }
+        fn complete(selection: Selection, number: u64, length: u64) {
+            let metadata = crate::model::ObjectMetadata {
+                version: selection.version.clone(),
+                length,
+                content_type: None,
+                expires_at: crate::model::ExpiresAt::from_system_time(std::time::UNIX_EPOCH)
+                    .unwrap(),
+            };
+            let admission: Quotas<AdmissionPolicy> = Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            selection
+                .complete(super::tests::page_result(&admission, &metadata, number))
+                .unwrap();
+        }
+        #[test]
+        fn mixed_gate_tickets_bound_turns_under_sustained_ordered_demand() {
+            use std::task::Poll;
+            let scheduler = Scheduler::new(4);
+            let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
+            let mut a = scheduler
+                .register(version(), range, 2, 2 * PAGE_BYTES, true)
+                .unwrap();
+            let mut b = scheduler
+                .register(version(), range, 2, 2 * PAGE_BYTES, true)
+                .unwrap();
+            let mut unordered = scheduler
+                .register(version(), range, 1, PAGE_BYTES, false)
+                .unwrap();
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            for _ in 0..32 {
+                let Poll::Ready(Ok(Some((pa, ga)))) = a.poll_ordered(&mut cx) else {
+                    panic!("ordered resumes")
+                };
+                let Poll::Ready(Ok(Some((pb, gb)))) = b.poll_ordered(&mut cx) else {
+                    panic!("concurrent ordered resumes")
+                };
+                assert!(unordered.poll_next(&mut cx).is_pending());
+                let mut newcomer = scheduler
+                    .register(version(), range, 1, PAGE_BYTES, true)
+                    .unwrap();
+                assert!(
+                    newcomer.poll_ordered(&mut cx).is_pending(),
+                    "new readers cannot bypass a waiting selection"
+                );
+                drop(newcomer);
+                // Keep both ordered readers capacity-bearing, and poll them first
+                // at every boundary. Neither can refill ahead of the waiting ticket.
+                assert!(a.poll_ordered(&mut cx).is_pending());
+                assert!(b.poll_ordered(&mut cx).is_pending());
+                drop(ga);
+                a.issued(pa).unwrap();
+                a.release(pa, PAGE_BYTES as u32).unwrap();
+                assert!(a.poll_ordered(&mut cx).is_pending());
+                assert!(
+                    unordered.poll_next(&mut cx).is_pending(),
+                    "last fence still live"
+                );
+                drop(gb);
+                b.issued(pb).unwrap();
+                b.release(pb, PAGE_BYTES as u32).unwrap();
+                for _ in 0..8 {
+                    assert!(a.poll_ordered(&mut cx).is_pending());
+                    assert!(b.poll_ordered(&mut cx).is_pending());
+                }
+                let Poll::Ready(Ok(Next::Select(selection))) = unordered.poll_next(&mut cx) else {
+                    panic!("selection gets the very next turn after two fences")
+                };
+                assert!(a.poll_ordered(&mut cx).is_pending());
+                // Simulate an unsuccessful selection. Even immediate retries cannot
+                // starve the ordered tickets queued during the preceding batch.
+                drop(selection);
+                assert!(unordered.poll_next(&mut cx).is_pending());
+            }
+            drop((a, b, unordered));
+            let state = scheduler.state.lock().unwrap();
+            assert!(state.fixed.is_empty());
+            assert!(state.selecting.is_empty());
+            assert!(state.demands.is_empty());
+        }
+        #[test]
+        fn canceled_gate_waiter_wakes_successor_without_releasing_live_fences() {
+            use std::sync::atomic::AtomicUsize;
+            use std::sync::atomic::Ordering;
+            use std::task::Poll;
+            #[derive(Default)]
+            struct Wakes(AtomicUsize);
+            impl futures::task::ArcWake for Wakes {
+                fn wake_by_ref(this: &Arc<Self>) {
+                    this.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let wakes = Arc::new(Wakes::default());
+            let waker = futures::task::waker(wakes.clone());
+            let mut cx = std::task::Context::from_waker(&waker);
+            let scheduler = Scheduler::new(3);
+            let range = ByteRange::From(0).resolve(100 * PAGE_BYTES).unwrap();
+            let mut ordered = scheduler
+                .register(version(), range, 4, 4 * PAGE_BYTES, true)
+                .unwrap();
+            let mut canceled = scheduler
+                .register(version(), range, 1, PAGE_BYTES, false)
+                .unwrap();
+            let Poll::Ready(Ok(Some((_, first)))) = ordered.poll_ordered(&mut cx) else {
+                panic!()
+            };
+            assert!(canceled.poll_next(&mut cx).is_pending());
+            assert!(ordered.poll_ordered(&mut cx).is_pending());
+            let before = wakes.0.load(Ordering::Relaxed);
+            drop(canceled);
+            assert!(wakes.0.load(Ordering::Relaxed) > before);
+            let Poll::Ready(Ok(Some((_, second)))) = ordered.poll_ordered(&mut cx) else {
+                panic!("canceled selection no longer blocks refill")
+            };
+            let mut successor = scheduler
+                .register(version(), range, 1, PAGE_BYTES, false)
+                .unwrap();
+            assert!(successor.poll_next(&mut cx).is_pending());
+            assert!(ordered.poll_ordered(&mut cx).is_pending());
+            drop(ordered);
+            assert!(successor.poll_next(&mut cx).is_pending());
+            drop(first);
+            assert!(successor.poll_next(&mut cx).is_pending());
+            let before = wakes.0.load(Ordering::Relaxed);
+            drop(second);
+            assert!(wakes.0.load(Ordering::Relaxed) > before);
+            assert!(matches!(
+                successor.poll_next(&mut cx),
+                Poll::Ready(Ok(Next::Select(_)))
+            ));
+            drop(successor);
+            let state = scheduler.state.lock().unwrap();
+            assert!(state.demands.is_empty());
+            assert!(state.fixed.is_empty());
+            assert!(state.selecting.is_empty());
+        }
+        #[test]
+        fn ordered_reservations_are_exact_and_mixed_exclusion_outlives_demand() {
+            let scheduler = Scheduler::new(3);
+            let range = ByteRange::From(PAGE_BYTES - 3)
+                .resolve(2 * PAGE_BYTES + 5)
+                .unwrap();
+            let mut ordered = scheduler
+                .register(version(), range, 2, PAGE_BYTES, true)
+                .unwrap();
+            let mut unordered = scheduler
+                .register(version(), range, 1, PAGE_BYTES, false)
+                .unwrap();
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let std::task::Poll::Ready(Ok(Next::Select(selection))) = unordered.poll_next(&mut cx)
+            else {
+                panic!()
+            };
+            assert!(ordered.poll_ordered(&mut cx).is_pending());
+            drop(selection);
+            let std::task::Poll::Ready(Ok(Some((number, guard)))) = ordered.poll_ordered(&mut cx)
+            else {
+                panic!()
+            };
+            assert_eq!(number, PageNumber(0));
+            {
+                let state = scheduler.state.lock().unwrap();
+                let credits = &state.demands[&ordered.id].credits;
+                assert!(credits.can_reserve(PAGE_BYTES - 3));
+                assert!(!credits.can_reserve(PAGE_BYTES - 2));
+            }
+            assert!(
+                ordered.poll_ordered(&mut cx).is_pending(),
+                "byte credit reserved before work"
+            );
+            assert!(unordered.poll_next(&mut cx).is_pending());
+            drop(ordered);
+            assert!(
+                unordered.poll_next(&mut cx).is_pending(),
+                "worker still owns exclusion"
+            );
+            drop(guard);
+            assert!(matches!(
+                unordered.poll_next(&mut cx),
+                std::task::Poll::Ready(Ok(Next::Select(_)))
+            ));
+            drop(unordered);
+            let state = scheduler.state.lock().unwrap();
+            assert!(state.fixed.is_empty());
+            assert!(state.selecting.is_empty());
+            assert!(state.demands.is_empty());
+        }
+        #[test]
+        fn production_aggregate_is_compact_exclusive_and_contracts_never_refill() {
+            use crate::model::MembershipVersion;
+            use crate::model::NodeId;
+            use crate::peer::subscriptions::PageInterval;
+            let scheduler = Scheduler::new(4);
+            let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
+            let mut first = scheduler
+                .register(version(), range, 1, PAGE_BYTES, false)
+                .unwrap();
+            let mut second = scheduler
+                .register(
+                    version(),
+                    ByteRange::From(900_000 * PAGE_BYTES)
+                        .resolve(range.end())
+                        .unwrap(),
+                    1,
+                    PAGE_BYTES,
+                    false,
+                )
+                .unwrap();
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let std::task::Poll::Ready(Ok(Next::Select(selection))) = first.poll_next(&mut cx)
+            else {
+                panic!()
+            };
+            assert_eq!(
+                selection.demand.intervals(),
+                &[PageInterval { start: 0, end: 1 }]
+            );
+            assert!(second.poll_next(&mut cx).is_pending());
+            let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            let (one, _) = scheduler
+                .contract(
+                    version(),
+                    MembershipVersion(1),
+                    NodeId("provider".into()),
+                    selection.demand.clone(),
+                    deadline,
+                )
+                .unwrap();
+            let (two, expires) = scheduler
+                .contract(
+                    version(),
+                    MembershipVersion(1),
+                    NodeId("provider".into()),
+                    selection.demand.clone(),
+                    deadline + std::time::Duration::from_secs(30),
+                )
+                .unwrap();
+            assert_eq!(one.id, two.id);
+            assert_eq!(two.sequence, one.sequence + 1);
+            assert_eq!(two.page_budget + 1, one.page_budget);
+            assert_eq!(two.byte_budget + PAGE_BYTES + 16, one.byte_budget);
+            assert_eq!(expires, deadline);
+            drop(first);
+            assert!(
+                second.poll_next(&mut cx).is_pending(),
+                "detached consumer cannot release owned work"
+            );
+            drop(selection);
+            assert!(matches!(
+                second.poll_next(&mut cx),
+                std::task::Poll::Ready(Ok(Next::Select(_)))
+            ));
+        }
+        #[test]
+        fn production_ticket_cannot_be_spent_on_rotating_disjoint_low_readers() {
+            use std::task::Poll;
+            let scheduler = Scheduler::new(3);
+            let length = 1000 * PAGE_BYTES;
+            let mut high = scheduler
+                .register(
+                    version(),
+                    ByteRange::From(900 * PAGE_BYTES).resolve(length).unwrap(),
+                    1,
+                    PAGE_BYTES,
+                    false,
+                )
+                .unwrap();
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            for low_page in 0..32 {
+                let mut low = scheduler
+                    .register(
+                        version(),
+                        ByteRange::Closed {
+                            first: low_page * PAGE_BYTES,
+                            last: (low_page + 1) * PAGE_BYTES - 1,
+                        }
+                        .resolve(length)
+                        .unwrap(),
+                        1,
+                        PAGE_BYTES,
+                        false,
+                    )
+                    .unwrap();
+                let Poll::Ready(Ok(Next::Select(selection))) = low.poll_next(&mut cx) else {
+                    panic!()
+                };
+                assert!(high.poll_next(&mut cx).is_pending());
+                drop(selection);
+                assert!(low.poll_next(&mut cx).is_pending());
+                let Poll::Ready(Ok(Next::Select(selection))) = high.poll_next(&mut cx) else {
+                    panic!("oldest ticket must run")
+                };
+                assert_eq!(
+                    selection.demand.intervals(),
+                    &[crate::peer::subscriptions::PageInterval {
+                        start: 900,
+                        end: 901
+                    }]
+                );
+                assert!(!selection.demand.contains(low_page));
+                drop((selection, low));
+            }
+        }
+        #[test]
+        fn production_selection_advertises_only_credit_eligible_slices() {
+            let scheduler = Scheduler::new(1);
+            let range = ByteRange::From(PAGE_BYTES - 1)
+                .resolve(3 * PAGE_BYTES + 2)
+                .unwrap();
+            let mut reader = scheduler
+                .register(version(), range, 2, PAGE_BYTES, false)
+                .unwrap();
+            {
+                let mut state = scheduler.state.lock().unwrap();
+                let demand = state.demands.get_mut(&reader.id).unwrap();
+                demand.turn = true;
+                demand
+                    .credits
+                    .reserve(PageNumber(99), PAGE_BYTES - 2)
+                    .unwrap();
+            }
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let std::task::Poll::Ready(Ok(Next::Select(selection))) = reader.poll_next(&mut cx)
+            else {
+                panic!()
+            };
+            assert!(selection.demand.contains(0));
+            assert!(selection.demand.contains(3));
+            assert!(!selection.demand.contains(1));
+            assert!(!selection.demand.contains(2));
+        }
+        #[test]
+        fn pending_and_delivered_share_exact_once_credit() {
+            let mut credits = Window::new(2, 2 * PAGE_BYTES, PAGE_BYTES).unwrap();
+            credits.reserve(PageNumber(0), PAGE_BYTES).unwrap();
+            assert_eq!(
+                credits.release(PageNumber(0), PAGE_BYTES),
+                Err(flow_control::Error::InvalidInput)
+            );
+            credits.reserve(PageNumber(1), PAGE_BYTES).unwrap();
+            assert!(!credits.can_reserve(PAGE_BYTES));
+            assert_eq!(
+                credits.reserve(PageNumber(2), 1),
+                Err(flow_control::Error::Overloaded)
+            );
+            credits.issued(PageNumber(0)).unwrap();
+            assert_eq!(
+                credits.release(PageNumber(0), 1),
+                Err(flow_control::Error::InvalidInput)
+            );
+            credits.release(PageNumber(0), PAGE_BYTES).unwrap();
+            assert_eq!(
+                credits.release(PageNumber(0), PAGE_BYTES),
+                Err(flow_control::Error::InvalidInput)
+            );
+            assert!(credits.can_reserve(PAGE_BYTES));
+        }
+        #[test]
+        fn scheduler_is_compact_bounded_and_preserves_ordered_head() {
+            let scheduler = Scheduler::new(2);
+            let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
+            let mut first = scheduler
+                .register(version(), range, 2, 2 * PAGE_BYTES, true)
+                .unwrap();
+            let mut second = scheduler
+                .register(version(), range, 2, 2 * PAGE_BYTES, true)
+                .unwrap();
+            assert!(matches!(
+                scheduler.register(version(), range, 2, 2 * PAGE_BYTES, true),
+                Err(Error::Overloaded)
+            ));
+            assert_eq!(ordered(&mut first), Some(PageNumber(0)));
+            assert_eq!(ordered(&mut first), Some(PageNumber(1)));
+            assert_eq!(ordered(&mut second), Some(PageNumber(0)));
+            assert_eq!(ordered(&mut second), Some(PageNumber(1)));
+            let state = scheduler.state.lock().unwrap();
+            assert_eq!(state.demands.len(), 2);
+            assert!(
+                state
+                    .demands
+                    .values()
+                    .all(|demand| demand.selected.is_empty())
+            );
+            drop(state);
+            drop(first);
+            drop(second);
+            let state = scheduler.state.lock().unwrap();
+            assert!(state.demands.is_empty());
+            assert!(state.fixed.is_empty());
+        }
+        #[test]
+        fn unordered_provider_can_select_distant_pages_but_alternates_head_progress() {
+            let scheduler = Scheduler::new(2);
+            let range = ByteRange::From(0).resolve(100 * PAGE_BYTES).unwrap();
+            let mut reader = scheduler
+                .register(version(), range, 3, 3 * PAGE_BYTES, false)
+                .unwrap();
+            for number in [0, 5, 1] {
+                let choice = selection(&mut reader);
+                assert!(choice.demand.contains(number));
+                if number != 5 {
+                    assert_eq!(choice.demand.page_count(), 1);
+                }
+                complete(choice, number, range.end());
+                assert_eq!(selected(&mut reader), Some(PageNumber(number)));
+            }
+        }
+        #[test]
+        fn whole_demand_hot_assignment_fans_out_without_slow_reader_backpressure() {
+            let scheduler = Scheduler::new(4);
+            let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
+            let mut first = scheduler
+                .register(version(), range, 2, 2 * PAGE_BYTES, false)
+                .unwrap();
+            let mut second = scheduler
+                .register(version(), range, 2, 2 * PAGE_BYTES, false)
+                .unwrap();
+            let mut slow = scheduler
+                .register(version(), range, 1, PAGE_BYTES, false)
+                .unwrap();
+            let mut other_version = version();
+            other_version.etag = StrongEtag::test_value("v2");
+            let other = scheduler
+                .register(other_version, range, 2, 2 * PAGE_BYTES, false)
+                .unwrap();
+            complete(selection(&mut first), 0, range.end());
+            assert_eq!(selected(&mut first), Some(PageNumber(0)));
+            complete(selection(&mut first), 900_000, range.end());
+            assert_eq!(selected(&mut first), Some(PageNumber(900_000)));
+            assert_eq!(selected(&mut second), Some(PageNumber(0)));
+            assert_eq!(selected(&mut second), Some(PageNumber(900_000)));
+            assert_eq!(selected(&mut slow), Some(PageNumber(0)));
+            assert_eq!(selected(&mut slow), None);
+            assert!(!slow.exhausted());
+            assert!(
+                scheduler.state.lock().unwrap().demands[&other.id]
+                    .results
+                    .is_empty()
+            );
+            first.issued(PageNumber(0)).unwrap();
+            first.release(PageNumber(0), PAGE_BYTES as u32).unwrap();
+            let choice = selection(&mut first);
+            assert_eq!(
+                choice.demand.intervals(),
+                &[crate::peer::subscriptions::PageInterval { start: 1, end: 2 }]
+            );
+            complete(choice, 1, range.end());
+            assert_eq!(selected(&mut first), Some(PageNumber(1)));
+            assert_eq!(
+                selected(&mut slow),
+                None,
+                "slow subscriber reserves no additional work"
+            );
+            drop((first, second, slow, other));
+            assert!(scheduler.state.lock().unwrap().demands.is_empty());
+        }
+        #[test]
+        fn bounded_holes_and_credit_state_survive_adversarial_hot_pages() {
+            let scheduler = Scheduler::new(1);
+            let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
+            let mut reader = scheduler
+                .register(version(), range, 1, PAGE_BYTES, false)
+                .unwrap();
+            let mut seen = BTreeSet::new();
+            for turn in 0..1000 {
+                let choice = selection(&mut reader);
+                let hot = 900_000 + turn;
+                let number = if choice.demand.contains(hot) {
+                    hot
+                } else {
+                    choice.demand.intervals()[0].start
+                };
+                complete(choice, number, range.end());
+                let number = selected(&mut reader).unwrap();
+                assert!(seen.insert(number));
+                reader.issued(number).unwrap();
+                reader.release(number, PAGE_BYTES as u32).unwrap();
+                let state = scheduler.state.lock().unwrap();
+                let demand = &state.demands[&reader.id];
+                assert!(demand.selected.len() <= 64);
+                assert!(demand.results.is_empty());
+                assert!(demand.credits.is_empty());
+                assert!(state.selecting.is_empty());
+            }
+            assert!(scheduler.state.lock().unwrap().demands[&reader.id].next >= 500);
+        }
+        #[test]
+        fn partial_final_page_uses_exact_bytes_and_completion_does_not_require_release() {
+            let scheduler = Scheduler::new(1);
+            let range = ByteRange::From(PAGE_BYTES - 3)
+                .resolve(PAGE_BYTES + 5)
+                .unwrap();
+            let mut reader = scheduler
+                .register(version(), range, 2, PAGE_BYTES, true)
+                .unwrap();
+            assert_eq!(ordered(&mut reader), Some(PageNumber(0)));
+            assert_eq!(ordered(&mut reader), Some(PageNumber(1)));
+            assert!(reader.exhausted());
+            assert_eq!(ordered(&mut reader), None);
+            assert!(
+                !scheduler.state.lock().unwrap().demands[&reader.id]
+                    .credits
+                    .is_empty()
+            );
+            reader.issued(PageNumber(0)).unwrap();
+            assert_eq!(reader.release(PageNumber(0), 5), Err(Error::InvalidRequest));
+            reader.release(PageNumber(0), 3).unwrap();
+            assert_eq!(reader.release(PageNumber(0), 3), Err(Error::InvalidRequest));
+            reader.issued(PageNumber(1)).unwrap();
+            assert_eq!(reader.release(PageNumber(1), 3), Err(Error::InvalidRequest));
+            reader.release(PageNumber(1), 5).unwrap();
+            assert!(
+                scheduler.state.lock().unwrap().demands[&reader.id]
+                    .credits
+                    .is_empty()
+            );
+            drop(reader);
+            assert!(scheduler.state.lock().unwrap().demands.is_empty());
+        }
+        #[test]
+        fn inflight_page_outside_prefix_is_shared_and_drop_preserves_other_subscriber() {
+            let scheduler = Scheduler::new(2);
+            let length = 1_000_000 * PAGE_BYTES;
+            let range = ByteRange::From(0).resolve(length).unwrap();
+            let mut supplier = scheduler
+                .register(
+                    version(),
+                    ByteRange::From(800_000 * PAGE_BYTES)
+                        .resolve(length)
+                        .unwrap(),
+                    1,
+                    PAGE_BYTES,
+                    false,
+                )
+                .unwrap();
+            let pending = selection(&mut supplier);
+            let mut reader = scheduler
+                .register(version(), range, 2, 2 * PAGE_BYTES, false)
+                .unwrap();
+            assert_eq!(selected(&mut reader), None);
+            complete(pending, 800_000, length);
+            assert_eq!(selected(&mut supplier), Some(PageNumber(800_000)));
+            complete(selection(&mut reader), 0, length);
+            assert_eq!(selected(&mut reader), Some(PageNumber(0)));
+            complete(selection(&mut reader), 800_000, length);
+            assert_eq!(selected(&mut reader), Some(PageNumber(800_000)));
+            let page = PageId {
+                version: version(),
+                number: PageNumber(800_000),
+            };
+            assert_eq!(scheduler.state.lock().unwrap().demands.len(), 2);
+            drop(supplier);
+            assert_eq!(scheduler.state.lock().unwrap().demands.len(), 1);
+            reader.issued(page.number).unwrap();
+            reader.release(page.number, PAGE_BYTES as u32).unwrap();
+            complete(selection(&mut reader), 1, length);
+            assert_eq!(selected(&mut reader), Some(PageNumber(1)));
+        }
+        #[test]
+        fn credit_boundaries_and_invalid_transitions_preserve_request_errors() {
+            let scheduler = Scheduler::new(1);
+            let range = ByteRange::From(0).resolve(PAGE_BYTES).unwrap();
+            for (pages, bytes) in [(1, PAGE_BYTES), (64, 64 * PAGE_BYTES)] {
+                let mut reader = scheduler
+                    .register(version(), range, pages, bytes, true)
+                    .unwrap();
+                assert!(reader.ordered());
+                assert_eq!(reader.issued(PageNumber(0)), Err(Error::InvalidRequest));
+                assert_eq!(ordered(&mut reader), Some(PageNumber(0)));
+                assert_eq!(
+                    reader.release(PageNumber(0), PAGE_BYTES as u32),
+                    Err(Error::InvalidRequest)
+                );
+                reader.issued(PageNumber(0)).unwrap();
+                assert_eq!(reader.issued(PageNumber(0)), Err(Error::InvalidRequest));
+                reader.release(PageNumber(0), PAGE_BYTES as u32).unwrap();
+                assert_eq!(
+                    reader.release(PageNumber(0), PAGE_BYTES as u32),
+                    Err(Error::InvalidRequest)
+                );
+            }
+        }
+        #[test]
+        fn invalid_credit_contracts_never_admit_demand() {
+            let scheduler = Scheduler::new(1);
+            let range = ByteRange::From(0).resolve(1).unwrap();
+            for (pages, bytes) in [
+                (0, PAGE_BYTES),
+                (65, PAGE_BYTES),
+                (1, 0),
+                (1, PAGE_BYTES - 1),
+                (1, 64 * PAGE_BYTES + 1),
+                (1, 65 * PAGE_BYTES),
+            ] {
+                assert!(matches!(
+                    scheduler.register(version(), range, pages, bytes, false),
+                    Err(Error::InvalidRequest)
+                ));
+            }
+            assert!(scheduler.state.lock().unwrap().demands.is_empty());
+            let mut credits = Window::new(1, PAGE_BYTES, PAGE_BYTES).unwrap();
+            assert_eq!(
+                credits.reserve(PageNumber(0), 0),
+                Err(flow_control::Error::InvalidInput)
+            );
+            assert_eq!(
+                credits.reserve(PageNumber(0), PAGE_BYTES + 1),
+                Err(flow_control::Error::InvalidInput)
+            );
+            assert_eq!(
+                credits.issued(PageNumber(0)),
+                Err(flow_control::Error::InvalidInput)
+            );
+        }
     }
 }

@@ -25,21 +25,23 @@
 #[cfg(test)]
 mod measurement {
     //! Measurement correctness scenarios using the real page engine.
-    use super::tests::{input, keyring};
+    use super::tests::input;
+    use super::tests::keyring;
     use super::*;
     use crate::telemetry::Event;
     use crate::telemetry::Event::*;
     use crate::telemetry::Metrics;
-    use crate::{
-        memory::BufferPool,
-        model::{Nonce, PageEnvelope, ResourceClass, *},
-        security::aead::{PageCryptoEngine, page_aad},
-    };
+    use crate::memory::BufferPool;
+    use crate::model::Nonce;
+    use crate::model::PageEnvelope;
+    use crate::model::ResourceClass;
+    use crate::model::*;
+    use crate::security::aead::PageCryptoEngine;
+    use crate::security::aead::page_aad;
     use racer_crypto::aead;
-    use std::{
-        rc::Rc,
-        time::{Duration, Instant},
-    };
+    use std::rc::Rc;
+    use std::time::Duration;
+    use std::time::Instant;
     use uring_runtime::reactor::IoBuffer;
 
     fn page() -> PageId {
@@ -258,7 +260,8 @@ mod measurement {
 
     #[test]
     fn attribution_preserves_client_cleanup_and_dst() {
-        use uring_runtime::environment::{self, SimulationClock};
+        use uring_runtime::environment;
+        use uring_runtime::environment::SimulationClock;
         let clock = SimulationClock::new(73);
         let env = clock.environment(0);
         let _env = env.enter();
@@ -271,7 +274,8 @@ mod measurement {
     #[test]
     fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
         use std::time::Duration;
-        use uring_runtime::environment::{self, SimulationClock};
+        use uring_runtime::environment;
+        use uring_runtime::environment::SimulationClock;
         let clock = SimulationClock::new(42);
         let env = clock.environment(0);
         let _env = env.enter();
@@ -1031,13 +1035,18 @@ mod measurement {
     }
 }
 
-use super::{admission::AdmissionPolicy, deadline::RequestScope};
-use channel::{Receiver, SendFailure, Sender};
+use super::admission::AdmissionPolicy;
+use super::deadline::RequestScope;
+use channel::Receiver;
+use channel::SendFailure;
+use channel::Sender;
 
 mod channel {
     //! Racer error adapters for the runtime's bounded SPSC ownership handoffs.
-    use crate::error::{Error, Result};
-    use std::task::{Context, Poll};
+    use crate::error::Error;
+    use crate::error::Result;
+    use std::task::Context;
+    use std::task::Poll;
     use uring_runtime::channel;
 
     pub struct Sender<T>(channel::Sender<T>);
@@ -1117,22 +1126,27 @@ mod channel {
         }
     }
 }
-use crate::{
-    error::{Error, Operation, Result},
-    memory::{CiphertextPage, PlaintextBuffer, VerifiedPage},
-    model::{PageId, WorkerId},
-};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::memory::CiphertextPage;
+use crate::memory::PlaintextBuffer;
+use crate::memory::VerifiedPage;
+use crate::model::PageId;
+use crate::model::WorkerId;
 use racer_identity::KeyLease;
-use std::{
-    cell::{Cell, RefCell},
-    collections::{BTreeMap, VecDeque},
-    num::NonZeroUsize,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    task::{Context, Poll, Waker},
-};
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
 /// I/O-generated identity, independent of flights. Never reuse a sequence within
 /// a pair generation; restart increments the generation and rejects late results.
@@ -1812,7 +1826,8 @@ impl CryptoClient {
         // All waits have bounded original deadlines. The worker drives this even
         // without external I/O, allowing expired/canceled futures to detach.
         let wakes: Vec<_> = {
-            use std::ops::Bound::{Excluded, Unbounded};
+            use std::ops::Bound::Excluded;
+            use std::ops::Bound::Unbounded;
             let waiters = self.waiters.borrow();
             let start = self.deadline_cursor.get().map_or(Unbounded, Excluded);
             let mut wakes = Vec::new();
@@ -1953,10 +1968,9 @@ mod tests {
     pub(super) fn input(
         admission: &std::rc::Rc<flow_control::Quotas<AdmissionPolicy>>,
     ) -> CryptoInput {
-        use crate::{
-            memory::BufferPool,
-            model::{ResourceClass, *},
-        };
+        use crate::memory::BufferPool;
+        use crate::model::ResourceClass;
+        use crate::model::*;
         let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
         CryptoInput::Encrypt {
             page: PageId {
@@ -2243,9 +2257,12 @@ mod tests {
     }
 
     pub(super) fn keyring() -> racer_identity::Keyring {
-        use crate::model::{CacheId, ClusterId, NodeId};
+        use crate::model::CacheId;
+        use crate::model::ClusterId;
+        use crate::model::NodeId;
         use racer_control_wire::*;
-        use racer_identity::{KeyEpochs, Keyring};
+        use racer_identity::KeyEpochs;
+        use racer_identity::Keyring;
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let mut params = rcgen::CertificateParams::default();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);

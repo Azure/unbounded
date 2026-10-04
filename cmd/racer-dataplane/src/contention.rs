@@ -1,14 +1,14 @@
 //! Payload-free, discrete-event pressure model. Only admission is production code;
 //! queues, service times, placement, and page ownership are explicit abstractions.
 
-use crate::{
-    model::{CacheId, PAGE_BYTES, ResourceClass},
-    runtime::admission::{AdmissionExt, AdmissionPolicy},
-};
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::Arc,
-};
+use crate::model::CacheId;
+use crate::model::PAGE_BYTES;
+use crate::model::ResourceClass;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 const PLAIN: usize = PAGE_BYTES as usize;
 const CIPHER: usize = PLAIN + 16;
@@ -774,11 +774,11 @@ mod waiter_detach {
     use crate::read::flight::JoinedFlight;
     use crate::runtime::deadline::RequestScope;
     use crate::topology::Membership;
-    use std::{
-        rc::Rc,
-        task::{Context, Poll},
-        time::{Duration, Instant},
-    };
+    use std::rc::Rc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Duration;
+    use std::time::Instant;
 
     fn config() -> Config {
         Config {

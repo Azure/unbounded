@@ -6,7 +6,10 @@ pub mod subscriptions;
 #[cfg(test)]
 pub(crate) mod tests;
 mod timing {
-    use super::protocol::{Operation, PeerRequest, PeerResponse, VerifiedResponse};
+    use super::protocol::Operation;
+    use super::protocol::PeerRequest;
+    use super::protocol::PeerResponse;
+    use super::protocol::VerifiedResponse;
     use crate::rdma::TransportPlan;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
@@ -107,10 +110,12 @@ mod timing {
 }
 pub mod transport;
 
-use self::{
-    protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedRequest, VerifiedResponse},
-    transport::Transfers,
-};
+use self::protocol::PeerRequest;
+use self::protocol::SignedRequest;
+use self::protocol::SignedResponse;
+use self::protocol::VerifiedRequest;
+use self::protocol::VerifiedResponse;
+use self::transport::Transfers;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -124,7 +129,8 @@ use crate::security::forwarding::Forwarding;
 use crate::telemetry::Observer;
 use crate::telemetry::Stage;
 use crate::topology::Paths;
-use std::{rc::Rc, sync::Arc};
+use std::rc::Rc;
+use std::sync::Arc;
 
 /// Worker-local identity and a handle to the sole node-wide incoming registry.
 /// Outbound operations route directly from their retained membership lease.

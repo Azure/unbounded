@@ -9,13 +9,18 @@ use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::VersionMetadata;
 use crate::model::WorkerId;
-use crate::runtime::collections::{HashMap, HashSet};
-use page_alloc::{Extent, Generation, SegmentId, SegmentState, Segments};
-use std::{
-    cell::{Cell, RefCell},
-    collections::{BTreeMap, VecDeque},
-    rc::Rc,
-};
+use crate::runtime::collections::HashMap;
+use crate::runtime::collections::HashSet;
+use page_alloc::Extent;
+use page_alloc::Generation;
+use page_alloc::SegmentId;
+use page_alloc::SegmentState;
+use page_alloc::Segments;
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
+use std::rc::Rc;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordLocation {
     pub segment: SegmentId,
@@ -313,7 +318,8 @@ impl Index {
     /// Owner-local bounded cut. Appends are frozen by Checkpointer; removals are
     /// safe omissions. The age tree avoids rescanning a growing hash table.
     pub fn snapshot_pages(&self, after: u64, limit: usize) -> (u64, Vec<(PageId, IndexedPage)>) {
-        use std::ops::Bound::{Excluded, Unbounded};
+        use std::ops::Bound::Excluded;
+        use std::ops::Bound::Unbounded;
         let state = self.state.borrow();
         let mut cursor = after;
         let entries = state
@@ -426,9 +432,9 @@ impl Index {
     }
     fn validate_descriptor(m: &VersionMetadata) -> Result<()> {
         if m.version.object.cache.0.is_empty()
-            || m.version.object.cache.0.len() > super::format::MAX_ID_BYTES
+            || m.version.object.cache.0.len() > super::MAX_ID_BYTES
             || m.version.etag.as_bytes().is_empty()
-            || m.version.etag.as_bytes().len() > super::format::MAX_ETAG_BYTES
+            || m.version.etag.as_bytes().len() > super::MAX_ETAG_BYTES
         {
             return Err(Error::CorruptRecord);
         }
@@ -569,8 +575,12 @@ impl SegmentClock {
 }
 
 #[cfg(test)]
-mod lifecycle_tests {
+mod tests {
     use super::*;
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::StrongEtag;
+
     fn segments(bytes: u64, count: usize) -> Segments {
         let s = Segments::new(bytes);
         s.configure(
@@ -602,11 +612,6 @@ mod lifecycle_tests {
         clock.reclaim_now().unwrap();
         assert_eq!(segments.free_count(), 2);
     }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::{CacheId, CacheKey, StrongEtag};
     fn index(capacity: usize) -> Index {
         Index::new(WorkerId(0), capacity, crate::test_support::availability())
     }

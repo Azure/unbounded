@@ -12,10 +12,16 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::model::WorkerId;
 use racer_control_wire::RailMapping;
-use std::collections::{BTreeMap, HashSet};
-use uring_runtime::affinity::{CpuLocation, EffectiveTopology, NicLocality};
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use uring_runtime::affinity::CpuLocation;
+use uring_runtime::affinity::EffectiveTopology;
+use uring_runtime::affinity::NicLocality;
 #[cfg(test)]
-use uring_runtime::affinity::{CpuQuota, current_cpus, pin_cpu, set_cpus};
+use uring_runtime::affinity::CpuQuota;
+use uring_runtime::affinity::current_cpus;
+use uring_runtime::affinity::pin_cpu;
+use uring_runtime::affinity::set_cpus;
 
 /// One I/O shard and its crypto execution placement. Equal crypto CPU IDs across
 /// assignments explicitly identify the same execution thread, not duplicate threads.
@@ -205,7 +211,8 @@ impl AffinityPlan {
 mod tests {
     use super::*;
     use crate::config::DEFAULT_MAX_THREADS;
-    use std::{collections::BTreeSet, num::NonZeroU64};
+    use std::collections::BTreeSet;
+    use std::num::NonZeroU64;
 
     fn topology(cores: usize, quota: Option<(u64, u64)>) -> EffectiveTopology {
         EffectiveTopology {

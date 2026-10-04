@@ -1,14 +1,14 @@
 //! Shared semantic values. This layer imports neither I/O nor read policy.
 
-use crate::{
-    error::{Error, Result},
-    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
-};
-use std::{
-    fmt,
-    num::NonZeroUsize,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use crate::error::Error;
+use crate::error::Result;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use zeroize::Zeroizing;
 
 // Wire field bounds and canonical decimal encoding.
@@ -43,7 +43,10 @@ pub(crate) fn parse_decimal(value: &[u8]) -> Result<u64> {
 // Keys are exactly 32 bytes. Strong ETags are opaque version identifiers, not
 // content hashes. Placement excludes ETag; page cache and flight identity include it.
 
-pub use racer_control_wire::{CacheId, ClusterId, MembershipVersion, NodeId};
+pub use racer_control_wire::CacheId;
+pub use racer_control_wire::ClusterId;
+pub use racer_control_wire::MembershipVersion;
+pub use racer_control_wire::NodeId;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CacheKey(pub [u8; 32]);
 

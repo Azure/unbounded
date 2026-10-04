@@ -3,17 +3,19 @@
 //! Default to all eligible physical cores, subject to CPU and resource budgets.
 //! Shares and physical NIC bindings come from accepted controller membership.
 
-use crate::{
-    error::{Error, Result},
-    model::{ClusterId, Limits, NodeId, PAGE_BYTES},
-    store::format::MAX_HEADER_BYTES,
-};
-use std::{
-    net::{IpAddr, SocketAddr},
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::ClusterId;
+use crate::model::Limits;
+use crate::model::NodeId;
+use crate::model::PAGE_BYTES;
+use crate::store::MAX_HEADER_BYTES;
+use std::net::IpAddr;
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::Duration;
 
 pub const DEFAULT_MAX_THREADS: usize = usize::MAX;
 /// Not a Node UID. Only verified enrollment/local identity recovery may replace it.
@@ -24,7 +26,7 @@ const MAX_ENTRIES: usize = 1_048_576;
 
 pub struct Config {
     pub send_crc_pair: Option<crate::telemetry::Pair>,
-    pub page_hedge: crate::read::hedge::Config,
+    pub page_hedge: crate::read::candidates::HedgeConfig,
     pub peer_admission: crate::peer::adaptive::Config,
     pub shares: std::num::NonZeroU32,
     pub disk_page_entries: NonZeroUsize,
@@ -141,12 +143,12 @@ impl Config {
             value.parse().map_err(|_| Error::InvalidConfiguration)
         };
         let max_threads = to_usize(number("RACER_MAX_THREADS", DEFAULT_MAX_THREADS as u64)?)?;
-        let page_hedge = crate::read::hedge::Config {
+        let page_hedge = crate::read::candidates::HedgeConfig {
             delay: Duration::from_millis(number("RACER_PAGE_HEDGE_DELAY_MS", 100)?),
             slots: to_usize(number("RACER_PAGE_HEDGE_SLOTS", 0)?)?,
             bytes: to_usize(number(
                 "RACER_PAGE_HEDGE_BYTES",
-                crate::read::hedge::DUPLICATE_BYTES as u64,
+                crate::read::candidates::DUPLICATE_BYTES as u64,
             )?)?,
         };
         let peer_admission = crate::peer::adaptive::Config {
@@ -167,7 +169,9 @@ impl Config {
             Duration::from_millis(number("RACER_READER_STALL_TIMEOUT_MS", 10_000)?);
         let shutdown_timeout = Duration::from_millis(number("RACER_SHUTDOWN_TIMEOUT_MS", 30_000)?);
         let ranking_bytes = number("RACER_PLACEMENT_CACHE_BYTES", 16 * MIB)?;
-        if ranking_bytes < crate::topology::RANKING_BYTES as u64 || ranking_bytes > 512 * MIB {
+        if ranking_bytes < crate::topology::RANKING_BYTES as u64
+            || ranking_bytes > 512 * MIB
+        {
             return Err(Error::InvalidConfiguration);
         }
         let ranking_entries = ranking_bytes / crate::topology::RANKING_BYTES as u64;
@@ -967,10 +971,9 @@ mod tests {
     }
 
     fn peer_listener_round_trip(ip: &str) {
-        use std::{
-            io::Write,
-            net::{TcpListener, TcpStream},
-        };
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::net::TcpStream;
 
         let address = format!("[{ip}]:7443");
         let mut config = parse(&[("RACER_PEER_LISTEN", &address)]).unwrap();

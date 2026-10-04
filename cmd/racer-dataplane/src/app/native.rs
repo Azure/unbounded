@@ -2,7 +2,8 @@
 use super::*;
 use crate::rdma::WithNative;
 use crate::runtime::collections::HashMap;
-use rdma_verbs::{IoPort, NativePort};
+use rdma_verbs::IoPort;
+use rdma_verbs::NativePort;
 
 #[derive(Default)]
 pub(super) struct NativePairs {
@@ -94,11 +95,6 @@ impl NativePairs {
             Some(native) => Box::new(WithNative::new(engine, native)),
             None => Box::new(engine),
         })
-    }
-}
-impl Application {
-    pub fn discovered_nics(&self) -> &[racer_control_wire::RailMapping] {
-        &self.discovered_nics
     }
 }
 impl WorkerApplication {
@@ -209,18 +205,20 @@ impl WorkerApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use racer_control_wire::Publication;
     use crate::model::MembershipVersion;
     use crate::model::ResourceClass;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
-    use racer_control_wire::Publication;
-    use racer_control_wire::PublicationSequence;
+    use crate::topology::Member;
     use racer_control_wire::RailId;
+    use racer_control_wire::PublicationSequence;
     use std::num::NonZeroUsize;
 
     #[test]
     fn shared_inventory_recovers_new_hardware_and_revokes_removed_or_changed_ports() {
-        use rdma_verbs::simulation::{Device, Simulation};
+        use rdma_verbs::simulation::Device;
+        use rdma_verbs::simulation::Simulation;
         let sim = Simulation::new()
             .with_devices(vec![
                 Device::new("missing", [1; 16]),
@@ -237,7 +235,7 @@ mod tests {
             cluster: app.config.cluster.clone(),
             sequence: PublicationSequence(2),
             membership_version: MembershipVersion(2),
-            members: vec![racer_control_wire::Member {
+            members: vec![Member {
                 node: app.config.node.clone(),
                 shares: std::num::NonZeroU32::new(1).unwrap(),
                 peer_endpoint: "127.0.0.1:7443".into(),
@@ -358,7 +356,7 @@ mod tests {
             (ResourceClass::Plaintext, 3 * page),
             (
                 ResourceClass::Ciphertext,
-                3 * (page + 16) + crate::store::format::MAX_HEADER_BYTES,
+                3 * (page + 16) + crate::store::MAX_HEADER_BYTES,
             ),
             (ResourceClass::DirtyCiphertext, page + 16),
             (
@@ -385,7 +383,8 @@ mod tests {
     }
 
     fn four_pair_plan(config: &Config) -> AffinityPlan {
-        use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
+        use uring_runtime::affinity::CpuLocation;
+        use uring_runtime::affinity::EffectiveTopology;
         let plan = AffinityPlan::from_topology(
             config,
             EffectiveTopology {
@@ -409,7 +408,8 @@ mod tests {
 
     #[test]
     fn smt_startup_final_count_partitions_live_budgets_and_obeys_memory_floors() {
-        use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
+        use uring_runtime::affinity::CpuLocation;
+        use uring_runtime::affinity::EffectiveTopology;
         for (allow_smt, expected) in [(false, 3), (true, 5)] {
             let mut config = Config::from_lookup(|name| {
                 Ok(match name {
@@ -483,7 +483,8 @@ mod tests {
 
     #[test]
     fn resource_shortage_reduces_and_regroups_uneven_numa_workers() {
-        use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
+        use uring_runtime::affinity::CpuLocation;
+        use uring_runtime::affinity::EffectiveTopology;
         let mut config = default_config(false);
         let floor = 3 * crate::model::PAGE_BYTES as usize;
         for supported in 1..=10 {
@@ -808,7 +809,7 @@ mod tests {
                 cluster: app.config.cluster.clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
-                members: vec![racer_control_wire::Member {
+                members: vec![Member {
                     node: app.config.node.clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
@@ -827,7 +828,8 @@ mod tests {
 
     #[test]
     fn native_worker_selects_only_funded_local_rails_and_recovers() {
-        use rdma_verbs::simulation::{Device, Simulation};
+        use rdma_verbs::simulation::Device;
+        use rdma_verbs::simulation::Simulation;
         let sim = Simulation::new();
         let simulated = sim
             .with_devices(vec![Device::new("test-device", [1; 16])])
@@ -870,7 +872,7 @@ mod tests {
                 cluster: app.config.cluster.clone(),
                 sequence: PublicationSequence(2),
                 membership_version: MembershipVersion(2),
-                members: vec![racer_control_wire::Member {
+                members: vec![Member {
                     node: app.config.node.clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
@@ -895,8 +897,14 @@ mod tests {
         let mut app = configured();
         app.discovered_nics.push(app.discovered_nics[0].clone());
         assert!(
-            crate::rdma::select_worker(&app.discovered_nics[..1], &app.discovered_nics, 0, None, 1)
-                .is_empty()
+            crate::rdma::select_worker(
+                &app.discovered_nics[..1],
+                &app.discovered_nics,
+                0,
+                None,
+                1
+            )
+            .is_empty()
         );
     }
 

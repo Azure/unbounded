@@ -9,7 +9,11 @@ use crate::telemetry::Detail;
 use crate::telemetry::Failure;
 use crate::telemetry::Observer;
 use crate::telemetry::Stage;
-use flow_control::{Charge, Policy, Quotas, Rejection, SharedQuotas};
+use flow_control::Charge;
+use flow_control::Policy;
+use flow_control::Quotas;
+use flow_control::Rejection;
+use flow_control::SharedQuotas;
 use std::sync::Mutex;
 
 pub struct AdmissionPolicy {
@@ -74,7 +78,7 @@ impl Policy for AdmissionPolicy {
             ResourceClass::Plaintext => PAGE_BYTES as usize,
             // Disk reads own padded staging and decoded ciphertext together.
             ResourceClass::Ciphertext => {
-                2 * (PAGE_BYTES as usize + 16) + crate::store::format::MAX_HEADER_BYTES + 4096
+                2 * (PAGE_BYTES as usize + 16) + crate::store::MAX_HEADER_BYTES + 4096
             }
             ResourceClass::DirtyCiphertext | ResourceClass::Registered => PAGE_BYTES as usize + 16,
             _ => 1,
@@ -441,7 +445,8 @@ mod tests {
     #[test]
     #[ignore = "opt-in same-workload payload recycle benchmark"]
     fn payload_recycle_benchmark() {
-        use std::{hint::black_box, time::Instant};
+        use std::hint::black_box;
+        use std::time::Instant;
         const ITERATIONS: usize = 128;
         for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
             for retain in [true, false] {

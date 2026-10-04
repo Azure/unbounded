@@ -1,14 +1,20 @@
 //! Worker-local idle verified pages and original ciphertext; independent of disk clock.
-use super::{
-    BufferPool,
-    page::{CiphertextCopy, PageResult},
-};
-use crate::runtime::collections::{HashMap, HashSet};
-use crate::{
-    error::{Error, Result},
-    model::{CacheId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
-};
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
+use super::BufferPool;
+use super::page::CiphertextCopy;
+use super::page::PageResult;
+use crate::runtime::collections::HashMap;
+use crate::runtime::collections::HashSet;
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::CacheId;
+use crate::model::ObjectVersion;
+use crate::model::PageId;
+use crate::model::ResourceClass;
+use crate::model::VersionMetadata;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::sync::Arc;
 #[derive(Default)]
 struct Entries {
     pages: HashMap<PageId, (u64, PageResult)>,
@@ -354,10 +360,11 @@ fn idle(entry: &PageResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        memory::tests::{admission, bundle, bundle_for},
-        model::{ExpiresAt, ResourceClass},
-    };
+    use crate::memory::tests::admission;
+    use crate::memory::tests::bundle;
+    use crate::memory::tests::bundle_for;
+    use crate::model::ExpiresAt;
+    use crate::model::ResourceClass;
     #[test]
     fn ciphertext_residency_is_distinct_bounded_and_conditionally_invalidated() {
         let admission = admission(2);

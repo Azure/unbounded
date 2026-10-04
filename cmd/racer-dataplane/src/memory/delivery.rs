@@ -9,13 +9,18 @@
 //! rest of that page uses direct sends instead of repeating pipe drain round trips.
 //! Backpressured direct sends own immutable page views, not copied staging bytes.
 use super::VerifiedPage;
-use crate::{
-    error::{Error, Operation, Result},
-    http::{ConnectionLease, HttpContext, OwnedBuffer},
-    model::PageSlice,
-    runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
-};
-use flow_control::pipe::{PipeLease, PipePool};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::http::ConnectionLease;
+use crate::http::HttpContext;
+use crate::http::OwnedBuffer;
+use crate::model::PageSlice;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
+use crate::runtime::reactor::Reactor;
+use flow_control::pipe::PipeLease;
+use flow_control::pipe::PipePool;
 use std::io;
 #[cfg(test)]
 use std::os::fd::AsRawFd;
@@ -25,7 +30,9 @@ use std::task::Poll;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use uring_runtime::reactor::{Descriptor, IoBuffer, SendBuffer};
+use uring_runtime::reactor::Descriptor;
+use uring_runtime::reactor::IoBuffer;
+use uring_runtime::reactor::SendBuffer;
 
 // Limit both syscall size and work in one executor turn, even for a writable peer.
 const SEND_CHUNK_BYTES: usize = 64 * 1024;
@@ -380,19 +387,25 @@ use crate::error::cooperative_turn as yield_once;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        memory::{VerifiedBytes, pipe_tests::admission},
-        model::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId,
-            ResourceClass, StrongEtag,
-        },
-        runtime::{
-            admission::AdmissionPolicy,
-            deadline::{Cancellation, Deadline},
-            reactor::Reactor,
-        },
-    };
-    use std::{io::Read, os::unix::net::UnixStream, sync::Arc, task::Context};
+    use crate::memory::VerifiedBytes;
+    use crate::memory::pipe_tests::admission;
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::ObjectId;
+    use crate::model::ObjectVersion;
+    use crate::model::PageId;
+    use crate::model::PageNumber;
+    use crate::model::RequestId;
+    use crate::model::ResourceClass;
+    use crate::model::StrongEtag;
+    use crate::runtime::admission::AdmissionPolicy;
+    use crate::runtime::deadline::Cancellation;
+    use crate::runtime::deadline::Deadline;
+    use crate::runtime::reactor::Reactor;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::task::Context;
 
     fn setup(
         pipes: usize,
@@ -651,7 +664,8 @@ mod tests {
     #[test]
     #[ignore = "local TCP delivery CPU benchmark"]
     fn loopback_backpressure_thread_cpu() {
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
+        use std::net::TcpStream;
         const LENGTH: usize = 512 * 1024;
         const PAGES: usize = 1024;
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(5));
@@ -812,7 +826,8 @@ mod tests {
 
     #[test]
     fn tcp_splice_delivers_selected_slice_and_returns_connection() {
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
+        use std::net::TcpStream;
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1387,7 +1402,8 @@ mod tests {
 
     #[test]
     fn tcp_http_delivery_survives_page_and_pipe_release_before_peer_reads() {
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
+        use std::net::TcpStream;
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();

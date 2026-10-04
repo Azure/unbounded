@@ -328,7 +328,8 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    use std::{cell::Cell, num::NonZeroU32};
+    use std::cell::Cell;
+    use std::num::NonZeroU32;
     struct Service(Rc<Cell<usize>>);
     impl server::LocalPageService for Service {
         fn serve_peer<'a>(
@@ -757,7 +758,8 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    use std::task::{Context, Poll};
+    use std::task::Context;
+    use std::task::Poll;
     let (signers, _) = identities();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
@@ -906,10 +908,9 @@ fn signed_tcp_case(case: &str) {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    use std::{
-        net::TcpListener,
-        task::{Context, Poll},
-    };
+    use std::net::TcpListener;
+    use std::task::Context;
+    use std::task::Poll;
     struct Local;
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(
@@ -1101,12 +1102,12 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     use crate::runtime::reactor::Reactor;
     use crate::topology::LinkHealth;
     use crate::topology::Paths;
-    use std::{
-        future::Future,
-        io::{Read, Write},
-        os::unix::net::UnixStream,
-        task::{Context, Poll},
-    };
+    use std::future::Future;
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::task::Context;
+    use std::task::Poll;
 
     struct Never;
     impl server::LocalPageService for Never {
@@ -1309,10 +1310,9 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::topology::Route;
     use racer_control_wire::RailId;
     use racer_control_wire::RailMapping;
-    use std::{
-        net::TcpListener,
-        task::{Context, Poll},
-    };
+    use std::net::TcpListener;
+    use std::task::Context;
+    use std::task::Poll;
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
@@ -1593,12 +1593,11 @@ mod established_sessions {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    use std::{
-        cell::Cell,
-        future::Future,
-        os::unix::net::UnixStream,
-        task::{Context, Poll},
-    };
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::os::unix::net::UnixStream;
+    use std::task::Context;
+    use std::task::Poll;
 
     struct CountedService(Rc<Cell<usize>>);
     impl server::LocalPageService for CountedService {

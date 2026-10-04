@@ -1,13 +1,57 @@
 //! Deterministic test-only seams; no fake implementation is linked into production.
+use crate::read::dispatch::WorkerMap;
+use racer_control_wire::Publication;
+use racer_control_wire::CacheDefinition;
+use crate::control::PublishedState;
+use crate::control::SnapshotStore;
+use crate::memory::BufferPool;
+use crate::memory::cache::MemoryCache;
+use crate::memory::delivery::Delivery;
+use crate::model::MembershipVersion;
+use crate::model::ObjectMetadata;
+use crate::model::WorkerId;
+use crate::read::Coordinator;
+use crate::read::candidates::CandidatePolicy;
+use crate::read::dispatch::WorkerDirectory;
+use crate::read::dispatch::WorkerEndpoint;
+use crate::read::fill::Fill;
+use crate::read::fill::FillDependencies;
+use crate::read::flight::Flights;
+use crate::read::metadata::MetadataDependencies;
+use crate::read::metadata::MetadataService;
+use crate::read::range_stream::RangeStreams;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::crypto;
+use crate::runtime::crypto::CryptoClient;
+use crate::runtime::reactor::Reactor;
+use crate::runtime::worker::CryptoRuntime;
+use crate::runtime::worker::CryptoService;
+use crate::security::aead::PageCrypto;
+use crate::security::aead::PageCryptoEngine;
+use crate::security::credentials::CredentialCrypto;
+use crate::store::StoreReader;
+use crate::store::StoreWriter;
+use crate::store::catalog::Index;
+use crate::store::catalog::SegmentClock;
+use crate::test_support::origin::AdapterOrigin;
+use crate::topology::Member;
+use crate::topology::Placement;
+use racer_control_wire::PublicationSequence;
+use std::cell::RefCell;
+use std::num::NonZeroU32;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Context;
+use uring_runtime::drivers::DriverQueue;
 pub mod clock {
-    use crate::{
-        error::{Error, Result},
-        runtime::deadline::Deadline,
-    };
-    use std::{
-        cell::Cell,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-    };
+    use crate::error::Error;
+    use crate::error::Result;
+    use crate::runtime::deadline::Deadline;
+    use std::cell::Cell;
+    use std::time::Duration;
+    use std::time::Instant;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
 
     /// Pure deadline/freshness fixture. Reactor timers use SimulationClock.
     pub struct Clock {
@@ -70,10 +114,14 @@ pub mod clock {
     }
     #[test]
     fn wall_time_drives_freshness_but_expired_versions_still_answer_pins() {
-        use crate::model::{
-            CacheId, CacheKey, CurrentVersion, ExpiresAt, ObjectId, ObjectVersion, StrongEtag,
-            VersionMetadata,
-        };
+        use crate::model::CacheId;
+        use crate::model::CacheKey;
+        use crate::model::CurrentVersion;
+        use crate::model::ExpiresAt;
+        use crate::model::ObjectId;
+        use crate::model::ObjectVersion;
+        use crate::model::StrongEtag;
+        use crate::model::VersionMetadata;
         let clock = Clock::default();
         let descriptor = VersionMetadata {
             content_type: None,
@@ -123,23 +171,27 @@ pub mod origin {
     use crate::origin::OriginClient;
     use crate::runtime::admission::AdmissionPolicy;
     use crate::runtime::reactor::Reactor;
-    use std::{
-        collections::{BTreeMap, BTreeSet, VecDeque},
-        fs::File,
-        io::{Read, Write},
-        os::{
-            fd::AsRawFd,
-            unix::net::{UnixListener, UnixStream},
-        },
-        path::PathBuf,
-        rc::Rc,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, AtomicU64, Ordering},
-        },
-        thread::{self, JoinHandle},
-        time::{Duration, Instant, UNIX_EPOCH},
-    };
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+    use std::collections::VecDeque;
+    use std::fs::File;
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+    use std::time::Instant;
+    use std::time::UNIX_EPOCH;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub enum RequestKind {
@@ -548,14 +600,13 @@ impl NoPeers {
 
 /// Side-effect-free configuration for assembled worker scenarios.
 pub mod cluster {
-    use crate::{
-        config::Config,
-        model::{ClusterId, Limits, NodeId},
-    };
-    use std::{
-        num::{NonZeroU32, NonZeroUsize},
-        time::Duration,
-    };
+    use crate::config::Config;
+    use crate::model::ClusterId;
+    use crate::model::Limits;
+    use crate::model::NodeId;
+    use std::num::NonZeroU32;
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
 
     pub fn config(enable_rdma: bool) -> Config {
         let count = NonZeroUsize::new(16).unwrap();
@@ -629,45 +680,6 @@ impl std::task::Wake for WakeCounter {
 }
 
 // Real read ownership shared by read and client scenarios. Only the UDS adapter is scripted.
-use crate::control::PublishedState;
-use crate::control::SnapshotStore;
-use crate::memory::BufferPool;
-use crate::memory::cache::MemoryCache;
-use crate::memory::delivery::Delivery;
-use crate::model::MembershipVersion;
-use crate::model::ObjectMetadata;
-use crate::model::WorkerId;
-use crate::read::Coordinator;
-use crate::read::candidates::CandidatePolicy;
-use crate::read::dispatch::WorkerDirectory;
-use crate::read::dispatch::WorkerEndpoint;
-use crate::read::fill::Fill;
-use crate::read::fill::FillDependencies;
-use crate::read::flight::Flights;
-use crate::read::metadata::MetadataDependencies;
-use crate::read::metadata::MetadataService;
-use crate::read::range_stream::RangeStreams;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::crypto;
-use crate::runtime::crypto::CryptoClient;
-use crate::runtime::reactor::Reactor;
-use crate::runtime::worker::CryptoRuntime;
-use crate::runtime::worker::CryptoService;
-use crate::runtime::worker::WorkerMap;
-use crate::security::aead::PageCrypto;
-use crate::security::aead::PageCryptoEngine;
-use crate::security::credentials::CredentialCrypto;
-use crate::store::StoreReader;
-use crate::store::StoreWriter;
-use crate::store::catalog::Index;
-use crate::store::catalog::SegmentClock;
-use crate::test_support::origin::AdapterOrigin;
-use crate::topology::Placement;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::Publication;
-use racer_control_wire::PublicationSequence;
-use std::{cell::RefCell, num::NonZeroU32, rc::Rc, sync::Arc, task::Context};
-use uring_runtime::drivers::DriverQueue;
 
 pub(crate) struct ReadWorker {
     pub coordinator: Rc<Coordinator>,
@@ -706,7 +718,7 @@ impl ReadWorker {
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
-                members: vec![racer_control_wire::Member {
+                members: vec![Member {
                     node: keys.node().clone(),
                     shares: NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:1".into(),
@@ -732,7 +744,7 @@ impl ReadWorker {
             origin.root.join("slabs/worker-0-slab-0.dat"),
             256 * 1024 * 1024,
             64 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
+            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
         ));
         let writer = Rc::new(StoreWriter::new(
             index.clone(),

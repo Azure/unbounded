@@ -1,15 +1,13 @@
 use super::dataplane;
-use dataplane::{
-    error::Operation,
-    model::Limits,
-    runtime::{admission::AdmissionPolicy, reactor::Reactor},
-};
+use dataplane::error::Operation;
+use dataplane::model::Limits;
+use dataplane::runtime::admission::AdmissionPolicy;
+use dataplane::runtime::reactor::Reactor;
 
-use std::{
-    num::NonZeroUsize,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::num::NonZeroUsize;
+use std::rc::Rc;
+use std::time::Duration;
+use std::time::Instant;
 
 pub fn reactor() -> Rc<Reactor> {
     let n = NonZeroUsize::new(1024 * 1024).unwrap();

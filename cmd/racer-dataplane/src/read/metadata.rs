@@ -4,10 +4,9 @@
 //! admission; explicit pins may use expired metadata. A zero-TTL refresh admits its
 //! waiters once. Clock discontinuities invalidate uncertain freshness. Cache entries
 //! contain no origin context, Authorization, or opaque adapter metadata header.
-use super::{
-    candidates::{CandidatePolicy, CandidateResolution},
-    flight::AcquisitionBudget,
-};
+use super::candidates::CandidatePolicy;
+use super::candidates::CandidateResolution;
+use super::flight::AcquisitionBudget;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -27,16 +26,19 @@ use crate::runtime::collections::HashMap;
 use crate::runtime::deadline::RequestScope;
 use crate::security::credentials::CredentialCrypto;
 use crate::store::catalog::Index;
-use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeMap,
-    future::{Future, poll_fn},
-    pin::Pin,
-    rc::Rc,
-    sync::Arc,
-    task::{Poll, Waker},
-    time::{Duration, Instant, SystemTime},
-};
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::future::poll_fn;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Poll;
+use std::task::Waker;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
 
 const MAX_WAITERS: usize = 64;
 const MAX_REFRESH_ATTEMPTS: usize = 8;
@@ -660,7 +662,7 @@ impl MetadataService {
             }
         };
         scope.check()?;
-        validate_metadata(&context.object, &selector, &metadata)?;
+        super::validate_metadata(&metadata, &context.object, &selector)?;
         self.observe_clock()?;
         if matches!(selector, MetadataSelector::Fresh) && self.clock.borrow().epoch == clock_epoch {
             self.storage.index.publish_current(metadata.clone())?;
@@ -720,7 +722,7 @@ impl MetadataService {
                 return Err(Error::CorruptRecord.into());
             }
         }
-        validate_metadata(&context.object, selector, &reply.metadata)?;
+        super::validate_metadata(&reply.metadata, &context.object, selector)?;
         let page = if let Some(page) = reply.page_zero {
             let result = self
                 .storage
@@ -923,14 +925,6 @@ impl MetadataService {
     }
 }
 
-fn validate_metadata(
-    object: &ObjectId,
-    selector: &MetadataSelector,
-    metadata: &ObjectMetadata,
-) -> Result<()> {
-    super::validate_metadata(metadata, object, selector)
-}
-
 fn validate_bootstrap_metadata(expected: &ObjectMetadata, actual: &ObjectMetadata) -> Result<()> {
     if expected.version.object != actual.version.object {
         return Err(Error::CorruptRecord);
@@ -946,7 +940,10 @@ fn validate_bootstrap_metadata(expected: &ObjectMetadata, actual: &ObjectMetadat
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::{CacheId, CacheKey, ExpiresAt, WorkerId};
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::ExpiresAt;
+    use crate::model::WorkerId;
     use futures::task::noop_waker;
     use std::time::UNIX_EPOCH;
 
@@ -1283,12 +1280,16 @@ pub(crate) mod tests {
         );
         let selector = MetadataSelector::Pinned(expected.version.etag.clone());
         assert_eq!(
-            validate_metadata(&expected.version.object, &selector, &wrong),
+            crate::read::validate_metadata(&wrong, &expected.version.object, &selector),
             Err(Error::VersionUnavailable)
         );
         wrong.version.object.key = CacheKey([1; 32]);
         assert_eq!(
-            validate_metadata(&expected.version.object, &MetadataSelector::Fresh, &wrong),
+            crate::read::validate_metadata(
+                &wrong,
+                &expected.version.object,
+                &MetadataSelector::Fresh
+            ),
             Err(Error::CorruptRecord)
         );
         assert_eq!(

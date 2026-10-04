@@ -1,25 +1,46 @@
 //! Opt-in Go SDK fixture using the production library, not a second crate root.
-use crate::{
-    client, control, error, http, memory, model, origin, peer, read, runtime, security, store,
-    topology,
-};
-
+use crate::read::dispatch::WorkerMap;
+use crate::client;
+use crate::control;
+use crate::error;
+use crate::http;
+use crate::memory;
+use crate::model;
+use crate::origin;
+use crate::peer;
+use crate::read;
+use crate::runtime;
+use crate::security;
+use crate::store;
+use crate::topology;
 use error::Operation;
-use model::{OriginContext, PAGE_BYTES, ResourceClass, *};
-use runtime::{
-    admission::AdmissionPolicy,
-    deadline::RequestScope,
-    reactor::Reactor,
-    worker::{CryptoRuntime, CryptoService, WorkerMap},
-};
-use std::{
-    num::NonZeroUsize,
-    path::PathBuf,
-    rc::Rc,
-    sync::Arc,
-    task::Context,
-    time::{Duration, Instant, UNIX_EPOCH},
-};
+use model::OriginContext;
+use model::PAGE_BYTES;
+use model::ResourceClass;
+use model::*;
+use racer_control_wire::BundleGeneration;
+use racer_control_wire::CacheEncryptionKey;
+use racer_control_wire::CacheKeyPurpose;
+use racer_control_wire::CacheKeyRef;
+use racer_control_wire::CacheKeyState;
+use racer_control_wire::KeyringBundle;
+use racer_control_wire::SCHEMA_VERSION;
+use racer_identity::KeyEpochs;
+use racer_identity::Keyring;
+use runtime::admission::AdmissionPolicy;
+use runtime::deadline::RequestScope;
+use runtime::reactor::Reactor;
+use runtime::worker::CryptoRuntime;
+use runtime::worker::CryptoService;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Context;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::UNIX_EPOCH;
+use uring_runtime::reactor::IoBuffer;
 
 // Only origin content is generated. No client wire framing, scheduling, credit
 // accounting, page validation, encryption, or delivery is implemented here.
@@ -170,30 +191,34 @@ struct SubscriptionFixture {
 
 impl SubscriptionFixture {
     fn construct(root: PathBuf) -> Self {
-        use client::{RequestParser, listener::ClientListeners, response::Responses};
+        use client::RequestParser;
+        use client::listener::ClientListeners;
+        use client::response::Responses;
         use control::PublishedState;
         use control::SnapshotStore;
-        use memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool};
+        use memory::BufferPool;
+        use memory::cache::MemoryCache;
+        use memory::delivery::Delivery;
+        use memory::new_pipe_pool;
         use racer_control_wire::CacheDefinition;
         use racer_control_wire::Publication;
         use racer_control_wire::*;
-        use read::{
-            Coordinator,
-            candidates::CandidatePolicy,
-            dispatch::WorkerDirectory,
-            fill::{Fill, FillDependencies},
-            flight::Flights,
-            metadata::{MetadataDependencies, MetadataService},
-            range_stream::RangeStreams,
-        };
-        use security::{
-            aead::{PageCrypto, PageCryptoEngine},
-            credentials::CredentialCrypto,
-        };
-        use store::{
-            StoreReader, StoreWriter,
-            catalog::{Index, SegmentClock},
-        };
+        use read::Coordinator;
+        use read::candidates::CandidatePolicy;
+        use read::dispatch::WorkerDirectory;
+        use read::fill::Fill;
+        use read::fill::FillDependencies;
+        use read::flight::Flights;
+        use read::metadata::MetadataDependencies;
+        use read::metadata::MetadataService;
+        use read::range_stream::RangeStreams;
+        use security::aead::PageCrypto;
+        use security::aead::PageCryptoEngine;
+        use security::credentials::CredentialCrypto;
+        use store::StoreReader;
+        use store::StoreWriter;
+        use store::catalog::Index;
+        use store::catalog::SegmentClock;
 
         let mut limits = interop_limits();
         // Independent of the 512 MiB logical object: at most four plaintext pages.
@@ -248,7 +273,7 @@ impl SubscriptionFixture {
             root.join("slabs/worker-0-slab-0.dat"),
             256 * 1024 * 1024,
             64 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
+            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
         ));
         slabs.open_now().unwrap();
         let writer = Rc::new(StoreWriter::new(
@@ -449,9 +474,6 @@ fn interop_limits() -> Limits {
 }
 
 fn interop_keys() -> racer_identity::Keyring {
-    use racer_control_wire::*;
-    use racer_identity::{KeyEpochs, Keyring};
-
     let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
     let keys = Keyring::new(
         cluster.clone(),
@@ -487,4 +509,3 @@ fn interop_keys() -> racer_identity::Keyring {
     .unwrap();
     keys
 }
-use uring_runtime::reactor::IoBuffer;

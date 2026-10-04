@@ -1,6 +1,40 @@
 use super::*;
-mod checkpoint;
-use page_alloc::{Alignment, Generation, SegmentId, SegmentState, Segments, Slab};
+use crate::error::Error;
+use crate::error::Result;
+use crate::memory::BufferPool;
+use crate::memory::page::CiphertextCopy;
+use crate::model::CacheId;
+use crate::model::CacheKey;
+use crate::model::ExpiresAt;
+use crate::model::Nonce;
+use crate::model::ObjectId;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::PageEnvelope;
+use crate::model::PageId;
+use crate::model::PageNumber;
+use crate::model::RequestId;
+use crate::model::ResourceClass;
+use crate::model::StrongEtag;
+use crate::model::WorkerId;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
+use crate::runtime::reactor::Reactor;
+use page_alloc::Alignment;
+use page_alloc::Generation;
+use page_alloc::SegmentId;
+use page_alloc::SegmentState;
+use page_alloc::Segments;
+use page_alloc::Slab;
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
+use std::time::Instant;
 mod index_pressure {
     use super::*;
     fn fixture(capacity: usize) -> Fixture {
@@ -214,26 +248,6 @@ mod index_pressure {
         );
     }
 }
-use crate::{
-    error::{Error, Result},
-    memory::{BufferPool, page::CiphertextCopy},
-    model::{
-        CacheId, CacheKey, ExpiresAt, Nonce, ObjectId, ObjectMetadata, ObjectVersion, PageEnvelope,
-        PageId, PageNumber, RequestId, ResourceClass, StrongEtag, WorkerId,
-    },
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy},
-        deadline::RequestScope,
-        reactor::Reactor,
-    },
-};
-use std::{
-    future::Future,
-    path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
-    task::{Context, Poll},
-    time::{Duration, Instant},
-};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 pub(super) struct Directory(pub(super) PathBuf);
 impl Directory {
@@ -288,7 +302,7 @@ impl Fixture {
             directory.0.join("worker-0-slab-0.dat"),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + format::MAX_HEADER_BYTES + 16,
+            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
         ));
         let reader = Rc::new(
             StoreReader::new(
@@ -540,7 +554,8 @@ fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
 
 #[test]
 fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::Fault;
+    use uring_runtime::reactor::simulation::Simulation;
     for fault in [Fault::Delay(6), Fault::Errno(libc::EIO), Fault::Short(512)] {
         let simulation = Simulation::new();
         let _environment = simulation.enter();
@@ -616,15 +631,17 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
     let a = Alignment::new(512, 512, 512).unwrap();
     for length in [3, crate::model::PAGE_BYTES as usize] {
         let page = f.copy(9, length);
-        let disk = a.extent(0, format::logical_length(&page).unwrap()).unwrap();
+        let disk = a
+            .extent(0, crate::store::logical_length(&page).unwrap())
+            .unwrap();
         let reserve = f
             .admission
             .reserve(None, ResourceClass::Ciphertext, disk.length())
             .unwrap();
         let buffer = a.allocate(disk.length(), reserve).unwrap();
         assert_eq!(buffer.bytes().unwrap().as_ptr() as usize % a.memory(), 0);
-        let mut encoded = format::encode(&page, Generation(7), a, buffer).unwrap();
-        let parsed = format::parse(&encoded.buffer, disk).unwrap();
+        let mut encoded = crate::store::encode(&page, Generation(7), a, buffer).unwrap();
+        let parsed = crate::store::parse(&encoded.buffer, disk).unwrap();
         assert_eq!(
             &encoded.buffer.bytes().unwrap()[parsed.ciphertext.clone()],
             page.ciphertext.bytes()
@@ -636,13 +653,13 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
                 .all(|b| *b == 0)
         );
         assert_eq!(
-            format::decode(&encoded.buffer, &encoded.header).unwrap(),
+            crate::store::decode(&encoded.buffer, &encoded.header).unwrap(),
             *page.ciphertext.envelope()
         );
         encoded.header.generation = Generation(8);
-        assert!(format::decode(&encoded.buffer, &encoded.header).is_err());
+        assert!(crate::store::decode(&encoded.buffer, &encoded.header).is_err());
         encoded.buffer.bytes_mut().unwrap()[24] ^= 1;
-        assert!(format::parse(&encoded.buffer, disk).is_err());
+        assert!(crate::store::parse(&encoded.buffer, disk).is_err());
     }
 }
 #[test]
@@ -805,7 +822,7 @@ fn allocator_integration_reclaims_idle_charge_before_writer_admission_retry() {
     let length = slab
         .alignment()
         .unwrap()
-        .extent(0, format::logical_length(&page).unwrap())
+        .extent(0, crate::store::logical_length(&page).unwrap())
         .unwrap()
         .length();
     let charge = f
@@ -912,7 +929,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
     let mut malformed = f.copy(5, 64);
     malformed.metadata.length = 0;
     assert_eq!(
-        format::logical_length(&malformed),
+        crate::store::logical_length(&malformed),
         Err(Error::CorruptRecord)
     );
     // Capacity rejection precedes even header validation/length calculation.
@@ -1205,8 +1222,8 @@ fn stored_payload_and_tag_corruption_fail_mandatory_checksum() {
                 .read(&f.reactor, location.extent, staging, lease, &request),
         )
         .unwrap();
-        let parsed = super::format::parse(&stored, location.extent).unwrap();
-        assert_eq!(parsed.header.format_version, super::format::FORMAT_VERSION);
+        let parsed = super::parse(&stored, location.extent).unwrap();
+        assert_eq!(parsed.header.format_version, super::FORMAT_VERSION);
         assert_eq!(parsed.checksum, page.ciphertext.checksum());
         let offset = if corrupt_tag {
             parsed.ciphertext.end - 1
@@ -1770,4 +1787,1430 @@ fn fill_accepted_before_stop_can_transfer_dirty_ownership_during_drain() {
     drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
     assert!(f.store.writer.is_idle());
+}
+
+mod records {
+    use super::*;
+    use crate::memory::CiphertextBytes;
+    use crate::memory::CiphertextPage;
+    use crate::model::ExpiresAt;
+    use crate::model::PAGE_BYTES;
+    use crate::model::ResourceClass;
+    use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
+
+    fn admission() -> flow_control::Quotas<AdmissionPolicy> {
+        flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ))
+    }
+
+    fn page(
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        length: usize,
+        number: u64,
+        cache: &str,
+        etag: &str,
+    ) -> CiphertextCopy {
+        let metadata = VersionMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId(cache.into()),
+                    key: CacheKey([3; 32]),
+                },
+                etag: StrongEtag::test_value(etag),
+            },
+            length: number * PAGE_BYTES + length as u64,
+        };
+        CiphertextCopy {
+            ciphertext: CiphertextPage {
+                provenance: None,
+                inner: Arc::new(CiphertextBytes {
+                    checksum: std::sync::OnceLock::new(),
+                    envelope: PageEnvelope {
+                        page: PageId {
+                            version: metadata.version.clone(),
+                            number: PageNumber(number),
+                        },
+                        key_id: KeyId([1; 16]),
+                        nonce: Nonce([2; 24]),
+                        plaintext_length: length as u32,
+                        ciphertext_length: length as u32 + 16,
+                    },
+                    bytes: vec![2; length + 16],
+                    reservation: admission
+                        .reserve(None, ResourceClass::Ciphertext, length + 16)
+                        .unwrap(),
+                }),
+            },
+            metadata: metadata.for_pin(),
+        }
+    }
+
+    fn buffer(
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        alignment: Alignment,
+        length: usize,
+    ) -> AlignedBuffer<flow_control::Charge<AdmissionPolicy>> {
+        alignment
+            .allocate(
+                length,
+                admission
+                    .reserve(None, ResourceClass::Ciphertext, length)
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn unhex(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    // Independently packed little-endian fixture, verified against the pre-change
+    // serializer. Includes the header digest and ciphertext; remaining bytes are zero.
+    const GOLDEN_LOGICAL: &str = concat!(
+        "524352504147453101000000a900000007000000000000000300000000000000",
+        "0000000000000000030000001300000001010101010101010101010101010101",
+        "020202020202020202020202020202020202020202020202",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+        "0500000004000000636163686522763122",
+        "c5f4f39966532d8ab0ede8139c81d2a7368448b01ac36f50e5a2d39078b51b3c",
+        "02020202020202020202020202020202020202",
+    );
+    const GOLDEN_RECORD_SHA256: &str =
+        "5825196396c3fc29342422518a98d9fe550bcdb05701b97aadcb9c02271f3f03";
+
+    #[test]
+    fn current_wire_bytes_and_reused_padding_across_page_and_alignment_boundaries() {
+        let admission = admission();
+        // Normal v4 header is 181 bytes, plus a 16-byte tag. Straddle both units.
+        for (length, number, maximum, geometry, offset) in [
+            (1, 0, false, (512, 512, 512), 0),
+            (314, 0, false, (512, 512, 512), 512),
+            (315, 0, false, (512, 512, 512), 1024),
+            (316, 0, false, (512, 512, 512), 512),
+            (3898, 0, false, (4096, 4096, 4096), 4096),
+            (3899, 0, false, (4096, 4096, 4096), 8192),
+            (3900, 0, false, (4096, 4096, 4096), 4096),
+            (PAGE_BYTES as usize, 0, false, (4096, 512, 4096), 512),
+            (PAGE_BYTES as usize, 1, true, (512, 4096, 512), 4096),
+            (3, 2, true, (4096, 512, 4096), 1536),
+        ] {
+            // UTF-8 cache IDs are bounded in bytes; strong ETags are ASCII-only.
+            let cache = if maximum {
+                "é".repeat(MAX_ID_BYTES / 2)
+            } else {
+                "cache".into()
+            };
+            let etag = if maximum {
+                "x".repeat(MAX_ETAG_BYTES - 2)
+            } else {
+                "v1".into()
+            };
+            let mut page = page(&admission, length, number, &cache, &etag);
+            let alignment = Alignment::new(geometry.0, geometry.1, geometry.2).unwrap();
+            let logical = logical_length(&page).unwrap();
+            assert_eq!(
+                logical,
+                128 + 12 + cache.len() + etag.len() + 2 + 32 + length + 16
+            );
+            let extent = alignment.extent(offset, logical).unwrap();
+            let mut staging = buffer(&admission, alignment, extent.length());
+            staging.bytes_mut().unwrap().fill(0xa5);
+            let mut encoded =
+                encode_at(&page, Generation(u64::MAX), alignment, offset, staging).unwrap();
+            assert_eq!(
+                parse(&encoded.buffer, encoded.header.extent)
+                    .unwrap()
+                    .header
+                    .envelope,
+                *page.ciphertext.envelope()
+            );
+            assert_eq!(encoded.header.extent, extent);
+            assert_eq!(
+                decode(&encoded.buffer, &encoded.header).unwrap(),
+                *page.ciphertext.envelope()
+            );
+
+            // Reuse an actual record, shortening ciphertext into the old payload
+            // when possible. This catches stale bytes at the new padding boundary.
+            let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
+            inner.checksum.take();
+            if length > 1 {
+                inner.envelope.plaintext_length -= 1;
+                inner.envelope.ciphertext_length -= 1;
+                inner.bytes.pop();
+                page.metadata.length -= 1;
+            }
+            inner.bytes.fill(0x6b);
+            let shortened_logical = logical - usize::from(length > 1);
+            // At a rounding boundary, use a same-length replacement instead.
+            if alignment.extent(offset, shortened_logical).unwrap() != extent {
+                inner.bytes.push(0x6b);
+                inner.envelope.plaintext_length += 1;
+                inner.envelope.ciphertext_length += 1;
+                page.metadata.length += 1;
+            }
+            encoded = encode_at(&page, Generation(9), alignment, offset, encoded.buffer).unwrap();
+            let bytes = encoded.buffer.bytes().unwrap();
+            let decoded = parse(&encoded.buffer, extent).unwrap();
+            assert_eq!(&bytes[decoded.ciphertext.clone()], page.ciphertext.bytes());
+            assert!(bytes[decoded.ciphertext.end..].iter().all(|&b| b == 0));
+            assert_eq!(decoded.header.generation, Generation(9));
+            assert_eq!(decoded.header.metadata, page.metadata.immutable());
+        }
+        admission.reclaim_buffers();
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+
+    #[test]
+    fn malformed_inputs_reject_record_errors_before_geometry_checks() {
+        let admission = admission();
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        let mutations: &[fn(&mut CiphertextCopy)] = &[
+            |p| p.metadata.length = 0,
+            |p| p.metadata.length = 4,
+            |p| p.metadata.length = crate::model::MAX_WIRE_INTEGER + 1,
+            |p| p.metadata.version.object.key = CacheKey([4; 32]),
+            |p| {
+                Arc::get_mut(&mut p.ciphertext.inner)
+                    .unwrap()
+                    .envelope
+                    .page
+                    .number = PageNumber(u64::MAX)
+            },
+            |p| {
+                Arc::get_mut(&mut p.ciphertext.inner)
+                    .unwrap()
+                    .envelope
+                    .page
+                    .number = PageNumber(1)
+            },
+            |p| {
+                Arc::get_mut(&mut p.ciphertext.inner)
+                    .unwrap()
+                    .envelope
+                    .plaintext_length = 0
+            },
+            |p| {
+                Arc::get_mut(&mut p.ciphertext.inner)
+                    .unwrap()
+                    .envelope
+                    .plaintext_length = PAGE_BYTES as u32 + 1
+            },
+            |p| {
+                Arc::get_mut(&mut p.ciphertext.inner)
+                    .unwrap()
+                    .envelope
+                    .plaintext_length = u32::MAX
+            },
+            |p| {
+                Arc::get_mut(&mut p.ciphertext.inner)
+                    .unwrap()
+                    .envelope
+                    .ciphertext_length = 18
+            },
+            |p| {
+                Arc::get_mut(&mut p.ciphertext.inner).unwrap().bytes.pop();
+            },
+            |p| Arc::get_mut(&mut p.ciphertext.inner).unwrap().bytes.push(0),
+            |p| {
+                p.metadata.version.object.cache.0.clear();
+                Arc::get_mut(&mut p.ciphertext.inner)
+                    .unwrap()
+                    .envelope
+                    .page
+                    .version = p.metadata.version.clone();
+            },
+            |p| {
+                p.metadata.version.object.cache.0 = "é".repeat(MAX_ID_BYTES / 2 + 1);
+                Arc::get_mut(&mut p.ciphertext.inner)
+                    .unwrap()
+                    .envelope
+                    .page
+                    .version = p.metadata.version.clone();
+            },
+        ];
+        for mutate in mutations {
+            let mut page = page(&admission, 3, 0, "cache", "v1");
+            mutate(&mut page);
+            assert_eq!(logical_length(&page), Err(Error::CorruptRecord));
+            let baseline = admission.used(ResourceClass::Ciphertext);
+            for generation in [Generation(0), Generation(1)] {
+                // Bad offset/size must not mask the record error.
+                let actual = encode_at(
+                    &page,
+                    generation,
+                    alignment,
+                    1,
+                    buffer(&admission, alignment, 1024),
+                )
+                .err();
+                assert_eq!(actual, Some(Error::CorruptRecord));
+                assert_eq!(admission.used(ResourceClass::Ciphertext), baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn sizing_uses_generation_one_and_ignores_historical_freshness() {
+        let admission = admission();
+        let mut page = page(&admission, 3, 0, "cache", "v1");
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        for expiry in [
+            UNIX_EPOCH,
+            UNIX_EPOCH + std::time::Duration::from_secs(1),
+            UNIX_EPOCH + std::time::Duration::from_millis(1),
+        ] {
+            page.metadata.expires_at = ExpiresAt::from_system_time(expiry).unwrap();
+            assert_eq!(logical_length(&page), Ok(200));
+            let encoded = encode(
+                &page,
+                Generation(7),
+                alignment,
+                buffer(&admission, alignment, 512),
+            )
+            .unwrap();
+            assert_eq!(
+                parse(&encoded.buffer, encoded.header.extent)
+                    .unwrap()
+                    .header
+                    .metadata,
+                page.metadata.immutable()
+            );
+            assert_eq!(
+                parse(&encoded.buffer, encoded.header.extent)
+                    .unwrap()
+                    .checksum,
+                page.ciphertext.checksum()
+            );
+            assert_eq!(
+                encode_at(
+                    &page,
+                    Generation(0),
+                    alignment,
+                    1,
+                    buffer(&admission, alignment, 512)
+                )
+                .err(),
+                Some(Error::CorruptRecord)
+            );
+        }
+    }
+
+    #[test]
+    fn geometry_failures_release_owned_and_retained_charges() {
+        let admission = admission();
+        let page = page(&admission, 3, 0, "cache", "v1");
+        let baseline = admission.used(ResourceClass::Ciphertext);
+        let normal = Alignment::new(512, 512, 512).unwrap();
+        for (alignment, offset, length, expected) in [
+            (normal, 1, 512, Error::InvalidConfiguration),
+            (normal, 0, 1024, Error::InvalidConfiguration),
+            (normal, u64::MAX - 511, 512, Error::CorruptRecord),
+            (
+                Alignment::new(512, 512, usize::MAX).unwrap(),
+                0,
+                512,
+                Error::InvalidConfiguration,
+            ),
+            (
+                Alignment::new(512, 1, usize::MAX).unwrap(),
+                0,
+                512,
+                Error::InvalidConfiguration,
+            ),
+        ] {
+            let mut staging = buffer(&admission, normal, length);
+            staging.bytes_mut().unwrap().fill(0xa5);
+            staging.retain(std::rc::Rc::new(
+                admission
+                    .reserve(None, ResourceClass::Ciphertext, 17)
+                    .unwrap(),
+            ));
+            assert_eq!(
+                encode_at(&page, Generation(1), alignment, offset, staging).err(),
+                Some(expected)
+            );
+            assert_eq!(admission.used(ResourceClass::Ciphertext), baseline);
+        }
+    }
+
+    /// CPU/memory microbenchmark only: no slabs, files, reactor, or storage I/O.
+    /// Run with cargo test --release --lib memory_only_codec_benchmark -- --ignored --nocapture.
+    #[test]
+    #[ignore = "bounded release-only memory benchmark"]
+    fn memory_only_codec_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        assert!(!cfg!(debug_assertions), "run with --release");
+        let admission = admission();
+        let alignment = Alignment::new(4096, 4096, 4096).unwrap();
+        println!(
+            "memory-only; 5 samples; median [min,max] ns/record; GiB/s uses logical record bytes (sizing does not touch payload)"
+        );
+        for (size, length) in [("tiny", 3), ("full", PAGE_BYTES as usize)] {
+            for (ids, cache, etag) in [
+                ("normal", "cache".into(), "v1".into()),
+                (
+                    "max",
+                    "c".repeat(MAX_ID_BYTES),
+                    "x".repeat(MAX_ETAG_BYTES - 2),
+                ),
+            ] {
+                let page = page(&admission, length, 0, &cache, &etag);
+                let logical = logical_length(&page).unwrap();
+                let extent = alignment.extent(4096, logical).unwrap();
+                let mut staging = Some(buffer(&admission, alignment, extent.length()));
+                staging.as_mut().unwrap().bytes_mut().unwrap().fill(0xa5);
+                for mode in ["sizing", "encode-reuse", "two-sizing+encode"] {
+                    let iterations = if mode == "sizing" || size == "tiny" {
+                        2000
+                    } else {
+                        32
+                    };
+                    let mut run = |count: usize| {
+                        let start = Instant::now();
+                        for _ in 0..count {
+                            let page = black_box(&page);
+                            let sizing_count = match mode {
+                                "sizing" => 1,
+                                "two-sizing+encode" => 2,
+                                _ => 0,
+                            };
+                            for _ in 0..sizing_count {
+                                black_box(logical_length(black_box(page)).unwrap());
+                            }
+                            if mode != "sizing" {
+                                let buffer = black_box(staging.take().unwrap());
+                                let encoded = encode_at(
+                                    page,
+                                    black_box(Generation(7)),
+                                    black_box(alignment),
+                                    black_box(4096),
+                                    buffer,
+                                )
+                                .unwrap();
+                                black_box(encoded.buffer.bytes().unwrap());
+                                black_box(&encoded.header);
+                                staging = Some(encoded.buffer);
+                            }
+                        }
+                        start.elapsed().as_nanos() as f64 / count as f64
+                    };
+                    run(iterations / 4);
+                    let mut values: Vec<_> = (0..5).map(|_| run(iterations)).collect();
+                    values.sort_by(f64::total_cmp);
+                    let ns = values[2];
+                    let gib = logical as f64 / (1u64 << 30) as f64 / (ns / 1e9);
+                    println!(
+                        "{size}/{ids} {mode} n={iterations}: {ns:.1} [{:.1},{:.1}] ns/record, {gib:.3} logical GiB/s",
+                        values[0], values[4]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_v1_record_is_rejected() {
+        let mut expected = unhex(GOLDEN_LOGICAL);
+        expected.resize(512, 0);
+        assert_eq!(
+            Sha256::digest(&expected).as_slice(),
+            unhex(GOLDEN_RECORD_SHA256)
+        );
+        assert!(matches!(
+            parse_bytes(&expected, Extent::new(0, 512).unwrap()),
+            Err(Error::CorruptRecord)
+        ));
+    }
+
+    #[test]
+    fn current_records_preserve_bounded_content_type_and_reject_malformed_values() {
+        let admission = admission();
+        let mut page = page(&admission, 3, 0, "cache", "v1");
+        page.metadata.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        let encoded = encode(
+            &page,
+            Generation(7),
+            alignment,
+            buffer(&admission, alignment, 512),
+        )
+        .unwrap();
+        let parsed = parse(&encoded.buffer, encoded.header.extent).unwrap();
+        assert_eq!(parsed.header.format_version, FORMAT_VERSION);
+        assert_eq!(parsed.header.metadata, page.metadata.immutable());
+        assert_eq!(parsed.checksum, page.ciphertext.checksum());
+
+        // Reconstruct the obsolete v2 layout: content type, without a CRC.
+        let mut version_two = encoded.buffer.bytes().unwrap().to_vec();
+        let old_header = u32::from_le_bytes(version_two[12..16].try_into().unwrap()) as usize;
+        let crc_offset = 128 + "cache".len() + "\"v1\"".len();
+        version_two.drain(crc_offset..crc_offset + 8);
+        version_two.resize(512, 0);
+        version_two[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let header = old_header - 8;
+        version_two[12..16].copy_from_slice(&(header as u32).to_le_bytes());
+        let digest = Sha256::digest(&version_two[..header - 32]);
+        version_two[header - 32..header].copy_from_slice(&digest);
+        assert!(matches!(
+            parse_bytes(&version_two, encoded.header.extent),
+            Err(Error::CorruptRecord)
+        ));
+        let mut corrupted = encoded.buffer.bytes().unwrap().to_vec();
+        let start = corrupted
+            .windows(10)
+            .position(|w| w == b"text/plain")
+            .unwrap();
+        corrupted[start] = b'\r';
+        let end = u32::from_le_bytes(corrupted[12..16].try_into().unwrap()) as usize;
+        let digest = Sha256::digest(&corrupted[..end - 32]);
+        corrupted[end - 32..end].copy_from_slice(&digest);
+        assert!(parse_bytes(&corrupted, encoded.header.extent).is_err());
+    }
+
+    #[test]
+    fn only_current_version_is_accepted_even_with_valid_header_digest() {
+        let admission = admission();
+        let page = page(&admission, 3, 0, "cache", "v1");
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        let encoded = encode(
+            &page,
+            Generation(7),
+            alignment,
+            buffer(&admission, alignment, 512),
+        )
+        .unwrap();
+        let original = encoded.buffer.bytes().unwrap();
+        assert_eq!(&original[8..12], &4u32.to_le_bytes());
+        let header_len = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
+        let crc_offset = 128 + "cache".len() + "\"v1\"".len();
+        assert_eq!(
+            &original[crc_offset..crc_offset + 8],
+            &page.ciphertext.checksum().to_le_bytes()
+        );
+        for version in [0u32, 1, 2, 3, 4, 5, u32::MAX] {
+            let mut bytes = original.to_vec();
+            bytes[8..12].copy_from_slice(&version.to_le_bytes());
+            if version == 3 {
+                // Reconstruct an actual v3 checksum, not just its version label.
+                let mut ecma = 0u64;
+                for byte in page.ciphertext.bytes() {
+                    ecma ^= u64::from(*byte) << 56;
+                    for _ in 0..8 {
+                        ecma = (ecma << 1)
+                            ^ if ecma >> 63 != 0 {
+                                0x42f0_e1eb_a9ea_3693
+                            } else {
+                                0
+                            };
+                    }
+                }
+                assert_ne!(ecma, page.ciphertext.checksum());
+                bytes[crc_offset..crc_offset + 8].copy_from_slice(&ecma.to_le_bytes());
+            }
+            let digest = Sha256::digest(&bytes[..header_len - 32]);
+            bytes[header_len - 32..header_len].copy_from_slice(&digest);
+            let parsed = parse_bytes(&bytes, encoded.header.extent);
+            if version == FORMAT_VERSION {
+                assert_eq!(parsed.unwrap().checksum, page.ciphertext.checksum());
+            } else {
+                assert!(
+                    matches!(parsed, Err(Error::CorruptRecord)),
+                    "version {version}"
+                );
+            }
+        }
+
+        // A current-version header cannot omit the mandatory checksum even if
+        // the framing hash and lengths have been recomputed by the producer.
+        let mut missing_crc = original.to_vec();
+        missing_crc.drain(crc_offset..crc_offset + 8);
+        missing_crc.resize(original.len(), 0);
+        let shorter_header = header_len - 8;
+        missing_crc[12..16].copy_from_slice(&(shorter_header as u32).to_le_bytes());
+        let digest = Sha256::digest(&missing_crc[..shorter_header - 32]);
+        missing_crc[shorter_header - 32..shorter_header].copy_from_slice(&digest);
+        assert!(matches!(
+            parse_bytes(&missing_crc, encoded.header.extent),
+            Err(Error::CorruptRecord)
+        ));
+
+        let mut damaged_crc = original.to_vec();
+        damaged_crc[crc_offset] ^= 1;
+        assert!(matches!(
+            parse_bytes(&damaged_crc, encoded.header.extent),
+            Err(Error::CorruptRecord)
+        ));
+    }
+
+    #[test]
+    fn malformed_frames_are_rejected_without_unbounded_allocations() {
+        for len in [1, 16, 512] {
+            let bytes = vec![0; len];
+            assert!(parse_bytes(&bytes, Extent::new(0, len).unwrap()).is_err());
+        }
+        let mut bytes = vec![0; 512];
+        bytes[..8].copy_from_slice(MAGIC);
+        bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_bytes(&bytes, Extent::new(0, 512).unwrap()).is_err());
+    }
+}
+
+mod checkpoint {
+    use crate::store::checkpoint as checkpoint_format;
+    use crate::store::checkpoint::*;
+    use crate::store::tests::Directory;
+    use crate::error::Error;
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::ObjectId;
+    use crate::model::ObjectVersion;
+    use crate::model::PageId;
+    use crate::model::PageNumber;
+    use crate::model::StrongEtag;
+    use crate::model::VersionMetadata;
+    use crate::model::WorkerId;
+    use crate::store::catalog::Index;
+    use crate::store::catalog::IndexedPage;
+    use crate::store::catalog::RecordLocation;
+    use futures::executor::block_on;
+    use page_alloc::Alignment;
+    use page_alloc::Extent;
+    use page_alloc::SegmentState;
+    use page_alloc::Segments;
+    use sha2::Digest;
+    use sha2::Sha256;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use uring_runtime::reactor::simulation::Fault;
+    use uring_runtime::reactor::simulation::Simulation;
+
+    const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+
+    #[test]
+    fn canceled_async_publication_preserves_existing_slots_without_submission() {
+        use crate::runtime::admission::AdmissionPolicy;
+        use crate::runtime::deadline::RequestScope;
+        use crate::runtime::reactor::Reactor;
+        use std::time::Duration;
+        use std::time::Instant;
+        let directory = Directory::new();
+        let (index, segments) = state(8);
+        let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
+        checkpoint.configure_geometry(geometry()).unwrap();
+        let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
+            AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
+        ))));
+        let scope = RequestScope::new(
+            crate::model::RequestId([202; 16]),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        for slot in ["checkpoint.0", "checkpoint.1"] {
+            fs::write(directory.0.join(slot), b"retained cut").unwrap();
+        }
+        scope.cancel().unwrap();
+        assert_eq!(
+            block_on(
+                checkpoint
+                    .publish_async(vec![shard()], reactor.clone(), scope, 3, 0, 1024 * 1024)
+                    .unwrap()
+            ),
+            Err(Error::Cancelled)
+        );
+        assert_eq!(reactor.in_flight(), 0);
+        for slot in ["checkpoint.0", "checkpoint.1"] {
+            assert_eq!(fs::read(directory.0.join(slot)).unwrap(), b"retained cut");
+        }
+    }
+
+    #[test]
+    fn abandoned_async_publication_fences_io_and_preserves_existing_slots() {
+        use crate::runtime::admission::AdmissionPolicy;
+        use crate::runtime::deadline::RequestScope;
+        use crate::runtime::reactor::Reactor;
+        use std::task::Context;
+        use std::task::Poll;
+        use std::time::Duration;
+        use std::time::Instant;
+        let directory = Directory::new();
+        let (index, segments) = state(8);
+        let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
+        let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
+            AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
+        ))));
+        reactor.init().unwrap();
+        let scope = || {
+            RequestScope::new(
+                crate::model::RequestId([201; 16]),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap()
+        };
+        let drive = |mut operation: crate::error::Operation<'static, ()>| {
+            let end = Instant::now() + Duration::from_secs(10);
+            loop {
+                reactor.poll_budgeted(16).unwrap();
+                if let Poll::Ready(result) = operation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                {
+                    break result;
+                }
+                assert!(Instant::now() < end);
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+        };
+        for slot in ["checkpoint.0", "checkpoint.1"] {
+            fs::write(directory.0.join(slot), b"recoverable cut").unwrap();
+        }
+        let mut abandoned = checkpoint
+            .publish_async(vec![shard()], reactor.clone(), scope(), 3, 0, 1024 * 1024)
+            .unwrap();
+        // Encoding yields before the first file submission. Stop at the submission
+        // without reaping its completion, so abandonment exercises the actual fence.
+        for _ in 0..16 {
+            assert!(
+                abandoned
+                    .as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                    .is_pending()
+            );
+            if reactor.in_flight() > 0 {
+                break;
+            }
+        }
+        assert!(reactor.in_flight() > 0);
+        drop(abandoned);
+        let fence_reactor = reactor.clone();
+        drive(Box::pin(async move {
+            fence_reactor
+                .file_fence(crate::model::RequestId([201; 16]))
+                .await
+        }))
+        .unwrap();
+        assert_eq!(reactor.in_flight(), 0);
+        for slot in ["checkpoint.0", "checkpoint.1"] {
+            assert_eq!(
+                fs::read(directory.0.join(slot)).unwrap(),
+                b"recoverable cut"
+            );
+        }
+    }
+    fn geometry() -> CheckpointGeometry {
+        CheckpointGeometry::new(
+            SEGMENT_BYTES * 2,
+            SEGMENT_BYTES,
+            2,
+            Alignment::new(4096, 4096, 4096).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn descriptor(etag: &str, length: u64) -> VersionMetadata {
+        VersionMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId(crate::security::test_support::CACHE.into()),
+                    key: CacheKey([7; 32]),
+                },
+                etag: StrongEtag::parse(format!("\"{etag}\"").as_bytes()).unwrap(),
+            },
+            length,
+        }
+    }
+
+    fn state(capacity: usize) -> (Rc<Index>, Rc<Segments>) {
+        let g = geometry();
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            capacity,
+            crate::test_support::availability(),
+        ));
+        let segments = Rc::new(Segments::new(g.segment_bytes));
+        segments
+            .configure(
+                g.slab_bytes,
+                g.segment_count as usize,
+                g.alignment().unwrap(),
+            )
+            .unwrap();
+        (index, segments)
+    }
+
+    fn shard() -> ShardImage {
+        let (index, segments) = state(8);
+        let metadata = descriptor("v1", 17);
+        let page = PageId {
+            version: metadata.version.clone(),
+            number: PageNumber(0),
+        };
+        let lease = segments.append(4096).unwrap();
+        let allocation = segments
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|segment| matches!(segment.state, SegmentState::Open))
+            .unwrap();
+        index
+            .publish(
+                page,
+                IndexedPage {
+                    location: RecordLocation {
+                        segment: allocation.id,
+                        generation: allocation.generation,
+                        extent: lease.1,
+                    },
+                    metadata,
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                },
+            )
+            .unwrap();
+        drop(lease);
+        index.publish_version(descriptor("empty", 0)).unwrap();
+        ShardImage {
+            worker: WorkerId(0),
+            geometry: geometry(),
+            index: index.snapshot().unwrap(),
+            segments: segments.snapshot().unwrap(),
+        }
+    }
+
+    fn image(sequence: u64) -> CheckpointImage {
+        CheckpointImage {
+            version: CHECKPOINT_VERSION,
+            sequence,
+            shards: vec![shard()],
+        }
+    }
+
+    fn resign(bytes: &mut [u8]) {
+        let end = bytes.len() - DIGEST_BYTES;
+        let digest = Sha256::digest(&bytes[..end]);
+        bytes[end..].copy_from_slice(&digest);
+    }
+
+    #[test]
+    fn recovery_budget_accounts_for_decoded_strings_vectors_and_validation_before_decode() {
+        let bytes = encode(&image(1)).unwrap();
+        let required = recovery_memory(&bytes, usize::MAX).unwrap();
+        assert!(required > bytes.len());
+        assert!(matches!(
+            decode_with_budget(&bytes, bytes.len()),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            decode_with_budget(&bytes, required - 1),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(decode_with_budget(&bytes, required).unwrap().sequence, 1);
+        // Even a checksum-valid geometry may not inflate isolated validation tables
+        // beyond the encoded segment count.
+        let mut malformed = bytes.clone();
+        malformed[54..62].copy_from_slice(&1_000_000u64.to_le_bytes());
+        resign(&mut malformed);
+        assert!(matches!(
+            recovery_memory(&malformed, usize::MAX),
+            Err(Error::CorruptRecord)
+        ));
+        for length in 0..68 {
+            assert!(decode_with_budget(&bytes[..length], 1).is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_downsize_falls_back_or_starts_cold_without_retaining_two_images() {
+        use crate::store::checkpoint::candidates;
+        let directory = Directory::new();
+        let older = encode(&image(1)).unwrap();
+        let mut newer = image(2);
+        for n in 0..20 {
+            newer.shards[0]
+                .index
+                .metadata
+                .push(descriptor(&format!("extra-{n}"), 0));
+        }
+        let newer = encode(&newer).unwrap();
+        fs::write(directory.0.join("checkpoint.0"), &older).unwrap();
+        fs::write(directory.0.join("checkpoint.1"), &newer).unwrap();
+        let budget = recovery_memory(&older, usize::MAX).unwrap();
+        // Both encoded files fit; only the older decoded image fits.
+        assert!(newer.len() < budget);
+        assert_eq!(
+            candidates(&directory.0, budget)
+                .unwrap()
+                .next()
+                .unwrap()
+                .1
+                .sequence,
+            1
+        );
+        for tiny in [0, 1, older.len(), budget - 1] {
+            assert!(candidates(&directory.0, tiny).unwrap().next().is_none());
+        }
+        assert_eq!(
+            candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+                .unwrap()
+                .next()
+                .unwrap()
+                .1
+                .sequence,
+            2
+        );
+    }
+
+    #[test]
+    fn unreadable_slot_is_disposable_but_storage_directory_failure_is_fatal() {
+        use crate::store::checkpoint::candidates;
+        use std::os::fd::AsRawFd;
+        let directory = Directory::new();
+        fs::write(directory.0.join("checkpoint.1"), encode(&image(1)).unwrap()).unwrap();
+        // Opening a Unix socket as a file fails even when tests run as root.
+        let dir = fs::File::open(&directory.0).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(format!(
+            "/proc/self/fd/{}/checkpoint.0",
+            dir.as_raw_fd()
+        ))
+        .unwrap();
+        assert_eq!(
+            candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+                .unwrap()
+                .next()
+                .unwrap()
+                .1
+                .sequence,
+            1
+        );
+        assert!(matches!(
+            candidates(&directory.0.join("checkpoint.1"), MAX_CHECKPOINT_BYTES),
+            Err(Error::Io)
+        ));
+    }
+
+    #[test]
+    fn candidate_read_failure_tries_older_slot() {
+        use crate::store::checkpoint::candidates;
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let path = PathBuf::from("/recovery-budget-test");
+        sim.write_file(&path.join("checkpoint.0"), &encode(&image(1)).unwrap())
+            .unwrap();
+        sim.write_file(&path.join("checkpoint.1"), &encode(&image(2)).unwrap())
+            .unwrap();
+        let mut scan = candidates(&path, MAX_CHECKPOINT_BYTES).unwrap();
+        sim.inject("read", Fault::Errno(libc::EIO));
+        assert_eq!(scan.next().unwrap().1.sequence, 1);
+        assert!(scan.next().is_none());
+    }
+
+    #[test]
+    fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ShardImage>();
+        let encoded = checkpoint_format::encode(&image(7)).unwrap();
+        let decoded = checkpoint_format::decode(&encoded).unwrap();
+        assert_eq!(decoded.sequence, 7);
+        assert_eq!(&encoded[..8], b"RACERCP\0");
+        assert_eq!(&encoded[8..12], &CHECKPOINT_VERSION.to_le_bytes());
+        let shard = &decoded.shards[0];
+        assert_eq!(shard.geometry, geometry());
+        let (_, entry) = &shard.index.entries[0];
+        assert_eq!(entry.metadata, descriptor("v1", 17));
+        assert_eq!(
+            entry.key_id,
+            crate::model::key_id_from_generation(1, 1).unwrap()
+        );
+        assert_eq!(entry.location.extent.length(), 4096);
+        assert!(
+            shard
+                .index
+                .metadata
+                .iter()
+                .any(|metadata| metadata == &descriptor("empty", 0))
+        );
+        assert_eq!(checkpoint_format::encode(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn current_metadata_checkpoints_round_trip_without_data_loss() {
+        let encoded = checkpoint_format::encode(&image(9)).unwrap();
+        let mut recovered = checkpoint_format::decode(&encoded).unwrap();
+        assert_eq!(recovered.version, CHECKPOINT_VERSION);
+        assert!(
+            recovered.shards[0]
+                .index
+                .metadata
+                .iter()
+                .all(|m| m.content_type.is_none())
+        );
+        assert_eq!(checkpoint_format::encode(&recovered).unwrap(), encoded);
+        let value = crate::model::ContentType::parse(b"application/vnd.oci.image.manifest.v1+json")
+            .unwrap();
+        for m in recovered.shards[0].index.metadata.iter_mut() {
+            m.content_type = Some(value.clone());
+        }
+        for (_, entry) in recovered.shards[0].index.entries.iter_mut() {
+            entry.metadata.content_type = Some(value.clone());
+        }
+        let extended = checkpoint_format::encode(&recovered).unwrap();
+        let decoded = checkpoint_format::decode(&extended).unwrap();
+        assert_eq!(
+            decoded.shards[0].index.entries[0].1.metadata.content_type,
+            Some(value.clone())
+        );
+        assert!(
+            decoded.shards[0]
+                .index
+                .metadata
+                .iter()
+                .all(|m| m.content_type == Some(value.clone()))
+        );
+        assert_eq!(checkpoint_format::encode(&decoded).unwrap(), extended);
+    }
+
+    #[test]
+    fn empty_cut_has_stable_current_binary_vector() {
+        let (index, segments) = state(8);
+        let image = CheckpointImage {
+            version: CHECKPOINT_VERSION,
+            sequence: 1,
+            shards: vec![ShardImage {
+                worker: WorkerId(0),
+                geometry: geometry(),
+                index: index.snapshot().unwrap(),
+                segments: segments.snapshot().unwrap(),
+            }],
+        };
+        let bytes = checkpoint_format::encode(&image).unwrap();
+        assert_eq!(bytes.len(), 180);
+        let digest: String = bytes[148..]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            digest,
+            "088cec30ebf4ca46e9ae669e335ebad64dde2d3a98fe39a4d1be15b4cc7a5b75"
+        );
+    }
+
+    #[test]
+    fn populated_cut_preserves_legacy_slab_wire_field_and_rejects_nonzero() {
+        let bytes = checkpoint_format::encode(&image(7)).unwrap();
+        // Literal version-2 image(7) layout, independent of Encoder/Decoder:
+        // header 32 + shard count 4 + worker 2 + geometry 48 + segment count 4
+        // + two segments 50 + page count 4 + descriptor 92 (36-byte cache,
+        // 32-byte key, 4-byte quoted ETag, length 8, three string lengths 12)
+        // + page number 8 + key ID 16 + segment 8 + generation 8 = 276.
+        const SLAB_OFFSET: usize = 276;
+        assert_eq!(bytes.len(), 431);
+        assert_eq!(&bytes[SLAB_OFFSET..SLAB_OFFSET + 8], &[0; 8]);
+        // Independently packed legacy single-slab fixture, including its zero slab
+        // u64, extent (0, 4096), and standalone "empty" descriptor, has 399 body bytes.
+        let digest: String = bytes[399..]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            digest,
+            "39535d258c76e81ba92d01122d23943bb45de093e98c72d09a77ce692d3b531d"
+        );
+        let decoded = checkpoint_format::decode(&bytes).unwrap();
+        assert_eq!(decoded.shards[0].index.entries.len(), 1);
+        assert_eq!(
+            decoded.shards[0].index.entries[0].1.metadata,
+            descriptor("v1", 17)
+        );
+
+        // Exercise low and high bits of the whole legacy u64, not just its first byte.
+        for slab in [1u64, 1 << 63, u64::MAX] {
+            let mut malformed = bytes.clone();
+            malformed[SLAB_OFFSET..SLAB_OFFSET + 8].copy_from_slice(&slab.to_le_bytes());
+            resign(&mut malformed);
+            assert_eq!(&Sha256::digest(&malformed[..399])[..], &malformed[399..]);
+            assert!(matches!(
+                checkpoint_format::decode(&malformed),
+                Err(Error::CorruptRecord)
+            ));
+        }
+    }
+
+    #[test]
+    fn older_checkpoint_versions_are_rejected_and_recover_as_cold_cache() {
+        let directory = Directory::new();
+        for version in [0u32, 1, 3] {
+            let mut cut = image(9);
+            cut.version = version;
+            assert!(checkpoint_format::encode(&cut).is_err());
+            let mut bytes = checkpoint_format::encode(&image(9)).unwrap();
+            bytes[8..12].copy_from_slice(&version.to_le_bytes());
+            let end = bytes.len() - 32;
+            let digest = Sha256::digest(&bytes[..end]);
+            bytes[end..].copy_from_slice(&digest);
+            assert!(checkpoint_format::decode(&bytes).is_err());
+            assert!(sequence_hint(&bytes).is_err());
+            fs::write(directory.0.join("checkpoint.0"), bytes).unwrap();
+            let (index, segments) = state(8);
+            let recovery = Recovery::new(directory.0.clone(), index.clone(), segments);
+            recovery.configure_geometry(geometry()).unwrap();
+            assert!(
+                block_on(recovery.load(geometry().alignment().unwrap()))
+                    .unwrap()
+                    .is_none()
+            );
+            block_on(recovery.install_shard(None)).unwrap();
+            assert!(index.snapshot().unwrap().entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn metadata_order_does_not_affect_encoding_and_cross_shard_conflicts_fail() {
+        let mut image = image(1);
+        image.shards[0]
+            .index
+            .metadata
+            .push(descriptor("another", 1));
+        let first = checkpoint_format::encode(&image).unwrap();
+        image.shards[0].index.metadata.reverse();
+        assert_eq!(checkpoint_format::encode(&image).unwrap(), first);
+        let mut other = shard();
+        other.worker = WorkerId(1);
+        other.index.entries.clear();
+        other.index.metadata = vec![descriptor("v1", 18)];
+        image.shards.push(other);
+        assert!(checkpoint_format::encode(&image).is_err());
+    }
+
+    #[test]
+    fn newer_incompatible_geometry_or_catalog_falls_back_and_keys_filter_on_load() {
+        let directory = Directory::new();
+        fs::write(
+            directory.0.join("checkpoint.0"),
+            checkpoint_format::encode(&image(1)).unwrap(),
+        )
+        .unwrap();
+        let mut newer = image(2);
+        newer.shards[0].geometry.memory_alignment = 8192;
+        fs::write(
+            directory.0.join("checkpoint.1"),
+            checkpoint_format::encode(&newer).unwrap(),
+        )
+        .unwrap();
+        let (index, segments) = state(1);
+        let recovery = Recovery::new(directory.0.clone(), index, segments);
+        recovery.configure_geometry(geometry()).unwrap();
+        let recovered =
+            block_on(recovery.load_filtered(geometry().alignment().unwrap(), |_, _| false))
+                .unwrap()
+                .unwrap();
+        assert_eq!(recovered.sequence, 1);
+        assert!(recovered.shards[0].index.entries.is_empty());
+        assert_eq!(recovered.shards[0].index.metadata.len(), 1);
+        newer.shards[0].geometry = geometry();
+        newer.shards[0].index.metadata.push(descriptor("extra", 0));
+        fs::write(
+            directory.0.join("checkpoint.1"),
+            checkpoint_format::encode(&newer).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            block_on(recovery.load(geometry().alignment().unwrap()))
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn oversized_sparse_files_and_symlinks_are_rejected_without_payload_reads() {
+        use std::os::unix::fs::symlink;
+        let directory = Directory::new();
+        let file = fs::File::create(directory.0.join("checkpoint.0")).unwrap();
+        file.set_len(MAX_CHECKPOINT_BYTES as u64 + 1).unwrap();
+        fs::write(
+            directory.0.join("payload"),
+            checkpoint_format::encode(&image(3)).unwrap(),
+        )
+        .unwrap();
+        symlink(
+            directory.0.join("payload"),
+            directory.0.join("checkpoint.1"),
+        )
+        .unwrap();
+        let (index, segments) = state(8);
+        let recovery = Recovery::new(directory.0.clone(), index, segments);
+        assert!(
+            block_on(recovery.load(geometry().alignment().unwrap()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_hash_version_length_counts_and_trailing_bytes_are_rejected() {
+        let encoded = checkpoint_format::encode(&image(1)).unwrap();
+        for cut in [0, 7, 31, encoded.len() - 1] {
+            assert!(checkpoint_format::decode(&encoded[..cut]).is_err());
+        }
+        let mut corrupt = encoded.clone();
+        corrupt[20] ^= 1;
+        assert!(checkpoint_format::decode(&corrupt).is_err());
+        for (offset, value) in [(8, 3u32), (12, 1), (32, u32::MAX)] {
+            let mut corrupt = encoded.clone();
+            corrupt[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            resign(&mut corrupt);
+            assert!(checkpoint_format::decode(&corrupt).is_err());
+        }
+        let mut corrupt = encoded.clone();
+        corrupt[24..32].copy_from_slice(&1u64.to_le_bytes());
+        resign(&mut corrupt);
+        assert!(checkpoint_format::decode(&corrupt).is_err());
+        let mut corrupt = encoded;
+        corrupt.push(0);
+        assert!(checkpoint_format::decode(&corrupt).is_err());
+    }
+
+    #[test]
+    fn invalid_generation_bounds_duplicates_and_descriptor_conflicts_are_rejected() {
+        let mut bad = image(1);
+        bad.shards[0].index.entries[0].1.location.generation.0 += 1;
+        assert!(checkpoint_format::encode(&bad).is_err());
+        let mut bad = image(1);
+        bad.shards[0].index.entries[0].1.location.extent =
+            Extent::new(SEGMENT_BYTES, 4096).unwrap();
+        assert!(checkpoint_format::encode(&bad).is_err());
+        let mut bad = image(1);
+        let duplicate = bad.shards[0].index.entries[0].clone();
+        bad.shards[0].index.entries.push(duplicate);
+        assert!(checkpoint_format::encode(&bad).is_err());
+        let mut bad = image(1);
+        bad.shards[0].index.metadata.push(descriptor("v1", 18));
+        assert!(checkpoint_format::encode(&bad).is_err());
+    }
+
+    #[test]
+    fn overlapping_mappings_are_rejected() {
+        let mut bad = image(1);
+        let mut overlapping = bad.shards[0].index.entries[0].clone();
+        overlapping.0.version.object.key = CacheKey([8; 32]);
+        overlapping.1.metadata.version = overlapping.0.version.clone();
+        bad.shards[0].index.entries.push(overlapping);
+        assert!(checkpoint_format::encode(&bad).is_err());
+    }
+
+    #[test]
+    fn alternating_publication_falls_back_to_valid_older_cut_and_ignores_temp_and_payload() {
+        let directory = Directory::new();
+        let (index, segments) = state(8);
+        let checkpointer = Checkpointer::new(directory.0.clone(), index.clone(), segments.clone());
+        let recovery = Recovery::new(directory.0.clone(), index, segments);
+        recovery.configure_geometry(geometry()).unwrap();
+        assert!(
+            block_on(recovery.load(geometry().alignment().unwrap()))
+                .unwrap()
+                .is_none()
+        );
+        block_on(checkpointer.publish(vec![shard()])).unwrap();
+        block_on(checkpointer.publish(vec![shard()])).unwrap();
+        let load = || {
+            block_on(recovery.load(geometry().alignment().unwrap()))
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(load().sequence, 2);
+        fs::write(directory.0.join("checkpoint.1"), b"torn").unwrap();
+        fs::write(
+            directory.0.join(".checkpoint.tmp"),
+            checkpoint_format::encode(&image(99)).unwrap(),
+        )
+        .unwrap();
+        fs::write(directory.0.join("slab.0"), b"payload must not be scanned").unwrap();
+        assert_eq!(load().sequence, 1);
+        block_on(checkpointer.publish(vec![shard()])).unwrap();
+        assert_eq!(load().sequence, 2);
+        assert_eq!(
+            fs::read(directory.0.join("slab.0")).unwrap(),
+            b"payload must not be scanned"
+        );
+        fs::write(directory.0.join("checkpoint.0"), b"bad").unwrap();
+        fs::write(directory.0.join("checkpoint.1"), b"bad").unwrap();
+        assert!(
+            block_on(recovery.load(geometry().alignment().unwrap()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_validates_before_mutation_seals_segments_and_filters_missing_keys() {
+        let directory = Directory::new();
+        let (index, segments) = state(8);
+        let keep = descriptor("keep", 0);
+        index
+            .publish_current(crate::model::ObjectMetadata {
+                content_type: None,
+                version: keep.version.clone(),
+                length: keep.length,
+                expires_at: crate::model::ExpiresAt::test_time(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(300),
+                ),
+            })
+            .unwrap();
+        assert!(index.current(&keep.version.object).unwrap().is_some());
+        let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
+        recovery.configure_geometry(geometry()).unwrap();
+        let before = segments.snapshot().unwrap();
+        let mut bad = shard();
+        bad.index.entries[0].1.location.generation.0 += 1;
+        assert!(block_on(recovery.install_shard(Some(bad))).is_err());
+        assert!(
+            index
+                .version(&descriptor("keep", 0).version)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            segments.snapshot().unwrap()[0].used_bytes,
+            before[0].used_bytes
+        );
+        let mut recovered = image(1);
+        let page = recovered.shards[0].index.entries[0].0.clone();
+        Recovery::filter_available(&mut recovered, |_| true, |_, _| false);
+        block_on(recovery.install_shard(recovered.shards.pop())).unwrap();
+        assert!(index.lookup(&page).unwrap().is_none());
+        assert!(
+            index
+                .version(&descriptor("empty", 0).version)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            segments
+                .snapshot()
+                .unwrap()
+                .iter()
+                .all(|segment| !matches!(segment.state, SegmentState::Open))
+        );
+        assert!(index.current(&page.version.object).unwrap().is_none());
+        block_on(recovery.install_shard(Some(shard()))).unwrap();
+        assert!(index.lookup(&page).unwrap().is_some());
+        block_on(recovery.install_shard(None)).unwrap();
+        assert!(index.lookup(&page).unwrap().is_none());
+        assert!(
+            index
+                .version(&descriptor("empty", 0).version)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn catalog_capacity_failure_preserves_all_live_state() {
+        let directory = Directory::new();
+        let (index, segments) = state(1);
+        index.publish_version(descriptor("keep", 0)).unwrap();
+        let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
+        recovery.configure_geometry(geometry()).unwrap();
+        let mut recovered = shard();
+        recovered.index.metadata = vec![descriptor("one", 0), descriptor("two", 0)];
+        assert!(block_on(recovery.install_shard(Some(recovered))).is_err());
+        assert!(
+            index
+                .version(&descriptor("keep", 0).version)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            segments
+                .snapshot()
+                .unwrap()
+                .iter()
+                .all(|segment| segment.used_bytes == 0)
+        );
+    }
+
+    #[test]
+    fn snapshot_freeze_requires_explicit_owner_release() {
+        let directory = Directory::new();
+        let (index, segments) = state(8);
+        let checkpointer =
+            Checkpointer::new(directory.0.join("not-created"), index, segments.clone());
+        assert!(!directory.0.join("not-created").exists());
+        checkpointer.configure_geometry(geometry()).unwrap();
+        let snapshot = block_on(checkpointer.snapshot_shard()).unwrap();
+        assert!(segments.append(4096).is_err());
+        assert!(block_on(checkpointer.snapshot_shard()).is_err());
+        drop(snapshot);
+        assert!(segments.append(4096).is_err());
+        checkpointer.finish_snapshot();
+        checkpointer.finish_snapshot();
+        assert!(segments.append(4096).is_ok());
+    }
+
+    #[test]
+    fn failed_snapshot_releases_owner_and_failed_publication_preserves_prior_cut() {
+        let directory = Directory::new();
+        let (index, segments) = state(8);
+        let checkpointer = Checkpointer::new(directory.0.clone(), index.clone(), segments.clone());
+        checkpointer.configure_geometry(geometry()).unwrap();
+        let invalid = shard().index.entries.pop().unwrap();
+        index.publish(invalid.0, invalid.1).unwrap();
+        // The index references a generation without an allocated record in this table.
+        assert!(block_on(checkpointer.snapshot_shard()).is_err());
+        assert!(segments.append(4096).is_ok());
+
+        block_on(checkpointer.publish(vec![shard()])).unwrap();
+        // Force rename to fail while leaving the previously published slot readable.
+        fs::create_dir(directory.0.join("checkpoint.1")).unwrap();
+        assert!(block_on(checkpointer.publish(vec![shard()])).is_err());
+        let recovery = Recovery::new(directory.0.clone(), index, segments);
+        let recovered = block_on(recovery.load(geometry().alignment().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.sequence, 1);
+        assert!(fs::read_dir(&directory.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+    }
+
+    #[test]
+    fn outstanding_lease_and_wrong_worker_cannot_partially_install() {
+        let directory = Directory::new();
+        let (index, segments) = state(8);
+        index.publish_version(descriptor("keep", 0)).unwrap();
+        let recovery = Recovery::new(directory.0.clone(), index.clone(), segments.clone());
+        recovery.configure_geometry(geometry()).unwrap();
+        let lease = segments.append(4096).unwrap();
+        assert!(block_on(recovery.install_shard(Some(shard()))).is_err());
+        assert!(
+            index
+                .version(&descriptor("keep", 0).version)
+                .unwrap()
+                .is_some()
+        );
+        drop(lease);
+        let mut wrong = shard();
+        wrong.worker = WorkerId(1);
+        assert!(block_on(recovery.install_shard(Some(wrong))).is_err());
+        assert!(
+            index
+                .version(&descriptor("keep", 0).version)
+                .unwrap()
+                .is_some()
+        );
+    }
 }

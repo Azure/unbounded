@@ -1,11 +1,12 @@
 //! Real checkout/exchange fixtures for pool queueing, reuse, expiry, and fences.
 use super::*;
-use crate::{model::RequestId, test_support::WakeCounter};
-use std::{
-    sync::Arc,
-    task::{Context, Waker},
-};
-use uring_runtime::reactor::simulation::{Fault, Simulation};
+use crate::model::RequestId;
+use crate::test_support::WakeCounter;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Waker;
+use uring_runtime::reactor::simulation::Fault;
+use uring_runtime::reactor::simulation::Simulation;
 
 enum Listener {
     Tcp(std::net::TcpListener),
@@ -301,7 +302,8 @@ fn waiting_cancel_deadline_close_stop_and_drop_release_only_waiter_quota() {
 }
 #[test]
 fn worker_tick_wakes_bounded_round_robin_waiters_even_in_nested_executor() {
-    use futures::{Stream, stream::FuturesUnordered};
+    use futures::Stream;
+    use futures::stream::FuturesUnordered;
     let (_, _, pool) = setup();
     let (listener, endpoint) = Listener::peer();
     let (_held, _peer) = held(&pool, &endpoint, &listener);

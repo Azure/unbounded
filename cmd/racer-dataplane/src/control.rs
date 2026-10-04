@@ -30,7 +30,8 @@ use racer_identity::Keyring;
 use rest_client::Response;
 use serde::Deserialize;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+use sha2::Sha256;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -130,7 +131,7 @@ pub struct ControlClient {
     retry_after: Cell<Option<Duration>>,
     next: Cell<Option<Instant>>,
     active_scope: RefCell<Option<RequestScope>>,
-    lifecycle: RefCell<Option<Rc<crate::app::caches::CachePublication>>>,
+    lifecycle: RefCell<Option<Rc<crate::app::CachePublication>>>,
     projection_error: Cell<Option<Error>>,
     renewal_error: Cell<Option<Error>>,
     renew_next: Cell<Option<Instant>>,
@@ -331,10 +332,7 @@ impl ControlClient {
         self.key_transport.attach_io(io.clone());
         self.transport.attach_io(io);
     }
-    pub(crate) fn attach_cache_publication(
-        &self,
-        lifecycle: Rc<crate::app::caches::CachePublication>,
-    ) {
+    pub(crate) fn attach_cache_publication(&self, lifecycle: Rc<crate::app::CachePublication>) {
         *self.lifecycle.borrow_mut() = Some(lifecycle);
     }
     pub fn projection_error(&self) -> Option<Error> {
@@ -585,7 +583,8 @@ impl ControlClient {
         });
         let mut polled = None;
         std::future::poll_fn(|cx| {
-            use std::{future::Future, task::Poll};
+            use std::future::Future;
+            use std::task::Poll;
             if let Poll::Ready(result) = renewal.as_mut().poll(cx) {
                 return Poll::Ready(result);
             }
@@ -2370,17 +2369,22 @@ fn unix_time() -> rustls::pki_types::UnixTime {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use racer_control_wire::{
-        canonical_socket_paths, content_hash, decode_enrollment_request, decode_publication,
-        encode_enrollment_request, encode_publication, validate_definitions,
-    };
+    use racer_control_wire::canonical_socket_paths;
+    use racer_control_wire::content_hash;
+    use racer_control_wire::decode_enrollment_request;
+    use racer_control_wire::decode_publication;
+    use racer_control_wire::encode_enrollment_request;
+    use racer_control_wire::encode_publication;
+    use racer_control_wire::validate_definitions;
 
     pub(crate) mod bundle_tests {
         use super::*;
-        use std::{os::unix::fs::symlink, sync::Arc};
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
         #[test]
         fn bundle_installation_is_idempotent_and_rejects_rollback() {
-            use racer_identity::{KeyEpochs, KeyPurpose};
+            use racer_identity::KeyEpochs;
+            use racer_identity::KeyPurpose;
             let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../internal/racer/wire/testdata/publication.json"
@@ -2465,10 +2469,9 @@ pub(crate) mod tests {
 
     pub(crate) mod testing {
         use crate as dataplane;
-        use std::{
-            path::PathBuf,
-            sync::atomic::{AtomicU64, Ordering},
-        };
+        use std::path::PathBuf;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
         #[allow(dead_code)]
         mod io {
             include!(concat!(

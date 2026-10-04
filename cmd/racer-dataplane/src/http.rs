@@ -1,17 +1,25 @@
 //! Racer policy adapters for the standalone fixed-length HTTP implementation.
-use crate::{
-    error::{Error, Operation, Result},
-    model::ResourceClass,
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy, ConnectionReservation},
-        deadline::RequestScope,
-        reactor::Reactor,
-    },
-};
-use flow_control::pipe::{MAX_PIPE_BYTES, PipeLease};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::ResourceClass;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::admission::ConnectionReservation;
+use crate::runtime::deadline::RequestScope;
+use crate::runtime::reactor::Reactor;
+use flow_control::pipe::MAX_PIPE_BYTES;
+use flow_control::pipe::PipeLease;
 use http1::MessageHead;
-use std::{cell::RefCell, ops::Deref, path::PathBuf, rc::Rc, task::Poll, time::Duration};
-use uring_runtime::reactor::{Descriptor, IoBuffer, SocketAddress};
+use std::cell::RefCell;
+use std::ops::Deref;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::task::Poll;
+use std::time::Duration;
+use uring_runtime::reactor::Descriptor;
+use uring_runtime::reactor::IoBuffer;
+use uring_runtime::reactor::SocketAddress;
 
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
 pub struct RacerOpaque;
@@ -516,20 +524,24 @@ pub(crate) mod tests;
 mod relay_tests {
     //! Opaque transit, fallback, cancellation, and ownership-fence scenarios.
     use super::*;
-    use crate::{
-        memory::{acquire_wait, new_pipe_pool},
-        model::{RequestId, ResourceClass},
-        runtime::{admission::AdmissionPolicy, reactor::Reactor},
-    };
+    use crate::memory::acquire_wait;
+    use crate::memory::new_pipe_pool;
+    use crate::model::RequestId;
+    use crate::model::ResourceClass;
+    use crate::runtime::admission::AdmissionPolicy;
+    use crate::runtime::reactor::Reactor;
     use flow_control::pipe::PipePool;
-    use http1::{Header, MessageHead, StartLine};
-    use std::{
-        future::Future,
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        task::{Context, Poll},
-        time::Instant,
-    };
+    use http1::Header;
+    use http1::MessageHead;
+    use http1::StartLine;
+    use std::future::Future;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::net::TcpStream;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Instant;
 
     fn pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -548,8 +560,10 @@ mod relay_tests {
     // Match the production service's wake-driven FuturesUnordered and reactor wait,
     // rather than repeatedly polling a blocked future with a noop waker.
     fn drive_worker<T>(reactor: &Reactor, work: impl Future<Output = T>) -> T {
-        use futures::{Stream, stream::FuturesUnordered};
-        use std::{sync::Arc, task::Wake};
+        use futures::Stream;
+        use futures::stream::FuturesUnordered;
+        use std::sync::Arc;
+        use std::task::Wake;
         struct WakeReactor(uring_runtime::reactor::ReactorWake);
         impl Wake for WakeReactor {
             fn wake(self: Arc<Self>) {

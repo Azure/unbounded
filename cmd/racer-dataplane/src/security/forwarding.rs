@@ -39,7 +39,11 @@
 //!     requester.verify_response(reverse, &outstanding)
 //! }
 //! ```
-use super::connection::{Signatures, SignedHead, node_field, receiver, signed_digest};
+use super::connection::Signatures;
+use super::connection::SignedHead;
+use super::connection::node_field;
+use super::connection::receiver;
+use super::connection::signed_digest;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::NodeId;
@@ -53,9 +57,11 @@ use crate::peer::protocol::number;
 use crate::peer::protocol::push;
 use crate::peer::protocol::push_binary;
 use crate::topology::RouteBudget;
-use http1::{MessageHead, StartLine};
+use http1::MessageHead;
+use http1::StartLine;
 use racer_identity::VerifiedPeer;
-use std::{rc::Rc, sync::Arc};
+use std::rc::Rc;
+use std::sync::Arc;
 pub struct Forwarding {
     signatures: Rc<Signatures>,
 }
@@ -123,7 +129,8 @@ impl VerifiedRequest {
     /// page for the existing Fill implementation. This value must never be relayed
     /// or reverified: its immutable binding still names the full subscription.
     pub(crate) fn select_page(mut self, page: crate::model::PageId) -> Result<Self> {
-        use crate::peer::protocol::{FetchMode, Operation};
+        use crate::peer::protocol::FetchMode;
+        use crate::peer::protocol::Operation;
         let Operation::Subscribe { subscription, mode } = &self.signed.request.operation else {
             return Err(Error::InvalidRequest);
         };
@@ -823,16 +830,24 @@ fn check_grant_deadline(head: &MessageHead, request: &RequestBinding) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        model::{
-            EncryptedAuthorization, KeyId, Limits, MetadataSelector, Nonce, OpaqueMetadata,
-            PeerOriginContext, ResourceClass, *,
-        },
-        peer::protocol::{FetchMode, Operation},
-        runtime::{admission::AdmissionPolicy, deadline::RequestScope},
-        security::test_support::{clone_head, network, node},
-    };
-    use std::time::{Duration, Instant};
+    use crate::model::EncryptedAuthorization;
+    use crate::model::KeyId;
+    use crate::model::Limits;
+    use crate::model::MetadataSelector;
+    use crate::model::Nonce;
+    use crate::model::OpaqueMetadata;
+    use crate::model::PeerOriginContext;
+    use crate::model::ResourceClass;
+    use crate::model::*;
+    use crate::peer::protocol::FetchMode;
+    use crate::peer::protocol::Operation;
+    use crate::runtime::admission::AdmissionPolicy;
+    use crate::runtime::deadline::RequestScope;
+    use crate::security::test_support::clone_head;
+    use crate::security::test_support::network;
+    use crate::security::test_support::node;
+    use std::time::Duration;
+    use std::time::Instant;
     fn wire_ciphertext(envelope: PageEnvelope, length: usize) -> crate::memory::CiphertextPage {
         crate::memory::CiphertextPage {
             provenance: None,
@@ -1016,7 +1031,8 @@ mod tests {
     #[test]
     fn bootstrap_binds_intent_empty_page_zero_length_and_destination() {
         use crate::memory::tests::bundle_for;
-        use crate::model::{ExpiresAt, ObjectMetadata};
+        use crate::model::ExpiresAt;
+        use crate::model::ObjectMetadata;
         let mut request = request(90);
         request.operation = Operation::Bootstrap {
             object: request.origin.object.clone(),
@@ -1276,7 +1292,9 @@ mod tests {
 
         // Real wire framing and canonical logical decode retain the effective
         // balance independently of the immutable original signed ceiling.
-        use crate::peer::protocol::{SecurityCodec, decode_envelope, encode_envelope};
+        use crate::peer::protocol::SecurityCodec;
+        use crate::peer::protocol::decode_envelope;
+        use crate::peer::protocol::encode_envelope;
         let scope = forwarded.request.origin.scope().clone();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -1797,7 +1815,8 @@ mod tests {
     }
     #[test]
     fn successful_metadata_must_match_original_object_pin_and_operation() {
-        use crate::model::{ExpiresAt, ObjectMetadata};
+        use crate::model::ExpiresAt;
+        use crate::model::ObjectMetadata;
         let signatures = network(3);
         let f: Vec<_> = signatures
             .iter()
@@ -1858,7 +1877,8 @@ mod tests {
     }
     #[test]
     fn relay_cannot_assert_success_but_can_return_request_bound_errors() {
-        use crate::model::{ExpiresAt, ObjectMetadata};
+        use crate::model::ExpiresAt;
+        use crate::model::ObjectMetadata;
         let signatures = network(3);
         let requester = Forwarding::new(signatures[0].clone());
         let relay = Forwarding::new(signatures[1].clone());

@@ -1,6 +1,7 @@
 //! Process entry point. Configuration and application lifecycle own all resources.
 
-use racer_dataplane::{app::Application, config::Config};
+use racer_dataplane::app::Application;
+use racer_dataplane::config::Config;
 
 fn main() -> std::process::ExitCode {
     match run() {

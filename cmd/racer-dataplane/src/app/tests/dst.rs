@@ -1,22 +1,24 @@
 //! Generated traffic through the assembled production graph on hostless descriptors.
 //! The oracle owns immutable origin versions, never consults placement or cache data.
-use super::*;
+use crate::app::*;
+use racer_control_wire::CacheDefinition;
 use crate::model::PAGE_BYTES;
 use crate::model::ResourceClass;
 use crate::model::*;
 use racer_control_wire as wire;
-use racer_control_wire::CacheDefinition;
-use racer_identity::{PendingIdentity, SigningIdentity};
-use sha2::{Digest, Sha256};
-use std::{cell::RefCell, collections::BTreeMap};
-use std::{collections::VecDeque, num::NonZeroUsize};
-use uring_runtime::{
-    environment::SimulationClock,
-    reactor::{
-        Descriptor, SocketAddress,
-        simulation::{Fault, Simulation},
-    },
-};
+use racer_identity::PendingIdentity;
+use racer_identity::SigningIdentity;
+use sha2::Digest;
+use sha2::Sha256;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
+use std::num::NonZeroUsize;
+use uring_runtime::environment::SimulationClock;
+use uring_runtime::reactor::Descriptor;
+use uring_runtime::reactor::SocketAddress;
+use uring_runtime::reactor::simulation::Fault;
+use uring_runtime::reactor::simulation::Simulation;
 
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
@@ -164,8 +166,11 @@ mod faults {
         }
 
         pub(super) fn peer_security(&mut self) {
-            use crate::{http::Codec, peer::protocol as p, peer::protocol::encode_envelope};
-            use http1::{MessageHead, StartLine};
+            use crate::http::Codec;
+            use crate::peer::protocol as p;
+            use crate::peer::protocol::encode_envelope;
+            use http1::MessageHead;
+            use http1::StartLine;
             let receiver = self.rng.pick(self.nodes.len());
             let sender = (receiver + 1) % self.nodes.len();
             let keys = self.nodes[sender].workers[0].app.keys.clone();
@@ -592,7 +597,7 @@ mod faults {
             let mut staged = Vec::new();
             for node in &mut self.nodes {
                 node.workers[0].app.control = node.control.clone();
-                staged.push(caches::CachePublication {
+                staged.push(CachePublication {
                     node: node.workers[0].app.node.clone(),
                     listeners: node.workers[0].app.prepared_listeners.clone(),
                     capacity: node.config.limits.metadata_entries.get(),
@@ -613,7 +618,7 @@ mod faults {
                                 vec![],
                             );
                             publication.membership_version = MembershipVersion(self.generation);
-                            publication.members = members.iter().cloned().map(Into::into).collect();
+                            publication.members = members.clone();
                             node.workers[0]
                                 .app
                                 .snapshots
@@ -659,7 +664,8 @@ mod faults {
         }
 
         pub(super) fn native_fault(&mut self) {
-            use rdma_verbs::simulation::{Fault as NativeFault, Operation as NativeOperation};
+            use rdma_verbs::simulation::Fault as NativeFault;
+            use rdma_verbs::simulation::Operation as NativeOperation;
             if self.native_rules.is_empty() {
                 for op in [
                     NativeOperation::Bind,
@@ -721,9 +727,10 @@ mod scenarios {
     #[test]
     fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
         use crate::model::OriginContext;
-        use crate::peer::protocol::{
-            FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse,
-        };
+        use crate::peer::protocol::FetchMode;
+        use crate::peer::protocol::Operation as PeerOperation;
+        use crate::peer::protocol::PeerRequest;
+        use crate::peer::protocol::PeerResponse;
         use crate::peer::subscriptions::Demand;
         use crate::peer::subscriptions::PageInterval;
         use crate::peer::subscriptions::Subscription;
@@ -867,7 +874,8 @@ mod scenarios {
         use crate::peer::protocol::PeerRequest;
         use crate::peer::protocol::PeerResponse;
         use crate::topology::RouteBudget;
-        use futures::{Stream, stream::FuturesUnordered};
+        use futures::Stream;
+        use futures::stream::FuturesUnordered;
 
         let sim = Simulation::new();
         let _os = sim.enter();
@@ -1909,7 +1917,8 @@ fn node_id(id: usize) -> NodeId {
 }
 fn cache(id: usize) -> CacheDefinition {
     let name = format!("dst-{id}");
-    let (client_socket, origin_socket) = racer_control_wire::canonical_socket_paths(&name).unwrap();
+    let (client_socket, origin_socket) =
+        racer_control_wire::canonical_socket_paths(&name).unwrap();
     CacheDefinition {
         name,
         id: CacheId("33333333-3333-4333-8333-333333333333".into()),
@@ -2240,7 +2249,7 @@ impl Harness {
             .to_pkcs8_der()
             .unwrap();
         let pending = PendingIdentity::recover(&key).unwrap();
-        crate::control::tests::testing::signing_identity(
+        crate::control::testing::signing_identity(
             pending,
             &self.ca,
             &self.ca_key,
@@ -2338,8 +2347,8 @@ impl Harness {
         let mut publication =
             crate::app::tests::publication(&config, self.generation, vec![self.definition(id)]);
         publication.membership_version = MembershipVersion(self.generation);
-        publication.members = self.members().into_iter().map(Into::into).collect();
-        publication.members.push(member(&config).into());
+        publication.members = self.members();
+        publication.members.push(member(&config));
         app.snapshots.publish(publication).unwrap();
         let startup = scope(Duration::from_secs(30)).unwrap();
         let mut workers = vec![LocalWorker {
@@ -2487,7 +2496,7 @@ impl Harness {
             let mut p =
                 crate::app::tests::publication(&node.config, self.generation, vec![definition]);
             p.membership_version = MembershipVersion(self.generation);
-            p.members = members.iter().cloned().map(Into::into).collect();
+            p.members = members.clone();
             node.workers[0].app.snapshots.publish(p).unwrap();
         }
     }
@@ -3001,7 +3010,7 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
             vec![harness.definition(node.id)],
         );
         p.membership_version = MembershipVersion(harness.generation);
-        p.members = members.iter().cloned().map(Into::into).collect();
+        p.members = members.clone();
         node.workers[0].app.snapshots.publish(p).unwrap();
         assert!(
             node.workers[0]

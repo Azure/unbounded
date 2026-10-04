@@ -1,7 +1,8 @@
 //! Owned per-cache Unix sockets with permissions, bounded connections, and draining.
 //! Bind /run/racer/<cache name>/client/socket; mount its client directory separately
 //! from the origin directory so pods receive only their authorized endpoint.
-use super::{RequestParser, response::Responses};
+use super::RequestParser;
+use super::response::Responses;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -17,24 +18,28 @@ use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::Cancellation;
 use crate::runtime::deadline::RequestScope;
 use racer_control_wire::CacheDefinition;
-use std::{
-    cell::{Cell, RefCell},
-    collections::{BTreeMap, VecDeque},
-    ffi::CString,
-    fs::{self, File, OpenOptions},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{
-            fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-            net::UnixListener,
-        },
-    },
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
+use std::ffi::CString;
+use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
+use std::path::Path;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
 use uring_runtime::reactor::Descriptor;
 
 enum Listener {

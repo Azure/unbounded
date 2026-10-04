@@ -1,22 +1,30 @@
-use crate::{
-    error::{Error, Operation, Result},
-    model::{AttemptId, MembershipVersion, NodeId, ObjectId, PageNumber, RequestId},
-    runtime::deadline::{Deadline, RequestScope},
-};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::AttemptId;
+use crate::model::MembershipVersion;
+use crate::model::NodeId;
+use crate::model::ObjectId;
+use crate::model::PageNumber;
+use crate::model::RequestId;
+use crate::runtime::deadline::Deadline;
+use crate::runtime::deadline::RequestScope;
 pub use ::topology::MAX_DEGREE;
-use racer_control_wire::{RailMapping, valid_site};
-use sha2::{Digest, Sha256};
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
-    future::Future,
-    net::SocketAddr,
-    num::NonZeroU32,
-    rc::Rc,
-    sync::Arc,
-    task::Poll,
-    time::{Duration, Instant},
-};
+use racer_control_wire::RailMapping;
+use racer_control_wire::valid_site;
+use sha2::Digest;
+use sha2::Sha256;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::num::NonZeroU32;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
+use std::time::Instant;
 
 // Immutable placement, authenticated routing, and worker-local endpoint circuits.
 
@@ -729,7 +737,8 @@ pub(crate) mod tests {
         use crate::model::*;
         use crate::topology::Member;
         use crate::topology::Membership;
-        use std::{num::NonZeroU32, sync::Arc};
+        use std::num::NonZeroU32;
+        use std::sync::Arc;
 
         // Independent Python hashlib + outgoing-edge BFS vectors. N=1500, source=0,
         // destination=1499, request=[1;16], shares=1 at multiples of 3 and 4 elsewhere.

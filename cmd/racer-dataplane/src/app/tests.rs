@@ -1,15 +1,42 @@
 //! Application lifecycle tests and shared assembled-worker fixtures.
 use super::*;
 use racer_control_wire as state;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::crypto;
+use crate::runtime::crypto::CryptoClient;
+use crate::runtime::reactor::Reactor;
+use crate::http::Codec;
+use crate::model::ExpiresAt;
+use crate::model::MetadataSelector;
+use crate::model::ObjectMetadata;
+use crate::model::ResourceClass;
+use crate::model::*;
+use crate::peer::protocol;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::Operation as PeerOperation;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::decode_envelope;
+use crate::peer::protocol::encode_envelope;
+use crate::security::connection;
+use crate::security::test_support::network;
+use crate::security::test_support::node;
+use crate::topology::RouteBudget;
+use http1::Header;
+use http1::MessageHead;
+use http1::StartLine;
 use racer_control_wire as wire;
-use std::{
-    collections::VecDeque,
-    io::{Read, Write},
-    num::NonZeroUsize,
-    path::PathBuf,
-    thread,
-    time::Instant,
-};
+use std::collections::VecDeque;
+use std::io::Read;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Instant;
+use std::future::Future;
+use std::os::unix::net::UnixStream;
+use uring_runtime::affinity::EffectiveTopology;
 
 pub(super) struct ControlFixture {
     pub bundle: Arc<Mutex<wire::KeyringBundle>>,
@@ -97,7 +124,7 @@ impl EnrollmentHandler {
         self.issued.fetch_add(1, Ordering::Release);
         (
             200,
-            wire::encode_enrollment_response(&crate::control::tests::testing::issue_at(
+            wire::encode_enrollment_response(&crate::control::testing::issue_at(
                 &request,
                 &self.ca,
                 &self.ca_key,
@@ -328,7 +355,7 @@ fn control_tls() -> (
     rcgen::KeyPair,
     Arc<rustls::ServerConfig>,
 ) {
-    let (ca, ca_key) = crate::control::tests::testing::ca();
+    let (ca, ca_key) = crate::control::testing::ca();
     let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
@@ -476,7 +503,7 @@ pub(super) fn publication(
         cluster: config.cluster.clone(),
         sequence: wire::PublicationSequence(sequence),
         membership_version: crate::model::MembershipVersion(1),
-        members: vec![racer_control_wire::Member {
+        members: vec![crate::topology::Member {
             node: config.node.clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
             peer_endpoint: "127.0.0.1:7443".into(),
@@ -488,8 +515,11 @@ pub(super) fn publication(
 }
 
 pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
-    use crate::memory::{VerifiedBytes, VerifiedPage};
-    use crate::model::{ResourceClass, VersionMetadata, *};
+    use crate::memory::VerifiedBytes;
+    use crate::memory::VerifiedPage;
+    use crate::model::ResourceClass;
+    use crate::model::VersionMetadata;
+    use crate::model::*;
     let version = ObjectVersion {
         object: ObjectId {
             cache: definition().id,
@@ -544,14 +574,6 @@ pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
         .for_pin(),
     }
 }
-
-mod peer;
-
-use crate::runtime::{
-    admission::{AdmissionExt, AdmissionPolicy},
-    crypto::{self, CryptoClient},
-    reactor::Reactor,
-};
 
 #[test]
 fn worker_sizing_reports_specific_resource_floor() {
@@ -608,7 +630,8 @@ fn worker_sizing_reports_specific_resource_floor() {
 #[test]
 fn worker_sizing_funds_derived_connection_pools() {
     use crate::model::ResourceClass;
-    use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
+    use uring_runtime::affinity::CpuLocation;
+    use uring_runtime::affinity::EffectiveTopology;
     let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -804,7 +827,8 @@ fn application_budget_poll_preserves_cooperative_and_completion_wakes() {
 
 #[test]
 fn application_metadata_deadline_hook_is_budgeted_and_precedes_peer_polling() {
-    use futures::{Stream, stream::FuturesUnordered};
+    use futures::Stream;
+    use futures::stream::FuturesUnordered;
     let mut worker = wake_test_worker();
     worker.started = true;
     worker.stopping = true;
@@ -920,7 +944,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));
         assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
         // Admission bounds retained generations once across the node.
-        let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+        let mut publication = crate::control::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../internal/racer/wire/testdata/publication.json"
         )))
@@ -951,8 +975,9 @@ fn shared_factory_is_send_and_sync_without_moving_worker_graphs() {
 
 #[test]
 fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
-    use crate::{model::MembershipVersion, peer::PeerNetwork};
-    let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+    use crate::model::MembershipVersion;
+    use crate::peer::PeerNetwork;
+    let mut publication = crate::control::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../internal/racer/wire/testdata/publication.json"
     )))
@@ -1187,7 +1212,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     let late1 = page(&second);
     first.memory.publish(late0.clone()).unwrap();
     second.memory.publish(late1.clone()).unwrap();
-    let adapter = caches::CachePublication {
+    let adapter = CachePublication {
         node: node.clone(),
         listeners: first.prepared_listeners.clone(),
         capacity: config.limits.metadata_entries.get(),
@@ -1306,7 +1331,8 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
                 use crate::telemetry::Event;
                 app.telemetry
                     .metrics
-                    .record(Event::MemoryHit, u64::from(id) + 1);
+                    .record(Event::MemoryHit, u64::from(id) + 1)
+                    .unwrap();
                 drive(
                     &runtime,
                     &mut engine,
@@ -1382,7 +1408,9 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
 #[test]
 fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     use crate::telemetry::State;
-    use uring_runtime::environment::{SimulationClock, now, wall_now};
+    use uring_runtime::environment::SimulationClock;
+    use uring_runtime::environment::now;
+    use uring_runtime::environment::wall_now;
 
     // Complete each real control turn through the application's error handling.
     // Leave the next turn unsubmitted so the test controls all retry boundaries.
@@ -1612,7 +1640,8 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
 
 #[test]
 fn removal_publication_finishes_locally_after_controller_disappears() {
-    use crate::model::{VersionMetadata, *};
+    use crate::model::VersionMetadata;
+    use crate::model::*;
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let diagnostic_address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2565,4 +2594,836 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     assert_eq!(runtime.crypto.outstanding(), 0);
     assert!(fixture.directory.join("slabs/checkpoint.0").is_file());
 }
-use uring_runtime::affinity::EffectiveTopology;
+
+fn tcp_nodelay(fd: &impl std::os::fd::AsRawFd) -> i32 {
+    let mut value: libc::c_int = -1;
+    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+    // SAFETY: getsockopt writes only the supplied live integer and length.
+    assert_eq!(
+        unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        },
+        0
+    );
+    value
+}
+
+#[test]
+fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
+    for enabled in [false, true] {
+        let mut config = crate::test_support::cluster::config(false);
+        config.peer_tcp_nodelay = enabled;
+        let node = Arc::new(NodeState::default());
+        let (app, runtime, _) = local_worker(&config, &node, 0);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let scope = scope(Duration::from_secs(5)).unwrap();
+        let mut serving = app.peers.listen(address, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(serving.as_mut().poll(&mut cx).is_pending());
+        let endpoint = crate::http::Endpoint::Peer(address.to_string());
+        let mut connecting = app.http.checkout(&endpoint, &scope);
+        let mut outbound = None;
+        let mut inbound = None;
+        let until = Instant::now() + Duration::from_secs(3);
+        while outbound.is_none() || inbound.is_none() {
+            if outbound.is_none() {
+                if let Poll::Ready(result) = connecting.as_mut().poll(&mut cx) {
+                    outbound = Some(result.unwrap());
+                }
+            }
+            assert!(serving.as_mut().poll(&mut cx).is_pending());
+            runtime.reactor.poll_budgeted(64).unwrap();
+            if inbound.is_none() {
+                inbound = node
+                    .ingress
+                    .pop_batch::<1>(WorkerId(0), cx.waker(), 1)
+                    .unwrap()[0]
+                    .take();
+            }
+            assert!(Instant::now() < until, "peer socket setup stalled");
+        }
+        assert_eq!(
+            tcp_nodelay(outbound.as_ref().unwrap().socket().as_ref()),
+            i32::from(enabled)
+        );
+        assert_eq!(
+            tcp_nodelay(&inbound.as_ref().unwrap().fd),
+            i32::from(enabled)
+        );
+        drop(connecting);
+        drop(outbound);
+        drop(inbound);
+        scope.cancel().unwrap();
+        loop {
+            runtime.reactor.poll_budgeted(64).unwrap();
+            if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
+                assert_eq!(result, Err(Error::Cancelled));
+                break;
+            }
+            assert!(Instant::now() < until, "peer cancellation stalled");
+        }
+        assert_eq!(
+            runtime
+                .admission
+                .used(crate::model::ResourceClass::Connection),
+            0
+        );
+    }
+}
+
+#[test]
+fn peer_tcp_nodelay_accept_failure_closes_owned_socket_and_false_preserves_policy() {
+    use std::io::Read;
+    let mut config = crate::test_support::cluster::config(false);
+    config.peer_tcp_nodelay = true;
+    let (app, _, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
+    let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    assert!(matches!(
+        app.peers.configure_accepted(socket.into()),
+        Err(Error::Io)
+    ));
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+
+    config.peer_tcp_nodelay = false;
+    let (app, _, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    socket.set_nodelay(true).unwrap();
+    let socket = app.peers.configure_accepted(socket.into()).unwrap();
+    assert_eq!(
+        tcp_nodelay(&socket),
+        1,
+        "false must not rewrite existing policy"
+    );
+}
+
+#[test]
+fn assembly_applies_configured_client_request_timeout() {
+    use crate::model::ResourceClass;
+    use std::sync::atomic::AtomicBool;
+    for timeout in [Duration::from_millis(250), Duration::from_secs(45)] {
+        let clock = uring_runtime::environment::SimulationClock::new(908);
+        let _environment = clock.environment(0).enter();
+        let mut config = crate::test_support::cluster::config(false);
+        config.request_timeout = timeout;
+        config.reader_stall_timeout = timeout;
+        let (app, runtime, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
+        let (server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let reservation = runtime
+            .admission
+            .reserve_connection(ResourceClass::IngressConnection)
+            .unwrap();
+        let connection = crate::http::from_reserved(server.into(), reservation).unwrap();
+        app.clients
+            .install_connection(connection, definition().id, Arc::new(AtomicBool::default()))
+            .unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        app.clients.poll_budgeted(&mut cx, 64).unwrap();
+        clock.advance(timeout - Duration::from_millis(1));
+        app.clients.poll_budgeted(&mut cx, 64).unwrap();
+        assert_eq!(app.clients.active_connections(), 1);
+        clock.advance(Duration::from_millis(2));
+        for _ in 0..64 {
+            runtime.reactor.poll_budgeted(64).unwrap();
+            app.clients.poll_budgeted(&mut cx, 64).unwrap();
+            if app.clients.active_connections() == 0 {
+                break;
+            }
+        }
+        assert_eq!(app.clients.active_connections(), 0);
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(&mut client, &mut byte).unwrap(), 0);
+    }
+}
+
+#[test]
+fn worker_requesters_share_configured_admission_and_production_metrics() {
+    use crate::telemetry::Event;
+    use crate::telemetry::Gauge;
+    let mut config = crate::test_support::cluster::config(false);
+    config.peer_admission = crate::peer::adaptive::Config {
+        total: 2,
+        per_peer: 1,
+    };
+    let node = Arc::new(
+        NodeState::with_peer_admission(vec![WorkerId(0), WorkerId(1)], 16, config.peer_admission)
+            .unwrap(),
+    );
+    let (first, _, _) = local_worker(&config, &node, 0);
+    let (second, _, _) = local_worker(&config, &node, 1);
+    let a = first.peer_requester.admission();
+    let b = second.peer_requester.admission();
+    let peer = NodeId("test-peer".into());
+    let permit = a.acquire(&peer).unwrap();
+    assert!(matches!(b.acquire(&peer), Err(Error::Overloaded)));
+    assert_eq!(node.metrics[1].1.count(Event::PeerAdmissionAccepted), 1);
+    assert_eq!(node.metrics[1].1.count(Event::PeerAdmissionRejected), 1);
+    assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 1);
+    assert_eq!(node.metrics[1].1.gauge(Gauge::PeerAdmissionLimit), 2);
+    permit.observe(crate::peer::adaptive::Outcome::PeerFailure);
+    assert!(!b.available(&peer));
+    drop(permit);
+    assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 0);
+}
+
+#[test]
+fn workers_share_configured_page_hedge_slots_and_bytes() {
+    let clock = uring_runtime::environment::SimulationClock::new(907);
+    let _environment = clock.environment(0).enter();
+    let mut config = crate::test_support::cluster::config(false);
+    config.page_hedge.slots = 1;
+    let node = Arc::new(NodeState::default());
+    let (first, _, _) = local_worker(&config, &node, 0);
+    let owner = first.coordinator.hedge_owner().unwrap();
+    let (mut second, _, _) = local_worker(&config, &node, 1);
+    let permit = owner.acquire().unwrap();
+    let wake = Arc::new(crate::test_support::WakeCounter::default());
+    let waker = std::task::Waker::from(wake.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(permit.delay(&mut cx).is_pending());
+    clock.advance(config.page_hedge.delay);
+    // No listener/checkpoint startup in this composition-only fixture. Alarms
+    // must still wake before unrelated unstarted services report unavailable.
+    assert_eq!(second.poll_services(&mut cx, 1), Err(Error::Unavailable));
+    assert!(wake.count() > 0);
+    assert!(permit.delay(&mut cx).is_ready());
+    assert!(matches!(
+        second.coordinator.hedge_owner().unwrap().acquire(),
+        Err(Error::Overloaded)
+    ));
+    drop(permit);
+    assert!(second.coordinator.hedge_owner().unwrap().acquire().is_ok());
+}
+
+#[test]
+fn distributed_peer_listener_recovers_from_queue_pressure() {
+    let mut config = crate::test_support::cluster::config(false);
+    config.limits.queue_entries = NonZeroUsize::new(8).unwrap();
+    let node = Arc::new(NodeState::default());
+    let (app, runtime, _) = local_worker(&config, &node, 0);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let scope = scope(Duration::from_secs(5)).unwrap();
+    let mut serving = app.peers.listen(address, &scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = Rc::new(uring_runtime::reactor::Descriptor::from(reader));
+    let mut pressure = Vec::new();
+    for _ in 0..8 {
+        let mut wait = runtime
+            .reactor
+            .readiness(reader.clone(), libc::POLLIN as u32, &scope);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        pressure.push(wait);
+    }
+    for _ in 0..32 {
+        assert!(serving.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(runtime.reactor.in_flight(), 8);
+    }
+    let _client = std::net::TcpStream::connect(address).unwrap();
+    drop(pressure);
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(serving.as_mut().poll(&mut cx).is_pending());
+        runtime.reactor.poll_budgeted(64).unwrap();
+        if let Some(accepted) = node
+            .ingress
+            .pop_batch::<1>(WorkerId(0), cx.waker(), 1)
+            .unwrap()[0]
+            .take()
+        {
+            assert!(matches!(accepted.kind, crate::runtime::ingress::Kind::Peer));
+            break;
+        }
+        assert!(Instant::now() < until, "distributed peer accept stalled");
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    scope.cancel().unwrap();
+    loop {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
+            assert_eq!(result, Err(Error::Cancelled));
+            break;
+        }
+        assert!(Instant::now() < until, "peer cancellation stalled");
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+}
+
+#[test]
+fn assembly_uses_node_metrics_for_sparse_worker_ids() {
+    use crate::telemetry::Event;
+    use crate::telemetry::Gauge;
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::new(vec![WorkerId(9), WorkerId(2)], 16).unwrap());
+    let (first, _, _) = local_worker(&config, &node, 9);
+    let (second, _, _) = local_worker(&config, &node, 2);
+    first.telemetry.metrics.record(Event::MemoryHit, 2).unwrap();
+    second
+        .telemetry
+        .metrics
+        .record(Event::MemoryHit, 3)
+        .unwrap();
+    let request = first.telemetry.metrics.request().unwrap();
+    assert_eq!(second.telemetry.metrics.count(Event::MemoryHit), 5);
+    assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 1);
+    drop(first);
+    drop(request);
+    assert_eq!(second.telemetry.metrics.count(Event::RequestError), 1);
+    assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 0);
+}
+
+fn drive_peer<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let watchdog = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+        assert!(Instant::now() < watchdog);
+        if reactor.poll_budgeted(128).unwrap() == 0 {
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    }
+}
+
+fn application() -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
+    let mut config = crate::test_support::cluster::config(false);
+    // One fixture represents both ends of eight nodes' sockets. Fund those
+    // ingress leases plus the reserved outbound/control partition explicitly,
+    // including the shared fixture's 16-connection neighbor cap.
+    config.limits.client_connections = NonZeroUsize::new(64).unwrap();
+    config.limits.header_bytes = NonZeroUsize::new(32 * 1024).unwrap();
+    config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();
+    // Use the exact worker progress floor rather than the generous fixture budget.
+    config.limits.request_context_bytes =
+        NonZeroUsize::new(protocol::MIN_REQUEST_CONTEXT_BYTES + 4 * 32 * 1024).unwrap();
+    partition_limits(&config.limits, 1, false).unwrap();
+    local_worker(&config, &Arc::new(NodeState::default()), 0)
+}
+
+#[test]
+fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
+    let (app, runtime, _engine) = application();
+    let io = app.peers.transport_io();
+    let admission = &runtime.admission;
+    let reactor = &runtime.reactor;
+    reactor.init().unwrap();
+    let baseline = admission.used(ResourceClass::RequestContext);
+    let signers = network(protocol::MAX_HOPS + 1);
+    let forwarding: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
+    let codec = protocol::SecurityCodec::new(admission.clone(), BufferPool::new(admission.clone()));
+    let crypto = CredentialCrypto::new(
+        Rc::new(crate::security::test_support::keys()),
+        admission.clone(),
+    );
+    let scope = scope(Duration::from_secs(30)).unwrap();
+    let cache = CacheId(crate::security::test_support::CACHE.into());
+    let metadata = vec![b'm'; 8192];
+    let authorization = vec![b'a'; 8192];
+    let etag = format!("\"{}\"", "v".repeat(8190));
+    let head = MessageHead {
+        start: StartLine::Request {
+            method: "HEAD".into(),
+            target: format!("/v2/objects/{}", "ab".repeat(32)),
+        },
+        headers: vec![
+            Header {
+                name: "Host".into(),
+                value: b"racer".to_vec(),
+            },
+            Header {
+                name: "If-Match".into(),
+                value: etag.as_bytes().to_vec(),
+            },
+            Header {
+                name: "Racer-Metadata".into(),
+                value: metadata.clone(),
+            },
+            Header {
+                name: "Authorization".into(),
+                value: authorization.clone(),
+            },
+        ],
+    };
+    let client_codec = Codec::new(32 * 1024);
+    let raw = client_codec.encode_head(&head).unwrap();
+    let parsed = RequestParser::new(32 * 1024)
+        .parse(&cache, client_codec.decode_head(&raw).unwrap().unwrap().0)
+        .unwrap();
+    let pin = parsed.kind.pin().unwrap().clone();
+    let object = parsed.origin.object.clone();
+    let attempt = AttemptId([2; 16]);
+    let origin = crypto.seal(&parsed.origin, attempt, &scope).unwrap();
+    assert_eq!(
+        origin.authorization.as_ref().unwrap().ciphertext.len(),
+        8208
+    );
+    let ciphertext = origin.authorization.as_ref().unwrap().ciphertext.clone();
+    let request = PeerRequest {
+        operation: PeerOperation::Metadata {
+            object: object.clone(),
+            selector: MetadataSelector::Pinned(pin.clone()),
+            mode: FetchMode::Acquire,
+        },
+        origin,
+        route: RouteBudget {
+            membership: MembershipVersion(1),
+            request: scope.request,
+            attempt,
+            destination: node(protocol::MAX_HOPS),
+            visited: vec![node(0)],
+            remaining_links: protocol::MAX_HOPS as u8,
+            remaining_attempts: 1,
+            deadline: scope.deadline,
+        },
+    };
+    let (mut request, binding) = forwarding[0].sign_request_to(request, &node(1)).unwrap();
+    assert!(
+        encode_envelope(&request.authentication, false, 0)
+            .unwrap()
+            .unique("racer-original")
+            .unwrap()
+            .unwrap()
+            .len()
+            > 32 * 1024
+    );
+    let mut bindings = vec![binding];
+    let mut sockets = Vec::new();
+    let mut destination = None;
+    for index in 1..=protocol::MAX_HOPS {
+        let (left, right) = UnixStream::pair().unwrap();
+        let left = crate::http::from_accepted(left.into(), admission).unwrap();
+        let right = crate::http::from_accepted(right.into(), admission).unwrap();
+        let next = node(index);
+        let (left, right) = drive_peer(reactor, async {
+            futures::try_join!(
+                connection::connect(io, left, signers[index - 1].clone(), &next, &scope),
+                connection::accept(io, right, signers[index].clone(), &scope)
+            )
+        })
+        .unwrap();
+        let head = encode_envelope(&request.authentication, false, 0).unwrap();
+        let (sent, received) = drive_peer(reactor, async {
+            futures::try_join!(
+                io.send_head(left, head, &scope),
+                io.receive_head(right, &scope)
+            )
+        })
+        .unwrap();
+        sockets.push((sent.connection, received.connection));
+        let (auth, length) = decode_envelope(received.value, false).unwrap();
+        assert_eq!(length, 0);
+        assert_eq!(auth.hops.len(), index - 1);
+        let decoded = codec.request(auth, &scope).unwrap();
+        assert_eq!(
+            decoded
+                .request
+                .origin
+                .authorization
+                .as_ref()
+                .unwrap()
+                .ciphertext,
+            ciphertext
+        );
+        let verified = forwarding[index].verify_request(decoded).unwrap();
+        bindings.push(verified.binding().clone());
+        drop(request);
+        if index == protocol::MAX_HOPS {
+            destination = Some(verified);
+            break;
+        }
+        let mut route = verified.request().route.clone();
+        route.visited.push(node(index));
+        route.remaining_links -= 1;
+        request = forwarding[index]
+            .append_request(verified, &node(index + 1), route)
+            .unwrap();
+    }
+    let destination = destination.unwrap();
+    let mut response = forwarding[protocol::MAX_HOPS]
+        .sign_response(
+            destination.binding(),
+            PeerResponse::Metadata(ObjectMetadata {
+                content_type: None,
+                version: ObjectVersion { object, etag: pin },
+                length: 42,
+                expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
+            }),
+        )
+        .unwrap();
+    let opened = crypto
+        .open_charged(
+            destination.into_signed().request.origin,
+            scope.request,
+            attempt,
+        )
+        .unwrap();
+    assert_eq!(opened.metadata.as_ref().unwrap().as_header(), metadata);
+    assert_eq!(
+        opened.authorization.as_ref().unwrap().expose_for_origin(),
+        authorization
+    );
+    drop(opened);
+    for index in (1..=protocol::MAX_HOPS).rev() {
+        let (left, right) = sockets.pop().unwrap();
+        let head = encode_envelope(&response.authentication, true, 0).unwrap();
+        let (sent, received) = drive_peer(reactor, async {
+            futures::try_join!(
+                io.send_head(right, head, &scope),
+                io.receive_head(left, &scope)
+            )
+        })
+        .unwrap();
+        let (auth, _) = decode_envelope(received.value, true).unwrap();
+        let verified = forwarding[index - 1]
+            .verify_response(
+                codec.response(auth, vec![], &scope).unwrap(),
+                &bindings[index - 1],
+            )
+            .unwrap();
+        assert_eq!(
+            verified.signed().authentication.hops.len(),
+            protocol::MAX_HOPS - index
+        );
+        let PeerResponse::Metadata(result) = verified.response() else {
+            panic!("expected metadata")
+        };
+        assert_eq!(result.version.etag.as_str(), etag);
+        let mut left = received.connection;
+        let mut right = sent.connection;
+        left.finish_exchange().unwrap();
+        right.finish_exchange().unwrap();
+        if index > 1 {
+            response = forwarding[index - 1]
+                .append_response(verified, &node(index - 2))
+                .unwrap();
+        }
+    }
+    drive_peer(reactor, reactor.drain()).unwrap();
+    io.reclaim_buffer();
+    assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+}
+
+#[test]
+fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
+    use uring_runtime::affinity::CpuLocation;
+    use uring_runtime::affinity::EffectiveTopology;
+    let mut config = crate::test_support::cluster::config(false);
+    config.max_threads = 4;
+    config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();
+    config.limits.connections_per_neighbor = NonZeroUsize::new(1).unwrap();
+    // Fund control progress on all three planned shards so only context bytes
+    // determine which worker counts pass the boundary assertions below.
+    config.limits.client_connections = NonZeroUsize::new(36).unwrap();
+    let floor = protocol::MIN_REQUEST_CONTEXT_BYTES + 4 * config.limits.header_bytes.get();
+    for budget in [128 * 1024, floor - 1, floor, 2 * floor - 1, 2 * floor] {
+        config.limits.request_context_bytes = NonZeroUsize::new(budget).unwrap();
+        assert_eq!(
+            partition_limits(&config.limits, 1, false).is_ok(),
+            budget >= floor
+        );
+        assert_eq!(
+            partition_limits(&config.limits, 2, false).is_ok(),
+            budget >= 2 * floor
+        );
+        let mut plan = AffinityPlan::from_topology(
+            &config,
+            EffectiveTopology {
+                cpus: (0..4)
+                    .map(|cpu| CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: None,
+                    })
+                    .collect(),
+                quota: None,
+                nics: vec![],
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plan.pairs.len(), 3);
+        let result = size_workers(&config.limits, &mut plan, false);
+        if budget < floor {
+            assert!(matches!(result, Err(Error::InvalidConfiguration)));
+        } else {
+            let limits = result.unwrap();
+            assert_eq!(plan.pairs.len(), (budget / floor).min(2));
+            assert!(limits.request_context_bytes.get() >= floor);
+        }
+    }
+}
+
+#[test]
+fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission() {
+    use std::io::Read;
+    use std::io::Write;
+    let (app, runtime, _engine) = application();
+    let io = app.peers.transport_io();
+    let admission = &runtime.admission;
+    let reactor = &runtime.reactor;
+    reactor.init().unwrap();
+    let baseline = admission.used(ResourceClass::RequestContext);
+    let scope = scope(Duration::from_secs(30)).unwrap();
+    let head = || MessageHead {
+        start: StartLine::Request {
+            method: "POST".into(),
+            target: protocol::REQUEST_TARGET.into(),
+        },
+        headers: vec![Header {
+            name: "x".into(),
+            value: vec![b'x'; protocol::MAX_ENVELOPE_HEAD],
+        }],
+    };
+    let (socket, _other) = UnixStream::pair().unwrap();
+    let conn = crate::http::from_accepted(socket.into(), admission).unwrap();
+    assert!(matches!(
+        drive_peer(reactor, io.send_head(conn, head(), &scope)),
+        Err(Error::HeaderTooLarge)
+    ));
+    let (socket, mut other) = UnixStream::pair().unwrap();
+    let conn = crate::http::from_accepted(socket.into(), admission).unwrap();
+    let writer = std::thread::spawn(move || {
+        let _ = other.write_all(&vec![b'x'; protocol::MAX_ENVELOPE_HEAD + 1]);
+    });
+    assert!(matches!(
+        drive_peer(reactor, io.receive_head(conn, &scope)),
+        Err(Error::HeaderTooLarge)
+    ));
+    writer.join().unwrap();
+    io.reclaim_buffer();
+    assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+    let response = || MessageHead {
+        start: StartLine::Response { status: 200 },
+        headers: vec![Header {
+            name: "content-length".into(),
+            value: b"0".to_vec(),
+        }],
+    };
+    let encoded = Codec::new(protocol::MAX_ENVELOPE_HEAD)
+        .encode_head(&response())
+        .unwrap();
+    let send_budget = protocol::MAX_ENVELOPE_HEAD + encoded.len();
+    // Send scratch uses the head cap, but staging uses the actual encoded size.
+    // Insufficient receive staging, send scratch, or send staging rejects before I/O.
+    for (send, available, succeeds) in [
+        (false, 4096 - 1, false),
+        (true, protocol::MAX_ENVELOPE_HEAD - 1, false),
+        (true, send_budget - 1, false),
+        (true, send_budget, true),
+    ] {
+        let held = admission
+            .reserve(
+                None,
+                ResourceClass::RequestContext,
+                admission.limits().request_context_bytes.get() - baseline - available,
+            )
+            .unwrap();
+        let baseline = admission.used(ResourceClass::RequestContext);
+        let (socket, mut other) = UnixStream::pair().unwrap();
+        other
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let conn = crate::http::from_accepted(socket.into(), admission).unwrap();
+        let operation = async {
+            if send {
+                io.send_head(conn, response(), &scope).await.map(|_| ())
+            } else {
+                io.receive_head(conn, &scope).await.map(|_| ())
+            }
+        };
+        if succeeds {
+            assert_eq!(drive_peer(reactor, operation), Ok(()));
+            let mut received = vec![0; encoded.len()];
+            other.read_exact(&mut received).unwrap();
+            assert_eq!(received, encoded);
+        } else {
+            let mut operation = std::pin::pin!(operation);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert_eq!(
+                operation.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Overloaded)),
+                "send={send}, available={available}"
+            );
+            // The failed admission must close without sending even a partial head.
+            let mut byte = [0];
+            assert_eq!(other.read(&mut byte).unwrap(), 0);
+        }
+        assert_eq!(reactor.in_flight(), 0);
+        io.reclaim_buffer();
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        drop(held);
+    }
+}
+
+mod cache_publication {
+    use super::*;
+    #[test]
+    fn publication_waits_for_every_worker_and_failed_acceptance_rolls_back_preparation() {
+        let config = crate::test_support::cluster::config(false);
+        let node = Arc::new(NodeState::default());
+        let (mut worker, _, _) = crate::app::tests::local_worker(&config, &node, 0);
+        let (mut second, _, _) = crate::app::tests::local_worker(&config, &node, 1);
+        let adapter = CachePublication {
+            node: node.clone(),
+            listeners: worker.prepared_listeners.clone(),
+            capacity: config.limits.metadata_entries.get(),
+        };
+        assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        worker.poll_cache_preparation(&mut cx).unwrap();
+        assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
+        assert!(worker.prepared_listeners.borrow().is_some());
+        second.poll_cache_preparation(&mut cx).unwrap();
+        drop(adapter.stage(&[]).unwrap());
+        assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
+        worker.poll_cache_preparation(&mut cx).unwrap();
+        for _ in 0..2 {
+            adapter.stage(&[]).unwrap().commit();
+            assert!(node.cache_cut.lock().unwrap().committed);
+        }
+    }
+    #[test]
+    fn capacity_failure_keeps_last_good_generation_and_uid_reuse_needs_no_tombstones() {
+        let config = crate::test_support::cluster::config(false);
+        let node = Arc::new(NodeState::default());
+        let definition = crate::app::tests::definition();
+        let store = SnapshotStore::new(config.cluster.clone(), node.publications.clone(), 16);
+        store
+            .publish(crate::app::tests::publication(
+                &config,
+                1,
+                vec![definition.clone()],
+            ))
+            .unwrap();
+        let mut adapter = CachePublication {
+            node: node.clone(),
+            listeners: Rc::new(RefCell::new(None)),
+            capacity: 0,
+        };
+        assert!(matches!(
+            adapter.stage(&[definition.clone()]),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(node.cache_cut.lock().unwrap().generation, 0);
+        adapter.capacity = 16;
+        assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
+        let previous = node.cache_cut.lock().unwrap().generation;
+        assert!(matches!(
+            adapter.stage(&[definition]),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(node.cache_cut.lock().unwrap().generation, previous + 1);
+        assert_eq!(
+            store.cursor().unwrap(),
+            Some(racer_control_wire::PublicationSequence(1))
+        );
+    }
+}
+
+mod lifecycle {
+    use super::*;
+    #[test]
+    fn membership_attestation_requires_fresh_matching_workers() {
+        use racer_control_wire::PublicationSequence;
+        let observations = Observations::default();
+        let now = uring_runtime::environment::now();
+        let resources = Resources {
+            workers_usable: true,
+            observed_until: Some(now + Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let mut diagnostic = crate::telemetry::MembershipDiagnostic {
+            accepted_sequence: 9,
+            accepted_membership: 7,
+            accepted_hash: [42; 32],
+            ..Default::default()
+        };
+        observations
+            .record_snapshot(WorkerId(0), resources, 2, Some(PublicationSequence(9)))
+            .unwrap();
+        observations
+            .record_snapshot(WorkerId(1), resources, 2, Some(PublicationSequence(8)))
+            .unwrap();
+        observations.membership_workers(&mut diagnostic, 2).unwrap();
+        assert_eq!(diagnostic.matching_workers, 1);
+        assert!(!diagnostic.fully_applied());
+        observations
+            .record_snapshot(WorkerId(1), resources, 2, Some(PublicationSequence(9)))
+            .unwrap();
+        observations.membership_workers(&mut diagnostic, 2).unwrap();
+        assert!(diagnostic.fully_applied());
+        diagnostic.pending_sequence = 10;
+        diagnostic.pending_membership = 8;
+        assert!(!diagnostic.fully_applied());
+        diagnostic.pending_sequence = 0;
+        observations
+            .record_snapshot(
+                WorkerId(1),
+                Resources {
+                    observed_until: Some(now),
+                    ..resources
+                },
+                2,
+                Some(PublicationSequence(9)),
+            )
+            .unwrap();
+        observations.membership_workers(&mut diagnostic, 2).unwrap();
+        assert!(!diagnostic.fully_applied());
+    }
+    #[test]
+    fn readiness_requires_every_worker_and_expires_without_progress() {
+        let observations = Observations::default();
+        let now = uring_runtime::environment::now();
+        let resources = Resources {
+            workers_usable: true,
+            storage_usable: true,
+            listeners_usable: true,
+            membership_usable: true,
+            admission_usable: true,
+            credentials_valid_until: Some(now + Duration::from_secs(10)),
+            observed_until: Some(now + Duration::from_secs(1)),
+        };
+        observations.record(WorkerId(0), resources, 2).unwrap();
+        assert!(!observations.health.ready());
+        observations.record(WorkerId(1), resources, 2).unwrap();
+        assert!(observations.health.ready());
+        assert_eq!(
+            observations.health.state_at(now + Duration::from_secs(2)),
+            Ok(State::Degraded)
+        );
+        observations
+            .record(
+                WorkerId(1),
+                Resources {
+                    storage_usable: false,
+                    ..resources
+                },
+                2,
+            )
+            .unwrap();
+        assert!(!observations.health.ready());
+        observations.health.transition(State::Draining).unwrap();
+        observations.record(WorkerId(1), resources, 2).unwrap();
+        assert_eq!(observations.health.state(), Ok(State::Draining));
+    }
+}
+
+mod dst;

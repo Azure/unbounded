@@ -1,3 +1,6 @@
+pub(super) use crate::peer::Requester;
+use crate::read::dispatch::WorkerMap;
+pub(super) use crate::read::fill::*;
 pub(super) use crate::error::Error;
 pub(super) use crate::error::Operation;
 pub(super) use crate::error::Result;
@@ -11,12 +14,10 @@ pub(super) use crate::model::OriginContext;
 pub(super) use crate::model::PAGE_BYTES;
 pub(super) use crate::model::PageId;
 pub(super) use crate::origin::Origin;
-pub(super) use crate::peer::Requester;
 pub(super) use crate::peer::protocol::FetchMode;
 pub(super) use crate::peer::protocol::Operation as PeerOperation;
 pub(super) use crate::peer::protocol::PeerResponse;
 pub(super) use crate::read::candidates::CandidatePolicy;
-pub(super) use crate::read::fill::*;
 pub(super) use crate::read::flight::AcquisitionBudget;
 pub(super) use crate::read::flight::AcquisitionEvent;
 pub(super) use crate::read::flight::Flights;
@@ -32,7 +33,9 @@ pub(super) use crate::store::StoreWriter;
 pub(super) use crate::telemetry::Event;
 pub(super) use crate::telemetry::Gauge;
 pub(super) use crate::telemetry::Metrics;
-pub(super) use std::{rc::Rc, sync::Arc};
+
+pub(super) use std::rc::Rc;
+pub(super) use std::sync::Arc;
 mod metadata {
     //! Metadata refresh, bootstrap publication, and independently timed callers.
     use super::*;
@@ -47,10 +50,9 @@ mod metadata {
 
     #[test]
     fn metadata_cohorts_refresh_zero_ttl_and_do_not_negative_cache_adapter_failure() {
-        use crate::{
-            model::MetadataSelector,
-            test_support::origin::{AdapterOrigin, RequestKind},
-        };
+        use crate::model::MetadataSelector;
+        use crate::test_support::origin::AdapterOrigin;
+        use crate::test_support::origin::RequestKind;
         for failure in [None, Some(502)] {
             let clock = uring_runtime::environment::SimulationClock::new_at(
                 71,
@@ -148,7 +150,8 @@ mod metadata {
         let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let mut f = fixture();
-        use crate::test_support::origin::{AdapterOrigin, RequestKind};
+        use crate::test_support::origin::AdapterOrigin;
+        use crate::test_support::origin::RequestKind;
         let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
         adapter.set_body(vec![1; 3]);
         adapter.reject_next(RequestKind::InitialGet, 403);
@@ -437,7 +440,8 @@ mod metadata {
     fn blocked_metadata_leader_and_follower_notify_without_spinning() {
         let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        use crate::{model::MetadataSelector, test_support::WakeCounter};
+        use crate::model::MetadataSelector;
+        use crate::test_support::WakeCounter;
         use std::task::Waker;
         for cancel_leader in [false, true] {
             let f = fixture();
@@ -529,11 +533,11 @@ mod metadata {
     fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
         let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        use crate::{
-            model::MetadataSelector, read::metadata::tests::assert_ingress_counts,
-            test_support::WakeCounter,
-        };
-        use futures::{Stream, stream::FuturesUnordered};
+        use crate::model::MetadataSelector;
+        use crate::read::metadata::tests::assert_ingress_counts;
+        use crate::test_support::WakeCounter;
+        use futures::Stream;
+        use futures::stream::FuturesUnordered;
         use std::task::Waker;
         for (budget_earlier, expire_leader) in [(false, false), (true, false), (false, true)] {
             let f = fixture();
@@ -778,7 +782,8 @@ mod pressure {
         let dependencies = &f.fill.dependencies;
         assert_eq!(dependencies.writer.queued_count(), 1);
         assert_eq!(dependencies.memory.evict_idle(usize::MAX), Ok(0));
-        use crate::test_support::origin::{AdapterOrigin, RequestKind};
+        use crate::test_support::origin::AdapterOrigin;
+        use crate::test_support::origin::RequestKind;
         let mut metadata = f.origin.metadata.clone();
         metadata.version.etag = StrongEtag::test_value("empty");
         metadata.length = 0;
@@ -1137,21 +1142,21 @@ pub(super) use crate::runtime::crypto::CryptoClient;
 pub(super) use crate::runtime::reactor::Reactor;
 pub(super) use crate::runtime::worker::CryptoRuntime;
 pub(super) use crate::runtime::worker::CryptoService;
-pub(super) use crate::runtime::worker::WorkerMap;
 pub(super) use crate::security::aead::PageCryptoEngine;
 pub(super) use crate::store::catalog::Index;
 pub(super) use crate::store::catalog::SegmentClock;
 pub(super) use crate::topology::Member;
 pub(super) use crate::topology::Membership;
 pub(super) use crate::topology::Placement;
-pub(super) use std::{
-    cell::{Cell, RefCell},
-    future::Future,
-    num::NonZeroU32,
-    pin::Pin,
-    task::{Context, Poll},
-    time::{Duration, Instant},
-};
+pub(super) use std::cell::Cell;
+pub(super) use std::cell::RefCell;
+pub(super) use std::future::Future;
+pub(super) use std::num::NonZeroU32;
+pub(super) use std::pin::Pin;
+pub(super) use std::task::Context;
+pub(super) use std::task::Poll;
+pub(super) use std::time::Duration;
+pub(super) use std::time::Instant;
 
 pub(super) use crate::test_support::NoPeers as NoPeer;
 pub(super) struct TestOrigin {
@@ -1259,7 +1264,10 @@ impl Fixture {
         Rc::new(Index::new(
             WorkerId(0),
             capacity,
-            crate::control::for_caches(self.keys.clone(), vec![self.context.object.cache.clone()]),
+            crate::control::for_caches(
+                self.keys.clone(),
+                vec![self.context.object.cache.clone()],
+            ),
         ))
     }
 
@@ -1277,7 +1285,8 @@ impl Fixture {
         capacity: usize,
         index: Rc<Index>,
     ) -> super::super::metadata::MetadataService {
-        use super::super::metadata::{MetadataDependencies, MetadataService};
+        use super::super::metadata::MetadataDependencies;
+        use super::super::metadata::MetadataService;
         MetadataService::new(
             self.fill.dependencies.candidates.clone(),
             origin,
@@ -1303,7 +1312,9 @@ impl Fixture {
         crate::read::dispatch::WorkerEndpoint,
         Arc<crate::control::PublishedState>,
     ) {
+        use racer_control_wire::Publication;
         use crate::control::Availability;
+        use racer_control_wire::CacheDefinition;
         use crate::control::PublishedState;
         use crate::control::SnapshotStore;
         use crate::memory::delivery::Delivery;
@@ -1312,9 +1323,8 @@ impl Fixture {
         use crate::read::metadata::MetadataDependencies;
         use crate::read::metadata::MetadataService;
         use crate::read::range_stream::RangeStreams;
-        use racer_control_wire::CacheDefinition;
-        use racer_control_wire::Publication;
-        use racer_control_wire::{PublicationSequence, SCHEMA_VERSION};
+        use racer_control_wire::PublicationSequence;
+        use racer_control_wire::SCHEMA_VERSION;
         let published = Arc::new(PublishedState::default());
         let availability = Rc::new(Availability::new(published.clone(), self.keys.clone()));
         let snapshots = Rc::new(SnapshotStore::new(
@@ -1330,12 +1340,7 @@ impl Fixture {
                 cluster: self.keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: membership.version,
-                members: membership
-                    .members()
-                    .iter()
-                    .cloned()
-                    .map(Into::into)
-                    .collect(),
+                members: membership.members().to_vec(),
                 caches: vec![CacheDefinition {
                     id: self.context.object.cache.clone(),
                     name: settings.name.into(),
@@ -1459,7 +1464,7 @@ fn fixture_with_caches(
         directory.join(format!("worker-{}-slab-0.dat", worker.0)),
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
-        crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
+        crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
     ));
     slabs
         .open_now()
@@ -1606,10 +1611,11 @@ fn adapter_client(
     f: &Fixture,
     adapter: &crate::test_support::origin::AdapterOrigin,
 ) -> Rc<crate::origin::OriginClient> {
+    use racer_control_wire::Publication;
     use crate::control::PublishedState;
     use crate::control::SnapshotStore;
-    use racer_control_wire::Publication;
-    use racer_control_wire::{PublicationSequence, SCHEMA_VERSION};
+    use racer_control_wire::PublicationSequence;
+    use racer_control_wire::SCHEMA_VERSION;
     let snapshots = Rc::new(SnapshotStore::new(
         f.keys.cluster().clone(),
         Arc::new(PublishedState::default()),
@@ -1623,13 +1629,7 @@ fn adapter_client(
             cluster: f.keys.cluster().clone(),
             sequence: PublicationSequence(1),
             membership_version: f.membership.version,
-            members: f
-                .membership
-                .members()
-                .iter()
-                .cloned()
-                .map(Into::into)
-                .collect(),
+            members: f.membership.members().to_vec(),
             caches: vec![racer_control_wire::CacheDefinition {
                 id: f.context.object.cache.clone(),
                 name: "fixture".into(),
@@ -1737,7 +1737,8 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
 
 #[test]
 fn completed_fill_waits_release_shared_cancellation_capacity() {
-    use futures::{StreamExt, stream::FuturesUnordered};
+    use futures::StreamExt;
+    use futures::stream::FuturesUnordered;
     let mut f = fixture();
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
@@ -2207,10 +2208,9 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     // The public pinned coordinator may still know the immutable descriptor.
     // Its range body must nevertheless miss the retired completed page flight.
     {
-        use crate::{
-            client::{ClientRequest, ReadKind},
-            model::ByteRange,
-        };
+        use crate::client::ClientRequest;
+        use crate::client::ReadKind;
+        use crate::model::ByteRange;
         let (coordinator, mut endpoint, _) = f.read_graph(
             Rc::new(Fill::new(f.fill.dependencies.clone())),
             &f.membership,
@@ -2722,7 +2722,7 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
                     .read(&f.reactor, location.extent, staging, lease, &f.scope),
             )
             .unwrap();
-            let parsed = crate::store::format::parse(&stored, location.extent).unwrap();
+            let parsed = crate::store::parse(&stored, location.extent).unwrap();
             let offset = if corrupt_tag {
                 parsed.ciphertext.end - 1
             } else {
@@ -3026,7 +3026,8 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
 fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    use futures::{StreamExt, stream::FuturesUnordered};
+    use futures::StreamExt;
+    use futures::stream::FuturesUnordered;
     let mut f = fixture();
     for _ in 0..1100 {
         let mut requests = FuturesUnordered::new();

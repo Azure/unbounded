@@ -2,31 +2,47 @@
 //!
 //! The coordinator keeps every owner frozen through publication, then explicitly
 //! finishes each snapshot even on failure. Write/rename provides no fsync durability.
-use super::{
-    catalog::{Index, IndexSnapshot, IndexedPage, RecordLocation},
-    format::Decoder,
-};
-use crate::error::{Error, Operation, Result, cooperative_turn};
-use crate::{
-    model::{
-        CacheId, CacheKey, KeyId, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag,
-        VersionMetadata, WorkerId,
-    },
-    runtime::collections::{HashMap, HashSet},
-};
-use page_alloc::{
-    Alignment, Extent, Generation, SegmentId, SegmentSnapshot, SegmentState, Segments,
-};
-use sha2::{Digest, Sha256};
-use std::{
-    cell::Cell,
-    fs::{self, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use super::Decoder;
+use super::catalog::Index;
+use super::catalog::IndexSnapshot;
+use super::catalog::IndexedPage;
+use super::catalog::RecordLocation;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::error::cooperative_turn;
+use crate::model::CacheId;
+use crate::model::CacheKey;
+use crate::model::KeyId;
+use crate::model::ObjectId;
+use crate::model::ObjectVersion;
+use crate::model::PageId;
+use crate::model::PageNumber;
+use crate::model::StrongEtag;
+use crate::model::VersionMetadata;
+use crate::model::WorkerId;
+use crate::runtime::collections::HashMap;
+use crate::runtime::collections::HashSet;
+use page_alloc::Alignment;
+use page_alloc::Extent;
+use page_alloc::Generation;
+use page_alloc::SegmentId;
+use page_alloc::SegmentSnapshot;
+use page_alloc::SegmentState;
+use page_alloc::Segments;
+use sha2::Digest;
+use sha2::Sha256;
+use std::cell::Cell;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -223,7 +239,8 @@ impl Checkpointer {
             if bytes.len() > budget / 2 {
                 return Err(Error::Overloaded);
             }
-            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
             let dir = reactor
                 .file_open(
                     None,
@@ -603,7 +620,7 @@ impl CheckpointGeometry {
             .alignment()?
             .extent(
                 0,
-                crate::model::PAGE_BYTES as usize + 16 + super::format::MAX_HEADER_BYTES,
+                crate::model::PAGE_BYTES as usize + 16 + super::MAX_HEADER_BYTES,
             )?
             .length() as u64;
         let pages = self.segment_bytes / record;

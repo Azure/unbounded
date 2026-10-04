@@ -1,8 +1,7 @@
-//! Stable local page-to-worker dispatch, independent of cluster placement.
+//! Worker-local execution and bounded crypto-thread composition.
 //!
 //! Construct worker-local service graphs on their selected threads. Rc-owned graphs
 //! must never cross threads; only bounded commands and completion-safe leases do.
-//! Drain flights before changing the worker map; no live remapping is implied.
 //!
 //! Each worker is an I/O shard. The I/O thread owns the service graph,
 //! flights, storage shard, and admission. Page AEAD runs on a shared crypto thread
@@ -10,31 +9,38 @@
 //! until completion even after cancellation. Queue wakeups and completion capacity
 //! must permit progress when both threads share one CPU.
 
-use super::{
-    admission::AdmissionPolicy,
-    affinity::AffinityPlan,
-    crypto::{self, CryptoClient, CryptoPort, IoCryptoPort},
-    deadline::{Cancellation, Deadline, RequestScope},
-    reactor::Reactor,
-};
-use crate::{
-    error::{Error, Operation, Result},
-    model::{Limits, ObjectId, PageId, RequestId, WorkerId},
-};
-use sha2::{Digest, Sha256};
+use super::admission::AdmissionPolicy;
+use super::affinity::AffinityPlan;
+use super::crypto;
+use super::crypto::CryptoClient;
+use super::crypto::CryptoPort;
+use super::crypto::IoCryptoPort;
+use super::deadline::Cancellation;
+use super::deadline::Deadline;
+use super::deadline::RequestScope;
+use super::reactor::Reactor;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::Limits;
+use crate::model::RequestId;
+use crate::model::WorkerId;
 #[cfg(test)]
 use std::time::Instant;
-use std::{
-    collections::{HashMap, HashSet},
-    marker::PhantomData,
-    num::NonZeroUsize,
-    ops::Deref,
-    rc::Rc,
-    sync::{Arc, Mutex},
-    task::{Context, Poll, Wake, Waker},
-    thread,
-    time::Duration,
-};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::marker::PhantomData;
+use std::num::NonZeroUsize;
+use std::ops::Deref;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+use std::thread;
+use std::time::Duration;
 
 const WORK_BUDGET: usize = 64;
 const IDLE_WAIT: Duration = Duration::from_millis(1);
@@ -59,11 +65,14 @@ pub struct CryptoRuntime {
 use super::affinity::WorkerPair;
 #[cfg(test)]
 use uring_runtime::affinity::current_cpus;
-use uring_runtime::group::{Factory, FailureReporter, Group, Helper, Lane, Plan, Service};
+use uring_runtime::group::Factory;
+use uring_runtime::group::FailureReporter;
+use uring_runtime::group::Group;
+use uring_runtime::group::Helper;
+use uring_runtime::group::Lane;
+use uring_runtime::group::Plan;
+use uring_runtime::group::Service;
 use uring_runtime::reactor::ReactorWake;
-pub struct WorkerMap {
-    workers: Vec<WorkerId>,
-}
 pub struct WorkerGroup<'a> {
     plan: AffinityPlan,
     runtime: Group<RequestScope>,
@@ -149,41 +158,6 @@ pub trait CryptoService {
     fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
 }
 
-impl WorkerMap {
-    /// Canonical worker order makes assignment independent of discovery order.
-    /// Changing this set requires draining all flights first.
-    pub fn new(mut workers: Vec<WorkerId>) -> Result<Self> {
-        workers.sort_by_key(|worker| worker.0);
-        if workers.is_empty() || workers.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(Error::InvalidConfiguration);
-        }
-        Ok(Self { workers })
-    }
-
-    /// Same owner as this object's page zero, without needing an ETag first.
-    pub fn metadata_owner(&self, object: &ObjectId) -> Result<WorkerId> {
-        self.select(object, 0)
-    }
-    pub fn owner(&self, page: &PageId) -> Result<WorkerId> {
-        self.select(&page.version.object, page.number.0)
-    }
-
-    fn select(&self, object: &ObjectId, page: u64) -> Result<WorkerId> {
-        if self.workers.is_empty() {
-            return Err(Error::InvalidConfiguration);
-        }
-        let mut hash = Sha256::new();
-        hash.update(b"racer.local-worker.v1\0");
-        hash.update((object.cache.0.len() as u64).to_be_bytes());
-        hash.update(object.cache.0.as_bytes());
-        hash.update(object.key.0);
-        hash.update(page.to_be_bytes());
-        let digest = hash.finalize();
-        let index = u64::from_be_bytes(digest[..8].try_into().expect("eight digest bytes"))
-            % self.workers.len() as u64;
-        Ok(self.workers[index as usize])
-    }
-}
 impl<'a> WorkerGroup<'a> {
     pub fn new(plan: AffinityPlan) -> Self {
         Self {
@@ -661,14 +635,17 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
 #[cfg(test)]
 mod shared_tests {
     use super::*;
-    use crate::{
-        memory::BufferPool,
-        model::{ResourceClass, *},
-        runtime::crypto::{CryptoInput, CryptoOutput},
-        security::aead::PageCryptoEngine,
-    };
-    use racer_identity::{KeyPurpose, Keyring};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use crate::memory::BufferPool;
+    use crate::model::ResourceClass;
+    use crate::model::*;
+    use crate::runtime::crypto::CryptoInput;
+    use crate::runtime::crypto::CryptoOutput;
+    use crate::security::aead::PageCryptoEngine;
+    use racer_identity::KeyPurpose;
+    use racer_identity::Keyring;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     #[derive(Default)]
     struct Observed {
@@ -1370,36 +1347,6 @@ mod tests {
         send::<CryptoRuntime>();
     }
 
-    #[test]
-    fn stable_assignment_ignores_etag_and_worker_input_order() {
-        use crate::model::{CacheId, CacheKey, ObjectVersion, PageNumber, StrongEtag};
-        let map = WorkerMap::new(vec![WorkerId(9), WorkerId(3), WorkerId(1)]).unwrap();
-        let ordered = WorkerMap::new(vec![WorkerId(1), WorkerId(3), WorkerId(9)]).unwrap();
-        let object = ObjectId {
-            cache: CacheId("cache".into()),
-            key: CacheKey([7; 32]),
-        };
-        let mut page = PageId {
-            version: ObjectVersion {
-                object: object.clone(),
-                etag: StrongEtag::test_value("a"),
-            },
-            number: PageNumber(0),
-        };
-        assert_eq!(map.owner(&page), map.metadata_owner(&object));
-        for number in 0..100 {
-            page.number = PageNumber(number);
-            let owner = map.owner(&page);
-            assert_eq!(owner, ordered.owner(&page));
-            page.version.etag = StrongEtag::test_value("different");
-            assert_eq!(owner, map.owner(&page));
-        }
-        assert!(WorkerMap::new(vec![]).is_err());
-        assert!(WorkerMap::new(vec![WorkerId(1), WorkerId(1)]).is_err());
-        // SHA-256 encoding vector, independent of std's randomized hasher.
-        assert_eq!(map.metadata_owner(&object).unwrap(), WorkerId(1));
-    }
-
     #[derive(Clone)]
     struct TestFactory {
         events: Arc<Mutex<Vec<&'static str>>>,
@@ -1787,7 +1734,9 @@ mod tests {
 
     #[test]
     fn pending_start_backend_failure_notifies_group_before_deadline() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
         struct BackendFactory {
             sibling_started: Arc<AtomicBool>,
             sibling_drained: Arc<AtomicBool>,
@@ -1907,7 +1856,9 @@ mod tests {
 
     #[test]
     fn pending_drain_backend_failure_notifies_without_releasing_ownership() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
         struct PendingFactory {
             release: Arc<AtomicBool>,
             fences: Arc<AtomicUsize>,

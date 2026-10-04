@@ -23,15 +23,19 @@ use crate::runtime::deadline::RequestScope;
 use crate::security::connection::SignedHead;
 use crate::security::forwarding::ForwardedHead;
 use crate::topology::RouteBudget;
-use base64::{Engine, engine::general_purpose::STANDARD};
-use http1::{Header, MessageHead, StartLine};
-use std::{
-    rc::Rc,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use http1::Header;
+use http1::MessageHead;
+use http1::StartLine;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-pub use crate::security::forwarding::{VerifiedRequest, VerifiedResponse};
+pub use crate::security::forwarding::VerifiedRequest;
+pub use crate::security::forwarding::VerifiedResponse;
 
 pub enum FetchMode {
     CopyOnly,
@@ -1028,7 +1032,9 @@ fn version(head: &MessageHead) -> Result<ObjectVersion> {
     })
 }
 pub(crate) fn demand(head: &MessageHead) -> Result<super::subscriptions::Demand> {
-    use super::subscriptions::{Demand, MAX_DEMAND_INTERVALS, PageInterval};
+    use super::subscriptions::Demand;
+    use super::subscriptions::MAX_DEMAND_INTERVALS;
+    use super::subscriptions::PageInterval;
     let encoded = bytes(head, "racer-demand")?;
     if encoded.len() % 16 != 0 || encoded.len() / 16 > MAX_DEMAND_INTERVALS {
         return Err(Error::InvalidRequest);
@@ -1079,7 +1085,8 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
+    use std::time::UNIX_EPOCH;
     #[test]
     fn received_page_keeps_one_charge_and_rejects_foreign_reservations() {
         use crate::security::forwarding::ForwardedHead;

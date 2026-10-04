@@ -1,13 +1,13 @@
 //! Monotonic deadlines and bounded cancellation notification registrations.
-use crate::{
-    error::{Error, Result},
-    model::RequestId,
-};
-use std::{
-    sync::{Arc, Mutex, OnceLock},
-    time::Instant,
-};
-pub use uring_runtime::deadline::{CancellationRegistration, Deadline};
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::RequestId;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::Instant;
+pub use uring_runtime::deadline::CancellationRegistration;
+pub use uring_runtime::deadline::Deadline;
 
 /// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]
@@ -218,11 +218,11 @@ impl rest_client::Scope for RequestScope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::atomic::{AtomicUsize, Ordering},
-        task::{Wake, Waker},
-        time::Duration,
-    };
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Wake;
+    use std::task::Waker;
+    use std::time::Duration;
     #[test]
     fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
         use rest_client::Scope;

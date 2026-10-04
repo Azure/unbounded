@@ -1,30 +1,51 @@
 //! Independent client v2 and origin v1 wire checks.
 //! These exercise production HTTP/parser/writer components over real Unix sockets;
 //! they do not substitute for an Application/Coordinator end-to-end deployment.
-use http1::{Header, MessageHead, StartLine};
-use racer_dataplane::{
-    client::{ClientRequest, ReadKind, RequestParser, response::Responses},
-    error::{Error, Result},
-    http::{Codec, ConnectionLease, HttpIo},
-    memory::{delivery::Delivery, new_pipe_pool},
-    model::{
-        ByteRange, CacheId, CacheKey, ExpiresAt, Limits, ObjectId, ObjectMetadata, ObjectVersion,
-        PageId, PageNumber, RequestId, StrongEtag,
-    },
-    origin::{validate_bootstrap, validate_metadata, validate_page},
-    read::ReadResponse,
-    runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
-};
-use std::{
-    future::Future,
-    io::{Read, Write},
-    num::NonZeroUsize,
-    os::unix::net::UnixStream,
-    rc::Rc,
-    task::{Context, Poll},
-    thread,
-    time::{Duration, Instant, UNIX_EPOCH},
-};
+use http1::Header;
+use http1::MessageHead;
+use http1::StartLine;
+use racer_dataplane::client::ClientRequest;
+use racer_dataplane::client::ReadKind;
+use racer_dataplane::client::RequestParser;
+use racer_dataplane::client::response::Responses;
+use racer_dataplane::error::Error;
+use racer_dataplane::error::Result;
+use racer_dataplane::http::Codec;
+use racer_dataplane::http::ConnectionLease;
+use racer_dataplane::http::HttpIo;
+use racer_dataplane::memory::delivery::Delivery;
+use racer_dataplane::memory::new_pipe_pool;
+use racer_dataplane::model::ByteRange;
+use racer_dataplane::model::CacheId;
+use racer_dataplane::model::CacheKey;
+use racer_dataplane::model::ExpiresAt;
+use racer_dataplane::model::Limits;
+use racer_dataplane::model::ObjectId;
+use racer_dataplane::model::ObjectMetadata;
+use racer_dataplane::model::ObjectVersion;
+use racer_dataplane::model::PageId;
+use racer_dataplane::model::PageNumber;
+use racer_dataplane::model::RequestId;
+use racer_dataplane::model::StrongEtag;
+use racer_dataplane::origin::validate_bootstrap;
+use racer_dataplane::origin::validate_metadata;
+use racer_dataplane::origin::validate_page;
+use racer_dataplane::read::ReadResponse;
+use racer_dataplane::runtime::admission::AdmissionPolicy;
+use racer_dataplane::runtime::deadline::RequestScope;
+use racer_dataplane::runtime::reactor::Reactor;
+use std::future::Future;
+use std::io::Read;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::os::unix::net::UnixStream;
+use std::rc::Rc;
+use std::task::Context;
+use std::task::Poll;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::UNIX_EPOCH;
 use uring_runtime::reactor::IoBuffer;
 
 const LIMIT: usize = 32768;
@@ -804,12 +825,13 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
 mod sdk {
     use super::*;
     use racer_dataplane::model::ResourceClass;
-    use std::{
-        fs,
-        os::{fd::AsRawFd, unix::net::UnixListener},
-        path::PathBuf,
-        process::{Child, Command, Stdio},
-    };
+    use std::fs;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::process::Child;
+    use std::process::Command;
+    use std::process::Stdio;
 
     struct Process(Child);
     impl Drop for Process {

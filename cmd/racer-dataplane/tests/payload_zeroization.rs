@@ -1,21 +1,27 @@
 //! Observe the allocation at deallocation, before the system allocator can reuse it.
-use racer_dataplane::{
-    config::Config,
-    memory::BufferPool,
-    model::{
-        CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
-        ResourceClass, StrongEtag,
-    },
-    runtime::admission::AdmissionPolicy,
-};
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    rc::Rc,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
-    },
-};
+use racer_dataplane::config::Config;
+use racer_dataplane::memory::BufferPool;
+use racer_dataplane::model::CacheId;
+use racer_dataplane::model::CacheKey;
+use racer_dataplane::model::KeyId;
+use racer_dataplane::model::Nonce;
+use racer_dataplane::model::ObjectId;
+use racer_dataplane::model::ObjectVersion;
+use racer_dataplane::model::PageEnvelope;
+use racer_dataplane::model::PageId;
+use racer_dataplane::model::PageNumber;
+use racer_dataplane::model::ResourceClass;
+use racer_dataplane::model::StrongEtag;
+use racer_dataplane::runtime::admission::AdmissionPolicy;
+use std::alloc::GlobalAlloc;
+use std::alloc::Layout;
+use std::alloc::System;
+use std::rc::Rc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 struct InspectAllocator;
 static WATCH: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
@@ -176,20 +182,24 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
 fn failed_crypto_output_is_scrubbed(config: &Config) {
     use base64::Engine;
     use racer_crypto::aead;
-    use racer_dataplane::{
-        model::{ClusterId, NodeId, RequestId, WorkerId},
-        runtime::{
-            crypto::{CryptoId, CryptoInput, pair},
-            deadline::RequestScope,
-        },
-        security::aead::{PageCryptoEngine, page_aad},
-    };
-    use racer_identity::{KeyEpochs, KeyPurpose, Keyring};
-    use std::{
-        sync::Arc,
-        task::{Context, Poll},
-        time::{Duration, Instant},
-    };
+    use racer_dataplane::model::ClusterId;
+    use racer_dataplane::model::NodeId;
+    use racer_dataplane::model::RequestId;
+    use racer_dataplane::model::WorkerId;
+    use racer_dataplane::runtime::crypto::CryptoId;
+    use racer_dataplane::runtime::crypto::CryptoInput;
+    use racer_dataplane::runtime::crypto::pair;
+    use racer_dataplane::runtime::deadline::RequestScope;
+    use racer_dataplane::security::aead::PageCryptoEngine;
+    use racer_dataplane::security::aead::page_aad;
+    use racer_identity::KeyEpochs;
+    use racer_identity::KeyPurpose;
+    use racer_identity::Keyring;
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Duration;
+    use std::time::Instant;
 
     let keys = Keyring::new(
         ClusterId("11111111-1111-4111-8111-111111111111".into()),

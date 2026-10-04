@@ -144,7 +144,8 @@ impl From<uring_runtime::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Operation};
+    use super::Error;
+    use super::Operation;
 
     #[test]
     fn operation_preserves_local_borrows_and_racer_results() {

@@ -14,10 +14,9 @@ use racer_dataplane::control::*;
 use racer_dataplane::model::ClusterId;
 use racer_dataplane::model::RequestId;
 use racer_dataplane::runtime::deadline::RequestScope;
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::rc::Rc;
+use std::time::Duration;
+use std::time::Instant;
 
 #[test]
 #[ignore = "run RACER_RUST_INTEROP=1 go test ./internal/racer -run '^TestRustKeyringInterop$' -timeout=5m under the required external timeout"]
