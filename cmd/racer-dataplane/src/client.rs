@@ -5,6 +5,7 @@
 pub mod listener;
 pub mod response;
 
+use self::response::Responses;
 use crate::runtime::HashSet;
 use crate::error::Error;
 use crate::error::Result;
@@ -17,6 +18,12 @@ use crate::model::OpaqueMetadata;
 use crate::model::OriginContext;
 use crate::model::PAGE_BYTES;
 use crate::model::StrongEtag;
+use crate::http::ConnectionLease;
+use crate::read::ReadResponse;
+
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
+use std::time::Duration;
 
 use crate::http::MAX_HEAD_BYTES;
 use crate::model::MAX_FIELD_BYTES;
@@ -255,6 +262,80 @@ fn validate_opaque(value: &[u8]) -> Result<()> {
         return Err(Error::InvalidRequest.into());
     }
     Ok(())
+}
+
+/// Validate a completed read before committing success headers. Keep this boundary
+/// independent of acquisition so canceled or inconsistent successes fail closed.
+#[allow(clippy::too_many_arguments)]
+async fn handle_read_result(
+    connection: ConnectionLease,
+    kind: &ReadKind,
+    object: &ObjectId,
+    read_result: Result<ReadResponse>,
+    responses: &Responses,
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    scope: &RequestScope,
+    observation: &mut crate::telemetry::RequestMetrics,
+    timeout: Duration,
+) -> Result<Option<ConnectionLease>> {
+    let response = match read_result {
+        Ok(response) => response,
+        Err(error) => {
+            admission.policy().observer().record(
+                crate::telemetry::Failure::new(
+                    crate::telemetry::Stage::ClientRead,
+                    error,
+                )
+                .request(scope),
+            );
+            let error = if error == Error::NotFound && kind.pin().is_some() {
+                Error::VersionUnavailable
+            } else {
+                error
+            };
+            observation.fail(error);
+            responses.send_error(connection, error, scope).await?;
+            return Ok(None);
+        }
+    };
+    if let Err(error) = scope.check() {
+        observation.fail(error);
+        responses.send_error(connection, error, scope).await?;
+        return Ok(None);
+    }
+    if &response.metadata.version.object != object {
+        responses
+            .send_error(connection, Error::BadGateway, scope)
+            .await?;
+        return Ok(None);
+    }
+    if let Err(error) = responses.validate(kind, &response) {
+        observation.fail(error);
+        responses.send_error(connection, error, scope).await?;
+        return Ok(None);
+    }
+    let socket = connection.socket();
+    let mut send = if matches!(kind, ReadKind::Subscription { .. }) {
+        responses.send_subscription(connection, response, scope, observation, timeout)
+    } else {
+        responses.send_observed(connection, response, scope, observation)
+    };
+    let result = std::future::poll_fn(|cx| {
+        if socket.peer_disconnected() {
+            let _ = scope.cancel();
+        }
+        send.as_mut().poll(cx)
+    })
+    .await;
+    drop(send);
+    drop(socket);
+    match result {
+        Ok(connection) => Ok(Some(connection)),
+        Err(error) => {
+            observation.fail(error);
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
