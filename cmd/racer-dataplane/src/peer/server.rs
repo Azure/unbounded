@@ -468,7 +468,7 @@ impl PeerServer {
                             // Once the success head is sent, any body failure closes
                             // both dirty connections. Never append an error envelope.
                             let mut observation = self.metrics.opaque_relay_body(length);
-                            let result = crate::http::relay_body(
+                            let result = super::transport::relay_body(
                                 &self.io,
                                 downstream,
                                 connection,
