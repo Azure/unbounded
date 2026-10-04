@@ -971,6 +971,50 @@ pub(crate) mod tests {
         use racer_control_wire::RailMapping;
 
         #[test]
+        fn wire_member_adapter_preserves_publication_fields_at_validation() {
+            let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../internal/racer/wire/testdata/publication.json"
+            )))
+            .unwrap();
+            let membership = Membership::validate(
+                publication.membership_version,
+                publication
+                    .members
+                    .iter()
+                    .cloned()
+                    .map(Member::from)
+                    .collect(),
+            )
+            .unwrap();
+            for wire in &publication.members {
+                let local = membership.member(&wire.node).unwrap();
+                assert_eq!(local.node, wire.node);
+                assert_eq!(local.shares, wire.shares);
+                assert_eq!(local.peer_endpoint, wire.peer_endpoint);
+                assert_eq!(local.site, wire.site);
+                let mut expected = wire.rails.clone();
+                expected.sort_unstable_by(|a, b| {
+                    (a.rail, &a.device, a.port).cmp(&(b.rail, &b.device, b.port))
+                });
+                assert_eq!(local.rails, expected);
+            }
+            let roundtrip = racer_control_wire::Publication {
+                members: membership
+                    .members()
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+                ..publication.clone()
+            };
+            assert_eq!(
+                racer_control_wire::canonical_content(&roundtrip).unwrap(),
+                racer_control_wire::canonical_content(&publication).unwrap()
+            );
+        }
+
+        #[test]
         fn site_label_grammar_and_retained_bytes() {
             for site in ["", "A", "Site_1.west-2", &"a".repeat(63)] {
                 let mut node = member(0, 1);
