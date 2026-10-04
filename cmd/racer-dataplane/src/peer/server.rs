@@ -151,7 +151,7 @@ impl PeerServer {
     ) -> Self {
         let pipes = Rc::new(crate::http::new_pipe_pool(admission.clone()));
         let transfers = Rc::new(super::transport::Transfers::new(
-            Rc::new(crate::http::HttpPool::new(
+            Rc::new(crate::http::new_pool(
                 io.reactor().clone(),
                 admission.clone(),
                 1,
@@ -468,10 +468,14 @@ impl PeerServer {
                             // Once the success head is sent, any body failure closes
                             // both dirty connections. Never append an error envelope.
                             let mut observation = self.metrics.opaque_relay_body(length);
-                            let result = self
-                                .io
-                                .relay_body(downstream, connection, pipe, &request_scope)
-                                .await;
+                            let result = crate::http::relay_body(
+                                &self.io,
+                                downstream,
+                                connection,
+                                pipe,
+                                &request_scope,
+                            )
+                            .await;
                             if result.is_ok() {
                                 if let Some(observation) = &mut observation {
                                     observation.complete();
@@ -1011,7 +1015,6 @@ mod tests {
     #[test]
     fn materialized_transit_fin_and_parent_cancel_fence_head_and_body() {
         use crate::http::Codec;
-        use crate::http::HttpIo;
         use crate::runtime::Reactor;
         use std::net::Shutdown;
         use std::net::TcpListener;
@@ -1024,12 +1027,8 @@ mod tests {
                 )));
                 let reactor = Rc::new(Reactor::new(admission.clone()));
                 reactor.init().unwrap();
-                let io = HttpIo::with_admission(
-                    reactor.clone(),
-                    Codec::new(4096),
-                    admission.clone(),
-                    4096,
-                );
+                let io =
+                    crate::http::new_io(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
                 let parent = listener_scope();
                 let exchange = RequestScope::new(
                     RequestId([7; 16]),
@@ -1129,14 +1128,13 @@ mod tests {
     #[test]
     fn materialized_transit_success_fences_watch_before_keepalive() {
         use crate::http::Codec;
-        use crate::http::HttpIo;
         use crate::runtime::Reactor;
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         reactor.init().unwrap();
-        let io = HttpIo::with_admission(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
+        let io = crate::http::new_io(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
         let parent = listener_scope();
         let (socket, mut peer) = UnixStream::pair().unwrap();
         let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
@@ -1448,7 +1446,6 @@ mod tests {
     fn backpressured_handshake_responses_keep_fixed_deadline_and_fenced_admission() {
         use crate::http::Codec;
         use crate::http::ConnectionLease;
-        use crate::http::HttpIo;
         use crate::memory::BufferPool;
         use crate::peer::protocol::SecurityCodec;
         use crate::runtime::Reactor;
@@ -1529,7 +1526,7 @@ mod tests {
                 let reactor = Rc::new(Reactor::new(admission.clone()));
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
-                let io = Rc::new(HttpIo::with_admission(
+                let io = Rc::new(crate::http::new_io(
                     reactor.clone(),
                     Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD),
                     admission.clone(),

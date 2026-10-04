@@ -163,8 +163,6 @@ pub mod origin {
     //! The client, HTTP parser, reactor, and plaintext admission remain production code.
     use crate::control::SnapshotStore;
     use crate::http::Codec;
-    use crate::http::HttpIo;
-    use crate::http::HttpPool;
     use crate::memory::BufferPool;
     use crate::model::ObjectMetadata;
     use crate::model::PAGE_BYTES;
@@ -307,8 +305,8 @@ pub mod origin {
             Rc::new(
                 OriginClient::new(
                     snapshots,
-                    Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8)),
-                    Rc::new(HttpIo::with_admission(
+                    Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 8)),
+                    Rc::new(crate::http::new_io(
                         reactor,
                         Codec::new(32768),
                         admission.clone(),

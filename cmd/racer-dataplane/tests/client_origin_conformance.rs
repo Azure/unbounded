@@ -82,7 +82,7 @@ impl Rig {
             relay_transfers: n,
         })));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let io = Rc::new(HttpIo::with_admission(
+        let io = Rc::new(racer_dataplane::http::new_io(
             reactor.clone(),
             Codec::new(LIMIT),
             admission.clone(),

@@ -322,7 +322,6 @@ fn search_view_consumes_ingress_without_changing_signed_route() {
 #[test]
 fn server_authenticates_before_copy_only_service_and_signs_failures() {
     use crate::http::Codec;
-    use crate::http::HttpIo;
     use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
     use crate::topology::Member;
@@ -391,7 +390,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         network.clone(),
     ));
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = Rc::new(HttpIo::with_admission(
+    let io = Rc::new(crate::http::new_io(
         reactor,
         Codec::new(65536),
         admission.clone(),
@@ -751,8 +750,6 @@ fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
 #[test]
 fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     use crate::http::Codec;
-    use crate::http::HttpIo;
-    use crate::http::HttpPool;
     use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
     use crate::topology::Member;
@@ -765,13 +762,13 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         crate::test_support::cluster::config(false).limits,
     )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = Rc::new(HttpIo::with_admission(
+    let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(protocol::MAX_ENVELOPE_HEAD),
         admission.clone(),
         0,
     ));
-    let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
+    let pool = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2));
     let transfers = Rc::new(transport::Transfers::new(
         pool,
         io,
@@ -1098,7 +1095,6 @@ fn signed_tcp_case(case: &str) {
 #[test]
 fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     use crate::http::Codec;
-    use crate::http::HttpIo;
     use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
     use crate::topology::Paths;
@@ -1146,7 +1142,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
-        let io = Rc::new(HttpIo::with_admission(
+        let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             Codec::new(protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
@@ -1295,21 +1291,19 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
 fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::http::Codec;
     use crate::http::Endpoint;
-    use crate::http::HttpIo;
-    use crate::http::HttpPool;
     use crate::model::ExpiresAt;
     use crate::model::ObjectMetadata;
     use crate::model::PageEnvelope;
-    use crate::peer::protocol;
-    use crate::rdma;
-    use crate::rdma::TransportPlan;
-    use crate::runtime::Reactor;
     use crate::peer::forwarding::ForwardedHead;
+    use crate::peer::protocol;
+    use crate::runtime::Reactor;
     use crate::topology::Member;
     use crate::topology::Membership;
-    use crate::topology::Route;
+    use crate::topology::rails;
     use racer_control_wire::RailId;
     use racer_control_wire::RailMapping;
+    use crate::topology::rails::TransportPlan;
+    use crate::topology::Route;
     use std::net::TcpListener;
     use std::task::Context;
     use std::task::Poll;
@@ -1317,13 +1311,13 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         crate::test_support::cluster::config(false).limits,
     )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = Rc::new(HttpIo::with_admission(
+    let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(64 * 1024),
         admission.clone(),
         crate::model::PAGE_BYTES + 16,
     ));
-    let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
+    let pool = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1));
     let signers = signers();
     let transfers = transport::Transfers::new(
         pool,
@@ -1630,7 +1624,7 @@ mod established_sessions {
             )));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             reactor.init().unwrap();
-            let io = Rc::new(HttpIo::with_admission(
+            let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),

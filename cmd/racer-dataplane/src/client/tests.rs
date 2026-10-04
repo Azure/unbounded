@@ -2,13 +2,12 @@
 use super::*;
 use super::listener::*;
 use super::response::Responses;
-use crate::http::HttpIo;
+use racer_control_wire::CacheDefinition;
 use crate::admission::AdmissionPolicy;
 use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;
 use crate::test_support::ReadWorker;
 use crate::test_support::origin::RequestKind;
-use racer_control_wire::CacheDefinition;
 use std::time::Instant;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -671,7 +670,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     let _environment = sim.enter();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits())));
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = Rc::new(HttpIo::with_admission(
+    let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(32768),
         admission.clone(),
@@ -853,7 +852,7 @@ impl Fixture {
         let root = Root::new();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let io = Rc::new(HttpIo::with_admission(
+        let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             Codec::new(32768),
             admission.clone(),

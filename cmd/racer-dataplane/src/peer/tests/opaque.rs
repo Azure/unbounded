@@ -1064,7 +1064,7 @@ impl RelayFixture {
             .iter()
             .zip(&admissions)
             .map(|(r, a)| {
-                Rc::new(HttpIo::with_admission(
+                Rc::new(crate::http::new_io(
                     r.clone(),
                     Codec::new(protocol::MAX_ENVELOPE_HEAD),
                     a.clone(),
@@ -1106,7 +1106,7 @@ impl RelayFixture {
             .unwrap(),
         );
         let auth = Rc::new(Forwarding::new(signers[1].clone()));
-        let pool = Rc::new(HttpPool::new(
+        let pool = Rc::new(crate::http::new_pool(
             reactors[1].clone(),
             admissions[1].clone(),
             limit,

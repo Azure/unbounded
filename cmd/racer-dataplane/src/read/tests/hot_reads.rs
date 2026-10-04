@@ -67,7 +67,7 @@ mod duplex_release {
                 f.reactor.clone(),
                 Duration::from_secs(30),
             ));
-            let io = Rc::new(HttpIo::with_admission(
+            let io = Rc::new(crate::http::new_io(
                 f.reactor.clone(),
                 Codec::new(32768),
                 admission.clone(),
@@ -250,7 +250,7 @@ mod duplex_release {
             f.reactor.clone(),
             Duration::from_secs(30),
         ));
-        let io = Rc::new(HttpIo::with_admission(
+        let io = Rc::new(crate::http::new_io(
             f.reactor.clone(),
             Codec::new(32768),
             admission.clone(),
@@ -563,6 +563,27 @@ mod duplex_release {
         endpoint.uninstall().unwrap();
     }
 }
+use super::fill::*;
+use crate::peer::forwarding::Forwarding;
+use crate::client::ClientRequest;
+use crate::client::ReadKind;
+use crate::control::PublishedState;
+use crate::http::Codec;
+use crate::http::Delivery;
+use crate::http::new_pipe_pool;
+use crate::model::ByteRange;
+use crate::model::MembershipVersion;
+use crate::peer::PeerNetwork;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::forwarding::VerifiedResponse;
+use crate::peer::server::LocalPageService;
+use crate::peer::server::PeerServer;
+use crate::read::Coordinator;
+use crate::peer::protocol::Signatures;
+use crate::security::test_support::network;
+use crate::security::test_support::node;
+use crate::topology::LinkHealth;
+use crate::topology::Paths;
 
 struct Link {
     client: Rc<Requester>,
@@ -1171,14 +1192,14 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                 admission.clone(),
                 BufferPool::new(admission.clone()),
             ));
-            let io = Rc::new(HttpIo::with_admission(
+            let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
                 PAGE_BYTES + 16,
             ));
             let transfers = Rc::new(crate::peer::transport::Transfers::new(
-                Rc::new(crate::http::HttpPool::new(reactor, admission.clone(), 4)),
+                Rc::new(crate::http::new_pool(reactor, admission.clone(), 4)),
                 io,
                 None,
                 admission,
@@ -1231,7 +1252,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
         BufferPool::new(admission.clone()),
     ));
     let server = PeerServer::for_test(
-        Rc::new(HttpIo::with_admission(
+        Rc::new(crate::http::new_io(
             fixtures[2].reactor.clone(),
             Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),

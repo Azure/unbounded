@@ -24,7 +24,7 @@ fn setup() -> (
         crate::test_support::cluster::config(false).limits,
     )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = HttpIo::with_admission(
+    let io = new_io(
         reactor.clone(),
         Codec::new(4096),
         admission.clone(),
@@ -83,7 +83,7 @@ fn small_peer_send_stages_actual_head_under_context_pressure() {
     let (admission, reactor, _, scope) = setup();
     reactor.init().unwrap();
     let limit = crate::peer::protocol::MAX_ENVELOPE_HEAD;
-    let io = HttpIo::with_admission(reactor.clone(), Codec::new(limit), admission.clone(), 16);
+    let io = new_io(reactor.clone(), Codec::new(limit), admission.clone(), 16);
     let baseline = admission.used(ResourceClass::RequestContext);
     let held = admission
         .reserve(
@@ -162,7 +162,7 @@ fn decoded_field_storage_is_admitted_before_parser_allocations() {
 #[test]
 fn client_constructor_streams_beyond_page_cap_with_bounded_staging() {
     let (admission, reactor, _, scope) = setup();
-    let io = HttpIo::for_clients(reactor.clone(), admission.clone()).capped(4096);
+    let io = client_io(reactor.clone(), admission.clone()).capped(4096);
     reactor.init().unwrap();
     let baseline = admission.used(ResourceClass::RequestContext);
     let (socket, mut peer) = UnixStream::pair().unwrap();
@@ -242,13 +242,13 @@ fn client_constructor_streams_beyond_page_cap_with_bounded_staging() {
 fn client_send_limit_does_not_relax_receive_or_page_transport_limits() {
     let (admission, reactor, _, scope) = setup();
     let page_limit = crate::model::PAGE_BYTES + 16;
-    let page_io = HttpIo::with_admission(
+    let page_io = new_io(
         reactor.clone(),
         Codec::new(4096),
         admission.clone(),
         page_limit,
     );
-    let client_io = HttpIo::for_clients(reactor.clone(), admission.clone()).capped(4096);
+    let client_io = client_io(reactor.clone(), admission.clone()).capped(4096);
     for io in [&page_io, &client_io] {
         assert_eq!(
             io.framing(&response(page_limit as usize), false),
@@ -289,13 +289,13 @@ fn client_send_limit_does_not_relax_receive_or_page_transport_limits() {
 #[test]
 fn endpoint_caps_accept_exact_boundary_and_reject_one_extra_byte() {
     let (admission, reactor, _, scope) = setup();
-    let peer = HttpIo::with_admission(
+    let peer = new_io(
         reactor.clone(),
         Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
         admission.clone(),
         16,
     );
-    let client = HttpIo::for_clients(reactor.clone(), admission.clone());
+    let client = client_io(reactor.clone(), admission.clone());
     let origin = peer.capped(crate::http::MAX_HEAD_BYTES);
     for (io, limit) in [
         (&client, admission.policy().limits().header_bytes.get()),
@@ -430,7 +430,7 @@ fn tcp_pool_reuses_only_finished_exchanges_and_enforces_capacity() {
     let (admission, reactor, io, scope) = setup();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-    let pool = HttpPool::new(reactor.clone(), admission.clone(), 1);
+    let pool = new_pool(reactor.clone(), admission.clone(), 1);
     let thread = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         for _ in 0..2 {
@@ -553,7 +553,7 @@ fn unix_pool_reconnects_after_unread_response_and_bounds_endpoints() {
     ));
     let listener = UnixListener::bind(&path).unwrap();
     let endpoint = Endpoint::Unix(path.clone());
-    let pool = HttpPool::with_limits(reactor.clone(), admission.clone(), 1, 1, Duration::ZERO);
+    let pool = pool_with_limits(reactor.clone(), admission.clone(), 1, 1, Duration::ZERO);
     let thread = std::thread::spawn(move || {
         for _ in 0..2 {
             let (mut socket, _) = listener.accept().unwrap();
@@ -656,7 +656,7 @@ fn dropped_connect_retains_slot_until_fd_fence_then_releases_quota() {
     let (admission, reactor, _, scope) = setup();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-    let pool = HttpPool::new(reactor.clone(), admission.clone(), 1);
+    let pool = new_pool(reactor.clone(), admission.clone(), 1);
     let mut future = pool.checkout(&endpoint, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -677,7 +677,7 @@ fn dropped_checkout_and_destroyed_pool_release_quota_only_after_connect_fence() 
         let baseline = admission.used(ResourceClass::RequestContext);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let pool = HttpPool::new(reactor.clone(), admission.clone(), 1);
+        let pool = new_pool(reactor.clone(), admission.clone(), 1);
         let mut future = pool.checkout(&endpoint, &scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -730,7 +730,7 @@ fn canceled_receive_retains_resources_until_completion_and_reports_canceled() {
 fn raw_request_head_errors_return_fenced_socket_for_empty_400_and_431() {
     for oversized in [false, true] {
         let (admission, reactor, _, scope) = setup();
-        let io = HttpIo::with_admission(
+        let io = new_io(
             reactor.clone(),
             Codec::new(32 * 1024),
             admission.clone(),

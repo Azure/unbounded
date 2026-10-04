@@ -134,8 +134,8 @@ fn client() -> (
     };
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
-    let io = Rc::new(HttpIo::with_admission(
+    let pool = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2));
+    let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(32768),
         admission.clone(),
@@ -1102,7 +1102,7 @@ fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
         let _ = stream.write_all(response.as_bytes());
     });
     let (mut client, admission, reactor) = client();
-    client.io = Rc::new(HttpIo::with_admission(
+    client.io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(65536),
         admission.clone(),

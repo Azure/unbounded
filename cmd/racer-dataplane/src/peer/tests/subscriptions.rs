@@ -1,6 +1,5 @@
 use super::*;
 use crate::http::Codec;
-use crate::http::HttpIo;
 use crate::memory::page::CiphertextCopy;
 use crate::model::ExpiresAt;
 use crate::model::ObjectMetadata;
@@ -171,7 +170,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
             reject,
         });
         let server = server::PeerServer::for_test(
-            Rc::new(HttpIo::with_admission(
+            Rc::new(crate::http::new_io(
                 Rc::new(Reactor::new(admission.clone())),
                 Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
@@ -311,7 +310,7 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
         network,
     ));
     let server = server::PeerServer::for_test(
-        Rc::new(HttpIo::with_admission(
+        Rc::new(crate::http::new_io(
             Rc::new(Reactor::new(admission.clone())),
             Codec::new(protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),

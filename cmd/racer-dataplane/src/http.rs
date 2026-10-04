@@ -12,14 +12,13 @@ use flow_control::pipe::MAX_PIPE_BYTES;
 use flow_control::pipe::PipeLease;
 use http1::MessageHead;
 use std::cell::RefCell;
-use std::ops::Deref;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
-use uring_runtime::Descriptor;
-use uring_runtime::IoBuffer;
-use uring_runtime::SocketAddress;
+use uring_runtime::reactor::Descriptor;
+use uring_runtime::reactor::IoBuffer;
+use uring_runtime::reactor::SocketAddress;
 
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
 pub struct RacerOpaque;
@@ -29,7 +28,8 @@ impl http1::Opaque for RacerOpaque {
 pub type Codec = http1::Codec<RacerOpaque>;
 pub type ConnectionLease = http1::connection::ConnectionLease<HttpContext>;
 pub type OwnedBuffer = http1::connection::OwnedBuffer<HttpContext>;
-pub type HeadCompletion<T> = http1::connection::HeadCompletion<HttpContext, T>;
+pub type HttpIo = http1::connection::HttpIo<HttpContext>;
+pub type HttpPool = http1::connection::HttpPool<HttpContext>;
 
 /// HTTP's application context, separate from the generic quota authority.
 pub struct HttpContext(pub(crate) Rc<flow_control::Quotas<AdmissionPolicy>>);
@@ -49,7 +49,7 @@ impl http1::connection::Context for HttpContext {
             .map_err(Into::into)
     }
     fn outbound_slot(&self) -> Result<ConnectionReservation> {
-        reserve_connection(&self.0, ResourceClass::OutboundConnection)
+        self.0.reserve_connection(ResourceClass::OutboundConnection)
     }
     fn stopped(&self) -> bool {
         self.0.is_stopped()
@@ -120,7 +120,7 @@ pub fn from_accepted(
 ) -> Result<ConnectionLease> {
     from_reserved(
         fd,
-        reserve_connection(&admission, ResourceClass::IngressConnection)?,
+        admission.reserve_connection(ResourceClass::IngressConnection)?,
     )
 }
 pub(crate) fn from_reserved(
@@ -140,50 +140,31 @@ pub(crate) fn install_session(
     connection.begin_io();
     Ok(())
 }
-pub struct HttpIo(http1::connection::HttpIo<HttpContext>);
-impl Deref for HttpIo {
-    type Target = http1::connection::HttpIo<HttpContext>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub fn new_io(
+    reactor: Rc<Reactor>,
+    codec: Codec,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    body_limit: u64,
+) -> HttpIo {
+    HttpIo::new(
+        reactor,
+        codec,
+        Rc::new(HttpContext(admission)),
+        body_limit,
+        body_limit,
+    )
 }
-impl HttpIo {
-    pub fn with_admission(
-        reactor: Rc<Reactor>,
-        codec: Codec,
-        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-        body_limit: u64,
-    ) -> Self {
-        Self(http1::connection::HttpIo::new(
-            reactor,
-            codec,
-            Rc::new(HttpContext(admission)),
-            body_limit,
-            body_limit,
-        ))
-    }
-    pub fn for_clients(
-        reactor: Rc<Reactor>,
-        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    ) -> Self {
-        Self(http1::connection::HttpIo::new(
-            reactor,
-            Codec::new(
-                admission
-                    .policy()
-                    .limits()
-                    .header_bytes
-                    .get()
-                    .min(MAX_HEAD_BYTES),
-            ),
-            Rc::new(HttpContext(admission)),
-            crate::model::PAGE_BYTES + 16,
-            i64::MAX as u64,
-        ))
-    }
-    pub fn capped(&self, limit: usize) -> Self {
-        Self(self.0.capped(limit))
-    }
+pub fn client_io(
+    reactor: Rc<Reactor>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+) -> HttpIo {
+    HttpIo::new(
+        reactor,
+        Codec::new(admission.policy().limits().header_bytes.get().min(MAX_HEAD_BYTES)),
+        Rc::new(HttpContext(admission)),
+        crate::model::PAGE_BYTES + 16,
+        i64::MAX as u64,
+    )
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub enum Endpoint {
@@ -220,86 +201,57 @@ impl http1::connection::Endpoint<Error> for Endpoint {
         }
     }
 }
-pub struct HttpPool {
-    core: http1::connection::HttpPool<HttpContext>,
-    #[cfg(test)]
+pub fn new_pool(
     reactor: Rc<Reactor>,
-    #[cfg(test)]
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    per_endpoint: usize,
+) -> HttpPool {
+    pool_with_limits(
+        reactor,
+        admission,
+        per_endpoint,
+        256,
+        Duration::from_secs(30),
+    )
 }
-impl Deref for HttpPool {
-    type Target = http1::connection::HttpPool<HttpContext>;
-    fn deref(&self) -> &Self::Target {
-        &self.core
-    }
-}
-impl HttpPool {
-    pub fn new(
-        reactor: Rc<Reactor>,
-        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-        per_endpoint: usize,
-    ) -> Self {
-        Self::with_limits(
-            reactor,
-            admission,
+pub fn pool_with_limits(
+    reactor: Rc<Reactor>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    per_endpoint: usize,
+    max_endpoints: usize,
+    idle_timeout: Duration,
+) -> HttpPool {
+    HttpPool::new(
+        reactor.clone(),
+        Rc::new(HttpContext(admission.clone())),
+        http1::connection::PoolConfig {
             per_endpoint,
-            256,
-            Duration::from_secs(30),
-        )
-    }
-    pub fn with_limits(
-        reactor: Rc<Reactor>,
-        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-        per_endpoint: usize,
-        max_endpoints: usize,
-        idle_timeout: Duration,
-    ) -> Self {
-        Self {
-            core: http1::connection::HttpPool::new(
-                reactor.clone(),
-                Rc::new(HttpContext(admission.clone())),
-                http1::connection::PoolConfig {
-                    per_endpoint,
-                    secondary_cap: per_endpoint,
-                    max_endpoints,
-                    idle_timeout,
-                    waiter_cap: admission.policy().limits().queue_entries.get(),
-                    tcp_nodelay: false,
-                },
-            ),
-            #[cfg(test)]
-            reactor,
-            #[cfg(test)]
-            admission,
-        }
-    }
-    pub fn with_origin_limit(mut self, limit: usize) -> Self {
-        self.core.config_mut().secondary_cap = limit;
-        self
-    }
-    pub fn with_peer_tcp_nodelay(mut self, enabled: bool) -> Self {
-        self.core.config_mut().tcp_nodelay = enabled;
-        self
-    }
-    pub(crate) fn checkout_peer<'a>(
-        &'a self,
-        endpoint: &'a Endpoint,
-        relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
-        peer: Option<std::sync::Arc<crate::peer::Permit>>,
-        failure: Option<Rc<std::cell::Cell<bool>>>,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ConnectionLease> {
-        self.core.checkout_with_state(
-            endpoint,
-            State {
-                relay_reservation: relay,
-                peer_admission: peer,
-                connect_failure: failure,
-                ..State::default()
-            },
-            scope,
-        )
-    }
+            secondary_cap: per_endpoint,
+            max_endpoints,
+            idle_timeout,
+            waiter_cap: admission.policy().limits().queue_entries.get(),
+            tcp_nodelay: false,
+        },
+    )
+}
+pub(crate) fn checkout_peer<'a>(
+    pool: &'a HttpPool,
+    endpoint: &'a Endpoint,
+    relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
+    peer: Option<std::sync::Arc<crate::peer::Permit>>,
+    failure: Option<Rc<std::cell::Cell<bool>>>,
+    scope: &'a RequestScope,
+) -> Operation<'a, ConnectionLease> {
+    pool.checkout_with_state(
+        endpoint,
+        State {
+            relay_reservation: relay,
+            peer_admission: peer,
+            connect_failure: failure,
+            ..State::default()
+        },
+        scope,
+    )
 }
 fn peer_connect_failure(errno: Option<i32>) -> bool {
     matches!(
@@ -324,193 +276,190 @@ fn unsupported(error: &std::io::Error) -> bool {
         Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
     )
 }
-impl HttpIo {
-    pub(crate) async fn relay_body(
-        &self,
-        source: ConnectionLease,
-        destination: ConnectionLease,
-        pipe: Option<PipeLease<AdmissionPolicy>>,
-        scope: &RequestScope,
-    ) -> Result<ConnectionLease> {
-        if source.receive_remaining() != destination.send_remaining()
-            || source.receive_remaining().is_none()
-        {
-            return Err(Error::InvalidRequest);
-        }
-        if source.receive_remaining() == Some(0) {
-            let mut source = source;
-            let mut destination = destination;
-            finish(&mut source, &mut destination)?;
-            destination.state_mut().relay_reservation = None;
-            return Ok(destination);
-        }
-        #[cfg(test)]
-        let copied = destination.state().relay_fallback;
-        #[cfg(test)]
-        let fallback_at = destination.state().relay_fallback_at;
-        #[cfg(not(test))]
-        let copied = false;
-        let state = Rc::new(RefCell::new(Transit {
-            source,
-            destination,
-            pipe: pipe.ok_or(Error::InvalidRequest)?,
-            fallback: None,
-            pending: 0..0,
-            copied,
-            #[cfg(test)]
-            fallback_at,
-        }));
-        loop {
-            scope.check()?;
-            let wait = self.relay_chunk(&state)?;
-            {
-                let s = state.borrow();
-                if s.source.receive_remaining() == Some(0)
-                    && s.destination.send_remaining() == Some(0)
-                {
-                    break;
-                }
-            }
-            self.wait_relay_progress(state.clone(), wait, scope).await?;
-        }
-        scope.check()?;
-        let mut state = Rc::try_unwrap(state)
-            .map_err(|_| Error::Internal)?
-            .into_inner();
-        finish(&mut state.source, &mut state.destination)?;
-        state.destination.state_mut().relay_reservation = None;
-        Ok(state.destination)
+pub(crate) async fn relay_body(
+    io: &HttpIo,
+    source: ConnectionLease,
+    destination: ConnectionLease,
+    pipe: Option<PipeLease<AdmissionPolicy>>,
+    scope: &RequestScope,
+) -> Result<ConnectionLease> {
+    if source.receive_remaining() != destination.send_remaining()
+        || source.receive_remaining().is_none()
+    {
+        return Err(Error::InvalidRequest);
     }
-    fn relay_chunk(&self, state: &RefCell<Transit>) -> Result<Option<(Rc<Descriptor>, i16)>> {
-        let mut state = state.borrow_mut();
-        let s = &mut *state;
-        if s.destination.socket().peer_read_closed() {
-            return Err(Error::Io);
-        }
-        let mut wait = None;
-        for _ in 0..32 {
-            let remaining = s.source.receive_remaining().ok_or(Error::InvalidRequest)? as usize;
-            if s.pending.is_empty() && s.pipe.buffered() == 0 && remaining == 0 {
+    if source.receive_remaining() == Some(0) {
+        let mut source = source;
+        let mut destination = destination;
+        finish(&mut source, &mut destination)?;
+        destination.state_mut().relay_reservation = None;
+        return Ok(destination);
+    }
+    #[cfg(test)]
+    let copied = destination.state().relay_fallback;
+    #[cfg(test)]
+    let fallback_at = destination.state().relay_fallback_at;
+    #[cfg(not(test))]
+    let copied = false;
+    let state = Rc::new(RefCell::new(Transit {
+        source,
+        destination,
+        pipe: pipe.ok_or(Error::InvalidRequest)?,
+        fallback: None,
+        pending: 0..0,
+        copied,
+        #[cfg(test)]
+        fallback_at,
+    }));
+    loop {
+        scope.check()?;
+        let wait = relay_chunk(io, &state)?;
+        {
+            let s = state.borrow();
+            if s.source.receive_remaining() == Some(0) && s.destination.send_remaining() == Some(0)
+            {
                 break;
             }
-            let writing = !s.pending.is_empty() || s.pipe.buffered() != 0;
-            let result = if !s.pending.is_empty() {
-                s.destination
-                    .socket()
-                    .try_send(&s.fallback.as_ref().unwrap().bytes()?[s.pending.clone()])
-            } else if s.pipe.buffered() != 0 {
-                #[cfg(test)]
-                if s.fallback_at
-                    .is_some_and(|threshold| remaining <= threshold)
-                    && !s.copied
-                {
-                    s.copied = unsupported(&std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-                }
-                if s.copied {
-                    if s.fallback.is_none() {
-                        s.fallback = Some(self.buffer(MAX_PIPE_BYTES)?);
-                    }
-                    let n = s
-                        .pipe
-                        .try_read(s.fallback.as_mut().unwrap().bytes_mut()?)
-                        .map_err(|_| Error::Io)?;
-                    s.pending = 0..n;
-                    continue;
-                }
-                s.pipe.try_splice_connection(&s.destination.socket())
-            } else if let Some((ahead, range)) = s.source.take_read_ahead() {
-                let count = remaining.min(range.len()).min(MAX_PIPE_BYTES);
-                if s.fallback.is_none() {
-                    s.fallback = Some(self.buffer(MAX_PIPE_BYTES)?);
-                }
-                s.fallback.as_mut().unwrap().bytes_mut()?[..count]
-                    .copy_from_slice(&ahead.bytes()?[range.start..range.start + count]);
-                if range.len() > count {
-                    // Preserve all excess so finish_exchange still rejects pipelining.
-                    s.source
-                        .restore_read_ahead(ahead, range.start + count..range.end)?;
-                }
-                s.pending = 0..count;
-                s.source.consume_received(count)?;
-                continue;
-            } else if s.copied {
-                if s.fallback.is_none() {
-                    s.fallback = Some(self.buffer(MAX_PIPE_BYTES)?);
-                }
-                s.source.socket().try_recv(
-                    &mut s.fallback.as_mut().unwrap().bytes_mut()?[..remaining.min(MAX_PIPE_BYTES)],
-                )
-            } else {
-                s.pipe.try_splice_from(&s.source.socket(), remaining)
-            };
-            match result {
-                Ok(0) => return Err(Error::Io),
-                Ok(n) => {
-                    if writing {
-                        if !s.pending.is_empty() {
-                            s.pending.start += n;
-                        }
-                        s.destination.consume_sent(n)?;
-                    } else {
-                        s.source.consume_received(n)?;
-                        if s.copied {
-                            s.pending = 0..n;
-                        }
-                    }
-                }
-                Err(error) if unsupported(&error) => s.copied = true,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    wait = Some((
-                        if writing {
-                            s.destination.socket()
-                        } else {
-                            s.source.socket()
-                        },
-                        if writing { libc::POLLOUT } else { libc::POLLIN },
-                    ));
-                    break;
-                }
-                Err(_) => return Err(Error::Io),
-            }
         }
-        Ok(wait)
+        wait_relay_progress(io, state.clone(), wait, scope).await?;
     }
-    async fn wait_relay_progress(
-        &self,
-        state: Rc<RefCell<Transit>>,
-        wait: Option<(Rc<Descriptor>, i16)>,
-        scope: &RequestScope,
-    ) -> Result<()> {
-        if let Some((fd, interest)) = wait {
-            let mut tick = scope.clone();
-            tick.deadline.0 = tick
-                .deadline
-                .0
-                .min(uring_runtime::environment::now() + Duration::from_millis(10));
-            match self
-                .reactor()
-                .readiness_with_lease(fd, interest as u32, state.clone(), &tick)
-                .await
+    scope.check()?;
+    let mut state = Rc::try_unwrap(state)
+        .map_err(|_| Error::Internal)?
+        .into_inner();
+    finish(&mut state.source, &mut state.destination)?;
+    state.destination.state_mut().relay_reservation = None;
+    Ok(state.destination)
+}
+fn relay_chunk(io: &HttpIo, state: &RefCell<Transit>) -> Result<Option<(Rc<Descriptor>, i16)>> {
+    let mut state = state.borrow_mut();
+    let s = &mut *state;
+    if s.destination.socket().peer_read_closed() {
+        return Err(Error::Io);
+    }
+    let mut wait = None;
+    for _ in 0..32 {
+        let remaining = s.source.receive_remaining().ok_or(Error::InvalidRequest)? as usize;
+        if s.pending.is_empty() && s.pipe.buffered() == 0 && remaining == 0 {
+            break;
+        }
+        let writing = !s.pending.is_empty() || s.pipe.buffered() != 0;
+        let result = if !s.pending.is_empty() {
+            s.destination
+                .socket()
+                .try_send(&s.fallback.as_ref().unwrap().bytes()?[s.pending.clone()])
+        } else if s.pipe.buffered() != 0 {
+            #[cfg(test)]
+            if s.fallback_at
+                .is_some_and(|threshold| remaining <= threshold)
+                && !s.copied
             {
-                Ok(_) | Err(Error::DeadlineExceeded) => (),
-                Err(error) => return Err(error),
+                s.copied = unsupported(&std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
             }
-        } else {
-            let mut yielded = false;
-            std::future::poll_fn(|cx| {
-                if yielded {
-                    Poll::Ready(())
-                } else {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+            if s.copied {
+                if s.fallback.is_none() {
+                    s.fallback = Some(io.buffer(MAX_PIPE_BYTES)?);
                 }
-            })
-            .await;
+                let n = s
+                    .pipe
+                    .try_read(s.fallback.as_mut().unwrap().bytes_mut()?)
+                    .map_err(|_| Error::Io)?;
+                s.pending = 0..n;
+                continue;
+            }
+            s.pipe.try_splice_connection(&s.destination.socket())
+        } else if let Some((ahead, range)) = s.source.take_read_ahead() {
+            let count = remaining.min(range.len()).min(MAX_PIPE_BYTES);
+            if s.fallback.is_none() {
+                s.fallback = Some(io.buffer(MAX_PIPE_BYTES)?);
+            }
+            s.fallback.as_mut().unwrap().bytes_mut()?[..count]
+                .copy_from_slice(&ahead.bytes()?[range.start..range.start + count]);
+            if range.len() > count {
+                // Preserve all excess so finish_exchange still rejects pipelining.
+                s.source
+                    .restore_read_ahead(ahead, range.start + count..range.end)?;
+            }
+            s.pending = 0..count;
+            s.source.consume_received(count)?;
+            continue;
+        } else if s.copied {
+            if s.fallback.is_none() {
+                s.fallback = Some(io.buffer(MAX_PIPE_BYTES)?);
+            }
+            s.source.socket().try_recv(
+                &mut s.fallback.as_mut().unwrap().bytes_mut()?[..remaining.min(MAX_PIPE_BYTES)],
+            )
+        } else {
+            s.pipe.try_splice_from(&s.source.socket(), remaining)
+        };
+        match result {
+            Ok(0) => return Err(Error::Io),
+            Ok(n) => {
+                if writing {
+                    if !s.pending.is_empty() {
+                        s.pending.start += n;
+                    }
+                    s.destination.consume_sent(n)?;
+                } else {
+                    s.source.consume_received(n)?;
+                    if s.copied {
+                        s.pending = 0..n;
+                    }
+                }
+            }
+            Err(error) if unsupported(&error) => s.copied = true,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait = Some((
+                    if writing {
+                        s.destination.socket()
+                    } else {
+                        s.source.socket()
+                    },
+                    if writing { libc::POLLOUT } else { libc::POLLIN },
+                ));
+                break;
+            }
+            Err(_) => return Err(Error::Io),
         }
-        Ok(())
     }
+    Ok(wait)
+}
+async fn wait_relay_progress(
+    io: &HttpIo,
+    state: Rc<RefCell<Transit>>,
+    wait: Option<(Rc<Descriptor>, i16)>,
+    scope: &RequestScope,
+) -> Result<()> {
+    if let Some((fd, interest)) = wait {
+        let mut tick = scope.clone();
+        tick.deadline.0 = tick
+            .deadline
+            .0
+            .min(uring_runtime::environment::now() + Duration::from_millis(10));
+        match io
+            .reactor()
+            .readiness_with_lease(fd, interest as u32, state.clone(), &tick)
+            .await
+        {
+            Ok(_) | Err(Error::DeadlineExceeded) => (),
+            Err(error) => return Err(error),
+        }
+    } else {
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+    Ok(())
 }
 fn finish(source: &mut ConnectionLease, destination: &mut ConnectionLease) -> Result<()> {
     if let Err(error) = source
@@ -571,7 +520,7 @@ mod relay_tests {
         use futures::stream::FuturesUnordered;
         use std::sync::Arc;
         use std::task::Wake;
-        struct WakeReactor(uring_runtime::ReactorWake);
+        struct WakeReactor(uring_runtime::reactor::ReactorWake);
         impl Wake for WakeReactor {
             fn wake(self: Arc<Self>) {
                 self.0.wake().unwrap();
@@ -608,7 +557,7 @@ mod relay_tests {
             let reactor = Rc::new(Reactor::new(admission.clone()));
             reactor.init().unwrap();
             Self {
-                io: HttpIo::with_admission(
+                io: new_io(
                     reactor.clone(),
                     Codec::new(4096),
                     admission.clone(),
@@ -674,7 +623,7 @@ mod relay_tests {
         assert!(matches!(
             drive(
                 &f.reactor,
-                f.io.relay_body(source, destination, Some(pipe), &f.scope)
+                relay_body(&f.io, source, destination, Some(pipe), &f.scope)
             ),
             Err(Error::Io)
         ));
@@ -705,7 +654,8 @@ mod relay_tests {
                 } else {
                     None
                 };
-                let mut work = Box::pin(f.io.relay_body(source, destination, Some(pipe), &f.scope));
+                let mut work =
+                    Box::pin(relay_body(&f.io, source, destination, Some(pipe), &f.scope));
                 assert!(poll(work.as_mut()).is_pending());
                 if writing {
                     let until = Instant::now() + Duration::from_millis(15);
@@ -781,7 +731,7 @@ mod relay_tests {
         let pipe = f.pipes.acquire().unwrap();
         let result = drive(
             &f.reactor,
-            f.io.relay_body(source, destination, Some(pipe), &f.scope),
+            relay_body(&f.io, source, destination, Some(pipe), &f.scope),
         )
         .unwrap();
         assert!(result.is_reusable());
@@ -820,7 +770,7 @@ mod relay_tests {
         });
         let mut pipe = f.pipes.acquire().unwrap();
         pipe.prepare_transit();
-        let mut relay = Box::pin(f.io.relay_body(source, destination, Some(pipe), &f.scope));
+        let mut relay = Box::pin(relay_body(&f.io, source, destination, Some(pipe), &f.scope));
         let mut waiting = acquire_wait(&f.pipes, &f.scope);
         assert!(poll(waiting.as_mut()).is_pending());
         // The reader is deliberately not running. A page cannot fit in the bounded

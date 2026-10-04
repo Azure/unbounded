@@ -86,13 +86,13 @@ mod body_progress {
                 .policy()
                 .set_observer(telemetry.failures.observer(WorkerId(2)));
             let reactor = Rc::new(Reactor::new(admission.clone()));
-            let io = Rc::new(HttpIo::with_admission(
+            let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
                 crate::model::PAGE_BYTES + 16,
             ));
-            let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
+            let pool = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1));
             let signers = signers();
             let transfers = transport::Transfers::new(
                 pool.clone(),
@@ -646,7 +646,7 @@ mod destination_disconnect {
             )));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             reactor.init().unwrap();
-            let io = Rc::new(HttpIo::with_admission(
+            let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
@@ -982,10 +982,7 @@ mod encrypted_http {
     use super::*;
     use crate::http::Codec;
     use crate::http::Endpoint;
-    use crate::http::HttpIo;
-    use crate::http::HttpPool;
     use crate::memory::CiphertextPage;
-    use crate::rdma::TransportPlan;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
     use crate::runtime::Reactor;
@@ -995,6 +992,7 @@ mod encrypted_http {
     use crate::security::aead::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
+    use crate::topology::rails::TransportPlan;
     use racer_control_wire::CacheEncryptionKey;
     use racer_control_wire::CacheKeyPurpose;
     use racer_control_wire::CacheKeyRef;
@@ -1086,7 +1084,7 @@ mod encrypted_http {
         let ios: Vec<_> = admissions
             .iter()
             .map(|admission| {
-                Rc::new(HttpIo::with_admission(
+                Rc::new(crate::http::new_io(
                     reactor.clone(),
                     Codec::new(protocol::MAX_ENVELOPE_HEAD),
                     admission.clone(),
@@ -1094,7 +1092,11 @@ mod encrypted_http {
                 ))
             })
             .collect();
-        let pool = Rc::new(HttpPool::new(reactor.clone(), admissions[0].clone(), 1));
+        let pool = Rc::new(crate::http::new_pool(
+            reactor.clone(),
+            admissions[0].clone(),
+            1,
+        ));
         let transfers = transport::Transfers::new(
             pool.clone(),
             ios[0].clone(),
@@ -1364,6 +1366,15 @@ mod requester_safety {
     use crate::peer::protocol::encode_envelope;
     use crate::peer::transport::RelayResponse;
     use crate::peer::*;
+    use crate::http::Codec;
+    use crate::model::MembershipVersion;
+    use crate::model::ResourceClass;
+    use crate::peer::AdaptivePeers;
+    use crate::peer::Outcome;
+    use crate::peer::protocol::PeerResponse;
+    use crate::peer::protocol::decode_envelope;
+    use crate::peer::protocol::encode_envelope;
+    use crate::peer::transport::RelayResponse;
     use crate::admission::AdmissionPolicy;
     use crate::runtime::Reactor;
     use crate::security::connection;
@@ -1427,13 +1438,13 @@ mod requester_safety {
             crate::test_support::cluster::config(false).limits,
         )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let io = Rc::new(HttpIo::with_admission(
+        let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
             0,
         ));
-        let pool = Rc::new(HttpPool::new(reactor, admission.clone(), 2));
+        let pool = Rc::new(crate::http::new_pool(reactor, admission.clone(), 2));
         let adaptive = AdaptivePeers::new(Default::default(), Metrics::default()).unwrap();
         let signers = crate::peer::tests::signers();
         let requester = Requester::new(
@@ -2147,7 +2158,7 @@ impl SocketFixture {
             crate::test_support::cluster::config(false).limits,
         )));
         let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone()));
-        let io = Rc::new(crate::http::HttpIo::with_admission(
+        let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
@@ -2155,7 +2166,7 @@ impl SocketFixture {
         ));
         Self {
             codec: Rc::new(codec(&admission)),
-            pool: Rc::new(crate::http::HttpPool::new(
+            pool: Rc::new(crate::http::new_pool(
                 reactor.clone(),
                 admission.clone(),
                 pool_limit,

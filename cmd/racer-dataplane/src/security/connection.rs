@@ -952,7 +952,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::http::Codec;
     use crate::http::Endpoint;
-    use crate::http::HttpPool;
     use crate::model::RequestId;
     use crate::model::ResourceClass;
     use crate::admission::AdmissionPolicy;
@@ -1183,13 +1182,13 @@ pub(crate) mod tests {
             crate::test_support::cluster::config(false).limits,
         )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let io = HttpIo::with_admission(
+        let io = crate::http::new_io(
             reactor.clone(),
             Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
             u64::MAX,
         );
-        let pool = HttpPool::new(reactor.clone(), admission.clone(), 2);
+        let pool = crate::http::new_pool(reactor.clone(), admission.clone(), 2);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
         let listener = Rc::new(uring_runtime::Descriptor::from(listener));
@@ -1329,7 +1328,7 @@ pub(crate) mod tests {
             crate::test_support::cluster::config(false).limits,
         )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let io = HttpIo::with_admission(reactor.clone(), Codec::new(65536), admission.clone(), 0);
+        let io = crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
         let scope = RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
             .unwrap();
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1378,8 +1377,7 @@ pub(crate) mod tests {
             )));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             reactor.init().unwrap();
-            let io =
-                HttpIo::with_admission(reactor.clone(), Codec::new(65536), admission.clone(), 0);
+            let io = crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
             let scope = RequestScope::new(
                 RequestId([3; 16]),
                 Instant::now()

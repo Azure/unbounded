@@ -1624,7 +1624,6 @@ pub(super) mod tests {
     fn responses_stream_more_than_three_pages_only_with_client_sized_http_framing() {
         use crate::client::Responses;
         use crate::http::Codec;
-        use crate::http::HttpIo;
         use crate::http::new_pipe_pool;
         use crate::model::RequestId;
         use crate::model::ResourceClass;
@@ -1644,7 +1643,7 @@ pub(super) mod tests {
                 crate::test_support::cluster::config(false).limits,
             )));
             let reactor = Rc::new(Reactor::new(admission.clone()));
-            let io = Rc::new(HttpIo::with_admission(
+            let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(32768),
                 admission.clone(),

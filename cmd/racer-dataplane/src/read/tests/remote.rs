@@ -6,14 +6,13 @@ use crate::read::flight::AcquisitionBudget;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::http::Codec;
-use crate::http::HttpIo;
-use crate::http::HttpPool;
 use crate::memory::BufferPool;
 use crate::model::ExpiresAt;
 use crate::model::MetadataSelector;
 use crate::model::ObjectMetadata;
 use crate::model::OriginContext;
 use crate::model::*;
+use crate::peer::forwarding::Forwarding;
 use crate::peer::PeerNetwork;
 use crate::peer::Relay;
 use crate::peer::Requester;
@@ -28,7 +27,6 @@ use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
 use crate::runtime::Reactor;
 use crate::security::credentials::CredentialCrypto;
-use crate::peer::forwarding::Forwarding;
 use crate::security::test_support::Identity;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::LinkHealth;
@@ -339,7 +337,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         crate::test_support::cluster::config(false).limits,
     )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = Rc::new(HttpIo::with_admission(
+    let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(protocol::MAX_ENVELOPE_HEAD),
         admission.clone(),
@@ -350,7 +348,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         BufferPool::new(admission.clone()),
     ));
     let transfers = Rc::new(Transfers::new(
-        Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
+        Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2)),
         io.clone(),
         None,
         admission.clone(),
@@ -644,7 +642,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         };
         assert_eq!(result.err(), Some(expected));
         let responses = crate::client::Responses::new(
-            Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone())),
+            Rc::new(crate::http::client_io(reactor.clone(), admission.clone())),
             Rc::new(crate::http::Delivery::new(
                 Rc::new(crate::http::new_pipe_pool(admission.clone())),
                 reactor.clone(),

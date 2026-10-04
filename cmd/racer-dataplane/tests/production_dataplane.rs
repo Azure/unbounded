@@ -56,6 +56,57 @@ use racer_dataplane::security::aead::PageCryptoEngine;
 use racer_dataplane::peer::protocol::Signatures;
 use racer_dataplane::security::credentials::CredentialCrypto;
 use racer_dataplane::peer::forwarding::Forwarding;
+use racer_dataplane::client::RequestParser;
+use racer_dataplane::client::Responses;
+use racer_control_wire::Publication;
+use racer_control_wire::CacheDefinition;
+use racer_dataplane::control::PublishedState;
+use racer_dataplane::control::SnapshotStore;
+use racer_control_wire::canonical_socket_paths;
+use racer_dataplane::error::Error;
+use racer_dataplane::error::Operation;
+use racer_dataplane::error::Result;
+use racer_dataplane::http::Codec;
+use racer_dataplane::http::HttpIo;
+use racer_dataplane::memory::BufferPool;
+use racer_dataplane::memory::cache::MemoryCache;
+use racer_dataplane::http::Delivery;
+use racer_dataplane::http::new_pipe_pool;
+use racer_dataplane::config::Limits;
+use racer_dataplane::model::PAGE_BYTES;
+use racer_dataplane::model::ResourceClass;
+use racer_dataplane::model::*;
+use racer_dataplane::origin::OriginClient;
+use racer_dataplane::peer::PeerNetwork;
+use racer_dataplane::peer::Requester;
+use racer_dataplane::peer::protocol::FetchMode;
+use racer_dataplane::peer::protocol::Operation as PeerOperation;
+use racer_dataplane::peer::protocol::PeerRequest;
+use racer_dataplane::peer::protocol::PeerResponse;
+use racer_dataplane::peer::server::LocalPageService;
+use racer_dataplane::peer::transport::Transfers;
+use racer_dataplane::read::Coordinator;
+use racer_dataplane::read::candidates::CandidatePolicy;
+use racer_dataplane::read::dispatch::WorkerDirectory;
+use racer_dataplane::read::dispatch::WorkerEndpoint;
+use racer_dataplane::read::fill::Fill;
+use racer_dataplane::read::fill::FillDependencies;
+use racer_dataplane::read::flight::Flights;
+use racer_dataplane::read::metadata::MetadataDependencies;
+use racer_dataplane::read::metadata::MetadataService;
+use racer_dataplane::read::range_stream::RangeStreams;
+use racer_dataplane::admission::AdmissionPolicy;
+use racer_dataplane::runtime::crypto;
+use racer_dataplane::runtime::crypto::CryptoClient;
+use racer_dataplane::runtime::RequestScope;
+use racer_dataplane::runtime::Reactor;
+use racer_dataplane::runtime::worker::CryptoRuntime;
+
+use racer_dataplane::read::dispatch::WorkerMap;
+use racer_dataplane::security::aead::PageCrypto;
+use racer_dataplane::security::aead::PageCryptoEngine;
+use racer_dataplane::peer::protocol::Signatures;
+use racer_dataplane::security::credentials::CredentialCrypto;
 use racer_dataplane::store::StoreReader;
 use racer_dataplane::store::StoreWriter;
 use racer_dataplane::store::catalog::Index;
@@ -453,13 +504,17 @@ impl Rig {
             }
         };
         let entries = if benchmarking { 512 } else { 64 };
-        let io = Rc::new(HttpIo::with_admission(
+        let io = Rc::new(racer_dataplane::http::new_io(
             reactor.clone(),
             Codec::new(32768),
             admission.clone(),
             P + 16,
         ));
-        let http = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8));
+        let http = Rc::new(racer_dataplane::http::new_pool(
+            reactor.clone(),
+            admission.clone(),
+            8,
+        ));
         let buffers = BufferPool::new(admission.clone());
         let (keys, sender_keys) = fixture_keys();
         let published = Arc::new(PublishedState::default());
@@ -595,7 +650,10 @@ impl Rig {
             coordinator.clone(),
             snapshot.membership.clone(),
         );
-        let client_io = Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone()));
+        let client_io = Rc::new(racer_dataplane::http::client_io(
+            reactor.clone(),
+            admission.clone(),
+        ));
         let responses = Rc::new(Responses::new(client_io.clone(), delivery));
         Self {
             bootstrap,

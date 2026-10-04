@@ -233,8 +233,6 @@ mod native_exchange_tests {
     //! Signed native offer/fallback exchanges over real sockets and optional hardware.
     use super::*;
     use crate::http::Codec;
-    use crate::http::HttpIo;
-    use crate::http::HttpPool;
     use crate::memory::BufferPool;
     use crate::model::ExpiresAt;
     use crate::model::KeyId;
@@ -264,14 +262,14 @@ mod native_exchange_tests {
         let devices = Rc::new(Devices::new());
         let sessions = Rc::new(Sessions::new(devices.clone(), 2));
         let rdma = sessions.clone();
-        let io = Rc::new(HttpIo::with_admission(
+        let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
             crate::model::PAGE_BYTES + 16,
         ));
         Transfers::new(
-            Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
+            Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2)),
             io,
             Some(rdma),
             admission.clone(),
@@ -724,14 +722,14 @@ mod native_exchange_tests {
             devices.attach(io).unwrap();
             let sessions = Rc::new(Sessions::new(devices.clone(), 2));
             let rdma = sessions.clone();
-            let http = Rc::new(HttpIo::with_admission(
+            let http = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
                 crate::model::PAGE_BYTES + 16,
             ));
             let transfer = Transfers::new(
-                Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
+                Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2)),
                 http,
                 Some(rdma),
                 admission.clone(),
@@ -2267,15 +2265,15 @@ impl Transfers {
             let mut connection = observer.result(
                 Stage::PeerCheckout,
                 scope,
-                self.http
-                    .checkout_peer(
-                        &endpoint,
-                        relay.clone(),
-                        peer_admission.clone(),
-                        Some(failure.clone()),
-                        scope,
-                    )
-                    .await,
+                crate::http::checkout_peer(
+                    &self.http,
+                    &endpoint,
+                    relay.clone(),
+                    peer_admission.clone(),
+                    Some(failure.clone()),
+                    scope,
+                )
+                .await,
             )?;
             connection.state_mut().peer_admission = peer_admission.clone();
             if let Some(timing) = timing.as_deref_mut() {

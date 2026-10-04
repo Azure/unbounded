@@ -78,6 +78,64 @@ use crate::security::aead::PageCryptoEngine;
 use crate::peer::protocol::Signatures;
 use crate::security::credentials::CredentialCrypto;
 use crate::peer::forwarding::Forwarding;
+use crate::telemetry::Gauge;
+use crate::client::RequestParser;
+use crate::client::listener::ClientListeners;
+use crate::client::Responses;
+use crate::config::Config;
+use crate::control::BundleInstaller;
+use crate::control::ControlClient;
+use crate::control::ControlEndpoint;
+use crate::control::Enrollment;
+use crate::control::PublishedState;
+use crate::control::SnapshotStore;
+use crate::control::ReactorControlIo;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::http::HttpPool;
+use crate::memory::BufferPool;
+use crate::memory::cache::MemoryCache;
+use crate::http::Delivery;
+use crate::http::new_pipe_pool;
+use crate::config::Limits;
+use crate::model::NodeId;
+use crate::model::RequestId;
+use crate::model::WorkerId;
+use crate::origin::Origin;
+use crate::origin::OriginClient;
+use crate::peer::Relay;
+use crate::peer::Requester;
+use crate::peer::server::PeerServer;
+use crate::peer::transport::Transfers;
+use crate::rdma::Devices;
+use crate::rdma::Sessions;
+use crate::read::Coordinator;
+use crate::read::candidates::CandidatePolicy;
+use crate::read::dispatch::WorkerDirectory;
+use crate::read::dispatch::WorkerEndpoint;
+use crate::read::fill::Fill;
+use crate::read::fill::FillDependencies;
+use crate::read::flight::Flights;
+use crate::read::metadata::MetadataDependencies;
+use crate::read::metadata::MetadataService;
+use crate::read::range_stream::RangeStreams;
+
+use crate::admission::AdmissionPolicy;
+use crate::runtime::affinity::AffinityPlan;
+use crate::runtime::RequestScope;
+use crate::runtime::Reactor;
+use crate::runtime::worker::CryptoRuntime;
+
+use crate::runtime::worker::WorkerFactory;
+use crate::runtime::worker::WorkerGroup;
+use crate::read::dispatch::WorkerMap;
+use crate::runtime::worker::WorkerRuntime;
+
+use crate::security::aead::PageCrypto;
+use crate::security::aead::PageCryptoEngine;
+use crate::peer::protocol::Signatures;
+use crate::security::credentials::CredentialCrypto;
 use crate::store::Store;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
@@ -95,9 +153,6 @@ use racer_identity::Certificates;
 use racer_identity::KeyEpochs;
 use racer_identity::KeyPurpose;
 use racer_identity::Keyring;
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-use std::time::UNIX_EPOCH;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -529,21 +584,18 @@ impl WorkerApplication {
             None
         };
 
-        let http = Rc::new(
-            HttpPool::new(
-                reactor.clone(),
-                admission.clone(),
-                limits.connections_per_neighbor.get(),
-            )
-            .with_peer_tcp_nodelay(config.peer_tcp_nodelay)
-            .with_origin_limit(
-                config
-                    .origin_connections_per_cache
-                    .get()
-                    .min(limits.client_connections.get()),
-            ),
+        let mut http = crate::http::new_pool(
+            reactor.clone(),
+            admission.clone(),
+            limits.connections_per_neighbor.get(),
         );
-        let io = Rc::new(HttpIo::with_admission(
+        http.config_mut().tcp_nodelay = config.peer_tcp_nodelay;
+        http.config_mut().secondary_cap = config
+            .origin_connections_per_cache
+            .get()
+            .min(limits.client_connections.get());
+        let http = Rc::new(http);
+        let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             crate::http::Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
@@ -844,7 +896,7 @@ impl WorkerApplication {
         distributed: bool,
     ) -> Rc<ClientListeners> {
         let admission = runtime.admission.clone();
-        let io = Rc::new(HttpIo::for_clients(
+        let io = Rc::new(crate::http::client_io(
             runtime.reactor.clone(),
             admission.clone(),
         ));
