@@ -319,7 +319,7 @@ impl Fill {
     pub(super) fn reserve_copy_plaintext(
         &self,
         page: &PageId,
-        copy: &crate::memory::page::CiphertextCopy,
+        copy: &crate::memory::CiphertextCopy,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         validate_copy(copy, page)?;
         self.reserve_with_reclamation(

@@ -2626,7 +2626,7 @@ fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
             if free == 13_109_247 {
                 assert!(matches!(result, Err(Error::Overloaded)));
             } else {
-                let Some(crate::memory::page::AcquiredPage::Plaintext(page)) =
+                let Some(crate::memory::AcquiredPage::Plaintext(page)) =
                     result.expect("known local tail must fit its exact plaintext budget")
                 else {
                     panic!("local plaintext required")

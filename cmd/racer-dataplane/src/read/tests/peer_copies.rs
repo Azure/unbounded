@@ -475,7 +475,7 @@ fn retained_small_copy_admits_actual_plaintext_with_live_pressure() {
         f.fill
             .dependencies
             .memory
-            .publish_ciphertext(crate::memory::page::UnverifiedPage {
+            .publish_ciphertext(crate::memory::UnverifiedPage {
                 copy: copy.clone(),
                 disk_token: None,
             })
