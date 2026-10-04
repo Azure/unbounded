@@ -1,5 +1,54 @@
 //! Vetted XChaCha20-Poly1305 adapter, canonical page AAD, fresh cryptographic nonces.
 
+use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::memory::CiphertextBytes;
+use crate::memory::CiphertextPage;
+use crate::memory::PlaintextBuffer;
+use crate::memory::VerifiedBytes;
+use crate::memory::VerifiedPage;
+use crate::model::AttemptId;
+use crate::model::MAX_FIELD_BYTES;
+use crate::model::Nonce;
+use crate::model::ObjectId;
+use crate::model::PageEnvelope;
+use crate::model::PageId;
+use crate::model::RequestId;
+use crate::model::WorkerId;
+use crate::runtime::RequestScope;
+use crate::telemetry::AeadFailure;
+use crate::telemetry::Failure;
+use crate::telemetry::Stage;
+use crate::worker::CryptoRuntime;
+use racer_control_wire::KeyId;
+use racer_crypto::aead;
+use racer_identity::KeyLease;
+use racer_identity::KeyPurpose;
+use racer_identity::Keyring;
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::ops::Deref;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
+use uring_runtime::channel;
+use uring_runtime::channel::Receiver;
+use uring_runtime::channel::Sender;
+use uring_runtime::reactor::IoBuffer;
+use zeroize::Zeroizing;
+
 impl From<racer_identity::Error> for crate::error::Error {
     fn from(error: racer_identity::Error) -> Self {
         match error {
@@ -12,39 +61,6 @@ impl From<racer_identity::Error> for crate::error::Error {
         }
     }
 }
-use crate::admission::AdmissionPolicy;
-use crate::admission::ResourceClass;
-use crate::error::Error;
-use crate::error::Operation;
-use crate::error::Result;
-use crate::memory::CiphertextBytes;
-use crate::memory::CiphertextPage;
-use crate::memory::PlaintextBuffer;
-use crate::memory::VerifiedBytes;
-use crate::memory::VerifiedPage;
-use crate::model::AttemptId;
-use racer_control_wire::KeyId;
-use crate::model::MAX_FIELD_BYTES;
-use crate::model::Nonce;
-use crate::model::ObjectId;
-use crate::model::PageEnvelope;
-use crate::model::PageId;
-use crate::model::RequestId;
-use crate::runtime::RequestScope;
-use crate::worker::CryptoRuntime;
-use crate::telemetry::AeadFailure;
-use crate::telemetry::Failure;
-use crate::telemetry::Stage;
-use racer_crypto::aead;
-use racer_identity::KeyPurpose;
-use racer_identity::Keyring;
-use std::fmt;
-use std::ops::Deref;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::task::Context;
-use std::task::Poll;
-use zeroize::Zeroizing;
 
 // Request-scoped adapter context, deliberately absent from cache identities.
 // Credentials travel encrypted across peers and as local origin headers, never
@@ -919,20 +935,6 @@ impl CredentialCrypto {
         })
     }
 }
-use crate::model::WorkerId;
-use racer_identity::KeyLease;
-use std::cell::Cell;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
-use std::num::NonZeroUsize;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::task::Waker;
-use uring_runtime::channel;
-use uring_runtime::channel::Receiver;
-use uring_runtime::channel::Sender;
 
 /// Rejected crypto work retains its owner and Racer policy failure.
 pub struct CryptoSendFailure<T> {
@@ -1757,8 +1759,8 @@ mod tests {
     mod credentials;
     mod crypto;
     use super::*;
-    use racer_control_wire::KeyId;
     use crate::model::*;
+    use racer_control_wire::KeyId;
     use uring_runtime::group::Service;
     fn envelope() -> PageEnvelope {
         PageEnvelope {
@@ -2545,4 +2547,3 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     }
 }
-use uring_runtime::reactor::IoBuffer;

@@ -41,7 +41,6 @@
 //! ```
 use crate::error::Error;
 use crate::error::Result;
-use racer_control_wire::NodeId;
 use crate::peer::protocol;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
@@ -59,9 +58,15 @@ use crate::peer::protocol::signed_digest;
 use crate::topology::RouteBudget;
 use http1::MessageHead;
 use http1::StartLine;
+#[cfg(test)]
+use racer_control_wire::CacheId;
+#[cfg(test)]
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use racer_identity::VerifiedPeer;
 use std::rc::Rc;
 use std::sync::Arc;
+
 pub struct Forwarding {
     signatures: Rc<Signatures>,
 }
@@ -831,21 +836,21 @@ fn check_grant_deadline(head: &MessageHead, request: &RequestBinding) -> Result<
 mod tests {
     use super::*;
     use crate::admission::AdmissionPolicy;
+    use crate::admission::ResourceClass;
     use crate::config::Limits;
-    use crate::security::EncryptedAuthorization;
-    use racer_control_wire::KeyId;
     use crate::model::MetadataSelector;
     use crate::model::Nonce;
-    use crate::security::OpaqueMetadata;
-    use crate::security::PeerOriginContext;
-    use crate::admission::ResourceClass;
     use crate::model::*;
     use crate::peer::protocol::FetchMode;
     use crate::peer::protocol::Operation;
     use crate::runtime::RequestScope;
+    use crate::security::EncryptedAuthorization;
+    use crate::security::OpaqueMetadata;
+    use crate::security::PeerOriginContext;
     use crate::test_support::security::clone_head;
     use crate::test_support::security::network;
     use crate::test_support::security::node;
+    use racer_control_wire::KeyId;
     use std::time::Duration;
     use std::time::Instant;
     fn wire_ciphertext(envelope: PageEnvelope, length: usize) -> crate::memory::CiphertextPage {

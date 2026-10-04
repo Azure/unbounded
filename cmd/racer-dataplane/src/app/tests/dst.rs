@@ -1,11 +1,14 @@
 //! Generated traffic through the assembled production graph on hostless descriptors.
 //! The oracle owns immutable origin versions, never consults placement or cache data.
+
+use crate::admission::ResourceClass;
 use crate::app::*;
 use crate::model::PAGE_BYTES;
-use crate::admission::ResourceClass;
 use crate::model::*;
 use racer_control_wire as wire;
 use racer_control_wire::CacheDefinition;
+use racer_control_wire::CacheId;
+use racer_control_wire::MembershipVersion;
 use racer_identity::PendingIdentity;
 use racer_identity::SigningIdentity;
 use sha2::Digest;
@@ -728,7 +731,6 @@ mod scenarios {
 
     #[test]
     fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
-        use crate::security::OriginContext;
         use crate::peer::protocol::FetchMode;
         use crate::peer::protocol::Operation as PeerOperation;
         use crate::peer::protocol::PeerRequest;
@@ -736,6 +738,7 @@ mod scenarios {
         use crate::peer::subscriptions::Demand;
         use crate::peer::subscriptions::PageInterval;
         use crate::peer::subscriptions::Subscription;
+        use crate::security::OriginContext;
         use crate::topology::RouteBudget;
 
         let sim = Simulation::new();
@@ -870,11 +873,11 @@ mod scenarios {
     #[test]
     fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
         use crate::model::MetadataSelector;
-        use crate::security::OriginContext;
         use crate::peer::protocol::FetchMode;
         use crate::peer::protocol::Operation as PeerOperation;
         use crate::peer::protocol::PeerRequest;
         use crate::peer::protocol::PeerResponse;
+        use crate::security::OriginContext;
         use crate::topology::RouteBudget;
         use futures::Stream;
         use futures::stream::FuturesUnordered;

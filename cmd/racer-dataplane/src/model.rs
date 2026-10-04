@@ -2,6 +2,8 @@
 
 use crate::error::Error;
 use crate::error::Result;
+use racer_control_wire::CacheId;
+use racer_control_wire::KeyId;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -38,7 +40,6 @@ pub(crate) fn parse_decimal(value: &[u8]) -> Result<u64> {
 // Keys are exactly 32 bytes. Strong ETags are opaque version identifiers, not
 // content hashes. Placement excludes ETag; page cache and flight identity include it.
 
-use racer_control_wire::CacheId;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CacheKey(pub [u8; 32]);
 
@@ -562,8 +563,6 @@ pub enum MetadataSelector {
 // authenticate this descriptor; XChaCha20-Poly1305 authenticates page bytes.
 
 pub const AEAD_TAG_BYTES: u32 = 16;
-
-use racer_control_wire::KeyId;
 
 /// Application configuration constructor, distinct from wire syntax errors.
 pub fn key_id_from_generation(generation: u64, suffix: u32) -> Result<KeyId> {

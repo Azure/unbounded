@@ -1,9 +1,4 @@
 //! Correlated logical requests with monotonic budgets, attempts, and cancellation.
-pub mod forwarding;
-pub mod protocol;
-pub mod server;
-pub mod subscriptions;
-pub mod transport;
 use self::forwarding::Forwarding;
 use self::forwarding::VerifiedRequest;
 use self::forwarding::VerifiedResponse;
@@ -12,22 +7,21 @@ use self::protocol::SignedRequest;
 use self::protocol::SignedResponse;
 use self::transport::Transfers;
 use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
-use crate::admission::ResourceClass;
+use crate::rdma;
+use crate::rdma::TransportPlan;
 use crate::runtime::RequestScope;
 use crate::telemetry::Event;
 use crate::telemetry::Gauge;
 use crate::telemetry::Metrics;
 use crate::telemetry::Observer;
 use crate::telemetry::Stage;
-
-use crate::rdma;
-use crate::rdma::TransportPlan;
 use crate::topology::Paths;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -35,6 +29,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use uring_runtime::environment::now;
+
+pub mod forwarding;
+pub mod protocol;
+pub mod server;
+pub mod subscriptions;
+pub mod transport;
 
 const STAGES: [(Event, Event); 4] = [
     (Event::PeerPageCheckoutCount, Event::PeerPageCheckoutNs),
@@ -593,7 +593,10 @@ pub enum Requester {
     #[cfg(any(test, feature = "subscription-interop"))]
     Scripted {
         available: Box<
-            dyn Fn(&std::sync::Arc<crate::topology::Membership>, &racer_control_wire::NodeId) -> bool,
+            dyn Fn(
+                &std::sync::Arc<crate::topology::Membership>,
+                &racer_control_wire::NodeId,
+            ) -> bool,
         >,
         request: Box<
             dyn Fn(

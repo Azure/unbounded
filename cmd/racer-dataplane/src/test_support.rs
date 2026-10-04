@@ -1,11 +1,11 @@
 //! Deterministic test-only seams; no fake implementation is linked into production.
+
 use crate::admission::AdmissionPolicy;
 use crate::control::PublishedState;
 use crate::control::SnapshotStore;
 use crate::http::Delivery;
 use crate::memory::BufferPool;
 use crate::memory::MemoryCache;
-use racer_control_wire::MembershipVersion;
 use crate::model::ObjectMetadata;
 use crate::model::WorkerId;
 use crate::read::Coordinator;
@@ -20,21 +20,20 @@ use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
 use crate::runtime::Reactor;
-use crate::security;
+use crate::security::CredentialCrypto;
 use crate::security::CryptoClient;
-use crate::worker::CryptoRuntime;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::Publication;
-
 use crate::security::PageCrypto;
 use crate::security::PageCryptoEngine;
-use crate::security::CredentialCrypto;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
 use crate::store::catalog::Index;
 use crate::store::catalog::SegmentClock;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::Placement;
+use crate::worker::CryptoRuntime;
+use racer_control_wire::CacheDefinition;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::Publication;
 use racer_control_wire::PublicationSequence;
 use std::cell::RefCell;
 use std::num::NonZeroU32;
@@ -42,6 +41,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Context;
 use uring_runtime::drivers::DriverQueue;
+
 pub mod clock {
     use crate::error::Error;
     use crate::error::Result;
@@ -113,7 +113,6 @@ pub mod clock {
     }
     #[test]
     fn wall_time_drives_freshness_but_expired_versions_still_answer_pins() {
-        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::CurrentVersion;
         use crate::model::ExpiresAt;
@@ -121,6 +120,7 @@ pub mod clock {
         use crate::model::ObjectVersion;
         use crate::model::StrongEtag;
         use crate::model::VersionMetadata;
+        use racer_control_wire::CacheId;
         let clock = Clock::default();
         let descriptor = VersionMetadata {
             content_type: None,
@@ -760,7 +760,8 @@ impl ReadWorker {
             reactor.clone(),
             buffers.clone(),
         ));
-        let (port, engine) = security::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
+        let (port, engine) =
+            crate::security::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
         let crypto = Rc::new(CryptoClient::new(port));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let candidates = Rc::new(CandidatePolicy::new(

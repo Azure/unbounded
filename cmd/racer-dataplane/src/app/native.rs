@@ -1,4 +1,5 @@
 //! Native lifecycle endpoints remain per I/O shard, even with shared crypto threads.
+
 use super::*;
 use crate::rdma::WithNative;
 use crate::runtime::HashMap;
@@ -205,10 +206,10 @@ impl WorkerApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racer_control_wire::MembershipVersion;
     use crate::admission::ResourceClass;
     use crate::security;
     use crate::security::CryptoClient;
+    use racer_control_wire::MembershipVersion;
     use racer_control_wire::Publication;
     use racer_control_wire::PublicationSequence;
     use racer_control_wire::RailId;

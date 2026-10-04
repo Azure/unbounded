@@ -4,6 +4,7 @@
 //! encrypt origin data once. Publish only verified whole pages, with original
 //! ciphertext queued asynchronously on candidates. Disk failure may discard dirty
 //! bytes. Origin 412 does not prove old copies absent from other permitted caches.
+
 use super::candidates::CandidatePolicy;
 use super::candidates::CandidateResolution;
 use super::flight::AcquisitionBudget;
@@ -14,37 +15,35 @@ use super::flight::FlightLeader;
 use super::flight::Flights;
 use super::flight::JoinedCopy;
 use super::flight::JoinedFlight;
+use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
+use crate::memory::AcquiredPage;
 use crate::memory::BufferPool;
 use crate::memory::CiphertextPage;
 use crate::memory::MemoryCache;
-use crate::memory::AcquiredPage;
 use crate::memory::PageResult;
 use crate::memory::UnverifiedPage;
 use crate::model::ObjectMetadata;
-use crate::security::OriginContext;
 use crate::model::PAGE_BYTES;
 use crate::model::PageId;
-use crate::admission::ResourceClass;
 use crate::model::VersionMetadata;
 use crate::origin::Origin;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerResponse;
-
-use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
-use crate::security::PageCrypto;
 use crate::security::CredentialCrypto;
+use crate::security::OriginContext;
+use crate::security::PageCrypto;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
 use crate::telemetry::Event;
 use crate::telemetry::Gauge;
 use crate::telemetry::LookupTier;
 use crate::telemetry::Metrics;
-
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -687,8 +686,8 @@ impl Fill {
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }
-        use crate::model::PAGE_BYTES;
         use crate::admission::ResourceClass;
+        use crate::model::PAGE_BYTES;
         if origin.plaintext.bytes()?.len()
             != origin.metadata.immutable().page_length(page)? as usize
         {
@@ -1378,11 +1377,11 @@ fn merge_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
     use crate::model::StrongEtag;
+    use racer_control_wire::CacheId;
     #[test]
     fn decrypt_source_counters_preserve_results_and_ignore_non_corruption() {
         let metrics = Metrics::default();

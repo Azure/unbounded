@@ -11,6 +11,13 @@
 //! must permit progress when both threads share one CPU.
 
 use crate::admission::AdmissionPolicy;
+use crate::config::Config;
+use crate::config::Limits;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::RequestId;
+use crate::model::WorkerId;
 use crate::runtime::Cancellation;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
@@ -18,20 +25,14 @@ use crate::security;
 use crate::security::CryptoClient;
 use crate::security::CryptoPort;
 use crate::security::IoCryptoPort;
-use crate::config::Limits;
-use crate::error::Error;
-use crate::error::Operation;
-use crate::error::Result;
-use crate::model::ObjectId;
-use crate::model::PageId;
-use crate::model::RequestId;
-use crate::model::WorkerId;
-use sha2::Digest;
-use sha2::Sha256;
-#[cfg(test)]
-use std::time::Instant;
+use racer_control_wire::RailMapping;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(test)]
+use std::num::NonZeroUsize;
+#[cfg(test)]
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -42,18 +43,24 @@ use std::task::Waker;
 use std::thread;
 use std::time::Duration;
 #[cfg(test)]
-use std::num::NonZeroUsize;
-use std::ops::Deref;
-use uring_runtime::deadline::Deadline;
-
-const WORK_BUDGET: usize = 64;
-const IDLE_WAIT: Duration = Duration::from_millis(1);
-use crate::config::Config;
-use racer_control_wire::RailMapping;
-use std::collections::BTreeMap;
+use std::time::Instant;
 use uring_runtime::affinity::CpuLocation;
 use uring_runtime::affinity::EffectiveTopology;
 use uring_runtime::affinity::NicLocality;
+#[cfg(test)]
+use uring_runtime::affinity::current_cpus;
+use uring_runtime::deadline::Deadline;
+use uring_runtime::group::Factory;
+use uring_runtime::group::FailureReporter;
+use uring_runtime::group::Group;
+use uring_runtime::group::Helper;
+use uring_runtime::group::Lane;
+use uring_runtime::group::Plan;
+use uring_runtime::group::Service;
+use uring_runtime::reactor::ReactorWake;
+
+const WORK_BUDGET: usize = 64;
+const IDLE_WAIT: Duration = Duration::from_millis(1);
 /// One I/O shard and its crypto execution placement. Equal crypto CPU IDs identify
 /// the same execution thread. NIC locality never overrides the end-to-end rail.
 #[derive(Clone, Debug)]
@@ -241,16 +248,6 @@ pub struct WorkerRuntime {
 pub struct CryptoRuntime {
     pub port: CryptoPort,
 }
-#[cfg(test)]
-use uring_runtime::affinity::current_cpus;
-use uring_runtime::group::Factory;
-use uring_runtime::group::FailureReporter;
-use uring_runtime::group::Group;
-use uring_runtime::group::Helper;
-use uring_runtime::group::Lane;
-use uring_runtime::group::Plan;
-use uring_runtime::group::Service;
-use uring_runtime::reactor::ReactorWake;
 
 /// Rc-backed factories cannot cross the startup boundary:
 /// ```compile_fail
@@ -307,7 +304,6 @@ trait FaultRecipe: Sync {
         runtime: CryptoRuntime,
     ) -> Result<Box<dyn Service<RequestScope>>>;
 }
-
 
 impl WorkerGroup {
     pub fn new(plan: AffinityPlan) -> Self {
@@ -932,9 +928,9 @@ mod tests {
         use crate::admission::ResourceClass;
         use crate::memory::BufferPool;
         use crate::model::*;
-        use crate::security::PageCryptoEngine;
         use crate::security::CryptoInput;
         use crate::security::CryptoOutput;
+        use crate::security::PageCryptoEngine;
         use racer_identity::KeyPurpose;
         use racer_identity::Keyring;
         use std::sync::atomic::AtomicBool;

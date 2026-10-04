@@ -1,4 +1,5 @@
 //! Candidate policy exercised through real signing, handshake, TCP, and Requester.
+
 use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
@@ -7,7 +8,6 @@ use crate::memory::BufferPool;
 use crate::model::ExpiresAt;
 use crate::model::MetadataSelector;
 use crate::model::ObjectMetadata;
-use crate::security::OriginContext;
 use crate::model::*;
 use crate::peer::PeerNetwork;
 use crate::peer::Relay;
@@ -27,13 +27,18 @@ use crate::read::flight::AcquisitionBudget;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use crate::security::CredentialCrypto;
-use crate::test_support::security::Identity;
+use crate::security::OriginContext;
 use crate::test_support::origin::AdapterOrigin;
+use crate::test_support::security::Identity;
 use crate::topology::LinkHealth;
 use crate::topology::Member;
 use crate::topology::Membership;
 use crate::topology::Paths;
 use crate::topology::Placement;
+use racer_control_wire::CacheId;
+use racer_control_wire::ClusterId;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use racer_control_wire::PublicationSequence;
 use racer_control_wire::SCHEMA_VERSION;
 use racer_identity::Keyring;

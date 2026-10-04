@@ -2,7 +2,17 @@
 use super::listener::*;
 use super::*;
 use crate::admission::AdmissionPolicy;
+use crate::config::Limits;
+use crate::http::Codec;
+use crate::http::Delivery;
+use crate::http::new_pipe_pool;
+use crate::model::ExpiresAt;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::StrongEtag;
+use crate::read::ReadResponse;
 use crate::runtime::Cancellation;
+use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use crate::test_support::ReadWorker;
 use crate::test_support::origin::RequestKind;
@@ -13,19 +23,27 @@ use std::ffi::CString;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::Read;
+use std::io::Write;
+use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::UNIX_EPOCH;
+
 mod acquisition {
     use super::*;
 
@@ -748,23 +766,6 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     drop(reactor);
     assert_eq!(sim.live_handles(), 0);
 }
-use crate::config::Limits;
-use crate::http::Codec;
-use crate::http::Delivery;
-use crate::http::new_pipe_pool;
-use crate::model::ExpiresAt;
-use crate::model::ObjectMetadata;
-use crate::model::ObjectVersion;
-use crate::model::StrongEtag;
-use crate::read::ReadResponse;
-use crate::runtime::Reactor;
-use std::io::Read;
-use std::io::Write;
-use std::num::NonZeroUsize;
-use std::os::unix::net::UnixStream;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::time::UNIX_EPOCH;
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 struct Root(PathBuf);

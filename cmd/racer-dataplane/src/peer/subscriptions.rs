@@ -3,17 +3,18 @@
 //! All shared mutations are synchronous. No guard escapes into Fill or a future;
 //! wakers are invoked only after releasing the mutex. Live handles, including
 //! completed responses, retain capacity until consumed or dropped.
+
 use crate::error::Error;
 use crate::error::Result;
-use crate::memory::CiphertextPage;
 use crate::memory::CiphertextCopy;
+use crate::memory::CiphertextPage;
 use crate::model::MAX_FIELD_BYTES;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::PageNumber;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -814,10 +815,10 @@ fn include_page(intervals: &[PageInterval], page: u64) -> Vec<PageInterval> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::StrongEtag;
+    use racer_control_wire::CacheId;
 
     fn subscription(id: u8, start: u64, end: u64) -> Subscription {
         Subscription {
@@ -1121,12 +1122,11 @@ mod tests {
     #[test]
     fn successful_fanout_shares_allocation_and_charges_each_receiver_once() {
         use crate::admission::AdmissionPolicy;
+        use crate::admission::ResourceClass;
         use crate::memory::BufferPool;
         use crate::model::ExpiresAt;
-        use racer_control_wire::KeyId;
         use crate::model::Nonce;
         use crate::model::PageEnvelope;
-        use crate::admission::ResourceClass;
         use std::rc::Rc;
         use std::time::UNIX_EPOCH;
         let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());

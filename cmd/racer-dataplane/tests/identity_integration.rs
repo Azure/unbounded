@@ -3,6 +3,7 @@
 use racer_control_wire as wire;
 use racer_control_wire::*;
 use racer_dataplane::admission::AdmissionPolicy;
+use racer_dataplane::admission::ResourceClass;
 use racer_dataplane::config::Config;
 use racer_dataplane::control::BundleInstaller;
 use racer_dataplane::error::Error;
@@ -13,7 +14,6 @@ use racer_dataplane::model::ObjectVersion;
 use racer_dataplane::model::PageId;
 use racer_dataplane::model::PageNumber;
 use racer_dataplane::model::RequestId;
-use racer_dataplane::admission::ResourceClass;
 use racer_dataplane::model::StrongEtag;
 use racer_dataplane::model::WorkerId;
 use racer_dataplane::runtime::RequestScope;

@@ -2,6 +2,7 @@ use super::*;
 use crate::admission::ResourceClass;
 use crate::model::AttemptId;
 use racer_control_wire::CacheId;
+
 mod fill;
 mod hot_reads;
 mod peer_copies;
@@ -168,21 +169,21 @@ fn peer_failures_are_not_copy_misses() {
 
 mod flight {
     use crate::admission::AdmissionPolicy;
+    use crate::admission::ResourceClass;
     use crate::error::Error;
     use crate::error::Operation;
     use crate::error::Result;
     use crate::memory::PageResult;
-    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
-    use crate::security::OriginContext;
     use crate::model::PageId;
     use crate::model::PageNumber;
-    use crate::admission::ResourceClass;
     use crate::model::StrongEtag;
     use crate::read::flight::*;
     use crate::runtime::RequestScope;
+    use crate::security::OriginContext;
+    use racer_control_wire::CacheId;
     use std::rc::Rc;
     use std::task::Context;
     use std::task::Poll;
@@ -1112,12 +1113,9 @@ mod timeouts {
     use crate::error::Operation;
     use crate::error::Result;
     use crate::model::ExpiresAt;
-    use racer_control_wire::MembershipVersion;
     use crate::model::MetadataSelector;
-    use racer_control_wire::NodeId;
     use crate::model::ObjectMetadata;
     use crate::model::ObjectVersion;
-    use crate::security::OriginContext;
     use crate::model::PageNumber;
     use crate::model::RequestId;
     use crate::model::StrongEtag;
@@ -1132,10 +1130,13 @@ mod timeouts {
     use crate::read::candidates::*;
     use crate::read::flight::AcquisitionBudget;
     use crate::runtime::RequestScope;
+    use crate::security::OriginContext;
     use crate::test_support::security::network;
     use crate::topology::Candidates;
     use crate::topology::Member;
     use crate::topology::Membership;
+    use racer_control_wire::MembershipVersion;
+    use racer_control_wire::NodeId;
     use std::cell::Cell;
     use std::cell::RefCell;
     use std::future::Future;

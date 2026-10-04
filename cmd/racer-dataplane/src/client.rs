@@ -2,35 +2,39 @@
 //!
 //! Wire values follow pkg/racersdk: canonical lowercase keys, quoted strong pins,
 //! signed-63-bit decimal ranges, and byte-preserving opaque context.
-pub mod listener;
-
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::http::ConnectionLease;
-use crate::security::Authorization;
-use crate::model::ByteRange;
-use racer_control_wire::CacheId;
-use crate::model::CacheKey;
-use crate::model::ObjectId;
-use crate::security::OpaqueMetadata;
-use crate::security::OriginContext;
-use crate::model::PAGE_BYTES;
-use crate::model::StrongEtag;
-use crate::read::ReadResponse;
-use crate::runtime::HashSet;
-
-use crate::admission::AdmissionPolicy;
 use crate::http::Delivery;
 use crate::http::HttpIo;
+use crate::http::MAX_HEAD_BYTES;
 use crate::http::OwnedBuffer;
 use crate::http::ReaderLease;
+use crate::model::ByteRange;
+use crate::model::CacheKey;
+use crate::model::MAX_FIELD_BYTES;
+use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
+use crate::model::PAGE_BYTES;
 use crate::model::PageNumber;
 use crate::model::ResolvedRange;
+use crate::model::StrongEtag;
+use crate::read::ReadResponse;
 use crate::read::range_stream::RangeStream;
+use crate::runtime::HashSet;
 use crate::runtime::RequestScope;
+use crate::security::Authorization;
+use crate::security::OpaqueMetadata;
+use crate::security::OriginContext;
 use crate::telemetry::Observer;
+use http1::Header;
+use http1::MessageHead;
+use http1::StartLine;
+use http1::is_token;
+use http1::trim_ows;
+use racer_control_wire::CacheId;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::task::Context;
@@ -39,13 +43,7 @@ use std::time::Duration;
 use std::time::UNIX_EPOCH;
 use uring_runtime::reactor::IoBuffer;
 
-use crate::http::MAX_HEAD_BYTES;
-use crate::model::MAX_FIELD_BYTES;
-use http1::Header;
-use http1::MessageHead;
-use http1::StartLine;
-use http1::is_token;
-use http1::trim_ows;
+pub mod listener;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadKind {

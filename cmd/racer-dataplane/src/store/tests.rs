@@ -1,9 +1,10 @@
 use super::*;
+use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Result;
 use crate::memory::BufferPool;
 use crate::memory::CiphertextCopy;
-use racer_control_wire::CacheId;
 use crate::model::CacheKey;
 use crate::model::ExpiresAt;
 use crate::model::Nonce;
@@ -14,11 +15,8 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
-use crate::admission::ResourceClass;
 use crate::model::StrongEtag;
 use crate::model::WorkerId;
-
-use crate::admission::AdmissionPolicy;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use page_alloc::Alignment;
@@ -27,6 +25,7 @@ use page_alloc::SegmentId;
 use page_alloc::SegmentState;
 use page_alloc::Segments;
 use page_alloc::Slab;
+use racer_control_wire::CacheId;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -35,6 +34,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
+
 mod index_pressure {
     use super::*;
     fn fixture(capacity: usize) -> Fixture {
@@ -1793,11 +1793,11 @@ fn fill_accepted_before_stop_can_transfer_dirty_ownership_during_drain() {
 
 mod records {
     use super::*;
+    use crate::admission::ResourceClass;
     use crate::memory::CiphertextBytes;
     use crate::memory::CiphertextPage;
     use crate::model::ExpiresAt;
     use crate::model::PAGE_BYTES;
-    use crate::admission::ResourceClass;
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
 
@@ -2368,7 +2368,6 @@ mod records {
 
 mod checkpoint {
     use crate::error::Error;
-    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
@@ -2388,6 +2387,7 @@ mod checkpoint {
     use page_alloc::Extent;
     use page_alloc::SegmentState;
     use page_alloc::Segments;
+    use racer_control_wire::CacheId;
     use sha2::Digest;
     use sha2::Sha256;
     use std::fs;

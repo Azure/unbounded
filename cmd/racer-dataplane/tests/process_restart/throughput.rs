@@ -886,9 +886,9 @@ fn production_multicache_disk_baseline() {
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; two actual Applications with authenticated TCP peers"]
 fn production_peer_and_failed_neighbor_progress() {
     use racer_control_wire::CacheId;
-    use racer_dataplane::model::CacheKey;
     use racer_control_wire::MembershipVersion;
     use racer_control_wire::NodeId;
+    use racer_dataplane::model::CacheKey;
     use racer_dataplane::model::ObjectId;
     use racer_dataplane::model::PageNumber;
     use racer_dataplane::topology::Member;
@@ -1026,9 +1026,9 @@ fn production_peer_and_failed_neighbor_progress() {
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; actual noncandidate subscription"]
 fn production_remote_bootstrap_one_get_and_empty() {
     use racer_control_wire::CacheId;
-    use racer_dataplane::model::CacheKey;
     use racer_control_wire::MembershipVersion;
     use racer_control_wire::NodeId;
+    use racer_dataplane::model::CacheKey;
     use racer_dataplane::model::ObjectId;
     use racer_dataplane::model::PageNumber;
     use racer_dataplane::topology::Member;

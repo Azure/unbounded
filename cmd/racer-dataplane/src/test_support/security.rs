@@ -1,17 +1,17 @@
 //! Shared security fixtures. Never linked into production.
+use crate::http::Codec;
+use crate::peer::protocol;
 use crate::peer::protocol::Signatures;
 use crate::peer::protocol::SignedHead;
-use crate::http::Codec;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
-use racer_control_wire::NodeId;
-use crate::peer::protocol;
 use racer_control_wire::BundleGeneration;
 use racer_control_wire::CacheEncryptionKey;
+use racer_control_wire::CacheId;
 use racer_control_wire::CacheKeyPurpose;
 use racer_control_wire::CacheKeyRef;
 use racer_control_wire::CacheKeyState;
+use racer_control_wire::ClusterId;
 use racer_control_wire::KeyringBundle;
+use racer_control_wire::NodeId;
 use racer_control_wire::SCHEMA_VERSION;
 use racer_identity::Certificates;
 use racer_identity::KeyEpochs;
@@ -20,6 +20,7 @@ use racer_identity::Keyring;
 use racer_identity::PendingIdentity;
 use std::rc::Rc;
 use std::sync::Arc;
+
 pub struct Identity {
     pub keys: Rc<Keyring>,
     pub certificates: Rc<Certificates>,

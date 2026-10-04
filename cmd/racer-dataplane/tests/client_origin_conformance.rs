@@ -4,6 +4,7 @@
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
+use racer_control_wire::CacheId;
 use racer_dataplane::admission::AdmissionPolicy;
 use racer_dataplane::client::ClientRequest;
 use racer_dataplane::client::ReadKind;
@@ -18,7 +19,6 @@ use racer_dataplane::http::Delivery;
 use racer_dataplane::http::HttpIo;
 use racer_dataplane::http::new_pipe_pool;
 use racer_dataplane::model::ByteRange;
-use racer_control_wire::CacheId;
 use racer_dataplane::model::CacheKey;
 use racer_dataplane::model::ExpiresAt;
 use racer_dataplane::model::ObjectId;

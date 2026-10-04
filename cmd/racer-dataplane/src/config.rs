@@ -5,10 +5,10 @@
 
 use crate::error::Error;
 use crate::error::Result;
-use racer_control_wire::ClusterId;
-use racer_control_wire::NodeId;
 use crate::model::PAGE_BYTES;
 use crate::store::MAX_HEADER_BYTES;
+use racer_control_wire::ClusterId;
+use racer_control_wire::NodeId;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;

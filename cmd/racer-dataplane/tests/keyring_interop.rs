@@ -8,10 +8,10 @@ use racer_dataplane as dataplane;
 #[allow(dead_code)]
 mod enrollment_io;
 use racer_control_wire as state;
+use racer_control_wire::ClusterId;
 use racer_dataplane::control::ControlEndpoint;
 use racer_dataplane::control::Enrollment;
 use racer_dataplane::control::*;
-use racer_control_wire::ClusterId;
 use racer_dataplane::model::RequestId;
 use racer_dataplane::runtime::RequestScope;
 use std::rc::Rc;

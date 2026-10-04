@@ -1,6 +1,7 @@
 //! Owned per-cache Unix sockets with permissions, bounded connections, and draining.
 //! Bind /run/racer/<cache name>/client/socket; mount its client directory separately
 //! from the origin directory so pods receive only their authorized endpoint.
+
 use super::RequestParser;
 use super::Responses;
 use super::handle_read_result;
@@ -10,12 +11,12 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::http::ConnectionLease;
 use crate::http::HttpIo;
-use racer_control_wire::CacheId;
 use crate::model::RequestId;
 use crate::read::Coordinator;
 use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;
 use racer_control_wire::CacheDefinition;
+use racer_control_wire::CacheId;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;

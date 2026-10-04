@@ -2,13 +2,14 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::AttemptId;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
 use crate::model::ObjectId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
 use crate::runtime::RequestScope;
-pub use ::topology::MAX_DEGREE;
+#[cfg(test)]
+use racer_control_wire::CacheId;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use racer_control_wire::RailMapping;
 use racer_control_wire::valid_site;
 use sha2::Digest;
@@ -25,6 +26,8 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 use uring_runtime::deadline::Deadline;
+
+pub use ::topology::MAX_DEGREE;
 
 // Immutable placement, authenticated routing, and worker-local endpoint circuits.
 
@@ -1200,12 +1203,12 @@ pub(crate) mod tests {
 
     pub(crate) mod routing_tests {
         use super::*;
-        use racer_control_wire::MembershipVersion;
         use crate::topology::Membership;
         use crate::topology::scored_members;
         use crate::topology::tests::fixtures::member;
         use crate::topology::tests::fixtures::membership;
         use crate::topology::tests::fixtures::object;
+        use racer_control_wire::MembershipVersion;
         use std::sync::Arc;
 
         #[test]
@@ -1478,8 +1481,9 @@ pub(crate) mod tests {
             for (i, member) in input.iter_mut().enumerate() {
                 member.shares = std::num::NonZeroU32::new(if i % 3 == 0 { 1 } else { 4 }).unwrap();
             }
-            let members =
-                Arc::new(Membership::validate(racer_control_wire::MembershipVersion(1), input).unwrap());
+            let members = Arc::new(
+                Membership::validate(racer_control_wire::MembershipVersion(1), input).unwrap(),
+            );
             let cached = Paths::new(Rc::new(LinkHealth), 1);
             let cold = Paths::new(Rc::new(LinkHealth), 0);
             for (attempt, expected) in crate::topology::tests::fixtures::V5_NEXT_HOPS {

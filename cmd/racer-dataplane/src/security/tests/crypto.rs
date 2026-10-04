@@ -22,22 +22,25 @@
 //! mean; these counters provide neither percentiles nor current queue age or total
 //! request latency.
 
+use crate::security::*;
+use racer_control_wire::CacheId;
+
 #[cfg(test)]
 mod measurement {
     //! Measurement correctness scenarios using the real page engine.
     use super::tests::input;
     use super::tests::keyring;
     use super::*;
-    use crate::telemetry::Event;
-    use crate::telemetry::Event::*;
-    use crate::telemetry::Metrics;
+    use crate::admission::ResourceClass;
     use crate::memory::BufferPool;
     use crate::model::Nonce;
     use crate::model::PageEnvelope;
-    use crate::admission::ResourceClass;
     use crate::model::*;
     use crate::security::PageCryptoEngine;
     use crate::security::page_aad;
+    use crate::telemetry::Event;
+    use crate::telemetry::Event::*;
+    use crate::telemetry::Metrics;
     use racer_crypto::aead;
     use std::rc::Rc;
     use std::time::Duration;
@@ -1036,8 +1039,6 @@ mod measurement {
     }
 }
 
-use crate::security::*;
-use racer_control_wire::CacheId;
 #[cfg(test)]
 mod channel_tests {
     #[cfg(test)]
@@ -1102,8 +1103,8 @@ mod tests {
     pub(super) fn input(
         admission: &std::rc::Rc<flow_control::Quotas<AdmissionPolicy>>,
     ) -> CryptoInput {
-        use crate::memory::BufferPool;
         use crate::admission::ResourceClass;
+        use crate::memory::BufferPool;
         use crate::model::*;
         let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
         CryptoInput::Encrypt {
@@ -1428,8 +1429,8 @@ mod tests {
 
     #[test]
     fn abandoned_future_retains_buffers_key_and_permit_until_reaped() {
-        use crate::memory::BufferPool;
         use crate::admission::ResourceClass;
+        use crate::memory::BufferPool;
         use crate::model::*;
         use std::rc::Rc;
         use std::time::Duration;
@@ -1518,8 +1519,8 @@ mod tests {
 
     #[test]
     fn engine_drop_reclaims_queued_jobs_and_drain_finishes() {
-        use crate::memory::BufferPool;
         use crate::admission::ResourceClass;
+        use crate::memory::BufferPool;
         use crate::model::*;
         use std::rc::Rc;
         use std::time::Duration;
@@ -1578,8 +1579,8 @@ mod tests {
 
     #[test]
     fn original_scope_failure_is_returned_without_submission() {
-        use crate::memory::BufferPool;
         use crate::admission::ResourceClass;
+        use crate::memory::BufferPool;
         use crate::model::*;
         use std::rc::Rc;
         use std::time::Instant;

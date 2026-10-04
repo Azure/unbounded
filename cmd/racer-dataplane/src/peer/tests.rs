@@ -1,7 +1,39 @@
 //! Shared signed peer fixtures and scenario suites.
 use super::*;
+use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
+use crate::memory::BufferPool;
+use crate::model::MetadataSelector;
+use crate::model::Nonce;
+use crate::model::*;
+use crate::peer::forwarding::Forwarding;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::Operation;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::SecurityCodec;
+use crate::peer::protocol::Signatures;
+use crate::peer::protocol::decode_envelope;
+use crate::peer::protocol::encode_envelope;
+use crate::runtime::RequestScope;
+use crate::security::EncryptedAuthorization;
+use crate::security::PeerOriginContext;
+use crate::topology::RouteBudget;
+use racer_control_wire::CacheId;
+use racer_control_wire::ClusterId;
+use racer_control_wire::KeyId;
+use racer_identity::Certificates;
+use racer_identity::Keyring;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+use uring_runtime::deadline::Deadline;
+use uring_runtime::environment::SimulationClock;
 #[cfg(test)]
 use uring_runtime::group::Service;
+use uring_runtime::reactor::IoBuffer;
+
 mod body_progress {
     use super::*;
     use crate::http::Codec;
@@ -473,7 +505,6 @@ mod destination_disconnect {
     use super::*;
     use crate::http::Codec;
     use crate::http::HttpIo;
-    use crate::security::OriginContext;
     use crate::read::flight::AcquisitionBudget;
     use crate::read::flight::AcquisitionEvent;
     use crate::read::flight::AcquisitionFailure;
@@ -481,6 +512,7 @@ mod destination_disconnect {
     use crate::read::flight::JoinedCopy;
     use crate::read::flight::JoinedFlight;
     use crate::runtime::Reactor;
+    use crate::security::OriginContext;
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
@@ -1347,9 +1379,8 @@ mod protocol_socket;
 mod requester_safety {
     //! Real socket exchange with the adaptive controller attached to routing/requester.
     use crate::admission::AdmissionPolicy;
-    use crate::http::Codec;
-    use racer_control_wire::MembershipVersion;
     use crate::admission::ResourceClass;
+    use crate::http::Codec;
     use crate::peer::AdaptivePeers;
     use crate::peer::Outcome;
     use crate::peer::protocol as connection;
@@ -1365,6 +1396,7 @@ mod requester_safety {
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
+    use racer_control_wire::MembershipVersion;
     use std::sync::Arc;
     use std::task::Context;
     use std::task::Poll;
@@ -2775,34 +2807,6 @@ mod timing {
         }
     }
 }
-use crate::memory::BufferPool;
-use crate::security::EncryptedAuthorization;
-use racer_control_wire::KeyId;
-use crate::model::MetadataSelector;
-use crate::model::Nonce;
-use crate::security::PeerOriginContext;
-use crate::admission::ResourceClass;
-use crate::model::*;
-use crate::peer::forwarding::Forwarding;
-use crate::peer::protocol::FetchMode;
-use crate::peer::protocol::Operation;
-use crate::peer::protocol::PeerRequest;
-use crate::peer::protocol::PeerResponse;
-use crate::peer::protocol::SecurityCodec;
-use crate::peer::protocol::decode_envelope;
-use crate::peer::protocol::encode_envelope;
-
-use crate::admission::AdmissionPolicy;
-use crate::peer::protocol::Signatures;
-use crate::runtime::RequestScope;
-use crate::topology::RouteBudget;
-use racer_identity::Certificates;
-use racer_identity::Keyring;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
-use uring_runtime::deadline::Deadline;
 
 const A: &str = "00000001-1111-4111-8111-111111111111";
 const B: &str = "00000002-1111-4111-8111-111111111111";
@@ -2973,8 +2977,6 @@ impl Drop for NoOutbound {
         );
     }
 }
-use uring_runtime::environment::SimulationClock;
-use uring_runtime::reactor::IoBuffer;
 #[test]
 fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
     use crate::peer::Event;

@@ -1,6 +1,7 @@
 use super::*;
-use racer_control_wire::CacheId;
 use crate::model::CacheKey;
+use racer_control_wire::CacheId;
+
 #[test]
 fn local_context_is_independently_charged_and_keeps_exact_sensitive_fields() {
     let keys = Rc::new(crate::test_support::security::keys());

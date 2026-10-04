@@ -1,5 +1,7 @@
 //! Opt-in Go SDK fixture using the production library, not a second crate root.
+
 use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::client;
 use crate::config::Limits;
 use crate::control;
@@ -15,10 +17,9 @@ use crate::runtime;
 use crate::security;
 use crate::store;
 use crate::topology;
+use crate::worker::CryptoRuntime;
 use error::Operation;
-use security::OriginContext;
 use model::PAGE_BYTES;
-use admission::ResourceClass;
 use model::*;
 use racer_control_wire::BundleGeneration;
 use racer_control_wire::CacheEncryptionKey;
@@ -27,12 +28,12 @@ use racer_control_wire::CacheKeyRef;
 use racer_control_wire::CacheKeyState;
 use racer_control_wire::KeyringBundle;
 use racer_control_wire::SCHEMA_VERSION;
+use racer_control_wire::{CacheId, ClusterId, NodeId};
 use racer_identity::KeyEpochs;
 use racer_identity::Keyring;
 use runtime::Reactor;
 use runtime::RequestScope;
-use worker::CryptoRuntime;
-
+use security::OriginContext;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -213,9 +214,9 @@ impl SubscriptionFixture {
         use read::metadata::MetadataDependencies;
         use read::metadata::MetadataService;
         use read::range_stream::RangeStreams;
+        use security::CredentialCrypto;
         use security::PageCrypto;
         use security::PageCryptoEngine;
-        use security::CredentialCrypto;
         use store::StoreReader;
         use store::StoreWriter;
         use store::catalog::Index;

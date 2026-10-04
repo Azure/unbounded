@@ -3,6 +3,7 @@
 //! Recovery validates every shard before installation and seeds the periodic slot
 //! sequence. The worker lifecycle decides when to poll or finish a cut; its writer
 //! gating and shutdown drain predicates remain in app.rs.
+
 use super::*;
 use crate::runtime::HashMap;
 use crate::runtime::HashSet;
@@ -654,7 +655,6 @@ mod tests {
 
     #[test]
     fn ownership_and_capacity_are_checked_on_every_worker() {
-        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::ObjectVersion;

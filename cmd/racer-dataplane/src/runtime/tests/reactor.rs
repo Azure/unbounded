@@ -1,5 +1,6 @@
 //! Reactor ownership and simulation regression tests.
 use crate::runtime::*;
+
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
@@ -358,9 +359,9 @@ mod simulation_tests {
     use super::tests::poll;
     use super::tests::scope;
     use crate::admission::AdmissionPolicy;
+    use crate::admission::ResourceClass;
     use crate::error::Error;
     use crate::error::Result;
-    use crate::admission::ResourceClass;
     use crate::runtime::RequestScope;
     use std::cell::Cell;
     use std::ffi::CString;
@@ -556,7 +557,6 @@ mod simulation_tests {
     }
     #[test]
     fn immutable_ciphertext_send_shares_backing_and_retains_it_through_cancel_fences() {
-        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::ObjectVersion;

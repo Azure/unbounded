@@ -1,10 +1,10 @@
 //! Racer resource policy and compound admission operations.
-use crate::model::WorkerId;
+
 use crate::config::Limits;
 use crate::error::Error;
 use crate::error::Result;
-use racer_control_wire::CacheId;
 use crate::model::PAGE_BYTES;
+use crate::model::WorkerId;
 use crate::telemetry::Detail;
 use crate::telemetry::Failure;
 use crate::telemetry::Observer;
@@ -14,6 +14,7 @@ use flow_control::Policy;
 use flow_control::Quotas;
 use flow_control::Rejection;
 use flow_control::SharedQuotas;
+use racer_control_wire::CacheId;
 use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;

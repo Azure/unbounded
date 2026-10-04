@@ -1,14 +1,13 @@
 //! Ranked acquisition and copy-only predecessor probes. Only a validated local
 //! candidate can mint origin authority; request headers never change placement.
+
 use super::flight::AcquisitionBudget;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::AttemptId;
 use crate::model::MetadataSelector;
-use racer_control_wire::NodeId;
 use crate::model::ObjectId;
-use crate::security::OriginContext;
 use crate::model::PageNumber;
 use crate::peer::Requester;
 use crate::peer::forwarding::VerifiedResponse;
@@ -18,17 +17,17 @@ use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
 use crate::runtime::RequestScope;
 use crate::security::CredentialCrypto;
+use crate::security::OriginContext;
 use crate::telemetry::Detail;
 use crate::telemetry::Event;
 use crate::telemetry::Failure;
 use crate::telemetry::Metrics;
 use crate::telemetry::Observer;
 use crate::telemetry::Stage;
-use uring_runtime::deadline::Deadline;
-
 use crate::topology::Candidates;
 use crate::topology::Placement;
 use crate::topology::RouteBudget;
+use racer_control_wire::NodeId;
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -40,6 +39,7 @@ use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
+use uring_runtime::deadline::Deadline;
 
 fn reserve_hedge_pages(
     admission: &flow_control::Quotas<crate::admission::AdmissionPolicy>,
@@ -49,8 +49,8 @@ fn reserve_hedge_pages(
     flow_control::Charge<crate::admission::AdmissionPolicy>,
     flow_control::Charge<crate::admission::AdmissionPolicy>,
 )> {
-    use crate::model::PAGE_BYTES;
     use crate::admission::ResourceClass;
+    use crate::model::PAGE_BYTES;
     let plaintext = admission.reserve(
         Some(cache),
         ResourceClass::Plaintext,
@@ -1422,12 +1422,12 @@ fn recoverable(error: Error) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ExpiresAt;
     use crate::model::ObjectMetadata;
     use crate::model::ObjectVersion;
     use crate::model::StrongEtag;
+    use racer_control_wire::CacheId;
     #[test]
     fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
         struct Routes(RefCell<Vec<(u8, u32)>>);
@@ -1560,11 +1560,11 @@ pub(super) mod tests {
         Rc<CredentialCrypto>,
     ) {
         use crate::admission::AdmissionPolicy;
-        use racer_control_wire::ClusterId;
-        use racer_control_wire::MembershipVersion;
         use crate::model::RequestId;
         use crate::topology::Member;
         use crate::topology::Membership;
+        use racer_control_wire::ClusterId;
+        use racer_control_wire::MembershipVersion;
         use racer_identity::KeyEpochs;
         use racer_identity::Keyring;
         let membership = std::sync::Arc::new(
@@ -1864,9 +1864,9 @@ pub(super) mod tests {
         }
     }
     fn membership() -> std::sync::Arc<crate::topology::Membership> {
-        use racer_control_wire::MembershipVersion;
         use crate::topology::Member;
         use crate::topology::Membership;
+        use racer_control_wire::MembershipVersion;
         std::sync::Arc::new(
             Membership::validate(
                 MembershipVersion(1),

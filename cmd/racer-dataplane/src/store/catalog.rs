@@ -2,7 +2,6 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::CurrentVersion;
-use racer_control_wire::KeyId;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
@@ -16,11 +15,13 @@ use page_alloc::Generation;
 use page_alloc::SegmentId;
 use page_alloc::SegmentState;
 use page_alloc::Segments;
+use racer_control_wire::KeyId;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::rc::Rc;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordLocation {
     pub segment: SegmentId,
@@ -577,9 +578,9 @@ impl SegmentClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::StrongEtag;
+    use racer_control_wire::CacheId;
 
     fn segments(bytes: u64, count: usize) -> Segments {
         let s = Segments::new(bytes);

@@ -1,5 +1,6 @@
 //! Request scope and cancellation regression tests.
 use crate::runtime::*;
+
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;

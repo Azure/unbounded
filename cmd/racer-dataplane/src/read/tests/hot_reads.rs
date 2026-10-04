@@ -7,7 +7,6 @@ use crate::http::Codec;
 use crate::http::Delivery;
 use crate::http::new_pipe_pool;
 use crate::model::ByteRange;
-use racer_control_wire::MembershipVersion;
 use crate::peer::PeerNetwork;
 use crate::peer::forwarding::Forwarding;
 use crate::peer::forwarding::VerifiedResponse;
@@ -20,6 +19,8 @@ use crate::test_support::security::network;
 use crate::test_support::security::node;
 use crate::topology::LinkHealth;
 use crate::topology::Paths;
+use racer_control_wire::MembershipVersion;
+
 mod duplex_release {
     //! Exercise release credit through the real duplex response, not release_page.
     use super::*;

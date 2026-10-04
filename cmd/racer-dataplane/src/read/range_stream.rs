@@ -1,6 +1,7 @@
 //! Shared compact subscription demand with independently leased page slices.
 //! A stream pins its version and length once. A late error terminates that stream;
 //! it cannot replace headers or reopen against a newer version.
+
 use super::dispatch::WorkerDirectory;
 use super::flight::AcquisitionBudget;
 use crate::admission::AdmissionPolicy;
@@ -12,7 +13,6 @@ use crate::http::ReaderLease;
 use crate::memory::PageResult;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
-use crate::security::OriginContext;
 use crate::model::PAGE_BYTES;
 use crate::model::PageId;
 use crate::model::PageNumber;
@@ -20,7 +20,7 @@ use crate::model::ResolvedRange;
 #[cfg(test)]
 use crate::read::dispatch::WorkerMap;
 use crate::runtime::RequestScope;
-
+use crate::security::OriginContext;
 use flow_control::Window;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -992,21 +992,21 @@ fn validate_pin(expected: &ObjectMetadata, actual: &ObjectMetadata) -> Result<()
 pub(super) mod tests {
     use super::*;
     use crate::admission::AdmissionPolicy;
+    use crate::admission::ResourceClass;
     use crate::http::new_pipe_pool;
     use crate::model::ByteRange;
-    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ExpiresAt;
-    use racer_control_wire::MembershipVersion;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
     use crate::model::PAGE_BYTES;
     use crate::model::RequestId;
-    use crate::admission::ResourceClass;
     use crate::model::StrongEtag;
     use crate::model::WorkerId;
     use crate::runtime::Reactor;
     use crate::topology::Membership;
+    use racer_control_wire::CacheId;
+    use racer_control_wire::MembershipVersion;
 
     struct Fixture {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -1075,13 +1075,13 @@ pub(super) mod tests {
         metadata: &ObjectMetadata,
         number: u64,
     ) -> PageResult {
+        use crate::admission::ResourceClass;
         use crate::memory::CiphertextBytes;
         use crate::memory::CiphertextPage;
         use crate::memory::VerifiedBytes;
         use crate::memory::VerifiedPage;
         use crate::model::Nonce;
         use crate::model::PageEnvelope;
-        use crate::admission::ResourceClass;
         let length = (metadata.length - number * PAGE_BYTES).min(PAGE_BYTES) as usize;
         let page = PageId {
             version: metadata.version.clone(),
@@ -1622,11 +1622,11 @@ pub(super) mod tests {
 
     #[test]
     fn responses_stream_more_than_three_pages_only_with_client_sized_http_framing() {
+        use crate::admission::ResourceClass;
         use crate::client::Responses;
         use crate::http::Codec;
         use crate::http::new_pipe_pool;
         use crate::model::RequestId;
-        use crate::admission::ResourceClass;
         use crate::read::ReadResponse;
         use crate::runtime::Reactor;
         use std::io::Read;
@@ -1872,11 +1872,11 @@ pub(super) mod tests {
         use super::*;
         use crate::admission::AdmissionPolicy;
         use crate::model::ByteRange;
-        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::StrongEtag;
         use flow_control::Quotas;
+        use racer_control_wire::CacheId;
         use std::task::Context;
         use std::task::Poll;
         fn version() -> ObjectVersion {
@@ -2100,9 +2100,9 @@ pub(super) mod tests {
         }
         #[test]
         fn production_aggregate_is_compact_exclusive_and_contracts_never_refill() {
+            use crate::peer::subscriptions::PageInterval;
             use racer_control_wire::MembershipVersion;
             use racer_control_wire::NodeId;
-            use crate::peer::subscriptions::PageInterval;
             let scheduler = Scheduler::new(4);
             let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
             let mut first = scheduler

@@ -1,5 +1,8 @@
 //! Signed envelopes, routing contracts, and real socket/session exchanges.
+
 use super::*;
+use racer_control_wire::CacheId;
+use uring_runtime::reactor::IoBuffer;
 
 #[test]
 fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
@@ -1884,4 +1887,3 @@ mod established_sessions {
         );
     }
 }
-use uring_runtime::reactor::IoBuffer;

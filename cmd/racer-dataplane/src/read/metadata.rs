@@ -4,6 +4,7 @@
 //! admission; explicit pins may use expired metadata. A zero-TTL refresh admits its
 //! waiters once. Clock discontinuities invalidate uncertain freshness. Cache entries
 //! contain no origin context, Authorization, or opaque adapter metadata header.
+
 use super::candidates::CandidatePolicy;
 use super::candidates::CandidateResolution;
 use super::flight::AcquisitionBudget;
@@ -14,7 +15,6 @@ use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
-use crate::security::OriginContext;
 use crate::model::PageId;
 use crate::model::PageNumber;
 use crate::model::StrongEtag;
@@ -25,6 +25,7 @@ use crate::peer::protocol::PeerResponse;
 use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::CredentialCrypto;
+use crate::security::OriginContext;
 use crate::store::catalog::Index;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -940,7 +941,6 @@ fn validate_bootstrap_metadata(expected: &ObjectMetadata, actual: &ObjectMetadat
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ExpiresAt;
     use crate::model::WorkerId;

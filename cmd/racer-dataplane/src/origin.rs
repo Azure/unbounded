@@ -4,6 +4,7 @@
 //! Credentials are only origin-fetch context, never Racer authorization. Do not
 //! persist headers or retain them in pooled connections after an operation ends.
 use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::control::SnapshotStore;
 use crate::error::Error;
 use crate::error::Operation;
@@ -19,14 +20,13 @@ use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
-use crate::security::OriginContext;
 use crate::model::PAGE_BYTES;
 use crate::model::PageId;
 use crate::model::PageNumber;
-use crate::admission::ResourceClass;
 use crate::model::StrongEtag;
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
+use crate::security::OriginContext;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use uring_runtime::reactor::Completion;
 use uring_runtime::reactor::IoBuffer;
+
 /// OriginClient is the shipping adapter implementation. Scripted implementations
 /// remain for poll-exact cancellation, wake ordering, and reservation-fence tests;
 /// ordinary adapter scenarios should use the shared test_support UDS fixture.

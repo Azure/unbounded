@@ -2,6 +2,7 @@
 //! threads; the coordinator, futures, delivery leases, and streams stay local.
 //! Stable local page assignment is independent of cluster placement. Drain flights
 //! before changing the worker map; no live remapping is implied.
+
 use super::Coordinator;
 use super::flight::AcquisitionBudget;
 use crate::error::Error;
@@ -13,9 +14,7 @@ use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
-use crate::security::OriginContext;
 use crate::model::PageId;
-use crate::security::PeerOriginContext;
 use crate::model::VersionMetadata;
 use crate::model::WorkerId;
 use crate::peer::forwarding::VerifiedRequest;
@@ -24,7 +23,8 @@ use crate::peer::server::LocalPageService;
 use crate::runtime::Cancellation;
 use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
-
+use crate::security::OriginContext;
+use crate::security::PeerOriginContext;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
@@ -1002,19 +1002,19 @@ impl WorkerMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::RequestId;
     use crate::model::StrongEtag;
+    use racer_control_wire::CacheId;
     use std::time::Duration;
     use std::time::Instant;
     #[test]
     fn stable_assignment_ignores_etag_and_worker_input_order() {
-        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectVersion;
         use crate::model::PageNumber;
         use crate::model::StrongEtag;
+        use racer_control_wire::CacheId;
         let map = WorkerMap::new(vec![WorkerId(9), WorkerId(3), WorkerId(1)]).unwrap();
         let ordered = WorkerMap::new(vec![WorkerId(1), WorkerId(3), WorkerId(9)]).unwrap();
         let object = ObjectId {

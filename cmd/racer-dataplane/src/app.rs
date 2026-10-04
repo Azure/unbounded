@@ -10,6 +10,8 @@
 //! fences kernel/NIC references, then destroys buffers/devices and owned sockets.
 //! Cache removal closes new admission; accepted resource owners drain independently.
 //! Startup failures roll back created resources. Constructors perform no operational I/O.
+
+use crate::admission::AdmissionPolicy;
 use crate::client::RequestParser;
 use crate::client::Responses;
 use crate::client::listener::ClientListeners;
@@ -32,13 +34,14 @@ use crate::http::HttpPool;
 use crate::http::new_pipe_pool;
 use crate::memory::BufferPool;
 use crate::memory::MemoryCache;
-use racer_control_wire::NodeId;
 use crate::model::RequestId;
 use crate::model::WorkerId;
 use crate::origin::Origin;
 use crate::origin::OriginClient;
 use crate::peer::Relay;
 use crate::peer::Requester;
+use crate::peer::forwarding::Forwarding;
+use crate::peer::protocol::Signatures;
 use crate::peer::server::PeerServer;
 use crate::peer::transport::Transfers;
 use crate::rdma::Devices;
@@ -56,30 +59,11 @@ use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
 use crate::runtime::HashMap;
 use crate::runtime::HashSet;
-use crate::telemetry::Gauge;
-use crate::telemetry::Health;
-use crate::telemetry::Resources;
-use crate::telemetry::State;
-use racer_control_wire::CacheDefinition;
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-use std::time::UNIX_EPOCH;
-
-use crate::admission::AdmissionPolicy;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
-use crate::worker::AffinityPlan;
-use crate::worker::CryptoRuntime;
-
-use crate::worker::WorkerGroup;
-use crate::worker::WorkerRuntime;
-
-use crate::peer::forwarding::Forwarding;
-use crate::peer::protocol::Signatures;
+use crate::security::CredentialCrypto;
 use crate::security::PageCrypto;
 use crate::security::PageCryptoEngine;
-use crate::security::CredentialCrypto;
-
 use crate::store::Store;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
@@ -89,14 +73,26 @@ use crate::store::checkpoint::CheckpointGeometry;
 use crate::store::checkpoint::Checkpointer;
 use crate::store::checkpoint::Recovery;
 use crate::store::checkpoint::ShardImage;
+use crate::telemetry::Gauge;
+use crate::telemetry::Health;
+use crate::telemetry::Resources;
+use crate::telemetry::State;
 use crate::telemetry::Telemetry;
 use crate::topology::LinkHealth;
 use crate::topology::Paths;
 use crate::topology::Placement;
+use crate::worker::AffinityPlan;
+use crate::worker::CryptoRuntime;
+use crate::worker::WorkerGroup;
+use crate::worker::WorkerRuntime;
+use racer_control_wire::CacheDefinition;
+use racer_control_wire::NodeId;
 use racer_identity::Certificates;
 use racer_identity::KeyEpochs;
 use racer_identity::KeyPurpose;
 use racer_identity::Keyring;
+use std::cell::RefCell;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -106,6 +102,7 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 mod native;
 mod recovery;

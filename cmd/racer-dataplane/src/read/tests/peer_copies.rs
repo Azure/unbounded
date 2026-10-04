@@ -1,12 +1,13 @@
 //! Real AEAD and signed peer responses, with deterministic ranked source scripts.
+
 use super::fill::*;
 use crate::memory::CiphertextCopy;
-use racer_control_wire::NodeId;
 use crate::peer::forwarding::Forwarding;
 use crate::peer::forwarding::VerifiedResponse;
 use crate::peer::protocol::PeerRequest;
 use crate::test_support::security::network;
 use crate::test_support::security::node;
+use racer_control_wire::NodeId;
 use std::collections::VecDeque;
 
 enum Reply {

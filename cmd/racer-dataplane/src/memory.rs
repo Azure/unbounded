@@ -1,29 +1,24 @@
 //! Distinct accounting and lifetimes for plaintext, ciphertext, pipes, and kernel I/O.
 //! Cache lookups retain the original encrypted page and immutable version metadata.
 //! Eviction releases idle leases; retirement hides entries without revoking owners.
-use crate::runtime::HashMap;
-use crate::runtime::HashSet;
+
 use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::error::Error;
-use crate::error::Operation;
 use crate::error::Result;
-use racer_control_wire::CacheId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PAGE_BYTES;
 use crate::model::PageEnvelope;
 use crate::model::PageId;
-use crate::admission::ResourceClass;
 use crate::model::VersionMetadata;
-use crate::runtime::RequestScope;
-use flow_control::Quotas;
-use flow_control::pipe::PipeLease;
-use flow_control::pipe::PipePool;
+use crate::runtime::HashMap;
+use crate::runtime::HashSet;
+use racer_control_wire::CacheId;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Waker;
 
 #[derive(Clone)]
 pub struct BufferPool {
@@ -1160,10 +1155,13 @@ pub(crate) mod tests {
     }
     pub(in crate::memory) mod pipe_tests {
         use super::*;
-        use crate::http::new_pipe_pool;
-        use crate::http::acquire_wait;
         use crate::config::Limits;
         use crate::error::Error;
+        use crate::http::acquire_wait;
+        use crate::http::new_pipe_pool;
+        use crate::runtime::RequestScope;
+        use flow_control::Quotas;
+        use std::task::Waker;
 
         pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
             let small = std::num::NonZeroUsize::new(8).unwrap();

@@ -2,6 +2,7 @@
 //!
 //! The coordinator keeps every owner frozen through publication, then explicitly
 //! finishes each snapshot even on failure. Write/rename provides no fsync durability.
+
 use super::Decoder;
 use super::catalog::Index;
 use super::catalog::IndexSnapshot;
@@ -10,9 +11,7 @@ use super::catalog::RecordLocation;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use racer_control_wire::CacheId;
 use crate::model::CacheKey;
-use racer_control_wire::KeyId;
 use crate::model::ObjectId;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
@@ -30,6 +29,8 @@ use page_alloc::SegmentId;
 use page_alloc::SegmentSnapshot;
 use page_alloc::SegmentState;
 use page_alloc::Segments;
+use racer_control_wire::CacheId;
+use racer_control_wire::KeyId;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;

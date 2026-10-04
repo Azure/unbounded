@@ -1,5 +1,6 @@
 //! Shared client/peer coordinator. Fresh admission, explicit version pins, and
 //! page-zero bootstrap use the same metadata owner and Fill flights.
+
 use self::fill::Fill;
 use self::flight::AcquisitionBudget;
 use self::metadata::MetadataService;
@@ -15,8 +16,6 @@ use crate::model::ByteRange;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
-use crate::security::OriginContext;
-use crate::security::PeerOriginContext;
 use crate::model::ResolvedRange;
 use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::FetchMode;
@@ -26,8 +25,10 @@ use crate::peer::server::LocalPageService;
 use crate::runtime::RequestScope;
 use crate::security::ChargedOriginContext;
 use crate::security::CredentialCrypto;
-
+use crate::security::OriginContext;
+use crate::security::PeerOriginContext;
 use std::rc::Rc;
+
 pub mod candidates;
 pub mod dispatch;
 pub mod fill;

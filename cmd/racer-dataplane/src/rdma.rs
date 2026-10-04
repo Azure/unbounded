@@ -1,25 +1,27 @@
 use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::BufferPool;
 use crate::memory::CiphertextPage;
-use racer_control_wire::NodeId;
 use crate::model::PageEnvelope;
 use crate::model::PageId;
-use crate::admission::ResourceClass;
 use crate::model::TransferId;
-use crate::runtime::RequestScope;
-use uring_runtime::deadline::Deadline;
-#[cfg(test)]
-use uring_runtime::group::Service;
-
 use crate::peer::protocol::VerifiedHead;
+use crate::runtime::RequestScope;
 use crate::security::PageCryptoEngine;
 use crate::topology::FAILURE_LINKS;
 use crate::topology::Route;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+#[cfg(test)]
+use racer_control_wire::CacheId;
+#[cfg(test)]
+use racer_control_wire::KeyId;
+#[cfg(test)]
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use racer_control_wire::RailId;
 use racer_control_wire::RailMapping;
 use racer_identity::VerifiedPeer;
@@ -44,6 +46,9 @@ use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use uring_runtime::deadline::Deadline;
+#[cfg(test)]
+use uring_runtime::group::Service;
 
 // Match discovered ports to trusted local fabric associations and publication.
 // Fabric strings are opaque labels: a GID or enumeration order is never a label.
@@ -1481,7 +1486,6 @@ pub(crate) mod tests {
         use super::*;
         #[test]
         fn real_signed_setup_rejects_tampering_and_replay() {
-            use racer_control_wire::ClusterId;
             use crate::peer::protocol::Signatures;
             use crate::peer::protocol::SignedHead;
             use crate::test_support::security::CLUSTER;
@@ -1491,6 +1495,7 @@ pub(crate) mod tests {
             use http1::MessageHead;
             use http1::StartLine;
             use racer_control_wire::BundleGeneration;
+            use racer_control_wire::ClusterId;
             use racer_control_wire::KeyringBundle;
             use racer_control_wire::SCHEMA_VERSION;
             use racer_identity::Certificates;

@@ -1,3 +1,6 @@
+use crate::read::dispatch::WorkerMap;
+pub(super) use uring_runtime::reactor::IoBuffer;
+
 pub(super) use crate::admission::AdmissionPolicy;
 pub(super) use crate::error::Error;
 pub(super) use crate::error::Operation;
@@ -8,7 +11,6 @@ pub(super) use crate::memory::MemoryCache;
 pub(super) use crate::memory::PageResult;
 pub(super) use crate::memory::UnverifiedPage;
 pub(super) use crate::model::ObjectMetadata;
-pub(super) use crate::security::OriginContext;
 pub(super) use crate::model::PAGE_BYTES;
 pub(super) use crate::model::PageId;
 pub(super) use crate::origin::Origin;
@@ -17,7 +19,6 @@ pub(super) use crate::peer::protocol::FetchMode;
 pub(super) use crate::peer::protocol::Operation as PeerOperation;
 pub(super) use crate::peer::protocol::PeerResponse;
 pub(super) use crate::read::candidates::CandidatePolicy;
-use crate::read::dispatch::WorkerMap;
 pub(super) use crate::read::fill::*;
 pub(super) use crate::read::flight::AcquisitionBudget;
 pub(super) use crate::read::flight::AcquisitionEvent;
@@ -25,8 +26,9 @@ pub(super) use crate::read::flight::Flights;
 pub(super) use crate::read::flight::JoinedCopy;
 pub(super) use crate::read::flight::JoinedFlight;
 pub(super) use crate::runtime::RequestScope;
-pub(super) use crate::security::PageCrypto;
 pub(super) use crate::security::CredentialCrypto;
+pub(super) use crate::security::OriginContext;
+pub(super) use crate::security::PageCrypto;
 pub(super) use crate::store::StoreReader;
 pub(super) use crate::store::StoreWriter;
 pub(super) use crate::telemetry::Event;
@@ -1123,14 +1125,13 @@ mod pressure {
         assert!(deps.memory.get(&second).unwrap().is_some());
     }
 }
-pub(super) use racer_control_wire::CacheId;
+pub(super) use crate::admission::ResourceClass;
 pub(super) use crate::model::CacheKey;
 pub(super) use crate::model::ExpiresAt;
 pub(super) use crate::model::ObjectId;
 pub(super) use crate::model::ObjectVersion;
 pub(super) use crate::model::PageNumber;
 pub(super) use crate::model::RequestId;
-pub(super) use crate::admission::ResourceClass;
 pub(super) use crate::model::StrongEtag;
 pub(super) use crate::model::WorkerId;
 pub(super) use crate::origin::MetadataReply;
@@ -1140,6 +1141,7 @@ pub(super) use crate::runtime::Reactor;
 pub(super) use crate::security;
 pub(super) use crate::security::CryptoClient;
 pub(super) use crate::worker::CryptoRuntime;
+pub(super) use racer_control_wire::CacheId;
 
 pub(super) use crate::security::PageCryptoEngine;
 pub(super) use crate::store::catalog::Index;
@@ -3488,4 +3490,3 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
 }
-pub(super) use uring_runtime::reactor::IoBuffer;

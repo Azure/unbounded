@@ -1,15 +1,15 @@
 //! Payload-free, discrete-event pressure model. Only admission is production code;
 //! queues, service times, placement, and page ownership are explicit abstractions.
-use racer_control_wire::CacheId;
-use crate::model::PAGE_BYTES;
-use crate::admission::ResourceClass;
-#[cfg(test)]
-use uring_runtime::group::Service;
 
 use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
+use crate::model::PAGE_BYTES;
+use racer_control_wire::CacheId;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+#[cfg(test)]
+use uring_runtime::group::Service;
 
 const PLAIN: usize = PAGE_BYTES as usize;
 const CIPHER: usize = PLAIN + 16;
@@ -758,10 +758,8 @@ mod waiter_detach {
     use super::*;
     use crate::error::Error;
     use crate::model::CacheKey;
-    use racer_control_wire::MembershipVersion;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
-    use crate::security::OriginContext;
     use crate::model::PageId;
     use crate::model::PageNumber;
     use crate::model::RequestId;
@@ -772,7 +770,9 @@ mod waiter_detach {
     use crate::read::flight::Flights;
     use crate::read::flight::JoinedFlight;
     use crate::runtime::RequestScope;
+    use crate::security::OriginContext;
     use crate::topology::Membership;
+    use racer_control_wire::MembershipVersion;
     use std::rc::Rc;
     use std::task::Context;
     use std::task::Poll;
@@ -1025,16 +1025,15 @@ mod fidelity {
     use super::*;
     use crate::error::Operation;
     use crate::memory::BufferPool;
-    use crate::memory::VerifiedBytes;
-    use crate::memory::VerifiedPage;
     use crate::memory::MemoryCache;
     use crate::memory::PageResult;
+    use crate::memory::VerifiedBytes;
+    use crate::memory::VerifiedPage;
     use crate::model::CacheKey;
     use crate::model::MetadataSelector;
     use crate::model::Nonce;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
-    use crate::security::OriginContext;
     use crate::model::PageEnvelope;
     use crate::model::PageId;
     use crate::model::PageNumber;
@@ -1057,11 +1056,12 @@ mod fidelity {
     use crate::runtime::RequestScope;
     use crate::security;
     use crate::security::CryptoClient;
+    use crate::security::OriginContext;
     use crate::worker::CryptoRuntime;
 
+    use crate::security::CredentialCrypto;
     use crate::security::PageCrypto;
     use crate::security::PageCryptoEngine;
-    use crate::security::CredentialCrypto;
     use crate::store::StoreReader;
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;

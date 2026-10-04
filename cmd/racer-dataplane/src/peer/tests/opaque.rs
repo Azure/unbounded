@@ -1,4 +1,28 @@
 use super::*;
+use crate::http::Codec;
+use crate::http::ConnectionLease;
+use crate::http::HttpIo;
+use crate::http::HttpPool;
+use crate::model::ExpiresAt;
+use crate::model::ObjectMetadata;
+use crate::model::PageEnvelope;
+use crate::peer::protocol as connection;
+use crate::runtime::Reactor;
+use crate::topology::LinkHealth;
+use crate::topology::Member;
+use crate::topology::Membership;
+use crate::topology::Paths;
+use http1::connection::BufferRange;
+use racer_control_wire::CacheId;
+use racer_control_wire::ClusterId;
+use racer_crypto::aead;
+use std::cell::Cell;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::task::Context;
+use std::task::Poll;
+use uring_runtime::reactor::IoBuffer;
+
 mod materialized_pairing {
     //! Distinct bodies make cross-exchange substitution visible across relay reuse.
     use super::*;
@@ -796,26 +820,6 @@ mod safety {
         assert_eq!(f.admissions[0].used(ResourceClass::Plaintext), 0);
     }
 }
-use crate::http::Codec;
-use crate::http::ConnectionLease;
-use crate::http::HttpIo;
-use crate::http::HttpPool;
-use crate::model::ExpiresAt;
-use crate::model::ObjectMetadata;
-use crate::model::PageEnvelope;
-use crate::peer::protocol as connection;
-use crate::runtime::Reactor;
-use crate::topology::LinkHealth;
-use crate::topology::Member;
-use crate::topology::Membership;
-use crate::topology::Paths;
-use http1::connection::BufferRange;
-use racer_crypto::aead;
-use std::cell::Cell;
-use std::net::TcpListener;
-use std::net::TcpStream;
-use std::task::Context;
-use std::task::Poll;
 
 // These opaque-transport fixtures intentionally use empty AAD, not page AAD.
 fn seal_fixture(nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8> {
@@ -902,8 +906,8 @@ struct RelayFixture {
 #[test]
 fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
     use crate::security::CryptoClient;
-    use crate::security::pair;
     use crate::security::PageCrypto;
+    use crate::security::pair;
     use crate::telemetry::Pair;
     use crate::telemetry::Samples;
     for mode in ["success", "failure", "drop"] {
@@ -1596,4 +1600,3 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
-use uring_runtime::reactor::IoBuffer;

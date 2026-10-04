@@ -1,6 +1,9 @@
 //! Signed peer operations and canonical encoding/decoding with charged ownership.
 //! Binary fields use padded standard base64, integers minimal decimal, and keys
 //! lowercase hex. Encoders never include page bytes; transports preserve signed heads.
+
+use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Result;
 use crate::http::Codec;
@@ -8,27 +11,27 @@ use crate::http::ConnectionLease;
 use crate::http::HttpIo;
 use crate::memory::BufferPool;
 use crate::memory::CiphertextPage;
-use crate::security::EncryptedAuthorization;
 use crate::model::ExpiresAt;
-use racer_control_wire::KeyId;
 use crate::model::MetadataSelector;
 use crate::model::Nonce;
 use crate::model::ObjectMetadata;
-use crate::security::OpaqueMetadata;
 use crate::model::PageEnvelope;
-use crate::security::PeerOriginContext;
-use crate::admission::ResourceClass;
 use crate::model::*;
 use crate::peer::forwarding::ForwardedHead;
-use crate::admission::AdmissionPolicy;
-use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
+use crate::security::EncryptedAuthorization;
+use crate::security::OpaqueMetadata;
+use crate::security::PeerOriginContext;
 use crate::topology::RouteBudget;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
+use racer_control_wire::CacheId;
+use racer_control_wire::KeyId;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use racer_identity::Certificates;
 use racer_identity::Keyring;
 use racer_identity::VerifiedPeer;
@@ -40,6 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use uring_runtime::deadline::Deadline;
 
 pub enum FetchMode {
     CopyOnly,
@@ -2117,11 +2121,11 @@ pub(crate) mod tests {
 
     pub(crate) mod sessions {
         use super::*;
+        use crate::admission::AdmissionPolicy;
+        use crate::admission::ResourceClass;
         use crate::http::Codec;
         use crate::http::Endpoint;
         use crate::model::RequestId;
-        use crate::admission::ResourceClass;
-        use crate::admission::AdmissionPolicy;
         use crate::runtime::Reactor;
         use std::future::Future;
         use std::task::Context;

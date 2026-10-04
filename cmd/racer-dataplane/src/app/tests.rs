@@ -1,16 +1,13 @@
 //! Application lifecycle tests and shared assembled-worker fixtures.
-use super::*;
-use crate::admission::reserve_connection;
-use racer_control_wire as state;
-#[cfg(test)]
-use uring_runtime::group::Service;
 
+use super::*;
 use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
+use crate::admission::reserve_connection;
 use crate::http::Codec;
 use crate::model::ExpiresAt;
 use crate::model::MetadataSelector;
 use crate::model::ObjectMetadata;
-use crate::admission::ResourceClass;
 use crate::model::*;
 use crate::peer::protocol;
 use crate::peer::protocol as connection;
@@ -29,7 +26,10 @@ use crate::topology::RouteBudget;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
+use racer_control_wire as state;
 use racer_control_wire as wire;
+use racer_control_wire::CacheId;
+use racer_control_wire::MembershipVersion;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Read;
@@ -40,6 +40,8 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
 use uring_runtime::affinity::EffectiveTopology;
+#[cfg(test)]
+use uring_runtime::group::Service;
 
 pub(super) struct ControlFixture {
     pub bundle: Arc<Mutex<wire::KeyringBundle>>,
@@ -518,9 +520,9 @@ pub(super) fn publication(
 }
 
 pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
+    use crate::admission::ResourceClass;
     use crate::memory::VerifiedBytes;
     use crate::memory::VerifiedPage;
-    use crate::admission::ResourceClass;
     use crate::model::VersionMetadata;
     use crate::model::*;
     let version = ObjectVersion {
@@ -907,7 +909,8 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         let second_admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             config.limits.clone(),
         )));
-        let (second_io, second_engine) = security::pair(WorkerId(1), 0, config.limits.queue_entries);
+        let (second_io, second_engine) =
+            security::pair(WorkerId(1), 0, config.limits.queue_entries);
         let second_runtime = WorkerRuntime {
             reactor: Rc::new(Reactor::new(second_admission.clone())),
             admission: second_admission,
@@ -968,8 +971,8 @@ fn shared_factory_is_send_and_sync_without_moving_worker_graphs() {
 
 #[test]
 fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
-    use racer_control_wire::MembershipVersion;
     use crate::peer::PeerNetwork;
+    use racer_control_wire::MembershipVersion;
     let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../internal/racer/wire/testdata/publication.json"
@@ -2007,8 +2010,8 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
 
 #[test]
 fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
-    use crate::worker::WorkerPair;
     use crate::store::checkpoint;
+    use crate::worker::WorkerPair;
     let mut fixture = ControlFixture::new();
     let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
     let keys = Keyring::new(

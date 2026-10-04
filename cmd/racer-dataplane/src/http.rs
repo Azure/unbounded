@@ -1,16 +1,16 @@
 //! Racer policy adapters for the standalone fixed-length HTTP implementation.
+
+use crate::admission::AdmissionPolicy;
+use crate::admission::ConnectionReservation;
+use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::VerifiedPage;
 use crate::model::PageSlice;
-use crate::admission::ResourceClass;
-use crate::runtime::cooperative_turn as yield_once;
-
-use crate::admission::AdmissionPolicy;
-use crate::admission::ConnectionReservation;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
+use crate::runtime::cooperative_turn as yield_once;
 use flow_control::pipe::PipeLease;
 use flow_control::pipe::PipePool;
 use http1::MessageHead;
@@ -636,21 +636,20 @@ pub(crate) mod tests {
     use uring_runtime::reactor::IoBuffer;
 
     mod delivery {
+        use crate::admission::AdmissionPolicy;
+        use crate::admission::ResourceClass;
         use crate::http::*;
         use crate::memory::VerifiedBytes;
-        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::ObjectVersion;
         use crate::model::PageId;
         use crate::model::PageNumber;
         use crate::model::RequestId;
-        use crate::admission::ResourceClass;
         use crate::model::StrongEtag;
-        use crate::admission::AdmissionPolicy;
         use crate::runtime::Cancellation;
-        use uring_runtime::deadline::Deadline;
         use crate::runtime::Reactor;
+        use racer_control_wire::CacheId;
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
@@ -658,6 +657,7 @@ pub(crate) mod tests {
         use std::task::Context;
         use std::task::Poll;
         use std::time::Instant;
+        use uring_runtime::deadline::Deadline;
         fn admission(pipes: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
             let small = std::num::NonZeroUsize::new(8).unwrap();
             let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();

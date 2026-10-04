@@ -1068,8 +1068,8 @@ fn enrolled_identity(
     control: &control::Control,
     processes: usize,
 ) -> racer_dataplane::control::LocalSigningIdentity {
-    use racer_dataplane::control::Enrollment;
     use racer_control_wire::ClusterId;
+    use racer_dataplane::control::Enrollment;
     assert_eq!(
         control.enrollments.load(Ordering::Acquire),
         2 * processes,

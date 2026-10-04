@@ -1,48 +1,52 @@
 //! Transport-neutral ciphertext lifecycle, selecting HTTP or authenticated RDMA.
+
 use super::protocol::PeerResponse;
 use super::protocol::SecurityCodec;
 use super::protocol::SignedRequest;
 use super::protocol::SignedResponse;
 use super::protocol::decode_envelope;
 use super::protocol::encode_envelope;
-use crate::peer::forwarding::ForwardedHead;
-use crate::peer::protocol as p;
-use crate::telemetry::BodyProgress;
-use crate::telemetry::Detail;
-use crate::telemetry::Failure;
-use crate::telemetry::Stage;
-use crate::telemetry::timestamp;
+use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::http::ConnectionLease;
 use crate::http::HttpIo;
 use crate::http::HttpPool;
-use racer_control_wire::NodeId;
-use crate::admission::ResourceClass;
 use crate::model::TransferId;
+use crate::peer::forwarding::ForwardedHead;
+use crate::peer::protocol as p;
 use crate::peer::protocol::Signatures;
 use crate::peer::protocol::SignedHead;
 use crate::peer::protocol::VerifiedHead;
 use crate::peer::protocol::signed_digest;
-use crate::rdma::Sessions;
 use crate::rdma::AuthenticatedDescriptor;
 use crate::rdma::COMPLETION_HEADER;
 use crate::rdma::DESCRIPTOR_HEADER;
 use crate::rdma::SETUP_BINDING_HEADER;
 use crate::rdma::SETUP_HEADER;
+use crate::rdma::Sessions;
 use crate::rdma::SetupParameters;
-
-use crate::admission::AdmissionPolicy;
-use crate::runtime::RequestScope;
-use racer_control_wire::RailId;
 use crate::rdma::TransportPlan;
+use crate::runtime::RequestScope;
+use crate::telemetry::BodyProgress;
+use crate::telemetry::Detail;
+use crate::telemetry::Failure;
+use crate::telemetry::Stage;
+use crate::telemetry::timestamp;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-use std::task::Poll;
+#[cfg(test)]
+use racer_control_wire::CacheId;
+#[cfg(test)]
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
+use racer_control_wire::RailId;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use uring_runtime::reactor::IoBuffer;
 
@@ -1801,20 +1805,20 @@ mod tests {
     mod native_exchange_tests {
         //! Signed native offer/fallback exchanges over real sockets and optional hardware.
         use super::*;
+        use crate::admission::ResourceClass;
         use crate::http::Codec;
         use crate::memory::BufferPool;
         use crate::model::ExpiresAt;
-        use racer_control_wire::KeyId;
         use crate::model::Nonce;
         use crate::model::ObjectMetadata;
         use crate::model::PageEnvelope;
-        use crate::admission::ResourceClass;
         use crate::model::*;
         use crate::peer::protocol as p;
         use crate::peer::protocol::Signatures;
         use crate::rdma::Devices;
         use crate::rdma::Sessions;
         use crate::runtime::Reactor;
+        use racer_control_wire::KeyId;
         use std::os::unix::net::UnixStream;
         use std::rc::Rc;
         use std::sync::Arc;

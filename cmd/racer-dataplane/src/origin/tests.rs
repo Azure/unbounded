@@ -2,17 +2,16 @@ use super::*;
 use crate::config::Limits;
 use crate::control::PublishedState;
 use crate::http::Codec;
-use crate::security::Authorization;
-use racer_control_wire::CacheId;
 use crate::model::CacheKey;
-use racer_control_wire::ClusterId;
 use crate::model::ObjectId;
-use crate::security::OpaqueMetadata;
 use crate::model::RequestId;
 use crate::model::StrongEtag;
-
 use crate::runtime::Reactor;
+use crate::security::Authorization;
+use crate::security::OpaqueMetadata;
 use futures::executor::block_on;
+use racer_control_wire::CacheId;
+use racer_control_wire::ClusterId;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
@@ -942,8 +941,6 @@ fn real_uds_errors_preserve_credential_and_version_contracts() {
 
 #[test]
 fn public_operations_reject_wrong_authority_before_io() {
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
     use crate::peer::protocol::FetchMode;
     use crate::peer::protocol::Operation as PeerOperation;
     use crate::read::candidates::CandidatePolicy;
@@ -952,6 +949,8 @@ fn public_operations_reject_wrong_authority_before_io() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Placement;
+    use racer_control_wire::MembershipVersion;
+    use racer_control_wire::NodeId;
     let node = NodeId("node".into());
     let membership = Arc::new(
         Membership::validate(

@@ -1,17 +1,17 @@
 //! Observe the allocation at deallocation, before the system allocator can reuse it.
+use racer_control_wire::CacheId;
+use racer_control_wire::KeyId;
 use racer_dataplane::admission::AdmissionPolicy;
+use racer_dataplane::admission::ResourceClass;
 use racer_dataplane::config::Config;
 use racer_dataplane::memory::BufferPool;
-use racer_control_wire::CacheId;
 use racer_dataplane::model::CacheKey;
-use racer_control_wire::KeyId;
 use racer_dataplane::model::Nonce;
 use racer_dataplane::model::ObjectId;
 use racer_dataplane::model::ObjectVersion;
 use racer_dataplane::model::PageEnvelope;
 use racer_dataplane::model::PageId;
 use racer_dataplane::model::PageNumber;
-use racer_dataplane::admission::ResourceClass;
 use racer_dataplane::model::StrongEtag;
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
@@ -181,17 +181,17 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
 
 fn failed_crypto_output_is_scrubbed(config: &Config) {
     use base64::Engine;
-    use racer_crypto::aead;
     use racer_control_wire::ClusterId;
     use racer_control_wire::NodeId;
+    use racer_crypto::aead;
     use racer_dataplane::model::RequestId;
     use racer_dataplane::model::WorkerId;
     use racer_dataplane::runtime::RequestScope;
     use racer_dataplane::security::CryptoId;
     use racer_dataplane::security::CryptoInput;
-    use racer_dataplane::security::pair;
     use racer_dataplane::security::PageCryptoEngine;
     use racer_dataplane::security::page_aad;
+    use racer_dataplane::security::pair;
     use racer_identity::KeyEpochs;
     use racer_identity::KeyPurpose;
     use racer_identity::Keyring;

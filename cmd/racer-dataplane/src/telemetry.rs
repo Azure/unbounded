@@ -1,13 +1,11 @@
 use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::AttemptId;
-use racer_control_wire::NodeId;
 use crate::model::RequestId;
-use crate::admission::ResourceClass;
 use crate::model::WorkerId;
-
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use ::telemetry::Ring;
@@ -16,12 +14,7 @@ use ::telemetry::server;
 use ::telemetry::server::Handler;
 use ::telemetry::server::Response;
 use ::telemetry::server::Server;
-pub use server::CONNECTION_TIMEOUT;
-pub use server::CONTROL_SLOTS;
-pub use server::MAX_CONNECTIONS;
-pub use server::MAX_REQUEST_BYTES;
-pub use server::MAX_RESPONSE_BYTES;
-pub use server::RESERVED_BYTES;
+use racer_control_wire::NodeId;
 use std::cell::OnceCell;
 use std::fmt::Write;
 use std::net::SocketAddr;
@@ -38,6 +31,13 @@ use std::time::Instant;
 use uring_runtime::deadline::Deadline;
 use uring_runtime::environment;
 use uring_runtime::reactor::Descriptor;
+
+pub use server::CONNECTION_TIMEOUT;
+pub use server::CONTROL_SLOTS;
+pub use server::MAX_CONNECTIONS;
+pub use server::MAX_REQUEST_BYTES;
+pub use server::MAX_RESPONSE_BYTES;
+pub use server::RESERVED_BYTES;
 
 // Bounded diagnostics and HTTP endpoints, polled by an existing worker.
 

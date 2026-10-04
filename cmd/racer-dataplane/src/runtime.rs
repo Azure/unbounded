@@ -1,5 +1,26 @@
 //! Explicit execution ownership. No library may introduce an unbudgeted thread pool.
 
+use crate::admission::AdmissionPolicy;
+use crate::admission::ConnectionReservation;
+use crate::admission::ResourceClass;
+use crate::admission::reserve_connection;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::RequestId;
+use std::ops::Deref;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::Instant;
+use uring_runtime::deadline::CancellationRegistration;
+use uring_runtime::deadline::Deadline;
+use uring_runtime::reactor::ReactorWake;
+use uring_runtime::reactor::SUBMISSION_BYTES;
+use uring_runtime::reactor::SubmissionCapacity;
+use uring_runtime::reactor::filesystem::Buffer;
+
 // Seeded hashing only in simulated worlds; production retains std hashing.
 #[cfg(not(test))]
 pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V>;
@@ -39,16 +60,6 @@ impl std::hash::BuildHasher for HashState {
         }
     }
 }
-use crate::error::Error;
-use crate::error::Operation;
-use crate::error::Result;
-use crate::model::RequestId;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::time::Instant;
-use uring_runtime::deadline::CancellationRegistration;
-use uring_runtime::deadline::Deadline;
 
 /// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]
@@ -256,16 +267,6 @@ impl rest_client::Scope for RequestScope {
         scope
     }
 }
-use crate::admission::AdmissionPolicy;
-use crate::admission::ConnectionReservation;
-use crate::admission::reserve_connection;
-use crate::admission::ResourceClass;
-use std::ops::Deref;
-use std::rc::Rc;
-use uring_runtime::reactor::ReactorWake;
-use uring_runtime::reactor::SUBMISSION_BYTES;
-use uring_runtime::reactor::SubmissionCapacity;
-use uring_runtime::reactor::filesystem::Buffer;
 
 pub struct AdmissionBudget(Rc<flow_control::Quotas<AdmissionPolicy>>);
 impl uring_runtime::Budget for AdmissionBudget {
