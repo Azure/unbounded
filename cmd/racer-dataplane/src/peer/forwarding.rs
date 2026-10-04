@@ -8,10 +8,10 @@
 //! use racer_control_wire::NodeId;
 //! use racer_dataplane::{
 //!     error::Result,
-//!     peer::{server::LocalPageService, protocol::{PeerRequest, VerifiedResponse}},
+//!     peer::{server::LocalPageService, protocol::PeerRequest},
 //!     runtime::RequestScope,
-//!     peer::forwarding::Forwarding,
-//!     topology::{membership::std::sync::Arc<crate::topology::Membership>, routing::RouteBudget},
+//!     peer::forwarding::{Forwarding, VerifiedResponse},
+//!     topology::{Membership, RouteBudget},
 //! };
 //!
 //! async fn round_trip(
@@ -23,7 +23,7 @@
 //!     next: &NodeId,
 //!     previous: &NodeId,
 //!     budget: RouteBudget,
-//!     membership: std::sync::Arc<crate::topology::Membership>,
+//!     membership: std::sync::Arc<Membership>,
 //!     scope: &RequestScope,
 //! ) -> Result<VerifiedResponse> {
 //!     let (outbound, outstanding) = requester.sign_request(request)?;

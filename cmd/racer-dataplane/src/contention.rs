@@ -1085,7 +1085,7 @@ mod fidelity {
 
     impl MetadataOwners {
         fn reserve(admission: &flow_control::Quotas<AdmissionPolicy>, cache: &CacheId) -> Self {
-            let reserved = crate::admission::reserve_fill(&admission, cache, false).unwrap();
+            let reserved = crate::admission::reserve_fill(admission, cache, false).unwrap();
             Self {
                 bundle: super::Bundle {
                     plain: Arc::new(reserved.plaintext),
@@ -1144,7 +1144,7 @@ mod fidelity {
     ) -> PageResult {
         let metadata = descriptor(cache, version, length);
         let id = page_id(&metadata);
-        let reserved = crate::admission::reserve_fill(&admission, cache, false).unwrap();
+        let reserved = crate::admission::reserve_fill(admission, cache, false).unwrap();
         let pool = BufferPool::new(admission.clone());
         let mut plaintext = pool.plaintext(reserved.plaintext, length).unwrap();
         plaintext.bytes_mut().unwrap().fill(7);

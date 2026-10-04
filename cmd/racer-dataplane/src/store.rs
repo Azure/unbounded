@@ -135,7 +135,7 @@ impl StoreReader {
         self
     }
     fn corrupt_miss(&self) {
-        let _ = self.metrics.record(crate::telemetry::Event::CorruptMiss, 1);
+        self.metrics.record(crate::telemetry::Event::CorruptMiss, 1);
     }
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
         self.index.remove_if_matches(&token.page, &token.location);
@@ -522,8 +522,7 @@ impl StoreWriter {
         self.discarded.get()
     }
     fn note_discard(&self, count: usize) {
-        let _ = self
-            .metrics
+        self.metrics
             .record(crate::telemetry::Event::DirtyDiscard, count as u64);
         self.discarded
             .set(self.discarded.get().saturating_add(count as u64));

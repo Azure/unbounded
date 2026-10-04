@@ -1241,7 +1241,7 @@ impl Hedges {
         self.config.slots > 0
     }
     pub(crate) fn suppressed(&self) {
-        let _ = self.metrics.record(Event::PageHedgeSuppressed, 1);
+        self.metrics.record(Event::PageHedgeSuppressed, 1);
     }
     pub(crate) fn acquire(self: &Arc<Self>) -> Result<Permit> {
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
@@ -1295,14 +1295,13 @@ impl Permit {
         }
     }
     pub(crate) fn started(&self) {
-        let _ = self.owner.metrics.record(Event::PageHedgeStarted, 1);
-        let _ = self
-            .owner
+        self.owner.metrics.record(Event::PageHedgeStarted, 1);
+        self.owner
             .metrics
             .record(Event::PageHedgeDuplicateBytes, DUPLICATE_BYTES as u64);
     }
     pub(crate) fn won(&self) {
-        let _ = self.owner.metrics.record(Event::PageHedgeWon, 1);
+        self.owner.metrics.record(Event::PageHedgeWon, 1);
     }
 }
 impl Drop for Permit {

@@ -1098,10 +1098,10 @@ impl CryptoCompletion {
             m.queue_ns.unwrap_or(0),
         ];
         for (event, amount) in events.into_iter().zip(amounts) {
-            let _ = metrics.record(event, amount);
+            metrics.record(event, amount);
         }
         if let Some(rejection) = m.rejection {
-            let _ = metrics.record(
+            metrics.record(
                 match rejection {
                     IntegrityRejection::Crc => CryptoDecryptCrcRejected,
                     IntegrityRejection::Aead => CryptoDecryptAeadRejected,

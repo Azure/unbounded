@@ -89,8 +89,8 @@ impl<'a> PageTiming<'a> {
         {
             // Concurrent scrapes are not atomic snapshots.
             for ((count, sum), duration) in STAGES.into_iter().zip(self.durations) {
-                let _ = self.metrics.record(sum, duration);
-                let _ = self.metrics.record(count, 1);
+                self.metrics.record(sum, duration);
+                self.metrics.record(count, 1);
             }
             self.active = false;
         }
@@ -99,7 +99,7 @@ impl<'a> PageTiming<'a> {
 impl Drop for PageTiming<'_> {
     fn drop(&mut self) {
         if self.active {
-            let _ = self.metrics.record(Event::PeerPageCensored, 1);
+            self.metrics.record(Event::PeerPageCensored, 1);
         }
     }
 }
@@ -267,7 +267,7 @@ impl Permit {
         };
         // Local quota pressure adapts only the node-wide admission limit.
         if outcome == Outcome::LocalPressure {
-            let _ = self.owner.metrics.record(Event::PeerLocalPressure, 1);
+            self.owner.metrics.record(Event::PeerLocalPressure, 1);
             if now.saturating_duration_since(state.updated) >= BACKOFF {
                 state.limit = (state.limit / 2).max(1);
                 state.updated = now;
@@ -295,7 +295,7 @@ impl Permit {
             Outcome::LocalPressure => Event::PeerLocalPressure,
             Outcome::Neutral => return,
         };
-        let _ = self.owner.metrics.record(event, 1);
+        self.owner.metrics.record(event, 1);
         if peer.generation != self.generation {
             return;
         }
@@ -461,11 +461,11 @@ impl Relay {
     /// exchange complete envelopes. Verify the downstream response against that
     /// binding before appending a reverse hop. Never re-sign the original response.
     ///
-    /// ```compile_fail
+    /// ```compile_fail,E0308
     /// use racer_dataplane::{peer::{Relay, protocol::SignedRequest},
-    ///     runtime::RequestScope, topology::std::sync::Arc<crate::topology::Membership>};
+    ///     runtime::RequestScope, topology::Membership};
     /// fn unverified(relay: &Relay, request: SignedRequest,
-    ///     membership: std::sync::Arc<crate::topology::Membership>, scope: &RequestScope) {
+    ///     membership: std::sync::Arc<Membership>, scope: &RequestScope) {
     ///     relay.forward(request, membership, scope);
     /// }
     /// ```
@@ -592,12 +592,20 @@ pub enum Requester {
     },
     #[cfg(any(test, feature = "subscription-interop"))]
     Scripted {
+        #[expect(
+            clippy::type_complexity,
+            reason = "Keep the concrete membership owner visible instead of restoring a lease alias"
+        )]
         available: Box<
             dyn Fn(
                 &std::sync::Arc<crate::topology::Membership>,
                 &racer_control_wire::NodeId,
             ) -> bool,
         >,
+        #[expect(
+            clippy::type_complexity,
+            reason = "The scripted callback mirrors the owned production request without a facade"
+        )]
         request: Box<
             dyn Fn(
                 PeerRequest,
@@ -752,12 +760,12 @@ impl Requester {
 ///     Relay, server::PeerServer,
 ///     protocol::{PeerRequest, SignedRequest, SignedResponse}, forwarding::VerifiedResponse},
 ///     runtime::RequestScope, peer::forwarding::Forwarding,
-///     topology::std::sync::Arc<crate::topology::Membership>};
+///     topology::Membership};
 /// async fn interfaces(
 ///     client: &Requester, transport: &Requester,
 ///     server: &PeerServer, relay: &Relay, auth: &Forwarding,
 ///     local: PeerRequest, wire: SignedRequest, outbound: SignedRequest,
-///     inbound: SignedRequest, membership: std::sync::Arc<crate::topology::Membership>, scope: &RequestScope,
+///     inbound: SignedRequest, membership: std::sync::Arc<Membership>, scope: &RequestScope,
 /// ) -> Result<()> {
 ///     let verified: VerifiedResponse = client.request(local, membership.clone(), scope).await?;
 ///     let _wire_response: SignedResponse = verified.into_signed();

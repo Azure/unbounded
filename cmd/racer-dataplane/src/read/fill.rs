@@ -89,7 +89,7 @@ impl DecryptSource {
     fn observe(self, metrics: &Metrics, result: Result<PageResult>) -> Result<PageResult> {
         result.inspect_err(|error| {
             if *error == Error::CorruptRecord {
-                let _ = metrics.record(
+                metrics.record(
                     match self {
                         Self::Disk => Event::FillDecryptDiskCorrupt,
                         Self::Retained => Event::FillDecryptRetainedCorrupt,
@@ -1231,7 +1231,7 @@ impl Fill {
         scope.check()?;
         let copy = response_copy(response.response(), page).inspect_err(|error| {
             if *error == Error::CorruptRecord {
-                let _ = self.metrics.record(Event::CorruptMiss, 1);
+                self.metrics.record(Event::CorruptMiss, 1);
             }
         })?;
         let reservation = match reservation {
@@ -1242,7 +1242,7 @@ impl Fill {
             .await
             .inspect_err(|error| {
                 if *error == Error::CorruptRecord {
-                    let _ = self.metrics.record(Event::CorruptMiss, 1);
+                    self.metrics.record(Event::CorruptMiss, 1);
                 }
             })
     }

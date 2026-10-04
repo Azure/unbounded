@@ -502,8 +502,7 @@ impl Delivery {
                 let sent = match reader.try_send(&connection.socket(), copying) {
                     Ok(sent) => {
                         if copying {
-                            let _ = self
-                                .metrics
+                            self.metrics
                                 .record(crate::telemetry::Event::DeliveryDirectBytes, sent as u64);
                         }
                         sent
@@ -542,8 +541,7 @@ impl Delivery {
                                 }
                                 _ => return Err(Error::Io),
                             }
-                            let _ = self
-                                .metrics
+                            self.metrics
                                 .record(crate::telemetry::Event::DeliveryPipeDrain, 1);
                             DeliveryBuffer::Pipe(buffer)
                         };
@@ -574,7 +572,7 @@ impl Delivery {
                         // any unsent suffix. Avoid another write/splice/drain on
                         // the next backpressured chunk; keep the owned-send fence.
                         copying = true;
-                        let _ = self.metrics.record(
+                        self.metrics.record(
                             crate::telemetry::Event::DeliveryDirectBytes,
                             completion.bytes as u64,
                         );
