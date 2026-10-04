@@ -2515,6 +2515,164 @@ fn cold_disk_fixture() -> Fixture {
     f
 }
 
+fn local_tail_fixture(length: u64, disk: bool) -> Fixture {
+    let mut f = fixture_with(length, None);
+    f.page.number = PageNumber(3);
+    f.reactor.init().unwrap();
+    futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let original = acquire(&mut f, &mut budget).unwrap();
+    if disk {
+        assert_eq!(
+            drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap(),
+            1
+        );
+    }
+    drop(original);
+    // The queued writer or disk index remains the sole acquisition tier under test.
+    f.fill
+        .dependencies
+        .memory
+        .remove_cache(&f.context.object.cache)
+        .unwrap();
+    f.fill.dependencies.admission.reclaim_buffers();
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(&f.page)
+            .unwrap()
+            .is_none(),
+        disk
+    );
+    f.origin.calls.set(0);
+    f
+}
+
+#[test]
+fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    for disk in [true, false] {
+        for free in [13_109_248usize, 13_109_247, PAGE_BYTES as usize] {
+            let mut f = local_tail_fixture(63_440_896, disk);
+            let admission = f.fill.dependencies.admission.clone();
+            let pressure = admission
+                .reserve(
+                    None,
+                    ResourceClass::Plaintext,
+                    admission.limit(ResourceClass::Plaintext) - free,
+                )
+                .unwrap();
+            let result = drive_io(
+                f.fill.acquire_local_copy(&f.page, &f.scope, true),
+                &f.reactor,
+                &mut f.engine,
+                &f.crypto,
+            );
+            if free == 13_109_247 {
+                assert!(matches!(result, Err(Error::Overloaded)));
+            } else {
+                let Some(crate::memory::page::AcquiredPage::Plaintext(page)) =
+                    result.expect("known local tail must fit its exact plaintext budget")
+                else {
+                    panic!("local plaintext required")
+                };
+                assert_eq!(page.plaintext.bytes().len(), 13_109_248);
+                assert!(page.plaintext.bytes().iter().all(|&b| b == 3));
+                assert_eq!(page.metadata.length, 63_440_896);
+                assert_eq!(
+                    admission.used(ResourceClass::Plaintext),
+                    pressure.amount() + 13_109_248
+                );
+            }
+            assert_eq!(f.origin.calls.get(), 0);
+            assert_eq!(f.reactor.in_flight(), 0);
+            assert_eq!(f.crypto.outstanding(), 0);
+            assert_eq!(
+                pressure.amount(),
+                admission.limit(ResourceClass::Plaintext) - free
+            );
+        }
+    }
+}
+
+#[test]
+fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    for disk in [true, false] {
+        let mut f = local_tail_fixture(4 * PAGE_BYTES, disk);
+        let admission = f.fill.dependencies.admission.clone();
+        let pressure = admission
+            .reserve(
+                None,
+                ResourceClass::Plaintext,
+                admission.limit(ResourceClass::Plaintext) - PAGE_BYTES as usize + 1,
+            )
+            .unwrap();
+        assert!(matches!(
+            drive_io(
+                f.fill.acquire_local_copy(&f.page, &f.scope, true),
+                &f.reactor,
+                &mut f.engine,
+                &f.crypto
+            ),
+            Err(Error::Overloaded)
+        ));
+        drop(pressure);
+        let value = drive_io(
+            f.fill.acquire_local_copy(&f.page, &f.scope, true),
+            &f.reactor,
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(value.copy().metadata.length, 4 * PAGE_BYTES);
+        assert_eq!(f.origin.calls.get(), 0);
+    }
+    for pending in [false, true] {
+        let mut f = local_tail_fixture(63_440_896, true);
+        let admission = f.fill.dependencies.admission.clone();
+        f.fill.dependencies.writer.slabs().reclaim_idle();
+        admission.reclaim_buffers();
+        let before = admission.used(ResourceClass::Ciphertext);
+        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        if !pending {
+            scope.cancel().unwrap();
+        }
+        let mut work = Box::pin(f.fill.acquire_local_copy(&f.page, &scope, true));
+        if pending {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(work.as_mut().poll(&mut cx).is_pending());
+            assert!(f.reactor.in_flight() > 0);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            scope.cancel().unwrap();
+        }
+        assert!(matches!(
+            drive_io(work, &f.reactor, &mut f.engine, &f.crypto),
+            Err(Error::Cancelled)
+        ));
+        drive_disk(&f, f.reactor.drain()).unwrap();
+        f.fill.dependencies.writer.slabs().reclaim_idle();
+        admission.reclaim_buffers();
+        assert_eq!(f.reactor.in_flight(), 0);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), before);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(f.crypto.outstanding(), 0);
+        assert_eq!(f.origin.calls.get(), 0);
+    }
+}
+
 #[test]
 fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));

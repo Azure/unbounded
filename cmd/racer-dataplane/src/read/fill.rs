@@ -855,8 +855,8 @@ impl Fill {
         .await
     }
 
-    /// Local copies own ciphertext already; the temporary plaintext reservation
-    /// ends here before network acquisition reserves its independent progress budget.
+    /// Read and validate local ciphertext before admitting its exact plaintext.
+    /// A local miss leaves network acquisition's independent progress budget intact.
     pub(super) async fn acquire_local_copy(
         &self,
         page: &PageId,
@@ -866,11 +866,6 @@ impl Fill {
         scope.check()?;
         // Pending copies already own ciphertext. Disk owns a separate complete
         // staging/decoded bundle; neither source needs speculative network bytes.
-        let plaintext = if want_plaintext {
-            Some(self.reserve_bootstrap(&page.version.object.cache)?)
-        } else {
-            None
-        };
         let local = self.metrics.lookup(
             LookupTier::Pending,
             self.dependencies.writer.copy_only(page),
@@ -924,16 +919,18 @@ impl Fill {
                     disk_token: token,
                 })));
             }
-            let reservation = match plaintext {
-                Some(value) => value,
-                None => self.reserve_bootstrap(&page.version.object.cache)?,
-            };
             let source = if token.is_some() {
                 DecryptSource::Disk
             } else {
                 DecryptSource::Retained
             };
-            match self.decrypt(page, copy, reservation, scope, source).await {
+            let result = async {
+                scope.check()?;
+                let reservation = self.reserve_copy_plaintext(page, &copy)?;
+                self.decrypt(page, copy, reservation, scope, source).await
+            }
+            .await;
+            match result {
                 Ok(result) => {
                     self.publish(result.clone(), None, scope).await?;
                     self.metrics.record(
@@ -956,8 +953,6 @@ impl Fill {
                 }
                 Err(error) => return Err(error),
             }
-        } else {
-            drop(plaintext);
         }
         Ok(None)
     }
