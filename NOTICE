@@ -36,6 +36,26 @@ notices:
     license:
       - name: ISC License
         link: https://github.com/d3/d3-scale/blob/HEAD/LICENSE
+  - dependency: futures
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures/0.3.34/source/LICENSE-MIT
+  - dependency: getrandom
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2018-2024 The rust-random Project Developers
+      - Copyright (c) 2014 The Rust Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/getrandom/0.2.17/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/getrandom/0.2.17/source/LICENSE-MIT
   - dependency: github.com/Azure/azure-sdk-for-go/sdk/azcore
     ecosystem: go
     copyright:
@@ -586,6 +606,16 @@ notices:
         link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
+  - dependency: io-uring
+    ecosystem: cargo
+    copyright:
+      - Copyright 2019 quininer kel
+      - Copyright (c) 2019 quininer@live.com
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/io-uring/0.7.15/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/io-uring/0.7.15/source/LICENSE-MIT
   - dependency: k8s.io/api
     ecosystem: go
     copyright:
@@ -642,6 +672,15 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes/utils/blob/be93311217bd/LICENSE
+  - dependency: libc
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) The Rust Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/libc/0.2.189/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/libc/0.2.189/source/LICENSE-MIT
   - dependency: modernc.org/sqlite
     ecosystem: go
     copyright:
@@ -703,3 +742,12 @@ notices:
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+  - dependency: zeroize
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2018-2026 The RustCrypto Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/zeroize/1.9.0/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/zeroize/1.9.0/source/LICENSE-MIT

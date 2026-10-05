@@ -103,6 +103,8 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
   Development dependencies are excluded; normal, target, build, and optional
   direct dependencies are included.
+  Local path dependencies are traversed to collect their direct registry
+  dependencies; registry transitive dependencies are not traversed.
 - Native collection is fully local. Its metadata and canonical license links
   are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
   `OPENSSL_VERSION` in `Makefile`.
