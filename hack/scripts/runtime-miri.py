@@ -12,6 +12,19 @@ import sys
 TOOLCHAIN = "nightly-2025-11-21"
 GROUPS = {
     "channel": [
+        "channel::tests::endpoint_layout_is_compact_but_shared_cursors_remain_isolated",
+        "channel::tests::cursor_mapping_and_distance_cover_both_laps_and_maximum_capacity",
+        "channel::tests::peer_caches_remain_conservative_across_wrap_and_advisory_polling",
+        "channel::tests::send_wake_reentry_refreshes_caches_without_outer_restore",
+        "channel::tests::receive_wake_reentry_refreshes_caches_without_outer_restore",
+        "channel::tests::registration_clone_and_drop_reentry_can_wrap_cached_cursors",
+        "channel::tests::endpoint_drop_orders_reclaim_each_value_once",
+        "channel::tests::reentrant_cleanup_after_wrap_and_panic_resumes_from_authoritative_head",
+        "channel::tests::zero_sized_values_still_have_exactly_once_destructors",
+        "channel::tests::readiness_future_cancellation_and_closure",
+        "channel::tests::receiver_drop_racing_send_preserves_ownership",
+        "channel::tests::sender_close_racing_receive_never_reports_eof_before_final_value",
+        "channel::tests::transitions_before_during_and_after_waker_registration_are_not_lost",
         "channel::tests::orphan_destructor_can_reenter_cleanup",
         "channel::tests::orphan_cleanup_advances_before_panicking_destructor",
         "channel::tests::invalid_capacity_is_rejected_before_allocation",
