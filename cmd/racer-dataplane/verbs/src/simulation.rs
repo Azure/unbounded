@@ -17,6 +17,7 @@ pub struct Simulation {
     devices: Vec<Device>,
 }
 
+/// Discoverable simulated port and its optional NUMA placement.
 #[derive(Clone, Debug)]
 pub struct Device {
     pub name: String,
@@ -26,6 +27,7 @@ pub struct Device {
 }
 
 impl Device {
+    /// Describe port one of a device without a NUMA preference.
     pub fn new(name: impl Into<String>, gid: [u8; 16]) -> Self {
         Self {
             name: name.into(),
@@ -41,11 +43,13 @@ pub struct Environment {
     previous: Option<Simulation>,
 }
 impl Drop for Environment {
+    /// Restore the discovery scope that was active before this one.
     fn drop(&mut self) {
         CURRENT.with(|current| *current.borrow_mut() = self.previous.take());
     }
 }
 
+/// Native ABI operation that can be traced or targeted by a fault rule.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
     Discover,
@@ -76,6 +80,7 @@ pub enum Fault {
     Completion(u32),
 }
 
+/// Ordered observation of an ABI call or work completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Event {
     pub sequence: u64,
@@ -87,6 +92,7 @@ pub struct Event {
     pub completion: bool,
 }
 
+/// Shared fabric resources, scripted faults, and deterministic event trace.
 #[derive(Default)]
 struct World {
     next: u32,
@@ -96,6 +102,7 @@ struct World {
     trace: Vec<Event>,
     sequence: u64,
 }
+/// One live device, queue pair, region, or memory window in the fabric.
 enum Resource {
     Device(Device),
     Qp {
@@ -115,18 +122,21 @@ enum Resource {
         grant: Option<Grant>,
     },
 }
+/// Active remote-write permission owned by a window and bound queue pair.
 #[derive(Clone, Copy)]
 struct Grant {
     qp: u32,
     region: u32,
     length: u32,
 }
+/// Queued operation with its remaining poll delay and injected status.
 struct Work {
     id: u64,
     delay: usize,
     status: u32,
     action: Action,
 }
+/// Deferred memory effect performed when a work request completes successfully.
 #[derive(Clone, Copy)]
 enum Action {
     Bind {
@@ -145,6 +155,7 @@ enum Action {
     },
 }
 impl Action {
+    /// Map a deferred effect to its trace and fault operation.
     fn operation(&self) -> Operation {
         match self {
             Self::Bind { .. } => Operation::Bind,
@@ -152,6 +163,7 @@ impl Action {
             Self::Write { .. } => Operation::Write,
         }
     }
+    /// Return the native completion opcode expected by the production owner.
     fn opcode(&self) -> u32 {
         match self {
             Self::Bind { .. } => 5,
@@ -171,12 +183,14 @@ impl Simulation {
             world.rejects.push((operation, qpn));
         }
     }
+    /// Create an empty fabric with deterministic resource identifiers.
     pub fn new() -> Self {
         Self {
             world: Rc::new(RefCell::new(World::default())),
             devices: Vec::new(),
         }
     }
+    /// Create a discovery view sharing this fabric after validating its ports.
     pub fn with_devices(&self, devices: Vec<Device>) -> Result<Self> {
         if devices.len() > 64
             || devices.iter().any(|d| {
@@ -198,14 +212,17 @@ impl Simulation {
             devices,
         })
     }
+    /// Install this discovery view on the current thread until the guard drops.
     pub fn enter(&self) -> Environment {
         Environment {
             previous: CURRENT.with(|current| current.replace(Some(self.clone()))),
         }
     }
+    /// Queue a one-shot fault for the next matching operation on any resource.
     pub fn fault(&self, operation: Operation, fault: Fault) {
         self.fault_on(operation, None, fault);
     }
+    /// Queue a targeted fault, panicking on unsupported delays or zero error status.
     pub fn fault_on(&self, operation: Operation, qpn: Option<u32>, fault: Fault) {
         assert!(
             matches!(fault, Fault::Reject)
@@ -220,34 +237,42 @@ impl Simulation {
             .faults
             .push_back((operation, qpn, fault));
     }
+    /// Snapshot all events recorded so far without consuming them.
     pub fn trace(&self) -> Vec<Event> {
         self.world.borrow().trace.clone()
     }
+    /// Drain recorded events while preserving the fabric's sequence counter.
     pub fn take_trace(&self) -> Vec<Event> {
         std::mem::take(&mut self.world.borrow_mut().trace)
     }
+    /// Count resources still owned or deliberately quarantined by native handles.
     pub fn live_resources(&self) -> usize {
         self.world.borrow().resources.len()
     }
+    /// Count unconsumed one-shot faults, excluding persistent rejection rules.
     pub fn pending_faults(&self) -> usize {
         self.world.borrow().faults.len()
     }
 }
 impl Default for Simulation {
+    /// Create an empty deterministic fabric.
     fn default() -> Self {
         Self::new()
     }
 }
 
+/// Clone the current thread's active discovery view, if any.
 pub(crate) fn current() -> Option<Simulation> {
     CURRENT.with(|current| current.borrow().clone())
 }
+/// Identify this simulated adapter by its open function pointer.
 pub(super) fn is_api(api: &Api) -> bool {
     std::ptr::fn_addr_eq(
         api.open,
         open as unsafe extern "C" fn(*const c_char) -> *mut c_void,
     )
 }
+/// Build the ABI table used by the production native ownership layer.
 pub(super) fn api() -> Rc<Api> {
     Rc::new(Api {
         library: None,
@@ -270,15 +295,17 @@ pub(super) fn api() -> Rc<Api> {
     })
 }
 
-// ABI pointers own only stable fabric IDs. The world owns allocations; production
-// Rc owners determine when native destruction is permitted, including quarantine.
+/// Opaque ABI handle retaining its fabric and stable resource identifier.
+/// The world owns allocations; production owners control destruction and quarantine.
 struct Handle {
     sim: Simulation,
     id: u32,
 }
+/// Borrow a live ABI handle for no longer than its owning native resource lives.
 unsafe fn handle<'a>(raw: *mut c_void) -> &'a Handle {
     unsafe { &*raw.cast::<Handle>() }
 }
+/// Insert a fabric resource and allocate its stable opaque handle.
 fn allocate(sim: &Simulation, resource: Resource) -> *mut c_void {
     let id = sim.world.borrow_mut().insert(resource);
     Box::into_raw(Box::new(Handle {
@@ -287,6 +314,7 @@ fn allocate(sim: &Simulation, resource: Resource) -> *mut c_void {
     }))
     .cast()
 }
+/// Read the configured placement from a live simulated device handle.
 pub(super) fn numa_node(raw: NonNull<c_void>) -> Option<usize> {
     let h = unsafe { handle(raw.as_ptr()) };
     match h.sim.world.borrow().resources.get(&h.id) {
@@ -294,6 +322,7 @@ pub(super) fn numa_node(raw: NonNull<c_void>) -> Option<usize> {
         _ => None,
     }
 }
+/// Return a region's deterministic wire address, never its host allocation pointer.
 pub(super) fn address(raw: NonNull<c_void>) -> u64 {
     let h = unsafe { handle(raw.as_ptr()) };
     match h.sim.world.borrow().resources.get(&h.id) {
@@ -302,6 +331,7 @@ pub(super) fn address(raw: NonNull<c_void>) -> u64 {
     }
 }
 impl World {
+    /// Assign a fresh identifier within the native 24-bit queue pair number space.
     fn insert(&mut self, resource: Resource) -> u32 {
         self.next = self
             .next
@@ -311,6 +341,7 @@ impl World {
         self.resources.insert(self.next, resource);
         self.next
     }
+    /// Append a call or completion with a monotonically increasing sequence number.
     fn record(
         &mut self,
         operation: Operation,
@@ -329,6 +360,7 @@ impl World {
         });
         self.sequence += 1;
     }
+    /// Apply persistent rejection first, otherwise consume the first matching fault.
     fn fault(&mut self, operation: Operation, resource: u32) -> Option<Fault> {
         if self
             .rejects
@@ -342,6 +374,7 @@ impl World {
         })?;
         self.faults.remove(i).map(|(_, _, fault)| fault)
     }
+    /// Record whether a synchronous operation is rejected by its fault rule.
     fn rejected(&mut self, operation: Operation, resource: u32) -> bool {
         let rejected = self.fault(operation, resource) == Some(Fault::Reject);
         self.record(
@@ -353,6 +386,7 @@ impl World {
         );
         rejected
     }
+    /// Resolve a resource to the device context that owns it.
     fn device(&self, id: u32) -> Option<u32> {
         match self.resources.get(&id)? {
             Resource::Device(_) => Some(id),
@@ -361,6 +395,7 @@ impl World {
             | Resource::Window { device, .. } => Some(*device),
         }
     }
+    /// Report whether a queue pair has endpoints and has not been stopped.
     fn ready(&self, id: u32) -> bool {
         matches!(
             self.resources.get(&id),
@@ -372,6 +407,7 @@ impl World {
             })
         )
     }
+    /// Require live queue pairs with mutually matching local and remote endpoints.
     fn paired(&self, id: u32, peer: u32) -> bool {
         match (self.resources.get(&id), self.resources.get(&peer)) {
             (
@@ -391,6 +427,7 @@ impl World {
             _ => false,
         }
     }
+    /// Validate and queue one effect, preserving synchronous rejection semantics.
     fn post(&mut self, qp: u32, id: u64, action: Action) -> c_int {
         let op = action.operation();
         let fault = self.fault(op, qp);
@@ -436,9 +473,11 @@ impl World {
         self.record(op, qp, Some(id), 0, false);
         0
     }
+    /// Check that a nonempty transfer fits its registered allocation.
     fn region_fits(&self, region: u32, length: u32) -> bool {
         matches!(self.resources.get(&region), Some(Resource::Region { bytes, .. }) if length > 0 && length as usize <= bytes.len())
     }
+    /// Apply a queued effect or return a native protection error without copying.
     fn execute(&mut self, qp: u32, action: &Action) -> u32 {
         match *action {
             Action::Bind {
@@ -446,19 +485,19 @@ impl World {
                 region,
                 length,
             } => {
-                if let Some(Resource::Window { grant, .. }) = self.resources.get_mut(&window) {
-                    if grant.is_none() {
-                        *grant = Some(Grant { qp, region, length });
-                        return 0;
-                    }
+                if let Some(Resource::Window { grant, .. }) = self.resources.get_mut(&window)
+                    && grant.is_none()
+                {
+                    *grant = Some(Grant { qp, region, length });
+                    return 0;
                 }
             }
             Action::Invalidate { key } => {
-                if let Some(Resource::Window { grant, .. }) = self.resources.get_mut(&key) {
-                    if grant.is_some_and(|g| g.qp == qp) {
-                        *grant = None;
-                        return 0;
-                    }
+                if let Some(Resource::Window { grant, .. }) = self.resources.get_mut(&key)
+                    && grant.is_some_and(|g| g.qp == qp)
+                {
+                    *grant = None;
+                    return 0;
                 }
             }
             Action::Write {
@@ -512,6 +551,7 @@ impl World {
     }
 }
 
+/// Write the active discovery view into the caller's bounded port array.
 unsafe extern "C" fn discover(out: *mut Port, capacity: u32) -> c_int {
     let Some(sim) = current() else {
         return -1;
@@ -540,6 +580,7 @@ unsafe extern "C" fn discover(out: *mut Port, capacity: u32) -> c_int {
     }
     sim.devices.len() as c_int
 }
+/// Open a named device from the active discovery view unless a fault rejects it.
 unsafe extern "C" fn open(name: *const c_char) -> *mut c_void {
     let Some(sim) = current() else {
         return std::ptr::null_mut();
@@ -553,6 +594,7 @@ unsafe extern "C" fn open(name: *const c_char) -> *mut c_void {
     };
     allocate(&sim, Resource::Device(device.clone()))
 }
+/// Allocate a queue pair on a matching device port and return its unique number.
 unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) -> *mut c_void {
     let h = unsafe { handle(device) };
     let mut world = h.sim.world.borrow_mut();
@@ -577,6 +619,7 @@ unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) ->
     }
     raw
 }
+/// Validate both fabric endpoints and assign them to an unconnected queue pair.
 unsafe extern "C" fn connect(
     raw: *mut c_void,
     local: *const Endpoint,
@@ -628,6 +671,7 @@ unsafe extern "C" fn connect(
     *theirs = Some(remote);
     0
 }
+/// Cancel queued work and revoke this queue pair's grants after a successful fence.
 unsafe extern "C" fn stop(raw: *mut c_void) -> c_int {
     let h = unsafe { handle(raw) };
     let mut world = h.sim.world.borrow_mut();
@@ -640,14 +684,15 @@ unsafe extern "C" fn stop(raw: *mut c_void) -> c_int {
     *stopped = true;
     work.clear();
     for resource in world.resources.values_mut() {
-        if let Resource::Window { grant, .. } = resource {
-            if grant.is_some_and(|g| g.qp == h.id) {
-                *grant = None;
-            }
+        if let Resource::Window { grant, .. } = resource
+            && grant.is_some_and(|g| g.qp == h.id)
+        {
+            *grant = None;
         }
     }
     0
 }
+/// Release a resource only when no live work, grant, or dependent owner refers to it.
 unsafe fn free(raw: *mut c_void, operation: Operation) -> c_int {
     let h = unsafe { handle(raw) };
     let mut world = h.sim.world.borrow_mut();
@@ -690,18 +735,23 @@ unsafe fn free(raw: *mut c_void, operation: Operation) -> c_int {
     }
     0
 }
+/// Close a device once its dependent resources have been released.
 unsafe extern "C" fn close(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::Close) }
 }
+/// Free a queue pair with no outstanding work or grants.
 unsafe extern "C" fn qp_free(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::QpFree) }
 }
+/// Release registered memory when no queued work or grant retains it.
 unsafe extern "C" fn deregister(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::Deregister) }
 }
+/// Free a revoked window when no queued work retains its key.
 unsafe extern "C" fn window_free(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::WindowFree) }
 }
+/// Allocate zeroed registered memory with a deterministic virtual address.
 unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
     let h = unsafe { handle(device) };
     let mut world = h.sim.world.borrow_mut();
@@ -719,6 +769,7 @@ unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
         },
     )
 }
+/// Return the stable backing pointer while the native region owner keeps it alive.
 unsafe extern "C" fn bytes(raw: *mut c_void) -> *mut u8 {
     let h = unsafe { handle(raw) };
     match h.sim.world.borrow_mut().resources.get_mut(&h.id) {
@@ -726,6 +777,7 @@ unsafe extern "C" fn bytes(raw: *mut c_void) -> *mut u8 {
         _ => std::ptr::null_mut(),
     }
 }
+/// Allocate an unbound window whose resource identifier is its remote key.
 unsafe extern "C" fn window(device: *mut c_void, key: *mut u32) -> *mut c_void {
     let h = unsafe { handle(device) };
     if h.sim.world.borrow_mut().rejected(Operation::Window, h.id) {
@@ -743,6 +795,7 @@ unsafe extern "C" fn window(device: *mut c_void, key: *mut u32) -> *mut c_void {
     }
     raw
 }
+/// Queue a bind only when the queue pair, window, and region share one fabric.
 unsafe extern "C" fn bind(
     qp: *mut c_void,
     window: *mut c_void,
@@ -768,6 +821,7 @@ unsafe extern "C" fn bind(
         },
     )
 }
+/// Queue key revocation for validation and execution at completion time.
 unsafe extern "C" fn invalidate(qp: *mut c_void, key: u32, id: u64) -> c_int {
     let q = unsafe { handle(qp) };
     q.sim
@@ -775,6 +829,7 @@ unsafe extern "C" fn invalidate(qp: *mut c_void, key: u32, id: u64) -> c_int {
         .borrow_mut()
         .post(q.id, id, Action::Invalidate { key })
 }
+/// Queue a same-fabric write whose remote permission is checked at completion.
 unsafe extern "C" fn write(
     qp: *mut c_void,
     region: *mut c_void,
@@ -798,6 +853,7 @@ unsafe extern "C" fn write(
         },
     )
 }
+/// Execute at most 32 ordered requests, stopping on a delay or failed completion.
 unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) -> c_int {
     let q = unsafe { handle(qp) };
     let mut world = q.sim.world.borrow_mut();
@@ -853,9 +909,12 @@ unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) 
 
 #[cfg(test)]
 mod tests {
+    //! Connected DMA, failure ownership, discovery, and safe proxy integration tests.
     use super::*;
+    use crate::test_guard::ready;
     use std::task::{Context, Poll};
 
+    /// Build connected native peers with 17-byte transfers in 32-byte allocations.
     fn connected(
         sim: &Simulation,
     ) -> (
@@ -882,6 +941,7 @@ mod tests {
     }
 
     #[test]
+    /// Delayed writes require completion and invalidated keys reject subsequent DMA.
     fn connected_copy_waits_for_completion_and_invalidation_revokes_key() {
         let sim = Simulation::new();
         {
@@ -914,6 +974,7 @@ mod tests {
     }
 
     #[test]
+    /// Both completion orders retain the old grant until a successful terminal fence.
     fn fallback_cannot_reuse_quarantined_region_in_either_completion_order() {
         for remote_first in [false, true] {
             let sim = Simulation::new();
@@ -996,6 +1057,7 @@ mod tests {
     }
 
     #[test]
+    /// Inclusive expiry blocks admission but failed fencing still permits late DMA.
     fn expiry_is_inclusive_but_not_a_remote_fence_and_faults_are_ordered() {
         use std::time::Duration;
         use uring_runtime::environment::{SimulationClock, now};
@@ -1055,6 +1117,7 @@ mod tests {
     }
 
     #[test]
+    /// Invalid capabilities, ranges, and peer pairing cannot modify the destination.
     fn wrong_key_address_length_and_peer_cannot_write() {
         for case in 0..4 {
             let sim = Simulation::new();
@@ -1081,6 +1144,7 @@ mod tests {
     }
 
     #[test]
+    /// Failed invalidation and fencing retain remote access until fencing is retried.
     fn failed_invalidation_and_stop_keep_live_grant_until_retry() {
         let sim = Simulation::new();
         {
@@ -1109,6 +1173,7 @@ mod tests {
     }
 
     #[test]
+    /// Rejected posts leave the source idle and terminal fencing cancels delayed DMA.
     fn stop_cancels_delayed_dma_and_post_rejection_keeps_source_reusable() {
         let sim = Simulation::new();
         {
@@ -1134,6 +1199,7 @@ mod tests {
     }
 
     #[test]
+    /// A poll error with failed fencing keeps source memory busy until a retry.
     fn polling_failure_retains_pending_source_until_stop_succeeds() {
         let sim = Simulation::new();
         {
@@ -1157,6 +1223,7 @@ mod tests {
     }
 
     #[test]
+    /// Invalid discovery views and scripted discovery failures never fabricate ports.
     fn discovery_failure_and_invalid_device_definitions_fail_closed() {
         let sim = Simulation::new();
         assert!(sim.with_devices(vec![Device::new("bad", [0; 16])]).is_err());
@@ -1184,7 +1251,9 @@ mod tests {
     }
 
     #[test]
+    /// Nested discovery scopes restore correctly and repeated runs reproduce addresses.
     fn discovery_scopes_restore_and_virtual_addresses_replay() {
+        /// Run one scoped discovery and allocation sequence for replay comparison.
         fn run() -> (u64, Vec<Event>) {
             let sim = Simulation::new();
             let node = sim
@@ -1212,8 +1281,9 @@ mod tests {
     }
 
     #[test]
+    /// Paired native services discover separate nodes and copy through safe poll APIs.
     fn native_services_activate_discovered_nodes_and_copy_through_io_proxies() {
-        use crate::{Configuration, NativeService, lifecycle, pair};
+        use crate::{Configuration, NativeService, QueuePairHandle, Region, pair};
         let sim = Simulation::new();
         let mut charges = Vec::new();
         let mut nodes = Vec::new();
@@ -1256,38 +1326,39 @@ mod tests {
                 Poll::Ready(Ok(_))
             ));
             drop(activation);
-            let qp = lifecycle::QueuePairHandle::new(devices.device(0)).unwrap();
+            let qp = ready(QueuePairHandle::poll_new(devices.device(0), None)).unwrap();
             nodes.push((native, devices, qp));
         }
         let (mut left, devices_left, sender) = nodes.remove(0);
         let (mut right, devices_right, receiver) = nodes.remove(0);
-        sender.connect(receiver.endpoint).unwrap();
-        receiver.connect(sender.endpoint).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        ready(sender.poll_connect(receiver.endpoint)).unwrap();
+        ready(receiver.poll_connect(sender.endpoint)).unwrap();
         left.poll_budgeted(1).unwrap();
         right.poll_budgeted(1).unwrap();
         sender.progress().unwrap();
         receiver.progress().unwrap();
         assert!(sender.ready() && receiver.ready());
-        let target = lifecycle::Region::acquire(&receiver, 17).unwrap();
-        let (window, bind) = receiver.bind(target.clone()).unwrap();
+        let target = ready(Region::poll_acquire(&receiver, 17)).unwrap();
+        let (window, bind) = ready(receiver.poll_bind(target.clone())).unwrap();
         right.poll_budgeted(1).unwrap();
         right.poll_budgeted(1).unwrap();
         assert_eq!(bind.result(), Some(Ok(())));
-        let source = lifecycle::Region::acquire(&sender, 17).unwrap();
-        source.copy_from(&[0xa5; 17]).unwrap();
-        let write = sender
-            .write(source.clone(), window.address.get(), window.key.get())
-            .unwrap();
+        let source = ready(Region::poll_acquire(&sender, 17)).unwrap();
+        ready(source.poll_copy_from(&[0xa5; 17])).unwrap();
+        let write =
+            ready(sender.poll_write(source.clone(), window.address.get(), window.key.get()))
+                .unwrap();
         left.poll_budgeted(1).unwrap();
         left.poll_budgeted(1).unwrap();
         assert_eq!(write.result(), Some(Ok(())));
-        let invalidation = receiver.invalidate(window.clone()).unwrap();
+        let invalidation = ready(receiver.poll_invalidate(window.clone(), &mut cx)).unwrap();
         right.poll_budgeted(1).unwrap();
         right.poll_budgeted(1).unwrap();
         assert_eq!(invalidation.result(), Some(Ok(())));
-        receiver.stop().unwrap();
+        receiver.stop();
         right.poll_budgeted(1).unwrap();
-        assert_eq!(target.copy_to().unwrap(), [0xa5; 17]);
+        assert_eq!(ready(target.poll_copy_to(&mut cx)).unwrap(), [0xa5; 17]);
         drop((
             source,
             target,

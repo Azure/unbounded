@@ -223,7 +223,7 @@ impl Sessions {
         {
             return Poll::Ready(Err(Error::Overloaded));
         }
-        let qp = std::task::ready!(QueuePairHandle::poll_new_admitted(
+        let qp = std::task::ready!(QueuePairHandle::poll_new(
             self.devices.select(rail)?.handle,
             if receive.is_some() {
                 Some(std::sync::Arc::new((permit, receive)) as rdma_verbs::Guard)
@@ -249,7 +249,7 @@ impl Sessions {
             match qp.progress() {
                 Ok(n) => count += n,
                 Err(_) => {
-                    let _ = qp.stop();
+                    qp.stop();
                 }
             }
         }
@@ -268,7 +268,7 @@ impl Sessions {
                 .map(|(_, qp)| qp.clone())
                 .collect();
             for qp in &qps {
-                qp.stop()?;
+                qp.stop();
             }
             for qp in qps {
                 futures::future::poll_fn(|cx| qp.poll_stopped(cx)).await?;
@@ -292,7 +292,7 @@ impl Sessions {
             .collect();
         Box::pin(async move {
             for qp in &qps {
-                qp.stop()?;
+                qp.stop();
             }
             for qp in qps {
                 futures::future::poll_fn(|cx| qp.poll_stopped(cx)).await?;
@@ -353,13 +353,13 @@ impl PreparedSession {
 impl Drop for PreparedSession {
     fn drop(&mut self) {
         if !self.finished.get() {
-            let _ = self.qp.stop();
+            self.qp.stop();
         }
     }
 }
 impl Drop for SessionLease {
     fn drop(&mut self) {
-        let _ = self.qp.stop();
+        self.qp.stop();
     }
 }
 impl SessionLease {
@@ -381,7 +381,7 @@ impl SessionLease {
             futures::future::poll_fn(|cx| {
                 cancellation.register(cx.waker());
                 if let Err(error) = scope.check() {
-                    let _ = self.qp.stop();
+                    self.qp.stop();
                     return Poll::Ready(Err(error));
                 }
                 self.qp.poll_connected(cx).map_err(Into::into)
@@ -411,7 +411,8 @@ impl SessionLease {
         Ok(())
     }
     pub fn abort(&self) -> Result<()> {
-        self.qp.stop().map_err(Into::into)
+        self.qp.stop();
+        Ok(())
     }
 }
 
@@ -519,7 +520,7 @@ impl Grant {
             impl Drop for Abort<'_> {
                 fn drop(&mut self) {
                     if let Some(qp) = self.0 {
-                        let _ = qp.stop();
+                        qp.stop();
                     }
                 }
             }
@@ -572,11 +573,11 @@ impl Grant {
             poll_fn(move |cx| {
                 cancellation.register(cx.waker());
                 if let Err(error) = scope.check() {
-                    let _ = self.qp.stop();
+                    self.qp.stop();
                     return Poll::Ready(Err(error));
                 }
                 if uring_runtime::environment::now() >= self.deadline.0 {
-                    let _ = self.qp.stop();
+                    self.qp.stop();
                     return Poll::Ready(Err(Error::DeadlineExceeded));
                 }
                 if let Err(error) = self.qp.progress() {
@@ -648,7 +649,7 @@ impl Drop for Grant {
     fn drop(&mut self) {
         // Dropping a future/grant is an abort, never implicit completion. On a
         // failed fence QP-owned window/region references preserve quarantine.
-        let _ = self.qp.stop();
+        self.qp.stop();
     }
 }
 pub(crate) fn completion_bytes(binding: [u8; 32], transfer: TransferId) -> Vec<u8> {
@@ -674,7 +675,7 @@ impl SendCompletion {
 struct AbortOnDrop(Rc<QueuePairHandle>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.stop();
+        self.0.stop();
     }
 }
 /// Ciphertext-only movement. Failed attempts are fenced before HTTP fallback.
@@ -2109,6 +2110,7 @@ pub(crate) mod tests {
                 let devices = Rc::new(Devices::test(io));
                 let qp = immediate(QueuePairHandle::poll_new(
                     devices.select(RailId(0)).unwrap().handle,
+                    None,
                 ))
                 .unwrap();
                 let sessions = Sessions::new(devices, 1);
@@ -2147,7 +2149,7 @@ pub(crate) mod tests {
                 drop(prepare);
                 let remote = done(&mut sessions.prepare(&peer.peer, RailId(0), &scope));
                 assert!(matches!(
-                    QueuePairHandle::poll_new(io.device(0)),
+                    QueuePairHandle::poll_new(io.device(0), None),
                     Poll::Ready(Err(rdma_verbs::Error::Overloaded))
                 ));
                 assert!(matches!(
@@ -2527,7 +2529,7 @@ pub(crate) mod tests {
                     futures::executor::block_on(receive_gate.acquire(&receive_quota, &scope()))
                         .unwrap()
                         .unwrap();
-                let qp = immediate(QueuePairHandle::poll_new_admitted(
+                let qp = immediate(QueuePairHandle::poll_new(
                     io.device(0),
                     Some(std::sync::Arc::new((permit, receive))),
                 ))
@@ -2565,7 +2567,7 @@ pub(crate) mod tests {
                 native.poll_budgeted(2).unwrap();
                 assert_eq!(written.result(), Some(Ok(())));
                 drop((source, written));
-                writer.stop().unwrap();
+                writer.stop();
                 native.poll_budgeted(2).unwrap();
                 drop(writer);
                 let completion = verified(
@@ -3198,7 +3200,7 @@ pub(crate) mod tests {
             }
         }
         pub(super) fn claim(io: &Rc<IoPort>) -> Rc<QueuePairHandle> {
-            immediate(QueuePairHandle::poll_new(io.device(0))).unwrap()
+            immediate(QueuePairHandle::poll_new(io.device(0), None)).unwrap()
         }
         pub(super) fn connect_pair(
             a: &QueuePairHandle,
@@ -3308,7 +3310,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
                 let peer = NodeId("native-peer".into());
-                let qp = immediate(QueuePairHandle::poll_new_admitted(
+                let qp = immediate(QueuePairHandle::poll_new(
                     io.device(0),
                     Some(admission.acquire(&peer).unwrap()),
                 ))
@@ -3338,7 +3340,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
                 let peer = NodeId("native-quarantine".into());
-                let qp = immediate(QueuePairHandle::poll_new_admitted(
+                let qp = immediate(QueuePairHandle::poll_new(
                     io.device(0),
                     Some(admission.acquire(&peer).unwrap()),
                 ))

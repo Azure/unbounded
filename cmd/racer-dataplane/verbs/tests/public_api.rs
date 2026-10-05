@@ -1,8 +1,7 @@
-#![cfg(feature = "simulation")]
-
-use rdma_verbs::{
-    Configuration, Error, Guard, IoPort, NativeService, QueuePairHandle, Region, pair, simulation,
-};
+//! Public contracts for tagged activation, ownership, scoped waits, and fencing.
+use rdma_verbs::{Configuration, Error, Guard, IoPort, NativeService, pair};
+#[cfg(feature = "simulation")]
+use rdma_verbs::{QueuePairHandle, Region, simulation};
 use std::{
     rc::Rc,
     sync::{
@@ -12,13 +11,17 @@ use std::{
     task::{Context, Poll},
 };
 
+/// Lifetime charge whose final drop is observable without retaining the charge.
 struct Charge(Arc<AtomicUsize>);
 impl Drop for Charge {
+    /// Record final guard release without extending the guard's lifetime.
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
+/// Create a simulated native service while retaining its I/O port and fabric.
+#[cfg(feature = "simulation")]
 fn fixture(slots: usize) -> (simulation::Simulation, Rc<IoPort>, NativeService) {
     let sim = simulation::Simulation::new()
         .with_devices(vec![simulation::Device::new("sim0", [1; 16])])
@@ -31,6 +34,8 @@ fn fixture(slots: usize) -> (simulation::Simulation, Rc<IoPort>, NativeService) 
     (sim, Rc::new(io), native)
 }
 
+/// Submit the shared one-device configuration without advancing native progress.
+#[cfg(feature = "simulation")]
 fn configure(io: &IoPort, guards: Vec<Guard>) {
     futures::executor::block_on(io.configure(Configuration {
         discover: true,
@@ -44,6 +49,8 @@ fn configure(io: &IoPort, guards: Vec<Guard>) {
     .unwrap();
 }
 
+/// Require success in a fixture that deliberately has no mailbox contention.
+#[cfg(feature = "simulation")]
 fn ready<T>(poll: Poll<rdma_verbs::Result<T>>) -> T {
     match poll {
         Poll::Ready(Ok(value)) => value,
@@ -52,6 +59,8 @@ fn ready<T>(poll: Poll<rdma_verbs::Result<T>>) -> T {
     }
 }
 
+/// Tagged claims stay bounded and reopening rejects all previous-generation handles.
+#[cfg(feature = "simulation")]
 #[test]
 fn selected_ports_route_bounded_claims_and_reopen_revokes_old_devices() {
     let sim = simulation::Simulation::new()
@@ -101,7 +110,7 @@ fn selected_ports_route_bounded_claims_and_reopen_revokes_old_devices() {
             native.poll_budgeted(1).unwrap();
             assert!(io.activation().is_none());
             assert!(matches!(
-                QueuePairHandle::poll_new(io.device(7)),
+                QueuePairHandle::poll_new(io.device(7), None),
                 Poll::Ready(Err(Error::Overloaded))
             ));
         }
@@ -115,28 +124,28 @@ fn selected_ports_route_bounded_claims_and_reopen_revokes_old_devices() {
         assert!(io.activation().is_none(), "activation is consumed once");
         for stale in &stale_devices {
             assert!(matches!(
-                QueuePairHandle::poll_new(stale.clone()),
+                QueuePairHandle::poll_new(stale.clone(), None),
                 Poll::Ready(Err(Error::Unavailable))
             ));
         }
         let second = io.device(7);
         let first = io.device(u32::MAX);
-        let a = ready(QueuePairHandle::poll_new(second.clone()));
-        let b = ready(QueuePairHandle::poll_new(second.clone()));
+        let a = ready(QueuePairHandle::poll_new(second.clone(), None));
+        let b = ready(QueuePairHandle::poll_new(second.clone(), None));
         assert_eq!((a.endpoint.gid, a.endpoint.port), ([2; 16], 2));
         assert_eq!((b.endpoint.gid, b.endpoint.port), ([2; 16], 2));
         assert_ne!(a.endpoint.qpn, b.endpoint.qpn);
         for device in [second.clone(), io.device(99)] {
             assert!(matches!(
-                QueuePairHandle::poll_new(device),
+                QueuePairHandle::poll_new(device, None),
                 Poll::Ready(Err(Error::Overloaded))
             ));
         }
         // Exhausting one tag must not consume another tag's remaining slot.
-        let c = ready(QueuePairHandle::poll_new(first.clone()));
+        let c = ready(QueuePairHandle::poll_new(first.clone(), None));
         assert_eq!((c.endpoint.gid, c.endpoint.port), ([1; 16], 1));
         assert!(matches!(
-            QueuePairHandle::poll_new(first.clone()),
+            QueuePairHandle::poll_new(first.clone(), None),
             Poll::Ready(Err(Error::Overloaded))
         ));
         stale_devices.extend([first, second]);
@@ -156,6 +165,8 @@ fn selected_ports_route_bounded_claims_and_reopen_revokes_old_devices() {
     }
 }
 
+/// Caller-held guard clones do not masquerade as retained native quarantine owners.
+#[cfg(feature = "simulation")]
 #[test]
 fn caller_arc_clones_do_not_block_quarantine_drain_and_reopen() {
     let (sim, io, mut native) = fixture(1);
@@ -177,6 +188,8 @@ fn caller_arc_clones_do_not_block_quarantine_drain_and_reopen() {
     assert_eq!(count.load(Ordering::Acquire), 0);
 }
 
+/// Selection executes during native progress and rejects invalid tag/index plans.
+#[cfg(feature = "simulation")]
 #[test]
 fn selectors_run_on_native_role_and_invalid_plans_fail_closed() {
     for plan in [vec![(0, 1)], vec![(0, 0), (0, 0)], vec![(0, 0), (1, 0)]] {
@@ -198,7 +211,7 @@ fn selectors_run_on_native_role_and_invalid_plans_fail_closed() {
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(io.activation(), Some(Err(Error::InvalidConfiguration)));
         assert!(matches!(
-            QueuePairHandle::poll_new(io.device(0)),
+            QueuePairHandle::poll_new(io.device(0), None),
             Poll::Ready(Err(Error::Overloaded))
         ));
         io.close();
@@ -207,6 +220,8 @@ fn selectors_run_on_native_role_and_invalid_plans_fail_closed() {
     }
 }
 
+/// Failed fencing and retained staging keep the configured guard alive.
+#[cfg(feature = "simulation")]
 #[test]
 fn configured_guards_survive_failed_fence_and_last_io_lease() {
     let (sim, io, mut native) = fixture(1);
@@ -215,7 +230,7 @@ fn configured_guards_survive_failed_fence_and_last_io_lease() {
     native.poll_budgeted(1).unwrap();
     native.poll_budgeted(1).unwrap();
     io.activation().unwrap().unwrap();
-    let Poll::Ready(Ok(qp)) = QueuePairHandle::poll_new(io.device(u32::MAX)) else {
+    let Poll::Ready(Ok(qp)) = QueuePairHandle::poll_new(io.device(u32::MAX), None) else {
         panic!("claim")
     };
     let Poll::Ready(Ok(region)) = Region::poll_acquire(&qp, 17) else {
@@ -240,6 +255,8 @@ fn configured_guards_survive_failed_fence_and_last_io_lease() {
     assert_eq!(sim.live_resources(), 0);
 }
 
+/// Connected DMA preserves payloads and only exposes readback after a terminal fence.
+#[cfg(feature = "simulation")]
 #[test]
 fn public_ports_copy_only_after_terminal_fence() {
     let (sim, io, mut native) = fixture(2);
@@ -247,10 +264,10 @@ fn public_ports_copy_only_after_terminal_fence() {
     native.poll_budgeted(2).unwrap();
     native.poll_budgeted(1).unwrap();
     io.activation().unwrap().unwrap();
-    let Poll::Ready(Ok(sender)) = QueuePairHandle::poll_new(io.device(u32::MAX)) else {
+    let Poll::Ready(Ok(sender)) = QueuePairHandle::poll_new(io.device(u32::MAX), None) else {
         panic!("sender")
     };
-    let Poll::Ready(Ok(receiver)) = QueuePairHandle::poll_new(io.device(u32::MAX)) else {
+    let Poll::Ready(Ok(receiver)) = QueuePairHandle::poll_new(io.device(u32::MAX), None) else {
         panic!("receiver")
     };
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -356,7 +373,7 @@ fn public_ports_copy_only_after_terminal_fence() {
         Some(Ok(())),
         "earlier tickets keep their result"
     );
-    receiver.stop().unwrap();
+    receiver.stop();
     assert!(receiver.poll_stopped(&mut cx).is_pending());
     native.poll_budgeted(2).unwrap();
     assert_eq!(receiver.poll_stopped(&mut cx), Poll::Ready(Ok(())));
@@ -382,6 +399,7 @@ fn public_ports_copy_only_after_terminal_fence() {
     assert_eq!(sim.live_resources(), 0);
 }
 
+/// An empty plan releases its guards without requiring a native library.
 #[test]
 fn empty_plan_releases_guards_without_loading_native_adapter() {
     let (io, port) = pair(1).unwrap();
@@ -401,4 +419,454 @@ fn empty_plan_releases_guards_without_loading_native_adapter() {
     native.poll_budgeted(1).unwrap();
     assert_eq!(io.activation(), Some(Ok(vec![])));
     assert_eq!(count.load(Ordering::Acquire), 0);
+}
+
+/// Ports can cross threads but capacities outside the fixed bound are rejected.
+#[test]
+fn endpoint_handoff_is_send_and_capacity_is_bounded() {
+    /// Check a handoff type's Send bound at compile time.
+    fn send<T: Send>() {}
+    send::<IoPort>();
+    send::<rdma_verbs::NativePort>();
+    assert!(pair(0).is_err());
+    assert!(pair(257).is_err());
+}
+
+/// Scoped activation and service composition through the public crate boundary.
+mod scoped {
+    use super::*;
+    use rdma_verbs::WithNative;
+    use std::{
+        cell::RefCell,
+        task::{Wake, Waker},
+    };
+    use uring_runtime::{
+        Operation, Scope,
+        deadline::Cancellation,
+        group::{FailureReporter, Service},
+        poll_scoped,
+    };
+
+    /// Preserve runtime and verbs failures as distinct observable outcomes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Failure {
+        Runtime(uring_runtime::Error),
+        Verbs(Error),
+    }
+    impl From<uring_runtime::Error> for Failure {
+        /// Preserve runtime cancellation as a distinct failure source.
+        fn from(e: uring_runtime::Error) -> Self {
+            Self::Runtime(e)
+        }
+    }
+    impl From<Error> for Failure {
+        /// Preserve native-operation errors as a distinct failure source.
+        fn from(e: Error) -> Self {
+            Self::Verbs(e)
+        }
+    }
+    /// Minimal scope with optional cancellation and no wall-clock dependency.
+    #[derive(Clone)]
+    struct TestScope(Option<Cancellation>);
+    impl Scope for TestScope {
+        type Error = Failure;
+        /// Reject canceled scopes without introducing a clock dependency.
+        fn check(&self) -> Result<(), Failure> {
+            if self.0.as_ref().is_some_and(|c| c.is_cancelled()) {
+                Err(uring_runtime::Error::Cancelled.into())
+            } else {
+                Ok(())
+            }
+        }
+        /// Expose the optional cancellation source for waiter registration.
+        fn cancellation(&self) -> Option<&Cancellation> {
+            self.0.as_ref()
+        }
+    }
+    /// Build an empty plan that avoids native discovery but still owns a guard.
+    fn config(guard: Guard) -> Configuration {
+        Configuration {
+            discover: false,
+            selector: Box::new(|ports| {
+                assert!(ports.is_empty());
+                Ok(vec![])
+            }),
+            guards: vec![guard],
+            bytes: 32,
+        }
+    }
+    /// Count notifications issued to a registered task waker.
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        /// Count each notification received through the test waker.
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    /// Read a lifetime charge count without holding the underlying guard.
+    struct Observer(Arc<AtomicUsize>);
+    impl Observer {
+        /// Return the number of live fixture charges.
+        fn get(&self) -> usize {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+    /// Create one independently observable charge for cancellation assertions.
+    fn guard() -> (Guard, Observer) {
+        let count = Arc::new(AtomicUsize::new(1));
+        (Arc::new(Charge(count.clone())), Observer(count))
+    }
+
+    /// Cancellation wakes the waiter and takes precedence over another operation poll.
+    #[test]
+    fn scoped_wait_wakes_and_checks_cancellation_before_operation() {
+        let scope = TestScope(Some(Cancellation::new().unwrap()));
+        let calls = std::cell::Cell::new(0);
+        let mut future = Box::pin(poll_scoped(&scope, |_| -> Poll<Result<(), Error>> {
+            calls.set(calls.get() + 1);
+            Poll::Pending
+        }));
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        scope.0.as_ref().unwrap().cancel().unwrap();
+        assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Cancelled)))
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            futures::executor::block_on(poll_scoped(&TestScope(None), |_| Poll::Ready(
+                Err::<(), _>(Error::Io)
+            ))),
+            Err(Failure::Verbs(Error::Io))
+        );
+    }
+
+    /// Abandoned activation retains its submitted guard until native progress.
+    #[test]
+    fn activation_drop_or_cancel_retains_submitted_guard_until_native_turn() {
+        for cancel in [false, true] {
+            let (io, port) = pair(1).unwrap();
+            let mut native = NativeService::new(port);
+            let scope = TestScope(Some(Cancellation::new().unwrap()));
+            let (guard, observer) = guard();
+            let mut future = Box::pin(io.activate(config(guard), &scope));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            if cancel {
+                scope.0.as_ref().unwrap().cancel().unwrap();
+                assert_eq!(
+                    future.as_mut().poll(&mut cx),
+                    Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Cancelled)))
+                );
+            }
+            drop(future);
+            assert!(io.closed());
+            assert_eq!(observer.get(), 1);
+            native.poll_budgeted(1).unwrap();
+            assert_eq!(observer.get(), 0);
+            assert!(native.drained());
+        }
+    }
+
+    /// Scope-free configuration still supports both empty success and selector failure.
+    #[test]
+    fn activation_success_and_selector_error_preserve_scope_free_use() {
+        for fail in [false, true] {
+            let (io, port) = pair(1).unwrap();
+            let mut native = NativeService::new(port);
+            let scope = TestScope(None);
+            let mut config = config(Arc::new(()));
+            if fail {
+                config.selector = Box::new(|_| Err(Error::InvalidConfiguration));
+            }
+            let mut future = Box::pin(io.activate(config, &scope));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            native.poll_budgeted(1).unwrap();
+            let result = future.as_mut().poll(&mut cx);
+            if fail {
+                assert_eq!(
+                    result,
+                    Poll::Ready(Err(Failure::Verbs(Error::InvalidConfiguration)))
+                );
+                assert!(io.closed());
+            } else {
+                assert_eq!(result, Poll::Ready(Ok(vec![])));
+                assert!(!io.closed());
+            }
+        }
+    }
+
+    /// Record hook order and assert admission/fence state from an inner service.
+    struct Inner {
+        calls: Rc<RefCell<Vec<&'static str>>>,
+        io: Rc<IoPort>,
+        failure: Option<Failure>,
+        wake: Waker,
+    }
+    impl Service<TestScope> for Inner {
+        /// Record lookup and return either the configured waker or failure.
+        fn waker(&self) -> Result<Waker, Failure> {
+            self.calls.borrow_mut().push("waker");
+            self.failure.map_or_else(|| Ok(self.wake.clone()), Err)
+        }
+        /// Record that driver registration reached the inner service.
+        fn register_driver(&self, _: &Waker) {
+            self.calls.borrow_mut().push("register");
+        }
+        /// Record successful startup without allocating native resources.
+        fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+            self.calls.borrow_mut().push("start");
+            Box::pin(async { Ok(()) })
+        }
+        /// Assert unchanged budget forwarding and record the polling turn.
+        fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<(), Failure> {
+            assert_eq!(budget, 7);
+            self.calls.borrow_mut().push("poll");
+            Ok(())
+        }
+        /// Verify native drainage permits reopening before the inner drain runs.
+        fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+            assert!(self.io.closed());
+            self.io
+                .reopen()
+                .expect("native fence must precede inner drain");
+            self.calls.borrow_mut().push("drain");
+            Box::pin(async { Ok(()) })
+        }
+        /// Assert accepted native work remains available after inner admission stops.
+        fn stop_admission(&mut self) -> Result<(), Failure> {
+            assert!(
+                !self.io.closed(),
+                "accepted native work must remain available"
+            );
+            self.calls.borrow_mut().push("stop");
+            self.failure.map_or(Ok(()), Err)
+        }
+        /// Verify native admission is already closed before returning an inner error.
+        fn close(&mut self) -> Result<(), Failure> {
+            assert!(self.io.closed());
+            self.calls.borrow_mut().push("close");
+            self.failure.map_or(Ok(()), Err)
+        }
+        /// Record fencing only after native admission closes.
+        fn fence<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+            assert!(self.io.closed());
+            self.calls.borrow_mut().push("fence");
+            Box::pin(async move { self.failure.map_or(Ok(()), Err) })
+        }
+        /// Record successful forwarding of the shutdown hook.
+        fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+            self.calls.borrow_mut().push("shutdown");
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Wrapper hooks retain their ordering even when the drain scope is canceled.
+    #[test]
+    fn wrapper_drives_inner_and_fences_native_before_canceled_scope_drain() {
+        let (io, port) = pair(1).unwrap();
+        let calls = Rc::new(RefCell::new(vec![]));
+        let wake = Waker::from(Arc::new(Count(AtomicUsize::new(0))));
+        let mut service = WithNative::new(
+            Inner {
+                calls: calls.clone(),
+                io: Rc::new(io),
+                failure: None,
+                wake: wake.clone(),
+            },
+            port,
+        );
+        let scope = TestScope(Some(Cancellation::new().unwrap()));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(service.waker().unwrap().will_wake(&wake));
+        service.register_driver(cx.waker());
+        futures::executor::block_on(service.start(&scope)).unwrap();
+        service.poll_budgeted(&mut cx, 7).unwrap();
+        service.stop_admission().unwrap();
+        scope.0.as_ref().unwrap().cancel().unwrap();
+        let mut drain = service.drain(&scope);
+        assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(drain);
+        service.close().unwrap();
+        futures::executor::block_on(service.fence(&scope)).unwrap();
+        futures::executor::block_on(service.shutdown(&scope)).unwrap();
+        futures::executor::block_on(service.fence(&scope)).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [
+                "waker", "register", "start", "poll", "stop", "drain", "close", "fence",
+                "shutdown", "fence"
+            ]
+        );
+    }
+
+    /// Inner hook failures do not prevent native admission from being closed.
+    #[test]
+    fn wrapper_forwards_hook_errors_and_closes_native_on_inner_close_failure() {
+        let (io, port) = pair(1).unwrap();
+        let io = Rc::new(io);
+        let mut service = WithNative::new(
+            Inner {
+                calls: Rc::default(),
+                io: io.clone(),
+                failure: Some(Failure::Verbs(Error::Io)),
+                wake: Waker::noop().clone(),
+            },
+            port,
+        );
+        assert!(matches!(service.waker(), Err(Failure::Verbs(Error::Io))));
+        assert_eq!(service.stop_admission(), Err(Failure::Verbs(Error::Io)));
+        assert_eq!(service.close(), Err(Failure::Verbs(Error::Io)));
+        assert!(io.closed());
+        assert_eq!(
+            futures::executor::block_on(service.fence(&TestScope(None))),
+            Err(Failure::Verbs(Error::Io))
+        );
+    }
+
+    /// Run a reporting service through a real one-lane group and check its result.
+    fn reported_failure(error: Error, name: &str) {
+        use uring_runtime::group::{Factory, Group, Lane, Plan};
+        /// Inner service that reports the selected failure on its first poll.
+        struct Reporting {
+            reporter: Option<FailureReporter<Failure>>,
+            error: Error,
+        }
+        impl Service<TestScope> for Reporting {
+            /// Store the group reporter forwarded through the wrapper.
+            fn set_failure_reporter(&mut self, reporter: FailureReporter<Failure>) {
+                self.reporter = Some(reporter);
+            }
+            /// Start successfully so the test reaches asynchronous reporting.
+            fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+                Box::pin(async { Ok(()) })
+            }
+            /// Report the configured failure through the installed group reporter.
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
+                self.reporter
+                    .as_ref()
+                    .expect("forwarded reporter")
+                    .report(self.error.into());
+                Ok(())
+            }
+            /// Drain successfully without masking the reported failure.
+            fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+                Box::pin(async { Ok(()) })
+            }
+            /// Complete shutdown without masking the reported failure.
+            fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        /// Build the same wrapper fixture for either reported failure.
+        struct Recipe(Error);
+        impl Factory<TestScope> for Recipe {
+            /// Build a native wrapper around the selected reporting scenario.
+            fn build_lane(&self, _: usize) -> Result<Box<dyn Service<TestScope>>, Failure> {
+                let (_io, port) = pair(1)?;
+                Ok(Box::new(WithNative::new(
+                    Reporting {
+                        reporter: None,
+                        error: self.0,
+                    },
+                    port,
+                )))
+            }
+        }
+        let cpu = *uring_runtime::affinity::current_cpus()
+            .unwrap()
+            .first()
+            .unwrap();
+        let mut group = Group::new(Plan {
+            lanes: vec![Lane {
+                name: name.into(),
+                cpu,
+            }],
+            helpers: vec![],
+            max_threads: 1,
+        });
+        assert_eq!(
+            group.run(&Recipe(error), &TestScope(None)),
+            Err(Failure::Verbs(error))
+        );
+        assert_eq!(group.stats().done, 1);
+    }
+
+    /// Cancellation reports travel through the wrapper to the owning group.
+    #[test]
+    fn wrapper_failure_reporter_reaches_inner_service_and_group() {
+        reported_failure(Error::Cancelled, "verbs-forwarding");
+    }
+
+    /// Native teardown retries outlive cancellation and precede either inner hook.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn wrapper_drain_and_fence_retry_native_failure_despite_cancellation() {
+        for fence in [false, true] {
+            let clock = uring_runtime::environment::SimulationClock::new(17);
+            let _clock = clock.environment(0).enter();
+            let sim = simulation::Simulation::new()
+                .with_devices(vec![simulation::Device::new("sim0", [1; 16])])
+                .unwrap();
+            let _sim = sim.enter();
+            let (io, port) = pair(1).unwrap();
+            let io = Rc::new(io);
+            let calls = Rc::new(RefCell::new(vec![]));
+            let mut service = WithNative::new(
+                Inner {
+                    calls: calls.clone(),
+                    io: io.clone(),
+                    failure: None,
+                    wake: Waker::noop().clone(),
+                },
+                port,
+            );
+            let (guard, observer) = guard();
+            futures::executor::block_on(io.configure(Configuration {
+                discover: true,
+                guards: vec![guard],
+                bytes: 32,
+                selector: Box::new(|_| Ok(vec![(0, 0)])),
+            }))
+            .unwrap();
+            let mut cx = Context::from_waker(Waker::noop());
+            service.poll_budgeted(&mut cx, 7).unwrap();
+            service.poll_budgeted(&mut cx, 7).unwrap();
+            io.activation().unwrap().unwrap();
+            // Public wrapper polling also drives the inner service during setup.
+            calls.borrow_mut().clear();
+            let scope = TestScope(Some(Cancellation::new().unwrap()));
+            scope.0.as_ref().unwrap().cancel().unwrap();
+            sim.reject(simulation::Operation::Stop, None, true);
+            let mut operation = if fence {
+                service.fence(&scope)
+            } else {
+                service.drain(&scope)
+            };
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            assert!(
+                calls.borrow().is_empty(),
+                "inner hook must wait for native destruction"
+            );
+            assert_eq!(observer.get(), 1);
+            sim.reject(simulation::Operation::Stop, None, false);
+            clock.advance(std::time::Duration::from_millis(10));
+            assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+            drop(operation);
+            assert_eq!(*calls.borrow(), [if fence { "fence" } else { "drain" }]);
+            assert_eq!(observer.get(), 0);
+            assert_eq!(sim.live_resources(), 0);
+        }
+    }
+
+    /// Configuration failure reports also propagate through the wrapper and group.
+    #[test]
+    fn wrapper_forwards_reporter_and_lifecycle_errors_through_group() {
+        reported_failure(Error::InvalidConfiguration, "native-wrapper");
+    }
 }
