@@ -424,7 +424,7 @@ func (b *fakeLateBody) Close() error           { close(b.closed); return nil }
 func fakeSubscriptionSocket(t *testing.T, client *Client, headers string) (net.Conn, *http.Response) {
 	t.Helper()
 
-	conn, err := client.dial(context.Background(), "tcp", "racer")
+	conn, _, err := client.bulk.Get(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,7 +783,7 @@ func TestFakeSubscriptionPendingCallbackCancellation(t *testing.T) {
 
 	t.Cleanup(cleanup)
 
-	conn, err := client.dial(context.Background(), "tcp", "racer")
+	conn, _, err := client.bulk.Get(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}

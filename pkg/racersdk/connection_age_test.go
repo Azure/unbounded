@@ -11,15 +11,14 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/connpool"
 )
 
-// Timers are fired explicitly, including stopped callbacks to model an already
-// runnable callback waiting on Client.mu. No test changes the process clock.
 type connTestTimer struct {
 	delay time.Duration
 	fire  func()
@@ -36,17 +35,11 @@ type connTestClock struct {
 
 func installConnClock(c *Client, age time.Duration) *connTestClock {
 	clock := &connTestClock{now: time.Now()}
-	c.connNow = func() time.Time {
-		clock.mu.Lock()
-		defer clock.mu.Unlock()
-
-		return clock.now
-	}
-	c.connAge = func() time.Duration {
-		clock.ages.Add(1)
-		return age
-	}
-	c.connAfterFunc = func(d time.Duration, f func()) connectionTimer {
+	config := c.bulk.Config()
+	config.Now = func() time.Time { clock.mu.Lock(); defer clock.mu.Unlock(); return clock.now }
+	config.MaxAge = age
+	config.Jitter = func(n int64) int64 { clock.ages.Add(1); return n - 1 }
+	config.AfterFunc = func(d time.Duration, f func()) connpool.Timer {
 		clock.mu.Lock()
 		defer clock.mu.Unlock()
 
@@ -55,6 +48,7 @@ func installConnClock(c *Client, age time.Duration) *connTestClock {
 
 		return timer
 	}
+	c.configurePools(config)
 
 	return clock
 }
@@ -64,41 +58,6 @@ func (clock *connTestClock) advance(d time.Duration) {
 	defer clock.mu.Unlock()
 
 	clock.now = clock.now.Add(d)
-}
-
-func (clock *connTestClock) latest() *connTestTimer {
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
-
-	return clock.timers[len(clock.timers)-1]
-}
-
-func pipeConnClient(t *testing.T) (*Client, *connTestClock) {
-	t.Helper()
-	c := testClient(t, "unused", 1)
-	clock := installConnClock(c, 4*time.Second)
-	c.dial = func(context.Context, string, string) (net.Conn, error) {
-		conn, peer := net.Pipe()
-
-		t.Cleanup(func() { closeBody(peer) })
-
-		return conn, nil
-	}
-
-	return c, clock
-}
-
-func checkoutConn(t *testing.T, c *Client, pool *connectionPool) (*pooledConn, bool) {
-	t.Helper()
-
-	conn, reused, err := c.connection(context.Background(), pool, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(func() { closeBody(conn) })
-
-	return conn, reused
 }
 
 func TestConnectionAgeConfigAndJitter(t *testing.T) {
@@ -121,151 +80,7 @@ func TestConnectionAgeConfigAndJitter(t *testing.T) {
 			if configured.config.MaxConnAge != maxAge {
 				t.Fatal("positive duration changed")
 			}
-
-			for _, upper := range []bool{false, true} {
-				age := jitteredConnAge(maxAge, func(n int64) int64 {
-					if n != int64(maxAge/4)+1 || n <= 0 {
-						t.Fatal("invalid uniform random bound", n)
-					}
-
-					if upper {
-						return n - 1
-					}
-
-					return 0
-				})
-
-				want := maxAge - maxAge/4
-				if upper {
-					want = maxAge
-				}
-
-				if age != want || age <= 0 {
-					t.Fatal("jitter endpoint", age, want)
-				}
-			}
 		})
-	}
-}
-
-func TestConnectionAgeLifecycle(t *testing.T) {
-	for _, poolName := range []string{"bulk", "metadata", "small"} {
-		for _, at := range []string{"checkout", "recycle", "timer", "idle"} {
-			t.Run(poolName+"/"+at, func(t *testing.T) {
-				c, clock := pipeConnClient(t)
-				pool := map[string]*connectionPool{"bulk": &c.bulk, "metadata": &c.metadataPool, "small": &c.smallPool}[poolName]
-
-				conn, reused := checkoutConn(t, c, pool)
-				if reused || conn.expiresAt != c.connNow().Add(4*time.Second) {
-					t.Fatal("fresh connection deadline")
-				}
-
-				if at == "recycle" {
-					clock.advance(4 * time.Second)
-					c.recycle(pool, conn)
-				} else {
-					if at == "idle" {
-						c.config.IdleConnTimeout = time.Second
-					}
-
-					clock.advance(time.Second)
-					c.recycle(pool, conn)
-
-					timer := clock.latest()
-
-					wantDelay := 3 * time.Second
-					if at == "idle" {
-						wantDelay = time.Second
-					}
-
-					if timer.delay != wantDelay {
-						t.Fatal("idle timer ignores remaining lifetime", timer.delay)
-					}
-
-					clock.advance(wantDelay)
-
-					if at == "checkout" {
-						next, reused := checkoutConn(t, c, pool)
-						if next == conn || reused {
-							t.Fatal("expired connection checked out")
-						}
-
-						closeBody(next)
-					}
-
-					timer.fire()
-					timer.fire()
-				}
-
-				closeBody(conn)
-
-				wantRotations, wantDials := uint64(1), uint64(1)
-				if at == "idle" {
-					wantRotations = 0
-				}
-
-				if at == "checkout" {
-					wantDials = 2
-				}
-
-				if s := c.Stats(); s.ConnectionRotations != wantRotations || s.Dials != wantDials || s.Retries != 0 || s.ConnectionReuses != 0 || s.Connections != 0 || s.IdleConnections != 0 {
-					t.Fatal(s)
-				}
-
-				if clock.ages.Load() != int32(wantDials) {
-					t.Fatal("age not chosen once per successful dial")
-				}
-			})
-		}
-	}
-}
-
-func TestConnectionAgeStaleTimerGeneration(t *testing.T) {
-	c, clock := pipeConnClient(t)
-	conn, _ := checkoutConn(t, c, &c.bulk)
-	c.recycle(&c.bulk, conn)
-
-	old := clock.latest()
-	clock.advance(time.Second)
-
-	next, reused := checkoutConn(t, c, &c.bulk)
-	if next != conn || !reused {
-		t.Fatal("healthy connection not reused")
-	}
-
-	clock.advance(3 * time.Second)
-	old.fire() // Even an expired connection belongs to its active response.
-
-	if s := c.Stats(); s.Connections != 1 || s.ConnectionRotations != 0 {
-		t.Fatal("old timer interrupted active response", s)
-	}
-
-	c.recycle(&c.bulk, conn)
-	old.fire()
-
-	if s := c.Stats(); s.ConnectionRotations != 1 || s.Connections != 0 || clock.ages.Load() != 1 {
-		t.Fatal(s)
-	}
-}
-
-func TestConnectionAgeOldTimerAfterRecycling(t *testing.T) {
-	c, clock := pipeConnClient(t)
-	conn, _ := checkoutConn(t, c, &c.bulk)
-	c.recycle(&c.bulk, conn)
-
-	old := clock.latest()
-	clock.advance(time.Second)
-
-	conn, _ = checkoutConn(t, c, &c.bulk)
-	c.recycle(&c.bulk, conn)
-	old.fire()
-
-	if s := c.Stats(); s.Connections != 1 || s.IdleConnections != 1 || s.ConnectionRotations != 0 {
-		t.Fatal("old timer removed a newer idle generation", s)
-	}
-
-	if clock.latest().delay != 3*time.Second || clock.ages.Load() != 1 {
-		t.Fatal("reuse renewed lifetime")
 	}
 }
 
@@ -358,42 +173,41 @@ func TestConnectionAgeActiveResponseCompletes(t *testing.T) {
 }
 
 func TestConnectionAgeDialFailureAfterRotation(t *testing.T) {
-	c, clock := pipeConnClient(t)
-	conn, _ := checkoutConn(t, c, &c.metadataPool)
-	c.recycle(&c.metadataPool, conn)
+	c := testClient(t, "unused", 1)
+	config := c.bulk.Config()
+
+	var fail atomic.Bool
+
+	config.Dial = func(context.Context, string, string) (net.Conn, error) {
+		if fail.Load() {
+			return nil, io.EOF
+		}
+
+		conn, peer := net.Pipe()
+
+		t.Cleanup(func() { closeBody(peer) })
+
+		return conn, nil
+	}
+	c.configurePools(config)
+	clock := installConnClock(c, 4*time.Second)
+
+	conn, _, err := c.metadataPool.Get(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.metadataPool.Recycle(conn)
 	clock.advance(4 * time.Second)
+	fail.Store(true)
 
-	c.dial = func(context.Context, string, string) (net.Conn, error) { return nil, io.EOF }
-
-	_, err := c.Stat(context.Background(), Request{})
+	_, err = c.Stat(context.Background(), Request{})
 	if !errors.Is(err, io.EOF) {
 		t.Fatal("dial failure lost", err)
 	}
 
 	if s := c.Stats(); s.ConnectionRotations != 1 || s.Dials != 2 || s.Retries != 0 || s.ConnectionReuses != 0 || s.Connections != 0 || s.ActiveBulk != 0 || clock.ages.Load() != 1 {
 		t.Fatal("rotation became a retry or retained capacity", s)
-	}
-}
-
-func TestConnectionAgeCloseTimerRace(t *testing.T) {
-	for range 50 {
-		c, clock := pipeConnClient(t)
-		conn, _ := checkoutConn(t, c, &c.bulk)
-		c.recycle(&c.bulk, conn)
-
-		timer := clock.latest()
-		clock.advance(4 * time.Second)
-
-		var wg sync.WaitGroup
-		wg.Go(timer.fire)
-		wg.Go(timer.fire)
-		wg.Go(func() { closeBody(c) })
-		wg.Wait()
-		timer.fire()
-
-		if s := c.Stats(); s.ConnectionRotations > 1 || s.Connections != 0 || s.IdleConnections != 0 || s.Retries != 0 || s.Dials != 1 {
-			t.Fatal("close/age race double counted or leaked", s)
-		}
 	}
 }
 
@@ -529,88 +343,6 @@ func TestConnectionAgeContinuationKeepsContext(t *testing.T) {
 	closeBody(v)
 
 	if s := c.Stats(); s.ConnectionRotations != 0 || s.Dials != 1 || s.Retries != 0 || s.Connections != 0 || s.ActiveBulk != 0 {
-		t.Fatal(s)
-	}
-}
-
-func TestConnectionAgeUnusableResponsesDoNotRotate(t *testing.T) {
-	for _, mode := range []string{"partial", "close", "surplus", "failed"} {
-		t.Run(mode, func(t *testing.T) {
-			c, clock := pipeConnClient(t)
-			conn, _ := checkoutConn(t, c, &c.bulk)
-			body := &responseBody{client: c, pool: &c.bulk, conn: conn, reusable: true}
-
-			switch mode {
-			case "partial":
-				// An incomplete HEAD never marks its connection reusable.
-				body.reusable = false
-			case "close", "failed":
-				body.reusable = false
-			case "surplus":
-				conn.reader.Reset(strings.NewReader("extra"))
-
-				if _, err := conn.reader.Peek(1); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			clock.advance(4 * time.Second)
-			closeBody(body)
-			closeBody(body)
-
-			if s := c.Stats(); s.ConnectionRotations != 0 || s.Connections != 0 || s.IdleConnections != 0 {
-				t.Fatal("unusable response counted as age retirement", s)
-			}
-		})
-	}
-}
-
-func TestConnectionAgeCheckoutSkipsExpiredCandidates(t *testing.T) {
-	c, clock := pipeConnClient(t)
-	first, _ := checkoutConn(t, c, &c.bulk)
-	second, _ := checkoutConn(t, c, &c.bulk)
-
-	clock.advance(time.Second)
-
-	healthy, _ := checkoutConn(t, c, &c.bulk)
-	c.recycle(&c.bulk, healthy)
-	c.recycle(&c.bulk, first)
-	c.recycle(&c.bulk, second)
-	clock.advance(3 * time.Second)
-
-	next, reused := checkoutConn(t, c, &c.bulk)
-	if next != healthy || !reused {
-		t.Fatal("did not reuse healthy candidate after retiring expired candidates")
-	}
-
-	closeBody(next)
-
-	if s := c.Stats(); s.ConnectionRotations != 2 || s.Dials != 3 || s.ConnectionReuses != 1 || s.Retries != 0 || s.Connections != 0 {
-		t.Fatal(s)
-	}
-}
-
-func TestConnectionAgeRealTimer(t *testing.T) {
-	c := testClient(t, "unused", 1)
-	// Keep the production monotonic clock and timer. Only fix the sampled age.
-	c.connAge = func() time.Duration { return 20 * time.Millisecond }
-
-	conn, peer := net.Pipe()
-	defer closeBody(peer)
-
-	c.dial = func(context.Context, string, string) (net.Conn, error) { return conn, nil }
-	pooled, _ := checkoutConn(t, c, &c.bulk)
-	c.recycle(&c.bulk, pooled)
-
-	if err := peer.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
-		t.Fatal("idle age timer did not close connection", err)
-	}
-	// Stats takes Client.mu, so it observes the completed timer's accounting.
-	if s := c.Stats(); s.ConnectionRotations != 1 || s.Dials != 1 || s.Connections != 0 || s.IdleConnections != 0 {
 		t.Fatal(s)
 	}
 }

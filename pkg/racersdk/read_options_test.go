@@ -330,12 +330,15 @@ func TestClientIdleAndCloseConnectionPolicy(t *testing.T) {
 
 			var dials atomic.Int32
 
-			dial := c.dial
+			poolConfig := c.bulk.Config()
+			dial := poolConfig.Dial
 
-			c.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+			poolConfig.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 				dials.Add(1)
 				return dial(ctx, network, address)
 			}
+			c.configurePools(poolConfig)
+
 			for i := range 2 {
 				v, err := c.Get(context.Background(), Request{})
 				if err != nil {
@@ -352,9 +355,7 @@ func TestClientIdleAndCloseConnectionPolicy(t *testing.T) {
 					deadline := time.Now().Add(time.Second)
 
 					for {
-						c.mu.Lock()
-						idle := len(c.bulk.idle)
-						c.mu.Unlock()
+						idle := c.bulk.Stats().IdleConnections
 
 						if idle == 0 {
 							break

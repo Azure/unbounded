@@ -6,10 +6,10 @@ package racersdk
 import (
 	"context"
 	"io"
-	"math/rand/v2"
-	"net"
 	"sync"
 	"time"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/connpool"
 )
 
 // ClientConfig selects a cache and bounds a Client's resources. Zero numeric
@@ -61,16 +61,11 @@ type Client struct {
 	path                          string
 	ctx                           context.Context
 	cancel                        context.CancelFunc
-	dial                          func(context.Context, string, string) (net.Conn, error)
-	// Connection lifecycle seams are immutable after construction.
-	connNow          func() time.Time
-	connAge          func() time.Duration
-	connAfterFunc    func(time.Duration, func()) connectionTimer
-	stats            clientStats
-	copySlots        chan struct{}
-	copyBuffers      chan *[copyBufferSize]byte
-	smallCopySlots   chan struct{}
-	smallCopyBuffers chan *[copyBufferSize]byte
+	stats                         clientStats
+	copySlots                     chan struct{}
+	copyBuffers                   chan *[copyBufferSize]byte
+	smallCopySlots                chan struct{}
+	smallCopyBuffers              chan *[copyBufferSize]byte
 }
 
 // NewClient validates config without dialing. Contexts bound stream lifetimes;
@@ -152,12 +147,42 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	c.smallPool.queued = make(chan struct{}, config.SmallObjectQueuedRequests)
 	c.smallCopySlots = make(chan struct{}, config.SmallObjectConnections)
 	c.smallCopyBuffers = make(chan *[copyBufferSize]byte, config.SmallObjectConnections)
-	c.dial = (&net.Dialer{Timeout: config.DialTimeout}).DialContext
-	c.connNow = time.Now
-	c.connAge = func() time.Duration { return jitteredConnAge(config.MaxConnAge, rand.Int64N) }
-	c.connAfterFunc = func(d time.Duration, f func()) connectionTimer { return time.AfterFunc(d, f) }
+	c.configurePools(connpool.Config{})
 
 	return c, nil
+}
+
+// configurePools is a construction-only hook for the fake daemon and tests.
+// Call only before any checkout; pool policy is immutable once work begins.
+func (c *Client) configurePools(config connpool.Config) {
+	config.Path = c.path
+
+	config.DialTimeout = c.config.DialTimeout
+	if config.MaxAge == 0 {
+		config.MaxAge = c.config.MaxConnAge
+	}
+
+	if config.IdleTimeout == 0 {
+		config.IdleTimeout = c.config.IdleConnTimeout
+	}
+
+	for _, pool := range []*connectionPool{&c.bulk, &c.metadataPool, &c.smallPool} {
+		pool.Pool = connpool.New(config)
+	}
+}
+
+// Admission bounds live Values, not just sockets, so it remains in the SDK.
+type connectionPool struct {
+	*connpool.Pool
+	slots, queued chan struct{}
+}
+
+func (c *Client) closeIdleConnections() {
+	for _, pool := range []*connectionPool{&c.bulk, &c.metadataPool, &c.smallPool} {
+		if pool.Pool != nil {
+			pool.CloseIdle()
+		}
+	}
 }
 
 // admit bounds waiters before allocating a Value, derived context, or callback.
@@ -328,6 +353,12 @@ func stopPending(v *Value, stop func() bool) {
 func (c *Client) Close() error {
 	c.mu.Lock()
 	c.closed = true
+	// Seal recycling before active cleanup, preserving closed-before-age policy.
+	for _, pool := range []*connectionPool{&c.bulk, &c.metadataPool, &c.smallPool} {
+		if pool.Pool != nil {
+			closeBody(pool.Pool)
+		}
+	}
 
 	for _, buffers := range []chan *[copyBufferSize]byte{c.copyBuffers, c.smallCopyBuffers} {
 	drainCopyBuffers:
@@ -353,8 +384,6 @@ func (c *Client) Close() error {
 	if c.cancel != nil {
 		c.cancel()
 	}
-
-	c.closeIdleConnections()
 
 	return nil
 }

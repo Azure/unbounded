@@ -328,7 +328,7 @@ func TestStreamingReadAhead(t *testing.T) {
 	}
 	defer closeBody(v)
 
-	if v.stream.conn.reader.Buffered() != 45 {
+	if v.stream.conn.Reader.Buffered() != 45 {
 		t.Fatal("fixture did not read ahead")
 	}
 

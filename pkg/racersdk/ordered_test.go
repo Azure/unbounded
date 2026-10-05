@@ -437,11 +437,13 @@ func TestGetReadAheadReleaseFailureCleanup(t *testing.T) {
 		_, _ = io.WriteString(conn, "ab")
 		_, _ = io.Copy(io.Discard, reader)
 	})
-	dial := c.dial
-	c.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+	poolConfig := c.bulk.Config()
+	dial := poolConfig.Dial
+	poolConfig.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		conn, err := dial(ctx, network, address)
 		return orderedReleaseFailureConn{conn}, err
 	}
+	c.configurePools(poolConfig)
 
 	v, err := c.Get(t.Context(), Request{}, ReadOptions{Offset: ByteOffset(first), PageCredits: 1})
 	if err != nil {

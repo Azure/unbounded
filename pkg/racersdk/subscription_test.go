@@ -204,7 +204,8 @@ func rawSubscriptionClient(t *testing.T, serve func(net.Conn, *bufio.Reader, []b
 	t.Helper()
 	c := testClient(t, "unused", 1)
 	c.config.BodyReadTimeout = time.Second
-	c.dial = func(context.Context, string, string) (net.Conn, error) {
+	poolConfig := c.bulk.Config()
+	poolConfig.Dial = func(context.Context, string, string) (net.Conn, error) {
 		client, peer := net.Pipe()
 
 		t.Cleanup(func() { closeBody(peer) })
@@ -222,6 +223,7 @@ func rawSubscriptionClient(t *testing.T, serve func(net.Conn, *bufio.Reader, []b
 
 		return client, nil
 	}
+	c.configurePools(poolConfig)
 
 	return c
 }

@@ -273,7 +273,7 @@ func (h *streamingHTTP) payload(remaining int64) (int64, error) {
 	for remaining > 0 {
 		batch := min(remaining, int64(copyBufferSize))
 		// Never bypass read-ahead: it may contain payload and later frame headers.
-		buffered := s.conn.reader.Buffered()
+		buffered := s.conn.Reader.Buffered()
 		raw, unix := s.conn.Conn.(*net.UnixConn)
 
 		rf, fast := h.writer.(io.ReaderFrom)
@@ -339,7 +339,7 @@ func (h *streamingHTTP) payload(remaining int64) (int64, error) {
 			return written, ioFailure("subscription deadline", err)
 		}
 
-		n, readErr := s.conn.reader.Read(h.buffer[:batch])
+		n, readErr := s.conn.Reader.Read(h.buffer[:batch])
 		_ = s.conn.SetReadDeadline(time.Time{}) //nolint:errcheck // Preserve successful bytes after peer closure.
 
 		h.value.client.stats.bytesRead.Add(uint64(n))

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Azure/unbounded/pkg/racersdk/internal/connpool"
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
@@ -52,7 +53,7 @@ type PageStream struct {
 	readMu           sync.Mutex
 	writeMu          sync.Mutex
 	owner            *Value
-	conn             *pooledConn
+	conn             *connpool.Conn
 	first, end       uint64
 	pages, delivered uint64
 	pageCredits      int
@@ -169,7 +170,7 @@ func (s *PageStream) open(descriptor OriginRequest, o ReadOptions) error {
 		return err
 	}
 
-	v.body = &responseBody{conn: conn, client: v.client, pool: v.pool}
+	v.body = connpool.NewBody(conn)
 	v.mu.Unlock()
 
 	if err := conn.SetDeadline(time.Now().Add(v.client.config.ResponseHeaderTimeout)); err != nil {
@@ -182,7 +183,7 @@ func (s *PageStream) open(descriptor OriginRequest, o ReadOptions) error {
 		return ioFailure("subscription request", io.ErrShortWrite)
 	}
 
-	head, err := readRawHead(conn.reader, true)
+	head, err := readRawHead(conn.Reader, true)
 	if err != nil {
 		return err
 	}
@@ -393,7 +394,7 @@ func (s *PageStream) readBytes(p []byte, payload bool) error {
 			return ioFailure("subscription deadline", err)
 		}
 
-		n, err := s.conn.reader.Read(p)
+		n, err := s.conn.Reader.Read(p)
 		if payload {
 			s.owner.client.stats.bytesRead.Add(uint64(n))
 		}
@@ -456,7 +457,7 @@ func (s *PageStream) release(number uint64, length uint32) error {
 		// The peer may already have sent Complete and closed while this lease
 		// was held. The read side, not a racing release write, decides whether
 		// the subscription completed or was truncated.
-		if err != nil && !staleConnectionError(err) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
+		if err != nil && !connpool.StaleError(err) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
 			if s.buffers != nil {
 				return ioFailure("subscription release", err)
 			}

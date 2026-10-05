@@ -163,7 +163,7 @@ func TestIntegrationClientConnectionReuse(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		connections = append(connections, v.body.(*responseBody).conn.Conn)
+		connections = append(connections, v.stream.conn.Conn)
 
 		if n, err := io.CopyN(io.Discard, v, int64(PageSize)); err != nil || n != int64(PageSize) {
 			t.Fatal(n, err)
@@ -180,13 +180,16 @@ func TestIntegrationClientConnectionReuse(t *testing.T) {
 func TestIntegrationCancelBlockedDial(t *testing.T) {
 	client := testClient(t, "unused", 1)
 	entered, stopped := make(chan struct{}), make(chan struct{})
-	client.dial = func(ctx context.Context, _, _ string) (net.Conn, error) {
+	poolConfig := client.bulk.Config()
+	poolConfig.Dial = func(ctx context.Context, _, _ string) (net.Conn, error) {
 		close(entered)
 		<-ctx.Done()
 		close(stopped)
 
 		return nil, ctx.Err()
 	}
+	client.configurePools(poolConfig)
+
 	result := make(chan error, 1)
 
 	go func() { _, err := client.Get(context.Background(), Request{}); result <- err }()
@@ -329,7 +332,7 @@ func TestIntegrationAbortedConnectionNotReused(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		connections = append(connections, value.body.(*responseBody).conn.Conn)
+		connections = append(connections, value.stream.conn.Conn)
 
 		closeBody(value)
 	}

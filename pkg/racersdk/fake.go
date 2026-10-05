@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Azure/unbounded/pkg/racersdk/internal/connpool"
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
@@ -154,9 +155,9 @@ func NewFakeClient(origin Origin) (*Client, func(), error) {
 		return nil, nil, err
 	}
 
-	client.dial = func(ctx context.Context, _, _ string) (net.Conn, error) {
+	client.configurePools(connpool.Config{Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return dialer.DialContext(ctx, "tcp4", address)
-	}
+	}})
 
 	return client, cleanup, nil
 }

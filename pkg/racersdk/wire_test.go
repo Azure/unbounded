@@ -49,6 +49,7 @@ func TestWireErrorMapping(t *testing.T) {
 		{wire.ErrorCanceled, ErrorCanceled},
 		{wire.ErrorDeadline, ErrorDeadline},
 		{wire.ErrorIO, ErrorIO},
+		{wire.ErrorKind(255), ErrorInternal},
 	} {
 		for _, status := range []int{0, 503} {
 			err := fromWireError(&wire.Error{Kind: tt.wire, Operation: "response", Status: status, Err: cause})

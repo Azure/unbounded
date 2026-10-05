@@ -3,7 +3,11 @@
 
 package racersdk
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/connpool"
+)
 
 // Stats is a fixed-size, credential-free client telemetry snapshot. Counters are
 // cumulative since construction; gauges describe the sampling instant. Fields
@@ -54,17 +58,26 @@ type Stats struct {
 
 type clientStats struct {
 	queueWaits, queueWaitNanoseconds, queueRejections, queueTimeouts atomic.Uint64
-	dials, connectionReuses, retries, bytesRead                      atomic.Uint64
-	connectionRotations                                              atomic.Uint64
-	connections                                                      atomic.Int64
+	retries, bytesRead                                               atomic.Uint64
 }
 
 // Stats returns bounded telemetry without allocating per-request labels or
 // depending on a metrics framework. It is safe concurrently with Get, Stat and Close.
 func (c *Client) Stats() Stats {
-	c.mu.Lock()
-	idle := len(c.bulk.idle) + len(c.metadataPool.idle) + len(c.smallPool.idle)
-	c.mu.Unlock()
+	var connections connpool.Stats
+
+	for _, pool := range []*connectionPool{&c.bulk, &c.metadataPool, &c.smallPool} {
+		if pool.Pool == nil {
+			continue
+		}
+
+		s := pool.Stats()
+		connections.Dials += s.Dials
+		connections.ConnectionReuses += s.ConnectionReuses
+		connections.ConnectionRotations += s.ConnectionRotations
+		connections.Connections += s.Connections
+		connections.IdleConnections += s.IdleConnections
+	}
 
 	bulk, metadata, small := len(c.bulk.queued), len(c.metadataPool.queued), len(c.smallPool.queued)
 
@@ -76,9 +89,9 @@ func (c *Client) Stats() Stats {
 		QueueRejections:      c.stats.queueRejections.Load(), QueueTimeouts: c.stats.queueTimeouts.Load(),
 		ActiveBulk: len(c.slots), ActiveMetadata: len(c.metadataPool.slots),
 		ActiveSmallObjects: len(c.smallPool.slots),
-		Connections:        c.stats.connections.Load(), IdleConnections: idle,
-		Dials: c.stats.dials.Load(), ConnectionReuses: c.stats.connectionReuses.Load(),
-		ConnectionRotations: c.stats.connectionRotations.Load(),
+		Connections:        connections.Connections, IdleConnections: connections.IdleConnections,
+		Dials: connections.Dials, ConnectionReuses: connections.ConnectionReuses,
+		ConnectionRotations: connections.ConnectionRotations,
 		Retries:             c.stats.retries.Load(), BytesRead: c.stats.bytesRead.Load(),
 	}
 }

@@ -77,10 +77,13 @@ func TestReadOptionsSnapshot(t *testing.T) {
 
 func TestReadOptionsInvalidSnapshotDoesNotFetch(t *testing.T) {
 	c := testClient(t, "unused", 1)
-	c.dial = func(context.Context, string, string) (net.Conn, error) {
+	poolConfig := c.bulk.Config()
+	poolConfig.Dial = func(context.Context, string, string) (net.Conn, error) {
 		t.Error("invalid snapshot performed I/O")
 		return nil, errors.New("unexpected dial")
 	}
+	c.configurePools(poolConfig)
+
 	valid := originMeta(3)
 	invalid := []Metadata{{}, valid, valid, valid, valid}
 	invalid[1].Size = ByteLength(math.MaxUint64)

@@ -225,7 +225,7 @@ func TestRustSubscriptionInterop(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				_, err := stream.conn.reader.Peek(1)
+				_, err := stream.conn.Reader.Peek(1)
 
 				var timeout net.Error
 				if !errors.As(err, &timeout) || !timeout.Timeout() {
@@ -287,7 +287,7 @@ func TestRustSubscriptionInterop(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err = stream.conn.reader.Peek(1)
+		_, err = stream.conn.Reader.Peek(1)
 
 		var timeout net.Error
 		if !errors.As(err, &timeout) || !timeout.Timeout() {

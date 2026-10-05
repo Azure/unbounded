@@ -55,6 +55,8 @@ func fromWireError(err error) error {
 		kind = ErrorDeadline
 	case wire.ErrorIO:
 		kind = ErrorIO
+	default:
+		kind = ErrorInternal
 	}
 
 	return &Error{kind: kind, operation: e.Operation, status: e.Status, cause: fromWireError(e.Err)}
