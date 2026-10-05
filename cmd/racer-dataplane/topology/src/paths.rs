@@ -1175,16 +1175,20 @@ mod tests {
         assert_eq!(route.last(), Some(&1499));
         assert!(route.len() > 2);
         // Blocking the destination's first-hop edge does not ban reaching it later.
+        let triangle =
+            Membership::new((0u16..3).map(|i| Binary(i.to_be_bytes())).collect()).unwrap();
+        let direct = query(0, 2, 2);
+        assert!(triangle.neighbors(0).contains(&2));
+        assert_eq!(block_on(paths.route(&triangle, direct)), Ok(vec![0, 2]));
         assert_eq!(
             block_on(paths.route(
-                &members,
+                &triangle,
                 PathQuery {
-                    blocked: &[1499],
-                    ..basic
+                    blocked: &[2],
+                    ..direct
                 }
-            ))
-            .unwrap(),
-            route
+            )),
+            Ok(vec![0, 1, 2])
         );
         for invalid in [
             PathQuery {
