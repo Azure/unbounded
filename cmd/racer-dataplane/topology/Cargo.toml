@@ -1,0 +1,12 @@
+[package]
+name = "topology"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Runtime-independent membership, placement, and routing algorithms"
+
+[dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+futures = "0.3"
