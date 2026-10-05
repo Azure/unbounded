@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "control-wire", "uds-endpoint", "wire-codec"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "control-wire", "controlplane", "uds-endpoint", "wire-codec"]
 resolver = "3"
 
 [package]
@@ -22,6 +22,7 @@ path = "tests/subscription_interop.rs"
 required-features = ["subscription-interop"]
 
 [dependencies]
+controlplane = { path = "controlplane" }
 uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec", features = ["rest"] }
 racer-control-wire = { path = "control-wire" }

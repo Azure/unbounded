@@ -1,0 +1,14 @@
+[package]
+name = "controlplane"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Generic bounded control feeds, rollout barriers, and immutable publication"
+
+[dependencies]
+uring-runtime = { path = "../runtime" }
+wire-codec = { path = "../wire-codec", features = ["rest"] }
+futures = "0.3"
+
+[dev-dependencies]
+uring-runtime = { path = "../runtime", features = ["simulation"] }
