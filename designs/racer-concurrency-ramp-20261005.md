@@ -36,7 +36,7 @@ Next exact mutation: `kubectl --context=joolshev-scale-test -n unbounded-system 
 
 Read-only Parca C8 interval 16:32:45-16:34:15Z covers only node `aks-ddv5-17198779-vmss0000ad`. Loadgen sampled 450.474 CPU seconds: SHA-256 `blockSHANI` 292.421s flat (64.91%), kernel bucket 32.84%. Gantry sampled 68.526 CPU seconds: kernel 81.87%, `internal/poll.Splice` cumulative 76.11%. Dataplane sampled 142.421s: kernel 79.08%. Kernel samples collapse into an address-zero bucket and its symbol is unstable: do not attribute to individual kernel functions. This supports verification plus kernel/socket work, not a specific kernel-copy optimization claim.
 
-Code matches inline verification (`cmd/racer-loadgen/pull.go:420-435`) and SDK Unix-socket forwarding via `io.ReaderFrom` (`pkg/racersdk/http_stream.go:279-295`). Checkout is not asserted identical to deployed images.
+Code matches inline verification (`cmd/racer-loadgen/pull.go:420-435`) and SDK Unix-socket forwarding via `io.ReaderFrom` (`pkg/racersdk/value.go:523-541`). Checkout is not asserted identical to deployed images.
 
 Fleet CPU at 16:34:15Z: user 50.49%, system 34.74%, softirq 10.61%, idle 4.17%, I/O wait 0.00008%, steal zero. 1,497 nodes have eight logical CPUs, three have sixteen. Profiled node 97.18% busy; its loadgen CPU 4.865 cores is at ~51st percentile but throughput 3.017 GiB/s is only ~14th percentile. Profile is representative of saturation, not all CPU architectures.
 

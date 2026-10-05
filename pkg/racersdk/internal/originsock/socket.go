@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racersdk
+// Package originsock owns origin Unix socket binding, identity, and stale recovery.
+package originsock
 
 import (
 	"errors"
@@ -17,11 +18,100 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const socketPathLimit = 107
+
+// Error classifies socket failures without inspecting diagnostic text.
+type Error struct {
+	Invalid   bool
+	Operation string
+	Cause     error
+}
+
+func (e *Error) Error() string { return "origin socket: " + e.Operation }
+func (e *Error) Unwrap() error { return e.Cause }
+
+func ioFailure(op string, err error) error { return &Error{Operation: op, Cause: err} }
+
+func closeBody(c interface{ Close() error }) {
+	if err := c.Close(); err != nil {
+		return
+	}
+}
+
+// Listen binds an origin socket and returns identity-safe cleanup. Recovery is opt-in.
+func Listen(path string, mode os.FileMode, recoverStale bool) (*net.UnixListener, func(), error) {
+	if recoverStale {
+		return listenOwnedOrigin(path, mode)
+	}
+
+	return listenOrigin(path, mode)
+}
+
+func listenOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(path) > socketPathLimit {
+		return nil, nil, &Error{Invalid: true, Operation: "socket path"}
+	}
+
+	parent := string(filepath.Separator)
+
+	parts := strings.Split(strings.TrimPrefix(path, parent), parent)
+	for _, part := range parts[:len(parts)-1] {
+		parent = filepath.Join(parent, part)
+
+		info, err := os.Lstat(parent)
+		if err != nil {
+			return nil, nil, ioFailure("socket directory", err)
+		}
+
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, nil, &Error{Invalid: true, Operation: "socket directory"}
+		}
+	}
+
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		if err == nil {
+			err = os.ErrExist
+		}
+
+		return nil, nil, ioFailure("socket exists", err)
+	}
+
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		return nil, nil, ioFailure("socket bind", err)
+	}
+
+	l.SetUnlinkOnClose(false)
+
+	info, err := os.Lstat(path)
+	if err != nil {
+		closeBody(l)
+		return nil, nil, ioFailure("socket identity", err)
+	}
+
+	cleanup := func() {
+		closeBody(l)
+
+		current, err := os.Lstat(path)
+		if err == nil && current.Mode()&os.ModeSocket != 0 && os.SameFile(info, current) && info.ModTime().Equal(current.ModTime()) {
+			if err := os.Remove(path); err != nil {
+				return
+			}
+		}
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		cleanup()
+		return nil, nil, ioFailure("socket mode", err)
+	}
+
+	return l, cleanup, nil
+}
+
 // Never unlink the lock file: waiters must always contend on the same inode.
 // A hard-linked socket witness pins identity across crashes and inode reuse.
 func listenOwnedOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(path) > socketPathLimit {
-		return nil, nil, failure(ErrorInvalidArgument, "socket path", nil)
+		return nil, nil, &Error{Invalid: true, Operation: "socket path"}
 	}
 
 	dir, err := openOriginDirectory(filepath.Dir(path))

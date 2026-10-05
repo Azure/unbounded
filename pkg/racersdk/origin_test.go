@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,6 +20,141 @@ import (
 	"testing"
 	"time"
 )
+
+func TestOriginCopyBufferRetentionAndClearing(t *testing.T) {
+	for range cap(originCopyBuffers) + 1 {
+		b := new([copyBufferSize]byte)
+		b[0], b[len(b)-1] = 1, 2
+		releaseOriginBuffer(b)
+	}
+
+	if len(originCopyBuffers) != cap(originCopyBuffers) {
+		t.Fatal("unbounded retention")
+	}
+
+	for range cap(originCopyBuffers) + 1 {
+		b := acquireOriginBuffer()
+		for _, value := range b {
+			if value != 0 {
+				t.Fatal("retained payload")
+			}
+		}
+	}
+}
+
+func TestOwnedOriginCrashChild(t *testing.T) {
+	path := os.Getenv("RACER_ORIGIN_CRASH_PATH")
+	if path == "" {
+		return
+	}
+
+	cache, err := ParseCacheName("gantry")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = serveOrigin(context.Background(), OriginConfig{Cache: cache, RecoverStaleSocket: true},
+		func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) { return originMeta(0), nil, nil }, path)
+	t.Fatal(err)
+}
+
+func TestOwnedOriginSIGKILLRestart(t *testing.T) {
+	path := filepath.Join(socketDir(t), "socket")
+	lockPath := filepath.Join(filepath.Dir(path), ".racer-origin.lock")
+
+	for range 2 {
+		child := exec.Command(os.Args[0], "-test.run=^TestOwnedOriginCrashChild$")
+
+		child.Env = append(os.Environ(), "RACER_ORIGIN_CRASH_PATH="+path)
+
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Cleanup(func() {
+			_ = child.Process.Kill()
+			if child.ProcessState == nil {
+				_ = child.Wait()
+			}
+		})
+		client := originClient(t, path, 1)
+		deadline := time.Now().Add(10 * time.Second)
+
+		for {
+			conn, err := net.DialTimeout("unix", path, 50*time.Millisecond)
+			if err == nil {
+				closeBody(conn)
+				break
+			}
+
+			if time.Now().After(deadline) {
+				t.Fatalf("child did not start: %v", err)
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+		// A real protocol request proves the restarted origin serves, not just binds.
+		value, err := client.Get(t.Context(), Request{Key: Key{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		closeBody(value)
+
+		before, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		lock, err := os.Stat(lockPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, _, err := listenOwnedOrigin(path, 0o600); err == nil {
+			t.Fatal("replaced live owner")
+		}
+
+		if err := child.Process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := child.Wait(); err == nil {
+			t.Fatal("child was not killed")
+		}
+
+		current, err := os.Lstat(path)
+		if err != nil || !os.SameFile(before, current) {
+			t.Fatalf("SIGKILL did not retain socket: %v", err)
+		}
+
+		if _, _, err := listenOrigin(path, 0o600); err == nil {
+			t.Fatal("default SDK contract recovered an existing socket")
+		}
+
+		current, err = os.Stat(lockPath)
+		if err != nil || !os.SameFile(lock, current) {
+			t.Fatalf("lock changed: %v", err)
+		}
+	}
+
+	_, cleanup, err := listenOwnedOrigin(path, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cleanup()
+	cleanup() // Cleanup is idempotent and cannot act on a reused directory FD.
+
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("clean shutdown retained socket: %v", err)
+	}
+
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("clean shutdown removed lock: %v", err)
+	}
+}
 
 func startOrigin(t *testing.T, config OriginConfig, origin Origin) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
@@ -412,79 +548,6 @@ func TestOriginLateCallbackAndSaturation(t *testing.T) {
 	waitClosed(t, body)
 }
 
-func TestOriginSocketLifecycle(t *testing.T) {
-	dir := socketDir(t)
-
-	path := filepath.Join(dir, "socket")
-	if err := os.WriteFile(path, []byte("preserve"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, _, err := listenOrigin(path, 0o600); err == nil {
-		t.Fatal("replaced file")
-	}
-
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.Symlink("missing", path); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, _, err := listenOrigin(path, 0o600); err == nil {
-		t.Fatal("followed socket symlink")
-	}
-
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-
-	link := filepath.Join(dir, "link")
-	if err := os.Symlink(dir, link); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, _, err := listenOrigin(filepath.Join(link, "socket"), 0o600); err == nil {
-		t.Fatal("followed parent symlink")
-	}
-
-	l, cleanup, err := listenOrigin(path, 0o640)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0o640 {
-		t.Fatal("mode", err)
-	}
-
-	if _, _, err := listenOrigin(path, 0o600); err == nil {
-		t.Fatal("replaced live socket")
-	}
-
-	closeBody(l)
-
-	if _, _, err := listenOrigin(path, 0o600); err == nil {
-		t.Fatal("replaced stale socket")
-	}
-
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	cleanup()
-
-	data, err := os.ReadFile(path)
-	if err != nil || string(data) != "replacement" {
-		t.Fatal("removed replacement", err)
-	}
-}
-
 func TestOriginDisconnectAndServerCancel(t *testing.T) {
 	for _, serverCancel := range []bool{false, true} {
 		t.Run(strconv.FormatBool(serverCancel), func(t *testing.T) {
@@ -740,7 +803,8 @@ func TestOriginExactRawLimitsAndTarget(t *testing.T) {
 type panicCloser struct{ closed atomic.Int32 }
 
 func (*panicCloser) Read([]byte) (int, error) { return 0, io.EOF }
-func (b *panicCloser) Close() error           { b.closed.Add(1); panic("credential in Close") }
+
+func (b *panicCloser) Close() error { b.closed.Add(1); panic("credential in Close") }
 
 func TestOriginClosePanicContained(t *testing.T) {
 	body := &panicCloser{}
@@ -761,5 +825,34 @@ func TestOriginClosePanicContained(t *testing.T) {
 
 	if body.closed.Load() != 1 {
 		t.Fatal("panic close count")
+	}
+}
+
+func TestOriginHeadReservedFromFullBodyAdmission(t *testing.T) {
+	path, cancel, done := startOrigin(t, OriginConfig{MaxConcurrentRequests: 2, MaxConcurrentHeadRequests: 1}, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+		if r.Operation() == OperationHead {
+			return originMeta(1), nil, nil
+		}
+
+		return originMeta(1), &blockedBody{done: make(chan struct{}), first: true}, nil
+	})
+
+	defer func() { cancel(); <-done }()
+
+	c := originClient(t, path, 2)
+	for range 2 {
+		v, err := c.Get(context.Background(), Request{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeBody(v)
+	}
+
+	ctx, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+
+	m, err := c.Stat(ctx, Request{})
+	if err != nil || m.Size != 1 {
+		t.Fatal("GET bodies starved origin HEAD", err)
 	}
 }

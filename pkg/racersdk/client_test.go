@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,88 +19,92 @@ import (
 	"time"
 )
 
-// Keep socket and test scratch paths inside this worktree, including under race.
-func socketDir(t testing.TB) string {
-	t.Helper()
+func TestStatAdmissionLeaseLifecycle(t *testing.T) {
+	for _, action := range []string{"success", "protocol", "context", "client"} {
+		t.Run(action, func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			defer close(release)
 
-	dir, err := os.MkdirTemp("../../tmp", "sdk-")
-	if err != nil {
-		t.Fatal(err)
+			c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, head []byte) {
+				if !strings.HasPrefix(string(head), "HEAD /v2/objects/") {
+					t.Error("Stat did not issue HEAD")
+				}
+
+				close(entered)
+				<-release
+
+				if action == "protocol" {
+					_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+				} else {
+					_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n\r\n")
+					_, _ = io.Copy(io.Discard, reader)
+				}
+			})
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			done := make(chan error, 1)
+
+			go func() {
+				m, err := c.Stat(ctx, Request{})
+				if err == nil && m.Size != 7 {
+					t.Error("wrong Stat metadata", m)
+				}
+
+				done <- err
+			}()
+
+			<-entered
+			c.mu.Lock()
+
+			active := len(c.active)
+			for lease := range c.active {
+				if lease.pool != &c.metadataPool || lease.cleanup != nil {
+					t.Error("Stat lease attached value consumption state")
+				}
+			}
+			c.mu.Unlock()
+
+			if active != 1 || len(c.slots) != 0 || c.Stats().ActiveMetadata != 1 {
+				t.Fatal("wrong in-flight Stat accounting", active, c.Stats())
+			}
+
+			switch action {
+			case "context":
+				cancel()
+			case "client":
+				closeBody(c)
+			default:
+				release <- struct{}{}
+			}
+
+			err := <-done
+
+			switch action {
+			case "success":
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "protocol":
+				assertKind(t, err, ErrorProtocol)
+			case "context":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case "client":
+				assertKind(t, err, ErrorClosed)
+			}
+
+			c.mu.Lock()
+			active = len(c.active)
+			c.mu.Unlock()
+
+			if active != 0 || c.Stats().ActiveMetadata != 0 || c.Stats().BytesRead != 0 {
+				t.Fatal("Stat retained lease or counted body bytes", active, c.Stats())
+			}
+		})
 	}
-
-	path, err := filepath.Abs(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(func() {
-		if err := os.RemoveAll(path); err != nil {
-			t.Error(err)
-		}
-	})
-
-	return path
-}
-
-func testClient(t *testing.T, path string, maxConn int) *Client {
-	t.Helper()
-
-	cache, err := ParseCacheName("test")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	c, err := newClient(ClientConfig{Cache: cache, MaxConnections: maxConn}, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(func() {
-		if err := c.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-
-	return c
-}
-
-func clientPeer(t *testing.T, handler http.Handler) string {
-	t.Helper()
-	return rawClientPeer(t, subscriptionHandler(handler))
-}
-
-func rawClientPeer(t *testing.T, handler http.Handler) string {
-	t.Helper()
-	path := filepath.Join(socketDir(t), "socket")
-
-	l, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s := &http.Server{Handler: handler, ReadHeaderTimeout: time.Second}
-	done := make(chan struct{})
-
-	go func() { defer close(done); _ = s.Serve(l) }()
-
-	t.Cleanup(func() { _ = s.Close(); <-done })
-
-	return path
-}
-
-type repeatedByte byte
-
-func (b repeatedByte) Read(p []byte) (int, error) {
-	// Use bulk copies rather than a scalar byte-store loop. The latter can
-	// dominate transport benchmarks and is sensitive to linked code alignment.
-	if len(p) > 0 {
-		p[0] = byte(b)
-		for filled := 1; filled < len(p); {
-			filled += copy(p[filled:], p[:filled])
-		}
-	}
-
-	return len(p), nil
 }
 
 func TestRepeatedByteFillsOnlyDestination(t *testing.T) {
@@ -126,23 +129,6 @@ func TestRepeatedByteFillsOnlyDestination(t *testing.T) {
 
 	if n, err := repeatedByte('x').Read(nil); n != 0 || err != nil {
 		t.Fatal(n, err)
-	}
-}
-
-func streamResponse(w http.ResponseWriter, first, length, size int64, tag string) {
-	streamResponseHead(w, first, length, size, tag)
-	_, _ = io.CopyN(w, repeatedByte('x'), length)
-}
-
-func streamResponseHead(w http.ResponseWriter, first, length, size int64, tag string) {
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("ETag", tag)
-	w.Header().Set("Racer-Expires-At", "0")
-
-	if length != 0 {
-		w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(first, 10)+"-"+strconv.FormatInt(first+length-1, 10)+"/"+strconv.FormatInt(size, 10))
-		w.WriteHeader(206)
 	}
 }
 
@@ -328,10 +314,6 @@ func TestClientRawResponses(t *testing.T) {
 		})
 	}
 }
-
-type shortDestination struct{}
-
-func (shortDestination) Write(p []byte) (int, error) { return len(p) / 2, nil }
 
 func TestClientFailuresAndCapacity(t *testing.T) {
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { streamResponse(w, 0, 10, 10, `"v"`) }))
@@ -601,5 +583,414 @@ func TestClientConcurrentCloseWaitsForCleanup(t *testing.T) {
 		}
 
 		wg.Wait()
+	}
+}
+
+func TestClientQueueBoundsAndMetadataReservation(t *testing.T) {
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "HEAD" {
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("ETag", `"v"`)
+			w.Header().Set("Racer-Expires-At", "0")
+
+			return
+		}
+
+		streamResponse(w, 0, 1, 1, `"v"`)
+	}))
+
+	c, err := newClient(ClientConfig{Cache: CacheName{value: "test"}, MaxConnections: 1, MetadataConnections: 1, MaxQueuedRequests: 1, QueueTimeout: 100 * time.Millisecond}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(c)
+
+	v, err := c.Get(context.Background(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
+
+	for _, cancelWait := range []bool{true, false} {
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+
+		go func() { _, err := c.Get(ctx, Request{}); result <- err }()
+
+		until := time.Now().Add(time.Second)
+		for len(c.queued) != 1 && time.Now().Before(until) {
+			time.Sleep(time.Millisecond)
+		}
+
+		if len(c.queued) != 1 {
+			t.Fatal("waiter not admitted")
+		}
+
+		c.mu.Lock()
+		active := len(c.active)
+		c.mu.Unlock()
+
+		if active != 1 {
+			t.Fatal("queued request allocated active state")
+		}
+
+		_, err := c.Get(context.Background(), Request{})
+		assertKind(t, err, ErrorUnavailable)
+
+		m, err := c.Stat(context.Background(), Request{})
+		if err != nil || m.Size != 1 {
+			t.Fatal("bulk queue starved reserved metadata", err)
+		}
+
+		if cancelWait {
+			cancel()
+		}
+
+		err = <-result
+		if cancelWait {
+			if !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+		} else {
+			assertKind(t, err, ErrorDeadline)
+		}
+
+		cancel()
+
+		if len(c.queued) != 0 {
+			t.Fatal("queue slot leaked")
+		}
+	}
+
+	closeBody(v)
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			v, err := c.Get(context.Background(), Request{})
+			if err != nil {
+				var typed *Error
+				if !errors.As(err, &typed) || typed.Kind() != ErrorUnavailable {
+					t.Error(err)
+				}
+
+				return
+			}
+			defer closeBody(v)
+
+			if n, err := io.Copy(io.Discard, v); err != nil || n != 1 {
+				t.Error(n, err)
+			}
+		})
+	}
+
+	wg.Wait()
+
+	if len(c.slots) != 0 || len(c.metadataPool.slots) != 0 || len(c.queued) != 0 {
+		t.Fatal("concurrent calls leaked admission")
+	}
+}
+
+func TestClientReservedPoolFiniteAdmissionAndCancellation(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	path := clientPeer(t, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+
+		<-r.Context().Done()
+	}))
+
+	c, err := newClient(ClientConfig{Cache: CacheName{value: "test"}, MetadataConnections: 2, MetadataQueuedRequests: 3}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(c)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	results := make(chan error, 5)
+
+	for range 2 {
+		go func() { _, err := c.Stat(ctx, Request{}); results <- err }()
+	}
+
+	for range 2 {
+		<-entered
+	}
+
+	for range 3 {
+		go func() { _, err := c.Stat(ctx, Request{}); results <- err }()
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for len(c.metadataPool.queued) != 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	if len(c.metadataPool.queued) != 3 || len(c.metadataPool.slots) != 2 {
+		t.Fatal("metadata admission not bounded")
+	}
+
+	_, err = c.Stat(context.Background(), Request{})
+	assertKind(t, err, ErrorUnavailable)
+	cancel()
+
+	for range 5 {
+		select {
+		case err := <-results:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Stat cancellation blocked")
+		}
+	}
+
+	if len(c.metadataPool.slots) != 0 || len(c.metadataPool.queued) != 0 {
+		t.Fatal("Stat retained admission")
+	}
+}
+
+func TestIndependentQueuesAndSmallObjectAdmission(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+
+	var heads atomic.Int32
+
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "HEAD" {
+			if heads.Add(1) == 1 {
+				close(entered)
+
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return
+				}
+			}
+
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("ETag", `"v"`)
+			w.Header().Set("Racer-Expires-At", "0")
+
+			return
+		}
+
+		streamResponse(w, 0, 1, 1, `"v"`)
+	}))
+
+	c, err := newClient(ClientConfig{Cache: CacheName{value: "test"}, MaxConnections: 1, MaxQueuedRequests: 1, MetadataConnections: 1, MetadataQueuedRequests: 1, SmallObjectConnections: 1, SmallObjectQueuedRequests: 1}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(c)
+
+	v, err := c.Get(context.Background(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bulkDone := make(chan error, 1)
+
+	go func() { _, err := c.Get(ctx, Request{}); bulkDone <- err }()
+
+	waitDepth := func(want int) {
+		t.Helper()
+
+		until := time.Now().Add(time.Second)
+		for c.Stats().QueueDepth != want && time.Now().Before(until) {
+			time.Sleep(time.Millisecond)
+		}
+
+		if c.Stats().QueueDepth != want {
+			t.Fatal("queue depth", c.Stats())
+		}
+	}
+	waitDepth(1)
+
+	headDone := make(chan error, 2)
+
+	go func() { _, err := c.Stat(ctx, Request{}); headDone <- err }()
+
+	<-entered
+
+	go func() { _, err := c.Stat(ctx, Request{}); headDone <- err }()
+
+	waitDepth(2)
+
+	small, err := c.Get(ctx, Request{}, ReadOptions{SmallObject: true})
+	if err != nil {
+		t.Fatal("bulk/HEAD saturation blocked small GET", err)
+	}
+	defer closeBody(small)
+
+	smallDone := make(chan error, 1)
+
+	go func() { _, err := c.Get(ctx, Request{}, ReadOptions{SmallObject: true}); smallDone <- err }()
+
+	waitDepth(3)
+
+	s := c.Stats()
+	if s.BulkQueueDepth != 1 || s.MetadataQueueDepth != 1 || s.SmallObjectQueueDepth != 1 || s.ActiveSmallObjects != 1 || s.Connections != 3 {
+		t.Fatal(s)
+	}
+
+	_, err = c.Get(ctx, Request{}, ReadOptions{SmallObject: true})
+	assertKind(t, err, ErrorUnavailable)
+	close(release)
+
+	for range 2 {
+		if err := <-headDone; err != nil {
+			t.Fatal("reserved metadata queue rejected HEAD", err)
+		}
+	}
+
+	cancel()
+
+	for _, done := range []chan error{bulkDone, smallDone} {
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	}
+
+	closeBody(small)
+	closeBody(v)
+
+	if s := c.Stats(); s.QueueDepth != 0 || s.ActiveBulk != 0 || s.ActiveMetadata != 0 || s.ActiveSmallObjects != 0 {
+		t.Fatal(s)
+	}
+}
+
+func TestReservedAdmissionConfigValidation(t *testing.T) {
+	for _, config := range []ClientConfig{{SmallObjectConnections: -1}, {SmallObjectQueuedRequests: -1}, {MetadataQueuedRequests: -1}} {
+		config.Cache = CacheName{value: "test"}
+		_, err := NewClient(config)
+		assertKind(t, err, ErrorInvalidArgument)
+	}
+
+	_, err := (OriginConfig{Cache: CacheName{value: "test"}, MaxConcurrentHeadRequests: -1}).defaults()
+	assertKind(t, err, ErrorInvalidArgument)
+}
+
+func TestSmallObjectDefaultQueueAcceptsSynchronizedBurst(t *testing.T) {
+	release := make(chan struct{})
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+
+		streamResponse(w, 0, 1, 1, `"v"`)
+	}))
+
+	c := testClient(t, path, 1)
+	if cap(c.smallPool.slots) != 4 || cap(c.smallPool.queued) != 128 {
+		t.Fatal("unexpected small-object defaults", c.config)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 64)
+
+	for range 64 {
+		go func() {
+			<-start
+
+			v, err := c.Get(context.Background(), Request{}, ReadOptions{SmallObject: true})
+			if err == nil {
+				_, err = v.WriteTo(io.Discard)
+				closeBody(v)
+			}
+
+			results <- err
+		}()
+	}
+
+	close(start)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for c.Stats().SmallObjectQueueDepth != 60 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	s := c.Stats()
+
+	close(release)
+
+	if s.ActiveSmallObjects != 4 || s.SmallObjectQueueDepth != 60 || s.QueueRejections != 0 {
+		t.Error("burst was not bounded and queued", s)
+	}
+
+	for range 64 {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Error("burst request failed", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("burst did not complete")
+		}
+	}
+
+	if s := c.Stats(); s.ActiveSmallObjects != 0 || s.SmallObjectQueueDepth != 0 || s.QueueRejections != 0 || s.BytesRead != 64 {
+		t.Fatal("burst leaked admission or lost bytes", s)
+	}
+}
+
+func TestContentTypeExactCompatibilityAndRawWhitespace(t *testing.T) {
+	for _, initial := range []string{"", "text/plain"} {
+		for _, current := range []string{"", "text/plain", "application/json"} {
+			m := originMeta(3)
+			m.ContentType = initial
+			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if current != "" {
+					w.Header().Set("Racer-Content-Type", current)
+				}
+
+				streamResponse(w, 0, 3, 3, `"v"`)
+			}))
+			c := testClient(t, path, 1)
+
+			v, err := c.Get(context.Background(), Request{}, ReadOptions{Metadata: &m})
+			if initial != current {
+				assertKind(t, err, ErrorProtocol)
+				continue
+			}
+
+			if err != nil {
+				t.Fatal(initial, current, err)
+			}
+
+			if n, err := v.WriteTo(io.Discard); err != nil || n != 3 {
+				t.Fatal(n, err)
+			}
+
+			closeBody(v)
+
+			if v.Metadata() != m {
+				t.Fatal("initial metadata changed")
+			}
+		}
+	}
+
+	r := OriginRequest{operation: OperationBootstrap, byteRange: bootstrapRange()}
+
+	for _, value := range []string{"text/plain", "  text/plain", "\ttext/plain", " text/plain ", " text/plain\t", " text/plain;\tcharset=utf-8"} {
+		head := rawResponse(200, "Content-Length: 0\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\nRacer-Content-Type:"+value+"\r\n")
+		if _, err := parseResponseHead(head, r, nil); err == nil {
+			t.Fatal("normalized invalid raw MIME", value)
+		}
+	}
+
+	for _, value := range []string{" text/plain", " text/plain; charset=utf-8", " text/plain; x=\"a b\""} {
+		head := rawResponse(200, "Content-Length: 0\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\nRacer-Content-Type:"+value+"\r\n")
+
+		result, err := parseResponseHead(head, r, nil)
+		if err != nil || result.metadata.ContentType != strings.TrimPrefix(value, " ") {
+			t.Fatal(value, err)
+		}
 	}
 }

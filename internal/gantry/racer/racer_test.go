@@ -25,6 +25,7 @@ import (
 	registryorigin "github.com/Azure/unbounded/internal/gantry/origin"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/pkg/racersdk"
+	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
 type testUpstream struct {
@@ -105,7 +106,7 @@ func requireKind(t *testing.T, err error, want racersdk.ErrorKind) {
 func fakeClient(t *testing.T, origin racersdk.Origin) *racersdk.Client {
 	t.Helper()
 
-	client, cleanup, err := racersdk.NewFakeClient(origin)
+	client, cleanup, err := racersdktest.NewClient(origin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,7 +566,7 @@ func TestFakeClientCleanupInterruptsUpstream(t *testing.T) {
 		},
 	}
 
-	client, cleanup, err := racersdk.NewFakeClient(Origin(testConfig(), upstream))
+	client, cleanup, err := racersdktest.NewClient(Origin(testConfig(), upstream))
 	if err != nil {
 		t.Fatal(err)
 	}

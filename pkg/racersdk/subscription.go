@@ -4,25 +4,26 @@
 package racersdk
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"net"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/connpool"
+	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
 // PageLease owns one verified page slice. Data is valid until Release. Do not
 // copy a lease or access Data concurrently with Release. Release is idempotent.
 type PageLease struct {
+	// Number is the absolute object page number.
 	Number uint64
+	// Offset is the absolute object offset of the first byte in Data.
 	Offset ByteOffset
+	// Data is the verified selected slice, valid until Release.
 	Data   []byte
 	stream *PageStream
 	number uint64
@@ -32,6 +33,7 @@ type PageLease struct {
 	err    error
 }
 
+// Release returns the page's credits and invalidates Data exactly once.
 func (p *PageLease) Release() error {
 	if p == nil || p.stream == nil {
 		return failure(ErrorInvalidArgument, "page lease", nil)
@@ -47,35 +49,38 @@ func (p *PageLease) Release() error {
 	return p.err
 }
 
-type pageInterval struct{ first, end uint64 }
-
 // PageStream receives page slices, unordered unless Ordered was requested.
 // One goroutine calls Next; Release and Close may run concurrently. Call Close
 // on every path. Next waits when credits are held by outstanding leases.
 type PageStream struct {
-	mu                               sync.Mutex
-	readMu                           sync.Mutex
-	writeMu                          sync.Mutex
-	owner                            *Value
-	conn                             *pooledConn
-	first, end                       uint64
-	pages, delivered, deliveredBytes uint64
-	pageCredits                      int
-	byteCredits                      uint64
-	bytesHeld                        uint64
-	outstanding                      map[uint64]uint32
-	intervals                        []pageInterval
-	ordered                          bool
-	complete                         bool
-	notify                           chan struct{}
+	mu               sync.Mutex
+	readMu           sync.Mutex
+	writeMu          sync.Mutex
+	owner            *Value
+	conn             *connpool.Conn
+	first, end       uint64
+	pages, delivered uint64
+	pageCredits      int
+	byteCredits      uint64
+	bytesHeld        uint64
+	outstanding      map[uint64]uint32
+	sequence         *wire.Sequence
+	ordered          bool
+	complete         bool
+	notify           chan struct{}
 	// Get alone reuses payload storage, within this subscription. Public leases
 	// from OpenPages keep their existing synchronous allocation behavior.
 	buffers chan []byte
 }
 
-func (s *PageStream) Metadata() Metadata              { return s.owner.metadata }
+// Metadata returns the immutable full-object metadata snapshot.
+func (s *PageStream) Metadata() Metadata { return s.owner.metadata }
+
+// Range returns the selected start offset and exclusive end offset.
 func (s *PageStream) Range() (ByteOffset, ByteOffset) { return ByteOffset(s.first), ByteOffset(s.end) }
-func (s *PageStream) Close() error                    { return s.owner.Close() }
+
+// Close cancels the subscription without draining; it is idempotent.
+func (s *PageStream) Close() error { return s.owner.Close() }
 
 // OpenPages resolves metadata and subscribes to the entire selected range with
 // one POST. It never performs a bootstrap or continuation request.
@@ -101,7 +106,8 @@ func (c *Client) OpenPages(ctx context.Context, request Request, options ...Read
 		o.ByteCredits = ByteLength(o.PageCredits) * PageSize
 	}
 
-	if o.PageCredits < 1 || o.PageCredits > 64 || o.ByteCredits < PageSize || o.ByteCredits > 64*PageSize || uint64(o.Offset) > math.MaxInt64 || uint64(o.Length) > math.MaxInt64-uint64(o.Offset) {
+	if o.PageCredits < 1 || o.PageCredits > 64 || o.ByteCredits < PageSize || o.ByteCredits > 64*PageSize ||
+		uint64(o.Offset) > math.MaxInt64 || uint64(o.Length) > math.MaxInt64-uint64(o.Offset) {
 		return nil, failure(ErrorInvalidArgument, "subscription options", nil)
 	}
 
@@ -137,43 +143,30 @@ func (c *Client) OpenPages(ctx context.Context, request Request, options ...Read
 		pool = &c.smallPool
 	}
 
-	v, err := c.admit(ctx, pool)
+	lease, err := c.admit(ctx, pool)
 	if err != nil {
 		return nil, err
 	}
 
-	s := &PageStream{owner: v, pageCredits: o.PageCredits, byteCredits: uint64(o.ByteCredits), ordered: o.Ordered, outstanding: make(map[uint64]uint32), notify: make(chan struct{}, 1)}
-	if err := s.open(request, r, o); err != nil {
+	v := &Value{admissionLease: lease}
+
+	s := &PageStream{
+		owner: v, pageCredits: o.PageCredits, byteCredits: uint64(o.ByteCredits), ordered: o.Ordered,
+		outstanding: make(map[uint64]uint32), notify: make(chan struct{}, 1),
+	}
+	if err := s.open(r, o); err != nil {
 		return nil, s.fail(err)
 	}
 
 	return s, nil
 }
 
-func (s *PageStream) open(request Request, descriptor OriginRequest, o ReadOptions) error {
+func (s *PageStream) open(descriptor OriginRequest, o ReadOptions) error {
 	v := s.owner
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "POST /v2/objects/%s HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: %d\r\nRacer-Byte-Credits: %d\r\nRacer-Ordered: %d\r\n", request.Key.String(), o.PageCredits, o.ByteCredits, boolNumber(o.Ordered))
-
-	if o.Offset != 0 || o.Length != 0 {
-		fmt.Fprintf(&b, "Range: bytes=%d-", o.Offset)
-
-		if o.Length != 0 {
-			fmt.Fprintf(&b, "%d", uint64(o.Offset)+uint64(o.Length)-1)
-		}
-
-		b.WriteString("\r\n")
-	}
-
-	for name, values := range requestHeaders(descriptor) {
-		fmt.Fprintf(&b, "%s: %s\r\n", name, values[0])
-	}
-
-	b.WriteString("\r\n")
-
-	if err := validateRawHead([]byte(b.String()), false); err != nil {
-		return err
+	b, err := wire.SubscriptionHead(descriptor.wire(), o.wire())
+	if err != nil {
+		return fromWireError(err)
 	}
 
 	conn, _, err := v.client.connection(v.ctx, v.pool, true)
@@ -192,20 +185,20 @@ func (s *PageStream) open(request Request, descriptor OriginRequest, o ReadOptio
 		return err
 	}
 
-	v.body = &responseBody{conn: conn, client: v.client, pool: v.pool}
+	v.body = connpool.NewBody(conn)
 	v.mu.Unlock()
 
 	if err := conn.SetDeadline(time.Now().Add(v.client.config.ResponseHeaderTimeout)); err != nil {
 		return ioFailure("subscription deadline", err)
 	}
 
-	if n, err := io.WriteString(conn, b.String()); err != nil {
+	if n, err := conn.Write(b); err != nil {
 		return ioFailure("subscription request", err)
-	} else if n != b.Len() {
+	} else if n != len(b) {
 		return ioFailure("subscription request", io.ErrShortWrite)
 	}
 
-	head, err := readRawHead(conn.reader, true)
+	head, err := readRawHead(conn.Reader, true)
 	if err != nil {
 		return err
 	}
@@ -221,122 +214,14 @@ func (s *PageStream) open(request Request, descriptor OriginRequest, o ReadOptio
 	return v.err()
 }
 
-func boolNumber(b bool) int {
-	if b {
-		return 1
-	}
-
-	return 0
-}
-
 func (s *PageStream) parseHead(head []byte, o ReadOptions) error {
-	bad := failure(ErrorProtocol, "subscription response", nil)
-
-	if err := validateRawHead(head, true); err != nil {
-		return err
-	}
-
-	h := headHeaders(head)
-
-	line := string(head[:bytes.Index(head, []byte("\r\n"))])
-	if len(line) < 12 || !strings.HasPrefix(line, "HTTP/1.1 ") || len(line) > 12 && line[12] != ' ' || forbiddenHeaders(h) {
-		return bad
-	}
-
-	status, err := strconv.Atoi(line[9:12])
+	r, err := wire.ParseSubscriptionResponse(head, o.wire())
 	if err != nil {
-		return bad
+		return fromWireError(err)
 	}
 
-	length, err := decimal(h.Get("Content-Length"))
-	if err != nil {
-		return bad
-	}
-
-	if status != 200 {
-		if length != 0 {
-			return bad
-		}
-
-		if status == 416 {
-			value := h.Get("Content-Range")
-			if !strings.HasPrefix(value, "bytes */") {
-				return bad
-			}
-
-			if _, err := decimal(strings.TrimPrefix(value, "bytes */")); err != nil {
-				return bad
-			}
-		} else if h.Get("Content-Range") != "" {
-			return bad
-		}
-
-		return statusError(status)
-	}
-
-	if !connectionClose(h) || h.Get("Content-Range") != "" || h.Get("Content-Type") != "application/octet-stream" {
-		return bad
-	}
-
-	size, err := decimal(h.Get("Racer-Object-Length"))
-	if err != nil {
-		return bad
-	}
-
-	first, err := decimal(h.Get("Racer-Range-Start"))
-	if err != nil {
-		return bad
-	}
-
-	end, err := decimal(h.Get("Racer-Range-End"))
-	if err != nil {
-		return bad
-	}
-
-	expiry, err := decimal(h.Get("Racer-Expires-At"))
-	if err != nil {
-		return bad
-	}
-
-	tag, err := ParseETag(h.Get("ETag"))
-	if err != nil {
-		return bad
-	}
-
-	m := Metadata{Size: ByteLength(size), ETag: tag, ExpiresAt: time.UnixMilli(int64(expiry)).UTC(), ContentType: h.Get("Racer-Content-Type")}
-	if m.Validate() != nil || first > end || end > size || first != uint64(o.Offset) || o.Length == 0 && end != size || o.Pin.value != "" && o.Pin != tag {
-		return bad
-	}
-
-	if o.Length != 0 && end-first != uint64(o.Length) {
-		if end == size && uint64(o.Length) > end-first {
-			return failure(ErrorUnsatisfiableRange, "subscription range", nil)
-		}
-
-		return bad
-	}
-
-	if o.Metadata != nil && (o.Metadata.Size != m.Size || o.Metadata.ETag != m.ETag || o.Metadata.ContentType != m.ContentType) {
-		return bad
-	}
-
-	if o.SmallObject && m.Size > PageSize {
-		return failure(ErrorInvalidArgument, "small object size", nil)
-	}
-
-	s.first, s.end = first, end
-	if end > first {
-		s.pages = (end-1)/uint64(PageSize) - first/uint64(PageSize) + 1
-	}
-
-	if s.pages+1 > (math.MaxInt64-(end-first))/21 || length != end-first+21*(s.pages+1) {
-		return bad
-	}
-
-	s.owner.metadata = m
-	if o.Metadata != nil {
-		s.owner.metadata = *o.Metadata
-	}
+	s.first, s.end, s.pages = r.First, r.End, r.Pages
+	s.owner.metadata = fromWireMetadata(r.Metadata)
 
 	return nil
 }
@@ -404,21 +289,20 @@ func (s *PageStream) next() (*PageLease, error) {
 		}
 	}
 
-	var frame [21]byte
+	var frame [wire.FrameSize]byte
 	if err := s.readFull(frame[:]); err != nil {
 		return nil, err
 	}
 
-	number := binary.BigEndian.Uint64(frame[1:9])
-	offset := binary.BigEndian.Uint64(frame[9:17])
-	length := binary.BigEndian.Uint32(frame[17:21])
+	f := wire.DecodeFrame(frame)
+	number, offset, length := f.Number, f.Offset, f.Length
 	bad := failure(ErrorProtocol, "subscription frame", nil)
 
-	if frame[0] == 2 {
-		if number != s.pages || s.delivered != s.pages || offset != s.end-s.first || s.deliveredBytes != offset || length != 0 {
-			return nil, bad
-		}
+	if err := s.validateFrame(f, "subscription frame"); err != nil {
+		return nil, err
+	}
 
+	if f.Kind == wire.CompleteFrame {
 		s.mu.Lock()
 		s.complete = true
 		s.mu.Unlock()
@@ -426,24 +310,9 @@ func (s *PageStream) next() (*PageLease, error) {
 		return nil, io.EOF
 	}
 
-	if frame[0] != 1 || length == 0 || offset < s.first || offset >= s.end || number != offset/uint64(PageSize) {
-		return nil, bad
-	}
-
-	start := max(s.first, number*uint64(PageSize))
-
-	end := min(s.end, (number+1)*uint64(PageSize))
-	if offset != start || uint64(length) != end-start || s.ordered && number != s.first/uint64(PageSize)+s.delivered {
-		return nil, bad
-	}
-
 	s.mu.Lock()
 
 	valid := len(s.outstanding) < s.pageCredits && uint64(length) <= s.byteCredits-s.bytesHeld
-	if valid {
-		valid = s.record(number)
-	}
-
 	if valid {
 		s.outstanding[number] = length
 		s.bytesHeld += uint64(length)
@@ -474,14 +343,13 @@ func (s *PageStream) next() (*PageLease, error) {
 
 	s.delivered++
 
-	s.deliveredBytes += uint64(length)
 	if s.delivered == s.pages {
 		if err := s.readFull(frame[:]); err != nil {
 			return nil, err
 		}
 
-		if frame[0] != 2 || binary.BigEndian.Uint64(frame[1:9]) != s.pages || binary.BigEndian.Uint64(frame[9:17]) != s.end-s.first || binary.BigEndian.Uint32(frame[17:21]) != 0 || s.deliveredBytes != s.end-s.first {
-			return nil, bad
+		if err := s.validateFrame(wire.DecodeFrame(frame), "subscription frame"); err != nil {
+			return nil, err
 		}
 
 		s.mu.Lock()
@@ -516,42 +384,15 @@ func (s *PageStream) putBuffer(buffer []byte) {
 	}
 }
 
-// record merges adjacent page intervals, avoiding an object-sized bitmap. The
-// hard interval limit bounds memory even for an adversarial fragmented stream.
-func (s *PageStream) record(n uint64) bool {
-	i := 0
-	for i < len(s.intervals) && s.intervals[i].end <= n {
-		i++
+func (s *PageStream) validateFrame(f wire.Frame, operation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.sequence == nil {
+		s.sequence = wire.NewSequence(s.first, s.end, s.ordered)
 	}
 
-	if i < len(s.intervals) && s.intervals[i].first <= n {
-		return false
-	}
-
-	if i > 0 && s.intervals[i-1].end == n {
-		s.intervals[i-1].end++
-		if i < len(s.intervals) && s.intervals[i].first == n+1 {
-			s.intervals[i-1].end = s.intervals[i].end
-			s.intervals = append(s.intervals[:i], s.intervals[i+1:]...)
-		}
-
-		return true
-	}
-
-	if i < len(s.intervals) && s.intervals[i].first == n+1 {
-		s.intervals[i].first = n
-		return true
-	}
-
-	if len(s.intervals) == 4096 {
-		return false
-	}
-
-	s.intervals = append(s.intervals, pageInterval{})
-	copy(s.intervals[i+1:], s.intervals[i:])
-	s.intervals[i] = pageInterval{n, n + 1}
-
-	return true
+	return fromWireError(s.sequence.Accept(f, operation))
 }
 
 func (s *PageStream) readFull(p []byte) error {
@@ -568,7 +409,7 @@ func (s *PageStream) readBytes(p []byte, payload bool) error {
 			return ioFailure("subscription deadline", err)
 		}
 
-		n, err := s.conn.reader.Read(p)
+		n, err := s.conn.Reader.Read(p)
 		if payload {
 			s.owner.client.stats.bytesRead.Add(uint64(n))
 		}
@@ -613,9 +454,7 @@ func (s *PageStream) release(number uint64, length uint32) error {
 			return err
 		}
 
-		var frame [12]byte
-		binary.BigEndian.PutUint64(frame[:8], number)
-		binary.BigEndian.PutUint32(frame[8:], length)
+		frame := (wire.Credit{Number: number, Length: length}).Encode()
 
 		err := s.conn.SetWriteDeadline(time.Now().Add(s.owner.client.config.BodyReadTimeout))
 		if err == nil {
@@ -633,7 +472,7 @@ func (s *PageStream) release(number uint64, length uint32) error {
 		// The peer may already have sent Complete and closed while this lease
 		// was held. The read side, not a racing release write, decides whether
 		// the subscription completed or was truncated.
-		if err != nil && !staleConnectionError(err) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
+		if err != nil && !connpool.StaleError(err) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
 			if s.buffers != nil {
 				return ioFailure("subscription release", err)
 			}
@@ -648,56 +487,4 @@ func (s *PageStream) release(number uint64, length uint32) error {
 	}
 
 	return nil
-}
-
-// DownloadTo writes page slices at absolute object offsets. It releases every
-// lease after WriteAt returns and closes the subscription on all exit paths.
-// An arbitrary caller-owned WriterAt cannot be interrupted by cancellation.
-func (c *Client) DownloadTo(ctx context.Context, request Request, w io.WriterAt, options ...ReadOptions) (int64, error) {
-	if w == nil {
-		return 0, failure(ErrorInvalidArgument, "download destination", nil)
-	}
-
-	s, err := c.OpenPages(ctx, request, options...)
-	if err != nil {
-		return 0, err
-	}
-	defer closeBody(s)
-
-	var written int64
-
-	for {
-		p, err := s.Next()
-		if err == io.EOF {
-			return written, nil
-		}
-
-		if err != nil {
-			return written, err
-		}
-
-		n, err := w.WriteAt(p.Data, int64(p.Offset))
-		if n < 0 || n > len(p.Data) {
-			n = 0
-
-			if err == nil {
-				err = io.ErrShortWrite
-			}
-		}
-
-		written += int64(n)
-		if err == nil && n != len(p.Data) {
-			err = io.ErrShortWrite
-		}
-
-		releaseErr := p.Release()
-
-		if err != nil {
-			return written, err
-		}
-
-		if releaseErr != nil {
-			return written, releaseErr
-		}
-	}
 }
