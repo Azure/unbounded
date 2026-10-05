@@ -307,11 +307,7 @@ impl<H: Host> Enrollment<H> {
         if san.value.general_names.len() != 1 {
             return Err(Error::Unauthorized);
         }
-        let private_material = Zeroizing::new(
-            STANDARD
-                .decode(&*p.private_key.0)
-                .map_err(|_| Error::CorruptRecord)?,
-        );
+        let private_material = decode_private_key(&p.private_key)?;
         let key = crate::SigningKey::from_pkcs8_der(&private_material)
             .map_err(|_| Error::CorruptRecord)?;
         if public.key != key.verifying_key() {
@@ -621,14 +617,25 @@ fn decode_pending(bytes: &[u8]) -> Result<PendingIdentity, Error> {
     PendingIdentity::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
 }
 
+/// Own bounded wiping output before base64 can write even a partial private key.
+fn decode_private_key(encoded: &EncodedPrivateKey) -> Result<Zeroizing<Vec<u8>>, Error> {
+    if encoded.0.len() > wire::MAX_ENROLLMENT_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    // The encoded record bound makes this rounded decoded capacity nonoverflowing.
+    let capacity = encoded.0.len().div_ceil(4) * 3;
+    let mut secret = Zeroizing::new(vec![0; capacity]);
+    let length = STANDARD
+        .decode_slice(encoded.0.as_bytes(), secret.as_mut_slice())
+        .map_err(|_| Error::CorruptRecord)?;
+    secret.truncate(length);
+    Ok(secret)
+}
+
 /// Reject a corrupt or mismatched pending key before submitting its CSR.
 fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error> {
     use x509_parser::prelude::FromDer;
-    let secret = Zeroizing::new(
-        STANDARD
-            .decode(&*pending.private_key.0)
-            .map_err(|_| Error::CorruptRecord)?,
-    );
+    let secret = decode_private_key(&pending.private_key)?;
     let key = crate::SigningKey::from_pkcs8_der(&secret).map_err(|_| Error::CorruptRecord)?;
     let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr)
         .map_err(|_| Error::CorruptRecord)?;
@@ -1064,6 +1071,87 @@ mod tests {
         assert_ne!(fresh.enrollment, request.enrollment);
         drive(&files, e.load_identity(&scope)).unwrap().unwrap();
         assert!(sim.metadata(Path::new("/private/pending.json")).is_ok());
+    }
+
+    /// Late base64 failures preserve pending work and never publish or recover a key.
+    #[test]
+    fn late_private_key_base64_errors_preserve_identity_records() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let (ca, key) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let response = issue(&request, &ca, &key, |_| {});
+        let original = sim.read_file(Path::new("/private/pending.json")).unwrap();
+        let pending = decode_pending(&original).unwrap();
+        let decoded = decode_private_key(&pending.private_key).unwrap();
+        assert_eq!(STANDARD.encode(&*decoded), *pending.private_key.0);
+        assert!(decoded.len() > 32);
+        for suffix in ["!AAA", "A===", "AA=A"] {
+            let mut pending = decode_pending(&original).unwrap();
+            // Leave complete valid groups before corrupting only the final group.
+            let length = pending.private_key.0.len();
+            pending.private_key.0.replace_range(length - 4.., suffix);
+            assert!(matches!(
+                decode_private_key(&pending.private_key),
+                Err(Error::CorruptRecord)
+            ));
+            let corrupted = encode_private(&pending, wire::MAX_ENROLLMENT_BYTES).unwrap();
+            sim.write_file(Path::new("/private/pending.json"), &corrupted)
+                .unwrap();
+            assert!(matches!(
+                drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)),
+                Err(error) if error == Error::CorruptRecord.into()
+            ));
+            assert!(matches!(
+                drive(&files, e.accept_response(response.clone(), &scope)),
+                Err(error) if error == Error::CorruptRecord.into()
+            ));
+            assert!(sim.metadata(Path::new("/private/identity.json")).is_err());
+            assert_eq!(
+                sim.read_file(Path::new("/private/pending.json")).unwrap(),
+                *corrupted
+            );
+
+            // Recovery reaches validate's decoder independently of the CSR check.
+            let persisted = PersistedIdentity {
+                pending,
+                response: STANDARD.encode(wire::encode_enrollment_response(&response).unwrap()),
+            }
+            .encode()
+            .unwrap();
+            sim.write_file(Path::new("/private/identity.json"), &persisted)
+                .unwrap();
+            sim.chmod(Path::new("/private/identity.json"), 0o600)
+                .unwrap();
+            assert!(
+                matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == Error::CorruptRecord.into())
+            );
+            assert_eq!(
+                sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                *persisted
+            );
+            assert_eq!(
+                sim.read_file(Path::new("/private/pending.json")).unwrap(),
+                *corrupted
+            );
+            sim.unlink(Path::new("/private/identity.json")).unwrap();
+        }
+        let oversized =
+            EncodedPrivateKey(Zeroizing::new("A".repeat(wire::MAX_ENROLLMENT_BYTES + 1)));
+        assert!(matches!(
+            decode_private_key(&oversized),
+            Err(Error::CorruptRecord)
+        ));
+        sim.write_file(Path::new("/private/pending.json"), &original)
+            .unwrap();
+        assert!(drive(&files, e.accept_response(response, &scope)).is_ok());
+        assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
     }
 
     /// Invalid certificates and pending material never publish an identity.
