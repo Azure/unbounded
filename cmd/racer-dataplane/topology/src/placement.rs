@@ -46,6 +46,9 @@ pub struct Placement {
 
     /// Progress of [`Placement::maintain`], kept between calls.
     maintenance: RefCell<MaintenanceWork>,
+
+    /// One cold resident refresh, independent of foreground cache admission.
+    refresh: RefCell<Option<(CacheKey, Ranking)>>,
 }
 
 /// Progress of moving cached entries from the old membership to the new one.
@@ -95,10 +98,15 @@ impl RankingCache {
     /// Evict one entry that no request is using. Recently used entries get a
     /// second chance first. Returns false if every entry is in use.
     fn evict(&mut self) -> bool {
+        self.evict_bounded(self.entries.len().saturating_mul(2))
+    }
+
+    /// Advance CLOCK by at most `budget` entries, retaining the hand on failure.
+    fn evict_bounded(&mut self, budget: usize) -> bool {
         // CLOCK gives referenced entries a second chance. Two full rotations
         // find any unpinned entry, including one beyond 64 busy entries.
         use std::ops::Bound::{Excluded, Unbounded};
-        for _ in 0..self.entries.len().saturating_mul(2) {
+        for _ in 0..budget.min(self.entries.len().saturating_mul(2)) {
             let next = self
                 .hand
                 .and_then(|key| self.entries.range((Excluded(key), Unbounded)).next())
@@ -339,6 +347,7 @@ impl Placement {
             capacity,
             cache: RefCell::default(),
             maintenance: RefCell::default(),
+            refresh: RefCell::default(),
         }
     }
 
@@ -347,8 +356,70 @@ impl Placement {
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         let cache = self.cache.borrow();
-        std::mem::size_of::<Self>()
-            .saturating_add(cache.entries.len().saturating_mul(Self::ENTRY_BYTES))
+        std::mem::size_of::<Self>().saturating_add(
+            (cache.entries.len() + usize::from(self.refresh.borrow().is_some()))
+                .saturating_mul(Self::ENTRY_BYTES),
+        )
+    }
+
+    /// Look up completed current-placement owners without scoring, admission,
+    /// eviction, or refreshing CLOCK. Partial and obsolete rankings are misses.
+    #[must_use]
+    pub fn cached<M: Member>(&self, membership: &Membership<M>, key: &[u8]) -> Option<Vec<usize>> {
+        let cache = self.cache.borrow();
+        let ranking = cache
+            .entries
+            .get(&(membership.identity(), slot::<M>(key)))?;
+        let ranking = ranking.borrow();
+        (ranking.cursor == membership.members().len()).then(|| ranking.candidates())
+    }
+
+    /// Refresh one resident key with at most 256 scores and 64 CLOCK visits.
+    /// Repeat with the same key until complete. Changing placement or key drops
+    /// obsolete partial work. No cache-sized scan or foreground admission pin is
+    /// needed; one extra ranking is retained outside the bounded cache.
+    ///
+    /// With caching disabled, completion is returned without installing a hint.
+    pub fn refresh<M: Member>(&self, membership: &Membership<M>, key: &[u8]) -> Option<Vec<usize>> {
+        let cache_key = (membership.identity(), slot::<M>(key));
+        let mut work = self.refresh.borrow_mut();
+        if let Some(candidates) = self.cached(membership, key) {
+            *work = None;
+            return Some(candidates);
+        }
+        if work.as_ref().is_none_or(|(key, _)| *key != cache_key) {
+            *work = Some((cache_key, Ranking::default()));
+        }
+        let (_, ranking) = work.as_mut().unwrap();
+        ranking.advance(membership, cache_key.1, WORK_QUANTUM);
+        if ranking.cursor != membership.members().len() {
+            return None;
+        }
+        let mut cache = self.cache.borrow_mut();
+        if self.capacity != 0
+            && !cache.entries.contains_key(&cache_key)
+            && cache.entries.len() >= self.capacity
+            && !cache.evict_bounded(64)
+        {
+            return None;
+        }
+        let (_, ranking) = work.take().unwrap();
+        let candidates = ranking.candidates();
+        if self.capacity != 0 {
+            if let Some(existing) = cache.entries.get(&cache_key) {
+                // A foreground request may hold this partial entry. Complete it
+                // in place, preserving sharing and the active-entry memory bound.
+                *existing.borrow_mut() = ranking;
+            } else {
+                cache
+                    .entries
+                    .insert(cache_key, Rc::new(RefCell::new(ranking)));
+            }
+            if cache.predecessor == Some(cache_key.0) {
+                cache.predecessor_dirty = true;
+            }
+        }
+        Some(candidates)
     }
 
     /// Find the cache entry for a slot, or add one. Never evicts an entry that
@@ -569,6 +640,135 @@ mod tests {
     /// Turn a number into a key.
     fn key(value: u64) -> [u8; 8] {
         value.to_be_bytes()
+    }
+
+    /// Retention lookups never score, admit, or protect cache entries.
+    #[test]
+    fn ownership_cached_misses_partial_and_obsolete_rankings_without_work() {
+        let placement = Placement::new(1);
+        let members = membership(1000);
+        assert!(placement.cached(&members, &key(0)).is_none());
+        assert!(placement.cache.borrow().entries.is_empty());
+        assert!(placement.refresh(&members, &key(0)).is_none());
+        for _ in 0..100 {
+            assert!(placement.cached(&members, &key(0)).is_none());
+        }
+        assert_eq!(placement.refresh.borrow().as_ref().unwrap().1.scored, 256);
+        for _ in 0..2 {
+            assert!(placement.refresh(&members, &key(0)).is_none());
+        }
+        let actual = placement.refresh(&members, &key(0)).unwrap();
+        assert_eq!(actual, Placement::new(0).rank(&members, &key(0)).unwrap());
+        let cache_key = (members.identity(), slot::<TestMember>(&key(0)));
+        placement.cache.borrow().entries[&cache_key]
+            .borrow_mut()
+            .referenced = false;
+        for _ in 0..100 {
+            assert_eq!(placement.cached(&members, &key(0)), Some(actual.clone()));
+        }
+        assert!(
+            !placement.cache.borrow().entries[&cache_key]
+                .borrow()
+                .referenced
+        );
+        assert_eq!(
+            placement.cache.borrow().entries[&cache_key].borrow().scored,
+            1000
+        );
+        assert!(placement.cached(&membership(999), &key(0)).is_none());
+    }
+
+    /// New topology work replaces, rather than finishes, an obsolete partial rank.
+    #[test]
+    fn ownership_refresh_restarts_obsolete_work_and_empty_membership_completes() {
+        let placement = Placement::new(2);
+        let old = membership(1000);
+        let next = membership(900);
+        assert!(placement.refresh(&old, &key(0)).is_none());
+        assert!(placement.refresh(&old, &key(0)).is_none());
+        assert!(placement.refresh(&next, &key(0)).is_none());
+        assert_eq!(placement.refresh.borrow().as_ref().unwrap().1.scored, 256);
+        for _ in 0..2 {
+            assert!(placement.refresh(&next, &key(0)).is_none());
+        }
+        assert_eq!(
+            placement.refresh(&next, &key(0)),
+            Some(Placement::new(0).rank(&next, &key(0)).unwrap())
+        );
+        assert!(placement.cached(&old, &key(0)).is_none());
+        assert_eq!(placement.refresh(&membership(0), &key(1)), Some(vec![]));
+        let disabled = Placement::new(0);
+        assert_eq!(disabled.refresh(&membership(1), &key(0)), Some(vec![0]));
+        assert!(disabled.cache.borrow().entries.is_empty());
+        assert!(disabled.refresh.borrow().is_none());
+    }
+
+    /// CLOCK admission progresses in bounded turns even beyond 64 busy entries.
+    #[test]
+    fn ownership_refresh_bounds_clock_and_never_pins_resident_rankings() {
+        let placement = Placement::new(200);
+        let members = membership(1);
+        let mut pinned = Vec::new();
+        for slot in 0..200 {
+            pinned.push(placement.ranking(&members, slot).unwrap());
+        }
+        let target = key(0);
+        assert!(slot::<TestMember>(&target) >= 200);
+        for expected in [63, 127, 191, 55] {
+            assert!(placement.refresh(&members, &target).is_none());
+            assert_eq!(placement.cache.borrow().hand.unwrap().1, expected);
+            assert_eq!(placement.refresh.borrow().as_ref().unwrap().1.scored, 1);
+            assert_eq!(placement.cache.borrow().entries.len(), 200);
+        }
+        drop(pinned);
+        assert_eq!(placement.refresh(&members, &target), Some(vec![0]));
+        let cache_key = (members.identity(), slot::<TestMember>(&target));
+        assert_eq!(
+            Rc::strong_count(&placement.cache.borrow().entries[&cache_key]),
+            1
+        );
+        assert!(placement.refresh.borrow().is_none());
+    }
+
+    /// Completing refresh preserves a foreground lease and its admission bound.
+    #[test]
+    fn ownership_refresh_completes_shared_partial_entry_without_replacing_lease() {
+        let placement = Placement::new(1);
+        let members = membership(1000);
+        let mut pending = Box::pin(placement.rank_async(&members, &key(0)));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        let cache_key = (members.identity(), slot::<TestMember>(&key(0)));
+        let shared = placement.cache.borrow().entries[&cache_key].clone();
+        assert!(placement.cached(&members, &key(0)).is_none());
+        for _ in 0..3 {
+            assert!(placement.refresh(&members, &key(0)).is_none());
+        }
+        let completed = placement.refresh(&members, &key(0)).unwrap();
+        assert!(Rc::ptr_eq(
+            &shared,
+            &placement.cache.borrow().entries[&cache_key]
+        ));
+        assert_eq!(pending.as_mut().poll(&mut cx), Poll::Ready(Ok(completed)));
+        assert_eq!(placement.cache.borrow().entries.len(), 1);
+    }
+
+    /// Weight-only changes invalidate hints even when all member IDs survive.
+    #[test]
+    fn ownership_weight_change_invalidates_hint_and_refresh_matches_oracle() {
+        let placement = Placement::new(2);
+        let old = membership(10);
+        let initial = placement.refresh(&old, &key(0)).unwrap();
+        let mut nodes = old.members().to_vec();
+        nodes[initial[0]].1 = NonZeroU32::new(1).unwrap();
+        nodes[initial[1]].1 = NonZeroU32::new(u32::MAX).unwrap();
+        let next = Membership::new(nodes).unwrap().with_predecessor(&old);
+        assert!(placement.cached(&next, &key(0)).is_none());
+        let updated = placement.refresh(&next, &key(0)).unwrap();
+        assert_ne!(initial, updated);
+        assert_eq!(updated, Placement::new(0).rank(&next, &key(0)).unwrap());
+        assert_eq!(placement.cached(&old, &key(0)), Some(initial));
+        assert_eq!(placement.cached(&next, &key(0)), Some(updated));
     }
 
     /// Slots, rankings, and costs match known fixed values.
