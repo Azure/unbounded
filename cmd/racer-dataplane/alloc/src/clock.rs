@@ -19,24 +19,36 @@ pub struct SegmentClock {
     segments: Rc<Segments>,
     hand: Cell<usize>,
     recent: RefCell<HashSet<SegmentId>>,
+    restore_epoch: Cell<u64>,
 }
 impl SegmentClock {
     pub fn new(segments: Rc<Segments>) -> Self {
+        let epoch = segments.restore_epoch();
         Self {
             segments,
             hand: Cell::new(0),
             recent: RefCell::new(HashSet::new()),
+            restore_epoch: Cell::new(epoch),
         }
     }
     pub fn mark_read(&self, segment: SegmentId) -> Result<()> {
+        self.sync_restore();
         if !matches!(
             self.segments.state(segment)?,
             SegmentState::Open | SegmentState::Sealed
         ) {
-            return Err(Error::Corrupt);
+            // Reads accepted before eviction may complete after the state changed.
+            return Ok(());
         }
         self.recent.borrow_mut().insert(segment);
         Ok(())
+    }
+    fn sync_restore(&self) {
+        let epoch = self.segments.restore_epoch();
+        if self.restore_epoch.replace(epoch) != epoch {
+            self.hand.set(0);
+            self.recent.borrow_mut().clear();
+        }
     }
     fn next(&self, count: usize) -> SegmentId {
         let hand = self.hand.get() % count;
@@ -51,6 +63,7 @@ impl SegmentClock {
         max_visits: usize,
         mut ready: impl FnMut() -> bool,
     ) -> Result<()> {
+        self.sync_restore();
         if ready() {
             return Ok(());
         }
@@ -60,7 +73,9 @@ impl SegmentClock {
             if self.recent.borrow_mut().remove(&id) {
                 continue;
             }
-            entries.remove_bounded(id, 1);
+            if entries.remove_bounded(id, 1) > 1 {
+                return Err(Error::InvalidConfiguration);
+            }
             if ready() {
                 return Ok(());
             }
@@ -69,6 +84,8 @@ impl SegmentClock {
     }
     /// Reclaim a caller-selected reserve with bounded visits and mapping removals.
     /// Busy leases keep segments Evicting until a later sweep; no compaction occurs.
+    /// A zero reserve is a no-op. A zero mapping budget can recycle empty segments
+    /// but does not begin eviction of segments that still have mappings.
     pub fn reclaim(
         &self,
         entries: &impl SegmentEntries,
@@ -76,11 +93,15 @@ impl SegmentClock {
         max_visits: usize,
         max_entries: usize,
     ) -> Result<()> {
+        self.sync_restore();
+        if free_reserve == 0 {
+            return Ok(());
+        }
         let count = self.segments.count();
         if count == 0 {
             return Err(Error::Unavailable);
         }
-        let target = free_reserve.max(1).min(count);
+        let target = free_reserve.min(count);
         let mut free = self.segments.free_count();
         let mut entries_left = max_entries;
         for _ in 0..count.saturating_mul(2).min(max_visits) {
@@ -97,12 +118,19 @@ impl SegmentClock {
             if self.recent.borrow_mut().remove(&id) {
                 continue;
             }
+            if entries_left == 0 && !entries.is_empty(id) {
+                continue;
+            }
             self.segments.begin_evict(id)?;
-            let removed = entries.remove_bounded(id, entries_left);
-            assert!(removed <= entries_left, "segment removal exceeded budget");
-            entries_left -= removed;
+            if entries_left != 0 && !entries.is_empty(id) {
+                let removed = entries.remove_bounded(id, entries_left);
+                if removed > entries_left {
+                    return Err(Error::InvalidConfiguration);
+                }
+                entries_left -= removed;
+            }
             if !entries.is_empty(id) {
-                return Err(Error::Busy);
+                continue;
             }
             match self.segments.recycle(id) {
                 Ok(()) => free += 1,
@@ -231,7 +259,7 @@ mod tests {
         assert_eq!(*entries.counts.borrow(), [1, 0]);
         assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 256)]);
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
-        assert_eq!(segments.free_count(), 0);
+        assert_eq!(segments.free_count(), 1);
         clock.reclaim(&entries, 2, 64, 256).unwrap();
         assert_eq!(segments.free_count(), 2);
         assert_eq!(*entries.counts.borrow(), [0, 0]);
@@ -244,16 +272,17 @@ mod tests {
         drop(segments.append(1024).unwrap());
         let clock = SegmentClock::new(segments.clone());
         let entries = Entries::new(vec![1, 1]);
-        segments.freeze().unwrap();
+        let frozen = segments.freeze().unwrap();
         assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
         assert!(entries.calls.borrow().is_empty());
-        segments.thaw();
+        drop(frozen);
         clock.mark_read(SegmentId(1)).unwrap();
         assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
         assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
         assert_eq!(segments.free_count(), 1);
-        assert_eq!(clock.mark_read(SegmentId(0)), Err(Error::Corrupt));
-        assert_eq!(clock.mark_read(SegmentId(1)), Err(Error::Corrupt));
+        assert_eq!(clock.mark_read(SegmentId(0)), Ok(()));
+        assert_eq!(clock.mark_read(SegmentId(1)), Ok(()));
+        assert!(clock.recent.borrow().is_empty());
         drop(held);
         clock.reclaim(&entries, 2, 64, 256).unwrap();
         assert_eq!(segments.free_count(), 2);
@@ -267,11 +296,125 @@ mod tests {
         let clock = SegmentClock::new(segments.clone());
         let entries = Entries::new(vec![1]);
         clock.mark_read(SegmentId(0)).unwrap();
-        assert_eq!(clock.reclaim(&entries, 0, 64, 256), Err(Error::Busy));
+        assert_eq!(clock.reclaim(&entries, 1, 64, 256), Err(Error::Busy));
         drop(segments.append(512).unwrap());
-        assert_eq!(clock.reclaim(&entries, 0, 1, 256), Err(Error::Busy));
+        assert_eq!(clock.reclaim(&entries, 1, 1, 256), Err(Error::Busy));
         assert!(entries.calls.borrow().is_empty());
-        clock.reclaim(&entries, 0, 1, 256).unwrap();
+        clock.reclaim(&entries, 1, 1, 256).unwrap();
         assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 256)]);
+    }
+
+    #[test]
+    fn no_space_rollover_seals_tail_for_reclaim_and_retry() {
+        for retain_lease in [false, true] {
+            let segments = segments(1);
+            let mut held = Some(segments.append(512).unwrap().0);
+            if !retain_lease {
+                drop(held.take());
+            }
+            assert!(matches!(segments.append(1024), Err(Error::Busy)));
+            let image = &segments.snapshot()[0];
+            assert_eq!(image.state, SegmentState::Sealed);
+            assert_eq!(image.used_bytes, 512);
+            assert_eq!(image.generation, Generation(1));
+            let clock = SegmentClock::new(segments.clone());
+            let entries = Entries::new(vec![0]);
+            if retain_lease {
+                assert_eq!(clock.reclaim(&entries, 1, 2, 0), Err(Error::Busy));
+                assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
+                drop(held.take());
+            }
+            clock.reclaim(&entries, 1, 2, 0).unwrap();
+            assert!(entries.calls.borrow().is_empty());
+            let (lease, extent) = segments.append(1024).unwrap();
+            assert_eq!(lease.id(), SegmentId(0));
+            assert_eq!(lease.generation(), Generation(2));
+            assert_eq!(extent.offset(), 0);
+            assert_eq!(extent.length(), 1024);
+        }
+    }
+
+    #[test]
+    fn zero_budget_does_not_start_populated_eviction_but_recycles_empty_candidates() {
+        let segments = segments(2);
+        drop(segments.append(1024).unwrap());
+        drop(segments.append(1024).unwrap());
+        let clock = SegmentClock::new(segments.clone());
+        let entries = Entries::new(vec![1, 0]);
+        clock.reclaim(&entries, 1, 2, 0).unwrap();
+        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
+        assert_eq!(segments.state(SegmentId(1)), Ok(SegmentState::Free));
+        assert_eq!(*entries.counts.borrow(), [1, 0]);
+        assert!(entries.calls.borrow().is_empty());
+        assert_eq!(clock.reclaim(&entries, 2, 64, 0), Err(Error::Busy));
+        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
+    }
+
+    #[test]
+    fn zero_reserve_has_no_side_effects_even_when_unconfigured() {
+        let unconfigured = SegmentClock::new(Rc::new(Segments::new(1024)));
+        assert_eq!(
+            unconfigured.reclaim(&Entries::new(vec![]), 0, 64, 256),
+            Ok(())
+        );
+        let segments = segments(1);
+        drop(segments.append(1024).unwrap());
+        let clock = SegmentClock::new(segments.clone());
+        let entries = Entries::new(vec![1]);
+        clock.mark_read(SegmentId(0)).unwrap();
+        assert_eq!(clock.reclaim(&entries, 0, 64, 256), Ok(()));
+        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
+        assert!(entries.calls.borrow().is_empty());
+        assert!(clock.recent.borrow().contains(&SegmentId(0)));
+    }
+
+    #[test]
+    fn removal_contract_violations_return_errors_without_panicking() {
+        struct InvalidEntries;
+        impl SegmentEntries for InvalidEntries {
+            fn remove_bounded(&self, _: SegmentId, budget: usize) -> usize {
+                budget + 1
+            }
+            fn is_empty(&self, _: SegmentId) -> bool {
+                false
+            }
+        }
+        let segments = segments(1);
+        drop(segments.append(1024).unwrap());
+        let clock = SegmentClock::new(segments.clone());
+        assert_eq!(
+            clock.reclaim_index(&InvalidEntries, 1, || false),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            clock.reclaim(&InvalidEntries, 1, 1, 1),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
+        assert_eq!(segments.free_count(), 0);
+    }
+
+    #[test]
+    fn restore_resets_cursor_and_recent_reads_before_any_clock_operation() {
+        let segments = segments(2);
+        drop(segments.append(1024).unwrap());
+        drop(segments.append(1024).unwrap());
+        let clock = SegmentClock::new(segments.clone());
+        let entries = Entries::new(vec![10, 10]);
+        assert_eq!(clock.reclaim_index(&entries, 1, || false), Err(Error::Busy));
+        clock.mark_read(SegmentId(0)).unwrap();
+        assert_eq!(clock.hand.get(), 1);
+        segments.restore(segments.snapshot()).unwrap();
+        entries.calls.borrow_mut().clear();
+        assert_eq!(clock.reclaim_index(&entries, 1, || false), Err(Error::Busy));
+        assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 1)]);
+        clock.mark_read(SegmentId(1)).unwrap();
+        segments.restore(segments.snapshot()).unwrap();
+        clock.mark_read(SegmentId(0)).unwrap();
+        assert_eq!(clock.hand.get(), 0);
+        assert_eq!(*clock.recent.borrow(), HashSet::from([SegmentId(0)]));
+        segments.restore(segments.snapshot()).unwrap();
+        clock.reclaim(&entries, 0, 0, 0).unwrap();
+        assert!(clock.recent.borrow().is_empty());
     }
 }

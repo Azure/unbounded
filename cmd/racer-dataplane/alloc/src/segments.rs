@@ -1,4 +1,4 @@
-use crate::{Alignment, Error, Extent, Result};
+use crate::{Alignment, Error, Extent, MAX_SEGMENTS, Result, SegmentGeometry};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeSet,
@@ -16,7 +16,7 @@ pub enum SegmentState {
     Sealed,
     Evicting,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentSnapshot {
     pub id: SegmentId,
     pub generation: Generation,
@@ -28,6 +28,10 @@ pub struct SegmentLease {
     id: SegmentId,
     generation: Generation,
     count: Rc<Cell<usize>>,
+    table: Rc<()>,
+    geometry: SegmentGeometry,
+    start: u64,
+    end: u64,
 }
 impl SegmentLease {
     pub fn id(&self) -> SegmentId {
@@ -35,6 +39,32 @@ impl SegmentLease {
     }
     pub fn generation(&self) -> Generation {
         self.generation
+    }
+    pub(crate) fn table_identity(&self) -> Rc<()> {
+        self.table.clone()
+    }
+    pub(crate) fn geometry(&self) -> SegmentGeometry {
+        self.geometry
+    }
+    /// An existing lease remains valid during eviction, but cannot authorize
+    /// bytes appended after it was acquired.
+    pub(crate) fn validate_extent(&self, extent: &Extent) -> Result<()> {
+        let end = extent
+            .offset()
+            .checked_add(extent.length() as u64)
+            .ok_or(Error::Corrupt)?;
+        if extent.offset() < self.start
+            || end > self.end
+            || self
+                .geometry()
+                .alignment()
+                .extent(extent.offset(), extent.length())
+                .map_err(|_| Error::Corrupt)?
+                != *extent
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
     }
 }
 impl Drop for SegmentLease {
@@ -46,23 +76,35 @@ struct Slot {
     image: SegmentSnapshot,
     leases: Rc<Cell<usize>>,
 }
+/// Holds a freeze independently of the table's lifetime. Dropping it thaws the table.
+#[must_use = "keep the guard alive while the table must remain frozen"]
+#[derive(Debug)]
+pub struct FreezeGuard(Rc<Cell<bool>>);
+impl Drop for FreezeGuard {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
 pub struct Segments {
     segment_bytes: u64,
-    capacity_bytes: Cell<u64>,
-    alignment: Cell<Option<Alignment>>,
+    geometry: Cell<Option<SegmentGeometry>>,
     slots: RefCell<Vec<Slot>>,
-    frozen: Cell<bool>,
+    frozen: Rc<Cell<bool>>,
+    table: Rc<()>,
+    restore_epoch: Cell<u64>,
     open: Cell<Option<usize>>,
     free: RefCell<BTreeSet<usize>>,
 }
 impl Segments {
+    /// Create an unconfigured table. Use configure or from_geometry before append.
     pub fn new(segment_bytes: u64) -> Self {
         Self {
             segment_bytes,
-            capacity_bytes: Cell::new(0),
-            alignment: Cell::new(None),
+            geometry: Cell::new(None),
             slots: RefCell::new(Vec::new()),
-            frozen: Cell::new(false),
+            frozen: Rc::new(Cell::new(false)),
+            table: Rc::new(()),
+            restore_epoch: Cell::new(0),
             open: Cell::new(None),
             free: RefCell::new(BTreeSet::new()),
         }
@@ -71,23 +113,40 @@ impl Segments {
         self.segment_bytes
     }
     pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_bytes.get()
+        self.geometry.get().map_or(0, SegmentGeometry::slab_bytes)
+    }
+    /// Build an entirely free table, rejecting geometry above the retained slot limit.
+    pub fn from_geometry(geometry: SegmentGeometry) -> Result<Self> {
+        let segments = Self::new(geometry.segment_bytes());
+        segments.configure(
+            geometry.slab_bytes(),
+            usize::try_from(geometry.segment_count()).map_err(|_| Error::InvalidConfiguration)?,
+            geometry.alignment(),
+        )?;
+        Ok(segments)
+    }
+    pub fn is_configured(&self) -> bool {
+        self.geometry.get().is_some()
+    }
+    pub fn geometry(&self) -> Option<SegmentGeometry> {
+        self.geometry.get()
+    }
+    pub(crate) fn table_identity(&self) -> Rc<()> {
+        self.table.clone()
+    }
+    pub(crate) fn restore_epoch(&self) -> u64 {
+        self.restore_epoch.get()
     }
     pub fn configure(&self, capacity: u64, count: usize, alignment: Alignment) -> Result<()> {
-        if !self.slots.borrow().is_empty()
-            || self.segment_bytes == 0
-            || capacity == 0
-            || !capacity.is_multiple_of(self.segment_bytes)
-            || !self.segment_bytes.is_multiple_of(alignment.offset())
-            || !self.segment_bytes.is_multiple_of(alignment.length() as u64)
-            || count == 0
-            || count > 1_000_000
-            || count as u64 > capacity / self.segment_bytes
-        {
+        if self.frozen.get() {
+            return Err(Error::Busy);
+        }
+        if self.is_configured() || count as u64 > MAX_SEGMENTS {
             return Err(Error::InvalidConfiguration);
         }
-        self.capacity_bytes.set(capacity);
-        self.alignment.set(Some(alignment));
+        let geometry = SegmentGeometry::new(capacity, self.segment_bytes, count as u64, alignment)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        self.geometry.set(Some(geometry));
         *self.slots.borrow_mut() = (0..count)
             .map(|id| Slot {
                 image: SegmentSnapshot {
@@ -102,11 +161,14 @@ impl Segments {
         *self.free.borrow_mut() = (0..count).collect();
         Ok(())
     }
+    /// Reserve an aligned used range. Malformed requests and lease overflow leave
+    /// state unchanged. A valid rollover without a free slot seals the open tail
+    /// before returning Busy, allowing reclamation to make a retry possible.
     pub fn append(&self, length: usize) -> Result<(SegmentLease, Extent)> {
         if self.frozen.get() {
             return Err(Error::Busy);
         }
-        let alignment = self.alignment.get().ok_or(Error::Unavailable)?;
+        let alignment = self.geometry().ok_or(Error::Unavailable)?.alignment();
         if length == 0
             || length as u64 > self.segment_bytes
             || alignment.extent(0, length)?.length() != length
@@ -114,19 +176,24 @@ impl Segments {
             return Err(Error::InvalidConfiguration);
         }
         let mut slots = self.slots.borrow_mut();
-        if let Some(position) = self.open.get() {
-            let slot = &mut slots[position];
-            if self.segment_bytes - slot.image.used_bytes < length as u64 {
-                slot.image.state = SegmentState::Sealed;
-                self.open.set(None);
-            }
-        }
-        let position = match self.open.get() {
+        let previous_open = self.open.get();
+        let usable_open = previous_open.filter(|&position| {
+            self.segment_bytes - slots[position].image.used_bytes >= length as u64
+        });
+        let position = match usable_open {
             Some(position) => position,
-            None => self.free.borrow_mut().pop_first().ok_or(Error::Busy)?,
+            None => match self.free.borrow().first() {
+                Some(&position) => position,
+                None => {
+                    if let Some(previous) = previous_open {
+                        slots[previous].image.state = SegmentState::Sealed;
+                        self.open.set(None);
+                    }
+                    return Err(Error::Busy);
+                }
+            },
         };
-        self.open.set(Some(position));
-        let slot = &mut slots[position];
+        let slot = &slots[position];
         let offset = slot
             .image
             .id
@@ -135,22 +202,48 @@ impl Segments {
             .and_then(|v| v.checked_add(slot.image.used_bytes))
             .ok_or(Error::InvalidConfiguration)?;
         let extent = alignment.extent(offset, length)?;
-        let lease = Self::take_lease(slot)?;
+        let used_bytes = slot
+            .image
+            .used_bytes
+            .checked_add(length as u64)
+            .ok_or(Error::InvalidConfiguration)?;
+        // All fallible checks, including lease-counter overflow, precede mutation.
+        let lease = self.take_lease(slot, used_bytes)?;
+        if usable_open.is_none() {
+            if let Some(previous) = previous_open {
+                slots[previous].image.state = SegmentState::Sealed;
+            }
+            self.free.borrow_mut().remove(&position);
+        }
+        self.open.set(Some(position));
+        let slot = &mut slots[position];
         slot.image.state = SegmentState::Open;
-        slot.image.used_bytes += length as u64;
+        slot.image.used_bytes = used_bytes;
         if slot.image.used_bytes == self.segment_bytes {
             slot.image.state = SegmentState::Sealed;
             self.open.set(None);
         }
         Ok((lease, extent))
     }
-    fn take_lease(slot: &Slot) -> Result<SegmentLease> {
+    fn take_lease(&self, slot: &Slot, used_bytes: u64) -> Result<SegmentLease> {
+        let start = slot
+            .image
+            .id
+            .0
+            .checked_mul(self.segment_bytes)
+            .ok_or(Error::Corrupt)?;
+        let end = start.checked_add(used_bytes).ok_or(Error::Corrupt)?;
+        let geometry = self.geometry().ok_or(Error::Unavailable)?;
         slot.leases
             .set(slot.leases.get().checked_add(1).ok_or(Error::Busy)?);
         Ok(SegmentLease {
             id: slot.image.id,
             generation: slot.image.generation,
             count: slot.leases.clone(),
+            table: self.table.clone(),
+            geometry,
+            start,
+            end,
         })
     }
     fn position(id: SegmentId) -> Result<usize> {
@@ -162,9 +255,9 @@ impl Segments {
         if slot.image.generation != generation
             || !matches!(slot.image.state, SegmentState::Open | SegmentState::Sealed)
         {
-            return Err(Error::Corrupt);
+            return Err(Error::Stale);
         }
-        Self::take_lease(slot)
+        self.take_lease(slot, slot.image.used_bytes)
     }
     pub fn begin_evict(&self, id: SegmentId) -> Result<()> {
         if self.frozen.get() {
@@ -202,29 +295,37 @@ impl Segments {
         self.free.borrow_mut().insert(Self::position(id)?);
         Ok(())
     }
-    pub fn snapshot(&self) -> Result<Vec<SegmentSnapshot>> {
-        Ok(self
-            .slots
+    pub fn snapshot(&self) -> Vec<SegmentSnapshot> {
+        self.slots
             .borrow()
             .iter()
             .map(|s| s.image.clone())
-            .collect())
+            .collect()
     }
-    pub fn freeze(&self) -> Result<()> {
+    /// Block allocation, eviction, recycling, and restore until the guard drops.
+    /// Reads and snapshots remain available; only one guard may exist at a time.
+    pub fn freeze(&self) -> Result<FreezeGuard> {
         if self.frozen.replace(true) {
             return Err(Error::Busy);
         }
-        Ok(())
-    }
-    pub fn thaw(&self) {
-        self.frozen.set(false);
+        Ok(FreezeGuard(self.frozen.clone()))
     }
     pub fn validate_restore(&self, images: &[SegmentSnapshot]) -> Result<()> {
+        self.validate_restore_epoch(images).map(|_| ())
+    }
+    fn validate_restore_epoch(&self, images: &[SegmentSnapshot]) -> Result<u64> {
+        if self.frozen.get() {
+            return Err(Error::Busy);
+        }
         let slots = self.slots.borrow();
-        if images.len() != slots.len() || slots.iter().any(|s| s.leases.get() != 0) {
+        if slots.iter().any(|s| s.leases.get() != 0) {
+            return Err(Error::Busy);
+        }
+        if images.len() != slots.len() {
             return Err(Error::Corrupt);
         }
-        let alignment = self.alignment.get().ok_or(Error::Unavailable)?;
+        let alignment = self.geometry().ok_or(Error::Unavailable)?.alignment();
+        let mut open = false;
         for (i, s) in images.iter().enumerate() {
             if s.id.0 != i as u64
                 || s.generation.0 == 0
@@ -232,14 +333,26 @@ impl Segments {
                 || !s.used_bytes.is_multiple_of(alignment.offset())
                 || !s.used_bytes.is_multiple_of(alignment.length() as u64)
                 || (s.state == SegmentState::Free && s.used_bytes != 0)
+                || (s.state != SegmentState::Free && s.used_bytes == 0)
             {
                 return Err(Error::Corrupt);
             }
+            if s.state == SegmentState::Open {
+                if open || s.used_bytes == self.segment_bytes {
+                    return Err(Error::Corrupt);
+                }
+                open = true;
+            }
         }
-        Ok(())
+        self.restore_epoch
+            .get()
+            .checked_add(1)
+            .ok_or(Error::Unavailable)
     }
+    /// Validate the complete image before publishing it, sealing its open tail.
+    /// Frozen tables and outstanding leases return Busy without changing state.
     pub fn restore(&self, images: Vec<SegmentSnapshot>) -> Result<()> {
-        self.validate_restore(&images)?;
+        let epoch = self.validate_restore_epoch(&images)?;
         let mut slots = self.slots.borrow_mut();
         self.open.set(None);
         self.free.borrow_mut().clear();
@@ -252,6 +365,7 @@ impl Segments {
             }
             slot.image = image;
         }
+        self.restore_epoch.set(epoch);
         Ok(())
     }
     pub fn validate(&self, id: SegmentId, generation: Generation, extent: &Extent) -> Result<()> {
@@ -264,7 +378,10 @@ impl Segments {
             .ok_or(Error::Corrupt)?;
         if slot.image.generation != generation
             || !matches!(slot.image.state, SegmentState::Open | SegmentState::Sealed)
-            || extent.offset() < start
+        {
+            return Err(Error::Stale);
+        }
+        if extent.offset() < start
             || end
                 > start
                     .checked_add(slot.image.used_bytes)
@@ -272,11 +389,23 @@ impl Segments {
         {
             return Err(Error::Corrupt);
         }
-        let alignment = self.alignment.get().ok_or(Error::Unavailable)?;
-        if alignment.extent(extent.offset(), extent.length())? != *extent {
+        let alignment = self.geometry().ok_or(Error::Unavailable)?.alignment();
+        if alignment
+            .extent(extent.offset(), extent.length())
+            .map_err(|_| Error::Corrupt)?
+            != *extent
+        {
             return Err(Error::Corrupt);
         }
         Ok(())
+    }
+    /// Validate a live lease, including table identity and its captured used range.
+    /// Existing leases remain usable while their segment is Evicting.
+    pub fn validate_lease(&self, lease: &SegmentLease, extent: &Extent) -> Result<()> {
+        if !Rc::ptr_eq(&self.table, &lease.table) {
+            return Err(Error::Stale);
+        }
+        lease.validate_extent(extent)
     }
     pub fn free_count(&self) -> usize {
         self.free.borrow().len()

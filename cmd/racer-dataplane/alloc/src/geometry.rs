@@ -1,6 +1,9 @@
 //! Validated allocation geometry without checkpoint or record-format policy.
 use crate::{Alignment, Error, Result, Segments};
 
+/// Maximum number of slots retained by a segment allocation table.
+pub const MAX_SEGMENTS: u64 = 1_000_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SegmentGeometry {
     slab_bytes: u64,
@@ -9,7 +12,8 @@ pub struct SegmentGeometry {
     alignment: Alignment,
 }
 impl SegmentGeometry {
-    /// Validate physical geometry. Callers separately bound retained table sizes.
+    /// Validate physical geometry, independently of retained allocation table size.
+    /// Segments::configure separately enforces MAX_SEGMENTS on retained slots.
     pub fn new(
         slab_bytes: u64,
         segment_bytes: u64,
@@ -69,7 +73,16 @@ mod tests {
         assert_eq!(geometry.segment_bytes(), 1024);
         assert_eq!(geometry.segment_count(), 2);
         assert_eq!(geometry.alignment(), alignment());
-        assert!(SegmentGeometry::new(1024 * 1_000_001, 1024, 1_000_001, alignment()).is_ok());
+        assert!(SegmentGeometry::new(1024 * MAX_SEGMENTS, 1024, MAX_SEGMENTS, alignment()).is_ok());
+        assert!(
+            SegmentGeometry::new(
+                1024 * (MAX_SEGMENTS + 1),
+                1024,
+                MAX_SEGMENTS + 1,
+                alignment()
+            )
+            .is_ok()
+        );
         assert!(
             SegmentGeometry::new(u64::MAX, 1, u64::MAX, Alignment::new(1, 1, 1).unwrap()).is_ok()
         );
@@ -119,5 +132,20 @@ mod tests {
                 .unwrap()
                 .matches_segments(&segments)
         );
+    }
+
+    #[test]
+    fn divisibility_by_each_unit_is_equivalent_to_lcm_divisibility() {
+        let alignment = Alignment::new(512, 512, 768).unwrap();
+        assert!(SegmentGeometry::new(3072, 1536, 2, alignment).is_ok());
+        assert_eq!(
+            SegmentGeometry::new(2048, 1024, 2, alignment),
+            Err(Error::Corrupt)
+        );
+        assert_eq!(
+            SegmentGeometry::new(1536, 768, 2, alignment),
+            Err(Error::Corrupt)
+        );
+        assert!(SegmentGeometry::new(u64::MAX, 1, 1, Alignment::new(1, 1, 1).unwrap()).is_ok());
     }
 }
