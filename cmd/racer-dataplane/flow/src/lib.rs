@@ -31,6 +31,15 @@ mod admission;
 /// Keyed cohorts and completion-owned flight tracking.
 pub mod coalesce;
 
+/// Progress prediction and bounded synchronous reclamation.
+pub mod progress;
+
+/// Deadline-aware FIFO admission bookkeeping.
+pub mod fifo;
+
+/// Compact interval selection and bounded subscription fanout.
+pub mod subscriptions;
+
 /// Charged kernel pipes and worker-local reuse.
 mod pipe;
 
@@ -158,6 +167,41 @@ pub enum Rejection<C> {
     },
 }
 
+/// One admission failure with the facts from that exact attempt, not a later
+/// counter snapshot. Non-quota failures have no rejection detail.
+#[derive(Clone, Copy, Debug)]
+pub struct ReserveError<C> {
+    /// The same failure returned by the compact admission API.
+    pub error: Error,
+
+    /// Exact quota facts, absent for invalid input or stopped admission.
+    pub rejection: Option<Rejection<C>>,
+}
+
+impl<C> From<Error> for ReserveError<C> {
+    /// Preserve failures that are not caused by resource pressure.
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            rejection: None,
+        }
+    }
+}
+
+/// Restores a worker-local synchronous observation sink, even during unwind.
+struct RejectionGuard<'a, C: Copy> {
+    sink: &'a RefCell<Option<Option<Rejection<C>>>>,
+
+    previous: Option<Option<Rejection<C>>>,
+}
+
+impl<C: Copy> Drop for RejectionGuard<'_, C> {
+    /// Nested operations cannot overwrite their parent's rejection facts.
+    fn drop(&mut self) {
+        *self.sink.borrow_mut() = self.previous.take();
+    }
+}
+
 /// Worker-local keyed admission and recycler authority; never moves across workers.
 ///
 /// Only shared handles and charges may cross threads:
@@ -193,6 +237,8 @@ pub struct Quotas<P: Policy> {
     buffers: Arc<Buffers<P>>,
 
     local: PhantomData<Rc<()>>,
+
+    rejection: RefCell<Option<Option<Rejection<P::Class>>>>,
 }
 
 /// Owns a live charge independently of the local quota authority and policy.
@@ -263,26 +309,40 @@ impl<P: Policy> SharedQuotas<P> {
 
     /// Admit a nonzero unkeyed amount without retaining the local recycler.
     pub fn reserve(&self, class: P::Class, amount: usize) -> Result<Charge<P>> {
+        self.reserve_detailed(class, amount)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Return exact unkeyed rejection facts without retaining any observation sink.
+    pub fn reserve_detailed(
+        &self,
+        class: P::Class,
+        amount: usize,
+    ) -> std::result::Result<Charge<P>, ReserveError<P::Class>> {
         if self.is_stopped() && !P::allows_stopped(class) {
-            return Err(Error::Unavailable);
+            return Err(Error::Unavailable.into());
         }
         if amount == 0 {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidInput.into());
         }
         let limit = self.limit(class);
         self.totals
             .counter(class)
             .reserve(amount, limit)
             .map_err(|_| {
-                self.policy.rejected(Rejection::Resource {
+                let rejection = Rejection::Resource {
                     class,
                     used: self.used(class),
                     limit,
                     requested: amount,
                     key_used: None,
                     key_limit: None,
-                });
-                Error::Overloaded
+                };
+                self.policy.rejected(rejection);
+                ReserveError {
+                    error: Error::Overloaded,
+                    rejection: Some(rejection),
+                }
             })?;
         Ok(Charge {
             class,
@@ -441,12 +501,32 @@ impl<P: Policy> Quotas<P> {
             stopped: Arc::new(AtomicBool::new(false)),
             buffers: Arc::new(Mutex::new(Vec::new())),
             local: PhantomData,
+            rejection: RefCell::new(None),
         }
     }
 
     /// Borrow application policy without transferring local authority.
     pub fn policy(&self) -> &P {
         &self.policy
+    }
+
+    /// Observe this synchronous compound operation only. The local authority
+    /// cannot cross threads; no policy mutex, thread identity, or async guard is
+    /// needed. Nested operations restore their parent's sink, including on panic.
+    /// Callers decide whether a recovered rejection describes their final result.
+    pub fn observe_rejections<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> (T, Option<Rejection<P::Class>>) {
+        let previous = self.rejection.replace(Some(None));
+        let guard = RejectionGuard {
+            sink: &self.rejection,
+            previous,
+        };
+        let result = operation();
+        let rejection = self.rejection.borrow().as_ref().copied().flatten();
+        drop(guard);
+        (result, rejection)
     }
 
     /// Create a transferable unkeyed handle without retaining recycler storage.
@@ -523,6 +603,18 @@ impl<P: Policy> Quotas<P> {
         class: P::Class,
         amount: usize,
     ) -> Result<Charge<P>> {
+        self.reserve_detailed(key, class, amount)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Admit ordinary work and return exact final-attempt quota rejection facts.
+    /// Every failed attempt is still reported to policy, even if retry recovers.
+    pub fn reserve_detailed(
+        &self,
+        key: Option<&P::Key>,
+        class: P::Class,
+        amount: usize,
+    ) -> std::result::Result<Charge<P>, ReserveError<P::Class>> {
         self.reserve_reclaiming(key, class, amount, AdmissionMode::Ordinary)
     }
 
@@ -533,6 +625,18 @@ impl<P: Policy> Quotas<P> {
         class: P::Class,
         amount: usize,
     ) -> Result<Charge<P>> {
+        self.reserve_completion_detailed(key, class, amount)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Return exact completion-admission rejection facts while preserving drain
+    /// bypass policy and aggregate limits.
+    pub fn reserve_completion_detailed(
+        &self,
+        key: Option<&P::Key>,
+        class: P::Class,
+        amount: usize,
+    ) -> std::result::Result<Charge<P>, ReserveError<P::Class>> {
         self.reserve_reclaiming(key, class, amount, AdmissionMode::Completion)
     }
 
@@ -569,9 +673,15 @@ impl<P: Policy> Quotas<P> {
         class: P::Class,
         amount: usize,
         mode: AdmissionMode,
-    ) -> Result<Charge<P>> {
+    ) -> std::result::Result<Charge<P>, ReserveError<P::Class>> {
         let result = self.reserve_inner(key, class, amount, mode);
-        if matches!(result, Err(Error::Overloaded)) {
+        if matches!(
+            result,
+            Err(ReserveError {
+                error: Error::Overloaded,
+                ..
+            })
+        ) {
             self.reclaim_buffers_for(key, class);
             return self.reserve_inner(key, class, amount, mode);
         }
@@ -599,12 +709,12 @@ impl<P: Policy> Quotas<P> {
         class: P::Class,
         amount: usize,
         mode: AdmissionMode,
-    ) -> Result<Charge<P>> {
+    ) -> std::result::Result<Charge<P>, ReserveError<P::Class>> {
         if self.is_stopped() && mode == AdmissionMode::Ordinary && !P::allows_stopped(class) {
-            return Err(Error::Unavailable);
+            return Err(Error::Unavailable.into());
         }
         if amount == 0 {
-            return Err(Error::InvalidInput);
+            return Err(Error::InvalidInput.into());
         }
         let limit = self.limit(class);
         let local = key.map(|key| self.key_counters(key)).transpose()?;
@@ -612,8 +722,7 @@ impl<P: Policy> Quotas<P> {
             let fair = self.fair_limit(class, self.active_keys.load(Ordering::Acquire).max(1));
             let used = local.counter(class).used();
             if used.checked_add(amount).is_none_or(|next| next > fair) {
-                self.rejected(class, amount, Some(used), Some(fair));
-                return Err(Error::Overloaded);
+                return Err(self.rejected(class, amount, Some(used), Some(fair)));
             }
         }
         // Application cloning may panic. Finish it before committing admission
@@ -622,10 +731,7 @@ impl<P: Policy> Quotas<P> {
         self.totals
             .counter(class)
             .reserve(amount, limit)
-            .map_err(|_| {
-                self.rejected(class, amount, None, None);
-                Error::Overloaded
-            })?;
+            .map_err(|_| self.rejected(class, amount, None, None))?;
         if let Some(local) = &local {
             local.counter(class).add(amount);
         }
@@ -641,7 +747,10 @@ impl<P: Policy> Quotas<P> {
     }
 
     /// Reuse a live key record or create one after bounded retirement cleanup.
-    fn key_counters(&self, key: &P::Key) -> Result<Arc<Counters<P::Key>>> {
+    fn key_counters(
+        &self,
+        key: &P::Key,
+    ) -> std::result::Result<Arc<Counters<P::Key>>, ReserveError<P::Class>> {
         let mut keys = self.keys.borrow_mut();
         let mut retired = self.retired_keys.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..256 {
@@ -657,11 +766,10 @@ impl<P: Policy> Quotas<P> {
         }
         drop(retired);
         if !keys.contains_key(key) && keys.len() >= self.policy.max_keys() {
-            self.policy.rejected(Rejection::Keys {
+            return Err(self.report_rejection(Rejection::Keys {
                 used: keys.len(),
                 limit: self.policy.max_keys(),
-            });
-            return Err(Error::Overloaded);
+            }));
         }
         if let Some(counts) = keys.get(key).and_then(Weak::upgrade) {
             return Ok(counts);
@@ -683,15 +791,27 @@ impl<P: Policy> Quotas<P> {
         requested: usize,
         key_used: Option<usize>,
         key_limit: Option<usize>,
-    ) {
-        self.policy.rejected(Rejection::Resource {
+    ) -> ReserveError<P::Class> {
+        self.report_rejection(Rejection::Resource {
             class,
             used: self.used(class),
             limit: self.limit(class),
             requested,
             key_used,
             key_limit,
-        });
+        })
+    }
+
+    /// Report one failed attempt and retain its facts in the active local sink.
+    fn report_rejection(&self, rejection: Rejection<P::Class>) -> ReserveError<P::Class> {
+        if let Some(sink) = self.rejection.borrow_mut().as_mut() {
+            *sink = Some(rejection);
+        }
+        self.policy.rejected(rejection);
+        ReserveError {
+            error: Error::Overloaded,
+            rejection: Some(rejection),
+        }
     }
 }
 
@@ -991,6 +1111,76 @@ fn wipe_payload(bytes: &mut Vec<u8>) {
 #[cfg(test)]
 mod quota_tests {
     use super::*;
+
+    /// Exact failures survive counter changes and never cross observation scopes.
+    #[test]
+    fn detailed_rejection_and_nested_unwind_observation() {
+        let quotas = Quotas::new(TestPolicy::new(10, 1));
+        let key = "a".to_owned();
+        let held = quotas.reserve(Some(&key), Resource::Payload, 10).unwrap();
+        let Err(failure) = quotas.reserve_detailed(Some(&key), Resource::Payload, 1) else {
+            panic!("full quota")
+        };
+        assert_eq!(failure.error, Error::Overloaded);
+        assert!(matches!(
+            failure.rejection,
+            Some(Rejection::Resource {
+                used: 10,
+                requested: 1,
+                key_used: Some(10),
+                key_limit: Some(10),
+                ..
+            })
+        ));
+        drop(held);
+        assert_eq!(quotas.used(Resource::Payload), 0);
+        assert!(matches!(
+            failure.rejection,
+            Some(Rejection::Resource { used: 10, .. })
+        ));
+        let (_, rejection) = quotas.observe_rejections(|| {
+            let (_, inner) =
+                quotas.observe_rejections(|| quotas.reserve(None, Resource::Payload, 11));
+            assert!(inner.is_some());
+        });
+        assert!(rejection.is_none());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            quotas.observe_rejections(|| {
+                let _ = quotas.reserve(None, Resource::Payload, 11);
+                panic!("fixture");
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(quotas.rejection.borrow().is_none());
+        let (_, rejection) = quotas.observe_rejections(|| {
+            let shared = quotas.shared();
+            std::thread::spawn(move || {
+                assert!(shared.reserve_detailed(Resource::Payload, 11).is_err());
+            })
+            .join()
+            .unwrap();
+        });
+        assert!(
+            rejection.is_none(),
+            "shared policy cannot pollute local facts"
+        );
+        let Err(invalid) = quotas.reserve_detailed(None, Resource::Payload, 0) else {
+            panic!("zero request")
+        };
+        assert_eq!(invalid.error, Error::InvalidInput);
+        assert!(invalid.rejection.is_none());
+        quotas.stop();
+        let Err(stopped) = quotas.reserve_detailed(None, Resource::Payload, 1) else {
+            panic!("stopped")
+        };
+        assert_eq!(stopped.error, Error::Unavailable);
+        assert!(stopped.rejection.is_none());
+        assert!(
+            quotas
+                .reserve_completion_detailed(None, Resource::Payload, 1)
+                .is_ok()
+        );
+    }
 
     /// Distinct payload, wake-enabled, and drain-progress fixture classes.
     #[derive(Clone, Copy, Debug)]
