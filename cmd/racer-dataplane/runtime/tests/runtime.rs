@@ -37,6 +37,7 @@ mod filesystem {
     #[derive(Clone)]
     struct RequestScope {
         deadline: Instant,
+
         canceled: Rc<Cell<bool>>,
     }
     impl RequestScope {
@@ -53,7 +54,10 @@ mod filesystem {
         }
     }
     impl Scope for RequestScope {
+        /// Report cancellation and deadline failures using runtime errors.
         type Error = Error;
+
+        /// Reject canceled requests and requests whose deadline has passed.
         fn check(&self) -> Result<()> {
             if self.canceled.get() {
                 Err(Error::Cancelled)
@@ -69,15 +73,20 @@ mod filesystem {
     /// Return the exact accounted amount when its owner is dropped.
     struct Charge {
         used: Rc<Cell<usize>>,
+
         amount: usize,
     }
     impl Drop for Charge {
+        /// Release this charge from the shared budget counter.
         fn drop(&mut self) {
             self.used.set(self.used.get() - self.amount);
         }
     }
     impl Budget for CountingBudget {
+        /// Retain the accounted amount until the charge is dropped.
         type Charge = Charge;
+
+        /// Account for the requested amount and return its release guard.
         fn charge(&self, amount: usize) -> Result<Charge> {
             self.0.set(self.0.get() + amount);
             Ok(Charge {
@@ -89,10 +98,14 @@ mod filesystem {
     /// Public reactor plus externally observed budget usage, without private access.
     struct Reactor {
         core: Core<RequestScope, CountingBudget>,
+
         used: Rc<Cell<usize>>,
     }
     impl Deref for Reactor {
+        /// Expose the wrapped public reactor for filesystem operations.
         type Target = Core<RequestScope, CountingBudget>;
+
+        /// Borrow the wrapped reactor without changing its accounting.
         fn deref(&self) -> &Self::Target {
             &self.core
         }
@@ -121,6 +134,7 @@ mod filesystem {
         }
     }
     impl Drop for Directory {
+        /// Remove the test directory and all of its contents.
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
@@ -181,6 +195,7 @@ mod filesystem {
         Some(reactor)
     }
 
+    /// Check buffer progress, bounds, quota release, and empty reads.
     #[test]
     fn partial_completion_preserves_remaining_bytes_and_quota() {
         let Some(r) = kernel_reactor(16) else {
@@ -217,6 +232,7 @@ mod filesystem {
         assert_eq!(completion.buffer.remaining(), 17);
     }
 
+    /// Verify abandoned operations retain resources until kernel completion is fenced.
     #[test]
     fn abandoned_open_and_stat_remain_owned_until_real_cqe_fences() {
         let Some(r) = kernel_reactor(16) else {
@@ -262,6 +278,7 @@ mod filesystem {
         assert_eq!(r.used.get(), baseline);
     }
 
+    /// Check partial reads, abandoned opens, and canceled metadata requests on Linux.
     #[test]
     fn real_partial_read_and_abandoned_open_fence_own_resources() {
         let Some(r) = kernel_reactor(16) else {
@@ -313,6 +330,7 @@ mod filesystem {
         assert_eq!(r.used.get(), baseline);
     }
 
+    /// Verify publication contains staging paths and preserves permissions and symlinks.
     #[test]
     fn host_publication_containment_permissions_and_symlink_policy() {
         let root = Directory::new();
@@ -368,6 +386,7 @@ mod filesystem {
         assert_eq!(fs::read(&target).unwrap(), b"next");
     }
 
+    /// Verify publication permissions under a restrictive umask in an isolated child.
     #[test]
     fn host_publication_honors_umask_in_isolated_process() {
         const CHILD: &str = "URING_FILESYSTEM_UMASK_CHILD";
@@ -417,6 +436,7 @@ mod filesystem {
         fs::write(acknowledgment, b"assertions passed").unwrap();
     }
 
+    /// Check secure path access and replacement against real Linux filesystem behavior.
     #[test]
     fn real_secure_traversal_magiclinks_hardlinks_cloexec_and_append_normalization() {
         let Some(r) = kernel_reactor(16) else {
@@ -577,6 +597,7 @@ mod affinity {
             .collect()
     }
 
+    /// Verify affinity changes agree with Linux and leave another thread unchanged.
     #[test]
     fn affinity_round_trips_through_linux_without_affecting_another_thread() {
         let original = proc_cpus();
@@ -622,6 +643,7 @@ mod affinity {
         worker.join().unwrap();
     }
 
+    /// Verify a rejected CPU selection leaves the thread's affinity unchanged.
     #[test]
     fn kernel_rejected_affinity_preserves_the_mask() {
         thread::spawn(|| {
@@ -646,6 +668,7 @@ mod affinity {
         .unwrap();
     }
 
+    /// Compare discovered CPU and network device topology with host sysfs data.
     #[test]
     fn discovered_topology_matches_host_sysfs() {
         let allowed = proc_cpus();
@@ -717,7 +740,10 @@ mod reserved_capacity {
     #[derive(Clone)]
     struct OpenScope;
     impl Scope for OpenScope {
+        /// Use the runtime error type for the always-open scope.
         type Error = Error;
+
+        /// Allow every request without cancellation or deadline checks.
         fn check(&self) -> Result<()> {
             Ok(())
         }
@@ -739,6 +765,7 @@ mod reserved_capacity {
         panic!("simulated operation did not complete in 16 driver turns");
     }
 
+    /// Verify reservations belong to one reactor and unread failures retain capacity.
     #[test]
     fn reserved_capacity_is_reactor_local_and_failed_replies_release_it_only_on_consumption() {
         let simulation = Simulation::new();
@@ -827,6 +854,7 @@ mod reserved_capacity {
         assert_eq!(simulation.live_handles(), 0);
     }
 
+    /// Verify completed receives and accepts hold reserved slots until replies are read.
     #[test]
     fn reserved_receive_and_accept_keep_slots_until_reply_consumption() {
         use uring_runtime::reactor::{SocketAddress, simulation::Fault};
@@ -877,6 +905,7 @@ mod reserved_capacity {
         assert_eq!(simulation.live_handles(), 0);
     }
 
+    /// Verify simulated sends use shared buffer access without requesting mutable access.
     #[test]
     fn simulated_writes_use_immutable_accessor_like_production() {
         use uring_runtime::reactor::IoBuffer;
@@ -884,10 +913,15 @@ mod reserved_capacity {
         struct ReadOnly(Vec<u8>);
         // SAFETY: private stable Vec; mutation accessor fails without exposing aliases.
         unsafe impl IoBuffer for ReadOnly {
+            /// Report attempts to mutate the read-only buffer as runtime errors.
             type Error = Error;
+
+            /// Borrow the initialized bytes for sending.
             fn bytes(&self) -> Result<&[u8]> {
                 Ok(&self.0)
             }
+
+            /// Reject mutable access so the test detects an incorrect send accessor.
             fn bytes_mut(&mut self) -> Result<&mut [u8]> {
                 Err(Error::InvalidInput)
             }
@@ -908,6 +942,7 @@ mod reserved_capacity {
         assert_eq!(&bytes, b"ok");
     }
 
+    /// Verify reserved failures and unread accepts neither block ordinary sends nor leak handles.
     #[test]
     fn reserved_failures_and_unread_accepts_do_not_block_other_operations_or_leak_handles() {
         use uring_runtime::reactor::{SocketAddress, simulation::Fault};
@@ -988,6 +1023,7 @@ mod reserved_capacity {
         assert_eq!(simulation.live_handles(), 0);
     }
 
+    /// Verify rejected submissions release their reserved slot and owned buffer exactly once.
     #[test]
     fn reserved_sq_rejection_releases_exact_partition_and_buffer_owner() {
         use std::cell::Cell;
@@ -996,15 +1032,21 @@ mod reserved_capacity {
         struct Owned(Vec<u8>, Rc<Cell<usize>>);
         // SAFETY: private non-resizing Vec retains initialized backing across moves.
         unsafe impl IoBuffer for Owned {
+            /// Use runtime errors for buffer access results.
             type Error = Error;
+
+            /// Borrow the initialized bytes without transferring ownership.
             fn bytes(&self) -> Result<&[u8]> {
                 Ok(&self.0)
             }
+
+            /// Borrow the initialized bytes for an operation that needs mutable storage.
             fn bytes_mut(&mut self) -> Result<&mut [u8]> {
                 Ok(&mut self.0)
             }
         }
         impl Drop for Owned {
+            /// Record the release of this owned submission buffer.
             fn drop(&mut self) {
                 self.1.set(self.1.get() + 1);
             }
