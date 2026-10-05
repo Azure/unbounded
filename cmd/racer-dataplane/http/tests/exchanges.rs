@@ -214,6 +214,164 @@ fn disconnect_waits_for_work_cleanup_before_returning_failure() {
     assert!(canceled.get() && cleaned.get() && watch_canceled.get());
     assert_eq!(io.reactor().in_flight(), 0);
 }
+
+/// Independent caller scopes exercise cancellation and watch fencing without Racer.
+mod disconnect_scopes {
+    use super::*;
+    use std::cell::Cell;
+    use uring_runtime::environment::Cancellation;
+
+    /// A cancellable caller scope, independent of wall time.
+    #[derive(Clone)]
+    struct CancelScope(Cancellation);
+
+    impl Scope for CancelScope {
+        type Error = Failure;
+
+        fn check(&self) -> Result<(), Failure> {
+            if self.0.is_cancelled() {
+                Err(uring_runtime::Error::Cancelled.into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn cancellation(&self) -> Option<&Cancellation> {
+            Some(&self.0)
+        }
+    }
+
+    /// Permissive resource hooks keep this contract independent of quota policy.
+    struct ScopedCaller;
+
+    impl Context for ScopedCaller {
+        type Error = Failure;
+
+        type Scope = CancelScope;
+
+        type Budget = ();
+
+        type Reactor = Rc<Reactor<CancelScope, ()>>;
+
+        type Charge = ();
+
+        type Slot = ();
+
+        type Opaque = ();
+
+        type State = ();
+
+        type Endpoint = Address;
+
+        fn charge(&self, _: usize) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        fn outbound_slot(&self) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        fn stopped(&self) -> bool {
+            false
+        }
+    }
+
+    /// Both success and parent cancellation await the independent readiness fence.
+    #[test]
+    fn success_and_parent_cancel_fence_watch_and_keep_parent_independent() {
+        for cancel in [false, true] {
+            let io = HttpIo::new(
+                Rc::new(Rc::new(Reactor::new(16, ()))),
+                Codec::new(256),
+                Rc::new(ScopedCaller),
+                16,
+                16,
+            );
+            io.reactor().init().unwrap();
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
+            let parent = CancelScope(Cancellation::new().unwrap());
+            let exchange = CancelScope(Cancellation::new().unwrap());
+            let watch = CancelScope(Cancellation::new().unwrap());
+            let cleanup_turns = Cell::new(0);
+            let work = std::future::poll_fn(|cx| {
+                if cancel && !exchange.0.is_cancelled() {
+                    return Poll::Pending;
+                }
+                cleanup_turns.set(cleanup_turns.get() + 1);
+                if cleanup_turns.get() < 2 {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(7))
+                }
+            });
+            let mut operation = Box::pin(http1::connection::disconnect_fenced(
+                &io,
+                &connection,
+                &parent,
+                || Ok(watch.clone()),
+                || exchange.0.cancel().unwrap(),
+                |scope| scope.0.cancel().unwrap(),
+                work,
+            ));
+            let mut cx = std::task::Context::from_waker(Waker::noop());
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            if cancel {
+                parent.0.cancel().unwrap();
+            }
+            let until = Instant::now() + Duration::from_secs(2);
+            let result = loop {
+                if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
+                    break result;
+                }
+                assert!(Instant::now() < until, "disconnect fence watchdog");
+                io.reactor().poll_budgeted(32).unwrap();
+            };
+            assert_eq!(
+                result,
+                if cancel {
+                    Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+                } else {
+                    Ok(7)
+                }
+            );
+            assert!(watch.0.is_cancelled());
+            assert_eq!(parent.0.is_cancelled(), cancel);
+            assert_eq!(exchange.0.is_cancelled(), cancel);
+            assert_eq!(cleanup_turns.get(), 2);
+            assert_eq!(io.reactor().in_flight(), 0);
+        }
+    }
+
+    /// Watch-scope allocation failure never polls work or submits readiness I/O.
+    #[test]
+    fn failed_watch_scope_preserves_error_without_polling_work() {
+        let io = HttpIo::new(
+            Rc::new(Rc::new(Reactor::new(16, ()))),
+            Codec::new(256),
+            Rc::new(ScopedCaller),
+            16,
+            16,
+        );
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
+        let parent = CancelScope(Cancellation::new().unwrap());
+        let error = Failure::Runtime(uring_runtime::Error::Overloaded);
+        let result = futures::executor::block_on(http1::connection::disconnect_fenced(
+            &io,
+            &connection,
+            &parent,
+            || Err(error),
+            || panic!("must not cancel work"),
+            |_| panic!("no watch exists"),
+            std::future::poll_fn(|_| -> Poll<Result<(), Failure>> { panic!("must not poll work") }),
+        ));
+        assert_eq!(result, Err(error));
+        assert_eq!(io.reactor().in_flight(), 0);
+        assert!(!parent.0.is_cancelled());
+    }
+}
 /// Poll one operation and its reactor under a fixed progress deadline.
 fn drive<T>(io: &HttpIo<Caller>, future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
