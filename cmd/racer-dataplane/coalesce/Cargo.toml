@@ -1,9 +1,0 @@
-[package]
-name = "coalesce"
-version = "0.1.0"
-edition = "2024"
-publish = false
-description = "Worker-local bounded keyed cohorts and result broadcast"
-
-[dependencies]
-futures = "0.3"

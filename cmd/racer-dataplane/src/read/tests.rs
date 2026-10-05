@@ -1030,7 +1030,7 @@ mod flight {
                 },
                 number: PageNumber(0),
             },
-            identity: coalesce::flight::Identity {
+            identity: flow_control::coalesce::flight::Identity {
                 owner: Rc::new(()),
                 incarnation: 1,
                 generation: 1,

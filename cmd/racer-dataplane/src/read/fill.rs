@@ -65,7 +65,7 @@ pub struct FillDependencies {
     /// Page workers keep their own page-attached descriptor even if that catalog evicts it.
     pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
 }
-type LocalCopies = coalesce::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
+type LocalCopies = flow_control::coalesce::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
 
 /// Optional writes may use half of the aggregate class budget, with a floor
 /// sufficient for one valid page when the configured budget can hold it. Owned

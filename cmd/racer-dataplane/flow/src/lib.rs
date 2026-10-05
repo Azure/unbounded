@@ -19,9 +19,14 @@
 //! ownership rules. Pipes retain their charges while idle; socket-retained bytes
 //! are outside the pipe capacity budget. The `simulation` feature forwards the
 //! runtime's simulated descriptors without changing admission policy.
+//!
+//! [`coalesce`] provides worker-local keyed cohorts, shared results, and flight
+//! lifecycle tracking. Callers retain execution, admission, and result policy;
+//! cancellation never substitutes for real operation completion.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod admission;
+pub mod coalesce;
 mod pipe;
 
 pub use admission::{

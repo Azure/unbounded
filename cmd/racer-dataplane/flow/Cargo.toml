@@ -3,7 +3,7 @@ name = "flow-control"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Policy-driven quotas, payload recycling, credit windows, and bounded kernel pipes"
+description = "Policy-driven quotas, keyed coalescing, completion-owned flights, and bounded I/O resources"
 
 [features]
 simulation = ["uring-runtime/simulation"]

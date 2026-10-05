@@ -41,8 +41,6 @@ COPY cmd/racer-dataplane/topology/Cargo.toml ./topology/Cargo.toml
 COPY cmd/racer-dataplane/topology/src ./topology/src
 COPY cmd/racer-dataplane/telemetry/Cargo.toml ./telemetry/Cargo.toml
 COPY cmd/racer-dataplane/telemetry/src ./telemetry/src
-COPY cmd/racer-dataplane/coalesce/Cargo.toml ./coalesce/Cargo.toml
-COPY cmd/racer-dataplane/coalesce/src ./coalesce/src
 COPY cmd/racer-dataplane/uds-endpoint/Cargo.toml ./uds-endpoint/Cargo.toml
 COPY cmd/racer-dataplane/uds-endpoint/src ./uds-endpoint/src
 COPY cmd/racer-dataplane/wire-codec/Cargo.toml ./wire-codec/Cargo.toml

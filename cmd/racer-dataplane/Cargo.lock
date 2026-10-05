@@ -154,13 +154,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
-name = "coalesce"
-version = "0.1.0"
-dependencies = [
- "futures",
-]
-
-[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -695,7 +688,6 @@ name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "base64",
- "coalesce",
  "flow-control",
  "futures",
  "getrandom",

@@ -1,7 +1,7 @@
 //! Public ownership boundaries and synchronous reentrant notification contracts.
 
-use coalesce::flight::{self, Entry, Operations, Stale};
-use coalesce::{CapacityError, Event, Limits, Table, shared};
+use flow_control::coalesce::flight::{self, Entry, Operations, Stale};
+use flow_control::coalesce::{CapacityError, Event, Limits, Table, shared};
 use futures::executor::block_on;
 use std::cell::{Cell, RefCell};
 use std::future::Future;

@@ -26,6 +26,7 @@ use crate::runtime::RequestScope;
 use crate::security::CredentialCrypto;
 use crate::security::OriginContext;
 use crate::store::catalog::Index;
+use flow_control::coalesce;
 use std::cell::RefCell;
 use std::future::Future;
 use std::future::poll_fn;

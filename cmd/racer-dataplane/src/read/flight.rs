@@ -27,6 +27,7 @@ use crate::memory::UnverifiedPage;
 use crate::model::PageId;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
+use flow_control::coalesce;
 use std::cell::RefCell;
 use std::future::poll_fn;
 use std::rc::Rc;
