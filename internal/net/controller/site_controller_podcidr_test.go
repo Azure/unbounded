@@ -1117,7 +1117,7 @@ func TestAssignPodCIDRsAllowedWithLease(t *testing.T) {
 	}
 }
 
-func TestTryAllocateForNodeLeaseFence(t *testing.T) {
+func TestGetSiteForNodeDoesNotAllocateRegardlessOfLease(t *testing.T) {
 	// Admission now resolves sites without allocating, regardless of the fence.
 	cases := map[string]time.Time{
 		"held":       time.Now().Add(time.Minute),
