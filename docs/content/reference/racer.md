@@ -173,6 +173,32 @@ The **bare binary** defaults `RACER_PEER_LISTEN` to `0.0.0.0:7443` and
 with the ports above. The operator also wires trust/token paths and
 `/var/lib/racer/identity/private`; standalone defaults do not replace managed wiring.
 
+### Membership and credential reconciliation
+
+Endpoint selection uses the newest eligible Pod controlled by the current managed
+DaemonSet, breaking creation-time ties by Pod UID. Failed, Succeeded, terminating,
+and IP-less Pods are not eligible. Readiness does not gate membership. Pod phase
+changes trigger reconciliation; readiness-only changes do not. A previously admitted
+Node retains its last endpoint across discovery gaps, while a never-admitted Node
+with no eligible endpoint is omitted.
+
+A custom `RACER_DAEMONSET_NAME` must be a valid DNS subdomain and fit a Kubernetes
+label value (at most 63 characters), because it also identifies the workload's
+immutable instance selector.
+
+Issued leaves start validity one minute before issuance to tolerate modest clock
+skew, matching issuer roots. Expiration remains issuance time plus
+`RACER_CERTIFICATE_LIFETIME`; the skew allowance does not extend expiration or grant
+server-auth usage. Clocks must still be synchronized. A staged issuer must cover
+its actual activation, the full interval until its replacement activates, and the
+last issued leaf's lifetime. If that horizon no longer fits, the controller stages
+a fresh issuer and waits a complete preparation period instead of activating the
+stale issuer.
+
+Topology and keyring reconciliation retry dependency-local timeouts or cancellation
+errors while their reconcile context remains live. Cancellation or expiration of
+the reconcile context itself is terminal for that operation.
+
 ## Diagnostics and metrics
 
 | Dataplane HTTP path | Use |
