@@ -1238,7 +1238,7 @@ mod protected_failure_tests {
         }
         impl std::fmt::Write for Output<'_> {
             fn write_str(&mut self, text: &str) -> std::fmt::Result {
-                assert!(self.failures.4.try_lock().is_ok());
+                assert!(self.failures.4.try_snapshot().is_some());
                 if self.fail {
                     return Err(std::fmt::Error);
                 }
@@ -1282,10 +1282,10 @@ mod protected_failure_tests {
         }
         impl std::fmt::Write for Output<'_> {
             fn write_str(&mut self, s: &str) -> std::fmt::Result {
-                assert!(self.failures.0.try_lock().is_ok());
-                assert!(self.failures.1.try_lock().is_ok());
-                assert!(self.failures.2.try_lock().is_ok());
-                assert!(self.failures.3.try_lock().is_ok());
+                assert!(self.failures.0.try_snapshot().is_some());
+                assert!(self.failures.1.try_snapshot().is_some());
+                assert!(self.failures.2.try_snapshot().is_some());
+                assert!(self.failures.3.try_snapshot().is_some());
                 if self.fail {
                     return Err(std::fmt::Error);
                 }
@@ -2974,8 +2974,8 @@ pub(crate) mod tests {
             }
             impl std::fmt::Write for Unlocked<'_> {
                 fn write_str(&mut self, value: &str) -> std::fmt::Result {
-                    assert!(self.failures.0.try_lock().is_ok());
-                    assert!(self.failures.1.try_lock().is_ok());
+                    assert!(self.failures.0.try_snapshot().is_some());
+                    assert!(self.failures.1.try_snapshot().is_some());
                     self.text.push_str(value);
                     Ok(())
                 }
