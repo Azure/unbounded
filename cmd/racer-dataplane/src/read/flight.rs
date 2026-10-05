@@ -143,7 +143,7 @@ impl FlightOperation {
     /// transport cancellation. Cancellation is not itself a completion fence.
     pub fn cancellation_requested(&self) -> bool {
         let table = self.flights.table.borrow();
-        table.stopping
+        table.is_stopping()
             || table.get(&self.fence.page).is_none_or(|entry| {
                 self.fence.validate(&entry.fence).is_err()
                     || !matches!(entry.phase, Phase::Acquiring)
@@ -687,7 +687,7 @@ impl Flights {
         validate_context(&page, context)?;
         scope.check()?;
         self.update(|table, wakes| {
-            if table.stopping {
+            if table.is_stopping() {
                 return Err(Error::Cancelled);
             }
             self.admit_join(&page, table.get(&page))?;
@@ -720,7 +720,7 @@ impl Flights {
                 ResourceClass::Waiter,
                 1,
             )?;
-            let id = table.next_waiter.next_id().map_err(|_| Error::Overloaded)?;
+            let id = table.next_waiter_id().map_err(|_| Error::Overloaded)?;
             if !table.contains_key(&page) {
                 if table.len() >= self.limits.entries {
                     return Err(Error::Overloaded);
@@ -782,7 +782,7 @@ impl Flights {
     ) -> Result<JoinedCopy<'a>> {
         scope.check()?;
         self.update(|table, wakes| {
-            if table.stopping {
+            if table.is_stopping() {
                 return Err(Error::Cancelled);
             }
             let Some(entry) = table.get_mut(page) else {
@@ -810,7 +810,7 @@ impl Flights {
                 ResourceClass::Waiter,
                 1,
             )?;
-            let id = table.next_waiter.next_id().map_err(|_| Error::Overloaded)?;
+            let id = table.next_waiter_id().map_err(|_| Error::Overloaded)?;
             let entry = table.get_mut(page).expect("existing copy flight");
             entry.state.register(
                 id,
@@ -962,7 +962,7 @@ impl Flights {
                     return Poll::Ready(Ok(()));
                 }
                 scope.check()?;
-                coalesce::flight::state::store_waker(&mut table.drain_waker, cx.waker());
+                table.register_drain(cx.waker());
                 Poll::Pending
             })
             .await
@@ -977,10 +977,7 @@ impl Flights {
         resources: telemetry::Lease,
     ) -> Result<FlightOperation> {
         self.update(|table, wakes| {
-            let id = table
-                .next_operation
-                .next_id()
-                .map_err(|_| Error::Overloaded)?;
+            let id = table.next_operation_id().map_err(|_| Error::Overloaded)?;
             let entry = self.leader_entry(table, leader, wakes)?;
             if entry.operations.len() >= self.limits.operations_per_flight {
                 return Err(Error::Overloaded);
@@ -1051,10 +1048,6 @@ impl Flights {
 }
 
 impl coalesce::flight::Entry for Entry {
-    fn incarnation(&self) -> u64 {
-        self.fence.incarnation
-    }
-
     fn refresh(&mut self, wakes: &mut Vec<Waker>) {
         // One cancellation candidate per entry, independent of fan-in.
         self.state.sweep_waiter(wakes);
@@ -1106,7 +1099,7 @@ fn validate_leader(entry: &Entry, leader: &FlightLeader) -> Result<()> {
         .map_err(|_| Error::StaleFlight)
 }
 fn registered<'a>(table: &'a mut Table, registration: &Registration) -> Result<&'a mut Entry> {
-    if table.stopping {
+    if table.is_stopping() {
         return Err(Error::Cancelled);
     }
     let entry = table
