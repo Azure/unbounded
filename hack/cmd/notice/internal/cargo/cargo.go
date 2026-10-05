@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/pelletier/go-toml/v2"
+
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/license"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 )
@@ -375,57 +377,68 @@ func (c *Collector) home() (string, error) {
 }
 
 func directDependencies(data string) (map[string]dependency, error) {
-	direct := map[string]dependency{}
-	section := ""
-
-	scanner := bufio.NewScanner(strings.NewReader(data))
-	for scanner.Scan() {
-		line := strings.TrimSpace(strings.SplitN(scanner.Text(), "#", 2)[0])
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			continue
-		}
-
-		if !dependencySection(section) || line == "" {
-			continue
-		}
-
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) == "" {
-			return nil, fmt.Errorf("invalid dependency line %q", line)
-		}
-
-		name := strings.Trim(strings.TrimSpace(key), `"'`)
-
-		packageName := name
-		if parsed := inlineField(value, "package"); parsed != "" {
-			packageName = parsed
-		}
-
-		direct[name] = dependency{packageName: packageName, path: inlineField(value, "path")}
+	var manifest cargoManifest
+	if err := toml.Unmarshal([]byte(data), &manifest); err != nil {
+		return nil, fmt.Errorf("invalid dependency line or manifest: %w", err)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, err
+	return manifest.directDependencies()
+}
+
+type dependencyTables struct {
+	Dependencies      map[string]any `toml:"dependencies"`
+	BuildDependencies map[string]any `toml:"build-dependencies"`
+}
+
+type cargoManifest struct {
+	dependencyTables
+	Target map[string]dependencyTables `toml:"target"`
+}
+
+func (m cargoManifest) directDependencies() (map[string]dependency, error) {
+	direct := map[string]dependency{}
+
+	tables := []dependencyTables{m.dependencyTables}
+	for _, target := range m.Target {
+		tables = append(tables, target)
+	}
+
+	for _, table := range tables {
+		for _, deps := range []map[string]any{table.Dependencies, table.BuildDependencies} {
+			for alias, value := range deps {
+				dep := dependency{packageName: alias}
+
+				switch value := value.(type) {
+				case string:
+				case map[string]any:
+					for _, field := range []string{"package", "path"} {
+						if raw, exists := value[field]; exists {
+							text, ok := raw.(string)
+							if !ok || text == "" {
+								return nil, fmt.Errorf("dependency %s: invalid %s", alias, field)
+							}
+
+							if field == "package" {
+								dep.packageName = text
+							} else {
+								dep.path = text
+							}
+						}
+					}
+				default:
+					return nil, fmt.Errorf("dependency %s: expected version or table", alias)
+				}
+
+				if previous, exists := direct[alias]; exists && previous != dep {
+					return nil, fmt.Errorf("dependency %s has conflicting declarations", alias)
+				}
+
+				direct[alias] = dep
+			}
+		}
 	}
 
 	return direct, nil
-}
-
-func inlineField(value, name string) string {
-	for _, field := range strings.Split(strings.Trim(value, " {}"), ",") {
-		key, fieldValue, found := strings.Cut(field, "=")
-		if found && strings.TrimSpace(key) == name {
-			return quotedValue(strings.TrimSpace(fieldValue))
-		}
-	}
-
-	return ""
-}
-
-func dependencySection(section string) bool {
-	return section == "dependencies" || section == "build-dependencies" ||
-		(strings.HasPrefix(section, "target.") && (strings.HasSuffix(section, ".dependencies") || strings.HasSuffix(section, ".build-dependencies")))
 }
 
 func lockedDirectVersions(data string, direct map[string]dependency, owner string) (map[string]string, error) {
