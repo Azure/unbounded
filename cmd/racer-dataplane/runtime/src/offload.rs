@@ -614,6 +614,7 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
                     wakes.push(waiter.waker.clone());
                 } else if fenced {
                     abandoned.push(*id);
+                    wakes.push(waiter.waker.clone());
                 }
             }
             wakes
@@ -940,6 +941,42 @@ mod tests {
         waiters.deliver(1, ());
         waiters.deliver(2, ());
         assert!(waiters.is_empty());
+    }
+
+    /// Fenced worker loss wakes bulk-abandoned pending delivery outside registry borrows.
+    #[test]
+    fn worker_loss_wakes_bulk_abandoned_pending_results() {
+        let waiters = Rc::new(Waiters::<u64, ()>::default());
+        let (count, waker) = wake_counter();
+        waiters.register(7, &waker);
+        let mut cx = Context::from_waker(&waker);
+        assert!(waiters.poll_result(7, &mut cx).is_pending());
+        waiters.abandon_all();
+        waiters.worker_closed(1, false);
+        waiters.worker_closed(0, true);
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
+        assert_eq!(waiters.len(), 1);
+        waiters.worker_closed(1, true);
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            waiters.poll_result(7, &mut cx),
+            Poll::Ready(Err(crate::Error::Cancelled))
+        );
+
+        let waker = callback_waker();
+        waiters.register(8, &waker);
+        assert!(
+            waiters
+                .poll_result(8, &mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        waiters.abandon_all();
+        let reenter = waiters.clone();
+        let _hook = on_callback(move || {
+            assert!(reenter.entries.try_borrow_mut().is_ok());
+            assert!(reenter.is_empty());
+        });
+        waiters.worker_closed(1, true);
     }
 
     /// Worker-loss inspection spends its budget on every visited entry, not only matches.
