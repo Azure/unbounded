@@ -65,6 +65,94 @@ func testClient(t *testing.T, path string, maxConn int) *Client {
 	return c
 }
 
+func TestStatAdmissionLeaseLifecycle(t *testing.T) {
+	for _, action := range []string{"success", "protocol", "context", "client"} {
+		t.Run(action, func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			defer close(release)
+
+			c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, head []byte) {
+				if !strings.HasPrefix(string(head), "HEAD /v2/objects/") {
+					t.Error("Stat did not issue HEAD")
+				}
+
+				close(entered)
+				<-release
+
+				if action == "protocol" {
+					_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+				} else {
+					_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n\r\n")
+					_, _ = io.Copy(io.Discard, reader)
+				}
+			})
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			done := make(chan error, 1)
+
+			go func() {
+				m, err := c.Stat(ctx, Request{})
+				if err == nil && m.Size != 7 {
+					t.Error("wrong Stat metadata", m)
+				}
+
+				done <- err
+			}()
+
+			<-entered
+			c.mu.Lock()
+
+			active := len(c.active)
+			for lease := range c.active {
+				if lease.pool != &c.metadataPool || lease.cleanup != nil {
+					t.Error("Stat lease attached value consumption state")
+				}
+			}
+			c.mu.Unlock()
+
+			if active != 1 || len(c.slots) != 0 || c.Stats().ActiveMetadata != 1 {
+				t.Fatal("wrong in-flight Stat accounting", active, c.Stats())
+			}
+
+			switch action {
+			case "context":
+				cancel()
+			case "client":
+				closeBody(c)
+			default:
+				release <- struct{}{}
+			}
+
+			err := <-done
+
+			switch action {
+			case "success":
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "protocol":
+				assertKind(t, err, ErrorProtocol)
+			case "context":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case "client":
+				assertKind(t, err, ErrorClosed)
+			}
+
+			c.mu.Lock()
+			active = len(c.active)
+			c.mu.Unlock()
+
+			if active != 0 || c.Stats().ActiveMetadata != 0 || c.Stats().BytesRead != 0 {
+				t.Fatal("Stat retained lease or counted body bytes", active, c.Stats())
+			}
+		})
+	}
+}
+
 func clientPeer(t *testing.T, handler http.Handler) string {
 	t.Helper()
 	return rawClientPeer(t, subscriptionHandler(handler))

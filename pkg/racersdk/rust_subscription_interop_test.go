@@ -326,30 +326,47 @@ func TestRustSubscriptionInterop(t *testing.T) {
 		assertInteropAccounting(t, stream)
 	})
 
-	t.Run("DownloadTo/partial-and-empty", func(t *testing.T) {
-		sink := &interopWriterAt{seen: make(map[int64]bool)}
-		options := ReadOptions{Offset: ByteOffset(PageSize - 7), Length: PageSize + 20, PageCredits: 1, ByteCredits: PageSize}
+	t.Run("OpenPages/large-bounded", func(t *testing.T) {
+		stream, err := client.OpenPages(ctx, Request{Key: Key{4}}, ReadOptions{PageCredits: 2, ByteCredits: 2 * PageSize})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeBody(stream)
 
-		n, err := client.DownloadTo(ctx, Request{Key: Key{3}}, sink, options)
-		if err != nil || n != int64(options.Length) || len(sink.seen) != 3 || !sink.seen[int64(options.Offset)] {
-			t.Fatal("partial absolute-offset download", n, err, sink.seen)
+		var total int64
+
+		seen := make(map[ByteOffset]bool)
+
+		for {
+			page, err := stream.Next()
+			if err == io.EOF {
+				break
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if seen[page.Offset] {
+				t.Fatal("duplicate offset", page.Offset)
+			}
+
+			seen[page.Offset] = true
+			checkInteropPage(t, page)
+			total += int64(len(page.Data))
+
+			assertInteropAccounting(t, stream)
+
+			if err := page.Release(); err != nil {
+				t.Fatal(err)
+			}
 		}
 
-		empty := &interopWriterAt{seen: make(map[int64]bool)}
-		if n, err := client.DownloadTo(ctx, Request{}, empty); n != 0 || err != nil || len(empty.seen) != 0 {
-			t.Fatal("empty download", n, err)
-		}
-	})
-
-	t.Run("DownloadTo/large-bounded", func(t *testing.T) {
-		sink := &interopWriterAt{seen: make(map[int64]bool)}
-
-		n, err := client.DownloadTo(ctx, Request{Key: Key{4}}, sink, ReadOptions{PageCredits: 2, ByteCredits: 2 * PageSize})
-		if err != nil || n != 32*int64(PageSize)+13 || len(sink.seen) != 33 {
-			t.Fatalf("download bytes=%d pages=%d: %v", n, len(sink.seen), err)
+		if total != 32*int64(PageSize)+13 || len(seen) != 33 {
+			t.Fatalf("bytes=%d pages=%d", total, len(seen))
 		}
 
-		t.Logf("verified %d bytes with two SDK page credits and 64 MiB Rust plaintext limit", n)
+		assertInteropAccounting(t, stream)
 	})
 
 	for _, closeStream := range []bool{false, true} {
@@ -412,13 +429,33 @@ func TestRustSubscriptionInterop(t *testing.T) {
 		})
 	}
 
-	t.Run("DownloadTo/writer-failure", func(t *testing.T) {
+	t.Run("OpenPages/writer-failure", func(t *testing.T) {
 		sentinel := errors.New("destination failure")
 
-		n, err := client.DownloadTo(ctx, Request{Key: Key{5}}, interopFailWriter{sentinel})
+		stream, err := client.OpenPages(ctx, Request{Key: Key{5}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeBody(stream)
+
+		page, err := stream.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		n, err := (writeFunc(func([]byte) (int, error) { return 0, sentinel })).Write(page.Data)
 		if n != 0 || !errors.Is(err, sentinel) {
 			t.Fatal(n, err)
 		}
+
+		closeBody(stream)
+
+		_ = page.Release()
+		if page.Data != nil || client.Stats().ActiveBulk != 0 {
+			t.Fatal("failed destination retained ownership")
+		}
+
+		assertInteropAccounting(t, stream)
 	})
 }
 
@@ -462,20 +499,3 @@ func (c *fragmentedReleaseConn) Write(p []byte) (int, error) {
 
 	return len(p), nil
 }
-
-// No object-sized backing buffer; validate absolute offsets and each byte.
-type interopWriterAt struct{ seen map[int64]bool }
-
-func (w *interopWriterAt) WriteAt(p []byte, offset int64) (int, error) {
-	if w.seen[offset] {
-		return 0, fmt.Errorf("duplicate offset %d", offset)
-	}
-
-	w.seen[offset] = true
-
-	return (&offsetSink{offset: offset}).Write(p)
-}
-
-type interopFailWriter struct{ err error }
-
-func (w interopFailWriter) WriteAt([]byte, int64) (int, error) { return 0, w.err }

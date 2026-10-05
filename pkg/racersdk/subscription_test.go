@@ -268,7 +268,7 @@ func TestPageStreamUnorderedReleaseAndCompletion(t *testing.T) {
 	defer closeBody(s)
 
 	p, err := s.Next()
-	if err != nil || p.Number != 1 || string(p.Data) != "xyz" {
+	if err != nil || p.Number != 1 || p.Offset != ByteOffset(PageSize) || string(p.Data) != "xyz" {
 		t.Fatal(p, err)
 	}
 
@@ -292,7 +292,7 @@ func TestPageStreamUnorderedReleaseAndCompletion(t *testing.T) {
 	}
 
 	next := <-result
-	if err := <-errors; err != nil || next.Number != 0 || string(next.Data) != "ab" {
+	if err := <-errors; err != nil || next.Number != 0 || next.Offset != ByteOffset(first) || string(next.Data) != "ab" {
 		t.Fatal(next, err)
 	}
 
@@ -383,65 +383,104 @@ func TestPageStreamMalformedFrames(t *testing.T) {
 	}
 }
 
-type writerAtFunc func([]byte, int64) (int, error)
+func TestPageStreamPartialAndEmptyRanges(t *testing.T) {
+	c, cleanup, err := NewFakeClient(func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+		if r.Key()[0] == 1 {
+			return originMeta(0), nil, nil
+		}
 
-func (f writerAtFunc) WriteAt(p []byte, off int64) (int, error) { return f(p, off) }
+		if r.Operation() == OperationHead {
+			return originMeta(9), nil, nil
+		}
 
-func TestDownloadToAbsoluteOffsetsAndFailures(t *testing.T) {
-	for _, mode := range []string{"success", "short", "error", "negative", "excess"} {
-		t.Run(mode, func(t *testing.T) {
-			c, cleanup, err := NewFakeClient(func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
-				if r.Operation() == OperationHead {
-					return originMeta(9), nil, nil
-				}
+		return originMeta(9), io.NopCloser(strings.NewReader("012345678")), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-				return originMeta(9), io.NopCloser(strings.NewReader("012345678")), nil
-			})
-			if err != nil {
-				t.Fatal(err)
+	t.Cleanup(cleanup)
+
+	for _, offset := range []ByteOffset{3, 9} {
+		o := ReadOptions{Offset: offset}
+		request := Request{}
+
+		if offset == 3 {
+			o.Length = 3
+		} else {
+			o.Offset = 0
+			request.Key[0] = 1
+		}
+
+		s, err := c.OpenPages(t.Context(), request, o)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		p, err := s.Next()
+		if offset == 3 {
+			if err != nil || p.Offset != 3 || string(p.Data) != "345" {
+				t.Fatal(p, err)
 			}
 
-			t.Cleanup(cleanup)
-
-			failed := errors.New("destination failed")
-			n, err := c.DownloadTo(t.Context(), Request{}, writerAtFunc(func(p []byte, off int64) (int, error) {
-				if off != 3 || string(p) != "345" {
-					t.Fatal(off, string(p))
-				}
-
-				switch mode {
-				case "short":
-					return 1, nil
-				case "error":
-					return 2, failed
-				case "negative":
-					return -1, nil
-				case "excess":
-					return 4, nil
-				}
-
-				return len(p), nil
-			}), ReadOptions{Offset: 3, Length: 3})
-
-			switch mode {
-			case "success":
-				if n != 3 || err != nil {
-					t.Fatal(n, err)
-				}
-			case "error":
-				if n != 2 || !errors.Is(err, failed) {
-					t.Fatal(n, err)
-				}
-			default:
-				if !errors.Is(err, io.ErrShortWrite) {
-					t.Fatal(n, err)
-				}
+			if err := p.Release(); err != nil || p.Data != nil {
+				t.Fatal("release retained payload", err)
 			}
 
-			if c.Stats().ActiveBulk != 0 {
-				t.Fatal("download leaked admission")
-			}
-		})
+			p, err = s.Next()
+		}
+
+		if p != nil || err != io.EOF {
+			t.Fatal("missing Complete", p, err)
+		}
+
+		closeBody(s)
+
+		if c.Stats().ActiveBulk != 0 {
+			t.Fatal("range retained admission")
+		}
+	}
+}
+
+func TestPageStreamCallerFailureReleasesOwnership(t *testing.T) {
+	c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
+		first, end := uint64(PageSize)-1, uint64(PageSize)+1
+		_, _ = io.WriteString(conn, subscriptionHead(end, first, end))
+		_ = fakeSubscriptionFrame(conn, 1, 0, first, 1)
+		_, _ = io.WriteString(conn, "x")
+		_, _ = io.Copy(io.Discard, reader)
+	})
+
+	s, err := c.OpenPages(t.Context(), Request{}, ReadOptions{Offset: ByteOffset(PageSize - 1), PageCredits: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(s)
+
+	p, err := s.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failed := errors.New("destination failed")
+
+	_, err = (writeFunc(func([]byte) (int, error) { return 0, failed })).Write(p.Data)
+	if !errors.Is(err, failed) {
+		t.Fatal(err)
+	}
+	// The caller owns cleanup after its destination fails. Close must not
+	// invalidate a held public lease, and Release must work after Close.
+	closeBody(s)
+
+	if string(p.Data) != "x" || c.Stats().ActiveBulk != 0 {
+		t.Fatal("close invalidated lease or retained admission")
+	}
+
+	assertKind(t, p.Release(), ErrorClosed)
+	assertKind(t, p.Release(), ErrorClosed)
+
+	if p.Data != nil || s.bytesHeld != 0 || len(s.outstanding) != 0 {
+		t.Fatal("release retained ownership")
 	}
 }
 
@@ -669,45 +708,6 @@ func TestPageStreamReleaseAfterTerminalAndIntervalBound(t *testing.T) {
 
 	if err := p.Release(); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestDownloadToUnorderedPages(t *testing.T) {
-	const (
-		first = uint64(PageSize) - 2
-		end   = uint64(PageSize) + 3
-	)
-
-	c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, head []byte) {
-		if headHeaders(head).Get("Racer-Ordered") != "0" {
-			t.Error("download forced ordering")
-		}
-
-		_, _ = io.WriteString(conn, subscriptionHead(end, first, end))
-		_ = fakeSubscriptionFrame(conn, 1, 1, uint64(PageSize), 3)
-		_, _ = io.WriteString(conn, "cde")
-
-		var release [12]byte
-		if _, err := io.ReadFull(reader, release[:]); err != nil {
-			return
-		}
-
-		_ = fakeSubscriptionFrame(conn, 1, 0, first, 2)
-		_, _ = io.WriteString(conn, "ab")
-		_ = fakeSubscriptionFrame(conn, 2, 2, 5, 0)
-	})
-
-	var (
-		data    [5]byte
-		offsets []int64
-	)
-
-	n, err := c.DownloadTo(t.Context(), Request{}, writerAtFunc(func(p []byte, off int64) (int, error) {
-		offsets = append(offsets, off)
-		return copy(data[uint64(off)-first:], p), nil
-	}), ReadOptions{Offset: ByteOffset(first), Length: 5, PageCredits: 1})
-	if err != nil || n != 5 || string(data[:]) != "abcde" || len(offsets) != 2 || offsets[0] != int64(PageSize) || offsets[1] != int64(first) {
-		t.Fatal(n, err, offsets, string(data[:]))
 	}
 }
 

@@ -159,7 +159,12 @@ func (p *Pool) Get(ctx context.Context, fresh bool) (*Conn, bool, error) {
 
 	p.connections.Add(1)
 
-	return &Conn{Conn: conn, Reader: bufio.NewReader(conn), pool: p, expiresAt: p.config.Now().Add(jitteredConnAge(p.config.MaxAge, p.config.Jitter))}, false, nil
+	return &Conn{
+		Conn:      conn,
+		Reader:    bufio.NewReader(conn),
+		pool:      p,
+		expiresAt: p.config.Now().Add(jitteredConnAge(p.config.MaxAge, p.config.Jitter)),
+	}, false, nil
 }
 
 // Recycle transfers a clean lease back to its originating pool. The caller must
@@ -248,7 +253,13 @@ func (p *Pool) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	return Stats{Dials: p.dials.Load(), ConnectionReuses: p.reuses.Load(), ConnectionRotations: p.rotations.Load(), Connections: p.connections.Load(), IdleConnections: len(p.idle)}
+	return Stats{
+		Dials:               p.dials.Load(),
+		ConnectionReuses:    p.reuses.Load(),
+		ConnectionRotations: p.rotations.Load(),
+		Connections:         p.connections.Load(),
+		IdleConnections:     len(p.idle),
+	}
 }
 
 // Body owns a connection lease. Close interrupts reads unless SetReusable was
@@ -271,6 +282,7 @@ func (b *Body) SetReusable(reusable bool) {
 	b.reusable = reusable
 }
 
+// Close returns a clean reusable connection or closes it, exactly once.
 func (b *Body) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

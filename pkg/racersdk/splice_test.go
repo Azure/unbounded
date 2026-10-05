@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build linux
-
 package racersdk
 
 import (
@@ -11,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -65,10 +62,7 @@ func TestValueWriteToSplicesOrderedHTTPBodies(t *testing.T) {
 		done <- err
 	}()
 
-	sink, err := NewFDSink(connection)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sink := &tcpTransferWriter{TCPConn: connection.(*net.TCPConn)}
 
 	n, err := v.WriteTo(sink)
 	if err != nil || n != size {
@@ -79,8 +73,8 @@ func TestValueWriteToSplicesOrderedHTTPBodies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if sink.SplicedBytes() != 0 {
-		t.Fatal("framed subscription bypassed page validation", sink.SplicedBytes())
+	if sink.readFrom != 0 {
+		t.Fatal("buffered subscription bypassed page validation", sink.readFrom)
 	}
 
 	if len(c.slots) != 0 {
@@ -93,6 +87,29 @@ func TestValueWriteToSplicesOrderedHTTPBodies(t *testing.T) {
 	}
 
 	closeBody(other)
+
+	streaming, err := c.GetStreaming(ctx, Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(streaming)
+
+	go func() {
+		_, err := io.CopyN(&offsetSink{}, peer, size)
+		done <- err
+	}()
+
+	if n, err := streaming.WriteToHTTP(sink); err != nil || n != size {
+		t.Fatal(n, err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	if sink.readFrom == 0 || c.Stats().ActiveBulk != 0 {
+		t.Fatal("streaming transfer did not dispatch ReaderFrom or release admission")
+	}
 }
 
 func TestValueWriteToSpliceCancellation(t *testing.T) {
@@ -104,10 +121,11 @@ func TestValueWriteToSpliceCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	v, err := c.Get(ctx, Request{})
+	v, err := c.GetStreaming(ctx, Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeBody(v)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -131,14 +149,15 @@ func TestValueWriteToSpliceCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sink, err := NewFDSink(connection)
-	if err != nil {
+	if err := peer.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 
+	sink := &tcpTransferWriter{TCPConn: connection.(*net.TCPConn)}
+
 	done := make(chan error, 1)
 
-	go func() { _, err := v.WriteTo(sink); done <- err }()
+	go func() { _, err := v.WriteToHTTP(sink); done <- err }()
 	// Consume a prefix, then leave the destination blocked and cancel the Value.
 	if _, err := io.CopyN(io.Discard, peer, 64*1024); err != nil {
 		t.Fatal(err)
@@ -160,44 +179,16 @@ func TestValueWriteToSpliceCancellation(t *testing.T) {
 	}
 }
 
-func TestValueServeHTTPLifecycle(t *testing.T) {
-	const size = int64(PageSize) + 173
+// tcpTransferWriter exposes the real TCP ReaderFrom and deadline implementations
+// without HTTP buffering, so transfers exercise Unix-to-TCP dispatch directly.
+type tcpTransferWriter struct {
+	*net.TCPConn
+	readFrom int
+}
 
-	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		first, last := fixtureRange(t, r, size)
-
-		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
-		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
-	}))
-	c := testClient(t, path, 2)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		v, err := c.Get(r.Context(), Request{})
-		if err != nil {
-			t.Error(err)
-			return
-		}
-
-		v.ServeHTTP(w, r)
-	}))
-	defer server.Close()
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	for range 2 {
-		response, err := client.Get(server.URL)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if response.ContentLength != size || response.Header.Get("ETag") != `"v"` {
-			t.Fatal("HTTP metadata")
-		}
-
-		n, err := io.Copy(&offsetSink{}, response.Body)
-		closeBody(response.Body)
-
-		if err != nil || n != size {
-			t.Fatal(n, err)
-		}
-	}
+func (w *tcpTransferWriter) Header() http.Header { return make(http.Header) }
+func (w *tcpTransferWriter) WriteHeader(int)     {}
+func (w *tcpTransferWriter) ReadFrom(r io.Reader) (int64, error) {
+	w.readFrom++
+	return w.TCPConn.ReadFrom(r)
 }

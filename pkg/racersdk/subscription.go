@@ -19,8 +19,11 @@ import (
 // PageLease owns one verified page slice. Data is valid until Release. Do not
 // copy a lease or access Data concurrently with Release. Release is idempotent.
 type PageLease struct {
+	// Number is the absolute object page number.
 	Number uint64
+	// Offset is the absolute object offset of the first byte in Data.
 	Offset ByteOffset
+	// Data is the verified selected slice, valid until Release.
 	Data   []byte
 	stream *PageStream
 	number uint64
@@ -30,6 +33,7 @@ type PageLease struct {
 	err    error
 }
 
+// Release returns the page's credits and invalidates Data exactly once.
 func (p *PageLease) Release() error {
 	if p == nil || p.stream == nil {
 		return failure(ErrorInvalidArgument, "page lease", nil)
@@ -69,9 +73,14 @@ type PageStream struct {
 	buffers chan []byte
 }
 
-func (s *PageStream) Metadata() Metadata              { return s.owner.metadata }
+// Metadata returns the immutable full-object metadata snapshot.
+func (s *PageStream) Metadata() Metadata { return s.owner.metadata }
+
+// Range returns the selected start offset and exclusive end offset.
 func (s *PageStream) Range() (ByteOffset, ByteOffset) { return ByteOffset(s.first), ByteOffset(s.end) }
-func (s *PageStream) Close() error                    { return s.owner.Close() }
+
+// Close cancels the subscription without draining; it is idempotent.
+func (s *PageStream) Close() error { return s.owner.Close() }
 
 // OpenPages resolves metadata and subscribes to the entire selected range with
 // one POST. It never performs a bootstrap or continuation request.
@@ -133,10 +142,12 @@ func (c *Client) OpenPages(ctx context.Context, request Request, options ...Read
 		pool = &c.smallPool
 	}
 
-	v, err := c.admit(ctx, pool)
+	lease, err := c.admit(ctx, pool)
 	if err != nil {
 		return nil, err
 	}
+
+	v := &Value{admissionLease: lease}
 
 	s := &PageStream{owner: v, pageCredits: o.PageCredits, byteCredits: uint64(o.ByteCredits), ordered: o.Ordered, outstanding: make(map[uint64]uint32), notify: make(chan struct{}, 1)}
 	if err := s.open(r, o); err != nil {
@@ -472,56 +483,4 @@ func (s *PageStream) release(number uint64, length uint32) error {
 	}
 
 	return nil
-}
-
-// DownloadTo writes page slices at absolute object offsets. It releases every
-// lease after WriteAt returns and closes the subscription on all exit paths.
-// An arbitrary caller-owned WriterAt cannot be interrupted by cancellation.
-func (c *Client) DownloadTo(ctx context.Context, request Request, w io.WriterAt, options ...ReadOptions) (int64, error) {
-	if w == nil {
-		return 0, failure(ErrorInvalidArgument, "download destination", nil)
-	}
-
-	s, err := c.OpenPages(ctx, request, options...)
-	if err != nil {
-		return 0, err
-	}
-	defer closeBody(s)
-
-	var written int64
-
-	for {
-		p, err := s.Next()
-		if err == io.EOF {
-			return written, nil
-		}
-
-		if err != nil {
-			return written, err
-		}
-
-		n, err := w.WriteAt(p.Data, int64(p.Offset))
-		if n < 0 || n > len(p.Data) {
-			n = 0
-
-			if err == nil {
-				err = io.ErrShortWrite
-			}
-		}
-
-		written += int64(n)
-		if err == nil && n != len(p.Data) {
-			err = io.ErrShortWrite
-		}
-
-		releaseErr := p.Release()
-
-		if err != nil {
-			return written, err
-		}
-
-		if releaseErr != nil {
-			return written, releaseErr
-		}
-	}
 }

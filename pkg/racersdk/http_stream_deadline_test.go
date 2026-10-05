@@ -132,7 +132,7 @@ func TestStreamingOperationClearPreservesCancellation(t *testing.T) {
 	defer cancel()
 
 	dst := &streamingDeadlineState{ResponseWriter: httptest.NewRecorder()}
-	h := &streamingHTTP{value: &Value{ctx: ctx}, controller: http.NewResponseController(dst)}
+	h := &streamingHTTP{value: &Value{admissionLease: &admissionLease{ctx: ctx}}, controller: http.NewResponseController(dst)}
 	interrupt := time.Now().Add(-time.Second)
 
 	cancel()

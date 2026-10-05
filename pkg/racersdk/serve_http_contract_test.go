@@ -46,12 +46,27 @@ func completeTestValue(t *testing.T, size uint64, completion string) *Value {
 	return v
 }
 
-func TestServeHTTPCompleteBeforeEmptySuccessAndAbortAfterCommit(t *testing.T) {
+func TestWriteToHTTPCompleteBeforeEmptySuccessAndAbortAfterCommit(t *testing.T) {
 	for _, mode := range []string{"http", "tls", "nonhijackable"} {
 		for _, size := range []uint64{0, 4, uint64(PageSize) + 1} {
 			for _, completion := range []string{"good", "bad", "missing"} {
 				t.Run(mode+"/"+strconv.FormatUint(size, 10)+"/"+completion, func(t *testing.T) {
 					v := completeTestValue(t, size, completion)
+					handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						defer closeBody(v)
+
+						w.Header().Set("Content-Length", strconv.FormatUint(size, 10))
+
+						n, err := v.WriteToHTTP(w)
+						if err != nil {
+							if n > 0 {
+								panic(http.ErrAbortHandler)
+							}
+
+							w.Header().Del("Content-Length")
+							http.Error(w, "value unavailable", http.StatusBadGateway)
+						}
+					})
 
 					if mode == "nonhijackable" {
 						w := httptest.NewRecorder()
@@ -61,7 +76,7 @@ func TestServeHTTPCompleteBeforeEmptySuccessAndAbortAfterCommit(t *testing.T) {
 						func() {
 							defer func() { caught = recover() }()
 
-							v.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+							handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
 						}()
 
 						if completion == "good" {
@@ -79,7 +94,7 @@ func TestServeHTTPCompleteBeforeEmptySuccessAndAbortAfterCommit(t *testing.T) {
 						return
 					}
 
-					server := httptest.NewUnstartedServer(v)
+					server := httptest.NewUnstartedServer(handler)
 
 					server.Config.ErrorLog = log.New(io.Discard, "", 0)
 					if mode == "tls" {
@@ -119,26 +134,5 @@ func TestServeHTTPCompleteBeforeEmptySuccessAndAbortAfterCommit(t *testing.T) {
 				})
 			}
 		}
-	}
-}
-
-func TestServeHTTPHeadDoesNotRequireCompleteAndStreamingIsRejected(t *testing.T) {
-	for _, size := range []uint64{0, 4} {
-		v := completeTestValue(t, size, "missing")
-		w := httptest.NewRecorder()
-		v.ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/", nil))
-
-		if w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("Content-Length") != strconv.FormatUint(size, 10) {
-			t.Fatal(w.Code, w.Body.Len(), w.Header())
-		}
-	}
-
-	v := completeTestValue(t, 0, "good")
-	v.streaming = true
-	w := httptest.NewRecorder()
-	v.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
-
-	if w.Code < 400 {
-		t.Fatal("ServeHTTP accepted exclusive streaming Value")
 	}
 }

@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -19,29 +18,6 @@ import (
 )
 
 type writeFunc func([]byte) (int, error)
-
-func TestServeHTTPPreservesContentTypeAndRejectsPartialValue(t *testing.T) {
-	for _, partial := range []bool{false, true} {
-		v := copyTestValue(t, io.NopCloser(strings.NewReader("abc")), 3)
-		v.metadata.Size = 3
-
-		v.metadata.ContentType = "text/plain"
-		if partial {
-			v.end = 2
-		}
-
-		response := httptest.NewRecorder()
-		v.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-
-		if partial {
-			if response.Code != http.StatusServiceUnavailable {
-				t.Fatalf("partial value status: %d", response.Code)
-			}
-		} else if response.Code != http.StatusOK || response.Body.String() != "abc" || response.Header().Get("Content-Type") != "text/plain" || response.Header().Get("Content-Length") != "3" {
-			t.Fatalf("response: %d %v %q", response.Code, response.Header(), response.Body.String())
-		}
-	}
-}
 
 func (f writeFunc) Write(p []byte) (int, error) { return f(p) }
 
