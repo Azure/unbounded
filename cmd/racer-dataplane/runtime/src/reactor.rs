@@ -45,6 +45,8 @@ enum Submission {
 }
 // Control-owned filesystem extension; shares this reactor's completion fences.
 pub mod filesystem;
+pub mod ready_set;
+pub mod timer;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,

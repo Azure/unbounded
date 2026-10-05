@@ -27,6 +27,7 @@ use racer_control_wire::canonical_content;
 use racer_control_wire::validate_publication;
 use racer_identity::KeyPurpose;
 use racer_identity::Keyring;
+use racer_identity::unix_time;
 use rest_client::Response;
 use serde::Deserialize;
 use serde::Serialize;
@@ -37,10 +38,10 @@ use std::cell::RefCell;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::net::SocketAddr;
+#[cfg(test)]
 use std::os::fd::AsRawFd;
+#[cfg(test)]
 use std::os::fd::FromRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -51,7 +52,10 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use uring_runtime::Busy;
 use uring_runtime::reactor::Descriptor;
+use uring_runtime::reactor::filesystem::secure;
+use uring_runtime::reactor::filesystem::secure::{BENEATH, NO_MAGICLINKS, NO_SYMLINKS};
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
@@ -141,24 +145,14 @@ pub struct ControlClient {
     pending: RefCell<Option<Rc<crate::control::PreparedPublication>>>,
     install_next: Cell<Option<Instant>>,
 }
-struct Busy<'a>(&'a Cell<bool>);
 struct ActiveTurn<'a>(&'a RefCell<Option<RequestScope>>);
 impl Drop for ActiveTurn<'_> {
     fn drop(&mut self) {
         self.0.borrow_mut().take();
     }
 }
-impl Drop for Busy<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
-    }
-}
 fn enter(flag: &Cell<bool>) -> Result<Busy<'_>> {
-    if flag.replace(true) {
-        Err(Error::Overloaded)
-    } else {
-        Ok(Busy(flag))
-    }
+    Busy::try_enter(flag).map_err(Into::into)
 }
 impl ControlClient {
     pub fn new(
@@ -1417,56 +1411,16 @@ impl ReactorControlIo {
     }
     pub fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
-            scope.check()?;
-            let duration = until.saturating_duration_since(uring_runtime::environment::now());
-            if duration.is_zero() {
-                return Ok(());
-            }
+            use uring_runtime::reactor::timer::SleepMode;
             #[cfg(test)]
-            if uring_runtime::reactor::simulation::Simulation::current().is_some() {
-                return std::future::poll_fn(|cx| {
-                    scope.check()?;
-                    if uring_runtime::environment::now() >= until {
-                        std::task::Poll::Ready(Ok(()))
-                    } else {
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                })
-                .await;
-            }
-            let raw = unsafe {
-                libc::timerfd_create(
-                    libc::CLOCK_MONOTONIC,
-                    libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
-                )
+            let mode = if uring_runtime::reactor::simulation::Simulation::current().is_some() {
+                SleepMode::ClockPoll
+            } else {
+                SleepMode::Kernel
             };
-            if raw < 0 {
-                return Err(Error::Io);
-            }
-            let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
-            let interval = libc::itimerspec {
-                it_interval: libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                },
-                it_value: libc::timespec {
-                    tv_sec: duration
-                        .as_secs()
-                        .try_into()
-                        .map_err(|_| Error::InvalidRequest)?,
-                    tv_nsec: duration.subsec_nanos() as _,
-                },
-            };
-            if unsafe { libc::timerfd_settime(fd.as_raw_fd(), 0, &interval, std::ptr::null_mut()) }
-                != 0
-            {
-                return Err(Error::Io);
-            }
-            self.reactor
-                .readiness(fd, libc::POLLIN as u32, scope)
-                .await?;
-            scope.check()
+            #[cfg(not(test))]
+            let mode = SleepMode::Kernel;
+            self.reactor.sleep_until(until, mode, scope).await
         })
     }
 }
@@ -2128,20 +2082,11 @@ impl LocalSigningIdentity {
 }
 
 // Bounded file operations issued only through the serving worker's reactor.
-const BENEATH: u64 = 0x08;
-const NO_MAGICLINKS: u64 = 0x02;
-const NO_SYMLINKS: u64 = 0x04;
 fn name(s: &OsStr) -> Result<CString> {
-    if s.as_bytes().len() > 4096 {
-        return Err(Error::InvalidRequest);
-    }
-    CString::new(s.as_bytes()).map_err(|_| Error::InvalidRequest)
+    secure::path_name(s, 4096).map_err(Into::into)
 }
 fn component(s: &str) -> Result<CString> {
-    if !matches!(Path::new(s).components().next(), Some(Component::Normal(_))) || s.contains('/') {
-        return Err(Error::InvalidRequest);
-    }
-    name(s.as_ref())
+    secure::component(s.as_ref(), 4096).map_err(Into::into)
 }
 pub(crate) async fn directory(
     r: &Reactor,
@@ -2150,43 +2095,7 @@ pub(crate) async fn directory(
     private: bool,
     scope: &RequestScope,
 ) -> Result<Rc<Descriptor>> {
-    // Bound traversal work before issuing the first operation.
-    name(path.as_os_str())?;
-    let mut fd = r
-        .file_open(
-            None,
-            CString::new(if path.is_absolute() { "/" } else { "." }).unwrap(),
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            NO_SYMLINKS,
-            scope,
-        )
-        .await?;
-    for part in path.components() {
-        let Component::Normal(part) = part else {
-            if matches!(part, Component::RootDir | Component::CurDir) {
-                continue;
-            }
-            return Err(Error::InvalidConfiguration);
-        };
-        if create {
-            match r.file_mkdir(fd.clone(), name(part)?, scope).await {
-                Ok(()) => r.file_sync(fd.clone(), scope).await?,
-                // An earlier canceled mkdir may have created this component but
-                // missed the parent fsync. Reestablish that durability fence.
-                Err(Error::Replay) => r.file_sync(fd.clone(), scope).await?,
-                Err(e) => return Err(e),
-            }
-        }
-        fd = r
-            .file_open(
-                Some(fd),
-                name(part)?,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-                BENEATH | NO_SYMLINKS,
-                scope,
-            )
-            .await?;
-    }
+    let fd = r.file_directory(path, create, 4096, scope).await?;
     if private {
         check_private(&r.file_stat(fd.clone(), scope).await?, false)?;
     }
@@ -2201,14 +2110,18 @@ fn check_private(stat: &libc::statx, regular: bool) -> Result<()> {
     };
     #[cfg(not(test))]
     let uid = unsafe { libc::geteuid() };
-    let mask = libc::STATX_MODE | libc::STATX_UID | libc::STATX_NLINK;
-    if stat.stx_mask & mask != mask {
-        return Err(Error::Io);
-    }
-    if stat.stx_mode & 0o077 != 0 || stat.stx_uid != uid || regular && stat.stx_nlink != 1 {
-        return Err(Error::Unauthorized);
-    }
-    Ok(())
+    secure::check_access(
+        stat,
+        secure::AccessRequirements {
+            owner: uid,
+            forbidden_mode: 0o077,
+            links: regular.then_some(1),
+        },
+    )
+    .map_err(|error| match error {
+        secure::AccessError::MissingMetadata => Error::Io,
+        secure::AccessError::PermissionDenied => Error::Unauthorized,
+    })
 }
 pub(crate) async fn read_file(
     r: &Reactor,
@@ -2221,30 +2134,17 @@ pub(crate) async fn read_file(
         return Err(Error::Overloaded);
     }
     let stat = r.file_stat(fd.clone(), scope).await?;
-    let mask = libc::STATX_TYPE | libc::STATX_SIZE;
-    if stat.stx_mask & mask != mask
-        || stat.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG
-        || stat.stx_size > limit as u64
-    {
-        return Err(Error::InvalidRequest);
-    }
+    secure::check_regular_size(&stat, limit as u64)?;
     if private {
         check_private(&stat, true)?;
     }
-    let mut out = Zeroizing::new(Vec::new());
-    loop {
-        let buffer = r.file_buffer((limit + 1 - out.len()).min(16384))?;
-        let completion = r
-            .read_at(fd.clone(), out.len() as u64, buffer, (), scope)
-            .await?;
-        if completion.bytes == 0 {
-            return Ok(out);
-        }
-        out.extend_from_slice(completion.buffer.prefix(completion.bytes)?);
-        if out.len() > limit {
-            return Err(Error::Overloaded);
-        }
-    }
+    r.file_read_bounded(
+        fd,
+        limit,
+        std::num::NonZeroUsize::new(16384).unwrap(),
+        scope,
+    )
+    .await
 }
 pub(crate) async fn read_path(
     r: &Reactor,
@@ -2282,28 +2182,6 @@ pub(crate) async fn read_at(
         .await?;
     read_file(r, fd, limit, private, scope).await
 }
-#[cfg(test)]
-pub(crate) async fn projected_file(
-    r: &Reactor,
-    path: &Path,
-    file: &str,
-    limit: usize,
-    scope: &RequestScope,
-) -> Result<Zeroizing<Vec<u8>>> {
-    let dir = directory(r, path, false, false, scope).await?;
-    // One openat2 resolves ..data and pins the target directory across rotation.
-    // BENEATH rejects absolute/escaping links; NO_MAGICLINKS rejects proc escapes.
-    let generation = r
-        .file_open(
-            Some(dir),
-            CString::new("..data").unwrap(),
-            libc::O_RDONLY | libc::O_DIRECTORY,
-            BENEATH | NO_MAGICLINKS,
-            scope,
-        )
-        .await?;
-    read_at(r, &generation, file, limit, false, scope).await
-}
 pub(crate) async fn atomic_write(
     r: &Reactor,
     dir: &Rc<Descriptor>,
@@ -2316,33 +2194,22 @@ pub(crate) async fn atomic_write(
         return Err(Error::Overloaded);
     }
     let temporary = format!(".{target}.stage");
-    remove(r, dir, &temporary, scope).await?;
     let fd = r
-        .file_open(
-            Some(dir.clone()),
-            component(&temporary)?,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            BENEATH | NO_SYMLINKS,
-            scope,
-        )
+        .file_stage(dir.clone(), temporary.as_ref(), 4096, scope)
         .await?;
-    let mut buffer = r.file_bytes(bytes)?;
-    let mut offset = 0;
-    while buffer.remaining() != 0 {
-        let completion = r.write_at(fd.clone(), offset, buffer, (), scope).await?;
-        buffer = completion.buffer;
-        buffer.advance(completion.bytes)?;
-        offset += completion.bytes as u64;
-    }
-    r.file_sync(fd, scope).await?;
-    r.file_rename(
-        dir.clone(),
-        component(&temporary)?,
-        component(target)?,
+    let buffer = r.file_bytes(bytes)?;
+    r.file_replace(
+        uring_runtime::reactor::filesystem::Replacement {
+            directory: dir.clone(),
+            staged: fd,
+            temporary: component(&temporary)?,
+            target: component(target)?,
+            durability: uring_runtime::reactor::filesystem::Durability::FileAndDirectory,
+        },
+        buffer,
         scope,
     )
-    .await?;
-    r.file_sync(dir.clone(), scope).await
+    .await
 }
 pub(crate) async fn remove(
     r: &Reactor,
@@ -2350,25 +2217,15 @@ pub(crate) async fn remove(
     file: &str,
     scope: &RequestScope,
 ) -> Result<()> {
-    match r.file_unlink(dir.clone(), component(file)?, scope).await {
-        Ok(()) | Err(Error::MissingKey) => (),
-        Err(e) => return Err(e),
-    }
-    r.file_sync(dir.clone(), scope).await
-}
-
-/// Racer TLS time adapter over the runtime's scoped wall clock.
-fn unix_time() -> rustls::pki_types::UnixTime {
-    rustls::pki_types::UnixTime::since_unix_epoch(
-        uring_runtime::environment::wall_now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default(),
-    )
+    r.file_remove_synced(dir.clone(), component(file)?, scope)
+        .await
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_support::enrollment as testing;
+    use crate::test_support::projected_file;
     use racer_control_wire::canonical_socket_paths;
     use racer_control_wire::content_hash;
     use racer_control_wire::decode_enrollment_request;
@@ -2434,7 +2291,7 @@ pub(crate) mod tests {
             let read = || {
                 testing::drive(
                     &reactor,
-                    Box::pin(crate::control::projected_file(
+                    Box::pin(crate::test_support::projected_file(
                         &reactor,
                         &d.0,
                         "bundle.json",
@@ -2467,112 +2324,10 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) mod testing {
-        use crate as dataplane;
-        use std::path::PathBuf;
-        use std::sync::atomic::AtomicU64;
-        use std::sync::atomic::Ordering;
-        #[allow(dead_code)]
-        mod io {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/support/enrollment.rs"
-            ));
-        }
-        pub(crate) use io::ca;
-        pub(crate) use io::drive;
-        pub(crate) use io::signing_identity;
-        pub(crate) struct Directory(pub PathBuf);
-        impl Directory {
-            pub fn new() -> Self {
-                static NEXT: AtomicU64 = AtomicU64::new(0);
-                let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("target/control-tests")
-                    .join(format!(
-                        "{}-{}",
-                        std::process::id(),
-                        NEXT.fetch_add(1, Ordering::Relaxed)
-                    ));
-                std::fs::create_dir_all(&path).unwrap();
-                Self(path)
-            }
-        }
-        impl Drop for Directory {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        pub(crate) fn scope() -> crate::runtime::RequestScope {
-            crate::runtime::RequestScope::new(
-                crate::model::RequestId([7; 16]),
-                std::time::Instant::now() + std::time::Duration::from_secs(10),
-            )
-            .unwrap()
-        }
-        pub(crate) fn reactor() -> Option<std::rc::Rc<crate::runtime::Reactor>> {
-            match io_uring::IoUring::new(2) {
-                Ok(ring) => drop(ring),
-                Err(e)
-                    if matches!(
-                        e.raw_os_error(),
-                        Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
-                    ) =>
-                {
-                    eprintln!("control io_uring unavailable: {e}");
-                    return None;
-                }
-                Err(e) => panic!("io_uring setup: {e}"),
-            }
-            Some(io::reactor())
-        }
-        pub(crate) fn issue(
-            request: &racer_control_wire::EnrollmentRequest,
-            ca: &rcgen::Certificate,
-            key: &rcgen::KeyPair,
-            node: &str,
-        ) -> racer_control_wire::EnrollmentResponse {
-            issue_at(
-                request,
-                ca,
-                key,
-                node,
-                uring_runtime::environment::wall_now() - std::time::Duration::from_secs(1),
-            )
-        }
-        pub(crate) fn issue_at(
-            request: &racer_control_wire::EnrollmentRequest,
-            ca: &rcgen::Certificate,
-            key: &rcgen::KeyPair,
-            node: &str,
-            not_before: std::time::SystemTime,
-        ) -> racer_control_wire::EnrollmentResponse {
-            let der =
-                rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
-            let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-            csr.params.not_before = not_before.into();
-            csr.params.not_after = (not_before + std::time::Duration::from_secs(86400)).into();
-            csr.params.subject_alt_names = vec![rcgen::SanType::URI(
-                format!("spiffe://{}/node/{node}", request.cluster.0)
-                    .try_into()
-                    .unwrap(),
-            )];
-            csr.params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-            csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-            let cert = csr.signed_by(ca, key).unwrap();
-            racer_control_wire::EnrollmentResponse {
-                schema_version: 1,
-                cluster: request.cluster.clone(),
-                node: racer_control_wire::NodeId(node.into()),
-                enrollment: request.enrollment.clone(),
-                certificate_chain: vec![cert.der().to_vec()],
-            }
-        }
-    }
-
     pub(crate) mod client_tests {
         use super::*;
         use crate::control::PublishedState;
-        use crate::control::tests::testing;
+        use crate::test_support::enrollment as testing;
         use racer_control_wire::ClusterId;
         use racer_control_wire::NodeId;
         use racer_identity::KeyEpochs;
@@ -3289,7 +3044,7 @@ pub(crate) mod tests {
     pub(crate) mod scenarios {
         use super::*;
         use crate::control::Enrollment;
-        use crate::control::tests::testing;
+        use crate::test_support::enrollment as testing;
         use std::cell::Cell;
         use std::cell::RefCell;
         use std::io::Read;
@@ -3928,7 +3683,7 @@ pub(crate) mod tests {
             assert!(enrollment.request(&pending).unwrap().rdma_nics.is_empty());
         }
         use super::*;
-        use crate::control::tests::testing;
+        use crate::test_support::enrollment as testing;
         const OLD_NODE: &str = "22222222-2222-4222-8222-222222222222";
         const NEW_NODE: &str = "33333333-3333-4333-8333-333333333333";
 
@@ -4328,7 +4083,79 @@ pub(crate) mod tests {
     pub(crate) mod async_files_tests {
         use super::*;
         use crate::control::Enrollment;
-        use crate::control::tests::testing;
+        use crate::test_support::enrollment as testing;
+        #[test]
+        fn secure_adapters_preserve_token_symlinks_identity_rejection_and_errors() {
+            use uring_runtime::reactor::simulation::Simulation;
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let r = testing::reactor().unwrap();
+            let scope = testing::scope();
+            sim.write_file(Path::new("/token-data"), b"token").unwrap();
+            sim.symlink(Path::new("token-data"), Path::new("/token"))
+                .unwrap();
+            assert_eq!(
+                &*testing::drive(&r, Box::pin(read_path(&r, Path::new("/token"), 5, &scope)))
+                    .unwrap(),
+                b"token"
+            );
+            let dir = testing::drive(
+                &r,
+                Box::pin(directory(&r, Path::new("/"), false, false, &scope)),
+            )
+            .unwrap();
+            assert!(matches!(
+                testing::drive(&r, Box::pin(read_at(&r, &dir, "token", 5, false, &scope))),
+                Err(Error::Io)
+            ));
+            assert!(matches!(
+                testing::drive(
+                    &r,
+                    Box::pin(read_at(&r, &dir, "token-data", 4, false, &scope))
+                ),
+                Err(Error::InvalidRequest)
+            ));
+            assert!(matches!(
+                testing::drive(
+                    &r,
+                    Box::pin(read_at(
+                        &r,
+                        &dir,
+                        "token-data",
+                        1024 * 1024 + 1,
+                        false,
+                        &scope
+                    ))
+                ),
+                Err(Error::Overloaded)
+            ));
+            assert!(matches!(
+                testing::drive(
+                    &r,
+                    Box::pin(directory(&r, Path::new("/../escape"), false, false, &scope))
+                ),
+                Err(Error::InvalidConfiguration)
+            ));
+            sim.chmod(Path::new("/token-data"), 0o644).unwrap();
+            assert!(matches!(
+                testing::drive(
+                    &r,
+                    Box::pin(read_at(&r, &dir, "token-data", 5, true, &scope))
+                ),
+                Err(Error::Unauthorized)
+            ));
+            sim.chmod(Path::new("/token-data"), 0o600).unwrap();
+            assert_eq!(
+                &*testing::drive(
+                    &r,
+                    Box::pin(read_at(&r, &dir, "token-data", 5, true, &scope))
+                )
+                .unwrap(),
+                b"token"
+            );
+            let stat: libc::statx = unsafe { std::mem::zeroed() };
+            assert_eq!(check_private(&stat, true), Err(Error::Io));
+        }
         #[test]
         fn enrollment_creates_private_child_beneath_kubelet_host_path() {
             use std::os::unix::fs::PermissionsExt;

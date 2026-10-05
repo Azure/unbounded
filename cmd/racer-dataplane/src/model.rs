@@ -167,19 +167,12 @@ pub struct PageSlice {
 impl ByteRange {
     /// Parse exactly one canonical SDK byte range, without trimming or merging.
     pub fn parse(value: &[u8]) -> Result<Self> {
-        let bounds = value.strip_prefix(b"bytes=").ok_or(Error::InvalidRange)?;
-        let separator = bounds
-            .iter()
-            .position(|&b| b == b'-')
-            .ok_or(Error::InvalidRange)?;
-        let (first, rest) = bounds.split_at(separator);
-        let last = &rest[1..];
-        let decimal = |bytes| parse_decimal(bytes).map_err(|_| Error::InvalidRange);
-        match (first.is_empty(), last.is_empty()) {
-            (true, true) => Err(Error::InvalidRange),
-            (true, false) => Self::suffix(decimal(last)?),
-            (false, true) => Self::from(decimal(first)?),
-            (false, false) => Self::closed(decimal(first)?, decimal(last)?),
+        let range = http1::range::ByteRange::parse_with(value, parse_decimal)
+            .map_err(|_| Error::InvalidRange)?;
+        match range {
+            http1::range::ByteRange::Closed { first, last } => Self::closed(first, last),
+            http1::range::ByteRange::From(first) => Self::from(first),
+            http1::range::ByteRange::Suffix(length) => Self::suffix(length),
         }
     }
 
@@ -296,86 +289,23 @@ pub const CONTENT_TYPE_HEADER: &str = "Racer-Content-Type";
 pub const MAX_CONTENT_TYPE_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContentType(String);
+pub struct ContentType(http1::ContentType);
 
 impl ContentType {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.is_empty()
-            || bytes.len() > MAX_CONTENT_TYPE_BYTES
-            || bytes.iter().any(|b| !(0x20..=0x7e).contains(b))
-            || bytes.first() == Some(&b' ')
-            || bytes.last() == Some(&b' ')
-        {
+        if bytes.len() > MAX_CONTENT_TYPE_BYTES {
             return Err(Error::InvalidRequest);
         }
-        let mut rest = bytes;
-        token(&mut rest)?;
-        consume(&mut rest, b'/')?;
-        token(&mut rest)?;
-        let mut parameters: Vec<&[u8]> = Vec::new();
-        while !rest.is_empty() {
-            spaces(&mut rest);
-            consume(&mut rest, b';')?;
-            spaces(&mut rest);
-            let name = token(&mut rest)?;
-            if parameters.iter().any(|old| old.eq_ignore_ascii_case(name)) {
-                return Err(Error::InvalidRequest);
-            }
-            parameters.push(name);
-            spaces(&mut rest);
-            consume(&mut rest, b'=')?;
-            spaces(&mut rest);
-            if rest.first() == Some(&b'"') {
-                rest = &rest[1..];
-                loop {
-                    let byte = *rest.first().ok_or(Error::InvalidRequest)?;
-                    rest = &rest[1..];
-                    match byte {
-                        b'"' => break,
-                        b'\\' => {
-                            rest = rest.get(1..).ok_or(Error::InvalidRequest)?;
-                        }
-                        _ => {}
-                    }
-                }
-            } else {
-                token(&mut rest)?;
-            }
-        }
-        Ok(Self(
-            String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidRequest)?,
-        ))
+        http1::ContentType::parse(bytes)
+            .map(Self)
+            .map_err(Into::into)
     }
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
-}
-fn spaces(rest: &mut &[u8]) {
-    while rest.first() == Some(&b' ') {
-        *rest = &rest[1..];
-    }
-}
-fn consume(rest: &mut &[u8], byte: u8) -> Result<()> {
-    if rest.first() != Some(&byte) {
-        return Err(Error::InvalidRequest);
-    }
-    *rest = &rest[1..];
-    Ok(())
-}
-fn token<'a>(rest: &mut &'a [u8]) -> Result<&'a [u8]> {
-    let length = rest
-        .iter()
-        .take_while(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b))
-        .count();
-    if length == 0 {
-        return Err(Error::InvalidRequest);
-    }
-    let value = &rest[..length];
-    *rest = &rest[length..];
-    Ok(value)
 }
 
 // Metadata

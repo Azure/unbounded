@@ -1,9 +1,15 @@
 //! Policy-driven flow control without application resource names or telemetry.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod adaptive;
+pub mod buffer;
+pub mod circuit;
+pub mod handoff;
+pub mod hedge;
 pub mod pipe;
 pub mod quota;
 pub mod window;
+pub use buffer::ChargedBuffer;
 pub use quota::{Charge, Class, Policy, Quotas, Rejection, SharedQuotas};
 pub use window::Window;
 

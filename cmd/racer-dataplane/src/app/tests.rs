@@ -22,6 +22,7 @@ use crate::security;
 use crate::security::CryptoClient;
 use crate::test_support::security::network;
 use crate::test_support::security::node;
+use crate::test_support::wake_test_worker;
 use crate::topology::RouteBudget;
 use http1::Header;
 use http1::MessageHead;
@@ -129,7 +130,7 @@ impl EnrollmentHandler {
         self.issued.fetch_add(1, Ordering::Release);
         (
             200,
-            wire::encode_enrollment_response(&crate::control::tests::testing::issue_at(
+            wire::encode_enrollment_response(&crate::test_support::enrollment::issue_at(
                 &request,
                 &self.ca,
                 &self.ca_key,
@@ -360,7 +361,7 @@ fn control_tls() -> (
     rcgen::KeyPair,
     Arc<rustls::ServerConfig>,
 ) {
-    let (ca, ca_key) = crate::control::tests::testing::ca();
+    let (ca, ca_key) = crate::test_support::enrollment::ca();
     let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
@@ -633,6 +634,158 @@ fn worker_sizing_reports_specific_resource_floor() {
 }
 
 #[test]
+fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
+    use uring_runtime::affinity::CpuLocation;
+    use uring_runtime::reactor::simulation::Simulation;
+    let config = Config::from_lookup(|name| {
+        Ok(match name {
+            "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+            "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+            "RACER_ENABLE_RDMA" => Some("false".into()),
+            "RACER_QUEUE_ENTRIES" => Some("16".into()),
+            _ => None,
+        })
+    })
+    .unwrap();
+    let mut plan = AffinityPlan::from_topology(
+        &config,
+        EffectiveTopology {
+            cpus: (0..8)
+                .map(|cpu| CpuLocation {
+                    cpu,
+                    package: 0,
+                    core: cpu,
+                    numa_node: Some(0),
+                })
+                .collect(),
+            quota: None,
+            nics: vec![],
+        },
+        &[],
+    )
+    .unwrap();
+    assert_eq!(plan.pairs.len(), 5);
+    for workers in 3..=5 {
+        assert_eq!(
+            partition_limits_with_cause(&config.limits, workers, false).err(),
+            Some(("queue_entries", Error::InvalidConfiguration))
+        );
+    }
+    let limits = size_workers(&config.limits, &mut plan, false).unwrap();
+    assert_eq!(plan.pairs.len(), 2);
+    assert_eq!(limits.queue_entries.get(), 8);
+
+    let minimum = crate::telemetry::CONTROL_SLOTS + 2;
+    for entries in 2..=minimum + 1 {
+        let mut node = config.limits.clone();
+        node.queue_entries = NonZeroUsize::new(entries).unwrap();
+        let result = partition_limits_with_cause(&node, 1, false);
+        if entries < minimum {
+            assert_eq!(
+                result.err(),
+                Some(("queue_entries", Error::InvalidConfiguration)),
+                "queue_entries={entries}"
+            );
+            let mut rejected_plan = AffinityPlan {
+                pairs: plan.pairs.clone(),
+                max_threads: plan.max_threads,
+            };
+            assert!(matches!(
+                size_workers(&node, &mut rejected_plan, false),
+                Err(Error::InvalidConfiguration)
+            ));
+            continue;
+        }
+
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            result.unwrap(),
+        )));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        reactor.init().unwrap();
+        let baseline = admission.used(ResourceClass::RequestContext);
+        let diagnostics =
+            crate::telemetry::DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap();
+        assert_eq!(
+            admission.used(ResourceClass::ControlProgress),
+            crate::telemetry::CONTROL_SLOTS
+        );
+        assert_eq!(
+            admission.used(ResourceClass::RequestContext),
+            baseline + crate::telemetry::RESERVED_BYTES
+        );
+        let ordinary = admission
+            .reserve(None, ResourceClass::ControlProgress, 2)
+            .unwrap();
+        let (reader, _writer) = sim.socket_pair();
+        let reader = Rc::new(reader);
+        let scope = scope(Duration::from_secs(30)).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut pending = Vec::new();
+        for _ in 0..entries - crate::telemetry::CONTROL_SLOTS {
+            let mut wait = reactor.readiness(reader.clone(), libc::POLLIN as u32, &scope);
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            pending.push(wait);
+        }
+        let mut excess = reactor.readiness(reader, libc::POLLIN as u32, &scope);
+        assert!(matches!(
+            excess.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        drop((excess, pending));
+        drive_peer(&reactor, reactor.drain()).unwrap();
+        drop((ordinary, diagnostics));
+        assert_eq!(admission.used(ResourceClass::ControlProgress), 0);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        drop(reactor);
+        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+    }
+}
+
+#[test]
+fn worker_sizing_rejects_four_queue_entries_with_two_threads() {
+    use uring_runtime::affinity::CpuLocation;
+    let config = Config::from_lookup(|name| {
+        Ok(match name {
+            "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+            "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+            "RACER_ENABLE_RDMA" => Some("false".into()),
+            "RACER_QUEUE_ENTRIES" => Some("4".into()),
+            "RACER_MAX_THREADS" => Some("2".into()),
+            _ => None,
+        })
+    })
+    .unwrap();
+    let mut plan = AffinityPlan::from_topology(
+        &config,
+        EffectiveTopology {
+            cpus: (0..8)
+                .map(|cpu| CpuLocation {
+                    cpu,
+                    package: 0,
+                    core: cpu,
+                    numa_node: None,
+                })
+                .collect(),
+            quota: None,
+            nics: vec![],
+        },
+        &[],
+    )
+    .unwrap();
+    assert_eq!(plan.pairs.len(), 1);
+    assert_eq!(
+        partition_limits_with_cause(&config.limits, 1, false).err(),
+        Some(("queue_entries", Error::InvalidConfiguration))
+    );
+    assert!(matches!(
+        size_workers(&config.limits, &mut plan, false),
+        Err(Error::InvalidConfiguration)
+    ));
+}
+
+#[test]
 fn worker_sizing_funds_derived_connection_pools() {
     use crate::admission::ResourceClass;
     use uring_runtime::affinity::CpuLocation;
@@ -719,28 +872,11 @@ fn worker_sizing_funds_derived_connection_pools() {
     }
 }
 
-pub(crate) fn wake_test_worker() -> WorkerApplication {
-    let config = crate::test_support::cluster::config(false);
-    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
-        config.limits.clone(),
-    )));
-    let (io, _engine) = security::pair(WorkerId(0), 0, config.limits.queue_entries);
-    WorkerApplication::assemble(
-        &config,
-        Arc::new(NodeState::default()),
-        WorkerId(0),
-        WorkerRuntime {
-            reactor: Rc::new(Reactor::new(admission.clone())),
-            admission,
-            crypto: Rc::new(CryptoClient::new(io)),
-        },
-        Vec::new(),
-    )
-    .unwrap()
-}
-
-pub(crate) fn wake_test_coordinator() -> Rc<Coordinator> {
-    wake_test_worker().coordinator
+impl WorkerApplication {
+    // Keep private-field access local; shared fixture assembly belongs to test_support.
+    pub(crate) fn into_test_coordinator(self) -> Rc<Coordinator> {
+        self.coordinator
+    }
 }
 
 #[test]
@@ -2973,8 +3109,10 @@ fn application() -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     config.limits.header_bytes = NonZeroUsize::new(32 * 1024).unwrap();
     config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();
     // Use the exact worker progress floor rather than the generous fixture budget.
-    config.limits.request_context_bytes =
-        NonZeroUsize::new(protocol::MIN_REQUEST_CONTEXT_BYTES + 4 * 32 * 1024).unwrap();
+    config.limits.request_context_bytes = NonZeroUsize::new(
+        crate::telemetry::RESERVED_BYTES + protocol::MIN_REQUEST_CONTEXT_BYTES + 4 * 32 * 1024,
+    )
+    .unwrap();
     partition_limits(&config.limits, 1, false).unwrap();
     local_worker(&config, &Arc::new(NodeState::default()), 0)
 }
@@ -3194,7 +3332,9 @@ fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
     // Fund control progress on all three planned shards so only context bytes
     // determine which worker counts pass the boundary assertions below.
     config.limits.client_connections = NonZeroUsize::new(36).unwrap();
-    let floor = protocol::MIN_REQUEST_CONTEXT_BYTES + 4 * config.limits.header_bytes.get();
+    let ordinary_floor = protocol::MIN_REQUEST_CONTEXT_BYTES
+        + 4 * config.limits.header_bytes.get().max(MAX_FIELD_BYTES);
+    let floor = crate::telemetry::RESERVED_BYTES + ordinary_floor;
     for budget in [128 * 1024, floor - 1, floor, 2 * floor - 1, 2 * floor] {
         config.limits.request_context_bytes = NonZeroUsize::new(budget).unwrap();
         assert_eq!(
@@ -3230,6 +3370,20 @@ fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
             let limits = result.unwrap();
             assert_eq!(plan.pairs.len(), (budget / floor).min(2));
             assert!(limits.request_context_bytes.get() >= floor);
+            let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits));
+            let diagnostics = admission
+                .reserve(
+                    None,
+                    ResourceClass::RequestContext,
+                    crate::telemetry::RESERVED_BYTES,
+                )
+                .unwrap();
+            let ordinary = admission
+                .reserve(None, ResourceClass::RequestContext, ordinary_floor)
+                .unwrap();
+            assert_eq!(admission.used(ResourceClass::RequestContext), floor);
+            drop((diagnostics, ordinary));
+            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
         }
     }
 }

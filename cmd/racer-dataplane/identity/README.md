@@ -29,3 +29,13 @@ timeout --signal=TERM --kill-after=10s 300s cargo test -p racer-dataplane --test
 
 Certificate and atomic-epoch tests live here. Cross-component page-engine and
 decode/BundleInstaller scenarios live in the application's top-level tests.
+
+`unix_time()` maps the scoped runtime wall clock to rustls time, clamping
+pre-epoch values to zero and retaining whole-second truncation. It does not
+change validity windows or certificate acceptance policy.
+
+The opt-in `test-util` feature exports `test_util::{ca,issue,issue_pending}`.
+These retain the existing Ed25519 CA and node-certificate fixture defaults;
+callers may customize certificate parameters explicitly. `issue_pending`
+uses an already generated identity key, without consuming additional entropy.
+Production dependencies do not enable this feature.

@@ -3,6 +3,15 @@
 use super::*;
 use std::ffi::CString;
 use zeroize::Zeroize;
+mod operations;
+pub use operations::{Durability, Replacement};
+mod chunked;
+pub use chunked::publish_new;
+#[cfg(all(test, feature = "simulation"))]
+mod operations_tests;
+pub mod secure;
+#[cfg(all(test, feature = "simulation"))]
+mod secure_tests;
 
 pub struct Buffer {
     data: Vec<u8>,

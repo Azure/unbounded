@@ -34,10 +34,8 @@ use racer_control_wire::KeyId;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
-use std::fs;
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -269,26 +267,17 @@ impl Checkpointer {
                     &scope,
                 )
                 .await?;
-            let mut offset = 0usize;
-            for chunk in bytes.chunks(16384) {
-                let mut buffer = reactor.file_bytes(chunk)?;
-                while buffer.remaining() != 0 {
-                    let completion = reactor
-                        .write_at(fd.clone(), offset as u64, buffer, (), &scope)
-                        .await?;
-                    if completion.bytes == 0 {
-                        return Err(Error::Io);
-                    }
-                    offset += completion.bytes;
-                    buffer = completion.buffer;
-                    buffer.advance(completion.bytes)?;
-                }
-            }
             reactor
-                .file_rename(
-                    dir,
-                    temporary,
-                    CString::new(CHECKPOINT_NAMES[slot]).unwrap(),
+                .file_replace_chunked(
+                    uring_runtime::reactor::filesystem::Replacement {
+                        directory: dir,
+                        staged: fd,
+                        temporary,
+                        target: CString::new(CHECKPOINT_NAMES[slot]).unwrap(),
+                        durability: uring_runtime::reactor::filesystem::Durability::Publish,
+                    },
+                    &bytes,
+                    std::num::NonZeroUsize::new(16384).unwrap(),
                     &scope,
                 )
                 .await
@@ -303,51 +292,23 @@ impl Drop for Checkpointer {
 }
 
 fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
-    #[cfg(test)]
-    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
-        sim.create_dir_all(directory).map_err(|_| Error::Io)?;
-        let temporary = directory.join(format!(".checkpoint.{}.tmp", sim.next_sequence()));
-        let result = (|| {
-            sim.write_file(&temporary, bytes).map_err(|_| Error::Io)?;
-            sim.rename(&temporary, &directory.join(CHECKPOINT_NAMES[slot]), 0)
-                .map_err(|_| Error::Io)
-        })();
-        if result.is_err() {
-            let _ = sim.unlink(&temporary);
-        }
-        return result;
-    }
-    fs::create_dir_all(directory).map_err(|_| Error::Io)?;
     // A stale partial file never prevents a later publication, including after PID
     // reuse. Exactly one application coordinator serializes publications.
-    let mut attempts = 0;
-    let (temporary, mut file) = loop {
-        if attempts == 128 {
-            return Err(Error::Io);
+    let candidates = (0..128).map(|_| {
+        #[cfg(test)]
+        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+            return directory.join(format!(".checkpoint.{}.tmp", sim.next_sequence()));
         }
-        attempts += 1;
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary =
-            directory.join(format!(".checkpoint.{}.{sequence}.tmp", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => break (temporary, file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(Error::Io),
-        }
-    };
-    let result = (|| {
-        file.write_all(bytes).map_err(|_| Error::Io)?;
-        drop(file);
-        fs::rename(&temporary, directory.join(CHECKPOINT_NAMES[slot])).map_err(|_| Error::Io)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+        directory.join(format!(".checkpoint.{}.{sequence}.tmp", std::process::id()))
+    });
+    uring_runtime::reactor::filesystem::publish_new(
+        directory,
+        &directory.join(CHECKPOINT_NAMES[slot]),
+        bytes,
+        candidates,
+    )
+    .map_err(|_| Error::Io)
 }
 
 /// Newest-valid checkpoint selection with empty-cache fallback and no payload scan.
@@ -656,20 +617,20 @@ impl CheckpointGeometry {
         )?)
     }
     pub fn validate(&self) -> Result<()> {
-        self.alignment()?;
-        if self.segment_bytes == 0
-            || self.slab_bytes == 0
-            || self.segment_count == 0
-            || self.segment_count > MAX_ITEMS as u64
-            || self.slab_bytes % self.segment_bytes != 0
-            || self.segment_count > self.slab_bytes / self.segment_bytes
-            || self.segment_bytes % self.offset_alignment != 0
-            || self.segment_bytes % self.length_alignment != 0
-            || self.segment_count.checked_mul(self.segment_bytes).is_none()
-        {
+        self.allocation_geometry()?;
+        Ok(())
+    }
+    fn allocation_geometry(&self) -> Result<page_alloc::SegmentGeometry> {
+        let alignment = self.alignment()?;
+        if self.segment_count > MAX_ITEMS as u64 {
             return Err(Error::CorruptRecord);
         }
-        Ok(())
+        Ok(page_alloc::SegmentGeometry::new(
+            self.slab_bytes,
+            self.segment_bytes,
+            self.segment_count,
+            alignment,
+        )?)
     }
     pub fn matches_alignment(&self, alignment: Alignment) -> bool {
         self.memory_alignment == alignment.memory() as u64
@@ -677,11 +638,7 @@ impl CheckpointGeometry {
             && self.length_alignment == alignment.length() as u64
     }
     pub(crate) fn validate_live(&self, segments: &Segments) -> Result<()> {
-        self.validate()?;
-        if segments.capacity_bytes() != self.slab_bytes
-            || segments.segment_bytes() != self.segment_bytes
-            || segments.snapshot()?.len() as u64 != self.segment_count
-        {
+        if !self.allocation_geometry()?.matches_segments(segments) {
             return Err(Error::InvalidConfiguration);
         }
         Ok(())
@@ -1084,25 +1041,30 @@ fn validate_image(image: &CheckpointImage) -> Result<()> {
 
 struct Encoder(Vec<u8>);
 impl Encoder {
+    fn writer(&mut self) -> wire_codec::Writer<'_> {
+        wire_codec::Writer::new(
+            &mut self.0,
+            MAX_CHECKPOINT_BYTES - DIGEST_BYTES,
+            wire_codec::Endian::Little,
+        )
+    }
     fn bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        if bytes.len() > (MAX_CHECKPOINT_BYTES - DIGEST_BYTES).saturating_sub(self.0.len()) {
-            return Err(Error::CorruptRecord);
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(())
+        self.writer().bytes(bytes).map_err(|_| Error::CorruptRecord)
     }
     fn u32(&mut self, value: u32) -> Result<()> {
-        self.bytes(&value.to_le_bytes())
+        self.writer().u32(value).map_err(|_| Error::CorruptRecord)
     }
     fn u64(&mut self, value: u64) -> Result<()> {
-        self.bytes(&value.to_le_bytes())
+        self.writer().u64(value).map_err(|_| Error::CorruptRecord)
     }
     fn count(&mut self, value: usize) -> Result<()> {
-        self.u32(u32::try_from(value).map_err(|_| Error::CorruptRecord)?)
+        self.writer().count(value).map_err(|_| Error::CorruptRecord)
     }
     fn string(&mut self, value: &[u8]) -> Result<()> {
-        self.count(value.len())?;
-        self.bytes(value)
+        // Descriptor validation owns field limits; preserve the u32 wire bound.
+        self.writer()
+            .length_prefixed(value, u32::MAX as usize)
+            .map_err(|_| Error::CorruptRecord)
     }
     fn descriptor(&mut self, metadata: &VersionMetadata) -> Result<()> {
         self.string(metadata.version.object.cache.0.as_bytes())?;
@@ -1128,15 +1090,10 @@ impl<'a> Decoder<'a> {
         Ok(cache + etag + mime)
     }
     fn count(&mut self, max: usize, minimum_bytes: usize) -> Result<usize> {
-        let count = self.u32()? as usize;
-        if count > max || count > self.0.len() / minimum_bytes {
-            return Err(Error::CorruptRecord);
-        }
-        Ok(count)
+        self.read(|reader| reader.count(max, minimum_bytes))
     }
     fn string(&mut self) -> Result<&'a [u8]> {
-        let length = self.count(MAX_STRING_BYTES, 1)?;
-        self.take(length)
+        self.read(|reader| reader.length_prefixed(MAX_STRING_BYTES))
     }
     fn descriptor(&mut self) -> Result<VersionMetadata> {
         let cache = std::str::from_utf8(self.string()?)

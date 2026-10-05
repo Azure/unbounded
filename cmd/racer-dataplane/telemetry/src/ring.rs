@@ -1,6 +1,42 @@
 //! Caller-synchronized bounded records. Clone under the caller's lock, then
 //! iterate and format the snapshot after releasing that lock.
 
+use std::sync::{Arc, Mutex, MutexGuard, TryLockResult};
+
+/// Shared bounded diagnostics. Poisoned locks retain records rather than losing
+/// diagnostics. Clone shares the writer; snapshot copies retention under the lock.
+pub struct SharedRing<T, const N: usize>(Arc<Mutex<Ring<T, N>>>);
+
+impl<T, const N: usize> Clone for SharedRing<T, N> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T, const N: usize> Default for SharedRing<T, N> {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(Ring::default())))
+    }
+}
+
+impl<T, const N: usize> SharedRing<T, N> {
+    pub fn push(&self, value: T) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(value);
+    }
+
+    /// Explicit access for callers that need a compound diagnostic observation.
+    pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, Ring<T, N>>> {
+        self.0.try_lock()
+    }
+}
+
+impl<T: Clone, const N: usize> SharedRing<T, N> {
+    /// The returned snapshot holds no lock; formatting cannot block writers.
+    pub fn snapshot(&self) -> Ring<T, N> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct Ring<T, const N: usize> {
     entries: [Option<(u64, T)>; N],
@@ -65,6 +101,49 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn shared_snapshots_release_lock_and_preserve_retention() {
+        let ring = SharedRing::<String, 2>::default();
+        let writer = ring.clone();
+        assert!(ring.snapshot().is_empty());
+        writer.push("first".into());
+        ring.push("second".into());
+        let snapshot = ring.snapshot();
+        assert!(ring.try_lock().is_ok());
+        writer.push("third".into());
+        assert_eq!(
+            snapshot
+                .iter_refs()
+                .map(|(n, s)| (n, s.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "first"), (2, "second")]
+        );
+        assert_eq!(
+            ring.snapshot()
+                .iter_refs()
+                .map(|(n, s)| (n, s.as_str()))
+                .collect::<Vec<_>>(),
+            [(2, "second"), (3, "third")]
+        );
+    }
+
+    #[test]
+    fn shared_ring_recovers_records_after_poisoning() {
+        let ring = SharedRing::<u8, 2>::default();
+        let writer = ring.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let mut guard = writer.0.lock().unwrap();
+                guard.push(1);
+                panic!("poison diagnostics");
+            })
+            .join()
+            .is_err()
+        );
+        ring.push(2);
+        assert_eq!(ring.snapshot().iter().collect::<Vec<_>>(), [(1, 1), (2, 2)]);
+    }
 
     #[test]
     fn clone_handles_preserve_snapshot_and_external_owners_after_overwrite() {

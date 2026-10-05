@@ -402,19 +402,7 @@ impl Reactor {
     }
 }
 
-/// Yield one cooperative turn without retaining an executor or I/O owner.
-pub(crate) async fn cooperative_turn() {
-    let mut yielded = false;
-    std::future::poll_fn(|cx| {
-        if std::mem::replace(&mut yielded, true) {
-            std::task::Poll::Ready(())
-        } else {
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await
-}
+pub(crate) use uring_runtime::yield_now as cooperative_turn;
 #[cfg(test)]
 mod tests {
     use super::HashMap;
@@ -1391,7 +1379,7 @@ mod tests {
                     .unwrap();
                 let bytes = drive(
                     &r,
-                    Box::pin(crate::control::projected_file(
+                    Box::pin(crate::test_support::projected_file(
                         &r,
                         Path::new("/projected"),
                         "bundle",

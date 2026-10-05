@@ -15,6 +15,13 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/testutil"
 )
 
+// Keep fixtures independent of crateInputs so omitted members fail collection tests.
+var workspaceMembers = []string{
+	"runtime", "alloc", "crypto", "verbs", "http", "http-splice", "topology",
+	"telemetry", "flow", "rest", "control-wire", "identity", "coalesce",
+	"uds-endpoint", "wire-codec", "env-config",
+}
+
 func TestCollectorCollectHermetic(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
@@ -283,7 +290,7 @@ func writeCollectorFixtures(t *testing.T, root, version string) {
 		t.Fatal(err)
 	}
 
-	for _, member := range []string{"runtime", "alloc", "crypto", "http", "telemetry"} {
+	for _, member := range workspaceMembers {
 		testutil.WriteTree(t, root, map[string]string{
 			"cmd/racer-dataplane/" + member + "/Cargo.toml": "[package]\nname = \"racer-" + member + "\"\n",
 		})
@@ -380,8 +387,19 @@ name = "racer-dataplane"
 racer-runtime = { path = "runtime" }
 racer-alloc = { path = "alloc" }
 racer-crypto = { path = "crypto" }
+rdma-verbs = { path = "verbs" }
 http1 = { path = "http" }
+http-splice = { path = "http-splice" }
+topology = { path = "topology" }
 telemetry = { path = "telemetry" }
+flow-control = { path = "flow" }
+rest-client = { path = "rest" }
+racer-control-wire = { path = "control-wire" }
+racer-identity = { path = "identity" }
+coalesce = { path = "coalesce" }
+uds-endpoint = { path = "uds-endpoint" }
+wire-codec = { path = "wire-codec" }
+env-config = { path = "env-config" }
 `,
 		"cmd/racer-dataplane/Cargo.lock": "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n",
 	})
@@ -392,7 +410,7 @@ telemetry = { path = "telemetry" }
 	lock := "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n"
 	want := map[string]string{"foo": "1.2.3"}
 
-	for _, member := range []string{"runtime", "alloc", "crypto", "http", "telemetry"} {
+	for _, member := range workspaceMembers {
 		name := member + "-dep"
 		want[name] = "1.2.3"
 		testutil.WriteTree(t, root, map[string]string{
@@ -428,7 +446,7 @@ version = "2.0.0"
 	}
 
 	// A stale adjacent member lock must not override the workspace lock.
-	for _, member := range []string{"runtime", "alloc", "crypto", "http", "telemetry"} {
+	for _, member := range workspaceMembers {
 		testutil.WriteTree(t, root, map[string]string{
 			"cmd/racer-dataplane/" + member + "/Cargo.lock": "invalid stale member lock\n",
 		})
@@ -459,14 +477,12 @@ version = "2.0.0"
 }
 
 func TestCollectorRequiresWorkspaceInputs(t *testing.T) {
-	for _, missing := range []string{
-		"cmd/racer-dataplane/runtime/Cargo.toml",
-		"cmd/racer-dataplane/alloc/Cargo.toml",
-		"cmd/racer-dataplane/crypto/Cargo.toml",
-		"cmd/racer-dataplane/http/Cargo.toml",
-		"cmd/racer-dataplane/telemetry/Cargo.toml",
-		"cmd/racer-dataplane/Cargo.lock",
-	} {
+	inputs := []string{"cmd/racer-dataplane/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"}
+	for _, member := range workspaceMembers {
+		inputs = append(inputs, "cmd/racer-dataplane/"+member+"/Cargo.toml")
+	}
+
+	for _, missing := range inputs {
 		t.Run(missing, func(t *testing.T) {
 			root := t.TempDir()
 			testutil.WriteTree(t, root, map[string]string{

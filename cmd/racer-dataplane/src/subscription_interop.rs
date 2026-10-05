@@ -1,4 +1,9 @@
-//! Opt-in Go SDK fixture using the production library, not a second crate root.
+//! Test-only Go SDK fixture, compiled only with the `subscription-interop` feature.
+//!
+//! This private module stays in the library because fixture assembly needs
+//! `Requester::scripted`, `ClientListeners::set_root`, and `MemoryCache::remove_cache`,
+//! which are crate-private. Moving it to the integration-test crate would expose
+//! those internals or compile a second crate root. Only the launcher is reexported.
 
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;

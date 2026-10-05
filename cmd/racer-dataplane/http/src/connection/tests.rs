@@ -511,3 +511,129 @@ fn completed_connect_releases_observation_charge_but_retains_connection_slot() {
     drop(connection);
     assert_eq!(hooks.slots.get(), 0);
 }
+
+#[test]
+fn exact_body_read_combines_ahead_and_socket_without_consuming_next_body_bytes() {
+    use std::io::Write;
+    let hooks = hooks();
+    let reactor = reactor();
+    let io = HttpIo::<Hooks>::new(reactor.clone(), Codec::new(128), hooks.clone(), 8, 8);
+    let (mut connection, mut peer) = lease(&hooks, Policy::default());
+    connection.rx_remaining = Some(6);
+    connection
+        .restore_read_ahead(OwnedBuffer::copy_from(hooks.as_ref(), b"ab").unwrap(), 0..2)
+        .unwrap();
+    peer.write_all(b"cdef").unwrap();
+    let first = drive(
+        &reactor,
+        io.read_body_exact(connection, io.buffer(4).unwrap(), &TestScope),
+    )
+    .unwrap();
+    assert_eq!(first.bytes, 4);
+    assert_eq!(first.buffer.bytes().unwrap(), b"abcd");
+    assert_eq!(first.lease.receive_remaining(), Some(2));
+    let last = drive(&reactor, io.collect_body(first.lease, 2, &TestScope)).unwrap();
+    assert_eq!(last.buffer.bytes().unwrap(), b"ef");
+    assert_eq!(last.lease.receive_remaining(), Some(0));
+}
+
+#[test]
+fn exact_body_read_rejects_short_framing_eof_and_missing_framing() {
+    use std::io::Write;
+    for (remaining, expected) in [
+        (Some(1), Failure::Runtime(uring_runtime::Error::Io)),
+        (Some(2), Failure::Runtime(uring_runtime::Error::Io)),
+        (None, Failure::Http(Error::Malformed)),
+    ] {
+        let hooks = hooks();
+        let reactor = reactor();
+        let io = HttpIo::<Hooks>::new(reactor.clone(), Codec::new(128), hooks.clone(), 8, 8);
+        let (mut connection, mut peer) = lease(&hooks, Policy::default());
+        connection.rx_remaining = remaining;
+        peer.write_all(b"a").unwrap();
+        drop(peer);
+        let result = drive(
+            &reactor,
+            io.read_body_exact(connection, io.buffer(2).unwrap(), &TestScope),
+        );
+        assert!(matches!(result, Err(error) if error == expected));
+        io.reclaim_buffer();
+        assert_eq!(hooks.used.get(), 0);
+        assert_eq!(hooks.slots.get(), 0);
+    }
+}
+
+#[test]
+fn empty_exact_read_preserves_no_io_behavior() {
+    let hooks = hooks();
+    let reactor = reactor();
+    let io = HttpIo::<Hooks>::new(reactor.clone(), Codec::new(128), hooks.clone(), 8, 8);
+    let (connection, _peer) = lease(&hooks, Policy::default());
+    let done = drive(
+        &reactor,
+        io.read_body_exact(connection, io.buffer(0).unwrap(), &TestScope),
+    )
+    .unwrap();
+    assert_eq!(done.bytes, 0);
+    assert_eq!(done.lease.receive_remaining(), None);
+    assert_eq!(reactor.in_flight(), 0);
+}
+
+#[test]
+fn exact_read_abandonment_retains_buffer_and_slot_until_drain() {
+    let hooks = hooks();
+    let reactor = reactor();
+    reactor.init().unwrap();
+    let io = HttpIo::<Hooks>::new(reactor.clone(), Codec::new(128), hooks.clone(), 8, 8);
+    let (mut connection, _peer) = lease(&hooks, Policy::default());
+    connection.rx_remaining = Some(4);
+    let mut operation = io.read_body_exact(connection, io.buffer(4).unwrap(), &TestScope);
+    assert!(
+        operation
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    drop(operation);
+    assert_eq!(hooks.used.get(), 4);
+    assert_eq!(hooks.slots.get(), 1);
+    drive(&reactor, reactor.drain()).unwrap();
+    io.reclaim_buffer();
+    assert_eq!(hooks.used.get(), 0);
+    assert_eq!(hooks.slots.get(), 0);
+}
+
+#[test]
+fn body_bytes_write_is_exact_and_enforces_framing() {
+    use std::io::Read;
+    for remaining in [0, 2, 3] {
+        let hooks = hooks();
+        let reactor = reactor();
+        let io = HttpIo::<Hooks>::new(reactor.clone(), Codec::new(128), hooks.clone(), 8, 8);
+        let (mut connection, mut peer) = lease(&hooks, Policy::default());
+        connection.tx_remaining = Some(remaining);
+        let result = drive(
+            &reactor,
+            io.write_body_bytes(connection, b"abc", &TestScope),
+        );
+        if remaining == 3 {
+            let done = result.unwrap();
+            assert_eq!(done.bytes, 3);
+            assert_eq!(done.buffer.bytes().unwrap(), b"abc");
+            assert_eq!(done.lease.send_remaining(), Some(0));
+            drop(done);
+        } else {
+            assert!(matches!(result, Err(Failure::Http(Error::Malformed))));
+        }
+        let mut wire = Vec::new();
+        peer.read_to_end(&mut wire).unwrap();
+        assert_eq!(
+            wire.as_slice(),
+            if remaining == 3 {
+                b"abc".as_slice()
+            } else {
+                b""
+            }
+        );
+    }
+}

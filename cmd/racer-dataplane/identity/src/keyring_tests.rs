@@ -117,6 +117,36 @@ fn every_install_rejects_opaque_zero_and_future_key_generations() {
         }
     }
 }
+
+#[test]
+fn public_install_preserves_generation_errors_and_installed_state() {
+    let keys = keys();
+    let roots = (*keys.peer_trust_roots().unwrap()).clone();
+    for id in [
+        KeyId([1; 16]),
+        KeyId(*b"RKG1\0\0\0\0\0\0\0\0\0\0\0\0"),
+        KeyId::from_generation(3, 0).unwrap(),
+    ] {
+        let bundle = racer_control_wire::KeyringBundle {
+            schema_version: SCHEMA_VERSION,
+            cluster: ClusterId(CLUSTER.into()),
+            generation: BundleGeneration(2),
+            peer_trust_roots: roots.clone(),
+            cache_keys: vec![racer_control_wire::CacheEncryptionKey::new(
+                CacheKeyRef {
+                    cache: CacheId(CACHE.into()),
+                    id,
+                    purpose: CacheKeyPurpose::Page,
+                },
+                CacheKeyState::Active,
+                Zeroizing::new([9; 32]),
+            )],
+        };
+        assert_eq!(keys.install(bundle), Err(Error::InvalidConfiguration));
+        assert_eq!(keys.generation().unwrap(), Some(1));
+    }
+}
+
 fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> KeyringBundle {
     KeyringBundle {
         schema_version: SCHEMA_VERSION,

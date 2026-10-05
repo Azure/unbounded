@@ -25,11 +25,9 @@ use crate::memory::AcquiredPage;
 use crate::memory::PageResult;
 use crate::memory::UnverifiedPage;
 use crate::model::PageId;
-use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::future::poll_fn;
 use std::rc::Rc;
 use std::task::Context;
@@ -64,56 +62,58 @@ impl Default for FlightLimits {
     }
 }
 
-#[derive(Default)]
-pub(super) struct Table {
-    pub(super) entries: HashMap<PageId, Entry>,
-    sweep: BTreeMap<u64, PageId>,
-    sweep_cursor: u64,
-    next_incarnation: u64,
-    next_waiter: u64,
-    next_operation: u64,
-    stopping: bool,
-    drain_waker: Option<Waker>,
-}
+#[cfg(not(test))]
+type FlightHashState = std::collections::hash_map::RandomState;
+#[cfg(test)]
+type FlightHashState = crate::runtime::HashState;
+pub(super) type Table = coalesce::flight::Table<PageId, Entry, FlightHashState>;
 pub(super) struct Entry {
     fence: Fence,
-    pub(super) phase: Phase,
-    leader: Option<u64>,
-    pub(super) waiters: BTreeMap<u64, WaiterRecord>,
-    pub(super) deadlines: BTreeMap<(Instant, u64), ()>,
-    waiter_cursor: u64,
-    operations: HashMap<u64, Option<Retained>>,
-    ciphertext: Option<UnverifiedPage>,
+    state: FlightCore,
+    operations: coalesce::flight::Operations<Retained, FlightHashState>,
     _reservation: flow_control::Charge<AdmissionPolicy>,
+}
+type FlightCore =
+    coalesce::flight::state::State<PageResult, UnverifiedPage, AcquiredPage, WaiterRecord>;
+impl std::ops::Deref for Entry {
+    type Target = FlightCore;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl std::ops::DerefMut for Entry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 pub(super) struct WaiterRecord {
     scope: RequestScope,
-    acquisition: bool,
-    plaintext: bool,
     pub(super) budget_deadline: Instant,
-    issued: bool,
-    error: Option<Error>,
-    waker: Option<Waker>,
     _reservation: flow_control::Charge<AdmissionPolicy>,
+}
+impl coalesce::flight::state::WaiterPolicy for WaiterRecord {
+    type Error = Error;
+    fn check(&self) -> Option<Error> {
+        self.scope.check().err().or_else(|| {
+            (uring_runtime::environment::now() >= self.budget_deadline)
+                .then_some(Error::DeadlineExceeded)
+        })
+    }
+    fn deadline(&self) -> Instant {
+        self.scope.deadline.0.min(self.budget_deadline)
+    }
 }
 struct Retained {
     _resources: telemetry::Lease,
     _reservation: flow_control::Charge<AdmissionPolicy>,
 }
-pub(super) enum Outcome {
-    Published(AcquiredPage),
-    Failed(Error),
-    Retry,
+pub(super) type Outcome = coalesce::flight::state::Outcome<AcquiredPage, Error>;
+pub(super) type Phase = coalesce::flight::state::Phase<PageResult, AcquiredPage, Error>;
+pub(super) trait PhaseState {
+    fn state(&self) -> FlightState;
 }
-pub(super) enum Phase {
-    Acquiring,
-    RetryPending,
-    Draining(Outcome),
-    Complete(PageResult),
-    Failed(Error),
-}
-impl Phase {
-    pub(super) fn state(&self) -> FlightState {
+impl PhaseState for Phase {
+    fn state(&self) -> FlightState {
         match self {
             Self::Acquiring => FlightState::Acquiring,
             Self::RetryPending => FlightState::RetryPending,
@@ -144,7 +144,7 @@ impl FlightOperation {
     pub fn cancellation_requested(&self) -> bool {
         let table = self.flights.table.borrow();
         table.stopping
-            || table.entries.get(&self.fence.page).is_none_or(|entry| {
+            || table.get(&self.fence.page).is_none_or(|entry| {
                 self.fence.validate(&entry.fence).is_err()
                     || !matches!(entry.phase, Phase::Acquiring)
                     || entry
@@ -316,21 +316,28 @@ impl AcquisitionBudget {
 /// Counters must never wrap; drain/restart the owner before exhaustion.
 #[derive(Clone)]
 pub(super) struct Fence {
-    pub(super) owner: Rc<()>,
     pub(super) page: PageId,
-    pub(super) incarnation: u64,
-    pub(super) generation: u64,
+    pub(super) identity: coalesce::flight::Identity,
+}
+impl std::ops::Deref for Fence {
+    type Target = coalesce::flight::Identity;
+    fn deref(&self) -> &Self::Target {
+        &self.identity
+    }
+}
+impl std::ops::DerefMut for Fence {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.identity
+    }
 }
 impl Fence {
     pub(super) fn validate(&self, current: &Self) -> Result<()> {
-        if !Rc::ptr_eq(&self.owner, &current.owner)
-            || self.page != current.page
-            || self.incarnation != current.incarnation
-            || self.generation != current.generation
-        {
+        if self.page != current.page {
             return Err(Error::StaleFlight);
         }
-        Ok(())
+        self.identity
+            .validate(&current.identity)
+            .map_err(|_| Error::StaleFlight)
     }
 }
 
@@ -456,24 +463,24 @@ impl AcquisitionWaiter<'_> {
                     Err(error) => return Poll::Ready(Err(error)),
                 };
                 refresh(entry, wakes);
-                let waiter = entry.waiters.get_mut(&self.registration.id).unwrap();
+                let waiter = entry.state.waiters.get_mut(&self.registration.id).unwrap();
                 if let Some(error) = waiter.error {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                 }
-                if let Phase::Complete(result) = &entry.phase {
+                if let Phase::Complete(result) = &entry.state.phase {
                     return Poll::Ready(Ok(AcquisitionEvent::Complete(result.clone())));
                 }
-                if !waiter.plaintext {
-                    if let Some(copy) = &entry.ciphertext {
+                if !waiter.complete {
+                    if let Some(copy) = &entry.state.partial {
                         return Poll::Ready(Ok(AcquisitionEvent::Ciphertext(copy.clone())));
                     }
                 }
-                if let Phase::Failed(error) = entry.phase {
+                if let Phase::Failed(error) = entry.state.phase {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                 }
-                if matches!(entry.phase, Phase::RetryPending) && !waiter.issued {
+                if matches!(entry.state.phase, Phase::RetryPending) && !waiter.issued {
                     if uring_runtime::environment::now() >= self.budget.deadline
-                        || (self.budget.attempts == 0 && entry.ciphertext.is_none())
+                        || (self.budget.attempts == 0 && entry.state.partial.is_none())
                     {
                         let error = if self.budget.attempts == 0 {
                             Error::Unavailable
@@ -484,15 +491,21 @@ impl AcquisitionWaiter<'_> {
                         refresh(entry, wakes);
                         return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                     }
-                    if entry.fence.generation >= flights.limits.generations_per_flight {
-                        entry.phase = Phase::Draining(Outcome::Failed(Error::Unavailable));
+                    if entry
+                        .state
+                        .elect(
+                            self.registration.id,
+                            &mut entry.fence.identity,
+                            flights.limits.generations_per_flight,
+                        )
+                        .is_err()
+                    {
+                        entry
+                            .state
+                            .begin_completion(Outcome::Failed(Error::Unavailable));
                         settle(entry, wakes);
                         return Poll::Ready(Ok(AcquisitionEvent::Failed(Error::Unavailable)));
                     }
-                    entry.fence.generation += 1;
-                    entry.phase = Phase::Acquiring;
-                    entry.leader = Some(self.registration.id);
-                    waiter.issued = true;
                     self.registration.fence.generation = entry.fence.generation;
                     return Poll::Ready(Ok(AcquisitionEvent::Lead(FlightLeader {
                         flights: flights.clone(),
@@ -501,7 +514,7 @@ impl AcquisitionWaiter<'_> {
                         active: true,
                     })));
                 }
-                store_waker(&mut waiter.waker, cx);
+                coalesce::flight::state::store_waker(&mut waiter.waker, cx.waker());
                 Poll::Pending
             })
         }))
@@ -551,20 +564,20 @@ impl CopyWaiter<'_> {
                     Err(error) => return Poll::Ready(Err(error)),
                 };
                 refresh(entry, wakes);
-                let waiter = entry.waiters.get_mut(&self.registration.id).unwrap();
+                let waiter = entry.state.waiters.get_mut(&self.registration.id).unwrap();
                 if let Some(error) = waiter.error {
                     return Poll::Ready(Err(error));
                 }
-                if let Phase::Failed(error) = entry.phase {
+                if let Phase::Failed(error) = entry.state.phase {
                     return Poll::Ready(Err(error));
                 }
-                if let Phase::Complete(result) = &entry.phase {
+                if let Phase::Complete(result) = &entry.state.phase {
                     return Poll::Ready(Ok(result.clone().into()));
                 }
-                if let Some(copy) = &entry.ciphertext {
+                if let Some(copy) = &entry.state.partial {
                     return Poll::Ready(Ok(AcquiredPage::Ciphertext(copy.clone())));
                 }
-                store_waker(&mut waiter.waker, cx);
+                coalesce::flight::state::store_waker(&mut waiter.waker, cx.waker());
                 Poll::Pending
             })
         }))
@@ -624,7 +637,7 @@ impl Flights {
                 return Some(result.copy());
             }
             entry
-                .ciphertext
+                .partial
                 .as_ref()
                 .map(|p| p.copy.clone())
                 .or_else(|| match &entry.phase {
@@ -644,12 +657,7 @@ impl Flights {
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Table, &mut Vec<Waker>) -> T) -> T {
-        let mut wakes = Vec::new();
-        let result = f(&mut self.table.borrow_mut(), &mut wakes);
-        for waker in wakes {
-            waker.wake();
-        }
-        result
+        coalesce::flight::update(&self.table, f)
     }
 
     /// Validate context.object against page.version.object before registration.
@@ -682,14 +690,14 @@ impl Flights {
             if table.stopping {
                 return Err(Error::Cancelled);
             }
-            self.admit_join(&page, table.entries.get(&page))?;
-            if let Some(entry) = table.entries.get_mut(&page) {
+            self.admit_join(&page, table.get(&page))?;
+            if let Some(entry) = table.get_mut(&page) {
                 refresh(entry, wakes);
                 if let Phase::Complete(result) = &entry.phase {
                     return Ok(JoinedFlight::Complete(result.clone()));
                 }
                 if !plaintext {
-                    if let Some(copy) = &entry.ciphertext {
+                    if let Some(copy) = &entry.partial {
                         return Ok(JoinedFlight::Ciphertext(copy.clone()));
                     }
                 }
@@ -703,12 +711,7 @@ impl Flights {
             if uring_runtime::environment::now() >= budget.deadline {
                 return Err(Error::DeadlineExceeded);
             }
-            if budget.attempts == 0
-                && table
-                    .entries
-                    .get(&page)
-                    .is_none_or(|e| e.ciphertext.is_none())
-            {
+            if budget.attempts == 0 && table.get(&page).is_none_or(|e| e.partial.is_none()) {
                 return Err(Error::Unavailable);
             }
             let cancellation = scope.cancellation.subscribe()?;
@@ -717,9 +720,9 @@ impl Flights {
                 ResourceClass::Waiter,
                 1,
             )?;
-            let id = next(&mut table.next_waiter)?;
-            if !table.entries.contains_key(&page) {
-                if table.entries.len() >= self.limits.entries {
+            let id = table.next_waiter.next_id().map_err(|_| Error::Overloaded)?;
+            if !table.contains_key(&page) {
+                if table.len() >= self.limits.entries {
                     return Err(Error::Overloaded);
                 }
                 let flight = self.admission.reserve(
@@ -727,44 +730,32 @@ impl Flights {
                     ResourceClass::Flight,
                     1,
                 )?;
-                let incarnation = next(&mut table.next_incarnation)?;
-                table.entries.insert(
+                let identity = table
+                    .identity(self.owner.clone())
+                    .map_err(|_| Error::Overloaded)?;
+                table.insert(
                     page.clone(),
                     Entry {
                         fence: Fence {
-                            owner: self.owner.clone(),
                             page: page.clone(),
-                            incarnation,
-                            generation: 0,
+                            identity,
                         },
-                        phase: Phase::RetryPending,
-                        leader: None,
-                        waiters: BTreeMap::new(),
-                        deadlines: BTreeMap::new(),
-                        waiter_cursor: 0,
-                        operations: HashMap::default(),
-                        ciphertext: None,
+                        state: FlightCore::default(),
+                        operations: coalesce::flight::Operations::default(),
                         _reservation: flight,
                     },
                 );
-                table.sweep.insert(incarnation, page.clone());
             }
-            let entry = table.entries.get_mut(&page).unwrap();
-            entry
-                .deadlines
-                .insert((scope.deadline.0.min(budget.deadline), id), ());
-            entry.waiters.insert(
+            let entry = table.get_mut(&page).unwrap();
+            entry.state.register(
                 id,
                 WaiterRecord {
                     scope: scope.clone(),
-                    acquisition: true,
-                    plaintext,
                     budget_deadline: budget.deadline,
-                    issued: false,
-                    error: None,
-                    waker: None,
                     _reservation: reservation,
                 },
+                true,
+                plaintext,
             );
             Ok(JoinedFlight::Waiter(AcquisitionWaiter {
                 registration: Registration {
@@ -794,7 +785,7 @@ impl Flights {
             if table.stopping {
                 return Err(Error::Cancelled);
             }
-            let Some(entry) = table.entries.get_mut(page) else {
+            let Some(entry) = table.get_mut(page) else {
                 return Ok(JoinedCopy::Miss);
             };
             if self.admit_join(page, Some(entry)).is_err() {
@@ -804,7 +795,7 @@ impl Flights {
             if let Phase::Complete(result) = &entry.phase {
                 return Ok(JoinedCopy::Complete(result.clone()));
             }
-            if let Some(copy) = &entry.ciphertext {
+            if let Some(copy) = &entry.partial {
                 return Ok(JoinedCopy::Ciphertext(copy.clone()));
             }
             if matches!(entry.phase, Phase::Failed(_) | Phase::Draining(_)) {
@@ -819,20 +810,17 @@ impl Flights {
                 ResourceClass::Waiter,
                 1,
             )?;
-            let id = next(&mut table.next_waiter)?;
-            entry.deadlines.insert((scope.deadline.0, id), ());
-            entry.waiters.insert(
+            let id = table.next_waiter.next_id().map_err(|_| Error::Overloaded)?;
+            let entry = table.get_mut(page).expect("existing copy flight");
+            entry.state.register(
                 id,
                 WaiterRecord {
                     scope: scope.clone(),
-                    acquisition: false,
-                    plaintext: false,
                     budget_deadline: scope.deadline.0,
-                    issued: false,
-                    error: None,
-                    waker: None,
                     _reservation: reservation,
                 },
+                false,
+                false,
             );
             Ok(JoinedCopy::Waiter(CopyWaiter {
                 registration: Registration {
@@ -856,12 +844,12 @@ impl Flights {
     }
 
     pub(crate) fn ciphertext_for(&self, leader: &FlightLeader) -> Result<Option<UnverifiedPage>> {
-        self.update(|table, wakes| Ok(self.leader_entry(table, leader, wakes)?.ciphertext.clone()))
+        self.update(|table, wakes| Ok(self.leader_entry(table, leader, wakes)?.partial.clone()))
     }
 
     pub(crate) fn discard_ciphertext(&self, leader: &FlightLeader) -> Result<()> {
         self.update(|table, wakes| {
-            self.leader_entry(table, leader, wakes)?.ciphertext = None;
+            self.leader_entry(table, leader, wakes)?.partial = None;
             Ok(())
         })
     }
@@ -874,7 +862,7 @@ impl Flights {
         self.update(|table, wakes| {
             let entry = self.leader_entry(table, &leader, wakes)?;
             page.validate_for(&entry.fence.page)?;
-            entry.phase = Phase::Draining(Outcome::Published(page));
+            entry.state.begin_completion(Outcome::Published(page));
             leader.active = false;
             settle(entry, wakes);
             Ok(entry.phase.state())
@@ -894,19 +882,18 @@ impl Flights {
     ) -> Result<FlightState> {
         self.update(|table, wakes| {
             let entry = self.leader_entry(table, &leader, wakes)?;
-            entry.phase = Phase::Draining(match failure {
+            let outcome = match failure {
                 AcquisitionFailure::OriginRejected => {
-                    entry.waiters.get_mut(&leader.caller).unwrap().error =
-                        Some(Error::OriginRejected);
+                    entry.state.cancel(leader.caller, Error::OriginRejected);
                     Outcome::Retry
                 }
                 AcquisitionFailure::OriginForbidden => {
-                    entry.waiters.get_mut(&leader.caller).unwrap().error =
-                        Some(Error::OriginForbidden);
+                    entry.state.cancel(leader.caller, Error::OriginForbidden);
                     Outcome::Retry
                 }
                 AcquisitionFailure::Terminal(error) => Outcome::Failed(error),
-            });
+            };
+            entry.state.begin_completion(outcome);
             leader.active = false;
             notify(entry, wakes);
             settle(entry, wakes);
@@ -937,7 +924,6 @@ impl Flights {
     pub fn next_deadline(&self) -> Option<Instant> {
         self.table
             .borrow()
-            .entries
             .values()
             .filter_map(|entry| {
                 entry
@@ -950,47 +936,7 @@ impl Flights {
 
     fn sweep_budgeted(&self, work_budget: usize) -> Result<()> {
         self.update(|table, wakes| {
-            for _ in 0..work_budget.min(table.sweep.len()) {
-                let Some((&id, page)) = table
-                    .sweep
-                    .range((
-                        std::ops::Bound::Excluded(table.sweep_cursor),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .next()
-                    .or_else(|| table.sweep.first_key_value())
-                else {
-                    break;
-                };
-                let page = page.clone();
-                table.sweep_cursor = id;
-                if let Some(entry) = table.entries.get_mut(&page) {
-                    // One cancellation candidate per entry, independent of fan-in.
-                    let waiter = entry
-                        .waiters
-                        .range((
-                            std::ops::Bound::Excluded(entry.waiter_cursor),
-                            std::ops::Bound::Unbounded,
-                        ))
-                        .next()
-                        .or_else(|| entry.waiters.first_key_value())
-                        .map(|(id, _)| *id);
-                    if let Some(id) = waiter {
-                        entry.waiter_cursor = id;
-                        refresh_waiter(entry, id, wakes);
-                    }
-                    refresh(entry, wakes);
-                    if entry.waiters.is_empty() && entry.operations.is_empty() {
-                        table.entries.remove(&page);
-                        table.sweep.remove(&id);
-                    }
-                }
-            }
-            if table.entries.is_empty() {
-                if let Some(waker) = table.drain_waker.take() {
-                    wakes.push(waker);
-                }
-            }
+            table.sweep(work_budget, wakes);
             Ok(())
         })
     }
@@ -1001,17 +947,10 @@ impl Flights {
         // Initiate shutdown synchronously: dropping the returned future cannot
         // reopen admission or discard accepted work.
         self.update(|table, wakes| {
-            table.stopping = true;
-            for entry in table.entries.values_mut() {
-                for waiter in entry.waiters.values_mut() {
-                    waiter.error = Some(Error::Cancelled);
-                }
-                entry.phase = Phase::Draining(Outcome::Failed(Error::Cancelled));
-                notify(entry, wakes);
-                entry.waiters.clear();
-                entry.deadlines.clear();
+            table.stop(wakes, |entry, wakes| {
+                entry.state.stop(Error::Cancelled, wakes);
                 settle(entry, wakes);
-            }
+            });
         });
         Box::pin(async move {
             let cancellation = scope.cancellation.subscribe()?;
@@ -1019,11 +958,11 @@ impl Flights {
                 cancellation.register(cx.waker());
                 self.poll_with_context(cx, self.limits.entries)?;
                 let mut table = self.table.borrow_mut();
-                if table.entries.is_empty() && uring_runtime::drivers::pending() == 0 {
+                if table.is_empty() && uring_runtime::drivers::pending() == 0 {
                     return Poll::Ready(Ok(()));
                 }
                 scope.check()?;
-                store_waker(&mut table.drain_waker, cx);
+                coalesce::flight::state::store_waker(&mut table.drain_waker, cx.waker());
                 Poll::Pending
             })
             .await
@@ -1038,7 +977,10 @@ impl Flights {
         resources: telemetry::Lease,
     ) -> Result<FlightOperation> {
         self.update(|table, wakes| {
-            let id = next(&mut table.next_operation)?;
+            let id = table
+                .next_operation
+                .next_id()
+                .map_err(|_| Error::Overloaded)?;
             let entry = self.leader_entry(table, leader, wakes)?;
             if entry.operations.len() >= self.limits.operations_per_flight {
                 return Err(Error::Overloaded);
@@ -1050,10 +992,10 @@ impl Flights {
             )?;
             entry.operations.insert(
                 id,
-                Some(Retained {
+                Retained {
                     _resources: resources,
                     _reservation: reservation,
-                }),
+                },
             );
             Ok(FlightOperation {
                 flights: self.clone(),
@@ -1066,43 +1008,26 @@ impl Flights {
     pub(super) fn complete_operation(&self, fence: &Fence, id: u64) -> Result<()> {
         // Drop caller-owned resource bundles outside the table borrow.
         let resources = self.update(|table, _wakes| {
-            let entry = table
-                .entries
-                .get_mut(&fence.page)
-                .ok_or(Error::StaleFlight)?;
+            let entry = table.get_mut(&fence.page).ok_or(Error::StaleFlight)?;
             fence.validate(&entry.fence)?;
-            entry
-                .operations
-                .get_mut(&id)
-                .and_then(Option::take)
-                .ok_or(Error::StaleFlight)
+            entry.operations.take(id).map_err(|_| Error::StaleFlight)
         })?;
         drop(resources);
         self.update(|table, wakes| -> Result<()> {
-            let entry = table
-                .entries
-                .get_mut(&fence.page)
-                .ok_or(Error::StaleFlight)?;
+            let entry = table.get_mut(&fence.page).ok_or(Error::StaleFlight)?;
             fence.validate(&entry.fence)?;
             // Keep the slot occupied while resource destructors run: they may
             // reenter the worker, but cannot cause an overlapping election.
-            entry.operations.remove(&id).ok_or(Error::StaleFlight)?;
+            entry
+                .operations
+                .complete(id)
+                .map_err(|_| Error::StaleFlight)?;
             refresh(entry, wakes);
-            if let Some(waker) = table.drain_waker.take() {
-                wakes.push(waker);
-            }
+            table.notify_drain(wakes);
             Ok(())
         })?;
         self.update(|table, _wakes| {
-            if table
-                .entries
-                .get(&fence.page)
-                .is_some_and(|entry| entry.waiters.is_empty() && entry.operations.is_empty())
-            {
-                if let Some(entry) = table.entries.remove(&fence.page) {
-                    table.sweep.remove(&entry.fence.incarnation);
-                }
-            }
+            table.remove_quiescent(&fence.page);
             Ok(())
         })
     }
@@ -1117,7 +1042,6 @@ impl Flights {
             return Err(Error::StaleFlight);
         }
         let entry = table
-            .entries
             .get_mut(&leader.fence.page)
             .ok_or(Error::StaleFlight)?;
         refresh(entry, wakes);
@@ -1126,150 +1050,84 @@ impl Flights {
     }
 }
 
-fn next(counter: &mut u64) -> Result<u64> {
-    *counter = counter.checked_add(1).ok_or(Error::Overloaded)?;
-    Ok(*counter)
-}
-fn store_waker(slot: &mut Option<Waker>, cx: &Context<'_>) {
-    if slot.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
-        *slot = Some(cx.waker().clone());
+impl coalesce::flight::Entry for Entry {
+    fn incarnation(&self) -> u64 {
+        self.fence.incarnation
+    }
+
+    fn refresh(&mut self, wakes: &mut Vec<Waker>) {
+        // One cancellation candidate per entry, independent of fan-in.
+        self.state.sweep_waiter(wakes);
+        refresh(self, wakes);
+    }
+
+    fn quiescent(&self) -> bool {
+        self.waiters.is_empty() && self.operations.is_empty()
     }
 }
 fn notify(entry: &mut Entry, wakes: &mut Vec<Waker>) {
-    for waiter in entry.waiters.values_mut() {
-        if let Some(waker) = waiter.waker.take() {
-            wakes.push(waker);
-        }
-    }
-}
-fn eligible(waiter: &WaiterRecord) -> bool {
-    waiter.acquisition && !waiter.issued && waiter.error.is_none()
+    entry.state.notify(wakes);
 }
 fn settle(entry: &mut Entry, wakes: &mut Vec<Waker>) {
-    if !entry.operations.is_empty() || !matches!(entry.phase, Phase::Draining(_)) {
-        return;
+    entry.state.settle(
+        entry.operations.is_empty(),
+        Error::Unavailable,
+        split_result,
+        wakes,
+    );
+}
+fn split_result(
+    page: AcquiredPage,
+) -> coalesce::flight::state::Published<PageResult, UnverifiedPage> {
+    match page {
+        AcquiredPage::Plaintext(page) => coalesce::flight::state::Published::Complete(page),
+        AcquiredPage::Ciphertext(page) => coalesce::flight::state::Published::Partial(page),
     }
-    let Phase::Draining(outcome) = std::mem::replace(&mut entry.phase, Phase::RetryPending) else {
-        unreachable!();
-    };
-    entry.leader = None;
-    entry.phase = match outcome {
-        Outcome::Published(AcquiredPage::Plaintext(page)) => {
-            entry.ciphertext = None;
-            Phase::Complete(page)
-        }
-        Outcome::Published(AcquiredPage::Ciphertext(page)) => {
-            entry.ciphertext = Some(page);
-            for waiter in entry.waiters.values_mut() {
-                if waiter.plaintext {
-                    waiter.issued = false;
-                }
-            }
-            Phase::RetryPending
-        }
-        Outcome::Failed(error) => Phase::Failed(error),
-        Outcome::Retry if entry.waiters.values().any(eligible) => Phase::RetryPending,
-        Outcome::Retry => Phase::Failed(Error::Unavailable),
-    };
-    notify(entry, wakes);
 }
 fn revoke(entry: &mut Entry, error: Error, wakes: &mut Vec<Waker>) {
-    if let Some(waiter) = entry.leader.and_then(|id| entry.waiters.get_mut(&id)) {
-        waiter.error = Some(error);
-    }
-    entry.phase = Phase::Draining(Outcome::Retry);
-    notify(entry, wakes);
+    entry.state.revoke(error, wakes);
     settle(entry, wakes);
 }
 fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
-    if let Some(id) = entry.leader {
-        refresh_waiter(entry, id, wakes);
-    }
-    // Deadline work is bounded independently of the number of waiters. More
-    // expired entries retain their index and are serviced on the next turn.
-    for _ in 0..64 {
-        let Some((&(deadline, id), _)) = entry.deadlines.first_key_value() else {
-            break;
-        };
-        if deadline > uring_runtime::environment::now() {
-            break;
-        }
-        entry.deadlines.remove(&(deadline, id));
-        refresh_waiter(entry, id, wakes);
-    }
-    if matches!(entry.phase, Phase::Acquiring)
-        && entry
-            .leader
-            .and_then(|id| entry.waiters.get(&id))
-            .is_none_or(|w| w.error.is_some())
-    {
-        let error = entry
-            .leader
-            .and_then(|id| entry.waiters.get(&id))
-            .and_then(|w| w.error)
-            .unwrap_or(Error::Cancelled);
-        revoke(entry, error, wakes);
-    }
-    settle(entry, wakes);
-    if matches!(entry.phase, Phase::RetryPending)
-        && entry.ciphertext.is_none()
-        && !entry.waiters.values().any(eligible)
-    {
-        entry.phase = Phase::Draining(Outcome::Failed(Error::Unavailable));
-        settle(entry, wakes);
-    }
-}
-fn refresh_waiter(entry: &mut Entry, id: u64, wakes: &mut Vec<Waker>) {
-    let Some(waiter) = entry.waiters.get_mut(&id) else {
-        return;
-    };
-    if waiter.error.is_none() {
-        waiter.error = waiter.scope.check().err().or_else(|| {
-            (uring_runtime::environment::now() >= waiter.budget_deadline)
-                .then_some(Error::DeadlineExceeded)
-        });
-    }
-    if waiter.error.is_some() {
-        entry
-            .deadlines
-            .remove(&(waiter.scope.deadline.0.min(waiter.budget_deadline), id));
-        if let Some(waker) = waiter.waker.take() {
-            wakes.push(waker);
-        }
-    }
+    entry.state.refresh(
+        entry.operations.is_empty(),
+        Error::Unavailable,
+        Error::Cancelled,
+        uring_runtime::environment::now,
+        split_result,
+        wakes,
+    );
 }
 fn validate_leader(entry: &Entry, leader: &FlightLeader) -> Result<()> {
     leader.fence.validate(&entry.fence)?;
-    if !leader.active
-        || !matches!(entry.phase, Phase::Acquiring)
-        || entry.leader != Some(leader.caller)
-    {
-        return Err(Error::StaleFlight);
-    }
-    Ok(())
+    entry
+        .state
+        .validate_leader(leader.caller, leader.active)
+        .map_err(|_| Error::StaleFlight)
 }
 fn registered<'a>(table: &'a mut Table, registration: &Registration) -> Result<&'a mut Entry> {
     if table.stopping {
         return Err(Error::Cancelled);
     }
     let entry = table
-        .entries
         .get_mut(&registration.fence.page)
         .ok_or(Error::StaleFlight)?;
-    if !registration.attached
-        || !Rc::ptr_eq(&registration.fence.owner, &entry.fence.owner)
-        || registration.fence.incarnation != entry.fence.incarnation
-        || !entry.waiters.contains_key(&registration.id)
-    {
-        return Err(Error::StaleFlight);
-    }
+    entry
+        .state
+        .validate_registration(
+            registration.id,
+            registration.attached,
+            &registration.fence.identity,
+            &entry.fence.identity,
+        )
+        .map_err(|_| Error::StaleFlight)?;
     Ok(entry)
 }
 impl Registration {
     fn cancel(&self, error: Error) {
         self.flights.update(|table, wakes| {
             if let Ok(entry) = registered(table, self) {
-                entry.waiters.get_mut(&self.id).unwrap().error = Some(error);
+                entry.state.cancel(self.id, error);
                 refresh(entry, wakes);
             }
         });
@@ -1277,21 +1135,14 @@ impl Registration {
     fn detach(&mut self) -> Result<FlightState> {
         let state = self.flights.update(|table, wakes| {
             let entry = registered(table, self)?;
-            if let Some(waiter) = entry.waiters.remove(&self.id) {
-                entry
-                    .deadlines
-                    .remove(&(waiter.scope.deadline.0.min(waiter.budget_deadline), self.id));
-            }
+            entry.state.detach(self.id);
             refresh(entry, wakes);
-            if entry.waiters.is_empty() && entry.operations.is_empty() {
-                table.entries.remove(&self.fence.page);
-                table.sweep.remove(&self.fence.incarnation);
-                if let Some(waker) = table.drain_waker.take() {
-                    wakes.push(waker);
-                }
+            let state = entry.phase.state();
+            if table.remove_quiescent(&self.fence.page) {
+                table.notify_drain(wakes);
                 Ok(FlightState::Removed)
             } else {
-                Ok(entry.phase.state())
+                Ok(state)
             }
         });
         self.attached = false;
@@ -1309,7 +1160,7 @@ impl Drop for FlightLeader {
     fn drop(&mut self) {
         if self.active {
             self.flights.update(|table, wakes| {
-                if let Some(entry) = table.entries.get_mut(&self.fence.page) {
+                if let Some(entry) = table.get_mut(&self.fence.page) {
                     if validate_leader(entry, self).is_ok() {
                         revoke(entry, Error::Cancelled, wakes);
                     }

@@ -21,6 +21,14 @@ use uring_runtime::reactor::Descriptor;
 /// Spliced bytes retained by sockets are subject to socket buffer limits instead.
 pub const MAX_PIPE_BYTES: usize = 64 * 1024;
 
+/// Unsupported splice leaves buffered bytes available to a copy fallback.
+pub fn splice_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    )
+}
+
 pub struct PipePool<P: Policy> {
     quotas: Rc<Quotas<P>>,
     pipe_class: P::Class,
@@ -544,6 +552,16 @@ fn syscall_count(value: isize) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unsupported_splice_is_distinct_from_backpressure_and_disconnect() {
+        for code in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert!(splice_unsupported(&io::Error::from_raw_os_error(code)));
+        }
+        for code in [libc::EAGAIN, libc::EINTR, libc::EPIPE, libc::ECONNRESET] {
+            assert!(!splice_unsupported(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(!splice_unsupported(&io::Error::other("custom")));
+    }
     use std::{
         future::Future,
         sync::{

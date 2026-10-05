@@ -45,8 +45,6 @@ use crate::telemetry::Gauge;
 use crate::telemetry::LookupTier;
 use crate::telemetry::Metrics;
 use crate::telemetry::{Detail, FillAdmissionSite};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use uring_runtime::reactor::IoBuffer;
@@ -67,14 +65,12 @@ pub struct FillDependencies {
     /// Page workers keep their own page-attached descriptor even if that catalog evicts it.
     pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
 }
-type LocalCopy = futures::future::Shared<
-    futures::future::LocalBoxFuture<'static, Result<Option<UnverifiedPage>>>,
->;
+type LocalCopies = coalesce::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
 #[derive(Clone)]
 pub struct Fill {
     pub(super) dependencies: FillDependencies,
     pub(super) metrics: Metrics,
-    pub(super) local_copies: Rc<RefCell<BTreeMap<PageId, LocalCopy>>>,
+    pub(super) local_copies: Rc<LocalCopies>,
 }
 
 /// Immediate acquisition tier, not the original producer or corruption location.
@@ -487,7 +483,7 @@ impl Fill {
         Self {
             dependencies,
             metrics: Metrics::default(),
-            local_copies: Rc::new(RefCell::new(BTreeMap::new())),
+            local_copies: Rc::new(LocalCopies::default()),
         }
     }
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
@@ -959,7 +955,6 @@ impl Fill {
         page: &PageId,
         scope: &RequestScope,
     ) -> Result<Option<UnverifiedPage>> {
-        use futures::FutureExt;
         use std::future::Future;
         scope.check()?;
         let _waiter = self.dependencies.admission.reserve(
@@ -968,7 +963,7 @@ impl Fill {
             1,
         )?;
         let cancellation = scope.cancellation.subscribe()?;
-        let existing = self.local_copies.borrow().get(page).cloned();
+        let existing = self.local_copies.get(page);
         let mut receive = if let Some(existing) = existing {
             existing
         } else {
@@ -979,13 +974,9 @@ impl Fill {
                 1,
             )?;
             let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
-            let (send, receive) = futures::channel::oneshot::channel();
-            let receive = async move { receive.await.map_err(|_| Error::Unavailable)? }
-                .boxed_local()
-                .shared();
-            self.local_copies
-                .borrow_mut()
-                .insert(page.clone(), receive.clone());
+            let (receive, completion) = self
+                .local_copies
+                .start(page.clone(), Err(Error::Unavailable));
             let fill = self.clone();
             let page = page.clone();
             permit.submit_detached(Box::pin(async move {
@@ -1010,8 +1001,7 @@ impl Fill {
                     Ok(Some(copy))
                 }
                 .await;
-                fill.local_copies.borrow_mut().remove(&page);
-                let _ = send.send(result);
+                completion.finish(result);
                 Ok::<_, Error>(())
             }));
             receive

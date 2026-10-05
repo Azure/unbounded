@@ -517,6 +517,53 @@ impl<C: Context> HttpIo<C> {
                 .await
         })
     }
+    /// Copy borrowed bytes into admitted storage before submitting a body write.
+    /// The owned copy and connection remain retained through the completion fence.
+    pub fn write_body_bytes<'a>(
+        &'a self,
+        connection: ConnectionLease<C>,
+        bytes: &'a [u8],
+        scope: &'a C::Scope,
+    ) -> Operation<'a, C, Completion<OwnedBuffer<C>, ConnectionLease<C>>> {
+        Box::pin(async move {
+            let mut buffer = self.buffer(bytes.len())?;
+            buffer.bytes.copy_from_slice(bytes);
+            self.write_body(connection, buffer, scope).await
+        })
+    }
+    /// Fill the caller's entire fixed buffer, possibly across read-ahead and
+    /// multiple receives. A framed end or socket EOF before the buffer is full
+    /// is an I/O error. An empty buffer completes without submitting I/O.
+    pub fn read_body_exact<'a, B: IoBuffer>(
+        &'a self,
+        mut connection: ConnectionLease<C>,
+        mut buffer: B,
+        scope: &'a C::Scope,
+    ) -> Operation<'a, C, Completion<B, ConnectionLease<C>>>
+    where
+        C::Error: From<B::Error>,
+    {
+        Box::pin(async move {
+            let length = buffer.bytes()?.len();
+            let mut offset = 0;
+            while offset < length {
+                let completed = self
+                    .read_body_range(connection, buffer, offset..length, scope)
+                    .await?;
+                if completed.bytes == 0 || completed.bytes > length - offset {
+                    return Err(uring_runtime::Error::Io.into());
+                }
+                offset += completed.bytes;
+                buffer = completed.buffer;
+                connection = completed.lease;
+            }
+            Ok(Completion {
+                buffer,
+                bytes: offset,
+                lease: connection,
+            })
+        })
+    }
     pub fn read_body_range<'a, B: IoBuffer>(
         &'a self,
         mut connection: ConnectionLease<C>,
@@ -654,7 +701,7 @@ impl<C: Context> HttpIo<C> {
     }
     pub fn collect_body<'a>(
         &'a self,
-        mut connection: ConnectionLease<C>,
+        connection: ConnectionLease<C>,
         maximum: usize,
         scope: &'a C::Scope,
     ) -> Operation<'a, C, Completion<OwnedBuffer<C>, ConnectionLease<C>>> {
@@ -665,24 +712,8 @@ impl<C: Context> HttpIo<C> {
             if length > maximum {
                 return Err(Error::Malformed.into());
             }
-            let mut buffer = self.buffer(length)?;
-            let mut offset = 0;
-            while offset < length {
-                let completed = self
-                    .read_body_range(connection, buffer, offset..length, scope)
-                    .await?;
-                if completed.bytes == 0 {
-                    return Err(uring_runtime::Error::Io.into());
-                }
-                offset += completed.bytes;
-                buffer = completed.buffer;
-                connection = completed.lease;
-            }
-            Ok(Completion {
-                buffer,
-                bytes: length,
-                lease: connection,
-            })
+            let buffer = self.buffer(length)?;
+            self.read_body_exact(connection, buffer, scope).await
         })
     }
 }

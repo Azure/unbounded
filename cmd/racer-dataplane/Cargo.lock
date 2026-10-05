@@ -154,6 +154,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "coalesce"
+version = "0.1.0"
+dependencies = [
+ "futures",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -320,6 +327,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "env-config"
+version = "0.1.0"
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -449,6 +460,16 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi",
+]
+
+[[package]]
+name = "http-splice"
+version = "0.1.0"
+dependencies = [
+ "flow-control",
+ "http1",
+ "libc",
+ "uring-runtime",
 ]
 
 [[package]]
@@ -664,6 +685,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "wire-codec",
  "x509-parser",
  "zeroize",
 ]
@@ -686,9 +708,12 @@ name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "coalesce",
+ "env-config",
  "flow-control",
  "futures",
  "getrandom",
+ "http-splice",
  "http1",
  "io-uring",
  "libc",
@@ -705,7 +730,9 @@ dependencies = [
  "sha2",
  "telemetry",
  "topology",
+ "uds-endpoint",
  "uring-runtime",
+ "wire-codec",
  "x509-parser",
  "zeroize",
 ]
@@ -1050,6 +1077,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "uds-endpoint"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1167,6 +1201,10 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "wire-codec"
+version = "0.1.0"
 
 [[package]]
 name = "x509-parser"

@@ -42,6 +42,13 @@ impl KeyId {
         bytes[12..].copy_from_slice(&suffix.to_be_bytes());
         Ok(Self(bytes))
     }
+
+    /// Read the nonzero creation generation of an RKG1 ID, not bundle admission policy.
+    pub fn generation(self) -> Option<u64> {
+        (self.0[..4] == *b"RKG1")
+            .then(|| u64::from_be_bytes(self.0[4..12].try_into().expect("generation bytes")))
+            .filter(|generation| *generation != 0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -69,6 +76,18 @@ pub struct CacheDefinition {
     pub name: String,
     pub client_socket: PathBuf,
     pub origin_socket: PathBuf,
+}
+
+/// Canonical lowercase UUID syntax only; callers choose nil/version policy.
+pub fn valid_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+            }
+        })
 }
 
 pub fn valid_site(value: &str) -> bool {
@@ -120,4 +139,49 @@ pub fn validate_definitions(definitions: &[CacheDefinition]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_generation_requires_magic_and_nonzero_epoch_but_not_a_suffix_policy() {
+        assert_eq!(KeyId::from_generation(0, 0), Err(Error::InvalidRequest));
+        for generation in [1, 256, u64::MAX] {
+            for suffix in [0, u32::MAX] {
+                let id = KeyId::from_generation(generation, suffix).unwrap();
+                assert_eq!(id.generation(), Some(generation));
+                let mut invalid = id;
+                invalid.0[0] ^= 1;
+                assert_eq!(invalid.generation(), None);
+                invalid = id;
+                invalid.0[4..12].fill(0);
+                assert_eq!(invalid.generation(), None);
+            }
+        }
+        assert_eq!(KeyId([0; 16]).generation(), None);
+    }
+
+    #[test]
+    fn uuid_syntax_rejects_aliases_without_enforcing_version_or_nil_policy() {
+        for value in [
+            "00000000-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        ] {
+            assert!(valid_uuid(value));
+        }
+        for value in [
+            "",
+            "0123456789abcdef0123456789abcdef",
+            "01234567-89AB-cdef-0123-456789abcdef",
+            "01234567_89ab-cdef-0123-456789abcdef",
+            "01234567-89ab-cdef-0123-456789abcdeg",
+            "01234567-89ab-cdef-0123-456789abcde\n",
+            "01234567-89ab-cdef-0123-456789abcdé",
+        ] {
+            assert!(!valid_uuid(value), "{value:?}");
+        }
+    }
 }

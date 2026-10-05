@@ -41,6 +41,16 @@ COPY cmd/racer-dataplane/topology/Cargo.toml ./topology/Cargo.toml
 COPY cmd/racer-dataplane/topology/src ./topology/src
 COPY cmd/racer-dataplane/telemetry/Cargo.toml ./telemetry/Cargo.toml
 COPY cmd/racer-dataplane/telemetry/src ./telemetry/src
+COPY cmd/racer-dataplane/coalesce/Cargo.toml ./coalesce/Cargo.toml
+COPY cmd/racer-dataplane/coalesce/src ./coalesce/src
+COPY cmd/racer-dataplane/uds-endpoint/Cargo.toml ./uds-endpoint/Cargo.toml
+COPY cmd/racer-dataplane/uds-endpoint/src ./uds-endpoint/src
+COPY cmd/racer-dataplane/wire-codec/Cargo.toml ./wire-codec/Cargo.toml
+COPY cmd/racer-dataplane/wire-codec/src ./wire-codec/src
+COPY cmd/racer-dataplane/env-config/Cargo.toml ./env-config/Cargo.toml
+COPY cmd/racer-dataplane/env-config/src ./env-config/src
+COPY cmd/racer-dataplane/http-splice/Cargo.toml ./http-splice/Cargo.toml
+COPY cmd/racer-dataplane/http-splice/src ./http-splice/src
 COPY images/racer-dataplane/build-native.sh ./build-native.sh
 COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh
 RUN set -eu; \

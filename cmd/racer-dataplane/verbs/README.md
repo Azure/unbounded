@@ -19,7 +19,7 @@ environments for time and randomness, including deterministic simulation.
    Set `discover: false` only for an intentionally empty plan; this invokes the
    selector with an empty slice without loading the native adapter.
 4. Poll `activation()` for the selected ports. Construct I/O-local device handles
-   with `Rc<IoPort>::device(tag)`. Claim a `QueuePair` with `poll_new` or
+   with `Rc<IoPort>::device(tag)`. Claim a `QueuePairHandle` with `poll_new` or
    `poll_new_admitted`, optionally attaching another opaque lifetime guard.
 5. Exchange authenticated `Endpoint` values using the application's own protocol.
    Connect, acquire a `Region`, bind a `Window`, and write using the poll APIs.
@@ -36,6 +36,14 @@ Dropping a QP requests cancellation without blocking I/O. Native ownership and
 caller guards survive failed destruction, including intentional bounded quarantine
 leaks. Reopening requires native drainage and release of all I/O leases. Caller
 Arc clones do not affect the internal quarantine reference count.
+
+Use `uring_runtime::poll_scoped` for caller-scoped poll APIs; the runtime owns
+cancellation registration and scope checks. Never use it to truncate a required
+native completion fence. `WithNative<T>` forwards the inner runtime service's
+failure reporter, waker, and lifecycle hooks. Admission stop leaves native progress
+available for accepted work; drain fences native resources before draining the
+inner service. Close shuts native admission even if inner close fails, and fence
+drives native destruction before the inner ownership fence, without scope checks.
 
 ## Features and native adapter
 

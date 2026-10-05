@@ -744,7 +744,7 @@ pub const MAX_HEAD: usize = 64 * 1024;
 
 /// Canonical Kubernetes UUID spelling. Reject normalization at the trust boundary.
 pub fn uuid(value: &str) -> Result<()> {
-    if !racer_identity::canonical_uuid(value) {
+    if !racer_control_wire::valid_uuid(value) {
         return Err(Error::InvalidRequest);
     }
     Ok(())
@@ -788,42 +788,15 @@ pub fn push_binary(head: &mut MessageHead, name: &str, bytes: &[u8]) {
     push(head, name, binary(bytes));
 }
 pub fn millis(time: SystemTime) -> Result<u64> {
-    u64::try_from(
-        time.duration_since(UNIX_EPOCH)
-            .map_err(|_| Error::InvalidRequest)?
-            .as_millis(),
-    )
-    .map_err(|_| Error::InvalidRequest)
+    uring_runtime::deadline::unix_millis(time).map_err(Into::into)
 }
 /// Stable environment clock mapping. Decode wire deadlines with `decode_deadline`,
 /// never reconstruct them from a new relative timeout at each hop.
 pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
-    let (mono, wall) = uring_runtime::environment::clock_anchor();
-    let time = if deadline.0 >= mono {
-        wall.checked_add(deadline.0.duration_since(mono))
-    } else {
-        wall.checked_sub(mono.duration_since(deadline.0))
-    }
-    .ok_or(Error::InvalidRequest)?;
-    millis(time)
+    deadline.to_unix_millis().map_err(Into::into)
 }
 pub fn decode_deadline(value: u64) -> Result<Deadline> {
-    let (mono, wall) = uring_runtime::environment::clock_anchor();
-    let base = millis(wall)?;
-    // Account for submillisecond wall-clock origin, making encode/decode exact.
-    let fraction = wall
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| Error::InvalidRequest)?
-        .subsec_nanos()
-        % 1_000_000;
-    let instant = if value >= base {
-        mono.checked_add(Duration::from_millis(value - base))
-    } else {
-        mono.checked_sub(Duration::from_millis(base - value))
-    }
-    .and_then(|i| i.checked_sub(Duration::from_nanos(u64::from(fraction))))
-    .ok_or(Error::InvalidRequest)?;
-    Ok(Deadline(instant))
+    Deadline::from_unix_millis(value).map_err(Into::into)
 }
 /// Canonical node-list encoding: concatenated u32 big-endian length + UTF-8 ID,
 /// then padded base64. Empty lists encode as an empty header value.
@@ -867,16 +840,7 @@ pub fn decode_nodes(value: &[u8]) -> Result<Vec<NodeId>> {
 fn object_fields(head: &mut MessageHead, object: &ObjectId) -> Result<()> {
     uuid(&object.cache.0)?;
     push(head, "racer-cache", &object.cache.0);
-    push(
-        head,
-        "racer-key",
-        object
-            .key
-            .0
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>(),
-    );
+    push(head, "racer-key", wire_codec::encode_hex(&object.key.0));
     Ok(())
 }
 fn version_fields(head: &mut MessageHead, version: &ObjectVersion) -> Result<()> {
@@ -1448,18 +1412,7 @@ fn object(head: &MessageHead) -> Result<ObjectId> {
         return Err(Error::InvalidRequest);
     }
     let key = field(head, "racer-key")?;
-    if key.len() != 64
-        || !key
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(Error::InvalidRequest);
-    }
-    let mut decoded = [0; 32];
-    for (index, byte) in decoded.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&key[index * 2..index * 2 + 2], 16)
-            .map_err(|_| Error::InvalidRequest)?;
-    }
+    let decoded = wire_codec::decode_hex(key.as_bytes()).map_err(|_| Error::InvalidRequest)?;
     Ok(ObjectId {
         cache: CacheId(cache),
         key: CacheKey(decoded),
@@ -2829,7 +2782,6 @@ pub(crate) mod tests {
             // Historical proofs are reusable; only fresh connection heads admit work.
             n[1].verify_proof(clone_head(&original)).unwrap();
             n[2].verify_historical(&original).unwrap();
-            super::sessions::replay_and_binding_checks();
         }
         #[test]
         pub(crate) fn malformed_fields_unknown_algorithm_and_historical_expiry() {
@@ -2880,6 +2832,41 @@ pub(crate) mod tests {
     mod canonical_tests {
         use super::*;
         use std::time::Instant;
+
+        #[test]
+        fn object_hex_round_trip_and_rejections_preserve_boundary_errors() {
+            let expected = ObjectId {
+                cache: CacheId("11111111-1111-4111-8111-111111111111".into()),
+                key: CacheKey(std::array::from_fn(|i| (i as u8) * 8)),
+            };
+            let mut head = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: Vec::new(),
+            };
+            object_fields(&mut head, &expected).unwrap();
+            assert_eq!(object(&head).unwrap(), expected);
+            assert_eq!(
+                field(&head, "racer-key").unwrap(),
+                "0008101820283038404850586068707880889098a0a8b0b8c0c8d0d8e0e8f0f8"
+            );
+            for value in [
+                "".to_owned(),
+                "0".repeat(63),
+                "0".repeat(65),
+                "AB".repeat(32),
+                format!("{}g0", "00".repeat(31)),
+                format!("{} 0", "00".repeat(31)),
+                format!("{}é", "00".repeat(31)),
+            ] {
+                head.headers
+                    .iter_mut()
+                    .find(|h| h.name == "racer-key")
+                    .unwrap()
+                    .value = value.into_bytes();
+                assert_eq!(object(&head), Err(Error::InvalidRequest));
+            }
+        }
+
         #[test]
         fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
             assert_eq!(binary(&[0, 1, 255]), "AAH/");

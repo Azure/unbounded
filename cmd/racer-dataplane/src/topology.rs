@@ -14,9 +14,6 @@ use racer_control_wire::RailMapping;
 use racer_control_wire::valid_site;
 use sha2::Digest;
 use sha2::Sha256;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -28,6 +25,9 @@ use std::time::Instant;
 use uring_runtime::deadline::Deadline;
 
 pub use ::topology::MAX_DEGREE;
+pub(crate) use ::topology::hash::{
+    bytes as hash_bytes, finish as hash_finish, named_domain as hash_domain,
+};
 
 // Immutable placement, authenticated routing, and worker-local endpoint circuits.
 
@@ -39,28 +39,11 @@ const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
 
 // Worker-local link circuits, distinct from process readiness and placement.
 pub struct LinkHealth {
-    capacity: usize,
-    states: RefCell<BTreeMap<NodeId, Circuit>>,
-    probes: RefCell<BTreeSet<NodeId>>,
+    inner: flow_control::circuit::Circuits<NodeId>,
 }
-pub struct LinkProbe<'a> {
-    health: &'a LinkHealth,
-    node: Option<NodeId>,
-}
-impl Drop for LinkProbe<'_> {
-    fn drop(&mut self) {
-        if let Some(node) = &self.node {
-            self.health.probes.borrow_mut().remove(node);
-        }
-    }
-}
+pub type LinkProbe<'a> = flow_control::circuit::Probe<'a, NodeId>;
 #[allow(non_upper_case_globals, clippy::declare_interior_mutable_const)]
 pub const LinkHealth: LinkHealth = LinkHealth::new(MAX_DEGREE);
-struct Circuit {
-    failures: u32,
-    retry_at: Instant,
-    probe_until: Option<Instant>,
-}
 #[derive(Clone, Copy, Debug)]
 pub enum LinkOutcome {
     Success,
@@ -70,20 +53,9 @@ pub enum LinkOutcome {
 }
 impl LinkHealth {
     pub fn acquire(&self, node: &NodeId) -> Result<LinkProbe<'_>> {
-        if !self.try_acquire(node)? {
-            return Err(Error::Unavailable);
-        }
-        let probe = self.states.borrow().contains_key(node);
-        if probe {
-            if self.probes.borrow().len() >= self.capacity {
-                return Err(Error::Overloaded);
-            }
-            self.probes.borrow_mut().insert(node.clone());
-        }
-        Ok(LinkProbe {
-            health: self,
-            node: probe.then(|| node.clone()),
-        })
+        self.inner
+            .acquire(node, uring_runtime::environment::now())
+            .map_err(Into::into)
     }
     /// Application misses and credential rejection do not open transport circuits.
     pub async fn run<T>(
@@ -107,72 +79,39 @@ impl LinkHealth {
     }
     pub const fn new(capacity: usize) -> Self {
         Self {
-            capacity,
-            states: RefCell::new(BTreeMap::new()),
-            probes: RefCell::new(BTreeSet::new()),
+            inner: flow_control::circuit::Circuits::new(capacity, Duration::from_secs(1)),
         }
     }
     pub fn observe(&self, neighbor: &NodeId, outcome: LinkOutcome) -> Result<()> {
         self.observe_at(neighbor, outcome, uring_runtime::environment::now())
     }
     pub fn observe_at(&self, neighbor: &NodeId, outcome: LinkOutcome, now: Instant) -> Result<()> {
-        let mut states = self.states.borrow_mut();
         if matches!(outcome, LinkOutcome::Success) {
-            states.remove(neighbor);
+            self.inner.success(neighbor);
             return Ok(());
         }
-        if !states.contains_key(neighbor) && states.len() >= self.capacity {
-            return Err(Error::Overloaded);
-        }
-        let state = states.entry(neighbor.clone()).or_insert(Circuit {
-            failures: 0,
-            retry_at: now,
-            probe_until: None,
-        });
-        state.failures = state.failures.saturating_add(1);
-        state.retry_at = now + backoff(neighbor, state.failures);
-        state.probe_until = None;
-        Ok(())
+        self.inner
+            .failure(neighbor, now, backoff)
+            .map_err(Into::into)
     }
     /// Routing hint only; actual sends acquire an exclusive half-open probe.
     pub fn available(&self, neighbor: &NodeId) -> Result<bool> {
         self.available_at(neighbor, uring_runtime::environment::now())
     }
     pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
-        if self.probes.borrow().contains(neighbor) {
-            return Ok(false);
-        }
-        Ok(self
-            .states
-            .borrow()
-            .get(neighbor)
-            .is_none_or(|s| now >= s.retry_at && s.probe_until.is_none_or(|until| now >= until)))
+        Ok(self.inner.available(neighbor, now))
     }
     pub fn try_acquire(&self, neighbor: &NodeId) -> Result<bool> {
         self.try_acquire_at(neighbor, uring_runtime::environment::now())
     }
     pub fn try_acquire_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
-        if self.probes.borrow().contains(neighbor) {
-            return Ok(false);
-        }
-        let mut states = self.states.borrow_mut();
-        let Some(state) = states.get_mut(neighbor) else {
-            return Ok(true);
-        };
-        if now < state.retry_at || state.probe_until.is_some_and(|until| now < until) {
-            return Ok(false);
-        }
-        // A dropped or hung probe releases eligibility only after this timeout.
-        state.probe_until = Some(now + Duration::from_secs(1));
-        Ok(true)
+        Ok(self.inner.try_acquire(neighbor, now))
     }
     pub fn retain_neighbors(&self, neighbors: &[NodeId]) {
-        self.states
-            .borrow_mut()
-            .retain(|node, _| neighbors.contains(node));
+        self.inner.retain(neighbors);
     }
     pub fn tracked_links(&self) -> usize {
-        self.states.borrow().len()
+        self.inner.len()
     }
 }
 fn backoff(node: &NodeId, failures: u32) -> Duration {
@@ -185,22 +124,10 @@ fn backoff(node: &NodeId, failures: u32) -> Duration {
     Duration::from_millis(base + jitter)
 }
 
-pub(crate) fn hash_domain(name: &[u8]) -> Sha256 {
-    let mut hash = Sha256::new();
-    hash.update(name);
-    hash
-}
-pub(crate) fn hash_bytes(hash: &mut Sha256, value: &[u8]) {
-    hash.update((value.len() as u32).to_be_bytes());
-    hash.update(value);
-}
 pub(crate) fn hash_object(hash: &mut Sha256, object: &ObjectId, page: PageNumber) {
     hash_bytes(hash, object.cache.0.as_bytes());
     hash.update(object.key.0);
     hash.update(page.0.to_be_bytes());
-}
-pub(crate) fn hash_finish(hash: Sha256) -> [u8; 32] {
-    hash.finalize().into()
 }
 
 // Stable sorted node identities and immutable leased membership versions.

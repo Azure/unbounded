@@ -396,17 +396,7 @@ impl<I: Io + ?Sized> Connection<I> {
     async fn step(&mut self, scope: &I::Scope) -> Result<(), I::Error> {
         self.check(scope)?;
         // Even a continuously readable peer must yield to other owner work.
-        let mut yielded = false;
-        std::future::poll_fn(|cx| {
-            if yielded {
-                std::task::Poll::Ready(())
-            } else {
-                yielded = true;
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-        })
-        .await;
+        uring_runtime::yield_now().await;
         let mut progress = false;
         if self.tls.wants_write() {
             match self.tls.write_tls(&mut self.stream) {

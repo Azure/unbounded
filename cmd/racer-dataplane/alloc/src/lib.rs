@@ -2,10 +2,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod buffer;
+mod clock;
+mod geometry;
 mod segments;
 mod slab;
 
 pub use buffer::{AlignedBuffer, Alignment, Charge, Extent};
+pub use clock::{SegmentClock, SegmentEntries};
+pub use geometry::SegmentGeometry;
 pub use segments::{Generation, SegmentId, SegmentLease, SegmentSnapshot, SegmentState, Segments};
 pub use slab::Slab;
 

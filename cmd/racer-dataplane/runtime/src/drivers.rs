@@ -22,6 +22,22 @@ use std::{
 /// A local task. The caller must handle its outcome before returning unit.
 pub type Task = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
+/// Poll an optional local task once and clear its slot before returning a result.
+/// Pending tasks retain their owner; absent tasks and pending tasks return None.
+/// No scope, result-handling, scheduling, or shutdown policy is added.
+pub fn poll_task<F: Future + ?Sized>(
+    task: &mut Option<Pin<Box<F>>>,
+    cx: &mut Context<'_>,
+) -> Option<F::Output> {
+    match task.as_mut()?.as_mut().poll(cx) {
+        Poll::Pending => None,
+        Poll::Ready(result) => {
+            task.take();
+            Some(result)
+        }
+    }
+}
+
 thread_local! {
     static CURRENT: RefCell<Option<Rc<DriverQueue>>> = const { RefCell::new(None) };
 }
@@ -505,13 +521,7 @@ mod tests {
         assert_eq!(pending(), 0);
     }
 
-    #[derive(Default)]
-    struct WakeCount(std::sync::atomic::AtomicUsize);
-    impl std::task::Wake for WakeCount {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    use crate::test_util::WakeCounter as WakeCount;
 
     #[test]
     fn runnable_replaces_owner_preserves_in_poll_wake_and_force() {
@@ -535,7 +545,7 @@ mod tests {
                 .poll(work.as_mut(), &mut Context::from_waker(&w1), false)
                 .is_pending()
         );
-        assert_eq!(first.0.load(Ordering::Relaxed), 1);
+        assert_eq!(first.count(), 1);
         assert!(
             runnable
                 .poll(work.as_mut(), &mut Context::from_waker(&w2), false)
@@ -549,8 +559,8 @@ mod tests {
         );
         assert_eq!(polls.get(), 2);
         saved.borrow().as_ref().unwrap().wake_by_ref();
-        assert_eq!(second.0.load(Ordering::Relaxed), 1);
-        assert_eq!(first.0.load(Ordering::Relaxed), 1);
+        assert_eq!(second.count(), 1);
+        assert_eq!(first.count(), 1);
         assert!(
             runnable
                 .poll(work.as_mut(), &mut Context::from_waker(&w2), false)
@@ -572,6 +582,48 @@ mod tests {
         let waker = Waker::from(wake.clone());
         queue.poll(&mut Context::from_waker(&waker), 0);
         spawn(Box::pin(async {})).unwrap();
-        assert_eq!(wake.0.load(Ordering::Relaxed), 1);
+        assert_eq!(wake.count(), 1);
+    }
+
+    #[test]
+    fn task_slot_retains_pending_and_drops_ready_before_returning_result() {
+        struct Local {
+            ready: Rc<Cell<bool>>,
+            dropped: Rc<Cell<bool>>,
+            result: Result<usize>,
+        }
+        impl Future for Local {
+            type Output = Result<usize>;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.ready.get() {
+                    Poll::Ready(self.result)
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        impl Drop for Local {
+            fn drop(&mut self) {
+                self.dropped.set(true);
+            }
+        }
+        for result in [Ok(7), Err(Error::Io)] {
+            let ready = Rc::new(Cell::new(false));
+            let dropped = Rc::new(Cell::new(false));
+            let mut task = Some(Box::pin(Local {
+                ready: ready.clone(),
+                dropped: dropped.clone(),
+                result,
+            }));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert_eq!(poll_task(&mut task, &mut cx), None);
+            assert!(task.is_some());
+            assert!(!dropped.get());
+            ready.set(true);
+            assert_eq!(poll_task(&mut task, &mut cx), Some(result));
+            assert!(task.is_none());
+            assert!(dropped.get());
+            assert_eq!(poll_task(&mut task, &mut cx), None);
+        }
     }
 }

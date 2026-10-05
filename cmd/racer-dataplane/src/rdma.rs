@@ -28,13 +28,14 @@ use racer_identity::VerifiedPeer;
 use rdma_verbs::DeviceHandle;
 use rdma_verbs::Endpoint;
 use rdma_verbs::IoPort;
-use rdma_verbs::NativePort;
+#[cfg(test)]
 use rdma_verbs::NativeService;
 use rdma_verbs::PortInfo;
 use rdma_verbs::QueuePairHandle;
 use rdma_verbs::Region;
 use rdma_verbs::Ticket;
 use rdma_verbs::Window;
+use rdma_verbs::discovery::valid_device;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
@@ -43,12 +44,11 @@ use std::future::poll_fn;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Mutex;
-use std::task::Context;
 use std::task::Poll;
-use std::task::Waker;
 use uring_runtime::deadline::Deadline;
 #[cfg(test)]
 use uring_runtime::group::Service;
+use uring_runtime::poll_scoped;
 
 // Match discovered ports to trusted local fabric associations and publication.
 // Fabric strings are opaque labels: a GID or enumeration order is never a label.
@@ -57,65 +57,8 @@ use uring_runtime::group::Service;
 // lifecycle endpoints, activate devices against publication, and run `WithNative`
 // on the crypto role. I/O turns consume mailboxes and drive session progress.
 
-pub(crate) async fn wait<T, E: Into<Error>>(
-    scope: &RequestScope,
-    mut poll: impl FnMut(&mut Context<'_>) -> Poll<std::result::Result<T, E>>,
-) -> Result<T> {
-    let cancellation = scope.cancellation.subscribe()?;
-    std::future::poll_fn(|cx| {
-        cancellation.register(cx.waker());
-        scope.check()?;
-        poll(cx).map_err(Into::into)
-    })
-    .await
-}
-
 /// Compose page crypto and native progress on the existing paired crypto thread.
-pub struct WithNative {
-    inner: PageCryptoEngine,
-    native: NativeService,
-}
-impl WithNative {
-    pub fn new(inner: PageCryptoEngine, port: NativePort) -> Self {
-        Self {
-            inner,
-            native: NativeService::new(port),
-        }
-    }
-}
-impl uring_runtime::group::Service<RequestScope> for WithNative {
-    fn register_driver(&self, waker: &Waker) {
-        self.inner.register_driver(waker);
-        self.native.register_driver(waker);
-    }
-    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        self.inner.start(scope)
-    }
-    fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
-        self.inner.poll_budgeted(cx, budget)?;
-        self.native.poll_budgeted(budget).map_err(Into::into)
-    }
-    fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async move {
-            self.native.close();
-            futures::future::poll_fn(|cx| -> Poll<Result<()>> {
-                self.native.register_driver(cx.waker());
-                self.native.poll_budgeted(1)?;
-                if self.native.drained() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    // The worker's bounded tick retries failed native fences.
-                    Poll::Pending
-                }
-            })
-            .await?;
-            self.inner.drain(scope).await
-        })
-    }
-    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        self.inner.shutdown(scope)
-    }
-}
+pub type WithNative = rdma_verbs::WithNative<PageCryptoEngine>;
 
 pub const SETUP_HEADER: &str = "racer-rdma-setup";
 pub const SETUP_BINDING_HEADER: &str = "racer-rdma-setup-binding";
@@ -154,12 +97,7 @@ impl SetupParameters {
         let mut encoded = b"racer-rdma-setup-v1\0".to_vec();
         encoded.extend_from_slice(&rail.0.to_be_bytes());
         encoded.extend_from_slice(&nonce);
-        encoded.extend_from_slice(&endpoint.gid);
-        for v in [endpoint.qpn, endpoint.psn, endpoint.mtu] {
-            encoded.extend_from_slice(&v.to_be_bytes());
-        }
-        encoded.extend_from_slice(&endpoint.lid.to_be_bytes());
-        encoded.extend_from_slice(&[endpoint.port, endpoint.link_layer]);
+        encoded.extend_from_slice(&endpoint.to_bytes());
         Ok(Self { rail, encoded })
     }
     fn endpoint(&self) -> Result<Endpoint> {
@@ -171,17 +109,7 @@ impl SetupParameters {
         if u16::from_be_bytes(b[..2].try_into().unwrap()) != self.rail.0 || b[2..18] == [0; 16] {
             return Err(Error::InvalidRequest);
         }
-        let endpoint = Endpoint {
-            gid: b[18..34].try_into().unwrap(),
-            qpn: u32::from_be_bytes(b[34..38].try_into().unwrap()),
-            psn: u32::from_be_bytes(b[38..42].try_into().unwrap()),
-            mtu: u32::from_be_bytes(b[42..46].try_into().unwrap()),
-            lid: u16::from_be_bytes(b[46..48].try_into().unwrap()),
-            port: b[48],
-            link_layer: b[49],
-        };
-        endpoint.validate()?;
-        Ok(endpoint)
+        Endpoint::from_bytes(&b[18..]).map_err(Into::into)
     }
     pub fn header_value(&self) -> Vec<u8> {
         STANDARD.encode(&self.encoded).into_bytes()
@@ -270,7 +198,7 @@ impl Sessions {
     ) -> Operation<'a, PreparedSession> {
         #[cfg(test)]
         self.prepare_attempts.set(self.prepare_attempts.get() + 1);
-        Box::pin(wait(scope, move |cx| {
+        Box::pin(poll_scoped(scope, move |cx| {
             self.register_driver(cx.waker());
             self.poll_prepare(peer, rail, permit.clone(), receive.clone())
         }))
@@ -399,7 +327,7 @@ impl PreparedSession {
                 return Err(Error::Replay);
             }
             let endpoint = remote.endpoint()?;
-            wait(scope, |cx| {
+            poll_scoped(scope, |cx| {
                 self.qp.register_waiter(cx);
                 self.qp.poll_connect(endpoint)
             })
@@ -596,7 +524,7 @@ impl Grant {
                 }
             }
             let mut abort = Abort(Some(&session.qp));
-            let (window, bound) = wait(scope, |cx| {
+            let (window, bound) = poll_scoped(scope, |cx| {
                 session.qp.register_waiter(cx);
                 session.qp.poll_bind(buffer.region.clone())
             })
@@ -771,7 +699,7 @@ impl Sessions {
             let _abort = AbortOnDrop(session.qp.clone());
             let mut buffer = RegisteredLease::acquire(session, page.bytes().len(), scope).await?;
             buffer.copy_from(page.bytes(), scope).await?;
-            let ticket = wait(scope, |cx| {
+            let ticket = poll_scoped(scope, |cx| {
                 session.qp.register_waiter(cx);
                 session.qp.poll_write(
                     buffer.region.clone(),
@@ -796,7 +724,7 @@ impl Sessions {
             // before returning a control completion or admitting a fallback.
             // Request termination abandons this wait, not the native owner's
             // quarantine. Only a successful terminal fence permits completion.
-            wait(scope, |cx| session.qp.poll_stopped(cx)).await?;
+            poll_scoped(scope, |cx| session.qp.poll_stopped(cx)).await?;
             Ok(SendCompletion {
                 binding: session.binding(),
                 transfer: descriptor.descriptor.transfer,
@@ -870,7 +798,7 @@ impl RegisteredLease {
     ) -> Operation<'a, RegisteredLease> {
         Box::pin(async move {
             registered_charge(length)?;
-            let region = wait(scope, |cx| {
+            let region = poll_scoped(scope, |cx| {
                 session.qp.register_waiter(cx);
                 Region::poll_acquire(&session.qp, length)
             })
@@ -892,13 +820,13 @@ impl RegisteredLease {
         ciphertext: &'a [u8],
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
-        Box::pin(wait(scope, |cx| {
+        Box::pin(poll_scoped(scope, |cx| {
             self.region.register_waiter(cx);
             self.region.poll_copy_from(ciphertext)
         }))
     }
     pub fn to_vec<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, Vec<u8>> {
-        Box::pin(wait(scope, |cx| self.region.poll_copy_to(cx)))
+        Box::pin(poll_scoped(scope, |cx| self.region.poll_copy_to(cx)))
     }
 }
 fn registered_charge(length: usize) -> Result<usize> {
@@ -1038,61 +966,32 @@ impl Devices {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let requested = publication.clone();
-            let mut configure = std::pin::pin!(port.configure(rdma_verbs::Configuration {
-                discover: !publication.is_empty(),
-                guards: quotas,
-                bytes: bytes_per_slot,
-                selector: Box::new(move |ports| {
-                    match_publication(&requested, ports)
-                        .map(|selected| {
-                            selected
-                                .into_iter()
-                                .map(|(r, i)| (u32::from(r.rail.0), i))
-                                .collect()
-                        })
-                        .map_err(|e| match e {
-                            Error::InvalidConfiguration => rdma_verbs::Error::InvalidConfiguration,
-                            Error::Overloaded => rdma_verbs::Error::Overloaded,
-                            _ => rdma_verbs::Error::Unavailable,
-                        })
-                }),
-            }));
-            wait(scope, |cx| {
-                std::future::Future::poll(configure.as_mut(), cx)
-            })
-            .await?;
-            struct ActivationGuard<'a> {
-                port: &'a IoPort,
-                completed: bool,
-            }
-            impl Drop for ActivationGuard<'_> {
-                fn drop(&mut self) {
-                    if !self.completed {
-                        self.port.close();
-                    }
-                }
-            }
-            let mut guard = ActivationGuard {
-                port: &port,
-                completed: false,
-            };
-            let cancel = scope.cancellation.subscribe()?;
-            let mappings = futures::future::poll_fn(|cx| {
-                port.register_driver(cx.waker());
-                cancel.register(cx.waker());
-                if port.closed() {
-                    return std::task::Poll::Ready(Err(Error::Unavailable));
-                }
-                if let Err(error) = scope.check() {
-                    port.close();
-                    return std::task::Poll::Ready(Err(error));
-                }
-                port.activation()
-                    .map(|r| r.map_err(Error::from))
-                    .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
-            })
-            .await?;
-            guard.completed = true;
+            let mappings = port
+                .activate(
+                    rdma_verbs::Configuration {
+                        discover: !publication.is_empty(),
+                        guards: quotas,
+                        bytes: bytes_per_slot,
+                        selector: Box::new(move |ports| {
+                            match_publication(&requested, ports)
+                                .map(|selected| {
+                                    selected
+                                        .into_iter()
+                                        .map(|(r, i)| (u32::from(r.rail.0), i))
+                                        .collect()
+                                })
+                                .map_err(|e| match e {
+                                    Error::InvalidConfiguration => {
+                                        rdma_verbs::Error::InvalidConfiguration
+                                    }
+                                    Error::Overloaded => rdma_verbs::Error::Overloaded,
+                                    _ => rdma_verbs::Error::Unavailable,
+                                })
+                        }),
+                    },
+                    scope,
+                )
+                .await?;
             let mappings: Vec<_> = mappings
                 .into_iter()
                 .map(|selected| {
@@ -1180,16 +1079,6 @@ impl Devices {
 
 /// Shared durable-journal bound for admission, restoration, and enrollment I/O.
 pub const MAX_JOURNAL_BYTES: usize = 64 * 1024;
-
-// Native ABI names have 64 bytes including the trailing NUL. These local names
-// are also sysfs path components, unlike unrestricted authenticated wire names.
-fn valid_device(device: &str) -> bool {
-    !device.is_empty()
-        && device.len() <= 63
-        && !device.contains(['/', '\0', '\r', '\n'])
-        && device != "."
-        && device != ".."
-}
 
 /// One process-wide inventory, shared by enrollment and every worker. Withdrawn
 /// ports keep their rail reservation: neither outages nor GID changes renumber
@@ -1310,34 +1199,12 @@ pub fn inventory() -> Vec<RailMapping> {
     )
 }
 
-fn inventory_at(mut ports: Vec<PortInfo>, root: &Path) -> Vec<RailMapping> {
-    // Names come from the native provider, not membership. Still reject path
-    // components before joining sysfs paths.
-    ports.retain(|p| valid_device(&p.device) && p.port != 0 && p.gid != [0; 16]);
-    let mut ports: Vec<_> = ports
-        .into_iter()
-        .map(|mut port| {
-            let device = root.join(&port.device).join("device");
-            let bdf = std::fs::canonicalize(&device)
-                .ok()
-                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()));
-            port.numa_node = std::fs::read_to_string(device.join("numa_node"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .map(|n| n as usize);
-            (bdf, port)
-        })
-        .collect();
-    ports.sort_by(|(a, x), (b, y)| {
-        (a.is_none(), a, x.port, &x.device).cmp(&(b.is_none(), b, y.port, &y.device))
-    });
-    let mut physical = std::collections::BTreeSet::new();
-    ports.retain(|(_, p)| physical.insert((p.device.clone(), p.port)));
-    ports
+fn inventory_at(ports: Vec<PortInfo>, root: &Path) -> Vec<RailMapping> {
+    rdma_verbs::discovery::inventory_at(ports, root)
         .into_iter()
         .take(64)
         .enumerate()
-        .map(|(i, (_, p))| RailMapping {
+        .map(|(i, p)| RailMapping {
             device: p.device,
             port: p.port,
             rail: RailId(i as u16),
@@ -1582,7 +1449,6 @@ pub(crate) mod tests {
                 signature: verified.signed.signature,
             };
             signatures.verify_proof(replay).unwrap();
-            crate::peer::protocol::tests::sessions::replay_and_binding_checks();
             let mut tampered = signatures.sign(head()).unwrap();
             tampered
                 .head
@@ -1606,6 +1472,17 @@ pub(crate) mod tests {
             };
             let mut s = SetupParameters::new(RailId(7), e).unwrap();
             assert_eq!(s.endpoint().unwrap(), e);
+            // Freeze the existing envelope layout independently of the codec.
+            let prefix = b"racer-rdma-setup-v1\0";
+            assert_eq!(s.encoded.len(), prefix.len() + 50);
+            assert_eq!(&s.encoded[..prefix.len()], prefix);
+            assert_eq!(&s.encoded[prefix.len()..prefix.len() + 2], &[0, 7]);
+            assert_ne!(&s.encoded[prefix.len() + 2..prefix.len() + 18], &[0; 16]);
+            assert_eq!(&s.encoded[prefix.len() + 18..prefix.len() + 34], &[1; 16]);
+            assert_eq!(
+                &s.encoded[prefix.len() + 34..],
+                &[0, 0, 0, 3, 0, 0, 0, 9, 0, 0, 0, 3, 0, 2, 1, 1]
+            );
             s.rail = RailId(8);
             assert_eq!(s.endpoint(), Err(Error::InvalidRequest));
             s.rail = RailId(7);
@@ -2558,7 +2435,7 @@ pub(crate) mod tests {
                     let configure = io.configure(plan());
                     let mut configure: Operation<'_, ()> = Box::pin(async {
                         let mut configure = std::pin::pin!(configure);
-                        wait(&scope, |cx| {
+                        poll_scoped(&scope, |cx| {
                             std::future::Future::poll(configure.as_mut(), cx)
                         })
                         .await

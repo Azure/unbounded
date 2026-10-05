@@ -27,8 +27,12 @@ pub mod topology;
 pub mod worker;
 
 #[cfg(feature = "subscription-interop")]
+mod subscription_interop;
+
+// The integration-test launcher needs one opt-in entry point, not a public fixture module.
+#[cfg(feature = "subscription-interop")]
 #[doc(hidden)]
-pub mod subscription_interop;
+pub use subscription_interop::go_sdk_subscription_server as run_subscription_interop_fixture;
 
 #[cfg(test)]
 mod contention;

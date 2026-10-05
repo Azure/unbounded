@@ -28,24 +28,18 @@ use racer_crypto::aead;
 use racer_identity::KeyLease;
 use racer_identity::KeyPurpose;
 use racer_identity::Keyring;
-use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
-use uring_runtime::channel;
-use uring_runtime::channel::Receiver;
-use uring_runtime::channel::Sender;
+use uring_runtime::offload;
 use uring_runtime::reactor::IoBuffer;
 use zeroize::Zeroizing;
 
@@ -949,6 +943,22 @@ impl<T> From<uring_runtime::channel::SendFailure<T>> for CryptoSendFailure<T> {
         }
     }
 }
+impl From<offload::Error> for Error {
+    fn from(error: offload::Error) -> Self {
+        match error {
+            offload::Error::Stale => Self::StaleFlight,
+            offload::Error::Runtime(error) => error.into(),
+        }
+    }
+}
+impl<T> From<offload::SendFailure<T>> for CryptoSendFailure<T> {
+    fn from(failure: offload::SendFailure<T>) -> Self {
+        Self {
+            command: failure.command,
+            error: failure.error.into(),
+        }
+    }
+}
 /// I/O-generated identity, independent of flights. Never reuse a sequence within
 /// a pair generation; restart increments the generation and rejects late results.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -956,6 +966,18 @@ pub struct CryptoId {
     pub worker: WorkerId,
     pub generation: u64,
     pub sequence: u64,
+}
+impl offload::Identity for CryptoId {
+    type Owner = WorkerId;
+    fn owner(self) -> WorkerId {
+        self.worker
+    }
+    fn generation(self) -> u64 {
+        self.generation
+    }
+    fn sequence(self) -> u64 {
+        self.sequence
+    }
 }
 impl Ord for CryptoId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -993,18 +1015,6 @@ pub enum CryptoOutput {
     Decrypted(VerifiedPage, CiphertextPage),
     Encrypted(VerifiedPage, CiphertextPage),
 }
-/// Composition descriptor shared only by the two endpoints and their permits.
-/// Bound queued + executing + unconsumed completions by capacity, not merely jobs.
-struct Handoff {
-    worker: WorkerId,
-    generation: u64,
-    capacity: NonZeroUsize,
-    outstanding: AtomicUsize,
-    closed: AtomicBool,
-    capacity_waker: futures::task::AtomicWaker,
-    engine_waker: futures::task::AtomicWaker,
-    io_waker: futures::task::AtomicWaker,
-}
 /// Non-cloneable, pair-bound reservation of both submission and completion space.
 /// Only the I/O endpoint can mint it. Failed submission returns the entire job.
 /// ```compile_fail
@@ -1013,10 +1023,9 @@ struct Handoff {
 /// ```
 pub struct CryptoPermit {
     pub(crate) send_sample: Option<crate::telemetry::Work>,
-    handoff: Arc<Handoff>,
-    id: CryptoId,
     measurement: Measurement,
     pub(crate) aead_failure: Option<crate::telemetry::AeadFailure>,
+    reservation: offload::Permit<CryptoId>,
 }
 #[derive(Default)]
 struct Measurement {
@@ -1111,12 +1120,6 @@ impl CryptoCompletion {
         }
     }
 }
-impl Drop for CryptoPermit {
-    fn drop(&mut self) {
-        self.handoff.outstanding.fetch_sub(1, Ordering::AcqRel);
-        self.handoff.capacity_waker.wake();
-    }
-}
 pub struct CryptoJob {
     pub(crate) input: CryptoInput,
     pub(crate) key: KeyLease,
@@ -1147,7 +1150,12 @@ impl CryptoPermit {
 }
 impl CryptoJob {
     pub fn id(&self) -> CryptoId {
-        self.permit.id
+        self.permit.reservation.id()
+    }
+}
+impl offload::Reserved<CryptoId> for CryptoJob {
+    fn permit(&self) -> &offload::Permit<CryptoId> {
+        &self.permit.reservation
     }
 }
 /// Failed/canceled work returns its input allocations and reservations intact.
@@ -1165,21 +1173,21 @@ pub struct CryptoCompletion {
 }
 impl CryptoCompletion {
     pub fn id(&self) -> CryptoId {
-        self.permit.id
+        self.permit.reservation.id()
+    }
+}
+impl offload::Reserved<CryptoId> for CryptoCompletion {
+    fn permit(&self) -> &offload::Permit<CryptoId> {
+        &self.permit.reservation
     }
 }
 /// Endpoints move to their respective threads before constructing local services.
 /// They are not Clone: exactly one producer/consumer exists in each direction.
 pub struct IoCryptoPort {
-    handoff: Arc<Handoff>,
-    jobs: Sender<CryptoJob>,
-    completions: RefCell<Receiver<CryptoCompletion>>,
-    last_sequence: Cell<Option<u64>>,
+    queue: offload::ClientPort<CryptoId, CryptoJob, CryptoCompletion>,
 }
 pub struct CryptoPort {
-    handoff: Arc<Handoff>,
-    jobs: Option<Receiver<CryptoJob>>,
-    completions: Sender<CryptoCompletion>,
+    queue: offload::WorkerPort<CryptoId, CryptoJob, CryptoCompletion>,
 }
 /// Allocate fixed-capacity handoffs without starting either service.
 pub fn pair(
@@ -1195,116 +1203,61 @@ pub fn try_pair(
     generation: u64,
     capacity: NonZeroUsize,
 ) -> Result<(IoCryptoPort, CryptoPort)> {
-    let (jobs_tx, jobs_rx) = channel::bounded(capacity.get())?;
-    let (results_tx, results_rx) = channel::bounded(capacity.get())?;
-    let handoff = Arc::new(Handoff {
-        worker,
-        generation,
+    let (client, worker) = offload::try_pair(
+        CryptoId {
+            worker,
+            generation,
+            sequence: 0,
+        },
         capacity,
-        outstanding: AtomicUsize::new(0),
-        closed: AtomicBool::new(false),
-        capacity_waker: futures::task::AtomicWaker::new(),
-        engine_waker: futures::task::AtomicWaker::new(),
-        io_waker: futures::task::AtomicWaker::new(),
-    });
-    Ok((
-        IoCryptoPort {
-            handoff: handoff.clone(),
-            jobs: jobs_tx,
-            completions: RefCell::new(results_rx),
-            last_sequence: Cell::new(None),
-        },
-        CryptoPort {
-            handoff,
-            jobs: Some(jobs_rx),
-            completions: results_tx,
-        },
-    ))
+    )?;
+    Ok((IoCryptoPort { queue: client }, CryptoPort { queue: worker }))
 }
 impl IoCryptoPort {
     /// Atomically reserve both directions. Saturation parks with a wakeup rather
     /// than holding a job-only slot. Reject wrong-worker/stale IDs.
     pub fn poll_reserve(&self, cx: &mut Context<'_>, id: CryptoId) -> Poll<Result<CryptoPermit>> {
-        self.handoff.capacity_waker.register(cx.waker());
-        if self.handoff.closed.load(Ordering::Acquire) {
-            return Poll::Ready(Err(Error::Unavailable));
-        }
-        if id.worker != self.handoff.worker
-            || id.generation != self.handoff.generation
-            || self
-                .last_sequence
-                .get()
-                .is_some_and(|last| id.sequence <= last)
-        {
-            return Poll::Ready(Err(Error::StaleFlight));
-        }
-        if self
-            .handoff
-            .outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.handoff.capacity.get()).then_some(n + 1)
-            })
-            .is_err()
-        {
-            return Poll::Pending;
-        }
-        self.last_sequence.set(Some(id.sequence));
-        Poll::Ready(Ok(CryptoPermit {
-            send_sample: None,
-            aead_failure: None,
-            handoff: self.handoff.clone(),
-            id,
-            measurement: Measurement::default(),
-        }))
+        self.queue.poll_reserve(cx, id).map(|result| {
+            result
+                .map(|reservation| CryptoPermit {
+                    send_sample: None,
+                    aead_failure: None,
+                    reservation,
+                    measurement: Measurement::default(),
+                })
+                .map_err(Into::into)
+        })
     }
     /// Rejected submission returns all ownership; accepted jobs outlive waiters.
     pub fn try_submit(
         &self,
-        mut job: CryptoJob,
+        job: CryptoJob,
     ) -> std::result::Result<(), CryptoSendFailure<CryptoJob>> {
-        if !Arc::ptr_eq(&self.handoff, &job.permit.handoff)
-            || self.handoff.closed.load(Ordering::Acquire)
-        {
-            return Err(CryptoSendFailure {
-                command: job,
-                error: Error::Unavailable,
-            });
-        }
         // Capture at publication attempt, not reservation. Retry overwrites it.
-        job.permit.measurement.submitted = Some(uring_runtime::environment::now());
-        self.jobs.try_send(job)?;
-        self.handoff.engine_waker.wake();
-        Ok(())
+        self.queue
+            .try_submit(job, |job| {
+                job.permit.measurement.submitted = Some(uring_runtime::environment::now());
+            })
+            .map_err(Into::into)
     }
     /// Drain even abandoned/stale completions before returning their credits.
     pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Result<Option<CryptoCompletion>>> {
-        self.completions
-            .borrow_mut()
-            .poll_receive(cx)
-            .map_err(Into::into)
+        self.queue.poll_completion(cx).map_err(Into::into)
     }
     /// Refuse new reservations/submissions, but keep completions available.
     pub fn close_submissions(&self) -> Result<()> {
-        self.handoff.closed.store(true, Ordering::Release);
-        self.jobs.close();
-        self.handoff.engine_waker.wake();
-        self.handoff.capacity_waker.wake();
+        self.queue.close_submissions();
         Ok(())
     }
 }
 impl CryptoPort {
     /// Worker-level wake registration independent of per-operation polling.
     pub fn register_driver(&self, waker: &Waker) {
-        self.handoff.engine_waker.register(waker);
+        self.queue.register_driver(waker);
     }
     /// None means closed and all accepted jobs consumed, not temporarily empty.
     pub fn poll_job(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<CryptoJob>>> {
-        let result = self
-            .jobs
-            .as_mut()
-            .expect("live engine endpoint")
-            .poll_receive(cx)
-            .map_err(Into::into);
+        let result = self.queue.poll_job(cx).map_err(Into::into);
         match result {
             Poll::Ready(Ok(Some(mut job))) => {
                 job.permit.measurement.queue_ns = job.permit.measurement.submitted.map(elapsed_ns);
@@ -1318,29 +1271,7 @@ impl CryptoPort {
         &mut self,
         completion: CryptoCompletion,
     ) -> std::result::Result<(), CryptoSendFailure<CryptoCompletion>> {
-        if !Arc::ptr_eq(&self.handoff, &completion.permit.handoff) {
-            return Err(CryptoSendFailure {
-                command: completion,
-                error: Error::StaleFlight,
-            });
-        }
-        self.completions.try_send(completion)?;
-        self.handoff.io_waker.wake();
-        Ok(())
-    }
-}
-impl Drop for CryptoPort {
-    fn drop(&mut self) {
-        // No engine accesses queued jobs. Drain unique-consumer ownership before EOF.
-        self.handoff.closed.store(true, Ordering::Release);
-        if let Some(mut jobs) = self.jobs.take() {
-            while let Ok(Some(job)) = jobs.receive() {
-                drop(job);
-            }
-        }
-        self.completions.close();
-        self.handoff.io_waker.wake();
-        self.handoff.capacity_waker.wake();
+        self.queue.complete(completion).map_err(Into::into)
     }
 }
 /// Local submission facade driven by the worker, not by the waiting future.
@@ -1350,61 +1281,20 @@ pub struct CryptoClient {
     observer: RefCell<crate::telemetry::Observer>,
     port: IoCryptoPort,
     metrics: RefCell<Option<crate::telemetry::Metrics>>,
-    waiters: RefCell<BTreeMap<CryptoId, Waiter>>,
-    sequence: Cell<u64>,
-    pending: RefCell<VecDeque<(CryptoId, Waker, RequestScope)>>,
-    deadline_cursor: Cell<Option<CryptoId>>,
-    pending_cursor: Cell<usize>,
+    waiters: offload::Waiters<CryptoId, CryptoCompletion>,
+    pending: offload::AdmissionQueue<RequestScope>,
     drain_waiter: RefCell<Option<(RequestScope, Waker)>>,
-}
-struct Waiter {
-    waker: Waker,
-    abandoned: bool,
-    result: Option<CryptoCompletion>,
-}
-struct Registration<'a> {
-    client: &'a CryptoClient,
-    id: CryptoId,
-}
-struct CapacityWaiter<'a> {
-    client: &'a CryptoClient,
-    id: CryptoId,
-}
-impl Drop for CapacityWaiter<'_> {
-    fn drop(&mut self) {
-        let wake = {
-            let mut pending = self.client.pending.borrow_mut();
-            pending.retain(|(id, _, _)| *id != self.id);
-            pending.front().map(|(_, waker, _)| waker.clone())
-        };
-        if let Some(waker) = wake {
-            waker.wake();
-        }
-    }
-}
-impl Drop for Registration<'_> {
-    fn drop(&mut self) {
-        let mut waiters = self.client.waiters.borrow_mut();
-        if let Some(waiter) = waiters.get_mut(&self.id) {
-            if waiter.result.is_some() {
-                waiters.remove(&self.id);
-            } else {
-                waiter.abandoned = true;
-            }
-        }
-    }
 }
 impl CryptoClient {
     pub fn new(port: IoCryptoPort) -> Self {
+        let pending =
+            offload::AdmissionQueue::new(NonZeroUsize::new(port.queue.capacity()).unwrap());
         Self {
             observer: RefCell::new(crate::telemetry::Observer::default()),
             port,
             metrics: RefCell::new(None),
-            waiters: RefCell::new(BTreeMap::new()),
-            sequence: Cell::new(0),
-            pending: RefCell::new(VecDeque::new()),
-            deadline_cursor: Cell::new(None),
-            pending_cursor: Cell::new(0),
+            waiters: offload::Waiters::default(),
+            pending,
             drain_waiter: RefCell::new(None),
         }
     }
@@ -1435,41 +1325,18 @@ impl CryptoClient {
         Box::pin(async move {
             scope.check()?;
             let cancellation = scope.cancellation.subscribe()?;
-            if self.pending.borrow().len() >= self.port.handoff.capacity.get() {
-                return Err(Error::Overloaded);
-            }
-            let sequence = self
-                .sequence
-                .get()
-                .checked_add(1)
-                .ok_or(Error::Unavailable)?;
-            self.sequence.set(sequence);
+            let capacity_waiter =
+                futures::future::poll_fn(|cx| Poll::Ready(self.pending.enter(scope.clone(), cx)))
+                    .await?;
             let id = CryptoId {
-                worker: self.port.handoff.worker,
-                generation: self.port.handoff.generation,
-                sequence,
+                worker: self.port.queue.identity().worker,
+                generation: self.port.queue.identity().generation,
+                sequence: capacity_waiter.sequence(),
             };
-            let capacity_waiter = CapacityWaiter { client: self, id };
             let mut permit = futures::future::poll_fn(|cx| {
                 cancellation.register(cx.waker());
                 scope.check()?;
-                let mut pending = self.pending.borrow_mut();
-                if let Some((_, waker, _)) = pending
-                    .iter_mut()
-                    .find(|(candidate, _, _)| *candidate == id)
-                {
-                    *waker = cx.waker().clone();
-                } else {
-                    pending.push_back((id, cx.waker().clone(), scope.clone()));
-                }
-                if pending
-                    .front()
-                    .is_some_and(|(candidate, _, _)| *candidate != id)
-                {
-                    return Poll::Pending;
-                }
-                drop(pending);
-                self.port.poll_reserve(cx, id)
+                capacity_waiter.poll(cx, |cx| self.port.poll_reserve(cx, id))
             })
             .await?;
             drop(capacity_waiter);
@@ -1478,48 +1345,32 @@ impl CryptoClient {
             }
             permit.send_sample = sample;
             let mut job = Some(permit.job(input, key, scope.clone()));
-            futures::future::poll_fn(|cx| {
-                self.waiters.borrow_mut().insert(
-                    id,
-                    Waiter {
-                        waker: cx.waker().clone(),
-                        abandoned: false,
-                        result: None,
-                    },
-                );
-                Poll::Ready(())
+            let registration = futures::future::poll_fn(|cx| {
+                Poll::Ready(self.waiters.register_guard(id, cx.waker()))
             })
             .await;
-            let registration = Registration { client: self, id };
             if let Err(failure) = self.port.try_submit(job.take().unwrap()) {
-                self.waiters.borrow_mut().remove(&id);
+                self.waiters.remove(id);
                 return Err(failure.error);
             }
             let result = futures::future::poll_fn(|cx| {
                 // Returning after acceptance is itself a completion fence; scope
                 // failure cannot elect a replacement acquisition before that fence.
-                let mut waiters = self.waiters.borrow_mut();
-                let Some(waiter) = waiters.get_mut(&id) else {
-                    return Poll::Ready(Err(Error::Cancelled));
-                };
-                waiter.waker = cx.waker().clone();
-                if let Some(completion) = waiter.result.take() {
-                    let canceled = waiter.abandoned;
-                    waiters.remove(&id);
-                    if canceled {
-                        return Poll::Ready(Err(Error::Cancelled));
+                match self.waiters.poll_result(id, cx) {
+                    Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
+                    Poll::Ready(Ok(completion)) => {
+                        scope.check()?;
+                        Poll::Ready(match completion.outcome {
+                            CryptoOutcome::Completed(output) => Ok(output),
+                            CryptoOutcome::Failed { error, .. } => Err(error),
+                        })
                     }
-                    if let Err(error) = scope.check() {
-                        return Poll::Ready(Err(error));
-                    }
-                    Poll::Ready(match completion.outcome {
-                        CryptoOutcome::Completed(output) => Ok(output),
-                        CryptoOutcome::Failed { error, .. } => Err(error),
-                    })
-                } else if self.port.completions.borrow().is_closed() && self.outstanding() == 0 {
-                    Poll::Ready(Err(Error::Unavailable))
-                } else {
                     Poll::Pending
+                        if self.port.queue.completions_closed() && self.outstanding() == 0 =>
+                    {
+                        Poll::Ready(Err(Error::Unavailable))
+                    }
+                    Poll::Pending => Poll::Pending,
                 }
             })
             .await;
@@ -1530,7 +1381,7 @@ impl CryptoClient {
     /// I/O reaps even when no user futures remain, before admitting more work.
     pub fn poll_budgeted(&self, work_budget: usize) -> Result<()> {
         for _ in 0..work_budget {
-            let completion = self.port.completions.borrow_mut().receive()?;
+            let completion = self.port.queue.receive()?;
             let Some(completion) = completion else {
                 break;
             };
@@ -1548,79 +1399,18 @@ impl CryptoClient {
             if let Some(failure) = completion.permit.aead_failure {
                 self.observer.borrow().record_aead(id, failure);
             }
-            let wake = {
-                let mut waiters = self.waiters.borrow_mut();
-                if let Some(waiter) = waiters.get_mut(&id) {
-                    if waiter.abandoned {
-                        waiters.remove(&id).map(|waiter| waiter.waker)
-                    } else {
-                        let wake = waiter.waker.clone();
-                        waiter.result = Some(completion);
-                        Some(wake)
-                    }
-                } else {
-                    None
-                }
-            };
-            if let Some(wake) = wake {
-                wake.wake();
-            }
+            self.waiters.deliver(id, completion);
         }
-        if self.port.completions.borrow().is_closed() {
-            self.port.jobs.discard_closed();
-            if self.outstanding() == 0 {
-                let abandoned: Vec<_> = self
-                    .waiters
-                    .borrow()
-                    .iter()
-                    .filter(|(_, waiter)| waiter.abandoned)
-                    .take(work_budget)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in abandoned {
-                    self.waiters.borrow_mut().remove(&id);
-                }
-            }
+        if self.port.queue.completions_closed() {
+            self.port.queue.discard_closed();
+            self.waiters
+                .worker_closed(work_budget, self.outstanding() == 0);
         }
         // Original deadlines bound every wait. The worker drives expiry even
         // without external I/O so canceled futures can detach.
-        let wakes: Vec<_> = {
-            use std::ops::Bound::Excluded;
-            use std::ops::Bound::Unbounded;
-            let waiters = self.waiters.borrow();
-            let start = self.deadline_cursor.get().map_or(Unbounded, Excluded);
-            let mut wakes = Vec::new();
-            for (id, waiter) in waiters
-                .range((start, Unbounded))
-                .chain(waiters.iter())
-                .take(work_budget.min(waiters.len()))
-            {
-                self.deadline_cursor.set(Some(*id));
-                if !waiter.abandoned && self.port.completions.borrow().is_closed() {
-                    wakes.push(waiter.waker.clone());
-                }
-            }
-            wakes
-        };
-        for waker in wakes {
-            waker.wake();
-        }
-        let expired: Vec<_> = {
-            let pending = self.pending.borrow();
-            let mut wakes = Vec::new();
-            for _ in 0..work_budget.min(pending.len()) {
-                let index = self.pending_cursor.get() % pending.len();
-                self.pending_cursor.set(index + 1);
-                let (_, waker, scope) = &pending[index];
-                if scope.check().is_err() || self.port.handoff.closed.load(Ordering::Acquire) {
-                    wakes.push(waker.clone());
-                }
-            }
-            wakes
-        };
-        for waker in expired {
-            waker.wake();
-        }
+        self.pending.wake_if(work_budget, |scope| {
+            scope.check().is_err() || self.port.queue.submissions_closed()
+        });
         let drain_wake = self
             .drain_waiter
             .borrow()
@@ -1633,10 +1423,10 @@ impl CryptoClient {
         Ok(())
     }
     pub fn outstanding(&self) -> usize {
-        self.port.handoff.outstanding.load(Ordering::Acquire)
+        self.port.queue.outstanding()
     }
     pub fn register_driver(&self, waker: &Waker) {
-        self.port.handoff.io_waker.register(waker);
+        self.port.queue.register_driver(waker);
     }
     pub fn close_submissions(&self) -> Result<()> {
         self.port.close_submissions()
@@ -1659,25 +1449,10 @@ impl CryptoClient {
                 }
                 *self.drain_waiter.borrow_mut() = Some((scope.clone(), cx.waker().clone()));
                 self.register_driver(cx.waker());
-                self.port.handoff.capacity_waker.register(cx.waker());
-                self.poll_budgeted(self.port.handoff.capacity.get())?;
+                self.port.queue.register_capacity(cx.waker());
+                self.poll_budgeted(self.port.queue.capacity())?;
                 if scope.check().is_err() {
-                    let wakes: Vec<_> = self
-                        .waiters
-                        .borrow()
-                        .values()
-                        .filter(|waiter| waiter.result.is_some())
-                        .map(|waiter| waiter.waker.clone())
-                        .collect();
-                    for waiter in self.waiters.borrow_mut().values_mut() {
-                        waiter.abandoned = true;
-                    }
-                    self.waiters
-                        .borrow_mut()
-                        .retain(|_, waiter| waiter.result.is_none());
-                    for waker in wakes {
-                        waker.wake();
-                    }
+                    self.waiters.abandon_all();
                 }
                 if self.outstanding() == 0 {
                     Poll::Ready(Ok(()))
@@ -2215,7 +1990,7 @@ mod tests {
                 thread.join().unwrap();
                 admission.reclaim_buffers();
                 assert_eq!(client.outstanding(), 0);
-                assert!(client.waiters.borrow().is_empty());
+                assert!(client.waiters.is_empty());
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
                 assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
                 let events = measurement_events(decrypt);
@@ -2718,15 +2493,15 @@ mod tests {
                         &scopes[1],
                     ));
                     assert!(future.as_mut().unwrap().as_mut().poll(&mut cx).is_pending());
-                    assert_eq!(waiting.pending.borrow().len(), 1);
-                    assert!(waiting.waiters.borrow().is_empty());
+                    assert_eq!(waiting.pending.len(), 1);
+                    assert!(waiting.waiters.is_empty());
                     clock.advance(Duration::from_millis(100));
                     assert!(future.as_mut().unwrap().as_mut().poll(&mut cx).is_pending());
                     assert!(waiting_engine.poll_job(&mut cx).is_pending());
                     drop(blocker);
                     assert!(future.as_mut().unwrap().as_mut().poll(&mut cx).is_pending());
-                    assert!(waiting.pending.borrow().is_empty());
-                    assert_eq!(waiting.waiters.borrow().len(), 1);
+                    assert!(waiting.pending.is_empty());
+                    assert_eq!(waiting.waiters.len(), 1);
 
                     let mut other_future = other.execute(
                         measurement_input(&admission, &cache, lease(), &scopes[0], decrypt, false),
@@ -3361,7 +3136,7 @@ mod tests {
                         Poll::Ready(Err(Error::StaleFlight))
                     ));
                 }
-                assert_eq!(io.handoff.outstanding.load(Ordering::Acquire), 0);
+                assert_eq!(io.queue.outstanding(), 0);
             }
 
             #[test]

@@ -22,14 +22,11 @@ use crate::origin::Origin;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerResponse;
-use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::CredentialCrypto;
 use crate::security::OriginContext;
 use crate::store::catalog::Index;
-use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::future::poll_fn;
 use std::pin::Pin;
@@ -65,270 +62,82 @@ impl RefreshKey {
     }
 }
 
-/// Only credential-free coordination lives here. Context, membership and credits
-/// remain request-owned or in its admitted worker driver, never in this table.
-#[derive(Default)]
-struct Refresh {
-    next: u64,
-    leader: Option<u64>,
-    attempts: usize,
-    waiters: HashMap<u64, Option<Waker>>,
-    result: Option<Result<RefreshOutput>>,
-}
 #[derive(Clone)]
 struct RefreshOutput {
     metadata: ObjectMetadata,
     page: Option<crate::memory::AcquiredPage>,
 }
-#[derive(Default)]
+// Match runtime::HashMap's cfg exactly: dependency simulation features must not
+// switch production or integration-test builds to seeded hashing.
+#[cfg(not(test))]
+type RefreshHashState = std::collections::hash_map::RandomState;
+#[cfg(test)]
+type RefreshHashState = crate::runtime::HashState;
+type Cohorts = coalesce::Table<RefreshKey, Result<RefreshOutput>, RefreshHashState>;
+type Registration = coalesce::Registration<RefreshKey, Result<RefreshOutput>, RefreshHashState>;
+type RefreshEvent = coalesce::Event<Result<RefreshOutput>>;
+
+/// Only credential-free coordination lives here. Context, membership and credits
+/// remain request-owned or in its admitted worker driver, never in this table.
 struct RefreshTable {
-    active: RefCell<HashMap<RefreshKey, Rc<RefCell<Refresh>>>>,
-    // Includes completed cohorts still held by slow readers, not just active keys.
-    registrations: Cell<usize>,
+    inner: Rc<Cohorts>,
 }
-#[derive(Clone)]
-struct Registration {
-    table: Rc<RefreshTable>,
-    key: RefreshKey,
-    refresh: Rc<RefCell<Refresh>>,
-    id: u64,
-    lifetime: Rc<()>,
+impl Default for RefreshTable {
+    fn default() -> Self {
+        Self {
+            inner: Rc::new(Cohorts::new(
+                coalesce::Limits {
+                    waiters_per_cohort: MAX_WAITERS,
+                    attempts_per_cohort: MAX_REFRESH_ATTEMPTS,
+                },
+                Err(Error::Unavailable),
+            )),
+        }
+    }
 }
-enum RefreshEvent {
-    Lead,
-    Complete(Result<RefreshOutput>),
-}
-
 impl RefreshTable {
-    fn join(self: &Rc<Self>, key: RefreshKey, capacity: usize) -> Result<Registration> {
-        if self.registrations.get() >= capacity.saturating_mul(MAX_WAITERS) {
-            return Err(Error::Overloaded);
-        }
-        let mut active = self.active.borrow_mut();
-        let refresh = if let Some(refresh) = active.get(&key) {
-            refresh.clone()
-        } else {
-            if active.len() >= capacity {
-                return Err(Error::Overloaded);
-            }
-            let refresh = Rc::new(RefCell::new(Refresh::default()));
-            active.insert(key.clone(), refresh.clone());
-            refresh
-        };
-        let id = {
-            let mut state = refresh.borrow_mut();
-            if state.waiters.len() >= MAX_WAITERS {
-                return Err(Error::Overloaded);
-            }
-            let id = state.next;
-            state.next = state.next.checked_add(1).ok_or(Error::Overloaded)?;
-            state.waiters.insert(id, None);
-            id
-        };
-        self.registrations.set(self.registrations.get() + 1);
-        Ok(Registration {
-            table: self.clone(),
-            key,
-            refresh,
-            id,
-            lifetime: Rc::new(()),
-        })
+    fn join(&self, key: RefreshKey, capacity: usize) -> Result<Registration> {
+        self.inner
+            .join(key, capacity)
+            .map_err(|_| Error::Overloaded)
     }
-}
-impl Registration {
-    fn retry(&self) {
-        let wakers = {
-            let mut state = self.refresh.borrow_mut();
-            if state.leader == Some(self.id) {
-                state.leader = None;
-            }
-            take_wakers(&mut state)
-        };
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-    fn event(&self, waker: &Waker) -> Poll<RefreshEvent> {
-        let mut state = self.refresh.borrow_mut();
-        if let Some(result) = &state.result {
-            return Poll::Ready(RefreshEvent::Complete(result.clone()));
-        }
-        state.waiters.insert(self.id, Some(waker.clone()));
-        if state.leader.is_none() {
-            if state.attempts >= MAX_REFRESH_ATTEMPTS {
-                drop(state);
-                self.finish(Err(Error::Unavailable));
-                return Poll::Ready(RefreshEvent::Complete(Err(Error::Unavailable)));
-            }
-            state.attempts += 1;
-            state.leader = Some(self.id);
-            return Poll::Ready(RefreshEvent::Lead);
-        }
-        Poll::Pending
-    }
-
-    fn remove_active(&self) {
-        let mut active = self.table.active.borrow_mut();
-        if active
-            .get(&self.key)
-            .is_some_and(|entry| Rc::ptr_eq(entry, &self.refresh))
-        {
-            active.remove(&self.key);
-        }
-    }
-
-    fn finish(&self, result: Result<RefreshOutput>) {
-        let wakers = {
-            let mut state = self.refresh.borrow_mut();
-            state.result = Some(result);
-            state.leader = None;
-            take_wakers(&mut state)
-        };
-        // Close admission before waking the cohort. In particular, a new caller
-        // cannot consume a completed zero-TTL observation even if old waiters live.
-        self.remove_active();
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-}
-impl Drop for Registration {
-    fn drop(&mut self) {
-        // An accepted worker driver holds the same registration until its real
-        // operation completes, fencing detach/re-election after ingress drops.
-        if Rc::strong_count(&self.lifetime) != 1 {
-            return;
-        }
-        let (empty, wakers) = {
-            let mut state = self.refresh.borrow_mut();
-            state.waiters.remove(&self.id);
-            let wakers = if state.leader == Some(self.id) {
-                state.leader = None;
-                take_wakers(&mut state)
-            } else {
-                Vec::new()
-            };
-            (state.waiters.is_empty(), wakers)
-        };
-        self.table
-            .registrations
-            .set(self.table.registrations.get() - 1);
-        if empty {
-            self.remove_active();
-        }
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-}
-fn take_wakers(state: &mut Refresh) -> Vec<Waker> {
-    state
-        .waiters
-        .values_mut()
-        .filter_map(Option::take)
-        .collect()
 }
 
 #[derive(Default)]
 struct IngressDeadlines {
-    next: Cell<u64>,
-    pending: RefCell<BTreeMap<(Instant, u64), Rc<RefCell<IngressDeadlineState>>>>,
-}
-#[derive(Default)]
-struct IngressDeadlineState {
-    expired: bool,
-    waker: Option<Waker>,
+    inner: Rc<uring_runtime::deadline_registry::Registry>,
 }
 /// One entry per admitted resolve, shared across its follower and leader waits.
 /// The refresh registration quota bounds these entries. Drivers never own this
 /// guard: ingress expiry must not release their acquisition or completion fences.
 struct IngressDeadline {
-    table: Rc<IngressDeadlines>,
-    key: (Instant, u64),
-    state: Rc<RefCell<IngressDeadlineState>>,
+    inner: uring_runtime::deadline_registry::Registration,
 }
 impl IngressDeadlines {
     fn register(self: &Rc<Self>, deadline: Instant) -> Result<IngressDeadline> {
-        let id = self.next.get();
-        self.next.set(id.checked_add(1).ok_or(Error::Overloaded)?);
-        let key = (deadline, id);
-        let state = Rc::new(RefCell::new(IngressDeadlineState::default()));
-        self.pending.borrow_mut().insert(key, state.clone());
         Ok(IngressDeadline {
-            table: self.clone(),
-            key,
-            state,
+            inner: self.inner.register(deadline).map_err(Error::from)?,
         })
     }
 
     fn poll(&self, now: Instant, budget: usize) -> usize {
-        let mut wakers = Vec::new();
-        let mut expired = 0;
-        {
-            let mut pending = self.pending.borrow_mut();
-            while expired < budget
-                && pending
-                    .first_key_value()
-                    .is_some_and(|(key, _)| key.0 <= now)
-            {
-                let (_, state) = pending.pop_first().expect("due ingress deadline");
-                let mut state = state.borrow_mut();
-                state.expired = true;
-                if let Some(waker) = state.waker.take() {
-                    wakers.push(waker);
-                }
-                expired += 1;
-            }
-        }
-        // Waking can schedule code that touches either table or ingress state.
-        for waker in wakers {
-            waker.wake();
-        }
-        expired
+        self.inner.poll(now, budget)
     }
 }
 impl IngressDeadline {
     fn check(&self, scope: &RequestScope, waker: &Waker) -> Result<()> {
         scope.check()?;
-        let mut state = self.state.borrow_mut();
-        if state.expired {
-            return Err(Error::DeadlineExceeded);
-        }
-        if state.waker.as_ref().is_none_or(|old| !old.will_wake(waker)) {
-            state.waker = Some(waker.clone());
-        }
-        Ok(())
-    }
-}
-impl Drop for IngressDeadline {
-    fn drop(&mut self) {
-        self.table.pending.borrow_mut().remove(&self.key);
+        self.inner.check(waker).map_err(Error::from)
     }
 }
 
 #[derive(Default)]
 struct Clock {
-    sample: Option<(SystemTime, Instant)>,
-    epoch: u64,
+    inner: uring_runtime::clock_observer::Observer,
 }
 impl Clock {
     fn observe(&mut self, wall: SystemTime, monotonic: Instant) -> bool {
-        let uncertain = self.sample.is_some_and(|(previous_wall, previous_mono)| {
-            match (
-                wall.duration_since(previous_wall),
-                monotonic.checked_duration_since(previous_mono),
-            ) {
-                (Ok(wall_elapsed), Some(elapsed)) => {
-                    wall_elapsed.abs_diff(elapsed) > Duration::from_secs(1)
-                }
-                _ => true,
-            }
-        });
-        self.sample = Some((wall, monotonic));
-        if uncertain {
-            self.epoch = self.epoch.saturating_add(1);
-        }
-        uncertain
+        self.inner.observe(wall, monotonic, Duration::from_secs(1))
     }
 }
 
@@ -525,7 +334,7 @@ impl MetadataService {
                             }
                             if !owned_scope.cancellation.is_cancelled()
                                 && (caller_scope.check().is_err()
-                                    || Rc::strong_count(&driver_registration.lifetime) == 1)
+                                    || driver_registration.is_only_handle())
                             {
                                 let _ = owned_scope.cancel();
                             }
@@ -592,7 +401,7 @@ impl MetadataService {
     ) -> std::result::Result<RefreshOutput, RefreshFailure> {
         scope.check()?;
         self.observe_clock()?;
-        let clock_epoch = self.clock.borrow().epoch;
+        let clock_epoch = self.clock.borrow().inner.epoch();
         let candidates = self
             .candidates
             .candidates_scoped(membership.clone(), &context.object, PageNumber(0), scope)
@@ -665,7 +474,9 @@ impl MetadataService {
         scope.check()?;
         super::validate_metadata(&metadata, &context.object, &selector)?;
         self.observe_clock()?;
-        if matches!(selector, MetadataSelector::Fresh) && self.clock.borrow().epoch == clock_epoch {
+        if matches!(selector, MetadataSelector::Fresh)
+            && self.clock.borrow().inner.epoch() == clock_epoch
+        {
             self.storage.index.publish_current(metadata.clone())?;
         } else {
             self.storage.index.publish_version(metadata.immutable())?;
@@ -998,8 +809,8 @@ pub(crate) mod tests {
         deadlines: usize,
         refreshes: usize,
     ) {
-        assert_eq!(service.deadlines.pending.borrow().len(), deadlines);
-        assert_eq!(service.refreshes.registrations.get(), refreshes);
+        assert_eq!(service.deadlines.inner.len(), deadlines);
+        assert_eq!(service.refreshes.inner.registration_count(), refreshes);
     }
 
     #[test]
@@ -1032,9 +843,9 @@ pub(crate) mod tests {
         assert_eq!(latest.count(), 2);
         assert_eq!(table.poll(due, 64), 0);
         assert_eq!(latest.count(), 2);
-        assert_eq!(table.pending.borrow().len(), 1);
+        assert_eq!(table.inner.len(), 1);
         drop(later);
-        assert!(table.pending.borrow().is_empty());
+        assert!(table.inner.is_empty());
         assert_eq!(table.poll(due + Duration::from_secs(1), 64), 0);
     }
 
@@ -1046,12 +857,12 @@ pub(crate) mod tests {
         for _ in 0..2 * MAX_WAITERS {
             let registration = refreshes.join(key(), 1).unwrap();
             let deadline = table.register(due).unwrap();
-            assert_eq!(table.pending.borrow().len(), 1);
+            assert_eq!(table.inner.len(), 1);
             registration.finish(Ok(output()));
             drop(deadline);
             drop(registration);
-            assert!(table.pending.borrow().is_empty());
-            assert_eq!(refreshes.registrations.get(), 0);
+            assert!(table.inner.is_empty());
+            assert_eq!(refreshes.inner.registration_count(), 0);
         }
         let entries: Vec<_> = (0..MAX_WAITERS)
             .map(|_| {
@@ -1062,14 +873,18 @@ pub(crate) mod tests {
             })
             .collect();
         assert!(matches!(refreshes.join(key(), 1), Err(Error::Overloaded)));
-        assert_eq!(table.pending.borrow().len(), MAX_WAITERS);
+        assert_eq!(table.inner.len(), MAX_WAITERS);
         drop(entries);
-        assert!(table.pending.borrow().is_empty());
-        assert!(refreshes.active.borrow().is_empty());
-        assert_eq!(refreshes.registrations.get(), 0);
-        table.next.set(u64::MAX);
+        assert!(table.inner.is_empty());
+        assert_eq!(refreshes.inner.active_count(), 0);
+        assert_eq!(refreshes.inner.registration_count(), 0);
+        let table = Rc::new(IngressDeadlines {
+            inner: Rc::new(uring_runtime::deadline_registry::Registry::with_next_id(
+                u64::MAX,
+            )),
+        });
         assert!(matches!(table.register(due), Err(Error::Overloaded)));
-        assert!(table.pending.borrow().is_empty());
+        assert!(table.inner.is_empty());
     }
 
     #[test]
@@ -1138,10 +953,10 @@ pub(crate) mod tests {
         uring_runtime::drivers::poll(&mut cx, 64);
         drop(request);
         assert!(follower.event(&waker).is_pending());
-        assert_eq!(table.registrations.get(), 2);
+        assert_eq!(table.inner.registration_count(), 2);
         complete.send(()).unwrap();
         uring_runtime::drivers::poll(&mut cx, 64);
-        assert_eq!(table.registrations.get(), 1);
+        assert_eq!(table.inner.registration_count(), 1);
         assert!(matches!(
             follower.event(&waker),
             Poll::Ready(RefreshEvent::Lead)
@@ -1250,7 +1065,7 @@ pub(crate) mod tests {
             wall + Duration::from_secs(100),
             mono + Duration::from_secs(4)
         ));
-        assert_eq!(clock.epoch, 2);
+        assert_eq!(clock.inner.epoch(), 2);
         let index = Index::new(WorkerId(0), 4, crate::test_support::availability());
         let old = metadata("old", 7);
         let mut new = metadata("new", 900);

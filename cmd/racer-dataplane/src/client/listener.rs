@@ -21,17 +21,10 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::ffi::CString;
 use std::fs;
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
-use std::os::fd::FromRawFd;
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -39,10 +32,14 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-use uring_runtime::reactor::Descriptor;
+pub(super) use uds_endpoint::file_path;
+use uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
+#[cfg(test)]
+pub(super) use uds_endpoint::same_inode;
+use uring_runtime::reactor::ready_set::ReadySet;
 
 enum Listener {
-    Real(UnixListener),
+    Real(uds_endpoint::BoundSocket),
     #[cfg(test)]
     Sim(uring_runtime::reactor::Descriptor),
 }
@@ -58,34 +55,16 @@ impl Listener {
                 .map(|fd| (fd, ())),
         }
     }
-    fn set_nonblocking(&self, value: bool) -> std::io::Result<()> {
-        match self {
-            Self::Real(listener) => listener.set_nonblocking(value),
-            #[cfg(test)]
-            Self::Sim(_) => Ok(()),
-        }
-    }
 }
 enum Directory {
-    Real(File),
+    Real(Rc<File>),
     #[cfg(test)]
     Sim {
         sim: uring_runtime::reactor::simulation::Simulation,
         path: PathBuf,
     },
 }
-impl AsRawFd for Directory {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        match self {
-            Self::Real(file) => file.as_raw_fd(),
-            #[cfg(test)]
-            Self::Sim { .. } => panic!("simulated directory reached host syscall"),
-        }
-    }
-}
-pub(super) fn file_path(file: &File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
-}
+#[cfg(test)]
 impl Directory {
     fn anchor(&self) -> PathBuf {
         match self {
@@ -103,8 +82,7 @@ pub(super) struct BoundListener {
     device: u64,
     inode: u64,
     retired: Arc<std::sync::atomic::AtomicBool>,
-    basename: RefCell<String>,
-    witness: Option<String>,
+    basename: Rc<RefCell<String>>,
     pub(super) owner: Option<Rc<EndpointOwner>>,
 }
 
@@ -112,38 +90,19 @@ impl Drop for BoundListener {
     fn drop(&mut self) {
         self.retired
             .store(true, std::sync::atomic::Ordering::Release);
-        let path = self
-            .directory
-            .anchor()
-            .join(self.basename.borrow().as_str());
         #[cfg(test)]
         if let Directory::Sim { sim, .. } = &self.directory {
+            let path = self
+                .directory
+                .anchor()
+                .join(self.basename.borrow().as_str());
             if sim.metadata(&path).is_ok_and(|(inode, mode)| {
                 inode == self.inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
             }) {
                 let _ = sim.unlink(&path);
             }
-            return;
         }
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            if metadata.file_type().is_socket()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
-            {
-                if fs::remove_file(path).is_err() {
-                    // Keep the witness if pathname cleanup failed.
-                    return;
-                }
-            }
-        }
-        if let Some(witness) = &self.witness {
-            let path = self.directory.anchor().join(witness);
-            if fs::symlink_metadata(&path).is_ok_and(|m| {
-                m.file_type().is_socket() && m.dev() == self.device && m.ino() == self.inode
-            }) {
-                let _ = fs::remove_file(path);
-            }
-        }
+        // The real BoundSocket cleans up before its endpoint owner is released.
     }
 }
 
@@ -330,11 +289,10 @@ impl ClientListeners {
                 definitions: definitions.to_vec(),
                 target: self.listeners.clone(),
                 next: BTreeMap::new(),
-                replacements: Vec::new(),
+                publication: Publication::default(),
                 preparing: self.preparing.clone(),
                 accepting: self.accepting.clone(),
                 cleanup: self.cleanup.clone(),
-                committed: false,
             };
             // Finish older deferred unlinks before reusing a removed cache name.
             self.cleanup.borrow_mut().clear();
@@ -356,7 +314,7 @@ impl ClientListeners {
                     .get(&definition.id)
                     .filter(|current| current.definition == *definition)
                 {
-                    if !owns(current, "socket") {
+                    if !current.owns("socket") {
                         return Err(Error::Io);
                     }
                     if let (Some(owner), Directory::Real(directory)) =
@@ -381,21 +339,10 @@ impl ClientListeners {
                     &temporary,
                     previous.as_deref(),
                 )?);
-                if let Some(previous) = &previous {
-                    if !owns(previous, "socket")
-                        || !same_directory(&previous.directory, &next.directory)?
-                    {
-                        return Err(Error::Io);
-                    }
-                } else if !absent(&next.directory, "socket") {
-                    return Err(Error::Io);
-                }
+                let replacement =
+                    Replacement::prepare(next.clone(), previous, temporary, "socket".into())?;
                 prepared.next.insert(definition.id.clone(), next.clone());
-                pending.push(Replacement {
-                    next,
-                    previous,
-                    temporary,
-                });
+                pending.push(replacement);
                 let mut yielded = false;
                 std::future::poll_fn(|cx| {
                     if yielded {
@@ -410,28 +357,7 @@ impl ClientListeners {
             }
             for replacement in pending {
                 scope.check()?;
-                let next = &replacement.next;
-                if let Some(previous) = &replacement.previous {
-                    if !owns(previous, "socket") || !owns(next, &replacement.temporary) {
-                        return Err(Error::Io);
-                    }
-                    rename(
-                        &next.directory,
-                        &replacement.temporary,
-                        "socket",
-                        libc::RENAME_EXCHANGE,
-                    )?;
-                    *previous.basename.borrow_mut() = replacement.temporary.clone();
-                } else {
-                    rename(
-                        &next.directory,
-                        &replacement.temporary,
-                        "socket",
-                        libc::RENAME_NOREPLACE,
-                    )?;
-                }
-                *next.basename.borrow_mut() = "socket".into();
-                prepared.replacements.push(replacement);
+                prepared.publication.publish(replacement)?;
             }
             scope.check()?;
             Ok(prepared)
@@ -812,10 +738,8 @@ pub(super) fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result
 #[derive(Default)]
 struct ReadyListeners {
     generation: u64,
-    fd: Option<Rc<Descriptor>>,
+    index: Option<ReadySet<Error>>,
     listeners: Vec<std::rc::Weak<BoundListener>>,
-    ready: VecDeque<usize>,
-    wait: Option<Operation<'static, u32>>,
     scope: Option<RequestScope>,
 }
 impl Drop for ReadyListeners {
@@ -836,20 +760,16 @@ impl ReadyListeners {
             if let Some(scope) = self.scope.take() {
                 scope.cancel()?;
             }
-            self.wait.take();
-            self.ready.clear();
+            if let Some(index) = &mut self.index {
+                index.clear();
+            }
             self.listeners = owner
                 .listeners
                 .borrow()
                 .values()
                 .map(Rc::downgrade)
                 .collect();
-            // SAFETY: epoll_create1 returns a uniquely owned descriptor.
-            let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-            if fd < 0 {
-                return Err(Error::Io);
-            }
-            let fd = Rc::new(unsafe { Descriptor::from_raw_fd(fd) });
+            let mut ready = ReadySet::new()?;
             for (index, listener) in self.listeners.iter().enumerate() {
                 let listener = listener.upgrade().ok_or(Error::Unavailable)?;
                 let socket = match &listener.listener {
@@ -857,92 +777,36 @@ impl ReadyListeners {
                     #[cfg(test)]
                     _ => return Err(Error::InvalidConfiguration),
                 };
-                let mut event = libc::epoll_event {
-                    events: libc::EPOLLIN as u32,
-                    u64: index as u64,
-                };
-                // SAFETY: both descriptors and the initialized event live through ctl.
-                if unsafe {
-                    libc::epoll_ctl(
-                        fd.as_raw_fd(),
-                        libc::EPOLL_CTL_ADD,
-                        socket.as_raw_fd(),
-                        &mut event,
-                    )
-                } < 0
-                {
-                    return Err(Error::Io);
-                }
+                ready.insert(socket.as_raw_fd(), index)?;
             }
-            self.fd = Some(fd);
+            self.index = Some(ready);
             self.scope = Some(new_scope(
                 Duration::from_secs(365 * 24 * 3600),
                 Cancellation::new()?,
             )?);
             self.generation = owner.generation.get();
         }
-        if let Some(index) = self.ready.pop_front() {
-            return Ok(self.listeners[index].upgrade());
-        }
-        if let Some(wait) = &mut self.wait {
-            match wait.as_mut().poll(cx) {
-                Poll::Pending => return Ok(None),
-                Poll::Ready(result) => {
-                    result?;
-                    self.wait.take();
-                }
-            }
-        }
-        let Some(fd) = &self.fd else {
+        let Some(index) = &mut self.index else {
             return Ok(None);
         };
-        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
-        // SAFETY: events is writable for the bounded requested event count.
-        let count = unsafe {
-            libc::epoll_wait(
-                fd.as_raw_fd(),
-                events.as_mut_ptr(),
-                budget.clamp(1, 64) as i32,
-                0,
-            )
-        };
-        if count < 0 {
-            return Err(Error::Io);
-        }
-        self.ready.extend(
-            events[..count as usize]
-                .iter()
-                .map(|event| event.u64 as usize),
-        );
-        if let Some(index) = self.ready.pop_front() {
-            return Ok(self.listeners[index].upgrade());
-        }
-        let reactor = owner.io.reactor().clone();
-        let fd = fd.clone();
-        let scope = self.scope.as_ref().ok_or(Error::Internal)?.clone();
-        self.wait = Some(Box::pin(async move {
-            uring_runtime::retry_listener(&scope, || {
-                reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, fd.clone(), &scope)
+        let ready = index.next(cx, budget, |fd| {
+            let reactor = owner.io.reactor().clone();
+            let scope = self.scope.clone();
+            Box::pin(async move {
+                let scope = scope.ok_or(Error::Internal)?;
+                uring_runtime::retry_listener(&scope, || {
+                    reactor.readiness_with_lease(
+                        fd.clone(),
+                        libc::POLLIN as u32,
+                        fd.clone(),
+                        &scope,
+                    )
+                })
+                .await
             })
-            .await
-        }));
-        if let Some(wait) = &mut self.wait {
-            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
-                result?;
-                self.wait.take();
-                cx.waker().wake_by_ref();
-            }
-        }
-        Ok(None)
+        })?;
+        Ok(ready.and_then(|index| self.listeners[index].upgrade()))
     }
-}
-
-// Worker-local listener preparation. Filesystem publication precedes control
-// publication; no new listener is accepted until the infallible memory swap.
-struct Replacement {
-    next: Rc<BoundListener>,
-    previous: Option<Rc<BoundListener>>,
-    temporary: String,
 }
 
 /// Owns prepared paths and sockets. Keep this on the listener's worker. Drop
@@ -952,11 +816,10 @@ pub struct PreparedListeners {
     definitions: Vec<CacheDefinition>,
     target: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
     next: BTreeMap<CacheId, Rc<BoundListener>>,
-    replacements: Vec<Replacement>,
+    publication: Publication<BoundListener>,
     preparing: Rc<Cell<bool>>,
     accepting: Rc<Cell<bool>>,
     cleanup: Rc<RefCell<VecDeque<Rc<BoundListener>>>>,
-    committed: bool,
 }
 
 impl PreparedListeners {
@@ -993,12 +856,10 @@ impl PreparedListeners {
                 cleanup.push_back(listener);
             }
         }
-        for replacement in &self.replacements {
-            if let Some(previous) = &replacement.previous {
-                cleanup.push_back(previous.clone());
-            }
+        for previous in self.publication.previous() {
+            cleanup.push_back(previous.clone());
         }
-        self.committed = true;
+        self.publication.commit();
     }
 }
 
@@ -1010,112 +871,29 @@ impl crate::control::CacheTransition for PreparedListeners {
 
 impl Drop for PreparedListeners {
     fn drop(&mut self) {
-        if !self.committed {
-            for replacement in self.replacements.iter().rev() {
-                let next = &replacement.next;
-                if let Some(previous) = &replacement.previous {
-                    // Never exchange or unlink a foreign replacement inode. Under
-                    // exclusive directory ownership these checks also make rollback
-                    // independent of the caller's expired/canceled request scope.
-                    if owns(next, "socket") && owns(previous, &replacement.temporary) {
-                        if rename(
-                            &next.directory,
-                            "socket",
-                            &replacement.temporary,
-                            libc::RENAME_EXCHANGE,
-                        )
-                        .is_ok()
-                        {
-                            *next.basename.borrow_mut() = replacement.temporary.clone();
-                            *previous.basename.borrow_mut() = "socket".into();
-                        }
-                    } else if absent(&next.directory, "socket")
-                        && owns(previous, &replacement.temporary)
-                    {
-                        if rename(
-                            &next.directory,
-                            &replacement.temporary,
-                            "socket",
-                            libc::RENAME_NOREPLACE,
-                        )
-                        .is_ok()
-                        {
-                            *previous.basename.borrow_mut() = "socket".into();
-                        }
-                    }
-                }
-            }
-        }
+        self.publication.rollback();
         self.preparing.set(false);
     }
 }
 
 pub(super) fn open_directory(path: &Path) -> Result<File> {
-    // Open every component with O_NOFOLLOW, including /run/racer's ancestors.
-    let mut directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/")
-        .map_err(|_| Error::Io)?;
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(name) => {
-                directory = child_directory(&directory, name.as_encoded_bytes())?;
-            }
-            _ => return Err(Error::InvalidConfiguration),
-        }
-    }
-    Ok(directory)
+    uds_endpoint::open_directory(path, 0o755).map_err(directory_error)
 }
 
 pub(super) fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
-    let name = CString::new(name).map_err(|_| Error::InvalidConfiguration)?;
-    // SAFETY: C strings are terminated; descriptors remain owned for each syscall.
-    unsafe {
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let mut fd = libc::openat(parent.as_raw_fd(), name.as_ptr(), flags);
-        if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
-            if libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) != 0
-                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
-            {
-                return Err(Error::Io);
-            }
-            fd = libc::openat(parent.as_raw_fd(), name.as_ptr(), flags);
-        }
-        if fd < 0 {
-            return Err(Error::Io);
-        }
-        Ok(File::from_raw_fd(fd))
+    uds_endpoint::child_directory(parent, name, 0o755).map_err(directory_error)
+}
+
+fn directory_error(error: std::io::Error) -> Error {
+    if error.kind() == std::io::ErrorKind::InvalidInput && error.raw_os_error().is_none() {
+        Error::InvalidConfiguration
+    } else {
+        Error::Io
     }
 }
 
 pub(super) fn prepare_client_directory(directory: &File) -> Result<()> {
-    let before = directory.metadata().map_err(|_| Error::Io)?;
-    // Only harden directories we own, even when running with CAP_FOWNER.
-    // SAFETY: geteuid has no preconditions.
-    if !before.is_dir() || before.uid() != unsafe { libc::geteuid() } {
-        return Err(Error::Io);
-    }
-    let mode = before.mode() & 0o7777 & !0o022;
-    if before.mode() & 0o022 != 0 {
-        // The O_NOFOLLOW directory descriptor pins the inode across path swaps.
-        // Never chmod ancestors or broaden existing read/search permissions.
-        // SAFETY: directory owns the descriptor for the duration of fchmod.
-        if unsafe { libc::fchmod(directory.as_raw_fd(), mode) } != 0 {
-            return Err(Error::Io);
-        }
-    }
-    let after = directory.metadata().map_err(|_| Error::Io)?;
-    if !after.is_dir()
-        || after.uid() != before.uid()
-        || after.gid() != before.gid()
-        || !same_inode(&before, &after)
-        || after.mode() & 0o7777 != mode
-    {
-        return Err(Error::Io);
-    }
-    Ok(())
+    uds_endpoint::restrict_directory(directory, 0o022).map_err(|_| Error::Io)
 }
 
 fn bind(
@@ -1143,8 +921,7 @@ fn bind(
             device: 1,
             inode,
             retired: Arc::new(std::sync::atomic::AtomicBool::default()),
-            basename: RefCell::new(basename.into()),
-            witness: None,
+            basename: Rc::new(RefCell::new(basename.into())),
             owner: None,
         };
         allow_socket_access(&bound.directory, bound.device, bound.inode, basename)?;
@@ -1161,29 +938,32 @@ fn bind(
         }
         None => Rc::new(EndpointOwner::acquire(&directory)?),
     };
-    let path = file_path(&directory).join(basename);
-    // Bind the witness first, so every crash after bind leaves recoverable proof.
-    let witness = format!(".racer-owned-{basename}");
-    let witness_path = file_path(&directory).join(&witness);
-    let listener = UnixListener::bind(&witness_path).map_err(|_| Error::Io)?;
-    let metadata = fs::symlink_metadata(&witness_path).map_err(|_| Error::Io)?;
+    let directory = Rc::new(directory);
+    let listener = uds_endpoint::BoundSocket::bind(
+        directory.clone(),
+        owner.0.clone(),
+        basename.into(),
+        format!("{}{basename}", ENDPOINT_LAYOUT.witness_prefix),
+    )
+    .map_err(|_| Error::Io)?;
+    let (device, inode) = listener.identity();
+    let basename = listener.basename();
     let bound = BoundListener {
         definition,
         listener: Listener::Real(listener),
         directory: Directory::Real(directory),
-        device: metadata.dev(),
-        inode: metadata.ino(),
+        device,
+        inode,
         retired: Arc::new(std::sync::atomic::AtomicBool::default()),
-        basename: RefCell::new(basename.into()),
-        witness: Some(witness),
+        basename,
         owner: Some(owner),
     };
-    fs::hard_link(&witness_path, &path).map_err(|_| Error::Io)?;
-    bound
-        .listener
-        .set_nonblocking(true)
-        .map_err(|_| Error::Io)?;
-    allow_socket_access(&bound.directory, bound.device, bound.inode, basename)?;
+    allow_socket_access(
+        &bound.directory,
+        bound.device,
+        bound.inode,
+        &bound.basename.borrow(),
+    )?;
     Ok(bound)
 }
 
@@ -1206,15 +986,13 @@ fn allow_socket_access(
         return sim.chmod(&path, 0o666).map_err(|_| Error::Io);
     }
     // Pin the final inode too: a replacement symlink must not redirect chmod.
-    let socket = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory.anchor().join(basename))
-        .map_err(|_| Error::Io)?;
-    let metadata = socket.metadata().map_err(|_| Error::Io)?;
-    if metadata.dev() != device || metadata.ino() != inode || !metadata.file_type().is_socket() {
-        return Err(Error::Io);
-    }
+    let directory = match directory {
+        Directory::Real(directory) => directory,
+        #[cfg(test)]
+        Directory::Sim { .. } => unreachable!("simulation handled before host syscall"),
+    };
+    let socket =
+        uds_endpoint::pin_socket(directory, basename, device, inode).map_err(|_| Error::Io)?;
     #[cfg(test)]
     if FAIL_CHMOD.with(|fail| fail.replace(false)) {
         return Err(Error::Io);
@@ -1225,224 +1003,119 @@ fn allow_socket_access(
         .map_err(|_| Error::Io)
 }
 
-fn owns(listener: &BoundListener, basename: &str) -> bool {
-    #[cfg(test)]
-    if let Directory::Sim { sim, path } = &listener.directory {
-        return sim
-            .metadata(&path.join(basename))
-            .is_ok_and(|(inode, mode)| {
-                inode == listener.inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
-            });
-    }
-    fs::symlink_metadata(listener.directory.anchor().join(basename)).is_ok_and(|metadata| {
-        metadata.file_type().is_socket()
-            && metadata.dev() == listener.device
-            && metadata.ino() == listener.inode
-    })
-}
+impl Endpoint for BoundListener {
+    type Error = Error;
 
-fn absent(directory: &Directory, basename: &str) -> bool {
-    #[cfg(test)]
-    if let Directory::Sim { sim, path } = directory {
-        return sim
-            .metadata(&path.join(basename))
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    fn ownership_error() -> Error {
+        Error::Io
     }
-    fs::symlink_metadata(directory.anchor().join(basename))
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-}
 
-fn same_directory(first: &Directory, second: &Directory) -> Result<bool> {
-    match (first, second) {
-        (Directory::Real(first), Directory::Real(second)) => {
-            let first = first.metadata().map_err(|_| Error::Io)?;
-            let second = second.metadata().map_err(|_| Error::Io)?;
-            Ok(first.dev() == second.dev() && first.ino() == second.ino())
+    fn owns(&self, basename: &str) -> bool {
+        #[cfg(test)]
+        if let Directory::Sim { sim, path } = &self.directory {
+            return sim
+                .metadata(&path.join(basename))
+                .is_ok_and(|(inode, mode)| {
+                    inode == self.inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
+                });
+        }
+        match &self.listener {
+            Listener::Real(socket) => socket.owns(basename),
+            #[cfg(test)]
+            Listener::Sim(_) => unreachable!("simulation handled before host syscall"),
+        }
+    }
+
+    fn absent(&self, basename: &str) -> bool {
+        #[cfg(test)]
+        if let Directory::Sim { sim, path } = &self.directory {
+            return sim
+                .metadata(&path.join(basename))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        }
+        match &self.listener {
+            Listener::Real(socket) => socket.absent(basename),
+            #[cfg(test)]
+            Listener::Sim(_) => unreachable!("simulation handled before host syscall"),
+        }
+    }
+
+    fn same_directory(&self, other: &Self) -> Result<bool> {
+        match (&self.listener, &other.listener) {
+            (Listener::Real(first), Listener::Real(second)) => {
+                first.same_directory(second).map_err(|_| Error::Io)
+            }
+            #[cfg(test)]
+            (Listener::Sim(_), Listener::Sim(_)) => match (&self.directory, &other.directory) {
+                (Directory::Sim { sim, path: first }, Directory::Sim { path: second, .. }) => {
+                    Ok(sim.metadata(first).map_err(|_| Error::Io)?.0
+                        == sim.metadata(second).map_err(|_| Error::Io)?.0)
+                }
+                _ => unreachable!("simulated listener requires simulated directory"),
+            },
+            #[cfg(test)]
+            _ => Ok(false),
+        }
+    }
+
+    fn rename(&self, from: &str, to: &str, mode: Rename) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_RENAME_AFTER.with(|remaining| match remaining.get() {
+            Some(0) => {
+                remaining.set(None);
+                true
+            }
+            Some(count) => {
+                remaining.set(Some(count - 1));
+                false
+            }
+            None => false,
+        }) {
+            return Err(Error::Io);
         }
         #[cfg(test)]
-        (Directory::Sim { sim, path: first }, Directory::Sim { path: second, .. }) => {
-            Ok(sim.metadata(first).map_err(|_| Error::Io)?.0
-                == sim.metadata(second).map_err(|_| Error::Io)?.0)
+        if let Directory::Sim { sim, path } = &self.directory {
+            return sim
+                .rename(&path.join(from), &path.join(to), mode.flags())
+                .map_err(|_| Error::Io);
         }
-        #[cfg(test)]
-        _ => Ok(false),
+        match &self.listener {
+            Listener::Real(socket) => socket.rename(from, to, mode).map_err(directory_error),
+            #[cfg(test)]
+            Listener::Sim(_) => unreachable!("simulation handled before host syscall"),
+        }
     }
-}
 
-fn rename(directory: &Directory, from: &str, to: &str, flags: u32) -> Result<()> {
-    #[cfg(test)]
-    if FAIL_RENAME_AFTER.with(|remaining| match remaining.get() {
-        Some(0) => {
-            remaining.set(None);
-            true
-        }
-        Some(count) => {
-            remaining.set(Some(count - 1));
-            false
-        }
-        None => false,
-    }) {
-        return Err(Error::Io);
+    fn set_basename(&self, basename: String) {
+        *self.basename.borrow_mut() = basename;
     }
-    #[cfg(test)]
-    if let Directory::Sim { sim, path } = directory {
-        return sim
-            .rename(&path.join(from), &path.join(to), flags)
-            .map_err(|_| Error::Io);
-    }
-    let from = CString::new(from).map_err(|_| Error::InvalidConfiguration)?;
-    let to = CString::new(to).map_err(|_| Error::InvalidConfiguration)?;
-    // SAFETY: the owned directory pins both names; strings are NUL terminated.
-    if unsafe {
-        libc::renameat2(
-            directory.as_raw_fd(),
-            from.as_ptr(),
-            directory.as_raw_fd(),
-            to.as_ptr(),
-            flags,
-        )
-    } != 0
-    {
-        return Err(Error::Io);
-    }
-    Ok(())
 }
 
 // Persistent per-endpoint ownership. Never remove the lock inode, even on clean
 // shutdown. Socket hard links are crash witnesses, not connect-failure heuristics.
-const LOCK: &str = ".racer-client.lock";
-const WITNESS: &str = ".racer-owned-";
+const ENDPOINT_LAYOUT: uds_endpoint::Layout = uds_endpoint::Layout {
+    lock: ".racer-client.lock",
+    canonical: "socket",
+    witness_prefix: ".racer-owned-",
+    temporary_name,
+};
 
-pub(super) struct EndpointOwner {
-    pub(super) lock: File,
-    directory: File,
-}
-
-impl Drop for EndpointOwner {
-    fn drop(&mut self) {
-        // A concurrent process spawn can inherit this open file description until
-        // exec closes CLOEXEC descriptors. Explicitly release our ownership rather
-        // than waiting for that unrelated child to close its inherited reference.
-        // BoundListener unlinks its owned paths before dropping this last owner.
-        unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
+pub(super) struct EndpointOwner(Rc<uds_endpoint::EndpointOwner>);
 
 impl EndpointOwner {
+    #[cfg(test)]
+    pub(super) fn clone_lock_for_test(&self) -> std::io::Result<File> {
+        self.0.clone_lock_for_test()
+    }
+
     pub(super) fn acquire(directory: &File) -> Result<Self> {
-        let metadata = directory.metadata().map_err(|_| Error::Io)?;
-        // SAFETY: geteuid has no preconditions.
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
-            return Err(Error::Io);
-        }
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(file_path(directory).join(LOCK))
-            .map_err(|_| Error::Io)?;
-        let metadata = lock.metadata().map_err(|_| Error::Io)?;
-        if !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
-            return Err(Error::Io);
-        }
-        // SAFETY: lock owns a valid descriptor. Nonblocking flock covers the entire
-        // listener lifetime and is released by the kernel on process death.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(Error::Io);
-        }
-        let owner = Self {
-            lock,
-            directory: directory.try_clone().map_err(|_| Error::Io)?,
-        };
-        owner.validate(directory)?;
-        owner.recover()?;
-        Ok(owner)
+        uds_endpoint::EndpointOwner::acquire(directory, ENDPOINT_LAYOUT, 0o600)
+            .map(|owner| Self(Rc::new(owner)))
+            .map_err(|_| Error::Io)
     }
 
     fn validate(&self, directory: &File) -> Result<()> {
-        let first = self.directory.metadata().map_err(|_| Error::Io)?;
-        let second = directory.metadata().map_err(|_| Error::Io)?;
-        let lock = self.lock.metadata().map_err(|_| Error::Io)?;
-        let current =
-            fs::symlink_metadata(file_path(directory).join(LOCK)).map_err(|_| Error::Io)?;
-        if first.dev() != second.dev()
-            || first.ino() != second.ino()
-            || !current.is_file()
-            || lock.dev() != current.dev()
-            || lock.ino() != current.ino()
-            || current.nlink() != 1
-        {
-            return Err(Error::Io);
-        }
-        Ok(())
-    }
-
-    fn recover(&self) -> Result<()> {
-        let directory = file_path(&self.directory);
-        let mut witnesses = Vec::new();
-        let mut temporary_paths = Vec::new();
-        for entry in fs::read_dir(&directory).map_err(|_| Error::Io)? {
-            let entry = entry.map_err(|_| Error::Io)?;
-            let name = entry.file_name();
-            if name.to_str().is_some_and(temporary_name) {
-                temporary_paths.push(entry.path());
-                continue;
-            }
-            let Some(name) = name.to_str().filter(|name| name.starts_with(WITNESS)) else {
-                continue;
-            };
-            let temporary = &name[WITNESS.len()..];
-            if !temporary_name(temporary) {
-                return Err(Error::Io);
-            }
-            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| Error::Io)?;
-            if !metadata.file_type().is_socket() {
-                return Err(Error::Io);
-            }
-            witnesses.push((name.to_owned(), metadata));
-        }
-        let socket = directory.join("socket");
-        let canonical = match fs::symlink_metadata(&socket) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err(Error::Io),
-        };
-        if canonical.as_ref().is_some_and(|canonical| {
-            !canonical.file_type().is_socket()
-                || !witnesses.iter().any(|(_, m)| same_inode(canonical, m))
-        }) {
-            return Err(Error::Io);
-        }
-        // Validate every witness before touching any path. A noncooperating live
-        // listener (including an inherited FD) remains protected without its lock.
-        for (name, _) in &witnesses {
-            refused(&directory.join(name))?;
-        }
-        for path in &temporary_paths {
-            let current = fs::symlink_metadata(path).map_err(|_| Error::Io)?;
-            if !current.file_type().is_socket()
-                || !witnesses.iter().any(|(_, m)| same_inode(&current, m))
-            {
-                return Err(Error::Io);
-            }
-        }
-        if canonical.is_some() {
-            fs::remove_file(socket).map_err(|_| Error::Io)?;
-        }
-        for path in temporary_paths {
-            fs::remove_file(path).map_err(|_| Error::Io)?;
-        }
-        for (name, _) in witnesses {
-            fs::remove_file(directory.join(name)).map_err(|_| Error::Io)?;
-        }
-        Ok(())
+        self.0.validate(directory).map_err(|_| Error::Io)
     }
 }
 
@@ -1450,49 +1123,6 @@ fn temporary_name(name: &str) -> bool {
     name.len() == 39
         && name.starts_with(".racer-")
         && name[7..].bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-pub(super) fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
-    first.dev() == second.dev() && first.ino() == second.ino()
-}
-
-fn refused(path: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = path.as_os_str().as_bytes();
-    // SAFETY: zero is a valid initial representation for sockaddr_un.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    if bytes.len() >= address.sun_path.len() {
-        return Err(Error::Io);
-    }
-    address.sun_family = libc::AF_UNIX as _;
-    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
-        *target = *source as _;
-    }
-    // SAFETY: socket has no pointer arguments; File owns the returned descriptor.
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::Io);
-    }
-    let socket = unsafe { File::from_raw_fd(fd) };
-    // SAFETY: address is initialized and its full size is supplied.
-    let result = unsafe {
-        libc::connect(
-            socket.as_raw_fd(),
-            (&address as *const libc::sockaddr_un).cast(),
-            std::mem::size_of_val(&address) as _,
-        )
-    };
-    if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECONNREFUSED) {
-        Ok(())
-    } else {
-        Err(Error::Io)
-    }
 }
 
 #[cfg(test)]

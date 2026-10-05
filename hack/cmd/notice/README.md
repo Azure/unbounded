@@ -2,7 +2,7 @@
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
 `go.mod`, `frontend/package.json`, `cmd/racer-dataplane/Cargo.toml`, its
-`runtime`, `alloc`, `crypto`, `http`, and `telemetry` workspace members, and
+workspace members, and
 `cmd/racer-loadgen/performance/Cargo.toml` plus
 any paired libfabric and OpenSSL source pins in `Makefile` (currently absent).
 
@@ -97,6 +97,9 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   dependencies are deduplicated. Conflicting direct versions fail collection.
   Development dependencies are excluded; normal, target, build, and optional
   direct dependencies are included. Local first-party path dependencies are excluded.
+  Workspace manifests are explicitly listed in `internal/cargo/cargo.go`; when
+  adding members, update that list and the independent member fixtures in
+  `internal/cargo/cargo_test.go` to keep coverage complete.
 - Native collection is fully local. Its metadata and canonical license links
   are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
   `OPENSSL_VERSION` in `Makefile`. With both legacy source pins removed, no native

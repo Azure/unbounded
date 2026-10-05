@@ -26,36 +26,23 @@ pub struct BufferPool {
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
 /// Fixed-size owned backing stays at the same address when this owner moves.
-pub struct PlaintextBuffer {
-    bytes: Vec<u8>,
-    reservation: Option<flow_control::Charge<AdmissionPolicy>>,
-}
+pub struct PlaintextBuffer(flow_control::ChargedBuffer<AdmissionPolicy>);
 impl PlaintextBuffer {
-    pub(crate) fn into_parts(mut self) -> (Box<[u8]>, flow_control::Charge<AdmissionPolicy>) {
-        (
-            std::mem::take(&mut self.bytes).into_boxed_slice(),
-            self.reservation.take().expect("owned reservation"),
-        )
+    pub(crate) fn into_parts(self) -> (Box<[u8]>, flow_control::Charge<AdmissionPolicy>) {
+        self.0.into_parts()
     }
     pub(crate) fn reservation(&self) -> &flow_control::Charge<AdmissionPolicy> {
-        self.reservation.as_ref().expect("owned reservation")
-    }
-}
-impl Drop for PlaintextBuffer {
-    fn drop(&mut self) {
-        if let Some(reservation) = &mut self.reservation {
-            reservation.recycle(std::mem::take(&mut self.bytes));
-        }
+        self.0.charge()
     }
 }
 // SAFETY: private fixed backing and reservation remain exclusively owned.
 unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
     type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
-        Ok(&self.bytes)
+        Ok(self.0.bytes())
     }
     fn bytes_mut(&mut self) -> Result<&mut [u8]> {
-        Ok(&mut self.bytes)
+        Ok(self.0.bytes_mut())
     }
 }
 /// Only page authentication/origin validation may create this publishable type.
@@ -95,7 +82,7 @@ impl BufferPool {
     }
     pub fn plaintext(
         &self,
-        mut reservation: flow_control::Charge<AdmissionPolicy>,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         length: usize,
     ) -> Result<PlaintextBuffer> {
         if length == 0 || length > PAGE_BYTES as usize {
@@ -107,14 +94,10 @@ impl BufferPool {
             length,
             reservation.key(),
         )?;
-        let bytes = reservation.buffer(length)?;
-        // Keep exact charged capacity, but no Box while reactor pointers are live.
-        let bytes = bytes.into_boxed_slice().into_vec();
-        reservation.shrink(bytes.len())?;
-        Ok(PlaintextBuffer {
-            bytes,
-            reservation: Some(reservation),
-        })
+        Ok(PlaintextBuffer(flow_control::ChargedBuffer::new(
+            reservation,
+            length,
+        )?))
     }
     pub fn ciphertext(
         &self,

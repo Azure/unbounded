@@ -938,17 +938,7 @@ mod socket {
             loop {
                 match reactor.accept(listener.clone(), &scope).await {
                     Err(Error::Overloaded) => {
-                        let mut yielded = false;
-                        std::future::poll_fn(|cx| {
-                            if yielded {
-                                Poll::Ready(())
-                            } else {
-                                yielded = true;
-                                cx.waker().wake_by_ref();
-                                Poll::Pending
-                            }
-                        })
-                        .await;
+                        crate::yield_now().await;
                     }
                     result => break result,
                 }

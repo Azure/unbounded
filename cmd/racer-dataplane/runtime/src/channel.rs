@@ -281,26 +281,20 @@ mod tests {
     }
     #[test]
     fn wakeups_cover_capacity_data_and_close() {
-        use std::{sync::atomic::AtomicUsize, task::Wake};
-        struct Counter(AtomicUsize);
-        impl Wake for Counter {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        use crate::test_util::WakeCounter;
         let (sender, mut receiver) = bounded(1).unwrap();
-        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let counter = Arc::new(WakeCounter::default());
         let waker = std::task::Waker::from(counter.clone());
         let mut cx = Context::from_waker(&waker);
         assert!(receiver.poll_receive(&mut cx).is_pending());
         assert!(sender.try_send(7).is_ok());
-        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        assert_eq!(counter.count(), 1);
         assert!(sender.poll_ready(&mut cx).is_pending());
         assert_eq!(receiver.receive().unwrap(), Some(7));
-        assert_eq!(counter.0.load(Ordering::Relaxed), 2);
+        assert_eq!(counter.count(), 2);
         assert!(receiver.poll_receive(&mut cx).is_pending());
         sender.close();
-        assert_eq!(counter.0.load(Ordering::Relaxed), 3);
+        assert_eq!(counter.count(), 3);
     }
     #[test]
     fn orphan_cleanup_advances_before_panicking_destructor() {

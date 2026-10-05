@@ -311,7 +311,7 @@ mod flight {
             drop(copy);
             drop(a);
             drop(b);
-            assert!(flights.table.borrow().entries.is_empty());
+            assert!(flights.table.borrow().is_empty());
         }
 
         #[test]
@@ -356,10 +356,10 @@ mod flight {
                 }));
             drop(a);
             flights.poll_budgeted(1).unwrap();
-            assert_eq!(flights.table.borrow().entries.len(), 1);
+            assert_eq!(flights.table.borrow().len(), 1);
             send.send(()).unwrap();
             flights.poll_budgeted(1).unwrap();
-            assert!(flights.table.borrow().entries.is_empty());
+            assert!(flights.table.borrow().is_empty());
             assert_eq!(uring_runtime::drivers::pending(), 0);
         }
 
@@ -385,7 +385,6 @@ mod flight {
             flights
                 .table
                 .borrow_mut()
-                .entries
                 .get_mut(&fence().page)
                 .unwrap()
                 .waiters
@@ -394,7 +393,7 @@ mod flight {
                 .budget_deadline = Instant::now();
             {
                 let mut table = flights.table.borrow_mut();
-                let entry = table.entries.get_mut(&fence().page).unwrap();
+                let entry = table.get_mut(&fence().page).unwrap();
                 entry
                     .deadlines
                     .retain(|(_, id), _| *id != b.registration.id);
@@ -482,7 +481,13 @@ mod flight {
             flights.poll_budgeted(1).unwrap();
             assert_eq!(metrics.gauge(Gauge::ActiveFills), 1);
             assert_eq!(
-                flights.table.borrow().entries[&fence().page].phase.state(),
+                flights
+                    .table
+                    .borrow()
+                    .get(&fence().page)
+                    .unwrap()
+                    .phase
+                    .state(),
                 FlightState::Draining
             );
             assert!(poll(b.wait()).is_pending());
@@ -596,7 +601,7 @@ mod flight {
             failed(&mut b, Error::Unavailable);
             drop(a);
             drop(b);
-            assert!(flights.table.borrow().entries.is_empty());
+            assert!(flights.table.borrow().is_empty());
             assert_eq!(flights.admission.used(ResourceClass::Flight), 0);
             assert_eq!(flights.admission.used(ResourceClass::Waiter), 0);
             assert_eq!(flights.admission.used(ResourceClass::ControlProgress), 0);
@@ -613,7 +618,7 @@ mod flight {
             drop(leader);
             assert!(operation.cancellation_requested());
             assert!(matches!(
-                flights.table.borrow().entries[&fence().page].phase,
+                flights.table.borrow().get(&fence().page).unwrap().phase,
                 Phase::Draining(_)
             ));
             let expired =
@@ -622,7 +627,7 @@ mod flight {
                 poll(flights.drain(&expired)),
                 Poll::Ready(Err(Error::DeadlineExceeded))
             ));
-            assert_eq!(flights.table.borrow().entries.len(), 1);
+            assert_eq!(flights.table.borrow().len(), 1);
             assert!(matches!(
                 flights.join_copy(&fence().page, &scope),
                 Err(Error::Cancelled)
@@ -644,10 +649,10 @@ mod flight {
             drop(leader);
             drop(a);
             flights.poll_budgeted(100).unwrap();
-            assert_eq!(flights.table.borrow().entries.len(), 1);
+            assert_eq!(flights.table.borrow().len(), 1);
             // Simulate the worker reaping the actual completion, not request drop.
             flights.complete_operation(&fence, id).unwrap();
-            assert!(flights.table.borrow().entries.is_empty());
+            assert!(flights.table.borrow().is_empty());
         }
     }
 
@@ -901,7 +906,7 @@ mod flight {
         drop(a);
         drop(b);
         drop(copy);
-        assert!(flights.table.borrow().entries.is_empty());
+        assert!(flights.table.borrow().is_empty());
         assert!(matches!(
             flights.join_copy(&fence().page, &scope),
             Ok(JoinedCopy::Miss)
@@ -993,7 +998,7 @@ mod flight {
             }));
         drop(a);
         flights.poll_budgeted(1).unwrap();
-        assert_eq!(flights.table.borrow().entries.len(), 1);
+        assert_eq!(flights.table.borrow().len(), 1);
         send.send(()).unwrap();
         assert!(matches!(poll(flights.drain(&scope)), Poll::Ready(Ok(()))));
         assert_eq!(uring_runtime::drivers::pending(), 0);
@@ -1015,7 +1020,6 @@ mod flight {
 
     fn fence() -> Fence {
         Fence {
-            owner: Rc::new(()),
             page: PageId {
                 version: ObjectVersion {
                     object: ObjectId {
@@ -1026,8 +1030,11 @@ mod flight {
                 },
                 number: PageNumber(0),
             },
-            incarnation: 1,
-            generation: 1,
+            identity: coalesce::flight::Identity {
+                owner: Rc::new(()),
+                incarnation: 1,
+                generation: 1,
+            },
         }
     }
 

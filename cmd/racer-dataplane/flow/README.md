@@ -1,7 +1,8 @@
 # flow-control
 
-Policy-driven quotas, charged payload recycling, exact-once credit windows, and
-bounded Linux kernel pipes. It contains no application resource names, cache
+Policy-driven quotas, charged payload recycling, exact-once credit windows,
+bounded handoffs, circuits, adaptive admission, and Linux kernel pipes.
+It contains no application resource names, cache
 identity, telemetry implementation, deadlines, or cancellation policy.
 
 Implement `Class` with dense, stable indices in `0..COUNT`, then implement `Policy`
@@ -29,6 +30,38 @@ least 1 MiB retain their live charges. `reclaim_buffers()` releases idle buffers
 and quota pressure retries admission after applicable reclamation. `stop()` also
 reclaims buffers; shared handles do not keep them alive.
 
+`ChargedBuffer::new(charge, length)` owns fixed initialized backing and its charge,
+shrinks excess charge, and recycles on drop. Mutable access is slice-only and the
+buffer implements the runtime `IoBuffer` contract. `into_parts()` transfers both
+backing and charge to a final owner. The application still checks class, key,
+provenance, and authenticated publication rules.
+
+`circuit::Circuits<K>` tracks bounded failures independently of active-work limits.
+Supply capacity and probe timeout at construction, explicit time for operations,
+and a retry-delay callback to `failure`. `success` removes failure state. `acquire`
+returns an owned exclusive half-open `Probe`; its exclusivity survives timeout,
+success, and retention changes until guard drop. `try_acquire` without a guard
+instead relies on the probe timeout. Error classification and jitter stay with
+the caller; capacity rejection does not dictate how an operation reports failure.
+
+`adaptive::Adaptive<K, O>` provides shared total/per-key admission with `Arc`-owned
+permits. `Config` supplies limits, table capacity, backoff, recovery and retirement
+intervals. Supply an `Observer` for events/gauges and a clock function (including a
+simulation-aware clock when needed). Call `Permit::observe` with a classified
+outcome: verified success, remote/peer failure, local pressure, or neutral. Local
+pressure only reduces the total limit; generation-fenced failure and exclusive
+verified probes control per-key recovery. The last permit owner releases active
+usage, so I/O owners can retain it through completion. Callbacks must not reenter
+the admission lock. No application error taxonomy or telemetry is imported.
+
+`handoff::Handoff<K, A, T>` scans installed admission sources in round-robin order,
+reserving target capacity before returning an `Offer`. Implement `Admission` with
+reservation and release-wake behavior. `Offer::deliver` builds the queued item
+only if its target remains open; the item must retain its reservation. Queued and
+undelivered items thus share the target's quota ceiling. `pop_batch` enforces a
+caller budget and installs a wake target; `close` releases queued items outside
+the lock. Admission and item-building callbacks must not reenter the handoff.
+
 Create `Window::<K>::new(slots, bytes, max_item)` for ordered item keys. Call
 `reserve(key, length)`, then `issued(key)`, then `release(key, length)` with the
 exact admitted length. Pending and issued items consume the same slot and byte
@@ -50,9 +83,13 @@ Empty returned pipes retain their charges in the local pool; partially drained
 pipes close instead of being reused. Socket-retained bytes are outside the pipe
 capacity budget.
 
+`pipe::splice_unsupported` distinguishes the unsupported-operation errno set from
+backpressure, interruption, and disconnect; callers retain their copy-fallback
+policy and buffered bytes.
+
 Admission and credit operations use `Error::{InvalidInput, Overloaded,
 Unavailable, Io}`; pipe data operations return `std::io::Result`. The opt-in
 `simulation` feature forwards `uring-runtime/simulation` and uses simulated pipe
 descriptors when a simulation is active. Run focused tests from the enclosing
-workspace with `timeout --signal=TERM --kill-after=10s 300s cargo test -p
+workspace with `timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo test -p
 flow-control --all-features`.

@@ -33,6 +33,32 @@ pub struct Header {
     pub name: String,
     pub value: Vec<u8>,
 }
+impl Header {
+    /// Copy exact field bytes. Validation remains at the codec boundary.
+    pub fn new(name: impl Into<String>, value: impl AsRef<[u8]>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.as_ref().to_vec(),
+        }
+    }
+}
+
+#[test]
+fn header_constructor_copies_exact_bytes_and_codec_still_validates() {
+    let mut value = b" padded\t".to_vec();
+    let header = Header::new("X-MiXeD", &value);
+    value.fill(0);
+    assert_eq!(header.name, "X-MiXeD");
+    assert_eq!(header.value, b" padded\t");
+    let head = MessageHead {
+        start: StartLine::Response { status: 200 },
+        headers: vec![Header::new("X-Test", b"bad\r\nvalue")],
+    };
+    assert_eq!(
+        Codec::<()>::new(128).encode_head(&head),
+        Err(Error::Malformed)
+    );
+}
 impl Drop for Header {
     fn drop(&mut self) {
         self.value.zeroize();

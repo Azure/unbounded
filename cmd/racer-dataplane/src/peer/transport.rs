@@ -213,14 +213,10 @@ impl Binding {
             .fields()
             .iter()
             .map(|name| {
-                Ok(Header {
-                    name: (*name).into(),
-                    value: signed
-                        .head
-                        .unique(name)?
-                        .ok_or(Error::Unauthorized)?
-                        .to_vec(),
-                })
+                Ok(Header::new(
+                    *name,
+                    signed.head.unique(name)?.ok_or(Error::Unauthorized)?,
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         p::agrees(
@@ -753,26 +749,14 @@ impl Transfers {
     }
     async fn read_ciphertext(
         &self,
-        mut connection: ConnectionLease,
+        connection: ConnectionLease,
         length: usize,
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, WireBuffer)> {
         let (admission, _) = &self.wire;
-        let mut buffer = WireBuffer::new(admission, length)?;
-        let mut offset = 0;
-        while offset < length {
-            let read = self
-                .io
-                .read_body_range(connection, buffer, offset..length, scope)
-                .await?;
-            if read.bytes == 0 || read.bytes > length - offset {
-                return Err(Error::Io);
-            }
-            offset += read.bytes;
-            connection = read.lease;
-            buffer = read.buffer;
-        }
-        Ok((connection, buffer))
+        let buffer = WireBuffer::new(admission, length)?;
+        let read = self.io.read_body_exact(connection, buffer, scope).await?;
+        Ok((read.lease, read.buffer))
     }
     /// A completed control round always pairs one request and one response before
     /// resetting HTTP framing. No pipelining or detached state map is required.
@@ -1571,23 +1555,11 @@ fn validate_body_length(response: &PeerResponse, length: usize) -> Result<()> {
     }
     Ok(())
 }
-/// Racer-specific opaque relay. Both connections remain completion-owned.
-struct Transit {
-    source: crate::http::ConnectionLease,
-    destination: crate::http::ConnectionLease,
-    pipe: flow_control::pipe::PipeLease<AdmissionPolicy>,
-    fallback: Option<crate::http::OwnedBuffer>,
-    pending: std::ops::Range<usize>,
-    copied: bool,
-    #[cfg(test)]
-    fallback_at: Option<usize>,
-}
-fn unsupported(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
-    )
-}
+/// Both connections and all relay resources follow the readiness completion fence.
+type Transit = http_splice::relay::Relay<
+    crate::http::HttpContext,
+    flow_control::pipe::PipeLease<AdmissionPolicy>,
+>;
 pub(crate) async fn relay_body(
     io: &HttpIo,
     source: crate::http::ConnectionLease,
@@ -1611,136 +1583,32 @@ pub(crate) async fn relay_body(
     let copied = destination.state().relay_fallback;
     #[cfg(test)]
     let fallback_at = destination.state().relay_fallback_at;
-    #[cfg(not(test))]
-    let copied = false;
-    let state = Rc::new(std::cell::RefCell::new(Transit {
-        source,
-        destination,
-        pipe: pipe.ok_or(Error::InvalidRequest)?,
-        fallback: None,
-        pending: 0..0,
-        copied,
-        #[cfg(test)]
-        fallback_at,
-    }));
+    let state = Transit::new(source, destination, pipe.ok_or(Error::InvalidRequest)?)?;
+    #[cfg(test)]
+    let state = {
+        let mut state = state;
+        state.force_fallback(copied, fallback_at);
+        state
+    };
+    let state = Rc::new(std::cell::RefCell::new(state));
     loop {
         scope.check()?;
-        let wait = relay_chunk(io, &state)?;
-        {
-            let s = state.borrow();
-            if s.source.receive_remaining() == Some(0) && s.destination.send_remaining() == Some(0)
-            {
-                break;
-            }
-        }
+        let step = state.borrow_mut().step(io)?;
+        let wait = match step {
+            http_splice::relay::Step::Complete => break,
+            http_splice::relay::Step::Yield => None,
+            http_splice::relay::Step::Readiness { socket, interest } => Some((socket, interest)),
+        };
         wait_relay_progress(io, state.clone(), wait, scope).await?;
     }
     scope.check()?;
     let mut state = Rc::try_unwrap(state)
         .map_err(|_| Error::Internal)?
         .into_inner();
-    finish_relay(&mut state.source, &mut state.destination)?;
-    state.destination.state_mut().relay_reservation = None;
-    Ok(state.destination)
-}
-fn relay_chunk(
-    io: &HttpIo,
-    state: &std::cell::RefCell<Transit>,
-) -> Result<Option<(Rc<uring_runtime::reactor::Descriptor>, i16)>> {
-    use flow_control::pipe::MAX_PIPE_BYTES;
-    let mut state = state.borrow_mut();
-    let s = &mut *state;
-    if s.destination.socket().peer_read_closed() {
-        return Err(Error::Io);
-    }
-    let mut wait = None;
-    for _ in 0..32 {
-        let remaining = s.source.receive_remaining().ok_or(Error::InvalidRequest)? as usize;
-        if s.pending.is_empty() && s.pipe.buffered() == 0 && remaining == 0 {
-            break;
-        }
-        let writing = !s.pending.is_empty() || s.pipe.buffered() != 0;
-        let result = if !s.pending.is_empty() {
-            s.destination
-                .socket()
-                .try_send(&s.fallback.as_ref().unwrap().bytes()?[s.pending.clone()])
-        } else if s.pipe.buffered() != 0 {
-            #[cfg(test)]
-            if s.fallback_at
-                .is_some_and(|threshold| remaining <= threshold)
-                && !s.copied
-            {
-                s.copied = unsupported(&std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-            }
-            if s.copied {
-                if s.fallback.is_none() {
-                    s.fallback = Some(io.buffer(MAX_PIPE_BYTES)?);
-                }
-                let n = s
-                    .pipe
-                    .try_read(s.fallback.as_mut().unwrap().bytes_mut()?)
-                    .map_err(|_| Error::Io)?;
-                s.pending = 0..n;
-                continue;
-            }
-            s.pipe.try_splice_connection(&s.destination.socket())
-        } else if let Some((ahead, range)) = s.source.take_read_ahead() {
-            let count = remaining.min(range.len()).min(MAX_PIPE_BYTES);
-            if s.fallback.is_none() {
-                s.fallback = Some(io.buffer(MAX_PIPE_BYTES)?);
-            }
-            s.fallback.as_mut().unwrap().bytes_mut()?[..count]
-                .copy_from_slice(&ahead.bytes()?[range.start..range.start + count]);
-            if range.len() > count {
-                // Preserve all excess so finish_exchange still rejects pipelining.
-                s.source
-                    .restore_read_ahead(ahead, range.start + count..range.end)?;
-            }
-            s.pending = 0..count;
-            s.source.consume_received(count)?;
-            continue;
-        } else if s.copied {
-            if s.fallback.is_none() {
-                s.fallback = Some(io.buffer(MAX_PIPE_BYTES)?);
-            }
-            s.source.socket().try_recv(
-                &mut s.fallback.as_mut().unwrap().bytes_mut()?[..remaining.min(MAX_PIPE_BYTES)],
-            )
-        } else {
-            s.pipe.try_splice_from(&s.source.socket(), remaining)
-        };
-        match result {
-            Ok(0) => return Err(Error::Io),
-            Ok(n) => {
-                if writing {
-                    if !s.pending.is_empty() {
-                        s.pending.start += n;
-                    }
-                    s.destination.consume_sent(n)?;
-                } else {
-                    s.source.consume_received(n)?;
-                    if s.copied {
-                        s.pending = 0..n;
-                    }
-                }
-            }
-            Err(error) if unsupported(&error) => s.copied = true,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                wait = Some((
-                    if writing {
-                        s.destination.socket()
-                    } else {
-                        s.source.socket()
-                    },
-                    if writing { libc::POLLOUT } else { libc::POLLIN },
-                ));
-                break;
-            }
-            Err(_) => return Err(Error::Io),
-        }
-    }
-    Ok(wait)
+    let (source, destination) = state.connections_mut();
+    finish_relay(source, destination)?;
+    destination.state_mut().relay_reservation = None;
+    Ok(state.into_destination())
 }
 async fn wait_relay_progress(
     io: &HttpIo,
@@ -2891,7 +2759,6 @@ mod tests {
                     )
                     .unwrap();
             }
-            crate::peer::protocol::tests::sessions::replay_and_binding_checks();
         }
         #[test]
         fn control_extension_and_fallback_length_schema_is_closed() {

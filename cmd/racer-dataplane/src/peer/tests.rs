@@ -3243,20 +3243,13 @@ mod adaptive {
             owner.acquire(&NodeId("new".into())),
             Err(Error::Overloaded)
         ));
-        // Even a stale timestamp must not make an active backoff evictable.
-        owner
-            .state
-            .lock()
-            .unwrap()
-            .peers
-            .get_mut(&node)
-            .unwrap()
-            .updated = now() - Duration::from_secs(61);
+        // Stale internal timestamps are covered by flow-control's generic test.
+        // Service-level churn must preserve this circuit until its retry boundary.
         assert!(matches!(
             owner.acquire(&NodeId("new".into())),
             Err(Error::Overloaded)
         ));
-        assert!(owner.state.lock().unwrap().peers.contains_key(&node));
+        assert!(!owner.available(&node));
         drop(held);
     }
     #[test]
@@ -3322,8 +3315,9 @@ mod adaptive {
         assert!(!owner.available(&node)); // Still exclusive until its I/O fence.
         drop(probe);
         assert!(owner.available(&node));
-        let state = owner.state.lock().unwrap();
-        assert_eq!(state.peers[&node].limit, 3);
+        let held: Vec<_> = (0..3).map(|_| owner.acquire(&node).unwrap()).collect();
+        assert!(matches!(owner.acquire(&node), Err(Error::Overloaded)));
+        drop(held);
     }
     #[test]
     fn state_capacity_never_evicts_live_permits_and_ages_retired_entries() {
@@ -3347,7 +3341,16 @@ mod adaptive {
         ));
         drop(permits);
         let _permit = owner.acquire(&NodeId("new".into())).unwrap();
-        assert_eq!(owner.state.lock().unwrap().peers.len(), CAPACITY);
+        // The generic test asserts the internal table length. Here verify the
+        // configured capacity accepts exactly that many simultaneously live keys.
+        let held: Vec<_> = (1..CAPACITY)
+            .map(|i| owner.acquire(&NodeId(i.to_string())).unwrap())
+            .collect();
+        assert!(matches!(
+            owner.acquire(&NodeId("overflow".into())),
+            Err(Error::Overloaded)
+        ));
+        drop(held);
     }
     #[test]
     fn local_pressure_shrinks_node_limit_without_revoking_work_or_blame() {

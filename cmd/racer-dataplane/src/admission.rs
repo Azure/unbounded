@@ -15,7 +15,6 @@ use flow_control::Quotas;
 use flow_control::Rejection;
 use flow_control::SharedQuotas;
 use racer_control_wire::CacheId;
-use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -384,6 +383,11 @@ pub fn reserve_fill(
 
 /// Shared ingress admission never transfers cache authority or payload pools.
 pub fn reserve_ingress(admission: &SharedQuotas<AdmissionPolicy>) -> Result<ConnectionReservation> {
+    reserve_ingress_charges(admission).map_err(Into::into)
+}
+fn reserve_ingress_charges(
+    admission: &SharedQuotas<AdmissionPolicy>,
+) -> flow_control::Result<ConnectionReservation> {
     let role = admission.reserve(ResourceClass::IngressConnection, 1)?;
     let total = admission.reserve(ResourceClass::Connection, 1)?;
     Ok(ConnectionReservation {
@@ -402,78 +406,31 @@ pub(crate) struct Accepted {
     pub reservation: ConnectionReservation,
     pub kind: Kind,
 }
-struct Target {
-    admission: Option<SharedQuotas<AdmissionPolicy>>,
-    queue: VecDeque<Accepted>,
-    waker: Option<Waker>,
-    closed: bool,
+struct IngressAdmission(SharedQuotas<AdmissionPolicy>);
+impl flow_control::handoff::Admission for IngressAdmission {
+    type Reservation = ConnectionReservation;
+    fn register(&self, waker: &Waker) {
+        self.0.register(waker);
+    }
+    fn reserve(&self) -> flow_control::Result<ConnectionReservation> {
+        reserve_ingress_charges(&self.0)
+    }
 }
-struct IngressState {
-    targets: Vec<(WorkerId, Target)>,
-    cursor: usize,
-}
-pub(crate) struct Ingress(Mutex<IngressState>);
-pub(crate) struct Offer {
-    ingress: Arc<Ingress>,
-    target: usize,
-    reservation: ConnectionReservation,
-}
+pub(crate) struct Ingress(
+    Arc<flow_control::handoff::Handoff<WorkerId, IngressAdmission, Accepted>>,
+);
+pub(crate) struct Offer(flow_control::handoff::Offer<WorkerId, IngressAdmission, Accepted>);
 impl Ingress {
     pub fn new(workers: &[WorkerId]) -> Self {
-        Self(Mutex::new(IngressState {
-            targets: workers
-                .iter()
-                .map(|id| {
-                    (
-                        *id,
-                        Target {
-                            admission: None,
-                            queue: VecDeque::new(),
-                            waker: None,
-                            closed: false,
-                        },
-                    )
-                })
-                .collect(),
-            cursor: 0,
-        }))
+        Self(Arc::new(flow_control::handoff::Handoff::new(workers)))
     }
     pub fn install(&self, worker: WorkerId, admission: &Quotas<AdmissionPolicy>) -> Result<()> {
-        let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
-        let target = &mut state
-            .targets
-            .iter_mut()
-            .find(|(id, _)| *id == worker)
-            .ok_or(Error::InvalidConfiguration)?
-            .1;
-        if target.admission.is_some() || target.closed {
-            return Err(Error::InvalidConfiguration);
-        }
-        target.admission = Some(admission.shared());
-        Ok(())
+        self.0
+            .install(&worker, IngressAdmission(admission.shared()))
+            .map_err(Into::into)
     }
     pub fn reserve(self: &Arc<Self>, waker: &Waker) -> Result<Offer> {
-        let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
-        for offset in 0..state.targets.len() {
-            let index = (state.cursor + offset) % state.targets.len();
-            let (_, target) = &state.targets[index];
-            if target.closed {
-                continue;
-            }
-            let Some(admission) = &target.admission else {
-                continue;
-            };
-            admission.register(waker);
-            if let Ok(reservation) = reserve_ingress(admission) {
-                state.cursor = (index + 1) % state.targets.len();
-                return Ok(Offer {
-                    ingress: self.clone(),
-                    target: index,
-                    reservation,
-                });
-            }
-        }
-        Err(Error::Overloaded)
+        self.0.reserve(waker).map(Offer).map_err(Into::into)
     }
     pub fn pop_batch<const N: usize>(
         &self,
@@ -481,59 +438,21 @@ impl Ingress {
         waker: &Waker,
         budget: usize,
     ) -> Result<[Option<Accepted>; N]> {
-        let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
-        let target = &mut state
-            .targets
-            .iter_mut()
-            .find(|(id, _)| *id == worker)
-            .ok_or(Error::InvalidConfiguration)?
-            .1;
-        if let Some(old) = &mut target.waker {
-            old.clone_from(waker);
-        } else {
-            target.waker = Some(waker.clone());
-        }
-        Ok(std::array::from_fn(|index| {
-            if index < budget {
-                target.queue.pop_front()
-            } else {
-                None
-            }
-        }))
+        self.0.pop_batch(&worker, waker, budget).map_err(Into::into)
     }
     pub fn close(&self, worker: WorkerId) {
-        let queued = {
-            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            let Some((_, target)) = state.targets.iter_mut().find(|(id, _)| *id == worker) else {
-                return;
-            };
-            target.closed = true;
-            std::mem::take(&mut target.queue)
-        };
-        drop(queued);
+        self.0.close(&worker);
     }
 }
 impl Offer {
     pub fn deliver(self, fd: OwnedFd, kind: Kind) -> Result<()> {
-        let mut state = self.ingress.0.lock().map_err(|_| Error::Unavailable)?;
-        // The target vector is immutable after construction.
-        let target = &mut state.targets[self.target].1;
-        if target.closed {
-            return Err(Error::Unavailable);
-        }
-        // Every queue element holds one target reservation; queue length therefore
-        // cannot exceed its ingress ceiling, even while the worker is stalled.
-        target.queue.push_back(Accepted {
-            fd,
-            reservation: self.reservation,
-            kind,
-        });
-        let waker = target.waker.clone();
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        Ok(())
+        self.0
+            .deliver(|reservation| Accepted {
+                fd,
+                reservation,
+                kind,
+            })
+            .map_err(Into::into)
     }
 }
 

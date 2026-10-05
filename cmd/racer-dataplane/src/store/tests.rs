@@ -2518,6 +2518,67 @@ mod checkpoint {
         .unwrap()
     }
 
+    #[test]
+    fn checkpoint_geometry_keeps_item_limit_alignment_errors_and_live_dimensions() {
+        let valid = geometry();
+        let excessive = CheckpointGeometry {
+            slab_bytes: SEGMENT_BYTES * 1_000_001,
+            segment_count: 1_000_001,
+            ..valid
+        };
+        assert_eq!(excessive.validate(), Err(Error::CorruptRecord));
+        assert_eq!(
+            CheckpointGeometry {
+                memory_alignment: 3,
+                ..excessive
+            }
+            .validate(),
+            Err(Error::DirectIoUnsupported)
+        );
+        for invalid in [
+            CheckpointGeometry {
+                slab_bytes: 0,
+                ..valid
+            },
+            CheckpointGeometry {
+                segment_bytes: 0,
+                ..valid
+            },
+            CheckpointGeometry {
+                segment_count: 0,
+                ..valid
+            },
+            CheckpointGeometry {
+                segment_count: 3,
+                ..valid
+            },
+            CheckpointGeometry {
+                length_alignment: 3,
+                ..valid
+            },
+        ] {
+            assert_eq!(invalid.validate(), Err(Error::CorruptRecord));
+        }
+        let (_, segments) = state(8);
+        assert_eq!(valid.validate_live(&segments), Ok(()));
+        assert_eq!(
+            CheckpointGeometry {
+                segment_count: 1,
+                ..valid
+            }
+            .validate_live(&segments),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            CheckpointGeometry {
+                slab_bytes: SEGMENT_BYTES * 3,
+                ..valid
+            }
+            .validate_live(&segments),
+            Err(Error::InvalidConfiguration)
+        );
+    }
+
     fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         VersionMetadata {
             content_type: None,

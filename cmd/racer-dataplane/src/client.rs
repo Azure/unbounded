@@ -473,9 +473,7 @@ async fn send_frame(
     bytes: [u8; 21],
     scope: &RequestScope,
 ) -> Result<ConnectionLease> {
-    let mut buffer = io.buffer(21)?;
-    buffer.bytes_mut()?.copy_from_slice(&bytes);
-    Ok(io.write_body(connection, buffer, scope).await?.lease)
+    Ok(io.write_body_bytes(connection, &bytes, scope).await?.lease)
 }
 fn poll_slice_or_readiness(
     cx: &mut Context<'_>,
@@ -834,10 +832,7 @@ impl Responses {
     }
 }
 fn header(name: &str, value: impl AsRef<[u8]>) -> Header {
-    Header {
-        name: name.into(),
-        value: value.as_ref().to_vec(),
-    }
+    Header::new(name, value)
 }
 fn error_head(error: Error) -> Result<MessageHead> {
     let status = match error {

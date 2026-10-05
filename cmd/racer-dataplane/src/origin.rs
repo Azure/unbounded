@@ -36,6 +36,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 use uring_runtime::reactor::Completion;
+#[cfg(test)]
 use uring_runtime::reactor::IoBuffer;
 
 /// OriginClient is the shipping adapter implementation. Scripted implementations
@@ -302,30 +303,14 @@ impl OriginClient {
 
     async fn read_page(
         &self,
-        mut connection: ConnectionLease,
-        mut buffer: PlaintextBuffer,
+        connection: ConnectionLease,
+        buffer: PlaintextBuffer,
         scope: &RequestScope,
     ) -> Result<Completion<PlaintextBuffer, ConnectionLease>> {
-        let length = buffer.bytes()?.len();
-        let mut offset = 0;
-        while offset < length {
-            let completion = self
-                .io
-                .read_body_range(connection, buffer, offset..length, scope)
-                .await
-                .map_err(response_error)?;
-            if completion.bytes == 0 || completion.bytes > length - offset {
-                return Err(Error::BadGateway);
-            }
-            offset += completion.bytes;
-            connection = completion.lease;
-            buffer = completion.buffer;
-        }
-        Ok(Completion {
-            buffer,
-            bytes: offset,
-            lease: connection,
-        })
+        self.io
+            .read_body_exact(connection, buffer, scope)
+            .await
+            .map_err(response_error)
     }
 }
 
@@ -409,10 +394,7 @@ impl Origin for OriginClient {
 }
 
 fn header(name: &str, value: &[u8]) -> Header {
-    Header {
-        name: name.to_owned(),
-        value: value.to_vec(),
-    }
+    Header::new(name, value)
 }
 
 fn response_error(error: Error) -> Error {
@@ -690,25 +672,9 @@ fn metadata(head: &MessageHead, object: &ObjectId, length: u64) -> Result<Object
 }
 
 fn content_range(head: &MessageHead) -> Result<(u64, u64, u64)> {
-    let value = required(head, "Content-Range")?
-        .strip_prefix(b"bytes ")
-        .ok_or(Error::BadGateway)?;
-    let slash = value
-        .iter()
-        .position(|b| *b == b'/')
-        .ok_or(Error::BadGateway)?;
-    let bounds = &value[..slash];
-    let dash = bounds
-        .iter()
-        .position(|b| *b == b'-')
-        .ok_or(Error::BadGateway)?;
-    let first = decimal(&bounds[..dash])?;
-    let last = decimal(&bounds[dash + 1..])?;
-    let total = decimal(&value[slash + 1..])?;
-    if first > last || last >= total {
-        return Err(Error::BadGateway);
-    }
-    Ok((first, last, total))
+    let range = http1::range::ContentRange::parse_with(required(head, "Content-Range")?, decimal)
+        .map_err(|_| Error::BadGateway)?;
+    Ok((range.first, range.last, range.total))
 }
 
 #[cfg(test)]

@@ -8,15 +8,17 @@
 //! Caches are worker-local. Cooperative futures bound work per poll but leave
 //! deadlines, cancellation, health, transport, and membership versions to callers.
 //! Changing a member's domain changes placement and routing across the cluster.
-mod hash;
+pub mod hash;
 mod membership;
 mod paths;
 mod placement;
+mod workers;
 
 pub use membership::Membership;
 pub use paths::{PathQuery, Paths};
 pub use placement::Placement;
 use std::num::NonZeroU32;
+pub use workers::StaticWorkerMap;
 
 pub const MAX_DEGREE: usize = 64;
 pub(crate) const RADIX: usize = 32;

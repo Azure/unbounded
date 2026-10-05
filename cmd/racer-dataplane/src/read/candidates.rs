@@ -34,14 +34,12 @@ use crate::topology::RouteBudget;
 use racer_control_wire::NodeId;
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
-use std::task::Waker;
 use std::time::Duration;
+#[cfg(test)]
 use std::time::Instant;
 use uring_runtime::deadline::Deadline;
 
@@ -1519,22 +1517,14 @@ impl HedgeConfig {
         Ok(())
     }
 }
-struct Alarm {
-    due: Instant,
-    wake: Option<Waker>,
-}
-struct State {
-    next: u64,
-    alarms: BTreeMap<u64, Alarm>,
-}
 pub(crate) struct Hedges {
     config: HedgeConfig,
-    state: Mutex<State>,
+    capacity: Arc<flow_control::hedge::Hedges>,
     metrics: Metrics,
 }
 pub(crate) struct Permit {
     owner: Arc<Hedges>,
-    id: u64,
+    capacity: flow_control::hedge::Permit,
 }
 impl Hedges {
     pub(crate) fn new(config: HedgeConfig, metrics: Metrics) -> Result<Arc<Self>> {
@@ -1542,10 +1532,7 @@ impl Hedges {
         Ok(Arc::new(Self {
             config,
             metrics,
-            state: Mutex::new(State {
-                next: 0,
-                alarms: BTreeMap::new(),
-            }),
+            capacity: flow_control::hedge::Hedges::new(config.slots, config.bytes),
         }))
     }
     pub(crate) fn enabled(&self) -> bool {
@@ -1555,55 +1542,22 @@ impl Hedges {
         self.metrics.record(Event::PageHedgeSuppressed, 1);
     }
     pub(crate) fn acquire(self: &Arc<Self>) -> Result<Permit> {
-        let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
-        if state.alarms.len() >= self.config.slots
-            || (state.alarms.len() + 1) * DUPLICATE_BYTES > self.config.bytes
-        {
-            return Err(Error::Overloaded);
-        }
-        state.next = state.next.checked_add(1).ok_or(Error::Unavailable)?;
-        let id = state.next;
-        state.alarms.insert(
-            id,
-            Alarm {
-                due: uring_runtime::environment::now() + self.config.delay,
-                wake: None,
-            },
-        );
+        let capacity = self.capacity.acquire(
+            DUPLICATE_BYTES,
+            uring_runtime::environment::now() + self.config.delay,
+        )?;
         Ok(Permit {
             owner: self.clone(),
-            id,
+            capacity,
         })
     }
     pub(crate) fn poll(&self) {
-        let now = uring_runtime::environment::now();
-        let wakes: Vec<_> = self
-            .state
-            .lock()
-            .map(|mut state| {
-                state
-                    .alarms
-                    .values_mut()
-                    .filter(|a| now >= a.due)
-                    .filter_map(|a| a.wake.take())
-                    .collect()
-            })
-            .unwrap_or_default();
-        for wake in wakes {
-            wake.wake();
-        }
+        self.capacity.poll(uring_runtime::environment::now());
     }
 }
 impl Permit {
     pub(crate) fn delay(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let mut state = self.owner.state.lock().expect("hedge alarm lock");
-        let alarm = state.alarms.get_mut(&self.id).expect("live hedge alarm");
-        if uring_runtime::environment::now() >= alarm.due {
-            Poll::Ready(())
-        } else {
-            alarm.wake = Some(cx.waker().clone());
-            Poll::Pending
-        }
+        self.capacity.delay(uring_runtime::environment::now(), cx)
     }
     pub(crate) fn started(&self) {
         self.owner.metrics.record(Event::PageHedgeStarted, 1);
@@ -1615,10 +1569,24 @@ impl Permit {
         self.owner.metrics.record(Event::PageHedgeWon, 1);
     }
 }
-impl Drop for Permit {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.owner.state.lock() {
-            state.alarms.remove(&self.id);
+impl uring_runtime::hedge::Scope for RequestScope {
+    fn cancel(&self) {
+        let _ = RequestScope::cancel(self);
+    }
+}
+impl uring_runtime::hedge::Policy<Error> for &Permit {
+    fn delay(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        Permit::delay(self, cx)
+    }
+    fn recoverable(&self, error: Error) -> bool {
+        recoverable(error)
+    }
+    fn failure(&mut self) -> Error {
+        Error::Unavailable
+    }
+    fn won(&mut self, contender: uring_runtime::hedge::Contender) {
+        if contender == uring_runtime::hedge::Contender::Secondary {
+            Permit::won(self);
         }
     }
 }
@@ -1633,90 +1601,14 @@ pub(crate) async fn race(
     parent: &crate::runtime::RequestScope,
     permit: &Permit,
 ) -> Result<crate::memory::PageResult> {
-    parent.check()?;
-    let mut primary = Box::pin(primary);
-    let mut secondary = Box::pin(secondary);
-    let registration = parent.cancellation.subscribe()?;
-    let mut a_done = false;
-    let mut b_done = false;
-    let mut launched = false;
-    let mut winner = None;
-    let mut fatal = None;
-    std::future::poll_fn(|cx| {
-        registration.register(cx.waker());
-        if let Err(error) = parent.check() {
-            fatal = Some(error);
-        }
-        if fatal.is_some() || winner.is_some() {
-            if !a_done {
-                let _ = primary_scope.cancel();
-            }
-            if !b_done {
-                let _ = secondary_scope.cancel();
-            }
-        }
-        if !a_done {
-            if let Poll::Ready(result) = primary.as_mut().poll(cx) {
-                a_done = true;
-                match result {
-                    Ok(value) if winner.is_none() && fatal.is_none() => winner = Some(value),
-                    Err(error) if !recoverable(error) && winner.is_none() && fatal.is_none() => {
-                        fatal = Some(error)
-                    }
-                    _ => {}
-                }
-                if !launched {
-                    b_done = true;
-                }
-            }
-        }
-        if !launched
-            && !b_done
-            && fatal.is_none()
-            && winner.is_none()
-            && permit.delay(cx).is_ready()
-        {
-            launched = true;
-        }
-        if launched && !b_done {
-            if fatal.is_some() || winner.is_some() {
-                let _ = secondary_scope.cancel();
-            }
-            if let Poll::Ready(result) = secondary.as_mut().poll(cx) {
-                b_done = true;
-                match result {
-                    Ok(value) if winner.is_none() && fatal.is_none() => {
-                        permit.won();
-                        winner = Some(value);
-                    }
-                    Err(error) if !recoverable(error) && winner.is_none() && fatal.is_none() => {
-                        fatal = Some(error)
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if winner.is_some() || fatal.is_some() {
-            if !a_done {
-                let _ = primary_scope.cancel();
-            }
-            if !b_done {
-                let _ = secondary_scope.cancel();
-            }
-            if !launched {
-                b_done = true;
-            }
-        }
-        if a_done && b_done {
-            Poll::Ready(if let Some(error) = fatal {
-                Err(error)
-            } else {
-                winner.take().ok_or(Error::Unavailable)
-            })
-        } else {
-            Poll::Pending
-        }
-    })
+    uring_runtime::hedge::race(
+        primary,
+        secondary,
+        primary_scope,
+        secondary_scope,
+        parent,
+        permit,
+    )
     .await
 }
 fn recoverable(error: Error) -> bool {

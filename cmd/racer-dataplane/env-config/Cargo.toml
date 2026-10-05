@@ -1,0 +1,6 @@
+[package]
+name = "env-config"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Strict environment value parsing without application policy"

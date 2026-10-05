@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "rest", "control-wire", "identity"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "http-splice", "topology", "telemetry", "flow", "rest", "control-wire", "identity", "coalesce", "uds-endpoint", "wire-codec", "env-config"]
 resolver = "3"
 
 [package]
@@ -13,7 +13,7 @@ description = "Racer node-local read-through cache dataplane"
 default = []
 # Enables the separately loaded native verbs adapter; unavailable hardware uses HTTP.
 rdma = ["rdma-verbs/native"]
-# Opt-in Go SDK interoperability fixture using the production library.
+# Test-only Go SDK launcher; keeps crate-private fixture assembly out of default builds.
 subscription-interop = []
 
 [[test]]
@@ -22,6 +22,10 @@ path = "tests/subscription_interop.rs"
 required-features = ["subscription-interop"]
 
 [dependencies]
+coalesce = { path = "coalesce" }
+uds-endpoint = { path = "uds-endpoint" }
+wire-codec = { path = "wire-codec" }
+env-config = { path = "env-config" }
 racer-identity = { path = "identity" }
 racer-control-wire = { path = "control-wire" }
 flow-control = { path = "flow" }
@@ -29,6 +33,7 @@ rest-client = { path = "rest" }
 topology = { path = "topology" }
 telemetry = { path = "telemetry" }
 http1 = { path = "http" }
+http-splice = { path = "http-splice" }
 racer-crypto = { path = "crypto" }
 rdma-verbs = { path = "verbs" }
 page-alloc = { path = "alloc" }
@@ -47,12 +52,15 @@ x509-parser = { version = "0.16", features = ["verify"] }
 zeroize = "1"
 
 [dev-dependencies]
+racer-identity = { path = "identity", features = ["test-util"] }
+http-splice = { path = "http-splice", features = ["test-util"] }
+uds-endpoint = { path = "uds-endpoint", features = ["test-util"] }
 flow-control = { path = "flow", features = ["simulation"] }
 rest-client = { path = "rest", features = ["simulation"] }
 rdma-verbs = { path = "verbs", features = ["simulation"] }
 http1 = { path = "http", features = ["test-util"] }
 page-alloc = { path = "alloc", features = ["simulation"] }
-uring-runtime = { path = "runtime", features = ["simulation"] }
+uring-runtime = { path = "runtime", features = ["simulation", "test-util"] }
 
 # Keep source locations and inline frames for Parca.
 [profile.release]

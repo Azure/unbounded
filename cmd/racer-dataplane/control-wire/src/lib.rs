@@ -18,10 +18,6 @@ pub const RETRY_MIN: Duration = Duration::from_secs(1);
 pub const RETRY_MAX: Duration = Duration::from_secs(30);
 pub const CERTIFICATE_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 pub const RENEW_AFTER: Duration = Duration::from_secs(16 * 60 * 60);
-pub const SHARES_ANNOTATION: &str = "racer.unbounded-cloud.io/shares";
-pub const RAILS_ANNOTATION: &str = "racer.unbounded-cloud.io/rails";
-pub const ALIGNMENT_ANNOTATION: &str = "racer.unbounded-cloud.io/aligned-rails";
-pub const EXCLUSION_LABEL: &str = "racer.unbounded-cloud.io/exclude";
 pub const DEFAULT_SHARES: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -331,16 +327,6 @@ mod codec {
         }
         Ok(b)
     }
-    pub fn valid_uuid(s: &str) -> bool {
-        s.len() == 36
-            && s.bytes().enumerate().all(|(i, b)| {
-                if [8, 13, 18, 23].contains(&i) {
-                    b == b'-'
-                } else {
-                    b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
-                }
-            })
-    }
     fn uuid(s: &str) -> Result<()> {
         if valid_uuid(s) {
             Ok(())
@@ -542,19 +528,7 @@ mod codec {
             let gid = nic
                 .gid
                 .map(|value| {
-                    if value.len() != 32
-                        || !value
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
-                    {
-                        return Err(Error::InvalidRequest);
-                    }
-                    let mut gid = [0; 16];
-                    for (i, byte) in gid.iter_mut().enumerate() {
-                        *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)
-                            .map_err(|_| Error::InvalidRequest)?;
-                    }
-                    Ok(gid)
+                    wire_codec::decode_hex(value.as_bytes()).map_err(|_| Error::InvalidRequest)
                 })
                 .transpose()?;
             result.push(RailMapping {
@@ -576,9 +550,7 @@ mod codec {
                     device: nic.device.clone(),
                     port: nic.port,
                     rail: nic.rail.0,
-                    gid: nic
-                        .gid
-                        .map(|gid| gid.iter().map(|b| format!("{b:02x}")).collect()),
+                    gid: nic.gid.map(|gid| wire_codec::encode_hex(&gid)),
                     numa_node: nic
                         .numa_node
                         .map(u32::try_from)
@@ -971,8 +943,8 @@ mod codec {
             let id: [u8; 16] = bytes(&k.id)?
                 .try_into()
                 .map_err(|_| Error::InvalidRequest)?;
-            let created = u64::from_be_bytes(id[4..12].try_into().unwrap());
-            if &id[..4] != b"RKG1" || created == 0 || created > generation.0 {
+            let created = KeyId(id).generation().ok_or(Error::InvalidRequest)?;
+            if created > generation.0 {
                 return Err(Error::InvalidRequest);
             }
             let material = key_material(&k.material)?;
@@ -1115,6 +1087,66 @@ mod codec {
             env!("CARGO_MANIFEST_DIR"),
             "/../../../internal/racer/wire/testdata/bundle.json"
         ));
+        #[test]
+        fn gid_hex_round_trip_preserves_bytes_and_rejects_noncanonical_input() {
+            let gid = std::array::from_fn(|i| (i as u8) * 17);
+            let nic = RailMapping {
+                device: "mlx5_0".into(),
+                port: 1,
+                rail: RailId(0),
+                gid: Some(gid),
+                numa_node: None,
+            };
+            let dto = nics_to_dto(std::slice::from_ref(&nic)).unwrap();
+            assert_eq!(
+                dto[0].gid.as_deref(),
+                Some("00112233445566778899aabbccddeeff")
+            );
+            assert_eq!(nics_from_dto(dto).unwrap(), vec![nic.clone()]);
+            let mut absent = nic.clone();
+            absent.gid = None;
+            assert_eq!(
+                nics_from_dto(nics_to_dto(std::slice::from_ref(&absent)).unwrap()).unwrap(),
+                vec![absent]
+            );
+            for value in [
+                "".to_owned(),
+                "0".repeat(31),
+                "0".repeat(33),
+                "AB".repeat(16),
+                format!("{}g0", "00".repeat(15)),
+                format!("{} 0", "00".repeat(15)),
+                format!("{}é", "00".repeat(15)),
+            ] {
+                let mut dto = nics_to_dto(std::slice::from_ref(&nic)).unwrap();
+                dto[0].gid = Some(value);
+                assert_eq!(nics_from_dto(dto), Err(Error::InvalidRequest));
+            }
+        }
+
+        #[test]
+        fn bundle_key_generation_maps_syntax_and_future_epochs_to_invalid_request() {
+            let mut bundle: Value = serde_json::from_str(BUNDLE).unwrap();
+            bundle["generation"] = "1".into();
+            bundle["cache_keys"].as_array_mut().unwrap().truncate(1);
+            bundle["cache_keys"][0]["state"] = "active".into();
+            bundle["cache_keys"][0]["id"] = STANDARD
+                .encode(KeyId::from_generation(1, 0).unwrap().0)
+                .into();
+            assert!(decode_bundle(&serde_json::to_vec(&bundle).unwrap()).is_ok());
+            for id in [
+                KeyId([1; 16]),
+                KeyId(*b"RKG1\0\0\0\0\0\0\0\0\0\0\0\0"),
+                KeyId::from_generation(2, 0).unwrap(),
+            ] {
+                bundle["cache_keys"][0]["id"] = STANDARD.encode(id.0).into();
+                assert!(matches!(
+                    decode_bundle(&serde_json::to_vec(&bundle).unwrap()),
+                    Err(Error::InvalidRequest)
+                ));
+            }
+        }
+
         #[test]
         fn key_material_requires_exact_length_canonical_padding_and_trailing_bits() {
             let canonical = STANDARD.encode([0xa7; 32]);

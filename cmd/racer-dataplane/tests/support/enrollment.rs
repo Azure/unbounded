@@ -79,15 +79,50 @@ pub fn fields(head: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-pub fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
-    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params.key_usages = vec![
-        rcgen::KeyUsagePurpose::KeyCertSign,
-        rcgen::KeyUsagePurpose::CrlSign,
-    ];
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-    (params.self_signed(&key).unwrap(), key)
+#[allow(unused_imports)]
+pub use racer_identity::test_util::ca;
+
+pub fn issue(
+    request: &racer_control_wire::EnrollmentRequest,
+    ca: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    node: &str,
+) -> racer_control_wire::EnrollmentResponse {
+    issue_at(
+        request,
+        ca,
+        key,
+        node,
+        uring_runtime::environment::wall_now() - std::time::Duration::from_secs(1),
+    )
+}
+
+pub fn issue_at(
+    request: &racer_control_wire::EnrollmentRequest,
+    ca: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    node: &str,
+    not_before: std::time::SystemTime,
+) -> racer_control_wire::EnrollmentResponse {
+    let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
+    let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
+    csr.params.not_before = not_before.into();
+    csr.params.not_after = (not_before + std::time::Duration::from_secs(86400)).into();
+    csr.params.subject_alt_names = vec![rcgen::SanType::URI(
+        format!("spiffe://{}/node/{node}", request.cluster.0)
+            .try_into()
+            .unwrap(),
+    )];
+    csr.params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let cert = csr.signed_by(ca, key).unwrap();
+    racer_control_wire::EnrollmentResponse {
+        schema_version: 1,
+        cluster: request.cluster.clone(),
+        node: racer_control_wire::NodeId(node.into()),
+        enrollment: request.enrollment.clone(),
+        certificate_chain: vec![cert.der().to_vec()],
+    }
 }
 
 pub fn signing_identity(
@@ -97,29 +132,11 @@ pub fn signing_identity(
     cluster: racer_control_wire::ClusterId,
     node: racer_control_wire::NodeId,
 ) -> std::sync::Arc<racer_identity::SigningIdentity> {
-    let secret = pending.export_pkcs8_for_persistence().unwrap();
-    let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-        &rustls::pki_types::PrivatePkcs8KeyDer::from(secret.as_slice()),
-        &rcgen::PKCS_ED25519,
-    )
-    .unwrap();
-    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.subject_alt_names = vec![rcgen::SanType::URI(
-        format!("spiffe://{}/node/{}", cluster.0, node.0)
-            .try_into()
-            .unwrap(),
-    )];
-    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key, ca, ca_key).unwrap();
+    let (pending, chain) =
+        racer_identity::test_util::issue_pending(pending, ca, ca_key, &cluster, &node, |_| {});
     std::sync::Arc::new(
         pending
-            .accept(
-                cluster,
-                node,
-                vec![cert.der().to_vec()],
-                &[ca.der().to_vec()],
-            )
+            .accept(cluster, node, chain, &[ca.der().to_vec()])
             .unwrap(),
     )
 }

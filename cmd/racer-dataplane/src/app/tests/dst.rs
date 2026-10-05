@@ -2259,7 +2259,7 @@ impl Harness {
             .to_pkcs8_der()
             .unwrap();
         let pending = PendingIdentity::recover(&key).unwrap();
-        crate::control::tests::testing::signing_identity(
+        crate::test_support::enrollment::signing_identity(
             pending,
             &self.ca,
             &self.ca_key,

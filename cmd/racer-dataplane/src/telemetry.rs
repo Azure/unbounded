@@ -9,6 +9,9 @@ use crate::model::WorkerId;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use ::telemetry::Ring;
+use ::telemetry::SampleBudget;
+use ::telemetry::SampleLimits;
+use ::telemetry::SharedRing;
 use ::telemetry::metrics;
 use ::telemetry::server;
 use ::telemetry::server::Handler;
@@ -227,11 +230,19 @@ fn get(
     mut output: &mut dyn Write,
 ) -> std::result::Result<Response, std::fmt::Error> {
     let ready = admission_usable && telemetry.health.ready();
+    const LIVE_PROBE: ::telemetry::health::Probe =
+        ::telemetry::health::Probe::new("ok\n", "not live\n");
+    const READY_PROBE: ::telemetry::health::Probe =
+        ::telemetry::health::Probe::new("ready\n", "not ready\n");
     let (response, body, event) = match path {
-        "/healthz" if telemetry.health.live() => (Response::Text, "ok\n", Event::DiagnosticHealth),
-        "/healthz" => (Response::Unavailable, "not live\n", Event::DiagnosticHealth),
-        "/readyz" if ready => (Response::Text, "ready\n", Event::DiagnosticReady),
-        "/readyz" => (Response::Unavailable, "not ready\n", Event::DiagnosticReady),
+        "/healthz" => {
+            let (response, body) = LIVE_PROBE.response(telemetry.health.live());
+            (response, body, Event::DiagnosticHealth)
+        }
+        "/readyz" => {
+            let (response, body) = READY_PROBE.response(ready);
+            (response, body, Event::DiagnosticReady)
+        }
         "/metrics" => (Response::Metrics, "", Event::DiagnosticMetrics),
         "/debug/membership" => (Response::Text, "", Event::DiagnosticMetrics),
         "/debug/failures"
@@ -275,21 +286,8 @@ fn get(
 }
 
 #[derive(Clone, Default)]
-pub struct Health(Arc<Mutex<Status>>);
-#[derive(Default)]
-struct Status {
-    lifecycle: State,
-    resources: Resources,
-}
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum State {
-    #[default]
-    Starting,
-    Ready,
-    Degraded,
-    Draining,
-    Stopped,
-}
+pub struct Health(::telemetry::health::Health<Resources>);
+pub use ::telemetry::health::State;
 /// Complete worker observation; no identities or credentials enter health state.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Resources {
@@ -319,15 +317,12 @@ impl Health {
         self.state_at(uring_runtime::environment::now())
     }
     pub fn state_at(&self, now: Instant) -> Result<State> {
-        let status = self.0.lock().map_err(|_| Error::Unavailable)?;
-        Ok(match status.lifecycle {
-            State::Ready if !status.resources.usable_at(now) => State::Degraded,
-            state => state,
-        })
+        self.0
+            .state_at(now, Resources::usable_at)
+            .map_err(|_| Error::Unavailable)
     }
     pub fn observe(&self, resources: Resources) -> Result<()> {
-        self.0.lock().map_err(|_| Error::Unavailable)?.resources = resources;
-        Ok(())
+        self.0.observe(resources).map_err(|_| Error::Unavailable)
     }
     pub fn ready(&self) -> bool {
         self.state().is_ok_and(|state| state == State::Ready)
@@ -337,19 +332,11 @@ impl Health {
         self.state().is_ok_and(|state| state != State::Stopped)
     }
     pub fn transition(&self, state: State) -> Result<()> {
-        let mut status = self.0.lock().map_err(|_| Error::Unavailable)?;
-        if status.lifecycle == State::Stopped && state != State::Stopped
-            || status.lifecycle == State::Draining
-                && !matches!(state, State::Draining | State::Stopped)
-            || state == State::Ready
-                && !status
-                    .resources
-                    .usable_at(uring_runtime::environment::now())
-        {
-            return Err(Error::Unavailable);
-        }
-        status.lifecycle = state;
-        Ok(())
+        self.0
+            .transition(state, |resources| {
+                resources.usable_at(uring_runtime::environment::now())
+            })
+            .map_err(|_| Error::Unavailable)
     }
 }
 
@@ -357,6 +344,11 @@ impl Health {
 // Shared limits: one active owner, two samples/second, 240 total, 120 seconds.
 // Cached CRCs are reused. Pending/unavailable samples do not prove agreement.
 pub const SEND_CRC_CAPACITY: usize = 64;
+const SEND_CRC_LIMITS: SampleLimits = SampleLimits {
+    total: 240,
+    duration: Duration::from_secs(120),
+    interval: Duration::from_millis(500),
+};
 #[derive(Clone, Debug)]
 pub struct Pair {
     pub sender: NodeId,
@@ -385,23 +377,13 @@ impl Pair {
 #[derive(Clone, Default)]
 pub struct Samples(Arc<Mutex<SendCrcState>>);
 struct SendCrcState {
-    first: Option<Instant>,
-    last: Option<Instant>,
-    busy: bool,
-    eligible: u64,
-    sampled: u64,
-    skipped: u64,
+    budget: SampleBudget,
     entries: Ring<Arc<Sample>, SEND_CRC_CAPACITY>,
 }
 impl Default for SendCrcState {
     fn default() -> Self {
         Self {
-            first: None,
-            last: None,
-            busy: false,
-            eligible: 0,
-            sampled: 0,
-            skipped: 0,
+            budget: SampleBudget::new(SEND_CRC_LIMITS),
             entries: Ring::default(),
         }
     }
@@ -433,9 +415,13 @@ impl Samples {
             "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111",
         )
         .unwrap();
-        for _ in 0..SEND_CRC_CAPACITY {
-            self.0.lock().unwrap().last = None;
-            let (ticket, mut work) = self.begin(&pair, &pair.sender, &pair.receiver).unwrap();
+        let now = environment::now();
+        for i in 0..SEND_CRC_CAPACITY {
+            let (ticket, mut work) = self
+                .begin_at(&pair, &pair.sender, &pair.receiver, || {
+                    now + SEND_CRC_LIMITS.interval * i as u32
+                })
+                .unwrap();
             work.facts = Some(crate::telemetry::test_aead_failure());
             work.identify(crate::security::CryptoId {
                 worker: crate::model::WorkerId(u16::MAX),
@@ -452,28 +438,23 @@ impl Samples {
         sender: &NodeId,
         receiver: &NodeId,
     ) -> Option<(Ticket, Work)> {
+        self.begin_at(pair, sender, receiver, environment::now)
+    }
+    fn begin_at(
+        &self,
+        pair: &Pair,
+        sender: &NodeId,
+        receiver: &NodeId,
+        now: impl FnOnce() -> Instant,
+    ) -> Option<(Ticket, Work)> {
         if sender != &pair.sender || receiver != &pair.receiver {
             return None;
         }
-        let now = environment::now();
+        let now = now();
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        state.eligible = state.eligible.saturating_add(1);
-        let first = *state.first.get_or_insert(now);
-        if state.busy
-            || state.sampled >= 240
-            || now.saturating_duration_since(first) >= Duration::from_secs(120)
-            || state.last.is_some_and(|last| {
-                now.saturating_duration_since(last) < Duration::from_millis(500)
-            })
-        {
-            state.skipped = state.skipped.saturating_add(1);
-            return None;
-        }
-        state.busy = true;
-        state.last = Some(now);
-        state.sampled += 1;
+        let sequence = state.budget.acquire(now)?;
         let sample = Arc::new(Sample {
-            sequence: state.sampled,
+            sequence,
             sender: sender.clone(),
             receiver: receiver.clone(),
             data: Mutex::new(Data {
@@ -498,12 +479,13 @@ impl Samples {
     pub fn write(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         let (entries, eligible, sampled, skipped, busy) = {
             let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let counts = state.budget.counts();
             (
                 state.entries.clone(),
-                state.eligible,
-                state.sampled,
-                state.skipped,
-                state.busy,
+                counts.eligible,
+                counts.sampled,
+                counts.skipped,
+                counts.busy,
             )
         };
         writeln!(
@@ -583,7 +565,12 @@ impl Drop for Work {
                 data.status = "unavailable";
             }
         }
-        self.owner.0.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
+        self.owner
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .budget
+            .release();
     }
 }
 
@@ -664,7 +651,7 @@ impl AeadFailure {
     }
 }
 
-type AeadRing = Ring<(crate::security::CryptoId, AeadFailure), AEAD_CAPACITY>;
+type AeadRing = SharedRing<(crate::security::CryptoId, AeadFailure), AEAD_CAPACITY>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Stage {
@@ -785,11 +772,11 @@ impl Failure {
 
 #[derive(Clone, Default)]
 pub struct Failures(
-    Arc<Mutex<Ring<(WorkerId, Failure), FAILURE_CAPACITY>>>,
-    Arc<Mutex<AeadRing>>,
-    Arc<Mutex<Ring<ProtectedFailure, 64>>>,
-    Arc<Mutex<Ring<ProtectedFailure, 64>>>,
-    Arc<Mutex<Ring<(WorkerId, CandidateFinal), 16>>>,
+    SharedRing<(WorkerId, Failure), FAILURE_CAPACITY>,
+    AeadRing,
+    SharedRing<ProtectedFailure, 64>,
+    SharedRing<ProtectedFailure, 64>,
+    SharedRing<(WorkerId, CandidateFinal), 16>,
 );
 
 /// Operation-local recent facts, not a client outcome or a transport diagnosis.
@@ -907,7 +894,7 @@ struct ProtectedFailure {
 pub struct Observer(Option<(Failures, WorkerId)>);
 impl Failures {
     pub(crate) fn write_candidate_final(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let snapshot = self.4.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let snapshot = self.4.snapshot();
         writeln!(
             out,
             "schema_version=1 total={} retained={} overwritten={} capacity=16 coverage=candidate_operation_final operations=resolve,remaining_copy,origin_miss excluded=standalone_subscribe,hedge_errors origin_miss_trail=predecessors_only trail_capacity=4 trail_unit=events",
@@ -980,7 +967,7 @@ impl Failures {
         out: &mut impl std::fmt::Write,
     ) -> std::fmt::Result {
         let ring = if admission { &self.3 } else { &self.2 };
-        let snapshot = ring.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let snapshot = ring.snapshot();
         writeln!(
             out,
             "schema_version=1 total={} retained={} overwritten={} capacity=64 coverage={}",
@@ -1032,7 +1019,7 @@ impl Failures {
         Ok(())
     }
     pub fn write_aead(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let ring = self.1.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let ring = self.1.snapshot();
         let (total, len) = (ring.total(), ring.len());
         writeln!(
             out,
@@ -1073,7 +1060,7 @@ impl Failures {
     }
     pub fn write(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         // Copy bounded records before formatting; never hold the lock across I/O.
-        let ring = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let ring = self.0.snapshot();
         let (total, len) = (ring.total(), ring.len());
         writeln!(
             out,
@@ -1142,43 +1129,30 @@ impl Failures {
 impl Observer {
     pub(crate) fn candidate_final(&self, record: CandidateFinal) {
         if let Some((failures, worker)) = &self.0 {
-            failures
-                .4
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((*worker, record));
+            failures.4.push((*worker, record));
         }
     }
     pub(crate) fn record_aead(&self, id: crate::security::CryptoId, failure: AeadFailure) {
         let Some((failures, _)) = &self.0 else {
             return;
         };
-        let mut ring = failures.1.lock().unwrap_or_else(|e| e.into_inner());
-        ring.push((id, failure));
+        failures.1.push((id, failure));
     }
     pub fn record(&self, failure: Failure) {
         let Some((failures, worker)) = &self.0 else {
             return;
         };
-        failures
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((*worker, failure));
+        failures.0.push((*worker, failure));
         if matches!(
             failure.stage,
             Stage::ClientRead | Stage::FirstSlice | Stage::NextSlice | Stage::ClientWrite
         ) {
-            failures
-                .2
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(ProtectedFailure {
-                    worker: *worker,
-                    failure,
-                    site: None,
-                    page: None,
-                });
+            failures.2.push(ProtectedFailure {
+                worker: *worker,
+                failure,
+                site: None,
+                page: None,
+            });
         }
     }
     pub(crate) fn final_fill_admission(
@@ -1191,18 +1165,14 @@ impl Observer {
         let Some((failures, worker)) = &self.0 else {
             return;
         };
-        failures
-            .3
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(ProtectedFailure {
-                worker: *worker,
-                failure: Failure::new(Stage::Admission, Error::Overloaded)
-                    .request(scope)
-                    .detail(detail.unwrap_or_default()),
-                site: Some(site),
-                page,
-            });
+        failures.3.push(ProtectedFailure {
+            worker: *worker,
+            failure: Failure::new(Stage::Admission, Error::Overloaded)
+                .request(scope)
+                .detail(detail.unwrap_or_default()),
+            site: Some(site),
+            page,
+        });
     }
     pub fn result<T>(&self, stage: Stage, scope: &RequestScope, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
@@ -1733,16 +1703,18 @@ impl Metrics {
         // Only runtime worker IDs are labels. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
-        const QUOTAS: [&str; 4] = [
-            "racer_worker_relay_used",
-            "racer_worker_relay_limit",
-            "racer_worker_ciphertext_used_bytes",
-            "racer_worker_ciphertext_limit_bytes",
-        ];
+        const QUOTAS: ::telemetry::metrics::LabeledGauges<4> =
+            ::telemetry::metrics::LabeledGauges::new(
+                [
+                    "racer_worker_relay_used",
+                    "racer_worker_relay_limit",
+                    "racer_worker_ciphertext_used_bytes",
+                    "racer_worker_ciphertext_limit_bytes",
+                ],
+                "worker",
+            );
         if self.admission.iter().any(|s| s.get().is_some()) {
-            for name in QUOTAS {
-                writeln!(out, "# TYPE {name} gauge")?;
-            }
+            QUOTAS.write_types(out)?;
             for shard in self.admission.iter() {
                 if let Some((worker, usage)) = shard.get() {
                     let (relay_used, relay_limit) = (
@@ -1753,14 +1725,12 @@ impl Metrics {
                         usage.used(crate::admission::ResourceClass::Ciphertext),
                         usage.limit(crate::admission::ResourceClass::Ciphertext),
                     );
-                    for (name, value) in QUOTAS.into_iter().zip([
-                        relay_used,
-                        relay_limit,
-                        ciphertext_used,
-                        ciphertext_limit,
-                    ]) {
-                        writeln!(out, "{name}{{worker=\"{}\"}} {value}", worker.0)?;
-                    }
+                    QUOTAS.write_sample(
+                        out,
+                        u64::from(worker.0),
+                        [relay_used, relay_limit, ciphertext_used, ciphertext_limit]
+                            .map(|value| value as u64),
+                    )?;
                 }
             }
         }
@@ -2729,6 +2699,64 @@ pub(crate) mod tests {
         use super::*;
         use std::time::Duration;
         #[test]
+        fn lifecycle_probes_keep_resource_policy_bodies_and_irreversible_drain() {
+            let telemetry = Telemetry::default();
+            let now = environment::now();
+            let usable = Resources {
+                workers_usable: true,
+                storage_usable: true,
+                listeners_usable: true,
+                membership_usable: true,
+                admission_usable: true,
+                credentials_valid_until: Some(now + Duration::from_secs(60)),
+                observed_until: Some(now + Duration::from_secs(60)),
+            };
+            let probe = |path, admission, expected, available: bool| {
+                let mut body = String::new();
+                let response = get(&telemetry, path, admission, &mut body).unwrap();
+                assert_eq!(body, expected);
+                assert_eq!(matches!(response, Response::Text), available);
+                assert_eq!(matches!(response, Response::Unavailable), !available);
+            };
+            probe("/healthz", true, "ok\n", true);
+            probe("/readyz", true, "not ready\n", false);
+            assert_eq!(
+                telemetry.health.transition(State::Ready),
+                Err(Error::Unavailable)
+            );
+            telemetry.health.observe(usable).unwrap();
+            telemetry.health.transition(State::Ready).unwrap();
+            probe("/readyz", true, "ready\n", true);
+            probe("/readyz", false, "not ready\n", false);
+            telemetry
+                .health
+                .observe(Resources {
+                    storage_usable: false,
+                    ..usable
+                })
+                .unwrap();
+            assert_eq!(telemetry.health.state(), Ok(State::Degraded));
+            probe("/healthz", true, "ok\n", true);
+            probe("/readyz", true, "not ready\n", false);
+            telemetry.health.observe(usable).unwrap();
+            assert_eq!(telemetry.health.state(), Ok(State::Ready));
+            telemetry.health.transition(State::Draining).unwrap();
+            assert_eq!(
+                telemetry.health.transition(State::Ready),
+                Err(Error::Unavailable)
+            );
+            probe("/healthz", true, "ok\n", true);
+            probe("/readyz", true, "not ready\n", false);
+            telemetry.health.transition(State::Stopped).unwrap();
+            assert_eq!(
+                telemetry.health.transition(State::Starting),
+                Err(Error::Unavailable)
+            );
+            probe("/healthz", true, "not live\n", false);
+            assert_eq!(telemetry.metrics.count(Event::DiagnosticHealth), 4);
+            assert_eq!(telemetry.metrics.count(Event::DiagnosticReady), 5);
+        }
+        #[test]
         fn observation_and_credential_expiry_are_inclusive() {
             let now = uring_runtime::environment::now();
             for (observed, boundary) in [(5, 5), (20, 10)] {
@@ -2769,6 +2797,9 @@ pub(crate) mod tests {
         }
         #[test]
         fn send_crc_pair_and_shared_owner_bounds() {
+            let clock = environment::SimulationClock::new(72);
+            let _env = clock.environment(0).enter();
+            let _strict = environment::require_simulated();
             for value in [
                 "",
                 "x,y",
@@ -2789,9 +2820,9 @@ pub(crate) mod tests {
                     .join()
                     .unwrap()
             );
-            assert!(samples.0.lock().unwrap().busy);
+            assert!(samples.0.lock().unwrap().budget.counts().busy);
             drop(work);
-            assert!(!samples.0.lock().unwrap().busy);
+            assert!(!samples.0.lock().unwrap().budget.counts().busy);
             assert!(
                 samples.begin(&p, &p.sender, &p.receiver).is_none(),
                 "burst is one"
@@ -2799,9 +2830,27 @@ pub(crate) mod tests {
             let mut text = String::new();
             samples.write(&mut text).unwrap();
             assert!(text.contains("send=abandoned status=unavailable"));
-            samples.0.lock().unwrap().last = None;
-            samples.0.lock().unwrap().first = Some(environment::now() - Duration::from_secs(120));
+            clock.advance(Duration::from_secs(120));
             assert!(samples.begin(&p, &p.sender, &p.receiver).is_none());
+        }
+        #[test]
+        fn send_crc_ineligible_pairs_do_not_start_the_sampling_window() {
+            let clock = environment::SimulationClock::new(76);
+            let _env = clock.environment(0).enter();
+            let _strict = environment::require_simulated();
+            let p = pair();
+            let samples = Samples::default();
+            assert!(samples.begin(&p, &p.receiver, &p.sender).is_none());
+            clock.advance(Duration::from_secs(120));
+            let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+            assert_eq!(ticket.0.sequence, 1);
+            assert_eq!(samples.0.lock().unwrap().budget.counts().eligible, 1);
+            work.finish(Some(Error::Io));
+            drop(work);
+            assert!(!samples.0.lock().unwrap().budget.counts().busy);
+            let mut text = String::new();
+            samples.write(&mut text).unwrap();
+            assert!(text.contains("status=unavailable error=Some(Io)"));
         }
         #[test]
         fn send_crc_interval_accepts_exactly_500ms() {
@@ -2820,7 +2869,7 @@ pub(crate) mod tests {
             assert_eq!(ticket.0.sequence, 2);
             drop(work);
             drop(ticket);
-            let state = samples.0.lock().unwrap();
+            let state = samples.0.lock().unwrap().budget.counts();
             assert_eq!((state.eligible, state.sampled, state.skipped), (3, 2, 1));
             assert!(!state.busy);
         }
@@ -2870,18 +2919,20 @@ pub(crate) mod tests {
 
         #[test]
         fn send_crc_ring_is_bounded_and_preserves_send_outcomes() {
+            let clock = environment::SimulationClock::new(75);
+            let _env = clock.environment(0).enter();
+            let _strict = environment::require_simulated();
             let p = pair();
             let samples = Samples::default();
             for i in 0..240 {
-                samples.0.lock().unwrap().last = None;
                 let (ticket, mut work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
                 ticket.finish(i % 2 == 0);
                 work.facts = Some(crate::telemetry::test_aead_failure());
                 work.finish(None);
                 drop(work);
                 drop(ticket);
+                clock.advance(Duration::from_millis(500));
             }
-            samples.0.lock().unwrap().last = None;
             assert!(samples.begin(&p, &p.sender, &p.receiver).is_none());
             let mut text = String::new();
             samples.write(&mut text).unwrap();
@@ -3063,7 +3114,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             observer.result(Stage::ClientRead, &scope, Ok(())).unwrap();
-            assert_eq!(failures.0.lock().unwrap().total(), 0);
+            assert_eq!(failures.0.snapshot().total(), 0);
             std::thread::spawn(move || {
                 for _ in 0..FAILURE_CAPACITY + 2 {
                     observer.record(

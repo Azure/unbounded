@@ -1095,19 +1095,27 @@ pub fn decode(
 }
 pub(super) struct Decoder<'a>(pub(super) &'a [u8]);
 impl<'a> Decoder<'a> {
+    fn read<T>(
+        &mut self,
+        read: impl FnOnce(&mut wire_codec::Reader<'a>) -> wire_codec::Result<T>,
+    ) -> Result<T> {
+        let mut reader = wire_codec::Reader::new(self.0, wire_codec::Endian::Little);
+        let result = read(&mut reader);
+        self.0 = reader.remaining();
+        result.map_err(|_| Error::CorruptRecord)
+    }
+
     pub(super) fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let (value, rest) = self.0.split_at_checked(len).ok_or(Error::CorruptRecord)?;
-        self.0 = rest;
-        Ok(value)
+        self.read(|reader| reader.take(len))
     }
     pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.take(N)?.try_into().map_err(|_| Error::CorruptRecord)
+        self.read(|reader| reader.array())
     }
     pub(super) fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.array()?))
+        self.read(|reader| reader.u32())
     }
     pub(super) fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.array()?))
+        self.read(|reader| reader.u64())
     }
 }
 

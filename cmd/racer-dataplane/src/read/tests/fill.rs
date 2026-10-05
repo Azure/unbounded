@@ -3093,7 +3093,7 @@ fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waite
             .unwrap()
             .is_none()
     );
-    assert!(f.fill.local_copies.borrow().is_empty());
+    assert!(f.fill.local_copies.is_empty());
     assert!(matches!(
         flights.join_copy(&f.page, &f.scope).unwrap(),
         JoinedCopy::Complete(_)
@@ -3428,7 +3428,7 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
             assert_eq!(f.fill.metrics.count(Event::PageDecrypt), 0);
             assert_eq!(f.origin.calls.get(), 0);
             assert_eq!(f.reactor.in_flight(), 0);
-            assert!(f.fill.local_copies.borrow().is_empty());
+            assert!(f.fill.local_copies.is_empty());
             assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
             assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
             if acquire {
@@ -3558,7 +3558,7 @@ fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
     assert!(first.as_mut().poll(&mut cx).is_pending());
     assert!(second.as_mut().poll(&mut cx).is_pending());
     assert_eq!(f.reactor.in_flight(), 1, "one cold disk submission");
-    assert_eq!(f.fill.local_copies.borrow().len(), 1);
+    assert_eq!(f.fill.local_copies.len(), 1);
     let (first, second) = drive_io(
         futures::future::join(first, second),
         &f.reactor,
@@ -3598,7 +3598,7 @@ fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
     assert_eq!(f.fill.metrics.count(Event::PageDecrypt), 0);
     assert_eq!(f.origin.calls.get(), 0);
     assert_eq!(f.reactor.in_flight(), 0);
-    assert!(f.fill.local_copies.borrow().is_empty());
+    assert!(f.fill.local_copies.is_empty());
     assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
     assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
     assert_eq!(
@@ -3649,7 +3649,7 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
     drop((first, second));
     assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
     assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 1);
-    assert_eq!(f.fill.local_copies.borrow().len(), 1);
+    assert_eq!(f.fill.local_copies.len(), 1);
     assert_eq!(f.reactor.in_flight(), 1);
     // A replacement joins the still-owned read, not a second disk submission.
     let mut replacement = f.fill.copy_only(&f.page, &f.scope);
@@ -3662,7 +3662,7 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
     );
     assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
     assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
-    assert!(f.fill.local_copies.borrow().is_empty());
+    assert!(f.fill.local_copies.is_empty());
     assert_eq!(f.reactor.in_flight(), 0);
     assert_eq!(f.origin.calls.get(), 0);
 }
@@ -3684,7 +3684,7 @@ fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
                 .is_none()
         );
         drop(requests);
-        assert!(f.fill.local_copies.borrow().is_empty());
+        assert!(f.fill.local_copies.is_empty());
         assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
         assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
         assert_eq!(uring_runtime::drivers::pending(), 0);
@@ -3799,7 +3799,7 @@ fn copy_only_local_state_admission_failure_releases_all_reservations() {
         ),
         Err(Error::Overloaded)
     ));
-    assert!(f.fill.local_copies.borrow().is_empty());
+    assert!(f.fill.local_copies.is_empty());
     assert_eq!(admission.used(ResourceClass::Waiter), 0);
     assert_eq!(uring_runtime::drivers::pending(), 0);
     drop(pressure);

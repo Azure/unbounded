@@ -38,7 +38,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
-use std::task::Wake;
 use std::task::Waker;
 use std::thread;
 use std::time::Duration;
@@ -50,6 +49,7 @@ use uring_runtime::affinity::NicLocality;
 #[cfg(test)]
 use uring_runtime::affinity::current_cpus;
 use uring_runtime::deadline::Deadline;
+use uring_runtime::drive_local_with;
 use uring_runtime::group::Factory;
 use uring_runtime::group::FailureReporter;
 use uring_runtime::group::Group;
@@ -57,7 +57,6 @@ use uring_runtime::group::Helper;
 use uring_runtime::group::Lane;
 use uring_runtime::group::Plan;
 use uring_runtime::group::Service;
-use uring_runtime::reactor::ReactorWake;
 
 const WORK_BUDGET: usize = 64;
 const IDLE_WAIT: Duration = Duration::from_millis(1);
@@ -484,25 +483,9 @@ impl Drop for WorkerGroup {
     }
 }
 
-struct ThreadWake(thread::Thread, Option<ReactorWake>);
-impl Wake for ThreadWake {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
-        if let Some(reactor) = &self.1 {
-            let _ = reactor.wake();
-        }
-    }
-}
-
 fn driver_waker(runtime: Option<&WorkerRuntime>) -> Result<Waker> {
     let reactor = runtime.map(|runtime| runtime.reactor.waker()).transpose()?;
-    Ok(Waker::from(Arc::new(ThreadWake(
-        thread::current(),
-        reactor,
-    ))))
+    Ok(uring_runtime::thread_waker(reactor))
 }
 
 /// Independently drive resource completions while a service future borrows its
@@ -521,36 +504,6 @@ fn drive_local<'a>(
         },
         move || runtime.reactor.wait(IDLE_WAIT),
     )
-}
-
-fn drive_local_with<'a>(
-    mut operation: Operation<'a, ()>,
-    reporter: Option<&'a FailureReporter<Error>>,
-    mut poll: impl FnMut(&Waker) -> Result<()> + 'a,
-    mut wait: impl FnMut() -> Result<()> + 'a,
-) -> Operation<'a, ()> {
-    let mut error = None;
-    Box::pin(std::future::poll_fn(move |cx| {
-        if let Err(failure) = poll(cx.waker()) {
-            if let Some(reporter) = reporter {
-                reporter.report(failure);
-            }
-            error.get_or_insert(failure);
-        }
-        if let Poll::Ready(result) = operation.as_mut().poll(cx) {
-            return Poll::Ready(error.map_or(result, Err));
-        }
-        if let Err(failure) = wait() {
-            if let Some(reporter) = reporter {
-                reporter.report(failure);
-            }
-            error.get_or_insert(failure);
-        }
-        // The reactor already performed the bounded wait. Do not add a second
-        // generic executor sleep before consuming its newly available CQEs.
-        thread::current().unpark();
-        Poll::Pending
-    }))
 }
 
 fn lifecycle_scope() -> Result<RequestScope> {
@@ -2441,19 +2394,14 @@ mod tests {
 
         #[test]
         fn engine_driver_wake_survives_noop_operation_poll() {
-            struct Count(std::sync::atomic::AtomicUsize);
-            impl Wake for Count {
-                fn wake(self: Arc<Self>) {
-                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            }
+            use uring_runtime::test_util::WakeCounter;
             let (_, factory) = fixture(3);
             let (io, port) = security::pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
             let mut engine = TestCrypto {
                 factory,
                 _port: port,
             };
-            let count = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+            let count = Arc::new(WakeCounter::default());
             engine.register_driver(&Waker::from(count.clone()));
             assert!(
                 engine
@@ -2462,7 +2410,7 @@ mod tests {
                     .is_pending()
             );
             io.close_submissions().unwrap();
-            assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(count.count(), 1);
         }
 
         #[test]

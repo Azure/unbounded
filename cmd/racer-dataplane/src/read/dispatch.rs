@@ -29,18 +29,26 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+#[cfg(test)]
 use std::future::Future;
+#[cfg(test)]
 use std::pin::Pin;
 use std::rc::Rc;
 use std::rc::Weak;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+#[cfg(test)]
 use std::task::Waker;
+use uring_runtime::mailbox;
+
+type Completion = mailbox::Completion<Result<Value>, AcquisitionBudget>;
+type Reply = mailbox::Reply<Result<Value>, AcquisitionBudget>;
+type Command = mailbox::Command<Work, Result<Value>, AcquisitionBudget, RequestScope>;
+type Receipt = mailbox::Receipt<Work, Result<Value>, AcquisitionBudget, RequestScope>;
+type Handoff = mailbox::Mailbox<Work, Result<Value>, AcquisitionBudget, RequestScope>;
 
 thread_local! {
     // Installed only on the owning I/O thread. No Rc enters the shared directory.
@@ -49,14 +57,13 @@ thread_local! {
 
 struct Mailbox {
     worker: WorkerId,
-    state: Mutex<MailboxState>,
+    inner: Arc<Handoff>,
 }
-struct MailboxState {
-    installed: bool,
-    closed: bool,
-    outstanding: usize,
-    queue: VecDeque<Command>,
-    waker: Option<Waker>,
+impl std::ops::Deref for Mailbox {
+    type Target = Handoff;
+    fn deref(&self) -> &Handoff {
+        &self.inner
+    }
 }
 
 /// The map is immutable for the lifetime of this directory. Construct a replacement
@@ -65,7 +72,6 @@ pub struct WorkerDirectory {
     pub(crate) subscriptions: Arc<super::range_stream::Scheduler>,
     map: Arc<WorkerMap>,
     mailboxes: Vec<Arc<Mailbox>>,
-    capacity: usize,
     sequence: AtomicU64,
 }
 
@@ -105,92 +111,6 @@ enum Value {
     Published,
     Retained(Option<VersionMetadata>),
     Peer(PeerResponse),
-}
-struct Completion {
-    value: Result<Value>,
-    budget: Option<AcquisitionBudget>,
-}
-struct Reply {
-    generation: u64,
-    abandoned: AtomicBool,
-    state: Mutex<ReplyState>,
-}
-struct ReplyState {
-    completion: Option<Completion>,
-    waker: Option<Waker>,
-    finished: bool,
-}
-impl Reply {
-    fn complete(&self, generation: u64, completion: Completion) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if generation != self.generation || state.finished {
-            return Err(Error::StaleFlight);
-        }
-        state.finished = true;
-        if !self.abandoned.load(Ordering::Acquire) {
-            state.completion = Some(completion);
-        }
-        let waker = state.waker.take();
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        Ok(())
-    }
-}
-struct Permit(Arc<Mailbox>);
-impl Drop for Permit {
-    fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
-        state.outstanding -= 1;
-        let waker = state.waker.clone();
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
-struct Command {
-    generation: u64,
-    work: Work,
-    scope: RequestScope,
-    budget: Option<AcquisitionBudget>,
-    reply: Arc<Reply>,
-    permit: Arc<Permit>,
-}
-struct Receipt {
-    reply: Arc<Reply>,
-    scope: RequestScope,
-    cancellation: uring_runtime::deadline::CancellationRegistration,
-    _permit: Arc<Permit>,
-}
-impl Future for Receipt {
-    type Output = Result<Completion>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.cancellation.register(cx.waker());
-        if let Err(error) = self.scope.check() {
-            return Poll::Ready(Err(error));
-        }
-        if self.reply.abandoned.load(Ordering::Acquire) {
-            return Poll::Ready(Err(Error::Cancelled));
-        }
-        let mut state = self.reply.state.lock().unwrap();
-        if let Some(completion) = state.completion.take() {
-            return Poll::Ready(Ok(completion));
-        }
-        state.waker = Some(cx.waker().clone());
-        Poll::Pending
-    }
-}
-impl Drop for Receipt {
-    fn drop(&mut self) {
-        self.reply.abandoned.store(true, Ordering::Release);
-        // Cancellation is a notification, not release of the accepted permit.
-        let waker = self._permit.0.state.lock().unwrap().waker.clone();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
 }
 struct Active {
     cancellation: Result<uring_runtime::deadline::CancellationRegistration>,
@@ -269,16 +189,7 @@ impl WorkerDirectory {
         let receipt = self.submit(owner, Work::Selected(copy), scope, None)?;
         // Cancellation notifies the owner, but selection exclusivity must survive
         // until its accepted crypto and publication work actually completes.
-        let completion = std::future::poll_fn(|cx| {
-            receipt.cancellation.register(cx.waker());
-            let mut state = receipt.reply.state.lock().unwrap();
-            if let Some(completion) = state.completion.take() {
-                return Poll::Ready(completion);
-            }
-            state.waker = Some(cx.waker().clone());
-            Poll::Pending
-        })
-        .await;
+        let completion = std::future::poll_fn(|cx| receipt.poll_completion(cx)).await;
         scope.check()?;
         match completion.value? {
             Value::Page(result) => Ok(result),
@@ -291,12 +202,8 @@ impl WorkerDirectory {
     #[cfg(test)]
     pub(crate) fn simulation_crash(&self) {
         for mailbox in &self.mailboxes {
-            let commands = {
-                let mut state = mailbox.state.lock().unwrap();
-                state.closed = true;
-                std::mem::take(&mut state.queue)
-            };
-            drop(commands);
+            mailbox.stop_admission();
+            drop(mailbox.take_queued());
         }
     }
     /// Select a logical worker on the single-threaded simulation scheduler.
@@ -337,17 +244,10 @@ impl WorkerDirectory {
                 .map(|worker| {
                     Arc::new(Mailbox {
                         worker,
-                        state: Mutex::new(MailboxState {
-                            installed: false,
-                            closed: false,
-                            outstanding: 0,
-                            queue: VecDeque::new(),
-                            waker: None,
-                        }),
+                        inner: Arc::new(Handoff::new(capacity).expect("validated capacity")),
                     })
                 })
                 .collect(),
-            capacity,
             sequence: AtomicU64::new(1),
         })
     }
@@ -368,11 +268,7 @@ impl WorkerDirectory {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            let mut state = mailbox.state.lock().unwrap();
-            if state.installed || state.closed {
-                return Err(Error::InvalidConfiguration);
-            }
-            state.installed = true;
+            mailbox.install()?;
             locals.insert(key, (worker, Rc::downgrade(&local)));
             Ok(())
         })?;
@@ -434,51 +330,12 @@ impl WorkerDirectory {
         budget: Option<AcquisitionBudget>,
     ) -> Result<Receipt> {
         scope.check()?;
-        // A receipt has a task-specific waker, not the worker's stable waker.
-        // Release its notification slot when the receipt completes or detaches.
-        let cancellation = scope.cancellation.subscribe()?;
         let mailbox = self.mailbox(worker)?;
         let generation = self
             .sequence
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Unavailable)?;
-        let mut state = mailbox.state.lock().unwrap();
-        if state.closed || !state.installed {
-            return Err(Error::Unavailable);
-        }
-        if state.outstanding >= self.capacity {
-            return Err(Error::Overloaded);
-        }
-        state.outstanding += 1;
-        let permit = Arc::new(Permit(mailbox.clone()));
-        let reply = Arc::new(Reply {
-            generation,
-            abandoned: AtomicBool::new(false),
-            state: Mutex::new(ReplyState {
-                completion: None,
-                waker: None,
-                finished: false,
-            }),
-        });
-        state.queue.push_back(Command {
-            generation,
-            work,
-            scope: scope.clone(),
-            budget,
-            reply: reply.clone(),
-            permit: permit.clone(),
-        });
-        let waker = state.waker.take();
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        Ok(Receipt {
-            reply,
-            scope: scope.clone(),
-            cancellation,
-            _permit: permit,
-        })
+        mailbox.inner.submit(generation, work, scope, budget)
     }
 
     async fn budgeted(
@@ -701,10 +558,10 @@ impl WorkerEndpoint {
         self.active.clear();
     }
     pub fn stop_admission(&self) {
-        self.mailbox.state.lock().unwrap().closed = true;
+        self.mailbox.stop_admission();
     }
     pub fn is_drained(&self) -> bool {
-        self.mailbox.state.lock().unwrap().outstanding == 0
+        self.mailbox.outstanding() == 0
     }
     /// Close admission and continue reaping every accepted command. An expired
     /// shutdown scope requests cancellation but never substitutes for completion.
@@ -715,9 +572,19 @@ impl WorkerEndpoint {
                 for active in &self.active {
                     let _ = active.scope.cancel();
                 }
-                let state = self.mailbox.state.lock().unwrap();
-                for command in &state.queue {
-                    command.reply.abandoned.store(true, Ordering::Release);
+                // Unstarted work is fenced by non-submission, not abandonment:
+                // completion-only waiters must receive an explicit result. Take
+                // ownership before releasing ciphertext, budgets, and permits;
+                // permit release locks this same mailbox.
+                let queued = self.mailbox.take_queued();
+                for mut command in queued {
+                    let _ = command.reply.complete(
+                        command.generation,
+                        Completion {
+                            value: Err(Error::Cancelled),
+                            budget: command.budget.take(),
+                        },
+                    );
                 }
             }
             if let Err(error) = self.poll(cx, 64) {
@@ -732,10 +599,10 @@ impl WorkerEndpoint {
     }
     /// Register a reactor waker and execute at most `work_budget` command/poll steps.
     pub fn poll(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        self.mailbox.state.lock().unwrap().waker = Some(cx.waker().clone());
+        self.mailbox.register(cx.waker());
         let mut remaining_polls = self.active.len();
         for _ in 0..work_budget {
-            let command = self.mailbox.state.lock().unwrap().queue.pop_front();
+            let command = self.mailbox.pop();
             if let Some(command) = command {
                 remaining_polls += 1;
                 let local = self.local.clone();
@@ -759,7 +626,7 @@ impl WorkerEndpoint {
                             permit,
                             ..
                         } = command;
-                        let value = if reply.abandoned.load(Ordering::Acquire) {
+                        let value = if reply.is_abandoned() {
                             Err(Error::Cancelled)
                         } else {
                             execute(&local, work, &scope, budget.as_mut()).await
@@ -768,7 +635,7 @@ impl WorkerEndpoint {
                         // receipt retains the slot until its result is consumed.
                         let completed = reply.complete(generation, Completion { value, budget });
                         drop(permit);
-                        completed
+                        completed.map_err(|_| Error::StaleFlight)
                     }),
                 });
             }
@@ -780,7 +647,7 @@ impl WorkerEndpoint {
                     cancellation.register(cx.waker());
                 }
                 if active.cancellation.is_err()
-                    || active.reply.abandoned.load(Ordering::Acquire)
+                    || active.reply.is_abandoned()
                     || active.caller.check().is_err()
                 {
                     let _ = active.scope.cancel();
@@ -797,7 +664,7 @@ impl WorkerEndpoint {
         }
         // Active length is not runnable work: every future may be blocked. Keep
         // round-robin order; the bounded worker tick reaches the rest of the set.
-        if work_budget != 0 && !self.mailbox.state.lock().unwrap().queue.is_empty() {
+        if work_budget != 0 && self.mailbox.has_queued() {
             cx.waker().wake_by_ref();
         }
         Ok(())
@@ -809,11 +676,10 @@ impl WorkerEndpoint {
     /// Earliest caller deadline. The I/O loop currently uses its bounded 1 ms tick
     /// to check deadlines rather than scheduling this value directly.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        let state = self.mailbox.state.lock().unwrap();
         self.active
             .iter()
             .map(|active| active.caller.deadline.0)
-            .chain(state.queue.iter().map(|command| command.scope.deadline.0))
+            .chain(self.mailbox.queued_min(|scope| scope.deadline.0))
             .min()
     }
     pub fn uninstall(&mut self) -> Result<()> {
@@ -821,7 +687,7 @@ impl WorkerEndpoint {
         if !self.is_drained() || !self.active.is_empty() {
             return Err(Error::Unavailable);
         }
-        self.mailbox.state.lock().unwrap().installed = false;
+        self.mailbox.uninstall()?;
         LOCALS.with(|locals| {
             locals
                 .borrow_mut()
@@ -840,7 +706,7 @@ impl Drop for WorkerEndpoint {
         });
         // Queued work has not started and can be fenced as non-submission. Drop
         // outside the mailbox lock because its permit releases against that lock.
-        let queued = std::mem::take(&mut self.mailbox.state.lock().unwrap().queue);
+        let queued = self.mailbox.take_queued();
         for mut command in queued {
             let _ = command.reply.complete(
                 command.generation,
@@ -961,16 +827,14 @@ impl LocalPageService for Arc<WorkerDirectory> {
 }
 
 pub struct WorkerMap {
-    workers: Vec<WorkerId>,
+    workers: ::topology::StaticWorkerMap<WorkerId>,
 }
 impl WorkerMap {
     /// Canonical worker order makes assignment independent of discovery order.
     /// Changing this set requires draining all flights first.
-    pub fn new(mut workers: Vec<WorkerId>) -> Result<Self> {
-        workers.sort_by_key(|worker| worker.0);
-        if workers.is_empty() || workers.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(Error::InvalidConfiguration);
-        }
+    pub fn new(workers: Vec<WorkerId>) -> Result<Self> {
+        let workers = ::topology::StaticWorkerMap::new_by_key(workers, |worker| worker.0)
+            .ok_or(Error::InvalidConfiguration)?;
         Ok(Self { workers })
     }
 
@@ -983,9 +847,6 @@ impl WorkerMap {
     }
 
     fn select(&self, object: &ObjectId, page: u64) -> Result<WorkerId> {
-        if self.workers.is_empty() {
-            return Err(Error::InvalidConfiguration);
-        }
         let mut hash = Sha256::new();
         hash.update(b"racer.local-worker.v1\0");
         hash.update((object.cache.0.len() as u64).to_be_bytes());
@@ -993,9 +854,7 @@ impl WorkerMap {
         hash.update(object.key.0);
         hash.update(page.to_be_bytes());
         let digest = hash.finalize();
-        let index = u64::from_be_bytes(digest[..8].try_into().expect("eight digest bytes"))
-            % self.workers.len() as u64;
-        Ok(self.workers[index as usize])
+        Ok(*self.workers.select(&digest.into()))
     }
 }
 
@@ -1008,6 +867,27 @@ mod tests {
     use racer_control_wire::CacheId;
     use std::time::Duration;
     use std::time::Instant;
+    #[test]
+    fn worker_map_preserves_configuration_errors_and_single_worker_assignment() {
+        assert!(matches!(
+            WorkerMap::new(vec![]),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert!(matches!(
+            WorkerMap::new(vec![WorkerId(9), WorkerId(1), WorkerId(9)]),
+            Err(Error::InvalidConfiguration)
+        ));
+        let map = WorkerMap::new(vec![WorkerId(u16::MAX)]).unwrap();
+        let page = PageId {
+            version: version(),
+            number: crate::model::PageNumber(u64::MAX),
+        };
+        assert_eq!(map.owner(&page), Ok(WorkerId(u16::MAX)));
+        assert_eq!(
+            map.metadata_owner(&page.version.object),
+            Ok(WorkerId(u16::MAX))
+        );
+    }
     #[test]
     fn stable_assignment_ignores_etag_and_worker_input_order() {
         use crate::model::CacheKey;
@@ -1051,7 +931,7 @@ mod tests {
         )
         .unwrap();
         for mailbox in &directory.mailboxes {
-            mailbox.state.lock().unwrap().installed = true;
+            mailbox.install().unwrap();
         }
         directory
     }
@@ -1089,30 +969,13 @@ mod tests {
         let mut selected = Box::pin(directory.accept_selected(page.copy(), &scope));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(selected.as_mut().poll(&mut cx).is_pending());
-        let command = directory
-            .mailbox(owner)
-            .unwrap()
-            .state
-            .lock()
-            .unwrap()
-            .queue
-            .pop_front()
-            .unwrap();
+        let command = directory.mailbox(owner).unwrap().pop().unwrap();
         assert!(
             matches!(&command.work, Work::Selected(copy) if copy.metadata.version == version())
         );
         scope.cancel().unwrap();
         assert!(selected.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(
-            directory
-                .mailbox(owner)
-                .unwrap()
-                .state
-                .lock()
-                .unwrap()
-                .outstanding,
-            1
-        );
+        assert_eq!(directory.mailbox(owner).unwrap().outstanding(), 1);
         command
             .reply
             .complete(
@@ -1128,16 +991,187 @@ mod tests {
             Poll::Ready(Err(Error::Cancelled))
         ));
         drop((selected, command));
-        assert_eq!(
-            directory
-                .mailbox(owner)
-                .unwrap()
-                .state
-                .lock()
-                .unwrap()
-                .outstanding,
-            0
-        );
+        assert_eq!(directory.mailbox(owner).unwrap().outstanding(), 0);
+    }
+
+    #[test]
+    fn expired_drain_completes_queued_selected_waiters_and_reclaims_ciphertext() {
+        use crate::admission::ResourceClass;
+        for cancel_caller in [false, true] {
+            let directory = Arc::new(directory(1));
+            let caller = scope();
+            let admission = Rc::new(flow_control::Quotas::new(
+                crate::admission::AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                ),
+            ));
+            let page = crate::memory::tests::bundle_for(
+                &admission,
+                VersionMetadata {
+                    version: version(),
+                    length: 3,
+                    content_type: None,
+                },
+            );
+            let owner = directory.page_owner(page.plaintext.page()).unwrap();
+            let mailbox = directory.mailbox(owner).unwrap().clone();
+            let mut endpoint = WorkerEndpoint {
+                mailbox: mailbox.clone(),
+                directory: directory.clone(),
+                local: crate::test_support::wake_test_coordinator(),
+                active: VecDeque::new(),
+            };
+            // Model ingress on the other worker so the real selected handoff is used.
+            let _ingress =
+                directory.simulation_scope(Some((WorkerId(1 - owner.0), endpoint.local.clone())));
+            let mut selected = Box::pin(directory.accept_selected(page.copy(), &caller));
+            drop(page);
+            let count = Arc::new(crate::test_support::WakeCounter::default());
+            let waker = Waker::from(count.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(selected.as_mut().poll(&mut cx).is_pending());
+            assert!(mailbox.has_queued());
+            assert_eq!(mailbox.outstanding(), 1);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            if cancel_caller {
+                caller.cancel().unwrap();
+                assert!(selected.as_mut().poll(&mut cx).is_pending());
+            }
+            let shutdown = RequestScope::new(RequestId([2; 16]), Instant::now()).unwrap();
+            assert_eq!(shutdown.check(), Err(Error::DeadlineExceeded));
+            let mut drain = endpoint.drain(&shutdown);
+            let before = count.count();
+            assert!(drain.as_mut().poll(&mut cx).is_pending());
+            assert!(
+                count.count() > before,
+                "queued completion must wake its waiter"
+            );
+            assert!(!mailbox.has_queued());
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+            assert_eq!(mailbox.outstanding(), 1, "unread receipt retains its slot");
+            assert!(matches!(
+                selected.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+            assert_eq!(mailbox.outstanding(), 0);
+            assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+            drop(drain);
+            assert!(
+                endpoint.active.is_empty(),
+                "queued work was never submitted"
+            );
+            endpoint.uninstall().unwrap();
+        }
+    }
+
+    #[test]
+    fn expired_drain_returns_queued_budget_and_reclaims_detached_receipts() {
+        for detach in [false, true] {
+            let directory = Arc::new(directory(1));
+            let mut endpoint = WorkerEndpoint {
+                mailbox: directory.mailboxes[0].clone(),
+                directory: directory.clone(),
+                local: crate::test_support::wake_test_coordinator(),
+                active: VecDeque::new(),
+            };
+            let caller = scope();
+            let mut budget = AcquisitionBudget::new(caller.deadline.0, 4, 8);
+            budget
+                .begin_attempt(Instant::now(), caller.deadline.0)
+                .unwrap();
+            budget.charge_links(3).unwrap();
+            let mut receipt = directory
+                .submit(
+                    WorkerId(0),
+                    Work::Retained(version()),
+                    &caller,
+                    Some(budget),
+                )
+                .unwrap();
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(Pin::new(&mut receipt).poll(&mut cx).is_pending());
+            let shutdown = RequestScope::new(RequestId([2; 16]), Instant::now()).unwrap();
+            let mut drain = endpoint.drain(&shutdown);
+            if detach {
+                drop(receipt);
+                assert_eq!(directory.mailboxes[0].outstanding(), 1);
+                assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+            } else {
+                assert!(drain.as_mut().poll(&mut cx).is_pending());
+                let Poll::Ready(Ok(completion)) = Pin::new(&mut receipt).poll(&mut cx) else {
+                    panic!("queued non-submission must return a normal completion");
+                };
+                assert!(matches!(completion.value, Err(Error::Cancelled)));
+                let budget = completion.budget.unwrap();
+                assert_eq!(budget.remaining_attempts(), 3);
+                assert_eq!(budget.remaining_links(), 5);
+                assert_eq!(budget.deadline(), caller.deadline.0);
+                assert_eq!(directory.mailboxes[0].outstanding(), 1);
+                drop(receipt);
+                assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+            }
+            drop(drain);
+            assert_eq!(directory.mailboxes[0].outstanding(), 0);
+            assert!(endpoint.active.is_empty());
+            endpoint.uninstall().unwrap();
+        }
+    }
+
+    #[test]
+    fn expired_drain_keeps_active_work_until_its_completion_fence() {
+        let directory = Arc::new(directory(1));
+        let mut endpoint = WorkerEndpoint {
+            mailbox: directory.mailboxes[0].clone(),
+            directory: directory.clone(),
+            local: crate::test_support::wake_test_coordinator(),
+            active: VecDeque::new(),
+        };
+        let caller = scope();
+        let receipt = directory
+            .submit(WorkerId(0), Work::Retained(version()), &caller, None)
+            .unwrap();
+        let command = endpoint.mailbox.pop().unwrap();
+        let active_scope = scope();
+        let (finish, fence) = futures::channel::oneshot::channel::<()>();
+        endpoint.active.push_back(Active {
+            cancellation: caller.cancellation.subscribe(),
+            runnable: uring_runtime::drivers::Runnable::new(),
+            scope: active_scope.clone(),
+            caller,
+            reply: command.reply.clone(),
+            // Model accepted work whose cancellation is not a completion fence.
+            future: Box::pin(async move {
+                fence.await.map_err(|_| Error::Unavailable)?;
+                command
+                    .reply
+                    .complete(
+                        command.generation,
+                        Completion {
+                            value: Err(Error::Cancelled),
+                            budget: None,
+                        },
+                    )
+                    .map_err(|_| Error::StaleFlight)?;
+                drop(command);
+                Ok(())
+            }),
+        });
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        endpoint.poll(&mut cx, 1).unwrap();
+        let shutdown = RequestScope::new(RequestId([2; 16]), Instant::now()).unwrap();
+        let mut drain = endpoint.drain(&shutdown);
+        assert!(drain.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(active_scope.check(), Err(Error::Cancelled));
+        assert!(receipt.poll_completion(&mut cx).is_pending());
+        drop(receipt);
+        assert_eq!(directory.mailboxes[0].outstanding(), 1);
+        assert!(drain.as_mut().poll(&mut cx).is_pending());
+        finish.send(()).unwrap();
+        assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        drop(drain);
+        assert!(endpoint.active.is_empty());
+        assert_eq!(directory.mailboxes[0].outstanding(), 0);
+        endpoint.uninstall().unwrap();
     }
 
     #[test]
@@ -1153,15 +1187,7 @@ mod tests {
             let mut lookup = Box::pin(directory.cached_page(page.clone(), &scope));
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(lookup.as_mut().poll(&mut cx).is_pending());
-            let command = directory
-                .mailbox(owner)
-                .unwrap()
-                .state
-                .lock()
-                .unwrap()
-                .queue
-                .pop_front()
-                .unwrap();
+            let command = directory.mailbox(owner).unwrap().pop().unwrap();
             assert!(matches!(&command.work, Work::Cached(requested) if requested == &page));
             assert!(command.budget.is_none(), "cache lookup cannot acquire");
             command
@@ -1180,16 +1206,7 @@ mod tests {
                 _ => panic!("unexpected lookup completion"),
             }
             drop((lookup, command));
-            assert_eq!(
-                directory
-                    .mailbox(owner)
-                    .unwrap()
-                    .state
-                    .lock()
-                    .unwrap()
-                    .outstanding,
-                0
-            );
+            assert_eq!(directory.mailbox(owner).unwrap().outstanding(), 0);
         }
     }
 
@@ -1225,7 +1242,7 @@ mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             for (mailbox, value) in directory.mailboxes.iter().zip(values) {
                 assert!(lookup.as_mut().poll(&mut cx).is_pending());
-                let command = mailbox.state.lock().unwrap().queue.pop_front().unwrap();
+                let command = mailbox.pop().unwrap();
                 assert!(
                     matches!(&command.work, Work::Retained(requested) if requested == &version)
                 );
@@ -1244,7 +1261,7 @@ mod tests {
             assert_eq!(lookup.as_mut().poll(&mut cx), Poll::Ready(expected));
             drop(lookup);
             for mailbox in &directory.mailboxes {
-                assert_eq!(mailbox.state.lock().unwrap().outstanding, 0);
+                assert_eq!(mailbox.outstanding(), 0);
             }
         }
     }
@@ -1255,7 +1272,7 @@ mod tests {
         let mut endpoint = WorkerEndpoint {
             mailbox: directory.mailboxes[0].clone(),
             directory,
-            local: crate::app::tests::wake_test_coordinator(),
+            local: crate::test_support::wake_test_coordinator(),
             active: VecDeque::new(),
         };
         let count = Arc::new(crate::test_support::WakeCounter::default());
@@ -1270,15 +1287,7 @@ mod tests {
                 runnable: uring_runtime::drivers::Runnable::new(),
                 scope: scope(),
                 caller,
-                reply: Arc::new(Reply {
-                    generation: id,
-                    abandoned: AtomicBool::new(false),
-                    state: Mutex::new(ReplyState {
-                        completion: None,
-                        waker: None,
-                        finished: false,
-                    }),
-                }),
+                reply: Arc::new(Reply::new(id)),
                 future: Box::pin(std::future::poll_fn(move |_| {
                     order.borrow_mut().push(id);
                     Poll::Pending
@@ -1312,7 +1321,7 @@ mod tests {
                 let mut endpoint = WorkerEndpoint {
                     mailbox: directory.mailboxes[0].clone(),
                     directory: directory.clone(),
-                    local: crate::app::tests::wake_test_coordinator(),
+                    local: crate::test_support::wake_test_coordinator(),
                     active: VecDeque::new(),
                 };
                 let count = Arc::new(crate::test_support::WakeCounter::default());
@@ -1365,15 +1374,9 @@ mod tests {
             directory.submit(WorkerId(0), Work::Retained(version()), &scope, None),
             Err(Error::Overloaded)
         ));
-        let command = directory.mailboxes[0]
-            .state
-            .lock()
-            .unwrap()
-            .queue
-            .pop_front()
-            .unwrap();
+        let command = directory.mailboxes[0].pop().unwrap();
         drop(receipt);
-        assert!(command.reply.abandoned.load(Ordering::Acquire));
+        assert!(command.reply.is_abandoned());
         assert!(matches!(
             directory.submit(WorkerId(0), Work::Retained(version()), &scope, None),
             Err(Error::Overloaded)
@@ -1388,21 +1391,15 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(command.reply.state.lock().unwrap().completion.is_none());
+        assert!(command.reply.is_abandoned());
         drop(command);
         let next = directory
             .submit(WorkerId(0), Work::Retained(version()), &scope, None)
             .unwrap();
-        let command = directory.mailboxes[0]
-            .state
-            .lock()
-            .unwrap()
-            .queue
-            .pop_front()
-            .unwrap();
+        let command = directory.mailboxes[0].pop().unwrap();
         drop(next);
         drop(command);
-        assert_eq!(directory.mailboxes[0].state.lock().unwrap().outstanding, 0);
+        assert_eq!(directory.mailboxes[0].outstanding(), 0);
     }
     #[test]
     fn completion_fence_rejects_late_and_duplicate_results_and_returns_spent_budget() {
@@ -1418,13 +1415,7 @@ mod tests {
                 )
                 .unwrap(),
         );
-        let mut command = directory.mailboxes[0]
-            .state
-            .lock()
-            .unwrap()
-            .queue
-            .pop_front()
-            .unwrap();
+        let mut command = directory.mailboxes[0].pop().unwrap();
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(receipt.as_mut().poll(&mut cx).is_pending());
@@ -1436,7 +1427,7 @@ mod tests {
                     budget: None
                 }
             ),
-            Err(Error::StaleFlight)
+            Err(mailbox::StaleCompletion)
         );
         let mut budget = command.budget.take().unwrap();
         budget
@@ -1461,7 +1452,7 @@ mod tests {
                     budget: None
                 }
             ),
-            Err(Error::StaleFlight)
+            Err(mailbox::StaleCompletion)
         );
         drop(command);
         // Completed but unread replies still consume their bounded slot.
@@ -1483,7 +1474,7 @@ mod tests {
         );
         assert!(matches!(completion.value, Ok(Value::Retained(None))));
         drop(receipt);
-        assert_eq!(directory.mailboxes[0].state.lock().unwrap().outstanding, 0);
+        assert_eq!(directory.mailboxes[0].outstanding(), 0);
     }
     #[test]
     fn metadata_owner_matches_page_zero_across_versions_and_closed_mailboxes_reject() {
@@ -1496,13 +1487,7 @@ mod tests {
         assert_eq!(directory.page_owner(&page).unwrap(), owner);
         page.version.etag = StrongEtag::test_value("another-version");
         assert_eq!(directory.page_owner(&page).unwrap(), owner);
-        directory
-            .mailbox(owner)
-            .unwrap()
-            .state
-            .lock()
-            .unwrap()
-            .closed = true;
+        directory.mailbox(owner).unwrap().stop_admission();
         assert!(matches!(
             directory.submit(owner, Work::Retained(version()), &scope(), None),
             Err(Error::Unavailable)
@@ -1519,21 +1504,15 @@ mod tests {
     }
     #[test]
     fn slot_is_retained_until_both_completion_and_receipt_release() {
-        let mailbox = Arc::new(Mailbox {
-            worker: WorkerId(0),
-            state: Mutex::new(MailboxState {
-                installed: true,
-                closed: false,
-                outstanding: 1,
-                queue: VecDeque::new(),
-                waker: None,
-            }),
-        });
-        let accepted = Arc::new(Permit(mailbox.clone()));
-        let receipt = accepted.clone();
+        let directory = directory(1);
+        let mailbox = &directory.mailboxes[0];
+        let receipt = directory
+            .submit(WorkerId(0), Work::Retained(version()), &scope(), None)
+            .unwrap();
+        let accepted = mailbox.pop().unwrap();
         drop(receipt);
-        assert_eq!(mailbox.state.lock().unwrap().outstanding, 1);
+        assert_eq!(mailbox.outstanding(), 1);
         drop(accepted);
-        assert_eq!(mailbox.state.lock().unwrap().outstanding, 0);
+        assert_eq!(mailbox.outstanding(), 0);
     }
 }

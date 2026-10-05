@@ -2630,7 +2630,7 @@ impl Handle {
         }
         Ok(len)
     }
-    fn file_write(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
+    pub(super) fn file_write(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         let (node, flags) = self.node()?;
         if !self.sim.0.borrow().executing {
             check_direct(flags, offset, bytes.as_ptr(), bytes.len())?;

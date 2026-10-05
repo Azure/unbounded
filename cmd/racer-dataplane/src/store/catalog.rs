@@ -13,7 +13,6 @@ use crate::runtime::HashSet;
 use page_alloc::Extent;
 use page_alloc::Generation;
 use page_alloc::SegmentId;
-use page_alloc::SegmentState;
 use page_alloc::Segments;
 use racer_control_wire::KeyId;
 use std::cell::Cell;
@@ -475,10 +474,21 @@ impl Index {
 /// Per-worker bounded second-chance clock, with no payload compaction.
 pub struct SegmentClock {
     index: Rc<Index>,
-    segments: Rc<Segments>,
     free_reserve: usize,
-    hand: Cell<usize>,
-    recent: RefCell<HashSet<SegmentId>>,
+    clock: page_alloc::SegmentClock,
+}
+impl page_alloc::SegmentEntries for Index {
+    fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
+        let entries = self.segment_entries_bounded(segment, budget);
+        let removed = entries.len();
+        for (page, location) in entries {
+            self.remove_if_matches(&page, &location);
+        }
+        removed
+    }
+    fn is_empty(&self, segment: SegmentId) -> bool {
+        self.segment_empty(segment)
+    }
 }
 impl SegmentClock {
     pub fn reserve(&self) -> usize {
@@ -487,91 +497,29 @@ impl SegmentClock {
     pub fn new(index: Rc<Index>, segments: Rc<Segments>, free_reserve: usize) -> Self {
         Self {
             index,
-            segments,
             free_reserve,
-            hand: Cell::new(0),
-            recent: RefCell::new(HashSet::default()),
+            clock: page_alloc::SegmentClock::new(segments),
         }
     }
     pub fn mark_read(&self, segment: SegmentId) -> Result<()> {
-        if !matches!(
-            self.segments.state(segment)?,
-            SegmentState::Open | SegmentState::Sealed
-        ) {
-            return Err(Error::CorruptRecord);
-        }
-        self.recent.borrow_mut().insert(segment);
-        Ok(())
+        self.clock.mark_read(segment).map_err(Into::into)
     }
     /// Make index room independently of slab space, with at most two rotations.
     /// Use the same segment-level second chance as payload reclamation, but only
     /// forget mappings: even an open segment can lose its index entries safely.
     /// Its bytes and generation stay intact until normal lease-fenced recycling.
     pub fn reclaim_index_for(&self, page: &PageId) -> Result<()> {
-        if self.index.preflight_capacity(page).is_ok() {
-            return Ok(());
-        }
-        let count = self.segments.count();
-        for _ in 0..count.saturating_mul(2).min(64) {
-            let hand = self.hand.get() % count;
-            self.hand.set((hand + 1) % count);
-            let id = SegmentId(hand as u64);
-            if self.recent.borrow_mut().remove(&id) {
-                continue;
-            }
-            for (victim, location) in self.index.segment_entries_bounded(id, 1) {
-                self.index.remove_if_matches(&victim, &location);
-            }
-            if self.index.preflight_capacity(page).is_ok() {
-                return Ok(());
-            }
-        }
-        Err(Error::Overloaded)
+        self.clock
+            .reclaim_index(&*self.index, 64, || {
+                self.index.preflight_capacity(page).is_ok()
+            })
+            .map_err(Into::into)
     }
     /// At most two rotations. Busy segments remain Evicting until a later poll.
     pub fn reclaim_now(&self) -> Result<()> {
-        let count = self.segments.count();
-        if count == 0 {
-            return Err(Error::Unavailable);
-        }
-        let target = self.free_reserve.max(1).min(count);
-        let mut free = self.segments.free_count();
-        let mut entries_left = 256;
-        for _ in 0..count.saturating_mul(2).min(64) {
-            if free >= target {
-                return Ok(());
-            }
-            let hand = self.hand.get() % count;
-            self.hand.set((hand + 1) % count);
-            let id = SegmentId(hand as u64);
-            if !matches!(
-                self.segments.state(id)?,
-                SegmentState::Sealed | SegmentState::Evicting
-            ) {
-                continue;
-            }
-            if self.recent.borrow_mut().remove(&id) {
-                continue;
-            }
-            self.segments.begin_evict(id)?;
-            for (page, location) in self.index.segment_entries_bounded(id, entries_left) {
-                self.index.remove_if_matches(&page, &location);
-                entries_left -= 1;
-            }
-            if !self.index.segment_empty(id) {
-                return Err(Error::Overloaded);
-            }
-            match self.segments.recycle(id).map_err(Error::from) {
-                Ok(()) => free += 1,
-                Err(Error::Overloaded) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if free >= target {
-            Ok(())
-        } else {
-            Err(Error::Overloaded)
-        }
+        self.clock
+            .reclaim(&*self.index, self.free_reserve, 64, 256)
+            .map_err(Into::into)
     }
 }
 

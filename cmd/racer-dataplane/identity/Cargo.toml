@@ -5,6 +5,10 @@ edition = "2024"
 publish = false
 description = "Racer certificate identities and immutable purpose-bound key epochs"
 
+[features]
+default = []
+test-util = []
+
 [dependencies]
 racer-control-wire = { path = "../control-wire" }
 racer-crypto = { path = "../crypto" }

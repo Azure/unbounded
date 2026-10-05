@@ -2328,8 +2328,7 @@ fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keep
         .owner
         .as_ref()
         .unwrap()
-        .lock
-        .try_clone()
+        .clone_lock_for_test()
         .unwrap();
     let mut socket = fixture.connect();
     socket.write_all(&request("HEAD", "")).unwrap();

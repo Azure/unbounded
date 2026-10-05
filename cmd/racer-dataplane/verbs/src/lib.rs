@@ -1,11 +1,14 @@
 //! Bounded paired-thread RDMA operations. Native owners never cross threads.
+pub mod discovery;
+mod endpoint;
 mod ffi;
 mod lifecycle;
+mod scoped;
+pub use scoped::WithNative;
 
 pub use ffi::Endpoint;
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;
-pub use lifecycle::QueuePairHandle as QueuePair;
 #[cfg(feature = "simulation")]
 pub use lifecycle::testing;
 pub use lifecycle::{

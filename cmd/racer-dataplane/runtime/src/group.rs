@@ -3,7 +3,7 @@ use crate::{Error, Operation, Result, Scope, affinity};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Condvar, Mutex, MutexGuard},
-    task::{Context, Poll, Wake, Waker},
+    task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -59,7 +59,7 @@ pub trait Service<S: Scope> {
     /// sibling admission without canceling teardown futures or ownership fences.
     fn set_failure_reporter(&mut self, _reporter: FailureReporter<S::Error>) {}
     fn waker(&self) -> Result<Waker, S::Error> {
-        Ok(Waker::from(Arc::new(ThreadWake(thread::current()))))
+        Ok(crate::thread_waker(None))
     }
     fn register_driver(&self, _waker: &Waker) {}
     fn start<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error>;
@@ -381,15 +381,6 @@ impl<E: Copy + From<Error>> Drop for Exit<E> {
         self.control.changed.notify_all();
     }
 }
-struct ThreadWake(thread::Thread);
-impl Wake for ThreadWake {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
-    }
-}
 fn attempt<T, E: From<Error>>(f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(Error::Io.into()))
 }
@@ -544,7 +535,7 @@ fn lane_thread<S: Scope>(
     );
     let waker = attempt(|| service.waker()).unwrap_or_else(|error| {
         control.fail(error);
-        Waker::from(Arc::new(ThreadWake(thread::current())))
+        crate::thread_waker(None)
     });
     let started = attempt(|| drive(service.start(&startup), &startup, control, true, &waker));
     if started.is_ok() {
@@ -623,7 +614,7 @@ fn helper_thread<S: Scope>(
         lane: None,
     };
     affinity::pin_cpu(helper.cpu)?;
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+    let waker = crate::thread_waker(None);
     let mut services = Vec::new();
     for &index in &helper.lanes {
         match attempt(|| factory.build_helper(index)) {
@@ -1048,7 +1039,7 @@ mod tests {
         let factory = recipe(&plan, false);
         let mut service = PanickingHelper(0);
         let control = Control::new(1, 1, true);
-        let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+        let waker = crate::thread_waker(None);
         let mut cx = Context::from_waker(&waker);
         {
             let mut operation =

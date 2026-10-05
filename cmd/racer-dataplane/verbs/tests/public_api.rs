@@ -1,7 +1,7 @@
 #![cfg(feature = "simulation")]
 
 use rdma_verbs::{
-    Configuration, Error, Guard, IoPort, NativeService, QueuePair, Region, pair, simulation,
+    Configuration, Error, Guard, IoPort, NativeService, QueuePairHandle, Region, pair, simulation,
 };
 use std::{
     rc::Rc,
@@ -101,7 +101,7 @@ fn selected_ports_route_bounded_claims_and_reopen_revokes_old_devices() {
             native.poll_budgeted(1).unwrap();
             assert!(io.activation().is_none());
             assert!(matches!(
-                QueuePair::poll_new(io.device(7)),
+                QueuePairHandle::poll_new(io.device(7)),
                 Poll::Ready(Err(Error::Overloaded))
             ));
         }
@@ -115,28 +115,28 @@ fn selected_ports_route_bounded_claims_and_reopen_revokes_old_devices() {
         assert!(io.activation().is_none(), "activation is consumed once");
         for stale in &stale_devices {
             assert!(matches!(
-                QueuePair::poll_new(stale.clone()),
+                QueuePairHandle::poll_new(stale.clone()),
                 Poll::Ready(Err(Error::Unavailable))
             ));
         }
         let second = io.device(7);
         let first = io.device(u32::MAX);
-        let a = ready(QueuePair::poll_new(second.clone()));
-        let b = ready(QueuePair::poll_new(second.clone()));
+        let a = ready(QueuePairHandle::poll_new(second.clone()));
+        let b = ready(QueuePairHandle::poll_new(second.clone()));
         assert_eq!((a.endpoint.gid, a.endpoint.port), ([2; 16], 2));
         assert_eq!((b.endpoint.gid, b.endpoint.port), ([2; 16], 2));
         assert_ne!(a.endpoint.qpn, b.endpoint.qpn);
         for device in [second.clone(), io.device(99)] {
             assert!(matches!(
-                QueuePair::poll_new(device),
+                QueuePairHandle::poll_new(device),
                 Poll::Ready(Err(Error::Overloaded))
             ));
         }
         // Exhausting one tag must not consume another tag's remaining slot.
-        let c = ready(QueuePair::poll_new(first.clone()));
+        let c = ready(QueuePairHandle::poll_new(first.clone()));
         assert_eq!((c.endpoint.gid, c.endpoint.port), ([1; 16], 1));
         assert!(matches!(
-            QueuePair::poll_new(first.clone()),
+            QueuePairHandle::poll_new(first.clone()),
             Poll::Ready(Err(Error::Overloaded))
         ));
         stale_devices.extend([first, second]);
@@ -198,7 +198,7 @@ fn selectors_run_on_native_role_and_invalid_plans_fail_closed() {
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(io.activation(), Some(Err(Error::InvalidConfiguration)));
         assert!(matches!(
-            QueuePair::poll_new(io.device(0)),
+            QueuePairHandle::poll_new(io.device(0)),
             Poll::Ready(Err(Error::Overloaded))
         ));
         io.close();
@@ -215,7 +215,7 @@ fn configured_guards_survive_failed_fence_and_last_io_lease() {
     native.poll_budgeted(1).unwrap();
     native.poll_budgeted(1).unwrap();
     io.activation().unwrap().unwrap();
-    let Poll::Ready(Ok(qp)) = QueuePair::poll_new(io.device(u32::MAX)) else {
+    let Poll::Ready(Ok(qp)) = QueuePairHandle::poll_new(io.device(u32::MAX)) else {
         panic!("claim")
     };
     let Poll::Ready(Ok(region)) = Region::poll_acquire(&qp, 17) else {
@@ -247,10 +247,10 @@ fn public_ports_copy_only_after_terminal_fence() {
     native.poll_budgeted(2).unwrap();
     native.poll_budgeted(1).unwrap();
     io.activation().unwrap().unwrap();
-    let Poll::Ready(Ok(sender)) = QueuePair::poll_new(io.device(u32::MAX)) else {
+    let Poll::Ready(Ok(sender)) = QueuePairHandle::poll_new(io.device(u32::MAX)) else {
         panic!("sender")
     };
-    let Poll::Ready(Ok(receiver)) = QueuePair::poll_new(io.device(u32::MAX)) else {
+    let Poll::Ready(Ok(receiver)) = QueuePairHandle::poll_new(io.device(u32::MAX)) else {
         panic!("receiver")
     };
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());

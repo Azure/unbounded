@@ -279,17 +279,7 @@ impl Subscriptions {
                     // A ready/hot rank must not chain arbitrary endpoint work in
                     // one poll. Also separate the final cold quantum from the
                     // next rank, preserving the per-poll member hash bound.
-                    let mut yielded = false;
-                    std::future::poll_fn(|cx| {
-                        if yielded {
-                            Poll::Ready(())
-                        } else {
-                            yielded = true;
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                    })
-                    .await;
+                    uring_runtime::yield_now().await;
                 }
             }
         }

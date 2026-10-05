@@ -662,18 +662,118 @@ pub mod cluster {
     }
 }
 
-#[derive(Default)]
-pub struct WakeCounter(std::sync::atomic::AtomicUsize);
+pub use uring_runtime::test_util::WakeCounter;
 
-impl WakeCounter {
-    pub fn count(&self) -> usize {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
-    }
+/// Assemble the real worker without activating I/O for wake and quota scenarios.
+pub(crate) fn wake_test_worker() -> crate::app::WorkerApplication {
+    let config = cluster::config(false);
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        config.limits.clone(),
+    )));
+    let (io, _engine) = crate::security::pair(WorkerId(0), 0, config.limits.queue_entries);
+    crate::app::WorkerApplication::assemble(
+        &config,
+        Arc::new(crate::app::NodeState::default()),
+        WorkerId(0),
+        crate::worker::WorkerRuntime {
+            reactor: Rc::new(Reactor::new(admission.clone())),
+            admission,
+            crypto: Rc::new(CryptoClient::new(io)),
+        },
+        Vec::new(),
+    )
+    .unwrap()
 }
 
-impl std::task::Wake for WakeCounter {
-    fn wake(self: std::sync::Arc<Self>) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+pub(crate) fn wake_test_coordinator() -> Rc<Coordinator> {
+    wake_test_worker().into_test_coordinator()
+}
+
+/// Projected-volume fixture composed from the production secure file operations.
+pub(crate) async fn projected_file(
+    r: &Reactor,
+    path: &std::path::Path,
+    file: &str,
+    limit: usize,
+    scope: &crate::runtime::RequestScope,
+) -> crate::error::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use uring_runtime::reactor::filesystem::secure::{BENEATH, NO_MAGICLINKS};
+
+    let dir = crate::control::directory(r, path, false, false, scope).await?;
+    // One openat2 resolves ..data and pins the target directory across rotation.
+    // BENEATH rejects absolute/escaping links; NO_MAGICLINKS rejects proc escapes.
+    let generation = r
+        .file_open(
+            Some(dir),
+            std::ffi::CString::new("..data").unwrap(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            BENEATH | NO_MAGICLINKS,
+            scope,
+        )
+        .await?;
+    crate::control::read_at(r, &generation, file, limit, false, scope).await
+}
+
+/// Enrollment I/O and certificate fixtures shared by control and application tests.
+pub(crate) mod enrollment {
+    use crate as dataplane;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    #[allow(dead_code)]
+    mod io {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/enrollment.rs"
+        ));
+    }
+    pub(crate) use io::ca;
+    pub(crate) use io::drive;
+    pub(crate) use io::issue;
+    pub(crate) use io::issue_at;
+    pub(crate) use io::signing_identity;
+    pub(crate) struct Directory(pub PathBuf);
+    impl Directory {
+        pub fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/control-tests")
+                .join(format!(
+                    "{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    pub(crate) fn scope() -> crate::runtime::RequestScope {
+        crate::runtime::RequestScope::new(
+            crate::model::RequestId([7; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+    }
+    pub(crate) fn reactor() -> Option<std::rc::Rc<crate::runtime::Reactor>> {
+        match io_uring::IoUring::new(2) {
+            Ok(ring) => drop(ring),
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
+                ) =>
+            {
+                eprintln!("control io_uring unavailable: {e}");
+                return None;
+            }
+            Err(e) => panic!("io_uring setup: {e}"),
+        }
+        Some(io::reactor())
     }
 }
 

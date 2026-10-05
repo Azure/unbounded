@@ -7,25 +7,28 @@ use racer_control_wire::{
     BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KeyId, NodeId, SCHEMA_VERSION,
 };
 mod environment {
+    pub use crate::unix_time;
     pub use uring_runtime::environment::*;
-    pub fn unix_time() -> rustls::pki_types::UnixTime {
-        rustls::pki_types::UnixTime::since_unix_epoch(
-            wall_now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default(),
-        )
-    }
 }
 mod error;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-util"))]
+#[path = "test_support.rs"]
+pub mod test_util;
 pub use error::{Error, Result};
+pub use racer_control_wire::valid_uuid as canonical_uuid;
+#[cfg(test)]
+use test_util as test_support;
 
-fn key_generation(id: KeyId) -> Option<u64> {
-    (id.0[..4] == *b"RKG1")
-        .then(|| u64::from_be_bytes(id.0[4..12].try_into().expect("generation bytes")))
-        .filter(|generation| *generation != 0)
+/// Scoped wall time for rustls, clamped to the Unix epoch for pre-epoch clocks.
+/// This retains rustls's whole-second truncation and does not set certificate policy.
+pub fn unix_time() -> rustls::pki_types::UnixTime {
+    rustls::pki_types::UnixTime::since_unix_epoch(
+        uring_runtime::environment::wall_now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
 }
+
 use racer_crypto::ed25519::{SigningKey, VerifyingKey};
 use rustls::{
     RootCertStore,
@@ -334,16 +337,6 @@ pub(crate) fn spiffe(cluster: &ClusterId, node: &NodeId) -> Result<String> {
         return Err(Error::Unauthorized);
     }
     Ok(format!("spiffe://{}/node/{}", cluster.0, node.0))
-}
-pub fn canonical_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(i, b)| {
-            if matches!(i, 8 | 13 | 18 | 23) {
-                b == b'-'
-            } else {
-                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
-            }
-        })
 }
 pub(crate) fn verify_chain(
     roots: &[Vec<u8>],
@@ -672,7 +665,11 @@ impl Keyring {
         // Validate the downloaded epoch before acquiring the shared publication
         // lock. Existing immutable secret leases remain usable during validation.
         for (i, candidate) in bundle.cache_keys.iter().enumerate() {
-            let generation = key_generation(candidate.key.id).ok_or(Error::InvalidConfiguration)?;
+            let generation = candidate
+                .key
+                .id
+                .generation()
+                .ok_or(Error::InvalidConfiguration)?;
             if generation > bundle.generation.0 {
                 return Err(Error::InvalidConfiguration);
             }
@@ -714,7 +711,11 @@ impl Keyring {
             if state.generation == Some(bundle.generation) {
                 continue;
             }
-            let generation = key_generation(candidate.key.id).ok_or(Error::InvalidConfiguration)?;
+            let generation = candidate
+                .key
+                .id
+                .generation()
+                .ok_or(Error::InvalidConfiguration)?;
             // Removed IDs cannot reenter admission, even as prepared keys.
             if state.generation.is_some_and(|g| generation <= g.0)
                 && !state.entries.iter().any(|e| e.reference == candidate.key)
@@ -1030,6 +1031,14 @@ mod certificate_tests {
             "11111111-1111-4111-8111-11111111111/",
         ] {
             assert!(!canonical_uuid(value));
+            assert_eq!(
+                spiffe(&ClusterId(value.into()), &NodeId(NODE.into())),
+                Err(Error::Unauthorized)
+            );
+            assert_eq!(
+                spiffe(&ClusterId(CLUSTER.into()), &NodeId(value.into())),
+                Err(Error::Unauthorized)
+            );
         }
     }
 }

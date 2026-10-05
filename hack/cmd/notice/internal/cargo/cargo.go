@@ -32,6 +32,17 @@ var crateInputs = []crateInput{
 	{"cmd/racer-dataplane/crypto/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/http/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/telemetry/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/verbs/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/flow/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/rest/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/topology/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/control-wire/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/identity/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/coalesce/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/uds-endpoint/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/wire-codec/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/env-config/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/http-splice/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 }
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text

@@ -104,6 +104,8 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
+use uring_runtime::drivers::poll_task;
+
 mod native;
 mod recovery;
 
@@ -1290,19 +1292,6 @@ impl WorkerApplication {
     }
 }
 
-fn poll_task(
-    task: &mut Option<Operation<'static, ()>>,
-    cx: &mut Context<'_>,
-) -> Option<Result<()>> {
-    match task.as_mut()?.as_mut().poll(cx) {
-        Poll::Pending => None,
-        Poll::Ready(result) => {
-            task.take();
-            Some(result)
-        }
-    }
-}
-
 impl Application {
     fn prepare_workers(&self) -> Result<()> {
         let resources = crate::worker::Resources::new(
@@ -2078,10 +2067,16 @@ fn partition_limits_with_cause(
         (
             "request_context_bytes",
             limits.request_context_bytes.get()
-                < crate::peer::protocol::MIN_REQUEST_CONTEXT_BYTES
+                < crate::telemetry::RESERVED_BYTES
+                    + crate::peer::protocol::MIN_REQUEST_CONTEXT_BYTES
                     + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES),
         ),
-        ("queue_entries", limits.queue_entries.get() < 2),
+        // Diagnostics permanently partition the reactor and ControlProgress
+        // quota. Preserve the ordinary two-slot progress floor alongside them.
+        (
+            "queue_entries",
+            limits.queue_entries.get() < crate::telemetry::CONTROL_SLOTS + 2,
+        ),
         (
             "client_connections",
             limits.client_connections < limits.connections_per_neighbor,

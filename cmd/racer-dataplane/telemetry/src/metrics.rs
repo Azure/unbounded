@@ -15,6 +15,41 @@ pub trait Metric: Copy + 'static {
     fn name(self) -> &'static str;
 }
 
+/// A fixed gauge schema with one numeric label. Names must be trusted valid
+/// Prometheus identifiers; dynamic text labels and registration are not accepted.
+/// The caller owns label cardinality and observes values at scrape time.
+pub struct LabeledGauges<const N: usize> {
+    names: [&'static str; N],
+    label: &'static str,
+}
+
+impl<const N: usize> LabeledGauges<N> {
+    pub const fn new(names: [&'static str; N], label: &'static str) -> Self {
+        Self { names, label }
+    }
+
+    /// Emit type declarations once, only when the caller has installed sources.
+    pub fn write_types(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        for name in self.names {
+            writeln!(out, "# TYPE {name} gauge")?;
+        }
+        Ok(())
+    }
+
+    /// Stream a source's samples without allocating an intermediate string.
+    pub fn write_sample(
+        &self,
+        out: &mut impl fmt::Write,
+        label: u64,
+        values: [u64; N],
+    ) -> fmt::Result {
+        for (name, value) in self.names.into_iter().zip(values) {
+            writeln!(out, "{name}{{{}=\"{label}\"}} {value}", self.label)?;
+        }
+        Ok(())
+    }
+}
+
 /// Declare a fixed metric enum, its ordered array, and its count.
 ///
 /// ```
@@ -188,6 +223,40 @@ impl Drop for Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_labeled_gauges_preserve_order_maxima_and_empty_schema() {
+        let gauges = LabeledGauges::new(["used", "limit"], "shard");
+        let mut out = String::new();
+        gauges.write_types(&mut out).unwrap();
+        gauges.write_sample(&mut out, 0, [0, u64::MAX]).unwrap();
+        gauges.write_sample(&mut out, u64::MAX, [1, 2]).unwrap();
+        assert_eq!(
+            out,
+            "# TYPE used gauge\n# TYPE limit gauge\nused{shard=\"0\"} 0\nlimit{shard=\"0\"} 18446744073709551615\nused{shard=\"18446744073709551615\"} 1\nlimit{shard=\"18446744073709551615\"} 2\n"
+        );
+        out.clear();
+        let empty = LabeledGauges::<0>::new([], "shard");
+        empty.write_types(&mut out).unwrap();
+        empty.write_sample(&mut out, 1, []).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn labeled_gauge_output_errors_propagate_without_consuming_schema() {
+        struct Fail;
+        impl fmt::Write for Fail {
+            fn write_str(&mut self, _: &str) -> fmt::Result {
+                Err(fmt::Error)
+            }
+        }
+        let gauges = LabeledGauges::new(["used"], "shard");
+        assert!(gauges.write_types(&mut Fail).is_err());
+        assert!(gauges.write_sample(&mut Fail, 1, [2]).is_err());
+        let mut out = String::new();
+        gauges.write_sample(&mut out, 1, [2]).unwrap();
+        assert_eq!(out, "used{shard=\"1\"} 2\n");
+    }
 
     crate::metrics! { Event, EVENTS, EVENT_COUNT;
         Self::A => "a_total", Self::B => "b_total", Self::C => "c_total",

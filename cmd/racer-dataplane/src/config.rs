@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::model::PAGE_BYTES;
 use crate::store::MAX_HEADER_BYTES;
 use racer_control_wire::ClusterId;
+use racer_control_wire::DEFAULT_SHARES;
 use racer_control_wire::NodeId;
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -117,13 +118,7 @@ impl Config {
             return Err(Error::InvalidConfiguration);
         }
         let mut text = |name: &str, default: Option<&str>| -> Result<String> {
-            let value = lookup(name)?
-                .or_else(|| default.map(str::to_owned))
-                .ok_or(Error::InvalidConfiguration)?;
-            if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
-                return Err(Error::InvalidConfiguration);
-            }
-            Ok(value)
+            env_config::text(lookup(name)?, default, 4096).map_err(|_| Error::InvalidConfiguration)
         };
         let cluster = ClusterId(text("RACER_CLUSTER_ID", None)?);
         let control_endpoint = text("RACER_CONTROL_ENDPOINT", None)?;
@@ -140,8 +135,7 @@ impl Config {
             _ => return Err(Error::InvalidConfiguration),
         };
         let mut boolean = |name| {
-            text(name, Some("false"))?
-                .parse::<bool>()
+            env_config::boolean(&text(name, Some("false"))?)
                 .map_err(|_| Error::InvalidConfiguration)
         };
         let allow_smt = boolean("RACER_ALLOW_SMT")?;
@@ -162,10 +156,7 @@ impl Config {
         let slab_directory = text("RACER_SLAB_DIRECTORY", Some("/var/lib/racer/slabs"))?.into();
         let mut number = |name: &str, default: u64| -> Result<u64> {
             let value = text(name, Some(&default.to_string()))?;
-            if !value.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(Error::InvalidConfiguration);
-            }
-            value.parse().map_err(|_| Error::InvalidConfiguration)
+            env_config::unsigned(&value).map_err(|_| Error::InvalidConfiguration)
         };
         let max_threads = to_usize(number("RACER_MAX_THREADS", DEFAULT_MAX_THREADS as u64)?)?;
         let page_hedge = crate::read::candidates::HedgeConfig {
@@ -180,10 +171,8 @@ impl Config {
             total: to_usize(number("RACER_PEER_INFLIGHT_MAX", 256)?)?,
             per_peer: to_usize(number("RACER_PEER_PER_NEIGHBOR_MAX", 32)?)?,
         };
-        let shares = std::num::NonZeroU32::new(
-            u32::try_from(number("RACER_SHARES", 4)?).map_err(|_| Error::InvalidConfiguration)?,
-        )
-        .ok_or(Error::InvalidConfiguration)?;
+        let shares = env_config::nonzero_u32(number("RACER_SHARES", u64::from(DEFAULT_SHARES))?)
+            .map_err(|_| Error::InvalidConfiguration)?;
         let peer_receive = crate::peer::receive::Config {
             active: to_usize(number("RACER_PEER_RECEIVE_MAX", 0)?)?,
             queued: to_usize(number("RACER_PEER_RECEIVE_QUEUE_MAX", 256)?)?,
@@ -204,7 +193,8 @@ impl Config {
         }
         let ranking_entries = ranking_bytes / crate::topology::RANKING_BYTES as u64;
         let mut limit = |name: &str, default| {
-            NonZeroUsize::new(to_usize(number(name, default)?)?).ok_or(Error::InvalidConfiguration)
+            env_config::nonzero_usize(number(name, default)?)
+                .map_err(|_| Error::InvalidConfiguration)
         };
         let limits = Limits {
             plaintext_bytes: limit("RACER_PLAINTEXT_BYTES", 256 * MIB)?,
@@ -422,19 +412,15 @@ impl Config {
 }
 
 fn env_value(name: &str) -> Result<Option<String>> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidConfiguration),
-    }
+    env_config::lookup(name).map_err(|_| Error::InvalidConfiguration)
 }
 
 fn to_usize(value: u64) -> Result<usize> {
-    usize::try_from(value).map_err(|_| Error::InvalidConfiguration)
+    env_config::usize_value(value).map_err(|_| Error::InvalidConfiguration)
 }
 
 fn valid_uuid(value: &str) -> bool {
-    racer_identity::canonical_uuid(value) && value != "00000000-0000-0000-0000-000000000000"
+    racer_control_wire::valid_uuid(value) && value != "00000000-0000-0000-0000-000000000000"
 }
 
 // Kubernetes expands a single bracketed Pod IP template for both IP families.
@@ -443,22 +429,14 @@ fn parse_listener_address(value: &str) -> Result<SocketAddr> {
     if let Some((host, port)) = value.strip_prefix('[').and_then(|v| v.split_once("]:"))
         && let Ok(ip) = host.parse::<std::net::Ipv4Addr>()
     {
-        return format!("{ip}:{port}")
-            .parse()
+        return env_config::socket_address(&format!("{ip}:{port}"))
             .map_err(|_| Error::InvalidConfiguration);
     }
-    value.parse().map_err(|_| Error::InvalidConfiguration)
+    env_config::socket_address(value).map_err(|_| Error::InvalidConfiguration)
 }
 
 fn validate_socket(address: SocketAddr) -> Result<()> {
-    if address.port() == 0
-        || address.ip().is_multicast()
-        || matches!(address.ip(), IpAddr::V4(ip) if ip.is_broadcast())
-        || matches!(address, SocketAddr::V6(ip) if ip.flowinfo() != 0 || ip.scope_id() != 0 || ip.ip().to_ipv4_mapped().is_some())
-    {
-        return Err(Error::InvalidConfiguration);
-    }
-    Ok(())
+    env_config::unscoped_socket(address).map_err(|_| Error::InvalidConfiguration)
 }
 
 fn validate_endpoint(url: &str) -> Result<()> {
@@ -524,17 +502,7 @@ fn validate_endpoint(url: &str) -> Result<()> {
 }
 
 fn validate_path(path: &Path) -> Result<()> {
-    let text = path.to_str().ok_or(Error::InvalidConfiguration)?;
-    if !path.is_absolute()
-        || text.len() > 4095
-        || text.chars().any(char::is_control)
-        || text[1..]
-            .split('/')
-            .any(|part| part.is_empty() || matches!(part, "." | "..") || part.len() > 255)
-    {
-        return Err(Error::InvalidConfiguration);
-    }
-    Ok(())
+    env_config::absolute_path(path, 4095, 255).map_err(|_| Error::InvalidConfiguration)
 }
 
 #[cfg(test)]
@@ -1100,6 +1068,7 @@ mod tests {
     #[test]
     fn numeric_and_boolean_parsing_is_strict() {
         assert_eq!(parse(&[]).unwrap().shares.get(), 4);
+        assert_eq!(parse(&[]).unwrap().shares.get(), DEFAULT_SHARES);
         assert_eq!(parse(&[("RACER_SHARES", "9")]).unwrap().shares.get(), 9);
         for value in ["0", "-1", "+4", "4294967296", "4.0"] {
             assert!(parse(&[("RACER_SHARES", value)]).is_err());
