@@ -34,6 +34,7 @@ type Collector struct {
 type dependency struct {
 	packageName string
 	path        string
+	workspace   bool
 }
 
 // New constructs a Collector. An empty cargoHome uses CARGO_HOME or Cargo's
@@ -122,6 +123,11 @@ func localRegistryVersions(root, lock string) (map[string]string, error) {
 	versions := map[string]string{}
 	visited := map[string]bool{}
 
+	workspace, err := readManifest(root)
+	if err != nil {
+		return nil, err
+	}
+
 	var visit func(string, string) error
 
 	visit = func(dir, name string) error {
@@ -138,14 +144,40 @@ func localRegistryVersions(root, lock string) (map[string]string, error) {
 
 		visited[canonical] = true
 
-		manifest, err := os.ReadFile(manifestPath)
+		manifest, err := readManifest(dir)
 		if err != nil {
-			return fmt.Errorf("reading %s: %w", manifestPath, err)
+			return err
 		}
 
-		direct, err := directDependencies(string(manifest))
+		if manifest.Package.Name != "" {
+			name = manifest.Package.Name
+		}
+
+		direct, err := manifest.directDependencies()
 		if err != nil {
 			return fmt.Errorf("parsing %s: %w", manifestPath, err)
+		}
+
+		for alias, dep := range direct {
+			if dep.workspace {
+				inherited := cargoManifest{dependencyTables: dependencyTables{Dependencies: workspace.Workspace.Dependencies}}
+
+				deps, err := inherited.directDependencies()
+				if err != nil {
+					return err
+				}
+
+				resolved, ok := deps[alias]
+				if !ok || resolved.workspace {
+					return fmt.Errorf("dependency %s missing from workspace.dependencies", alias)
+				}
+
+				if resolved.path != "" && !filepath.IsAbs(resolved.path) {
+					resolved.path = filepath.Join(root, resolved.path)
+				}
+
+				direct[alias] = resolved
+			}
 		}
 
 		locked, err := lockedDirectVersions(lock, direct, name)
@@ -178,8 +210,48 @@ func localRegistryVersions(root, lock string) (map[string]string, error) {
 		return nil
 	}
 
-	if err := visit(root, crateName); err != nil {
-		return nil, err
+	// A virtual workspace has no root package or lock entry.
+	if workspace.Package.Name != "" || workspace.Workspace.Members == nil {
+		if err := visit(root, crateName); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, pattern := range workspace.Workspace.Members {
+		members, err := filepath.Glob(filepath.Join(root, pattern))
+		if err != nil || len(members) == 0 {
+			return nil, fmt.Errorf("workspace member pattern %q has no valid matches", pattern)
+		}
+
+		for _, member := range members {
+			excluded := false
+
+			for _, pattern := range workspace.Workspace.Exclude {
+				match, err := filepath.Match(filepath.Join(root, pattern), member)
+				if err != nil {
+					return nil, fmt.Errorf("invalid workspace exclude %q: %w", pattern, err)
+				}
+
+				excluded = excluded || match
+			}
+
+			if excluded {
+				continue
+			}
+
+			manifest, err := readManifest(member)
+			if err != nil {
+				return nil, err
+			}
+
+			if manifest.Package.Name == "" {
+				return nil, fmt.Errorf("workspace member %s has no package name", member)
+			}
+
+			if err := visit(member, manifest.Package.Name); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	return versions, nil
@@ -392,7 +464,30 @@ type dependencyTables struct {
 
 type cargoManifest struct {
 	dependencyTables
-	Target map[string]dependencyTables `toml:"target"`
+	Target    map[string]dependencyTables `toml:"target"`
+	Package   struct{ Name string }       `toml:"package"`
+	Workspace struct {
+		Members      []string       `toml:"members"`
+		Exclude      []string       `toml:"exclude"`
+		Dependencies map[string]any `toml:"dependencies"`
+	} `toml:"workspace"`
+}
+
+func readManifest(dir string) (cargoManifest, error) {
+	var manifest cargoManifest
+
+	path := filepath.Join(dir, "Cargo.toml")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return manifest, fmt.Errorf("reading %s: %w", path, err)
+	}
+
+	if err := toml.Unmarshal(data, &manifest); err != nil {
+		return manifest, fmt.Errorf("invalid dependency line or manifest %s: %w", path, err)
+	}
+
+	return manifest, nil
 }
 
 func (m cargoManifest) directDependencies() (map[string]dependency, error) {
@@ -411,6 +506,15 @@ func (m cargoManifest) directDependencies() (map[string]dependency, error) {
 				switch value := value.(type) {
 				case string:
 				case map[string]any:
+					if raw, exists := value["workspace"]; exists {
+						inherited, ok := raw.(bool)
+						if !ok || !inherited {
+							return nil, fmt.Errorf("dependency %s: invalid workspace inheritance", alias)
+						}
+
+						dep.workspace = true
+					}
+
 					for _, field := range []string{"package", "path"} {
 						if raw, exists := value[field]; exists {
 							text, ok := raw.(string)
