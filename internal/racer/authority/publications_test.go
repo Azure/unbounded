@@ -8,13 +8,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/google/uuid"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/wire"
@@ -608,5 +620,1065 @@ func TestPublicationInstalledStateNeverExceedsHighWater(t *testing.T) {
 				t.Fatal("rejected install mutated state")
 			}
 		})
+	}
+}
+
+func TestPrepareCanonicalEquivalence(t *testing.T) {
+	numa := uint32(3)
+	members := AcceptedMembers{
+		testNodeUID:  {Node: testNodeUID, Shares: 4, PeerEndpoint: "192.0.2.1:7443", RDMANICs: []wire.RDMANIC{{Rail: 2, Device: "β<&>", Port: 1, NUMANode: &numa}, {Rail: 1, Device: "mlx5_0", Port: 1}}},
+		testOtherUID: {Node: testOtherUID, Shares: 1, PeerEndpoint: "[2001:db8::1]:7443"},
+	}
+	caches := []wire.CacheDefinition{{ID: testNodeUID, Name: "cache", ClientSocket: "/run/racer/cache/client/socket", OriginSocket: "/run/racer/cache/origin/socket"}}
+	v := wire.Publication{SchemaVersion: wire.SchemaVersion, Cluster: testNodeUID}
+
+	content, membership, err := wire.ContentHashes(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previous := VersionRecord{Cluster: v.Cluster, Sequence: 1, MembershipVersion: 1, ContentHash: content, MembershipHash: membership}
+	p := NewPublications()
+
+	for _, tc := range []struct {
+		name       string
+		members    AcceptedMembers
+		caches     []wire.CacheDefinition
+		sequence   wire.Sequence
+		membership wire.MembershipVersion
+	}{
+		{"unchanged empty", nil, nil, 1, 1},
+		{"cache only", nil, caches, 2, 1},
+		{"membership", members, caches, 3, 2},
+		{"unchanged populated", members, caches, 3, 2},
+		{"remove cache", members, nil, 4, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, err := p.Prepare(previous, "rv", tc.members, tc.caches)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			v.Sequence, v.MembershipVersion, v.Caches = tc.sequence, tc.membership, tc.caches
+
+			v.Members = nil
+			for _, member := range tc.members {
+				v.Members = append(v.Members, member)
+			}
+
+			want, err := wire.EncodePublication(v)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			content, membership, err := wire.ContentHashes(v)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			wantRecord := VersionRecord{Cluster: v.Cluster, Sequence: tc.sequence, MembershipVersion: tc.membership, ContentHash: content, MembershipHash: membership}
+			if prepared.record != wantRecord || prepared.encoded != string(want) || prepared.previous != previous || prepared.resourceVersion != "rv" || prepared.owner != p {
+				t.Fatal("prepared bytes, hashes, counters, or commit metadata differ")
+			}
+
+			previous = prepared.record
+		})
+	}
+}
+
+func TestPrepareRejectsFinalCounterGrowth(t *testing.T) {
+	v := wire.Publication{
+		SchemaVersion: wire.SchemaVersion, Cluster: testNodeUID, Sequence: 9, MembershipVersion: 9,
+		Members: []wire.Member{{Node: testNodeUID, Shares: 1, PeerEndpoint: "192.0.2.1:1", RDMANICs: []wire.RDMANIC{{Device: "x", Port: 1}}}},
+	}
+
+	b, err := wire.EncodePublication(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v.Members[0].RDMANICs[0].Device += strings.Repeat("x", wire.MaxPublicationBytes-len(b))
+
+	content, membership, err := wire.ContentHashes(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previous := VersionRecord{Cluster: v.Cluster, Sequence: 9, MembershipVersion: 9, ContentHash: content, MembershipHash: membership}
+	members := AcceptedMembers{testNodeUID: v.Members[0]}
+	p := NewPublications()
+
+	prepared, err := p.Prepare(previous, "rv", members, nil)
+	if err != nil || len(prepared.encoded) != wire.MaxPublicationBytes {
+		t.Fatalf("exact final bound: %v", err)
+	}
+
+	// Same-width input change grows both assigned counters from 9 to 10. The
+	// counter-free hash still fits, but the final publication must be rejected.
+	m := members[testNodeUID]
+	m.Shares++
+
+	members[testNodeUID] = m
+	if prepared, err := p.Prepare(previous, "rv", members, nil); !errors.Is(err, wire.TooLarge) || prepared != nil {
+		t.Fatalf("oversized final encoding accepted: %v", err)
+	}
+}
+
+func stagedTopology(t *testing.T) *TopologyReconciler {
+	t.Helper()
+	r := testTopology(t)
+
+	marker, err := readInstallation(t.Context(), r.APIReader, r.Config, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	marker.Data[markerInitializationProtocol] = stagedInitialization
+	if err := r.Update(t.Context(), marker); err != nil {
+		t.Fatal(err)
+	}
+	// The fake client does not assign server UIDs. Model the API's identity and
+	// immutable ConfigMap data rules, including metadata updates remaining legal.
+	r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			obj.SetUID(types.UID(uuid.NewString()))
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if cm, ok := obj.(*corev1.ConfigMap); ok {
+				old := &corev1.ConfigMap{}
+				if err := c.Get(ctx, client.ObjectKeyFromObject(cm), old); err != nil {
+					return err
+				}
+
+				if old.Immutable != nil && *old.Immutable && (!reflect.DeepEqual(old.Data, cm.Data) || cm.Immutable == nil || !*cm.Immutable) {
+					return errors.New("immutable data changed")
+				}
+			}
+
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+
+	return r
+}
+
+// Each write boundary is tested both before persistence and with an uncertain
+// successful response, including cancellation immediately after persistence.
+func interruptInitialization(base client.WithWatch, boundary string, cancel context.CancelFunc) client.WithWatch {
+	boom := errors.New("interrupted initialization")
+
+	return interceptor.NewClient(base, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if boundary == "before create" {
+				return boom
+			}
+
+			if err := c.Create(ctx, obj, opts...); err != nil {
+				return err
+			}
+
+			if boundary == "after create" {
+				return boom
+			}
+
+			if boundary == "cancel create" {
+				cancel()
+			}
+
+			return nil
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if boundary == "before commit" {
+				return boom
+			}
+
+			if err := c.Update(ctx, obj, opts...); err != nil {
+				return err
+			}
+
+			if boundary == "after commit" {
+				return boom
+			}
+
+			if boundary == "cancel commit" {
+				cancel()
+			}
+
+			return nil
+		},
+	})
+}
+
+func TestStagedInitializationEveryBoundary(t *testing.T) {
+	for _, credentials := range []bool{false, true} {
+		for _, boundary := range []string{"before create", "after create", "cancel create", "before commit", "after commit", "cancel commit"} {
+			t.Run(fmt.Sprintf("credentials=%t/%s", credentials, boundary), func(t *testing.T) {
+				r := stagedTopology(t)
+
+				base := r.Client.(client.WithWatch)
+				if credentials {
+					if err := ensureInstalled(t.Context(), base, r.APIReader, r.Config); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				writer := interruptInitialization(base, boundary, cancel)
+
+				run := func(ctx context.Context, c client.WithWatch) error {
+					if !credentials {
+						return ensureInstalled(ctx, c, r.APIReader, r.Config)
+					}
+
+					_, err := Assemble(r.Config, c, r.APIReader).Keyring.Reconcile(ctx, ctrl.Request{})
+
+					return err
+				}
+				if err := run(ctx, writer); err == nil {
+					t.Fatal("interruption not observed")
+				}
+
+				var before client.Object = &corev1.ConfigMap{}
+
+				name := r.Config.VersionConfigMapName
+				if credentials {
+					before, name = &corev1.Secret{}, r.Config.CredentialsSecretName
+				}
+
+				err := base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, before)
+				if err != nil && !apierrors.IsNotFound(err) {
+					t.Fatal(err)
+				}
+
+				if boundary != "after commit" && boundary != "cancel commit" {
+					if credentials {
+						if _, err := loadSigning(t.Context(), base, r.Config, Assemble(r.Config, base, base).Keyring.now()); err == nil {
+							t.Fatal("uncommitted credentials usable")
+						}
+					} else if _, _, err := readVersion(t.Context(), base, r.Config); err == nil {
+						t.Fatal("uncommitted version usable")
+					}
+				}
+
+				if err := run(t.Context(), base); err != nil {
+					t.Fatalf("restart: %v", err)
+				}
+
+				after := before.DeepCopyObject().(client.Object)
+				if err := base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, after); err != nil {
+					t.Fatal(err)
+				}
+
+				if before.GetUID() != "" && before.GetUID() != after.GetUID() {
+					t.Fatal("recovery replaced staged material")
+				}
+
+				if secret, ok := before.(*corev1.Secret); ok && secret.UID != "" && !reflect.DeepEqual(secret.Data, after.(*corev1.Secret).Data) {
+					t.Fatal("recovery changed exact secret material")
+				}
+			})
+		}
+	}
+}
+
+func TestStagedCommittedDeletionAndReplacementFailClosed(t *testing.T) {
+	for _, credentials := range []bool{false, true} {
+		for _, replace := range []bool{false, true} {
+			t.Run(fmt.Sprintf("credentials=%t/replace=%t", credentials, replace), func(t *testing.T) {
+				r := stagedTopology(t)
+
+				base := r.Client.(client.WithWatch)
+				if err := ensureInstalled(t.Context(), base, base, r.Config); err != nil {
+					t.Fatal(err)
+				}
+
+				runKeys(t, Assemble(r.Config, base, base).Keyring)
+
+				var obj client.Object = &corev1.ConfigMap{}
+
+				name := r.Config.VersionConfigMapName
+				if credentials {
+					obj, name = &corev1.Secret{}, r.Config.CredentialsSecretName
+				}
+
+				if err := base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, obj); err != nil {
+					t.Fatal(err)
+				}
+
+				if err := base.Delete(t.Context(), obj); err != nil {
+					t.Fatal(err)
+				}
+
+				if replace {
+					obj.SetResourceVersion("")
+
+					if err := base.Create(t.Context(), obj); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				noWrites := interceptor.NewClient(base, interceptor.Funcs{
+					Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+						t.Fatal("recreated committed state")
+						return nil
+					},
+					Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+						t.Fatal("rewrote committed state")
+						return nil
+					},
+				})
+				if credentials {
+					if _, err := Assemble(r.Config, noWrites, base).Keyring.Reconcile(t.Context(), ctrl.Request{}); err == nil {
+						t.Fatal("lost credentials accepted")
+					}
+				} else if err := ensureInstalled(t.Context(), noWrites, base, r.Config); err == nil {
+					t.Fatal("lost version accepted")
+				}
+			})
+		}
+	}
+}
+
+func TestStagedCompetingInstallers(t *testing.T) {
+	r := stagedTopology(t)
+	base := r.Client.(client.WithWatch)
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			if err := ensureInstalled(t.Context(), base, base, r.Config); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+
+	wg.Wait()
+
+	for range 8 {
+		wg.Go(func() {
+			if _, err := Assemble(r.Config, base, base).Keyring.Reconcile(t.Context(), ctrl.Request{}); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+
+	wg.Wait()
+	runKeys(t, Assemble(r.Config, base, base).Keyring)
+}
+
+func TestStagedDelayedCreateCannotResurrectAuthority(t *testing.T) {
+	for _, credentials := range []bool{false, true} {
+		t.Run(fmt.Sprint(credentials), func(t *testing.T) {
+			r := stagedTopology(t)
+
+			base := r.Client.(client.WithWatch)
+			if credentials {
+				if err := ensureInstalled(t.Context(), base, base, r.Config); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			writer := interceptor.NewClient(base, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				// Let a competitor fully commit, then lose its resource, while this
+				// installer is paused after its NotFound but before its Create.
+				if credentials {
+					runKeys(t, Assemble(r.Config, base, base).Keyring)
+				} else if err := ensureInstalled(ctx, base, base, r.Config); err != nil {
+					t.Fatal(err)
+				}
+
+				if err := base.Delete(ctx, obj); err != nil {
+					t.Fatal(err)
+				}
+
+				return c.Create(ctx, obj, opts...)
+			}})
+			if credentials {
+				_, _ = Assemble(r.Config, writer, base).Keyring.Reconcile(t.Context(), ctrl.Request{})
+				if _, err := Assemble(r.Config, base, base).Keyring.Reconcile(t.Context(), ctrl.Request{}); err == nil {
+					t.Fatal("delayed Create restored credentials authority")
+				}
+			} else {
+				if err := ensureInstalled(t.Context(), writer, base, r.Config); err == nil {
+					t.Fatal("delayed Create restored version authority")
+				}
+
+				if _, _, err := readVersion(t.Context(), base, r.Config); err == nil {
+					t.Fatal("orphan version accepted")
+				}
+			}
+		})
+	}
+}
+
+func TestStagedRejectsUnboundOrCorruptCandidates(t *testing.T) {
+	for _, credentials := range []bool{false, true} {
+		for _, corruption := range []string{"binding", "protocol", "immutable", "data"} {
+			t.Run(fmt.Sprintf("credentials=%t/%s", credentials, corruption), func(t *testing.T) {
+				r := stagedTopology(t)
+
+				base := r.Client.(client.WithWatch)
+				if credentials {
+					if err := ensureInstalled(t.Context(), base, base, r.Config); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				writer := interruptInitialization(base, "after create", func() {})
+
+				var obj client.Object = &corev1.ConfigMap{}
+
+				name := r.Config.VersionConfigMapName
+				if credentials {
+					_, _ = Assemble(r.Config, writer, base).Keyring.Reconcile(t.Context(), ctrl.Request{})
+					obj, name = &corev1.Secret{}, r.Config.CredentialsSecretName
+				} else {
+					_ = ensureInstalled(t.Context(), writer, base, r.Config)
+				}
+
+				if err := base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, obj); err != nil {
+					t.Fatal(err)
+				}
+
+				switch corruption {
+				case "binding":
+					obj.GetAnnotations()[installationUIDAnnotation] = "foreign"
+				case "protocol":
+					delete(obj.GetAnnotations(), initializationProtocol)
+				case "immutable":
+					immutable := true
+					if credentials {
+						obj.(*corev1.Secret).Immutable = &immutable
+					} else {
+						obj.(*corev1.ConfigMap).Immutable = &immutable
+					}
+				case "data":
+					if credentials {
+						delete(obj.(*corev1.Secret).Data, "issuer.json")
+					} else {
+						obj.(*corev1.ConfigMap).Data["sequence"] = "2"
+					}
+				}
+
+				if err := base.Update(t.Context(), obj); err != nil {
+					t.Fatal(err)
+				}
+
+				if credentials {
+					if _, err := Assemble(r.Config, base, base).Keyring.Reconcile(t.Context(), ctrl.Request{}); err == nil {
+						t.Fatal("invalid candidate committed")
+					}
+
+					version, _, err := readVersion(t.Context(), base, r.Config)
+					if err != nil || version.Annotations[credentialClaim] != "" {
+						t.Fatal("invalid candidate consumed claim")
+					}
+				} else {
+					if err := ensureInstalled(t.Context(), base, base, r.Config); err == nil {
+						t.Fatal("invalid candidate committed")
+					}
+
+					if _, err := readInstallation(t.Context(), base, r.Config, true); err != nil {
+						t.Fatal("invalid candidate consumed marker")
+					}
+				}
+			})
+		}
+	}
+}
+
+func integrationStagedInitialization(t *testing.T, c client.WithWatch) {
+	for _, credentials := range []bool{false, true} {
+		for i, boundary := range []string{"before create", "after create", "cancel create", "before commit", "after commit", "cancel commit"} {
+			t.Run(fmt.Sprintf("credentials=%t/%s", credentials, boundary), func(t *testing.T) {
+				a := integrationInstallation(t, c, fmt.Sprintf("staged-%t-%d", credentials, i))
+				cfg := a.Topology.Config
+
+				marker, err := readInstallation(t.Context(), c, cfg, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				marker.Data[markerInitializationProtocol] = stagedInitialization
+				if err := c.Update(t.Context(), marker); err != nil {
+					t.Fatal(err)
+				}
+
+				if credentials {
+					if err := ensureInstalled(t.Context(), c, c, cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				writer := interruptInitialization(c, boundary, cancel)
+				if credentials {
+					if _, err := Assemble(cfg, writer, c).Keyring.Reconcile(ctx, ctrl.Request{}); err == nil {
+						t.Fatal("interruption not injected")
+					}
+
+					runKeys(t, Assemble(cfg, c, c).Keyring)
+				} else {
+					if err := ensureInstalled(ctx, writer, c, cfg); err == nil {
+						t.Fatal("interruption not injected")
+					}
+
+					if err := ensureInstalled(t.Context(), c, c, cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				marker, err = readInstallation(t.Context(), c, cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				marker.Data[versionUID] = "replacement"
+				if err := c.Update(t.Context(), marker); err == nil {
+					t.Fatal("API allowed rewriting immutable binding")
+				}
+			})
+		}
+	}
+}
+
+func testConfig(t *testing.T) Config {
+	t.Helper()
+	t.Setenv("RACER_CLUSTER_ID", testOtherUID)
+	t.Setenv("POD_NAMESPACE", "racer")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return cfg
+}
+
+func testTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
+	t.Helper()
+	cfg := testConfig(t)
+
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, racerv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	marker := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName, UID: "installation-uid"}, Data: map[string]string{"cluster": string(cfg.Cluster), "version_configmap": cfg.VersionConfigMapName, "state": "fresh"}}
+	objects = append(objects, marker)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithIndex(&corev1.Pod{}, podNodeIndex, podNodeKeys).Build()
+
+	return Assemble(cfg, c, c).Topology
+}
+
+func initializedTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
+	t.Helper()
+
+	r := testTopology(t, objects...)
+	if err := ensureInstalled(context.Background(), r.Client, r.APIReader, r.Config); err != nil {
+		t.Fatal(err)
+	}
+
+	return r
+}
+
+func reconcileTopology(t *testing.T, r *TopologyReconciler, ctx context.Context) *CommittedPublication {
+	t.Helper()
+
+	result, err := r.Reconcile(ctx, ctrl.Request{})
+	if err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("reconcile: %v, %v", result, err)
+	}
+
+	p, err := r.Publications.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return p
+}
+
+func TestInitializeCrashOrdering(t *testing.T) {
+	for _, stage := range []string{"before marker", "marker response lost", "after marker", "create response lost", "success"} {
+		t.Run(stage, func(t *testing.T) {
+			r := testTopology(t)
+			base := r.Client.(client.WithWatch)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			writes := []string{}
+			boom := errors.New("simulated crash")
+			r.Client = interceptor.NewClient(base, interceptor.Funcs{
+				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+					writes = append(writes, "consume")
+
+					if stage == "before marker" {
+						return boom
+					}
+
+					if err := c.Update(ctx, obj, opts...); err != nil {
+						return err
+					}
+
+					if stage == "marker response lost" {
+						return boom
+					}
+
+					if stage == "after marker" {
+						cancel()
+					}
+
+					return nil
+				},
+				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					writes = append(writes, "create")
+
+					marker, err := readInstallation(ctx, r.APIReader, r.Config, false)
+					if err != nil || marker.Immutable == nil || !*marker.Immutable {
+						t.Fatalf("counter create before marker freeze: %v", err)
+					}
+
+					if err := c.Create(ctx, obj, opts...); err != nil {
+						return err
+					}
+
+					if stage == "create response lost" {
+						return boom
+					}
+
+					return nil
+				},
+			})
+
+			err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config)
+			if (err == nil) != (stage == "success") {
+				t.Fatalf("initialize: %v", err)
+			}
+
+			wantWrites := []string{"consume"}
+			if stage == "create response lost" || stage == "success" {
+				wantWrites = append(wantWrites, "create")
+			}
+
+			if !reflect.DeepEqual(writes, wantWrites) {
+				t.Fatalf("writes: %v", writes)
+			}
+
+			writes = nil
+
+			if stage == "before marker" {
+				r.Client = base
+				if err := ensureInstalled(context.Background(), r.Client, r.APIReader, r.Config); err != nil {
+					t.Fatalf("fresh marker cannot initialize: %v", err)
+				}
+			} else {
+				restart, stop := context.WithTimeout(t.Context(), 100*time.Millisecond)
+				defer stop()
+
+				err := ensureInstalled(restart, r.Client, r.APIReader, r.Config)
+				if (err == nil) != (stage == "success" || stage == "create response lost") {
+					t.Fatalf("restart: %v", err)
+				}
+
+				if len(writes) != 0 {
+					t.Fatalf("restart wrote state: %v", writes)
+				}
+			}
+
+			_, _, err = readVersion(context.Background(), r.APIReader, r.Config)
+
+			valid := stage == "before marker" || stage == "create response lost" || stage == "success"
+			if (err == nil) != valid {
+				t.Fatalf("recovery: %v", err)
+			}
+		})
+	}
+}
+
+func TestInitializeConflictAndExistingState(t *testing.T) {
+	r := testTopology(t)
+	base := r.Client.(client.WithWatch)
+	creates := 0
+
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+			return apierrors.NewConflict(corev1.Resource("configmaps"), "marker", errors.New("concurrent initializer"))
+		},
+		Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+			creates++
+			return nil
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	if err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config); !errors.Is(err, context.DeadlineExceeded) || creates != 0 {
+		t.Fatalf("marker conflict: %v, creates=%d", err, creates)
+	}
+
+	r.Client = base
+	if err := base.Create(context.Background(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.VersionConfigMapName}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureInstalled(context.Background(), r.Client, r.APIReader, r.Config); !errors.Is(err, wire.Conflict) {
+		t.Fatalf("existing counters accepted: %v", err)
+	}
+
+	if _, err := readInstallation(context.Background(), r.APIReader, r.Config, true); err != nil {
+		t.Fatalf("marker consumed despite existing counters: %v", err)
+	}
+}
+
+func TestInitializeCanceledBeforeMarker(t *testing.T) {
+	r := testTopology(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled initialize: %v", err)
+	}
+
+	if _, err := readInstallation(context.Background(), r.APIReader, r.Config, true); err != nil {
+		t.Fatalf("canceled initialize consumed marker: %v", err)
+	}
+}
+
+func TestStalePreparedPublicationCannotCommit(t *testing.T) {
+	r := initializedTopology(t)
+	ctx := context.Background()
+
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := r.Publications.Prepare(previous, cm.ResourceVersion, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another writer changes only metadata, but even equal counters require the
+	// exact read resource version. No install token can escape a stale candidate.
+	cm.Labels = map[string]string{"changed": "true"}
+	if err := r.Update(ctx, cm); err != nil {
+		t.Fatal(err)
+	}
+
+	if committed, err := r.CommitVersion(ctx, p); !apierrors.IsConflict(err) || committed != nil {
+		t.Fatalf("stale candidate committed: %p, %v", committed, err)
+	}
+}
+
+func TestTopologyNamespaceOwnershipAndMissingDaemonSet(t *testing.T) {
+	node := memberNode()
+	pod := memberPod("pod", 1, "192.0.2.1")
+	pod.Namespace = "unrelated"
+	r := initializedTopology(t, &node, &pod)
+	ctx := context.Background()
+
+	first := reconcileTopology(t, r, ctx)
+	if len(r.Accepted) != 0 {
+		t.Fatal("pod in unrelated namespace admitted")
+	}
+
+	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.DaemonSetName, UID: testDaemonSetUID}}
+	if err := r.Create(ctx, ds); err != nil {
+		t.Fatal(err)
+	}
+
+	if next := reconcileTopology(t, r, ctx); next != first {
+		t.Fatal("foreign pod admitted by matching owner UID")
+	}
+
+	pod.Namespace = r.Config.Namespace
+
+	pod.ResourceVersion = ""
+	if err := r.Create(ctx, &pod); err != nil {
+		t.Fatal(err)
+	}
+
+	member := reconcileTopology(t, r, ctx)
+	if len(r.Accepted) != 1 {
+		t.Fatal("managed endpoint not admitted")
+	}
+
+	if err := r.Delete(ctx, ds); err != nil {
+		t.Fatal(err)
+	}
+
+	if gap := reconcileTopology(t, r, ctx); gap != member {
+		t.Fatal("missing workload discarded warm endpoint")
+	}
+
+	r = Assemble(r.Config, r.Client, r.APIReader).Topology
+	if restarted := reconcileTopology(t, r, ctx); restarted.record != member.record || restarted.encoded != member.encoded {
+		t.Fatal("cold restart changed admitted membership during workload gap")
+	}
+
+	if len(r.Accepted) != 1 {
+		t.Fatal("cold restart lost persisted admitted identity")
+	}
+}
+
+func TestRecoveryNeverRecreatesCounters(t *testing.T) {
+	for _, mutation := range []string{"missing version", "missing marker", "corrupt", "wrong cluster", "wrong marker uid", "mutable marker", "fresh marker"} {
+		t.Run(mutation, func(t *testing.T) {
+			r := initializedTopology(t)
+			ctx := context.Background()
+
+			cm, _, err := readVersion(ctx, r.APIReader, r.Config)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			marker, err := readInstallation(ctx, r.APIReader, r.Config, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			switch mutation {
+			case "missing version":
+				err = r.Delete(ctx, cm)
+			case "missing marker":
+				err = r.Delete(ctx, marker)
+			case "corrupt":
+				cm.Data["sequence"] = "01"
+				err = r.Update(ctx, cm)
+			case "wrong cluster":
+				cm.Data["cluster"] = testNodeUID
+				err = r.Update(ctx, cm)
+			case "wrong marker uid":
+				cm.Annotations[installationUIDAnnotation] = "replacement"
+				err = r.Update(ctx, cm)
+			case "mutable marker":
+				marker.Immutable = nil
+				err = r.Update(ctx, marker)
+			case "fresh marker":
+				marker.Data["state"] = "fresh"
+				err = r.Update(ctx, marker)
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			writes := 0
+
+			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+				Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+					writes++
+					return nil
+				},
+				Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+					writes++
+					return nil
+				},
+			})
+			if _, err := r.Reconcile(ctx, ctrl.Request{}); err == nil || writes != 0 {
+				t.Fatalf("unsafe recovery: %v, writes=%d", err, writes)
+			}
+
+			if _, err := r.Publications.Current(); err == nil {
+				t.Fatal("served invalid recovery")
+			}
+		})
+	}
+}
+
+func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
+	r := initializedTopology(t)
+	ctx := context.Background()
+
+	empty := reconcileTopology(t, r, ctx)
+	if v := empty.record; v.Sequence != 1 || v.MembershipVersion != 1 {
+		t.Fatalf("initial counters: %+v", v)
+	}
+
+	if same := reconcileTopology(t, r, ctx); same != empty {
+		t.Fatal("unchanged install replaced shared allocation")
+	}
+
+	cache := catalogCache("cache-a", testNodeUID)
+	if err := r.Create(ctx, &cache); err != nil {
+		t.Fatal(err)
+	}
+
+	runKeys(t, Assemble(r.Config, r.Client, r.APIReader).Keyring)
+
+	catalog := reconcileTopology(t, r, ctx)
+	if v := catalog.record; v.Sequence != 2 || v.MembershipVersion != 1 {
+		t.Fatalf("catalog counters: %+v", v)
+	}
+
+	node, pod := memberNode(), memberPod("pod", 1, "192.0.2.1")
+
+	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: r.Config.DaemonSetName, Namespace: r.Config.Namespace, UID: testDaemonSetUID}}
+	for _, obj := range []client.Object{&node, &pod, ds} {
+		if err := r.Create(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	member := reconcileTopology(t, r, ctx)
+	if v := member.record; v.Sequence != 3 || v.MembershipVersion != 2 {
+		t.Fatalf("member counters: %+v", v)
+	}
+
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.CommitVersion(ctx, prepared); err != nil {
+		t.Fatal(err)
+	}
+	// Simulated crash before install: no candidate bytes or history were exposed.
+	if current, _ := r.Publications.Current(); current != member {
+		t.Fatal("commit installed prematurely")
+	}
+
+	if len(r.Accepted) != 1 {
+		t.Fatal("commit replaced history")
+	}
+
+	r = Assemble(r.Config, r.Client, r.APIReader).Topology
+
+	recovered := reconcileTopology(t, r, ctx)
+	if v := recovered.record; v.Sequence != 5 || v.MembershipVersion != 4 {
+		t.Fatalf("recovery reused an unserved counter: %+v", v)
+	}
+}
+
+func TestCASConflictRetriesFreshInputsAndKeepsHistory(t *testing.T) {
+	node, pod := memberNode(), memberPod("pod", 1, "192.0.2.1")
+	r := initializedTopology(t, &node, &pod, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane", Namespace: "racer", UID: testDaemonSetUID}})
+	ctx := context.Background()
+	initial := reconcileTopology(t, r, ctx)
+	base := r.Client.(client.WithWatch)
+	updates := 0
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		updates++
+		if updates == 1 {
+			n := &corev1.Node{}
+			if err := c.Get(ctx, client.ObjectKey{Name: node.Name}, n); err != nil {
+				return err
+			}
+
+			n.Annotations = map[string]string{wire.SharesAnnotation: "9"}
+			if err := c.Update(ctx, n); err != nil {
+				return err
+			}
+
+			return apierrors.NewConflict(corev1.Resource("configmaps"), obj.GetName(), wire.Conflict)
+		}
+
+		return c.Update(ctx, obj, opts...)
+	}})
+
+	result, err := r.Reconcile(ctx, ctrl.Request{})
+	if err != nil || result.RequeueAfter <= 0 || updates != 1 {
+		t.Fatalf("conflict retry: %v, %v, writes=%d", result, err, updates)
+	}
+
+	if current, _ := r.Publications.Current(); current != initial || r.Accepted[testNodeUID].Shares != 4 {
+		t.Fatal("failed commit changed publication/history")
+	}
+
+	next := reconcileTopology(t, r, ctx)
+	if r.Accepted[testNodeUID].Shares != 9 || next.record.Sequence != initial.record.Sequence+1 {
+		t.Fatal("retry reused stale inputs")
+	}
+}
+
+func TestCancellationBeforeWritesAndInstall(t *testing.T) {
+	for _, stage := range []string{"before reconcile", "read", "conflict", "after commit"} {
+		t.Run(stage, func(t *testing.T) {
+			r := initializedTopology(t)
+			base := r.Client.(client.WithWatch)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			writes := 0
+			r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				writes++
+
+				if stage == "conflict" {
+					cancel()
+					return apierrors.NewConflict(corev1.Resource("configmaps"), obj.GetName(), wire.Conflict)
+				}
+
+				err := c.Update(ctx, obj, opts...)
+
+				cancel()
+
+				return err
+			}})
+
+			if stage == "before reconcile" {
+				cancel()
+			}
+
+			if stage == "read" {
+				r.APIReader = interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					err := c.Get(ctx, key, obj, opts...)
+
+					cancel()
+
+					return err
+				}})
+			}
+
+			result, err := r.Reconcile(ctx, ctrl.Request{})
+			if !errors.Is(err, context.Canceled) || !errors.Is(err, reconcile.TerminalError(nil)) || result.RequeueAfter != 0 {
+				t.Fatalf("canceled reconcile retried: %+v, %v", result, err)
+			}
+
+			if (stage == "before reconcile" || stage == "read") && writes != 0 {
+				t.Fatal("write after cancellation")
+			}
+
+			if _, err := r.Publications.Current(); err == nil {
+				t.Fatal("installed after cancellation")
+			}
+		})
+	}
+	// Also cover cancellation between returning a committed token and Install.
+	r := initializedTopology(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := r.Publications.Prepare(previous, cm.ResourceVersion, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	committed, err := r.CommitVersion(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+
+	if err := r.Publications.Install(committed); !errors.Is(err, context.Canceled) {
+		t.Fatalf("late install: %v", err)
 	}
 }
