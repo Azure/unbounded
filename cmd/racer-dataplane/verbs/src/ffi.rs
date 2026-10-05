@@ -11,10 +11,11 @@ use std::{
 };
 
 #[cfg(any(test, feature = "simulation"))]
-// Simulation implements this private ABI and must share the unsafe owner boundary.
+/// Simulated fabric sharing the native ABI and unsafe ownership boundary.
 #[path = "simulation.rs"]
 pub mod simulation;
 
+/// Discovered port layout shared with the native adapter.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Port {
@@ -26,19 +27,28 @@ struct Port {
     link_layer: u8,
 }
 
+/// Connection parameters exchanged with a remote queue pair.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Endpoint {
+    /// Global identifier of the local port.
     pub gid: [u8; 16],
+    /// Nonzero 24-bit queue pair number.
     pub qpn: u32,
+    /// Initial 24-bit packet sequence number.
     pub psn: u32,
+    /// Verbs MTU code: 1, 2, 3, 4, or 5 for 256 through 4096 bytes.
     pub mtu: u32,
+    /// Local identifier used by InfiniBand addressing.
     pub lid: u16,
+    /// One-based physical port number.
     pub port: u8,
+    /// Verbs link-layer code: 1 for InfiniBand or 2 for Ethernet.
     pub link_layer: u8,
 }
 
 impl Endpoint {
+    /// Check portable field bounds, without establishing provider compatibility.
     pub fn validate(&self) -> Result<()> {
         if self.qpn == 0
             || self.qpn > 0xffffff
@@ -54,6 +64,7 @@ impl Endpoint {
     }
 }
 
+/// One native completion with its work identifier, status, and opcode.
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 struct Completion {
@@ -62,16 +73,17 @@ struct Completion {
     opcode: u32,
 }
 
-// This ABI consists only of fixed-width scalars, opaque pointers and repr(C)
-// records. Every symbol is version-checked before any native handle is created.
+/// Define the fixed-layout ABI table and its version-checked symbol loader.
 macro_rules! native_api {
     ($($field:ident: $signature:ty),* $(,)?) => {
+        /// Loaded adapter functions, kept alive by every native resource owner.
         struct Api {
             library: Option<NonNull<c_void>>,
             $($field: $signature,)*
         }
         impl Api {
             #[cfg(all(feature = "native", target_os = "linux"))]
+            /// Resolve all required symbols from an already version-checked library.
             unsafe fn symbols(library: NonNull<c_void>) -> Result<Self> {
                 Ok(Self {
                     library: Some(library),
@@ -107,11 +119,13 @@ native_api! {
 
 impl Api {
     #[cfg(not(all(feature = "native", target_os = "linux")))]
+    /// Report that this build cannot load the native adapter.
     fn load() -> Result<Rc<Self>> {
         Err(Error::Unavailable)
     }
 
     #[cfg(all(feature = "native", target_os = "linux"))]
+    /// Load the administrator-selected adapter and validate its ABI version.
     fn load() -> Result<Rc<Self>> {
         // The loader search path is administrator-controlled. No peer-supplied
         // library names or paths are accepted.
@@ -121,8 +135,10 @@ impl Api {
                 libc::RTLD_NOW | libc::RTLD_LOCAL,
             ))
             .ok_or(Error::Unavailable)?;
+            /// Close the library if loading exits before ownership is transferred.
             struct Guard(NonNull<c_void>);
             impl Drop for Guard {
+                /// Release the library handle after a failed load.
                 fn drop(&mut self) {
                     unsafe {
                         libc::dlclose(self.0.as_ptr());
@@ -130,6 +146,7 @@ impl Api {
                 }
             }
             let guard = Guard(library);
+            /// Resolve a required symbol with its exact native signature.
             macro_rules! sym {
                 ($name:literal, $ty:ty) => {{
                     let pointer =
@@ -151,6 +168,7 @@ impl Api {
     }
 }
 impl Drop for Api {
+    /// Unload the adapter after all nonquarantined owners release it.
     fn drop(&mut self) {
         if let Some(library) = self.library {
             unsafe {
@@ -160,13 +178,15 @@ impl Drop for Api {
     }
 }
 
-pub struct NativeDevice {
+/// Owning device context that keeps the adapter loaded for dependent resources.
+pub(crate) struct NativeDevice {
     api: Rc<Api>,
     raw: NonNull<c_void>,
-    pub name: String,
-    pub endpoint: Endpoint,
+    pub(crate) name: String,
+    pub(crate) endpoint: Endpoint,
 }
 impl NativeDevice {
+    /// Read the device's NUMA node, or its simulated placement when applicable.
     pub(crate) fn numa_node(&self) -> Option<usize> {
         #[cfg(any(test, feature = "simulation"))]
         if simulation::is_api(&self.api) {
@@ -186,6 +206,7 @@ impl NativeDevice {
     }
 }
 impl Drop for NativeDevice {
+    /// Close the device, retaining the adapter if native teardown fails.
     fn drop(&mut self) {
         if unsafe { (self.api.close)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.api.clone());
@@ -193,7 +214,8 @@ impl Drop for NativeDevice {
     }
 }
 
-pub fn discover() -> Result<Vec<NativeDevice>> {
+/// Reject discovery above 64 ports and retain only ports whose contexts open.
+pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
     #[cfg(any(test, feature = "simulation"))]
     let api = match simulation::current() {
         Some(_) => simulation::api(),
@@ -254,6 +276,7 @@ pub(crate) struct NativeRegion {
     busy: Cell<bool>,
 }
 impl NativeRegion {
+    /// Register a nonempty allocation and retain its quota until safe teardown.
     pub(crate) fn new(
         device: Rc<NativeDevice>,
         length: usize,
@@ -274,6 +297,7 @@ impl NativeRegion {
             busy: Cell::new(false),
         }))
     }
+    /// Return the native or simulated wire address of this allocation.
     pub(crate) fn address(&self) -> u64 {
         #[cfg(any(test, feature = "simulation"))]
         if simulation::is_api(&self.device.api) {
@@ -281,9 +305,11 @@ impl NativeRegion {
         }
         unsafe { (self.device.api.bytes)(self.raw.as_ptr()) as u64 }
     }
+    /// Return the active transfer length within the registered allocation.
     pub(crate) fn length(&self) -> usize {
         self.used.get()
     }
+    /// Change the transfer length only while the allocation is idle.
     pub(crate) fn resize(&self, length: usize) -> Result<()> {
         if self.busy.get() || length == 0 || length > self.length {
             return Err(Error::InvalidRange);
@@ -291,6 +317,7 @@ impl NativeRegion {
         self.used.set(length);
         Ok(())
     }
+    /// Copy idle memory into an exact-length caller buffer.
     pub(crate) fn copy_into(&self, bytes: &mut [u8]) -> Result<()> {
         if self.busy.get() || bytes.len() != self.length() {
             return Err(Error::Unavailable);
@@ -304,6 +331,7 @@ impl NativeRegion {
         }
         Ok(())
     }
+    /// Fill idle memory from an exact-length caller buffer.
     pub(crate) fn copy_from(&self, bytes: &[u8]) -> Result<()> {
         if self.busy.get() || bytes.len() != self.length() {
             return Err(Error::InvalidRequest);
@@ -318,6 +346,7 @@ impl NativeRegion {
         Ok(())
     }
     #[cfg(test)]
+    /// Snapshot idle memory for native ownership tests.
     pub(crate) fn copy_to(&self) -> Result<Vec<u8>> {
         if self.busy.get() {
             return Err(Error::Unavailable);
@@ -329,6 +358,7 @@ impl NativeRegion {
     }
 }
 impl Drop for NativeRegion {
+    /// Deregister memory, retaining the device and quota if deregistration fails.
     fn drop(&mut self) {
         if unsafe { (self.device.api.deregister)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.device.clone());
@@ -337,6 +367,7 @@ impl Drop for NativeRegion {
     }
 }
 
+/// Native remote-write capability retaining its backing memory.
 pub(crate) struct Window {
     device: Rc<NativeDevice>,
     raw: NonNull<c_void>,
@@ -344,6 +375,7 @@ pub(crate) struct Window {
     region: Rc<NativeRegion>,
 }
 impl Drop for Window {
+    /// Free the capability, retaining its backing owners on teardown failure.
     fn drop(&mut self) {
         if unsafe { (self.device.api.window_free)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.device.clone());
@@ -352,18 +384,22 @@ impl Drop for Window {
     }
 }
 
+/// Completion state shared independently of a submitted operation's lifetime.
 #[derive(Default)]
 struct TicketState {
     result: Cell<Option<Result<()>>>,
 }
+/// Observation handle for one native completion.
 #[derive(Clone)]
 pub(crate) struct Ticket(Rc<TicketState>);
 impl Ticket {
+    /// Return the completion result, or none while native ownership is pending.
     pub(crate) fn result(&self) -> Option<Result<()>> {
         self.0.result.get()
     }
 }
 
+/// Resources retained until a matching completion or successful terminal fence.
 struct Pending {
     ticket: Ticket,
     opcode: u32,
@@ -372,6 +408,7 @@ struct Pending {
     _window: Option<Rc<Window>>,
 }
 impl Pending {
+    /// Publish completion after releasing local DMA access to the source region.
     fn finish(self, result: Result<()>) {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         if let Some(region) = &self.region {
@@ -381,10 +418,11 @@ impl Pending {
     }
 }
 
-pub struct NativeQueuePair {
+/// Reactor-local queue pair owning outstanding work and active remote grants.
+pub(crate) struct NativeQueuePair {
     device: Rc<NativeDevice>,
     raw: NonNull<c_void>,
-    pub endpoint: Endpoint,
+    pub(crate) endpoint: Endpoint,
     stopped: Cell<bool>,
     terminating: Cell<bool>,
     connected: Cell<bool>,
@@ -396,6 +434,7 @@ pub struct NativeQueuePair {
     expires: Cell<Option<std::time::Instant>>,
 }
 impl NativeQueuePair {
+    /// Allocate a queue pair and choose its local packet sequence number.
     pub(crate) fn new(device: Rc<NativeDevice>) -> Result<Rc<Self>> {
         let mut qpn = 0;
         let raw = NonNull::new(unsafe {
@@ -439,6 +478,7 @@ impl NativeQueuePair {
             expires: Cell::new(None),
         }))
     }
+    /// Connect once to a validated peer using the same link layer.
     pub(crate) fn connect(&self, remote: Endpoint) -> Result<()> {
         remote.validate()?;
         if self.stopped.get()
@@ -456,9 +496,11 @@ impl NativeQueuePair {
         Ok(())
     }
     #[cfg(test)]
+    /// Expose the owning device to native test fixtures.
     pub(crate) fn device(&self) -> &Rc<NativeDevice> {
         &self.device
     }
+    /// Verify that the provider can allocate and free a memory window.
     pub(crate) fn probe_window(&self) -> Result<()> {
         let mut key = 0;
         let window =
@@ -470,17 +512,21 @@ impl NativeQueuePair {
         }
         Ok(())
     }
+    /// Report whether this connected queue pair still accepts work.
     pub(crate) fn ready(&self) -> bool {
         self.connected.get() && !self.stopped.get() && !self.terminating.get()
     }
     #[cfg(test)]
+    /// Report whether the terminal native fence has succeeded.
     pub(crate) fn stopped(&self) -> bool {
         self.stopped.get()
     }
     #[cfg(test)]
+    /// Set the deadline checked by native test progress calls.
     pub(crate) fn expire_at(&self, deadline: std::time::Instant) {
         self.expires.set(Some(deadline));
     }
+    /// Reserve one of 32 work entries while retaining its DMA owners.
     fn reserve(
         &self,
         opcode: u32,
@@ -507,6 +553,7 @@ impl NativeQueuePair {
         );
         Ok((id, ticket))
     }
+    /// Release reserved owners when a single work request is rejected immediately.
     fn submitted(&self, id: u64, rc: i32) -> Result<()> {
         if rc != 0 {
             // Exactly one WR was posted, so a synchronous rejection posts none.
@@ -517,6 +564,7 @@ impl NativeQueuePair {
         }
         Ok(())
     }
+    /// Bind the sole active window and block CPU access until the terminal fence.
     pub(crate) fn bind(&self, region: Rc<NativeRegion>) -> Result<(Rc<Window>, Ticket)> {
         if !Rc::ptr_eq(&region.device, &self.device)
             || region.busy.get()
@@ -554,6 +602,7 @@ impl NativeQueuePair {
         }
         Ok((window, ticket))
     }
+    /// Submit key revocation without releasing the region's terminal-fence hold.
     pub(crate) fn invalidate(&self, window: Rc<Window>) -> Result<Ticket> {
         if !self.windows.borrow().iter().any(|w| Rc::ptr_eq(w, &window)) {
             return Err(Error::InvalidRequest);
@@ -563,6 +612,7 @@ impl NativeQueuePair {
         self.submitted(id, rc)?;
         Ok(ticket)
     }
+    /// Submit the active bytes, checking address overflow against allocation capacity.
     pub(crate) fn write(&self, region: Rc<NativeRegion>, address: u64, key: u32) -> Result<Ticket> {
         if !Rc::ptr_eq(&region.device, &self.device)
             || region.busy.get()
@@ -587,7 +637,7 @@ impl NativeQueuePair {
         Ok(ticket)
     }
     /// Nonblocking and bounded to 32 CQEs per call. Call on the owning reactor.
-    pub fn progress(&self) -> Result<usize> {
+    pub(crate) fn progress(&self) -> Result<usize> {
         if self.stopped.get() {
             return Ok(0);
         }
@@ -627,7 +677,7 @@ impl NativeQueuePair {
         Ok(n as usize)
     }
     /// Terminal DMA fence. Success permits reuse; failure retains all ownership.
-    pub fn stop(&self) -> Result<()> {
+    pub(crate) fn stop(&self) -> Result<()> {
         if self.stopped.get() {
             return Ok(());
         }
@@ -647,6 +697,7 @@ impl NativeQueuePair {
     }
 }
 impl Drop for NativeQueuePair {
+    /// Fence before destruction, quarantining all DMA owners if fencing fails.
     fn drop(&mut self) {
         if self.stop().is_err() {
             std::mem::forget(std::mem::take(self.pending.get_mut()));
@@ -662,8 +713,10 @@ impl Drop for NativeQueuePair {
 
 #[cfg(test)]
 mod tests {
+    //! Endpoint validation and optional native discovery contracts.
     use super::*;
     #[test]
+    /// Reject queue pair numbers outside the native 24-bit field.
     fn endpoint_rejects_invalid_native_parameters() {
         let mut e = Endpoint {
             gid: [1; 16],
@@ -679,6 +732,7 @@ mod tests {
         assert_eq!(e.validate(), Err(Error::InvalidRequest));
     }
     #[test]
+    /// Discovery returns real port descriptions or an explicit unavailable result.
     fn optional_runtime_never_fabricates_a_device() {
         match discover() {
             Ok(devices) => {
@@ -700,6 +754,7 @@ pub(crate) mod lifetime_tests {
     use std::time::Duration;
     use std::{collections::VecDeque, time::Instant};
 
+    /// Scripted native failures, queued completions, and teardown observations.
     #[derive(Default)]
     struct Faults {
         events: Vec<&'static str>,
@@ -709,18 +764,23 @@ pub(crate) mod lifetime_tests {
         poll_fails: bool,
     }
     thread_local! { static FAULTS: RefCell<Faults> = RefCell::new(Faults::default()); }
+    /// Record the order of native ownership releases.
     fn event(value: &'static str) {
         FAULTS.with_borrow_mut(|f| f.events.push(value));
     }
+    /// Allocate an opaque fixture handle with a stable address.
     fn pointer() -> *mut c_void {
         Box::into_raw(Box::new(0u8)).cast()
     }
+    /// Report no discoverable ports for the direct ownership fixture.
     unsafe extern "C" fn discover(_: *mut Port, _: u32) -> c_int {
         0
     }
+    /// Allocate a fixture device context.
     unsafe extern "C" fn open(_: *const c_char) -> *mut c_void {
         pointer()
     }
+    /// Record and release a fixture device context.
     unsafe extern "C" fn close(p: *mut c_void) -> c_int {
         event("pd-context");
         unsafe {
@@ -728,15 +788,18 @@ pub(crate) mod lifetime_tests {
         }
         0
     }
+    /// Allocate a fixture queue pair with a fixed valid number.
     unsafe extern "C" fn qp(_: *mut c_void, _: u8, _: u32, qpn: *mut u32) -> *mut c_void {
         unsafe {
             *qpn = 7;
         }
         pointer()
     }
+    /// Accept connection setup without a physical peer.
     unsafe extern "C" fn connect(_: *mut c_void, _: *const Endpoint, _: *const Endpoint) -> c_int {
         0
     }
+    /// Record a terminal fence and apply the scripted failure state.
     unsafe extern "C" fn stop(_: *mut c_void) -> c_int {
         event("stop");
         if FAULTS.with_borrow(|f| f.stop_fails) {
@@ -745,6 +808,7 @@ pub(crate) mod lifetime_tests {
             0
         }
     }
+    /// Record and release the fixture queue pair and completion queue.
     unsafe extern "C" fn qp_free(p: *mut c_void) -> c_int {
         event("cq");
         unsafe {
@@ -752,9 +816,11 @@ pub(crate) mod lifetime_tests {
         }
         0
     }
+    /// Allocate zeroed fixture memory behind an opaque region handle.
     unsafe extern "C" fn register(_: *mut c_void, length: u32) -> *mut c_void {
         Box::into_raw(Box::new(vec![0u8; length as usize])).cast()
     }
+    /// Record and release the fixture region's allocation.
     unsafe extern "C" fn deregister(p: *mut c_void) -> c_int {
         event("mr");
         unsafe {
@@ -762,15 +828,18 @@ pub(crate) mod lifetime_tests {
         }
         0
     }
+    /// Return the fixture region's stable backing allocation.
     unsafe extern "C" fn bytes(p: *mut c_void) -> *mut u8 {
         unsafe { (&mut *p.cast::<Vec<u8>>()).as_mut_ptr() }
     }
+    /// Allocate a fixture window with a fixed remote key.
     unsafe extern "C" fn window(_: *mut c_void, key: *mut u32) -> *mut c_void {
         unsafe {
             *key = 71;
         }
         pointer()
     }
+    /// Record and release a fixture memory window.
     unsafe extern "C" fn window_free(p: *mut c_void) -> c_int {
         event("mw");
         unsafe {
@@ -778,6 +847,7 @@ pub(crate) mod lifetime_tests {
         }
         0
     }
+    /// Accept a bind whose completion is injected separately.
     unsafe extern "C" fn bind(
         _: *mut c_void,
         _: *mut c_void,
@@ -788,9 +858,11 @@ pub(crate) mod lifetime_tests {
     ) -> c_int {
         0
     }
+    /// Accept invalidation whose completion is injected separately.
     unsafe extern "C" fn invalidate(_: *mut c_void, _: u32, _: u64) -> c_int {
         0
     }
+    /// Accept or synchronously reject a write according to the fault script.
     unsafe extern "C" fn write(
         _: *mut c_void,
         _: *mut c_void,
@@ -805,6 +877,7 @@ pub(crate) mod lifetime_tests {
             0
         }
     }
+    /// Drain injected completions unless polling is scripted to fail.
     unsafe extern "C" fn poll(_: *mut c_void, out: *mut Completion, cap: u32) -> c_int {
         FAULTS.with_borrow_mut(|f| {
             if f.poll_fails {
@@ -820,10 +893,12 @@ pub(crate) mod lifetime_tests {
         })
     }
     pub(crate) use crate::test_guard::Observer as QuotaObserver;
+    /// Create a quota owner and an observer of its retained charge.
     pub(crate) fn quota() -> (Arc<GuardOwner>, QuotaObserver) {
         let (guard, observer) = crate::test_guard::guard();
         (GuardOwner::new(guard), observer)
     }
+    /// Reset faults and create a connected queue pair with charged source memory.
     pub(crate) fn fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
         FAULTS.with_borrow_mut(|f| *f = Faults::default());
         let api = Rc::new(Api {
@@ -865,12 +940,15 @@ pub(crate) mod lifetime_tests {
         let region = NativeRegion::new(device, 32, quota).unwrap();
         (qp, region, charged)
     }
+    /// Queue a completion for the next fixture progress call.
     pub(crate) fn complete(id: u64, status: u32, opcode: u32) {
         FAULTS.with_borrow_mut(|f| f.cq.push_back(Completion { id, status, opcode }));
     }
+    /// Enable or clear repeated terminal-fence failures.
     pub(crate) fn fail_stop(fail: bool) {
         FAULTS.with_borrow_mut(|f| f.stop_fails = fail);
     }
+    /// Create an unconnected queue pair alongside charged source memory.
     pub(crate) fn fresh_fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
         let (qp, region, charged) = fixture();
         let fresh = NativeQueuePair::new(qp.device.clone()).unwrap();
@@ -878,6 +956,7 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// Dropping the waiter must not release memory still owned by native work.
     fn canceled_waiter_retains_source_and_quota_until_terminal_fence() {
         let (qp, region, charged) = fixture();
         let ticket = qp.write(region.clone(), 4096, 7).unwrap();
@@ -893,6 +972,7 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// Failed fencing retains the grant and quota while late DMA remains possible.
     fn failed_fence_quarantines_late_remote_writes_and_quota() {
         let (qp, region, charged) = fixture();
         let (window, ticket) = qp.bind(region.clone()).unwrap();
@@ -923,6 +1003,7 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// Invalid completions and poll failures retain owners until fencing succeeds.
     fn cq_errors_and_unknown_ids_require_fence_before_release() {
         for mode in 0..3 {
             let (qp, region, charged) = fixture();
@@ -949,6 +1030,7 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// Immediate rejection and successful completion each restore source access.
     fn write_success_and_post_rejection_have_distinct_release_paths() {
         let (qp, region, charged) = fixture();
         FAULTS.with_borrow_mut(|f| f.post_fails = true);
@@ -966,6 +1048,7 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// Out-of-order completions release only the corresponding allocation.
     fn reversed_completions_release_only_their_own_allocation() {
         let (qp, first, first_charge) = fixture();
         let (quota, second_charge) = quota();
@@ -986,6 +1069,7 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// Destruction after an unrecoverable fence deliberately retains charged owners.
     fn unrecoverable_destroy_never_releases_quarantined_quota() {
         let (qp, region, charged) = fixture();
         let (window, ticket) = qp.bind(region.clone()).unwrap();
@@ -1000,6 +1084,7 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// Expiry fences idle grants and the work table rejects its thirty-third entry.
     fn deadline_retires_idle_remote_grant_and_bounds_submission_table() {
         let (qp, region, _) = fixture();
         let (_window, _ticket) = qp.bind(region.clone()).unwrap();
@@ -1016,6 +1101,7 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// Key revocation alone never permits CPU reuse of remotely writable memory.
     fn invalidation_cqe_does_not_release_remote_buffer_before_terminal_fence() {
         let (qp, region, charged) = fixture();
         let (window, bind) = qp.bind(region.clone()).unwrap();
@@ -1036,6 +1122,7 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// Rust ABI records match the native adapter's asserted sizes and offsets.
     fn private_abi_layout_matches_c_static_assertions() {
         assert_eq!(std::mem::size_of::<Port>(), 88);
         assert_eq!(std::mem::offset_of!(Port, mtu), 80);
@@ -1047,6 +1134,7 @@ pub(crate) mod lifetime_tests {
     #[cfg(feature = "native")]
     #[test]
     #[ignore = "requires the installed native adapter and a host with zero usable RDMA ports"]
+    /// An installed adapter reports no ports on a deliberately empty test host.
     fn native_no_device() {
         let devices = super::discover().expect("native adapter must be installed for this test");
         assert!(devices.is_empty(), "this is not a no-device host");
@@ -1055,6 +1143,7 @@ pub(crate) mod lifetime_tests {
     #[cfg(feature = "native")]
     #[test]
     #[ignore = "requires an active type-2B provider; exercises real loopback RC DMA"]
+    /// Real loopback DMA copies bytes and rejects a capability after invalidation.
     fn native_available_provider_write_bind_invalidate_and_fence() {
         let devices = super::discover().expect("native adapter unavailable");
         let name =
@@ -1073,6 +1162,7 @@ pub(crate) mod lifetime_tests {
         let source = NativeRegion::new(device.clone(), 4096, quota().0).unwrap();
         source.copy_from(&vec![0xa5; 4096]).unwrap();
         let (window, bind) = receiver.bind(destination.clone()).unwrap();
+        /// Poll a real provider with a bounded completion deadline.
         fn wait(qp: &NativeQueuePair, ticket: &Ticket) {
             let until = Instant::now() + Duration::from_secs(10);
             while ticket.result().is_none() {
