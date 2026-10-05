@@ -1,4 +1,4 @@
-//! Integer weighted rendezvous placement with bounded cooperative scoring.
+//! Picks which members own a key, using weighted rendezvous hashing.
 
 use crate::{Error, MAX_INCREMENTAL_CHANGES, Member, MemberChange, Membership, hash};
 
@@ -6,89 +6,94 @@ use sha2::Digest;
 
 use std::{cell::RefCell, collections::BTreeMap, future::Future, rc::Rc, task::Poll};
 
-/// Maximum number of distinct members returned by placement, in preference order.
+/// Most owners returned for one key.
 pub const REPLICAS: usize = 3;
 
-/// Number of high digest bits used to select a placement slot.
+/// Number of hash bits used to pick a key's slot.
 pub const SLOT_BITS: u32 = 20;
 
-/// Number of placement slots; keys in the same slot share a ranking.
+/// Number of slots. Keys in the same slot get the same owners.
 pub const SLOT_COUNT: u32 = 1 << SLOT_BITS;
 
-/// Maximum cold scores evaluated during one cooperative poll or turn.
+/// Most members scored in one poll or one maintenance step.
 const WORK_QUANTUM: usize = 256;
 
-/// Outcome of one cooperative maintenance turn.
+/// Result of one [`Placement::maintain`] step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Maintenance {
-    /// No more resident predecessor slots need work.
+    /// Nothing left to do.
     Idle,
 
-    /// A slot was migrated or a cold scoring quantum completed.
+    /// Some work was done. Call again.
     Progress,
 
-    /// A predecessor is pinned by a request; retry after requests progress.
+    /// The next old entry is in use by a request. Try again later.
     Blocked,
 }
 
-/// Worker-local weighted rendezvous rankings over immutable memberships.
+/// Picks owners for keys and caches the results.
 ///
-/// A bounded CLOCK cache coalesces resident work. Rankings contain positions in
-/// the supplied membership's ID-sorted slice, not application-owned records.
-/// This type is not thread-safe; use a separate instance for each worker.
+/// Results are member positions. Requests for the same slot share one cache
+/// entry and its work. The cache uses CLOCK eviction.
+///
+/// Not thread-safe. Give each worker its own `Placement`.
 pub struct Placement {
-    /// Maximum resident generation/slot pairs; zero means uncached scoring.
+    /// Most cache entries kept. Zero turns caching off.
     capacity: usize,
 
-    /// Worker-local shared rankings and CLOCK admission state.
+    /// Cached rankings.
     cache: RefCell<RankingCache>,
 
-    /// Migration progress that survives individual maintenance turns.
+    /// Progress of [`Placement::maintain`], kept between calls.
     maintenance: RefCell<MaintenanceWork>,
 }
 
-/// Resumable predecessor scan with independently pinned cold work.
+/// Progress of moving cached entries from the old membership to the new one.
 #[derive(Default)]
 struct MaintenanceWork {
-    /// Current target generation, reset when the caller switches snapshots.
+    /// The new membership. Changing it restarts maintenance.
     identity: Option<[u8; 32]>,
 
-    /// Last migrated predecessor key, retained even after scan completion.
+    /// Last old entry moved. Kept after the scan finishes.
     cursor: Option<CacheKey>,
 
-    /// Independent pin: restarting a dirty scan must not discard cold progress.
+    /// A slot being fully rescored. Held so requests cannot evict it, and kept
+    /// when the scan restarts.
     active: Option<(u32, Rc<RefCell<Ranking>>)>,
 
-    /// Completed scan latch, cleared only by relevant admissions or a reset.
+    /// True when the scan is done. Cleared when an old entry is added or the
+    /// membership changes.
     finished: bool,
 }
 
-/// Placement generation followed by slot, ordered for predecessor range scans.
+/// Membership identity, then slot. Sorting this way keeps each membership's
+/// entries together.
 type CacheKey = ([u8; 32], u32);
 
-/// Bounded CLOCK entries plus a coalesced predecessor-admission latch.
+/// CLOCK cache of rankings.
 #[derive(Default)]
 struct RankingCache {
-    /// Resident progress ordered by generation and then slot.
+    /// Rankings, sorted by membership and then slot.
     entries: BTreeMap<CacheKey, Rc<RefCell<Ranking>>>,
 
-    /// Last inspected CLOCK key, which need not still be resident.
+    /// Where the CLOCK hand last stopped. That entry may be gone.
     hand: Option<CacheKey>,
 
-    /// Only admissions to this predecessor can invalidate the migration scan.
+    /// The old membership that maintenance is moving away from.
     predecessor: Option<[u8; 32]>,
 
-    /// Coalesces predecessor insertions without an unbounded dirty queue.
+    /// Set when an entry is added for `predecessor`, so maintenance rescans.
     predecessor_dirty: bool,
 }
 
 impl RankingCache {
-    /// Remove an entry without changing the ordered CLOCK scan position.
+    /// Remove an entry. The CLOCK hand does not move.
     fn remove(&mut self, key: &CacheKey) {
         self.entries.remove(key);
     }
 
-    /// Give referenced entries a second chance without evicting pinned work.
+    /// Evict one entry that no request is using. Recently used entries get a
+    /// second chance first. Returns false if every entry is in use.
     fn evict(&mut self) -> bool {
         // CLOCK gives referenced entries a second chance. Two full rotations
         // find any unpinned entry, including one beyond 64 busy entries.
@@ -111,28 +116,30 @@ impl RankingCache {
     }
 }
 
-/// Partial or complete top-three scoring progress shared by resident requests.
+/// The best three scores for one slot, finished or still in progress.
+/// Requests for the same slot share it.
 struct Ranking {
-    /// First unscored member; the membership length marks completion.
+    /// Next member to score. Equals the member count when done.
     cursor: usize,
 
-    /// At most three winners with one spare allocation slot for insertion.
+    /// Up to three best scores, plus room for one more so inserts never
+    /// reallocate.
     best: Vec<Score>,
 
-    /// CLOCK second-chance bit, refreshed whenever a request finds this entry.
+    /// CLOCK "recently used" bit. Set whenever a request finds this entry.
     referenced: bool,
 
-    /// Total score evaluations, including incremental admission work.
+    /// Test only: how many scores were computed, including cheap updates.
     #[cfg(test)]
     scored: usize,
 
-    /// Whether bounded predecessor hints produced this ranking.
+    /// Test only: true if this was built cheaply from the old membership.
     #[cfg(test)]
     incremental: bool,
 }
 
 impl Default for Ranking {
-    /// Reserve one spare score slot so insertion never grows the allocation.
+    /// Start empty, with room for one extra score so inserts never reallocate.
     fn default() -> Self {
         Self {
             cursor: 0,
@@ -146,21 +153,22 @@ impl Default for Ranking {
     }
 }
 
-/// Integer exponential cost and weight for one frozen membership position.
+/// One member's score for one slot. Lower is better.
 #[derive(Clone, Copy)]
 struct Score {
-    /// Membership position, also the frozen-ID tie breaker.
+    /// Member position. Also breaks ties.
     node: usize,
 
-    /// Fixed-point exponential cost before division by shares.
+    /// Random cost from the hash, before dividing by the weight.
     cost: u64,
 
-    /// Positive frozen weight, compared through exact integer products.
+    /// Member weight.
     shares: u32,
 }
 
 impl Score {
-    /// Compare exact cost/share ratios, breaking ties by frozen ID order.
+    /// Compare cost divided by weight, exactly, using integer math. Ties go to
+    /// the lower position, which is the lower ID.
     fn compare(&self, other: &Self) -> std::cmp::Ordering {
         (u128::from(self.cost) * u128::from(other.shares))
             .cmp(&(u128::from(other.cost) * u128::from(self.shares)))
@@ -168,11 +176,11 @@ impl Score {
     }
 }
 
-/// Map an application-encoded key to its domain-separated placement slot.
+/// Return the slot for a key, in `0..SLOT_COUNT`.
 ///
-/// Returns a value in `0..SLOT_COUNT`. Keys are opaque bytes with no prescribed
-/// schema. Use the same [`Member::DOMAIN`] as the membership being ranked;
-/// membership construction validates the domain, but this helper does not.
+/// The key can be any bytes. Use the same [`Member`] type as the membership
+/// you rank with. This function does not check [`Member::DOMAIN`];
+/// [`Membership::new`] does.
 #[must_use]
 pub fn slot<M: Member>(key: &[u8]) -> u32 {
     let mut digest = hash::domain::<M>(b"/slot/v1\0");
@@ -181,8 +189,8 @@ pub fn slot<M: Member>(key: &[u8]) -> u32 {
     u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) >> (u32::BITS - SLOT_BITS)
 }
 
-/// Q32.32 approximation of -log2((sample+1)/2^64). Binary logarithm
-/// via repeated squaring is fully specified integer arithmetic on all targets.
+/// Return -log2((sample + 1) / 2^64) as a Q32.32 fixed-point number.
+/// It uses only integer math, so every platform gets the same answer.
 fn exponential_cost(sample: u64) -> u64 {
     let value = u128::from(sample) + 1;
     let exponent = value.ilog2();
@@ -202,7 +210,7 @@ fn exponential_cost(sample: u64) -> u64 {
 }
 
 impl Ranking {
-    /// Hash one frozen member into a deterministic weighted rendezvous score.
+    /// Score one member for a slot.
     #[cfg_attr(
         not(test),
         allow(
@@ -226,7 +234,7 @@ impl Ranking {
         }
     }
 
-    /// Keep only the three lowest ordered costs, without expanding weights.
+    /// Add a score, keeping only the best three.
     fn insert(&mut self, score: Score) {
         let position = self.best.partition_point(|old| old.compare(&score).is_lt());
         if position < REPLICAS {
@@ -235,7 +243,12 @@ impl Ranking {
         }
     }
 
-    /// Reuse complete predecessor winners when no unseen candidate can emerge.
+    /// Build this slot's ranking for the new membership from the old one,
+    /// scoring only the changed members.
+    ///
+    /// Returns `None` when that could give a wrong answer and a full rescore is
+    /// needed: there is no change list, the old ranking is unfinished, or a
+    /// winner left or lost weight (an unseen fourth member could move up).
     fn updated<M: Member>(&self, membership: &Membership<M>, slot: u32) -> Option<Self> {
         let delta = membership.delta.as_ref()?;
         debug_assert!(delta.changes.len() <= MAX_INCREMENTAL_CHANGES);
@@ -289,7 +302,7 @@ impl Ranking {
         Some(next)
     }
 
-    /// Score at most the supplied quantum without restarting completed work.
+    /// Score up to `work` more members, continuing where the last call stopped.
     fn advance<M: Member>(&mut self, membership: &Membership<M>, slot: u32, work: usize) {
         let end = self
             .cursor
@@ -302,24 +315,24 @@ impl Ranking {
         self.cursor = end;
     }
 
-    /// Copy ranked positions without exposing mutable resident scores.
+    /// Return the ranked member positions, best first.
     fn candidates(&self) -> Vec<usize> {
         self.best.iter().map(|score| score.node).collect()
     }
 }
 
 impl Placement {
-    /// Conservative structural budget per resident entry: map occupancy/slack,
-    /// `Rc`/`RefCell`, and the four-score vector allocation. This is
-    /// not an allocator hard bound: allocator metadata, size classes, and process
-    /// fragmentation are platform-dependent. Regression tests check the modeled
-    /// structures and actual vector capacities against this budget.
+    /// Estimated bytes per cache entry.
+    ///
+    /// This is a generous estimate of the map node, `Rc`, `RefCell`, and score
+    /// vector. It does not cover allocator overhead or fragmentation, which
+    /// vary by platform. Tests check that the real structures fit.
     pub const ENTRY_BYTES: usize = 1024;
 
-    /// Create an empty cache retaining at most `capacity` slot/generation pairs.
+    /// Create a placement that caches up to `capacity` entries.
     ///
-    /// Zero capacity disables caching. Concurrent uncached asynchronous requests
-    /// do not coalesce; callers must bound their total number independently.
+    /// Zero turns caching off. Then concurrent [`Self::rank_async`] calls do
+    /// not share work, so callers must limit how many run at once.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -329,8 +342,8 @@ impl Placement {
         }
     }
 
-    /// Conservative resident storage estimate, including the inline cache and
-    /// CLOCK cursor. Excludes caller-owned result vectors and uncached requests.
+    /// Estimated bytes used, including this `Placement` itself. Does not count
+    /// returned vectors or uncached requests.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         let cache = self.cache.borrow();
@@ -338,7 +351,8 @@ impl Placement {
             .saturating_add(cache.entries.len().saturating_mul(Self::ENTRY_BYTES))
     }
 
-    /// Coalesce a resident slot or admit new work without displacing its pins.
+    /// Find the cache entry for a slot, or add one. Never evicts an entry that
+    /// a request is using.
     fn ranking<M: Member>(
         &self,
         membership: &Membership<M>,
@@ -374,14 +388,15 @@ impl Placement {
         Ok(ranking)
     }
 
-    /// Rank up to [`REPLICAS`] member indices. Cache pressure never rejects a
-    /// synchronous request: if every eligible entry is pinned, score uncached.
-    /// Empty memberships return an empty vector. Cold work runs to completion.
+    /// Return up to [`REPLICAS`] owners for `key`, best first.
+    ///
+    /// Does all the work before returning. If the cache is full of entries in
+    /// use, it skips the cache instead of failing. An empty membership returns
+    /// an empty list.
     ///
     /// # Errors
     ///
-    /// Currently always succeeds for a constructed membership. The `Result`
-    /// return type is retained for compatibility with fallible placement callers.
+    /// Never fails today. The `Result` is kept for API compatibility.
     pub fn rank<M: Member>(
         &self,
         membership: &Membership<M>,
@@ -398,18 +413,18 @@ impl Placement {
         Ok(ranking.candidates())
     }
 
-    /// Rank member indices cooperatively, coalescing resident requests.
-    /// Each poll scores at most 256 cold
-    /// members (plus a bounded membership delta on admission). CLOCK admission
-    /// may inspect the whole bounded cache; no borrow is held across a yield.
-    /// Dropping the future releases its admission without discarding resident
-    /// progress. Results have the same ordering as [`Self::rank`].
+    /// Like [`Self::rank`], but yields so it does not block the executor.
+    ///
+    /// Each poll scores at most 256 members. Adding a cache entry may also do a
+    /// small update from the old membership and may scan the whole cache to
+    /// evict something. Requests for the same slot share work. Dropping the
+    /// future releases its hold on the entry but keeps the work done so far.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Overloaded`] when a nonzero-capacity cache cannot admit
-    /// the request: all eviction candidates are pinned, or its own predecessor
-    /// is pinned and there is no spare capacity for another generation.
+    /// Returns [`Error::Overloaded`] if the cache is full and cannot take this
+    /// request. That happens when every entry is in use, or when this slot's
+    /// old entry is in use and there is no room for a new one.
     pub fn rank_async<'a, M: Member>(
         &'a self,
         membership: &'a Membership<M>,
@@ -432,21 +447,25 @@ impl Placement {
         }
     }
 
-    /// Migrate one resident predecessor slot or advance one cold quantum. A
-    /// pinned predecessor returns [`Maintenance::Blocked`] without advancing the scan cursor.
-    /// Active cold work is pinned across turns so requests cannot evict progress.
-    /// [`Maintenance::Idle`] means the current scan is complete; switching to a
-    /// different membership resets the scan and releases any old active work.
-    /// A newly admitted predecessor slot reopens the scan on the next turn,
-    /// including grace requests behind the cursor or after completion. Such
-    /// admissions never discard active cold progress or its pin. Without new
-    /// predecessor admissions, a completed scan stays idle without rescanning.
+    /// Do one step of moving cached entries from the old membership to
+    /// `membership`, so requests after a change still hit the cache.
+    ///
+    /// Each step either moves one old entry or scores up to 256 members for an
+    /// entry that needs a full rescore. Call it repeatedly:
+    ///
+    /// - [`Maintenance::Progress`]: work was done. Call again.
+    /// - [`Maintenance::Blocked`]: the next old entry is in use. Try later.
+    /// - [`Maintenance::Idle`]: done. Stays idle until a request adds another
+    ///   old entry, which restarts the scan.
+    ///
+    /// Partial rescore work is held between steps so requests cannot evict it,
+    /// and a restarted scan keeps it. Passing a different membership starts
+    /// over and drops that work.
     ///
     /// # Errors
     ///
-    /// Currently succeeds for constructed memberships: pinned entries report
-    /// [`Maintenance::Blocked`], not cache overload. The `Result` return type is
-    /// retained for compatibility with fallible maintenance callers.
+    /// Never fails today. An entry in use returns [`Maintenance::Blocked`]
+    /// instead. The `Result` is kept for API compatibility.
     pub fn maintain<M: Member>(&self, membership: &Membership<M>) -> Result<Maintenance, Error> {
         use std::ops::Bound::{Excluded, Unbounded};
         let mut work = self.maintenance.borrow_mut();
@@ -512,47 +531,47 @@ impl Placement {
     }
 }
 
-/// Exact scoring, cache admission, cooperative progress, and churn contracts.
+/// Tests for scoring, caching, async progress, and membership changes.
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::{num::NonZeroU32, task::Context};
 
-    /// Stable ordered test ID with a positive weight.
+    /// Test member with a string ID and a weight.
     #[derive(Clone, Debug)]
     struct TestMember(String, NonZeroU32);
 
     impl Member for TestMember {
         const DOMAIN: &'static str = "placement-tests";
 
-        /// Return the zero-padded ordered ID.
+        /// Return the ID.
         fn id(&self) -> &[u8] {
             self.0.as_bytes()
         }
 
-        /// Return the configured positive weight.
+        /// Return the weight.
         fn weight(&self) -> NonZeroU32 {
             self.1
         }
     }
 
-    /// Build a node whose lexical and numeric ID orders agree.
+    /// Build a member whose ID sorts in index order.
     fn member(index: usize, weight: u32) -> TestMember {
         TestMember(format!("node-{index:06}"), NonZeroU32::new(weight).unwrap())
     }
 
-    /// Construct equally weighted test members.
+    /// Build `count` members with equal weights.
     fn membership(count: usize) -> Membership<TestMember> {
         Membership::new((0..count).map(|i| member(i, 4)).collect()).unwrap()
     }
 
-    /// Encode a page-like opaque key in stable byte order.
+    /// Turn a number into a key.
     fn key(value: u64) -> [u8; 8] {
         value.to_be_bytes()
     }
 
-    /// Pin the existing slot, ranking, and integer-cost compatibility vectors.
+    /// Slots, rankings, and costs match known fixed values.
     #[test]
     fn golden_slot_and_weighted_ranking_vectors() {
         let members = Membership::new(
@@ -585,7 +604,7 @@ mod tests {
         }
     }
 
-    /// Verify extrema, powers of two, full-width products, and ID-order ties.
+    /// Cost math is right at the edges, and ties go to the lower ID.
     #[test]
     fn integer_log_edges_and_ties() {
         assert_eq!(exponential_cost(0), 64 << 32);
@@ -622,7 +641,7 @@ mod tests {
         );
     }
 
-    /// Primary ownership follows weights without allocating per-share records.
+    /// First owners are spread in proportion to weight.
     #[test]
     fn weighted_distribution_without_share_expansion() {
         let members = Membership::new(vec![member(0, 1), member(1, 3), member(2, 6)]).unwrap();
@@ -644,7 +663,8 @@ mod tests {
         assert_eq!(Placement::new(1).rank(&huge, &key(0)).unwrap()[0], 0);
     }
 
-    /// Shared polls advance bounded work and cancellation releases admission.
+    /// Async requests share work, the cache stays bounded, and dropping a
+    /// request releases its entry.
     #[test]
     fn cooperative_coalescing_bounded_cache_and_cancellation() {
         let placement = Placement::new(1);
@@ -696,21 +716,21 @@ mod tests {
         assert!(uncached.cache.borrow().entries.is_empty());
     }
 
-    /// Different application domains cannot reuse each other's cached scores.
+    /// Different domains never share slots or cached results.
     #[test]
     fn generic_domain_isolates_identity_slot_and_cached_scores() {
-        /// Same member data under an independent application domain.
+        /// Same member data under another domain.
         struct Other(TestMember);
 
         impl Member for Other {
             const DOMAIN: &'static str = "object-store";
 
-            /// Return the wrapped stable identity.
+            /// Return the wrapped ID.
             fn id(&self) -> &[u8] {
                 self.0.id()
             }
 
-            /// Return the wrapped positive weight.
+            /// Return the wrapped weight.
             fn weight(&self) -> NonZeroU32 {
                 self.0.weight()
             }
@@ -744,7 +764,8 @@ mod tests {
         }
     }
 
-    /// Repeated joins, removals, and weight changes agree with cold placement.
+    /// After many joins, leaves, and weight changes, cached results still
+    /// match a fresh computation.
     #[test]
     fn predecessor_maintenance_and_churn_match_cold_oracle() {
         let placement = Placement::new(512);
@@ -774,7 +795,7 @@ mod tests {
         }
     }
 
-    /// Finish maintenance within a bounded number of unblocked turns.
+    /// Run maintenance until idle. Fail if it blocks or takes too many steps.
     fn warm_to_idle(placement: &Placement, members: &Membership<TestMember>, limit: usize) {
         for _ in 0..limit {
             match placement.maintain(members).unwrap() {
@@ -786,7 +807,8 @@ mod tests {
         panic!("maintenance did not finish within bounded turns");
     }
 
-    /// Migration preserves every demanded slot through incremental and cold work.
+    /// Maintenance keeps every cached slot, using both cheap updates and full
+    /// rescores.
     #[test]
     fn full_cache_warm_migration_retains_every_populated_slot() {
         for cold in [false, true] {
@@ -838,7 +860,7 @@ mod tests {
         }
     }
 
-    /// Only new predecessor admissions invalidate a completed migration scan.
+    /// A finished scan restarts only when an old entry is added.
     #[test]
     fn late_predecessor_admission_reopens_completed_scan_only_when_relevant() {
         let placement = Placement::new(8);
@@ -876,7 +898,8 @@ mod tests {
         }
     }
 
-    /// Restarting the scan retains active progress and honors late grace pins.
+    /// Restarting the scan keeps partial work and waits for old requests that
+    /// are still running.
     #[test]
     fn late_predecessor_behind_cursor_preserves_active_work_and_grace_pins() {
         let placement = Placement::new(4);
@@ -930,7 +953,7 @@ mod tests {
         );
     }
 
-    /// A pinned predecessor blocks migration without advancing its cursor.
+    /// An old entry in use blocks maintenance without losing its place.
     #[test]
     fn pinned_predecessor_blocks_without_losing_cursor_or_old_request() {
         let placement = Placement::new(1);
@@ -962,7 +985,7 @@ mod tests {
         );
     }
 
-    /// Foreground work shares and cannot evict active cold maintenance progress.
+    /// Requests share maintenance's partial work and cannot evict it.
     #[test]
     fn cold_maintenance_progress_is_pinned_and_coalesces_with_requests() {
         let placement = Placement::new(1);
@@ -1001,7 +1024,8 @@ mod tests {
         );
     }
 
-    /// CLOCK scans past long pinned runs and honors refreshed reference bits.
+    /// CLOCK skips long runs of busy entries and gives recently used entries a
+    /// second chance.
     #[test]
     fn clock_rotation_inspects_more_than_64_busy_entries_and_refreshes_hits() {
         let placement = Placement::new(80);
@@ -1040,12 +1064,12 @@ mod tests {
         assert!(!cache.entries.contains_key(&(members.identity(), 2)));
     }
 
-    /// Live record mutation cannot change frozen scoring inputs.
+    /// Changing a record after it is frozen does not change results.
     #[test]
     fn scoring_uses_frozen_snapshots_not_live_member_accessors() {
         use std::cell::Cell;
 
-        /// Mutable application record used to challenge placement isolation.
+        /// Record whose ID and weight can change.
         struct Mutable {
             id: Cell<&'static [u8]>,
 
@@ -1055,12 +1079,12 @@ mod tests {
         impl Member for Mutable {
             const DOMAIN: &'static str = "mutable-placement";
 
-            /// Read the current mutable identity.
+            /// Return the current ID.
             fn id(&self) -> &[u8] {
                 self.id.get()
             }
 
-            /// Read the current mutable weight.
+            /// Return the current weight.
             fn weight(&self) -> NonZeroU32 {
                 self.weight.get()
             }
@@ -1091,7 +1115,7 @@ mod tests {
         }
     }
 
-    /// Incremental and fallback paths agree with independently sorted scores.
+    /// Cheap updates and full rescores both match a plain sort of all scores.
     #[test]
     fn randomized_incremental_diff_matches_full_sort_oracle() {
         let mut state = 0x1365_a739_2135_bcedu64;
@@ -1145,7 +1169,7 @@ mod tests {
         assert!(fast > 0 && cold > 0, "fast={fast}, cold={cold}");
     }
 
-    /// Integer exponential costs decrease monotonically across sample boundaries.
+    /// Cost never goes up as the sample goes up.
     #[test]
     fn exponential_is_monotonic_including_extrema_and_power_boundaries() {
         let mut samples = vec![0, 1, u64::MAX - 1, u64::MAX];
@@ -1168,7 +1192,7 @@ mod tests {
         assert_eq!(SLOT_COUNT, 1_048_576);
     }
 
-    /// The resident estimate covers modeled map, reference, and score storage.
+    /// `ENTRY_BYTES` covers the real per-entry structures.
     #[test]
     fn entry_budget_covers_structures_and_dynamic_score_capacity() {
         use std::mem::size_of;

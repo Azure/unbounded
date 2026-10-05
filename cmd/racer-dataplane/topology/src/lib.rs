@@ -1,30 +1,22 @@
-//! Runtime-independent algorithms over immutable, domain-separated membership.
+//! Placement and routing for a set of cluster members.
 //!
-//! Implement [`Member`] for application-owned records, then freeze them in a
-//! [`Membership`]. [`Placement`] ranks up to three members for an opaque key;
-//! [`Paths`] selects a weighted next hop among equal-cost routes on the overlay.
-//! Results are positions in the supplied membership's ID-sorted member slice.
+//! This crate answers two questions for the Racer dataplane:
 //!
-//! Caches are worker-local. Cooperative futures bound work per poll but leave
-//! deadlines, cancellation, health, transport, and membership versions to callers.
-//! Changing a member's domain changes placement and routing across the cluster.
+//! - **Which members store this key?** [`Placement`] picks up to three.
+//! - **How do I get from one member to another?** [`Paths`] picks a short route.
 //!
-//! [`Membership::new_with_predecessor`] shares immutable graph storage when
-//! frozen IDs match, including weight-only and metadata-only updates. It does
-//! not retain the predecessor membership. [`Membership::with_predecessor`]
-//! alone only adds placement hints after construction; it does not share graphs.
-//! Membership can cross threads when its record type permits, but caches remain
-//! worker-local. Construction is synchronous; applications decide where to run it.
+//! It does no I/O and has no timers. The caller owns networking, timeouts,
+//! cancellation, health checks, and when to publish a new membership.
 //!
-//! [`Membership::retained_bytes`] uses a cached immutable-storage estimate plus
-//! the current bounded delta capacity, so reading it is O(1). Each estimate
-//! includes the full graph even when multiple memberships share it; summing them
-//! is conservative rather than unique-allocation accounting.
+//! # Basics
+//!
+//! 1. Implement [`Member`] for your member type.
+//! 2. Build a [`Membership`] from a list of members. It sorts them by ID.
+//! 3. Ask [`Placement`] or [`Paths`]. Answers are positions in that sorted list.
+//!
+//! A position only has meaning for the membership that produced it.
 //!
 //! # Example
-//!
-//! This crate serves the Racer dataplane without owning its wire records or
-//! runtime policy. A neutral model is sufficient for the algorithm API:
 //!
 //! ```
 //! use std::num::NonZeroU32;
@@ -51,14 +43,14 @@
 //! ])?;
 //! let a = members.position(b"a").unwrap();
 //! let b = members.position(b"b").unwrap();
-//! assert_eq!(a, 0); // Positions follow frozen ID order, not input order.
+//! assert_eq!(a, 0); // Sorted by ID, not by input order.
 //!
 //! let placement = Placement::new(16);
 //! let owners = placement.rank(&members, b"opaque application key")?;
-//! assert_eq!(owners.len(), 2); // At most three, with no duplicate owners.
+//! assert_eq!(owners.len(), 2); // Up to three owners, never repeated.
 //! assert!(owners.contains(&a) && owners.contains(&b));
 //!
-//! // Independent entry, accounted-byte, and distinct active-search limits.
+//! // Cache up to 16 routes or 1 MiB, and run up to 2 searches at once.
 //! let paths = Paths::with_limits(16, 1024 * 1024, 2);
 //! futures::executor::block_on(async {
 //!     let query = PathQuery {
@@ -75,10 +67,11 @@
 //!         Err(Error::Unreachable),
 //!     );
 //!
-//!     // A validated self route needs neither links nor search admission.
+//!     // A route to yourself always works, even with no search slots.
 //!     let no_searches = Paths::with_limits(0, 0, 0);
 //!     let self_query = PathQuery { to: a, links: 0, ..query };
 //!     assert_eq!(no_searches.route(&members, self_query).await?, vec![a]);
+//!     // But the query is still checked.
 //!     assert_eq!(
 //!         no_searches.route(&members, PathQuery { visited: &[a], ..self_query }).await,
 //!         Err(Error::InvalidQuery),
@@ -89,96 +82,51 @@
 //! # }
 //! ```
 //!
-//! The example executor is only a test/dev dependency. Production callers poll
-//! these worker-local futures on their own executor and impose deadlines and
-//! total request limits. Byte accounting is not an allocator or RSS hard bound.
+//! The example uses a simple test executor. Real callers use their own.
 //!
-//! # Membership and compatibility
+//! # Membership
 //!
-//! Membership freezes arbitrary binary IDs and positive weights, rejects duplicate
-//! IDs, IDs longer than `u32::MAX`, and NUL-containing domains, then sorts by ID.
-//! Positions belong to that snapshot, not a durable cluster-wide index. Empty
-//! memberships are valid but have no valid route endpoints.
+//! Each member has a binary ID and a positive weight. IDs must be unique.
+//! An empty membership is allowed, but has nothing to route between.
 //!
-//! The overlay joins 32 independently hashed rings over stable IDs. Edges are
-//! symmetric, unique, sorted, self-free, and bounded by [`MAX_DEGREE`]. Every
-//! nonempty membership is connected, but this does not guarantee four-hop routes.
-//! A single join or leave changes only predecessor/successor edges in each ring.
-//! Construction is synchronous: O(32 N log N) for bounded-size IDs, with up to
-//! 64 N adjacency slots, N vector headers, and one reused N-entry sorting buffer.
-//! At 100,000 members, adjacency slots alone occupy about 48.8 MiB on 64-bit targets.
+//! Members are linked into a graph built from 32 hash rings. Each member has
+//! at most [`MAX_DEGREE`] neighbors and the graph is always connected. Adding
+//! or removing one member only changes that member's ring neighbors. Weights
+//! do not affect the graph.
 //!
-//! Placement retains the `/slot/v1`, `/hrw/v1`, and `/placement-identity/v1`
-//! contracts: 2^20 slots, integer weighted rendezvous, and up to three replicas.
-//! Ring ordering uses its own v1 domain and u64 ID lengths. Routing's
-//! `/next-hop/v5` schema independently prefixes seed, source ID, and destination
-//! ID with big-endian u32 lengths. Do not merge these distinct encodings.
-//! Schema changes require coordinated cluster transitions: matching membership
-//! versions do not establish mixed-routing safety or automatic negotiation.
+//! Building a membership takes O(N log N) time. At 100,000 members the graph
+//! uses about 49 MiB.
 //!
-//! # Cache ownership and budgets
+//! When membership changes, build the new one with
+//! [`Membership::new_with_predecessor`]. It reuses the old graph when the IDs
+//! are the same, and helps [`Placement`] update its cache cheaply.
 //!
-//! Placement's bounded CLOCK cache coalesces resident work and pins active
-//! requests. Zero capacity computes uncached. Cold async scoring handles at most
-//! 256 members per poll plus a bounded admission delta; CLOCK admission may inspect
-//! the resident cache. Sync ranking falls back to uncached scoring under pressure.
-//! Maintenance migrates demanded predecessor slots, not the entire slot space.
+//! # Threads and caches
 //!
-//! Paths have independent entry, accounted-byte, and distinct cold-search limits.
-//! Disabling retention does not disable searches; disabling search admission still
-//! permits validated self routes and cache hits. Searches yield after at most 32
-//! vertex expansions, each with at most 64 edges. Equivalent canonical queries
-//! share search admission across seeds and weight-only snapshots. The last dropped
-//! waiter releases unfinished search state. Admission does not bound waiter count
-//! or scratch bytes. Oversized results do not flush useful smaller cached routes.
-//! [`Paths::new`] defaults to 8 MiB of accounted cache bytes and eight active
-//! searches. Search retention excludes active scratch, returned results, graphs,
-//! allocator overhead, and the inline cache object.
+//! A [`Membership`] can be shared across threads. [`Placement`] and [`Paths`]
+//! cannot: make one per worker thread. Their async methods do a little work
+//! per poll, so a large job never stalls the worker.
 //!
-//! Routing retains one canonical shortest-path witness per eligible first hop,
-//! not every full path. Selection uses frozen next-hop weights and bounded integer
-//! rejection sampling, reselecting on cache hits for each caller's seed and weights.
-//! Visited positions exclude nodes throughout the path; blocked positions remove
-//! only edges from the source. Queries allow at most 255 visited positions plus
-//! remaining links, 64 blocked inputs, and a 65,536-byte seed. Visited positions
-//! must be distinct and exclude endpoints; blocked duplicates are canonicalized.
-//! Self routes validate inputs before bypassing admission, and zero links reach
-//! only self. Applications may impose tighter forwarding limits.
+//! Every cache has a size limit. Byte counts are estimates, not hard memory
+//! limits. [`Membership::retained_bytes`] counts a shared graph in full for
+//! every membership that uses it, so adding them up overcounts.
 //!
-//! Placement CLOCK and path LRU intentionally remain separate: their pinning,
-//! migration, admission, and variable-byte retention requirements differ.
-//! [`Placement::ENTRY_BYTES`] models resident structures, not allocator metadata
-//! or fragmentation. Membership estimates exclude nested application allocations
-//! and count a shared graph in full for each snapshot. Unique allocation accounting
-//! must deduplicate graphs; conservative publication budgets may count each copy.
-//! Neither estimate is an RSS cap, and leased snapshots need separate headroom.
+//! # Compatibility
 //!
-//! # Application boundary
+//! Every node in a cluster must agree on placement and routing. Both depend
+//! on [`Member::DOMAIN`], member IDs, weights, and this crate's hash formats.
 //!
-//! Racer owns publication, leases, authenticated forwarding, deadlines,
-//! cancellation, health, transport, and application key encoding. Its control
-//! publication owner prepares memberships off the I/O thread, while installation
-//! separately checks accepted state. Canceling a waiter does not cancel CPU work
-//! already started; the application owns job admission and shutdown cleanup.
-//! Racer admits one unfinished preparation job per store without a backlog and
-//! retains its admission after waiter cancellation. Dropping the store joins that
-//! owned job without an independent timeout. Input-size bounds do not guarantee
-//! elapsed time. Unchanged membership version/content can reuse a whole snapshot;
-//! new versions can share graphs through [`Membership::new_with_predecessor`].
-//! Cache budgets are partitioned among I/O workers, while active path-search
-//! limits are per worker. These policies do not belong in the algorithm crate.
-//!
-//! Public constants describe caller contracts: replica/slot geometry, degree,
-//! incremental-delta limit, and placement entry accounting. Work quanta and hash
-//! domains remain implementation details. The non-exhaustive error enum keeps
-//! invalid input, overload, unreachability, and exhausted sampling distinct.
+//! - Changing a domain moves every key and route.
+//! - Hash formats are versioned (`/slot/v1`, `/hrw/v1`,
+//!   `/placement-identity/v1`, `/next-hop/v5`, and ring `v1`). Changing one
+//!   needs a planned cluster-wide rollout. Nothing here detects a mismatch.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-/// Cooperative equal-cost routing over the immutable overlay.
+/// Routing between members.
 mod paths;
 
-/// Weighted rendezvous placement and worker-local ranking maintenance.
+/// Choosing which members store a key.
 mod placement;
 
 pub use paths::{PathQuery, Paths};
@@ -189,54 +137,55 @@ use sha2::Digest;
 
 use std::{mem::size_of, num::NonZeroU32, sync::Arc};
 
-/// Maximum neighbors in the symmetric union of independent hash rings.
+/// Most neighbors any member can have in the graph.
 pub const MAX_DEGREE: usize = 2 * overlay::RINGS as usize;
 
-/// Algorithm inputs snapshotted when constructing a membership.
-/// Domains separate unrelated applications while preserving their hash contracts.
+/// A cluster member, as seen by this crate.
+///
+/// [`Membership`] reads the ID and weight once, when it is built.
 pub trait Member {
-    /// Application hash prefix, which must not contain NUL (`\0`). Empty, ASCII,
-    /// and UTF-8 prefixes are otherwise accepted by [`Membership::new`].
-    /// Hashes concatenate this prefix with an algorithm suffix ending in NUL.
-    /// Excluding NUL here keeps that terminator unambiguous, preventing domain
-    /// bytes from absorbing member data without changing existing hash bytes.
+    /// A name that keeps this application's hashes apart from others.
+    ///
+    /// Must not contain a NUL byte (`\0`). Any other string, even an empty one,
+    /// is fine. Changing it moves every key and route.
     const DOMAIN: &'static str;
 
-    /// Stable identity, sorted lexicographically within the membership.
+    /// Unique ID for this member. Should not change over the member's life.
     fn id(&self) -> &[u8];
 
-    /// Positive relative placement and next-hop selection weight.
+    /// How much this member is favored, compared to others. Higher is more.
+    /// Used for both placement and routing.
     fn weight(&self) -> NonZeroU32;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-/// Membership validation, routing, and admission failures.
+/// Errors from this crate.
 pub enum Error {
-    /// Two records have the same frozen identity.
+    /// Two members have the same ID.
     DuplicateMember,
 
-    /// The member domain contains a NUL byte.
+    /// [`Member::DOMAIN`] contains a NUL byte.
     InvalidDomain,
 
-    /// An identity exceeds the placement hash schema's u32 length limit.
+    /// A member ID is longer than `u32::MAX` bytes.
     InvalidMember,
 
-    /// Positions or hop constraints are invalid.
+    /// A query has a bad position or breaks a limit.
     InvalidQuery,
 
-    /// The configured concurrent work limit is reached.
+    /// Too much work is already running.
     Overloaded,
 
-    /// No eligible route exists within the hop budget.
+    /// No route fits within the allowed hops.
     Unreachable,
 
-    /// Bounded unbiased random selection exhausted its retry budget.
+    /// Weighted random picking ran out of tries. Very rare.
     SamplingExhausted,
 }
 
 impl std::fmt::Display for Error {
-    /// Describe the failure without exposing application-owned records.
+    /// Short description of the error.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::DuplicateMember => "duplicate member identity",
@@ -252,62 +201,62 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Maximum changed IDs retained for incremental computation.
+/// Most member changes [`Membership::with_predecessor`] will track. Bigger
+/// changes are handled by recomputing from scratch.
 pub const MAX_INCREMENTAL_CHANGES: usize = 64;
 
-/// Immutable ID-sorted members and bounded predecessor hints.
+/// A fixed set of members, sorted by ID.
 ///
-/// IDs and weights are snapshotted at construction. Original records remain
-/// accessible for metadata, but interior mutation cannot change algorithm inputs.
-/// Membership is `Send` and `Sync` when `M` is; caches remain worker-local.
+/// IDs and weights are copied when it is built, so later changes to the
+/// records do not affect it. It can be shared across threads if `M` can.
 #[derive(Debug)]
 pub struct Membership<M: Member> {
-    /// Application records kept in frozen ID order, not read during algorithms.
+    /// The original records, in ID order.
     members: Vec<M>,
 
-    /// Owned identity bytes that interior application mutation cannot change.
+    /// Copied IDs, in order.
     ids: Vec<Box<[u8]>>,
 
-    /// Positive placement and next-hop weights frozen alongside the IDs.
+    /// Copied weights, matching `ids`.
     weights: Vec<NonZeroU32>,
 
-    /// Placement schema digest including weights.
+    /// Hash of the domain, IDs, and weights.
     identity: [u8; 32],
 
-    /// Overlay schema digest excluding weights.
+    /// Hash of the domain and IDs only. Used as the route cache key.
     topology_identity: [u8; 32],
 
-    /// Immutable adjacency shared by searches and ID-identical successors.
+    /// Neighbor lists. Shared with later memberships that have the same IDs.
     graph: Arc<Vec<Vec<usize>>>,
 
-    /// Construction-time allocation estimate, excluding the replaceable delta.
+    /// Estimated bytes, measured once at build time. Excludes `delta`.
     owned_bytes: usize,
 
-    /// Optional bounded hint for exactly one predecessor generation.
+    /// What changed since the previous membership, if known.
     delta: Option<MembershipDelta>,
 }
 
-/// One changed ID with positions in its old and new snapshots.
+/// One member that changed, with its position in the old and new lists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MemberChange {
-    /// An ID present only in the predecessor.
+    /// The member left.
     Removed { old: usize },
 
-    /// An ID present only in the replacement.
+    /// The member joined.
     Added { new: usize },
 
-    /// An unchanged ID whose frozen weight changed.
+    /// The member stayed but its weight changed.
     Reweighted {
-        /// Position of the ID in the predecessor.
+        /// Position in the old list.
         old: usize,
 
-        /// Position of that same ID in the replacement.
+        /// Position in the new list.
         new: usize,
     },
 }
 
 impl MemberChange {
-    /// Return the predecessor position, if this ID existed there.
+    /// Position in the old list, if the member was there.
     fn old_position(self) -> Option<usize> {
         match self {
             Self::Removed { old } | Self::Reweighted { old, .. } => Some(old),
@@ -315,7 +264,7 @@ impl MemberChange {
         }
     }
 
-    /// Return the replacement position, if this ID still exists.
+    /// Position in the new list, if the member is there.
     fn new_position(self) -> Option<usize> {
         match self {
             Self::Added { new } | Self::Reweighted { new, .. } => Some(new),
@@ -324,51 +273,51 @@ impl MemberChange {
     }
 }
 
-/// Bounded, ID-ordered changes relative to one predecessor generation.
+/// Changes from one previous membership, in ID order.
 #[derive(Debug)]
 struct MembershipDelta {
-    /// Placement identity of the predecessor, including its frozen weights.
+    /// [`Membership::identity`] of the previous membership.
     base: [u8; 32],
 
-    /// Number of scores needed before predecessor winners can be reused.
+    /// Member count of the previous membership.
     old_count: usize,
 
-    /// Changes ordered by frozen ID for exact old-to-new index translation.
+    /// The changes, in ID order.
     changes: Vec<MemberChange>,
 }
 
 impl<M: Member> Membership<M> {
-    /// Freeze member IDs and weights, sort by ID, and construct ring adjacency.
+    /// Build a membership: copy IDs and weights, sort by ID, and build the graph.
     ///
-    /// Each accessor is read once. Construction hashes each ID 32 times and sorts
-    /// 32 rings, with O(64 N) adjacency and O(N) temporary ring sorting storage.
+    /// This runs synchronously and takes O(N log N) time, so choose where to
+    /// run it with care for large memberships.
     ///
     /// # Errors
-    /// Returns [`Error::InvalidDomain`] for NUL-containing domains,
-    /// [`Error::DuplicateMember`] for duplicate frozen IDs, or
-    /// [`Error::InvalidMember`] for an ID longer than `u32::MAX` bytes.
+    /// - [`Error::InvalidDomain`] if [`Member::DOMAIN`] contains NUL.
+    /// - [`Error::DuplicateMember`] if two members share an ID.
+    /// - [`Error::InvalidMember`] if an ID is longer than `u32::MAX` bytes.
     ///
     /// # Panics
-    /// Propagates panics from application-provided [`Member`] accessors.
+    /// Panics if a [`Member`] method panics.
     pub fn new(members: Vec<M>) -> Result<Self, Error> {
         Self::build(members, None)
     }
 
-    /// Freeze members and prepare hints, sharing the predecessor's immutable
-    /// graph when frozen IDs match. Weight and metadata changes do not rebuild
-    /// rings. Changed IDs use the same construction as [`Self::new`].
-    /// Does not retain the predecessor membership itself.
+    /// Build a membership that replaces `old`.
+    ///
+    /// Same as [`Self::new`] followed by [`Self::with_predecessor`], but also
+    /// reuses `old`'s graph when the IDs are the same. Does not keep `old` alive.
     ///
     /// # Errors
-    /// Returns the same validation errors as [`Self::new`].
+    /// Same as [`Self::new`].
     ///
     /// # Panics
-    /// Propagates panics from application-provided [`Member`] accessors.
+    /// Panics if a [`Member`] method panics.
     pub fn new_with_predecessor(members: Vec<M>, old: &Self) -> Result<Self, Error> {
         Ok(Self::build(members, Some(old))?.with_predecessor(old))
     }
 
-    /// Validate and snapshot records, optionally reusing ID-identical adjacency.
+    /// Shared code for the constructors. Reuses `old`'s graph if IDs match.
     fn build(members: Vec<M>, old: Option<&Self>) -> Result<Self, Error> {
         if M::DOMAIN.as_bytes().contains(&0) {
             return Err(Error::InvalidDomain);
@@ -418,10 +367,11 @@ impl<M: Member> Membership<M> {
         Ok(membership)
     }
 
-    /// Prepare bounded incremental hints outside request processing.
-    /// Larger changes use exact cooperative cold computation on demand.
-    /// Replaces previous hints, retaining at most [`MAX_INCREMENTAL_CHANGES`]
-    /// changed IDs. Does not retain the predecessor or replace this graph.
+    /// Record what changed since `old`, so [`Placement`] can update cheaply.
+    ///
+    /// Only up to [`MAX_INCREMENTAL_CHANGES`] changes are recorded. With more,
+    /// nothing is recorded and placement recomputes from scratch. Replaces any
+    /// earlier record. Does not keep `old` alive or change the graph.
     #[must_use]
     pub fn with_predecessor(mut self, old: &Self) -> Self {
         // Identical or over-budget replacements must not retain a stale hint.
@@ -466,67 +416,65 @@ impl<M: Member> Membership<M> {
         self
     }
 
-    /// Original records ordered by frozen ID; mutation cannot alter snapshots.
+    /// The original records, sorted by ID.
     #[must_use]
     pub fn members(&self) -> &[M] {
         &self.members
     }
 
-    /// Find a frozen ID's position, or `None` if it is absent.
+    /// Position of the member with this ID, or `None` if there is none.
     #[must_use]
     pub fn position(&self, id: &[u8]) -> Option<usize> {
         self.ids.binary_search_by(|m| m.as_ref().cmp(id)).ok()
     }
 
-    /// Placement identity v1 over domain, frozen IDs, and frozen weights only.
+    /// Hash of the domain, IDs, and weights. Equal hashes mean equal placement.
     #[must_use]
     pub fn identity(&self) -> [u8; 32] {
         self.identity
     }
 
-    /// Frozen ID at a valid position.
+    /// ID at a position.
     ///
     /// # Panics
-    /// Panics if the position is outside the member slice.
+    /// Panics if the position is out of range.
     fn id(&self, position: usize) -> &[u8] {
         &self.ids[position]
     }
 
-    /// Frozen weight at a valid position.
+    /// Weight at a position.
     ///
     /// # Panics
-    /// Panics if the position is outside the member slice.
+    /// Panics if the position is out of range.
     fn weight(&self, position: usize) -> NonZeroU32 {
         self.weights[position]
     }
 
-    /// Domain, frozen IDs, and overlay algorithm, independent of weights.
+    /// Hash of the domain and IDs. Weights are left out.
     fn topology_identity(&self) -> [u8; 32] {
         self.topology_identity
     }
 
-    /// Sorted, unique, symmetric ring neighbors; invalid positions return empty.
+    /// Neighbors of a member, sorted. Empty if the position is out of range.
     #[must_use]
     pub fn neighbors(&self, position: usize) -> Vec<usize> {
         self.neighbor_slice(position).to_vec()
     }
 
-    /// Borrow sorted adjacency without allocating; invalid positions return empty.
+    /// Like [`Self::neighbors`], but borrows instead of copying.
     fn neighbor_slice(&self, position: usize) -> &[usize] {
         self.graph.get(position).map_or(&[], Vec::as_slice)
     }
 
-    /// Share immutable adjacency with cooperative searches without copying it.
+    /// A shared handle to the graph.
     fn graph(&self) -> Arc<Vec<Vec<usize>>> {
         Arc::clone(&self.graph)
     }
 
-    /// Estimated allocated storage using retained capacities rather than lengths.
-    /// Includes frozen inputs, member buffer, delta, and the full shared graph.
-    /// Excludes this inline object, allocator overhead, and nested allocations in
-    /// application records. Count shared graphs once for unique-allocation totals.
-    /// Saturates at `usize::MAX`. O(1): immutable storage is measured once and only
-    /// the bounded delta capacity is inspected on each call.
+    /// Estimated heap bytes used by this membership. Fast to call.
+    ///
+    /// Counts the full graph even when it is shared with another membership.
+    /// Does not count heap memory owned by your records.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self.owned_bytes
@@ -538,7 +486,7 @@ impl<M: Member> Membership<M> {
             }))
     }
 
-    /// Measure immutable capacities once, charging the entire shared graph.
+    /// Measure the fixed part of [`Self::retained_bytes`].
     fn measure_owned_bytes(&self) -> usize {
         let mut bytes = self.members.capacity().saturating_mul(size_of::<M>());
         bytes = bytes.saturating_add(self.ids.capacity().saturating_mul(size_of::<Box<[u8]>>()));
@@ -564,55 +512,55 @@ impl<M: Member> Membership<M> {
     }
 }
 
-/// Reject IDs that cannot be represented by the placement hash schema.
+/// Reject IDs longer than `u32::MAX` bytes.
 fn validate_id_length(length: usize) -> Result<(), Error> {
     u32::try_from(length)
         .map(|_| ())
         .map_err(|_| Error::InvalidMember)
 }
 
-/// Stable SHA-256 helpers; callers own schema domains and field order.
+/// SHA-256 helpers. Hash output must never change, so edit with care.
 mod hash {
     use crate::Member;
 
     use sha2::{Digest, Sha256};
 
-    /// Start a hash with the member domain and exact algorithm suffix.
+    /// Start a hash with the member domain and then `suffix`.
     pub(super) fn domain<M: Member>(suffix: &[u8]) -> Sha256 {
         let mut hash = named_domain(M::DOMAIN.as_bytes());
         hash.update(suffix);
         hash
     }
 
-    /// Start a hash with the exact domain, including any schema terminator.
+    /// Start a hash with exactly these bytes.
     fn named_domain(name: &[u8]) -> Sha256 {
         let mut hash = Sha256::new();
         hash.update(name);
         hash
     }
 
-    /// Append a u32-length-prefixed field; callers must bound its length.
+    /// Add a value, preceded by its length as a big-endian u32.
     pub(super) fn bytes(hash: &mut Sha256, value: &[u8]) {
         hash.update(field_length(value.len()).to_be_bytes());
         hash.update(value);
     }
 
-    /// Check length representability without silently truncating schema bytes.
+    /// Convert a length to u32. Panics if it does not fit.
     fn field_length(length: usize) -> u32 {
         u32::try_from(length).expect("topology hash fields must fit the u32 length schema")
     }
 
-    /// Finalize the key without changing the underlying digest.
+    /// Finish the hash.
     pub(super) fn finish(hash: Sha256) -> [u8; 32] {
         hash.finalize().into()
     }
 
-    /// Exact encoding and boundary checks for shared hash primitives.
+    /// Hash helper tests.
     #[cfg(test)]
     mod tests {
         use super::*;
 
-        /// Length conversion accepts schema endpoints and rejects overflow.
+        /// Lengths up to `u32::MAX` work; longer ones panic.
         #[test]
         fn length_prefix_checks_without_allocating_gigabytes() {
             assert_eq!(field_length(0), 0);
@@ -622,7 +570,7 @@ mod hash {
             }
         }
 
-        /// Helper composition preserves exact application domain and field bytes.
+        /// The helpers produce exactly the expected bytes.
         #[test]
         fn exact_domain_and_length_prefix_bytes() {
             let mut hash = named_domain(b"app/key/v1\0");
@@ -636,7 +584,7 @@ mod hash {
             );
         }
 
-        /// Length framing and domains distinguish otherwise ambiguous inputs.
+        /// Different splits of the same bytes, or different domains, hash differently.
         #[test]
         fn field_boundaries_and_domains_are_distinct() {
             let key = |domain: &[u8], a: &[u8], b: &[u8]| {
@@ -651,24 +599,25 @@ mod hash {
     }
 }
 
-/// Symmetric union of 32 domain-separated SHA-256 rings over frozen IDs.
-/// Weights never affect edges. Construction retains at most 64 N adjacency
-/// slots and reuses one N-entry digest/position array as sorting scratch.
+/// The member graph.
+///
+/// Each of 32 rings orders members by a different hash of their ID. Each
+/// member links to its two neighbors in every ring. Weights play no part.
 mod overlay {
     use crate::{Member, hash};
 
     use sha2::Digest;
 
-    /// Number of independent rings in this compatibility version.
+    /// Number of rings.
     pub(super) const RINGS: u32 = 32;
 
-    /// Exact compatibility prefix for each ring's ordering digest.
+    /// Hash prefix for ring order. Changing it changes every graph.
     const RING_DOMAIN: &[u8] = b"/overlay/sha256-rings-32/v1\0";
 
-    /// Exact compatibility prefix for graph cache identities.
+    /// Hash prefix for `identity`.
     const IDENTITY_DOMAIN: &[u8] = b"/topology-identity/sha256-rings-32/v1\0";
 
-    /// Hash the domain, algorithm version, and sorted IDs without weights.
+    /// Hash the domain and sorted IDs. Weights are left out.
     pub(super) fn identity<M: Member>(ids: &[Box<[u8]>]) -> [u8; 32] {
         let mut digest = hash::domain::<M>(IDENTITY_DOMAIN);
         for id in ids {
@@ -678,7 +627,7 @@ mod overlay {
         hash::finish(digest)
     }
 
-    /// Join consecutive sorted ring entries, then canonicalize adjacency rows.
+    /// Build sorted, duplicate-free neighbor lists from all rings.
     pub(super) fn build<M: Member>(ids: &[Box<[u8]>]) -> Vec<Vec<usize>> {
         let mut graph: Vec<_> = (0..ids.len())
             .map(|_| Vec::with_capacity(if ids.len() > 1 { 2 * RINGS as usize } else { 0 }))
@@ -713,7 +662,7 @@ mod overlay {
         graph
     }
 
-    /// Overlay invariants and ID-local churn checks.
+    /// Graph tests.
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -722,35 +671,35 @@ mod overlay {
 
         use std::{collections::BTreeSet, num::NonZeroU32};
 
-        /// Fixed-width ID and positive weight for ring tests.
+        /// Test member with a 4-byte ID.
         #[derive(Clone, Debug)]
         struct Node([u8; 4], NonZeroU32);
 
         impl Member for Node {
             const DOMAIN: &'static str = "overlay-tests";
 
-            /// Return the stable binary ID.
+            /// Return the ID.
             fn id(&self) -> &[u8] {
                 &self.0
             }
 
-            /// Return the supplied positive weight.
+            /// Return the weight.
             fn weight(&self) -> NonZeroU32 {
                 self.1
             }
         }
 
-        /// Build one equally weighted test node.
+        /// Test member with weight 1.
         fn node(id: u32) -> Node {
             Node(id.to_be_bytes(), NonZeroU32::new(1).unwrap())
         }
 
-        /// Leave odd ID gaps to exercise ordered insertions.
+        /// Members with even IDs, leaving gaps to insert odd ones.
         fn membership(count: u32) -> Membership<Node> {
             Membership::new((0..count).map(|id| node(2 * id)).collect()).unwrap()
         }
 
-        /// Express undirected edges in stable IDs rather than shifted positions.
+        /// All edges, as ID pairs, so they can be compared across memberships.
         fn edges(members: &Membership<Node>) -> BTreeSet<(Vec<u8>, Vec<u8>)> {
             let mut edges = BTreeSet::new();
             for position in 0..members.members().len() {
@@ -763,7 +712,7 @@ mod overlay {
             edges
         }
 
-        /// Validate graph invariants across empty, small, and larger memberships.
+        /// Graphs are symmetric, connected, size-limited, and order-independent.
         #[test]
         fn symmetric_connected_bounded_and_deterministic() {
             for count in [0, 1, 2, 3, 32, 65, 257, 1024] {
@@ -806,7 +755,7 @@ mod overlay {
             }
         }
 
-        /// Joins and leaves alter only predecessor/successor edges in each ring.
+        /// A join or leave only changes edges next to that member.
         #[test]
         fn joins_and_leaves_change_only_local_id_edges() {
             let old = membership(512);
@@ -853,52 +802,52 @@ mod overlay {
     }
 }
 
-/// Membership snapshots, validation, bounded deltas, and allocation accounting.
+/// Membership tests.
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::{num::NonZeroU32, rc::Rc};
 
-    /// Arbitrary binary ID with a positive test weight.
+    /// Test member with a binary ID and a weight.
     #[derive(Clone, Debug)]
     struct BinaryMember(Vec<u8>, NonZeroU32);
 
     impl Member for BinaryMember {
         const DOMAIN: &'static str = "binary-store";
 
-        /// Return the binary identity.
+        /// Return the ID.
         fn id(&self) -> &[u8] {
             &self.0
         }
 
-        /// Return the positive placement weight.
+        /// Return the weight.
         fn weight(&self) -> NonZeroU32 {
             self.1
         }
     }
 
-    /// Build a binary test member with a checked positive weight.
+    /// Build a test member. `weight` must not be zero.
     fn member(id: &[u8], weight: u32) -> BinaryMember {
         BinaryMember(id.to_vec(), NonZeroU32::new(weight).unwrap())
     }
 
-    /// Define a test member using a chosen application hash domain.
+    /// Define a test member type with the given domain.
     macro_rules! domain_member {
         ($name:ident, $domain:expr) => {
-            /// Binary test record with a distinct compile-time domain.
+            /// Test member with its own domain.
             #[derive(Debug)]
             struct $name(BinaryMember);
 
             impl Member for $name {
                 const DOMAIN: &'static str = $domain;
 
-                /// Return the wrapped binary identity.
+                /// Return the wrapped ID.
                 fn id(&self) -> &[u8] {
                     self.0.id()
                 }
 
-                /// Return the wrapped positive weight.
+                /// Return the wrapped weight.
                 fn weight(&self) -> NonZeroU32 {
                     self.0.weight()
                 }
@@ -906,7 +855,7 @@ mod tests {
         };
     }
 
-    /// Reject domains that could absorb placement field framing.
+    /// A domain crafted to fake another hash input is rejected.
     #[test]
     fn domain_member_concatenation_collision_is_rejected() {
         domain_member!(Plain, "x");
@@ -931,10 +880,10 @@ mod tests {
         );
     }
 
-    /// Domain validation applies before empty/nonempty membership processing.
+    /// Domains with NUL are rejected, even for empty memberships.
     #[test]
     fn nul_domains_rejected_for_empty_and_nonempty_memberships() {
-        /// Check both empty and populated records for the invalid domain.
+        /// Expect `InvalidDomain` with and without members.
         macro_rules! check {
             ($domain:expr) => {{
                 domain_member!(Invalid, $domain);
@@ -953,10 +902,10 @@ mod tests {
         );
     }
 
-    /// Empty, Unicode, and non-NUL control bytes remain valid domain inputs.
+    /// Empty, Unicode, and control-character domains are allowed.
     #[test]
     fn domains_without_nul_remain_valid() {
-        /// Check the valid domain with empty and binary-ID records.
+        /// Expect success with and without members.
         macro_rules! check {
             ($domain:expr) => {{
                 domain_member!(Valid, $domain);
@@ -974,7 +923,7 @@ mod tests {
         check!("存储/é");
     }
 
-    /// Frozen binary ordering is deterministic and duplicates are invalid.
+    /// Members sort by ID bytes, duplicates fail, and empty is fine.
     #[test]
     fn binary_ids_sorted_duplicate_rejected_and_empty_allowed() {
         let members = Membership::new(vec![
@@ -1004,7 +953,7 @@ mod tests {
         assert_eq!(members.identity(), reordered.identity());
     }
 
-    /// Ordered changes retain old/new positions and fall back beyond 64 IDs.
+    /// Changes keep both positions and stop being tracked above 64.
     #[test]
     fn predecessor_delta_preserves_indices_and_caps_changes() {
         let old = Membership::new(vec![member(b"a", 1), member(b"c", 1), member(b"d", 1)]).unwrap();
@@ -1038,7 +987,7 @@ mod tests {
         }
     }
 
-    /// Typed changes expose only positions that exist in their snapshot.
+    /// Each change kind reports only the positions it has.
     #[test]
     fn member_changes_expose_only_present_positions() {
         for (change, old, new) in [
@@ -1055,12 +1004,12 @@ mod tests {
         }
     }
 
-    /// Interior record changes cannot affect frozen identity, weight, or graph.
+    /// Changing a record after build does not change the membership.
     #[test]
     fn interior_mutation_cannot_change_frozen_inputs() {
         use std::cell::Cell;
 
-        /// Mutable application metadata used to challenge snapshot isolation.
+        /// Record whose ID and weight can change after use.
         #[derive(Debug)]
         struct Mutable {
             id: Rc<Cell<&'static [u8]>>,
@@ -1071,12 +1020,12 @@ mod tests {
         impl Member for Mutable {
             const DOMAIN: &'static str = "mutable";
 
-            /// Read the current application identity.
+            /// Return the current ID.
             fn id(&self) -> &[u8] {
                 self.id.get()
             }
 
-            /// Read the current application weight.
+            /// Return the current weight.
             fn weight(&self) -> NonZeroU32 {
                 self.weight.get()
             }
@@ -1114,7 +1063,7 @@ mod tests {
         );
     }
 
-    /// Placement bytes remain v1 while graph identities exclude weights.
+    /// Placement hash is unchanged from v1; graph hash ignores weights.
     #[test]
     fn placement_identity_preserves_v1_and_topology_ignores_weights() {
         let old = Membership::new(vec![member(b"b", 9), member(b"a", 1)]).unwrap();
@@ -1138,7 +1087,7 @@ mod tests {
         assert_ne!(old.topology_identity(), other.topology_identity());
     }
 
-    /// Replacing hints with identical or over-budget predecessors clears them.
+    /// An identical or too-different predecessor clears old change records.
     #[test]
     fn replacing_predecessor_clears_stale_delta() {
         let old = Membership::new(vec![member(b"a", 1)]).unwrap();
@@ -1156,7 +1105,7 @@ mod tests {
         assert!(new.delta.is_none());
     }
 
-    /// Compare bounded merge diffs with an independently ordered ID-map oracle.
+    /// Random change lists match a simple map-based reference.
     #[test]
     fn randomized_diff_matches_independent_id_map() {
         use std::collections::{BTreeMap, BTreeSet};
@@ -1227,7 +1176,7 @@ mod tests {
         assert!(cold_cases > 0);
     }
 
-    /// Account for actual retained capacities including the full shared graph.
+    /// Byte estimate matches a hand count, including the shared graph.
     #[test]
     fn retained_storage_counts_capacities_and_shared_graph_once() {
         let old = Membership::new(vec![member(b"a", 1)]).unwrap();
@@ -1258,10 +1207,10 @@ mod tests {
         );
     }
 
-    /// Plain records permit snapshots and their shared graph to cross threads.
+    /// A membership of plain records can move to another thread.
     #[test]
     fn membership_is_send_and_sync_for_plain_members() {
-        /// Require both auto traits at compile time.
+        /// Compile only if `T` is `Send` and `Sync`.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Membership<BinaryMember>>();
         let members = Membership::new(vec![member(b"a", 1), member(b"b", 2)]).unwrap();
@@ -1275,7 +1224,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Validate length boundaries without constructing gigabyte-sized records.
+    /// ID length limit, checked without huge allocations.
     #[test]
     fn member_id_length_is_checked_without_large_allocations() {
         assert_eq!(validate_id_length(0), Ok(()));
@@ -1287,7 +1236,7 @@ mod tests {
         }
     }
 
-    /// Graph sharing depends only on frozen ID equality, not weight equality.
+    /// The graph is reused when IDs match, even if weights differ.
     #[test]
     fn predecessor_constructor_shares_graph_only_for_identical_frozen_ids() {
         let old = Membership::new(vec![member(b"a", 1), member(b"b", 2)]).unwrap();
@@ -1308,7 +1257,7 @@ mod tests {
         );
     }
 
-    /// A sentinel proves retained accounting uses cached immutable storage.
+    /// `retained_bytes` uses the stored measure plus the change list.
     #[test]
     fn retained_bytes_uses_cached_storage_and_bounded_delta_capacity() {
         let old = Membership::new(vec![member(b"a", 1)]).unwrap();

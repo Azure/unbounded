@@ -1,4 +1,4 @@
-//! Application workflows using only the topology crate's public API.
+//! End-to-end tests that use only the public API.
 
 use futures::{executor::block_on, task::noop_waker_ref};
 
@@ -6,31 +6,32 @@ use std::{future::Future, num::NonZeroU32, task::Context};
 
 use topology::{Error, Maintenance, Member, Membership, PathQuery, Paths, Placement};
 
-/// Application-owned fixed-width identity for placement and forwarding workflows.
+/// Test member with a 4-byte ID.
 #[derive(Clone, Debug)]
 struct Node([u8; 2]);
 
 impl Member for Node {
     const DOMAIN: &'static str = "workflow-store";
 
-    /// Expose the node's binary identity.
+    /// Return the ID.
     fn id(&self) -> &[u8] {
         &self.0
     }
 
-    /// Give every workflow node equal selection weight.
+    /// Every member has weight 1.
     fn weight(&self) -> NonZeroU32 {
         NonZeroU32::new(1).unwrap()
     }
 }
 
-/// Freeze reverse discovery order into canonical membership positions.
+/// Build a membership, passing members in reverse order.
 fn members(ids: std::ops::Range<u16>) -> Membership<Node> {
     // Discovery order is intentionally different from membership position order.
     Membership::new(ids.rev().map(|id| Node(id.to_be_bytes())).collect()).unwrap()
 }
 
-/// Check endpoints, budget, loop freedom, filters, and public overlay edges.
+/// Check that a route is valid: right ends, within limits, no loops,
+/// respects filters, and follows real graph edges.
 fn assert_route<M: Member>(members: &Membership<M>, query: PathQuery<'_>, route: &[usize]) {
     assert_eq!(route.first(), Some(&query.from));
     assert_eq!(route.last(), Some(&query.to));
@@ -47,7 +48,7 @@ fn assert_route<M: Member>(members: &Membership<M>, query: PathQuery<'_>, route:
     }
 }
 
-/// Route toward placement replicas and recover from failures at each relay.
+/// Route to a key's owners and retry around failures at each hop.
 #[test]
 fn route_to_a_replica_forward_without_loops_and_recover_from_blocked_links() {
     let members = members(0..1000);
@@ -154,7 +155,7 @@ fn route_to_a_replica_forward_without_loops_and_recover_from_blocked_links() {
     assert_eq!(block_on(paths.route(&members, query)).unwrap(), original);
 }
 
-/// Replace snapshots during cooperative placement and recover after cancellation.
+/// Swap memberships during async placement and recover after cancellation.
 #[test]
 fn replace_membership_during_pending_placement_then_fall_back_for_large_changes() {
     let old = members(0..600);
@@ -212,7 +213,7 @@ fn replace_membership_during_pending_placement_then_fall_back_for_large_changes(
     assert_eq!(placement.rank(&old, key).unwrap(), expected_old);
 }
 
-/// A stable identity whose weight may differ between immutable snapshots.
+/// Test member whose weight can differ between memberships.
 #[derive(Clone)]
 struct WeightedNode {
     id: Vec<u8>,
@@ -223,18 +224,19 @@ struct WeightedNode {
 impl Member for WeightedNode {
     const DOMAIN: &'static str = "racer";
 
-    /// Return the stable ID shared by predecessor and successor snapshots.
+    /// Return the ID.
     fn id(&self) -> &[u8] {
         &self.id
     }
 
-    /// Return this snapshot's selection weight.
+    /// Return the weight.
     fn weight(&self) -> NonZeroU32 {
         self.weight
     }
 }
 
-/// Share search admission across successors, cancel waiters, and reselect hits.
+/// Memberships that differ only in weight share searches; canceled callers
+/// free their slot; cache hits pick again.
 #[test]
 fn shared_routes_survive_cancellation_and_weight_only_successors() {
     let old = Membership::new(

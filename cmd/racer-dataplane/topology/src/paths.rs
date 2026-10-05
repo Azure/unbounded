@@ -1,4 +1,6 @@
-//! Bounded-degree graph and cooperative equal-cost shortest-path routing.
+//! Shortest-path routing over the membership graph.
+//!
+//! Searches run in small steps so one route never blocks a worker for long.
 
 use crate::{Error, MAX_DEGREE, Member, Membership, hash};
 
@@ -13,35 +15,37 @@ use std::{
     task::Poll,
 };
 
-/// Positions in one membership. `visited` excludes both endpoints and contains
-/// no duplicates; its length plus `links` may not exceed `u8::MAX`. `blocked`
-/// excludes only edges out of `from`, not these members at subsequent hops.
-/// Unordered sets are canonicalized; duplicate blocked positions are accepted.
+/// A route request. All positions refer to the same membership.
+///
+/// - `visited` must not repeat and must not contain `from` or `to`.
+/// - `visited.len() + links` must be at most 255.
+/// - `blocked` only stops the first hop out of `from`. Repeats are fine.
 #[derive(Clone, Copy, Debug)]
 pub struct PathQuery<'a> {
-    /// Source position in the supplied membership.
+    /// Where the route starts.
     pub from: usize,
 
-    /// Destination position in the supplied membership.
+    /// Where the route ends.
     pub to: usize,
 
-    /// Maximum number of edges in the returned route.
+    /// Most hops the route may take.
     pub links: u8,
 
-    /// Previously visited positions, distinct and excluding both endpoints.
+    /// Members the route must not pass through.
     pub visited: &'a [usize],
 
-    /// At most 64 positions (including duplicates). Only source edges are blocked;
-    /// valid positions that are not source neighbors are ignored canonically.
+    /// Neighbors of `from` to skip as the first hop. At most 64 entries.
+    /// Members that are not neighbors of `from` are ignored.
     pub blocked: &'a [usize],
 
-    /// Opaque selection seed, at most 65,536 bytes. The v5 selection schema
-    /// length-prefixes seed, source ID, and destination ID separately.
+    /// Picks among equally short routes. The same seed gives the same pick.
+    /// At most 65,536 bytes.
     pub seed: &'a [u8],
 }
 
-/// Worker-local bounded cache of eligible alternatives, reselected for every seed.
-/// No executor, clocks, I/O, health state, or application membership leases.
+/// Finds routes and caches the results.
+///
+/// Use one per worker thread. It does no I/O and has no timers.
 pub struct Paths {
     cache_entries: usize,
 
@@ -54,16 +58,17 @@ pub struct Paths {
     inflight: RefCell<BTreeMap<PathKey, Rc<RefCell<SharedSearch>>>>,
 }
 
-/// Maximum vertex expansions performed by one cooperative poll.
+/// Most nodes one poll may expand before yielding.
 const SEARCH_QUANTUM: usize = 32;
 
-/// Maximum opaque seed length accepted before allocating search state.
+/// Longest seed we accept.
 const MAX_SEED_BYTES: usize = 65_536;
 
-/// Routing operations share the crate's public error vocabulary.
+/// Result type for routing.
 type Result<T> = std::result::Result<T, Error>;
 
-/// Canonical search identity, deliberately independent of weights and seed.
+/// Cache key for a search. Weights and seed are left out on purpose, so
+/// requests that differ only in those share one search.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct PathKey {
     membership: [u8; 32],
@@ -80,7 +85,7 @@ struct PathKey {
 }
 
 impl PathKey {
-    /// Validate positions and limits, then canonicalize the unordered filters.
+    /// Check the query and sort its lists so equal queries get equal keys.
     fn new<M: Member>(membership: &Membership<M>, query: &PathQuery<'_>) -> Result<Self> {
         let count = membership.members().len();
         if query.from >= count
@@ -121,10 +126,10 @@ impl PathKey {
     }
 }
 
-/// Immutable route witnesses shared only within the owning worker.
+/// Candidate routes, one per usable first hop.
 type Alternatives = Rc<Vec<Vec<usize>>>;
 
-/// Byte-accounted LRU with shared keys linking entries in recency order.
+/// LRU cache of search results, limited by entry count and bytes.
 #[derive(Default)]
 struct PathCache {
     entries: BTreeMap<Rc<PathKey>, CacheEntry>,
@@ -136,7 +141,7 @@ struct PathCache {
     bytes: usize,
 }
 
-/// One retained result and its neighboring entries in the LRU chain.
+/// One cached result plus its links to older and newer entries.
 struct CacheEntry {
     alternatives: Alternatives,
 
@@ -148,11 +153,10 @@ struct CacheEntry {
 }
 
 impl PathCache {
-    /// Charge a full current-std B-tree internal node for every entry, rather
-    /// than relying on occupancy: 11 key/value slots, 12 child pointers, and a
-    /// generously rounded header. This deliberately overcounts sparse nodes.
-    /// The standard library does not promise node layout: this is an estimate,
-    /// not a hard allocator bound. Shared keys are allocated/counted only once.
+    /// Estimate the bytes one entry uses.
+    ///
+    /// Charges a full B-tree node per entry, so it errs high. This is an
+    /// estimate, since the standard library does not promise its layout.
     fn entry_bytes(key: &PathKey, alternatives: &[Vec<usize>], capacity: usize) -> usize {
         let node =
             11 * (size_of::<Rc<PathKey>>() + size_of::<CacheEntry>()) + 16 * size_of::<usize>();
@@ -167,7 +171,7 @@ impl PathCache {
         })
     }
 
-    /// Join an entry's neighbors after removing it from the recency chain.
+    /// Remove an entry from the LRU chain by linking its neighbors together.
     fn unlink(&mut self, older: Option<&Rc<PathKey>>, newer: Option<&Rc<PathKey>>) {
         if let Some(key) = older {
             self.entries.get_mut(key).unwrap().newer = newer.cloned();
@@ -181,7 +185,7 @@ impl PathCache {
         }
     }
 
-    /// Share a cached result and promote its entry without allocating a key.
+    /// Return a cached result and mark it as most recently used.
     fn get(&mut self, key: &PathKey) -> Option<Alternatives> {
         let (owned, entry) = self.entries.get_key_value(key)?;
         let alternatives = Rc::clone(&entry.alternatives);
@@ -200,7 +204,7 @@ impl PathCache {
         Some(alternatives)
     }
 
-    /// Remove the oldest entry from a nonempty cache and release its charge.
+    /// Drop the oldest entry. The cache must not be empty.
     fn evict(&mut self) {
         let key = self.oldest.take().unwrap();
         let entry = self.entries.remove(&key).unwrap();
@@ -212,7 +216,8 @@ impl PathCache {
         }
     }
 
-    /// Retain a new result within both limits, bypassing duplicates and oversize.
+    /// Add a result, evicting old entries to stay within limits. Skips
+    /// duplicates and results too big to fit at all.
     fn store(&mut self, key: PathKey, alternatives: Alternatives, entries: usize, bytes: usize) {
         if entries == 0 || bytes == 0 || self.entries.contains_key(&key) {
             return;
@@ -245,7 +250,7 @@ impl PathCache {
     }
 }
 
-/// Shared progress always owns either a live search or its completed result.
+/// A search that several callers may be waiting on.
 enum SharedSearch {
     Working(Box<EqualCostSearch>),
 
@@ -253,7 +258,8 @@ enum SharedSearch {
 }
 
 impl SharedSearch {
-    /// Advance one bounded turn, publishing completion to every retained waiter.
+    /// Run one small step. When done, cache the result and share it with
+    /// every waiter.
     fn poll(
         &mut self,
         paths: &Paths,
@@ -283,7 +289,7 @@ impl SharedSearch {
     }
 }
 
-/// A waiter's ownership of one admitted search generation.
+/// One caller's hold on a running search.
 struct SearchAdmission<'a> {
     paths: &'a Paths,
 
@@ -293,7 +299,7 @@ struct SearchAdmission<'a> {
 }
 
 impl Drop for SearchAdmission<'_> {
-    /// Cancel scratch state only when the last waiter owns this exact generation.
+    /// If this is the last caller waiting, cancel the search.
     fn drop(&mut self) {
         let mut inflight = self.paths.inflight.borrow_mut();
         if inflight
@@ -306,26 +312,21 @@ impl Drop for SearchAdmission<'_> {
 }
 
 impl Paths {
-    /// Cache at most `capacity` queries and 8 MiB of accounted storage.
-    /// Independently admit eight distinct cold searches, even with caching off.
+    /// Cache up to `capacity` results and about 8 MiB. Allow 8 searches at once.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self::with_limits(capacity, 8 * 1024 * 1024, 8)
     }
 
-    /// Set independent cache entry, accounted byte, and distinct search limits.
-    /// Either zero cache limit disables storage; zero active searches permits
-    /// only cache hits and validated self routes. Identical in-flight queries
-    /// share one admission slot, irrespective of seeds or frozen weights.
+    /// Set the cache entry limit, cache byte limit, and how many searches may
+    /// run at once.
     ///
-    /// Accounting includes key/result buffer capacities, `Rc` headers, and a
-    /// conservative full B-tree node allowance per entry (11 key/value slots,
-    /// 12 child pointers, rounded header). It excludes allocator overhead, this
-    /// object, membership graphs, and active scratch/caller-retained results.
-    /// Standard-library node layout is not guaranteed; this is an accounting
-    /// budget, not a hard allocator limit. Oversized entries bypass the cache.
-    /// Hits refresh LRU links in O(log entries), without cache allocations.
-    /// Insertion takes O((evicted + 1) log entries), with no route rescanning.
+    /// - A zero cache limit turns the cache off.
+    /// - Zero searches means only cache hits and self routes work.
+    /// - Identical queries share one search, even with different seeds.
+    ///
+    /// The byte count is an estimate of cache storage only. It is not a hard
+    /// memory limit. A result too big for the cache is not cached.
     #[must_use]
     pub fn with_limits(cache_entries: usize, cache_bytes: usize, active_searches: usize) -> Self {
         Self {
@@ -337,38 +338,39 @@ impl Paths {
         }
     }
 
-    /// Number of currently cached query alternatives.
+    /// Number of cached results.
     #[must_use]
     pub fn cached_entries(&self) -> usize {
         self.cache.borrow().entries.len()
     }
 
-    /// Constant-time accounted cache bytes; never exceeds its configured limit.
-    /// See [`Self::with_limits`] for included and excluded storage.
+    /// Estimated bytes in the cache. Never above the configured limit.
     #[must_use]
     pub fn cached_bytes(&self) -> usize {
         self.cache.borrow().bytes
     }
 
-    /// Number of distinct unfinished searches, not the number of waiting callers.
+    /// Number of searches running now. Callers sharing a search count once.
     #[must_use]
     pub fn active_searches(&self) -> usize {
         self.inflight.borrow().len()
     }
 
-    /// Yield after at most 32 vertex expansions, each examining at most 64 edges.
-    /// Reconstruction is bounded by 64 alternatives of at most 255 edges. Cache
-    /// insertion may evict entries to meet the independently configured limits.
-    /// Dropping the last waiter releases admission and scratch state; dropping
-    /// one duplicate waiter leaves the shared search available to the others.
+    /// Find a shortest route from `query.from` to `query.to`.
+    ///
+    /// Returns the positions along the route, including both ends. When
+    /// several routes are equally short, the seed and the first hop's weight
+    /// decide which one is returned.
+    ///
+    /// The search yields often, so it does not block the worker. Dropping
+    /// the future cancels the search unless another caller is still waiting
+    /// on it.
     ///
     /// # Errors
-    /// Returns [`Error::InvalidQuery`] for invalid positions, repeated visited
-    /// positions, visited endpoints, visited length plus links above 255, more
-    /// than 64 blocked inputs, or a seed exceeding 65,536 bytes. Validation also
-    /// applies to self routes. Returns [`Error::Unreachable`] when no route fits,
-    /// [`Error::Overloaded`] when a distinct cold search cannot be admitted, or
-    /// [`Error::SamplingExhausted`] after 64 rejected unbiased selection draws.
+    /// - [`Error::InvalidQuery`] if the query breaks a [`PathQuery`] rule.
+    /// - [`Error::Unreachable`] if no route fits in `links` hops.
+    /// - [`Error::Overloaded`] if too many searches are already running.
+    /// - [`Error::SamplingExhausted`] if weighted picking gives up (very rare).
     pub async fn route<M: Member>(
         &self,
         membership: &Membership<M>,
@@ -410,7 +412,7 @@ impl Paths {
         select_route(membership, &alternatives, query.seed)
     }
 
-    /// Apply this worker's retention limits to a completed search result.
+    /// Cache a finished search result.
     fn store(&self, key: PathKey, alternatives: Alternatives) {
         self.cache
             .borrow_mut()
@@ -418,7 +420,7 @@ impl Paths {
     }
 }
 
-/// Select from shared witnesses using this caller's frozen weights and seed.
+/// Pick one route using the seed and first-hop weights.
 fn select_route<M: Member>(
     membership: &Membership<M>,
     alternatives: &[Vec<usize>],
@@ -432,8 +434,8 @@ fn select_route<M: Member>(
     Ok(alternatives[index].clone())
 }
 
-/// Integer rejection sampling avoids modulo bias and platform variance. At most
-/// 64 u32 weights fit in u64; the retry cap bounds work without a biased fallback.
+/// Pick a route index, weighted by first-hop weight, using a hash of the seed
+/// and endpoints.
 fn weighted_index<M: Member>(
     membership: &Membership<M>,
     alternatives: &[Vec<usize>],
@@ -456,7 +458,7 @@ fn weighted_index<M: Member>(
     })
 }
 
-/// Bound rejection retries while preserving unbiased integer selection.
+/// Try up to 64 draws. Give up rather than pick unfairly.
 fn sample_index(weights: &[u64], total: u64, mut draw: impl FnMut(u32) -> u64) -> Result<usize> {
     for counter in 0u32..64 {
         if let Some(index) = weighted_draw(draw(counter), total, weights) {
@@ -466,7 +468,8 @@ fn sample_index(weights: &[u64], total: u64, mut draw: impl FnMut(u32) -> u64) -
     Err(Error::SamplingExhausted)
 }
 
-/// Map an accepted integer draw into positive cumulative weight intervals.
+/// Turn a random number into an index. Returns `None` for numbers that
+/// would bias the result, so the caller draws again.
 fn weighted_draw(sample: u64, total: u64, weights: &[u64]) -> Option<usize> {
     if sample < total.wrapping_neg() % total {
         return None;
@@ -481,7 +484,7 @@ fn weighted_draw(sample: u64, total: u64, weights: &[u64]) -> Option<usize> {
     unreachable!("ticket is below the sum of positive weights")
 }
 
-/// One BFS discovery with a canonical parent and all equal-depth first hops.
+/// What the search knows about one reached node.
 struct Visit {
     depth: u8,
 
@@ -490,7 +493,7 @@ struct Visit {
     first: u64,
 }
 
-/// One side of the alternating breadth-first search.
+/// One side of the search: from the source, or from the destination.
 struct EqualCostWave {
     visits: BTreeMap<usize, Visit>,
 
@@ -498,7 +501,7 @@ struct EqualCostWave {
 }
 
 impl EqualCostWave {
-    /// Start a wave at its endpoint with no first-hop bits yet assigned.
+    /// Start a side at its endpoint.
     fn new(root: usize) -> Self {
         Self {
             visits: BTreeMap::from([(
@@ -514,12 +517,11 @@ impl EqualCostWave {
     }
 }
 
-/// Complete the meeting layer, carrying source first-hop bitsets, not all paths.
-/// A complete preceding source layer propagates every equal-depth first-hop bit
-/// before its children expand. Complete the intersecting layer too: stopping at
-/// its first intersection would bias selection toward sorted IDs. Before that
-/// layer the two balls are disjoint, so every meeting has minimum total distance.
-/// Store one canonical witness per first hop (at most 64), not per full path.
+/// Search from both ends at once, one layer at a time, until the sides meet.
+///
+/// It tracks which first hops lead to each node. It finishes the whole layer
+/// where the sides meet, so every shortest first hop is found, not just the
+/// first one by ID. It keeps one route per first hop, not every route.
 struct EqualCostSearch {
     graph: Arc<Vec<Vec<usize>>>,
 
@@ -538,7 +540,7 @@ struct EqualCostSearch {
     done: bool,
 }
 
-/// Per-turn observability in production and tests, without retained counters.
+/// What one search step did.
 #[derive(Default)]
 struct SearchStep {
     done: bool,
@@ -549,7 +551,7 @@ struct SearchStep {
 }
 
 impl EqualCostSearch {
-    /// Retain the immutable graph and initialize deterministic endpoint waves.
+    /// Start a search on the given graph.
     fn new(graph: Arc<Vec<Vec<usize>>>, key: &PathKey) -> Self {
         let neighbors = &graph[key.from];
         assert!(neighbors.len() <= MAX_DEGREE);
@@ -565,7 +567,7 @@ impl EqualCostSearch {
         }
     }
 
-    /// Expand at most `quantum` vertices, alternating only at layer boundaries.
+    /// Expand up to `quantum` nodes. Sides switch after each full layer.
     fn step(&mut self, quantum: usize) -> SearchStep {
         let mut step = SearchStep::default();
         for _ in 0..quantum {
@@ -632,8 +634,7 @@ impl EqualCostSearch {
         step
     }
 
-    /// Reconstruct completed witnesses without moving or cloning search scratch.
-    /// The shared owner replaces the working state after this borrow ends.
+    /// Build the routes found by a finished search.
     fn finish(&self) -> Result<Vec<Vec<usize>>> {
         if self.key.from == self.key.to {
             return Ok(vec![vec![self.key.from]]);
@@ -678,7 +679,7 @@ impl EqualCostSearch {
 }
 
 #[cfg(test)]
-/// Independent graph oracles and regression coverage for routing ownership.
+/// Routing tests, checked against simple reference code.
 mod tests {
     use super::*;
 
@@ -686,7 +687,7 @@ mod tests {
 
     use std::{future::Future, num::NonZeroU32, task::Context};
 
-    /// Compare LRU links and accounting against an independent recency model.
+    /// The LRU cache matches a simple reference model.
     #[test]
     fn cache_duplicate_store_and_lru_match_deterministic_model() {
         let members = membership(32);
@@ -773,25 +774,25 @@ mod tests {
         assert_eq!(cache.bytes, charge);
     }
 
-    /// Binary identity and adjustable weight for deterministic routing fixtures.
+    /// Test member with a binary ID and a weight.
     #[derive(Clone)]
     struct TestMember(Vec<u8>, NonZeroU32);
 
     impl Member for TestMember {
         const DOMAIN: &'static str = "racer";
 
-        /// Return the fixture's stable identity bytes.
+        /// Return the ID.
         fn id(&self) -> &[u8] {
             &self.0
         }
 
-        /// Return the fixture's chosen positive weight.
+        /// Return the weight.
         fn weight(&self) -> NonZeroU32 {
             self.1
         }
     }
 
-    /// Freeze a numbered membership with equal initial weights.
+    /// Build a membership of `count` members, all with weight 1.
     fn membership(n: usize) -> Membership<TestMember> {
         Membership::new(
             (0..n)
@@ -806,7 +807,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Build an unfiltered query with an empty selection seed.
+    /// Build a query with no filters and an empty seed.
     fn query(from: usize, to: usize, links: u8) -> PathQuery<'static> {
         PathQuery {
             from,
@@ -818,7 +819,7 @@ mod tests {
         }
     }
 
-    /// Independently define the rings using explicit schema bytes and sorted tuples.
+    /// Rebuild the ring graph from scratch, as a check on the real code.
     fn graph(n: usize) -> Vec<Vec<usize>> {
         let mut edges = vec![vec![]; n];
         if n < 2 {
@@ -850,7 +851,7 @@ mod tests {
         edges
     }
 
-    /// Compute reverse distances independently of the bidirectional search.
+    /// Hop count from every node to `to`, by plain BFS.
     fn distances(edges: &[Vec<usize>], key: &PathKey) -> Vec<usize> {
         let mut distances = vec![usize::MAX; edges.len()];
         distances[key.to] = 0;
@@ -871,14 +872,14 @@ mod tests {
         distances
     }
 
-    /// Drive single-expansion turns to completion and return every witness.
+    /// Run a search one node at a time and return all routes it finds.
     fn search(members: &Membership<TestMember>, key: &PathKey) -> Result<Vec<Vec<usize>>> {
         let mut search = EqualCostSearch::new(members.graph(), key);
         while !search.step(1).done {}
         search.finish()
     }
 
-    /// Check all eligible first hops and route lengths against the independent oracle.
+    /// Search finds every shortest first hop, matching plain BFS.
     #[test]
     fn all_equal_next_hops_match_independent_oracle() {
         for n in [37, 401, 1500] {
@@ -933,7 +934,7 @@ mod tests {
         }
     }
 
-    /// Verify exact selection framing and fresh seed/weight selection on cache hits.
+    /// Route picks use the exact hash input and are redone on cache hits.
     #[test]
     fn independent_hash_vectors_cache_reselection_and_snapshot_weights() {
         let mut input = membership(1500).members().to_vec();
@@ -1024,7 +1025,7 @@ mod tests {
         assert_eq!(cold.cache.borrow().entries.len(), 0);
     }
 
-    /// Exercise the highest first-hop bit through propagation and reconstruction.
+    /// The 64th first hop works end to end.
     #[test]
     fn last_first_hop_bit_survives_search_and_reconstruction() {
         let n = 100_000;
@@ -1051,7 +1052,7 @@ mod tests {
         assert_eq!(search(&members, &key), Err(Error::Unreachable));
     }
 
-    /// Check rejection boundaries, exact integer proportions, and maximum weights.
+    /// Weighted picking is fair, including at its edges.
     #[test]
     fn weighted_integer_mapping_and_probabilities() {
         assert_eq!(weighted_draw(0, 5, &[4, 1]), None);
@@ -1064,7 +1065,7 @@ mod tests {
         assert_eq!(weighted_draw(u64::MAX, 64 * max, &[max; 64]), Some(1));
     }
 
-    /// Verify graph sharing and the per-turn expansion, edge, and witness bounds.
+    /// Each search step stays within its work limits.
     #[test]
     fn search_work_is_bounded_per_turn() {
         let members = membership(100_000);
@@ -1092,7 +1093,7 @@ mod tests {
         assert!(alternatives.iter().all(|p| p.len() <= 5));
     }
 
-    /// Compare every small-membership edge with the independent ring definition.
+    /// Small graphs match the from-scratch ring graph.
     #[test]
     fn exhaustive_inverse_matches_definition() {
         // Retain the historical test name, now checking the ID-ring definition.
@@ -1107,7 +1108,7 @@ mod tests {
         assert!(membership(1).neighbors(usize::MAX).is_empty());
     }
 
-    /// Check degree, symmetry, and sampled four-hop coverage on a large fixture.
+    /// Large graphs keep degree limits, symmetry, and short routes.
     #[test]
     fn hundred_thousand_nodes_bounded_symmetric_and_four_link_reachable() {
         let n = 100_000;
@@ -1138,21 +1139,21 @@ mod tests {
         }
     }
 
-    /// Verify binary identities, invalid inputs, and source-edge-only blocking.
+    /// Binary IDs, bad queries, and first-hop-only blocking.
     #[test]
     fn arbitrary_binary_members_invalid_queries_and_first_hop_only_blocking() {
-        /// A fixed-width binary identity, including embedded zero bytes.
+        /// Fixed-size binary ID that may contain zero bytes.
         struct Binary([u8; 2]);
 
         impl Member for Binary {
             const DOMAIN: &'static str = "binary";
 
-            /// Expose the fixture's raw identity without text encoding.
+            /// Return the raw ID.
             fn id(&self) -> &[u8] {
                 &self.0
             }
 
-            /// Keep selection uniform for this validation fixture.
+            /// Use equal weights.
             fn weight(&self) -> NonZeroU32 {
                 NonZeroU32::new(1).unwrap()
             }
@@ -1231,21 +1232,21 @@ mod tests {
         );
     }
 
-    /// Check canonical filters and domain isolation while allowing weight reselection.
+    /// Equal queries share cache entries; different domains do not.
     #[test]
     fn canonical_cache_identity_includes_domain_and_weights() {
-        /// Preserve records while changing only their algorithm domain.
+        /// Same records under a different domain.
         struct Other(TestMember);
 
         impl Member for Other {
             const DOMAIN: &'static str = "other";
 
-            /// Delegate the unchanged member identity.
+            /// Return the wrapped ID.
             fn id(&self) -> &[u8] {
                 self.0.id()
             }
 
-            /// Delegate the unchanged member weight.
+            /// Return the wrapped weight.
             fn weight(&self) -> NonZeroU32 {
                 self.0.weight()
             }
@@ -1287,7 +1288,7 @@ mod tests {
         assert_eq!(paths.cache.borrow().entries.len(), 2);
     }
 
-    /// Exercise admission release on cancellation independently of cache capacity.
+    /// Dropping a search frees its slot, with or without a cache.
     #[test]
     fn cooperative_admission_cancellation_and_cache_hits() {
         let members = membership(100_000);
@@ -1319,7 +1320,7 @@ mod tests {
         }
     }
 
-    /// Require validation even when self routes need neither storage nor admission.
+    /// Self routes are still checked for bad input.
     #[test]
     fn self_routes_validate_before_bypassing_admission_and_cache() {
         let members = membership(1500);
@@ -1349,7 +1350,7 @@ mod tests {
         assert_eq!(paths.active_searches(), 0);
     }
 
-    /// Check exact byte budgets, LRU promotion, and identity-based invalidation.
+    /// Cache byte limits, LRU order, and cache misses after IDs change.
     #[test]
     fn memory_budget_lru_and_same_count_id_invalidation() {
         let members = membership(1500);
@@ -1391,7 +1392,7 @@ mod tests {
         );
     }
 
-    /// Verify shared ownership, per-waiter selection, and cancellation generations.
+    /// Callers share a search but each gets its own pick.
     #[test]
     fn duplicate_searches_share_progress_survive_cancellation_and_reselect() {
         let members = membership(10_000);
@@ -1457,7 +1458,7 @@ mod tests {
         assert_eq!(paths.active_searches(), 0);
     }
 
-    /// Verify that cache retention cannot raise or lower cold-search admission.
+    /// Cache settings do not change the search limit.
     #[test]
     fn cache_size_and_admission_are_independent() {
         let members = membership(10_000);
@@ -1485,7 +1486,7 @@ mod tests {
         assert_eq!(Paths::new(0).search_limit, Paths::new(1000).search_limit);
     }
 
-    /// Cover query boundary limits before running deterministic filtered cases.
+    /// Query limits at their edges, then filtered queries.
     #[test]
     fn validation_limits_and_deterministic_fuzz_cases() {
         let members = membership(401);
@@ -1556,7 +1557,7 @@ mod tests {
         check_deterministic_fuzz_cases(&members, &paths);
     }
 
-    /// Compare varied deterministic queries with a separate reverse-distance oracle.
+    /// Many queries match plain BFS hop counts.
     fn check_deterministic_fuzz_cases(members: &Membership<TestMember>, paths: &Paths) {
         let edges = members.graph();
         let mut state = 0xa127_3921u64;
@@ -1602,7 +1603,7 @@ mod tests {
         }
     }
 
-    /// Distinguish exhausted rejection sampling from routing failure at its boundary.
+    /// Running out of draws gives `SamplingExhausted`, not `Unreachable`.
     #[test]
     fn rejection_retry_is_bounded_and_distinct_from_unreachable() {
         let mut calls = 0;
@@ -1621,12 +1622,12 @@ mod tests {
         );
     }
 
-    /// Ensure application-side mutation cannot change already frozen routing inputs.
+    /// Changing a record after building the membership does not affect routing.
     #[test]
     fn selection_reads_frozen_ids_and_weights_after_interior_mutation() {
         use std::cell::Cell;
 
-        /// Mutable records expose whether selection consults live application data.
+        /// Record whose ID and weight can change after use.
         struct Mutable {
             id: Vec<u8>,
 
@@ -1638,7 +1639,7 @@ mod tests {
         impl Member for Mutable {
             const DOMAIN: &'static str = "racer";
 
-            /// Switch identity after freezing to detect accidental live reads.
+            /// Return the current ID.
             fn id(&self) -> &[u8] {
                 if self.changed.get() {
                     b"changed"
@@ -1647,7 +1648,7 @@ mod tests {
                 }
             }
 
-            /// Read a weight that may change after the membership is constructed.
+            /// Return the current weight.
             fn weight(&self) -> NonZeroU32 {
                 self.weight.get()
             }
@@ -1690,7 +1691,7 @@ mod tests {
         assert_eq!(paths.cached_entries(), 1);
     }
 
-    /// Share unfinished witnesses across weights without sharing the final selection.
+    /// Memberships with different weights share a search but pick separately.
     #[test]
     fn concurrent_weight_snapshots_share_search_but_not_selection() {
         let members = membership(10_000);
@@ -1714,7 +1715,7 @@ mod tests {
         assert_eq!(block_on(new).unwrap()[1], favored);
     }
 
-    /// Release failed searches and allow cache hits while cold-search slots are full.
+    /// Failed searches free their slot; cache hits work when slots are full.
     #[test]
     fn unreachable_releases_admission_and_cache_hits_ignore_overload() {
         let members = membership(10_000);
@@ -1748,7 +1749,7 @@ mod tests {
         assert_eq!(paths.cached_entries(), 1);
     }
 
-    /// Exercise reconstruction and rejection at the full public link-count limit.
+    /// Routes work at the maximum of 255 links.
     #[test]
     fn full_u8_link_limit_reconstructs_without_overflow() {
         let members = membership(257);
