@@ -750,7 +750,7 @@ pub(crate) struct Slot {
     pub fenced: AtomicBool,
 
     /// Native teardown stopped DMA, even if readback publication was contended.
-    stopped: AtomicBool,
+    stopped: Arc<AtomicBool>,
 
     pub mailbox: Mutex<Mailbox>,
 
@@ -819,7 +819,7 @@ pub fn pair(slots: usize) -> Result<(IoPort, NativePort)> {
                     cancel: AtomicBool::new(false),
                     released: AtomicBool::new(false),
                     fenced: AtomicBool::new(false),
-                    stopped: AtomicBool::new(false),
+                    stopped: Arc::new(AtomicBool::new(false)),
                     mailbox: Mutex::new(Mailbox {
                         peer_admission: None,
                         endpoint: None,
@@ -1162,7 +1162,11 @@ impl NativeService {
             next_retry: None,
         });
         let resource = self.resources[i].as_mut().unwrap();
-        resource.qp = Some(ffi::NativeQueuePair::new_charged(device, quota)?);
+        resource.qp = Some(ffi::NativeQueuePair::new_charged(
+            device,
+            quota,
+            slot.stopped.clone(),
+        )?);
         let qp = resource.qp.as_ref().unwrap();
         qp.probe_window()?;
         mailbox.rail = selected.tag;
@@ -1358,7 +1362,11 @@ impl NativeService {
             }
             // Lease returned: build a fresh QP. Never reuse a QP. The region
             // stays registered for the life of the pool.
-            match ffi::NativeQueuePair::new_charged(resource.device.clone(), quota.clone()) {
+            match ffi::NativeQueuePair::new_charged(
+                resource.device.clone(),
+                quota.clone(),
+                slot.stopped.clone(),
+            ) {
                 Ok(qp) => {
                     mailbox.endpoint = Some(qp.endpoint);
                     resource.qp = Some(qp);
@@ -1379,6 +1387,7 @@ impl NativeService {
             slot.cancel.store(false, Ordering::Release);
             slot.released.store(false, Ordering::Release);
             slot.fenced.store(false, Ordering::Release);
+            slot.stopped.store(false, Ordering::Release);
             slot.state.store(READY, Ordering::Release);
             self.port.shared.io.wake();
             return;

@@ -440,6 +440,9 @@ pub(crate) struct NativeQueuePair {
     /// Keeps every QP, CQ, and probe leak charged to its slot.
     quota: Arc<GuardOwner>,
 
+    /// Publishes successful DMA stop even when it occurs during destructor retry.
+    stop_observer: Arc<std::sync::atomic::AtomicBool>,
+
     device: Rc<NativeDevice>,
 
     raw: NonNull<c_void>,
@@ -470,13 +473,18 @@ impl NativeQueuePair {
     #[cfg(test)]
     /// Create an independently charged QP for low-level tests.
     pub(crate) fn new(device: Rc<NativeDevice>) -> Result<Rc<Self>> {
-        Self::new_charged(device, GuardOwner::new(Arc::new(())))
+        Self::new_charged(
+            device,
+            GuardOwner::new(Arc::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
     }
 
     /// Create a QP with its slot's charge and a random starting PSN.
     pub(crate) fn new_charged(
         device: Rc<NativeDevice>,
         quota: Arc<GuardOwner>,
+        stop_observer: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Rc<Self>> {
         let mut qpn = 0;
         let raw = NonNull::new(unsafe {
@@ -512,6 +520,7 @@ impl NativeQueuePair {
         };
         Ok(Rc::new(Self {
             quota,
+            stop_observer,
             device,
             raw,
             endpoint,
@@ -742,6 +751,8 @@ impl NativeQueuePair {
             return Err(Error::Io);
         }
         self.stopped.set(true);
+        self.stop_observer
+            .store(true, std::sync::atomic::Ordering::Release);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         for (_, pending) in std::mem::take(&mut *self.pending.borrow_mut()) {
             pending.finish(Err(Error::Cancelled));

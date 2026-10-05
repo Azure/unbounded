@@ -459,7 +459,13 @@ fn leaked_qp_or_probe_keeps_charge_and_blocks_replacement_and_reopen() {
 #[cfg(feature = "simulation")]
 #[test]
 fn native_drop_releases_permit_only_after_successful_stop() {
-    for (fail, contended) in [(false, false), (false, true), (true, false)] {
+    for (fail, contended, transient) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (false, false, true),
+        (false, true, true),
+    ] {
         let (sim, io, mut native) = fixture(1);
         configure(&io, vec![Arc::new(())]);
         native.poll_budgeted(1).unwrap();
@@ -471,12 +477,15 @@ fn native_drop_releases_permit_only_after_successful_stop() {
         if fail {
             sim.reject(simulation::Operation::Stop, None, true);
         }
+        if transient {
+            sim.fault(simulation::Operation::Stop, simulation::Fault::Reject);
+        }
         if contended {
             io.with_contention(rdma_verbs::testing::Contention::Slot(0), || drop(native));
         } else {
             drop(native);
         }
-        if !fail && !contended {
+        if !fail && !contended && !transient {
             assert!(qp.stopped());
             assert_eq!(count.load(Ordering::Acquire), 0);
         }
@@ -486,6 +495,7 @@ fn native_drop_releases_permit_only_after_successful_stop() {
         if !fail {
             assert_eq!(sim.live_resources(), 0);
         }
+        assert_eq!(sim.pending_faults(), 0);
     }
 }
 
