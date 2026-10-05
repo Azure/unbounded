@@ -385,7 +385,7 @@ impl Handle {
         else {
             return Err(errno(libc::ENOTSOCK));
         };
-        if !connected {
+        if !*connected {
             return Err(errno(libc::ENOTCONN));
         }
         let closed = peer.is_none_or(|id| {
