@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/license"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
@@ -96,7 +98,7 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	for _, input := range crateInputs {
 		locked, err := collectVersions(root, input)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("collecting dependencies for %s: %w", filepath.Join(root, input.manifestPath), err)
 		}
 
 		for name, version := range locked {
@@ -124,6 +126,10 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 func collectVersions(root string, input crateInput) (map[string]string, error) {
 	manifestPath := filepath.Join(root, input.manifestPath)
 
+	if _, err := filepath.EvalSymlinks(manifestPath); err != nil {
+		return nil, fmt.Errorf("resolving %s: %w", manifestPath, err)
+	}
+
 	manifest, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", manifestPath, err)
@@ -148,7 +154,7 @@ func collectVersions(root string, input crateInput) (map[string]string, error) {
 
 	versions, err := lockedDirectVersions(string(lock), name, direct)
 	if err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", lockPath, err)
+		return nil, fmt.Errorf("resolving dependencies in %s: %w", lockPath, err)
 	}
 
 	return versions, nil
@@ -158,7 +164,9 @@ func manifestPackageName(data string) (string, error) {
 	section := ""
 
 	for line := range strings.SplitSeq(data, "\n") {
-		line = strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+		line, _, _ = cutUnquoted(line, '#')
+
+		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "[") {
 			section = strings.Trim(line, "[]")
 			continue
@@ -357,7 +365,9 @@ func directDependencies(data string) (map[string]dependency, error) {
 
 	scanner := bufio.NewScanner(strings.NewReader(data))
 	for scanner.Scan() {
-		line := strings.TrimSpace(strings.SplitN(scanner.Text(), "#", 2)[0])
+		line, _, _ := cutUnquoted(scanner.Text(), '#')
+
+		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
 			continue
@@ -373,14 +383,27 @@ func directDependencies(data string) (map[string]dependency, error) {
 		}
 
 		name := strings.Trim(strings.TrimSpace(key), `"'`)
-		// Local path dependencies are first-party crates, not registry sources.
-		if inlineField(value, "path") != "" {
-			continue
-		}
 
 		packageName := name
-		if parsed := inlinePackageName(value); parsed != "" {
+
+		parsed, err := inlineField(value, "package")
+		if err != nil {
+			return nil, fmt.Errorf("dependency %s: %w", name, err)
+		}
+
+		if parsed != "" {
 			packageName = parsed
+		}
+
+		path, err := inlineField(value, "path")
+		if err != nil {
+			return nil, fmt.Errorf("dependency %s: %w", name, err)
+		}
+
+		// Local path dependencies are first-party crates, not registry sources.
+		// Workspace members are collected separately using their shared lock.
+		if path != "" {
+			continue
 		}
 
 		direct[name] = dependency{packageName: packageName}
@@ -393,19 +416,66 @@ func directDependencies(data string) (map[string]dependency, error) {
 	return direct, nil
 }
 
-func inlinePackageName(value string) string {
-	return inlineField(value, "package")
-}
+// cutUnquoted finds separators outside single-line TOML strings. In literal
+// strings backslashes are ordinary characters; in basic strings they escape.
+func cutUnquoted(value string, separator byte) (string, string, bool) {
+	var quote byte
 
-func inlineField(value, fieldName string) string {
-	for _, field := range strings.Split(strings.Trim(value, " {}"), ",") {
-		key, fieldValue, found := strings.Cut(field, "=")
-		if found && strings.TrimSpace(key) == fieldName {
-			return quotedValue(strings.TrimSpace(fieldValue))
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if quote != 0 {
+			if quote == '"' && ch == '\\' {
+				i++
+			} else if ch == quote {
+				quote = 0
+			}
+
+			continue
+		}
+
+		if ch == separator {
+			return value[:i], value[i+1:], true
+		}
+
+		if ch == '\'' || ch == '"' {
+			quote = ch
 		}
 	}
 
-	return ""
+	return value, "", false
+}
+
+func inlineField(value, name string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "{") {
+		return "", nil
+	}
+
+	if !strings.HasSuffix(value, "}") {
+		return "", fmt.Errorf("invalid inline dependency table %q", value)
+	}
+
+	for rest := value[1 : len(value)-1]; rest != ""; {
+		var field string
+
+		field, rest, _ = cutUnquoted(rest, ',')
+
+		key, fieldValue, found := strings.Cut(field, "=")
+		if found && strings.TrimSpace(key) == name {
+			parsed, err := parseQuotedValue(strings.TrimSpace(fieldValue))
+			if err != nil {
+				return "", fmt.Errorf("invalid %s: %w", name, err)
+			}
+
+			if parsed == "" {
+				return "", fmt.Errorf("empty %s", name)
+			}
+
+			return parsed, nil
+		}
+	}
+
+	return "", nil
 }
 
 func dependencySection(section string) bool {
@@ -541,11 +611,46 @@ func lockDependency(value string) (string, string) {
 }
 
 func quotedValue(value string) string {
-	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+	parsed, err := parseQuotedValue(value)
+	if err != nil {
 		return ""
 	}
 
-	return value[1 : len(value)-1]
+	return parsed
+}
+
+// parseQuotedValue supports single-line TOML 1.0 literal and basic strings,
+// not multiline strings. Restrict Go's unquoter to TOML's escape vocabulary.
+func parseQuotedValue(value string) (string, error) {
+	if len(value) < 2 || (value[0] != '"' && value[0] != '\'') || value[len(value)-1] != value[0] || !utf8.ValidString(value) {
+		return "", fmt.Errorf("expected a single-line quoted string, got %q", value)
+	}
+
+	body := value[1 : len(value)-1]
+	for i := 0; i < len(body); i++ {
+		ch := body[i]
+		if (ch < 0x20 && ch != '\t') || ch == 0x7f || ch == value[0] {
+			return "", fmt.Errorf("invalid character in quoted string %q", value)
+		}
+
+		if value[0] == '"' && ch == '\\' {
+			i++
+			if i == len(body) || !strings.ContainsRune(`btnfr"\uU`, rune(body[i])) {
+				return "", fmt.Errorf("invalid basic string escape in %q", value)
+			}
+		}
+	}
+
+	if value[0] == '\'' {
+		return body, nil
+	}
+
+	parsed, err := strconv.Unquote(value)
+	if err != nil {
+		return "", fmt.Errorf("invalid basic string %q: %w", value, err)
+	}
+
+	return parsed, nil
 }
 
 func crateLicense(dir string) string {
