@@ -19,6 +19,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod enrollment;
+
 use chacha20poly1305::{
     KeyInit, Tag, XChaCha20Poly1305,
     aead::{AeadInOut, inout::InOutBuf},
@@ -308,6 +310,96 @@ pub mod identity {
         epochs: Arc<KeyEpochs>,
     }
 
+    /// Canonical bundle replay tracking paired with its current keyring owner.
+    pub struct BundleInstaller {
+        keys: RefCell<Rc<Keyring>>,
+
+        accepted: RefCell<Option<AcceptedBundle>>,
+    }
+
+    /// Accepted canonical content and the roots returned for idempotent delivery.
+    struct AcceptedBundle {
+        generation: BundleGeneration,
+
+        hash: [u8; 32],
+
+        roots: Vec<Vec<u8>>,
+    }
+
+    /// Bundle delivery errors preserve replay, codec, and keyring distinctions.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum BundleError {
+        /// A rollback or conflicting reuse of a generation was rejected.
+        Replay,
+
+        /// Canonical wire validation failed.
+        Wire(racer_control_wire::Error),
+
+        /// The keyring rejected the proposed epoch.
+        Identity(Error),
+    }
+
+    impl BundleInstaller {
+        /// Start delivery tracking for one keyring.
+        pub fn new(keys: Rc<Keyring>) -> Self {
+            Self {
+                keys: RefCell::new(keys),
+                accepted: RefCell::new(None),
+            }
+        }
+
+        /// Return the last successfully accepted bundle generation.
+        pub fn generation(&self) -> Option<BundleGeneration> {
+            self.accepted
+                .borrow()
+                .as_ref()
+                .map(|accepted| accepted.generation)
+        }
+
+        /// Replace the keyring and reset delivery tracking for its new owner.
+        pub fn bind_keyring(&self, keys: Rc<Keyring>) {
+            *self.keys.borrow_mut() = keys;
+            *self.accepted.borrow_mut() = None;
+        }
+
+        /// Canonicalize unordered records, reject replay, and atomically install keys.
+        pub fn install(
+            &self,
+            mut bundle: racer_control_wire::KeyringBundle,
+        ) -> std::result::Result<(BundleGeneration, Vec<Vec<u8>>), BundleError> {
+            bundle.peer_trust_roots.sort();
+            bundle
+                .cache_keys
+                .sort_by(|a, b| reference_order(&a.key).cmp(&reference_order(&b.key)));
+            let encoded = Zeroizing::new(
+                racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?,
+            );
+            let hash: [u8; 32] = Sha256::digest(&*encoded).into();
+            if let Some(old) = self.accepted.borrow().as_ref() {
+                if bundle.generation < old.generation
+                    || bundle.generation == old.generation && hash != old.hash
+                {
+                    return Err(BundleError::Replay);
+                }
+                if bundle.generation == old.generation {
+                    return Ok((old.generation, old.roots.clone()));
+                }
+            }
+            let roots = bundle.peer_trust_roots.clone();
+            let generation = self
+                .keys
+                .borrow()
+                .install(bundle)
+                .map_err(BundleError::Identity)?;
+            *self.accepted.borrow_mut() = Some(AcceptedBundle {
+                generation,
+                hash,
+                roots: roots.clone(),
+            });
+            Ok((generation, roots))
+        }
+    }
+
     /// An immutable secret owner, not a raw-key export capability.
     /// ```compile_fail
     /// fn raw(key: &racer_crypto::identity::KeyLease) {
@@ -348,8 +440,8 @@ pub mod identity {
     }
 
     /// An authenticated leaf key and the conservative lifetime of its trust snapshot.
-    struct ValidatedChain {
-        key: VerifyingKey,
+    pub(super) struct ValidatedChain {
+        pub(super) key: VerifyingKey,
 
         valid_from: u64,
 
@@ -1205,8 +1297,9 @@ pub mod identity {
         )
     }
 
-    /// Verify bounded client-auth certificates, canonical SAN, and Ed25519 leaf key.
-    fn verify_chain(
+    /// Shared enrollment/activation policy for bounded roots, client-auth chains,
+    /// canonical node URI, and a non-CA Ed25519 leaf without certificate-signing usage.
+    pub(super) fn verify_chain(
         roots: &[Vec<u8>],
         chain: &[Vec<u8>],
         cluster: &ClusterId,
@@ -1292,7 +1385,7 @@ pub mod identity {
     }
 
     /// Parse bounded CA roots and require every configured root to be valid now.
-    fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
+    pub(super) fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
         if roots.is_empty() || roots.len() > 32 {
             return Err(Error::Unauthorized);
         }
@@ -1394,6 +1487,77 @@ pub mod identity {
             customize(&mut params);
             let cert = params.signed_by(&key, ca, ca_key).unwrap();
             (pending, vec![cert.der().to_vec()])
+        }
+    }
+
+    /// Canonical bundle delivery, rejection, and owner replacement contracts.
+    #[cfg(test)]
+    mod bundle_tests {
+        use super::test_util::*;
+        use super::*;
+
+        /// Canonical delivery is idempotent, rejects rollback, and resets with its keyring.
+        #[test]
+        fn bundle_delivery_canonical_replay_and_rebinding() {
+            let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
+            let node = NodeId("22222222-2222-4222-8222-222222222222".into());
+            let (first, first_key) = ca();
+            let (second, _) = ca();
+            let keys = || {
+                Rc::new(Keyring::new(
+                    cluster.clone(),
+                    node.clone(),
+                    Arc::new(KeyEpochs::default()),
+                ))
+            };
+            let installer = BundleInstaller::new(keys());
+            assert_eq!(installer.generation(), None);
+            let mut bundle = racer_control_wire::KeyringBundle {
+                schema_version: 1,
+                cluster,
+                generation: BundleGeneration(2),
+                peer_trust_roots: vec![first.der().to_vec(), second.der().to_vec()],
+                cache_keys: vec![],
+            };
+            let accepted = installer.install(bundle.clone()).unwrap();
+            bundle.peer_trust_roots.reverse();
+            assert_eq!(installer.install(bundle.clone()).unwrap(), accepted);
+            let mut conflict = bundle.clone();
+            conflict.peer_trust_roots.pop();
+            assert_eq!(installer.install(conflict), Err(BundleError::Replay));
+            bundle.generation = BundleGeneration(1);
+            assert_eq!(installer.install(bundle.clone()), Err(BundleError::Replay));
+            assert_eq!(installer.generation(), Some(BundleGeneration(2)));
+            let replacement = Rc::new(Keyring::new(
+                bundle.cluster.clone(),
+                node,
+                Arc::new(KeyEpochs::default()),
+            ));
+            installer.bind_keyring(replacement);
+            assert_eq!(installer.generation(), None);
+            assert_eq!(
+                installer.install(bundle.clone()).unwrap().0,
+                BundleGeneration(1)
+            );
+            bundle.generation = BundleGeneration(3);
+            bundle.peer_trust_roots = vec![vec![0; 128]];
+            assert_eq!(
+                installer.install(bundle.clone()),
+                Err(BundleError::Wire(racer_control_wire::Error::InvalidRequest))
+            );
+            let (_, chain) = issue(
+                &first,
+                &first_key,
+                &bundle.cluster,
+                &NodeId("22222222-2222-4222-8222-222222222222".into()),
+                |_| {},
+            );
+            bundle.peer_trust_roots = chain;
+            assert_eq!(
+                installer.install(bundle),
+                Err(BundleError::Identity(Error::Unauthorized))
+            );
+            assert_eq!(installer.generation(), Some(BundleGeneration(1)));
         }
     }
 
