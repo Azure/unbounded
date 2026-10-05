@@ -7,9 +7,11 @@
 use super::*;
 use std::ffi::OsString;
 
+/// Controls persistence, power loss, and byte corruption in one simulated world.
 #[derive(Clone, Debug)]
 pub struct CrashDisk(pub(super) Simulation);
 
+/// Selects the live image, the last synced image, or both mutation targets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiskState {
     Volatile,
@@ -17,6 +19,7 @@ pub enum DiskState {
     Both,
 }
 
+/// An inode snapshot sharing immutable sparse pages until a write occurs.
 #[derive(Clone, Debug)]
 struct Image {
     mode: u16,
@@ -25,6 +28,7 @@ struct Image {
     symlink: Option<PathBuf>,
 }
 impl Image {
+    /// Snapshots current inode contents without copying allocated pages.
     fn capture(node: &Node) -> Self {
         Self {
             mode: node.mode,
@@ -33,6 +37,7 @@ impl Image {
             symlink: node.symlink.clone(),
         }
     }
+    /// Persists a new directory binding without implicitly syncing file data.
     fn initial(node: &Node) -> Self {
         Self {
             mode: node.mode,
@@ -41,6 +46,7 @@ impl Image {
             symlink: node.symlink.clone(),
         }
     }
+    /// Recreates an unlocked live inode after power loss.
     fn restore(&self, inode: u64) -> Node {
         Node {
             inode,
@@ -53,6 +59,7 @@ impl Image {
     }
 }
 
+/// Durable inodes, directory bindings, and weak watches for pending disk work.
 #[derive(Default, Debug)]
 pub(super) struct State {
     inodes: BTreeMap<u64, Image>,
@@ -61,12 +68,14 @@ pub(super) struct State {
     pub(super) generation: u64,
     pending: Vec<std::rc::Weak<PendingCrash>>,
 }
+/// Records whether a crash affected any path owned by a pending submission.
 #[derive(Debug)]
 pub(super) struct PendingCrash {
     paths: Vec<PathBuf>,
     pub(super) crashed: std::cell::Cell<bool>,
 }
 impl State {
+    /// Watches exact submission paths without retaining finished operations.
     pub(super) fn watch(&mut self, paths: Vec<PathBuf>) -> Rc<PendingCrash> {
         // Retain only live submissions, never a crash log or a global watermark.
         // A crash marks exact subtree owners before their descriptors disappear.
@@ -80,6 +89,7 @@ impl State {
         }
         pending
     }
+    /// Marks live submissions touching the crashed subtree.
     fn invalidate(&mut self, root: &Path) {
         self.pending.retain(|pending| {
             let Some(pending) = pending.upgrade() else {
@@ -91,6 +101,7 @@ impl State {
             true
         });
     }
+    /// Reconstructs reachable durable names while avoiding directory cycles.
     fn paths(&self) -> BTreeMap<PathBuf, u64> {
         let mut paths = BTreeMap::new();
         let Some(root) = self.root else {
@@ -113,6 +124,7 @@ impl State {
 }
 
 impl World {
+    /// Persists inode contents and, for directories, immediate child bindings.
     fn sync_inode(&mut self, node: &Rc<RefCell<Node>>) -> io::Result<()> {
         let n = node.borrow();
         let inode = n.inode;
@@ -307,13 +319,7 @@ impl CrashDisk {
         let count =
             length.min(usize::try_from(image.length.saturating_sub(offset)).unwrap_or(usize::MAX));
         let mut bytes = bounded_bytes(count)?;
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            let pos = offset + index as u64;
-            *byte = image
-                .pages
-                .get(&(pos / 4096))
-                .map_or(0, |page| page[(pos % 4096) as usize]);
-        }
+        read_pages(&image.pages, offset, &mut bytes);
         Ok(bytes)
     }
 
@@ -394,17 +400,41 @@ impl CrashDisk {
     }
 }
 
-fn overwrite(pages: &mut BTreeMap<u64, Rc<[u8; 4096]>>, offset: u64, bytes: &[u8]) {
-    for (index, byte) in bytes.iter().enumerate() {
+/// Copies allocated pages and zero-fills holes, including unaligned boundaries.
+fn read_pages(pages: &BTreeMap<u64, Rc<[u8; 4096]>>, offset: u64, bytes: &mut [u8]) {
+    let mut index = 0;
+    while index < bytes.len() {
         let pos = offset + index as u64;
-        Rc::make_mut(
-            pages
-                .entry(pos / 4096)
-                .or_insert_with(|| Rc::new([0; 4096])),
-        )[(pos % 4096) as usize] = *byte;
+        let start = (pos % 4096) as usize;
+        let count = (4096 - start).min(bytes.len() - index);
+        let output = &mut bytes[index..index + count];
+        if let Some(page) = pages.get(&(pos / 4096)) {
+            output.copy_from_slice(&page[start..start + count]);
+        } else {
+            output.fill(0);
+        }
+        index += count;
     }
 }
 
+/// Writes page-sized runs, preserving shared snapshots through copy-on-write.
+fn overwrite(pages: &mut BTreeMap<u64, Rc<[u8; 4096]>>, offset: u64, bytes: &[u8]) {
+    let mut index = 0;
+    while index < bytes.len() {
+        let pos = offset + index as u64;
+        let start = (pos % 4096) as usize;
+        let count = (4096 - start).min(bytes.len() - index);
+        let page = Rc::make_mut(
+            pages
+                .entry(pos / 4096)
+                .or_insert_with(|| Rc::new([0; 4096])),
+        );
+        page[start..start + count].copy_from_slice(&bytes[index..index + count]);
+        index += count;
+    }
+}
+
+/// Validates a sparse write's allocation budget before changing any page.
 fn check_page_budget(
     pages: &BTreeMap<u64, Rc<[u8; 4096]>>,
     offset: u64,
@@ -429,6 +459,7 @@ fn check_page_budget(
 }
 
 impl World {
+    /// Resolves a relative name against an open directory's current inode path.
     pub(super) fn path(&self, dir: Option<&Descriptor>, name: &Path) -> io::Result<PathBuf> {
         if name.is_absolute() {
             return normalize(name);
@@ -453,6 +484,7 @@ impl World {
         };
         normalize(&base.join(name))
     }
+    /// Allocates an empty inode with a deterministic identity.
     pub(super) fn node(&mut self, mode: u16) -> Rc<RefCell<Node>> {
         Rc::new(RefCell::new(Node {
             inode: self.id(),
@@ -463,6 +495,7 @@ impl World {
             symlink: None,
         }))
     }
+    /// Traverses symlinks while enforcing the requested openat2 boundary.
     fn resolve(
         &self,
         path: PathBuf,
@@ -532,6 +565,7 @@ impl World {
         }
         Ok(prefix)
     }
+    /// Validates supported openat2 policies and resolves the final pathname.
     pub(super) fn open_path(
         &self,
         dir: Option<&Descriptor>,
@@ -568,7 +602,8 @@ impl World {
         )
     }
 }
-pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
+/// Normalizes fixture names without allowing parent traversal.
+fn normalize(path: &Path) -> io::Result<PathBuf> {
     let mut out = PathBuf::from("/");
     for component in path.components() {
         match component {
@@ -581,6 +616,7 @@ pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
 }
 
 impl Simulation {
+    /// Creates missing ancestors as volatile directories for a fixture.
     pub fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         let path = normalize(path)?;
         let mut w = self.0.borrow_mut();
@@ -616,6 +652,7 @@ impl Simulation {
         w.paths.insert(path, node);
         Ok(())
     }
+    /// Opens a simulated file using ordinary pathname resolution.
     pub fn open(
         &self,
         dir: Option<&Descriptor>,
@@ -624,6 +661,7 @@ impl Simulation {
     ) -> io::Result<Descriptor> {
         self.open_resolved(dir, path, flags, 0)
     }
+    /// Creates a volatile symbolic link without resolving its target.
     pub fn symlink(&self, target: &Path, path: &Path) -> io::Result<()> {
         let path = normalize(path)?;
         let mut w = self.0.borrow_mut();
@@ -642,6 +680,7 @@ impl Simulation {
         w.record("symlink", 0, 0);
         Ok(())
     }
+    /// Opens a file under explicit openat2 resolution and creation policies.
     pub(super) fn open_resolved(
         &self,
         dir: Option<&Descriptor>,
@@ -650,10 +689,7 @@ impl Simulation {
         resolve: u64,
     ) -> io::Result<Descriptor> {
         if let Some(dir) = dir {
-            match dir.as_sim() {
-                Some(handle) if Rc::ptr_eq(&self.0, &handle.sim.0) => (),
-                _ => return Err(errno(libc::EXDEV)),
-            }
+            self.handle(dir)?;
         }
         let (node, opened_path) = {
             let mut w = self.0.borrow_mut();
@@ -709,6 +745,7 @@ impl Simulation {
             opened_path,
         }))
     }
+    /// Replaces a fixture file, retrying short writes without syncing it.
     pub fn write_file(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             self.create_dir_all(parent)?;
@@ -725,6 +762,7 @@ impl Simulation {
         }
         Ok(())
     }
+    /// Materializes a bounded file while honoring short reads and injected faults.
     pub fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         let fd = self.open(None, path, libc::O_RDONLY)?;
         let Some(h) = fd.as_sim() else { unreachable!() };
@@ -741,6 +779,7 @@ impl Simulation {
         }
         Ok(bytes)
     }
+    /// Returns a named inode's identity and mode without following symlinks.
     pub fn metadata(&self, path: &Path) -> io::Result<(u64, u16)> {
         let w = self.0.borrow();
         let node = w
@@ -750,6 +789,7 @@ impl Simulation {
             .borrow();
         Ok((node.inode, node.mode))
     }
+    /// Changes permission bits while preserving the inode's file type.
     pub fn chmod(&self, path: &Path, mode: u32) -> io::Result<()> {
         let mut w = self.0.borrow_mut();
         if let Some(Fault::Errno(n)) = w.fault("chmod") {
@@ -763,6 +803,7 @@ impl Simulation {
         node.mode = (node.mode & libc::S_IFMT as u16) | (mode as u16 & 0o7777);
         Ok(())
     }
+    /// Moves or exchanges names, descendants, and open-description crash paths.
     pub fn rename(&self, from: &Path, to: &Path, flags: u32) -> io::Result<()> {
         let mut w = self.0.borrow_mut();
         if let Some(Fault::Errno(n)) = w.fault("rename") {
@@ -883,6 +924,7 @@ impl Simulation {
         w.record("rename", 0, 0);
         Ok(())
     }
+    /// Removes a non-directory name while retaining any open inode owners.
     pub fn unlink(&self, path: &Path) -> io::Result<()> {
         let mut w = self.0.borrow_mut();
         if let Some(Fault::Errno(n)) = w.fault("unlink") {
@@ -901,13 +943,16 @@ impl Simulation {
         Ok(())
     }
 }
+
 impl Handle {
+    /// Borrows a file's inode and open flags, rejecting stale descriptors.
     pub(super) fn node(&self) -> io::Result<(Rc<RefCell<Node>>, i32)> {
         match self.sim.0.borrow().resources.get(&self.id) {
             Some(Resource::File { node, flags, .. }) => Ok((node.clone(), *flags)),
             _ => Err(errno(libc::EBADF)),
         }
     }
+    /// Reports inode metadata and the simulation's direct-I/O alignment.
     pub fn stat(&self) -> io::Result<libc::statx> {
         let (node, _) = self.node()?;
         let node = node.borrow();
@@ -923,6 +968,7 @@ impl Handle {
         stat.stx_gid = 0;
         Ok(stat)
     }
+    /// Resizes a writable file, clearing truncated data without allocating holes.
     pub fn set_len(&self, length: u64) -> io::Result<()> {
         if length > i64::MAX as u64 {
             return Err(errno(libc::EINVAL));
@@ -944,6 +990,7 @@ impl Handle {
         node.length = length;
         Ok(())
     }
+    /// Acquires an exclusive nonblocking inode lock owned by this descriptor.
     pub fn lock(&self) -> io::Result<()> {
         if matches!(
             self.sim.0.borrow().resources.get(&self.id),
@@ -970,6 +1017,7 @@ impl Handle {
         }
         Ok(())
     }
+    /// Reads a bounded sparse range after validating flags and direct alignment.
     pub fn file_read(&self, offset: u64, bytes: &mut [u8]) -> io::Result<usize> {
         if offset > i64::MAX as u64 {
             return Err(errno(libc::EINVAL));
@@ -995,22 +1043,10 @@ impl Handle {
             .min(node.length.saturating_sub(offset) as usize)
             .min(self.sim.0.borrow().max_chunk)
             .min(limit);
-        // Copy one sparse page at a time, including unaligned first/last pages.
-        let mut index = 0;
-        while index < len {
-            let pos = offset + index as u64;
-            let start = (pos % 4096) as usize;
-            let count = (4096 - start).min(len - index);
-            let output = &mut bytes[index..index + count];
-            if let Some(page) = node.pages.get(&(pos / 4096)) {
-                output.copy_from_slice(&page[start..start + count]);
-            } else {
-                output.fill(0);
-            }
-            index += count;
-        }
+        read_pages(&node.pages, offset, &mut bytes[..len]);
         Ok(len)
     }
+    /// Writes a bounded sparse range without modifying durable shared pages.
     pub(in crate::reactor) fn file_write(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         if offset > i64::MAX as u64 {
             return Err(errno(libc::EINVAL));
@@ -1045,23 +1081,13 @@ impl Handle {
             return Ok(0);
         }
         check_page_budget(&node.pages, offset, bytes.len())?;
-        let mut index = 0;
-        while index < bytes.len() {
-            let pos = offset + index as u64;
-            let start = (pos % 4096) as usize;
-            let count = (4096 - start).min(bytes.len() - index);
-            let page = Rc::make_mut(
-                node.pages
-                    .entry(pos / 4096)
-                    .or_insert_with(|| Rc::new([0; 4096])),
-            );
-            page[start..start + count].copy_from_slice(&bytes[index..index + count]);
-            index += count;
-        }
+        overwrite(&mut node.pages, offset, bytes);
         node.length = node.length.max(end);
         Ok(bytes.len())
     }
 }
+
+/// Checks the original request's alignment before a fault shortens its transfer.
 pub(super) fn check_direct(
     flags: i32,
     offset: u64,
@@ -1076,4 +1102,686 @@ pub(super) fn check_direct(
         return Err(errno(libc::EINVAL));
     }
     Ok(())
+}
+
+/// Durability, sparse-page, and reactor crash-ownership contracts.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Error;
+    use crate::reactor::simulation::network::tests::{drive, poll, reactor, scope};
+    use crate::reactor::tests::fixtures::{Reactor, RequestScope, ResourceClass};
+    use std::time::{Duration, Instant};
+
+    /// Enters a fresh world and creates reactor owners for crash and durability tests.
+    fn setup() -> (Simulation, Environment, Reactor, RequestScope) {
+        let sim = Simulation::new();
+        let environment = sim.enter();
+        let r = reactor();
+        let scope = RequestScope::new((), Instant::now() + Duration::from_secs(30)).unwrap();
+        (sim, environment, r, scope)
+    }
+    /// Opens an existing fixture for read/write submissions through the reactor.
+    fn open(sim: &Simulation, path: &str) -> Rc<Descriptor> {
+        Rc::new(sim.open(None, Path::new(path), libc::O_RDWR).unwrap())
+    }
+    /// Reads a small volatile prefix without allocating a sparse file's logical size.
+    fn read(sim: &Simulation, path: &str) -> Vec<u8> {
+        sim.disk()
+            .read(Path::new(path), 0, 64, DiskState::Volatile)
+            .unwrap()
+    }
+
+    #[test]
+    fn delayed_completion_and_fault_trace_replay_exactly() {
+        /// Captures one delayed-open and failed-read scenario for exact trace replay.
+        fn run() -> Vec<Event> {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let r = reactor();
+            let scope = scope();
+            sim.write_file(Path::new("/file"), b"abc").unwrap();
+            sim.inject("open", Fault::Delay(2)).unwrap();
+            let fd = drive(
+                &r,
+                r.file_open(
+                    None,
+                    CString::new("/file").unwrap(),
+                    libc::O_RDONLY,
+                    0,
+                    &scope,
+                ),
+            )
+            .unwrap();
+            sim.inject("read", Fault::Errno(libc::EIO)).unwrap();
+            assert!(matches!(
+                drive(&r, r.read_at(fd, 0, r.file_buffer(3).unwrap(), (), &scope)),
+                Err(Error::Os(libc::EIO))
+            ));
+            sim.trace()
+        }
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn sparse_page_copies_preserve_boundaries_holes_and_snapshots() {
+        for offset in [0, 1, 4095, 4096, 4097] {
+            for length in [0, 1, 4095, 4096, 4097, 8193] {
+                let sim = Simulation::new();
+                let file = sim
+                    .open(None, Path::new("/file"), libc::O_CREAT | libc::O_RDWR)
+                    .unwrap()
+                    .into_sim()
+                    .unwrap();
+                // Leave a full sparse page before an unaligned multi-page write.
+                let offset = 8192 + offset;
+                let original: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
+                assert_eq!(file.file_write(offset, &original).unwrap(), length);
+                let mut expected = vec![0; if length == 0 { 0 } else { offset as usize }];
+                expected.extend_from_slice(&original);
+                let (node, _) = file.node().unwrap();
+                let snapshot = node.borrow().pages.clone();
+                let replacement = vec![0xa5; length + 1];
+                sim.inject("write", Fault::Short(length / 2)).unwrap();
+                assert_eq!(file.file_write(offset, &replacement).unwrap(), length / 2);
+                if length != 0 {
+                    expected[offset as usize..offset as usize + length / 2].fill(0xa5);
+                }
+                for (index, byte) in original.iter().enumerate() {
+                    let pos = offset as usize + index;
+                    assert_eq!(snapshot[&(pos as u64 / 4096)][pos % 4096], *byte);
+                }
+                let mut output = vec![0xcc; expected.len() + 8];
+                assert_eq!(file.file_read(0, &mut output).unwrap(), expected.len());
+                assert_eq!(&output[..expected.len()], expected);
+                assert_eq!(&output[expected.len()..], &[0xcc; 8]);
+                let mut partial = vec![0xcc; length + 8];
+                sim.inject("read", Fault::Short(length / 2)).unwrap();
+                assert_eq!(file.file_read(offset, &mut partial).unwrap(), length / 2);
+                if length != 0 {
+                    assert_eq!(
+                        &partial[..length / 2],
+                        &expected[offset as usize..offset as usize + length / 2]
+                    );
+                }
+                assert!(partial[length / 2..].iter().all(|b| *b == 0xcc));
+                sim.inject("write", Fault::Errno(libc::EIO)).unwrap();
+                assert_eq!(
+                    file.file_write(offset, b"bad").unwrap_err().raw_os_error(),
+                    Some(libc::EIO)
+                );
+                assert_eq!(sim.read_file(Path::new("/file")).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_files_partial_io_faults_rename_unlink_and_open_inode_ownership() {
+        let (sim, _environment, r, scope) = setup();
+        sim.create_dir_all(Path::new("/data")).unwrap();
+        let dir = drive(
+            &r,
+            r.file_open(
+                None,
+                CString::new("/data").unwrap(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+                &scope,
+            ),
+        )
+        .unwrap();
+        let file = drive(
+            &r,
+            r.file_open(
+                Some(dir.clone()),
+                CString::new("a").unwrap(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+                0,
+                &scope,
+            ),
+        )
+        .unwrap();
+        sim.inject("write", Fault::Short(2)).unwrap();
+        let write = drive(
+            &r,
+            r.write_at(
+                file.clone(),
+                1 << 30,
+                r.file_bytes(b"abcdef").unwrap(),
+                (),
+                &scope,
+            ),
+        )
+        .unwrap();
+        assert_eq!(write.bytes, 2);
+        drop(write);
+        let stat = drive(&r, r.file_stat(file.clone(), &scope)).unwrap();
+        assert_eq!(stat.stx_size, (1 << 30) + 2);
+        sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
+        assert_eq!(
+            drive(&r, r.file_sync(file.clone(), &scope)),
+            Err(Error::Os(libc::EIO))
+        );
+        drive(&r, r.file_sync(file.clone(), &scope)).unwrap();
+        drive(
+            &r,
+            r.file_rename(
+                dir.clone(),
+                CString::new("a").unwrap(),
+                CString::new("b").unwrap(),
+                &scope,
+            ),
+        )
+        .unwrap();
+        drive(
+            &r,
+            r.file_unlink(dir.clone(), CString::new("b").unwrap(), &scope),
+        )
+        .unwrap();
+        let read = drive(
+            &r,
+            r.read_at(
+                file.clone(),
+                (1 << 30) - 2,
+                r.file_buffer(8).unwrap(),
+                (),
+                &scope,
+            ),
+        )
+        .unwrap();
+        assert_eq!(read.bytes, 4);
+        assert_eq!(read.buffer.prefix(4).unwrap(), b"\0\0ab");
+        assert!(matches!(
+            drive(
+                &r,
+                r.file_open(
+                    Some(dir.clone()),
+                    CString::new("b").unwrap(),
+                    libc::O_RDONLY,
+                    0,
+                    &scope
+                )
+            ),
+            Err(Error::NotFound)
+        ));
+        drop((read, file, dir));
+        assert_eq!(sim.live_handles(), 0);
+        assert!(
+            sim.trace()
+                .iter()
+                .any(|e| e.operation == "complete:fsync" && e.result == -(libc::EIO as i64))
+        );
+    }
+
+    #[test]
+    fn partition_stalls_established_streams_and_connects_then_heals_without_loss() {
+        let (sim, _environment, r, scope) = setup();
+        let a = SocketAddress::Inet("127.0.0.1:101".parse().unwrap());
+        let b = SocketAddress::Inet("127.0.0.1:102".parse().unwrap());
+        let listener = sim.listen(b.clone()).unwrap();
+        let _node = sim.enter_endpoint(a.clone());
+        let client = Rc::new(sim.connect(b.clone()).unwrap());
+        let listener = listener.into_sim().unwrap();
+        let server = Rc::new(listener.accept().unwrap());
+        drive(
+            &r,
+            r.send(client.clone(), r.file_bytes(b"before").unwrap(), (), &scope),
+        )
+        .unwrap();
+        sim.partition(a.clone(), b.clone());
+        let read = drive(
+            &r,
+            r.recv(server.clone(), r.file_buffer(32).unwrap(), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(read.buffer.prefix(read.bytes).unwrap(), b"before");
+        drop(read);
+        let mut send = r.send(client.clone(), r.file_bytes(b"after").unwrap(), (), &scope);
+        let mut reverse = r.send(
+            server.clone(),
+            r.file_bytes(b"reverse").unwrap(),
+            (),
+            &scope,
+        );
+        let fresh = Rc::new(Descriptor::socket(libc::AF_INET).unwrap());
+        let mut connect = r.connect(fresh.clone(), b.clone(), &scope);
+        let mut ready = r.readiness(client.clone(), libc::POLLOUT as u32, &scope);
+        for _ in 0..5 {
+            assert!(poll(&mut send).is_pending());
+            assert!(poll(&mut reverse).is_pending());
+            assert!(poll(&mut connect).is_pending());
+            assert!(poll(&mut ready).is_pending());
+            r.poll_budgeted(8).unwrap();
+        }
+        let (x, y) = sim.socket_pair();
+        x.try_send(b"ok").unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(y.try_recv(&mut bytes).unwrap(), 2);
+        sim.heal(b.clone(), a.clone());
+        assert_eq!(drive(&r, send).unwrap().bytes, 5);
+        assert_eq!(drive(&r, reverse).unwrap().bytes, 7);
+        drive(&r, connect).unwrap();
+        drive(&r, ready).unwrap();
+        assert_eq!(server.try_recv(&mut bytes).unwrap(), 5);
+        assert_eq!(&bytes[..5], b"after");
+        assert_eq!(client.try_recv(&mut bytes).unwrap(), 7);
+        assert_eq!(&bytes[..7], b"reverse");
+        sim.partition(a, b);
+        let weak = Rc::downgrade(&client);
+        let mut pending = r.send(client, r.file_bytes(b"blocked").unwrap(), (), &scope);
+        assert!(poll(&mut pending).is_pending());
+        drop(pending);
+        r.poll_budgeted(1).unwrap();
+        assert!(weak.upgrade().is_some());
+        drive(&r, r.drain()).unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn file_sync_and_namespace_sync_are_independent() {
+        for (file_sync, dir_sync) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (sim, _environment, r, scope) = setup();
+            sim.create_dir_all(Path::new("/disk")).unwrap();
+            sim.disk().sync_all().unwrap();
+            sim.write_file(Path::new("/disk/new"), b"contents").unwrap();
+            if file_sync {
+                drive(&r, r.file_sync(open(&sim, "/disk/new"), &scope)).unwrap();
+            }
+            if dir_sync {
+                let dir = Rc::new(
+                    sim.open(None, Path::new("/disk"), libc::O_RDONLY | libc::O_DIRECTORY)
+                        .unwrap(),
+                );
+                drive(&r, r.file_sync(dir, &scope)).unwrap();
+            }
+            sim.disk().crash().unwrap();
+            if !dir_sync {
+                assert_eq!(
+                    sim.read_file(Path::new("/disk/new"))
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::ENOENT)
+                );
+            } else {
+                assert_eq!(
+                    read(&sim, "/disk/new"),
+                    if file_sync {
+                        b"contents".as_slice()
+                    } else {
+                        b""
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_unlink_and_directory_ancestors_require_namespace_fences() {
+        let (sim, _environment, _, _) = setup();
+        sim.write_file(Path::new("/disk/current"), b"old").unwrap();
+        sim.disk().sync_all().unwrap();
+        sim.write_file(Path::new("/disk/stage"), b"new").unwrap();
+        sim.disk().sync(Path::new("/disk/stage")).unwrap();
+        sim.rename(Path::new("/disk/stage"), Path::new("/disk/current"), 0)
+            .unwrap();
+        sim.disk().crash().unwrap();
+        assert_eq!(read(&sim, "/disk/current"), b"old");
+        sim.write_file(Path::new("/disk/stage"), b"new").unwrap();
+        sim.disk().sync(Path::new("/disk/stage")).unwrap();
+        sim.rename(Path::new("/disk/stage"), Path::new("/disk/current"), 0)
+            .unwrap();
+        sim.disk().sync(Path::new("/disk")).unwrap();
+        sim.disk().crash().unwrap();
+        assert_eq!(read(&sim, "/disk/current"), b"new");
+        sim.unlink(Path::new("/disk/current")).unwrap();
+        sim.disk().crash().unwrap();
+        assert_eq!(read(&sim, "/disk/current"), b"new");
+        sim.unlink(Path::new("/disk/current")).unwrap();
+        sim.disk().sync(Path::new("/disk")).unwrap();
+        sim.disk().crash().unwrap();
+        assert!(sim.read_file(Path::new("/disk/current")).is_err());
+        sim.write_file(Path::new("/disk/child/file"), b"hidden")
+            .unwrap();
+        sim.disk().sync(Path::new("/disk/child/file")).unwrap();
+        sim.disk().sync(Path::new("/disk/child")).unwrap();
+        sim.disk().crash().unwrap();
+        assert!(sim.metadata(Path::new("/disk/child")).is_err());
+    }
+
+    #[test]
+    fn failed_sync_and_crash_during_pending_write_preserve_fences_and_other_disks() {
+        let (sim, _environment, r, scope) = setup();
+        for path in ["/a/file", "/b/file"] {
+            sim.write_file(Path::new(path), b"old").unwrap();
+        }
+        sim.disk().sync_all().unwrap();
+        let a = open(&sim, "/a/file");
+        let b = open(&sim, "/b/file");
+        drive(
+            &r,
+            r.write_at(a.clone(), 0, r.file_bytes(b"bad").unwrap(), (), &scope),
+        )
+        .unwrap();
+        sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
+        assert_eq!(
+            drive(&r, r.file_sync(a.clone(), &scope)),
+            Err(Error::Os(libc::EIO))
+        );
+        sim.inject("write", Fault::Delay(3)).unwrap();
+        let weak = Rc::downgrade(&a);
+        let lease = r
+            .admission
+            .reserve(None, ResourceClass::Connection, 1)
+            .unwrap();
+        let mut write = r.write_at(a, 0, r.file_bytes(b"late").unwrap(), lease, &scope);
+        assert!(poll(&mut write).is_pending());
+        sim.disk().crash_under(Path::new("/a")).unwrap();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(r.in_flight(), 1);
+        assert_eq!(read(&sim, "/a/file"), b"old");
+        drive(
+            &r,
+            r.write_at(b, 0, r.file_bytes(b"new").unwrap(), (), &scope),
+        )
+        .unwrap();
+        assert!(matches!(drive(&r, write), Err(Error::Os(libc::EIO))));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(read(&sim, "/a/file"), b"old");
+        assert_eq!(read(&sim, "/b/file"), b"new");
+        assert_eq!(r.admission.used(ResourceClass::Connection), 0);
+        // A path-only open queued before crash cannot recreate lost names afterwards.
+        sim.inject("open", Fault::Delay(2)).unwrap();
+        let mut op = r.file_open(
+            None,
+            CString::new("/a/late").unwrap(),
+            libc::O_CREAT | libc::O_RDWR,
+            0,
+            &scope,
+        );
+        assert!(poll(&mut op).is_pending());
+        sim.disk().crash_under(Path::new("/a")).unwrap();
+        assert!(matches!(drive(&r, op), Err(Error::Os(libc::EIO))));
+        assert!(sim.metadata(Path::new("/a/late")).is_err());
+    }
+
+    #[test]
+    fn sparse_corruption_and_truncate_do_not_mutate_durable_shared_pages() {
+        let (sim, _environment, r, scope) = setup();
+        sim.write_file(Path::new("/file"), b"abcdef").unwrap();
+        sim.disk().sync_all().unwrap();
+        let fd = open(&sim, "/file");
+        let Some(h) = fd.as_sim() else { unreachable!() };
+        h.set_len(2).unwrap();
+        h.set_len(6).unwrap();
+        assert_eq!(read(&sim, "/file"), b"ab\0\0\0\0");
+        assert_eq!(
+            sim.disk()
+                .read(Path::new("/file"), 0, 8, DiskState::Durable)
+                .unwrap(),
+            b"abcdef"
+        );
+        sim.disk()
+            .corrupt(Path::new("/file"), 1, b"X", DiskState::Volatile)
+            .unwrap();
+        sim.disk()
+            .corrupt(Path::new("/file"), 4, b"Y", DiskState::Durable)
+            .unwrap();
+        sim.disk().crash().unwrap();
+        assert_eq!(read(&sim, "/file"), b"abcdYf");
+        let fd = open(&sim, "/file");
+        drive(
+            &r,
+            r.write_at(
+                fd.clone(),
+                1 << 40,
+                r.file_bytes(b"sparse").unwrap(),
+                (),
+                &scope,
+            ),
+        )
+        .unwrap();
+        drive(&r, r.file_sync(fd, &scope)).unwrap();
+        assert_eq!(
+            sim.disk()
+                .read(Path::new("/file"), (1 << 40) - 2, 10, DiskState::Durable)
+                .unwrap(),
+            b"\0\0sparse"
+        );
+        assert!(
+            sim.disk()
+                .corrupt(Path::new("/file"), u64::MAX, b"bad", DiskState::Both)
+                .is_err()
+        );
+        sim.disk().crash().unwrap();
+        assert_eq!(
+            sim.disk()
+                .read(Path::new("/file"), 1 << 40, 6, DiskState::Volatile)
+                .unwrap(),
+            b"sparse"
+        );
+    }
+
+    #[test]
+    fn crash_after_sync_issue_before_cqe_and_abandoned_sync_keep_real_fences() {
+        let (sim, _environment, r, scope) = setup();
+        sim.write_file(Path::new("/file"), b"old").unwrap();
+        sim.disk().sync_all().unwrap();
+        let fd = open(&sim, "/file");
+        drive(
+            &r,
+            r.write_at(fd.clone(), 0, r.file_bytes(b"new").unwrap(), (), &scope),
+        )
+        .unwrap();
+        let mut sync = r.file_sync(fd.clone(), &scope);
+        assert!(poll(&mut sync).is_pending());
+        // Submit fsync, but leave its successful original CQE unconsumed.
+        r.poll_budgeted(1).unwrap();
+        assert_eq!(r.in_flight(), 1);
+        sim.disk().crash().unwrap();
+        assert_eq!(read(&sim, "/file"), b"new");
+        assert!(matches!(drive(&r, sync), Ok(())));
+        assert!(matches!(
+            drive(&r, r.file_stat(fd, &scope)),
+            Err(Error::Os(libc::EBADF))
+        ));
+        let fd = open(&sim, "/file");
+        drive(
+            &r,
+            r.write_at(fd.clone(), 0, r.file_bytes(b"bad").unwrap(), (), &scope),
+        )
+        .unwrap();
+        let weak = Rc::downgrade(&fd);
+        let mut sync = r.file_sync(fd, &scope);
+        assert!(poll(&mut sync).is_pending());
+        drop(sync);
+        r.poll_budgeted(1).unwrap();
+        assert!(weak.upgrade().is_some());
+        r.poll_budgeted(1).unwrap();
+        assert!(weak.upgrade().is_some());
+        r.poll_budgeted(1).unwrap();
+        assert!(weak.upgrade().is_none());
+        sim.disk().crash().unwrap();
+        assert_eq!(read(&sim, "/file"), b"new");
+    }
+
+    #[test]
+    fn renamed_directory_fsync_uses_inode_and_durable_corruption_targets_exact_generation() {
+        let (sim, _environment, _, _) = setup();
+        sim.write_file(Path::new("/old/file"), b"before").unwrap();
+        sim.disk().sync_all().unwrap();
+        let directory = sim
+            .open(None, Path::new("/old"), libc::O_RDONLY | libc::O_DIRECTORY)
+            .unwrap();
+        sim.rename(Path::new("/old"), Path::new("/new"), 0).unwrap();
+        sim.write_file(Path::new("/new/extra"), b"extra").unwrap();
+        sim.disk().sync(Path::new("/new/extra")).unwrap();
+        let directory = directory.into_sim().unwrap();
+        directory.sync().unwrap();
+        sim.disk().sync(Path::new("/")).unwrap();
+        sim.disk().crash().unwrap();
+        assert_eq!(read(&sim, "/new/file"), b"before");
+        assert_eq!(read(&sim, "/new/extra"), b"extra");
+        assert!(sim.metadata(Path::new("/old")).is_err());
+        sim.write_file(Path::new("/stage"), b"replace").unwrap();
+        sim.rename(Path::new("/stage"), Path::new("/new/file"), 0)
+            .unwrap();
+        assert_eq!(
+            sim.disk()
+                .corrupt(Path::new("/new/file"), 0, b"X", DiskState::Both)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ESTALE)
+        );
+        assert_eq!(read(&sim, "/new/file"), b"replace");
+        assert_eq!(
+            sim.disk()
+                .read(Path::new("/new/file"), 0, 64, DiskState::Durable)
+                .unwrap(),
+            b"before"
+        );
+    }
+
+    // Persistence faults mutate the integrated disk; production entries own I/O.
+    #[test]
+    fn crashprefix_covers_missing_torn_and_reordered_overwrites() {
+        let offset = (1 << 40) - 4;
+        for (prefix, expected) in [b"base", b"bBBe", b"AABe"].into_iter().enumerate() {
+            let (sim, _environment, r, scope) = setup();
+            let path = Path::new("/sparse");
+            sim.write_file(path, b"").unwrap();
+            let fd = open(&sim, "/sparse");
+            drive(
+                &r,
+                r.write_at(
+                    fd.clone(),
+                    offset,
+                    r.file_bytes(b"base").unwrap(),
+                    (),
+                    &scope,
+                ),
+            )
+            .unwrap();
+            sim.disk().sync_all().unwrap();
+            for (at, bytes) in [(offset, b"AAAA".as_slice()), (offset + 1, b"BB".as_slice())] {
+                drive(
+                    &r,
+                    r.write_at(fd.clone(), at, r.file_bytes(bytes).unwrap(), (), &scope),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                sim.disk()
+                    .read(path, offset, 4, DiskState::Volatile)
+                    .unwrap(),
+                b"ABBA"
+            );
+            // Explicit durable-only fault prefixes preserve the independent volatile image.
+            if prefix >= 1 {
+                sim.disk()
+                    .corrupt(path, offset + 1, b"BB", DiskState::Durable)
+                    .unwrap();
+            }
+            if prefix >= 2 {
+                sim.disk()
+                    .corrupt(path, offset, b"AA", DiskState::Durable)
+                    .unwrap();
+            }
+            assert_eq!(
+                sim.disk()
+                    .read(path, offset, 4, DiskState::Volatile)
+                    .unwrap(),
+                b"ABBA"
+            );
+            sim.disk().crash().unwrap();
+            assert!(matches!(
+                drive(
+                    &r,
+                    r.write_at(fd, offset, r.file_bytes(b"late").unwrap(), (), &scope)
+                ),
+                Err(Error::Os(libc::EBADF))
+            ));
+            let result = drive(
+                &r,
+                r.read_at(
+                    open(&sim, "/sparse"),
+                    offset,
+                    r.file_buffer(4).unwrap(),
+                    (),
+                    &scope,
+                ),
+            )
+            .unwrap();
+            assert_eq!(result.bytes, 4);
+            assert_eq!(result.buffer.prefix(4).unwrap(), expected);
+            drop(result);
+            assert_eq!(r.in_flight(), 0);
+            assert_eq!(sim.live_handles(), 0);
+        }
+    }
+
+    #[test]
+    fn invalid_fault_plans_and_extents_are_atomic_and_holes_are_zero() {
+        let (sim, _environment, r, scope) = setup();
+        let path = Path::new("/file");
+        sim.write_file(path, b"\0\0\0\0data").unwrap();
+        sim.disk().sync_all().unwrap();
+        for (offset, bytes) in [(4, b"large".as_slice()), (u64::MAX, b"x".as_slice())] {
+            assert!(
+                sim.disk()
+                    .corrupt(path, offset, bytes, DiskState::Both)
+                    .is_err()
+            );
+            for state in [DiskState::Volatile, DiskState::Durable] {
+                assert_eq!(sim.disk().read(path, 0, 8, state).unwrap(), b"\0\0\0\0data");
+            }
+        }
+        let old = open(&sim, "/file");
+        assert!(matches!(
+            drive(
+                &r,
+                r.write_at(
+                    old.clone(),
+                    u64::MAX,
+                    r.file_bytes(b"x").unwrap(),
+                    (),
+                    &scope
+                )
+            ),
+            Err(Error::InvalidInput)
+        ));
+        assert_eq!(read(&sim, "/file"), b"\0\0\0\0data");
+        let holes = drive(
+            &r,
+            r.read_at(old.clone(), 0, r.file_buffer(4).unwrap(), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(holes.buffer.prefix(4).unwrap(), &[0; 4]);
+        drop(holes);
+        assert_eq!(
+            drive(
+                &r,
+                r.read_at(old.clone(), 15, r.file_buffer(2).unwrap(), (), &scope)
+            )
+            .unwrap()
+            .bytes,
+            0
+        );
+        sim.disk().crash().unwrap();
+        let fresh = open(&sim, "/file");
+        let (Some(a), Some(b)) = (old.as_sim(), fresh.as_sim()) else {
+            unreachable!()
+        };
+        assert_ne!(a.id(), b.id());
+        assert!(matches!(
+            drive(&r, r.file_stat(old, &scope)),
+            Err(Error::Os(libc::EBADF))
+        ));
+        drive(
+            &r,
+            r.write_at(fresh, 0, r.file_bytes(b"new").unwrap(), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(read(&sim, "/file"), b"new\0data");
+        assert_eq!(r.in_flight(), 0);
+    }
 }
