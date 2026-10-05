@@ -1,3 +1,7 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
 [package]
 name = "racer-dataplane"
 version = "0.1.0"
