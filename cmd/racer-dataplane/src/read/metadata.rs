@@ -127,7 +127,13 @@ impl IngressDeadlines {
 impl IngressDeadline {
     fn check(&self, scope: &RequestScope, waker: &Waker) -> Result<()> {
         scope.check()?;
-        self.inner.check(waker).map_err(Error::from)
+        match self
+            .inner
+            .poll_expired(&mut std::task::Context::from_waker(waker))
+        {
+            Poll::Ready(()) => Err(Error::DeadlineExceeded),
+            Poll::Pending => Ok(()),
+        }
     }
 }
 
@@ -207,6 +213,10 @@ impl MetadataService {
     /// The worker tick calls this during normal polling and shutdown drain.
     pub(crate) fn poll_deadlines(&self, now: Instant, budget: usize) -> usize {
         self.deadlines.poll(now, budget)
+    }
+
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.deadlines.inner.next_deadline()
     }
 
     /// Missing pinned metadata may require a conditional page-zero probe; never
