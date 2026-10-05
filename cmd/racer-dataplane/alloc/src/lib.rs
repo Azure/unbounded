@@ -146,7 +146,6 @@ use std::{
     rc::{Rc, Weak},
 };
 use uring_runtime::reactor::IoBuffer;
-use zeroize::Zeroize;
 
 /// Storage failures, separated from application record and admission policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -413,6 +412,9 @@ impl Alignment {
                 layout,
                 charge,
                 retained: Vec::new(),
+                clean: true,
+                #[cfg(test)]
+                wipes: Rc::new(std::cell::Cell::new(0)),
             }),
             pool: Weak::new(),
         })
@@ -439,18 +441,56 @@ struct Allocation<C: Charge> {
     charge: C,
 
     retained: Vec<Rc<C>>,
+
+    // True only after zeroed allocation or a complete secure wipe. Every mutable
+    // exposure, including the runtime's kernel-write borrow, clears this first.
+    clean: bool,
+
+    #[cfg(test)]
+    wipes: Rc<std::cell::Cell<usize>>,
 }
 impl<C: Charge> Allocation<C> {
     /// Exclusively borrow the complete initialized allocation with its original size.
     fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.clean = false;
         // SAFETY: exclusive owner, initialized nonzero allocation, original layout.
         unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.layout.size()) }
+    }
+
+    /// Securely erase the entire allocation once after each mutable exposure.
+    fn wipe(&mut self) {
+        if self.clean {
+            return;
+        }
+        #[cfg(all(
+            target_os = "linux",
+            any(target_env = "gnu", target_env = "musl"),
+            not(miri)
+        ))]
+        // SAFETY: this exclusive owner holds layout.size() initialized writable
+        // bytes. explicit_bzero cannot be eliminated as a dead store. No kernel
+        // operation can outlive ownership's completion fence.
+        unsafe {
+            libc::explicit_bzero(self.pointer.as_ptr().cast(), self.layout.size())
+        };
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_env = "gnu", target_env = "musl"),
+            not(miri)
+        )))]
+        {
+            use zeroize::Zeroize;
+            self.as_mut_slice().zeroize();
+        }
+        self.clean = true;
+        #[cfg(test)]
+        self.wipes.set(self.wipes.get() + 1);
     }
 }
 impl<C: Charge> Drop for Allocation<C> {
     /// Erase and free before field destruction releases the accounting guards.
     fn drop(&mut self) {
-        self.as_mut_slice().zeroize();
+        self.wipe();
         // SAFETY: this owner holds the allocation and its original layout. Guards
         // are dropped only after zeroization and deallocation complete.
         unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
@@ -546,7 +586,7 @@ impl<C: Charge> Drop for AlignedBuffer<C> {
     /// Zeroize and return storage if possible, otherwise let its owner free it.
     fn drop(&mut self) {
         if let Some(pool) = self.pool.upgrade() {
-            self.allocation_mut().as_mut_slice().zeroize();
+            self.allocation_mut().wipe();
             // Caller-owned guard destructors may access the pool. Do not invoke
             // them while holding its RefCell borrow. Allocation remains owned
             // by this buffer if a destructor unwinds.
@@ -560,8 +600,9 @@ impl<C: Charge> Drop for AlignedBuffer<C> {
                 });
             }
         }
-        // Otherwise field drop zeroizes and frees the allocation, even when the
-        // pool is gone, occupied, or borrowed. Idle buffers never repool themselves.
+        // Field drop securely wipes any still-dirty allocation and frees it. A
+        // rejected pool return or idle free needs no second wipe. Idle buffers
+        // never repool themselves.
     }
 }
 // SAFETY: owned aligned backing is initialized, stable, and live until Drop.
@@ -612,6 +653,59 @@ mod buffer_tests {
         fn drop(&mut self) {
             self.live.set(self.live.get() - self.bytes);
         }
+    }
+
+    /// Full padded capacity is erased, and clean reuse does not erase twice.
+    #[test]
+    fn secure_wipe_covers_padding_and_skips_clean_pool_lifetimes() {
+        let alignment = Alignment::new(4096, 512, 512).unwrap();
+        let length = alignment.extent(0, 513).unwrap().length();
+        let pool = Rc::new(RefCell::new(None));
+        let mut buffer = alignment.allocate(length, ()).unwrap().pooled(&pool);
+        let wipes = buffer.allocation().wipes.clone();
+        assert!(buffer.allocation().clean);
+        assert_eq!(buffer.as_slice(), vec![0; 1024]);
+        drop(buffer);
+        assert_eq!(wipes.get(), 0);
+        buffer = pool.borrow_mut().take().unwrap().pooled(&pool);
+        buffer.as_mut_slice().fill(0xa5);
+        assert!(!buffer.allocation().clean);
+        drop(buffer);
+        assert_eq!(wipes.get(), 1);
+        buffer = pool.borrow_mut().take().unwrap().pooled(&pool);
+        assert_eq!(buffer.as_slice(), vec![0; 1024]);
+        assert!(buffer.allocation().clean);
+        drop(buffer);
+        drop(pool);
+        assert_eq!(wipes.get(), 1);
+    }
+
+    /// Runtime pointer writes dirty storage before submission, including padding.
+    #[test]
+    fn kernel_write_borrow_dirties_clean_reused_storage() {
+        let pool = Rc::new(RefCell::new(None));
+        let alignment = Alignment::new(64, 1, 1).unwrap();
+        let mut buffer = alignment.allocate(128, ()).unwrap().pooled(&pool);
+        let wipes = buffer.allocation().wipes.clone();
+        for expected in 1..=2 {
+            assert!(buffer.allocation().clean);
+            let pointer = IoBuffer::bytes_mut(&mut buffer).unwrap().as_mut_ptr();
+            // SAFETY: simulate a kernel completion while the exclusive owner is
+            // retained, before any subsequent access or release of the buffer.
+            unsafe { pointer.add(127).write(0x5a) };
+            assert!(!buffer.allocation().clean);
+            assert_eq!(buffer.as_slice()[127], 0x5a);
+            drop(buffer);
+            assert_eq!(wipes.get(), expected);
+            buffer = pool.borrow_mut().take().unwrap().pooled(&pool);
+            assert_eq!(IoBuffer::bytes(&buffer).unwrap(), &[0; 128]);
+        }
+        // Even an unused mutable borrow must conservatively require a wipe.
+        let _ = buffer.bytes_mut().unwrap();
+        drop(buffer);
+        assert_eq!(wipes.get(), 3);
+        drop(pool);
+        assert_eq!(wipes.get(), 3);
     }
 
     /// Invalid transfers must fail before inspecting accounting or allocating.
@@ -803,6 +897,8 @@ mod buffer_tests {
                 .allocate(8, TrackedCharge::new(&live, 8))
                 .unwrap()
                 .pooled(&pool);
+            buffer.as_mut_slice().fill(0x5a);
+            let wipes = buffer.allocation().wipes.clone();
             buffer.retain(Rc::new(TrackedCharge::new(&live, 3)));
             match scenario {
                 0 => {
@@ -832,6 +928,7 @@ mod buffer_tests {
                 }
             }
             assert_eq!(live.get(), 0);
+            assert_eq!(wipes.get(), 1);
         }
     }
 
@@ -863,13 +960,19 @@ mod buffer_tests {
             .pooled(&pool);
         let observed_pool = pool.clone();
         let observed_called = called.clone();
+        buffer.as_mut_slice().fill(0x5a);
+        let wipes = buffer.allocation().wipes.clone();
+        let observed_wipes = wipes.clone();
         buffer.retain(Rc::new(Guard(Some(Box::new(move || {
             assert!(observed_pool.borrow_mut().is_none());
+            assert_eq!(observed_wipes.get(), 1);
             observed_called.set(true);
         })))));
         drop(buffer);
         assert!(called.get());
         assert!(pool.borrow().is_some());
+        drop(pool);
+        assert_eq!(wipes.get(), 1);
     }
 
     /// Unwinding through extra accounting cannot leak primary allocation ownership.
@@ -907,6 +1010,8 @@ mod buffer_tests {
             )
             .unwrap()
             .pooled(&pool);
+        buffer.as_mut_slice().fill(0x5a);
+        let wipes = buffer.allocation().wipes.clone();
         buffer.retain(Rc::new(Guard {
             live: live.clone(),
             panic: true,
@@ -914,6 +1019,7 @@ mod buffer_tests {
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(buffer))).is_err());
         assert_eq!(live.get(), 0);
         assert!(pool.borrow().is_none());
+        assert_eq!(wipes.get(), 1);
     }
 }
 
