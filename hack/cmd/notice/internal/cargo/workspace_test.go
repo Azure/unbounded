@@ -163,8 +163,8 @@ func TestDependencyTOMLSyntax(t *testing.T) {
 }
 
 func TestLicenseIndex(t *testing.T) {
-	paths := []string{"LICENSE", "LICENSE-MIT", "LICENSE-APACHE"}
-	if !licenseIndex("LICENSE", []byte("See LICENSE-MIT or LICENSE-APACHE"), paths) {
+	paths := []string{"LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "LICENSE-ISC"}
+	if !licenseIndex("LICENSE", []byte(pemfileIndexFixture), paths) {
 		t.Fatal("rejected index")
 	}
 
@@ -189,9 +189,10 @@ func TestCollectorLicenseIndexCompanions(t *testing.T) {
 			}
 
 			testutil.WriteTree(t, home, map[string]string{
-				"registry/src/index/foo-1.2.3/LICENSE":        "Choose LICENSE-MIT or LICENSE-APACHE.",
+				"registry/src/index/foo-1.2.3/LICENSE":        pemfileIndexFixture,
 				"registry/src/index/foo-1.2.3/LICENSE-MIT":    companion,
 				"registry/src/index/foo-1.2.3/LICENSE-APACHE": testutil.Apache2License(),
+				"registry/src/index/foo-1.2.3/LICENSE-ISC":    iscFixture,
 			})
 
 			entries, err := New(home).Collect(root)
@@ -199,7 +200,7 @@ func TestCollectorLicenseIndexCompanions(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), "classifying") {
 					t.Fatalf("error = %v", err)
 				}
-			} else if err != nil || len(entries) != 1 || len(entries[0].License) != 2 {
+			} else if err != nil || len(entries) != 1 || len(entries[0].License) != 3 {
 				t.Fatalf("entries = %v, %v", entries, err)
 			}
 		})
