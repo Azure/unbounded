@@ -66,7 +66,7 @@ func planIdentity(ctx context.Context, env *component.Env, plan *component.Plan)
 		marker := &corev1.ConfigMap{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 			ObjectMeta: metav1.ObjectMeta{Name: markerName, Namespace: env.Namespace, Annotations: map[string]string{managerAnnotation: component.FieldOwner, claimAnnotation: string(claim.UID)}},
-			Data:       map[string]string{"cluster": claim.Data["cluster"], "version_configmap": versionName, "state": "fresh"},
+			Data:       map[string]string{"cluster": claim.Data["cluster"], "version_configmap": versionName, "state": "fresh", "initialization_protocol": "staged-v1"},
 		}
 		plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Component: name, Object: component.ToUnstructured(marker), DependsOn: []component.ObjectRef{cas.Ref()}})
 

@@ -99,9 +99,15 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 	}
 
 	if fresh {
-		err := env.LiveReader().Get(ctx, objectKey(env, versionName), &corev1.ConfigMap{})
+		version := &corev1.ConfigMap{}
+
+		err := env.LiveReader().Get(ctx, objectKey(env, versionName), version)
 		if !apierrors.IsNotFound(err) {
-			return nil, component.Result{}, fmt.Errorf("fresh Racer marker requires absent version state (read: %v)", err)
+			// Staged state is not authority. Keep the controller running to finish
+			// its marker CAS, but never deploy dataplanes before consumption.
+			if err != nil || marker.Data["initialization_protocol"] != "staged-v1" || version.Annotations["racer.unbounded-cloud.io/initialization"] != "staged-v1" || version.Annotations["racer.unbounded-cloud.io/installation-uid"] != string(marker.UID) {
+				return nil, component.Result{}, fmt.Errorf("fresh Racer marker requires absent or bound staged version state (read: %v)", err)
+			}
 		}
 	} else if err := racercore.ValidateInstallation(ctx, env.LiveReader(), env.Namespace, marker.Data["cluster"]); err != nil {
 		// Startup may be in its one-shot Create gap. Do not deploy dataplanes or

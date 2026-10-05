@@ -8,19 +8,27 @@ readiness still requires validated replicated state.
 
 Every controller replica runs the same startup guard before recovery and manager
 startup. A valid consumed, immutable marker and valid version record require no
-writes. For a fresh marker and absent version, one resource-version CAS winner
-consumes and freezes the marker, then makes exactly one version Create attempt.
-Concurrent losers only reread, waiting up to five seconds for the winner's gap.
+writes. New operator installations and fresh standalone manifests select
+`initialization_protocol: staged-v1` in the marker's data. The
+controller first creates an uncommitted, installation-bound version candidate,
+then consumes and freezes the marker with that candidate's Kubernetes UID in
+`version_uid`. A restart can finish the CAS after a crash or uncertain Create
+response. Competing installers converge using Create and resource-version CAS.
+The candidate cannot serve until the immutable marker binds its UID.
 
-A consumed marker with missing or corrupt version state never authorizes creation.
-A crash or lost response after marker consumption can therefore leave an unusable
-installation. This ambiguity is intentional: never reset or recreate a marker to
-retry, and never recreate lost version counters under the same cluster identity.
+A consumed marker with missing, replaced, or corrupt version state never authorizes
+creation. Markers without the protocol field retain the legacy one-shot ordering:
+consume and freeze, then one Create attempt. An interrupted legacy installation
+can remain unusable because absence cannot distinguish a failed Create from
+deleted committed state. Never add the protocol field to an existing installation,
+reset a marker, or recreate lost counters under the same cluster identity.
 Restore consistent durable state or explicitly rebootstrap with a new cluster UUID.
 
 For standalone manifests, use `InitializationState=fresh` only with a genuinely new
 cluster UUID and absent version state. After startup, retain `consumed` in
-declarative configuration and preserve the marker and version record. Constructors
+declarative configuration and preserve all marker data, including the controller's
+`version_uid` and protocol field, and the version record. Do not reapply a fresh
+template over a consumed immutable marker. Constructors
 do not initialize state; the running controller owns this guard.
 
 Standalone template inputs `InstallationConfigMapName`, `VersionConfigMapName`,
@@ -66,9 +74,18 @@ real API-server admission and RBAC regressions with a five-minute command bound.
 CI provisions assets and includes this target in `make racer-envtest-ci`.
 
 The permanent credentials annotation on the version ConfigMap records
-`secretName/initialRootFingerprint`. Its CAS authorizes exactly one Secret Create
-attempt. Claimed missing, corrupt, or mismatched credentials never authorize
-regeneration, even after an ambiguous Create response. Preserve the claim and
+`secretName/initialRootFingerprint`. For staged installations the controller first
+creates the complete, installation-bound credentials Secret, then commits the
+claim and `racer.unbounded-cloud.io/credentials-uid` together in one version CAS.
+Unclaimed staged material cannot be used by credential readers. Restart adopts
+only a complete generation-one candidate with matching installation and issuer
+identity. No private material is written to ConfigMaps or a second Secret.
+Deletion before commit can discard only never-authorized candidates; deletion or
+replacement after commit never authorizes regeneration. A delayed stale Create
+can at most leave an unusable orphan with a different UID, never restore authority.
+Legacy installations still authorize only one Secret Create attempt after the
+claim CAS; ambiguous legacy gaps remain fail closed. Claimed missing, corrupt, or
+mismatched credentials never authorize regeneration. Preserve the claim and
 consistent durable state. The persisted format is intentionally breaking; there
 is no compatibility reader or migration from the former split Secrets.
 
