@@ -21,7 +21,6 @@ run:
   build-tags:
     - e2e
     - integrationtest
-    - storageboundary
   # With default 1m timeout CI sometimes fails.
   timeout: 10m
 
@@ -98,8 +97,8 @@ linters:
       # We write American English. `locale: US` is what makes this linter
       # enforce that: at the default locale misspell only corrects unambiguous
       # typos and passes British spellings through, which is how ~370 of them
-      # accumulated in the tree. Go files only; the rule applies to Rust,
-      # shell, TLA+, and Markdown too, but nothing enforces it there.
+      # accumulated in the tree. Go files only; the rule applies to shell
+      # and Markdown too, but nothing enforces it there.
       locale: US
     wsl_v5:
       # By default, force error checking to happen right after the erroneous statement.

@@ -49,7 +49,7 @@ func SystemNamespace() string {
 const ReservedPrefix = "unbounded-cloud.io/"
 
 const (
-	// LegacyKubeNamespace is where machina, metalman, and storage ran before
+	// LegacyKubeNamespace is where machina and metalman ran before
 	// the consolidation onto SystemNamespace().
 	LegacyKubeNamespace = "unbounded-kube"
 

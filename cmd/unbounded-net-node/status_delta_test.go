@@ -233,6 +233,7 @@ func TestWebSocketCriticalNoopStatsAndResync(t *testing.T) {
 					t.Errorf("accept: %v", err)
 					return
 				}
+
 				defer func() { _ = conn.Close(websocket.StatusNormalClosure, "done") }()
 
 				var revision uint64

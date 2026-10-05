@@ -153,6 +153,7 @@ func TestSlowDetailCollectionDoesNotBlockRoutinePublishers(t *testing.T) {
 					if err != nil {
 						return
 					}
+
 					defer func() { _ = conn.Close(websocket.StatusNormalClosure, "done") }()
 
 					for {
@@ -276,6 +277,7 @@ func TestRoutineSummaryPublishers(t *testing.T) {
 						if err != nil {
 							return
 						}
+
 						defer func() { _ = conn.Close(websocket.StatusNormalClosure, "done") }()
 
 						for {

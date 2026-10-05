@@ -326,7 +326,7 @@ func TestCheckResolvableAllowsUnrelatedTemplateLabels(t *testing.T) {
 						"team": "platform",
 						// Restating a selector label with the value it already
 						// has changes nothing and must not be refused.
-						"app.kubernetes.io/name": "storage",
+						"app.kubernetes.io/name": "metalman",
 					},
 				},
 			},

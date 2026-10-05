@@ -162,71 +162,6 @@ jobs:
       - name: Run orca-inttest
         run: make orca-inttest
 
-  # ---------- Storage Integration ----------
-  # Verifies the unbounded-storage S3 frontend end to end: a client GET
-  # through an out-of-process two-node unbounded-storage ring flows
-  # through its S3 backend into an in-process orca edge and on to the
-  # same Garage S3 backend orca's own integration tests use. Needs the
-  # Rust toolchain + pinned libfabric (to build unbounded-storage) and
-  # sudo (RLIMIT_MEMLOCK for io_uring pinned buffers); Docker provides
-  # Garage + Azurite via testcontainers. This job builds and runs only
-  # the storage integration test, not the rest of the orca suite, so it
-  # does not depend on the frontend dist.
-  storage-inttest:
-    name: Storage Integration
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    env:
-      LIBFABRIC_VERSION: "2.5.1"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ca-certificates curl liburing-dev \
-            libibverbs-dev librdmacm-dev
-
-      - name: Cache libfabric
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: tmp/libfabric
-          key: libfabric-${{ env.LIBFABRIC_VERSION }}-${{ runner.os }}-${{ hashFiles('Makefile') }}
-
-      - name: Build libfabric
-        run: make libfabric LIBFABRIC_VERSION=$LIBFABRIC_VERSION
-
-      - name: Set up Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Cache cargo + crate target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            cmd/unbounded-storage/target
-          # Match the smoke-storage job's key so the two share the crate
-          # target cache, and invalidate on the native FFI inputs cargo
-          # cannot fingerprint from Cargo.lock alone.
-          key: cargo-unbounded-storage-${{ runner.os }}-fabric-${{ hashFiles('cmd/unbounded-storage/Cargo.lock', 'cmd/unbounded-storage/Cargo.toml', 'cmd/unbounded-storage/build.rs', 'cmd/unbounded-storage/src/fabric/shim.c') }}
-          restore-keys: |
-            cargo-unbounded-storage-${{ runner.os }}-fabric-
-            cargo-unbounded-storage-${{ runner.os }}-
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: Run storage-inttest
-        run: make storage-inttest LIBFABRIC_VERSION=$LIBFABRIC_VERSION
-
   # ---------- Build ----------
   build:
     name: Build
@@ -391,14 +326,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-
-      - name: Set up Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Fetch Rust dependencies
-        run: cargo fetch --manifest-path cmd/unbounded-storage/Cargo.toml --locked
 
       - name: Verify NOTICE
         run: make notice-check

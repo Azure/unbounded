@@ -602,6 +602,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 			defer wsCancel()
 
 			var registration *nodeWSConnection
+
 			defer func() {
 				health.markNodeWSStale(lastWSNodeName, registration, source)
 				health.unregisterNodeWS(lastWSNodeName, registration)
@@ -725,6 +726,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 			lastActivity := time.Now()
 
 			var frameData []byte
+
 			defer func() { nodeWSBuffers.put(frameData) }()
 
 			for {

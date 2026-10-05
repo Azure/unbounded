@@ -229,7 +229,6 @@ func stageLegacyWorkloads(ctx context.Context, t *testing.T, cli client.Client) 
 	metalman := inertDeployment(legacyKube, "metalman-controller-edge", map[string]string{"app": "unbounded-pxe", unboundedv1alpha3.MachineSiteLabelKey: "edge"})
 	metalman.Spec.Template.Spec.Containers[0].Args = []string{"serve-pxe", "--site=edge", "--dhcp-auto-interface"}
 	mustCreate(ctx, t, cli, metalman)
-	mustCreate(ctx, t, cli, unschedulableDaemonSet(legacyKube, "unbounded-storage-supervisor", map[string]string{"app.kubernetes.io/name": "unbounded-storage-supervisor"}))
 	mustCreate(ctx, t, cli, inertDeployment(legacyNet, "unbounded-net-controller", map[string]string{"app.kubernetes.io/name": "unbounded-net-controller"}))
 	mustCreate(ctx, t, cli, unschedulableDaemonSet(legacyNet, "unbounded-net-node", map[string]string{"app.kubernetes.io/name": "unbounded-net-node"}))
 }
@@ -254,10 +253,6 @@ func stageLegacyState(ctx context.Context, t *testing.T, cli client.Client) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: legacyNet, Name: "unbounded-net-config"},
 		Data:       map[string]string{"config.yaml": "sentinel: legacy-net-config", "LOG_LEVEL": "7"},
 		BinaryData: map[string][]byte{"routes.bin": {0, 1, 2}},
-	})
-	mustCreate(ctx, t, cli, &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: legacyKube, Name: "unbounded-storage-config"},
-		Data:       map[string]string{"config.yaml": "log_level: info"},
 	})
 }
 
@@ -423,9 +418,6 @@ func stageTargetWorkloads(ctx context.Context, t *testing.T, cli client.Client) 
 
 	mustCreate(ctx, t, cli, netController)
 	mustCreate(ctx, t, cli, netNode)
-	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-storage-supervisor-cluster"))
-	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-storage-supervisor-edge"))
-	mustCreate(ctx, t, cli, readyDaemonSet(targetNS, "unbounded-storage-supervisor-"+repairSite))
 	// The per-site metalman replacement must exist before the legacy metalman is
 	// reaped (presence gate; metalman is hostNetwork like net and cannot become
 	// Ready until the legacy one frees the host ports).
@@ -448,17 +440,9 @@ func assertTranslatedSites(ctx context.Context, t *testing.T, cli client.Client,
 		t.Fatalf("expected machina enabled on cluster site")
 	}
 
-	if !nestedBool(cluster, "spec", "components", "storage", "enabled") {
-		t.Fatalf("expected storage enabled on cluster site")
-	}
-
 	edge := getMachinaSite(ctx, t, cli, "edge")
 	if nestedBool(edge, "spec", "components", "machina", "enabled") {
 		t.Fatalf("did not expect machina enabled on edge site")
-	}
-
-	if !nestedBool(edge, "spec", "components", "storage", "enabled") {
-		t.Fatalf("expected storage enabled on edge site")
 	}
 
 	if !nestedBool(edge, "spec", "components", "metalman", "enabled") {
@@ -493,8 +477,7 @@ func assertStateMigrated(ctx context.Context, t *testing.T, cli client.Client) {
 		t.Fatalf("regenerable serving cert must NOT be copied, err=%v", err)
 	}
 
-	// machina-config is copied by name; storage config is copied into the
-	// operator-managed per-site ConfigMaps that storage DaemonSets mount.
+	// machina-config is copied by name.
 	if err := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: "machina-config"}, &corev1.ConfigMap{}); err != nil {
 		t.Fatalf("expected machina-config copied to target: %v", err)
 	}
@@ -506,21 +489,6 @@ func assertStateMigrated(ctx context.Context, t *testing.T, cli client.Client) {
 
 	if netConfig.Data["config.yaml"] != "sentinel: legacy-net-config" || netConfig.Data["LOG_LEVEL"] != "7" || string(netConfig.BinaryData["routes.bin"]) != string([]byte{0, 1, 2}) {
 		t.Fatalf("net config payload not preserved: data=%#v binaryData=%#v", netConfig.Data, netConfig.BinaryData)
-	}
-
-	for _, name := range []string{"unbounded-storage-config-cluster", "unbounded-storage-config-edge"} {
-		var cm corev1.ConfigMap
-		if err := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: name}, &cm); err != nil {
-			t.Fatalf("expected per-site storage config %s copied to target: %v", name, err)
-		}
-
-		if cm.Data["config.yaml"] != "log_level: info" {
-			t.Fatalf("storage config %s data not preserved: %q", name, cm.Data["config.yaml"])
-		}
-	}
-
-	if err := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: "unbounded-storage-config"}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("shared storage config must NOT be copied under the legacy name, err=%v", err)
 	}
 
 	// The Machine cloud-init ConfigMap is copied out of the legacy namespace.
@@ -562,13 +530,6 @@ func updateTargetConfigHashes(ctx context.Context, t *testing.T, cli client.Clie
 	updateDeploymentHash(ctx, t, cli, "machina-controller", "machina-config", "unbounded-cloud.io/machina-config-hash")
 	updateDeploymentHash(ctx, t, cli, "unbounded-net-controller", "unbounded-net-config", "unbounded-cloud.io/net-config-hash")
 	updateDaemonSetHash(ctx, t, cli, "unbounded-net-node", "unbounded-net-config", "unbounded-cloud.io/net-config-hash")
-
-	for _, site := range []string{"cluster", "edge", repairSite} {
-		updateDaemonSetHash(ctx, t, cli,
-			"unbounded-storage-supervisor-"+site,
-			"unbounded-storage-config-"+site,
-			"unbounded-cloud.io/storage-config-hash")
-	}
 }
 
 func updateDeploymentHash(ctx context.Context, t *testing.T, cli client.Client, workload, configName, annotation string) {
@@ -636,29 +597,13 @@ func waitForMigratedPayloads(ctx context.Context, t *testing.T, cli client.Clien
 
 		netErr := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: "unbounded-net-config"}, &netConfig)
 
-		var clusterStorage corev1.ConfigMap
-
-		clusterStorageErr := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: "unbounded-storage-config-cluster"}, &clusterStorage)
-
-		var edgeStorage corev1.ConfigMap
-
-		edgeStorageErr := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: "unbounded-storage-config-edge"}, &edgeStorage)
-
-		var repairStorage corev1.ConfigMap
-
-		repairStorageErr := cli.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: "unbounded-storage-config-" + repairSite}, &repairStorage)
-		if netErr == nil && clusterStorageErr == nil && edgeStorageErr == nil && repairStorageErr == nil &&
-			netConfig.Data["config.yaml"] == "sentinel: legacy-net-config" &&
-			clusterStorage.Data["config.yaml"] == "log_level: info" &&
-			edgeStorage.Data["config.yaml"] == "log_level: info" &&
-			repairStorage.Data["config.yaml"] == "log_level: info" {
+		if netErr == nil && netConfig.Data["config.yaml"] == "sentinel: legacy-net-config" {
 			return
 		}
 
 		select {
 		case <-ctx.Done():
-			t.Fatalf("wait for migrated payloads: %v (net=%v cluster storage=%v edge storage=%v repair storage=%v)",
-				ctx.Err(), netErr, clusterStorageErr, edgeStorageErr, repairStorageErr)
+			t.Fatalf("wait for migrated payloads: %v (net=%v)", ctx.Err(), netErr)
 		case <-ticker.C:
 		}
 	}

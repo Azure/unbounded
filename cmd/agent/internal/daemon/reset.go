@@ -45,6 +45,7 @@ func ownedReset(log *slog.Logger, store *installstate.Store, inner phases.Task) 
 		if err != nil {
 			return err
 		}
+
 		defer func() {
 			if err := lock.Release(); err != nil {
 				log.Error("release reset lock", "error", err)
@@ -106,6 +107,7 @@ func stopRecoveryUnit(ctx context.Context, log *slog.Logger) error {
 
 func durableReset(ctx context.Context, store *installstate.Store, inner phases.Task, paths []string, syncfs func(int) error) error {
 	var handles []*os.File
+
 	defer func() {
 		for _, f := range handles {
 			_ = f.Close() //nolint:errcheck // Read-only directory descriptor; teardown sync errors are returned below.
