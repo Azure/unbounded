@@ -70,6 +70,10 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_METADATA_ENTRIES` | `4096` | Node-wide catalog entries; at most 1,048,576 |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget; at most 1,048,576 |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB |
+| `RACER_PLACEMENT_CACHE_BYTES` | `16777216` (16 MiB) | Node-wide placement capacity estimate, divided among I/O workers; 1,024 bytes..512 MiB, with at least 1,024 bytes per worker |
+| `RACER_CACHED_PATHS` | `128` | Node-wide retained path-query entry budget, divided among I/O workers; 1..1,048,576 |
+| `RACER_PATH_CACHE_BYTES` | `8388608` (8 MiB) | Node-wide accounted path-cache allocation budget, divided among I/O workers; 1 byte..512 MiB, independent of entry count |
+| `RACER_ACTIVE_PATH_SEARCHES` | `8` | **Per I/O worker** distinct unfinished path-search limit; 1..64, independent of cache size |
 | `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** slab geometry; positive multiple of segment size |
 | `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead |
 | `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count, less than total segments |
@@ -85,6 +89,59 @@ Automatic sizing considers CPU affinity, quota, NUMA locality, and progress rese
 Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets
 can reduce workers. Storage grows with I/O workers. Admission budgets are not RSS limits:
 allocator, TLS, and filesystem cache are additional. Invalid combinations fail validation.
+
+### Topology capacity and version compatibility
+
+Placement capacity uses a conservative 1,024-byte structural estimate per cached
+ranking, rounding each worker's byte share down to whole entries. It is not an
+allocator hard bound. Path-cache accounting includes retained buffer capacities
+and reference-count headers, but excludes active search scratch, caller-held
+results, membership graphs, and allocator overhead. A result larger than the
+worker's path-cache budget is returned without retention. Cache entry and byte
+limits do not determine search concurrency: identical canonical queries share
+one active search, while distinct searches can report overload. The node's total
+distinct-search concurrency can reach I/O worker count times
+`RACER_ACTIVE_PATH_SEARCHES`.
+
+The overlay is now the symmetric union of 32 independently hashed rings over
+stable node IDs, replacing the position-based radix overlay. It has at most 64
+neighbors per member and is independent of shares. Building a new graph costs
+O(32 N log N) for bounded-size IDs and retains approximately 64N adjacency
+`usize` slots plus N vector headers. On a 64-bit target at 100,000 members,
+adjacency slots alone are about 48.8 MiB, in addition to membership records,
+construction scratch, and any retained old snapshots. These allocations are
+not covered by the path-cache byte limit.
+
+Publications with unchanged validated membership version and content reuse the
+whole membership. New versions with identical node IDs share immutable graph
+storage, including shares-only or metadata-only updates; changed IDs rebuild
+the graph. Membership byte estimates are cached at construction and read in
+constant time, but each snapshot's estimate includes the full shared graph.
+Summing them, as the publication grace budget does, is conservative rather than
+deduplicated allocation accounting.
+
+Live control updates prepare membership off the I/O polling thread. The
+publication store admits one unfinished preparation job with no queued backlog;
+additional preparation is rejected as overloaded until it finishes. Canceling
+the waiter or reaching its deadline does not interrupt a running CPU job or
+free its admission slot. Preparation does not publish by itself. Shutdown joins
+the owned job rather than detaching it, so cleanup may wait beyond the request
+deadline: the join has no independent timeout. Bounded input and job count are
+not a hard wall-clock shutdown guarantee.
+
+Routing selection uses `/next-hop/v5`, which independently length-prefixes the
+seed, source ID, and destination ID. Both ring edges and next-hop selection
+change routing compatibility. **Coordinate the cluster version transition and
+quiesce traffic until all participating dataplanes use the same routing
+implementation.** Matching membership version numbers do not negotiate the
+algorithm, and no automatic safe mixed-version routing is assumed. The
+placement slot, weighted rendezvous algorithm, and placement hash compatibility
+are unchanged for identical application keys, node IDs, and shares; that does
+not make mixed routing safe.
+
+Remove obsolete `RACER_ROUTING_ALGORITHM` and `RACER_CACHED_RANKINGS` settings:
+even empty values fail startup. Use the independent cache settings above, not
+an algorithm selector or the old ranking-entry setting.
 
 ## Controller and workload wiring
 

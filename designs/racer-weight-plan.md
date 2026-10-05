@@ -33,9 +33,10 @@ baseline/fixed/equal-healthy TX/RX. Refresh resourceVersions before execution.
 Positive uint32 shares are accepted (`internal/racer/topology.go:372-391`);
 maximum/invalid values are asserted in `membership_test.go:47-86`. Integer
 placement compares cost/share with UID-order ties. The application adapter is
-`cmd/racer-dataplane/src/topology.rs::Placement::rank`; comparison and
-its `integer_log_edges_and_ties` test live in
-`cmd/racer-dataplane/topology/src/placement.rs` (`Score::compare`). Tie indexes
+`cmd/racer-dataplane/src/topology.rs::Placement::rank`; comparison lives in
+`cmd/racer-dataplane/topology/src/placement.rs` (`Score::compare`), and its
+`integer_log_edges_and_ties` test is in
+`cmd/racer-dataplane/topology/src/placement/tests.rs`. Tie indexes
 follow ID order from `cmd/racer-dataplane/topology/src/membership.rs::Membership::new`,
 using Racer node ID bytes from `cmd/racer-dataplane/src/topology.rs`'s
 `topology::Member` implementation. V5 weights eligible equal-cost next hops
@@ -45,6 +46,12 @@ necessarily individual hashed next hops. Shares enter placement identity; more
 than 64 changes lose incremental hints
 (`cmd/racer-dataplane/topology/src/membership.rs::Membership::with_predecessor`).
 These current source references do not refresh the plan's historical results.
+In particular, the current stable-ID 32-ring overlay replaces the prior radix
+graph, and current `/next-hop/v5` hashing separately length-prefixes the seed and
+endpoint IDs. Historical routing-load predictions are not validation of this
+new graph or schema, even though placement hashes and integer scoring remain
+unchanged. Reevaluate routing-dependent predictions for the deployed algorithm;
+do not assume mixed routing versions are safe during rollout or rollback.
 
 The model assumes complete-catalog shuffle, primary hits, observed fixed demand,
 and expected healthy shortest-path routing. It excludes retries, coalescing,

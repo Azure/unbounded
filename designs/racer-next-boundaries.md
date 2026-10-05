@@ -36,8 +36,24 @@ violate Rust's orphan rules (`src/topology.rs::Member`, relative to
 `cmd/racer-dataplane/`). `src/control.rs::SnapshotStore::prepare` converts wire
 members at validation; wire publications, enrollment records, rail mappings,
 cache definitions, and codecs are consumed directly. Snapshot installation,
-enrollment lifecycle, transport, admission, readiness, and topology algorithms
-stay in the application.
+enrollment lifecycle, transport, admission, readiness, and authenticated routing
+policy stay in the application. The existing `topology` workspace crate owns
+frozen membership, integer placement, and cooperative path algorithms; it is a
+Racer dataplane component, not a general distributed framework. Its stable-ID
+32-ring overlay replaces radix routing, and its v5 next-hop schema separately
+length-prefixes the seed and endpoint IDs. Placement hash compatibility is
+unchanged, but routing requires a coordinated cluster version transition, not
+assumed safe mixed-version operation. See `cmd/racer-dataplane/topology/README.md`
+for cache ownership, memory estimates, and compatibility details.
+Live updates call `SnapshotStore::prepare_async` in `src/control.rs`, which owns
+one unfinished off-thread preparation job per store. Canceled waiters do not
+release that slot early, and store drop joins the job without an independent
+timeout. This keeps construction off I/O polling and bounds concurrent work,
+but trades prompt shutdown for owned completion. Same-version validated content
+reuses the whole membership; new versions with identical frozen IDs reuse Arc
+adjacency through `Membership::new_with_predecessor`. The crate remains
+synchronous and runtime-independent; the application owns this scheduling and
+publication policy.
 Shared identifiers are limited to the contract's needs; no general model crate
 is introduced.
 
