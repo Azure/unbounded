@@ -485,7 +485,7 @@ mod quota_tests {
         assert_eq!(shared.used(Resource::Silent), 0);
     }
 
-    /// A panicking application key clone cannot strand transferred admission.
+    /// A panicking key clone cannot strand fresh or transferred admission.
     #[test]
     fn key_clone_panic_keeps_split_and_recycle_admission_with_donor() {
         use std::{
@@ -566,6 +566,27 @@ mod quota_tests {
             .unwrap();
         drop(replacement);
         assert_eq!(quotas.used(Resource::Silent), 0);
+
+        // A live key record isolates the final charge-key clone from table setup.
+        // Both ordinary and drain admission must leave counters unchanged on panic.
+        for completion in [false, true] {
+            let donor = quotas.reserve(Some(&Key), Resource::Silent, size).unwrap();
+            PANIC_ON_CLONE.store(true, Ordering::SeqCst);
+            let failed = catch_unwind(AssertUnwindSafe(|| {
+                if completion {
+                    quotas.reserve_completion(Some(&Key), Resource::Silent, size)
+                } else {
+                    quotas.reserve(Some(&Key), Resource::Silent, size)
+                }
+            }));
+            PANIC_ON_CLONE.store(false, Ordering::SeqCst);
+            assert!(failed.is_err());
+            assert_eq!(quotas.used(Resource::Silent), size);
+            let refill = quotas.reserve(Some(&Key), Resource::Silent, size).unwrap();
+            assert_eq!(quotas.used(Resource::Silent), 2 * size);
+            drop((donor, refill));
+            assert_eq!(quotas.used(Resource::Silent), 0);
+        }
     }
 }
 
