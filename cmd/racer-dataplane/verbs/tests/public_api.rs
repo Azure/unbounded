@@ -399,6 +399,144 @@ fn public_ports_copy_only_after_terminal_fence() {
     assert_eq!(sim.live_resources(), 0);
 }
 
+/// Failed QP and probe frees permanently retain the slot charge and forbid reuse.
+#[cfg(feature = "simulation")]
+#[test]
+fn leaked_qp_or_probe_keeps_charge_and_blocks_replacement_and_reopen() {
+    for operation in [
+        simulation::Operation::QpFree,
+        simulation::Operation::WindowFree,
+    ] {
+        let (sim, io, mut native) = fixture(1);
+        let count = Arc::new(AtomicUsize::new(1));
+        configure(&io, vec![Arc::new(Charge(count.clone()))]);
+        if operation == simulation::Operation::WindowFree {
+            sim.fault(operation, simulation::Fault::Reject);
+        }
+        native.poll_budgeted(1).unwrap();
+        native.poll_budgeted(1).unwrap();
+        if operation == simulation::Operation::QpFree {
+            io.activation().unwrap().unwrap();
+            let qp = ready(QueuePairHandle::poll_new(io.device(u32::MAX), None));
+            sim.fault(operation, simulation::Fault::Reject);
+            drop(qp);
+        } else {
+            assert_eq!(io.activation(), Some(Err(Error::Io)));
+            io.close();
+        }
+        native.poll_budgeted(1).unwrap();
+        let allocated = sim
+            .trace()
+            .iter()
+            .filter(|event| event.operation == simulation::Operation::Qp)
+            .count();
+        for _ in 0..8 {
+            native.poll_budgeted(1).unwrap();
+        }
+        assert_eq!(
+            sim.trace()
+                .iter()
+                .filter(|event| event.operation == simulation::Operation::Qp)
+                .count(),
+            allocated
+        );
+        assert!(matches!(
+            QueuePairHandle::poll_new(io.device(u32::MAX), None),
+            Poll::Ready(Err(Error::Overloaded | Error::Unavailable))
+        ));
+        io.close();
+        native.poll_budgeted(1).unwrap();
+        assert_eq!(io.reopen(), Err(Error::Overloaded));
+        assert_eq!(sim.pending_faults(), 0);
+        drop(native);
+        drop(io);
+        assert_eq!(count.load(Ordering::Acquire), 1, "leak must stay charged");
+        assert!(sim.live_resources() > 0);
+    }
+}
+
+/// Ordinary native destruction releases a lease permit, including under contention.
+#[cfg(feature = "simulation")]
+#[test]
+fn native_drop_releases_permit_only_after_successful_stop() {
+    for (fail, contended) in [(false, false), (false, true), (true, false)] {
+        let (sim, io, mut native) = fixture(1);
+        configure(&io, vec![Arc::new(())]);
+        native.poll_budgeted(1).unwrap();
+        native.poll_budgeted(1).unwrap();
+        io.activation().unwrap().unwrap();
+        let count = Arc::new(AtomicUsize::new(1));
+        let permit: Guard = Arc::new(Charge(count.clone()));
+        let qp = ready(QueuePairHandle::poll_new(io.device(u32::MAX), Some(permit)));
+        if fail {
+            sim.reject(simulation::Operation::Stop, None, true);
+        }
+        if contended {
+            io.with_contention(rdma_verbs::testing::Contention::Slot(0), || drop(native));
+        } else {
+            drop(native);
+        }
+        if !fail && !contended {
+            assert!(qp.stopped());
+            assert_eq!(count.load(Ordering::Acquire), 0);
+        }
+        drop(qp);
+        drop(io);
+        assert_eq!(count.load(Ordering::Acquire), usize::from(fail));
+        if !fail {
+            assert_eq!(sim.live_resources(), 0);
+        }
+    }
+}
+
+/// Busy configuration and result locks do not block native polling or lose results.
+#[cfg(feature = "simulation")]
+#[test]
+fn native_poll_retains_activation_across_mailbox_contention() {
+    use rdma_verbs::testing::Contention;
+    for fail in [false, true] {
+        let (io, port) = pair(1).unwrap();
+        let mut native = NativeService::new(port);
+        futures::executor::block_on(io.configure(Configuration {
+            discover: false,
+            guards: vec![Arc::new(())],
+            bytes: 32,
+            selector: Box::new(move |_| {
+                if fail {
+                    Err(Error::InvalidConfiguration)
+                } else {
+                    Ok(vec![])
+                }
+            }),
+        }))
+        .unwrap();
+        io.with_contention(Contention::Configuration, || {
+            native.poll_budgeted(1).unwrap();
+            assert!(!native.drained());
+        });
+        assert!(io.activation().is_none());
+        io.with_contention(Contention::Activation, || {
+            native.poll_budgeted(1).unwrap();
+            native.poll_budgeted(1).unwrap();
+            assert!(!native.drained());
+        });
+        native.poll_budgeted(1).unwrap();
+        assert_eq!(
+            io.activation(),
+            Some(if fail {
+                Err(Error::InvalidConfiguration)
+            } else {
+                Ok(vec![])
+            })
+        );
+        native.poll_budgeted(1).unwrap();
+        assert!(
+            io.activation().is_none(),
+            "result is published exactly once"
+        );
+    }
+}
+
 /// An empty plan releases its guards without requiring a native library.
 #[test]
 fn empty_plan_releases_guards_without_loading_native_adapter() {

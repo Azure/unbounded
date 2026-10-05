@@ -216,10 +216,18 @@ pub struct NativePort {
 /// Poll it from that thread's runtime. It is not `Send`.
 pub struct NativeService {
     environment: uring_runtime::environment::Environment,
+
     port: NativePort,
+
     resources: Vec<Option<Resource>>,
+
     activation: Option<Activation>,
+
+    /// Completed activation retained until its mailbox can be locked.
+    activation_result: Option<Result<Vec<Selection>>>,
+
     cursor: usize,
+
     #[cfg(any(test, feature = "simulation"))]
     simulation: Option<simulation::Simulation>,
 }
@@ -729,13 +737,21 @@ pub(crate) struct Mailbox {
 pub(crate) struct Slot {
     /// IDLE, READY, OWNED, or RETIRED.
     pub state: AtomicU8,
+
     /// I/O side wants the QP stopped.
     pub cancel: AtomicBool,
+
     /// I/O side has dropped its lease.
     pub released: AtomicBool,
+
     /// Native side has stopped the QP. Safe to read the buffer.
     pub fenced: AtomicBool,
+
+    /// Native teardown stopped DMA, even if readback publication was contended.
+    stopped: AtomicBool,
+
     pub mailbox: Mutex<Mailbox>,
+
     /// Wakes the I/O task waiting on this slot.
     pub waiter: AtomicWaker,
 }
@@ -744,7 +760,7 @@ impl Drop for Slot {
     fn drop(&mut self) {
         // The NIC may still own this slot's memory, so its permit must stay
         // counted.
-        if !self.fenced.load(Ordering::Acquire) {
+        if !self.fenced.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire) {
             let mailbox = self.mailbox.get_mut().unwrap_or_else(|e| e.into_inner());
             if let Some(permit) = mailbox.peer_admission.take() {
                 std::mem::forget(permit);
@@ -801,6 +817,7 @@ pub fn pair(slots: usize) -> Result<(IoPort, NativePort)> {
                     cancel: AtomicBool::new(false),
                     released: AtomicBool::new(false),
                     fenced: AtomicBool::new(false),
+                    stopped: AtomicBool::new(false),
                     mailbox: Mutex::new(Mailbox {
                         peer_admission: None,
                         endpoint: None,
@@ -933,6 +950,7 @@ impl IoPort {
             slot.cancel.store(false, Ordering::Release);
             slot.released.store(false, Ordering::Release);
             slot.fenced.store(false, Ordering::Release);
+            slot.stopped.store(false, Ordering::Release);
             slot.state.store(IDLE, Ordering::Release);
         }
         self.shared.generation.store(generation, Ordering::Release);
@@ -1040,6 +1058,7 @@ impl NativeService {
             port,
             resources,
             activation: None,
+            activation_result: None,
             cursor: 0,
             #[cfg(any(test, feature = "simulation"))]
             simulation: simulation::current(),
@@ -1130,7 +1149,7 @@ impl NativeService {
             .try_reserve_exact(activation.bytes)
             .map_err(|_| Error::Overloaded)?;
         mailbox.bytes.resize(activation.bytes, 0);
-        let region = ffi::NativeRegion::new(device.clone(), activation.bytes, quota)?;
+        let region = ffi::NativeRegion::new(device.clone(), activation.bytes, quota.clone())?;
         self.resources[i] = Some(Resource {
             device: device.clone(),
             region,
@@ -1141,7 +1160,7 @@ impl NativeService {
             next_retry: None,
         });
         let resource = self.resources[i].as_mut().unwrap();
-        resource.qp = Some(ffi::NativeQueuePair::new(device)?);
+        resource.qp = Some(ffi::NativeQueuePair::new_charged(device, quota)?);
         let qp = resource.qp.as_ref().unwrap();
         qp.probe_window()?;
         mailbox.rail = selected.tag;
@@ -1167,16 +1186,23 @@ impl NativeService {
             return Ok(());
         }
         for _ in 0..budget.min(self.resources.len()) {
+            if self.activation_result.is_some() {
+                self.publish_activation()?;
+                if self.activation_result.is_some() {
+                    // Keep driving teardown even while result publication is busy.
+                    let index = self.cursor;
+                    self.cursor = (self.cursor + 1) % self.resources.len();
+                    self.drive(index);
+                    continue;
+                }
+            }
             let result = if self.activation.is_some() {
                 Some(self.activate_slot())
             } else {
-                let config = self
-                    .port
-                    .shared
-                    .config
-                    .lock()
-                    .map_err(|_| Error::Io)?
-                    .take();
+                let config = match try_mailbox(&self.port.shared.config) {
+                    Poll::Ready(result) => result?.take(),
+                    Poll::Pending => None,
+                };
                 config.map(|config| self.begin_activation(config))
             };
             if let Some(result) = result {
@@ -1186,8 +1212,8 @@ impl NativeService {
                     Err(error) => Err(error),
                 };
                 self.activation = None;
-                *self.port.shared.activation.lock().map_err(|_| Error::Io)? = Some(completed);
-                self.port.shared.io.wake();
+                self.activation_result = Some(completed);
+                self.publish_activation()?;
                 continue;
             }
             let index = self.cursor;
@@ -1199,6 +1225,13 @@ impl NativeService {
         if !self.port.shared.drained.load(Ordering::Acquire)
             && self.port.shared.closed.load(Ordering::Acquire)
             && self.activation.is_none()
+            && self.activation_result.is_none()
+            && self
+                .port
+                .shared
+                .config
+                .try_lock()
+                .is_ok_and(|c| c.is_none())
             && self.resources.iter().all(Option::is_none)
         {
             let mut drained = true;
@@ -1217,7 +1250,7 @@ impl NativeService {
                 if mailbox
                     .quota
                     .as_ref()
-                    .is_some_and(|q| Arc::strong_count(q) != 1)
+                    .is_some_and(|q| q.quarantined() || Arc::strong_count(q) != 1)
                 {
                     drained = false;
                     continue;
@@ -1235,6 +1268,18 @@ impl NativeService {
                 self.port.shared.drained.store(true, Ordering::Release);
                 self.port.shared.io.wake();
             }
+        }
+        Ok(())
+    }
+
+    /// Publish exactly once, retaining the result while the I/O side holds its lock.
+    fn publish_activation(&mut self) -> Result<()> {
+        match try_mailbox(&self.port.shared.activation) {
+            Poll::Ready(result) => {
+                *result? = self.activation_result.take();
+                self.port.shared.io.wake();
+            }
+            Poll::Pending => {}
         }
         Ok(())
     }
@@ -1304,9 +1349,14 @@ impl NativeService {
             if !slot.released.load(Ordering::Acquire) {
                 return;
             }
+            let quota = mailbox.quota.as_ref().unwrap();
+            if quota.quarantined() {
+                slot.state.store(RETIRED, Ordering::Release);
+                return;
+            }
             // Lease returned: build a fresh QP. Never reuse a QP. The region
             // stays registered for the life of the pool.
-            match ffi::NativeQueuePair::new(resource.device.clone()) {
+            match ffi::NativeQueuePair::new_charged(resource.device.clone(), quota.clone()) {
                 Ok(qp) => {
                     mailbox.endpoint = Some(qp.endpoint);
                     resource.qp = Some(qp);
@@ -1397,11 +1447,12 @@ impl NativeService {
     /// freed. [`IoPort::reopen`] may still wait on I/O holders or leaks.
     pub fn drained(&self) -> bool {
         self.activation.is_none()
+            && self.activation_result.is_none()
             && self
                 .port
                 .shared
                 .config
-                .lock()
+                .try_lock()
                 .is_ok_and(|config| config.is_none())
             && self.resources.iter().all(Option::is_none)
     }
@@ -1411,10 +1462,30 @@ impl Drop for NativeService {
     fn drop(&mut self) {
         self.close();
         // If a QP fails to stop, it leaks its region and guard on purpose.
-        for resource in self.resources.iter_mut().flatten() {
-            resource.qp.take();
-            resource.window.take();
-            resource.pending.take();
+        for (slot, resource) in self.port.shared.slots.iter().zip(&mut self.resources) {
+            if let Some(resource) = resource {
+                let stopped = resource.qp.as_ref().is_none_or(|qp| qp.stop().is_ok());
+                if stopped {
+                    // Publish the same safe readback as normal shutdown. If the
+                    // mailbox is busy, final Slot drop can release its permit
+                    // using `stopped`, without claiming readback was published.
+                    if let Ok(mut mailbox) = slot.mailbox.try_lock() {
+                        let copied = resource.window.is_none()
+                            || resource
+                                .region
+                                .copy_into(&mut mailbox.bytes[..resource.region.length()])
+                                .is_ok();
+                        if copied {
+                            slot.fenced.store(true, Ordering::Release);
+                            mailbox.peer_admission = None;
+                        }
+                    }
+                    slot.stopped.store(true, Ordering::Release);
+                }
+                resource.qp.take();
+                resource.window.take();
+                resource.pending.take();
+            }
         }
         for slot in &self.port.shared.slots {
             slot.waiter.wake();
@@ -1525,11 +1596,27 @@ impl NativeService {
 /// the caller keeps.
 struct GuardOwner {
     _guard: Guard,
+
+    /// A native allocation escaped destruction; this slot must never replenish it.
+    quarantined: AtomicBool,
 }
 impl GuardOwner {
     /// Wrap `guard`.
     fn new(guard: Guard) -> Arc<Self> {
-        Arc::new(Self { _guard: guard })
+        Arc::new(Self {
+            _guard: guard,
+            quarantined: AtomicBool::new(false),
+        })
+    }
+
+    /// Permanently retire the charged slot after a failed native free.
+    fn quarantine(&self) {
+        self.quarantined.store(true, Ordering::Release);
+    }
+
+    /// Whether a native allocation has been leaked against this charge.
+    fn quarantined(&self) -> bool {
+        self.quarantined.load(Ordering::Acquire)
     }
 }
 

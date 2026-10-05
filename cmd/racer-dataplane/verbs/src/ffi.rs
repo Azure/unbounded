@@ -372,6 +372,7 @@ impl Drop for NativeRegion {
     fn drop(&mut self) {
         if unsafe { (self.device.api.deregister)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.device.clone());
+            self.quota.as_ref().unwrap().quarantine();
             std::mem::forget(self.quota.take());
         }
     }
@@ -389,6 +390,7 @@ impl Drop for Window {
     /// Free the window. On failure, leak the device and region.
     fn drop(&mut self) {
         if unsafe { (self.device.api.window_free)(self.raw.as_ptr()) } != 0 {
+            self.region.quota.as_ref().unwrap().quarantine();
             std::mem::forget(self.device.clone());
             std::mem::forget(self.region.clone());
         }
@@ -435,32 +437,55 @@ impl Pending {
 /// Tracks posted work (up to 32) and the bound window. [`Self::stop`] is the
 /// only way to be sure the NIC is done with its memory.
 pub(crate) struct NativeQueuePair {
+    /// Keeps every QP, CQ, and probe leak charged to its slot.
+    quota: Arc<GuardOwner>,
+
     device: Rc<NativeDevice>,
+
     raw: NonNull<c_void>,
+
     pub(crate) endpoint: Endpoint,
+
     /// Stop succeeded. The NIC is done.
     stopped: Cell<bool>,
+
     /// Stop was requested. No new work.
     terminating: Cell<bool>,
+
     connected: Cell<bool>,
+
     /// Next work request ID.
     next: Cell<u64>,
+
     /// Posted work by ID.
     pending: RefCell<BTreeMap<u64, Pending>>,
+
     /// Bound windows. They stay open until stop, even after the bind completes.
     windows: RefCell<Vec<Rc<Window>>>,
+
     #[cfg(test)]
     expires: Cell<Option<std::time::Instant>>,
 }
 impl NativeQueuePair {
-    /// Create a QP with a random starting PSN (fixed in simulation).
+    #[cfg(test)]
+    /// Create an independently charged QP for low-level tests.
     pub(crate) fn new(device: Rc<NativeDevice>) -> Result<Rc<Self>> {
+        Self::new_charged(device, GuardOwner::new(Arc::new(())))
+    }
+
+    /// Create a QP with its slot's charge and a random starting PSN.
+    pub(crate) fn new_charged(
+        device: Rc<NativeDevice>,
+        quota: Arc<GuardOwner>,
+    ) -> Result<Rc<Self>> {
         let mut qpn = 0;
         let raw = NonNull::new(unsafe {
             (device.api.qp)(device.raw.as_ptr(), device.endpoint.port, 64, &mut qpn)
         });
         let Some(raw) = raw else {
             if qpn == u32::MAX {
+                quota.quarantine();
+                std::mem::forget(quota);
                 std::mem::forget(device);
             }
             return Err(Error::Unavailable);
@@ -474,6 +499,8 @@ impl NativeQueuePair {
             psn = qpn.to_be_bytes();
         } else if uring_runtime::environment::fill_random(&mut psn).is_err() {
             if unsafe { (device.api.qp_free)(raw.as_ptr()) } != 0 {
+                quota.quarantine();
+                std::mem::forget(quota);
                 std::mem::forget(device);
             }
             return Err(Error::Io);
@@ -484,6 +511,7 @@ impl NativeQueuePair {
             ..device.endpoint
         };
         Ok(Rc::new(Self {
+            quota,
             device,
             raw,
             endpoint,
@@ -526,6 +554,8 @@ impl NativeQueuePair {
             NonNull::new(unsafe { (self.device.api.window)(self.device.raw.as_ptr(), &mut key) })
                 .ok_or(Error::Unavailable)?;
         if unsafe { (self.device.api.window_free)(window.as_ptr()) } != 0 {
+            self.quota.quarantine();
+            std::mem::forget(self.quota.clone());
             std::mem::forget(self.device.clone());
             return Err(Error::Io);
         }
@@ -727,12 +757,16 @@ impl Drop for NativeQueuePair {
     /// device, since the NIC may still use them.
     fn drop(&mut self) {
         if self.stop().is_err() {
+            self.quota.quarantine();
+            std::mem::forget(self.quota.clone());
             std::mem::forget(std::mem::take(self.pending.get_mut()));
             std::mem::forget(std::mem::take(self.windows.get_mut()));
             std::mem::forget(self.device.clone());
             return;
         }
         if unsafe { (self.device.api.qp_free)(self.raw.as_ptr()) } != 0 {
+            self.quota.quarantine();
+            std::mem::forget(self.quota.clone());
             std::mem::forget(self.device.clone());
         }
     }
