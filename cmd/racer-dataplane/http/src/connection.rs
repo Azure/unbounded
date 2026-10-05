@@ -973,7 +973,7 @@ impl<C: Context> ConnectionLease<C> {
         Ok(())
     }
     /// Install synthetic framing for caller tests without submitting I/O.
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_framing(&mut self, receive: Option<u64>, send: Option<u64>, request_is_head: bool) {
         self.begin_io();
         self.rx_remaining = receive;

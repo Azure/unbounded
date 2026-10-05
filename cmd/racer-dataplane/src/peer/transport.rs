@@ -1559,10 +1559,8 @@ fn validate_body_length(response: &PeerResponse, length: usize) -> Result<()> {
     Ok(())
 }
 /// Both connections and all relay resources follow the readiness completion fence.
-type Transit = http_splice::relay::Relay<
-    crate::http::HttpContext,
-    flow_control::pipe::PipeLease<AdmissionPolicy>,
->;
+type Transit =
+    http1::relay::Relay<crate::http::HttpContext, flow_control::pipe::PipeLease<AdmissionPolicy>>;
 pub(crate) async fn relay_body(
     io: &HttpIo,
     source: crate::http::ConnectionLease,
@@ -1598,9 +1596,9 @@ pub(crate) async fn relay_body(
         scope.check()?;
         let step = state.borrow_mut().step(io)?;
         let wait = match step {
-            http_splice::relay::Step::Complete => break,
-            http_splice::relay::Step::Yield => None,
-            http_splice::relay::Step::Readiness { socket, interest } => Some((socket, interest)),
+            http1::relay::Step::Complete => break,
+            http1::relay::Step::Yield => None,
+            http1::relay::Step::Readiness { socket, interest } => Some((socket, interest)),
         };
         wait_relay_progress(io, state.clone(), wait, scope).await?;
     }

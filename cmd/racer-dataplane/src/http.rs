@@ -357,7 +357,7 @@ impl ReaderLease {
     }
 }
 struct DeliveryOwner(ReaderLease);
-impl http_splice::delivery::Owner<HttpContext> for DeliveryOwner {
+impl http1::delivery::Owner<HttpContext> for DeliveryOwner {
     type Pipe = PipeLease<AdmissionPolicy>;
     type View = PageSendRange;
     fn remaining(&self) -> usize {
@@ -384,7 +384,7 @@ struct DeliveryObserver<'a> {
     progressing: bool,
     final_send: Option<&'a FinalSend>,
 }
-impl http_splice::delivery::Observer<HttpContext> for DeliveryObserver<'_> {
+impl http1::delivery::Observer<HttpContext> for DeliveryObserver<'_> {
     fn scope(&self, stalled_at: std::time::Instant) -> Result<RequestScope> {
         if !self.progressing {
             self.scope.check()?;
@@ -524,7 +524,7 @@ impl Delivery {
             let socket = connection.socket();
             socket.validate_socket()?;
             drop(socket);
-            let (_reader, mut connection) = http_splice::delivery::send(
+            let (_reader, mut connection) = http1::delivery::send(
                 &self.context,
                 self.reactor.as_ref(),
                 DeliveryOwner(reader),

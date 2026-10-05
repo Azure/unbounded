@@ -42,7 +42,6 @@ var crateInputs = []crateInput{
 	{"cmd/racer-dataplane/uds-endpoint/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/wire-codec/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/env-config/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
-	{"cmd/racer-dataplane/http-splice/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 }
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text

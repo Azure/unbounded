@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "http-splice", "topology", "telemetry", "flow", "rest", "control-wire", "identity", "coalesce", "uds-endpoint", "wire-codec", "env-config"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "rest", "control-wire", "identity", "coalesce", "uds-endpoint", "wire-codec", "env-config"]
 resolver = "3"
 
 [package]
@@ -33,7 +33,6 @@ rest-client = { path = "rest" }
 topology = { path = "topology" }
 telemetry = { path = "telemetry" }
 http1 = { path = "http" }
-http-splice = { path = "http-splice" }
 racer-crypto = { path = "crypto" }
 rdma-verbs = { path = "verbs" }
 page-alloc = { path = "alloc" }
@@ -53,7 +52,6 @@ zeroize = "1"
 
 [dev-dependencies]
 racer-identity = { path = "identity", features = ["test-util"] }
-http-splice = { path = "http-splice", features = ["test-util"] }
 uds-endpoint = { path = "uds-endpoint", features = ["test-util"] }
 flow-control = { path = "flow", features = ["simulation"] }
 rest-client = { path = "rest", features = ["simulation"] }

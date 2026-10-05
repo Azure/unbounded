@@ -463,19 +463,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "http-splice"
-version = "0.1.0"
-dependencies = [
- "flow-control",
- "http1",
- "libc",
- "uring-runtime",
-]
-
-[[package]]
 name = "http1"
 version = "0.1.0"
 dependencies = [
+ "flow-control",
  "httparse",
  "libc",
  "uring-runtime",
@@ -713,7 +704,6 @@ dependencies = [
  "flow-control",
  "futures",
  "getrandom",
- "http-splice",
  "http1",
  "io-uring",
  "libc",

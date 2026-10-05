@@ -37,10 +37,20 @@
 //! Read-ahead beyond message framing must be retained so exchange completion can
 //! reject pipelining. HEAD and 304 representation lengths do not allocate bodies.
 //!
-//! The optional `test-util` feature exposes connection framing and pool inspection
-//! helpers for caller tests without introducing an application dependency.
+//! # Body transfer profiles
+//!
+//! [`delivery`] sends immutable backing through a staging pipe and owned sends;
+//! [`relay`] transfers opaque fixed-length bodies with bounded synchronous steps.
+//! Both adapt [`flow_control::pipe::PipeLease`] without selecting application
+//! authorization, telemetry, quotas, or scheduling policy. Callers retain exchange
+//! finalization and must keep complete transfer owners through completion fences.
+//!
+//! The optional `test-util` feature exposes connection framing, pool inspection,
+//! and deterministic relay fallback helpers without an application dependency.
 
 pub mod connection;
+pub mod delivery;
+pub mod relay;
 
 use std::marker::PhantomData;
 use zeroize::Zeroize;
@@ -529,6 +539,14 @@ pub mod range {
             Ok(Self { first, last, total })
         }
     }
+}
+
+/// Recognize kernel splice failures that permit a copying fallback.
+fn splice_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    )
 }
 
 /// Structural offsets and checked storage shared by decoding and admission.
