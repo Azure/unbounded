@@ -22,10 +22,15 @@ pub mod simulation;
 #[derive(Clone, Copy)]
 struct Port {
     name: [c_char; 64],
+
     gid: [u8; 16],
+
     mtu: u32,
+
     lid: u16,
+
     port: u8,
+
     link_layer: u8,
 }
 
@@ -35,16 +40,22 @@ struct Port {
 pub struct Endpoint {
     /// Port GID.
     pub gid: [u8; 16],
+
     /// QP number. Nonzero, 24 bits.
     pub qpn: u32,
+
     /// Starting packet sequence number. 24 bits.
     pub psn: u32,
+
     /// MTU code: 1 to 5 for 256 to 4096 bytes.
     pub mtu: u32,
+
     /// InfiniBand local ID.
     pub lid: u16,
+
     /// Port number, from 1.
     pub port: u8,
+
     /// 1 for InfiniBand, 2 for Ethernet (RoCE).
     pub link_layer: u8,
 }
@@ -72,7 +83,9 @@ impl Endpoint {
 #[derive(Default, Clone, Copy)]
 struct Completion {
     id: u64,
+
     status: u32,
+
     opcode: u32,
 }
 
@@ -84,7 +97,11 @@ macro_rules! native_api {
         /// so the library stays loaded.
         struct Api {
             library: Option<NonNull<c_void>>,
-            $($field: $signature,)*
+
+            $(
+                $field: $signature,
+
+            )*
         }
         impl Api {
             #[cfg(all(feature = "native", target_os = "linux"))]
@@ -185,8 +202,11 @@ impl Drop for Api {
 /// An open RDMA device.
 pub(crate) struct NativeDevice {
     api: Rc<Api>,
+
     raw: NonNull<c_void>,
+
     pub(crate) name: String,
+
     /// Port info. `qpn` and `psn` are unset.
     pub(crate) endpoint: Endpoint,
 }
@@ -277,12 +297,17 @@ pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
 /// while busy. Holds the slot's guard and leaks it if deregister fails.
 pub(crate) struct NativeRegion {
     device: Rc<NativeDevice>,
+
     raw: NonNull<c_void>,
+
     /// Allocated size.
     length: usize,
+
     /// Bytes in use for the current transfer.
     used: Cell<usize>,
+
     quota: Option<Arc<GuardOwner>>,
+
     busy: Cell<bool>,
 }
 impl NativeRegion {
@@ -381,9 +406,12 @@ impl Drop for NativeRegion {
 /// A memory window (MW): lets one peer write into a region.
 pub(crate) struct Window {
     device: Rc<NativeDevice>,
+
     raw: NonNull<c_void>,
+
     /// Remote key for the peer.
     pub(crate) key: u32,
+
     region: Rc<NativeRegion>,
 }
 impl Drop for Window {
@@ -416,9 +444,12 @@ impl Ticket {
 /// completes or the QP stops.
 struct Pending {
     ticket: Ticket,
+
     /// Expected completion opcode.
     opcode: u32,
+
     region: Option<Rc<NativeRegion>>,
+
     _window: Option<Rc<Window>>,
 }
 impl Pending {
@@ -840,9 +871,13 @@ pub(crate) mod lifetime_tests {
     #[derive(Default)]
     struct Faults {
         events: Vec<&'static str>,
+
         cq: VecDeque<Completion>,
+
         stop_fails: bool,
+
         post_fails: bool,
+
         poll_fails: bool,
     }
     thread_local! { static FAULTS: RefCell<Faults> = RefCell::new(Faults::default()); }

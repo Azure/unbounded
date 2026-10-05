@@ -167,10 +167,13 @@ impl std::error::Error for Error {}
 pub struct PortInfo {
     /// Device name, like `mlx5_0`.
     pub device: String,
+
     /// Port number on the device.
     pub port: u8,
+
     /// Port GID at index 0.
     pub gid: [u8; 16],
+
     /// NUMA node, if known.
     pub numa_node: Option<usize>,
 }
@@ -180,8 +183,10 @@ pub struct PortInfo {
 pub struct Selection {
     /// Your name for this port. Pass it to [`IoPort::device`].
     pub tag: u32,
+
     /// Position in the discovered port list.
     pub index: usize,
+
     /// The picked port.
     pub port: PortInfo,
 }
@@ -191,11 +196,14 @@ pub struct Configuration {
     /// Set false to skip discovery for an empty plan. The selector then sees
     /// no ports and must pick none.
     pub discover: bool,
+
     /// Runs on the native thread. Gets the port list, returns `(tag, index)`
     /// pairs. Tags and indices must be unique.
     pub selector: Box<PortSelector>,
+
     /// One guard per slot. The length sets the slot count.
     pub guards: Vec<Guard>,
+
     /// Buffer size per slot.
     pub bytes: usize,
 }
@@ -241,6 +249,7 @@ pub struct NativeService {
 /// - Close: closes both, native first.
 pub struct WithNative<T> {
     inner: T,
+
     native: NativeService,
 }
 
@@ -249,7 +258,9 @@ pub struct WithNative<T> {
 /// Goes stale after [`IoPort::reopen`].
 pub struct DeviceHandle {
     pub(crate) port: Rc<IoPort>,
+
     pub(crate) rail: u32,
+
     pub(crate) generation: u64,
 }
 
@@ -258,12 +269,18 @@ pub struct DeviceHandle {
 /// Each call queues a command for the native thread. Dropping it stops the QP.
 pub struct QueuePairHandle {
     lease: Rc<Lease>,
+
     /// This QP's address. Send it to the peer.
     pub endpoint: Endpoint,
+
     connecting: RefCell<Option<Ticket>>,
+
     connected: Cell<bool>,
+
     pending: RefCell<Option<Ticket>>,
+
     failure: Cell<Option<Error>>,
+
     expires: Cell<Option<std::time::Instant>>,
 }
 
@@ -274,6 +291,7 @@ pub struct QueuePairHandle {
 /// Read received bytes only after the QP has stopped and readback is published.
 pub struct Region {
     lease: Rc<Lease>,
+
     length: usize,
 }
 
@@ -283,7 +301,9 @@ pub struct Region {
 /// before that.
 pub struct Window {
     pub(crate) key: Cell<u32>,
+
     pub(crate) address: Cell<u64>,
+
     _region: Rc<Region>,
 }
 
@@ -346,6 +366,7 @@ use uring_runtime::{
 /// The I/O side's hold on a slot. Shared by the QP handle, region, and tickets.
 struct Lease {
     slot: Arc<Slot>,
+
     shared: Arc<Shared>,
 }
 impl Drop for Lease {
@@ -425,7 +446,9 @@ impl Region {
 /// A ticket's slot hold, its saved result, and the window it binds, if any.
 struct TicketState {
     lease: Rc<Lease>,
+
     result: Cell<Option<Result<()>>>,
+
     window: Option<Rc<Window>>,
 }
 impl Ticket {
@@ -718,20 +741,28 @@ pub(crate) enum Command {
 pub(crate) struct Mailbox {
     /// Lease permit, held until the QP stops.
     pub peer_admission: Option<Guard>,
+
     /// This slot's QP address.
     pub endpoint: Option<Endpoint>,
+
     /// Tag of the port this slot is on.
     pub rail: u32,
+
     /// Region length in use, or 0 if no region.
     pub length: usize,
+
     /// Copy of the region, readable by the I/O thread.
     pub bytes: Vec<u8>,
+
     /// Command waiting for the native side.
     pub command: Option<Command>,
+
     /// Result of the last command.
     pub result: Option<Result<()>>,
+
     /// Window address and key after a bind.
     pub descriptor: Option<(u64, u32)>,
+
     /// The slot's guard from [`Configuration::guards`].
     pub quota: Option<Arc<GuardOwner>>,
 }
@@ -773,22 +804,31 @@ impl Drop for Slot {
 /// State shared by [`IoPort`] and [`NativePort`].
 pub(crate) struct Shared {
     pub slots: Vec<Arc<Slot>>,
+
     /// Wakes the native service.
     pub engine: AtomicWaker,
+
     /// Wakes the I/O driver.
     pub io: AtomicWaker,
+
     /// No new work. Native side is shutting slots down.
     pub closed: AtomicBool,
+
     /// Bumped by each reopen. Stale [`DeviceHandle`]s are rejected.
     pub generation: AtomicU64,
+
     /// Closed and every slot freed. Reopen is allowed.
     drained: AtomicBool,
+
     /// False once the [`NativePort`] is dropped.
     alive: AtomicBool,
+
     /// A configuration was submitted this round.
     configured: AtomicBool,
+
     /// Configuration waiting for the native side.
     config: Mutex<Option<Configuration>>,
+
     /// Activation result waiting for the I/O side.
     activation: Mutex<Option<Result<Vec<Selection>>>>,
 }
@@ -873,6 +913,7 @@ impl IoPort {
         /// Closes the pool if dropped before activation finishes.
         struct ActivationGuard<'a> {
             port: &'a IoPort,
+
             completed: bool,
         }
         impl Drop for ActivationGuard<'_> {
@@ -1024,22 +1065,32 @@ impl Drop for IoPort {
 /// Native RDMA objects for one slot.
 struct Resource {
     device: Rc<ffi::NativeDevice>,
+
     region: Rc<ffi::NativeRegion>,
+
     qp: Option<Rc<ffi::NativeQueuePair>>,
+
     window: Option<Rc<ffi::Window>>,
+
     /// The command in flight, if any.
     pending: Option<ffi::Ticket>,
+
     /// Shutting this slot's QP down.
     stopping: bool,
+
     /// Wait until this time before retrying a failed stop or rebuild.
     next_retry: Option<std::time::Instant>,
 }
 /// Activation in progress. Slots are built one per step.
 struct Activation {
     devices: Vec<Rc<ffi::NativeDevice>>,
+
     selected: Vec<Selection>,
+
     quotas: std::vec::IntoIter<Guard>,
+
     bytes: usize,
+
     /// Next slot to build.
     next: usize,
 }
@@ -1666,8 +1717,10 @@ pub mod testing {
     pub struct Snapshot {
         /// Slot state.
         pub state: State,
+
         /// Stop was requested.
         pub cancelled: bool,
+
         /// The QP has stopped.
         pub fenced: bool,
     }

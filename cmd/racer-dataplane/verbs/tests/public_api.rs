@@ -752,8 +752,11 @@ mod scoped {
     /// Record hook order and assert admission/fence state from an inner service.
     struct Inner {
         calls: Rc<RefCell<Vec<&'static str>>>,
+
         io: Rc<IoPort>,
+
         failure: Option<Failure>,
+
         wake: Waker,
     }
     impl Service<TestScope> for Inner {
@@ -883,6 +886,7 @@ mod scoped {
         /// Inner service that reports the selected failure on its first poll.
         struct Reporting {
             reporter: Option<FailureReporter<Failure>>,
+
             error: Error,
         }
         impl Service<TestScope> for Reporting {

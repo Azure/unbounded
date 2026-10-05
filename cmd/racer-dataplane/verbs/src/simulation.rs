@@ -29,6 +29,7 @@ thread_local! {
 #[derive(Clone)]
 pub struct Simulation {
     world: Rc<RefCell<World>>,
+
     devices: Vec<Device>,
 }
 
@@ -36,8 +37,11 @@ pub struct Simulation {
 #[derive(Clone, Debug)]
 pub struct Device {
     pub name: String,
+
     pub gid: [u8; 16],
+
     pub port: u8,
+
     pub numa_node: Option<usize>,
 }
 
@@ -100,11 +104,16 @@ pub enum Fault {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Event {
     pub sequence: u64,
+
     pub operation: Operation,
+
     pub resource: u64,
+
     pub work_id: Option<u64>,
+
     /// 0 is success, negative is a rejected call, positive is a completion error.
     pub result: i64,
+
     pub completion: bool,
 }
 
@@ -112,10 +121,15 @@ pub struct Event {
 #[derive(Default)]
 struct World {
     next: u32,
+
     resources: BTreeMap<u32, Resource>,
+
     faults: VecDeque<(Operation, Option<u32>, Fault)>,
+
     rejects: Vec<(Operation, Option<u32>)>,
+
     trace: Vec<Event>,
+
     sequence: u64,
 }
 /// A live device, queue pair, region, or window.
@@ -142,14 +156,19 @@ enum Resource {
 #[derive(Clone, Copy)]
 struct Grant {
     qp: u32,
+
     region: u32,
+
     length: u32,
 }
 /// Queued work on a QP, with its remaining delay and final status.
 struct Work {
     id: u64,
+
     delay: usize,
+
     status: u32,
+
     action: Action,
 }
 /// What the work does when it completes successfully.
@@ -318,6 +337,7 @@ pub(super) fn api() -> Rc<Api> {
 /// The fabric owns the resource; `ffi.rs` decides when to free it.
 struct Handle {
     sim: Simulation,
+
     id: u32,
 }
 /// Turn a raw pointer back into a handle. The caller keeps it alive.
