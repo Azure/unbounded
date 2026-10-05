@@ -212,15 +212,14 @@ pub mod identity {
     //! # Validation and fixtures
     //!
     //! Private certificate-cache and epoch state-space tests live here. Public identity
-    //! workflows live in `tests/primitives.rs`; cross-component page-engine and
-    //! decode/BundleInstaller scenarios live in the application's integration tests.
+    //! workflows live in `tests/primitives.rs`. Cross-component application
+    //! integration tests are outside this extracted workspace.
     //! Run these gates from `cmd/racer-dataplane`:
     //!
     //! ```sh
     //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-crypto
     //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-crypto --features test-util
     //! timeout --signal=TERM --kill-after=10s 300s cargo clippy --locked -p racer-crypto --all-targets --all-features --no-deps -- -D warnings
-    //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-dataplane --test identity_integration
     //! ```
     //!
     //! The opt-in `test-util` feature exposes Ed25519 CA and node-certificate fixtures
@@ -313,18 +312,7 @@ pub mod identity {
 
     /// Canonical bundle replay tracking paired with its current keyring owner.
     pub struct BundleInstaller {
-        keys: RefCell<Rc<Keyring>>,
-
-        accepted: RefCell<Option<AcceptedBundle>>,
-    }
-
-    /// Accepted canonical content and the roots returned for idempotent delivery.
-    struct AcceptedBundle {
-        generation: BundleGeneration,
-
-        hash: [u8; 32],
-
-        roots: Vec<Vec<u8>>,
+        state: RefCell<BundleDelivery>,
     }
 
     /// Bundle delivery errors preserve replay, codec, and keyring distinctions.
@@ -340,27 +328,46 @@ pub mod identity {
         Identity(Error),
     }
 
+    /// Owner and replay cursor form one worker-local delivery state.
+    struct BundleDelivery {
+        keys: Rc<Keyring>,
+
+        accepted: Option<AcceptedBundle>,
+    }
+
+    /// Accepted canonical content used to reject conflicting delivery cursors.
+    struct AcceptedBundle {
+        generation: BundleGeneration,
+
+        hash: [u8; 32],
+    }
+
     impl BundleInstaller {
         /// Start delivery tracking for one keyring.
         pub fn new(keys: Rc<Keyring>) -> Self {
             Self {
-                keys: RefCell::new(keys),
-                accepted: RefCell::new(None),
+                state: RefCell::new(BundleDelivery {
+                    keys,
+                    accepted: None,
+                }),
             }
         }
 
         /// Return the last successfully accepted bundle generation.
         pub fn generation(&self) -> Option<BundleGeneration> {
-            self.accepted
+            self.state
                 .borrow()
+                .accepted
                 .as_ref()
                 .map(|accepted| accepted.generation)
         }
 
         /// Replace the keyring and reset delivery tracking for its new owner.
         pub fn bind_keyring(&self, keys: Rc<Keyring>) {
-            *self.keys.borrow_mut() = keys;
-            *self.accepted.borrow_mut() = None;
+            *self.state.borrow_mut() = BundleDelivery {
+                keys,
+                accepted: None,
+            };
         }
 
         /// Canonicalize unordered records, reject replay, and atomically install keys.
@@ -376,27 +383,18 @@ pub mod identity {
                 racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?,
             );
             let hash: [u8; 32] = Sha256::digest(&*encoded).into();
-            if let Some(old) = self.accepted.borrow().as_ref() {
-                if bundle.generation < old.generation
-                    || bundle.generation == old.generation && hash != old.hash
-                {
-                    return Err(BundleError::Replay);
-                }
-                if bundle.generation == old.generation {
-                    return Ok((old.generation, old.roots.clone()));
-                }
+            let mut state = self.state.borrow_mut();
+            if let Some(old) = state.accepted.as_ref()
+                && (bundle.generation < old.generation
+                    || bundle.generation == old.generation && hash != old.hash)
+            {
+                return Err(BundleError::Replay);
             }
+            // Even exact cached delivery must consult current shared epochs.
+            // Another keyring view may have advanced or retired this generation.
             let roots = bundle.peer_trust_roots.clone();
-            let generation = self
-                .keys
-                .borrow()
-                .install(bundle)
-                .map_err(BundleError::Identity)?;
-            *self.accepted.borrow_mut() = Some(AcceptedBundle {
-                generation,
-                hash,
-                roots: roots.clone(),
-            });
+            let generation = state.keys.install(bundle).map_err(BundleError::Identity)?;
+            state.accepted = Some(AcceptedBundle { generation, hash });
             Ok((generation, roots))
         }
     }
@@ -1496,6 +1494,49 @@ pub mod identity {
     mod bundle_tests {
         use super::test_util::*;
         use super::*;
+
+        /// Cached delivery cannot return stale roots after another view advances epochs.
+        #[test]
+        fn cached_delivery_revalidates_shared_keyring_epoch() {
+            let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
+            let node = NodeId("22222222-2222-4222-8222-222222222222".into());
+            let epochs = Arc::new(KeyEpochs::default());
+            let keys = Rc::new(Keyring::new(cluster.clone(), node.clone(), epochs.clone()));
+            let other = Keyring::new(cluster.clone(), node, epochs);
+            let installer = BundleInstaller::new(keys.clone());
+            let (old_ca, _) = ca();
+            let (new_ca, _) = ca();
+            let old = racer_control_wire::KeyringBundle {
+                schema_version: SCHEMA_VERSION,
+                cluster,
+                generation: BundleGeneration(2),
+                peer_trust_roots: vec![old_ca.der().to_vec()],
+                cache_keys: vec![],
+            };
+            let accepted = installer.install(old.clone()).unwrap();
+            let original_roots = keys.peer_trust_roots().unwrap();
+            assert_eq!(installer.install(old.clone()).unwrap(), accepted);
+            assert!(Arc::ptr_eq(
+                &keys.peer_trust_roots().unwrap(),
+                &original_roots
+            ));
+            let mut newer = old.clone();
+            newer.generation = BundleGeneration(3);
+            newer.peer_trust_roots = vec![new_ca.der().to_vec()];
+            other.install(newer.clone()).unwrap();
+            assert_eq!(keys.generation().unwrap(), Some(3));
+            assert_eq!(
+                installer.install(old),
+                Err(BundleError::Identity(Error::InvalidConfiguration))
+            );
+            assert_eq!(*keys.peer_trust_roots().unwrap(), newer.peer_trust_roots);
+            assert_eq!(installer.generation(), Some(BundleGeneration(2)));
+            assert_eq!(
+                installer.install(newer.clone()).unwrap(),
+                (BundleGeneration(3), newer.peer_trust_roots)
+            );
+            assert_eq!(installer.generation(), Some(BundleGeneration(3)));
+        }
 
         /// Canonical delivery is idempotent, rejects rollback, and resets with its keyring.
         #[test]

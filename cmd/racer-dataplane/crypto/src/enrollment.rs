@@ -2,6 +2,11 @@
 //! The caller persists NIC reservations before preparing a request, supplies current
 //! NICs and shares, and exclusively owns this identity directory. Attempt fencing
 //! must remain bound to the same serving reactor for the lifetime of this owner.
+//!
+//! Prepare persists a retry-stable key before exposing its CSR. Accept validates
+//! the response before durable replacement, and recovery revalidates trust before
+//! returning an identity. Cancellation and abandoned writes are fenced through
+//! the caller's host; transport retries and inventory remain application policy.
 
 use crate::identity;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -31,17 +36,22 @@ use zeroize::{Zeroize, Zeroizing};
 pub enum Error {
     /// Identity correlation, certificate, token, or key pairing failed.
     Unauthorized,
+
     /// Persisted JSON or private key material is corrupt.
     CorruptRecord,
+
     /// The configured cluster is not a canonical UUID.
     InvalidConfiguration,
+
     /// Entropy, serialization, or local key generation failed.
     Io,
+
     /// Preserve the wire codec's exact failure classification.
     Wire(wire::Error),
 }
 
 impl From<wire::Error> for Error {
+    /// Retain the wire failure category without including rejected record bytes.
     fn from(error: wire::Error) -> Self {
         Self::Wire(error)
     }
@@ -87,14 +97,44 @@ struct PendingIdentity {
 
     enrollment: String,
 
-    private_key: String,
+    private_key: EncodedPrivateKey,
 
     csr: String,
 }
 
-impl Drop for PendingIdentity {
+/// Own secret text before serde has constructed the surrounding record.
+struct EncodedPrivateKey(Zeroizing<String>);
+
+impl Serialize for EncodedPrivateKey {
+    /// Preserve the persisted base64 string schema.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for EncodedPrivateKey {
+    /// Protect a decoded field immediately, even if a later field is missing.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
+    }
+}
+
+/// Clear all JSON strings, including values not consumed by a failing DTO decode.
+struct PrivateJson(serde_json::Value);
+
+impl Drop for PrivateJson {
+    /// Erase temporary copies while their allocations are still owned.
     fn drop(&mut self) {
-        self.private_key.zeroize();
+        /// Visit every string in a private record's JSON tree.
+        fn clear(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::String(text) => text.zeroize(),
+                serde_json::Value::Array(values) => values.iter_mut().for_each(clear),
+                serde_json::Value::Object(values) => values.values_mut().for_each(clear),
+                _ => (),
+            }
+        }
+        clear(&mut self.0);
     }
 }
 
@@ -109,8 +149,8 @@ struct PersistedIdentity {
 impl PersistedIdentity {
     /// Reject duplicate fields and oversized records before deserializing.
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        serde_json::from_value(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES * 3)?)
-            .map_err(|_| Error::CorruptRecord)
+        let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES * 3)?);
+        Self::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
     }
 
     /// Decode the saved response through the same wire validation as live traffic.
@@ -124,9 +164,7 @@ impl PersistedIdentity {
 
     /// Keep serialized private material in zeroizing storage until submission.
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
-        Ok(Zeroizing::new(
-            serde_json::to_vec(self).map_err(|_| Error::Io)?,
-        ))
+        encode_private(self, wire::MAX_ENROLLMENT_BYTES * 3)
     }
 }
 
@@ -191,7 +229,7 @@ impl<H: Host> Enrollment<H> {
                 &h[16..20],
                 &h[20..]
             ),
-            private_key: STANDARD.encode(&*private),
+            private_key: EncodedPrivateKey(Zeroizing::new(STANDARD.encode(&*private))),
             csr: STANDARD.encode(csr.der()),
         })
     }
@@ -269,11 +307,7 @@ impl<H: Host> Enrollment<H> {
         if san.value.general_names.len() != 1 {
             return Err(Error::Unauthorized);
         }
-        let private_material = Zeroizing::new(
-            STANDARD
-                .decode(&p.private_key)
-                .map_err(|_| Error::CorruptRecord)?,
-        );
+        let private_material = decode_private_key(&p.private_key)?;
         let key = crate::SigningKey::from_pkcs8_der(&private_material)
             .map_err(|_| Error::CorruptRecord)?;
         if public.key != key.verifying_key() {
@@ -338,7 +372,7 @@ where
                 Err(e) => return Err(e),
             }
             let pending = self.generate()?;
-            let encoded = Zeroizing::new(serde_json::to_vec(&pending).map_err(|_| Error::Io)?);
+            let encoded = encode_private(&pending, wire::MAX_ENROLLMENT_BYTES)?;
             secure::atomic_write(r, &dir, "pending.json", &encoded, &scope).await?;
             self.request(&pending, nics, shares).map_err(Into::into)
         })
@@ -526,6 +560,39 @@ impl LocalSigningIdentity {
     }
 }
 
+/// Fixed-capacity output that cannot reallocate after receiving secret bytes.
+struct PrivateOutput {
+    bytes: Zeroizing<Vec<u8>>,
+
+    limit: usize,
+}
+
+impl std::io::Write for PrivateOutput {
+    /// Reject an oversized write before copying any bytes or growing the allocation.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit - self.bytes.len() {
+            return Err(std::io::ErrorKind::FileTooLarge.into());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    /// Serialization writes directly to memory, so there is nothing to flush.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize directly into wiping storage sized before any secrets are copied.
+fn encode_private(value: &impl Serialize, limit: usize) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let mut output = PrivateOutput {
+        bytes: Zeroizing::new(Vec::with_capacity(limit)),
+        limit,
+    };
+    serde_json::to_writer(&mut output, value).map_err(|_| Error::Io)?;
+    Ok(output.bytes)
+}
+
 /// Parse a projected bearer credential without retaining leading/trailing whitespace.
 fn token(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
     let token = Zeroizing::new(
@@ -546,18 +613,29 @@ fn token(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
 
 /// Decode bounded, duplicate-free pending JSON without changing its on-disk schema.
 fn decode_pending(bytes: &[u8]) -> Result<PendingIdentity, Error> {
-    serde_json::from_value(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES)?)
-        .map_err(|_| Error::CorruptRecord)
+    let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES)?);
+    PendingIdentity::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
+}
+
+/// Own bounded wiping output before base64 can write even a partial private key.
+fn decode_private_key(encoded: &EncodedPrivateKey) -> Result<Zeroizing<Vec<u8>>, Error> {
+    if encoded.0.len() > wire::MAX_ENROLLMENT_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    // The encoded record bound makes this rounded decoded capacity nonoverflowing.
+    let capacity = encoded.0.len().div_ceil(4) * 3;
+    let mut secret = Zeroizing::new(vec![0; capacity]);
+    let length = STANDARD
+        .decode_slice(encoded.0.as_bytes(), secret.as_mut_slice())
+        .map_err(|_| Error::CorruptRecord)?;
+    secret.truncate(length);
+    Ok(secret)
 }
 
 /// Reject a corrupt or mismatched pending key before submitting its CSR.
 fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error> {
     use x509_parser::prelude::FromDer;
-    let secret = Zeroizing::new(
-        STANDARD
-            .decode(&pending.private_key)
-            .map_err(|_| Error::CorruptRecord)?,
-    );
+    let secret = decode_private_key(&pending.private_key)?;
     let key = crate::SigningKey::from_pkcs8_der(&secret).map_err(|_| Error::CorruptRecord)?;
     let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr)
         .map_err(|_| Error::CorruptRecord)?;
@@ -593,6 +671,126 @@ mod tests {
         },
     };
 
+    std::thread_local! {
+        /// Observe secret-field destruction without reading deallocated memory.
+        static PRIVATE_KEY_DROPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    impl Drop for EncodedPrivateKey {
+        /// The zeroizing field is erased after this test-only observer runs.
+        fn drop(&mut self) {
+            PRIVATE_KEY_DROPS.with(|drops| drops.set(drops.get() + 1));
+        }
+    }
+
+    /// Partial pending and nested persisted records retain zeroizing field ownership.
+    #[test]
+    fn private_fields_drop_on_missing_and_late_invalid_record_fields() {
+        for pending in [
+            r#"{"cluster":"cluster","enrollment":"id","private_key":"secret"}"#,
+            r#"{"cluster":"cluster","enrollment":"id","private_key":"secret","csr":false}"#,
+        ] {
+            // Direct serde parsing exercises input order; production also retains
+            // a wiping JSON tree, whose sorted fields may fail before the key.
+            PRIVATE_KEY_DROPS.with(|drops| drops.set(0));
+            assert!(serde_json::from_str::<PendingIdentity>(pending).is_err());
+            assert_eq!(PRIVATE_KEY_DROPS.with(Cell::get), 1);
+            assert!(matches!(
+                decode_pending(pending.as_bytes()),
+                Err(Error::CorruptRecord)
+            ));
+            let persisted = format!(r#"{{"pending":{pending},"response":"response"}}"#);
+            PRIVATE_KEY_DROPS.with(|drops| drops.set(0));
+            assert!(serde_json::from_str::<PersistedIdentity>(&persisted).is_err());
+            assert_eq!(PRIVATE_KEY_DROPS.with(Cell::get), 1);
+            assert!(matches!(
+                PersistedIdentity::decode(persisted.as_bytes()),
+                Err(Error::CorruptRecord)
+            ));
+        }
+        for tail in ["", r#", "response":false"#] {
+            let persisted = format!(
+                r#"{{"pending":{{"cluster":"cluster","enrollment":"id","private_key":"secret","csr":"csr"}}{tail}}}"#
+            );
+            PRIVATE_KEY_DROPS.with(|drops| drops.set(0));
+            assert!(matches!(
+                PersistedIdentity::decode(persisted.as_bytes()),
+                Err(Error::CorruptRecord)
+            ));
+            assert_eq!(PRIVATE_KEY_DROPS.with(Cell::get), 1);
+        }
+    }
+
+    /// Fixed storage bounds both record families, including late serializer errors.
+    #[test]
+    fn private_serialization_is_bounded_non_reallocating_and_round_trips() {
+        use std::io::Write;
+        let pending =
+            r#"{"cluster":"cluster","enrollment":"id","private_key":"secret","csr":"csr"}"#;
+        let record = decode_pending(pending.as_bytes()).unwrap();
+        let encoded = encode_private(&record, pending.len()).unwrap();
+        assert_eq!(&*encoded, pending.as_bytes());
+        assert_eq!(
+            decode_pending(&encoded).unwrap().private_key.0.as_str(),
+            "secret"
+        );
+        assert!(matches!(
+            encode_private(&record, pending.len() - 1),
+            Err(Error::Io)
+        ));
+        let persisted = PersistedIdentity {
+            pending: record,
+            response: "response".into(),
+        };
+        let encoded = persisted.encode().unwrap();
+        let decoded = PersistedIdentity::decode(&encoded).unwrap();
+        assert_eq!(decoded.pending.private_key.0.as_str(), "secret");
+        assert_eq!(decoded.response, "response");
+        let oversized = PersistedIdentity {
+            pending: decode_pending(pending.as_bytes()).unwrap(),
+            response: "x".repeat(wire::MAX_ENROLLMENT_BYTES * 3),
+        };
+        assert!(matches!(oversized.encode(), Err(Error::Io)));
+        let mut oversized_pending = decode_pending(pending.as_bytes()).unwrap();
+        oversized_pending.csr = "x".repeat(wire::MAX_ENROLLMENT_BYTES);
+        assert!(matches!(
+            encode_private(&oversized_pending, wire::MAX_ENROLLMENT_BYTES),
+            Err(Error::Io)
+        ));
+
+        let mut output = PrivateOutput {
+            bytes: Zeroizing::new(Vec::with_capacity(6)),
+            limit: 6,
+        };
+        let pointer = output.bytes.as_ptr();
+        let capacity = output.bytes.capacity();
+        for part in [b"sec".as_slice(), b"ret"] {
+            output.write_all(part).unwrap();
+            assert_eq!(output.bytes.as_ptr(), pointer);
+            assert_eq!(output.bytes.capacity(), capacity);
+        }
+        assert_eq!(
+            output.write(b"! ").unwrap_err().kind(),
+            std::io::ErrorKind::FileTooLarge
+        );
+        assert_eq!(&*output.bytes, b"secret");
+        assert_eq!(output.bytes.as_ptr(), pointer);
+        assert_eq!(output.bytes.capacity(), capacity);
+
+        /// Fail after the serializer has already emitted a secret-bearing field.
+        struct FailsLate;
+        impl Serialize for FailsLate {
+            /// Exercise cleanup after a non-capacity serialization failure.
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStruct;
+                let mut record = serializer.serialize_struct("record", 2)?;
+                record.serialize_field("private_key", "secret")?;
+                Err(serde::ser::Error::custom("late failure"))
+            }
+        }
+        assert!(matches!(encode_private(&FailsLate, 128), Err(Error::Io)));
+    }
+
     /// Flat cause and publication phase keep test adapter errors lossless.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Failure {
@@ -605,11 +803,14 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Cause {
         Runtime(uring_runtime::Error),
+
         Enrollment(Error),
+
         Access(secure::AccessError),
     }
 
     impl From<uring_runtime::Error> for Failure {
+        /// Retain the runtime cause before any replacement phase is attached.
         fn from(e: uring_runtime::Error) -> Self {
             Self {
                 cause: Cause::Runtime(e),
@@ -619,6 +820,7 @@ mod tests {
     }
 
     impl From<Error> for Failure {
+        /// Retain enrollment validation failures independently of filesystem causes.
         fn from(e: Error) -> Self {
             Self {
                 cause: Cause::Enrollment(e),
@@ -628,6 +830,7 @@ mod tests {
     }
 
     impl From<secure::AccessError> for Failure {
+        /// Preserve secure access policy failures without flattening their category.
         fn from(e: secure::AccessError) -> Self {
             Self {
                 cause: Cause::Access(e),
@@ -637,6 +840,7 @@ mod tests {
     }
 
     impl From<ReplacementError<Failure>> for Failure {
+        /// Preserve whether replacement failed before, during, or after publication.
         fn from(e: ReplacementError<Failure>) -> Self {
             match e {
                 ReplacementError::BeforeRename(e) => e,
@@ -657,6 +861,7 @@ mod tests {
     impl Scope for Request {
         type Error = Failure;
 
+        /// Stop cancelled requests before admitting more simulated I/O.
         fn check(&self) -> Result<(), Failure> {
             if self.cancellation.is_cancelled() {
                 Err(uring_runtime::Error::Cancelled.into())
@@ -665,6 +870,7 @@ mod tests {
             }
         }
 
+        /// Share parent cancellation with the fresh attempt scope.
         fn cancellation(&self) -> Option<&Cancellation> {
             Some(&self.cancellation)
         }
@@ -682,10 +888,12 @@ mod tests {
 
         type Budget = ();
 
+        /// Keep every attempt bound to this serving reactor.
         fn reactor(&self) -> &Reactor<Request, ()> {
             &self.reactor
         }
 
+        /// Assign a distinct I/O identity while retaining parent cancellation.
         fn fresh_scope(&self, parent: &Request) -> Result<Request, Failure> {
             self.next.set(self.next.get() + 1);
             Ok(Request {
@@ -694,17 +902,22 @@ mod tests {
             })
         }
 
+        /// Drain only the abandoned attempt before a successor can access its files.
         fn fence<'a>(&'a self, previous: &'a Request) -> Operation<'a, (), Failure> {
             self.reactor
                 .fence_matching(move |scope| scope.id == previous.id)
         }
 
+        /// Distinguish absent records from other filesystem and policy failures.
         fn is_missing(error: Failure) -> bool {
             error == uring_runtime::Error::NotFound.into()
         }
     }
 
+    /// Canonical authority used for enrollment correlation in simulation.
     const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// Node identity assigned by the simulated certificate issuer.
     const NODE: &str = "22222222-2222-4222-8222-222222222222";
 
     /// Construct one namespace owner on the active simulation backend.
@@ -858,6 +1071,87 @@ mod tests {
         assert_ne!(fresh.enrollment, request.enrollment);
         drive(&files, e.load_identity(&scope)).unwrap().unwrap();
         assert!(sim.metadata(Path::new("/private/pending.json")).is_ok());
+    }
+
+    /// Late base64 failures preserve pending work and never publish or recover a key.
+    #[test]
+    fn late_private_key_base64_errors_preserve_identity_records() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let (ca, key) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let response = issue(&request, &ca, &key, |_| {});
+        let original = sim.read_file(Path::new("/private/pending.json")).unwrap();
+        let pending = decode_pending(&original).unwrap();
+        let decoded = decode_private_key(&pending.private_key).unwrap();
+        assert_eq!(STANDARD.encode(&*decoded), *pending.private_key.0);
+        assert!(decoded.len() > 32);
+        for suffix in ["!AAA", "A===", "AA=A"] {
+            let mut pending = decode_pending(&original).unwrap();
+            // Leave complete valid groups before corrupting only the final group.
+            let length = pending.private_key.0.len();
+            pending.private_key.0.replace_range(length - 4.., suffix);
+            assert!(matches!(
+                decode_private_key(&pending.private_key),
+                Err(Error::CorruptRecord)
+            ));
+            let corrupted = encode_private(&pending, wire::MAX_ENROLLMENT_BYTES).unwrap();
+            sim.write_file(Path::new("/private/pending.json"), &corrupted)
+                .unwrap();
+            assert!(matches!(
+                drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)),
+                Err(error) if error == Error::CorruptRecord.into()
+            ));
+            assert!(matches!(
+                drive(&files, e.accept_response(response.clone(), &scope)),
+                Err(error) if error == Error::CorruptRecord.into()
+            ));
+            assert!(sim.metadata(Path::new("/private/identity.json")).is_err());
+            assert_eq!(
+                sim.read_file(Path::new("/private/pending.json")).unwrap(),
+                *corrupted
+            );
+
+            // Recovery reaches validate's decoder independently of the CSR check.
+            let persisted = PersistedIdentity {
+                pending,
+                response: STANDARD.encode(wire::encode_enrollment_response(&response).unwrap()),
+            }
+            .encode()
+            .unwrap();
+            sim.write_file(Path::new("/private/identity.json"), &persisted)
+                .unwrap();
+            sim.chmod(Path::new("/private/identity.json"), 0o600)
+                .unwrap();
+            assert!(
+                matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == Error::CorruptRecord.into())
+            );
+            assert_eq!(
+                sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                *persisted
+            );
+            assert_eq!(
+                sim.read_file(Path::new("/private/pending.json")).unwrap(),
+                *corrupted
+            );
+            sim.unlink(Path::new("/private/identity.json")).unwrap();
+        }
+        let oversized =
+            EncodedPrivateKey(Zeroizing::new("A".repeat(wire::MAX_ENROLLMENT_BYTES + 1)));
+        assert!(matches!(
+            decode_private_key(&oversized),
+            Err(Error::CorruptRecord)
+        ));
+        sim.write_file(Path::new("/private/pending.json"), &original)
+            .unwrap();
+        assert!(drive(&files, e.accept_response(response, &scope)).is_ok());
+        assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
     }
 
     /// Invalid certificates and pending material never publish an identity.
