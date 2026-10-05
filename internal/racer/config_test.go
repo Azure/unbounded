@@ -137,22 +137,23 @@ func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
 }
 
 func TestComponentConfigFreezesDefaultsAtFirstUse(t *testing.T) {
-	a := Assemble(Config{}, nil, nil)
-	// Test Server's own capture separately from its transitive dependency freeze.
-	s := &Server{}
-	// Assemble remains a pure scaffold, even with an invalid zero config.
-	for name, component := range map[string]struct {
-		input *Config
-		get   func() Config
-	}{
-		"topology":    {&a.Topology.Config, a.Topology.runtimeConfig},
-		"keyring":     {&a.Keyring.Config, a.Keyring.runtimeConfig},
-		"replication": {&a.Replication.Config, a.Replication.runtimeConfig},
-		"bootstrap":   {&a.Server.Config, a.Server.runtimeFixtureConfig},
-		"issuer":      {&a.Server.Config, a.Server.runtimeFixtureConfig},
-		"server":      {&s.Config, func() Config { s.initializeAdmission(); return s.config }},
-	} {
+	for _, name := range []string{"topology", "keyring", "replication", "bootstrap", "issuer", "server"} {
 		t.Run(name, func(t *testing.T) {
+			// Each scenario owns its serving chain: freezing Server must not
+			// initialize another scenario's Replication before its inputs are set.
+			a := Assemble(Config{}, nil, nil)
+			s := &Server{}
+			component := map[string]struct {
+				input *Config
+				get   func() Config
+			}{
+				"topology":    {&a.Topology.Config, a.Topology.runtimeConfig},
+				"keyring":     {&a.Keyring.Config, a.Keyring.runtimeConfig},
+				"replication": {&a.Replication.Config, a.Replication.runtimeConfig},
+				"bootstrap":   {&a.Server.Config, a.Server.runtimeFixtureConfig},
+				"issuer":      {&a.Server.Config, a.Server.runtimeFixtureConfig},
+				"server":      {&s.Config, s.runtimeFixtureConfig},
+			}[name]
 			*component.input = testConfig(t)
 			component.input.CertificateLifetime = 0
 			component.input.SnapshotMaxAge = 0

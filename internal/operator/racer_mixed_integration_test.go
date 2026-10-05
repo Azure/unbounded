@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
@@ -109,12 +110,21 @@ func TestEnvtestRacerMixedMigration(t *testing.T) {
 	}
 
 	pass := func() { _, err := newReconciler().Reconcile(ctx, singletonRequest()); require.NoError(t, err) }
-	for range 4 {
-		pass()
-	}
-
 	startupDeployment := &appsv1.Deployment{}
-	require.NoError(t, c.Get(ctx, key("racer-controller"), startupDeployment))
+	// Staged identity can require more passes than runtime planning. Reconcile
+	// to the asserted resource, bounded by both this budget and the test context.
+	require.NoError(t, wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		if _, err := newReconciler().Reconcile(ctx, singletonRequest()); err != nil {
+			return false, err
+		}
+
+		err := c.Get(ctx, key("racer-controller"), startupDeployment)
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return err == nil, err
+	}))
 	require.Empty(t, startupDeployment.Spec.Template.Spec.Containers[0].Args)
 
 	config := &corev1.ConfigMap{}

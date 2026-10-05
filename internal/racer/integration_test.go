@@ -275,6 +275,10 @@ func integrationInitialization(t *testing.T, c client.Client) {
 
 func integrationRotation(t *testing.T, c client.Client) {
 	a := integrationInstallation(t, c, "rotation")
+	cfg := a.Keyring.Config
+	cfg.Rotation.Interval = 7 * 24 * time.Hour
+
+	a = assembleFixture(cfg, c, c)
 	if err := a.Recover(t.Context(), a.Topology.Client); err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +295,6 @@ func integrationRotation(t *testing.T, c client.Client) {
 	})
 
 	r := a.Keyring
-	r.Config.Rotation.Interval = 7 * 24 * time.Hour
 	now := time.Now().UTC().Truncate(time.Second)
 	fixtureDependencies[a.authority].now = func() time.Time { return now }
 
@@ -309,7 +312,7 @@ func integrationRotation(t *testing.T, c client.Client) {
 		boom := errors.New(step.name)
 		failed := false
 
-		fixtureDependencies[a.authority].Client = interruptedClient{Client: c, update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+		fixtureDependencies[r.authority].Client = interruptedClient{Client: c, update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
 			if obj.GetName() != step.secret {
 				return c.Update(ctx, obj, opts...)
 			}
@@ -522,9 +525,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 			t.Fatal(err)
 		}
 
-		apps[i] = Assemble(cfg, mgr.GetClient(), mgr.GetAPIReader())
-
-		apps[i].Topology.Client = interruptedClient{Client: mgr.GetClient(), update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+		writer := interruptedClient{Client: mgr.GetClient(), update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
 			if err := mgr.GetClient().Update(ctx, obj, opts...); err != nil {
 				return err
 			}
@@ -535,6 +536,8 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 
 			return nil
 		}}
+
+		apps[i] = Assemble(cfg, writer, mgr.GetAPIReader())
 		if err := apps[i].SetupWithManager(mgr); err != nil {
 			t.Fatal(err)
 		}
@@ -766,8 +769,8 @@ func (b countedBody) Read(p []byte) (int, error) {
 
 func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client, a *Application, peer *http.Client) {
 	t.Helper()
-	// A separate handler shares the elected application's lifecycle/publication.
-	// Its reader records actual API responses without mutating running dependencies.
+	// A separate owner uses the instrumented API dependency for every operation.
+	// Validate replicated state through public operations before measuring serving.
 	var requests, nodeLists, podLists, received atomic.Int64
 
 	connection := rest.CopyConfig(rc)
@@ -798,7 +801,31 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	}
 
 	measured := Assemble(a.Server.Config, reader, reader).Server
-	measured.Lifecycle, measured.authority = a.Lifecycle, a.authority
+	if err := measured.authority.Observe(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	image, err := wire.DecodePublication(strings.NewReader(capturePublication(t, a.authority).encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := measured.authority.AcceptReplica(t.Context(), t.Context(), image); err != nil {
+		t.Fatal(err)
+	}
+
+	measured.Lifecycle.process, measured.Lifecycle.synced, measured.Lifecycle.serving = t.Context(), true, true
+	// Positive control on this same owner proves the measurement is connected.
+	requests.Store(0)
+	received.Store(0)
+
+	if err := measured.authority.Observe(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if requests.Load() == 0 || received.Load() == 0 {
+		t.Fatal("instrumented authority positive control did not read API")
+	}
 
 	config, err := measured.TLSConfig(t.Context())
 	if err != nil {
