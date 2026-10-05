@@ -382,7 +382,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         )
         .unwrap(),
     );
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
+    let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4));
     let outbound = NoOutbound::new(signers[2].clone(), network.clone());
     let relay = Rc::new(Relay::new(
         paths,
@@ -561,7 +561,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             )
             .unwrap(),
         );
-        let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 1));
+        let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 1));
         let requester = Rc::new(Requester::new(
             paths.clone(),
             forwarding.clone(),
@@ -680,8 +680,8 @@ fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
         )
         .unwrap(),
     );
-    let paths = Paths::new(Rc::new(LinkHealth), 1);
-    let health = Rc::new(LinkHealth);
+    let paths = Paths::new(Rc::new(LinkHealth::default()), 1);
+    let health = Rc::new(LinkHealth::default());
     let cold = Paths::new(health.clone(), 0);
     let mut selected = std::collections::BTreeSet::new();
     for attempt in 1..=32 {
@@ -992,7 +992,8 @@ fn signed_tcp_case(case: &str) {
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
     let metrics = crate::telemetry::Metrics::default();
     let adaptive = crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive));
+    let paths =
+        Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(adaptive));
     let outbound = NoOutbound::new(signers[2].clone(), destination_network.clone());
     let relay = Rc::new(Relay::new(
         paths.clone(),
@@ -1168,7 +1169,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             ),
         );
         let relay = Rc::new(Relay::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+            Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
             forwarding.clone(),
             outbound.requester.clone(),
             admission.clone(),
@@ -1673,7 +1674,7 @@ mod established_sessions {
             );
             let outbound = NoOutbound::new(signers[2].clone(), network.clone());
             let relay = Rc::new(Relay::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+                Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
                 forwarding.clone(),
                 outbound.requester.clone(),
                 admission.clone(),

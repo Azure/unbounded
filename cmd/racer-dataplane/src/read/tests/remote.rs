@@ -371,7 +371,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         )
         .unwrap(),
     );
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 8));
+    let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 8));
     let auth = Rc::new(Forwarding::new(b.signatures.clone()));
     let outbound =
         crate::peer::tests::NoOutbound::new(b.signatures.clone(), destination_network.clone());

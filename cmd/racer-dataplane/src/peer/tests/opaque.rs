@@ -1123,7 +1123,7 @@ impl RelayFixture {
             Rc::new(codec(&admissions[1])),
             signers[1].clone(),
         ));
-        let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
+        let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4));
         let requester = Rc::new(Requester::new(
             paths.clone(),
             auth.clone(),

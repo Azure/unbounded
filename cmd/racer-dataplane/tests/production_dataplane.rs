@@ -510,7 +510,7 @@ impl Rig {
             signatures,
         ));
         let peers = Rc::new(Requester::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 64)),
+            Rc::new(Paths::new(Rc::new(LinkHealth::default()), 64)),
             forwarding.clone(),
             transfers,
             network,

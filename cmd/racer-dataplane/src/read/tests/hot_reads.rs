@@ -1189,7 +1189,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                 signers[i].clone(),
             ));
             let requester = Rc::new(crate::peer::Requester::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+                Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
                 Rc::new(Forwarding::new(signers[i].clone())),
                 transfers,
                 Rc::new(
@@ -1226,7 +1226,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     let network = Rc::new(PeerNetwork::new(node(2), publications[2].clone()).unwrap());
     let outbound = crate::peer::tests::NoOutbound::new(signers[2].clone(), network.clone());
     let relay = Rc::new(crate::peer::Relay::new(
-        Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+        Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
         auth.clone(),
         outbound.requester.clone(),
         admission.clone(),

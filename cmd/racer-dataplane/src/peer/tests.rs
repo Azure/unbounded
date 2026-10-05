@@ -733,7 +733,7 @@ mod destination_disconnect {
             });
             let outbound = NoOutbound::new(signers[2].clone(), network.clone());
             let relay = Rc::new(Relay::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+                Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
                 forwarding.clone(),
                 outbound.requester.clone(),
                 admission.clone(),
@@ -1471,7 +1471,7 @@ mod requester_safety {
         let adaptive = AdaptivePeers::new(Default::default(), Metrics::default()).unwrap();
         let signers = crate::peer::tests::signers();
         let requester = Requester::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive)),
+            Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(adaptive)),
             Rc::new(Forwarding::new(signers[0].clone())),
             Rc::new(Transfers::new(
                 pool,
@@ -1545,8 +1545,9 @@ mod requester_safety {
             drop(failed);
             std::thread::sleep(Duration::from_millis(260));
         }
-        let paths =
-            Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive.clone()));
+        let paths = Rc::new(
+            Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(adaptive.clone()),
+        );
         let forwarding = Rc::new(Forwarding::new(signers[0].clone()));
         let requester = Requester::new(
             paths,
@@ -1873,7 +1874,7 @@ mod subscriptions {
             let destination = Rc::new(Forwarding::new(signers[2].clone()));
             let outbound = NoOutbound::new(signers[2].clone(), network.clone());
             let relay = Rc::new(Relay::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+                Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
                 destination.clone(),
                 outbound.requester.clone(),
                 admission.clone(),
@@ -2045,7 +2046,7 @@ mod subscriptions {
         );
         let outbound = NoOutbound::new(signers[2].clone(), network.clone());
         let relay = Rc::new(Relay::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+            Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
             destination.clone(),
             outbound.requester.clone(),
             admission.clone(),
@@ -2394,7 +2395,7 @@ mod subscriptions {
                 .unwrap(),
             )
         };
-        let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
+        let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4));
         let destination = Rc::new(Forwarding::new(signers[2].clone()));
         let local = Rc::new(Local(admission.clone()));
         let outbound = NoOutbound::new(signers[2].clone(), network(C));
@@ -2773,9 +2774,11 @@ mod timing {
         );
         let metrics = Metrics::default();
         let requester = Requester::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(
-                crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap(),
-            )),
+            Rc::new(
+                Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(
+                    crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap(),
+                ),
+            ),
             Rc::new(Forwarding::new(signers[0].clone())),
             transfers,
             Rc::new(
@@ -3172,7 +3175,7 @@ impl NoOutbound {
         let socket = SocketFixture::new(2);
         let requester = Rc::new(Requester::new(
             Rc::new(crate::topology::Paths::new(
-                Rc::new(crate::topology::LinkHealth),
+                Rc::new(crate::topology::LinkHealth::default()),
                 4,
             )),
             Rc::new(Forwarding::new(signer.clone())),

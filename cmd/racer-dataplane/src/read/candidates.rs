@@ -2478,7 +2478,7 @@ pub(super) mod tests {
             );
             let requester = Rc::new(Requester::new(
                 Rc::new(crate::topology::Paths::new(
-                    Rc::new(crate::topology::LinkHealth),
+                    Rc::new(crate::topology::LinkHealth::default()),
                     1,
                 )),
                 Rc::new(Forwarding::new(signatures)),

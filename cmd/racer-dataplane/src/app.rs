@@ -805,7 +805,7 @@ impl WorkerApplication {
 
         let paths = Rc::new(
             Paths::with_limits(
-                Rc::new(LinkHealth),
+                Rc::new(LinkHealth::default()),
                 limits.cached_paths.get(),
                 limits.path_cache_bytes.get(),
                 limits.active_path_searches.get(),

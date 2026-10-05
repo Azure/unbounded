@@ -11,11 +11,9 @@ use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::RailMapping;
-use racer_control_wire::valid_site;
 use sha2::Digest;
 use sha2::Sha256;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,18 +26,11 @@ pub use ::topology::MAX_DEGREE;
 pub use ::topology::{Maintenance, SLOT_COUNT};
 
 // Application wire/hash schemas are independent of the topology implementation.
-pub(crate) fn hash_domain(name: &[u8]) -> Sha256 {
-    let mut hash = Sha256::new();
-    hash.update(name);
-    hash
-}
+pub(crate) use ::topology::hash::{finish as hash_finish, named_domain as hash_domain};
+
+/// Append an application field whose wire validation already bounds its length.
 pub(crate) fn hash_bytes(hash: &mut Sha256, value: &[u8]) {
-    let length = u32::try_from(value.len()).expect("validated hash field fits u32");
-    hash.update(length.to_be_bytes());
-    hash.update(value);
-}
-pub(crate) fn hash_finish(hash: Sha256) -> [u8; 32] {
-    hash.finalize().into()
+    ::topology::hash::try_bytes(hash, value).expect("validated hash field fits u32");
 }
 
 // Immutable placement, authenticated routing, and worker-local endpoint circuits.
@@ -52,8 +43,12 @@ pub struct LinkHealth {
     inner: flow_control::Circuits<NodeId>,
 }
 pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
-#[allow(non_upper_case_globals, clippy::declare_interior_mutable_const)]
-pub const LinkHealth: LinkHealth = LinkHealth::new(MAX_DEGREE);
+impl Default for LinkHealth {
+    /// Construct independent worker-local circuit state for all possible neighbors.
+    fn default() -> Self {
+        Self::new(MAX_DEGREE)
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub enum LinkOutcome {
     Success,
@@ -226,34 +221,12 @@ impl Membership {
             return Err(Error::InvalidConfiguration);
         }
         for member in &mut members {
-            if !valid_identity(&member.node.0) || !valid_site(&member.site) {
+            if !valid_identity(&member.node.0) {
                 return Err(Error::InvalidConfiguration);
             }
-            let endpoint: SocketAddr = member
-                .peer_endpoint
-                .parse()
+            racer_control_wire::validate_member_metadata(&member.peer_endpoint, &member.site)
+                .and_then(|()| racer_control_wire::normalize_rails(&mut member.rails))
                 .map_err(|_| Error::InvalidConfiguration)?;
-            // Match Go netip.ParseAddrPort: publication validity is independent
-            // of local reachability, but zones are not portable topology inputs.
-            if endpoint.port() == 0 || member.peer_endpoint.contains('%') {
-                return Err(Error::InvalidConfiguration);
-            }
-            member.rails.sort_unstable_by(|a, b| {
-                (a.rail, &a.device, a.port).cmp(&(b.rail, &b.device, b.port))
-            });
-            let mut physical = std::collections::BTreeSet::new();
-            if member.rails.len() > 64
-                || member.rails.iter().any(|mapping| {
-                    !valid_fabric(&mapping.device)
-                        || mapping.port == 0
-                        || !physical.insert((&mapping.device, mapping.port))
-                        || mapping
-                            .numa_node
-                            .is_some_and(|numa| u32::try_from(numa).is_err())
-                })
-            {
-                return Err(Error::InvalidConfiguration);
-            }
         }
         // Compute once per publication, never from a request's selected route.
         // A partially equipped hop must fall back rather than rehash the page.
@@ -327,13 +300,6 @@ impl Membership {
 
 fn valid_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
-}
-
-fn valid_fabric(value: &str) -> bool {
-    // Go wire.validRail accepts any nonempty UTF-8 string except NUL/CR/LF.
-    // String guarantees UTF-8 here. The bounded publication codec owns the
-    // aggregate byte limit; the wire contract has no per-fabric length limit.
-    !value.is_empty() && !value.contains(['\0', '\r', '\n'])
 }
 
 // Canonical slot encoding, placement, authenticated routing, and cancellation.
@@ -892,7 +858,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn default_tracks_all_64_neighbors_without_eviction() {
-            let health = LinkHealth;
+            let health = LinkHealth::default();
+            let independent = LinkHealth::default();
             let now = Instant::now();
             for i in 0..64 {
                 health
@@ -900,6 +867,12 @@ pub(crate) mod tests {
                     .unwrap();
             }
             assert_eq!(health.tracked_links(), 64);
+            assert_eq!(independent.tracked_links(), 0);
+            assert!(
+                independent
+                    .available_at(&NodeId("peer-0".into()), now)
+                    .unwrap()
+            );
             for i in 0..64 {
                 assert!(
                     !health
@@ -1511,7 +1484,7 @@ pub(crate) mod tests {
         fn path_search_limit_is_independent_of_cache_and_released_on_drop() {
             let members = membership(100_000);
             let source = &members.members()[0].node;
-            let paths = Paths::with_limits(Rc::new(LinkHealth), 0, 1, 1);
+            let paths = Paths::with_limits(Rc::new(LinkHealth::default()), 0, 1, 1);
             let request = budget(&members, 80_003, NORMAL_LINKS);
             let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
             let mut first = paths.shortest_async(members.clone(), source, &request, &scope);
@@ -1542,8 +1515,8 @@ pub(crate) mod tests {
             let members = Arc::new(
                 Membership::validate(racer_control_wire::MembershipVersion(1), input).unwrap(),
             );
-            let cached = Paths::new(Rc::new(LinkHealth), 1);
-            let cold = Paths::new(Rc::new(LinkHealth), 0);
+            let cached = Paths::new(Rc::new(LinkHealth::default()), 1);
+            let cold = Paths::new(Rc::new(LinkHealth::default()), 0);
             for (attempt, expected) in crate::topology::tests::fixtures::V5_NEXT_HOPS {
                 let mut request = budget(&members, 1499, NORMAL_LINKS);
                 request.attempt = AttemptId(attempt.to_be_bytes());
@@ -1593,7 +1566,7 @@ pub(crate) mod tests {
         fn health_eviction_budget_deadline_and_cancellation() {
             let members = membership(1500);
             let source = &members.members()[0].node;
-            let health = Rc::new(LinkHealth);
+            let health = Rc::new(LinkHealth::default());
             let paths = Paths::new(health.clone(), 1);
             let request = budget(&members, 1499, NORMAL_LINKS);
             let original = paths.shortest(members.clone(), source, &request).unwrap();
@@ -1645,7 +1618,7 @@ pub(crate) mod tests {
                     expected
                 );
             }
-            let cold = Paths::new(Rc::new(LinkHealth), 0);
+            let cold = Paths::new(Rc::new(LinkHealth::default()), 0);
             assert_eq!(
                 cold.shortest(members.clone(), source, &budget(&members, 0, 0))
                     .unwrap()
@@ -1691,7 +1664,7 @@ pub(crate) mod tests {
         fn yielded_search_rechecks_health_and_retains_only_current_neighbors() {
             let members = membership(100_000);
             let source = &members.members()[0].node;
-            let health = Rc::new(LinkHealth);
+            let health = Rc::new(LinkHealth::default());
             let paths = Paths::new(health.clone(), 1);
             let request = budget(&members, 80_003, 4);
             health
@@ -1728,7 +1701,8 @@ pub(crate) mod tests {
             let members = membership(100_000);
             let source = &members.members()[0].node;
             let admission = AdaptivePeers::new(Config::default(), Default::default()).unwrap();
-            let paths = Paths::new(Rc::new(LinkHealth), 1).with_peer_admission(admission.clone());
+            let paths = Paths::new(Rc::new(LinkHealth::default()), 1)
+                .with_peer_admission(admission.clone());
             let mut request = budget(&members, 80_003, 4);
             request.deadline =
                 Deadline(uring_runtime::environment::now() + Duration::from_secs(60));
@@ -1762,7 +1736,7 @@ pub(crate) mod tests {
             let source = &members.members()[0].node;
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             for case in 0..3 {
-                let paths = Paths::new(Rc::new(LinkHealth), 1);
+                let paths = Paths::new(Rc::new(LinkHealth::default()), 1);
                 let mut request = budget(&members, 80_003, 4);
                 let now = uring_runtime::environment::now();
                 request.deadline =

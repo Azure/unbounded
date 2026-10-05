@@ -245,6 +245,91 @@ impl Drop for CacheEncryptionKey {
     }
 }
 
+#[cfg(test)]
+mod transfer_tests {
+    #[test]
+    fn shared_member_metadata_contract_keeps_identity_policy_separate() {
+        for endpoint in ["0.0.0.0:80", "[ff02::1]:80", "192.0.2.1:65535"] {
+            validate_member_metadata(endpoint, "West_1").unwrap();
+        }
+        for (endpoint, site) in [
+            ("host:80", ""),
+            ("127.0.0.1:0", ""),
+            ("[fe80::1%3]:80", ""),
+            ("127.0.0.1:80", "bad/site"),
+        ] {
+            assert_eq!(
+                validate_member_metadata(endpoint, site),
+                Err(Error::InvalidRequest)
+            );
+        }
+        let nic = RailMapping {
+            device: "β\t fabric".into(),
+            port: 1,
+            rail: RailId(7),
+            gid: None,
+            numa_node: Some(u32::MAX as usize),
+        };
+        let mut rails = vec![
+            nic.clone(),
+            RailMapping {
+                port: 2,
+                ..nic.clone()
+            },
+        ];
+        normalize_rails(&mut rails).unwrap();
+        assert_eq!(rails[0].port, 1);
+        assert_eq!(
+            normalize_rails(&mut vec![nic.clone(); 65]),
+            Err(Error::Overloaded)
+        );
+        assert_eq!(
+            normalize_rails(&mut [nic.clone(), nic]),
+            Err(Error::InvalidRequest)
+        );
+        rails[0].device.push('\n');
+        assert_eq!(normalize_rails(&mut rails), Err(Error::InvalidRequest));
+    }
+
+    #[test]
+    fn protocol_failure_status_table_is_exact() {
+        use super::ProtocolFailure::*;
+        for (failure, status) in [
+            (InvalidRequest, 400),
+            (Unauthenticated, 401),
+            (Forbidden, 403),
+            (Conflict, 409),
+            (TooLarge, 413),
+            (UnsupportedVersion, 426),
+            (Overloaded, 429),
+            (Unavailable, 503),
+        ] {
+            assert_eq!(failure.status(), status);
+        }
+    }
+
+    use super::*;
+
+    #[test]
+    fn consuming_key_transfer_preserves_identity_and_zeroizing_ownership() {
+        let reference = CacheKeyRef {
+            cache: CacheId("11111111-1111-4111-8111-111111111111".into()),
+            id: KeyId::from_generation(1, 7).unwrap(),
+            purpose: CacheKeyPurpose::Page,
+        };
+        let key = CacheEncryptionKey::new(
+            reference.clone(),
+            CacheKeyState::Active,
+            zeroize::Zeroizing::new([0xa7; 32]),
+        );
+        let (actual, state, material): (_, _, zeroize::Zeroizing<[u8; 32]>) =
+            key.into_installation();
+        assert_eq!(actual, reference);
+        assert_eq!(state, CacheKeyState::Active);
+        assert_eq!(*material, [0xa7; 32]);
+        assert_eq!(KeyId::from_generation(0, 7), Err(Error::InvalidRequest));
+    }
+}
 /// Missing keys request retirement; no node certificates or private keys.
 #[derive(Clone)]
 pub struct KeyringBundle {
@@ -277,6 +362,23 @@ pub enum ProtocolFailure {
     Overloaded,
 
     Unavailable,
+}
+
+/// Payload-free control error response.
+impl ProtocolFailure {
+    /// Standard HTTP status for the bounded control failure contract.
+    pub const fn status(self) -> u16 {
+        match self {
+            Self::InvalidRequest => 400,
+            Self::Unauthenticated => 401,
+            Self::Forbidden => 403,
+            Self::Conflict => 409,
+            Self::TooLarge => 413,
+            Self::UnsupportedVersion => 426,
+            Self::Overloaded => 429,
+            Self::Unavailable => 503,
+        }
+    }
 }
 
 /// Payload-free control error response.
@@ -510,6 +612,38 @@ mod definitions {
             }
         }
     }
+}
+
+/// Validate portable endpoint/site metadata, without imposing a node-ID policy.
+/// Reachability is deliberately not part of the wire contract.
+pub fn validate_member_metadata(endpoint: &str, site: &str) -> Result<()> {
+    let address: std::net::SocketAddr = endpoint.parse().map_err(|_| Error::InvalidRequest)?;
+    if address.port() == 0 || endpoint.contains('%') || !valid_site(site) {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// Validate physical NIC identities and normalize their canonical wire order.
+/// Rail labels may repeat; physical device/port pairs may not. Device strings
+/// retain the wire's UTF-8 acceptance, with no additional local length bound.
+pub fn normalize_rails(rails: &mut [RailMapping]) -> Result<()> {
+    if rails.len() > 64 {
+        return Err(Error::Overloaded);
+    }
+    let mut physical = std::collections::HashSet::new();
+    for nic in rails.iter() {
+        if nic.device.is_empty()
+            || nic.device.contains(['\0', '\r', '\n'])
+            || nic.port == 0
+            || !physical.insert((&nic.device, nic.port))
+            || nic.numa_node.is_some_and(|n| u32::try_from(n).is_err())
+        {
+            return Err(Error::InvalidRequest);
+        }
+    }
+    rails.sort_unstable_by(|a, b| (a.rail, &a.device, a.port).cmp(&(b.rail, &b.device, b.port)));
+    Ok(())
 }
 
 /// Bounded JSON parsing, canonical encoding, and validated wire conversions.
@@ -928,16 +1062,8 @@ mod codec {
         if nics.len() > 64 {
             return Err(Error::Overloaded);
         }
-        let mut physical = HashSet::new();
         let mut result = Vec::new();
         for nic in nics {
-            if nic.device.is_empty()
-                || nic.device.contains(['\0', '\r', '\n'])
-                || nic.port == 0
-                || !physical.insert((nic.device.clone(), nic.port))
-            {
-                return Err(Error::InvalidRequest);
-            }
             let gid = nic
                 .gid
                 .map(|value| {
@@ -952,7 +1078,7 @@ mod codec {
                 numa_node: nic.numa_node.map(|n| n as usize),
             });
         }
-        result.sort_by(|a, b| (a.rail, &a.device, a.port).cmp(&(b.rail, &b.device, b.port)));
+        normalize_rails(&mut result)?;
         Ok(result)
     }
 
@@ -1052,11 +1178,7 @@ mod codec {
             if !nodes.insert(m.node.clone()) {
                 return Err(Error::InvalidRequest);
             }
-            let endpoint: std::net::SocketAddr =
-                m.peer_endpoint.parse().map_err(|_| Error::InvalidRequest)?;
-            if endpoint.port() == 0 || m.peer_endpoint.contains('%') || !valid_site(&m.site) {
-                return Err(Error::InvalidRequest);
-            }
+            validate_member_metadata(&m.peer_endpoint, &m.site)?;
             let rails = nics_from_dto(m.rdma_nics)?;
             members.push(Member {
                 node: NodeId(m.node),

@@ -1501,7 +1501,7 @@ mod tests {
                     ),
                 );
                 let relay = Rc::new(Relay::new(
-                    Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+                    Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
                     forwarding.clone(),
                     outbound.requester.clone(),
                     admission.clone(),
