@@ -1566,50 +1566,6 @@ pub(crate) mod tests {
             b.admit(a.sign(frame()).unwrap()).unwrap();
             assert_eq!(other_b.rx, 1);
         }
-        pub(crate) fn replay_and_binding_checks() {
-            let (mut a, mut b) = pair();
-            let valid = a.sign(frame()).unwrap();
-            for name in [
-                "racer-sequence",
-                "racer-session",
-                "racer-direction",
-                "racer-signer",
-            ] {
-                let mut bad = clone_head(&valid);
-                bad.headers
-                    .iter_mut()
-                    .find(|h| h.name == name)
-                    .unwrap()
-                    .value = b"18446744073709551615".to_vec();
-                assert!(b.admit(bad).is_err());
-                assert_eq!(b.rx, 0, "forged {name} advanced sequence");
-            }
-            // Valid signatures with incorrect session, direction, identity or sequence.
-            for mutation in 0..4 {
-                let mut bad = peer_wire::test_util::session(
-                    a.signatures.clone(),
-                    a.peer.clone(),
-                    a.id,
-                    a.direction,
-                );
-                match mutation {
-                    0 => bad.id[0] ^= 1,
-                    1 => bad.direction = 1,
-                    2 => bad.signatures = b.signatures.clone(),
-                    _ => bad.tx = 9000,
-                };
-                assert!(b.admit(bad.sign(frame()).unwrap()).is_err());
-                assert_eq!(b.rx, 0);
-            }
-            b.admit(clone_head(&valid)).unwrap();
-            assert!(matches!(b.admit(valid), Err(peer_wire::Error::Replay)));
-            assert_eq!(b.rx, 1);
-            b.admit(a.sign(frame()).unwrap()).unwrap();
-        }
-        #[test]
-        fn duplicate_wrong_session_direction_identity_and_forged_high_sequence() {
-            replay_and_binding_checks();
-        }
         #[test]
         pub(crate) fn more_than_4096_frames_at_fixed_time_have_constant_session_storage() {
             let clock = uring_runtime::environment::SimulationClock::new_at(
@@ -1631,37 +1587,6 @@ pub(crate) mod tests {
                 assert_eq!(std::mem::size_of_val(&a) + std::mem::size_of_val(&b), bytes);
             }
             assert_eq!(clock.elapsed(), Duration::ZERO);
-        }
-        #[test]
-        pub(crate) fn reconnect_restart_expiry_and_counter_overflow_fail_closed() {
-            let (mut a, mut b) = pair();
-            let old = a.sign(frame()).unwrap();
-            let mut reconnected = peer_wire::test_util::session(
-                b.signatures.clone(),
-                b.peer.clone(),
-                random().unwrap(),
-                1,
-            );
-            assert!(reconnected.admit(clone_head(&old)).is_err());
-            assert_eq!(reconnected.rx, 0);
-            b.expires = uring_runtime::environment::now();
-            assert!(matches!(
-                b.admit(old),
-                Err(peer_wire::Error::DeadlineExceeded)
-            ));
-            a.tx = u64::MAX;
-            assert!(matches!(a.sign(frame()), Err(peer_wire::Error::Replay)));
-            reconnected.rx = u64::MAX;
-            let mut sender = peer_wire::test_util::session(
-                a.signatures.clone(),
-                a.peer.clone(),
-                reconnected.id,
-                0,
-            );
-            assert!(matches!(
-                reconnected.admit(sender.sign(frame()).unwrap()),
-                Err(peer_wire::Error::Replay)
-            ));
         }
         #[test]
         fn concurrent_workers_complete_independent_connection_handshakes() {

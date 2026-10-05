@@ -20,6 +20,12 @@ pub trait Context: http1::connection::Context {
 }
 
 /// Never cloned, reset, or detached from its socket; idle pooling moves this value.
+///
+/// ```compile_fail
+/// fn duplicate(session: &peer_wire::Session) -> peer_wire::Session {
+///     session.clone()
+/// }
+/// ```
 pub struct Session {
     state: SessionState,
 }

@@ -365,3 +365,43 @@ fn route_transition_consumes_one_link_without_refilling_authority() {
         );
     }
 }
+
+#[test]
+fn credential_policy_runs_after_profile_checks_before_signature_verification() {
+    struct Reject(std::cell::Cell<usize>);
+
+    impl RequestMac for Reject {
+        fn sign(&self, _: &Keyring, _: &mut MessageHead) -> Result<()> {
+            Err(Error::Unavailable)
+        }
+
+        fn verify(&self, _: &Keyring, _: &MessageHead) -> Result<()> {
+            self.0.set(self.0.get() + 1);
+            Err(Error::Unavailable)
+        }
+    }
+
+    let n = network(2);
+    let policy = Rc::new(Reject(std::cell::Cell::new(0)));
+    let verifier = Signatures::new(n[1].keys.clone(), n[1].certificates.clone(), policy.clone());
+    let mut signed = n[0].sign(head()).unwrap();
+    signed.signature[0] ^= 1;
+    assert!(matches!(
+        verifier.verify_historical(&signed),
+        Err(Error::Unavailable)
+    ));
+    assert_eq!(policy.0.get(), 1);
+    signed
+        .head
+        .headers
+        .iter_mut()
+        .find(|h| h.name == "racer-profile")
+        .unwrap()
+        .value = b"other-profile".to_vec();
+    assert!(matches!(
+        verifier.verify_historical(&signed),
+        Err(Error::Unauthorized)
+    ));
+    assert_eq!(policy.0.get(), 1);
+    assert!(matches!(verifier.sign(head()), Err(Error::Unavailable)));
+}
