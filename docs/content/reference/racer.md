@@ -69,6 +69,9 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_REQUEST_CONTEXT_BYTES` | `67108864` (64 MiB) | Node-wide request-context budget |
 | `RACER_METADATA_ENTRIES` | `4096` | Node-wide catalog entries; at most 1,048,576 |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget; at most 1,048,576 |
+| `RACER_ADMISSION_MODE` | `second-sight` | Disk retention policy: `disabled` or `second-sight`; does not disable request resource admission |
+| `RACER_ADMISSION_HISTORY_BYTES` | `4194304` (4 MiB) | Node-wide Bloom history budget; 32 bytes..512 MiB, divided among final I/O workers, requiring at least 32 bytes per worker |
+| `RACER_ADMISSION_PERIOD_SECS` | `60` | History rotation period; 1..86,400 seconds |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB |
 | `RACER_PLACEMENT_CACHE_BYTES` | `16777216` (16 MiB) | Node-wide placement capacity estimate, divided among I/O workers; 1,024 bytes..512 MiB, with at least 1,024 bytes per worker |
 | `RACER_CACHED_PATHS` | `128` | Node-wide retained path-query entry budget, divided among I/O workers; 1..1,048,576 |
@@ -89,6 +92,82 @@ Automatic sizing considers CPU affinity, quota, NUMA locality, and progress rese
 Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets
 can reduce workers. Storage grows with I/O workers. Admission budgets are not RSS limits:
 allocator, TLS, and filesystem cache are additional. Invalid combinations fail validation.
+
+### Second-sight disk retention
+
+The default policy allows a currently owned page to persist on its first logical
+read. A non-owned page becomes eligible after an independent reader observes it
+within the recent history window. Retries and copy-only probes do not create
+independent demand. Eligibility is determined before inserting the observation;
+concurrent followers can qualify without promoting the first reader's own attempt.
+Persistence remains best effort and only uses verified ciphertext. A skipped or
+failed optional disk enqueue does not fail an otherwise valid read.
+
+Each I/O worker has four rotating Bloom generations for page history. Reader
+accounting uses exact operation-local interest tokens, retained across retries
+and handoffs, rather than an approximate reader-history filter.
+At the default period, observations remain for approximately 180-240 seconds.
+History allocations round down to 32-byte units and do not exceed the node budget.
+A budget too small for the final worker count fails startup rather than growing
+implicitly. Bloom false positives can retain extra pages but cannot suppress
+independent reader detection; history is never authorization or proof of integrity.
+
+Bounded exact resident heat entries use the worker's disk page-index capacity plus
+its pending-write queue capacity. Heat saturates at three and decays lazily by
+one per 60 seconds, independently of history rotation. Current ownership adds a
+soft eviction preference, not a pin; owned pages remain evictable. History and
+heat are process-local hints, not checkpoint state. `disabled` restores owned-only
+disk admission and neutral eviction scores; resource budgets, integrity checks,
+and authorization still apply. Configuration values are validated even when the
+policy is disabled.
+
+Ownership hints use completed rankings for the current accepted placement.
+Missing or obsolete hints provide no bonus until refreshed. Each worker also
+refreshes indexed residents, including recovered idle pages, without requiring
+foreground reads. A background step visits at most one resident, scores at most
+256 members, and visits at most 64 ranking-cache CLOCK entries. Steps are spaced
+at least 1 ms apart; completed passes and errors retry after 100 ms. Refresh is
+independent of other placement maintenance and stops during shutdown. These
+bounds limit background work, not the time to refresh every resident.
+
+Low-cardinality `racer_retention_*` metrics aggregate all I/O workers without page,
+cache, or reader labels. Counters report logical observations, qualified
+observations, persistence attempts, and accepted persistence attempts. Acceptance
+does not prove a completed disk publication; use `racer_disk_publications_total`
+for that. Gauges report set/total Bloom bits and tracked heat entries. Samples
+refresh on each worker's health tick (normally every 100 ms), so a stalled worker
+leaves its last sample visible. The aggregate is not an atomic node-wide snapshot.
+Storage metrics use the same health-tick snapshots. `classification` has exactly
+two values, `owned` and `nonowned`, sampled from the current cache-only ownership
+hint at each event. Missing or stale rankings classify as `nonowned`; the event
+does not initiate a ranking. This is an event-time classification, not the class
+at insertion, proof of nonownership, or an exact current resident-class aggregate.
+Ownership refresh affects subsequent events only, never rewrites old counters.
+
+| Metric | Meaning |
+| --- | --- |
+| `racer_disk_class_publications_total{classification}` | Completed writer publications; excludes checkpoint restoration and deduplicated enqueue |
+| `racer_disk_class_published_payload_bytes_total{classification}` | Logical page payload bytes in those publications |
+| `racer_disk_class_index_evicted_pages_total{classification}` | Victim mappings removed to reserve page-index capacity |
+| `racer_disk_class_index_evicted_payload_bytes_total{classification}` | Logical payload bytes of those index victims |
+| `racer_disk_class_segment_evicted_pages_total{classification}` | Victim mappings removed by bounded segment reclamation, including index-only segment reclamation |
+| `racer_disk_class_segment_evicted_payload_bytes_total{classification}` | Logical payload bytes of those segment victims, not physical reclaimed disk space |
+| `racer_disk_class_read_payload_bytes_total{classification}` | Logical page payload bytes returned successfully by StoreReader after framing and mapping checks |
+| `racer_disk_pending_payload_bytes` | Total logical payload bytes owned by pending writes, including submitted writes until cleanup |
+| `racer_disk_indexed_payload_bytes` | Total logical payload bytes in retained index mappings, including restored mappings |
+
+All payload byte metrics exclude AEAD tags, record headers, and alignment padding.
+Victim counters exclude invalidation, replacement, cache removal, and pending-write
+discards. A mapping is counted only by the removal path that actually evicts it.
+Read bytes count repeated full-page reads, including internal/copy-only consumers;
+CRC and AEAD validation happen later in fill. They measure disk-to-reader payload,
+not authenticated client-delivered bytes, requested-range bytes, or device I/O.
+Use their rates to compare disk reuse in benchmarks, not as client throughput.
+The two byte gauges are exact unclassified worker totals at sampling time, maintained
+on lifecycle events without scanning all pages. A page can briefly count in both
+while a published write is still pending cleanup. They are not physical allocation
+or unique resident-byte totals, nor ownership-split gauges. Tracked heat entries
+remain a separate measurement; persistence acceptance does not measure eviction.
 
 ### Topology capacity and version compatibility
 
