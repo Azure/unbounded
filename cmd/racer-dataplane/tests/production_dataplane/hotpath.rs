@@ -267,11 +267,11 @@ impl Service {
             }
         }
         let mut task = self.rig.writer_task.borrow_mut();
-        if let Some(write) = task.as_mut() {
-            if let Poll::Ready(result) = write.as_mut().poll(cx) {
-                result?;
-                *task = None;
-            }
+        if let Some(write) = task.as_mut()
+            && let Poll::Ready(result) = write.as_mut().poll(cx)
+        {
+            result?;
+            *task = None;
         }
         if task.is_none() && self.rig.writer.pending_count() > 0 {
             let writer = self.rig.writer.clone();
@@ -280,21 +280,22 @@ impl Service {
             }));
             cx.waker().wake_by_ref();
         }
-        if task.is_none() && self.rig.writer.is_idle() {
-            if let Some((evict, reply)) = self.inspection.take() {
-                if evict {
-                    self.rig.memory.evict_idle(usize::MAX)?;
-                    assert_eq!(self.rig.admission.used(ResourceClass::Plaintext), 0);
-                }
-                let entries = self.rig.writer.index().snapshot()?.entries.len();
-                let _ = reply.send(Stats {
-                    records: entries,
-                    discarded: self.rig.writer.discarded_count(),
-                    origin_calls: self.rig.adapter.calls().len(),
-                    failures: self.failures.borrow().clone(),
-                    requests: self.requests.get(),
-                });
+        if task.is_none()
+            && self.rig.writer.is_idle()
+            && let Some((evict, reply)) = self.inspection.take()
+        {
+            if evict {
+                self.rig.memory.evict_idle(usize::MAX)?;
+                assert_eq!(self.rig.admission.used(ResourceClass::Plaintext), 0);
             }
+            let entries = self.rig.writer.index().snapshot()?.entries.len();
+            let _ = reply.send(Stats {
+                records: entries,
+                discarded: self.rig.writer.discarded_count(),
+                origin_calls: self.rig.adapter.calls().len(),
+                failures: self.failures.borrow().clone(),
+                requests: self.requests.get(),
+            });
         }
         Ok(())
     }
@@ -461,7 +462,7 @@ fn automatic_and_capped_plans_preserve_shared_and_explicit_paired_crypto() {
         assert_eq!(owned.pairs.len(), io);
         assert_eq!(owned.crypto_groups().len(), crypto);
         assert_eq!(owned.max_threads, cap.saturating_add(1));
-        assert!(io + crypto + 1 <= owned.max_threads);
+        assert!(io + crypto < owned.max_threads);
         assert_eq!(owned.crypto_groups(), plan.crypto_groups());
     }
     config.max_threads = 1;
@@ -557,7 +558,11 @@ fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
 #[test]
 #[ignore = "owns brd/ext4 via sudo; release-only, worker-sized RAM preflight"]
 fn hotpath() {
-    assert!(!cfg!(debug_assertions), "run with --release");
+    // This ignored benchmark must fail at runtime, not prevent debug builds.
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(!cfg!(debug_assertions), "run with --release");
+    }
     let plan = default_plan();
     let mut disk = Brd::new(plan.pairs.len(), &budgets(), slab_bytes(plan.pairs.len()));
     if std::env::var_os("RACER_BENCH_FAIL_SETUP").is_some() {

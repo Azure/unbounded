@@ -1579,8 +1579,13 @@ pub(crate) enum LookupTier {
 #[derive(Clone)]
 pub struct Metrics {
     core: ::telemetry::Metrics<Event, Gauge>,
+
+    // Each registration pairs its worker identity with the shared quota view.
+    #[allow(clippy::type_complexity)]
     admission: Arc<[OnceLock<(WorkerId, flow_control::SharedQuotas<AdmissionPolicy>)>]>,
+
     retention: Arc<[Mutex<crate::retention::Snapshot>]>,
+
     shard: usize,
 }
 const RETENTION_METRICS: [(&str, &str); 9] = [
@@ -2803,8 +2808,10 @@ pub(crate) mod tests {
                     )
                 })
                 .collect();
-            let mut telemetry = Telemetry::default();
-            telemetry.metrics = workers[0].clone();
+            let telemetry = Telemetry {
+                metrics: workers[0].clone(),
+                ..Telemetry::default()
+            };
             for event in crate::telemetry::EVENTS {
                 telemetry.metrics.record(event, u64::MAX);
             }

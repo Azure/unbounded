@@ -1032,7 +1032,7 @@ pub fn response_head(
             ciphertext,
             grant,
         } => {
-            if &grant.page != &ciphertext.envelope().page
+            if grant.page != ciphertext.envelope().page
                 || ciphertext.bytes().len() != ciphertext.envelope().ciphertext_length as usize
             {
                 return Err(Error::InvalidRequest);
@@ -2642,7 +2642,11 @@ pub(crate) mod tests {
         fn signature_base_benchmark() {
             use std::hint::black_box;
             use std::time::Instant;
-            assert!(!cfg!(debug_assertions), "run with --release");
+            // This ignored benchmark must fail at runtime, not prevent debug builds.
+            #[allow(clippy::assertions_on_constants)]
+            {
+                assert!(!cfg!(debug_assertions), "run with --release");
+            }
             for (label, fields, value_bytes) in
                 [("small", 0, 0), ("fields", 24, 64), ("envelope", 24, 4096)]
             {

@@ -661,7 +661,7 @@ pub(crate) mod tests {
                     reservation: admission
                         .reserve(None, ResourceClass::Plaintext, bytes.len().max(1))
                         .unwrap(),
-                    bytes: bytes.into(),
+                    bytes,
                 }),
             }
         }
@@ -760,6 +760,8 @@ pub(crate) mod tests {
             let page = page(&admission, b"prefix-selected-suffix".to_vec());
             let weak = Arc::downgrade(&page.inner);
             let pointer = page.bytes()[7..].as_ptr();
+            // Deliberately malformed ranges exercise rejection, not iteration.
+            #[allow(clippy::reversed_empty_ranges)]
             for range in [8..7, 0..23, usize::MAX..usize::MAX] {
                 assert!(matches!(
                     PageSendRange::new(page.clone(), range),
@@ -1201,11 +1203,9 @@ pub(crate) mod tests {
                     }
                 }
                 reactor.poll_budgeted(64).unwrap();
-                if !complete {
-                    if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
-                        result.unwrap();
-                        complete = true;
-                    }
+                if !complete && let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
+                    result.unwrap();
+                    complete = true;
                 }
             }
             assert_eq!(received, bytes);

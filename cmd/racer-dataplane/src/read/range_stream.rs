@@ -540,8 +540,11 @@ impl RangeBudget {
     }
 }
 
+/// A pending acquisition or its materialized result in the bounded read window.
+#[allow(clippy::large_enum_variant)] // Avoid allocating again when an in-window page becomes ready.
 enum WindowPage {
     Waiting(Operation<'static, (Result<PageResult>, AcquisitionBudget)>),
+
     Ready(Result<PageResult>),
 }
 
@@ -953,14 +956,14 @@ fn poll_window(
     cx: &mut Context<'_>,
 ) -> Poll<()> {
     for (_, entry) in window.iter_mut() {
-        if let WindowPage::Waiting(future) = entry {
-            if let Poll::Ready(completion) = future.as_mut().poll(cx) {
-                let result = match completion {
-                    Ok((result, remaining)) => budget.complete(remaining).and(result),
-                    Err(error) => Err(error),
-                };
-                *entry = WindowPage::Ready(result);
-            }
+        if let WindowPage::Waiting(future) = entry
+            && let Poll::Ready(completion) = future.as_mut().poll(cx)
+        {
+            let result = match completion {
+                Ok((result, remaining)) => budget.complete(remaining).and(result),
+                Err(error) => Err(error),
+            };
+            *entry = WindowPage::Ready(result);
         }
     }
     if window
@@ -1140,7 +1143,7 @@ pub(super) mod tests {
         for number in 0..2 {
             stream.ready.push_back((
                 PageNumber(number),
-                WindowPage::Ready(Ok(page_result(&admission, &metadata, number))),
+                WindowPage::Ready(Ok(page_result(admission, &metadata, number))),
             ));
         }
         stream.configure_subscription(4, PAGE_BYTES, true).unwrap();
@@ -1266,7 +1269,7 @@ pub(super) mod tests {
                 for number in 0..2 {
                     stream.ready.push_back((
                         PageNumber(number),
-                        WindowPage::Ready(Ok(page_result(&admission, &metadata, number))),
+                        WindowPage::Ready(Ok(page_result(admission, &metadata, number))),
                     ));
                 }
                 stream
@@ -1279,7 +1282,7 @@ pub(super) mod tests {
                         assert_eq!(subscriptions::ordered(demand), Some(PageNumber(number)));
                     } else {
                         subscriptions::selection(demand)
-                            .complete(page_result(&admission, &metadata, number))
+                            .complete(page_result(admission, &metadata, number))
                             .unwrap();
                         assert_eq!(subscriptions::selected(demand), Some(PageNumber(number)));
                     }
@@ -1372,7 +1375,7 @@ pub(super) mod tests {
         // Model a delivered page still owned by a slow caller.
         let demand = stream.subscription.as_mut().unwrap();
         subscriptions::selection(demand)
-            .complete(page_result(&admission, &metadata, 0))
+            .complete(page_result(admission, &metadata, 0))
             .unwrap();
         assert_eq!(subscriptions::selected(demand), Some(PageNumber(0)));
         demand.issued(PageNumber(0)).unwrap();

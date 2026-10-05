@@ -167,6 +167,8 @@ fn accepted_clients(pid: u32, bound_path: &Path) -> usize {
         .count()
 }
 
+/// Measure a request workload against the running process and capture its counters.
+#[allow(clippy::too_many_arguments)] // Keep independently varied workload dimensions explicit.
 fn measure(
     process: &Process,
     profile: &Profile,
@@ -244,6 +246,8 @@ fn measure(
     (measured, deltas)
 }
 
+/// Run one throughput fixture with the selected workload dimensions.
+#[allow(clippy::too_many_arguments)] // Keep the benchmark matrix visible at call sites.
 fn case(
     pairs: usize,
     length: u64,
@@ -267,6 +271,8 @@ fn case(
     );
 }
 
+/// Execute a throughput fixture with its chosen request count.
+#[allow(clippy::too_many_arguments)] // Preserve the benchmark's existing independent controls.
 fn run_case(
     pairs: usize,
     length: u64,

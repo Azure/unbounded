@@ -594,15 +594,13 @@ impl MemoryCache {
             .get(&page.metadata.version)
             .and_then(|pages| pages.iter().next())
             .and_then(|id| entries.pages.get(id))
-        {
-            if !known
+            && !known
                 .1
                 .metadata
                 .immutable()
                 .compatible(&page.metadata.immutable())
-            {
-                return Err(Error::CorruptRecord);
-            }
+        {
+            return Err(Error::CorruptRecord);
         }
         if let Some((_, entry)) = entries.pages.get(id) {
             if entry.plaintext.bytes() != page.plaintext.bytes() {

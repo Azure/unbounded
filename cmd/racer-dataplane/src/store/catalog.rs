@@ -132,10 +132,10 @@ impl IndexSnapshot {
             .iter()
             .chain(self.entries.iter().map(|(_, entry)| &entry.metadata))
         {
-            if let Some(old) = lengths.get(&metadata.version) {
-                if !old.compatible(metadata) {
-                    return Err(Error::CorruptRecord);
-                }
+            if let Some(old) = lengths.get(&metadata.version)
+                && !old.compatible(metadata)
+            {
+                return Err(Error::CorruptRecord);
             }
             lengths.insert(&metadata.version, metadata);
         }

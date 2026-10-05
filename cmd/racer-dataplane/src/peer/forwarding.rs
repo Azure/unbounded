@@ -783,10 +783,10 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
             return Err(Error::Unauthorized);
         }
     }
-    if let Some(etag) = request.unique("racer-etag")? {
-        if response.unique("racer-etag")? != Some(etag) {
-            return Err(Error::Unauthorized);
-        }
+    if let Some(etag) = request.unique("racer-etag")?
+        && response.unique("racer-etag")? != Some(etag)
+    {
+        return Err(Error::Unauthorized);
     }
     if outcome == "page" && field(response, "racer-page")? != field(request, "racer-page")? {
         return Err(Error::Unauthorized);

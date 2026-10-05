@@ -450,15 +450,15 @@ impl StoreWriter {
             return Err(Error::MissingKey);
         }
         let id = page.ciphertext.envelope().page.clone();
-        if let Some(metadata) = self.index.version(&id.version)? {
-            if !metadata.compatible(&page.metadata.immutable()) {
-                return Err(Error::CorruptRecord);
-            }
+        if let Some(metadata) = self.index.version(&id.version)?
+            && !metadata.compatible(&page.metadata.immutable())
+        {
+            return Err(Error::CorruptRecord);
         }
-        if let Some(metadata) = self.metadata(&id.version)? {
-            if !metadata.compatible(&page.metadata.immutable()) {
-                return Err(Error::CorruptRecord);
-            }
+        if let Some(metadata) = self.metadata(&id.version)?
+            && !metadata.compatible(&page.metadata.immutable())
+        {
+            return Err(Error::CorruptRecord);
         }
         // Zero denotes already durable: no pending ticket or second append.
         if self.index.lookup(&id)?.is_some() {
@@ -888,10 +888,10 @@ impl StoreWriter {
             }
             // An application-held progress future must be polled alongside drain.
             std::future::poll_fn(|cx| {
-                if scope.check().is_err() {
-                    if let Err(error) = self.cancel_pending_writes() {
-                        return std::task::Poll::Ready(Err(error));
-                    }
+                if scope.check().is_err()
+                    && let Err(error) = self.cancel_pending_writes()
+                {
+                    return std::task::Poll::Ready(Err(error));
                 }
                 if !self.busy.get() {
                     std::task::Poll::Ready(Ok(()))

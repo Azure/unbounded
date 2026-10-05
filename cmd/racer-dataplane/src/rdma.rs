@@ -905,6 +905,13 @@ pub fn match_publication(
     }
     Ok(result)
 }
+impl Default for Devices {
+    /// Create an unattached device owner with no selected rails or mappings.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Devices {
     #[cfg(test)]
     pub(crate) fn test(port: std::rc::Rc<IoPort>) -> Self {
@@ -1596,7 +1603,7 @@ pub(crate) mod tests {
             assert!(
                 match_publication(
                     &[publication[0].clone(), publication[0].clone()],
-                    &[port.clone()]
+                    std::slice::from_ref(&port)
                 )
                 .is_err()
             );

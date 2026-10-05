@@ -190,6 +190,8 @@ impl Binding {
         p::push(&mut h, "racer-receiver", &to.0);
         signatures.sign(h)
     }
+    /// Verify the peer's signed phase against this transfer and its prior digest.
+    #[allow(clippy::too_many_arguments)] // Protocol evidence is checked together at this boundary.
     pub fn verify(
         &self,
         signatures: &Signatures,
@@ -519,6 +521,7 @@ impl Transfers {
     }
 
     /// The established session stays owned by the caller through completion or fencing.
+    #[allow(clippy::too_many_arguments)] // Keep session and transfer ownership visible across awaits.
     async fn send_native_page(
         &self,
         mut connection: ConnectionLease,
@@ -537,18 +540,17 @@ impl Transfers {
         else {
             return Err(Error::InvalidRequest);
         };
-        let descriptor =
-            AuthenticatedDescriptor::from_verified(&grant, &session, binding.transfer)?;
+        let descriptor = AuthenticatedDescriptor::from_verified(&grant, session, binding.transfer)?;
         let native_deadline = native_scope(scope);
         let complete = match rdma
-            .send_to(&session, ciphertext.clone(), descriptor, &native_deadline)
+            .send_to(session, ciphertext.clone(), descriptor, &native_deadline)
             .await
         {
             Ok(complete) => complete,
             Err(error) if native_failure(error, scope) => {
-                fence(&session, scope).await?;
+                fence(session, scope).await?;
                 return self
-                    .failed_then_fallback(connection, response, &binding, peer, previous, scope)
+                    .failed_then_fallback(connection, response, binding, peer, previous, scope)
                     .await;
             }
             Err(error) => return Err(error),
@@ -577,9 +579,9 @@ impl Transfers {
         )?;
         previous = signed_digest(&done.signed)?;
         if phase == Phase::Fallback {
-            fence(&session, scope).await?;
+            fence(session, scope).await?;
             return self
-                .send_fallback(connection, response, &binding, peer, previous, scope)
+                .send_fallback(connection, response, binding, peer, previous, scope)
                 .await;
         }
         let finish = binding.sign(signatures, peer, Phase::Finish, &previous, 0, vec![])?;
@@ -763,6 +765,8 @@ impl Transfers {
     }
     /// A completed control round always pairs one request and one response before
     /// resetting HTTP framing. No pipelining or detached state map is required.
+    /// Receive a native transfer with authenticated metadata and fallback framing.
+    #[allow(clippy::too_many_arguments)] // Preserve explicit authenticated transfer inputs.
     pub(super) async fn receive_native(
         &self,
         mut connection: ConnectionLease,
@@ -882,6 +886,8 @@ impl Transfers {
     }
 
     /// Grant, completion, and final acknowledgment share the established session owner.
+    /// Receive and fence one page using the caller's established session.
+    #[allow(clippy::too_many_arguments)] // Keep session and transfer ownership visible across awaits.
     async fn receive_native_page(
         &self,
         mut connection: ConnectionLease,
@@ -899,40 +905,40 @@ impl Transfers {
         let (admission, _) = &self.wire;
         let native_deadline = native_scope(scope);
         if let Err(error) = session.wait_ready(&native_deadline).await {
-            fence(&session, scope).await?;
+            fence(session, scope).await?;
             if native_failure(error, scope) {
                 return self
-                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .receive_fallback(connection, authentication, binding, peer, previous, scope)
                     .await;
             }
             return Err(error);
         }
         let grant = match rdma
-            .prepare_receive(&session, &envelope, binding.transfer, scope)
+            .prepare_receive(session, &envelope, binding.transfer, scope)
             .await
         {
             Ok(grant) => grant,
             Err(error) if recoverable(error) => {
-                fence(&session, scope).await?;
+                fence(session, scope).await?;
                 return self
-                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .receive_fallback(connection, authentication, binding, peer, previous, scope)
                     .await;
             }
             Err(error) => return Err(error),
         };
         if let Err(error) = grant.wait_bound(&native_deadline).await {
-            fence(&session, scope).await?;
+            fence(session, scope).await?;
             drop(grant);
             if native_failure(error, scope) {
                 return self
-                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .receive_fallback(connection, authentication, binding, peer, previous, scope)
                     .await;
             }
             return Err(error);
         }
         let request = binding.sign(
             signatures,
-            &peer,
+            peer,
             Phase::Grant,
             &previous,
             0,
@@ -944,7 +950,7 @@ impl Transfers {
         connection = conn;
         let (completed, phase) = binding.verify(
             signatures,
-            &peer,
+            peer,
             completed,
             &[Phase::Complete, Phase::Failed],
             &previous,
@@ -954,16 +960,16 @@ impl Transfers {
         previous = signed_digest(&completed.signed)?;
         connection.next_round()?;
         if phase == Phase::Failed {
-            fence(&session, scope).await?;
+            fence(session, scope).await?;
             drop(grant);
             return self
-                .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                .receive_fallback(connection, authentication, binding, peer, previous, scope)
                 .await;
         }
         let native_deadline = native_scope(scope);
         let page = match rdma
             .finish_receive(
-                &session,
+                session,
                 grant,
                 &completed,
                 envelope,
@@ -974,9 +980,9 @@ impl Transfers {
         {
             Ok(page) => page,
             Err(error) if native_failure(error, scope) => {
-                fence(&session, scope).await?;
+                fence(session, scope).await?;
                 return self
-                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .receive_fallback(connection, authentication, binding, peer, previous, scope)
                     .await;
             }
             Err(error) => return Err(error),
@@ -984,13 +990,13 @@ impl Transfers {
         #[cfg(test)]
         self.native_completions
             .set(self.native_completions.get() + 1);
-        let done = binding.sign(signatures, &peer, Phase::Done, &previous, 0, vec![])?;
+        let done = binding.sign(signatures, peer, Phase::Done, &previous, 0, vec![])?;
         previous = signed_digest(&done)?;
         connection = self.write_control(connection, done, scope).await?;
         let (mut conn, finish) = self.read_control(connection, true, scope).await?;
         binding.verify(
             signatures,
-            &peer,
+            peer,
             finish,
             &[Phase::Finish],
             &previous,
@@ -1145,11 +1151,15 @@ fn observe_read(
 
 /// Internal transport result: native delivery stays materialized; HTTP relay
 /// delivery owns an unfinished connection and its exact opaque body framing.
+#[allow(clippy::large_enum_variant)] // Keep completed delivery inline without another allocation.
 pub enum RelayResponse {
     Complete(SignedResponse),
+
     Http {
         authentication: crate::peer::forwarding::ForwardedHead,
+
         connection: Box<crate::http::ConnectionLease>,
+
         length: usize,
     },
 }
@@ -1238,6 +1248,8 @@ impl Transfers {
     }
     /// The signed envelope and HTTP ciphertext share one exclusive pooled socket.
     /// A failed/abandoned exchange is never marked reusable.
+    /// Exchange a signed request while recording the caller's transfer timing.
+    #[allow(clippy::too_many_arguments)] // Keep transport, security, and timing inputs explicit.
     pub(super) fn exchange_timed<'a>(
         &'a self,
         endpoint: crate::http::Endpoint,
@@ -1426,6 +1438,8 @@ impl Transfers {
         })
     }
 
+    /// Receive an authenticated HTTP body with its admission and reclaim policy.
+    #[allow(clippy::too_many_arguments)] // Preserve connection and resource ownership at the boundary.
     async fn receive_http_body(
         &self,
         mut connection: ConnectionLease,

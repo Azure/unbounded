@@ -499,6 +499,8 @@ impl MetadataService {
     }
 
     /// Acquire and authenticate page zero before publishing any fresh observation.
+    /// Refresh origin metadata under the selected authority and acquisition budget.
+    #[allow(clippy::too_many_arguments)] // Keep bootstrap policy and borrowed request inputs explicit.
     async fn refresh_origin(
         &self,
         authority: &super::candidates::OriginAuthority,

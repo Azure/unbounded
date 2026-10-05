@@ -99,7 +99,7 @@ impl RequestParser {
     /// reconstruct wire length: unknown fields need not have a separator SP.
     pub fn parse(&self, cache: &CacheId, head: MessageHead) -> Result<ClientRequest> {
         let StartLine::Request { method, target } = head.start else {
-            return Err(Error::InvalidRequest.into());
+            return Err(Error::InvalidRequest);
         };
         // Bound manually constructed input data as well, without pretending this
         // is a wire-length check. Framing owns start-line/colon/OWS/CRLF accounting.
@@ -128,7 +128,7 @@ impl RequestParser {
                     .iter()
                     .any(|&b| b == 0x7f || (b < 0x20 && b != b'\t'))
             {
-                return Err(Error::InvalidRequest.into());
+                return Err(Error::InvalidRequest);
             }
             let name = header.name.to_ascii_lowercase();
             let value = header.value.as_slice();
@@ -150,7 +150,7 @@ impl RequestParser {
                     | "racer-ordered"
             ) && !seen.insert(name.clone())
             {
-                return Err(Error::InvalidRequest.into());
+                return Err(Error::InvalidRequest);
             }
             match name.as_str() {
                 "host" => host = Some(value == b"racer"),
@@ -168,13 +168,13 @@ impl RequestParser {
                 | "if-none-match"
                 | "if-modified-since"
                 | "if-unmodified-since"
-                | "if-range" => return Err(Error::InvalidRequest.into()),
+                | "if-range" => return Err(Error::InvalidRequest),
                 "connection"
                     if value
                         .split(|&b| b == b',')
                         .any(|token| trim_ows(token).eq_ignore_ascii_case(b"upgrade")) =>
                 {
-                    return Err(Error::InvalidRequest.into());
+                    return Err(Error::InvalidRequest);
                 }
                 "if-match" => {
                     if value.len() > MAX_FIELD_BYTES {
@@ -191,7 +191,7 @@ impl RequestParser {
                     ordered = match value {
                         b"0" => false,
                         b"1" => true,
-                        _ => return Err(Error::InvalidRequest.into()),
+                        _ => return Err(Error::InvalidRequest),
                     }
                 }
                 "racer-metadata" => {
@@ -209,7 +209,7 @@ impl RequestParser {
             return Err(Error::HeaderTooLarge);
         }
         if host != Some(true) {
-            return Err(Error::InvalidRequest.into());
+            return Err(Error::InvalidRequest);
         }
         let key = CacheKey::parse_hex(
             target
@@ -222,7 +222,7 @@ impl RequestParser {
                 Some(etag) => ReadKind::HeadPinned { etag },
                 None => ReadKind::Head,
             },
-            "HEAD" => return Err(Error::InvalidRequest.into()),
+            "HEAD" => return Err(Error::InvalidRequest),
             "POST" if content_length => ReadKind::Subscription {
                 pin,
                 range,
@@ -230,7 +230,7 @@ impl RequestParser {
                 byte_credits,
                 ordered,
             },
-            "POST" => return Err(Error::InvalidRequest.into()),
+            "POST" => return Err(Error::InvalidRequest),
             _ => return Err(Error::MethodNotAllowed),
         };
         Ok(ClientRequest {
@@ -272,7 +272,7 @@ fn validate_opaque(value: &[u8]) -> Result<()> {
         || value.last() == Some(&b' ')
         || value.iter().any(|&b| b < 0x20 || b == 0x7f)
     {
-        return Err(Error::InvalidRequest.into());
+        return Err(Error::InvalidRequest);
     }
     Ok(())
 }

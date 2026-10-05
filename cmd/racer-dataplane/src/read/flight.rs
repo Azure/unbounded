@@ -471,10 +471,10 @@ impl AcquisitionWaiter<'_> {
                 if let Phase::Complete(result) = &entry.state.phase {
                     return Poll::Ready(Ok(AcquisitionEvent::Complete(result.clone())));
                 }
-                if !waiter.complete {
-                    if let Some(copy) = &entry.state.partial {
-                        return Poll::Ready(Ok(AcquisitionEvent::Ciphertext(copy.clone())));
-                    }
+                if !waiter.complete
+                    && let Some(copy) = &entry.state.partial
+                {
+                    return Poll::Ready(Ok(AcquisitionEvent::Ciphertext(copy.clone())));
                 }
                 if let Phase::Failed(error) = entry.state.phase {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
@@ -697,10 +697,8 @@ impl Flights {
                 if let Phase::Complete(result) = &entry.phase {
                     return Ok(JoinedFlight::Complete(result.clone()));
                 }
-                if !plaintext {
-                    if let Some(copy) = &entry.partial {
-                        return Ok(JoinedFlight::Ciphertext(copy.clone()));
-                    }
+                if !plaintext && let Some(copy) = &entry.partial {
+                    return Ok(JoinedFlight::Ciphertext(copy.clone()));
                 }
                 if let Phase::Failed(error) = entry.phase {
                     return Err(error);
@@ -1154,10 +1152,10 @@ impl Drop for FlightLeader {
     fn drop(&mut self) {
         if self.active {
             self.flights.update(|table, wakes| {
-                if let Some(entry) = table.get_mut(&self.fence.page) {
-                    if validate_leader(entry, self).is_ok() {
-                        revoke(entry, Error::Cancelled, wakes);
-                    }
+                if let Some(entry) = table.get_mut(&self.fence.page)
+                    && validate_leader(entry, self).is_ok()
+                {
+                    revoke(entry, Error::Cancelled, wakes);
                 }
             });
         }

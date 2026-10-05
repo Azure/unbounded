@@ -408,12 +408,11 @@ impl PageCryptoEngine {
             scope,
         } = job;
         let prepared = Self::prepare(&input, &key, &scope, &mut permit);
-        if let Some(sample) = &mut permit.send_sample {
-            if let CryptoInput::Checksum { ciphertext } = &input {
-                if let Ok(aad) = page_aad(ciphertext.envelope()) {
-                    sample.facts = Some(capture_aead_failure(ciphertext, &aad, scope.request));
-                }
-            }
+        if let Some(sample) = &mut permit.send_sample
+            && let CryptoInput::Checksum { ciphertext } = &input
+            && let Ok(aad) = page_aad(ciphertext.envelope())
+        {
+            sample.facts = Some(capture_aead_failure(ciphertext, &aad, scope.request));
         }
         let outcome = match prepared {
             Err(error) => CryptoOutcome::Failed { input, error },
@@ -601,11 +600,11 @@ impl PageCryptoEngine {
         let _environment = self.environment.enter();
         let mut exhausted = budget != 0;
         for _ in 0..budget {
-            if let Some(completion) = self.pending.take() {
-                if let Err(failure) = self.runtime.port.complete(completion) {
-                    self.pending = Some(failure.command);
-                    return Err(failure.error);
-                }
+            if let Some(completion) = self.pending.take()
+                && let Err(failure) = self.runtime.port.complete(completion)
+            {
+                self.pending = Some(failure.command);
+                return Err(failure.error);
             }
             match self.runtime.port.poll_job(cx) {
                 Poll::Pending => {
@@ -622,11 +621,11 @@ impl PageCryptoEngine {
             }
         }
         // The reserved completion must be published even at the last budget unit.
-        if let Some(completion) = self.pending.take() {
-            if let Err(failure) = self.runtime.port.complete(completion) {
-                self.pending = Some(failure.command);
-                return Err(failure.error);
-            }
+        if let Some(completion) = self.pending.take()
+            && let Err(failure) = self.runtime.port.complete(completion)
+        {
+            self.pending = Some(failure.command);
+            return Err(failure.error);
         }
         if exhausted {
             cx.waker().wake_by_ref();
@@ -1229,6 +1228,7 @@ impl IoCryptoPort {
         })
     }
     /// Rejected submission returns all ownership; accepted jobs outlive waiters.
+    #[allow(clippy::result_large_err)] // Return the owned job without allocating on rejection.
     pub fn try_submit(
         &self,
         job: CryptoJob,
@@ -1267,6 +1267,7 @@ impl CryptoPort {
         }
     }
     /// Reserved completion slots survive drain; failure returns engine ownership.
+    #[allow(clippy::result_large_err)] // Preserve allocation-free ownership return on backpressure.
     pub fn complete(
         &mut self,
         completion: CryptoCompletion,
@@ -2649,14 +2650,12 @@ mod tests {
                     CryptoInput::Decrypt {
                         ciphertext,
                         plaintext: admission
-                            .reserve(Some(&cache), crate::admission::ResourceClass::Plaintext, 1)
+                            .reserve(Some(cache), crate::admission::ResourceClass::Plaintext, 1)
                             .unwrap(),
                     }
                 } else {
-                    if corrupt {
-                        if let CryptoInput::Encrypt { page, .. } = &mut data {
-                            page.version.object.cache.0 = "wrong".into();
-                        }
+                    if corrupt && let CryptoInput::Encrypt { page, .. } = &mut data {
+                        page.version.object.cache.0 = "wrong".into();
                     }
                     data
                 }

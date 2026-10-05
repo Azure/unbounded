@@ -331,7 +331,7 @@ impl ClientListeners {
                 connection,
                 &task_cache,
                 &parser,
-                &*reads,
+                &reads,
                 &responses,
                 &io,
                 &admission,
@@ -569,11 +569,11 @@ impl ClientListeners {
     pub fn poll_budgeted(&self, cx: &mut Context<'_>, budget: usize) -> Result<usize> {
         let mut cleaned = 0;
         // Commit only retires owners; pathname cleanup runs on worker polling.
-        if budget != 0 {
-            if let Some(listener) = self.cleanup.borrow_mut().pop_front() {
-                drop(listener);
-                cleaned = 1;
-            }
+        if budget != 0
+            && let Some(listener) = self.cleanup.borrow_mut().pop_front()
+        {
+            drop(listener);
+            cleaned = 1;
         }
         // Alternate at budget one so retirement cannot starve completion owners.
         // One retirement step performs at most one nonblocking accept.
@@ -1119,6 +1119,8 @@ impl ReadyListeners {
             let mut ready = ReadySet::new()?;
             for (index, listener) in self.listeners.iter().enumerate() {
                 let listener = listener.upgrade().ok_or(Error::Unavailable)?;
+                // Test builds also have simulated listeners that must be rejected.
+                #[allow(clippy::infallible_destructuring_match)]
                 let socket = match &listener.listener {
                     Listener::Real(socket) => socket,
                     #[cfg(test)]

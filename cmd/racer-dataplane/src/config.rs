@@ -522,13 +522,12 @@ fn validate_endpoint(url: &str) -> Result<()> {
         }
         (host, port)
     };
-    if let Some(port) = port {
-        if port.is_empty()
+    if let Some(port) = port
+        && (port.is_empty()
             || !port.bytes().all(|b| b.is_ascii_digit())
-            || port.parse::<u16>().ok().is_none_or(|p| p == 0)
-        {
-            return Err(Error::InvalidConfiguration);
-        }
+            || port.parse::<u16>().ok().is_none_or(|p| p == 0))
+    {
+        return Err(Error::InvalidConfiguration);
     }
     rustls::pki_types::ServerName::try_from(host).map_err(|_| Error::InvalidConfiguration)?;
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -795,7 +794,7 @@ mod tests {
             numa_node: Some(0),
         };
         assert_eq!(
-            match_publication(&[nic.clone()], &[live.clone()]).unwrap()[0]
+            match_publication(std::slice::from_ref(&nic), std::slice::from_ref(&live)).unwrap()[0]
                 .0
                 .numa_node,
             Some(9)
@@ -814,9 +813,11 @@ mod tests {
                 ..live.clone()
             },
         ] {
-            assert!(match_publication(&[nic.clone()], &[bad]).is_err());
+            assert!(match_publication(std::slice::from_ref(&nic), &[bad]).is_err());
         }
-        assert!(match_publication(&[nic.clone()], &[live.clone(), live.clone()]).is_err());
+        assert!(
+            match_publication(std::slice::from_ref(&nic), &[live.clone(), live.clone()]).is_err()
+        );
         assert!(match_publication(&[nic.clone(), nic.clone()], &[live]).is_err());
         assert!(match_publication(&[nic], &[]).is_err());
     }
