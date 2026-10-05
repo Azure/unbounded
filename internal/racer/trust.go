@@ -260,6 +260,15 @@ type credentialState struct {
 }
 
 func readCredentials(ctx context.Context, reader client.Reader, cfg Config, claim string) (credentialState, error) {
+	version, _, err := readVersion(ctx, reader, cfg)
+	if err != nil {
+		return credentialState{}, err
+	}
+
+	return readBoundCredentials(ctx, reader, cfg, claim, version)
+}
+
+func readBoundCredentials(ctx context.Context, reader client.Reader, cfg Config, claim string, version *corev1.ConfigMap) (credentialState, error) {
 	var (
 		secret   corev1.Secret
 		b        wire.KeyringBundle
@@ -276,6 +285,10 @@ func readCredentials(ctx context.Context, reader client.Reader, cfg Config, clai
 	}
 
 	if !validCredentialClaim(cfg, claim) || secret.Annotations[credentialClaim] != claim || secret.DeletionTimestamp != nil || secret.ResourceVersion == "" {
+		return credentialState{}, wire.Unavailable
+	}
+
+	if version.Annotations[credentialClaim] != claim || (version.Annotations[initializationProtocol] == stagedInitialization && (secret.UID == "" || version.Annotations[credentialUID] != string(secret.UID))) {
 		return credentialState{}, wire.Unavailable
 	}
 

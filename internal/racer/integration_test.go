@@ -73,12 +73,13 @@ func TestEnvtestServer(t *testing.T) {
 		}
 	})
 
-	c, err := client.New(rc, client.Options{Scheme: scheme})
+	c, err := client.NewWithWatch(rc, client.Options{Scheme: scheme})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	t.Run("initialization-and-CAS", func(t *testing.T) { integrationInitialization(t, c) })
+	t.Run("staged-initialization", func(t *testing.T) { integrationStagedInitialization(t, c) })
 	t.Run("cache-name-admission", func(t *testing.T) { integrationCacheNameAdmission(t, c) })
 	t.Run("catalog-capacity", func(t *testing.T) { integrationCatalogCapacity(t, c) })
 	t.Run("rotation-crash-recovery", func(t *testing.T) { integrationRotation(t, c) })

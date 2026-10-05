@@ -150,7 +150,7 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 		return ctrl.Result{}, wire.Unavailable
 	}
 
-	credentials, err := readCredentials(ctx, r.APIReader, cfg, claim)
+	credentials, err := readBoundCredentials(ctx, r.APIReader, cfg, claim, version)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -286,10 +286,16 @@ func (c *credentialState) encodeRotation(encoded []byte) (bool, error) {
 func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.ConfigMap, catalog []wire.CacheDefinition) (ctrl.Result, error) {
 	cfg := r.runtimeConfig()
 
-	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.CredentialsSecretName}, &corev1.Secret{})
+	existing := &corev1.Secret{}
+
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.CredentialsSecretName}, existing)
 	if !apierrors.IsNotFound(err) {
 		if err != nil {
 			return ctrl.Result{}, err
+		}
+
+		if version.Annotations[initializationProtocol] == stagedInitialization {
+			return r.commitStagedCredentials(ctx, version, existing)
 		}
 
 		return ctrl.Result{}, wire.Unavailable
@@ -324,7 +330,6 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 	// preserves annotations with its CAS. Missing Secrets after this claim never
 	// authorize Create on recovery, even when the first create response was lost.
 	claim := fmt.Sprintf("%s/%s", cfg.CredentialsSecretName, id)
-	version.Annotations[credentialClaim] = claim
 
 	secret := credentialSecret(cfg, cfg.CredentialsSecretName, claim)
 	material := issuerMaterial{Keys: map[string]signingMaterial{id: {Certificate: cert, PrivateKey: key}}}
@@ -350,6 +355,20 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 		return ctrl.Result{}, err
 	}
 
+	if version.Annotations[initializationProtocol] == stagedInitialization {
+		// Unlike the legacy path, the claim is committed only after the complete
+		// Secret exists. Until then readers cannot use this candidate.
+		secret.Annotations[installationUIDAnnotation] = version.Annotations[installationUIDAnnotation]
+
+		secret.Annotations[initializationProtocol] = stagedInitialization
+		if err := r.Create(ctx, secret); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return r.commitStagedCredentials(ctx, version, secret)
+	}
+
+	version.Annotations[credentialClaim] = claim
 	if err := r.Update(ctx, version); err != nil {
 		return ctrl.Result{}, err
 	}

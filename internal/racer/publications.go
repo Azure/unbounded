@@ -570,8 +570,9 @@ func validateMarker(cm *corev1.ConfigMap, cfg Config, fresh bool) error {
 	return nil
 }
 
-// ensureInstalled allows only the successful marker CAS caller one Create attempt.
-// Lost responses and crashes never authorize a retry, even on process restart.
+// ensureInstalled dispatches explicitly staged installations to UID-bound recovery.
+// Legacy markers allow only the successful CAS caller one Create attempt; their
+// ambiguous missing state never authorizes a retry, even on process restart.
 func ensureInstalled(ctx context.Context, writer client.Writer, reader client.Reader, cfg Config) error {
 	if !wire.ValidUUID(string(cfg.Cluster)) {
 		return wire.InvalidRequest
@@ -584,6 +585,10 @@ func ensureInstalled(ctx context.Context, writer client.Writer, reader client.Re
 	marker := &corev1.ConfigMap{}
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName}, marker); err != nil {
 		return err
+	}
+
+	if marker.Data[markerInitializationProtocol] != "" {
+		return ensureStagedInstallation(ctx, writer, reader, cfg, marker)
 	}
 
 	if marker.Data["state"] == "consumed" {
@@ -723,6 +728,15 @@ func readVersion(ctx context.Context, reader client.Reader, cfg Config) (*corev1
 	}
 
 	v, err := parseVersion(cm, cfg.Cluster, marker.UID)
+	if err == nil && marker.Data[markerInitializationProtocol] != "" {
+		if marker.Data[markerInitializationProtocol] != stagedInitialization || marker.Data[versionUID] == "" || marker.Data[versionUID] != string(cm.UID) || cm.Annotations[initializationProtocol] != stagedInitialization {
+			err = wire.Unavailable
+		}
+	}
+
+	if marker.Data[markerInitializationProtocol] == "" && cm.Annotations[initializationProtocol] != "" {
+		err = wire.Unavailable
+	}
 
 	return cm, v, err
 }

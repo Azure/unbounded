@@ -163,7 +163,7 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 		return signingState{}, wire.Unavailable
 	}
 
-	credentials, err := readCredentials(ctx, reader, cfg, claim)
+	credentials, err := readBoundCredentials(ctx, reader, cfg, claim, version)
 	if err != nil {
 		return signingState{}, err
 	}

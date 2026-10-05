@@ -124,7 +124,7 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 	// before its keys exist; only the subsequent Secret event may publish it.
 	// Read authoritatively so a stale informer cannot admit rejected growth.
 	if claim := cm.Annotations[credentialClaim]; claim != "" {
-		credentials, err := readCredentials(ctx, r.APIReader, cfg, claim)
+		credentials, err := readBoundCredentials(ctx, r.APIReader, cfg, claim, cm)
 		if err != nil {
 			r.suspendInvalidAuthority(err)
 			return topologyUpdate{}, err
