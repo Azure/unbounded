@@ -147,9 +147,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pinned Rust
-        run: |
-          timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
-          timeout --signal=TERM --kill-after=10s 300s rustup override set 1.96.0
+        working-directory: cmd/racer-dataplane
+        run: timeout --signal=TERM --kill-after=10s 300s rustup show active-toolchain
 
       - name: Cache Rust dependencies and build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -158,9 +157,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-runtime-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
+          key: racer-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/rust-toolchain.toml') }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-runtime-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
+            racer-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/rust-toolchain.toml') }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
 
       - name: Check formatting and Clippy
         run: timeout --signal=TERM --kill-after=10s 300s make racer-dataplane-check
@@ -368,9 +367,8 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Set up Rust for Cargo notices
-        run: |
-          timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
-          timeout --signal=TERM --kill-after=10s 300s rustup override set 1.96.0
+        working-directory: cmd/racer-dataplane
+        run: timeout --signal=TERM --kill-after=10s 300s rustup show active-toolchain
 
       - name: Verify NOTICE
         run: make notice-check

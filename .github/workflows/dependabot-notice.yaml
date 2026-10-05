@@ -47,9 +47,8 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Set up Rust toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install stable --profile minimal
-          rustup default stable
+        working-directory: cmd/racer-dataplane
+        run: timeout --signal=TERM --kill-after=10s 300s rustup show active-toolchain
 
       - name: Generate NOTICE
         run: make notice
