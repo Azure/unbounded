@@ -399,6 +399,7 @@ fn reserve_ingress_charges(
 /// Bounded pre-session socket handoff. No submitted operation crosses reactors.
 pub(crate) enum Kind {
     Client(CacheId, Arc<AtomicBool>),
+    Retirement(crate::client::listener::RetirementAuthorization),
     Peer,
 }
 pub(crate) struct Accepted {

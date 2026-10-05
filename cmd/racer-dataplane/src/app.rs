@@ -1141,12 +1141,26 @@ impl WorkerApplication {
                 .flatten()
             {
                 let connection =
-                    crate::http::from_reserved(accepted.fd.into(), accepted.reservation)?;
+                    crate::http::from_reserved(accepted.fd.into(), accepted.reservation);
+                // Isolated retirement failures must not terminate listener service.
+                if let crate::admission::Kind::Retirement(authorization) = accepted.kind {
+                    match connection {
+                        Ok(connection) => {
+                            self.clients.install_retirement(connection, authorization)?;
+                        }
+                        Err(error) => eprintln!(
+                            "racer-dataplane: stage=client-retirement operation=from-reserved error={error}"
+                        ),
+                    }
+                    continue;
+                }
+                let connection = connection?;
                 match accepted.kind {
                     crate::admission::Kind::Client(cache, retired) => {
                         self.clients
                             .install_connection(connection, cache, retired)?;
                     }
+                    crate::admission::Kind::Retirement(_) => unreachable!("handled above"),
                     crate::admission::Kind::Peer => {
                         let peers = self.peers.clone();
                         let scope = self.task_scope.clone().ok_or(Error::Unavailable)?;

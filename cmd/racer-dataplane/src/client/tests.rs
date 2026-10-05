@@ -205,7 +205,9 @@ mod directory {
     }
     #[test]
     fn secure_client_directory_permissions_are_unchanged() {
-        for mode in [0o755, 0o750, 0o700, 0o500, 0o2750, 0o1700] {
+        // Generic mode combinations live in uds-endpoint. Keep adapter coverage
+        // for read-only/sticky modes and no metadata mutation on the first call.
+        for mode in [0o755, 0o500, 0o1700] {
             let root = Root::new();
             let directory = open_directory(&root.0).unwrap();
             directory
@@ -227,31 +229,22 @@ mod directory {
     }
     #[test]
     fn client_directory_preparation_pins_inode_across_path_replacement() {
-        for symlink in [false, true] {
-            let root = Root::new();
-            let parent = open_directory(&root.0).unwrap();
-            let directory = child_directory(&parent, b"client").unwrap();
-            directory
-                .set_permissions(fs::Permissions::from_mode(0o777))
-                .unwrap();
-            let path = root.0.join("client");
-            let moved = root.0.join("moved");
-            let target = root.0.join("target");
-            fs::create_dir(&target).unwrap();
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
-            fs::rename(&path, &moved).unwrap();
-            if symlink {
-                std::os::unix::fs::symlink(&target, &path).unwrap();
-                assert!(child_directory(&parent, b"client").is_err());
-            } else {
-                fs::create_dir(&path).unwrap();
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
-            }
-            prepare_client_directory(&directory).unwrap();
-            assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o7777, 0o755);
-            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o777);
-            assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o777);
-        }
+        // uds-endpoint covers symlink replacement. Exercise the application's
+        // adapter with a real replacement directory and the retained old handle.
+        let root = Root::new();
+        let parent = open_directory(&root.0).unwrap();
+        let directory = child_directory(&parent, b"client").unwrap();
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o777))
+            .unwrap();
+        let path = root.0.join("client");
+        let moved = root.0.join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+        prepare_client_directory(&directory).unwrap();
+        assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o7777, 0o755);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o777);
     }
     #[test]
     fn client_directory_preparation_rejects_non_directories_and_chmod_failure() {
@@ -736,6 +729,14 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     client
         .send(&request("HEAD", "If-Match: \"v1\"\r\n"))
         .unwrap();
+    // Exercise the same retirement path without a host filesystem. The queued
+    // socket still belongs to the old UID after publication exchanges its name.
+    let old = Rc::downgrade(&listeners.listeners.borrow()[&definition.id]);
+    let mut replacement = definition.clone();
+    replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
+    futures::executor::block_on(listeners.prepare(&[replacement], &scope()))
+        .unwrap()
+        .commit();
     let mut response = Vec::new();
     let mut bytes = [0; 4096];
     for _ in 0..1000 {
@@ -759,6 +760,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     }
     assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
     assert_eq!(listeners.read_scopes.borrow().len(), 1);
+    assert!(old.upgrade().is_none());
     drop(client);
     listeners.stop_admission();
     drop(listeners);
@@ -837,14 +839,19 @@ impl Fixture {
             .pop_batch::<1>(WorkerId(1), futures::task::noop_waker_ref(), 1)
             .unwrap();
         let accepted = accepted.expect("accepted socket queued for receiving worker");
-        let Kind::Client(cache, retired) = accepted.kind else {
-            panic!("client endpoint delivered a peer socket");
-        };
         let connection =
             crate::http::from_reserved(accepted.fd.into(), accepted.reservation).unwrap();
-        self.listeners
-            .install_connection(connection, cache, retired)
-            .unwrap();
+        match accepted.kind {
+            Kind::Client(cache, retired) => self
+                .listeners
+                .install_connection(connection, cache, retired)
+                .unwrap(),
+            Kind::Retirement(authorization) => self
+                .listeners
+                .install_retirement(connection, authorization)
+                .unwrap(),
+            Kind::Peer => panic!("client endpoint delivered a peer socket"),
+        }
     }
 
     fn new() -> Self {
@@ -2122,6 +2129,535 @@ fn real_coordinator_maps_adapter_metadata_failures() {
         fixture.assert_metrics(1, 1, 0);
         assert_no_body_leases(&fixture);
     }
+}
+
+#[test]
+fn exchanged_listener_backlog_is_budgeted_routed_to_old_uid_and_released() {
+    use crate::admission::Ingress;
+    use crate::model::WorkerId;
+
+    for distributed in [false, true] {
+        let mut fixture = Fixture::new();
+        let receiver = Fixture::new();
+        let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
+        if distributed {
+            ingress
+                .install(WorkerId(1), &receiver.listeners.admission)
+                .unwrap();
+            fixture.listeners = fixture.listeners.with_ingress(ingress.clone());
+        }
+        fixture.reconcile(&[definition()]).unwrap();
+        let old = Rc::downgrade(&fixture.listeners.listeners.borrow()[&definition().id]);
+        let old_inode = fs::metadata(fixture.socket()).unwrap().ino();
+        let mut first = fixture.connect();
+        let mut second = fixture.connect();
+        // Neither connection has been accepted when the canonical path changes.
+        first.write_all(&request("HEAD", "")).unwrap();
+        second.write_all(&request("HEAD", "")).unwrap();
+        let mut replacement = definition();
+        replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
+        fixture.reconcile(&[replacement.clone()]).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 0).unwrap(), 0);
+        assert!(old.upgrade().is_some());
+        assert_eq!(fixture.listeners.active_connections(), 0);
+        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
+        if distributed {
+            receiver.install_handoff(&ingress);
+        }
+        let serving = if distributed { &receiver } else { &fixture };
+        assert_eq!(
+            serving.listeners.active_connections_for(&definition().id),
+            1
+        );
+        assert_eq!(fixture.listeners.active_connections_for(&replacement.id), 0);
+        assert!(
+            old.upgrade().is_some(),
+            "budget exhaustion must retain the backlog"
+        );
+        for entry in fs::read_dir(fixture.socket().parent().unwrap()).unwrap() {
+            let metadata = entry.unwrap().metadata().unwrap();
+            if metadata.ino() == old_inode {
+                assert_eq!(
+                    metadata.mode() & 0o777,
+                    0,
+                    "both old hard links are restricted"
+                );
+            }
+        }
+        // A later publication must not clear an unfinished retirement backlog.
+        fixture.reconcile(&[replacement]).unwrap();
+        if distributed {
+            fixture.pump(2);
+            receiver.install_handoff(&ingress);
+        }
+        for _ in 0..32 {
+            fixture.pump(1);
+            if distributed {
+                receiver.pump(1);
+            }
+        }
+        assert_eq!(
+            serving.listeners.read_scopes.borrow().len(),
+            2,
+            "budget-one retirement must leave turns for active futures"
+        );
+        // The original UID exists in this coordinator, the replacement UID does
+        // not. Successful responses therefore prove routing did not follow name.
+        for socket in [&mut first, &mut second] {
+            assert!(serving.receive(socket, true).starts_with(b"HTTP/1.1 200"));
+        }
+        assert!(
+            old.upgrade().is_none(),
+            "WouldBlock must release the old owner"
+        );
+        // Concurrent identical HEADs may coalesce into one upstream request.
+        assert_eq!(serving.listeners.read_scopes.borrow().len(), 2);
+        assert_eq!(serving.listeners.active_connections(), 0);
+        if distributed {
+            assert!(
+                ingress
+                    .pop_batch::<1>(WorkerId(1), futures::task::noop_waker_ref(), 1)
+                    .unwrap()[0]
+                    .is_none(),
+                "both explicitly authorized handoffs were consumed"
+            );
+        }
+        assert_no_body_leases(&fixture);
+        assert_no_body_leases(serving);
+        assert_eq!(
+            fixture
+                .listeners
+                .admission
+                .used(crate::admission::ResourceClass::IngressConnection),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(fixture.socket().parent().unwrap())
+                .unwrap()
+                .count(),
+            3
+        );
+    }
+}
+
+#[test]
+fn retirement_accept_failure_and_retry_limit_release_the_listener() {
+    for failure in ["interrupted", "accept", "chmod", "pressure"] {
+        let fixture = Fixture::new();
+        fixture.reconcile(&[definition()]).unwrap();
+        let old = Rc::downgrade(&fixture.listeners.listeners.borrow()[&definition().id]);
+        let mut replacement = definition();
+        replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
+        fixture.reconcile(&[replacement]).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..256 {
+            if failure == "chmod" {
+                FAIL_CHMOD.with(|fail| fail.set(true));
+            } else {
+                FAIL_ACCEPT.with(|fail| {
+                    fail.set(Some(if failure == "pressure" {
+                        libc::EMFILE
+                    } else if failure == "accept" {
+                        libc::EIO
+                    } else {
+                        libc::EINTR
+                    }))
+                });
+            }
+            let result = fixture.listeners.poll_budgeted(&mut cx, 2);
+            if !matches!(failure, "interrupted" | "pressure") {
+                assert!(
+                    result.unwrap() <= 2,
+                    "retirement failure must not stop the worker"
+                );
+                break;
+            }
+            assert!(result.unwrap() <= 2);
+        }
+        assert!(
+            old.upgrade().is_none(),
+            "fatal errors and retry caps must release retirement"
+        );
+        assert_eq!(fixture.listeners.active_connections(), 0);
+        // A failed retired listener must not damage the replacement pathname.
+        assert_eq!(
+            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
+            0o666
+        );
+        assert_eq!(
+            fs::read_dir(fixture.socket().parent().unwrap())
+                .unwrap()
+                .count(),
+            3
+        );
+        assert_no_body_leases(&fixture);
+    }
+}
+
+#[test]
+fn retirement_waits_for_admission_but_expires_without_capacity() {
+    use crate::admission::ResourceClass;
+    for (expire, resource) in [
+        (false, ResourceClass::IngressConnection),
+        (false, ResourceClass::Connection),
+        (true, ResourceClass::IngressConnection),
+    ] {
+        let mut fixture = Fixture::new();
+        if expire {
+            fixture.listeners = fixture.listeners.with_request_timeout(Duration::ZERO);
+        }
+        fixture.reconcile(&[definition()]).unwrap();
+        let old = Rc::downgrade(&fixture.listeners.listeners.borrow()[&definition().id]);
+        let mut queued = fixture.connect();
+        queued.write_all(&request("HEAD", "")).unwrap();
+        let reservation = fixture
+            .listeners
+            .admission
+            .reserve(None, resource, fixture.listeners.admission.limit(resource))
+            .unwrap();
+        let mut replacement = definition();
+        replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
+        fixture.reconcile(&[replacement]).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..4 {
+            assert!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap() <= 1);
+        }
+        assert_eq!(old.upgrade().is_none(), expire);
+        assert_eq!(fixture.listeners.active_connections(), 0);
+        drop(reservation);
+        if !expire {
+            assert!(
+                fixture
+                    .receive(&mut queued, true)
+                    .starts_with(b"HTTP/1.1 200")
+            );
+            // One more retirement attempt observes the empty backlog.
+            fixture.pump(16);
+            assert!(old.upgrade().is_none());
+        }
+        assert_eq!(
+            fixture
+                .listeners
+                .admission
+                .used(ResourceClass::IngressConnection),
+            0
+        );
+        assert_no_body_leases(&fixture);
+    }
+}
+
+#[test]
+fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
+    use crate::control::{Availability, PublishedState, SnapshotStore};
+    use racer_control_wire::{MembershipVersion, Publication, PublicationSequence};
+    let mut fixture = Fixture::new();
+    let keys = Rc::new(crate::test_support::security::keys());
+    let state = Arc::new(PublishedState::default());
+    let snapshots = Rc::new(SnapshotStore::new(keys.cluster().clone(), state.clone(), 2));
+    let mut publication = Publication {
+        schema_version: 1,
+        cluster: keys.cluster().clone(),
+        sequence: PublicationSequence(1),
+        membership_version: MembershipVersion(1),
+        members: vec![racer_control_wire::Member {
+            node: keys.node().clone(),
+            shares: std::num::NonZeroU32::new(1).unwrap(),
+            peer_endpoint: "127.0.0.1:1".into(),
+            rails: vec![],
+            site: String::new(),
+        }],
+        caches: vec![definition()],
+    };
+    snapshots.publish(publication.clone()).unwrap();
+    let reads = &fixture.listeners.reads;
+    fixture.listeners.reads = Rc::new(crate::read::Coordinator::new(
+        snapshots.clone(),
+        reads.metadata.clone(),
+        reads.fill.clone(),
+        fixture.worker.as_ref().unwrap().streams.clone(),
+        reads.credentials.clone(),
+        Rc::new(Availability::new(state, keys)),
+    ));
+    fixture.reconcile(&[definition()]).unwrap();
+    let mut socket = fixture.connect();
+    socket.write_all(&request("HEAD", "")).unwrap();
+    publication.sequence = PublicationSequence(2);
+    publication.caches[0].id = CacheId("00000000-0000-4000-8000-000000000003".into());
+    let prepared = snapshots.prepare(publication.clone()).unwrap();
+    let transition =
+        futures::executor::block_on(fixture.listeners.prepare(&publication.caches, &scope()))
+            .unwrap();
+    snapshots
+        .publish_prepared(&prepared, Some(Box::new(transition)))
+        .unwrap();
+    assert_eq!(snapshots.current().unwrap().caches, publication.caches);
+    let response = fixture.receive(&mut socket, true);
+    assert!(response.starts_with(b"HTTP/1.1 503"), "{response:?}");
+    assert_eq!(
+        fixture.completed_heads(),
+        0,
+        "removed UID must not reach origin"
+    );
+    assert_eq!(fixture.listeners.read_scopes.borrow().len(), 1);
+    assert_no_body_leases(&fixture);
+}
+
+#[test]
+fn retirement_handoff_uses_remote_capacity_and_honors_shutdown() {
+    use crate::admission::{Ingress, ResourceClass};
+    use crate::model::WorkerId;
+    for stop in ["none", "receiver", "source"] {
+        let mut source = Fixture::new();
+        let receiver = Fixture::new();
+        let ingress = Arc::new(Ingress::new(&[WorkerId(0), WorkerId(1)]));
+        ingress
+            .install(WorkerId(0), &source.listeners.admission)
+            .unwrap();
+        ingress
+            .install(WorkerId(1), &receiver.listeners.admission)
+            .unwrap();
+        source.listeners = source.listeners.with_ingress(ingress.clone());
+        source.reconcile(&[definition()]).unwrap();
+        let mut socket = source.connect();
+        // Exhaust total source capacity, not just the ingress-role counter.
+        let held = source
+            .listeners
+            .admission
+            .reserve(
+                None,
+                ResourceClass::Connection,
+                source.listeners.admission.limit(ResourceClass::Connection),
+            )
+            .unwrap();
+        let mut replacement = definition();
+        replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
+        source.reconcile(&[replacement]).unwrap();
+        source.pump(1);
+        assert_eq!(source.listeners.active_connections(), 0);
+        assert_eq!(
+            receiver
+                .listeners
+                .admission
+                .used(ResourceClass::IngressConnection),
+            1
+        );
+        if stop == "receiver" {
+            receiver.listeners.stop_admission();
+        }
+        if stop == "source" {
+            source.listeners.stop_admission();
+        }
+        receiver.install_handoff(&ingress);
+        if stop == "none" {
+            socket.write_all(&request("HEAD", "")).unwrap();
+        }
+        let response = receiver.receive(&mut socket, true);
+        if stop != "none" {
+            assert!(response.is_empty());
+        } else {
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+        }
+        assert_eq!(
+            receiver
+                .listeners
+                .admission
+                .used(ResourceClass::IngressConnection),
+            0
+        );
+        drop(held);
+        assert_no_body_leases(&receiver);
+    }
+}
+
+#[test]
+fn retirement_generations_are_bounded_and_removal_allows_immediate_recreation() {
+    use crate::admission::ResourceClass;
+    let fixture = Fixture::new();
+    let held = fixture
+        .listeners
+        .admission
+        .reserve(
+            None,
+            ResourceClass::Connection,
+            fixture.listeners.admission.limit(ResourceClass::Connection),
+        )
+        .unwrap();
+    fixture.reconcile(&[definition()]).unwrap();
+    let first = Rc::downgrade(&fixture.listeners.listeners.borrow()[&definition().id]);
+    let mut replacement = definition();
+    for generation in 0..MAX_RETIRING_LISTENERS {
+        replacement.id = CacheId(format!("00000000-0000-4000-8000-{:012x}", generation + 10));
+        fixture.reconcile(&[replacement.clone()]).unwrap();
+    }
+    let inode = fs::metadata(fixture.socket()).unwrap().ino();
+    replacement.id = CacheId("00000000-0000-4000-8000-000000000999".into());
+    assert_eq!(fixture.reconcile(&[replacement]), Err(Error::Overloaded));
+    assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
+    assert!(first.upgrade().is_some());
+    // Production uses prepare/commit, not reconcile's convenience cleanup.
+    futures::executor::block_on(fixture.listeners.prepare(&[], &scope()))
+        .unwrap()
+        .commit();
+    fixture.reconcile(&[definition()]).unwrap();
+    assert!(
+        first.upgrade().is_none(),
+        "obsolete owners must not retain flock"
+    );
+    drop(held);
+    let mut socket = fixture.connect();
+    socket
+        .write_all(&request("HEAD", "Connection: close\r\n"))
+        .unwrap();
+    assert!(
+        fixture
+            .receive(&mut socket, true)
+            .starts_with(b"HTTP/1.1 200")
+    );
+}
+
+#[test]
+fn retirement_queued_authorization_outlives_fd_but_not_removal_or_explicit_stop() {
+    use crate::admission::{Ingress, ResourceClass};
+    use crate::model::WorkerId;
+    for action in ["keep", "remove-reuse", "stop-reuse"] {
+        let mut source = Fixture::new();
+        let receiver = Fixture::new();
+        let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
+        ingress
+            .install(WorkerId(1), &receiver.listeners.admission)
+            .unwrap();
+        source.listeners = source.listeners.with_ingress(ingress.clone());
+        source.reconcile(&[definition()]).unwrap();
+        let old = Rc::downgrade(&source.listeners.listeners.borrow()[&definition().id]);
+        let mut socket = source.connect();
+        let mut replacement = definition();
+        replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
+        source.reconcile(&[replacement]).unwrap();
+        source.pump(2); // Queue retirement handoff without polling the receiver.
+        source.pump(2); // WouldBlock releases the old listener and its FD.
+        assert!(old.upgrade().is_none());
+        assert_eq!(
+            receiver
+                .listeners
+                .admission
+                .used(ResourceClass::IngressConnection),
+            1
+        );
+        match action {
+            "remove-reuse" => {
+                source.reconcile(&[]).unwrap();
+                source.reconcile(&[definition()]).unwrap();
+            }
+            "stop-reuse" => {
+                source.listeners.stop_cache(&definition().id);
+                source.reconcile(&[definition()]).unwrap();
+            }
+            _ => {}
+        }
+        receiver.install_handoff(&ingress);
+        if action == "keep" {
+            // Merely finishing the source backlog must not revoke a valid handoff.
+            socket.write_all(&request("HEAD", "")).unwrap();
+            assert!(
+                receiver
+                    .receive(&mut socket, true)
+                    .starts_with(b"HTTP/1.1 200")
+            );
+        } else {
+            // Receiver still permits this UID. Only generation revocation prevents
+            // a stale handoff from being revived by reuse of that same UID.
+            assert_eq!(receiver.listeners.active_connections(), 0);
+            assert!(receiver.receive(&mut socket, true).is_empty());
+            assert_eq!(receiver.completed_heads(), 0);
+        }
+        assert_eq!(
+            receiver
+                .listeners
+                .admission
+                .used(ResourceClass::IngressConnection),
+            0
+        );
+        assert_no_body_leases(&receiver);
+    }
+}
+
+#[test]
+fn retirement_revocation_registry_bounds_queued_generations_after_fd_release() {
+    use crate::admission::Ingress;
+    use crate::model::WorkerId;
+    let mut source = Fixture::new();
+    let mut receiver_limits = limits();
+    receiver_limits.client_connections = NonZeroUsize::new(256).unwrap();
+    let receiver = Fixture::with_limits(receiver_limits);
+    let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
+    ingress
+        .install(WorkerId(1), &receiver.listeners.admission)
+        .unwrap();
+    source.listeners = source.listeners.with_ingress(ingress.clone());
+    source.reconcile(&[definition()]).unwrap();
+    let mut sockets = Vec::new();
+    let mut replacement = definition();
+    for generation in 0..MAX_RETIRING_LISTENERS {
+        let old = Rc::downgrade(&source.listeners.listeners.borrow()[&replacement.id]);
+        sockets.push(source.connect());
+        replacement.id = CacheId(format!("00000000-0000-4000-8000-{:012x}", generation + 10));
+        source.reconcile(&[replacement.clone()]).unwrap();
+        source.pump(2);
+        source.pump(2);
+        assert!(old.upgrade().is_none(), "only the queued token remains");
+    }
+    let inode = fs::metadata(source.socket()).unwrap().ino();
+    replacement.id = CacheId("00000000-0000-4000-8000-000000000999".into());
+    assert_eq!(
+        source.reconcile(&[replacement.clone()]),
+        Err(Error::Overloaded)
+    );
+    assert_eq!(fs::metadata(source.socket()).unwrap().ino(), inode);
+    // Consuming/dropping one queued token makes its weak record reclaimable.
+    let [accepted] = ingress
+        .pop_batch::<1>(WorkerId(1), futures::task::noop_waker_ref(), 1)
+        .unwrap();
+    drop(accepted.unwrap());
+    source.reconcile(&[replacement]).unwrap();
+    drop(sockets);
+}
+
+#[test]
+fn retirement_shutdown_overtaken_commit_defers_previous_socket_cleanup() {
+    let fixture = Fixture::new();
+    fixture.reconcile(&[definition()]).unwrap();
+    let old = Rc::downgrade(&fixture.listeners.listeners.borrow()[&definition().id]);
+    let inode = fs::metadata(fixture.socket()).unwrap().ino();
+    let mut replacement = definition();
+    replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
+    let prepared =
+        futures::executor::block_on(fixture.listeners.prepare(&[replacement], &scope())).unwrap();
+    let old_path = fs::read_dir(fixture.socket().parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| entry.metadata().unwrap().ino() == inode)
+        .unwrap()
+        .path();
+    fixture.listeners.stop_admission();
+    fixture.pump(1); // Consume stop_admission's old-owner cleanup before commit.
+    assert!(
+        old.upgrade().is_some(),
+        "the publication journal still owns it"
+    );
+    prepared.commit();
+    assert!(
+        old.upgrade().is_some(),
+        "commit must defer the journal's previous owner"
+    );
+    assert!(
+        old_path.exists(),
+        "infallible commit must not unlink the old socket"
+    );
+    fixture.pump(1);
+    assert!(old.upgrade().is_none());
+    assert!(!old_path.exists());
+    fixture.pump(1); // Release the unpublished next listener too.
 }
 
 #[test]
