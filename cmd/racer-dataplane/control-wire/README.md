@@ -13,27 +13,20 @@ Run standalone checks from the repository root:
 timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-control-wire
 ```
 
-The independent performance controller consumes this crate through
-`internal/racer-test/control.rs`, without linking the dataplane. The dataplane's
-`src/control.rs` consumes wire publications, enrollment records, cache definitions,
-rail mappings, and codecs directly, without compatibility re-exports or mirror DTOs.
-`SnapshotStore::prepare` converts wire members at `Membership::validate`; the local
-`src/topology.rs::Member` adapter remains necessary for the external
-`topology::Member` trait under Rust's orphan rules. Rail mappings and cache
-definitions pass through without conversion.
-Key bundles transfer directly into `racer_crypto::identity`, which owns epoch
-validation, certificate identities, and purpose-bound leases. Placement traits, publication
-installation, transport, persistence, and accepted control cursors remain in the
-application. Callers import shared identifiers, including the storage key ID,
-directly from `racer_control_wire`. The application's `model::key_id_from_generation`
-helper preserves the configuration-error classification for zero generations;
-the wire constructor
-continues reporting a syntax error. Identity independently validates generations.
+This extracted workspace does not include the controller or dataplane application.
+Callers can consume wire publications, enrollment records, cache definitions,
+rail mappings, and codecs directly. Key bundles transfer into
+`racer_crypto::identity`, which owns epoch validation, certificate identities,
+and purpose-bound leases. Placement, publication installation, transport,
+persistence, and accepted control cursors are caller responsibilities. Shared
+identifiers, including the storage key ID, are available from `racer_control_wire`.
+The wire key ID constructor reports a syntax error for zero generations;
+identity independently validates generations during installation.
 
 Wire key material is private and deliberately non-Debug. `into_installation`
 consumes its record and returns a `Zeroizing<[u8; 32]>` owner; there is no borrowed
 raw-key accessor. The source record also wipes on drop. Encoding a bundle still
 returns secret-bearing bytes, which callers must handle as sensitive data.
 
-Errors contain no input data. The application adapter preserves the existing
-invalid-request, incompatible-version, size-limit, and replay error mappings.
+Errors contain no input data. Callers map invalid-request, incompatible-version,
+size-limit, and replay failures into their own error domains.

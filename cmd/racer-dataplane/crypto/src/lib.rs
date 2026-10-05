@@ -210,15 +210,14 @@ pub mod identity {
     //! # Validation and fixtures
     //!
     //! Private certificate-cache and epoch state-space tests live here. Public identity
-    //! workflows live in `tests/primitives.rs`; cross-component page-engine and
-    //! decode/BundleInstaller scenarios live in the application's integration tests.
+    //! workflows live in `tests/primitives.rs`. Cross-component application
+    //! integration tests are outside this extracted workspace.
     //! Run these gates from `cmd/racer-dataplane`:
     //!
     //! ```sh
     //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-crypto
     //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-crypto --features test-util
     //! timeout --signal=TERM --kill-after=10s 300s cargo clippy --locked -p racer-crypto --all-targets --all-features --no-deps -- -D warnings
-    //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-dataplane --test identity_integration
     //! ```
     //!
     //! The opt-in `test-util` feature exposes Ed25519 CA and node-certificate fixtures
