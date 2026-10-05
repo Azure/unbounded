@@ -76,6 +76,7 @@ pub trait State<E>: Default + 'static {
     }
 
     /// The returned head is validated again; its framing controls body sending.
+    /// Head-only exchanges additionally require a bodyless request after signing.
     fn sign(&mut self, head: MessageHead) -> std::result::Result<MessageHead, E> {
         Ok(head)
     }
@@ -572,9 +573,20 @@ impl<C: Context> HttpIo<C> {
     /// Validate, sign, and send a head using the signed head's final framing.
     pub fn send_head<'a>(
         &'a self,
+        connection: ConnectionLease<C>,
+        head: MessageHead,
+        scope: &'a C::Scope,
+    ) -> Operation<'a, C, HeadCompletion<C, ()>> {
+        self.send_head_impl(connection, head, scope, false)
+    }
+
+    /// Apply signing once and enforce any head-only exchange constraint before sending.
+    fn send_head_impl<'a>(
+        &'a self,
         mut connection: ConnectionLease<C>,
         head: MessageHead,
         scope: &'a C::Scope,
+        bodyless_request: bool,
     ) -> Operation<'a, C, HeadCompletion<C, ()>> {
         Box::pin(async move {
             scope.check()?;
@@ -588,6 +600,12 @@ impl<C: Context> HttpIo<C> {
             let scratch = self.context.charge(self.codec.header_limit().max(1))?;
             let head = connection.state_mut().sign(head)?;
             let length = framing(&head, connection.request_is_head, self.send_limit)?;
+            if bodyless_request
+                && (!matches!(head.start, StartLine::Request { .. })
+                    || head.content_length()?.unwrap_or(0) != 0)
+            {
+                return Err(Error::Malformed.into());
+            }
             connection.close |= head.closes_connection()?;
             if let StartLine::Request { method, .. } = &head.start {
                 connection.request_is_head = method == "HEAD";
@@ -838,8 +856,9 @@ impl<C: Context> HttpIo<C> {
         Ok(completed)
     }
 
-    /// Require a bodyless request before signing, send its head, and receive a response head.
-    /// Signing may change body length; this convenience method does not send that body.
+    /// Send a bodyless request and receive a response head.
+    /// Both the input and final signed head must be bodyless requests. Signing that
+    /// adds a body or changes message kind is rejected before any bytes are sent.
     pub fn exchange_head<'a>(
         &'a self,
         connection: ConnectionLease<C>,
@@ -852,7 +871,9 @@ impl<C: Context> HttpIo<C> {
             {
                 return Err(Error::Malformed.into());
             }
-            let sent = self.send_head(connection, request, scope).await?;
+            let sent = self
+                .send_head_impl(connection, request, scope, true)
+                .await?;
             let received = self.receive_head(sent.connection, scope).await?;
             if !matches!(received.value.start, StartLine::Response { .. }) {
                 return Err(Error::Malformed.into());
@@ -2417,6 +2438,76 @@ mod tests {
             0,
             "prevalidation precedes charging and signing"
         );
+    }
+
+    /// Head-only exchanges validate the signed request before emitting any wire bytes.
+    #[test]
+    fn exchange_head_checks_signed_kind_and_length_before_send() {
+        use std::io::{Read, Write};
+
+        for (rewrite, accepted) in [
+            (Rewrite::Length(1), false),
+            (Rewrite::Kind, false),
+            (Rewrite::Status(304), false),
+            (Rewrite::Length(0), true),
+            (Rewrite::Ordinary, true),
+        ] {
+            let hooks = hooks();
+            let reactor = reactor();
+            let io = HttpIo::<Hooks>::new(reactor.clone(), Codec::new(256), hooks.clone(), 8, 8);
+            let calls = Rc::new(Cell::new(0));
+            let (connection, mut peer) = lease(
+                &hooks,
+                Policy {
+                    rewrite: Some(rewrite),
+                    hook_calls: Some(calls.clone()),
+                    ..Policy::default()
+                },
+            );
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            if accepted {
+                peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+            }
+            let request = MessageHead {
+                start: StartLine::Request {
+                    method: "GET".into(),
+                    target: "/".into(),
+                },
+                headers: vec![crate::Header::new("Content-Length", b"0")],
+            };
+            let result = drive(&reactor, io.exchange_head(connection, request, &TestScope));
+            if accepted {
+                let done = result.unwrap();
+                assert!(matches!(
+                    done.value.start,
+                    StartLine::Response { status: 200 }
+                ));
+                assert_eq!(done.connection.send_remaining(), Some(0));
+                assert_eq!(calls.get(), 2, "one sign and one response admission");
+                drop(done);
+            } else {
+                assert!(matches!(result, Err(Failure::Http(Error::Malformed))));
+                assert_eq!(calls.get(), 1, "signing runs exactly once");
+            }
+            let mut wire = Vec::new();
+            peer.read_to_end(&mut wire).unwrap();
+            if accepted {
+                let (head, end) = Codec::<()>::new(256).decode_head(&wire).unwrap().unwrap();
+                assert!(matches!(head.start, StartLine::Request { .. }));
+                assert_eq!(head.content_length().unwrap(), Some(0));
+                assert_eq!(end, wire.len(), "only the head was sent");
+            } else {
+                assert!(
+                    wire.is_empty(),
+                    "invalid signed head must never reach the wire"
+                );
+            }
+            assert_eq!(reactor.in_flight(), 0);
+            io.reclaim_buffer();
+            assert_eq!(hooks.slots.get(), 0);
+            assert_eq!(hooks.used.get(), 0);
+        }
     }
 
     /// Admission may change ordinary fields but never the wire framing snapshot.
