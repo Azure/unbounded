@@ -78,6 +78,10 @@ impl<P: Policy> Drop for Waiting<P> {
             if queue.is_empty() {
                 // Do not retain queue storage after its admission charges leave.
                 *queue = VecDeque::new();
+            } else if queue.capacity() > queue.len().saturating_mul(2) {
+                // Keep spare slots covered by live waiters' fixed allowances.
+                // Shrink geometrically rather than reallocating on every departure.
+                queue.shrink_to_fit();
             }
         }
         wake_front(&self.queue);
@@ -1041,6 +1045,54 @@ mod tests {
         assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
         drop(lease);
         assert!(pool.acquire().is_ok());
+    }
+
+    /// Head and tail cancellation keep allocated queue storage within live charges.
+    #[test]
+    fn review_regression_canceled_waiter_storage_remains_charged() {
+        const WAITERS: usize = 1024;
+        for keep_tail in [false, true] {
+            let quotas = admission(1);
+            let pool = PipePool::new(
+                quotas.clone(),
+                ResourceClass::Pipe,
+                ResourceClass::RequestContext,
+                WAITERS,
+            );
+            let held = pool.acquire().unwrap();
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut waiting: Vec<_> = (0..WAITERS).map(|_| acquire_wait(&pool)).collect();
+            for wait in &mut waiting {
+                assert!(wait.as_mut().poll(&mut cx).is_pending());
+            }
+            if keep_tail {
+                waiting.reverse();
+            }
+            while waiting.len() > 1 {
+                drop(waiting.pop());
+                let queue = pool.waiting.borrow();
+                assert_eq!(queue.len(), waiting.len());
+                let slots = queue.capacity() * std::mem::size_of::<Rc<RefCell<Option<Waker>>>>();
+                let owners = queue.len()
+                    * (std::mem::size_of::<Waiting<TestPolicy>>()
+                        + std::mem::size_of::<RefCell<Option<Waker>>>()
+                        + 2 * std::mem::size_of::<usize>());
+                assert!(
+                    slots + owners <= quotas.used(ResourceClass::RequestContext),
+                    "{} live waiters retain {} queue slots without admission",
+                    queue.len(),
+                    queue.capacity(),
+                );
+            }
+            drop(held);
+            assert!(matches!(
+                waiting[0].as_mut().poll(&mut cx),
+                Poll::Ready(Ok(_))
+            ));
+            drop(waiting);
+            assert_eq!(pool.waiting.borrow().capacity(), 0);
+            assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        }
     }
 
     /// Scheduled acquisition is bounded and FIFO without polling itself awake.
