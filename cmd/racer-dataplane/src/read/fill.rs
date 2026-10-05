@@ -322,6 +322,25 @@ impl Fill {
         scope: &RequestScope,
         page: &PageId,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
+        self.reserve_network_plaintext_with(scope, page, || {
+            self.dependencies
+                .admission
+                .reserve(
+                    Some(&page.version.object.cache),
+                    ResourceClass::Plaintext,
+                    PAGE_BYTES as usize,
+                )
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    pub(super) async fn reserve_network_plaintext_with(
+        &self,
+        scope: &RequestScope,
+        page: &PageId,
+        mut reserve: impl FnMut() -> Result<flow_control::Charge<AdmissionPolicy>>,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         let admission = &self.dependencies.admission;
         let cache = &page.version.object.cache;
         let amount = PAGE_BYTES as usize;
@@ -329,15 +348,21 @@ impl Fill {
         let mut exhausted = false;
         loop {
             scope.check()?;
-            let (result, detail) = admission.policy().capture_rejection(|| {
-                admission
-                    .reserve(Some(cache), ResourceClass::Plaintext, amount)
-                    .map_err(Into::into)
-            });
+            let (mut result, mut detail) = admission.policy().capture_rejection(&mut reserve);
             if !matches!(result, Err(Error::Overloaded)) {
                 return result;
             }
             let deficit = admission.reclamation(cache, ResourceClass::Plaintext, amount);
+            if deficit.is_none() {
+                // A remote completion may clear pressure after rejection. None
+                // also means an impossible request, so retry exactly once here,
+                // without restarting the scan or extending the caller's budget.
+                scope.check()?;
+                (result, detail) = admission.policy().capture_rejection(&mut reserve);
+                if !matches!(result, Err(Error::Overloaded)) {
+                    return result;
+                }
+            }
             if exhausted || deficit.is_none() {
                 admission.policy().observer().final_fill_admission(
                     scope,

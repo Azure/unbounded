@@ -1,6 +1,233 @@
 use crate::read::dispatch::WorkerMap;
 
 #[test]
+fn network_plaintext_rechecks_pressure_cleared_after_rejection() {
+    for (shrink, exhausted) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.plaintext_bytes = std::num::NonZeroUsize::new(858_993_459).unwrap();
+        let f = fixture_with(3, Some(limits));
+        let admission = &f.fill.dependencies.admission;
+        let cache = &f.context.object.cache;
+        let base = admission
+            .reserve(Some(cache), ResourceClass::Plaintext, 831_918_590)
+            .unwrap();
+        let mut page = Some(
+            admission
+                .reserve(Some(cache), ResourceClass::Plaintext, PAGE_BYTES as usize)
+                .unwrap(),
+        );
+        let failures = crate::telemetry::Failures::default();
+        admission
+            .policy()
+            .set_observer(failures.observer(WorkerId(4)));
+        let mut attempts = 0;
+        let result = futures::executor::block_on(f.fill.reserve_network_plaintext_with(
+            &f.scope,
+            &f.page,
+            || {
+                attempts += 1;
+                assert!(
+                    attempts <= 2 + usize::from(exhausted),
+                    "recovery must be bounded"
+                );
+                let result = admission
+                    .reserve(Some(cache), ResourceClass::Plaintext, PAGE_BYTES as usize)
+                    .map_err(Error::from);
+                if attempts == 1 + usize::from(exhausted) {
+                    assert!(matches!(result, Err(Error::Overloaded)));
+                    assert_eq!(admission.used(ResourceClass::Plaintext), 848_695_806);
+                    // Deterministically model a remote completion after the real
+                    // admission rejection, before the caller checks reclamation.
+                    if shrink {
+                        page.as_mut().unwrap().shrink(681).unwrap();
+                    } else {
+                        drop(page.take());
+                    }
+                    assert_eq!(
+                        admission.reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize),
+                        None
+                    );
+                }
+                result
+            },
+        ));
+        assert!(
+            result.is_ok(),
+            "cleared pressure returned {:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(attempts, 2 + usize::from(exhausted));
+        assert_eq!(result.as_ref().unwrap().amount(), PAGE_BYTES as usize);
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            831_918_590 + PAGE_BYTES as usize + if shrink { 681 } else { 0 }
+        );
+        drop((result, page, base));
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        let mut out = String::new();
+        failures.write_protected(true, &mut out).unwrap();
+        assert!(out.contains("total=0 retained=0"), "{out}");
+        assert_eq!(f.origin.calls.get(), 0);
+    }
+}
+
+#[test]
+fn network_plaintext_cleared_pressure_retry_is_bounded_and_reports_latest_failure() {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
+    let f = fixture_with(3, Some(limits));
+    let admission = &f.fill.dependencies.admission;
+    let cache = &f.context.object.cache;
+    let mut held = Some(
+        admission
+            .reserve(
+                Some(cache),
+                ResourceClass::Plaintext,
+                PAGE_BYTES as usize + 1,
+            )
+            .unwrap(),
+    );
+    let failures = crate::telemetry::Failures::default();
+    admission
+        .policy()
+        .set_observer(failures.observer(WorkerId(4)));
+    let mut attempts = 0;
+    let mut reserve = Box::pin(
+        f.fill
+            .reserve_network_plaintext_with(&f.scope, &f.page, || {
+                attempts += 1;
+                assert!(
+                    attempts <= 2,
+                    "must not loop on repeatedly cleared pressure"
+                );
+                if attempts == 2 {
+                    held = Some(
+                        admission
+                            .reserve(
+                                Some(cache),
+                                ResourceClass::Plaintext,
+                                2 * PAGE_BYTES as usize,
+                            )
+                            .unwrap(),
+                    );
+                }
+                let result = admission
+                    .reserve(Some(cache), ResourceClass::Plaintext, PAGE_BYTES as usize)
+                    .map_err(Error::from);
+                assert!(matches!(result, Err(Error::Overloaded)));
+                drop(held.take());
+                assert_eq!(
+                    admission.reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize),
+                    None
+                );
+                result
+            }),
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(matches!(
+        reserve.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    drop(reserve);
+    assert_eq!(attempts, 2);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    let mut out = String::new();
+    failures.write_protected(true, &mut out).unwrap();
+    assert!(out.contains("total=1 retained=1"), "{out}");
+    assert!(out.contains("used: 33554432"), "{out}");
+    assert!(out.contains("cache_used: Some(33554432)"), "{out}");
+    assert!(!out.contains("16777217"), "{out}");
+}
+
+#[test]
+fn network_plaintext_cleared_pressure_retry_checks_original_scope() {
+    for deadline in [false, true] {
+        let clock = uring_runtime::environment::SimulationClock::new(913);
+        let _clock = clock.environment(0).enter();
+        let f = fixture();
+        let admission = &f.fill.dependencies.admission;
+        let cache = &f.context.object.cache;
+        let scope = RequestScope::new(
+            f.scope.request,
+            uring_runtime::environment::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut held = Some(
+            admission
+                .reserve(
+                    Some(cache),
+                    ResourceClass::Plaintext,
+                    admission.limit(ResourceClass::Plaintext),
+                )
+                .unwrap(),
+        );
+        let failures = crate::telemetry::Failures::default();
+        admission
+            .policy()
+            .set_observer(failures.observer(WorkerId(4)));
+        let mut attempts = 0;
+        let result = futures::executor::block_on(f.fill.reserve_network_plaintext_with(
+            &scope,
+            &f.page,
+            || {
+                attempts += 1;
+                assert_eq!(attempts, 1, "canceled work must not retry admission");
+                let result = admission
+                    .reserve(Some(cache), ResourceClass::Plaintext, PAGE_BYTES as usize)
+                    .map_err(Error::from);
+                assert!(matches!(result, Err(Error::Overloaded)));
+                drop(held.take());
+                if deadline {
+                    clock.advance(Duration::from_secs(120));
+                } else {
+                    scope.cancel().unwrap();
+                }
+                result
+            },
+        ));
+        assert!(
+            matches!(result, Err(error) if error == if deadline { Error::DeadlineExceeded } else { Error::Cancelled })
+        );
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        let mut out = String::new();
+        failures.write_protected(true, &mut out).unwrap();
+        assert!(out.contains("total=0 retained=0"), "{out}");
+    }
+}
+
+#[test]
+fn network_plaintext_impossible_capacity_still_terminates_without_scanning() {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(PAGE_BYTES as usize - 1).unwrap();
+    let f = fixture_with(3, Some(limits));
+    let admission = &f.fill.dependencies.admission;
+    let mut attempts = 0;
+    let mut reserve = Box::pin(
+        f.fill
+            .reserve_network_plaintext_with(&f.scope, &f.page, || {
+                attempts += 1;
+                assert!(attempts <= 2);
+                admission
+                    .reserve(
+                        Some(&f.context.object.cache),
+                        ResourceClass::Plaintext,
+                        PAGE_BYTES as usize,
+                    )
+                    .map_err(Error::from)
+            }),
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(matches!(
+        reserve.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    drop(reserve);
+    assert_eq!(attempts, 2);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+#[test]
 fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(858_993_459).unwrap();
