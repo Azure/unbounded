@@ -324,11 +324,7 @@ impl Handle {
     /// Transfers a bounded stream prefix, honoring partitions and half-closes.
     pub fn send(&self, bytes: &[u8]) -> io::Result<usize> {
         let mut w = self.sim.0.borrow_mut();
-        let limit = match w.fault("send") {
-            Some(Fault::Errno(n)) => return Err(errno(n)),
-            Some(Fault::Short(n)) => n,
-            _ => usize::MAX,
-        };
+        let limit = w.transfer_limit("send")?;
         let capacity = w.stream_capacity;
         let max_chunk = w.max_chunk;
         let Some(Resource::Socket {
@@ -381,11 +377,7 @@ impl Handle {
     /// Drains buffered stream bytes before reporting EOF from a closed peer.
     pub fn recv(&self, bytes: &mut [u8]) -> io::Result<usize> {
         let mut w = self.sim.0.borrow_mut();
-        let limit = match w.fault("recv") {
-            Some(Fault::Errno(n)) => return Err(errno(n)),
-            Some(Fault::Short(n)) => n,
-            _ => usize::MAX,
-        };
+        let limit = w.transfer_limit("recv")?;
         let max_chunk = w.max_chunk;
         let Some(Resource::Socket {
             peer, connected, ..
@@ -503,11 +495,7 @@ impl Handle {
     }
     /// Writes a pipe prefix, preserving PIPE_BUF atomicity and reader-close errors.
     pub fn pipe_write(&self, bytes: &[u8]) -> io::Result<usize> {
-        let limit = match self.sim.0.borrow_mut().fault("pipe_write") {
-            Some(Fault::Errno(n)) => return Err(errno(n)),
-            Some(Fault::Short(n)) => n,
-            _ => usize::MAX,
-        };
+        let limit = self.sim.0.borrow_mut().transfer_limit("pipe_write")?;
         let w = self.sim.0.borrow();
         let Some(Resource::Pipe {
             bytes: output,
@@ -517,10 +505,7 @@ impl Handle {
         else {
             return Err(errno(libc::EBADF));
         };
-        let readers = w.resources.values().any(|resource| {
-            matches!(resource,
-            Resource::Pipe { bytes, write: false, .. } if Rc::ptr_eq(bytes, output))
-        });
+        let readers = w.pipe_endpoint_open(output, false);
         if !bytes.is_empty() && !readers {
             return Err(errno(libc::EPIPE));
         }
@@ -541,11 +526,7 @@ impl Handle {
     }
     /// Drains a pipe and reports EOF only after its last writer closes.
     pub fn pipe_read(&self, bytes: &mut [u8]) -> io::Result<usize> {
-        let limit = match self.sim.0.borrow_mut().fault("pipe_read") {
-            Some(Fault::Errno(n)) => return Err(errno(n)),
-            Some(Fault::Short(n)) => n,
-            _ => usize::MAX,
-        };
+        let limit = self.sim.0.borrow_mut().transfer_limit("pipe_read")?;
         let w = self.sim.0.borrow();
         let Some(Resource::Pipe {
             bytes: input,
@@ -555,10 +536,7 @@ impl Handle {
         else {
             return Err(errno(libc::EBADF));
         };
-        let writers = w.resources.values().any(|resource| {
-            matches!(resource,
-            Resource::Pipe { bytes, write: true, .. } if Rc::ptr_eq(bytes, input))
-        });
+        let writers = w.pipe_endpoint_open(input, true);
         let mut input = input.borrow_mut();
         let count = bytes.len().min(input.len()).min(limit);
         if count == 0 && !bytes.is_empty() && writers {
@@ -569,11 +547,7 @@ impl Handle {
     }
     /// Moves pipe bytes to a stream, consuming only the successfully sent prefix.
     pub fn splice(&self, socket: &Handle, count: usize) -> io::Result<usize> {
-        let count = match self.sim.0.borrow_mut().fault("splice") {
-            Some(Fault::Errno(n)) => return Err(errno(n)),
-            Some(Fault::Short(n)) => count.min(n),
-            _ => count,
-        };
+        let count = count.min(self.sim.0.borrow_mut().transfer_limit("splice")?);
         if !Rc::ptr_eq(&self.sim.0, &socket.sim.0) {
             return Err(errno(libc::EXDEV));
         }
@@ -592,10 +566,7 @@ impl Handle {
         let mut input = bytes.borrow_mut();
         if count != 0 && input.is_empty() {
             let w = self.sim.0.borrow();
-            if w.resources.values().any(|resource| {
-                matches!(resource,
-                Resource::Pipe { bytes: queue, write: true, .. } if Rc::ptr_eq(queue, &bytes))
-            }) {
+            if w.pipe_endpoint_open(&bytes, true) {
                 return Err(errno(libc::EAGAIN));
             }
             return Ok(0);
@@ -604,6 +575,16 @@ impl Handle {
         let sent = socket.send(&input.make_contiguous()[..count])?;
         input.drain(..sent);
         Ok(sent)
+    }
+}
+
+impl World {
+    /// Identify a live pipe end by shared queue identity, never by buffered bytes.
+    fn pipe_endpoint_open(&self, queue: &Rc<RefCell<VecDeque<u8>>>, writing: bool) -> bool {
+        self.resources.values().any(|resource| {
+            matches!(resource, Resource::Pipe { bytes, write, .. }
+                if *write == writing && Rc::ptr_eq(bytes, queue))
+        })
     }
 }
 
@@ -668,6 +649,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    /// Drive real reactor ownership through stream backpressure, replies, EOF, and drain.
     fn real_reactor_stream_backpressure_eof_and_completion_fences() {
         let sim = Simulation::new();
         let _environment = sim.enter();
@@ -757,6 +739,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    /// Isolate nested worlds and close unaccepted server sockets with their listener.
     fn scoped_selection_and_listener_pending_close_are_isolated() {
         let sim = Simulation::new();
         let other = Simulation::new();
@@ -786,6 +769,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    /// Preserve wrapped queue prefixes across short reads, splice failures, and EOF.
     fn wrapped_stream_and_pipe_copies_preserve_short_io_and_errors() {
         let sim = Simulation::new();
         let (writer, reader) = sim.socket_pair();
@@ -851,6 +835,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    /// Keep source addresses and packet boundaries through a datagram round trip.
     fn datagrams_preserve_packet_boundaries_and_source_addresses() {
         let sim = Simulation::new();
         let server_address = "127.0.0.1:53".parse().unwrap();
@@ -871,12 +856,14 @@ pub(super) mod tests {
     /// Counts owner destruction to verify resources survive both completion fences.
     struct Probe(Rc<Cell<usize>>);
     impl Drop for Probe {
+        /// Count one resource release after its final completion fence.
         fn drop(&mut self) {
             self.0.set(self.0.get() + 1);
         }
     }
 
     #[test]
+    /// Retain abandoned descriptors, buffers, and leases through either CQE ordering.
     fn abandoned_resources_wait_for_both_fences_in_either_order() {
         for cancel_first in [false, true] {
             let sim = Simulation::new();
@@ -941,6 +928,7 @@ pub(super) mod tests {
     }
 
     #[test]
+    /// Preserve owners and monotonic operation IDs through delayed short I/O and failure.
     fn scheduled_short_io_disconnect_and_budget_preserve_resource_ownership() {
         let sim = Simulation::new();
         let _environment = sim.enter();

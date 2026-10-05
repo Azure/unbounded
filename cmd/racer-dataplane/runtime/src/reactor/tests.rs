@@ -25,15 +25,19 @@ pub(super) mod fixtures {
     pub struct Admission {
         /// Queue ceiling used when constructing the associated reactor.
         pub limits: Limits,
+
         used: Rc<RefCell<BTreeMap<ResourceClass, usize>>>,
     }
     /// One counted resource amount released by its owner's destructor.
     pub struct Reservation {
         used: Rc<RefCell<BTreeMap<ResourceClass, usize>>>,
+
         class: ResourceClass,
+
         amount: usize,
     }
     impl Drop for Reservation {
+        /// Return the guard's exact charged amount to the shared ledger.
         fn drop(&mut self) {
             *self.used.borrow_mut().entry(self.class).or_default() -= self.amount;
         }
@@ -68,7 +72,10 @@ pub(super) mod fixtures {
     /// Adapt the ledger to the runtime's public allocation-budget contract.
     pub struct CountingBudget(Rc<Admission>);
     impl Budget for CountingBudget {
+        /// Exact ledger guard retained by the charged runtime owner.
         type Charge = Reservation;
+
+        /// Charge completion memory through the observable test ledger.
         fn charge(&self, bytes: usize) -> Result<Reservation> {
             self.0.reserve(None, ResourceClass::RequestContext, bytes)
         }
@@ -76,6 +83,7 @@ pub(super) mod fixtures {
     /// Scoped reactor with an accessible ledger for private completion regressions.
     pub struct Reactor {
         core: super::super::Reactor<RequestScope, CountingBudget>,
+
         /// Resource accounting shared with buffers, leases, and completion owners.
         pub admission: Rc<Admission>,
     }
@@ -96,7 +104,10 @@ pub(super) mod fixtures {
         }
     }
     impl Deref for Reactor {
+        /// Production implementation exercised by the test adapter.
         type Target = super::super::Reactor<RequestScope, CountingBudget>;
+
+        /// Expose the production reactor without duplicating operation implementations.
         fn deref(&self) -> &Self::Target {
             &self.core
         }
@@ -106,6 +117,7 @@ pub(super) mod fixtures {
     pub struct RequestScope {
         /// Absolute deadline in the active clock domain.
         pub deadline: Deadline,
+
         /// Shared cancellation state, checked before deadline expiration.
         pub cancellation: Cancellation,
     }
@@ -123,7 +135,10 @@ pub(super) mod fixtures {
         }
     }
     impl Scope for RequestScope {
+        /// Runtime classification used by ownership regressions.
         type Error = Error;
+
+        /// Give cancellation precedence over expiration in the active clock domain.
         fn check(&self) -> Result<()> {
             if self.cancellation.is_cancelled() {
                 Err(Error::Cancelled)
@@ -137,32 +152,44 @@ pub(super) mod fixtures {
 }
 
 #[test]
+/// Preserve application-specific buffer errors without publishing an operation.
 fn operation_preserves_scope_and_buffer_errors_before_submission() {
+    /// Distinguish runtime failures from the application's buffer rejection.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum AppError {
         Runtime(Error),
         Buffer,
     }
     impl From<Error> for AppError {
+        /// Preserve runtime error identity inside the application boundary.
         fn from(error: Error) -> Self {
             Self::Runtime(error)
         }
     }
+    /// Permit submission policy checks while the buffer independently fails.
     #[derive(Clone)]
     struct AppScope;
     impl Scope for AppScope {
+        /// Application boundary preserving both runtime and buffer failures.
         type Error = AppError;
+
+        /// Allow this operation so the regression reaches buffer validation.
         fn check(&self) -> Result<(), AppError> {
             Ok(())
         }
     }
+    /// Refuse both accessors without ever exposing a backing pointer.
     struct FailedBuffer;
     // SAFETY: never exposes backing pointers; every accessor fails.
     unsafe impl IoBuffer for FailedBuffer {
+        /// Application rejection returned by either accessor.
         type Error = AppError;
+
+        /// Reject immutable access with the application error.
         fn bytes(&self) -> Result<&[u8], AppError> {
             Err(AppError::Buffer)
         }
+        /// Reject mutable access with the same application error.
         fn bytes_mut(&mut self) -> Result<&mut [u8], AppError> {
             Err(AppError::Buffer)
         }
@@ -180,11 +207,89 @@ fn operation_preserves_scope_and_buffer_errors_before_submission() {
     assert!(reactor.state.borrow().ring.is_none());
 }
 
+/// Derive exactly one correctly borrowed region for every data opcode and preserve errors.
 #[test]
+fn data_region_selects_accessor_without_relocating_backing() {
+    /// Observe immutable versus exclusive accessor selection with stable private storage.
+    struct AccessBuffer {
+        bytes: Vec<u8>,
+
+        shared: Cell<usize>,
+
+        exclusive: Cell<usize>,
+
+        reject: bool,
+    }
+    // SAFETY: private initialized Vec storage never resizes and has no external aliases.
+    unsafe impl IoBuffer for AccessBuffer {
+        /// Runtime classification for deliberately rejected allocation access.
+        type Error = Error;
+
+        /// Count immutable access and optionally reject it before exposing bytes.
+        fn bytes(&self) -> Result<&[u8]> {
+            self.shared.set(self.shared.get() + 1);
+            if self.reject {
+                Err(Error::Unavailable)
+            } else {
+                Ok(&self.bytes)
+            }
+        }
+
+        /// Count exclusive access and optionally reject it before exposing bytes.
+        fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+            self.exclusive.set(self.exclusive.get() + 1);
+            if self.reject {
+                Err(Error::Unavailable)
+            } else {
+                Ok(&mut self.bytes)
+            }
+        }
+    }
+    for operation in [
+        BufferOperation::Read(7),
+        BufferOperation::Write(9),
+        BufferOperation::Recv,
+        BufferOperation::Send,
+    ] {
+        for length in [0, 1, 4096] {
+            for reject in [false, true] {
+                let mut buffer = AccessBuffer {
+                    bytes: vec![0x5a; length],
+                    shared: Cell::new(0),
+                    exclusive: Cell::new(0),
+                    reject,
+                };
+                let ptr = buffer.bytes.as_mut_ptr();
+                let result =
+                    super::Reactor::<RequestScope, ()>::buffer_region(&mut buffer, operation);
+                assert_eq!(
+                    result,
+                    if reject {
+                        Err(Error::Unavailable)
+                    } else {
+                        Ok((ptr, length as u32))
+                    }
+                );
+                let receives =
+                    matches!(operation, BufferOperation::Read(_) | BufferOperation::Recv);
+                assert_eq!(buffer.shared.get(), usize::from(!receives));
+                assert_eq!(buffer.exclusive.get(), usize::from(receives));
+                assert!(buffer.bytes.iter().all(|byte| *byte == 0x5a));
+            }
+        }
+    }
+}
+
+#[test]
+/// Reject invalid queue bounds and failed accounting before acquiring kernel owners.
 fn rejected_budget_and_invalid_capacity_publish_no_kernel_owners() {
+    /// Reject every memory charge for admission rollback checks.
     struct Reject;
     impl Budget for Reject {
+        /// No guard is ever constructed because every charge fails.
         type Charge = ();
+
+        /// Fail admission without producing a retained guard.
         fn charge(&self, _: usize) -> Result<()> {
             Err(Error::Overloaded)
         }
@@ -204,15 +309,20 @@ fn rejected_budget_and_invalid_capacity_publish_no_kernel_owners() {
     assert_eq!(zero.init(), Err(Error::InvalidConfiguration));
 }
 mod completion {
+    //! Original and cancellation accounting, owner release, and independent fence waiters.
     use super::*;
 
     #[test]
+    /// Release queue and notification borrows before application result destruction.
     fn finish_releases_slot_and_waker_borrow_before_result_destruction() {
+        /// Observe signal borrow availability while the completion result is destroyed.
         struct Probe {
             signal: Rc<Signal>,
+
             drops: Rc<Cell<usize>>,
         }
         impl Drop for Probe {
+            /// Verify the notification borrow ended before this application callback.
             fn drop(&mut self) {
                 assert!(self.signal.waker.try_borrow_mut().unwrap().is_none());
                 self.drops.set(self.drops.get() + 1);
@@ -271,6 +381,7 @@ mod completion {
     }
 
     #[test]
+    /// Keep connecting admission and the descriptor alive after future abandonment.
     fn connecting_lease_survives_abandonment_until_kernel_fence() {
         let Some(reactor) = kernel_reactor(4) else {
             return;
@@ -315,6 +426,7 @@ mod completion {
     }
 
     #[test]
+    /// Wake independent fence callers only after both CQEs in either ordering.
     fn fence_waiters_sleep_until_both_cqes_and_unregister_on_drop() {
         for cancel_first in [false, true] {
             let reactor = Reactor::new(Rc::new(Admission::new(limits(4))));
@@ -382,6 +494,7 @@ mod completion {
     }
 
     #[test]
+    /// Bound fence registrations and replace executor notifications on repoll.
     fn fence_waiters_are_bounded_and_refresh_executor_wakers() {
         let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
         reactor.state.borrow_mut().entries.insert(
@@ -440,6 +553,7 @@ mod completion {
     }
 
     #[test]
+    /// Wake registered fences from actual cancellation completion rather than self-waking.
     fn kernel_cancellation_wakes_registered_fences_without_self_waking() {
         let Some(reactor) = kernel_reactor(4) else {
             return;
@@ -478,6 +592,7 @@ mod completion {
     }
 
     #[test]
+    /// Keep descriptors, buffers, leases, and charges until the second required CQE.
     fn delayed_and_reordered_cancel_cqes_retain_every_owner() {
         for cancel_first in [false, true] {
             let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
@@ -559,6 +674,7 @@ mod completion {
     }
 
     #[test]
+    /// Keep accepted socket ownership through a later cancellation completion.
     fn accepted_descriptor_is_retained_until_cancel_fence() {
         use std::io::Read;
         use std::os::fd::IntoRawFd;
@@ -610,6 +726,7 @@ mod completion {
     }
 
     #[test]
+    /// Deliver short success and errors only when their original CQE arrives.
     fn delayed_short_success_and_error_return_only_on_original_cqe() {
         for result in [3, -libc::EIO] {
             let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
@@ -660,9 +777,11 @@ mod completion {
 }
 
 mod empty_submit_tests {
+    //! Submission suppression truth tables and progress through both worker entry points.
     use super::*;
 
     #[test]
+    /// Exhaust setup flags and queue state to keep unsupported ring modes fail-closed.
     fn empty_submit_decision_truth_table() {
         // Cover every setup bit independently, including SQPOLL (1), IOPOLL (0),
         // COOP_TASKRUN (8), TASKRUN_FLAG (9), SINGLE_ISSUER (12), DEFER_TASKRUN (13),
@@ -689,6 +808,7 @@ mod empty_submit_tests {
     }
 
     #[test]
+    /// Suppress unnecessary enter calls at both explicit polling and idle waiting.
     fn empty_submit_skips_both_worker_submit_points() {
         let Some(reactor) = kernel_reactor(2) else {
             return;
@@ -706,6 +826,7 @@ mod empty_submit_tests {
     }
 
     #[test]
+    /// Reinspect actual SQ occupancy after transient, partial, and fatal submit results.
     fn empty_submit_retries_shared_sq_after_transient_partial_and_fatal_results() {
         let Some(reactor) = kernel_reactor(2) else {
             return;
@@ -766,6 +887,7 @@ mod empty_submit_tests {
     }
 
     #[test]
+    /// Preserve external wakes and submitted receive progress while no new SQEs exist.
     fn empty_submit_wait_preserves_submitted_receive_and_external_wake_progress() {
         use std::io::Write;
 
@@ -860,6 +982,7 @@ mod empty_submit_tests {
     }
 
     #[test]
+    /// Publish cancellation despite an otherwise empty SQ and retain owners until fenced.
     fn empty_submit_still_submits_cancel_and_drains_submitted_receive() {
         let Some(reactor) = kernel_reactor(2) else {
             return;
@@ -908,8 +1031,10 @@ mod empty_submit_tests {
     }
 }
 mod reserved_submission_tests {
+    //! Queue reuse distinctions between ordinary operations and prepaid reply ownership.
     use super::*;
     #[test]
+    /// Return ordinary queue capacity at the fence rather than at reply consumption.
     fn ordinary_completed_reply_does_not_hold_queue_capacity() {
         let Some(reactor) = kernel_reactor(1) else {
             return;
@@ -941,6 +1066,7 @@ mod socket {
     use super::*;
 
     #[test]
+    /// Submit service-turn work before sleeping without prematurely processing its CQE.
     fn wait_submits_service_turn_sqe_before_next_completion_poll() {
         use std::io::Write;
 
@@ -1043,6 +1169,7 @@ mod socket {
     }
 
     #[test]
+    /// Retry accept publication after SQ pressure without disturbing unrelated owners.
     fn listener_retry_recovers_from_full_sq_without_losing_owners() {
         // Cancellation SQEs also consume SQ space without new table entries.
         // A smaller test ring isolates SQ publication failure from table pressure
@@ -1102,6 +1229,7 @@ mod socket {
     }
 
     #[test]
+    /// Fence abandoned receive owners during reactor destruction after admission fills.
     fn real_cancellation_abandonment_limits_and_drop_fence() {
         let Some(reactor) = kernel_reactor(1) else {
             return;
@@ -1138,6 +1266,7 @@ mod socket {
     }
 
     #[test]
+    /// Respect explicit cancellation and deadline errors through real readiness fences.
     fn real_deadline_and_explicit_cancel_fences() {
         let Some(reactor) = kernel_reactor(2) else {
             return;
@@ -1173,6 +1302,7 @@ mod socket {
     }
 
     #[test]
+    /// Preserve explicit file offsets and release completion accounting after delivery.
     fn real_offset_file_io_and_quota_release() {
         let Some(reactor) = kernel_reactor(2) else {
             return;
@@ -1203,6 +1333,7 @@ mod socket {
     }
 
     #[test]
+    /// Retain an off-thread wake until a bounded reactor wait consumes it.
     fn real_external_wake_is_persistent_and_bounded() {
         let Some(reactor) = kernel_reactor(1) else {
             return;
@@ -1223,6 +1354,7 @@ mod socket {
     }
 
     #[test]
+    /// Exercise short stream progress, readiness, EOF, and broken-pipe errors.
     fn real_socket_short_io_readiness_eof_and_broken_pipe() {
         let Some(reactor) = kernel_reactor(4) else {
             return;
@@ -1269,6 +1401,7 @@ mod socket {
     }
 
     #[test]
+    /// Keep successful connect admission in the unread completion until consumed.
     fn real_connect_lease_survives_cqes_until_result_is_consumed() {
         let Some(reactor) = kernel_reactor(2) else {
             return;
@@ -1320,6 +1453,7 @@ mod socket {
     }
 
     #[test]
+    /// Retain connecting owners through cancellation or kernel errors until final fencing.
     fn real_connect_lease_is_quarantined_after_cancel_and_error() {
         for (cancel, invalid_family) in [(true, false), (false, true)] {
             let Some(reactor) = kernel_reactor(2) else {
@@ -1390,6 +1524,7 @@ mod socket {
     }
 
     #[test]
+    /// Connect, accept, and transfer data using actual TCP descriptors.
     fn real_tcp_accept_connect() {
         let Some(reactor) = kernel_reactor(4) else {
             return;
@@ -1429,6 +1564,7 @@ mod socket {
     }
 
     #[test]
+    /// Retain owned Unix sockaddr backing through connect and subsequent data exchange.
     fn real_unix_connect_keeps_sockaddr_alive() {
         let Some(reactor) = kernel_reactor(4) else {
             return;
@@ -1439,8 +1575,10 @@ mod socket {
         // path. Use a process-unique socket in the existing build directory.
         let path =
             PathBuf::from("target").join(format!("reactor-unix-{}.sock", std::process::id()));
+        /// Remove the process-local Unix socket fixture after the test.
         struct RemoveSocket(PathBuf);
         impl Drop for RemoveSocket {
+            /// Unlink the fixture pathname even if the test unwinds.
             fn drop(&mut self) {
                 let _ = std::fs::remove_file(&self.0);
             }
@@ -1478,6 +1616,7 @@ use std::{num::NonZeroUsize, os::unix::net::UnixStream, time::Instant};
 #[derive(Default)]
 struct Count(AtomicUsize);
 impl std::task::Wake for Count {
+    /// Record one executor notification without executing user work.
     fn wake(self: Arc<Self>) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
@@ -1487,15 +1626,20 @@ impl std::task::Wake for Count {
 struct Buffer(Vec<u8>, Rc<Cell<usize>>);
 // SAFETY: private fixed Vec owns independently allocated backing.
 unsafe impl IoBuffer for Buffer {
+    /// Runtime errors accepted by the test reactor's scope.
     type Error = Error;
+
+    /// Borrow the stable initialized test allocation immutably.
     fn bytes(&self) -> Result<&[u8]> {
         Ok(&self.0)
     }
+    /// Borrow the same stable test allocation exclusively before submission.
     fn bytes_mut(&mut self) -> Result<&mut [u8]> {
         Ok(&mut self.0)
     }
 }
 impl Drop for Buffer {
+    /// Count backing allocation retirement after its final fence.
     fn drop(&mut self) {
         self.1.set(self.1.get() + 1);
     }
@@ -1503,6 +1647,7 @@ impl Drop for Buffer {
 /// Independent reuse guard whose drop must follow all applicable CQEs.
 struct Lease(Rc<Cell<usize>>);
 impl Drop for Lease {
+    /// Count independent lease retirement after its final fence.
     fn drop(&mut self) {
         self.0.set(self.0.get() + 1);
     }
@@ -1513,6 +1658,7 @@ fn buffer(bytes: &[u8]) -> Buffer {
 }
 
 #[test]
+/// Preserve connect errno attribution before mapping errors at the runtime boundary.
 fn connect_observation_retains_errno_before_generic_boundary_mapping() {
     for errno in [
         libc::ENOBUFS,
@@ -1532,6 +1678,7 @@ fn connect_observation_retains_errno_before_generic_boundary_mapping() {
     assert_eq!(observation.get(), None);
 }
 #[test]
+/// Validate sockaddr layout, stable storage, and rejected Unix pathname encodings.
 fn sockaddr_encoding_is_owned_and_validated() {
     let (address, len) =
         encode_address(SocketAddress::Inet("127.0.0.1:1234".parse().unwrap())).unwrap();
@@ -1565,6 +1712,7 @@ fn sockaddr_encoding_is_owned_and_validated() {
     }
 }
 #[test]
+/// Leave kernel resources uninitialized until a real operation requires them.
 fn constructor_does_not_open_kernel_resources() {
     let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
     assert!(reactor.state.borrow().ring.is_none());
@@ -1573,6 +1721,7 @@ fn constructor_does_not_open_kernel_resources() {
     assert_eq!(reactor.poll_budgeted(1).unwrap(), 0);
 }
 #[test]
+/// Avoid initializing a ring merely because the worker waits without queued work.
 fn wait_does_not_initialize_absent_ring() {
     let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
     reactor.wait(Duration::ZERO).unwrap();
@@ -1584,6 +1733,7 @@ fn wait_does_not_initialize_absent_ring() {
     assert_eq!(reactor.admission.used(ResourceClass::RequestContext), 0);
 }
 #[test]
+/// Defer transient submit errors while reporting all fatal driver failures.
 fn submission_classifies_transient_and_fatal_errors() {
     for count in [0, 1, 8] {
         assert_eq!(submission_result(Ok(count)), Ok(()));
@@ -1663,6 +1813,7 @@ pub(super) fn kernel_reactor(capacity: usize) -> Option<Reactor> {
 
 #[cfg(feature = "simulation")]
 mod retry_regressions {
+    //! Retry, cancellation, and reserved-capacity ownership across simulated submissions.
     use super::*;
     use simulation::{Fault, Simulation};
 
@@ -1675,6 +1826,7 @@ mod retry_regressions {
     }
 
     #[test]
+    /// Retain exact owners through transient errors and never replay positive progress.
     fn transient_data_errors_retain_exact_owners_and_return_partial_progress_once() {
         for reserved in [false, true] {
             for errno in [libc::EINTR, libc::EAGAIN] {
@@ -1730,6 +1882,7 @@ mod retry_regressions {
     }
 
     #[test]
+    /// Bound retry attempts and retain readiness owners until cancellation fences finish.
     fn retries_are_bounded_and_readiness_does_not_spin() {
         for errno in [libc::EINTR, libc::EAGAIN] {
             let sim = Simulation::new();
@@ -1808,6 +1961,7 @@ mod retry_regressions {
     }
 
     #[test]
+    /// Recheck cancellation after a transient CQE before publishing the next attempt.
     fn cancellation_between_transient_completion_and_retry_prevents_resubmission() {
         let sim = Simulation::new();
         let _environment = sim.enter();
@@ -1836,6 +1990,7 @@ mod retry_regressions {
     }
 
     #[test]
+    /// Preserve receive and positioned-I/O contents, offsets, and leases across retries.
     fn recv_and_positioned_io_retry_without_changing_buffer_or_offset() {
         for operation in [
             BufferOperation::Recv,
@@ -1904,6 +2059,7 @@ mod retry_regressions {
     }
 
     #[test]
+    /// Keep reserved error replies charged through arbitrary original/cancel ordering.
     fn arbitrary_error_permutations_use_published_reserved_entries() {
         for accept in [false, true] {
             for cancel_first in [false, true] {
@@ -1972,6 +2128,7 @@ mod retry_regressions {
     }
 
     #[test]
+    /// Cover reserved accept and receive cancellation under both CQE and abandonment orders.
     fn actual_reserved_entries_fence_original_and_cancel_in_both_orders() {
         for accept in [false, true] {
             for cancel_first in [false, true] {
@@ -2044,6 +2201,7 @@ mod retry_regressions {
     }
 
     #[test]
+    /// Reclaim an abandoned accepted descriptor only after both applicable CQEs.
     fn successful_accept_is_reclaimed_only_after_both_cqes_when_abandoned() {
         for cancel_first in [false, true] {
             let sim = Simulation::new();
@@ -2088,6 +2246,7 @@ mod retry_regressions {
     }
 
     #[test]
+    /// Roll back rejected retry publication exactly once and permit reserved-slot reuse.
     fn reserved_retry_publication_rejection_drops_buffer_and_lease_once_and_reuses_slot() {
         let sim = Simulation::new();
         let _environment = sim.enter();
@@ -2132,19 +2291,26 @@ mod retry_regressions {
     }
 
     #[test]
+    /// Release reactor borrows before scope destruction on completion and rejection.
     fn scope_destructor_reenters_reactor_after_completion_and_sq_rejection() {
+        /// Reenter the reactor when each retained scope clone is destroyed.
         #[derive(Clone)]
         struct ReenterScope {
             reactor: Rc<RefCell<Weak<super::super::Reactor<ReenterScope, ()>>>>,
+
             drops: Rc<Cell<usize>>,
         }
         impl Scope for ReenterScope {
+            /// Runtime failure type shared with the reentrant reactor.
             type Error = Error;
+
+            /// Allow all submissions so destruction is the observed callback.
             fn check(&self) -> Result<()> {
                 Ok(())
             }
         }
         impl Drop for ReenterScope {
+            /// Verify reactor borrows are released before counting this scope's retirement.
             fn drop(&mut self) {
                 if let Some(reactor) = self.reactor.borrow().upgrade() {
                     assert!(reactor.state.try_borrow_mut().is_ok());
@@ -2187,10 +2353,12 @@ mod retry_regressions {
 }
 
 mod review_regressions {
+    //! Reentrant callbacks, panic isolation, driver failures, and bounded shutdown contracts.
     use super::*;
 
     #[cfg(feature = "simulation")]
     #[test]
+    /// Roll back failed publication without retaining owners or consuming queue admission.
     fn simulated_publication_rejection_rolls_back_owners_and_admission() {
         let sim = simulation::Simulation::new();
         let _environment = sim.enter();
@@ -2228,6 +2396,7 @@ mod review_regressions {
     }
 
     #[test]
+    /// Reject sentinel and out-of-range offsets before publishing kernel work.
     fn positioned_io_rejects_kernel_sentinel_offsets_before_publication() {
         let Some(reactor) = kernel_reactor(2) else {
             return;
@@ -2271,12 +2440,14 @@ mod review_regressions {
     // inspects only the current test thread's optional probe.
     /// Build a raw waker whose lifecycle invokes the currently installed callback.
     fn callback_waker() -> Waker {
+        /// Invoke the thread-local probe while cloning a stateless raw waker.
         unsafe fn clone(_: *const ()) -> std::task::RawWaker {
             unsafe {
                 wake(std::ptr::null());
             }
             std::task::RawWaker::new(std::ptr::null(), &VTABLE)
         }
+        /// Invoke only the current thread's installed lifecycle callback.
         unsafe fn wake(_: *const ()) {
             WAKER_CALLBACK.with(|probe| {
                 if let Some(callback) = &*probe.borrow() {
@@ -2284,11 +2455,13 @@ mod review_regressions {
                 }
             });
         }
+        /// Exercise the same callback for borrowed wake notification.
         unsafe fn wake_ref(data: *const ()) {
             unsafe {
                 wake(data);
             }
         }
+        /// Exercise the same callback when a registration drops its waker.
         unsafe fn drop_waker(data: *const ()) {
             unsafe {
                 wake(data);
@@ -2301,6 +2474,7 @@ mod review_regressions {
     }
 
     #[test]
+    /// Allow waker clone, drop, and wake callbacks to reenter fence and delivery state.
     fn fence_and_waiting_waker_clone_drop_and_wake_allow_reentry() {
         let reactor = Rc::new(Reactor::new(Rc::new(Admission::new(limits(2)))));
         reactor
@@ -2361,6 +2535,7 @@ mod review_regressions {
     }
 
     #[test]
+    /// Deliver already-fenced replies and notifications before reporting driver failure.
     fn unknown_completion_and_fatal_submit_do_not_discard_prior_delivery() {
         for unknown in [false, true] {
             let reactor = Rc::new(Reactor::new(Rc::new(Admission::new(limits(4)))));
@@ -2410,15 +2585,20 @@ mod review_regressions {
     }
 
     #[test]
+    /// Finish unrelated callbacks before resuming a completion destructor or waker panic.
     fn panicking_finish_or_waker_does_not_discard_other_completions() {
+        /// Inject a panic from executor notification.
         struct PanicWake;
         impl std::task::Wake for PanicWake {
+            /// Panic while the reactor delivers an otherwise fenced completion.
             fn wake(self: Arc<Self>) {
                 panic!("injected wake panic");
             }
         }
+        /// Inject a panic from application resource destruction.
         struct PanicDrop;
         impl Drop for PanicDrop {
+            /// Panic while the reactor retires completion-owned resources.
             fn drop(&mut self) {
                 panic!("injected destructor panic");
             }
@@ -2457,6 +2637,7 @@ mod review_regressions {
     }
 
     #[test]
+    /// Quarantine owners when bounded shutdown never receives an original CQE.
     fn shutdown_timeout_and_drop_never_release_missing_original_owner() {
         let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
         let drops = Rc::new(Cell::new(0));
@@ -2481,6 +2662,7 @@ mod review_regressions {
     }
 
     #[test]
+    /// Retain the ring and every unfenced owner after fatal submission during Drop.
     fn fatal_drop_retains_ring_and_unfenced_resources() {
         let Some(reactor) = kernel_reactor(2) else {
             return;
@@ -2512,6 +2694,7 @@ mod review_regressions {
     }
 
     #[test]
+    /// Cancel all matching snapshot entries before awaiting the first individual fence.
     fn selective_fence_cancels_whole_snapshot_before_first_wait() {
         let reactor = Reactor::new(Rc::new(Admission::new(limits(4))));
         for id in 1..=3 {
@@ -2543,6 +2726,7 @@ mod review_regressions {
     }
 
     #[test]
+    /// Reject exhausted operation and waiter identifiers without wrapping or publishing.
     fn exhausted_operation_and_waiter_ids_fail_without_wrapping() {
         let Some(reactor) = kernel_reactor(2) else {
             return;
@@ -2573,6 +2757,7 @@ mod review_regressions {
     }
 
     #[test]
+    /// Rotate bounded cancellation scanning across the entire in-flight table.
     fn cancellation_scan_rotates_beyond_a_single_budget() {
         let Some(reactor) = kernel_reactor(8) else {
             return;
@@ -2610,10 +2795,14 @@ mod review_regressions {
 
     #[cfg(feature = "simulation")]
     #[test]
+    /// Invoke accounting and scope callbacks without holding reactor state borrows.
     fn budget_scope_and_scope_clone_can_reenter_without_refcell_borrows() {
+        /// Shared callback installed after the reactor's weak owner is available.
         type Callback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+        /// Invoke the shared reentry probe during policy checks and cloning.
         struct ReentrantScope(Callback);
         impl Clone for ReentrantScope {
+            /// Probe the reactor before retaining another scope callback owner.
             fn clone(&self) -> Self {
                 if let Some(callback) = &*self.0.borrow() {
                     callback();
@@ -2622,7 +2811,10 @@ mod review_regressions {
             }
         }
         impl Scope for ReentrantScope {
+            /// Runtime failure type used by the callback probe.
             type Error = Error;
+
+            /// Probe the reactor before allowing this submission attempt.
             fn check(&self) -> Result<()> {
                 if let Some(callback) = &*self.0.borrow() {
                     callback();
@@ -2630,9 +2822,13 @@ mod review_regressions {
                 Ok(())
             }
         }
+        /// Invoke the shared reentry probe during memory admission.
         struct ReentrantBudget(Callback);
         impl Budget for ReentrantBudget {
+            /// Empty guard because the probe observes reentry rather than accounting.
             type Charge = ();
+
+            /// Probe the reactor and admit bookkeeping without an additional guard.
             fn charge(&self, _: usize) -> Result<()> {
                 if let Some(callback) = &*self.0.borrow() {
                     callback();

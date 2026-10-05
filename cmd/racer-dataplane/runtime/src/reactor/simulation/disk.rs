@@ -23,8 +23,11 @@ pub enum DiskState {
 #[derive(Clone, Debug)]
 struct Image {
     mode: u16,
+
     length: u64,
+
     pages: BTreeMap<u64, Rc<[u8; 4096]>>,
+
     symlink: Option<PathBuf>,
 }
 impl Image {
@@ -63,15 +66,20 @@ impl Image {
 #[derive(Default, Debug)]
 pub(super) struct State {
     inodes: BTreeMap<u64, Image>,
+
     directories: BTreeMap<u64, BTreeMap<OsString, u64>>,
+
     root: Option<u64>,
-    pub(super) generation: u64,
+
+    generation: u64,
+
     pending: Vec<std::rc::Weak<PendingCrash>>,
 }
 /// Records whether a crash affected any path owned by a pending submission.
 #[derive(Debug)]
 pub(super) struct PendingCrash {
     paths: Vec<PathBuf>,
+
     pub(super) crashed: std::cell::Cell<bool>,
 }
 impl State {
@@ -1022,11 +1030,7 @@ impl Handle {
         if offset > i64::MAX as u64 {
             return Err(errno(libc::EINVAL));
         }
-        let limit = match self.sim.0.borrow_mut().fault("read") {
-            Some(Fault::Errno(n)) => return Err(errno(n)),
-            Some(Fault::Short(n)) => n,
-            _ => usize::MAX,
-        };
+        let limit = self.sim.0.borrow_mut().transfer_limit("read")?;
         let (node, flags) = self.node()?;
         if !self.sim.0.borrow().executing {
             check_direct(flags, offset, bytes.as_ptr(), bytes.len())?;
@@ -1055,11 +1059,7 @@ impl Handle {
         if !self.sim.0.borrow().executing {
             check_direct(flags, offset, bytes.as_ptr(), bytes.len())?;
         }
-        let limit = match self.sim.0.borrow_mut().fault("write") {
-            Some(Fault::Errno(n)) => return Err(errno(n)),
-            Some(Fault::Short(n)) => n,
-            _ => usize::MAX,
-        };
+        let limit = self.sim.0.borrow_mut().transfer_limit("write")?;
         let bytes = &bytes[..bytes.len().min(limit).min(self.sim.0.borrow().max_chunk)];
         if flags & libc::O_PATH != 0 || flags & libc::O_ACCMODE == libc::O_RDONLY {
             return Err(errno(libc::EBADF));
@@ -1133,6 +1133,7 @@ mod tests {
     }
 
     #[test]
+    /// Replay delayed and failed operations with exactly the same event sequence.
     fn delayed_completion_and_fault_trace_replay_exactly() {
         /// Captures one delayed-open and failed-read scenario for exact trace replay.
         fn run() -> Vec<Event> {
@@ -1164,6 +1165,7 @@ mod tests {
     }
 
     #[test]
+    /// Cover sparse page boundaries, holes, short progress, and snapshot isolation.
     fn sparse_page_copies_preserve_boundaries_holes_and_snapshots() {
         for offset in [0, 1, 4095, 4096, 4097] {
             for length in [0, 1, 4095, 4096, 4097, 8193] {
@@ -1216,6 +1218,7 @@ mod tests {
     }
 
     #[test]
+    /// Keep open inodes usable through rename and unlink while preserving short I/O.
     fn sparse_files_partial_io_faults_rename_unlink_and_open_inode_ownership() {
         let (sim, _environment, r, scope) = setup();
         sim.create_dir_all(Path::new("/data")).unwrap();
@@ -1314,6 +1317,7 @@ mod tests {
     }
 
     #[test]
+    /// Stall partitioned traffic without loss and resume it after symmetric healing.
     fn partition_stalls_established_streams_and_connects_then_heals_without_loss() {
         let (sim, _environment, r, scope) = setup();
         let a = SocketAddress::Inet("127.0.0.1:101".parse().unwrap());
@@ -1378,6 +1382,7 @@ mod tests {
     }
 
     #[test]
+    /// Cover every combination of inode-data and directory-binding persistence.
     fn file_sync_and_namespace_sync_are_independent() {
         for (file_sync, dir_sync) in [(false, false), (true, false), (false, true), (true, true)] {
             let (sim, _environment, r, scope) = setup();
@@ -1416,6 +1421,7 @@ mod tests {
     }
 
     #[test]
+    /// Require namespace fences for replacements, unlink, and new directory ancestors.
     fn replacement_unlink_and_directory_ancestors_require_namespace_fences() {
         let (sim, _environment, _, _) = setup();
         sim.write_file(Path::new("/disk/current"), b"old").unwrap();
@@ -1449,6 +1455,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserve production fences and unrelated disks across failed sync and power loss.
     fn failed_sync_and_crash_during_pending_write_preserve_fences_and_other_disks() {
         let (sim, _environment, r, scope) = setup();
         for path in ["/a/file", "/b/file"] {
@@ -1505,6 +1512,7 @@ mod tests {
     }
 
     #[test]
+    /// Keep durable shared pages independent from volatile truncation and corruption.
     fn sparse_corruption_and_truncate_do_not_mutate_durable_shared_pages() {
         let (sim, _environment, r, scope) = setup();
         sim.write_file(Path::new("/file"), b"abcdef").unwrap();
@@ -1562,6 +1570,7 @@ mod tests {
     }
 
     #[test]
+    /// Distinguish issued sync durability from its completion and abandonment fences.
     fn crash_after_sync_issue_before_cqe_and_abandoned_sync_keep_real_fences() {
         let (sim, _environment, r, scope) = setup();
         sim.write_file(Path::new("/file"), b"old").unwrap();
@@ -1605,6 +1614,7 @@ mod tests {
     }
 
     #[test]
+    /// Sync renamed directory inodes and reject corruption across replacement generations.
     fn renamed_directory_fsync_uses_inode_and_durable_corruption_targets_exact_generation() {
         let (sim, _environment, _, _) = setup();
         sim.write_file(Path::new("/old/file"), b"before").unwrap();
@@ -1643,6 +1653,7 @@ mod tests {
 
     // Persistence faults mutate the integrated disk; production entries own I/O.
     #[test]
+    /// Cover missing, torn, and reordered durable overwrite prefixes through real reads.
     fn crashprefix_covers_missing_torn_and_reordered_overwrites() {
         let offset = (1 << 40) - 4;
         for (prefix, expected) in [b"base", b"bBBe", b"AABe"].into_iter().enumerate() {
@@ -1720,6 +1731,7 @@ mod tests {
     }
 
     #[test]
+    /// Reject invalid extents atomically while preserving zero holes and stale-handle errors.
     fn invalid_fault_plans_and_extents_are_atomic_and_holes_are_zero() {
         let (sim, _environment, r, scope) = setup();
         let path = Path::new("/file");

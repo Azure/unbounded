@@ -23,9 +23,11 @@ pub use disk::{CrashDisk, DiskState};
 /// Enter this scope when polling that node; established sockets retain the label.
 pub struct EndpointEnvironment {
     sim: Simulation,
+
     previous: Option<SocketAddress>,
 }
 impl Drop for EndpointEnvironment {
+    /// Restore socket labeling without changing existing endpoint labels.
     fn drop(&mut self) {
         self.sim.0.borrow_mut().endpoint = self.previous.take();
     }
@@ -39,6 +41,7 @@ pub struct Environment {
     previous: Option<Simulation>,
 }
 impl Drop for Environment {
+    /// Restore the previous thread-local backend selection.
     fn drop(&mut self) {
         CURRENT.with(|s| *s.borrow_mut() = self.previous.take());
     }
@@ -48,8 +51,11 @@ impl Drop for Environment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
     pub sequence: u64,
+
     pub operation: String,
+
     pub resource: u64,
+
     pub result: i64,
 }
 /// Queued faults match the next submitted operation with this name (or `*`).
@@ -69,20 +75,35 @@ pub enum Fault {
 #[derive(Debug)]
 struct World {
     reject_submissions: usize,
+
     cancel_first: bool,
+
     next: u64,
+
     resources: BTreeMap<u64, Resource>,
+
     paths: BTreeMap<PathBuf, Rc<RefCell<Node>>>,
+
     listeners: BTreeMap<SocketAddress, u64>,
+
     datagrams: BTreeMap<std::net::SocketAddr, u64>,
+
     faults: VecDeque<(String, Fault)>,
+
     trace: Vec<Event>,
+
     next_event: u64,
+
     stream_capacity: usize,
+
     max_chunk: usize,
+
     executing: bool,
+
     endpoint: Option<SocketAddress>,
+
     partitions: BTreeSet<(SocketAddress, SocketAddress)>,
+
     disk: disk::State,
 }
 /// The kernel-side state of an open simulated descriptor.
@@ -90,17 +111,26 @@ struct World {
 enum Resource {
     Socket {
         domain: i32,
+
         read_shutdown: bool,
+
         write_shutdown: bool,
+
         peer: Option<u64>,
+
         bytes: VecDeque<u8>,
+
         connected: bool,
+
         local: Option<SocketAddress>,
+
         remote: Option<SocketAddress>,
     },
     Datagram {
         address: std::net::SocketAddr,
+
         peer: Option<std::net::SocketAddr>,
+
         packets: VecDeque<(std::net::SocketAddr, Vec<u8>)>,
     },
     Listener {
@@ -108,13 +138,18 @@ enum Resource {
     },
     File {
         node: Rc<RefCell<Node>>,
+
         flags: i32,
+
         lock_owner: bool,
+
         opened_path: PathBuf,
     },
     Pipe {
         bytes: Rc<RefCell<VecDeque<u8>>>,
+
         write: bool,
+
         capacity: usize,
     },
 }
@@ -122,10 +157,15 @@ enum Resource {
 #[derive(Debug)]
 struct Node {
     inode: u64,
+
     mode: u16,
+
     length: u64,
+
     pages: BTreeMap<u64, Rc<[u8; 4096]>>,
+
     locked: bool,
+
     symlink: Option<PathBuf>,
 }
 
@@ -133,9 +173,11 @@ struct Node {
 #[derive(Debug)]
 pub struct Handle {
     sim: Simulation,
+
     id: u64,
 }
 impl Drop for Handle {
+    /// Close this resource and pending accepts, releasing its lock and address bindings.
     fn drop(&mut self) {
         let mut w = self.sim.0.borrow_mut();
         match w.resources.remove(&self.id) {
@@ -225,6 +267,15 @@ impl World {
         );
         Some(fault)
     }
+
+    /// Consume a synchronous transfer fault without applying driver-only delays.
+    fn transfer_limit(&mut self, operation: &str) -> io::Result<usize> {
+        match self.fault(operation) {
+            Some(Fault::Errno(n)) => Err(errno(n)),
+            Some(Fault::Short(n)) => Ok(n),
+            _ => Ok(usize::MAX),
+        }
+    }
 }
 /// Orders two endpoints so both directions share one partition-table key.
 fn endpoint_pair(a: SocketAddress, b: SocketAddress) -> (SocketAddress, SocketAddress) {
@@ -300,12 +351,7 @@ impl Simulation {
         local: SocketAddress,
         remote: SocketAddress,
     ) -> io::Result<()> {
-        let Some(h) = fd.as_sim() else {
-            return Err(errno(libc::EXDEV));
-        };
-        if !Rc::ptr_eq(&self.0, &h.sim.0) {
-            return Err(errno(libc::EXDEV));
-        }
+        let h = self.handle(fd)?;
         let mut w = self.0.borrow_mut();
         let Some(Resource::Socket {
             peer,
@@ -374,12 +420,7 @@ impl Simulation {
     /// Disconnect an established stream even while production owns both handles.
     /// Already received bytes remain readable, then reads return EOF.
     pub fn disconnect(&self, descriptor: &Descriptor) -> io::Result<()> {
-        let Some(handle) = descriptor.as_sim() else {
-            return Err(errno(libc::EXDEV));
-        };
-        if !Rc::ptr_eq(&self.0, &handle.sim.0) {
-            return Err(errno(libc::EXDEV));
-        }
+        let handle = self.handle(descriptor)?;
         let mut w = self.0.borrow_mut();
         let Some(Resource::Socket { peer, .. }) = w.resources.get_mut(&handle.id) else {
             return Err(errno(libc::ENOTSOCK));
@@ -425,6 +466,7 @@ impl Simulation {
 }
 
 impl Default for Simulation {
+    /// Create an isolated world with a durable root directory.
     fn default() -> Self {
         Self::new()
     }
@@ -440,41 +482,54 @@ impl Handle {
 pub(super) enum Op {
     Buffer {
         fd: Rc<Descriptor>,
+
         operation: BufferOperation,
+
         ptr: *mut u8,
+
         len: usize,
     },
     Poll {
         fd: Rc<Descriptor>,
+
         interest: u32,
     },
     Accept(Rc<Descriptor>),
     Connect {
         fd: Rc<Descriptor>,
+
         address: SocketAddress,
     },
     Open {
         dir: Option<Rc<Descriptor>>,
+
         path: CString,
+
         flags: i32,
+
         resolve: u64,
     },
     Stat {
         fd: Rc<Descriptor>,
+
         ptr: *mut libc::statx,
     },
     Sync(Rc<Descriptor>),
     Mkdir {
         dir: Rc<Descriptor>,
+
         name: CString,
     },
     Rename {
         dir: Rc<Descriptor>,
+
         from: CString,
+
         to: CString,
     },
     Unlink {
         dir: Rc<Descriptor>,
+
         name: CString,
     },
 }
@@ -482,18 +537,26 @@ pub(super) enum Op {
 /// Executes submissions in identifier order and emits independent cancel fences.
 pub(super) struct Driver {
     sim: Simulation,
+
     pending: RefCell<BTreeMap<u64, Pending>>,
+
     completed: RefCell<VecDeque<(u64, KernelResult)>>,
 }
 
 /// Scheduling state retained until an operation's original completion is emitted.
 struct Pending {
     op: Op,
+
     delay: usize,
+
     limit: usize,
+
     error: Option<i32>,
+
     hold: usize,
+
     result: Option<KernelResult>,
+
     disk_crash: Rc<disk::PendingCrash>,
 }
 
@@ -862,7 +925,82 @@ mod tests {
             .unwrap()
     }
 
+    /// Consume synchronous transfer faults once without stealing driver-selected faults.
     #[test]
+    fn transfer_fault_policy_preserves_matching_order_and_execution_ownership() {
+        let sim = Simulation::new();
+        sim.inject("write", Fault::Short(3)).unwrap();
+        sim.inject("recv", Fault::Errno(libc::EINTR)).unwrap();
+        sim.inject("*", Fault::Short(0)).unwrap();
+        {
+            let mut world = sim.0.borrow_mut();
+            world.executing = true;
+            assert_eq!(world.transfer_limit("recv").unwrap(), usize::MAX);
+            assert_eq!(world.faults.len(), 3);
+            world.executing = false;
+            assert_eq!(code(world.transfer_limit("recv")), libc::EINTR);
+            assert_eq!(world.transfer_limit("send").unwrap(), 0);
+            assert_eq!(world.transfer_limit("write").unwrap(), 3);
+            assert_eq!(world.transfer_limit("read").unwrap(), usize::MAX);
+        }
+        for fault in [Fault::Delay(2), Fault::HoldCompletion(2)] {
+            sim.inject("read", fault).unwrap();
+            assert_eq!(
+                sim.0.borrow_mut().transfer_limit("read").unwrap(),
+                usize::MAX
+            );
+            assert!(sim.0.borrow().faults.is_empty());
+        }
+        let faults: Vec<_> = sim
+            .take_trace()
+            .into_iter()
+            .filter(|event| event.operation.starts_with("fault:"))
+            .map(|event| (event.operation, event.result))
+            .collect();
+        assert_eq!(
+            faults,
+            [
+                ("fault:recv".into(), -i64::from(libc::EINTR)),
+                ("fault:send".into(), 0),
+                ("fault:write".into(), 3),
+                ("fault:read".into(), 2),
+                ("fault:read".into(), 2),
+            ]
+        );
+    }
+
+    /// Reject foreign and host descriptors even when their numeric resource IDs collide.
+    #[test]
+    fn stream_mutation_checks_world_provenance_before_resource_lookup() {
+        let sim = Simulation::new();
+        let other = Simulation::new();
+        let (local, peer) = sim.socket_pair();
+        let (foreign, _foreign_peer) = other.socket_pair();
+        assert_eq!(local.as_sim().unwrap().id(), foreign.as_sim().unwrap().id());
+        let (host, _host_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let host = Descriptor::from(host);
+        let a = SocketAddress::Inet("127.0.0.1:101".parse().unwrap());
+        let b = SocketAddress::Inet("127.0.0.1:102".parse().unwrap());
+        for invalid in [&foreign, &host] {
+            assert_eq!(
+                code(sim.label_stream(invalid, a.clone(), b.clone())),
+                libc::EXDEV
+            );
+            assert_eq!(code(sim.disconnect(invalid)), libc::EXDEV);
+        }
+        sim.label_stream(&local, a.clone(), b.clone()).unwrap();
+        sim.partition(a.clone(), b.clone());
+        assert_eq!(code(local.try_send(b"x")), libc::EAGAIN);
+        sim.heal(a, b);
+        assert_eq!(local.try_send(b"x").unwrap(), 1);
+        sim.disconnect(&local).unwrap();
+        assert_eq!(peer.try_recv(&mut [0; 1]).unwrap(), 1);
+        assert_eq!(peer.try_recv(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(code(local.try_send(b"x")), libc::EPIPE);
+    }
+
+    #[test]
+    /// Exercise short sparse I/O, append, locks, bounds, and invalid fault inputs.
     fn short_files_zero_writes_append_locks_and_bounds() {
         let sim = Simulation::new();
         let file = sim
@@ -915,6 +1053,7 @@ mod tests {
     }
 
     #[test]
+    /// Enforce supported resolver boundaries and nonrecursive mkdir semantics.
     fn resolver_policies_and_single_component_mkdir() {
         let sim = Simulation::new();
         sim.write_file(Path::new("/root/child/f"), b"x").unwrap();
@@ -969,6 +1108,7 @@ mod tests {
     }
 
     #[test]
+    /// Attribute pending alias opens to their resolved disk rather than the alias path.
     fn delayed_alias_open_is_invalidated_by_target_disk_not_alias_disk() {
         for crash_root in ["/storage", "/alias"] {
             let sim = Simulation::new();
@@ -1000,6 +1140,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserve socket families, half-close semantics, and renamed Unix listeners.
     fn socket_families_half_close_and_renamed_listener_descendants() {
         let sim = Simulation::new();
         let address = SocketAddress::Inet("127.0.0.1:8080".parse().unwrap());
@@ -1041,6 +1182,7 @@ mod tests {
     }
 
     #[test]
+    /// Check pipe close errors, small-write atomicity, and empty splice behavior.
     fn pipe_close_atomicity_and_empty_splice() {
         let sim = Simulation::new();
         let (read, write) = sim.pipe(4096);
@@ -1066,6 +1208,7 @@ mod tests {
     }
 
     #[test]
+    /// Exercise rejected publication, explicit completion reordering, and bounded traces.
     fn scheduling_hooks_reject_sq_and_reorder_arbitrary_completions() {
         let sim = Simulation::new();
         let mut driver = Driver::new(sim.clone());
@@ -1110,6 +1253,7 @@ mod tests {
     }
 
     #[test]
+    /// Compare sparse writes, append, locks, and pipe EOF directly against Linux.
     fn linux_file_and_pipe_differential() {
         let raw = unsafe { libc::memfd_create(c"sim-differential".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(raw >= 0);
@@ -1194,6 +1338,7 @@ mod tests {
     }
 
     #[test]
+    /// Compare openat2 traversal policy errors against host syscalls.
     fn linux_openat2_policy_differential() {
         let directory = std::fs::File::open(".").unwrap();
         let sim = Simulation::new();
@@ -1205,7 +1350,9 @@ mod tests {
         #[repr(C)]
         struct How {
             flags: u64,
+
             mode: u64,
+
             resolve: u64,
         }
         for (name, policy) in [
@@ -1249,6 +1396,7 @@ mod tests {
     }
 
     #[test]
+    /// Compare stream half-close bytes and readiness directly against Linux.
     fn linux_socket_half_close_differential() {
         use std::io::{Read, Write};
         let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1287,6 +1435,7 @@ mod tests {
     }
 
     #[test]
+    /// Keep crash watches bounded and reclaim unreachable durable images.
     fn repeated_crashes_compact_history_and_reclaim_orphan_images() {
         let sim = Simulation::new();
         let affected = sim.0.borrow_mut().disk.watch(vec!["/unused/file".into()]);
@@ -1309,6 +1458,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserve unrelated pending disk operations across repeated subtree crashes.
     fn pending_reactor_operations_survive_unrelated_crashes_past_old_history_limit() {
         let sim = Simulation::new();
         let _environment = sim.enter();
@@ -1379,12 +1529,14 @@ mod tests {
         }
     }
     impl Drop for Directory {
+        /// Remove the host differential fixture even when assertions unwind.
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
     }
 
     #[test]
+    /// Compare final symlink and O_PATH behavior across supported open policies.
     fn linux_final_symlink_and_path_descriptor_differential() {
         let directory = Directory::new();
         std::fs::create_dir(directory.0.join("real")).unwrap();
@@ -1407,7 +1559,9 @@ mod tests {
         #[repr(C)]
         struct How {
             flags: u64,
+
             mode: u64,
+
             resolve: u64,
         }
         for path in [
@@ -1502,6 +1656,7 @@ mod tests {
     }
 
     #[test]
+    /// Allow metadata but reject data I/O and sync through actual O_PATH submissions.
     fn actual_reactor_path_descriptors_stat_but_reject_io() {
         let sim = Simulation::new();
         let _environment = sim.enter();
@@ -1573,6 +1728,7 @@ mod tests {
     }
 
     #[test]
+    /// Compare regular-file readiness across host poll, io_uring, and simulation.
     fn regular_file_readiness_matches_linux_poll_and_uring() {
         let Some(host) = crate::reactor::tests::kernel_reactor(8) else {
             return;
@@ -1617,6 +1773,7 @@ mod tests {
     }
 
     #[test]
+    /// Exhaust shutdown direction, fullness, endpoint, and readiness-interest combinations.
     fn linux_shutdown_matrix_and_outstanding_reactor_polls() {
         let all = libc::POLLIN | libc::POLLOUT | libc::POLLRDHUP;
         for full in [false, true] {
@@ -1725,6 +1882,7 @@ mod tests {
     }
 
     #[test]
+    /// Exhaust all two-operation CQE interleavings while observing retained owners.
     fn actual_reactor_arbitrary_completion_permutations_keep_both_fences() {
         use crate::reactor::tests::fixtures::ResourceClass;
         // Exhaust all 4! interleavings of two original/cancel pairs.
@@ -1806,6 +1964,7 @@ mod tests {
     }
 
     #[test]
+    /// Retire the driver's borrowed receive pointer before an injected original CQE.
     fn actual_reactor_injected_completion_retires_borrowed_pointer() {
         let sim = Simulation::new();
         let _environment = sim.enter();
@@ -1843,6 +2002,7 @@ mod tests {
     }
 
     #[test]
+    /// Reject invalid simulation bounds and fault plans without partial mutation.
     fn bounded_simulation_setters_validate_atomically() {
         let sim = Simulation::new();
         sim.set_stream_capacity(MAX_ALLOCATION).unwrap();
@@ -1904,6 +2064,7 @@ mod tests {
     }
 
     #[test]
+    /// Reject invalid Unix names without creating disk entries or submissions.
     fn unix_address_restrictions_match_shared_encoder_without_disk_side_effects() {
         use std::os::unix::ffi::OsStrExt;
         let sim = Simulation::new();
