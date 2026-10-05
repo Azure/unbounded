@@ -1,4 +1,8 @@
 //! Socket-level transport contracts exercised through the public client API.
+//!
+//! This cohesive integration suite intentionally stays below 1000 lines. Its
+//! loopback fixtures are shared with private library tests rather than duplicated
+//! or exposed through the production API merely to meet a file-size target.
 
 use std::{
     io::{Read, Write},
@@ -9,6 +13,7 @@ use std::{
 use wire_codec::rest::{Error as RestError, Method, Operation, Transport};
 
 #[path = "support/mod.rs"]
+/// Loopback I/O, identities, and join-on-drop servers shared with private tests.
 mod testing;
 
 use testing::{Error, RotationServer, TestTransport as _, WeeklyCertificates, rotation_request};
@@ -17,8 +22,10 @@ use testing::{FixtureIo, TestIdentity};
 /// Concrete transport used by loopback fixtures.
 type ControlTransport = Transport<FixtureIo>;
 
+/// Full-publication path used by fixture requests.
 const SNAPSHOT_PATH: &str = "/snapshot";
 
+/// Enrollment path used by bootstrap fixture requests.
 const BOOTSTRAP_PATH: &str = "/enroll";
 
 /// Bootstrap and mutual authentication both deliver bounded chunked JSON.
