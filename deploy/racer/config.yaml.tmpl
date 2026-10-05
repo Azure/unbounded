@@ -8,7 +8,7 @@ metadata:
 data:
   # Supply one permanent UUID before deployment. Empty fails configuration validation.
   RACER_CLUSTER_ID: {{ .ClusterID | default "" | quote }}
-  # Workload wiring is consumed by the operator's WorkloadConfig, not the controller.
+  # Workload wiring is consumed by the operator's workload.Config, not the controller.
   RACER_DATAPLANE_IMAGE: {{ .DataplaneImage | default "ghcr.io/azure/racer-dataplane:latest" | quote }}
   RACER_CONTROL_URL: {{ .ControlURL | default (printf "https://racer-controller.%s.svc:8443" (.Namespace | default "unbounded-system")) | quote }}
   RACER_CONTROL_ADDRESS: ":8443"

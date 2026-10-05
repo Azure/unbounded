@@ -35,6 +35,7 @@ import (
 	racercomponent "github.com/Azure/unbounded/internal/operator/components/racer"
 	"github.com/Azure/unbounded/internal/operator/override"
 	racercore "github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 // Real API/SSA and production generic reconciliation, with explicit controller
@@ -187,7 +188,7 @@ overrides:
 
 	const (
 		hostName = "racer-dataplane"
-		podName  = racercore.PodNetworkDaemonSetName
+		podName  = workload.PodNetworkDaemonSetName
 	)
 
 	ack := func(name string) {

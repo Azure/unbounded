@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 func TestMixedNetworkConfiguration(t *testing.T) {
@@ -28,36 +29,36 @@ func TestMixedNetworkConfiguration(t *testing.T) {
 
 	for _, input := range []string{`[]`, `["node-b","node-a"]`} {
 		values["RACER_POD_NETWORK_NODES"] = input
-		_, err := WorkloadConfigFromLookup(lookup)
+		_, err := workload.ConfigFromLookup(lookup)
 		require.NoError(t, err)
 	}
 
 	for _, input := range []string{"", "null", `{}`, `"node-a"`, `[1]`, `[null]`, `[""]`, `["Node-A"]`, `["node-a","node-a"]`, `["node-a"] trailing`} {
 		values["RACER_POD_NETWORK_NODES"] = input
-		_, err := WorkloadConfigFromLookup(lookup)
+		_, err := workload.ConfigFromLookup(lookup)
 		require.ErrorIs(t, err, wire.InvalidRequest, input)
 	}
 
 	values["RACER_POD_NETWORK_NODES"] = `["node-a"]`
 	values["RACER_HOST_NETWORK"] = "false"
-	_, err := WorkloadConfigFromLookup(lookup)
+	_, err := workload.ConfigFromLookup(lookup)
 	require.ErrorIs(t, err, wire.InvalidRequest)
 }
 
 func TestMixedNetworkBuilders(t *testing.T) {
 	cfg := workloadConfig(t)
-	legacy, err := DesiredDaemonSet(cfg)
+	legacy, err := workload.DesiredDaemonSet(cfg)
 	require.NoError(t, err)
-	sets, err := DesiredDaemonSets(cfg)
+	sets, err := workload.DesiredDaemonSets(cfg)
 	require.NoError(t, err)
 	require.Equal(t, []*appsv1.DaemonSet{legacy}, sets)
 
 	cfg.HostNetwork = true
 	cfg.PeerPort, cfg.DiagnosticsPort = 18082, 19090
 	cfg.PodNetworkNodes = []string{"node-b", "node-a"}
-	_, err = DesiredDaemonSet(cfg)
+	_, err = workload.DesiredDaemonSet(cfg)
 	require.ErrorIs(t, err, wire.InvalidRequest, "legacy planner must fail closed")
-	sets, err = DesiredDaemonSets(cfg)
+	sets, err = workload.DesiredDaemonSets(cfg)
 	require.NoError(t, err)
 	require.Len(t, sets, 2)
 	host, pod := sets[0], sets[1]

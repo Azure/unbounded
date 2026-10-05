@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 func TestTerminalPodsCannotReplaceEndpoints(t *testing.T) {
@@ -83,7 +84,7 @@ func TestWorkloadNameLabelBounds(t *testing.T) {
 			cfg.DaemonSetName = name
 			valid := len(validation.IsDNS1123Subdomain(name)) == 0 && len(validation.IsValidLabelValue(name)) == 0
 
-			ds, err := DesiredDaemonSet(cfg)
+			ds, err := workload.DesiredDaemonSet(cfg)
 			if !valid {
 				if !errors.Is(err, wire.InvalidRequest) || ds != nil {
 					t.Fatalf("invalid name accepted: %v", err)
@@ -103,7 +104,7 @@ func TestWorkloadNameLabelBounds(t *testing.T) {
 	cfg.BootstrapTrustConfigMap = strings.Repeat("a", 63) + ".trust"
 
 	cfg.DataplaneServiceAccount = strings.Repeat("a", 63) + ".account"
-	if _, err := DesiredDaemonSet(cfg); err != nil {
+	if _, err := workload.DesiredDaemonSet(cfg); err != nil {
 		t.Fatal(err)
 	}
 }

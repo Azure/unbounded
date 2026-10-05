@@ -18,7 +18,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/override"
-	racercore "github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 func strategyPlan(t *testing.T, env *component.Env) *component.Plan {
@@ -101,7 +101,7 @@ func TestDaemonSetOnDeleteOverride(t *testing.T) {
 		report := override.Apply(plan, entries, nil)
 		require.NoError(t, report.Err())
 		require.Len(t, report.Workloads, 1)
-		require.Equal(t, racercore.PodNetworkDaemonSetName, report.Workloads[0].Ref.Name)
+		require.Equal(t, workload.PodNetworkDaemonSetName, report.Workloads[0].Ref.Name)
 		require.Equal(t, host, plan.Operations[0].Object)
 		strategy, _, err := unstructured.NestedMap(plan.Operations[1].Object.Object, "spec", "updateStrategy")
 		require.NoError(t, err)

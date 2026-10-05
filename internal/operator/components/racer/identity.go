@@ -17,8 +17,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/operator/component"
-	racercore "github.com/Azure/unbounded/internal/racer"
 	"github.com/Azure/unbounded/internal/racer/wire"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 const (
@@ -151,7 +151,7 @@ func checkInstallationResources(ctx context.Context, env *component.Env, stagedM
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: controllerName}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: controllerName}},
 		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane"}},
-		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: racercore.PodNetworkDaemonSetName}},
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: workload.PodNetworkDaemonSetName}},
 	}
 	for _, obj := range objects {
 		if stagedMarker && obj.GetName() == markerName {

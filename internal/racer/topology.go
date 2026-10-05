@@ -268,19 +268,6 @@ func singleton(_ context.Context, _ client.Object) []reconcile.Request {
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: "racer"}}}
 }
 
-const (
-	DataplaneDaemonSetName  = "racer-dataplane"
-	PodNetworkDaemonSetName = "racer-dataplane-podnet"
-)
-
-func managedWorkloadNames(cfg Config) []string {
-	if cfg.DaemonSetName == DataplaneDaemonSetName {
-		return []string{DataplaneDaemonSetName, PodNetworkDaemonSetName}
-	}
-
-	return []string{cfg.DaemonSetName}
-}
-
 // DataplaneWorkloadIdentities is a bounded snapshot of live workload identities.
 // Refresh it for each authorization or topology pass; labels are not ownership.
 type DataplaneWorkloadIdentities struct {

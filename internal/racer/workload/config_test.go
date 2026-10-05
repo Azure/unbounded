@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package workload
 
 import (
 	"errors"
@@ -13,12 +13,12 @@ import (
 )
 
 func TestWorkloadConfigIdentityAndNames(t *testing.T) {
-	for name, mutate := range map[string]func(*WorkloadConfig){
-		"cluster":           func(c *WorkloadConfig) { c.Cluster = "invalid" },
-		"missing cluster":   func(c *WorkloadConfig) { c.Cluster = "" },
-		"namespace":         func(c *WorkloadConfig) { c.Namespace = "invalid.namespace" },
-		"missing namespace": func(c *WorkloadConfig) { c.Namespace = "" },
-		"zero port":         func(c *WorkloadConfig) { c.PeerPort = 0 },
+	for name, mutate := range map[string]func(*Config){
+		"cluster":           func(c *Config) { c.Cluster = "invalid" },
+		"missing cluster":   func(c *Config) { c.Cluster = "" },
+		"namespace":         func(c *Config) { c.Namespace = "invalid.namespace" },
+		"missing namespace": func(c *Config) { c.Namespace = "" },
+		"zero port":         func(c *Config) { c.PeerPort = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := workloadConfig(t)
@@ -55,18 +55,13 @@ func TestWorkloadConfigLookupDefaultsAndOverrides(t *testing.T) {
 	}
 	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 
-	cfg, err := WorkloadConfigFromLookup(lookup)
+	cfg, err := ConfigFromLookup(lookup)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	runtime, err := ConfigFromLookup(lookup)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if cfg.Namespace != runtime.Namespace || cfg.PeerPort != runtime.PeerPort || cfg.DaemonSetName != runtime.DaemonSetName || cfg.DataplaneServiceAccount != runtime.DataplaneServiceAccount || cfg.BootstrapTrustConfigMap != "racer-bootstrap-trust" {
-		t.Fatalf("workload defaults disagree with runtime: %+v", cfg)
+	if cfg.Namespace != "unbounded-system" || cfg.PeerPort != 8082 || cfg.DaemonSetName != "racer-dataplane" || cfg.DataplaneServiceAccount != "racer-dataplane" || cfg.BootstrapTrustConfigMap != "racer-bootstrap-trust" {
+		t.Fatalf("unexpected workload defaults: %+v", cfg)
 	}
 
 	for key, value := range map[string]string{
@@ -81,9 +76,9 @@ func TestWorkloadConfigLookupDefaultsAndOverrides(t *testing.T) {
 		t.Setenv(key, "invalid-process-value")
 	}
 
-	cfg, err = WorkloadConfigFromLookup(lookup)
+	cfg, err = ConfigFromLookup(lookup)
 
-	want := WorkloadConfig{
+	want := Config{
 		Cluster: "11111111-1111-1111-1111-111111111111", Namespace: "custom", PeerPort: 65535,
 		ControlURL: "https://controller:8443", DataplaneImage: "racer:test", DaemonSetName: "custom.dataplane",
 		DataplaneServiceAccount: "custom.account", BootstrapTrustConfigMap: "custom.trust",
@@ -101,7 +96,7 @@ func TestWorkloadConfigLookupDefaultsAndOverrides(t *testing.T) {
 				continue
 			}
 
-			if _, err := WorkloadConfigFromLookup(lookup); !errors.Is(err, wire.InvalidRequest) {
+			if _, err := ConfigFromLookup(lookup); !errors.Is(err, wire.InvalidRequest) {
 				t.Fatalf("%s=%q accepted: %v", key, invalid, err)
 			}
 		}
@@ -111,7 +106,7 @@ func TestWorkloadConfigLookupDefaultsAndOverrides(t *testing.T) {
 
 	for _, port := range []string{"0", "65536", "-1"} {
 		values["RACER_PEER_PORT"] = port
-		if _, err := WorkloadConfigFromLookup(lookup); !errors.Is(err, wire.InvalidRequest) {
+		if _, err := ConfigFromLookup(lookup); !errors.Is(err, wire.InvalidRequest) {
 			t.Fatalf("port %q accepted: %v", port, err)
 		}
 	}
@@ -124,7 +119,7 @@ func TestWorkloadConfigIgnoresControllerRuntime(t *testing.T) {
 		"RACER_CONTROL_URL": want.ControlURL, "RACER_DATAPLANE_IMAGE": want.DataplaneImage,
 	}
 
-	cfg, err := WorkloadConfigFromLookup(func(key string) (string, bool) {
+	cfg, err := ConfigFromLookup(func(key string) (string, bool) {
 		if value, ok := values[key]; ok {
 			return value, true
 		}
@@ -154,7 +149,7 @@ func TestWorkloadIgnoresLegacyKeyringSecret(t *testing.T) {
 		"RACER_CREDENTIALS_SECRET_NAME": "../obsolete",
 	}
 
-	cfg, err := WorkloadConfigFromLookup(func(key string) (string, bool) {
+	cfg, err := ConfigFromLookup(func(key string) (string, bool) {
 		value, ok := values[key]
 		return value, ok
 	})
@@ -183,7 +178,7 @@ func TestWorkloadNetworkPortBounds(t *testing.T) {
 	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 
 	for range 2 {
-		cfg, err := WorkloadConfigFromLookup(lookup)
+		cfg, err := ConfigFromLookup(lookup)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package workload
 
 import (
 	"encoding/json"
@@ -21,9 +21,9 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-// WorkloadConfig contains only the inputs needed to build the dataplane DaemonSet.
+// Config contains only the inputs needed to build the dataplane DaemonSet.
 // Controller limits, rotation policy, serving TLS, and durable state are independent.
-type WorkloadConfig struct {
+type Config struct {
 	Cluster                 wire.ClusterID
 	Namespace               string
 	ControlURL              string
@@ -38,9 +38,9 @@ type WorkloadConfig struct {
 	DaemonSetName           string
 }
 
-// WorkloadConfigFromLookup reads operator deployment wiring without loading or
+// ConfigFromLookup reads operator deployment wiring without loading or
 // validating controller runtime configuration. Shared settings retain the same defaults.
-func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfig, error) {
+func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 	env := func(key, fallback string) string {
 		if value, ok := lookup(key); ok {
 			return value
@@ -51,30 +51,30 @@ func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfi
 
 	port, err := strconv.ParseUint(env("RACER_PEER_PORT", "8082"), 10, 16)
 	if err != nil {
-		return WorkloadConfig{}, fmt.Errorf("RACER_PEER_PORT: %w", wire.InvalidRequest)
+		return Config{}, fmt.Errorf("RACER_PEER_PORT: %w", wire.InvalidRequest)
 	}
 
 	hostNetwork := env("RACER_HOST_NETWORK", "false")
 	if hostNetwork != "true" && hostNetwork != "false" {
-		return WorkloadConfig{}, fmt.Errorf("RACER_HOST_NETWORK must be true or false: %w", wire.InvalidRequest)
+		return Config{}, fmt.Errorf("RACER_HOST_NETWORK must be true or false: %w", wire.InvalidRequest)
 	}
 
 	var diagnosticsPort uint64
 	if value, ok := lookup("RACER_DIAGNOSTICS_PORT"); ok {
 		diagnosticsPort, err = strconv.ParseUint(value, 10, 16)
 		if err != nil || diagnosticsPort < 1024 {
-			return WorkloadConfig{}, fmt.Errorf("RACER_DIAGNOSTICS_PORT must be 1024..65535: %w", wire.InvalidRequest)
+			return Config{}, fmt.Errorf("RACER_DIAGNOSTICS_PORT must be 1024..65535: %w", wire.InvalidRequest)
 		}
 	}
 
 	var podNetworkNodes []string
 	if value, ok := lookup("RACER_POD_NETWORK_NODES"); ok {
 		if err := json.Unmarshal([]byte(value), &podNetworkNodes); err != nil || podNetworkNodes == nil {
-			return WorkloadConfig{}, fmt.Errorf("RACER_POD_NETWORK_NODES must be a JSON array: %w", wire.InvalidRequest)
+			return Config{}, fmt.Errorf("RACER_POD_NETWORK_NODES must be a JSON array: %w", wire.InvalidRequest)
 		}
 	}
 
-	cfg := WorkloadConfig{
+	cfg := Config{
 		Cluster:                 wire.ClusterID(env("RACER_CLUSTER_ID", "")),
 		Namespace:               env("POD_NAMESPACE", "unbounded-system"),
 		ControlURL:              env("RACER_CONTROL_URL", ""),
@@ -91,7 +91,7 @@ func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfi
 	return cfg, cfg.Validate()
 }
 
-func (c WorkloadConfig) Validate() error {
+func (c Config) Validate() error {
 	if len(c.PodNetworkNodes) != 0 && (!c.HostNetwork || c.DaemonSetName != DataplaneDaemonSetName) {
 		return fmt.Errorf("pod network exceptions require host networking and the fixed dataplane name: %w", wire.InvalidRequest)
 	}
@@ -143,7 +143,7 @@ func (c WorkloadConfig) Validate() error {
 // node-private identity and slab storage, socket mounts, and exclusion affinity.
 // It must never introduce a per-node Secret or trust a node-name as a Node UID.
 // This pure builder is consumed by the operator, never by controller startup.
-func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
+func DesiredDaemonSet(c Config) (*appsv1.DaemonSet, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
@@ -391,7 +391,7 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 // DesiredDaemonSets builds steady-state placement, not a safe migration plan.
 // The operator must additionally exclude occupied destination nodes until every
 // source Pod, including terminating Pods, has disappeared.
-func DesiredDaemonSets(c WorkloadConfig) ([]*appsv1.DaemonSet, error) {
+func DesiredDaemonSets(c Config) ([]*appsv1.DaemonSet, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}

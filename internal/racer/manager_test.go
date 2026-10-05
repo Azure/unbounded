@@ -14,6 +14,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 func TestAssemble(t *testing.T) {
@@ -66,7 +67,7 @@ func TestFailClosedEntryPoints(t *testing.T) {
 	operations := map[string]func() error{
 		"topology": func() error { _, err := a.Topology.Reconcile(ctx, ctrl.Request{}); return err },
 		"keyring":  func() error { _, err := a.Keyring.Reconcile(ctx, ctrl.Request{}); return err },
-		"workload": func() error { _, err := DesiredDaemonSet(WorkloadConfig{}); return err },
+		"workload": func() error { _, err := workload.DesiredDaemonSet(workload.Config{}); return err },
 		"server":   func() error { return a.Server.Start(ctx) },
 		"run":      func() error { return Run(ctx, Config{}) },
 	}
