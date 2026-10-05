@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/racersdk"
+	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
 func TestSDKFullReadUnpinnedMetadataValidation(t *testing.T) {
@@ -35,7 +36,7 @@ func TestSDKFullReadUnpinnedMetadataValidation(t *testing.T) {
 
 				var bootstrap, heads atomic.Int32
 
-				client, cleanup, err := racersdk.NewFakeClient(func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				client, cleanup, err := racersdktest.NewClient(func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 					if request.Operation() == racersdk.OperationHead {
 						heads.Add(1)
 					}
@@ -132,7 +133,7 @@ func TestUDSOriginProtocolReadiness(t *testing.T) {
 					callback = origin
 				}
 
-				client, cleanup, err := racersdk.NewFakeClient(callback)
+				client, cleanup, err := racersdktest.NewClient(callback)
 				if err != nil {
 					return err
 				}
@@ -229,7 +230,7 @@ func TestSDKSingleCreditFullReadContinues(t *testing.T) {
 
 	var bootstrap, pinned atomic.Int32
 
-	client, cleanup, err := racersdk.NewFakeClient(func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+	client, cleanup, err := racersdktest.NewClient(func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		switch request.Operation() {
 		case racersdk.OperationBootstrap:
 			bootstrap.Add(1)

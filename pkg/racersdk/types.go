@@ -628,9 +628,8 @@ func parseRange(s string) (Range, error) {
 	r, err := wire.ParseRange(s)
 	return fromWireRange(r), fromWireError(err)
 }
-func bootstrapRange() Range              { return fromWireRange(wire.BootstrapRange()) }
-func nominalPageEnd(first uint64) uint64 { return wire.NominalPageEnd(first) }
-func validatePageShape(r Range) error    { return fromWireError(wire.ValidatePageShape(r.wire())) }
+func bootstrapRange() Range           { return fromWireRange(wire.BootstrapRange()) }
+func validatePageShape(r Range) error { return fromWireError(wire.ValidatePageShape(r.wire())) }
 func (o ReadOptions) wire() wire.SubscriptionOptions {
 	r := wire.SubscriptionOptions{Offset: uint64(o.Offset), Length: uint64(o.Length), PageCredits: o.PageCredits, ByteCredits: uint64(o.ByteCredits), Ordered: o.Ordered, SmallObject: o.SmallObject, Pin: o.Pin.value}
 	if o.Metadata != nil {
@@ -640,8 +639,7 @@ func (o ReadOptions) wire() wire.SubscriptionOptions {
 
 	return r
 }
-func validateRequest(r OriginRequest) error      { return fromWireError(wire.ValidateRequest(r.wire())) }
-func requestHeaders(r OriginRequest) http.Header { return wire.RequestHeaders(r.wire()) }
+func validateRequest(r OriginRequest) error { return fromWireError(wire.ValidateRequest(r.wire())) }
 func requestHead(r OriginRequest) ([]byte, error) {
 	b, err := wire.RequestHead(r.wire())
 	return b, fromWireError(err)

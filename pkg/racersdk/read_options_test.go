@@ -271,7 +271,7 @@ func TestContentTypeWireAndOrigin(t *testing.T) {
 	m.ExpiresAt = m.ExpiresAt.UTC()
 	m.ContentType = "text/plain; charset=utf-8"
 
-	c, cleanup, err := NewFakeClient(func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+	c, cleanup, err := newFakeClient(t, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
 		if r.Operation() == OperationHead {
 			return m, nil, nil
 		}

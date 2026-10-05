@@ -12,7 +12,16 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk/internal/connpool"
+	"github.com/Azure/unbounded/pkg/racersdk/internal/sdkhook"
 )
+
+func init() {
+	sdkhook.NewClientAt = newClient
+	sdkhook.ServeOriginAt = serveOrigin
+	sdkhook.OriginDefaults = OriginConfig.defaults
+	sdkhook.InvalidOrigin = func() error { return failure(ErrorInvalidArgument, "fake origin", nil) }
+	sdkhook.MaxHeadBytes = maxHeadBytes
+}
 
 // ClientConfig selects a cache and bounds a Client's resources. Zero numeric
 // fields select defaults; negative values and a zero Cache are invalid.
@@ -155,7 +164,7 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	return c, nil
 }
 
-// configurePools is a construction-only hook for the fake daemon and tests.
+// configurePools initializes production pools and permits construction-only test policy overrides.
 // Call only before any checkout; pool policy is immutable once work begins.
 func (c *Client) configurePools(config connpool.Config) {
 	config.Path = c.path

@@ -23,6 +23,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/pkg/racersdk"
+	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
 func TestRacerFailureDiagnosticsRateBound(t *testing.T) {
@@ -160,7 +161,7 @@ func TestRacerFailureDiagnosticsPaths(t *testing.T) {
 				metadata.Size = 1 << 20
 			}
 
-			client, cleanup, err := racersdk.NewFakeClient(func(_ context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client, cleanup, err := racersdktest.NewClient(func(_ context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 				if req.Operation() == racersdk.OperationHead {
 					return metadata, nil, nil
 				}
@@ -265,7 +266,7 @@ func TestRacerFailureDiagnosticsPaths(t *testing.T) {
 }
 
 func TestRacerFailureDiagnosticsSDKResponse(t *testing.T) {
-	client, cleanup, err := racersdk.NewFakeClient(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+	client, cleanup, err := racersdktest.NewClient(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		return racersdk.Metadata{}, nil, racersdk.NewOriginError(racersdk.ErrorUnavailable, errors.New("secret origin URL"))
 	})
 	if err != nil {

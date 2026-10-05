@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk"
+	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
 // Deployment-only, compile-checked example: requires a provisioned Racer client
@@ -103,7 +104,7 @@ func ExampleNewFetchContext() {
 func ExampleClient_Stat() {
 	tag, _ := racersdk.ParseETag(`"v1"`)
 
-	client, cleanup, err := racersdk.NewFakeClient(func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+	client, cleanup, err := racersdktest.NewClient(func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		m := racersdk.Metadata{Size: 5, ETag: tag, ExpiresAt: time.UnixMilli(0), ContentType: "text/plain"}
 		if r.Operation() == racersdk.OperationHead {
 			return m, nil, nil

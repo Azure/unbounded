@@ -17,6 +17,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/fakeracer"
+	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
 // subscriptionHandler migrates HTTP payload fixtures to the duplex wire. The
@@ -38,10 +41,10 @@ func subscriptionHandler(handler http.Handler) http.Handler {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 
-		credits := &fakeSubscriptionCredits{outstanding: make(map[uint64]uint32), changed: make(chan struct{})}
-		go credits.releases(rw.Reader, cancel)
+		credits := fakeracer.NewCredits()
+		go credits.Releases(rw.Reader, cancel)
 
-		s, err := parseFakeSubscription(r)
+		s, err := wire.ParseSubscriptionRequest(r)
 		if err != nil {
 			return
 		}
@@ -57,8 +60,8 @@ type subscriptionFixture struct {
 	writer                              *bufio.ReadWriter
 	conn                                net.Conn
 	ctx                                 context.Context
-	credits                             *fakeSubscriptionCredits
-	request                             fakeSubscriptionRequest
+	credits                             *fakeracer.Credits
+	request                             wire.SubscriptionRequest
 	started                             bool
 	err                                 error
 	first, end, offset, frameEnd, count uint64
@@ -72,13 +75,13 @@ func (w *subscriptionFixture) SetWriteDeadline(deadline time.Time) error {
 func fixtureRange(t *testing.T, r *http.Request, size int64) (ByteOffset, ByteOffset) {
 	t.Helper()
 
-	s, err := parseFakeSubscription(r)
+	s, err := wire.ParseSubscriptionRequest(r)
 	if err != nil {
 		t.Error(err)
 		return 0, 0
 	}
 
-	return ByteOffset(s.first), ByteOffset(min(s.end, uint64(size)) - 1)
+	return ByteOffset(s.First), ByteOffset(min(s.End, uint64(size)) - 1)
 }
 
 func (w *subscriptionFixture) WriteHeader(status int) {
@@ -101,7 +104,7 @@ func (w *subscriptionFixture) WriteHeader(status int) {
 			return
 		}
 
-		w.first, w.end = w.request.first, min(size, w.request.end)
+		w.first, w.end = w.request.First, min(size, w.request.End)
 		w.offset = w.first
 
 		pages := uint64(0)
@@ -119,7 +122,7 @@ func (w *subscriptionFixture) WriteHeader(status int) {
 		status = 200
 	}
 
-	w.err = fakeSubscriptionHead(w.writer, status, w.header)
+	w.err = wire.WriteSubscriptionHead(w.writer, status, w.header)
 	if w.err == nil {
 		w.err = w.writer.Flush()
 	}
@@ -141,7 +144,7 @@ func (w *subscriptionFixture) Write(p []byte) (int, error) {
 			w.frameEnd = min(w.end, (w.offset/uint64(PageSize)+1)*uint64(PageSize))
 			length := uint32(w.frameEnd - w.offset)
 
-			w.err = w.credits.reserve(w.ctx, w.request, w.offset/uint64(PageSize), length)
+			w.err = w.credits.Reserve(w.ctx, w.request, w.offset/uint64(PageSize), length)
 			if w.err == nil {
 				w.err = fakeSubscriptionFrame(w.writer, 1, w.offset/uint64(PageSize), w.offset, length)
 			}
@@ -198,6 +201,12 @@ func subscriptionHead(size, first, end uint64) string {
 	}
 
 	return fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\nRacer-Object-Length: %d\r\nRacer-Range-Start: %d\r\nRacer-Range-End: %d\r\nConnection: close\r\n\r\n", end-first+21*(pages+1), size, first, end)
+}
+
+// fakeSubscriptionFrame encodes intentionally valid or malformed test frames
+// with the shared codec; sequence validation belongs to the client under test.
+func fakeSubscriptionFrame(w io.Writer, kind byte, page, offset uint64, length uint32) error {
+	return wire.WriteFrame(w, wire.Frame{Kind: kind, Number: page, Offset: offset, Length: length})
 }
 
 func rawSubscriptionClient(t *testing.T, serve func(net.Conn, *bufio.Reader, []byte)) *Client {
@@ -384,7 +393,7 @@ func TestPageStreamMalformedFrames(t *testing.T) {
 }
 
 func TestPageStreamPartialAndEmptyRanges(t *testing.T) {
-	c, cleanup, err := NewFakeClient(func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+	c, cleanup, err := newFakeClient(t, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
 		if r.Key()[0] == 1 {
 			return originMeta(0), nil, nil
 		}

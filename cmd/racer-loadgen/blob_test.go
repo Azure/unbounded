@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/racersdk"
+	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
 func TestBlobOptions(t *testing.T) {
@@ -114,7 +115,7 @@ func TestBlobBackendsShareOperations(t *testing.T) {
 				if backend == "uds" {
 					origin, _, err := syntheticOrigin(catalog, newMetrics(prometheus.NewRegistry()))
 					require.NoError(t, err)
-					client, cleanup, err := racersdk.NewFakeClient(origin)
+					client, cleanup, err := racersdktest.NewClient(origin)
 					require.NoError(t, err)
 					t.Cleanup(cleanup)
 
@@ -154,7 +155,7 @@ func TestSDKOriginPagesPinsAndUnknownKeys(t *testing.T) {
 	metrics := newMetrics(prometheus.NewRegistry())
 	origin, key, err := syntheticOrigin(catalog, metrics)
 	require.NoError(t, err)
-	client, cleanup, err := racersdk.NewFakeClient(origin)
+	client, cleanup, err := racersdktest.NewClient(origin)
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
@@ -207,7 +208,7 @@ func TestSDKBlobDiagnosticsAndFailure(t *testing.T) {
 	require.NoError(t, err)
 	origin, _, err := syntheticOrigin(catalog, newMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
-	client, cleanup, err := racersdk.NewFakeClient(func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+	client, cleanup, err := racersdktest.NewClient(func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		metadata, body, err := origin(ctx, request)
 		if body != nil {
 			body = corruptBlobBody{body}
@@ -384,7 +385,7 @@ func TestSDKBlobCancellationAndTimeout(t *testing.T) {
 
 			entered := make(chan struct{}, 1)
 			returned := make(chan struct{}, 1)
-			client, cleanup, err := racersdk.NewFakeClient(func(ctx context.Context, _ racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client, cleanup, err := racersdktest.NewClient(func(ctx context.Context, _ racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 				entered <- struct{}{}
 
 				<-ctx.Done()
@@ -469,7 +470,7 @@ func TestBlobTraversalAndLiveAdmission(t *testing.T) {
 
 	origin, _, err := syntheticOrigin(catalog, newMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
-	client, cleanup, err := racersdk.NewFakeClient(origin)
+	client, cleanup, err := racersdktest.NewClient(origin)
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
@@ -503,7 +504,7 @@ func TestSDKBlobNodeCapAdmission(t *testing.T) {
 	p.batches = catalog.batches
 	origin, _, err := syntheticOrigin(catalog, newMetrics(prometheus.NewRegistry()))
 	require.NoError(t, err)
-	client, cleanup, err := racersdk.NewFakeClient(origin)
+	client, cleanup, err := racersdktest.NewClient(origin)
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 

@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
 // benchmarkPeer generates bytes with fixed scratch. The SDK uses subscriptions;
@@ -76,13 +78,13 @@ func benchmarkPeer(b *testing.B, size int64, origin bool) string {
 			}
 
 			if r.Method == "POST" {
-				selected, err := parseFakeSubscription(r)
+				selected, err := wire.ParseSubscriptionRequest(r)
 				if err != nil {
 					b.Error(err)
 					return
 				}
 
-				streamResponse(w, int64(selected.first), int64(min(selected.end, uint64(size))-selected.first), size, `"v"`)
+				streamResponse(w, int64(selected.First), int64(min(selected.End, uint64(size))-selected.First), size, `"v"`)
 
 				return
 			}

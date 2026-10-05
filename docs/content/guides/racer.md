@@ -211,6 +211,13 @@ cover startup/shutdown and version/range behavior; the
 [API reference]({{< relref "reference/racer" >}}#go-sdk) covers options, classified
 errors, and opt-in owned stale-socket recovery.
 
+For local adapter tests, import `github.com/Azure/unbounded/pkg/racersdk/racersdktest`
+and call `racersdktest.NewClient(origin)`. Register its returned cleanup function
+with `t.Cleanup`; `Client.Close` alone does not stop the test servers. This helper
+uses private temporary Unix sockets and real SDK origin validation, but does not
+cache data or establish compatibility with the real Racer runtime. Use a short
+`TMPDIR` so each socket path fits the 107-byte Unix socket limit.
+
 ## 4. Verify Reads and Operate Safely
 
 Start origins before issuing reads. Read the fixture from consumers on two nodes

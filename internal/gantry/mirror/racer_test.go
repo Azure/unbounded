@@ -37,6 +37,7 @@ import (
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/pkg/racersdk"
+	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
 // Count before panicking: net/http recovers handler panics, so an accidental
@@ -89,7 +90,7 @@ func racerDigest(data []byte) digest.Digest {
 func racerFakeClient(t *testing.T, origin racersdk.Origin) *racersdk.Client {
 	t.Helper()
 
-	client, cleanup, err := racersdk.NewFakeClient(origin)
+	client, cleanup, err := racersdktest.NewClient(origin)
 	if err != nil {
 		t.Fatal(err)
 	}

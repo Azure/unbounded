@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/fakeracer"
 )
 
 // offsetStream makes wrong page offsets observable without allocating an object.
@@ -62,13 +64,7 @@ func pageForwarder(t *testing.T, path string, size int64) http.Handler {
 	transport := unixTransport(path)
 	t.Cleanup(transport.CloseIdleConnections)
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			serveFakeSubscription(w, r, transport)
-		} else {
-			serveFakeHead(w, r, transport)
-		}
-	})
+	return fakeracer.NewHandler(transport)
 }
 
 // originClient exercises the real Unix origin through the subscription fake.

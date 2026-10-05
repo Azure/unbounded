@@ -24,6 +24,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/origin"
 	gantryracer "github.com/Azure/unbounded/internal/gantry/racer"
 	"github.com/Azure/unbounded/pkg/racersdk"
+	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
 func TestGantryIntegration(t *testing.T) {
@@ -85,7 +86,7 @@ func TestGantryIntegration(t *testing.T) {
 
 	var callbacks atomic.Int64
 
-	client, cleanup, err := racersdk.NewFakeClient(func(ctx context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+	client, cleanup, err := racersdktest.NewClient(func(ctx context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		callbacks.Add(1)
 
 		metadata, body, err := callback(ctx, req)
@@ -285,7 +286,7 @@ func TestGantryGenericBlobs(t *testing.T) {
 	cfg := &config.Config{RacerEnabled: true, UpstreamRegistries: []config.UpstreamRegistry{{Name: "loadgen.invalid", Endpoint: upstreamServer.URL}}}
 	upstream, err := origin.New(cfg)
 	require.NoError(t, err)
-	client, cleanup, err := racersdk.NewFakeClient(gantryracer.Origin(cfg, upstream))
+	client, cleanup, err := racersdktest.NewClient(gantryracer.Origin(cfg, upstream))
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 

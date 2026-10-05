@@ -345,7 +345,7 @@ Import `github.com/Azure/unbounded/pkg/racersdk`; the SDK does not provision cac
 | `NewFetchContext` | Combine parsed adapter metadata and upstream authorization for `Request.Context` |
 | `ServeOrigin(ctx, OriginConfig, Origin)` | Serve the application's origin callback until cancellation or listener failure |
 | `NewOriginError` | Return a classified origin failure without exposing upstream details in diagnostics |
-| `NewFakeClient(Origin)` | Noncaching local test helper; always call its returned cleanup function, not just `Client.Close` |
+| `racersdktest.NewClient(Origin)` | Noncaching local test helper; import `github.com/Azure/unbounded/pkg/racersdk/racersdktest` and always call its returned cleanup function, not just `Client.Close` |
 
 `ReadOptions.Offset` and `Length` select bytes; zero length means through EOF. Overlong
 ranges are rejected, not truncated. Sizes/offsets must fit signed 64-bit wire values.

@@ -20,6 +20,23 @@ import (
 	"time"
 )
 
+// Root white-box tests use the daemon directly, without importing racersdktest
+// (which would cycle back to this package under test).
+func newFakeClient(t *testing.T, origin Origin) (*Client, func(), error) {
+	t.Helper()
+
+	if origin == nil {
+		return nil, nil, failure(ErrorInvalidArgument, "fake origin", nil)
+	}
+
+	path, cancel, done := startOrigin(t, OriginConfig{}, origin)
+	c := originClient(t, path, 64)
+
+	var once sync.Once
+
+	return c, func() { once.Do(func() { closeBody(c); cancel(); <-done }) }, nil
+}
+
 func TestFakeClientPages(t *testing.T) {
 	for _, size := range []ByteLength{0, 1, PageSize, PageSize + 13, 3*PageSize + 13} {
 		t.Run(strconv.FormatUint(uint64(size), 10), func(t *testing.T) {
@@ -33,7 +50,7 @@ func TestFakeClientPages(t *testing.T) {
 				authorization: Authorization{value: "Scheme opaque,credential\x80"},
 			}}
 
-			client, cleanup, err := NewFakeClient(func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+			client, cleanup, err := newFakeClient(t, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
 				call := calls.Add(1)
 
 				if r.Key() != request.Key || r.Context() != request.Context {
@@ -105,321 +122,6 @@ func TestFakeClientPages(t *testing.T) {
 		})
 	}
 }
-
-func TestFakeClientOriginValidation(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		size ByteLength
-		data string
-		kind ErrorKind
-	}{
-		{name: "short", size: 3, data: "ab", kind: ErrorIO},
-		{name: "long", size: 1, data: "ab", kind: ErrorIO},
-		{name: "empty excess", data: "x", kind: ErrorBadGateway},
-		{name: "invalid metadata", kind: ErrorBadGateway},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			body := &ownedReader{Reader: strings.NewReader(test.data)}
-
-			client, cleanup, err := NewFakeClient(func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
-				m := originMeta(test.size)
-				if test.name == "invalid metadata" {
-					m.ETag = ETag{}
-				}
-
-				return m, body, nil
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
-
-			v, err := client.Get(context.Background(), Request{})
-			if err == nil {
-				_, err = io.Copy(io.Discard, v)
-				closeBody(v)
-			}
-
-			assertKind(t, err, test.kind)
-			waitClosed(t, body)
-
-			if body.closed.Load() != 1 {
-				t.Fatal("origin body not closed exactly once")
-			}
-		})
-	}
-}
-
-func TestFakeClientErrors(t *testing.T) {
-	client, cleanup, err := NewFakeClient(nil)
-	assertKind(t, err, ErrorInvalidArgument)
-
-	if client != nil || cleanup != nil {
-		t.Fatal("invalid construction returned resources")
-	}
-
-	for _, kind := range []ErrorKind{ErrorUnauthorized, ErrorForbidden, ErrorNotFound, ErrorVersionUnavailable, ErrorUnavailable, ErrorInternal} {
-		t.Run(kind.String(), func(t *testing.T) {
-			body := &ownedReader{Reader: strings.NewReader("")}
-
-			client, cleanup, err := NewFakeClient(func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
-				return Metadata{}, body, NewOriginError(kind, nil)
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
-
-			_, err = client.Get(context.Background(), Request{})
-			assertKind(t, err, kind)
-			waitClosed(t, body)
-
-			if body.closed.Load() != 1 {
-				t.Fatal("error body leaked")
-			}
-		})
-	}
-}
-
-func TestFakeClientContinuationErrors(t *testing.T) {
-	for _, failPage := range []int32{1, 2} {
-		t.Run(strconv.Itoa(int(failPage)), func(t *testing.T) {
-			client, cleanup, err := NewFakeClient(func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
-				// Concurrent continuations may arrive out of order. Fail the
-				// selected page, not whichever request the server schedules first.
-				requested, _ := r.Range()
-
-				first, _, err := requested.Resolve(3 * PageSize)
-				if err != nil {
-					return Metadata{}, nil, err
-				}
-
-				if uint64(first)/uint64(PageSize) == uint64(failPage) {
-					return Metadata{}, nil, NewOriginError(ErrorNotFound, nil)
-				}
-
-				return originMeta(3 * PageSize), io.NopCloser(io.LimitReader(repeatedByte('x'), int64(PageSize))), nil
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
-
-			v, err := client.Get(context.Background(), Request{})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			n, err := io.Copy(io.Discard, v)
-			if n != int64(failPage)*int64(PageSize) {
-				t.Fatal("incorrect partial byte count", n)
-			}
-
-			if !errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Fatal("late multipage failure must truncate the committed frame", err)
-			}
-		})
-	}
-}
-
-func TestFakeClientCancellationAndCleanup(t *testing.T) {
-	for _, action := range []string{"context", "value", "client", "cleanup"} {
-		t.Run(action, func(t *testing.T) {
-			body := &blockedBody{done: make(chan struct{}), first: true}
-
-			client, cleanup, err := NewFakeClient(func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
-				return originMeta(1), body, nil
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			v, err := client.Get(ctx, Request{})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			result := make(chan error, 1)
-
-			go func() { _, err := v.Read(make([]byte, 1)); result <- err }()
-
-			switch action {
-			case "context":
-				cancel()
-			case "value":
-				closeBody(v)
-			case "client":
-				closeBody(client)
-			case "cleanup":
-				var wg sync.WaitGroup
-				for range 4 {
-					wg.Go(cleanup)
-				}
-
-				wg.Wait()
-			}
-
-			select {
-			case err := <-result:
-				if action == "context" {
-					if !errors.Is(err, context.Canceled) {
-						t.Fatal(err)
-					}
-				} else {
-					assertKind(t, err, ErrorClosed)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("read did not stop")
-			}
-
-			select {
-			case <-body.done:
-			case <-time.After(5 * time.Second):
-				t.Fatal("origin body retained after cancellation")
-			}
-
-			cleanup()
-
-			_, err = client.Get(context.Background(), Request{})
-			assertKind(t, err, ErrorClosed)
-
-			if body.closed.Load() != 1 {
-				t.Fatal("body close count", body.closed.Load())
-			}
-		})
-	}
-}
-
-func TestFakeClientPendingCallbackCleanup(t *testing.T) {
-	entered, release, closed := make(chan struct{}), make(chan struct{}), make(chan struct{})
-
-	client, cleanup, err := NewFakeClient(func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
-		close(entered)
-		<-ctx.Done()
-		<-release
-
-		return originMeta(0), &fakeLateBody{closed: closed}, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(cleanup)
-
-	result := make(chan error, 1)
-
-	go func() { _, err := client.Get(context.Background(), Request{}); result <- err }()
-
-	<-entered
-	cleanup()
-	close(release)
-
-	select {
-	case err := <-result:
-		assertKind(t, err, ErrorClosed)
-	case <-time.After(5 * time.Second):
-		t.Fatal("pending Get retained")
-	}
-
-	select {
-	case <-closed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("late callback body leaked")
-	}
-}
-
-func TestFakeClientImmutableContinuation(t *testing.T) {
-	for _, change := range []string{"pin", "size"} {
-		t.Run(change, func(t *testing.T) {
-			client, cleanup, err := NewFakeClient(func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
-				m := originMeta(3 * PageSize)
-				page, _ := r.Range()
-
-				first, _, err := page.Resolve(m.Size)
-				if err != nil {
-					return Metadata{}, nil, err
-				}
-
-				if first == ByteOffset(2*PageSize) {
-					if change == "pin" {
-						m.ETag = ETag{value: `"different"`}
-					} else {
-						m.Size++
-					}
-				}
-
-				return m, io.NopCloser(io.LimitReader(repeatedByte('x'), int64(PageSize))), nil
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
-
-			v, err := client.Get(context.Background(), Request{})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			n, err := io.Copy(io.Discard, v)
-			if n != 2*int64(PageSize) {
-				t.Fatal("changed immutable version was accepted", n, err)
-			}
-
-			if !errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Fatal("late immutable metadata failure must abort the committed frame", err)
-			}
-		})
-	}
-}
-
-func TestFakeClientFreshGets(t *testing.T) {
-	var calls atomic.Int32
-
-	client, cleanup, err := NewFakeClient(func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
-		if r.Operation() != OperationBootstrap {
-			t.Error("fresh Get reused a pin")
-		}
-
-		version := strconv.Itoa(int(calls.Add(1)))
-		m := originMeta(1)
-		m.ETag = ETag{value: `"` + version + `"`}
-
-		return m, io.NopCloser(strings.NewReader(version)), nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(cleanup)
-
-	for _, want := range []string{"1", "2"} {
-		v, err := client.Get(context.Background(), Request{})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		data, err := io.ReadAll(v)
-		closeBody(v)
-
-		if err != nil || string(data) != want || v.Metadata().ETag.String() != `"`+want+`"` {
-			t.Fatal("fresh Get did not select a fresh version", err)
-		}
-	}
-}
-
-type fakeLateBody struct{ closed chan struct{} }
-
-func (*fakeLateBody) Read([]byte) (int, error) { return 0, io.EOF }
-func (b *fakeLateBody) Close() error           { close(b.closed); return nil }
 
 func fakeSubscriptionSocket(t *testing.T, client *Client, headers string) (net.Conn, *http.Response) {
 	t.Helper()
@@ -520,7 +222,7 @@ func TestFakeSubscriptionFrames(t *testing.T) {
 		{name: "pinned", size: 13, headers: "If-Match: " + originMeta(13).ETag.String() + "\r\nRacer-Ordered: 1\r\n", end: 13},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			client, cleanup, err := NewFakeClient(fakeSubscriptionOrigin(t, test.size))
+			client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, test.size))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -571,7 +273,7 @@ func TestFakeSubscriptionCredits(t *testing.T) {
 		{name: "bytes", headers: "Racer-Page-Credits: 64\r\nRacer-Byte-Credits: 16777216\r\n", window: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			client, cleanup, err := NewFakeClient(fakeSubscriptionOrigin(t, 3*PageSize))
+			client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, 3*PageSize))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -621,7 +323,7 @@ func TestFakeSubscriptionInvalidRelease(t *testing.T) {
 		{name: "zero"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			client, cleanup, err := NewFakeClient(fakeSubscriptionOrigin(t, 2*PageSize))
+			client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, 2*PageSize))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -639,7 +341,7 @@ func TestFakeSubscriptionInvalidRelease(t *testing.T) {
 }
 
 func TestFakeSubscriptionInvalidHeaders(t *testing.T) {
-	client, cleanup, err := NewFakeClient(func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+	client, cleanup, err := newFakeClient(t, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 		t.Error("invalid subscription reached origin")
 		return Metadata{}, nil, nil
 	})
@@ -670,7 +372,7 @@ func TestFakeSubscriptionCancellation(t *testing.T) {
 		t.Run(action, func(t *testing.T) {
 			body := &blockedBody{done: make(chan struct{}), first: true}
 
-			client, cleanup, err := NewFakeClient(func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+			client, cleanup, err := newFakeClient(t, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 				return originMeta(1), body, nil
 			})
 			if err != nil {
@@ -702,7 +404,7 @@ func TestFakeSubscriptionCancellation(t *testing.T) {
 func TestFakeSubscriptionErrors(t *testing.T) {
 	for _, kind := range []ErrorKind{ErrorUnauthorized, ErrorForbidden, ErrorNotFound, ErrorVersionUnavailable, ErrorUnavailable, ErrorInternal} {
 		t.Run(kind.String(), func(t *testing.T) {
-			client, cleanup, err := NewFakeClient(func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+			client, cleanup, err := newFakeClient(t, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 				return Metadata{}, nil, NewOriginError(kind, nil)
 			})
 			if err != nil {
@@ -720,7 +422,7 @@ func TestFakeSubscriptionErrors(t *testing.T) {
 
 	for _, size := range []ByteLength{0, 13} {
 		t.Run("unsatisfiable/"+strconv.FormatUint(uint64(size), 10), func(t *testing.T) {
-			client, cleanup, err := NewFakeClient(fakeSubscriptionOrigin(t, size))
+			client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, size))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -736,7 +438,7 @@ func TestFakeSubscriptionErrors(t *testing.T) {
 }
 
 func TestFakeSubscriptionDuplicateRelease(t *testing.T) {
-	client, cleanup, err := NewFakeClient(fakeSubscriptionOrigin(t, 3*PageSize))
+	client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, 3*PageSize))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -754,7 +456,7 @@ func TestFakeSubscriptionDuplicateRelease(t *testing.T) {
 }
 
 func TestFakeSubscriptionPartialPageRelease(t *testing.T) {
-	client, cleanup, err := NewFakeClient(fakeSubscriptionOrigin(t, PageSize+3))
+	client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, PageSize+3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -770,7 +472,7 @@ func TestFakeSubscriptionPartialPageRelease(t *testing.T) {
 func TestFakeSubscriptionPendingCallbackCancellation(t *testing.T) {
 	entered, canceled := make(chan struct{}), make(chan struct{})
 
-	client, cleanup, err := NewFakeClient(func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
+	client, cleanup, err := newFakeClient(t, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
 		close(entered)
 		<-ctx.Done()
 		close(canceled)

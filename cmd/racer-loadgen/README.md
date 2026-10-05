@@ -35,6 +35,11 @@ Direct mode uses `pkg/racersdk` against
 `--metrics-listen` (default `:9090`). An operational Racer dataplane and cache
 configuration are prerequisites; loadgen does not start the dataplane.
 
+Unit tests use `pkg/racersdk/racersdktest.NewClient` with a noncaching local
+daemon and real SDK origin validation over temporary Unix sockets. They always
+call the returned cleanup function; closing only the client leaves servers
+running. These tests are not evidence of real Racer compatibility or performance.
+
 Use a dedicated cache, not a cache whose origin socket Gantry already owns. The
 origin directory must be owned by loadgen's UID and must not be group/world
 writable. Existing directory permissions are not changed; missing directories
