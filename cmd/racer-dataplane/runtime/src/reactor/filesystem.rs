@@ -473,6 +473,251 @@ pub mod secure {
     /// Reject all symlinks during path resolution.
     pub const NO_SYMLINKS: u64 = 0x04;
 
+    /// Filesystem hosting policy without application request IDs or executors.
+    pub trait Host {
+        /// Caller cancellation and error boundary.
+        type Scope: Scope;
+
+        /// Accounting retained by the reactor.
+        type Budget: Budget;
+
+        /// Serving worker's explicitly driven reactor.
+        fn reactor(&self) -> &Reactor<Self::Scope, Self::Budget>;
+
+        /// Allocate an independent attempt while retaining parent cancellation/deadline.
+        fn fresh_scope(
+            &self,
+            parent: &Self::Scope,
+        ) -> Result<Self::Scope, <Self::Scope as Scope>::Error>;
+
+        /// Fence all submissions of the previous attempt, including abandoned futures.
+        fn fence<'a>(
+            &'a self,
+            previous: &'a Self::Scope,
+        ) -> Operation<'a, (), <Self::Scope as Scope>::Error>;
+
+        /// Identify only the caller's missing-file error, never cancellation.
+        fn is_missing(error: <Self::Scope as Scope>::Error) -> bool;
+    }
+
+    impl<H: Host> Host for Rc<H> {
+        type Scope = H::Scope;
+
+        type Budget = H::Budget;
+
+        fn reactor(&self) -> &Reactor<Self::Scope, Self::Budget> {
+            (**self).reactor()
+        }
+
+        fn fresh_scope(
+            &self,
+            parent: &Self::Scope,
+        ) -> Result<Self::Scope, <Self::Scope as Scope>::Error> {
+            (**self).fresh_scope(parent)
+        }
+
+        fn fence<'a>(
+            &'a self,
+            previous: &'a Self::Scope,
+        ) -> Operation<'a, (), <Self::Scope as Scope>::Error> {
+            (**self).fence(previous)
+        }
+
+        fn is_missing(error: <Self::Scope as Scope>::Error) -> bool {
+            H::is_missing(error)
+        }
+    }
+
+    /// Serializes a namespace owner and retains abandoned attempts until fenced.
+    pub struct Attempts<S: Scope> {
+        busy: Cell<bool>,
+
+        previous: RefCell<Option<S>>,
+    }
+
+    impl<S: Scope> Default for Attempts<S> {
+        fn default() -> Self {
+            Self {
+                busy: Cell::new(false),
+                previous: RefCell::new(None),
+            }
+        }
+    }
+
+    impl<S: Scope> Attempts<S> {
+        /// Fence the previous attempt before publishing a fresh submission scope.
+        pub async fn begin<H: Host<Scope = S>>(
+            &self,
+            host: &H,
+            parent: &S,
+        ) -> Result<(crate::drivers::Busy<'_>, S), S::Error> {
+            parent.check()?;
+            let guard = crate::drivers::Busy::try_enter(&self.busy)?;
+            let previous = self.previous.borrow().clone();
+            if let Some(previous) = previous {
+                host.fence(&previous).await?;
+            }
+            let scope = host.fresh_scope(parent)?;
+            *self.previous.borrow_mut() = Some(scope.clone());
+            Ok((guard, scope))
+        }
+    }
+
+    /// Check owner-only access using the selected backend's effective owner.
+    pub fn check_private(stat: &libc::statx, regular: bool) -> Result<(), AccessError> {
+        #[cfg(feature = "simulation")]
+        let simulated = simulation::Simulation::current().is_some();
+        #[cfg(not(feature = "simulation"))]
+        let simulated = false;
+        // SAFETY: geteuid has no memory or lifetime preconditions.
+        let owner = if simulated {
+            0
+        } else {
+            unsafe { libc::geteuid() }
+        };
+        check_access(
+            stat,
+            AccessRequirements {
+                owner,
+                forbidden_mode: 0o077,
+                links: regular.then_some(1),
+            },
+        )
+    }
+
+    /// Pin a symlink-free directory, optionally creating and checking private access.
+    pub async fn directory<S: Scope, B: Budget>(
+        r: &Reactor<S, B>,
+        path: &Path,
+        create: bool,
+        private: bool,
+        scope: &S,
+    ) -> Result<Rc<Descriptor>, S::Error>
+    where
+        S::Error: From<AccessError>,
+    {
+        let fd = r.file_directory(path, create, 4096, scope).await?;
+        if private {
+            check_private(&r.file_stat(fd.clone(), scope).await?, false)?;
+        }
+        Ok(fd)
+    }
+
+    /// Read a regular file with a 1 MiB ceiling and optional private access checks.
+    pub async fn read_file<S: Scope, B: Budget>(
+        r: &Reactor<S, B>,
+        fd: Rc<Descriptor>,
+        limit: usize,
+        private: bool,
+        scope: &S,
+    ) -> Result<ReadBuffer, S::Error>
+    where
+        S::Error: From<AccessError>,
+    {
+        if limit > 1024 * 1024 {
+            return Err(Error::Overloaded.into());
+        }
+        let stat = r.file_stat(fd.clone(), scope).await?;
+        check_regular_size(&stat, limit as u64)?;
+        if private {
+            check_private(&stat, true)?;
+        }
+        r.file_read_bounded(fd, limit, NonZeroUsize::new(16384).unwrap(), scope)
+            .await
+    }
+
+    /// Read a projected file, permitting normal symlinks but never magic links.
+    pub async fn read_path<S: Scope, B: Budget>(
+        r: &Reactor<S, B>,
+        path: &Path,
+        limit: usize,
+        scope: &S,
+    ) -> Result<ReadBuffer, S::Error>
+    where
+        S::Error: From<AccessError>,
+    {
+        let fd = r
+            .file_open(
+                None,
+                path_name(path.as_os_str(), 4096)?,
+                libc::O_RDONLY,
+                NO_MAGICLINKS,
+                scope,
+            )
+            .await?;
+        read_file(r, fd, limit, false, scope).await
+    }
+
+    /// Read one direct child without following symlinks or escaping its pinned parent.
+    pub async fn read_at<S: Scope, B: Budget>(
+        r: &Reactor<S, B>,
+        dir: &Rc<Descriptor>,
+        file: &str,
+        limit: usize,
+        private: bool,
+        scope: &S,
+    ) -> Result<ReadBuffer, S::Error>
+    where
+        S::Error: From<AccessError>,
+    {
+        let fd = r
+            .file_open(
+                Some(dir.clone()),
+                component(file.as_ref(), 4096)?,
+                libc::O_RDONLY,
+                BENEATH | NO_SYMLINKS,
+                scope,
+            )
+            .await?;
+        read_file(r, fd, limit, private, scope).await
+    }
+
+    /// Durably replace a bounded file, preserving the exact publication failure phase.
+    /// The caller exclusively owns the target and its deterministic stage namespace.
+    pub async fn atomic_write<S: Scope, B: Budget>(
+        r: &Reactor<S, B>,
+        dir: &Rc<Descriptor>,
+        target: &str,
+        bytes: &[u8],
+        scope: &S,
+    ) -> Result<(), operations::ReplacementError<S::Error>> {
+        use operations::{Durability, Replacement, ReplacementError::BeforeRename};
+        let target_name = component(target.as_ref(), 4096).map_err(|e| BeforeRename(e.into()))?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(BeforeRename(Error::Overloaded.into()));
+        }
+        let temporary = format!(".{target}.stage");
+        let staged = r
+            .file_stage(dir.clone(), temporary.as_ref(), 4096, scope)
+            .await
+            .map_err(BeforeRename)?;
+        let buffer = r.file_bytes(bytes).map_err(|e| BeforeRename(e.into()))?;
+        r.file_replace(
+            Replacement {
+                directory: dir.clone(),
+                staged,
+                temporary: component(temporary.as_ref(), 4096)
+                    .map_err(|e| BeforeRename(e.into()))?,
+                target: target_name,
+                durability: Durability::FileAndDirectory,
+            },
+            buffer,
+            scope,
+        )
+        .await
+    }
+
+    /// Remove one child and sync its parent, including when the child was absent.
+    pub async fn remove<S: Scope, B: Budget>(
+        r: &Reactor<S, B>,
+        dir: &Rc<Descriptor>,
+        file: &str,
+        scope: &S,
+    ) -> Result<(), S::Error> {
+        r.file_remove_synced(dir.clone(), component(file.as_ref(), 4096)?, scope)
+            .await
+    }
+
     /// Validate byte length and embedded NULs without normalizing the path.
     pub fn path_name(path: &OsStr, limit: usize) -> Result<CString> {
         validate_path(path, limit)?;
