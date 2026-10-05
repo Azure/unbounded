@@ -1,0 +1,257 @@
+---
+title: "Racer Reference"
+weight: 7
+description: "Racer resources, configuration, diagnostics, Go SDK, and RDMA requirements."
+---
+
+See [Racer concepts]({{< relref "concepts/racer" >}}) and the [deployment/integration guide]({{< relref "guides/racer" >}}).
+
+## ClusterCache
+
+| Property | Contract |
+|----------|----------|
+| API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
+| Scope / short name | Cluster-scoped / `rcache` |
+| Fields | Kubernetes metadata only; no `spec` or `status` |
+| Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
+| Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: artifacts
+```
+
+The first ClusterCache triggers installation by the Unbounded operator, not a Site
+component flag. Cache data is disposable; this resource does not configure an origin.
+
+| Path on the node | Owner and purpose |
+|------------------|-------------------|
+| `/run/racer/<name>/client/socket` | Dataplane; SDK clients connect here |
+| `/run/racer/<name>/origin/socket` | Application origin adapter; dataplane calls it for upstream reads |
+
+Pod mounts grant access: expose only the needed cache/role. Origins need existing trusted
+parent directories. Clients do not automatically bypass Racer to connect directly to origins.
+
+## Node labels and annotations
+
+Keys below use the `racer.unbounded-cloud.io/` prefix unless shown in full.
+
+| Key | Meaning |
+|-----|---------|
+| Label `exclude` | Presence excludes the node from membership and dataplane placement, regardless of value |
+| Label `unbounded-cloud.io/site` | Canonical Site boundary for RDMA; absent or empty means HTTP-only |
+| Annotation `shares` | Positive decimal `uint32` placement weight; overrides enrolled shares; default 4 |
+| Annotation `rdma-nics` | Administrator NIC/rail policy; see [RDMA](#rdma); explicit `[]` disables eligibility |
+| Annotations `enrolled-shares`, `enrolled-rdma-nics` | Controller-managed authenticated dataplane reports; do not edit |
+| Annotation `last-admitted-member` | Controller-managed, Node-UID-bound retained membership; do not edit |
+| Annotations `rails`, `aligned-rails` | Obsolete; ignored with diagnostics |
+
+Malformed annotations retain admitted attributes; invalid new nodes are omitted. Site uses current labels.
+
+## Dataplane configuration
+
+Tune `racer-dataplane-config` in the installation namespace (normally `unbounded-system`).
+The operator preserves administrator data and hashes edits into managed rollouts.
+Explicit workload environment wiring takes precedence over ConfigMap imports.
+Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
+
+| Setting | Default | Scope / constraint |
+|---------|---------|--------------------|
+| `RACER_MAX_THREADS` | Unset (automatic) | Total userspace I/O and crypto threads; explicit value at least 2 |
+| `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
+| `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
+| `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
+| `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Each `268435456` (256 MiB) | Independent node-wide plaintext/ciphertext admission budgets |
+| `RACER_DIRTY_BYTES` | `134217728` (128 MiB) | Node-wide dirty-data budget |
+| `RACER_REGISTERED_BYTES` | `134217728` (128 MiB) | Node-wide native RDMA memory budget when enabled |
+| `RACER_REQUEST_CONTEXT_BYTES` | `67108864` (64 MiB) | Node-wide request-context budget |
+| `RACER_METADATA_ENTRIES` | `4096` | Node-wide catalog entries; at most 1,048,576 |
+| `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget; at most 1,048,576 |
+| `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB |
+| `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** slab geometry; positive multiple of segment size |
+| `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead |
+| `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count, less than total segments |
+| `RACER_CLIENT_CONNECTIONS` | `128` | Node-wide connection admission budget, partitioned among workers |
+| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024 |
+| `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `8` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections, further clamped to the worker's connection budget |
+| `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps |
+| `RACER_REQUEST_TIMEOUT_MS` / `RACER_PEER_ATTEMPT_TIMEOUT_MS` | Each `30000` | Independent request / local peer-exchange deadlines; 1..86,400,000 ms |
+| `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
+| `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1..3,600,000 ms |
+
+Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
+Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets
+can reduce workers. Storage grows with I/O workers. Admission budgets are not RSS limits:
+allocator, TLS, and filesystem cache are additional. Invalid combinations fail validation.
+
+## Controller and workload wiring
+
+`racer-config` holds controller settings and operator workload inputs. Listener changes
+also require matching Services, probes, network policy, and monitoring configuration.
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `RACER_CONTROL_ADDRESS` | `:8443` | Controller HTTPS listener |
+| `RACER_METRICS_ADDRESS` / `RACER_PROBE_ADDRESS` | `:8080` / `:8081` | Controller metrics / health and readiness listeners |
+| `RACER_PEER_PORT` | `8082` | Managed dataplane peer listener and membership publication; 1024..65535 |
+| `RACER_DIAGNOSTICS_PORT` | Unset | Managed dataplane defaults to 9090, or 9091 if peer port is 9090; explicit port must be 1024..65535 and distinct |
+| `RACER_HOST_NETWORK` | `false` | Explicit Racer host-network opt-in; not implied by RDMA |
+| `RACER_POD_NETWORK_NODES` | Unset | JSON array of node names kept on pod networking when host networking is enabled; operator drains before moving between workloads |
+| `RACER_SNAPSHOT_MAX_AGE` | `30s` | Maximum replicated snapshot age |
+| `RACER_CERTIFICATE_LIFETIME` | `24h` | Dataplane leaf lifetime; 2 minutes..24 hours |
+| `RACER_ROTATION_INTERVAL` / `RACER_ROTATION_PREPARE_FOR` / `RACER_ROTATION_RETAIN_FOR` | `24h` / `1h` / `48h` | Issuer/key rotation policy; interval must cover preparation and retention must cover leaf lifetime |
+
+Duration settings use Go syntax and positive whole seconds. Quiesce traffic for peer-port
+transitions; do not independently override the dataplane listener and published port.
+
+The operator owns identity/wiring: cluster UUID, URL, images, service accounts, trust,
+replication identity, and durable resource names. These are not tuning keys. Node identity
+comes from verified enrollment/local recovery, not a supplied Node name/UID. Do not reset
+markers, credentials, or version counters to repair an existing identity.
+
+The **bare binary** defaults `RACER_PEER_LISTEN` to `0.0.0.0:7443` and
+`RACER_DIAGNOSTICS_LISTEN` to `127.0.0.1:9090`. Managed workloads bind both to the Pod IP
+with the ports above. The operator also wires trust/token paths and
+`/var/lib/racer/identity/private`; standalone defaults do not replace managed wiring.
+
+## Diagnostics and metrics
+
+| Dataplane HTTP path | Use |
+|---------------------|-----|
+| `/healthz` | Process liveness |
+| `/readyz` | Serving readiness, including usable admission |
+| `/metrics` | Prometheus metrics, including `racer_ready` and `racer_live` |
+| `/debug/membership` | Applied membership state |
+| `/debug/failures` | Bounded failure diagnostics |
+
+Monitor `racer_requests_total`, `racer_request_errors_total`, `racer_overloads_total`,
+and per-tier `racer_*_lookup_hits_total` / `racer_*_lookup_misses_total`. Page-source events
+are not request counts or byte rates. A scrape is not readiness. Restrict diagnostics
+network access, especially with host networking.
+
+The [Racer Performance dashboard and provisioning notes](https://github.com/Azure/unbounded/blob/main/deploy/racer/grafana-README.md)
+describe Prometheus labels and Grafana setup. The example port `19090` is installation-specific.
+Persist scrape configuration on workload templates or supported overrides, not only live Pods.
+
+## Go SDK
+
+Import `github.com/Azure/unbounded/pkg/racersdk`; the SDK does not provision caches or origins.
+
+| API | Purpose / ownership |
+|-----|---------------------|
+| `ParseCacheName`, `ParseKey`, `ParseETag` | Validate cache name, 32-byte key encoded as 64 lowercase hex digits, and a strong quoted entity tag |
+| `NewClient(ClientConfig)` | Validate configuration without dialing; close the client when done |
+| `Client.Stat(ctx, Request)` | Fresh full-object metadata on a separately reserved connection pool |
+| `Client.Get(ctx, Request, ...ReadOptions)` | Ordered `Value` supporting `Read`, `WriteTo`, and `WriteToHTTP`; always close it |
+| `Client.OpenPages(ctx, Request, ...ReadOptions)` | Page delivery, unordered unless requested; close the stream and release each `PageLease` before reusing its credit |
+| `Client.GetStreaming` | Forward through `Value.WriteToHTTP` only; may expose an incomplete page prefix on failure |
+| `Client.Stats()` | SDK connection, admission, queue, and transfer counters |
+| `NewFetchContext` | Combine parsed adapter metadata and upstream authorization for `Request.Context` |
+| `ServeOrigin(ctx, OriginConfig, Origin)` | Serve the application's origin callback until cancellation or listener failure |
+| `NewOriginError` | Return a classified origin failure without exposing upstream details in diagnostics |
+| `NewFakeClient(Origin)` | Noncaching local test helper; always call its returned cleanup function, not just `Client.Close` |
+
+`ReadOptions.Offset` and `Length` select bytes; zero length means through EOF. Overlong
+ranges are rejected, not truncated. Sizes/offsets must fit signed 64-bit wire values.
+`Pin` selects an immutable version; a `Metadata` snapshot pins its ETag and must agree
+with any explicit pin. Page size is 16 MiB; `PageCredits` accepts 1..64 and `ByteCredits`
+accepts 1..64 pages of bytes. Zero selects the configured window and `PageCredits * PageSize`.
+`SmallObject` reserves admission for objects no larger than one page.
+
+Zero numeric fields choose defaults; negatives are invalid. `Cache` is required. Limits are per SDK instance.
+
+| `ClientConfig` field | Default |
+|----------------------|---------|
+| `MaxConnections` / `MaxQueuedRequests` | 64 / 128 |
+| `MetadataConnections` / `MetadataQueuedRequests` | 4 / 16 |
+| `SmallObjectConnections` / `SmallObjectQueuedRequests` | 4 / 128 |
+| `PageWindow` | 2; explicit 1..64 |
+| `QueueTimeout` / `DialTimeout` | 5s / 5s |
+| `ResponseHeaderTimeout` / `BodyReadTimeout` | 60s / 60s |
+| `IdleConnTimeout` / `MaxConnAge` | 90s / 5m |
+
+Contexts bound stream lifetime; body timeout bounds individual reads, not total lifetime
+or caller think time. Reuse age is 75..100% of `MaxConnAge`; expiry does not interrupt responses.
+
+| `OriginConfig` field | Default |
+|----------------------|---------|
+| `MaxConnections` | 128, including idle accepted connections |
+| `MaxConcurrentRequests` / `MaxConcurrentHeadRequests` | 64 GET callbacks/bodies / 4 HEAD callbacks |
+| `ReadHeaderTimeout` / `RequestTimeout` | 5s / 60s |
+| `WriteTimeout` / `IdleTimeout` | 30s / 30s |
+| `SocketMode` | `0600` |
+| `RecoverStaleSocket` | `false`; opt-in recovery only for sockets created in owned-endpoint mode |
+
+Origin callbacks may run concurrently and must honor cancellation. Return metadata/immutable
+bytes atomically; HEAD returns no body. Every nonnil body transfers to the SDK even on error;
+`Close` must interrupt `Read`. Recovery uses persistent lock/witness files in a user-owned,
+non-group/world-writable directory, not permission to remove arbitrary preexisting sockets.
+
+`Metadata` requires a size, strong quoted ETag, and nonnegative Unix expiration time
+with millisecond precision. Optional `ContentType` is limited to 256 bytes. Origin
+requests expose `Key()`, `Context()`, `Operation()`, `Pin()`, and `Range()`; honor the
+pin and return exactly the resolved range from that immutable version.
+
+Use `errors.As(err, &sdkError)` for `*racersdk.Error`, then `Kind()` and `StatusCode()`.
+Kinds distinguish not found (404), version unavailable (412), range (416), unavailable/overload
+(503), protocol, cancellation, deadline, and I/O failures. Pinned origin not-found becomes
+version unavailable; 416 requires valid metadata. The fake does not test distributed/RDMA behavior.
+
+## RDMA
+
+RDMA is optional per hop. Peers need the same **nonempty Site**, the page's selected rail
+in both published NIC lists, enabled native resources, and compatible local devices.
+Different/missing Sites or unavailable rails retain HTTP, without remapping the page.
+Site uses only `unbounded-cloud.io/site`, not `net.unbounded-cloud.io/site`. It does not
+change placement; in-flight snapshots mean label changes are not immediate revocation.
+
+| `RACER_ENABLE_RDMA` | Behavior |
+|---------------------|----------|
+| `auto` (default) | Reserve native resources only with usable startup hardware; otherwise HTTP-only until restart |
+| `true` | Reserve native capacity even without startup hardware, allowing later discovery to activate devices |
+| `false` | Disable native RDMA |
+
+Release images include native verbs support; discovery/provider failures retain HTTP.
+The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
+
+```json
+[{"device":"mlx5_0","port":1,"rail":0}]
+```
+
+`port` is 1..255; `rail` is 0..65535. Optional `gid` is 32 lowercase hex digits;
+optional `numa_node` is `uint32`. Device/port pairs must be unique; NICs may share a rail.
+Workers prefer same-rail local, then unknown, then remote NUMA, spreading within the best tier.
+
+Absent administrator policy uses active MW2B-capable ports in PCI BDF/port order, reported
+during authenticated enrollment/renewal and published from `enrolled-rdma-nics`. Explicit
+`[]` disables eligibility; a list overrides automatic rails. Discovery cannot infer cabling
+or correct asymmetric initial inventories: use explicit mappings when ordinals do not match.
+
+The private identity directory's `rdma-rails.json` preserves physical-port reservations
+across renewal/restart: missing ports retain rails; new ports append. Do not delete it
+independently of coordinated topology changes. Corruption fails enrollment instead of renumbering rails.
+
+Dataplanes run privileged as root with escalation allowed and a read-only root filesystem.
+HostPaths `/var/lib/racer/identity`, `/var/lib/racer/slabs`, and `/run/racer` are writable;
+`/dev/infiniband` is read-only for directory entries, not device-I/O isolation. This is
+hostPath access, not device-plugin/CDI allocation or a host security boundary. Kubelet may
+create an empty device directory on HTTP-only nodes; Racer does not provision drivers/devices.
+
+Verify from the actual Pod namespaces:
+
+- Compatible drivers/firmware/providers, active MW2B ports, and sufficient pinned-memory/resources.
+- Visible `/sys/class/infiniband`, `/sys/class/infiniband_verbs`, and `/sys/devices`
+  targets; no host `/sys` mount is automatically added.
+- RDMA namespace mode allows device access. Privilege/mounts do not override exclusive
+  namespace ownership; explicitly enable host networking if needed, reviewing port exposure/conflicts.
+- RoCE has the correct namespace-local Ethernet device, address, routing, and GID.
+  The adapter uses **GID index 0**. Annotation `gid` is a matching constraint, not an index
+  selector or RoCE configuration; retain HTTP when another index is required.
+
+Coordinate controller/dataplane upgrades and quiesce traffic. The `rails`/`alignment_enabled`
+to `rdma_nics` change breaks compatibility despite wire schema version 1; rolling updates
+do not make mixed versions safe. Remove `RACER_RAILS`, `RACER_ALIGNED_RAILS`,
+`RACER_FABRIC_PORTS`, and `RACER_FABRIC_PORTS_FILE`: even empty values fail startup.
+Validate transfers, HTTP fallback, and recovery on target hardware before relying on RDMA.

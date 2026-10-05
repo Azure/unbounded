@@ -60,67 +60,11 @@ all Site `nodeCidrs` and labels it with `unbounded-cloud.io/site=<name>`.
 
 #### Racer RDMA boundaries
 
-Racer uses Site membership as an RDMA fabric boundary. Each communicating pair
-must belong to the same nonempty Site before Racer attempts an RDMA upgrade.
-Nodes in different Sites, or nodes without a Site, use HTTP. A multi-hop route
-can mix transports: for `A → B → C`, if A and B belong to one Site and C belongs
-to another, A-B can use RDMA while B-C uses HTTP.
-
-Site membership uses only `unbounded-cloud.io/site` on each Node. There is no
-separate Racer fabric-ID annotation. Removing or emptying the canonical label
-clears membership; the old `net.unbounded-cloud.io/site` label is not supported.
-The networking controller manages the canonical label from Site configuration.
-
-Site membership is necessary but not sufficient for RDMA: peers must share a
-rail in published `rdma_nics`, enable RDMA, and pass local device compatibility
-checks. There are no per-rail fabric labels or alignment toggles. Site does not
-change cache placement or the page-to-rail hash. Uneven NIC counts and missing
-rails retain HTTP rather than remapping a transfer to another rail.
-
-Site label changes and removals advance Racer's published membership version,
-even when invalid NIC annotations cause the last accepted NIC configuration
-to be retained. In-flight operations can retain an older membership snapshot;
-a label change is not an immediate revocation mechanism.
-
-The Node annotation `racer.unbounded-cloud.io/rdma-nics` supplies entries such as
-`[{"device":"mlx5_0","port":1,"rail":0}]`. Optional fields are `gid` (32 lowercase
-hex digits) and `numa_node` (unsigned 32-bit integer). Device/port pairs are unique;
-multiple NICs may share a rail. NUMA locality is autodetected unless overridden;
-workers spread same-rail choices with a preference for local, then unknown, then
-remote locality. Unknown locality is eligible everywhere.
-
-When the annotation is absent, the dataplane discovers active MW2B-capable ports
-in PCI BDF/port order, assigns initial ordinal rails, and reports NIC details during
-authenticated bootstrap. The controller manages the resulting
-`racer.unbounded-cloud.io/enrolled-rdma-nics` annotation and publishes member
-`rdma_nics`. An explicit admin `[]` disables NIC eligibility instead of falling
-back to discovery. Explicit mappings override discovery when automatic ordinals
-do not reflect the intended topology.
-
-The dataplane persists physical-port rail reservations across renewal and restart,
-so an unavailable NIC does not renumber surviving NICs. New ports append to the
-reserved rail domain. Discovery refreshes during enrollment and renewal; it cannot
-infer cabling or correct asymmetric initial inventories. With automatic RDMA mode,
-no usable ports at startup keeps the process HTTP-only until restart. Explicit
-`RACER_ENABLE_RDMA=true` reserves capacity for hardware that becomes available later.
-
-Deploy matching controllers and dataplanes in a coordinated upgrade. The change
-from `rails`/`alignment_enabled` to `rdma_nics` is a hard break even though the wire
-schema version remains 1. Old rail/alignment Node annotations are ignored with
-diagnostics; legacy rail/fabric environment settings fail startup. Racer control
-JSON rejects unknown fields and requires member `rdma_nics`, explicit `site`, and
-positive `shares`. An explicit `"site":""` means HTTP-only; omitted `site` is
-invalid, not an HTTP fallback. Mixed-version peers are not supported. Owned Racer
-TLS connections require TLS 1.3.
-
-Release images include native verbs libraries and providers. Dataplanes run
-privileged as root with hostPath `/dev/infiniband` access, not device-plugin/CDI
-allocation. The mount tolerates an absent directory on non-RDMA nodes; the root
-filesystem remains read-only. This is not a host security boundary. RDMA does
-not force host networking: namespace-visible devices, sysfs topology, and usable
-RoCE GIDs must be verified in the Pod. See the
-[deployment requirements and upgrade checklist](https://github.com/Azure/unbounded/blob/main/deploy/racer/README.md#native-rdma-deployment),
-including the current GID-index-0 limitation.
+Racer uses the canonical Node label `unbounded-cloud.io/site` as an RDMA boundary:
+each communicating pair needs the same nonempty Site, a compatible selected rail,
+and usable local hardware. Different or missing Sites retain HTTP, and a multi-hop
+route can mix transports. See the [Racer RDMA reference]({{< relref "reference/racer#rdma" >}})
+for NIC policy, discovery, deployment requirements, and coordinated upgrades.
 
 ### Gateway Pools
 

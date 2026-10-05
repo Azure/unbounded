@@ -232,3 +232,63 @@ metrics:
 | `p2p_origin_fallback_total` | Remains near zero during healthy operation. |
 | `gantry_advertise_reconcile_total` | Continues increasing as Gantry reconciles containerd content with the DHT. |
 | `gantry_containerd_lease_created_total` | Increases when coordinated background pulls ingest new content. |
+
+## Use Racer as the Backend
+
+The installation and distribution flow above describe Gantry's default containerd
+backend. Racer mode instead uses Racer for object caching and peer reads, with
+Gantry supplying the registry origin adapter. First follow
+[Cache Objects with Racer]({{< relref "guides/racer" >}}) to install Racer, and
+separately create this cluster-scoped cache:
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: gantry
+```
+
+Racer must run on the same nodes as Gantry. Run one Gantry origin owner on every
+eligible node that can supply origin reads for this cache, with consistent
+upstream registry configuration. Match placement and tolerations; installing
+Gantry on only the requesting nodes is not sufficient.
+
+### Helm-Managed Gantry
+
+Add `--set racer.enabled=true` to the OCI chart installation command above,
+retaining its release version, image digest, upstream registries, and your other
+settings. For upgrades, keep those settings in your existing values file:
+
+```bash
+helm upgrade --install gantry oci://ghcr.io/azure/charts/gantry \
+  --version "$GANTRY_VERSION" --namespace gantry-system \
+  -f gantry-values.yaml --set racer.enabled=true --wait --timeout 5m
+```
+
+Here `gantry-values.yaml` contains the existing image and registry settings. The
+chart configures **Gantry only**; it does not deploy Racer or create the cache.
+The setting runs Gantry as UID/GID 0 and mounts `/run/racer/gantry` read-write for
+its client and origin sockets. Authorize that hostPath and root workload narrowly.
+
+### Operator-Managed Gantry
+
+Do not install a competing Helm release. Merge the `data.gantry-racer.yaml` entry
+from [racer-operator-overrides.yaml](https://github.com/Azure/unbounded/blob/main/deploy/gantry/examples/racer-operator-overrides.yaml)
+into your existing `unbounded-component-overrides` ConfigMap in the operator
+namespace. Preserve all other keys and reconcile any existing Gantry patches;
+do not replace the ConfigMap with the example. If no override ConfigMap exists,
+use the example to create it. See
+[workload overrides]({{< relref "reference/workload-overrides" >}}).
+
+The example enables `GANTRY_RACER_ENABLED`, selects UID/GID 0, and mounts
+`/run/racer/gantry` read-write. It does not provision Racer. Keep existing
+`GANTRY_RACER_*` tuning and registry configuration as appropriate for your release.
+
+### Verify Racer Mode
+
+Check Gantry's rollout with `kubectl -n NAMESPACE rollout status daemonset/gantry --timeout=5m`,
+then its `/readyz` endpoint and actual image pulls. Inspect
+`gantry_racer_mirror_requests_total`, `gantry_racer_origin_bytes_total`, and Racer
+diagnostics instead of expecting the default backend's DHT/containerd metrics.
+Gantry does not fall back to its legacy backend or bypass Racer directly on Racer
+failure. This does not remove containerd's independently configured registry routes.
