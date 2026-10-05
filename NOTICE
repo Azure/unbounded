@@ -29,6 +29,15 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/TanStack/table/blob/HEAD/LICENSE
+  - dependency: base64
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2015 Alice Maz
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/base64/0.22.1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/base64/0.22.1/source/LICENSE-MIT
   - dependency: d3-scale
     ecosystem: npm
     copyright:
@@ -620,6 +629,15 @@ notices:
         link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
+  - dependency: httparse
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2015-2025 Sean McArthur
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/httparse/1.10.1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/httparse/1.10.1/source/LICENSE-MIT
   - dependency: io-uring
     ecosystem: cargo
     copyright:
@@ -723,6 +741,48 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/facebook/react/blob/HEAD/LICENSE
+  - dependency: rustls
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
+      - Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/rustls/0.23.45/source/LICENSE-APACHE
+      - name: ISC License
+        link: https://docs.rs/crate/rustls/0.23.45/source/LICENSE-ISC
+      - name: MIT License
+        link: https://docs.rs/crate/rustls/0.23.45/source/LICENSE-MIT
+  - dependency: rustls-pemfile
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
+      - Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/rustls-pemfile/2.2.0/source/LICENSE-APACHE
+      - name: ISC License
+        link: https://docs.rs/crate/rustls-pemfile/2.2.0/source/LICENSE-ISC
+      - name: MIT License
+        link: https://docs.rs/crate/rustls-pemfile/2.2.0/source/LICENSE-MIT
+  - dependency: serde
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/serde/1.0.229/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/serde/1.0.229/source/LICENSE-MIT
+  - dependency: serde_json
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/serde_json/1.0.151/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/serde_json/1.0.151/source/LICENSE-MIT
   - dependency: sha2
     ecosystem: cargo
     copyright:
@@ -756,6 +816,15 @@ notices:
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+  - dependency: x509-parser
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2017 Pierre Chifflier
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/x509-parser/0.16.0/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/x509-parser/0.16.0/source/LICENSE-MIT
   - dependency: zeroize
     ecosystem: cargo
     copyright:
