@@ -75,7 +75,8 @@ Worker-local certificate caches retain Rc/RefCell ownership.
 
 Component tests retain private lifetime assertions; the runtime/page-engine
 ownership scenario and real decode/BundleInstaller rotation scenario are in
-`tests/identity_integration.rs`. See the component README for focused gates.
+`tests/identity_integration.rs`. See the crate docs in
+`cmd/racer-dataplane/identity/src/lib.rs` for focused gates.
 This component boundary is justified by cohesive ownership, not an invented
 second consumer. The independent performance controller remains wire-only.
 
