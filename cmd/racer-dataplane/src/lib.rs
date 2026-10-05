@@ -3,5 +3,5 @@
 
 //! Scaffolding for the Racer dataplane.
 //!
-//! The topology and runtime crates are available as workspace members. The runtime
-//! is not wired into the dataplane yet; application integration is not included.
+//! The topology crate is available as a workspace member. Application integration
+//! is not included; the dataplane binary remains empty.

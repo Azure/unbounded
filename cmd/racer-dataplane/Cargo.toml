@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "topology"]
+members = [".", "topology"]
 resolver = "3"
 
 [package]
@@ -12,7 +12,6 @@ description = "Racer node-local read-through cache dataplane"
 
 [dependencies]
 topology = { path = "topology" }
-uring-runtime = { path = "runtime" }
 
 # Keep debug assertions, overflow checks, and debug info while optimizing tests.
 [profile.test]
