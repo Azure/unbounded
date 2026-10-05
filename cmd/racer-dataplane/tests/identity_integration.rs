@@ -37,6 +37,92 @@ const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 const NODE: &str = "22222222-2222-4222-8222-222222222222";
 const CACHE: &str = "33333333-3333-4333-8333-333333333333";
 
+/// Shared worker views observe coherent identity trust across rejected and valid rotations.
+#[test]
+fn shared_identity_publication_revalidates_trust_without_revoking_held_owners() {
+    let cluster = ClusterId(CLUSTER.into());
+    let node = NodeId(NODE.into());
+    let epochs = Arc::new(KeyEpochs::default());
+    let publisher = Rc::new(Keyring::new(cluster.clone(), node.clone(), epochs.clone()));
+    let worker = Rc::new(Keyring::new(cluster.clone(), node.clone(), epochs.clone()));
+    let foreign = Keyring::new(ClusterId(CACHE.into()), node.clone(), epochs.clone());
+    let other_node = Keyring::new(cluster.clone(), NodeId(CACHE.into()), epochs);
+    assert_eq!(publisher.generation().unwrap(), None);
+    assert!(worker.signing_identity().is_err());
+    assert!(worker.peer_trust_roots().is_err());
+
+    let (ca, ca_key) = racer_identity::test_util::ca();
+    let (pending, chain) = racer_identity::test_util::issue(&ca, &ca_key, &cluster, &node, |_| {});
+    let roots = vec![ca.der().to_vec()];
+    let identity = Arc::new(
+        pending
+            .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+            .unwrap(),
+    );
+    let installer = BundleInstaller::new(publisher.clone());
+    let mut bundle = KeyringBundle {
+        schema_version: SCHEMA_VERSION,
+        cluster: cluster.clone(),
+        generation: BundleGeneration(1),
+        peer_trust_roots: roots,
+        cache_keys: vec![record(1, 7)],
+    };
+    install_decoded(&installer, &bundle).unwrap();
+    publisher
+        .install_signing_identity(identity.clone())
+        .unwrap();
+    let held = worker.signing_identity().unwrap();
+    assert!(Arc::ptr_eq(&held, &identity));
+    assert!(foreign.peer_trust_roots().is_err());
+    assert!(foreign.signing_identity().is_err());
+    assert!(other_node.signing_identity().is_err());
+    assert!(
+        other_node
+            .install_signing_identity(identity.clone())
+            .is_err()
+    );
+
+    let certificates = racer_identity::Certificates::new(cluster, worker.clone());
+    let message = b"shared publication";
+    let signature = held.sign(message).unwrap();
+    assert_eq!(
+        certificates
+            .verify_signed(&chain, &node, message, &signature)
+            .unwrap()
+            .node(),
+        &node,
+    );
+    let original_roots = worker.peer_trust_roots().unwrap();
+    let (replacement, _) = racer_identity::test_util::ca();
+    bundle.peer_trust_roots = vec![replacement.der().to_vec()];
+    assert!(install_decoded(&installer, &bundle).is_err());
+    assert!(Arc::ptr_eq(
+        &original_roots,
+        &worker.peer_trust_roots().unwrap()
+    ));
+    assert!(Arc::ptr_eq(&held, &worker.signing_identity().unwrap()));
+
+    bundle.generation = BundleGeneration(2);
+    install_decoded(&installer, &bundle).unwrap();
+    assert_eq!(worker.generation().unwrap(), Some(2));
+    assert!(worker.signing_identity().is_err());
+    assert!(publisher.install_signing_identity(identity).is_err());
+    assert!(
+        certificates
+            .verify_signed(&chain, &node, message, &signature)
+            .is_err()
+    );
+    assert_eq!(held.sign(message).unwrap(), signature);
+
+    bundle.generation = BundleGeneration(3);
+    bundle.peer_trust_roots = (*original_roots).clone();
+    install_decoded(&installer, &bundle).unwrap();
+    assert!(Arc::ptr_eq(&held, &worker.signing_identity().unwrap()));
+    certificates
+        .verify_signed(&chain, &node, message, &signature)
+        .unwrap();
+}
+
 fn fixture() -> (Rc<Keyring>, BundleInstaller, KeyringBundle) {
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
