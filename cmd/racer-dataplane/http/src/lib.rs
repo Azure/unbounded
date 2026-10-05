@@ -51,6 +51,7 @@
 #![warn(missing_docs)]
 
 pub mod connection;
+
 mod transfer;
 
 pub use transfer::{delivery, relay};
@@ -86,6 +87,7 @@ pub enum StartLine {
         /// The nonempty visible-ASCII request target.
         target: String,
     },
+
     /// A response without its discarded reason phrase.
     Response {
         /// A three-digit status from 100 through 599.
@@ -120,6 +122,7 @@ impl Opaque for () {
 pub enum Error {
     /// The bytes or owned fields violate the supported grammar.
     Malformed,
+
     /// The wire head or checked decoded storage exceeds its limit.
     HeadTooLarge,
 }
@@ -475,8 +478,10 @@ pub mod range {
             /// The last requested byte offset.
             last: u64,
         },
+
         /// All bytes starting at the given offset.
         From(u64),
+
         /// The requested suffix length, including zero if numeric policy allows it.
         Suffix(u64),
     }
@@ -690,12 +695,15 @@ mod tests {
 
     /// The ordinary head cap used by parser fixtures.
     const MAX_HEAD_BYTES: usize = 32 * 1024;
+
     /// Opaque field policy used by codec tests.
     struct Fields;
+
     impl Opaque for Fields {
         /// Fields with strict separator and edge-whitespace requirements.
         const NAMES: &'static [&'static str] = &["authorization", "x-metadata"];
     }
+
     /// A codec using the test opaque policy.
     type TestCodec = Codec<Fields>;
 

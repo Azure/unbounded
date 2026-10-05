@@ -2,6 +2,7 @@
 //!
 //! Charges cover payload buffers and explicit admissions, not every metadata
 //! allocation. The caller drives the reactor and ticks pool maintenance.
+
 use crate::{Codec, Error, MessageHead, Opaque, StartLine};
 use std::{
     cell::{Cell, RefCell},
@@ -20,6 +21,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// A result using the caller's connection error type.
 pub type Result<C, T> = std::result::Result<T, <C as Context>::Error>;
+
 /// An owned, lazy operation retaining resources through runtime completion.
 pub type Operation<'a, C, T> = uring_runtime::Operation<'a, T, <C as Context>::Error>;
 
@@ -99,6 +101,7 @@ pub trait State<E>: Default + 'static {
         self
     }
 }
+
 impl<E> State<E> for () {}
 
 /// Pool identity, destination address, and endpoint-specific capacity policy.
@@ -261,6 +264,7 @@ impl<C: Context> Drop for OwnedBuffer<C> {
         }
     }
 }
+
 impl<C: Context> OwnedBuffer<C> {
     /// Allocate zeroed fixed-length storage after obtaining its charge.
     pub fn new(context: &C, length: usize) -> Result<C, Self> {
@@ -284,6 +288,7 @@ impl<C: Context> OwnedBuffer<C> {
         Ok(buffer)
     }
 }
+
 // SAFETY: fixed, private backing allocation and charge remain owned through completion.
 unsafe impl<C: Context> IoBuffer for OwnedBuffer<C> {
     type Error = C::Error;
@@ -298,6 +303,7 @@ unsafe impl<C: Context> IoBuffer for OwnedBuffer<C> {
         Ok(&mut self.bytes)
     }
 }
+
 impl<B: IoBuffer> BufferRange<B> {
     /// Validate a range against the buffer before constructing its view.
     pub fn new<E: From<B::Error> + From<Error>>(
@@ -315,6 +321,7 @@ impl<B: IoBuffer> BufferRange<B> {
         self.buffer
     }
 }
+
 // SAFETY: the fixed view retains the complete stable backing owner.
 unsafe impl<B: IoBuffer> IoBuffer for BufferRange<B> {
     type Error = B::Error;
@@ -329,6 +336,7 @@ unsafe impl<B: IoBuffer> IoBuffer for BufferRange<B> {
         Ok(&mut self.buffer.bytes_mut()?[self.range.clone()])
     }
 }
+
 impl<C: Context> HttpIo<C> {
     /// Inspect receive framing without submitting I/O.
     #[cfg(feature = "test-util")]
@@ -901,6 +909,7 @@ impl<C: Context> HttpIo<C> {
         })
     }
 }
+
 impl<C: Context> ConnectionLease<C> {
     /// Adopt an already admitted descriptor and set it nonblocking.
     pub fn from_reserved(fd: Descriptor, slot: C::Slot, state: C::State) -> Result<C, Self> {
@@ -1068,6 +1077,7 @@ impl<C: Context> ConnectionLease<C> {
         self.receive_remaining()
     }
 }
+
 impl<C: Context> Drop for ConnectionLease<C> {
     /// Transform policy outside pool borrows and return only reusable idle owners.
     fn drop(&mut self) {
@@ -1526,12 +1536,14 @@ impl<C: Context> HttpPool<C> {
         }
     }
 }
+
 impl<C: Context> Drop for HttpPool<C> {
     /// Close the pool while outstanding leases retain their own runtime resources.
     fn drop(&mut self) {
         self.close();
     }
 }
+
 /// A healthy reusable connection and its retained policy and admission.
 struct Idle<C: Context> {
     state: C::State,
@@ -1542,6 +1554,7 @@ struct Idle<C: Context> {
 
     since: Instant,
 }
+
 /// Active and idle connections belonging to one endpoint generation.
 struct Entry<C: Context> {
     active: usize,
@@ -1550,6 +1563,7 @@ struct Entry<C: Context> {
 
     generation: u64,
 }
+
 impl<C: Context> Default for Entry<C> {
     /// Create an empty entry before assigning its pool generation.
     fn default() -> Self {
@@ -1560,6 +1574,7 @@ impl<C: Context> Default for Entry<C> {
         }
     }
 }
+
 impl<C: Context> Entry<C> {
     /// Move expired owners into deferred garbage without dropping policy in a borrow.
     fn expire_idle(&mut self, now: Instant, timeout: Duration, garbage: &mut Vec<Idle<C>>) {
@@ -1573,6 +1588,7 @@ impl<C: Context> Entry<C> {
         }
     }
 }
+
 /// Shared endpoint table, maintenance cursors, and bounded waiting queue.
 struct PoolState<C: Context> {
     entries: BTreeMap<C::Endpoint, Entry<C>>,
@@ -1591,6 +1607,7 @@ struct PoolState<C: Context> {
 
     next_waiter_poll: Instant,
 }
+
 /// One queued checkout and the task to wake when its endpoint may be available.
 struct WaitingEntry<C: Context> {
     endpoint: C::Endpoint,
@@ -1599,6 +1616,7 @@ struct WaitingEntry<C: Context> {
 
     waker: RefCell<Option<Waker>>,
 }
+
 /// Admission-backed queue registration removed when checkout finishes or cancels.
 struct Waiting<C: Context> {
     state: Rc<RefCell<PoolState<C>>>,
@@ -1607,6 +1625,7 @@ struct Waiting<C: Context> {
 
     _reservation: C::Charge,
 }
+
 impl<C: Context> Drop for Waiting<C> {
     /// Remove this registration and wake the next waiter for its endpoint.
     fn drop(&mut self) {
@@ -1618,6 +1637,7 @@ impl<C: Context> Drop for Waiting<C> {
         state.wake_endpoint(&self.entry.endpoint);
     }
 }
+
 impl<C: Context> PoolState<C> {
     /// Notify the first queued waiter for an endpoint without moving its owner.
     fn wake_endpoint(&self, endpoint: &C::Endpoint) {
@@ -1628,6 +1648,7 @@ impl<C: Context> PoolState<C> {
         }
     }
 }
+
 /// Weak return address preventing stale generations from reentering the idle pool.
 struct ReturnToPool<C: Context> {
     state: Weak<RefCell<PoolState<C>>>,
@@ -1644,6 +1665,7 @@ struct ConnectOwner<C: Context> {
 
     _charge: C::Charge,
 }
+
 impl<C: Context> ConnectOwner<C> {
     /// Size both reference-counted observation allocations for admission.
     fn allocation() -> usize {
@@ -1654,6 +1676,7 @@ impl<C: Context> ConnectOwner<C> {
 
 /// Roll back active admission if preparing a connection fails before lease creation.
 struct ConnectingSlot<C: Context>(Option<ReturnToPool<C>>);
+
 impl<C: Context> Drop for ConnectingSlot<C> {
     /// Release an untransferred active slot without adding a waiter wakeup.
     fn drop(&mut self) {
@@ -1740,6 +1763,7 @@ struct SendRange<B: SendBuffer> {
 
     range: Range<usize>,
 }
+
 impl<B: SendBuffer> SendRange<B> {
     /// Validate each head suffix before the reactor accesses its send view.
     fn checked<E: From<B::Error> + From<Error>>(
@@ -1752,6 +1776,7 @@ impl<B: SendBuffer> SendRange<B> {
         Ok(Self { buffer, range })
     }
 }
+
 // SAFETY: immutable fixed view retains its complete send owner.
 unsafe impl<B: SendBuffer> SendBuffer for SendRange<B> {
     type Error = B::Error;
@@ -1774,6 +1799,7 @@ struct WireFraming {
 
     close: bool,
 }
+
 impl WireFraming {
     /// Snapshot framing-sensitive fields before running an admission hook.
     fn new(head: &MessageHead) -> std::result::Result<Self, Error> {
@@ -1789,6 +1815,7 @@ impl WireFraming {
         })
     }
 }
+
 /// Validate fixed-length message semantics and return the effective body length.
 fn framing(
     head: &MessageHead,
@@ -1814,6 +1841,7 @@ fn framing(
     }
     Ok(body)
 }
+
 /// Preserve a rejected connection for a response, but forbid reuse and body reads.
 fn rejected_head<C: Context>(
     mut connection: ConnectionLease<C>,
@@ -1839,23 +1867,28 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Failure {
         Http(Error),
+
         Runtime(uring_runtime::Error),
     }
+
     impl From<Error> for Failure {
         /// Preserve an HTTP failure for assertions.
         fn from(e: Error) -> Self {
             Self::Http(e)
         }
     }
+
     impl From<uring_runtime::Error> for Failure {
         /// Preserve a runtime failure for assertions.
         fn from(e: uring_runtime::Error) -> Self {
             Self::Runtime(e)
         }
     }
+
     /// Always-live scope for explicit reactor-driving tests.
     #[derive(Clone)]
     struct TestScope;
+
     impl Scope for TestScope {
         type Error = Failure;
 
@@ -1864,14 +1897,17 @@ mod tests {
             Ok(())
         }
     }
+
     /// Counted admission released when its owner drops.
     struct Charge(Rc<Cell<usize>>, usize);
+
     impl Drop for Charge {
         /// Return the reserved count to the test ledger.
         fn drop(&mut self) {
             self.0.set(self.0.get() - self.1);
         }
     }
+
     /// Observable connection policy with configurable head rewrites.
     #[derive(Default)]
     struct Policy {
@@ -1887,17 +1923,25 @@ mod tests {
 
         hook_calls: Option<Rc<Cell<usize>>>,
     }
+
     /// Framing-sensitive and ordinary mutations exercised by policy tests.
     #[derive(Clone, Copy)]
     enum Rewrite {
         Length(u64),
+
         Status(u16),
+
         Head,
+
         Kind,
+
         Close,
+
         Transfer,
+
         Ordinary,
     }
+
     impl Policy {
         /// Apply the selected mutation and count the hook invocation.
         fn rewrite(&self, mut head: MessageHead) -> MessageHead {
@@ -1931,6 +1975,7 @@ mod tests {
             head
         }
     }
+
     impl State<Failure> for Policy {
         /// Count admission and apply its test mutation.
         fn admit(&mut self, head: MessageHead) -> std::result::Result<MessageHead, Failure> {
@@ -1958,17 +2003,21 @@ mod tests {
             self
         }
     }
+
     /// Single ordered endpoint for pool tests.
     #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct Key;
+
     impl Endpoint<Failure> for Key {
         /// Supply a loopback address without resolving names.
         fn address(&self) -> std::result::Result<SocketAddress, Failure> {
             Ok(SocketAddress::Inet("127.0.0.1:9".parse().unwrap()))
         }
     }
+
     /// Direct reactor owner satisfying the context's Deref contract without another Rc.
     struct TestReactor(Reactor<TestScope, ()>);
+
     impl Deref for TestReactor {
         type Target = Reactor<TestScope, ()>;
 
@@ -1988,6 +2037,7 @@ mod tests {
 
         reject_charge: Cell<bool>,
     }
+
     impl Context for Hooks {
         type Error = Failure;
 
@@ -2030,6 +2080,7 @@ mod tests {
             self.stopped.get()
         }
     }
+
     /// Create empty admission ledgers with all operations enabled.
     fn hooks() -> Rc<Hooks> {
         Rc::new(Hooks {
@@ -2039,10 +2090,12 @@ mod tests {
             reject_charge: Cell::new(false),
         })
     }
+
     /// Create the caller-owned reactor wrapper used by test contexts.
     fn reactor() -> Rc<TestReactor> {
         Rc::new(TestReactor(Reactor::new(16, ())))
     }
+
     /// Build a response with one explicit content length.
     fn head(status: u16, length: u64) -> MessageHead {
         MessageHead {
@@ -2053,6 +2106,7 @@ mod tests {
             }],
         }
     }
+
     /// Stable storage that records buffer access and can inject an access failure.
     struct ObservedBuffer {
         bytes: OwnedBuffer<Hooks>,
@@ -2061,6 +2115,7 @@ mod tests {
 
         reject: bool,
     }
+
     // SAFETY: the admitted backing owner keeps its fixed allocation and charge alive.
     unsafe impl IoBuffer for ObservedBuffer {
         type Error = Failure;
@@ -2232,6 +2287,7 @@ mod tests {
         assert_eq!(framing(&head(101, 0), false, 8), Err(Error::Malformed));
         assert_eq!(framing(&head(200, 8), false, 8), Ok(8));
     }
+
     /// Cached storage is cleared, charged, and unavailable after caller shutdown.
     #[test]
     fn buffer_charge_zeroization_and_stop_use_caller_hooks() {
@@ -2252,6 +2308,7 @@ mod tests {
         io.reclaim_buffer();
         assert_eq!(hooks.used.get(), 0);
     }
+
     /// Underflow and removed excess bytes cannot make a connection reusable.
     #[test]
     fn checked_consumption_and_taken_excess_cannot_enable_reuse() {
@@ -2305,6 +2362,7 @@ mod tests {
         assert!(!lease.is_reusable());
         assert_eq!(lease.next_round(), Err(Failure::Http(Error::Malformed)));
     }
+
     /// Pool return permits policy reentrancy and retains only reusable resources.
     #[test]
     fn pool_return_transforms_policy_outside_borrow_and_releases_resources() {
@@ -2363,6 +2421,7 @@ mod tests {
             std::thread::yield_now();
         }
     }
+
     /// Pair an admitted nonblocking connection with its test peer.
     fn lease(
         hooks: &Hooks,
