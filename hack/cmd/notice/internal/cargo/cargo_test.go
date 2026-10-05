@@ -213,14 +213,49 @@ func TestDirectDependenciesResolvesPackageAlias(t *testing.T) {
 	}
 }
 
-func TestCollectorPrecheckReportsMissingCache(t *testing.T) {
+func TestCollectorPrecheckAndCollectWithoutDependencies(t *testing.T) {
 	root := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
 		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\n",
-		"cmd/racer-dataplane/Cargo.lock": "version = 4\n",
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
+
+[[package]]
+name = "racer-dataplane"
+version = "0.1.0"
+`,
 	})
 
-	err := New(t.TempDir()).Precheck(root)
+	c := New(filepath.Join(t.TempDir(), "nonexistent-cache"))
+	if err := c.Precheck(root); err != nil {
+		t.Fatalf("Precheck: %v", err)
+	}
+
+	entries, err := c.Collect(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("Collect = %v, %v; want no entries and no error", entries, err)
+	}
+}
+
+func TestCollectorPrecheckReportsMissingCache(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
+
+[[package]]
+name = "foo"
+version = "1.2.3"
+
+[[package]]
+name = "racer-dataplane"
+version = "0.1.0"
+dependencies = [
+ "foo",
+]
+`,
+	})
+
+	err := New(filepath.Join(t.TempDir(), "nonexistent-cache")).Precheck(root)
 	if err == nil || !strings.Contains(err.Error(), "cargo fetch") {
 		t.Fatalf("Precheck error = %v", err)
 	}

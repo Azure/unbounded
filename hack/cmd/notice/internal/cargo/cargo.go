@@ -54,6 +54,22 @@ func (c *Collector) Precheck(root string) error {
 		return err
 	}
 
+	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
+
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", manifestPath, err)
+	}
+
+	direct, err := directDependencies(string(manifest))
+	if err != nil {
+		return fmt.Errorf("parsing %s: %w", manifestPath, err)
+	}
+
+	if len(direct) == 0 {
+		return nil
+	}
+
 	home, err := c.home()
 	if err != nil {
 		return err

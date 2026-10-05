@@ -52,8 +52,9 @@ hack/cmd/notice/
 
 Cargo and native collectors remain registered for the replacement Racer
 implementation. Cargo collection is inactive when neither `Cargo.toml` nor
-`Cargo.lock` exists under `cmd/racer-dataplane`; no Cargo registry cache is then
-required. The collector is configured for a `racer-dataplane` root package.
+`Cargo.lock` exists under `cmd/racer-dataplane`; no Cargo registry cache is
+required for a crate without direct dependencies. The collector is configured
+for a `racer-dataplane` root package.
 Native collection is inactive when neither native version pin is declared in
 `Makefile`. Incomplete inputs remain errors rather than silently omitting notices.
 
@@ -97,8 +98,8 @@ To add a new ecosystem (e.g. PyPI, Cargo):
 - Do not commit fake `node_modules/`, module-cache, or `site-packages/` trees.
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
 - Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
-  reads license files from the local Cargo registry source cache. Once the Racer
-  manifest is present, populate it with
+  reads license files from the local Cargo registry source cache for direct
+  dependencies. When the Racer crate has dependencies, populate it with
   `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
   Development dependencies are excluded; normal, target, build, and optional
   direct dependencies are included.
