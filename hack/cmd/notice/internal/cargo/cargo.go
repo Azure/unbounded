@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package cargo implements a notice.Collector for direct non-development
-// dependencies of cmd/unbounded-storage.
+// dependencies of cmd/racer-dataplane.
 package cargo
 
 import (
@@ -18,7 +18,10 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 )
 
-const cratePath = "cmd/unbounded-storage"
+const (
+	cratePath = "cmd/racer-dataplane"
+	crateName = "racer-dataplane"
+)
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text
 // from Cargo's populated registry source cache.
@@ -46,10 +49,25 @@ func (c *Collector) Name() string { return "cargo" }
 
 // Precheck implements notice.Collector.
 func (c *Collector) Precheck(root string) error {
-	for _, name := range []string{"Cargo.toml", "Cargo.lock"} {
-		if _, err := os.Stat(filepath.Join(root, cratePath, name)); err != nil {
-			return fmt.Errorf("stat %s: %w", filepath.Join(cratePath, name), err)
-		}
+	present, err := cargoFilesPresent(root)
+	if err != nil || !present {
+		return err
+	}
+
+	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
+
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", manifestPath, err)
+	}
+
+	direct, err := directDependencies(string(manifest))
+	if err != nil {
+		return fmt.Errorf("parsing %s: %w", manifestPath, err)
+	}
+
+	if len(direct) == 0 {
+		return nil
 	}
 
 	home, err := c.home()
@@ -66,6 +84,11 @@ func (c *Collector) Precheck(root string) error {
 
 // Collect implements notice.Collector.
 func (c *Collector) Collect(root string) ([]notice.Entry, error) {
+	present, err := cargoFilesPresent(root)
+	if err != nil || !present {
+		return nil, err
+	}
+
 	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
 
 	manifest, err := os.ReadFile(manifestPath)
@@ -101,6 +124,46 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	}
 
 	return entries, nil
+}
+
+// cargoFilesPresent permits an inactive scaffold, but rejects incomplete inputs.
+func cargoFilesPresent(root string) (bool, error) {
+	missing := make([]string, 0, 2)
+
+	for _, name := range []string{"Cargo.toml", "Cargo.lock"} {
+		path := filepath.Join(root, cratePath, name)
+
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			missing = append(missing, name)
+			continue
+		}
+
+		if err != nil {
+			return false, fmt.Errorf("stat %s: %w", path, err)
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			info, err = os.Stat(path)
+			if err != nil {
+				return false, fmt.Errorf("stat %s: %w", path, err)
+			}
+		}
+
+		if !info.Mode().IsRegular() {
+			return false, fmt.Errorf("%s is not a regular file", path)
+		}
+	}
+
+	if len(missing) == 2 {
+		return false, nil
+	}
+
+	if len(missing) != 0 {
+		return false, fmt.Errorf("missing %s", filepath.Join(cratePath, missing[0]))
+	}
+
+	return true, nil
 }
 
 func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
@@ -366,14 +429,14 @@ func lockedDirectVersions(data string, direct map[string]dependency) (map[string
 	var root *pkg
 
 	for i := range packages {
-		if packages[i].name == "unbounded-storage" {
+		if packages[i].name == crateName {
 			root = &packages[i]
 			break
 		}
 	}
 
 	if root == nil {
-		return nil, fmt.Errorf("unbounded-storage package not found")
+		return nil, fmt.Errorf("%s package not found", crateName)
 	}
 
 	versions := map[string]string{}

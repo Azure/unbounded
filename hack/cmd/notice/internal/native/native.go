@@ -40,7 +40,15 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, fmt.Errorf("reading Makefile: %w", err)
 	}
 
-	versions := makeVersions(string(data), "LIBFABRIC_VERSION", "OPENSSL_VERSION")
+	versions, err := makeVersions(string(data), "LIBFABRIC_VERSION", "OPENSSL_VERSION")
+	if err != nil {
+		return nil, fmt.Errorf("parsing Makefile: %w", err)
+	}
+
+	if len(versions) == 0 {
+		return nil, nil
+	}
+
 	for _, name := range []string{"LIBFABRIC_VERSION", "OPENSSL_VERSION"} {
 		if versions[name] == "" {
 			return nil, fmt.Errorf("%s pin not found in Makefile", name)
@@ -76,23 +84,44 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	}, nil
 }
 
-func makeVersions(data string, names ...string) map[string]string {
-	wanted := make(map[string]bool, len(names))
-	for _, name := range names {
-		wanted[name] = true
-	}
-
+func makeVersions(data string, names ...string) (map[string]string, error) {
 	versions := map[string]string{}
 
 	scanner := bufio.NewScanner(strings.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(strings.SplitN(scanner.Text(), "#", 2)[0])
+		for _, name := range names {
+			if !strings.HasPrefix(line, name) {
+				continue
+			}
 
-		fields := strings.Fields(line)
-		if len(fields) == 3 && wanted[fields[0]] && (fields[1] == "?=" || fields[1] == ":=" || fields[1] == "=") {
-			versions[fields[0]] = fields[2]
+			rest := strings.TrimPrefix(line, name)
+			// Do not mistake a longer variable name for a pin declaration.
+			if rest != "" && !strings.ContainsRune(" \t?:=+!", rune(rest[0])) {
+				continue
+			}
+
+			rest = strings.TrimSpace(rest)
+			value := ""
+
+			for _, operator := range []string{"?=", ":=", "="} {
+				if strings.HasPrefix(rest, operator) {
+					value = strings.TrimSpace(strings.TrimPrefix(rest, operator))
+					break
+				}
+			}
+
+			if len(strings.Fields(value)) != 1 || strings.ContainsAny(value, "$=:?+!\\") {
+				return nil, fmt.Errorf("invalid %s pin declaration %q", name, line)
+			}
+
+			versions[name] = value
 		}
 	}
 
-	return versions
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scanning version pins: %w", err)
+	}
+
+	return versions, nil
 }

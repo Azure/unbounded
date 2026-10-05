@@ -28,7 +28,7 @@ it generates before applying.
 every affected Site, and therefore to cluster-admin.**
 
 This is a property of the mechanism, not a limitation that could be tightened.
-`unbounded-net-node` and `unbounded-storage-supervisor` already run with
+`unbounded-net-node` already runs with
 `hostNetwork`, `hostPID`, `privileged: true` containers and hostPath mounts of
 the host root filesystem. Against pods in that state, changing a container
 image, changing its arguments, injecting an environment variable, or adding a
@@ -37,8 +37,8 @@ sidecar is arbitrary code execution on every node in the Site. Rejecting
 those are already present.
 
 `gantry` and `machina-controller` are not in that state, but it makes no
-difference to the conclusion: reaching any node is enough, and both `net` and
-`storage` are reachable from a single ConfigMap key.
+difference to the conclusion: reaching any node is enough, and `net` is
+reachable from a single ConfigMap key.
 
 Consequently:
 
@@ -82,15 +82,15 @@ data:
   overrides.yaml: |
     apiVersion: overrides.unbounded-cloud.io/v1alpha1
     overrides:
-      - component: storage
-        kind: DaemonSet
+      - component: metalman
+        kind: Deployment
         sites: [edge-west]
         patch:
           spec:
             template:
               spec:
                 containers:
-                  - name: run
+                  - name: metalman
                     resources:
                       limits:
                         memory: 512Mi
@@ -100,9 +100,9 @@ data:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `component` | yes | `net`, `machina`, `gantry`, `token-refresher`, `metalman` or `storage`. |
+| `component` | yes | `net`, `machina`, `gantry`, `token-refresher` or `metalman`. |
 | `kind` | yes | The kind that component emits. With `component` this identifies every workload the operator emits, so you never write a derived per-Site name. A pair the component cannot produce, such as `machina`/`DaemonSet`, is rejected rather than left to match nothing. |
-| `sites` | no | **Per-Site components only**, meaning `metalman` and `storage`. Naming it on `net`, `machina`, `gantry` or `token-refresher` is an error, because those are cluster singletons and there is one of each for the whole cluster. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
+| `sites` | no | **Per-Site components only**, meaning `metalman`. Naming it on `net`, `machina`, `gantry` or `token-refresher` is an error, because those are cluster singletons and there is one of each for the whole cluster. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
 | `patch` | no | A strategic merge patch against the whole workload object, so `metadata.labels`, `metadata.annotations`, `spec.replicas` and the pod template are all reachable. |
 | `extraArgs` | no | Arguments to append, keyed by container name. See below. |
 | `addContainers` | no | Names of containers this entry intends to create rather than modify. |
@@ -119,7 +119,6 @@ Each component emits one kind, except `net`:
 | `gantry` | `DaemonSet` | no |
 | `token-refresher` | `Deployment` | no |
 | `metalman` | `Deployment` | yes |
-| `storage` | `DaemonSet` | yes |
 
 ### Always use `extraArgs` to add arguments
 
@@ -184,7 +183,7 @@ cheapest way to never meet this.
 
 `nodeSelector`, `tolerations` and `affinity` are combined with the operator's own
 constraints rather than replacing them, because the operator relies on them:
-`metalman` and `storage` place their workloads with a mandatory per-Site node
+`metalman` places its workloads with a mandatory per-Site node
 affinity, and replacing it would let two Sites' workloads run on the same nodes.
 
 Node affinity terms are ORed by Kubernetes, so combining yours with the

@@ -380,6 +380,7 @@ func (m *nodeDetailRequests) notify() {
 
 func (m *nodeDetailRequests) run() {
 	cacheDone := make(chan struct{})
+
 	go func() {
 		defer close(cacheDone)
 

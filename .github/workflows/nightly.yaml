@@ -264,7 +264,6 @@ jobs:
   #   - metalman                      : synthesized per-Site Deployment; bakes
   #                                     the netboot image from CONTAINER_REGISTRY
   #   - netboot                       : PXE artifact referenced by metalman
-  #   - unbounded-storage-supervisor  : per-Site storage supervisor DaemonSet
   #   - gantry                        : cluster-wide gantry DaemonSet
   #   - orca                          : deployed separately by deploy-orca
   #
@@ -288,8 +287,6 @@ jobs:
             file: images/netboot/Containerfile
           - name: metalman
             file: images/metalman/Containerfile
-          - name: unbounded-storage-supervisor
-            file: images/unbounded-storage-supervisor/Containerfile
           - name: unbounded-operator
             file: images/unbounded-operator/Containerfile
           - name: gantry

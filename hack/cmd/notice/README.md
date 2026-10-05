@@ -1,8 +1,8 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod`, `frontend/package.json`, and `cmd/unbounded-storage/Cargo.toml` plus
-the pinned libfabric and OpenSSL source versions in `Makefile`.
+`go.mod`, `frontend/package.json`, and `cmd/racer-dataplane/Cargo.toml` plus
+the pinned libfabric and OpenSSL source versions in `Makefile`, when present.
 
 ## Usage
 
@@ -48,6 +48,16 @@ hack/cmd/notice/
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
 
+### Retained Racer scaffolding
+
+Cargo and native collectors remain registered for the replacement Racer
+implementation. Cargo collection is inactive when neither `Cargo.toml` nor
+`Cargo.lock` exists under `cmd/racer-dataplane`; no Cargo registry cache is
+required for a crate without direct dependencies. The collector is configured
+for a `racer-dataplane` root package.
+Native collection is inactive when neither native version pin is declared in
+`Makefile`. Incomplete inputs remain errors rather than silently omitting notices.
+
 ## Adding a new ecosystem
 
 To add a new ecosystem (e.g. PyPI, Cargo):
@@ -88,8 +98,9 @@ To add a new ecosystem (e.g. PyPI, Cargo):
 - Do not commit fake `node_modules/`, module-cache, or `site-packages/` trees.
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
 - Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
-  reads license files from the local Cargo registry source cache. Populate it
-  with `cargo fetch --manifest-path cmd/unbounded-storage/Cargo.toml --locked`.
+  reads license files from the local Cargo registry source cache for direct
+  dependencies. When the Racer crate has dependencies, populate it with
+  `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
   Development dependencies are excluded; normal, target, build, and optional
   direct dependencies are included.
 - Native collection is fully local. Its metadata and canonical license links
