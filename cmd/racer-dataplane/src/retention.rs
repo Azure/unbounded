@@ -2,15 +2,13 @@
 //! state; Bloom approximation applies ONLY to whether a page was seen previously.
 use crate::error::{Error, Result};
 use crate::model::PageId;
+use page_alloc::retention::{Heat, SecondSight};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, hash_map::RandomState};
-use std::hash::BuildHasher;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-const GENERATIONS: usize = 4;
 const PERIOD: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug)]
@@ -74,59 +72,24 @@ struct Counters {
     accepted: AtomicU64,
 }
 pub struct Retention {
-    hash: RandomState,
     state: RefCell<State>,
+
     ownership: RefCell<Ownership>,
+
     counters: Counters,
-    period: Duration,
+
     enabled: bool,
-    heat_capacity: usize,
+
     disk: Cell<[DiskClassSnapshot; 2]>,
+
     pending_payload_bytes: Cell<u64>,
+
     indexed_payload_bytes: Cell<u64>,
 }
 struct State {
-    pages: [Vec<u64>; GENERATIONS],
-    occupancy: [usize; GENERATIONS],
-    current: usize,
-    rotated: Instant,
-    heat: HashMap<PageId, Heat>,
-}
-struct Heat {
-    value: u8,
-    decayed: Instant,
-}
-impl Heat {
-    fn decay(&mut self, now: Instant) {
-        let periods = now.saturating_duration_since(self.decayed).as_secs() / 60;
-        self.value = self.value.saturating_sub(periods.min(3) as u8);
-        self.decayed += Duration::from_secs(periods * 60);
-    }
-}
-impl State {
-    fn rotate(&mut self, now: Instant, period: Duration) {
-        let elapsed = now.saturating_duration_since(self.rotated);
-        let periods = elapsed.as_nanos() / period.as_nanos();
-        if periods == 0 {
-            return;
-        }
-        for _ in 0..periods.min(GENERATIONS as u128) {
-            self.current = (self.current + 1) % GENERATIONS;
-            self.pages[self.current].fill(0);
-            self.occupancy[self.current] = 0;
-        }
-        self.rotated = now - Duration::from_nanos((elapsed.as_nanos() % period.as_nanos()) as u64);
-    }
-    fn touch(&mut self, page: &PageId, now: Instant) {
-        if let Some(heat) = self.heat.get_mut(page) {
-            heat.decay(now);
-            heat.value = (heat.value + 1).min(3);
-        }
-    }
-}
-fn positions(hash: u64, words: usize) -> [usize; 4] {
-    let step = hash.rotate_left(29) | 1;
-    std::array::from_fn(|i| hash.wrapping_add(step.wrapping_mul(i as u64)) as usize % (words * 64))
+    history: SecondSight,
+
+    heat: Heat<PageId>,
 }
 impl Retention {
     pub fn new(history_bytes: usize, heat_entries: usize) -> Result<Self> {
@@ -138,28 +101,14 @@ impl Retention {
         period: Duration,
         enabled: bool,
     ) -> Result<Self> {
-        let words = history_bytes / (GENERATIONS * 8);
-        if words == 0
-            || heat_entries == 0
-            || period.is_zero()
-            || period.as_nanos() > u64::MAX as u128
-        {
-            return Err(Error::InvalidConfiguration);
-        }
+        let history = SecondSight::new(history_bytes, period, uring_runtime::environment::now())
+            .ok_or(Error::InvalidConfiguration)?;
+        let heat = Heat::new(heat_entries).ok_or(Error::InvalidConfiguration)?;
         Ok(Self {
-            hash: RandomState::new(),
-            state: RefCell::new(State {
-                pages: std::array::from_fn(|_| vec![0; words]),
-                occupancy: [0; GENERATIONS],
-                current: 0,
-                rotated: uring_runtime::environment::now(),
-                heat: HashMap::new(),
-            }),
+            state: RefCell::new(State { history, heat }),
             ownership: RefCell::new(Rc::new(|_| false)),
             counters: Counters::default(),
-            period,
             enabled,
-            heat_capacity: heat_entries,
             disk: Cell::new([DiskClassSnapshot::default(); 2]),
             pending_payload_bytes: Cell::new(0),
             indexed_payload_bytes: Cell::new(0),
@@ -190,22 +139,9 @@ impl Retention {
         }
         let owned = self.is_owned(page);
         let mut state = self.state.borrow_mut();
-        state.rotate(now, self.period);
-        let bits = positions(self.hash.hash_one(page), state.pages[0].len());
-        let seen = state.pages.iter().any(|generation| {
-            bits.iter()
-                .all(|bit| generation[bit / 64] & (1 << (bit % 64)) != 0)
-        });
-        let current = state.current;
+        let seen = self.enabled && state.history.observe(page, now);
         if self.enabled {
-            for bit in bits {
-                let mask = 1 << (bit % 64);
-                if state.pages[current][bit / 64] & mask == 0 {
-                    state.pages[current][bit / 64] |= mask;
-                    state.occupancy[current] += 1;
-                }
-            }
-            state.touch(page, now);
+            state.heat.touch(page, now);
         }
         // Disabled second-sight keeps legacy owned-only admission.
         let observation = Observation {
@@ -224,28 +160,18 @@ impl Retention {
     /// Storage installs/removes heat with resident index mappings. Admission never
     /// replaces another resident's exact heat just because hashes collide.
     pub fn track(&self, page: &PageId) -> bool {
-        let mut state = self.state.borrow_mut();
-        if state.heat.contains_key(page) {
-            return true;
-        }
-        if state.heat.len() >= self.heat_capacity {
-            return false;
-        }
-        state.heat.insert(
-            page.clone(),
-            Heat {
-                value: 0,
-                decayed: uring_runtime::environment::now(),
-            },
-        );
-        true
+        self.state
+            .borrow_mut()
+            .heat
+            .track(page, uring_runtime::environment::now())
     }
     pub fn forget(&self, page: &PageId) {
-        self.state.borrow_mut().heat.remove(page);
+        self.state.borrow_mut().heat.forget(page);
     }
     pub fn touch(&self, page: &PageId) {
         self.state
             .borrow_mut()
+            .heat
             .touch(page, uring_runtime::environment::now());
     }
     pub fn score(&self, page: &PageId) -> u8 {
@@ -254,10 +180,7 @@ impl Retention {
     fn score_at(&self, page: &PageId, now: Instant) -> u8 {
         let owned = self.is_owned(page);
         let mut state = self.state.borrow_mut();
-        let heat = state.heat.get_mut(page).map_or(0, |heat| {
-            heat.decay(now);
-            heat.value
-        });
+        let heat = state.heat.score(page, now);
         if self.enabled {
             heat + u8::from(owned)
         } else {
@@ -327,7 +250,7 @@ impl Retention {
     }
     pub fn snapshot(&self) -> Snapshot {
         let mut state = self.state.borrow_mut();
-        state.rotate(uring_runtime::environment::now(), self.period);
+        let (set_bits, bits) = state.history.occupancy(uring_runtime::environment::now());
         let mut snapshot = Snapshot {
             observations: self.counters.observations.load(Ordering::Relaxed),
             qualified: self.counters.qualified.load(Ordering::Relaxed),
@@ -338,8 +261,8 @@ impl Retention {
             disk: self.disk.get(),
             ..Snapshot::default()
         };
-        snapshot.filter_set_bits = state.occupancy.iter().sum();
-        snapshot.filter_bits = state.pages[0].len() * 64 * GENERATIONS;
+        snapshot.filter_set_bits = set_bits;
+        snapshot.filter_bits = bits;
         snapshot.heat_entries = state.heat.len();
         snapshot
     }
@@ -421,7 +344,7 @@ mod tests {
     fn rotation_retains_three_to_four_minutes_and_clears_long_idle() {
         for period in [Duration::from_secs(60), Duration::from_millis(10)] {
             let policy = Retention::configured(4096, 1, period, true).unwrap();
-            let start = policy.state.borrow().rotated;
+            let start = uring_runtime::environment::now();
             let first = Interest::default();
             assert!(!policy.observe_at(&page(0), &first, start).eligible());
             assert!(

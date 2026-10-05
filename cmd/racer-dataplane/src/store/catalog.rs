@@ -18,7 +18,6 @@ use page_alloc::Segments;
 use racer_control_wire::KeyId;
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -32,26 +31,40 @@ pub struct RecordLocation {
 /// evicting a catalog item cannot remove a page's attached immutable descriptor.
 pub struct Index {
     worker: WorkerId,
+
     metadata_capacity: usize,
+
     page_capacity: Cell<usize>,
+
     state: RefCell<State>,
+
     availability: Rc<crate::control::Availability>,
+
     reserved: Cell<usize>,
+
     residency: Rc<Residency>,
-    victim_cursor: Cell<u64>,
+
     active_writes: Rc<RefCell<HashMap<SegmentId, usize>>>,
 }
+/// Production mappings use randomized hashing, as did the original catalog.
+#[cfg(not(test))]
+type Pages = page_alloc::index::PageIndex<PageId, IndexedPage>;
+/// Simulation keeps its deterministic hash state across the extraction boundary.
+#[cfg(test)]
+type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, crate::runtime::HashState>;
+
 #[derive(Default)]
 struct State {
-    pages: HashMap<PageId, IndexedPage>,
-    reverse: HashMap<SegmentId, BTreeMap<u64, PageId>>,
+    pages: Pages,
+
     versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,
+
     metadata: HashMap<ObjectVersion, VersionMetadata>,
+
     order: VecDeque<ObjectVersion>,
+
     current: HashMap<ObjectId, CurrentVersion>,
-    page_order: BTreeMap<u64, PageId>,
-    page_age: HashMap<PageId, u64>,
-    next_age: u64,
+
     residents: HashMap<PageId, Resident>,
 }
 /// One worker's exact union of pending and indexed pages. Guards release heat
@@ -164,7 +177,6 @@ impl Index {
                 )),
                 counts: RefCell::new(HashMap::default()),
             }),
-            victim_cursor: Cell::new(0),
             active_writes: Rc::new(RefCell::new(HashMap::default())),
         }
     }
@@ -242,26 +254,10 @@ impl Index {
     /// Scan at most 64 candidates with a separate cursor. Publication ordering is
     /// never changed by retention, so checkpoint traversal remains monotonic.
     fn victim(&self, state: &State) -> Option<PageId> {
-        use std::ops::Bound::{Excluded, Unbounded};
         let retention = self.retention();
-        let after = self.victim_cursor.get();
-        let mut best = None;
-        for (age, page) in state
-            .page_order
-            .range((Excluded(after), Unbounded))
-            .chain(state.page_order.range(..=after))
-            .take(64)
-        {
-            self.victim_cursor.set(*age);
-            let score = retention.score(page);
-            if best
-                .as_ref()
-                .is_none_or(|(value, oldest, _)| (score, age) < (*value, oldest))
-            {
-                best = Some((score, *age, page.clone()));
-            }
-        }
-        best.map(|(_, _, page)| page)
+        state
+            .pages
+            .victim(64, |page, _| u64::from(retention.score(page)))
     }
     /// Reserve one potential new mapping, optionally evicting a low-value mapping.
     /// Replacement writes also reserve: concurrent invalidation may remove the old
@@ -275,7 +271,14 @@ impl Index {
             let victim = self.victim(&state).ok_or(Error::Overloaded)?;
             self.retention().evicted(
                 &victim,
-                u64::from(state.pages[&victim].metadata.page_length(&victim)?),
+                u64::from(
+                    state
+                        .pages
+                        .get(&victim)
+                        .expect("victim mapping")
+                        .metadata
+                        .page_length(&victim)?,
+                ),
                 false,
             );
             Self::remove_page(&mut state, &victim);
@@ -304,7 +307,9 @@ impl Index {
             return Err(Error::Overloaded);
         }
         // Fail before removing a mapping or acquiring a residency owner.
-        let age = state.next_age.checked_add(1).ok_or(Error::Unavailable)?;
+        if !state.pages.can_publish() {
+            return Err(Error::Unavailable);
+        }
         // Acquire first: replacement retains its existing heat without a gap.
         let mut resident = self.track(&page)?;
         resident.payload = Some(self.retention().payload(payload_bytes, true));
@@ -314,15 +319,11 @@ impl Index {
             .entry(page.version.clone())
             .or_insert((entry.metadata.clone(), 0));
         version.1 += 1;
-        state.next_age = age;
+        let segment = entry.location.segment;
         state
-            .reverse
-            .entry(entry.location.segment)
-            .or_default()
-            .insert(age, page.clone());
-        state.page_order.insert(age, page.clone());
-        state.page_age.insert(page.clone(), age);
-        state.pages.insert(page, entry);
+            .pages
+            .insert(page, entry, segment)
+            .expect("preflighted publication age");
         state.residents.insert(resident.page.clone(), resident);
         Ok(())
     }
@@ -430,17 +431,14 @@ impl Index {
     /// Owner-local bounded cut. Appends are frozen by Checkpointer; removals are
     /// safe omissions. The age tree avoids rescanning a growing hash table.
     pub fn snapshot_pages(&self, after: u64, limit: usize) -> (u64, Vec<(PageId, IndexedPage)>) {
-        use std::ops::Bound::Excluded;
-        use std::ops::Bound::Unbounded;
         let state = self.state.borrow();
         let mut cursor = after;
         let entries = state
-            .page_order
-            .range((Excluded(after), Unbounded))
-            .take(limit)
-            .map(|(age, page)| {
-                cursor = *age;
-                (page.clone(), state.pages[page].clone())
+            .pages
+            .after(after, limit)
+            .map(|(age, page, entry)| {
+                cursor = age;
+                (page.clone(), entry.clone())
             })
             .collect();
         (cursor, entries)
@@ -466,7 +464,6 @@ impl Index {
             replacement.publish_version(m)?;
         }
         *self.state.borrow_mut() = replacement.state.into_inner();
-        self.victim_cursor.set(0);
         Ok(())
     }
     pub fn validate_snapshot(&self, snapshot: &IndexSnapshot) -> Result<()> {
@@ -508,38 +505,29 @@ impl Index {
         budget: usize,
     ) -> Vec<(PageId, RecordLocation)> {
         let s = self.state.borrow();
-        s.reverse
-            .get(&segment)
-            .into_iter()
-            .flat_map(|pages| pages.values())
-            .take(budget)
-            .filter_map(|p| s.pages.get(p).map(|e| (p.clone(), e.location.clone())))
+        s.pages
+            .segment(segment, budget)
+            .map(|(p, e)| (p.clone(), e.location.clone()))
             .collect()
     }
     pub fn segment_empty(&self, segment: SegmentId) -> bool {
-        !self.state.borrow().reverse.contains_key(&segment)
+        self.state.borrow().pages.segment_empty(segment)
     }
     /// Sum live payload value, not padded disk size. At most 256 mappings are
     /// inspected per segment. Larger segments use a conservative upper bound for
     /// the unseen suffix; this is a preference, never an eviction exemption.
     fn segment_score(&self, segment: SegmentId) -> u64 {
         let state = self.state.borrow();
-        let Some(pages) = state.reverse.get(&segment) else {
-            return 0;
-        };
         let retention = self.retention();
-        let mut score = 0u64;
-        for page in pages.values().take(256) {
-            let entry = &state.pages[page];
-            let bytes = entry
-                .metadata
-                .page_length(page)
-                .unwrap_or(crate::model::PAGE_BYTES as u32);
-            score = score.saturating_add(u64::from(bytes) * u64::from(retention.score(page)));
-        }
-        score.saturating_add(
-            (pages.len().saturating_sub(256) as u64).saturating_mul(crate::model::PAGE_BYTES * 4),
-        )
+        state
+            .pages
+            .segment_score(segment, 256, crate::model::PAGE_BYTES * 4, |page, entry| {
+                let bytes = entry
+                    .metadata
+                    .page_length(page)
+                    .unwrap_or(crate::model::PAGE_BYTES as u32);
+                u64::from(bytes) * u64::from(retention.score(page))
+            })
     }
     pub fn remove_cache(&self, cache: &racer_control_wire::CacheId) {
         let mut s = self.state.borrow_mut();
@@ -577,20 +565,8 @@ impl Index {
         Ok(())
     }
     fn remove_page(s: &mut State, page: &PageId) {
-        if let Some(old) = s.pages.remove(page) {
+        if s.pages.remove(page).is_some() {
             s.residents.remove(page);
-            let age = s.page_age.remove(page);
-            if let Some(age) = age {
-                s.page_order.remove(&age);
-            }
-            if let Some(set) = s.reverse.get_mut(&old.location.segment) {
-                if let Some(age) = age {
-                    set.remove(&age);
-                }
-                if set.is_empty() {
-                    s.reverse.remove(&old.location.segment);
-                }
-            }
             if let Some((_, count)) = s.versions.get_mut(&page.version) {
                 *count -= 1;
                 if *count == 0 {
@@ -640,7 +616,12 @@ impl page_alloc::SegmentEntries for Index {
         let removed = entries.len();
         for (page, location) in entries {
             // This synchronous bounded traversal cannot interleave with replacement.
-            let bytes = self.state.borrow().pages[&page]
+            let bytes = self
+                .state
+                .borrow()
+                .pages
+                .get(&page)
+                .expect("indexed page")
                 .metadata
                 .page_length(&page)
                 .expect("validated indexed page");
@@ -913,13 +894,12 @@ mod tests {
             "64 candidates plus one victim classification"
         );
         drop(ticket);
-        let first_cursor = index.victim_cursor.get();
         let (page, entry) = indexed(descriptor("new", 17), 0);
         index.publish(page.clone(), entry).unwrap();
         owned.set(false);
         let ticket = index.reserve_page(true).unwrap();
         assert_eq!(calls.get(), 130);
-        assert_ne!(index.victim_cursor.get(), first_cursor);
+        // Cursor progression and wrap are asserted in page_alloc::index tests.
         assert_eq!(retention.score(&page), 0);
         drop(ticket);
     }
@@ -1059,10 +1039,7 @@ mod tests {
         assert_eq!(retention.snapshot().heat_entries, 1);
         assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
         assert_eq!(retention.score(&page), 1);
-        index.state.borrow_mut().next_age = u64::MAX;
-        assert_eq!(index.publish(page.clone(), entry), Err(Error::Unavailable));
-        assert!(index.lookup(&page).unwrap().is_some());
-        assert_eq!(retention.score(&page), 1);
+        // Exhausted publication ages reject replacement atomically in page_alloc::index.
         drop(index);
         assert_eq!(retention.snapshot().heat_entries, 0);
     }

@@ -1,7 +1,8 @@
 //! Worker-local aligned storage with caller-owned accounting and I/O policy.
 //!
-//! This internal crate owns generic bytes, not keys, records, encryption, integrity
-//! checks, versions, admission classes, or a persistence protocol. The caller
+//! This internal crate owns generic bytes and caller-keyed retention indexes, not
+//! key schemas, records, encryption, integrity checks, versions, admission classes,
+//! or a persistence protocol. The caller
 //! supplies accounting guards, a reactor, cancellation policy, and index callbacks.
 //! There is no assumed OS page size and no cross-thread allocation authority.
 //!
@@ -130,6 +131,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
+pub mod index;
+pub mod retention;
 mod segments;
 
 mod slab;
