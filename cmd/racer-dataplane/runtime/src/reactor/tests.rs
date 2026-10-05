@@ -1,6 +1,140 @@
+//! Private-state regressions for completion fences, admission, and callback reentry.
+//! Synthetic CQEs exercise ownership transitions that public integration tests
+//! cannot observe; host and simulated operations also verify the actual driver path.
 use super::*;
 use fixtures::{Admission, Limits, Reactor, RequestScope, ResourceClass};
-pub(super) mod fixtures;
+pub(super) mod fixtures {
+    //! Counting guards and a scoped adapter for raw completion ownership tests.
+    use super::*;
+    use std::ops::Deref;
+
+    /// Independently counted connection leases and request bookkeeping bytes.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum ResourceClass {
+        /// A connection owner retained until its operation is fenced.
+        Connection,
+        /// Allocation and completion bookkeeping charged through the runtime budget.
+        RequestContext,
+    }
+    /// Queue ceiling selected by each ownership regression.
+    pub struct Limits {
+        /// Maximum accepted operations across ordinary and reserved partitions.
+        pub queue_entries: NonZeroUsize,
+    }
+    /// Shared accounting ledger for observing exact resource release boundaries.
+    pub struct Admission {
+        /// Queue ceiling used when constructing the associated reactor.
+        pub limits: Limits,
+        used: Rc<RefCell<BTreeMap<ResourceClass, usize>>>,
+    }
+    /// One counted resource amount released by its owner's destructor.
+    pub struct Reservation {
+        used: Rc<RefCell<BTreeMap<ResourceClass, usize>>>,
+        class: ResourceClass,
+        amount: usize,
+    }
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            *self.used.borrow_mut().entry(self.class).or_default() -= self.amount;
+        }
+    }
+    impl Admission {
+        /// Start an empty resource ledger with the selected queue limit.
+        pub fn new(limits: Limits) -> Self {
+            Self {
+                limits,
+                used: Rc::default(),
+            }
+        }
+        /// Charge one class and return an independently owned release guard.
+        pub fn reserve(
+            &self,
+            _: Option<&()>,
+            class: ResourceClass,
+            amount: usize,
+        ) -> Result<Reservation> {
+            *self.used.borrow_mut().entry(class).or_default() += amount;
+            Ok(Reservation {
+                used: self.used.clone(),
+                class,
+                amount,
+            })
+        }
+        /// Observe live guards without mutating the accounting ledger.
+        pub fn used(&self, class: ResourceClass) -> usize {
+            *self.used.borrow().get(&class).unwrap_or(&0)
+        }
+    }
+    /// Adapt the ledger to the runtime's public allocation-budget contract.
+    pub struct CountingBudget(Rc<Admission>);
+    impl Budget for CountingBudget {
+        type Charge = Reservation;
+        fn charge(&self, bytes: usize) -> Result<Reservation> {
+            self.0.reserve(None, ResourceClass::RequestContext, bytes)
+        }
+    }
+    /// Scoped reactor with an accessible ledger for private completion regressions.
+    pub struct Reactor {
+        core: super::super::Reactor<RequestScope, CountingBudget>,
+        /// Resource accounting shared with buffers, leases, and completion owners.
+        pub admission: Rc<Admission>,
+    }
+    impl Reactor {
+        /// Construct a lazy reactor using the ledger's queue ceiling.
+        pub fn new(admission: Rc<Admission>) -> Self {
+            Self {
+                core: super::super::Reactor::new(
+                    admission.limits.queue_entries.get(),
+                    CountingBudget(admission.clone()),
+                ),
+                admission,
+            }
+        }
+        /// Fence a snapshot of all current operations while leaving admission open.
+        pub fn file_fence(&self, _: ()) -> Operation<'_, ()> {
+            self.core.fence_matching(|_| true)
+        }
+    }
+    impl Deref for Reactor {
+        type Target = super::super::Reactor<RequestScope, CountingBudget>;
+        fn deref(&self) -> &Self::Target {
+            &self.core
+        }
+    }
+    /// Deadline and cancellation policy retained independently by each operation.
+    #[derive(Clone)]
+    pub struct RequestScope {
+        /// Absolute deadline in the active clock domain.
+        pub deadline: Deadline,
+        /// Shared cancellation state, checked before deadline expiration.
+        pub cancellation: Cancellation,
+    }
+    impl RequestScope {
+        /// Create a fresh cancellation source with a caller-selected deadline.
+        pub fn new(_: (), deadline: Instant) -> Result<Self> {
+            Ok(Self {
+                deadline: Deadline(deadline),
+                cancellation: Cancellation::new()?,
+            })
+        }
+        /// Request cancellation without treating the request as a kernel fence.
+        pub fn cancel(&self) -> Result<()> {
+            self.cancellation.cancel()
+        }
+    }
+    impl Scope for RequestScope {
+        type Error = Error;
+        fn check(&self) -> Result<()> {
+            if self.cancellation.is_cancelled() {
+                Err(Error::Cancelled)
+            } else if crate::environment::now() >= self.deadline.0 {
+                Err(Error::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
 
 #[test]
 fn operation_preserves_scope_and_buffer_errors_before_submission() {
@@ -1340,6 +1474,7 @@ use crate::deadline::{Cancellation, Deadline};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{num::NonZeroUsize, os::unix::net::UnixStream, time::Instant};
 
+/// Count executor notifications without running an executor.
 #[derive(Default)]
 struct Count(AtomicUsize);
 impl std::task::Wake for Count {
@@ -1348,6 +1483,7 @@ impl std::task::Wake for Count {
     }
 }
 
+/// Stable I/O allocation with observable destruction after its final fence.
 struct Buffer(Vec<u8>, Rc<Cell<usize>>);
 // SAFETY: private fixed Vec owns independently allocated backing.
 unsafe impl IoBuffer for Buffer {
@@ -1364,12 +1500,14 @@ impl Drop for Buffer {
         self.1.set(self.1.get() + 1);
     }
 }
+/// Independent reuse guard whose drop must follow all applicable CQEs.
 struct Lease(Rc<Cell<usize>>);
 impl Drop for Lease {
     fn drop(&mut self) {
         self.0.set(self.0.get() + 1);
     }
 }
+/// Allocate initialized test backing with a fresh release counter.
 fn buffer(bytes: &[u8]) -> Buffer {
     Buffer(bytes.into(), Rc::new(Cell::new(0)))
 }
@@ -1468,23 +1606,23 @@ fn submission_classifies_transient_and_fatal_errors() {
     );
 }
 
+/// Build a nonzero queue ceiling for a regression's admitted operation count.
 fn limits(capacity: usize) -> Limits {
     Limits {
         queue_entries: NonZeroUsize::new(capacity).unwrap(),
     }
 }
+/// Create fresh cancellation state and a five-second deadline for a test operation.
 pub(super) fn scope() -> RequestScope {
-    RequestScope {
-        request: (),
-        deadline: Deadline(Instant::now() + Duration::from_secs(5)),
-        cancellation: Cancellation::new().unwrap(),
-    }
+    RequestScope::new((), Instant::now() + Duration::from_secs(5)).unwrap()
 }
+/// Poll delivery once without advancing the kernel or simulated driver.
 pub(super) fn poll<T>(future: &mut Operation<'_, T>) -> Poll<Result<T>> {
     future
         .as_mut()
         .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
 }
+/// Drive explicit completion turns under a host deadline until delivery finishes.
 pub(super) fn drive<T>(reactor: &Reactor, mut future: Operation<'_, T>) -> Result<T> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1496,6 +1634,7 @@ pub(super) fn drive<T>(reactor: &Reactor, mut future: Operation<'_, T>) -> Resul
         reactor.wait(Duration::from_millis(1)).unwrap();
     }
 }
+/// Initialize a host reactor, skipping only unsupported or policy-denied io_uring.
 pub(super) fn kernel_reactor(capacity: usize) -> Option<Reactor> {
     // Skip only when the kernel lacks io_uring or policy denies ring creation.
     // Configuration, quota, opcode, and ordinary I/O errors must fail tests.
@@ -1527,6 +1666,7 @@ mod retry_regressions {
     use super::*;
     use simulation::{Fault, Simulation};
 
+    /// Count accepted submissions of one operation kind in the simulation trace.
     fn submissions(sim: &Simulation, name: &str) -> usize {
         sim.trace()
             .iter()
@@ -2129,6 +2269,7 @@ mod review_regressions {
     thread_local! { static WAKER_CALLBACK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None); }
     // No raw pointer ownership or non-Send data crosses threads. Each callback
     // inspects only the current test thread's optional probe.
+    /// Build a raw waker whose lifecycle invokes the currently installed callback.
     fn callback_waker() -> Waker {
         unsafe fn clone(_: *const ()) -> std::task::RawWaker {
             unsafe {
@@ -2200,6 +2341,7 @@ mod review_regressions {
         WAKER_CALLBACK.with(|probe| probe.borrow_mut().take());
     }
 
+    /// Build an unfenced synthetic entry with an observable completion callback.
     fn entry(
         finish: impl FnOnce(Result<KernelResult>) -> Option<Waker> + 'static,
     ) -> Entry<RequestScope> {
