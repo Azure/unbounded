@@ -29,24 +29,33 @@ pub fn splice_unsupported(error: &io::Error) -> bool {
     )
 }
 
+/// Worker-local pipe admission and a FIFO of bounded, byte-charged waiters.
 pub struct PipePool<P: Policy> {
     quotas: Rc<Quotas<P>>,
+
     pipe_class: P::Class,
+
     waiter_class: P::Class,
+
     waiter_limit: usize,
+
     waiting: Waiters,
+
     idle: Rc<RefCell<Vec<PipeResources<P>>>>,
 }
 
+/// Shared local queue whose head alone attempts scheduled admission.
 type Waiters = Rc<RefCell<VecDeque<Rc<RefCell<Option<Waker>>>>>>;
 
-// Contains no reactor reference: a pending send can own this through its fence.
+/// Wakes the queue after resource return; holds no reactor reference.
 struct Notify(Waiters);
 impl Drop for Notify {
+    /// Notify the oldest queued acquisition after lease resources are released.
     fn drop(&mut self) {
         wake_front(&self.0);
     }
 }
+/// Wake the FIFO head without holding a queue borrow through the callback.
 fn wake_front(waiters: &Waiters) {
     let wake = waiters
         .borrow()
@@ -56,12 +65,16 @@ fn wake_front(waiters: &Waiters) {
         wake.wake();
     }
 }
+/// Own a queue registration and its admission through cancellation or completion.
 struct Waiting<P: Policy> {
     queue: Waiters,
+
     entry: Rc<RefCell<Option<Waker>>>,
+
     _reservation: Charge<P>,
 }
 impl<P: Policy> Drop for Waiting<P> {
+    /// Remove exactly this waiter and notify its successor without self-polling.
     fn drop(&mut self) {
         {
             let mut queue = self.queue.borrow_mut();
@@ -75,23 +88,33 @@ impl<P: Policy> Drop for Waiting<P> {
     }
 }
 
+/// Non-cloneable local ownership of both descriptors and their admission charge.
 pub struct PipeLease<P: Policy> {
     resources: Option<PipeResources<P>>,
+
     pool: Weak<RefCell<Vec<PipeResources<P>>>>,
+
     quotas: Weak<Quotas<P>>,
+
     _notify: Notify,
 }
 
+/// Kernel pipe state; descriptors close before the trailing charge is released.
 struct PipeResources<P: Policy> {
     read: Descriptor,
+
     write: Descriptor,
+
     capacity: usize,
+
     buffered: usize,
+
     // Declared after the descriptors so capacity is returned only after closing.
     _reservation: Charge<P>,
 }
 
 impl<P: Policy> Drop for PipeLease<P> {
+    /// Recycle only empty pipes on a live authority; close partial payloads.
     fn drop(&mut self) {
         // Reactor ownership keeps the lease alive through every accepted CQE.
         // Never recycle canceled/partially drained payloads: close those pipes.
@@ -126,6 +149,7 @@ impl<P: Policy> PipePool<P> {
         }
     }
 
+    /// Borrow the worker-local authority used by pipe and waiter admission.
     pub fn quotas(&self) -> &Rc<Quotas<P>> {
         &self.quotas
     }
@@ -266,6 +290,7 @@ impl<P: Policy> PipePool<P> {
         }))
     }
 
+    /// Attach local recycling and notification to uniquely owned resources.
     fn lease(&self, resources: PipeResources<P>) -> PipeLease<P> {
         PipeLease {
             resources: Some(resources),
@@ -326,10 +351,12 @@ impl<P: Policy> PipeLease<P> {
         pipe.buffered += received;
         Ok(received)
     }
+    /// Return actual kernel capacity, which may be below the requested ceiling.
     pub fn capacity(&self) -> usize {
         self.resources.as_ref().unwrap().capacity
     }
 
+    /// Return the exact suffix still retained in this pipe.
     pub fn buffered(&self) -> usize {
         self.resources.as_ref().unwrap().buffered
     }
@@ -380,6 +407,7 @@ impl<P: Policy> PipeLease<P> {
         Ok(read)
     }
 
+    /// Splice a bounded suffix using production or simulated runtime descriptors.
     pub fn try_splice_descriptor(
         &mut self,
         socket: &Descriptor,
@@ -417,6 +445,7 @@ impl<P: Policy> PipeLease<P> {
         self.try_splice_descriptor(socket, self.buffered())
     }
 
+    /// Drain a validated socket while masking only this thread's generated SIGPIPE.
     fn splice_to_fd(&mut self, fd: libc::c_int, count: usize) -> io::Result<usize> {
         let pipe = self.resources.as_mut().unwrap();
         if count == 0 || pipe.buffered == 0 {
@@ -451,6 +480,7 @@ impl<P: Policy> PipeLease<P> {
     }
 }
 
+/// Require a live nonblocking stream socket before synchronous splice.
 fn validate_socket(socket: &impl AsFd) -> io::Result<()> {
     let fd = socket.as_fd().as_raw_fd();
     // SPLICE_F_NONBLOCK controls only the pipe side. O_NONBLOCK alone does not
@@ -484,13 +514,17 @@ fn validate_socket(socket: &impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Temporarily mask SIGPIPE while preserving the thread's prior signal state.
 struct SigpipeGuard {
     previous: libc::sigset_t,
+
     set: libc::sigset_t,
+
     was_pending: bool,
 }
 
 impl SigpipeGuard {
+    /// Save the thread mask, block SIGPIPE, and remember preexisting signals.
     fn block() -> io::Result<Self> {
         // SAFETY: all signal set pointers refer to initialized local storage.
         unsafe {
@@ -516,6 +550,7 @@ impl SigpipeGuard {
         }
     }
 
+    /// Consume only a newly generated signal without waiting.
     fn consume_generated(&self) {
         if self.was_pending {
             return;
@@ -535,12 +570,14 @@ impl SigpipeGuard {
 }
 
 impl Drop for SigpipeGuard {
+    /// Restore the exact mask saved after successful installation.
     fn drop(&mut self) {
         // SAFETY: restore the exact thread mask saved by successful pthread_sigmask.
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut()) };
     }
 }
 
+/// Convert a syscall byte count while preserving its OS error.
 fn syscall_count(value: isize) -> io::Result<usize> {
     if value < 0 {
         Err(io::Error::last_os_error())
@@ -549,9 +586,11 @@ fn syscall_count(value: isize) -> io::Result<usize> {
     }
 }
 
+/// Kernel behavior, admission, cancellation, and simulation ownership contracts.
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Unsupported operation errors never include backpressure or disconnects.
     #[test]
     fn unsupported_splice_is_distinct_from_backpressure_and_disconnect() {
         for code in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
@@ -571,6 +610,7 @@ mod tests {
         task::{Context, Wake},
     };
 
+    /// Independent pipe, waiter-context, and payload fixture resources.
     #[derive(Clone, Copy)]
     enum ResourceClass {
         Pipe,
@@ -579,40 +619,57 @@ mod tests {
     }
     impl crate::Class for ResourceClass {
         const COUNT: usize = 3;
+
+        /// Select the fixture's stable per-class counter.
         fn index(self) -> usize {
             self as usize
         }
     }
+    /// Independent pipe and context limits without quota-driven wake policy.
     struct TestPolicy {
         pipes: usize,
+
         context: usize,
     }
     impl Policy for TestPolicy {
         type Class = ResourceClass;
+
         type Key = ();
+
+        /// Give pipes their count ceiling and other classes a byte ceiling.
         fn limit(&self, class: ResourceClass) -> usize {
             match class {
                 ResourceClass::Pipe => self.pipes,
                 _ => self.context,
             }
         }
+
+        /// All pipe fixture admission is unkeyed.
         fn max_keys(&self) -> usize {
             0
         }
+
+        /// Pipe return drives wakeups instead of shared quota release.
         fn wakes(_: ResourceClass) -> bool {
             false
         }
+
+        /// Pipe counts do not authorize userspace page backing.
         fn covers(_: ResourceClass) -> bool {
             false
         }
+
+        /// Rejection facts are not needed by these pipe assertions.
         fn rejected(&self, _: crate::Rejection<ResourceClass>) {}
     }
+    /// Build a local authority with ample waiter-context capacity.
     fn admission(pipes: usize) -> Rc<Quotas<TestPolicy>> {
         Rc::new(Quotas::new(TestPolicy {
             pipes,
             context: 32 * 1024 * 1024,
         }))
     }
+    /// Build an eight-waiter pool using distinct pipe and context classes.
     fn new_pool(quotas: Rc<Quotas<TestPolicy>>) -> PipePool<TestPolicy> {
         PipePool::new(
             quotas,
@@ -621,38 +678,46 @@ mod tests {
             8,
         )
     }
+    /// Create an acquisition with no cancellation or deadline source.
     fn acquire_wait(
         pool: &PipePool<TestPolicy>,
     ) -> std::pin::Pin<Box<impl Future<Output = Result<PipeLease<TestPolicy>>> + '_>> {
         Box::pin(pool.acquire_wait(|| Ok::<_, Error>(()), || Ok(|_: &Waker| {})))
     }
+    /// Count progress notifications without requiring an executor.
     #[derive(Default)]
     struct WakeCounter(AtomicUsize);
     impl Wake for WakeCounter {
+        /// Count an owned wake notification.
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+        /// Count a borrowed wake notification.
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
     impl WakeCounter {
+        /// Read the number of observed progress notifications.
         fn count(&self) -> usize {
             self.0.load(Ordering::Relaxed)
         }
     }
 
+    /// Distinguish application gate rejection from flow-control exhaustion.
     #[derive(Debug, PartialEq)]
     enum GateError {
         Rejected,
         Flow(Error),
     }
     impl From<Error> for GateError {
+        /// Preserve the underlying flow-control failure.
         fn from(error: Error) -> Self {
             Self::Flow(error)
         }
     }
 
+    /// Immediate acquisition skips subscription and failed waits roll back fully.
     #[test]
     fn lazy_subscription_and_failure_rollback() {
         use std::cell::Cell;
@@ -709,11 +774,14 @@ mod tests {
         }
     }
 
+    /// Gate failure, stop, and abandonment release registration and exact charges.
     #[test]
     fn gate_stop_and_abandonment_drop_registration_and_exact_charge() {
         use std::cell::Cell;
+        /// Count a caller-owned cancellation registration until its closure drops.
         struct Registration(Rc<Cell<usize>>);
         impl Drop for Registration {
+            /// Release exactly this registration's live count.
             fn drop(&mut self) {
                 self.0.set(self.0.get() - 1);
             }
@@ -798,6 +866,7 @@ mod tests {
         }
     }
 
+    /// Both descriptor splice directions reject blocking sockets without data loss.
     #[test]
     fn public_descriptor_splice_validates_both_directions() {
         use std::{
@@ -832,6 +901,7 @@ mod tests {
         assert_eq!(&bytes, b"in!");
     }
 
+    /// Simulated descriptors preserve byte counts, pooling, and partial close.
     #[cfg(feature = "simulation")]
     #[test]
     fn simulation_uses_runtime_descriptors_and_preserves_accounting() {
@@ -866,6 +936,7 @@ mod tests {
         assert_eq!(quotas.used(ResourceClass::Pipe), 0);
     }
 
+    /// Empty pipes reuse both descriptors while partial payloads are closed.
     #[test]
     fn empty_pipe_reuses_descriptors_and_partial_pipe_is_closed() {
         let admission = admission(1);
@@ -894,6 +965,7 @@ mod tests {
         assert_eq!(unsafe { libc::fcntl(write, libc::F_GETFD) }, -1);
     }
 
+    /// A lease outliving its pool continues to hold capacity until drop.
     #[test]
     fn exhaustion_and_drop_return_capacity_even_after_pool_drop() {
         let admission = admission(1);
@@ -907,6 +979,7 @@ mod tests {
         assert!(pool.acquire().is_ok());
     }
 
+    /// Scheduled acquisition is bounded and FIFO without polling itself awake.
     #[test]
     fn scheduled_acquisition_is_bounded_fifo_and_wakes_only_for_progress() {
         let admission = admission(2);
@@ -960,6 +1033,7 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Pipe), 0);
     }
 
+    /// Kernel descriptors have bounded capacity and independent nonblocking data.
     #[test]
     fn pipes_are_nonblocking_bounded_cloexec_and_independent() {
         let admission = admission(2);
@@ -1009,6 +1083,7 @@ mod tests {
         assert_eq!(&out[..6], b"second");
     }
 
+    /// Copied pages remain intact after source reuse, partial drain, and pipe reuse.
     #[test]
     fn copied_splice_survives_source_reuse_and_partial_drain() {
         use std::{io::Read, os::unix::net::UnixStream};
@@ -1033,6 +1108,7 @@ mod tests {
         assert_eq!(&received, b"copied kernel pages");
     }
 
+    /// Blocking sockets and disconnects preserve the full buffered suffix.
     #[test]
     fn splice_rejects_blocking_socket_and_handles_disconnect_without_losing_bytes() {
         use std::os::unix::net::UnixStream;
@@ -1058,6 +1134,7 @@ mod tests {
         assert_eq!(&bytes, b"abc");
     }
 
+    /// Backpressure and invalid socket types leave fallback bytes untouched.
     #[test]
     fn splice_backpressure_preserves_buffered_bytes_and_socket_validation() {
         use std::{io::Write, os::unix::net::UnixStream};
