@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
+	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -402,7 +402,8 @@ func DesiredFieldsMatch(desired, current any) bool {
 }
 
 // AppliedPayloadHash returns the label-safe digest used to identify an exact
-// desired SSA payload.
+// desired SSA payload. Unpadded Base32 preserves all 256 bits in 52 alphanumeric
+// characters, including the first and last characters required by label values.
 func AppliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
 	payload := obj.DeepCopy()
 	labels := payload.GetLabels()
@@ -416,7 +417,7 @@ func AppliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
 
 	sum := sha256.Sum256(data)
 
-	return base64.RawURLEncoding.EncodeToString(sum[:]), nil
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:]), nil
 }
 
 // ListSites returns every Site in the cluster.

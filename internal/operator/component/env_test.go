@@ -5,7 +5,8 @@ package component
 
 import (
 	"context"
-	"regexp"
+	"fmt"
+	"math"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -15,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -57,7 +59,6 @@ func TestSetPodSpecImages(t *testing.T) {
 			"containers":     []any{map[string]any{"name": "run", "image": "old:run"}},
 		}}},
 	}}
-
 	if err := SetPodSpecImages(obj, "registry.example.com/azure/component:v1"); err != nil {
 		t.Fatalf("SetPodSpecImages: %v", err)
 	}
@@ -148,6 +149,56 @@ func TestConfigMapPayloadHashIncludesDataAndBinaryData(t *testing.T) {
 	if ConfigMapPayloadHash(first) == ConfigMapPayloadHash(changedData) ||
 		ConfigMapPayloadHash(first) == ConfigMapPayloadHash(changedBinary) {
 		t.Fatal("payload hash did not include all Data and BinaryData")
+	}
+}
+
+func TestAppliedPayloadHashLabelValue(t *testing.T) {
+	for i := range 256 {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   map[string]any{"name": fmt.Sprintf("payload-%d", i)},
+			"data":       map[string]any{"value": fmt.Sprint(i)},
+		}}
+		obj.SetLabels(map[string]string{"app": "test"})
+
+		hash, err := AppliedPayloadHash(obj)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(hash) != 52 {
+			t.Fatalf("payload hash length = %d, want 52", len(hash))
+		}
+
+		if errors := validation.IsValidLabelValue(hash); len(errors) != 0 {
+			t.Fatalf("payload %d hash %q is not a valid label value: %v", i, hash, errors)
+		}
+
+		obj.SetLabels(map[string]string{"app": "test", AppliedHashLabel: "previous-hash"})
+
+		repeated, err := AppliedPayloadHash(obj)
+		if err != nil || repeated != hash {
+			t.Fatalf("existing applied hash changed payload hash: %q, %v", repeated, err)
+		}
+
+		if obj.GetLabels()[AppliedHashLabel] != "previous-hash" {
+			t.Fatal("hashing mutated input labels")
+		}
+
+		obj.Object["data"] = map[string]any{"value": "changed"}
+
+		changed, err := AppliedPayloadHash(obj)
+		if err != nil || changed == hash {
+			t.Fatalf("changed payload hash: %q, %v", changed, err)
+		}
+	}
+}
+
+func TestAppliedPayloadHashInvalidPayload(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{"value": math.Inf(1)}}
+	if _, err := AppliedPayloadHash(obj); err == nil {
+		t.Fatal("unsupported JSON value did not return an error")
 	}
 }
 
@@ -271,7 +322,7 @@ func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 		t.Fatalf("appliedPayloadHash: %v", err)
 	}
 
-	if len(hash) > 63 || !regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(hash) {
+	if errors := validation.IsValidLabelValue(hash); len(errors) != 0 {
 		t.Fatalf("applied payload hash %q is not a valid label value", hash)
 	}
 
