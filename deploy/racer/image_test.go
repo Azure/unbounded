@@ -140,3 +140,14 @@ func TestDataplaneImageCopiesLocalCrates(t *testing.T) {
 		}
 	}
 }
+
+// Moving a library test into a helper integration suite must not hide it from this gate.
+func TestDataplaneTestDiscoversHelperIntegrationSuites(t *testing.T) {
+	data, err := os.ReadFile("../../Makefile")
+	require.NoError(t, err)
+
+	_, target, found := strings.Cut(string(data), "\nracer-dataplane-test:")
+	require.True(t, found)
+	target, _, _ = strings.Cut(target, "\n\n")
+	require.Contains(t, target, "--workspace --exclude racer-dataplane --all-features --tests")
+}
