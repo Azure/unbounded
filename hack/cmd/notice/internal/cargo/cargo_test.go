@@ -66,6 +66,7 @@ func TestCollectorRejectsCargoFilesystemErrors(t *testing.T) {
 				path := filepath.Join(root, cratePath, name)
 
 				var err error
+
 				switch kind {
 				case "directory":
 					err = os.Mkdir(path, 0o755)
