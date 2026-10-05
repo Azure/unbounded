@@ -1,4 +1,7 @@
 //! Shared loopback I/O and certificate fixtures for public and private invariants.
+//!
+//! This small test-only companion keeps one copy of the fixture machinery while
+//! preserving both external API tests and private connection-pool assertions.
 
 use std::{
     io::{Read, Write},
