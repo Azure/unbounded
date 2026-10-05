@@ -10,12 +10,16 @@ use std::ffi::OsStr;
 pub struct Replacement {
     /// Trusted parent directory pinned throughout validation and publication.
     pub directory: Rc<Descriptor>,
+
     /// Fresh, empty, single-link stage used to verify the reopened inode.
     pub staged: Rc<Descriptor>,
+
     /// Stage name as one component within the pinned directory.
     pub temporary: CString,
+
     /// Distinct destination component replaced atomically by rename.
     pub target: CString,
+
     /// Requested file and namespace durability fences.
     pub durability: Durability,
 }
@@ -51,6 +55,31 @@ pub enum Durability {
     FileAndDirectory,
 }
 
+/// Input ownership for the shared replacement pipeline.
+enum ReplacementInput<'a> {
+    /// Consume an already admitted buffer and release it once writing finishes.
+    Owned(Buffer),
+    /// Copy borrowed input through scratch retained until publication completes.
+    Chunked(&'a [u8], NonZeroUsize),
+}
+
+/// A validated replacement paired with its verified, nonappend write descriptor.
+/// Keeping these together prevents publication with another stage's descriptor.
+struct PreparedReplacement {
+    replacement: Replacement,
+
+    staged: Rc<Descriptor>,
+}
+
+/// A prepared replacement whose entire input has reached its write completion fence.
+/// Only this state can enter publication. Scratch remains charged for the same
+/// interval as the chunked API's original reusable allocation.
+struct WrittenReplacement {
+    prepared: PreparedReplacement,
+
+    _scratch: Option<Buffer>,
+}
+
 impl<S: Scope, B: Budget> Reactor<S, B> {
     /// Write a fresh empty stage, then atomically rename it. Reused/nonempty stages
     /// are rejected, including for empty input. Failure cleanup remains caller-owned.
@@ -60,16 +89,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         buffer: Buffer,
         scope: &'a S,
     ) -> Operation<'a, (), ReplacementError<S::Error>> {
-        Box::pin(async move {
-            let staged = self
-                .prepare_replacement(&replacement, scope)
-                .await
-                .map_err(ReplacementError::BeforeRename)?;
-            self.write_complete(staged.clone(), buffer, &mut 0, scope)
-                .await
-                .map_err(ReplacementError::BeforeRename)?;
-            self.publish_replacement(replacement, staged, scope).await
-        })
+        self.replace_input(replacement, ReplacementInput::Owned(buffer), scope)
     }
 
     /// Write a fresh stage with reusable, bounded scratch, then publish it.
@@ -82,34 +102,35 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         chunk: NonZeroUsize,
         scope: &'a S,
     ) -> Operation<'a, (), ReplacementError<S::Error>> {
+        self.replace_input(replacement, ReplacementInput::Chunked(bytes, chunk), scope)
+    }
+
+    /// Share validation, full-write completion, and publication across input forms.
+    fn replace_input<'a>(
+        &'a self,
+        replacement: Replacement,
+        input: ReplacementInput<'a>,
+        scope: &'a S,
+    ) -> Operation<'a, (), ReplacementError<S::Error>> {
         Box::pin(async move {
-            let staged = self
-                .prepare_replacement(&replacement, scope)
+            let prepared = self
+                .prepare_replacement(replacement, scope)
                 .await
                 .map_err(ReplacementError::BeforeRename)?;
-            let mut offset = 0u64;
-            let mut buffer = self
-                .file_buffer(bytes.len().min(chunk.get()))
-                .map_err(|e| ReplacementError::BeforeRename(e.into()))?;
-            for bytes in bytes.chunks(chunk.get()) {
-                buffer.start = 0;
-                buffer.end = bytes.len();
-                buffer.data[..bytes.len()].copy_from_slice(bytes);
-                buffer = self
-                    .write_complete(staged.clone(), buffer, &mut offset, scope)
-                    .await
-                    .map_err(ReplacementError::BeforeRename)?;
-            }
-            self.publish_replacement(replacement, staged, scope).await
+            let written = self
+                .write_replacement(prepared, input, scope)
+                .await
+                .map_err(ReplacementError::BeforeRename)?;
+            self.publish_replacement(written, scope).await
         })
     }
 
     /// Verify a fresh single-link stage and reopen its exact inode without append.
     async fn prepare_replacement(
         &self,
-        replacement: &Replacement,
+        replacement: Replacement,
         scope: &S,
-    ) -> Result<Rc<Descriptor>, S::Error> {
+    ) -> Result<PreparedReplacement, S::Error> {
         for name in [&replacement.temporary, &replacement.target] {
             secure::validate_component(OsStr::from_bytes(name.as_bytes()), PATH_BYTES)?;
         }
@@ -141,7 +162,44 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         {
             return Err(Error::InvalidInput.into());
         }
-        Ok(staged)
+        Ok(PreparedReplacement {
+            replacement,
+            staged,
+        })
+    }
+
+    /// Finish every input chunk before granting the capability to publish the stage.
+    /// Empty input still passes stage validation and preserves allocation policy.
+    async fn write_replacement(
+        &self,
+        prepared: PreparedReplacement,
+        input: ReplacementInput<'_>,
+        scope: &S,
+    ) -> Result<WrittenReplacement, S::Error> {
+        let mut offset = 0;
+        let scratch = match input {
+            ReplacementInput::Owned(buffer) => {
+                self.write_complete(prepared.staged.clone(), buffer, &mut offset, scope)
+                    .await?;
+                None
+            }
+            ReplacementInput::Chunked(bytes, chunk) => {
+                let mut buffer = self.file_buffer(bytes.len().min(chunk.get()))?;
+                for bytes in bytes.chunks(chunk.get()) {
+                    buffer.start = 0;
+                    buffer.end = bytes.len();
+                    buffer.data[..bytes.len()].copy_from_slice(bytes);
+                    buffer = self
+                        .write_complete(prepared.staged.clone(), buffer, &mut offset, scope)
+                        .await?;
+                }
+                Some(buffer)
+            }
+        };
+        Ok(WrittenReplacement {
+            prepared,
+            _scratch: scratch,
+        })
     }
 
     /// Consume short writes while retaining the same scratch allocation.
@@ -166,10 +224,14 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     /// Apply the selected durability fences and preserve the failed publication phase.
     async fn publish_replacement(
         &self,
-        replacement: Replacement,
-        staged: Rc<Descriptor>,
+        written: WrittenReplacement,
         scope: &S,
     ) -> Result<(), ReplacementError<S::Error>> {
+        let WrittenReplacement { prepared, _scratch } = written;
+        let PreparedReplacement {
+            replacement,
+            staged,
+        } = prepared;
         if matches!(replacement.durability, Durability::FileAndDirectory) {
             self.file_sync(staged.clone(), scope)
                 .await
@@ -261,6 +323,7 @@ mod publication {
     /// Pinned directory shared by validation, creation, publication and cleanup.
     pub(super) struct Directory {
         fd: Descriptor,
+
         #[cfg(feature = "simulation")]
         simulated: Option<(simulation::Simulation, PathBuf)>,
     }
@@ -478,6 +541,7 @@ mod chunked_tests {
         }
     }
 
+    /// Publish every chunk despite short writes without promising crash durability.
     #[test]
     fn chunked_publication_handles_short_writes_empty_and_non_durable_crash() {
         for bytes in [vec![], vec![7; 1024 * 1024 + 3]] {
@@ -515,6 +579,7 @@ mod chunked_tests {
         }
     }
 
+    /// Preserve the target and fence accepted owners after failures or abandonment.
     #[test]
     fn chunked_failures_and_abandonment_leave_target_and_fence_stage_owners() {
         for fault in ["write", "zero", "rename", "cancel", "abandon"] {
@@ -585,6 +650,7 @@ mod chunked_tests {
         }
     }
 
+    /// Skip occupied candidates and clean failed stages without issuing fsync.
     #[test]
     fn synchronous_publication_skips_collisions_cleans_failure_and_has_no_fsync() {
         let sim = Simulation::new();
@@ -616,6 +682,7 @@ mod chunked_tests {
         assert_eq!(sim.read_file(target).unwrap(), b"old");
     }
 
+    /// Validate containment before mutation and create only private files/directories.
     #[test]
     fn synchronous_simulation_uses_private_modes_and_validates_before_creation() {
         let sim = Simulation::new();
@@ -689,6 +756,7 @@ mod tests {
         .unwrap()
     }
 
+    /// Probe beyond the requested bound while respecting short reads and cancellation.
     #[test]
     fn bounded_reads_cover_empty_exact_short_growth_and_errors() {
         let sim = Simulation::new();
@@ -749,6 +817,58 @@ mod tests {
         }
     }
 
+    /// Preserve each input form's scratch lifetime and fence a shared held rename.
+    #[test]
+    fn shared_pipeline_preserves_scratch_accounting_through_publication() {
+        use crate::reactor::tests::fixtures::ResourceClass;
+
+        let mut retained = Vec::new();
+        for chunked in [false, true] {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let r = reactor();
+            let request = scope();
+            let replacement = replacement(&r, Durability::Publish);
+            let directory = Rc::downgrade(&replacement.directory);
+            let staged = Rc::downgrade(&replacement.staged);
+            let baseline = r.admission.used(ResourceClass::RequestContext);
+            sim.inject("rename", Fault::HoldCompletion(20)).unwrap();
+            let mut future = if chunked {
+                r.file_replace_chunked(
+                    replacement,
+                    b"new bytes",
+                    NonZeroUsize::new(3).unwrap(),
+                    &request,
+                )
+            } else {
+                r.file_replace(replacement, r.file_bytes(b"new bytes").unwrap(), &request)
+            };
+            for _ in 0..100 {
+                assert!(poll(&mut future).is_pending());
+                r.poll_budgeted(8).unwrap();
+                r.wait(Duration::from_millis(1)).unwrap();
+                if sim.trace().iter().any(|e| e.operation == "complete:rename") {
+                    break;
+                }
+            }
+            assert_eq!(sim.read_file(Path::new("/target")).unwrap(), b"new bytes");
+            assert!(staged.upgrade().is_some());
+            retained.push(r.admission.used(ResourceClass::RequestContext) - baseline);
+            drop(future);
+            assert!(staged.upgrade().is_none());
+            assert!(directory.upgrade().is_some());
+            assert_eq!(r.in_flight(), 1);
+            drive(&r, r.file_fence(())).unwrap();
+            assert!(directory.upgrade().is_none());
+            assert_eq!(r.in_flight(), 0);
+            assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
+        }
+        // Both paths retain identical rename bookkeeping. Only chunked input
+        // keeps its three-byte scratch allocation after all writes have finished.
+        assert_eq!(retained[1], retained[0] + 3);
+    }
+
+    /// Honor the selected durability fences after consuming all short writes.
     #[test]
     fn replacement_durability_is_explicit_and_short_writes_are_complete() {
         for durability in [Durability::Publish, Durability::FileAndDirectory] {
@@ -787,6 +907,7 @@ mod tests {
         }
     }
 
+    /// Reject invalid names and stale stages before any write or publication attempt.
     #[test]
     fn replacement_rejects_nested_names_and_nonempty_or_mismatched_stages() {
         for case in [
@@ -838,6 +959,7 @@ mod tests {
         }
     }
 
+    /// Keep output charged until drop and interpret prefixes at the current cursor.
     #[test]
     fn read_output_owns_budget_and_prefix_uses_current_cursor() {
         use crate::reactor::tests::fixtures::ResourceClass;
@@ -871,6 +993,7 @@ mod tests {
         assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
     }
 
+    /// Distinguish uncertain rename completion from failed post-publication sync.
     #[test]
     fn post_rename_sync_failure_and_held_cancellation_report_publication_phase() {
         for cancel in [false, true] {
@@ -917,11 +1040,16 @@ mod tests {
         }
     }
 
+    /// Reject output allocation before submitting reads when admission is exhausted.
     #[test]
     fn output_budget_failure_precedes_any_read() {
+        /// Budget that rejects every allocation to exercise admission ordering.
         struct Reject;
         impl Budget for Reject {
+            /// No charge can be constructed by this rejecting budget.
             type Charge = ();
+
+            /// Deny all requested bytes without retaining a charge.
             fn charge(&self, _: usize) -> Result<()> {
                 Err(Error::Overloaded)
             }
@@ -940,6 +1068,7 @@ mod tests {
         assert!(!sim.trace().iter().any(|e| e.operation == "submit:read"));
     }
 
+    /// Maintain positioned offsets when a completion consumes only part of scratch.
     #[test]
     fn explicitly_injected_short_completions_preserve_offsets_and_reused_scratch() {
         let sim = Simulation::new();
@@ -984,6 +1113,7 @@ mod tests {
         assert_eq!(sim.read_file(Path::new("/target")).unwrap(), b"abcdef");
     }
 
+    /// Leave the old target intact after failed or abandoned prepublication work.
     #[test]
     fn failed_or_abandoned_stage_never_publishes_partial_data() {
         for operation in ["write", "fsync", "rename", "abandon"] {
@@ -1020,6 +1150,7 @@ mod tests {
         }
     }
 
+    /// Retain a held rename's directory but do not invent a later durability sync.
     #[test]
     fn abandoned_held_rename_keeps_directory_owned_until_fenced() {
         let sim = Simulation::new();
@@ -1058,6 +1189,7 @@ mod tests {
         assert_eq!(r.in_flight(), 0);
     }
 
+    /// Publish empty input but reject a zero-byte completion for nonempty input.
     #[test]
     fn empty_replacement_and_zero_write_completion_are_distinct() {
         for empty in [true, false] {

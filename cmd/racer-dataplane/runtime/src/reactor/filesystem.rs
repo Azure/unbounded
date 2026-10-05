@@ -10,8 +10,11 @@ pub use operations::{Durability, Replacement, ReplacementError, publish_new};
 /// The entire allocation is zeroized on drop, including already consumed bytes.
 pub struct Buffer {
     data: Vec<u8>,
+
     start: usize,
+
     end: usize,
+
     _quota: Charge,
 }
 
@@ -21,12 +24,16 @@ pub struct ReadBuffer {
     buffer: Buffer,
 }
 impl Deref for ReadBuffer {
+    /// The initialized read output exposed to callers.
     type Target = [u8];
+
+    /// Borrow only initialized output, not the unused bounded-read capacity.
     fn deref(&self) -> &[u8] {
         &self.buffer.data[..self.buffer.end]
     }
 }
 impl AsRef<[u8]> for ReadBuffer {
+    /// Borrow the completed read without transferring its admission charge.
     fn as_ref(&self) -> &[u8] {
         self
     }
@@ -34,15 +41,21 @@ impl AsRef<[u8]> for ReadBuffer {
 
 // SAFETY: private non-resizing Vec retains allocation and quota through completion.
 unsafe impl IoBuffer for Buffer {
+    /// Buffer access uses the reactor's standard error boundary.
     type Error = Error;
+
+    /// Borrow the unconsumed region while retaining its stable allocation.
     fn bytes(&self) -> Result<&[u8]> {
         Ok(&self.data[self.start..self.end])
     }
+
+    /// Mutably borrow the unconsumed region without allowing a resize.
     fn bytes_mut(&mut self) -> Result<&mut [u8]> {
         Ok(&mut self.data[self.start..self.end])
     }
 }
 impl Drop for Buffer {
+    /// Erase the entire allocation before storage and its charge are released.
     fn drop(&mut self) {
         self.data.as_mut_slice().zeroize();
     }
@@ -246,19 +259,9 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
-    /// Create an owner-only directory relative to a pinned parent descriptor.
-    /// Existing names return an error; this primitive does not sync the parent.
-    pub fn file_mkdir<'a>(
-        &'a self,
-        dir: Rc<Descriptor>,
-        name: CString,
-        scope: &'a S,
-    ) -> Operation<'a, (), S::Error> {
-        self.file_mkdir_inner(dir, name, false, scope)
-    }
     /// Rename within a pinned directory; cancellation is not proof it did not execute.
     /// Callers own name validation, namespace serialization, and durability policy.
-    pub fn file_rename<'a>(
+    pub(super) fn file_rename<'a>(
         &'a self,
         dir: Rc<Descriptor>,
         from: CString,
@@ -299,72 +302,48 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         name: CString,
         scope: &'a S,
     ) -> Operation<'a, (), S::Error> {
-        self.file_unlink_inner(dir, name, false, scope)
+        self.file_change(dir, name, NamespaceChange::Unlink, scope)
     }
 
-    /// Create a private directory, optionally treating an existing name as success.
-    fn file_mkdir_inner<'a>(
+    /// Retain a relative mutation's descriptor, pathname, and quota as one owner.
+    /// Only a fenced kernel errno can satisfy the selected idempotency policy;
+    /// scope cancellation and admission failures always propagate unchanged.
+    fn file_change<'a>(
         &'a self,
         dir: Rc<Descriptor>,
         name: CString,
-        allow_exists: bool,
+        change: NamespaceChange,
         scope: &'a S,
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
             let quota = self.file_path_quota(&[&name])?;
             let name = PathArg::new(name);
-            let sqe = submission!(
-                self,
-                simulation::Op::Mkdir {
-                    dir: dir.clone(),
-                    name: name.simulated()
-                },
-                opcode::MkDirAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
-                    .mode(0o700)
-                    .build()
-                    .flags(squeue::Flags::ASYNC)
-            );
+            let sqe = match change {
+                NamespaceChange::EnsureDirectory => submission!(
+                    self,
+                    simulation::Op::Mkdir {
+                        dir: dir.clone(),
+                        name: name.simulated()
+                    },
+                    opcode::MkDirAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
+                        .mode(0o700)
+                        .build()
+                        .flags(squeue::Flags::ASYNC)
+                ),
+                NamespaceChange::Unlink | NamespaceChange::RemoveIfPresent => submission!(
+                    self,
+                    simulation::Op::Unlink {
+                        dir: dir.clone(),
+                        name: name.simulated()
+                    },
+                    opcode::UnlinkAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
+                        .build()
+                        .flags(squeue::Flags::ASYNC)
+                ),
+            };
             self.submit(sqe, scope, false, move |result| {
                 drop((dir, name, quota));
-                if allow_exists
-                    && matches!(result, Ok(KernelResult::Value(n)) if n == -libc::EEXIST)
-                {
-                    return Ok(());
-                }
-                value(result).map(|_| ())
-            })?
-            .await
-        })
-    }
-    /// Unlink a name, optionally accepting an already absent directory entry.
-    fn file_unlink_inner<'a>(
-        &'a self,
-        dir: Rc<Descriptor>,
-        name: CString,
-        allow_absent: bool,
-        scope: &'a S,
-    ) -> Operation<'a, (), S::Error> {
-        Box::pin(async move {
-            let quota = self.file_path_quota(&[&name])?;
-            let name = PathArg::new(name);
-            let sqe = submission!(
-                self,
-                simulation::Op::Unlink {
-                    dir: dir.clone(),
-                    name: name.simulated()
-                },
-                opcode::UnlinkAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
-                    .build()
-                    .flags(squeue::Flags::ASYNC)
-            );
-            self.submit(sqe, scope, false, move |result| {
-                drop((dir, name, quota));
-                if allow_absent
-                    && matches!(result, Ok(KernelResult::Value(n)) if n == -libc::ENOENT)
-                {
-                    return Ok(());
-                }
-                value(result).map(|_| ())
+                change.complete(result)
             })?
             .await
         })
@@ -380,6 +359,34 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
 
 /// Linux's pathname limit excluding NUL; filesystems may impose smaller components.
 const PATH_BYTES: usize = 4095;
+
+/// A namespace mutation paired with the only kernel error it may treat as success.
+/// Keeping operation and idempotency together prevents an unlink from accepting
+/// EEXIST or directory creation from accepting ENOENT by mistake.
+#[derive(Clone, Copy)]
+enum NamespaceChange {
+    /// Create a private directory or accept an existing entry for later validation.
+    EnsureDirectory,
+    /// Remove an entry, requiring it to exist when the operation executes.
+    Unlink,
+    /// Remove an entry or accept that it is already absent.
+    RemoveIfPresent,
+}
+
+impl NamespaceChange {
+    /// Decode a fenced completion without masking cancellation or other failures.
+    fn complete<E: From<Error>>(self, result: Result<KernelResult, E>) -> Result<(), E> {
+        let accepted = match self {
+            Self::EnsureDirectory => Some(-libc::EEXIST),
+            Self::Unlink => None,
+            Self::RemoveIfPresent => Some(-libc::ENOENT),
+        };
+        if matches!(result, Ok(KernelResult::Value(n)) if Some(n) == accepted) {
+            return Ok(());
+        }
+        value(result).map(|_| ())
+    }
+}
 
 /// Stable pathname backing that preserves pointer provenance across owner moves.
 /// Unlike CString's Box backing, this Vec must never resize after SQE publication.
@@ -452,8 +459,10 @@ pub mod secure {
     pub struct AccessRequirements {
         /// Required numeric owner ID.
         pub owner: u32,
+
         /// Any of these mode bits causes an access failure.
         pub forbidden_mode: u16,
+
         /// Optional exact link count; the metadata field is always required.
         pub links: Option<u32>,
     }
@@ -546,8 +555,13 @@ pub mod secure {
                     };
                     let name = path_name(part, path_limit)?;
                     if create {
-                        self.file_mkdir_inner(fd.clone(), name.clone(), true, scope)
-                            .await?;
+                        self.file_change(
+                            fd.clone(),
+                            name.clone(),
+                            NamespaceChange::EnsureDirectory,
+                            scope,
+                        )
+                        .await?;
                         self.file_sync(fd.clone(), scope).await?;
                     }
                     fd = self
@@ -574,8 +588,13 @@ pub mod secure {
         ) -> Operation<'a, (), S::Error> {
             Box::pin(async move {
                 validate_component(OsStr::from_bytes(name.as_bytes()), PATH_BYTES)?;
-                self.file_unlink_inner(directory.clone(), name, true, scope)
-                    .await?;
+                self.file_change(
+                    directory.clone(),
+                    name,
+                    NamespaceChange::RemoveIfPresent,
+                    scope,
+                )
+                .await?;
                 self.file_sync(directory, scope).await
             })
         }
@@ -628,8 +647,10 @@ pub mod secure {
 
     #[cfg(test)]
     mod tests {
+        //! Pure validation covers malformed names and incomplete metadata snapshots.
         use super::*;
 
+        /// Preserve arbitrary name bytes while rejecting escapes and invalid limits.
         #[test]
         fn names_preserve_bytes_and_reject_invalid_components_and_limits() {
             for name in ["", ".", "..", "/", "/child", "a/b", "a/", "a\0b"] {
@@ -647,6 +668,7 @@ pub mod secure {
             assert_eq!(path_name(OsStr::new("a\0b"), 3), Err(Error::InvalidInput));
         }
 
+        /// Require complete metadata before evaluating the requested access policy.
         #[test]
         fn access_checks_completeness_owner_modes_and_optional_exact_links() {
             let mut stat: libc::statx = unsafe { std::mem::zeroed() };
@@ -705,6 +727,7 @@ pub mod secure {
             }
         }
 
+        /// Bound regular-file size and reject wrong types or missing stat fields.
         #[test]
         fn regular_size_checks_empty_exact_oversized_type_and_missing_fields() {
             let mut stat: libc::statx = unsafe { std::mem::zeroed() };
@@ -749,6 +772,47 @@ mod secure_tests {
         })))
     }
 
+    /// Keep common namespace backing and charges until abandoned SQEs are fenced.
+    #[test]
+    fn abandoned_namespace_changes_retain_descriptor_and_admission() {
+        use crate::reactor::tests::fixtures::ResourceClass;
+
+        for change in [
+            NamespaceChange::EnsureDirectory,
+            NamespaceChange::Unlink,
+            NamespaceChange::RemoveIfPresent,
+        ] {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let r = reactor();
+            let request = scope();
+            let directory =
+                drive(&r, r.file_directory(Path::new("/"), false, 4096, &request)).unwrap();
+            let weak = Rc::downgrade(&directory);
+            let operation = match change {
+                NamespaceChange::EnsureDirectory => "mkdir",
+                NamespaceChange::Unlink | NamespaceChange::RemoveIfPresent => {
+                    sim.write_file(Path::new("/entry"), b"old").unwrap();
+                    "unlink"
+                }
+            };
+            let baseline = r.admission.used(ResourceClass::RequestContext);
+            sim.inject(operation, Fault::Delay(10)).unwrap();
+            let mut future =
+                r.file_change(directory, CString::new("entry").unwrap(), change, &request);
+            assert!(poll(&mut future).is_pending());
+            drop(future);
+            assert_eq!(r.in_flight(), 1);
+            assert!(weak.upgrade().is_some());
+            assert!(r.admission.used(ResourceClass::RequestContext) > baseline);
+            drive(&r, r.file_fence(())).unwrap();
+            assert_eq!(r.in_flight(), 0);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
+        }
+    }
+
+    /// Validate paths before mutation and reject symlinks during pinned traversal.
     #[test]
     fn traversal_pins_private_directories_and_rejects_parents_symlinks_and_bad_names() {
         let sim = Simulation::new();
@@ -799,6 +863,7 @@ mod secure_tests {
         ));
     }
 
+    /// Sync even existing directories and propagate both mkdir and fsync failures.
     #[test]
     fn existing_directory_creation_reestablishes_fsync_and_propagates_failure() {
         let sim = Simulation::new();
@@ -830,6 +895,7 @@ mod secure_tests {
         ));
     }
 
+    /// Fence stage cleanup without following links or publishing abandoned work.
     #[test]
     fn stage_removes_only_the_link_and_requires_cleanup_fence_before_exclusive_open() {
         let sim = Simulation::new();
@@ -926,6 +992,7 @@ mod memory_tests {
     use super::*;
     use std::ffi::CStr;
 
+    /// Keep cursor mutations bounded and release quota on allocation failure or drop.
     #[test]
     fn shared_allocation_preserves_cursor_and_releases_charge_on_failure() {
         let charge = Rc::new(());
@@ -951,6 +1018,7 @@ mod memory_tests {
         assert_eq!(Buffer::allocate(0, Box::new(())).unwrap().remaining(), 0);
     }
 
+    /// Preserve the pathname allocation when its owner moves into a completion.
     #[test]
     fn delayed_pathname_consumer_survives_owner_moves() {
         let path = PathArg::new(CString::new("stage-to-publish").unwrap());
@@ -969,6 +1037,7 @@ mod memory_tests {
         completion();
     }
 
+    /// Preserve syscall input and output pointers across completion-owner moves.
     #[test]
     fn delayed_syscall_read_and_write_survive_owner_moves() {
         let input = SyscallArg::new([11u64, 22]);
@@ -992,6 +1061,52 @@ mod kernel_tests {
     //! Private Linux flag validation; host behavior lives in tests/runtime.rs.
     use super::*;
 
+    /// Accept only the selected operation's idempotent errno, never scope failures.
+    #[test]
+    fn namespace_policy_is_bound_to_the_operation() {
+        for (change, exists, absent) in [
+            (
+                NamespaceChange::EnsureDirectory,
+                Ok(()),
+                Err(Error::NotFound),
+            ),
+            (
+                NamespaceChange::Unlink,
+                Err(Error::AlreadyExists),
+                Err(Error::NotFound),
+            ),
+            (
+                NamespaceChange::RemoveIfPresent,
+                Err(Error::AlreadyExists),
+                Ok(()),
+            ),
+        ] {
+            assert_eq!(change.complete::<Error>(Ok(KernelResult::Value(0))), Ok(()));
+            assert_eq!(
+                change.complete(Ok(KernelResult::Value(-libc::EEXIST))),
+                exists
+            );
+            assert_eq!(
+                change.complete(Ok(KernelResult::Value(-libc::ENOENT))),
+                absent
+            );
+            assert_eq!(
+                change.complete::<Error>(Ok(KernelResult::Value(-libc::EIO))),
+                Err(Error::Os(libc::EIO))
+            );
+            for error in [
+                Error::Cancelled,
+                Error::DeadlineExceeded,
+                Error::Overloaded,
+                Error::AlreadyExists,
+                Error::NotFound,
+            ] {
+                assert_eq!(change.complete::<Error>(Err(error)), Err(error));
+            }
+        }
+    }
+
+    /// Keep secure flags and Linux pathname bounds independent of service limits.
     #[test]
     fn flags_and_linux_path_bounds_are_not_application_limits() {
         assert_eq!(
