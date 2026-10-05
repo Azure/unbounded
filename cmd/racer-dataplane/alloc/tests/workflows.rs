@@ -21,14 +21,17 @@ use uring_runtime::{Operation, Scope, reactor::Reactor};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestError {
     Alloc(Error),
+
     Runtime(uring_runtime::Error),
 }
+
 impl From<Error> for TestError {
     /// Preserve the allocator category in workflow assertions.
     fn from(error: Error) -> Self {
         Self::Alloc(error)
     }
 }
+
 impl From<uring_runtime::Error> for TestError {
     /// Preserve runtime errors without enriching them as synchronous allocator errors.
     fn from(error: uring_runtime::Error) -> Self {
@@ -39,6 +42,7 @@ impl From<uring_runtime::Error> for TestError {
 /// An always-live caller scope for deterministic ownership tests.
 #[derive(Clone)]
 struct TestScope;
+
 impl Scope for TestScope {
     type Error = TestError;
 
@@ -77,6 +81,7 @@ struct CountingCharge {
 
     bytes: usize,
 }
+
 #[cfg(feature = "simulation")]
 impl CountingCharge {
     /// Record admission before passing the guard into allocator ownership.
@@ -88,6 +93,7 @@ impl CountingCharge {
         }
     }
 }
+
 #[cfg(feature = "simulation")]
 impl Charge for CountingCharge {
     /// Cover only the bytes actually admitted by this guard.
@@ -95,6 +101,7 @@ impl Charge for CountingCharge {
         self.bytes >= bytes
     }
 }
+
 #[cfg(feature = "simulation")]
 impl Drop for CountingCharge {
     /// Return admission when the final owner releases this guard.
@@ -667,6 +674,7 @@ fn replacement_hooks_are_fallible_and_refuse_live_writes() {
 
 /// Owns a unique project-local directory for real kernel workflows.
 struct Directory(PathBuf);
+
 impl Directory {
     /// Create an isolated test directory without using the host temporary directory.
     fn new() -> Self {
@@ -679,6 +687,7 @@ impl Directory {
         Self(path)
     }
 }
+
 impl Drop for Directory {
     /// Clean up only this test's owned directory.
     fn drop(&mut self) {
@@ -791,6 +800,7 @@ fn io_uring_roundtrip_and_completion_fence() {
     assert_eq!(reactor.in_flight(), 0);
     /// A completed roundtrip has no caller mappings left to remove.
     struct EmptyEntries;
+
     impl page_alloc::SegmentEntries for EmptyEntries {
         /// The smoke workflow publishes no index entries.
         fn remove_bounded(&self, _: SegmentId, _: usize) -> usize {
@@ -913,6 +923,7 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
 
         removals: Cell<usize>,
     }
+
     impl page_alloc::SegmentEntries for Entries {
         /// Forget the mapping only for its actual segment and a positive budget.
         fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
