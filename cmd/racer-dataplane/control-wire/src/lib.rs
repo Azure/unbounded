@@ -12,6 +12,27 @@
 //! secrets, so callers must protect the returned bytes. Key IDs reject zero
 //! generations as a syntax error; identity independently validates epoch policy.
 //!
+//! # Enrollment and application ownership
+//!
+//! `racer_crypto::enrollment` owns durable node-private enrollment, certificate
+//! validation, projected token reads, and identity recovery. It uses
+//! `uring_runtime::reactor::filesystem::secure` for bounded descriptor-relative I/O,
+//! private access checks, durable replacement, and fencing abandoned attempts.
+//! The caller supplies current NIC inventory and shares, persists NIC reservations
+//! before preparing enrollment, and exclusively owns the identity directory.
+//! `racer_crypto::identity::BundleInstaller` owns canonical bundle replay tracking
+//! and installation into its keyring; `wire_codec::rest` owns reusable REST/TLS.
+//!
+//! In the full application, publication adapters bind these wire records to the
+//! separate `controlplane` component's synchronization, immutable publication,
+//! retention, and generation-tagged rollout APIs. That component is application
+//! context, not a dependency or member of this extracted workspace. Application
+//! adapters own placement, cache/resource installation, credential policy, and
+//! error classification. Only owned preparation jobs and immutable shared
+//! generations cross threads, not worker-local I/O or credentials. Topology
+//! projection adapters remain caller-owned under Rust's orphan rules; rail
+//! mappings and cache definitions pass through without conversion.
+//!
 //! Tests consume Go-owned fixtures in `internal/racer/wire/testdata`; Rust does
 //! not regenerate them. Run from the repository root:
 //!
