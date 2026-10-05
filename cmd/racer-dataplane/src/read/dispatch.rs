@@ -827,14 +827,16 @@ impl LocalPageService for Arc<WorkerDirectory> {
 }
 
 pub struct WorkerMap {
-    workers: ::topology::StaticWorkerMap<WorkerId>,
+    workers: Vec<WorkerId>,
 }
 impl WorkerMap {
     /// Canonical worker order makes assignment independent of discovery order.
     /// Changing this set requires draining all flights first.
-    pub fn new(workers: Vec<WorkerId>) -> Result<Self> {
-        let workers = ::topology::StaticWorkerMap::new_by_key(workers, |worker| worker.0)
-            .ok_or(Error::InvalidConfiguration)?;
+    pub fn new(mut workers: Vec<WorkerId>) -> Result<Self> {
+        workers.sort_unstable_by_key(|worker| worker.0);
+        if workers.is_empty() || workers.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::InvalidConfiguration);
+        }
         Ok(Self { workers })
     }
 
@@ -849,12 +851,19 @@ impl WorkerMap {
     fn select(&self, object: &ObjectId, page: u64) -> Result<WorkerId> {
         let mut hash = Sha256::new();
         hash.update(b"racer.local-worker.v1\0");
-        hash.update((object.cache.0.len() as u64).to_be_bytes());
+        let length = u64::try_from(object.cache.0.len()).map_err(|_| Error::InvalidRequest)?;
+        hash.update(length.to_be_bytes());
         hash.update(object.cache.0.as_bytes());
         hash.update(object.key.0);
         hash.update(page.to_be_bytes());
         let digest = hash.finalize();
-        Ok(*self.workers.select(&digest.into()))
+        Ok(self.select_digest(&digest.into()))
+    }
+
+    fn select_digest(&self, digest: &[u8; 32]) -> WorkerId {
+        let index = u64::from_be_bytes(digest[..8].try_into().expect("eight digest bytes"))
+            % u64::try_from(self.workers.len()).expect("worker count fits u64");
+        self.workers[index as usize]
     }
 }
 
@@ -867,6 +876,43 @@ mod tests {
     use racer_control_wire::CacheId;
     use std::time::Duration;
     use std::time::Instant;
+    #[test]
+    fn canonical_order_rejects_empty_and_duplicate_identities() {
+        assert!(matches!(
+            WorkerMap::new(vec![]),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert!(matches!(
+            WorkerMap::new(vec![WorkerId(1), WorkerId(1)]),
+            Err(Error::InvalidConfiguration)
+        ));
+        let map = WorkerMap::new(vec![WorkerId(9), WorkerId(1), WorkerId(3)]).unwrap();
+        let ordered = WorkerMap::new(vec![WorkerId(1), WorkerId(3), WorkerId(9)]).unwrap();
+        for value in 0..100_u64 {
+            let mut digest = [0; 32];
+            digest[..8].copy_from_slice(&value.to_be_bytes());
+            assert_eq!(map.select_digest(&digest), ordered.select_digest(&digest));
+            assert_eq!(
+                map.select_digest(&digest),
+                WorkerId([1, 3, 9][(value % 3) as usize])
+            );
+        }
+    }
+
+    #[test]
+    fn selection_uses_big_endian_prefix_only_and_handles_singletons() {
+        let map = WorkerMap::new((0..7).rev().map(WorkerId).collect()).unwrap();
+        let mut digest = [255; 32];
+        digest[..8].copy_from_slice(&256_u64.to_be_bytes());
+        assert_eq!(map.select_digest(&digest), WorkerId(4));
+        digest[8..].fill(0);
+        assert_eq!(map.select_digest(&digest), WorkerId(4));
+        assert_eq!(map.select_digest(&[255; 32]), WorkerId(1));
+        let singleton = WorkerMap::new(vec![WorkerId(42)]).unwrap();
+        assert_eq!(singleton.select_digest(&[255; 32]), WorkerId(42));
+        assert_eq!(singleton.select_digest(&[0; 32]), WorkerId(42));
+    }
+
     #[test]
     fn worker_map_preserves_configuration_errors_and_single_worker_assignment() {
         assert!(matches!(

@@ -40,8 +40,11 @@ pub struct Limits {
     pub pipes: NonZeroUsize,
     pub range_window_pages: NonZeroUsize,
     pub header_bytes: NonZeroUsize,
-    pub cached_rankings: NonZeroUsize,
+    pub placement_cache_bytes: NonZeroUsize,
     pub cached_paths: NonZeroUsize,
+    pub path_cache_bytes: NonZeroUsize,
+    /// Per-worker active searches, independent of cache retention and worker count.
+    pub active_path_searches: NonZeroUsize,
     /// Old live membership generations in addition to current; cache-only
     /// publications reuse a generation and do not consume another slot.
     pub retained_snapshots: NonZeroUsize,
@@ -114,7 +117,9 @@ impl Config {
             }
         }
         // Removed selectors must fail explicitly, never silently change topology.
-        if lookup("RACER_ROUTING_ALGORITHM")?.is_some() {
+        if lookup("RACER_ROUTING_ALGORITHM")?.is_some()
+            || lookup("RACER_CACHED_RANKINGS")?.is_some()
+        {
             return Err(Error::InvalidConfiguration);
         }
         let mut text = |name: &str, default: Option<&str>| -> Result<String> {
@@ -187,11 +192,6 @@ impl Config {
         let reader_stall_timeout =
             Duration::from_millis(number("RACER_READER_STALL_TIMEOUT_MS", 10_000)?);
         let shutdown_timeout = Duration::from_millis(number("RACER_SHUTDOWN_TIMEOUT_MS", 30_000)?);
-        let ranking_bytes = number("RACER_PLACEMENT_CACHE_BYTES", 16 * MIB)?;
-        if ranking_bytes < crate::topology::RANKING_BYTES as u64 || ranking_bytes > 512 * MIB {
-            return Err(Error::InvalidConfiguration);
-        }
-        let ranking_entries = ranking_bytes / crate::topology::RANKING_BYTES as u64;
         let mut limit = |name: &str, default| {
             env_config::nonzero_usize(number(name, default)?)
                 .map_err(|_| Error::InvalidConfiguration)
@@ -210,8 +210,10 @@ impl Config {
             pipes: limit("RACER_PIPES", 16)?,
             range_window_pages: limit("RACER_RANGE_WINDOW_PAGES", 2)?,
             header_bytes: limit("RACER_HEADER_BYTES", 32 * 1024)?,
-            cached_rankings: limit("RACER_CACHED_RANKINGS", ranking_entries)?,
+            placement_cache_bytes: limit("RACER_PLACEMENT_CACHE_BYTES", 16 * MIB)?,
             cached_paths: limit("RACER_CACHED_PATHS", 128)?,
+            path_cache_bytes: limit("RACER_PATH_CACHE_BYTES", 8 * MIB)?,
+            active_path_searches: limit("RACER_ACTIVE_PATH_SEARCHES", 8)?,
             retained_snapshots: limit("RACER_RETAINED_SNAPSHOTS", 2)?,
             metadata_entries: limit("RACER_METADATA_ENTRIES", 4096)?,
             relay_transfers: limit("RACER_RELAY_TRANSFERS", 16)?,
@@ -360,8 +362,10 @@ impl Config {
             (limits.pipes, 65_536),
             (limits.range_window_pages, 64),
             (limits.header_bytes, 32 * 1024),
-            (limits.cached_rankings, MAX_ENTRIES),
+            (limits.placement_cache_bytes, 512 * MIB as usize),
             (limits.cached_paths, MAX_ENTRIES),
+            (limits.path_cache_bytes, 512 * MIB as usize),
+            (limits.active_path_searches, 64),
             (limits.retained_snapshots, 64),
             (limits.metadata_entries, MAX_ENTRIES),
             (limits.relay_transfers, 65_536),
@@ -388,6 +392,7 @@ impl Config {
             || limits.request_context_bytes.get() < 128 * 1024
             || limits.queue_entries.get() < 2
             || limits.retained_snapshots.get() < 2
+            || limits.placement_cache_bytes.get() < crate::topology::RANKING_BYTES
             || limits.connections_per_neighbor > limits.client_connections
             || limits
                 .flights
@@ -864,6 +869,54 @@ mod tests {
         for value in ["", "1", "2", "3", "4", "5", "6", "03", " 3", "3 ", "auto"] {
             assert!(parse(&[("RACER_ROUTING_ALGORITHM", value)]).is_err());
         }
+    }
+
+    #[test]
+    fn topology_cache_dimensions_are_independent_and_bounded() {
+        let defaults = parse(&[]).unwrap();
+        assert_eq!(
+            defaults.limits.placement_cache_bytes.get(),
+            16 * MIB as usize
+        );
+        assert_eq!(defaults.limits.cached_paths.get(), 128);
+        assert_eq!(defaults.limits.path_cache_bytes.get(), 8 * MIB as usize);
+        assert_eq!(defaults.limits.active_path_searches.get(), 8);
+        let config = parse(&[
+            ("RACER_PLACEMENT_CACHE_BYTES", "1025"),
+            ("RACER_CACHED_PATHS", "1"),
+            ("RACER_PATH_CACHE_BYTES", "7"),
+            ("RACER_ACTIVE_PATH_SEARCHES", "2"),
+        ])
+        .unwrap();
+        assert_eq!(config.limits.placement_cache_bytes.get(), 1025);
+        assert_eq!(config.limits.cached_paths.get(), 1);
+        assert_eq!(config.limits.path_cache_bytes.get(), 7);
+        assert_eq!(config.limits.active_path_searches.get(), 2);
+        for (name, value) in [
+            ("RACER_PLACEMENT_CACHE_BYTES", "1023"),
+            ("RACER_PLACEMENT_CACHE_BYTES", "536870913"),
+            ("RACER_PATH_CACHE_BYTES", "0"),
+            ("RACER_PATH_CACHE_BYTES", "536870913"),
+            ("RACER_ACTIVE_PATH_SEARCHES", "0"),
+            ("RACER_ACTIVE_PATH_SEARCHES", "65"),
+            ("RACER_CACHED_PATHS", "0"),
+            ("RACER_CACHED_PATHS", "1048577"),
+            ("RACER_CACHED_RANKINGS", ""),
+            ("RACER_CACHED_RANKINGS", "1"),
+        ] {
+            assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
+        }
+        let mut config = defaults;
+        config.limits.placement_cache_bytes = NonZeroUsize::new(1023).unwrap();
+        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        config.limits.placement_cache_bytes = NonZeroUsize::new(1024).unwrap();
+        config.limits.path_cache_bytes = NonZeroUsize::new(512 * MIB as usize + 1).unwrap();
+        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        config.limits.path_cache_bytes = NonZeroUsize::new(1).unwrap();
+        config.limits.active_path_searches = NonZeroUsize::new(65).unwrap();
+        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        config.limits.active_path_searches = NonZeroUsize::new(64).unwrap();
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]

@@ -1,56 +1,38 @@
 //! Bounded-degree graph and cooperative equal-cost shortest-path routing.
-use crate::{Error, MAX_DEGREE, Member, Membership, RADIX, hash};
+use crate::{Error, MAX_DEGREE, Member, Membership, hash};
 use sha2::Digest;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{BTreeMap, VecDeque},
+    mem::size_of,
+    rc::Rc,
+    sync::Arc,
     task::Poll,
 };
 
 const SEARCH_QUANTUM: usize = 32;
+const MAX_SEED_BYTES: usize = 65_536;
 type Result<T> = std::result::Result<T, Error>;
 
-impl<M: Member> Membership<M> {
-    /// Sorted union of incoming/outgoing radix edges, excluding self and duplicates.
-    /// An invalid position (including in empty membership) returns an empty list.
-    pub fn neighbors(&self, position: usize) -> Vec<usize> {
-        neighbor_positions_for(self.members().len(), position)
-    }
-}
-
-/// Incoming intervals are disjoint lifts of `node` modulo N. Their quotient
-/// by the radix gives every predecessor without scanning any other member.
-fn neighbor_positions_for(count: usize, node: usize) -> Vec<usize> {
-    if node >= count {
-        return vec![];
-    }
-    // Widen before multiplication: the public algorithm has no application size cap.
-    let count = count as u128;
-    let node = node as u128;
-    let radix = RADIX as u128;
-    let mut neighbors = Vec::with_capacity(MAX_DEGREE);
-    for digit in 0..radix {
-        neighbors.push(((radix * node + digit) % count) as usize);
-        neighbors.push(((node + digit * count) / radix) as usize);
-    }
-    neighbors.sort_unstable();
-    neighbors.dedup();
-    neighbors.retain(|other| *other != node as usize);
-    neighbors
-}
-
 /// Positions in one membership. `visited` excludes both endpoints and contains
-/// no duplicates; its length plus `links` may not exceed u8::MAX. `blocked`
+/// no duplicates; its length plus `links` may not exceed `u8::MAX`. `blocked`
 /// excludes only edges out of `from`, not these members at subsequent hops.
 /// Unordered sets are canonicalized; duplicate blocked positions are accepted.
 #[derive(Clone, Copy, Debug)]
 pub struct PathQuery<'a> {
+    /// Source position in the supplied membership.
     pub from: usize,
+    /// Destination position in the supplied membership.
     pub to: usize,
+    /// Maximum number of edges in the returned route.
     pub links: u8,
+    /// Previously visited positions, distinct and excluding both endpoints.
     pub visited: &'a [usize],
+    /// At most 64 positions (including duplicates). Only source edges are blocked;
+    /// valid positions that are not source neighbors are ignored canonically.
     pub blocked: &'a [usize],
-    /// Opaque selection seed, hashed before length-prefixed source/destination IDs.
+    /// Opaque selection seed, at most 65,536 bytes. The v5 selection schema
+    /// length-prefixes seed, source ID, and destination ID separately.
     pub seed: &'a [u8],
 }
 
@@ -69,6 +51,8 @@ impl PathKey {
         if query.from >= count
             || query.to >= count
             || query.visited.len() > usize::from(u8::MAX - query.links)
+            || query.blocked.len() > MAX_DEGREE
+            || query.seed.len() > MAX_SEED_BYTES
             || query
                 .visited
                 .iter()
@@ -85,8 +69,14 @@ impl PathKey {
         let mut blocked = query.blocked.to_vec();
         blocked.sort_unstable();
         blocked.dedup();
+        blocked.retain(|v| {
+            membership
+                .neighbor_slice(query.from)
+                .binary_search(v)
+                .is_ok()
+        });
         Ok(Self {
-            membership: membership.identity(),
+            membership: membership.topology_identity(),
             from: query.from,
             to: query.to,
             links: query.links,
@@ -96,84 +86,281 @@ impl PathKey {
     }
 }
 
+type Alternatives = Rc<Vec<Vec<usize>>>;
 #[derive(Default)]
 struct PathCache {
-    entries: BTreeMap<PathKey, Vec<Vec<usize>>>,
-    fifo: VecDeque<PathKey>,
+    entries: BTreeMap<Rc<PathKey>, CacheEntry>,
+    oldest: Option<Rc<PathKey>>,
+    newest: Option<Rc<PathKey>>,
+    bytes: usize,
+}
+struct CacheEntry {
+    alternatives: Alternatives,
+    older: Option<Rc<PathKey>>,
+    newer: Option<Rc<PathKey>>,
+    bytes: usize,
+}
+impl PathCache {
+    // Charge a full current-std B-tree internal node for every entry, rather
+    // than relying on occupancy: 11 key/value slots, 12 child pointers, and a
+    // generously rounded header. This deliberately overcounts sparse nodes.
+    // The standard library does not promise node layout: this is an estimate,
+    // not a hard allocator bound. Shared keys are allocated/counted only once.
+    fn entry_bytes(key: &PathKey, alternatives: &[Vec<usize>], capacity: usize) -> usize {
+        let node =
+            11 * (size_of::<Rc<PathKey>>() + size_of::<CacheEntry>()) + 16 * size_of::<usize>();
+        let bytes = node
+            .saturating_add(size_of::<PathKey>() + 2 * size_of::<usize>())
+            .saturating_add(key.visited.capacity().saturating_mul(size_of::<usize>()))
+            .saturating_add(key.blocked.capacity().saturating_mul(size_of::<usize>()))
+            .saturating_add(size_of::<Vec<Vec<usize>>>() + 2 * size_of::<usize>())
+            .saturating_add(capacity.saturating_mul(size_of::<Vec<usize>>()));
+        alternatives.iter().fold(bytes, |bytes, route| {
+            bytes.saturating_add(route.capacity().saturating_mul(size_of::<usize>()))
+        })
+    }
+
+    fn unlink(&mut self, older: Option<&Rc<PathKey>>, newer: Option<&Rc<PathKey>>) {
+        if let Some(key) = older {
+            self.entries.get_mut(key).unwrap().newer = newer.cloned();
+        } else {
+            self.oldest = newer.cloned();
+        }
+        if let Some(key) = newer {
+            self.entries.get_mut(key).unwrap().older = older.cloned();
+        } else {
+            self.newest = older.cloned();
+        }
+    }
+
+    fn get(&mut self, key: &PathKey) -> Option<Alternatives> {
+        let (owned, entry) = self.entries.get_key_value(key)?;
+        let alternatives = Rc::clone(&entry.alternatives);
+        if entry.newer.is_some() {
+            let owned = Rc::clone(owned);
+            let older = entry.older.clone();
+            let newer = entry.newer.clone();
+            self.unlink(older.as_ref(), newer.as_ref());
+            if let Some(newest) = &self.newest {
+                self.entries.get_mut(newest).unwrap().newer = Some(Rc::clone(&owned));
+            }
+            let entry = self.entries.get_mut(key).unwrap();
+            entry.older = self.newest.replace(owned);
+            entry.newer = None;
+        }
+        Some(alternatives)
+    }
+
+    fn evict(&mut self) {
+        let key = self.oldest.take().unwrap();
+        let entry = self.entries.remove(&key).unwrap();
+        self.unlink(None, entry.newer.as_ref());
+        self.bytes -= entry.bytes;
+        if self.entries.is_empty() {
+            // Drop the empty root allocation too, keeping empty accounting zero.
+            self.entries = BTreeMap::new();
+        }
+    }
+
+    fn store(&mut self, key: PathKey, alternatives: Alternatives, entries: usize, bytes: usize) {
+        if entries == 0 || bytes == 0 || self.entries.contains_key(&key) {
+            return;
+        }
+        let charge = Self::entry_bytes(&key, &alternatives, alternatives.capacity());
+        // An oversized route must not evict useful smaller entries.
+        if charge > bytes {
+            return;
+        }
+        while self.entries.len() >= entries || self.bytes > bytes - charge {
+            self.evict();
+        }
+        let key = Rc::new(key);
+        if let Some(newest) = &self.newest {
+            self.entries.get_mut(newest).unwrap().newer = Some(Rc::clone(&key));
+        } else {
+            self.oldest = Some(Rc::clone(&key));
+        }
+        let older = self.newest.replace(Rc::clone(&key));
+        self.entries.insert(
+            key,
+            CacheEntry {
+                alternatives,
+                older,
+                newer: None,
+                bytes: charge,
+            },
+        );
+        self.bytes += charge;
+    }
+}
+
+enum SharedSearch {
+    Working(Option<Box<EqualCostSearch>>),
+    Done(Result<Alternatives>),
+}
+impl SharedSearch {
+    fn poll(
+        &mut self,
+        paths: &Paths,
+        key: &PathKey,
+        cx: &std::task::Context<'_>,
+    ) -> Poll<Result<Alternatives>> {
+        if let Self::Working(search) = self {
+            let step = search.as_mut().unwrap().step(SEARCH_QUANTUM);
+            debug_assert!(
+                step.expansions <= SEARCH_QUANTUM && step.edges <= step.expansions * MAX_DEGREE
+            );
+            if !step.done {
+                // Every waiter drives progress; no leader or unbounded waker list.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let result = (*search.take().unwrap()).finish().map(Rc::new);
+            if let Ok(alternatives) = &result {
+                paths.store(key.clone(), Rc::clone(alternatives));
+            }
+            paths.inflight.borrow_mut().remove(key);
+            *self = Self::Done(result);
+        }
+        let Self::Done(result) = self else {
+            unreachable!()
+        };
+        Poll::Ready(result.clone())
+    }
 }
 
 /// Worker-local bounded cache of eligible alternatives, reselected for every seed.
 /// No executor, clocks, I/O, health state, or application membership leases.
 pub struct Paths {
-    capacity: usize,
+    cache_entries: usize,
+    cache_bytes: usize,
+    search_limit: usize,
     cache: RefCell<PathCache>,
-    active_searches: Cell<usize>,
+    inflight: RefCell<BTreeMap<PathKey, Rc<RefCell<SharedSearch>>>>,
 }
-struct SearchAdmission<'a>(&'a Cell<usize>);
+struct SearchAdmission<'a> {
+    paths: &'a Paths,
+    key: PathKey,
+    shared: Rc<RefCell<SharedSearch>>,
+}
 impl Drop for SearchAdmission<'_> {
     fn drop(&mut self) {
-        self.0.set(self.0.get() - 1);
+        let mut inflight = self.paths.inflight.borrow_mut();
+        if inflight
+            .get(&self.key)
+            .is_some_and(|search| Rc::ptr_eq(search, &self.shared) && Rc::strong_count(search) == 2)
+        {
+            inflight.remove(&self.key);
+        }
     }
 }
 impl Paths {
+    /// Cache at most `capacity` queries and 8 MiB of accounted storage.
+    /// Independently admit eight distinct cold searches, even with caching off.
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, 8 * 1024 * 1024, 8)
+    }
+
+    /// Set independent cache entry, accounted byte, and distinct search limits.
+    /// Either zero cache limit disables storage; zero active searches permits
+    /// only cache hits and validated self routes. Identical in-flight queries
+    /// share one admission slot, irrespective of seeds or frozen weights.
+    ///
+    /// Accounting includes key/result buffer capacities, `Rc` headers, and a
+    /// conservative full B-tree node allowance per entry (11 key/value slots,
+    /// 12 child pointers, rounded header). It excludes allocator overhead, this
+    /// object, membership graphs, and active scratch/caller-retained results.
+    /// Standard-library node layout is not guaranteed; this is an accounting
+    /// budget, not a hard allocator limit. Oversized entries bypass the cache.
+    /// Hits refresh LRU links in O(log entries), without cache allocations.
+    /// Insertion takes O((evicted + 1) log entries), with no route rescanning.
+    #[must_use]
+    pub fn with_limits(cache_entries: usize, cache_bytes: usize, active_searches: usize) -> Self {
         Self {
-            capacity,
+            cache_entries,
+            cache_bytes,
+            search_limit: active_searches,
             cache: RefCell::new(PathCache::default()),
-            active_searches: Cell::new(0),
+            inflight: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    /// Number of currently cached query alternatives.
+    #[must_use]
+    pub fn cached_entries(&self) -> usize {
+        self.cache.borrow().entries.len()
+    }
+    /// Constant-time accounted cache bytes; never exceeds its configured limit.
+    /// See [`Self::with_limits`] for included and excluded storage.
+    #[must_use]
+    pub fn cached_bytes(&self) -> usize {
+        self.cache.borrow().bytes
+    }
+    /// Number of distinct unfinished searches, not the number of waiting callers.
+    #[must_use]
+    pub fn active_searches(&self) -> usize {
+        self.inflight.borrow().len()
     }
 
     /// Yield after at most 32 vertex expansions, each examining at most 64 edges.
-    /// Dropping the future releases search admission and all scratch state.
-    pub async fn route<'a, M: Member>(
-        &'a self,
-        membership: &'a Membership<M>,
-        query: PathQuery<'a>,
+    /// Reconstruction is bounded by 64 alternatives of at most 255 edges. Cache
+    /// insertion may evict entries to meet the independently configured limits.
+    /// Dropping the last waiter releases admission and scratch state; dropping
+    /// one duplicate waiter leaves the shared search available to the others.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidQuery`] for invalid positions, repeated visited
+    /// positions, visited endpoints, visited length plus links above 255, more
+    /// than 64 blocked inputs, or a seed exceeding 65,536 bytes. Validation also
+    /// applies to self routes. Returns [`Error::Unreachable`] when no route fits,
+    /// [`Error::Overloaded`] when a distinct cold search cannot be admitted, or
+    /// [`Error::SamplingExhausted`] after 64 rejected unbiased selection draws.
+    pub async fn route<M: Member>(
+        &self,
+        membership: &Membership<M>,
+        query: PathQuery<'_>,
     ) -> Result<Vec<usize>> {
         let key = PathKey::new(membership, &query)?;
-        if key.from != key.to && key.links == 0 {
+        if key.from == key.to {
+            return Ok(vec![key.from]);
+        }
+        if key.links == 0 {
             return Err(Error::Unreachable);
         }
-        if let Some(alternatives) = self.cache.borrow().entries.get(&key) {
-            return select_route(membership, alternatives, query.seed);
+        if let Some(alternatives) = self.cache.borrow_mut().get(&key) {
+            return select_route(membership, &alternatives, query.seed);
         }
-        // A disabled cache still permits one cold computation at a time.
-        if self.active_searches.get() >= self.capacity.clamp(1, 8) {
-            return Err(Error::Overloaded);
-        }
-        self.active_searches.set(self.active_searches.get() + 1);
-        let _admission = SearchAdmission(&self.active_searches);
-        let mut search = EqualCostSearch::new(membership.members().len(), &key);
-        std::future::poll_fn(|cx| {
-            if search.step(SEARCH_QUANTUM) {
-                Poll::Ready(())
+        let shared = {
+            let mut inflight = self.inflight.borrow_mut();
+            if let Some(shared) = inflight.get(&key) {
+                Rc::clone(shared)
             } else {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                if inflight.len() >= self.search_limit {
+                    return Err(Error::Overloaded);
+                }
+                let shared = Rc::new(RefCell::new(SharedSearch::Working(Some(Box::new(
+                    EqualCostSearch::new(membership.graph(), &key),
+                )))));
+                inflight.insert(key.clone(), Rc::clone(&shared));
+                shared
             }
-        })
-        .await;
-        let alternatives = search.finish()?;
-        let selected = select_route(membership, &alternatives, query.seed);
-        self.store(key, alternatives);
-        selected
+        };
+        let admission = SearchAdmission {
+            paths: self,
+            key,
+            shared,
+        };
+        let alternatives =
+            std::future::poll_fn(|cx| admission.shared.borrow_mut().poll(self, &admission.key, cx))
+                .await?;
+        select_route(membership, &alternatives, query.seed)
     }
 
-    fn store(&self, key: PathKey, alternatives: Vec<Vec<usize>>) {
-        if self.capacity == 0 {
-            return;
-        }
-        let mut cache = self.cache.borrow_mut();
-        if cache.entries.contains_key(&key) {
-            return;
-        }
-        if cache.entries.len() == self.capacity {
-            let victim = cache.fifo.pop_front().unwrap();
-            cache.entries.remove(&victim);
-        }
-        cache.fifo.push_back(key.clone());
-        cache.entries.insert(key, alternatives);
+    fn store(&self, key: PathKey, alternatives: Alternatives) {
+        self.cache
+            .borrow_mut()
+            .store(key, alternatives, self.cache_entries, self.cache_bytes);
     }
 }
 
@@ -190,9 +377,8 @@ fn select_route<M: Member>(
     Ok(alternatives[index].clone())
 }
 
-/// Positive weights apply only to eligible next hops. Integer rejection sampling
-/// avoids modulo bias, floats, and platform variance. At most 64 u32 weights fit
-/// in u64; the retry cap bounds adversarial work without a biased fallback.
+/// Integer rejection sampling avoids modulo bias and platform variance. At most
+/// 64 u32 weights fit in u64; the retry cap bounds work without a biased fallback.
 fn weighted_index<M: Member>(
     membership: &Membership<M>,
     alternatives: &[Vec<usize>],
@@ -200,28 +386,28 @@ fn weighted_index<M: Member>(
 ) -> Result<usize> {
     let weights: Vec<_> = alternatives
         .iter()
-        .map(|path| u64::from(membership.members()[path[1]].weight().get()))
+        .map(|path| u64::from(membership.weight(path[1]).get()))
         .collect();
-    let total: u64 = weights.iter().sum();
-    let mut digest = hash::domain::<M>(b"/next-hop/v4\0");
-    digest.update(seed);
+    let total = weights.iter().sum();
+    let mut digest = hash::domain::<M>(b"/next-hop/v5\0");
+    hash::bytes(&mut digest, seed);
     let path = &alternatives[0];
-    hash::bytes(&mut digest, membership.members()[path[0]].id());
-    hash::bytes(
-        &mut digest,
-        membership.members()[*path.last().unwrap()].id(),
-    );
-    for counter in 0u32..64 {
+    hash::bytes(&mut digest, membership.id(path[0]));
+    hash::bytes(&mut digest, membership.id(*path.last().unwrap()));
+    sample_index(&weights, total, |counter| {
         let mut draw = digest.clone();
         draw.update(counter.to_be_bytes());
-        let sample = u64::from_be_bytes(hash::finish(draw)[..8].try_into().unwrap());
-        if let Some(index) = weighted_draw(sample, total, &weights) {
+        u64::from_be_bytes(hash::finish(draw)[..8].try_into().unwrap())
+    })
+}
+fn sample_index(weights: &[u64], total: u64, mut draw: impl FnMut(u32) -> u64) -> Result<usize> {
+    for counter in 0u32..64 {
+        if let Some(index) = weighted_draw(draw(counter), total, weights) {
             return Ok(index);
         }
     }
-    Err(Error::Unreachable)
+    Err(Error::SamplingExhausted)
 }
-
 fn weighted_draw(sample: u64, total: u64, weights: &[u64]) -> Option<usize> {
     if sample < total.wrapping_neg() % total {
         return None;
@@ -268,65 +454,52 @@ impl EqualCostWave {
 /// layer the two balls are disjoint, so every meeting has minimum total distance.
 /// Store one canonical witness per first hop (at most 64), not per full path.
 struct EqualCostSearch {
-    count: usize,
+    graph: Arc<Vec<Vec<usize>>>,
     key: PathKey,
-    neighbors: Vec<usize>,
     waves: [EqualCostWave; 2],
     side: usize,
     remaining: usize,
     layers: u8,
     meetings: Vec<Option<usize>>,
     done: bool,
-    #[cfg(test)]
+}
+/// Per-turn observability in production and tests, without retained counters.
+#[derive(Default)]
+struct SearchStep {
+    done: bool,
     expansions: usize,
-    #[cfg(test)]
     edges: usize,
 }
 impl EqualCostSearch {
-    #[cfg(test)]
-    fn visited_entries(&self) -> usize {
-        self.waves.iter().map(|wave| wave.visits.len()).sum()
-    }
-
-    fn new(count: usize, key: &PathKey) -> Self {
-        let neighbors = neighbor_positions_for(count, key.from);
+    fn new(graph: Arc<Vec<Vec<usize>>>, key: &PathKey) -> Self {
+        let neighbors = &graph[key.from];
         assert!(neighbors.len() <= MAX_DEGREE);
         Self {
-            count,
             key: key.clone(),
             meetings: vec![None; neighbors.len()],
-            neighbors,
+            graph,
             waves: [EqualCostWave::new(key.from), EqualCostWave::new(key.to)],
             side: 0,
             remaining: 1,
             layers: 0,
             done: key.from == key.to || key.links == 0,
-            #[cfg(test)]
-            expansions: 0,
-            #[cfg(test)]
-            edges: 0,
         }
     }
-    fn step(&mut self, quantum: usize) -> bool {
+    fn step(&mut self, quantum: usize) -> SearchStep {
+        let mut step = SearchStep::default();
         for _ in 0..quantum {
             if self.done {
-                return true;
+                break;
             }
             let Some(node) = self.waves[self.side].queue.pop_front() else {
                 self.done = true;
-                return true;
+                break;
             };
-            #[cfg(test)]
-            {
-                self.expansions += 1;
-            }
+            step.expansions += 1;
+            step.edges += self.graph[node].len();
             let depth = self.waves[self.side].visits[&node].depth + 1;
             let first = self.waves[self.side].visits[&node].first;
-            for next in neighbor_positions_for(self.count, node) {
-                #[cfg(test)]
-                {
-                    self.edges += 1;
-                }
+            for &next in &self.graph[node] {
                 if self.key.visited.binary_search(&next).is_ok()
                     || (node == self.key.from && self.key.blocked.binary_search(&next).is_ok())
                     || (next == self.key.from && self.key.blocked.binary_search(&node).is_ok())
@@ -334,7 +507,7 @@ impl EqualCostSearch {
                     continue;
                 }
                 let bits = if self.side == 0 && node == self.key.from {
-                    1u64 << self.neighbors.binary_search(&next).unwrap()
+                    1u64 << self.graph[self.key.from].binary_search(&next).unwrap()
                 } else {
                     first
                 };
@@ -374,7 +547,8 @@ impl EqualCostSearch {
                 self.remaining = self.waves[self.side].queue.len();
             }
         }
-        self.done
+        step.done = self.done;
+        step
     }
     fn finish(self) -> Result<Vec<Vec<usize>>> {
         if self.key.from == self.key.to {
@@ -392,8 +566,9 @@ impl EqualCostSearch {
                 current = if depth == 1 {
                     self.key.from
                 } else {
-                    neighbor_positions_for(self.count, current)
-                        .into_iter()
+                    self.graph[current]
+                        .iter()
+                        .copied()
                         .find(|candidate| {
                             self.waves[0].visits.get(candidate).is_some_and(|v| {
                                 v.depth + 1 == depth && v.first & (1u64 << bit) != 0
@@ -418,442 +593,4 @@ impl EqualCostSearch {
     }
 }
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::{executor::block_on, task::noop_waker_ref};
-    use std::{future::Future, num::NonZeroU32, task::Context};
-
-    #[derive(Clone)]
-    struct TestMember(Vec<u8>, NonZeroU32);
-    impl Member for TestMember {
-        const DOMAIN: &'static str = "racer";
-        fn id(&self) -> &[u8] {
-            &self.0
-        }
-        fn weight(&self) -> NonZeroU32 {
-            self.1
-        }
-    }
-    fn membership(n: usize) -> Membership<TestMember> {
-        Membership::new(
-            (0..n)
-                .map(|i| {
-                    TestMember(
-                        format!("node-{i:06}").into_bytes(),
-                        NonZeroU32::new(4).unwrap(),
-                    )
-                })
-                .collect(),
-        )
-        .unwrap()
-    }
-    fn query(from: usize, to: usize, links: u8) -> PathQuery<'static> {
-        PathQuery {
-            from,
-            to,
-            links,
-            visited: &[],
-            blocked: &[],
-            seed: &[],
-        }
-    }
-    // Independent outgoing-edge definition, not the production inverse algorithm.
-    fn graph(n: usize) -> Vec<Vec<usize>> {
-        let mut edges = vec![vec![]; n];
-        for i in 0..n {
-            for digit in 0..32 {
-                let j = (32 * i + digit) % n;
-                if i != j {
-                    edges[i].push(j);
-                    edges[j].push(i);
-                }
-            }
-        }
-        for neighbors in &mut edges {
-            neighbors.sort_unstable();
-            neighbors.dedup();
-        }
-        edges
-    }
-    fn distances(edges: &[Vec<usize>], key: &PathKey) -> Vec<usize> {
-        let mut distances = vec![usize::MAX; edges.len()];
-        distances[key.to] = 0;
-        let mut queue = VecDeque::from([key.to]);
-        while let Some(node) = queue.pop_front() {
-            for &next in &edges[node] {
-                if key.visited.contains(&next)
-                    || (node == key.from && key.blocked.contains(&next))
-                    || (next == key.from && key.blocked.contains(&node))
-                    || distances[next] != usize::MAX
-                {
-                    continue;
-                }
-                distances[next] = distances[node] + 1;
-                queue.push_back(next);
-            }
-        }
-        distances
-    }
-    fn search(n: usize, key: &PathKey) -> Result<Vec<Vec<usize>>> {
-        let mut search = EqualCostSearch::new(n, key);
-        while !search.step(1) {}
-        search.finish()
-    }
-    #[test]
-    fn all_equal_next_hops_match_independent_oracle() {
-        for n in [37, 401, 1500] {
-            let edges = graph(n);
-            let members = membership(n);
-            for source in [0, 19, n - 1] {
-                for to in (0..n).step_by(17).filter(|&to| to != source) {
-                    for filtered in [false, true] {
-                        let mut key = PathKey::new(&members, &query(source, to, 4)).unwrap();
-                        if filtered {
-                            key.visited = [7, 33]
-                                .into_iter()
-                                .filter(|v| *v != source && *v != to)
-                                .collect();
-                            key.blocked = edges[source].iter().copied().step_by(2).collect();
-                        }
-                        let distance = distances(&edges, &key);
-                        for links in [1, 2, 4, 255] {
-                            key.links = links;
-                            let result = search(n, &key);
-                            if distance[source] > links as usize {
-                                assert_eq!(result, Err(Error::Unreachable));
-                                continue;
-                            }
-                            let alternatives = result.unwrap();
-                            let expected: Vec<_> = edges[source]
-                                .iter()
-                                .copied()
-                                .filter(|v| {
-                                    !key.blocked.contains(v)
-                                        && !key.visited.contains(v)
-                                        && distance[*v].checked_add(1) == Some(distance[source])
-                                })
-                                .collect();
-                            assert_eq!(
-                                alternatives.iter().map(|p| p[1]).collect::<Vec<_>>(),
-                                expected
-                            );
-                            for path in alternatives {
-                                assert_eq!(path.first(), Some(&source));
-                                assert_eq!(path.last(), Some(&to));
-                                assert_eq!(path.len(), distance[source] + 1);
-                                for pair in path.windows(2) {
-                                    assert!(edges[pair[0]].contains(&pair[1]));
-                                    assert!(!key.visited.contains(&pair[1]));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    #[test]
-    fn independent_hash_vectors_cache_reselection_and_snapshot_weights() {
-        let mut input = membership(1500).members().to_vec();
-        for (i, member) in input.iter_mut().enumerate() {
-            member.1 = NonZeroU32::new(if i % 3 == 0 { 1 } else { 4 }).unwrap();
-        }
-        let members = Membership::new(input).unwrap();
-        let cached = Paths::new(1);
-        let cold = Paths::new(0);
-        // Independent Python hashlib + outgoing-edge BFS vectors, also asserted
-        // through the Racer adapter to verify request||attempt seed construction.
-        for (attempt, expected) in [(0u128, 1312), (1, 937), (2, 703), (127, 937)] {
-            let mut seed = vec![1; 16];
-            seed.extend_from_slice(&attempt.to_be_bytes());
-            let query = PathQuery {
-                seed: &seed,
-                ..query(0, 1499, 4)
-            };
-            let actual = block_on(cached.route(&members, query)).unwrap();
-            assert_eq!(actual[1], expected);
-            assert_eq!(actual, block_on(cold.route(&members, query)).unwrap());
-        }
-        let mut changed = members.members().to_vec();
-        changed[1312].1 = NonZeroU32::new(u32::MAX).unwrap();
-        let changed = Membership::new(changed).unwrap();
-        let mut seed = vec![1; 16];
-        seed.extend_from_slice(&[2; 16]);
-        let query = PathQuery {
-            seed: &seed,
-            ..query(0, 1499, 4)
-        };
-        assert_eq!(block_on(cached.route(&changed, query)).unwrap()[1], 1312);
-        assert_eq!(cached.cache.borrow().entries.len(), 1);
-        assert_eq!(cached.cache.borrow().fifo.len(), 1);
-        assert_eq!(cold.cache.borrow().entries.len(), 0);
-    }
-    #[test]
-    fn last_first_hop_bit_survives_search_and_reconstruction() {
-        let n = 100_000;
-        let source = 19;
-        let members = membership(n);
-        let neighbors = members.neighbors(source);
-        assert_eq!(neighbors.len(), 64);
-        let last = neighbors[63];
-        let mut key = PathKey::new(&members, &query(source, last, 4)).unwrap();
-        key.blocked = neighbors[..63].to_vec();
-        let next = members
-            .neighbors(last)
-            .into_iter()
-            .find(|v| *v != source && !neighbors.contains(v))
-            .unwrap();
-        for to in [last, next] {
-            key.to = to;
-            let alternatives = search(n, &key).unwrap();
-            assert_eq!(alternatives.len(), 1);
-            assert_eq!(alternatives[0][1], last);
-            assert_eq!(alternatives[0].last(), Some(&to));
-        }
-        key.blocked = neighbors;
-        assert_eq!(search(n, &key), Err(Error::Unreachable));
-    }
-    #[test]
-    fn weighted_integer_mapping_and_probabilities() {
-        assert_eq!(weighted_draw(0, 5, &[4, 1]), None);
-        let mut counts = [0; 2];
-        for sample in 1..=10_000 {
-            counts[weighted_draw(sample, 5, &[4, 1]).unwrap()] += 1;
-        }
-        assert_eq!(counts, [8000, 2000]);
-        let max = u64::from(u32::MAX);
-        assert_eq!(weighted_draw(u64::MAX, 64 * max, &[max; 64]), Some(1));
-    }
-    #[test]
-    fn search_work_is_bounded_per_turn() {
-        let members = membership(100_000);
-        let key = PathKey::new(&members, &query(0, 80_003, 4)).unwrap();
-        let mut search = EqualCostSearch::new(100_000, &key);
-        loop {
-            let before = search.expansions;
-            let done = search.step(7);
-            assert!(search.expansions - before <= 7);
-            assert!(search.edges <= search.expansions * MAX_DEGREE);
-            assert!(search.visited_entries() <= 2 * 100_000);
-            if done {
-                break;
-            }
-        }
-        let alternatives = search.finish().unwrap();
-        assert!(alternatives.len() <= MAX_DEGREE);
-        assert!(alternatives.iter().all(|p| p.len() <= 5));
-    }
-    #[test]
-    fn exhaustive_inverse_matches_definition() {
-        let radix = RADIX;
-        for n in 1..=160 {
-            for i in 0..n {
-                let expected: Vec<_> = (0..n)
-                    .filter(|&k| {
-                        k != i
-                            && (0..radix)
-                                .any(|j| (radix * i + j) % n == k || (radix * k + j) % n == i)
-                    })
-                    .collect();
-                assert_eq!(neighbor_positions_for(n, i), expected, "N={n}, i={i}");
-            }
-        }
-        assert!(neighbor_positions_for(0, 0).is_empty());
-        assert!(neighbor_positions_for(1, usize::MAX).is_empty());
-        assert!(
-            neighbor_positions_for(usize::MAX, usize::MAX - 1)
-                .iter()
-                .all(|&v| v < usize::MAX)
-        );
-    }
-    #[test]
-    fn hundred_thousand_nodes_bounded_symmetric_and_four_link_reachable() {
-        let n = 100_000;
-        for i in 0..n {
-            let neighbors = neighbor_positions_for(n, i);
-            assert!(neighbors.len() <= MAX_DEGREE);
-            for &other in &neighbors {
-                assert!(neighbor_positions_for(n, other).binary_search(&i).is_ok());
-            }
-        }
-        for source in [0, 1, 17, 49_999, 99_999] {
-            let mut distance = vec![u8::MAX; n];
-            distance[source] = 0;
-            let mut queue = VecDeque::from([source]);
-            while let Some(i) = queue.pop_front() {
-                if distance[i] == 4 {
-                    continue;
-                }
-                for j in neighbor_positions_for(n, i) {
-                    if distance[j] == u8::MAX {
-                        distance[j] = distance[i] + 1;
-                        queue.push_back(j);
-                    }
-                }
-            }
-            assert!(distance.iter().all(|d| *d <= 4));
-        }
-    }
-    #[test]
-    fn arbitrary_binary_members_invalid_queries_and_first_hop_only_blocking() {
-        struct Binary([u8; 2]);
-        impl Member for Binary {
-            const DOMAIN: &'static str = "binary";
-            fn id(&self) -> &[u8] {
-                &self.0
-            }
-            fn weight(&self) -> NonZeroU32 {
-                NonZeroU32::new(1).unwrap()
-            }
-        }
-        let members =
-            Membership::new((0u16..1500).map(|i| Binary(i.to_be_bytes())).collect()).unwrap();
-        let paths = Paths::new(2);
-        let basic = query(0, 1499, 255);
-        let route = block_on(paths.route(&members, basic)).unwrap();
-        assert_eq!(route.first(), Some(&0));
-        assert_eq!(route.last(), Some(&1499));
-        assert!(route.len() > 2);
-        // Blocking the destination's first-hop edge does not ban reaching it later.
-        assert_eq!(
-            block_on(paths.route(
-                &members,
-                PathQuery {
-                    blocked: &[1499],
-                    ..basic
-                }
-            ))
-            .unwrap(),
-            route
-        );
-        for invalid in [
-            PathQuery {
-                from: usize::MAX,
-                ..basic
-            },
-            PathQuery { to: 1500, ..basic },
-            PathQuery {
-                visited: &[1500],
-                links: 4,
-                ..basic
-            },
-            PathQuery {
-                blocked: &[usize::MAX],
-                ..basic
-            },
-            PathQuery {
-                visited: &[0],
-                links: 4,
-                ..basic
-            },
-            PathQuery {
-                visited: &[1499],
-                links: 4,
-                ..basic
-            },
-            PathQuery {
-                visited: &[1, 1],
-                links: 4,
-                ..basic
-            },
-            PathQuery {
-                visited: &[1],
-                ..basic
-            },
-        ] {
-            assert_eq!(
-                block_on(paths.route(&members, invalid)),
-                Err(Error::InvalidQuery)
-            );
-        }
-        assert_eq!(
-            block_on(paths.route(&members, query(0, 1499, 0))),
-            Err(Error::Unreachable)
-        );
-        assert_eq!(block_on(paths.route(&members, query(0, 0, 0))), Ok(vec![0]));
-        let empty = Membership::<Binary>::new(vec![]).unwrap();
-        assert!(empty.neighbors(0).is_empty());
-        assert!(members.neighbors(1500).is_empty());
-        assert_eq!(
-            block_on(paths.route(&empty, query(0, 0, 0))),
-            Err(Error::InvalidQuery)
-        );
-    }
-    #[test]
-    fn canonical_cache_identity_includes_domain_and_weights() {
-        struct Other(TestMember);
-        impl Member for Other {
-            const DOMAIN: &'static str = "other";
-            fn id(&self) -> &[u8] {
-                self.0.id()
-            }
-            fn weight(&self) -> NonZeroU32 {
-                self.0.weight()
-            }
-        }
-        let members = membership(1500);
-        let other =
-            Membership::new(members.members().iter().cloned().map(Other).collect()).unwrap();
-        let paths = Paths::new(4);
-        let a = PathQuery {
-            visited: &[7, 33],
-            blocked: &[1, 2],
-            ..query(0, 1499, 4)
-        };
-        let b = PathQuery {
-            visited: &[33, 7],
-            blocked: &[2, 1, 2],
-            ..a
-        };
-        assert_eq!(
-            block_on(paths.route(&members, a)),
-            block_on(paths.route(&members, b))
-        );
-        assert_eq!(paths.cache.borrow().entries.len(), 1);
-        let identical = membership(1500);
-        assert_eq!(
-            block_on(paths.route(&members, a)),
-            block_on(paths.route(&identical, a))
-        );
-        assert_eq!(paths.cache.borrow().entries.len(), 1);
-        assert_eq!(
-            block_on(paths.route(&other, a)).unwrap(),
-            block_on(Paths::new(0).route(&other, a)).unwrap()
-        );
-        assert_eq!(paths.cache.borrow().entries.len(), 2);
-        let mut changed = members.members().to_vec();
-        changed[0].1 = NonZeroU32::new(1).unwrap();
-        block_on(paths.route(&Membership::new(changed).unwrap(), a)).unwrap();
-        assert_eq!(paths.cache.borrow().entries.len(), 3);
-    }
-    #[test]
-    fn cooperative_admission_cancellation_and_cache_hits() {
-        let members = membership(100_000);
-        let query = query(0, 80_003, 4);
-        let mut cx = Context::from_waker(noop_waker_ref());
-        for capacity in [0, 1, 32] {
-            let paths = Paths::new(capacity);
-            let mut pending = Vec::new();
-            for _ in 0..capacity.clamp(1, 8) {
-                let mut future = Box::pin(paths.route(&members, query));
-                assert!(future.as_mut().poll(&mut cx).is_pending());
-                pending.push(future);
-            }
-            assert_eq!(
-                block_on(paths.route(&members, query)),
-                Err(Error::Overloaded)
-            );
-            drop(pending);
-            assert_eq!(paths.active_searches.get(), 0);
-            let expected = block_on(paths.route(&members, query)).unwrap();
-            assert_eq!(paths.active_searches.get(), 0);
-            let mut future = Box::pin(paths.route(&members, query));
-            let first = future.as_mut().poll(&mut cx);
-            if capacity == 0 {
-                assert!(first.is_pending());
-            } else {
-                assert_eq!(first, Poll::Ready(Ok(expected)));
-            }
-        }
-    }
-}
+mod tests;

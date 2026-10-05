@@ -404,7 +404,10 @@ impl CandidatePolicy {
             .take(3)
             .any(|node| node == &self.node)
     }
-    pub fn maintain(&self, membership: &std::sync::Arc<crate::topology::Membership>) -> Result<()> {
+    pub fn maintain(
+        &self,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+    ) -> Result<crate::topology::Maintenance> {
         self.placement.maintain(membership)
     }
     pub fn candidates_scoped<'a>(

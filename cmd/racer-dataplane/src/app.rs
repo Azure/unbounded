@@ -441,6 +441,8 @@ pub struct WorkerApplication {
     checkpoint_completed: u64,
     checkpoint_budget: usize,
     placement: Rc<Placement>,
+    placement_retry: std::time::Instant,
+    placement_warning: Option<std::time::Instant>,
     diagnostic_task: Option<Operation<'static, ()>>,
     diagnostic_scope: Option<RequestScope>,
     diagnostics_address: std::net::SocketAddr,
@@ -583,11 +585,16 @@ impl WorkerApplication {
         };
 
         let paths = Rc::new(
-            Paths::new(Rc::new(LinkHealth), limits.cached_paths.get())
-                .with_peer_admission(node.peer_admission.clone()),
+            Paths::with_limits(
+                Rc::new(LinkHealth),
+                limits.cached_paths.get(),
+                limits.path_cache_bytes.get(),
+                limits.active_path_searches.get(),
+            )
+            .with_peer_admission(node.peer_admission.clone()),
         );
         let placement = Rc::new(Placement::with_memory_budget(
-            limits.cached_rankings.get() * crate::topology::RANKING_BYTES,
+            limits.placement_cache_bytes.get(),
         ));
         let network = Rc::new(crate::peer::PeerNetwork::new(
             config.node.clone(),
@@ -776,6 +783,8 @@ impl WorkerApplication {
             checkpoint_completed: 0,
             checkpoint_budget: config.checkpoint_bytes.get(),
             placement,
+            placement_retry: uring_runtime::environment::now(),
+            placement_warning: None,
             diagnostic_task: None,
             diagnostic_scope: None,
             diagnostics_address: config.diagnostics_listen,
@@ -1058,13 +1067,13 @@ impl WorkerApplication {
         }
         let budget = work_budget.min(64);
         self.poll_native(cx)?;
+        let now = uring_runtime::environment::now();
         if !self.stopping
+            && now >= self.placement_retry
             && let Ok(snapshot) = self.snapshots.current()
         {
-            match self.placement.maintain(&snapshot.membership) {
-                Ok(()) | Err(Error::Overloaded) => (),
-                Err(error) => return Err(error),
-            }
+            let status = self.placement.maintain(&snapshot.membership);
+            self.observe_placement_maintenance(status, now, cx)?;
         }
         self.poll_checkpoint(cx)?;
         self.poll_ingress(cx, budget)?;
@@ -1088,6 +1097,35 @@ impl WorkerApplication {
         if now >= self.next_health {
             self.observe_health()?;
             self.next_health = now + Duration::from_millis(100);
+        }
+        Ok(())
+    }
+
+    fn observe_placement_maintenance(
+        &mut self,
+        status: Result<crate::topology::Maintenance>,
+        now: std::time::Instant,
+        cx: &mut Context<'_>,
+    ) -> Result<()> {
+        match status {
+            Ok(crate::topology::Maintenance::Progress) => cx.waker().wake_by_ref(),
+            Ok(crate::topology::Maintenance::Idle) => (),
+            Ok(crate::topology::Maintenance::Blocked) | Err(Error::Overloaded) => {
+                // Foreground requests release pinned rankings. Back off background
+                // work and rate-limit the capacity diagnostic, not request service.
+                self.placement_retry = now + Duration::from_millis(100);
+                if self
+                    .placement_warning
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60))
+                {
+                    eprintln!(
+                        "racer-dataplane: worker={} stage=placement-maintenance status=blocked retry_ms=100 action=check-inflight-requests-or-increase-RACER_PLACEMENT_CACHE_BYTES",
+                        self.worker.0
+                    );
+                    self.placement_warning = Some(now);
+                }
+            }
+            Err(error) => return Err(error),
         }
         Ok(())
     }
@@ -2036,8 +2074,9 @@ fn partition_limits_with_cause(
         ("queue_entries", &mut limits.queue_entries),
         ("client_connections", &mut limits.client_connections),
         ("pipes", &mut limits.pipes),
-        ("cached_rankings", &mut limits.cached_rankings),
+        ("placement_cache_bytes", &mut limits.placement_cache_bytes),
         ("cached_paths", &mut limits.cached_paths),
+        ("path_cache_bytes", &mut limits.path_cache_bytes),
         ("metadata_entries", &mut limits.metadata_entries),
         ("relay_transfers", &mut limits.relay_transfers),
     ] {
@@ -2060,6 +2099,10 @@ fn partition_limits_with_cause(
                 < (window + 1) * (page + 16) + crate::store::MAX_HEADER_BYTES,
         ),
         ("dirty_bytes", limits.dirty_bytes.get() < page + 16),
+        (
+            "placement_cache_bytes",
+            limits.placement_cache_bytes.get() < crate::topology::RANKING_BYTES,
+        ),
         (
             "registered_bytes",
             rdma && native::slot_count(&limits).map_err(|error| ("registered_bytes", error))? == 0,

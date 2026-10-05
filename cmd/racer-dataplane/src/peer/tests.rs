@@ -1981,10 +1981,30 @@ mod subscriptions {
         )));
         // Full protocol membership; the local provider has negligible weight. The
         // signed unavailable response below proves all 64 endpoints were ineligible.
+        // Keep authenticated ingress A adjacent to C on ring zero. Positional
+        // adjacency is not a property of the stable hashed overlay.
+        let ring_key = |id: &str| {
+            use sha2::Digest;
+            let mut hash = crate::topology::hash_domain(b"racer/overlay/sha256-rings-32/v1\0");
+            hash.update(0u32.to_be_bytes());
+            hash.update(u64::try_from(id.len()).unwrap().to_be_bytes());
+            hash.update(id.as_bytes());
+            crate::topology::hash_finish(hash)
+        };
+        let (a, c) = (ring_key(A), ring_key(C));
+        let (low, high) = (a.min(c), a.max(c));
         let membership = Arc::new(
             Membership::validate(
                 MembershipVersion(1),
-                (0..100_000)
+                (0..)
+                    .filter(|i| {
+                        if *i < 2 {
+                            return true;
+                        }
+                        let key = ring_key(&format!("member-{i:06}"));
+                        key < low || key > high
+                    })
+                    .take(100_000)
                     .map(|i| Member {
                         node: NodeId(match i {
                             0 => A.into(),
@@ -2000,6 +2020,12 @@ mod subscriptions {
                     .collect(),
             )
             .unwrap(),
+        );
+        assert!(
+            membership
+                .neighbors(&NodeId(C.into()))
+                .unwrap()
+                .contains(&NodeId(A.into()))
         );
         let destination = Rc::new(Forwarding::new(signers[2].clone()));
         let network = Rc::new(
@@ -2063,8 +2089,12 @@ mod subscriptions {
         let mut work = server.dispatch(codec(&admission).request(wire, &scope).unwrap(), &scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let before = scored_members();
-        assert!(work.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(scored_members() - before, 256);
+        match work.as_mut().poll(&mut cx) {
+            Poll::Pending => (),
+            Poll::Ready(Err(error)) => panic!("cold selection failed early: {error:?}"),
+            Poll::Ready(Ok(_)) => panic!("cold selection completed without yielding"),
+        }
+        assert_eq!(scored_members(), before, "ranking uses frozen weights");
         // Another OS worker must acquire the same node-wide scheduler while ingress
         // ranking is suspended. A bounded channel receive diagnoses lock retention.
         let scheduler = server.subscription_owner().clone();
@@ -2100,7 +2130,7 @@ mod subscriptions {
         assert_eq!(
             scored_members(),
             before,
-            "cancellation must hash no more members"
+            "cancellation must not reread member weights"
         );
         drop(work);
         assert_eq!(admission.used(ResourceClass::Waiter), 0);
@@ -2135,8 +2165,8 @@ mod subscriptions {
             let before = scored_members();
             let result = work.as_mut().poll(&mut cx);
             assert!(
-                scored_members() - before <= 256,
-                "poll {polls} exceeded rank quantum"
+                scored_members() == before,
+                "poll {polls} reread frozen member weights"
             );
             polls += 1;
             assert!(polls < 30_000, "bounded interval set must finish");
@@ -2150,8 +2180,8 @@ mod subscriptions {
         );
         assert_eq!(
             scored_members() - start,
-            64 * 100_000 - 256,
-            "canceled partial ranking is reused"
+            0,
+            "ranking uses frozen membership weights"
         );
         assert!(matches!(
             sender

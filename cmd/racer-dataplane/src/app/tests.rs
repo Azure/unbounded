@@ -607,6 +607,7 @@ fn worker_sizing_reports_specific_resource_floor() {
         "client_connections",
         "registered_bytes",
         "pipes",
+        "placement_cache_bytes",
     ] {
         let mut limits = base.clone();
         let value = match dimension {
@@ -617,6 +618,7 @@ fn worker_sizing_reports_specific_resource_floor() {
             "queue_entries" => &mut limits.queue_entries,
             "client_connections" => &mut limits.client_connections,
             "registered_bytes" => &mut limits.registered_bytes,
+            "placement_cache_bytes" => &mut limits.placement_cache_bytes,
             _ => &mut limits.pipes,
         };
         *value = NonZeroUsize::new(1).unwrap();
@@ -631,6 +633,31 @@ fn worker_sizing_reports_specific_resource_floor() {
             assert!(partition_limits_with_cause(&limits, workers, false).is_ok());
         }
     }
+}
+
+#[test]
+fn topology_budget_partition_preserves_bytes_and_per_worker_search_limit() {
+    let mut limits = Config::from_lookup(|name| {
+        Ok(match name {
+            "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+            "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+            "RACER_ENABLE_RDMA" => Some("false".into()),
+            _ => None,
+        })
+    })
+    .unwrap()
+    .limits;
+    limits.placement_cache_bytes = NonZeroUsize::new(2049).unwrap();
+    limits.path_cache_bytes = NonZeroUsize::new(8193).unwrap();
+    let partition = partition_limits(&limits, 2, false).unwrap();
+    assert_eq!(partition.placement_cache_bytes.get(), 1024);
+    assert_eq!(partition.path_cache_bytes.get(), 4096);
+    assert_eq!(partition.active_path_searches, limits.active_path_searches);
+    limits.placement_cache_bytes = NonZeroUsize::new(2047).unwrap();
+    assert_eq!(
+        partition_limits_with_cause(&limits, 2, false).err(),
+        Some(("placement_cache_bytes", Error::InvalidConfiguration))
+    );
 }
 
 #[test]
@@ -954,6 +981,47 @@ fn application_budget_poll_preserves_cooperative_and_completion_wakes() {
     worker.poll_budgeted(&mut cx, 1).unwrap();
     assert!(worker.peer_task.is_none());
     assert!(worker.diagnostic_task.is_none());
+}
+
+#[test]
+fn placement_maintenance_retries_pressure_without_spinning_or_log_floods() {
+    use crate::topology::Maintenance;
+    let mut worker = wake_test_worker();
+    let count = Arc::new(crate::test_support::WakeCounter::default());
+    let waker = std::task::Waker::from(count.clone());
+    let mut cx = Context::from_waker(&waker);
+    let now = uring_runtime::environment::now();
+    worker
+        .observe_placement_maintenance(Ok(Maintenance::Idle), now, &mut cx)
+        .unwrap();
+    assert_eq!(count.count(), 0);
+    worker
+        .observe_placement_maintenance(Ok(Maintenance::Progress), now, &mut cx)
+        .unwrap();
+    assert_eq!(count.count(), 1);
+    worker
+        .observe_placement_maintenance(Ok(Maintenance::Blocked), now, &mut cx)
+        .unwrap();
+    assert_eq!(worker.placement_retry, now + Duration::from_millis(100));
+    assert_eq!(worker.placement_warning, Some(now));
+    worker
+        .observe_placement_maintenance(
+            Err(Error::Overloaded),
+            now + Duration::from_secs(1),
+            &mut cx,
+        )
+        .unwrap();
+    assert_eq!(worker.placement_warning, Some(now));
+    assert_eq!(count.count(), 1);
+    let later = now + Duration::from_secs(60);
+    worker
+        .observe_placement_maintenance(Ok(Maintenance::Blocked), later, &mut cx)
+        .unwrap();
+    assert_eq!(worker.placement_warning, Some(later));
+    assert_eq!(
+        worker.observe_placement_maintenance(Err(Error::Internal), later, &mut cx),
+        Err(Error::Internal)
+    );
 }
 
 #[test]

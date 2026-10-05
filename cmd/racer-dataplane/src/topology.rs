@@ -25,14 +25,24 @@ use std::time::Instant;
 use uring_runtime::deadline::Deadline;
 
 pub use ::topology::MAX_DEGREE;
-pub(crate) use ::topology::hash::{
-    bytes as hash_bytes, finish as hash_finish, named_domain as hash_domain,
-};
+pub use ::topology::{Maintenance, SLOT_COUNT};
+
+// Application wire/hash schemas are independent of the topology implementation.
+pub(crate) fn hash_domain(name: &[u8]) -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(name);
+    hash
+}
+pub(crate) fn hash_bytes(hash: &mut Sha256, value: &[u8]) {
+    let length = u32::try_from(value.len()).expect("validated hash field fits u32");
+    hash.update(length.to_be_bytes());
+    hash.update(value);
+}
+pub(crate) fn hash_finish(hash: Sha256) -> [u8; 32] {
+    hash.finalize().into()
+}
 
 // Immutable placement, authenticated routing, and worker-local endpoint circuits.
-
-#[cfg(test)]
-pub(crate) const RADIX: usize = 32;
 
 /// Shared capacity bound for every supported topology, including first-hop masks.
 const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
@@ -150,8 +160,7 @@ pub struct Member {
 
 #[cfg(test)]
 thread_local! {
-    // Counts algorithm weight reads, including scoring. Placement/selection tests
-    // sample only ranking polls, excluding publication and weighted path queries.
+    // Accessors are read once at publication; ranking uses frozen crate weights.
     static WEIGHT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
@@ -204,7 +213,15 @@ impl From<Member> for racer_control_wire::Member {
 }
 
 impl Membership {
-    pub fn validate(version: MembershipVersion, mut members: Vec<Member>) -> Result<Self> {
+    pub fn validate(version: MembershipVersion, members: Vec<Member>) -> Result<Self> {
+        Self::validate_with_predecessor(version, members, None)
+    }
+    /// Validate application metadata and reuse ID-stable predecessor adjacency.
+    pub(crate) fn validate_with_predecessor(
+        version: MembershipVersion,
+        mut members: Vec<Member>,
+        old: Option<&Self>,
+    ) -> Result<Self> {
         if version.0 == 0 || members.len() > MAX_MEMBERS {
             return Err(Error::InvalidConfiguration);
         }
@@ -248,7 +265,6 @@ impl Membership {
             .collect();
         let retained_bytes = std::mem::size_of::<Self>()
             + rail_domain.capacity() * std::mem::size_of::<racer_control_wire::RailId>()
-            + members.capacity() * std::mem::size_of::<Member>()
             + members
                 .iter()
                 .map(|m| {
@@ -261,7 +277,11 @@ impl Membership {
                 .sum::<usize>();
         Ok(Self {
             version,
-            inner: ::topology::Membership::new(members).map_err(|_| Error::InvalidConfiguration)?,
+            inner: match old {
+                Some(old) => ::topology::Membership::new_with_predecessor(members, &old.inner),
+                None => ::topology::Membership::new(members),
+            }
+            .map_err(|_| Error::InvalidConfiguration)?,
             retained_bytes,
             rail_domain,
         })
@@ -278,7 +298,7 @@ impl Membership {
         self.inner.identity()
     }
     pub fn retained_bytes(&self) -> usize {
-        self.retained_bytes + 64 * std::mem::size_of::<(Option<usize>, Option<usize>)>()
+        self.retained_bytes + self.inner.retained_bytes()
     }
     pub fn members(&self) -> &[Member] {
         self.inner.members()
@@ -319,9 +339,7 @@ fn valid_fabric(value: &str) -> bool {
 // Canonical slot encoding, placement, authenticated routing, and cancellation.
 // Graph/search/weighted selection live in the runtime-independent topology crate.
 
-pub const SLOT_COUNT: u32 = 1 << 20;
-/// Conservative allocation charge: ranking, four scores, Rc/RefCell, BTree
-/// entry and FIFO key, including container slack and allocator overhead.
+/// Crate structural allocation estimate per cached ranking.
 pub const RANKING_BYTES: usize = ::topology::Placement::ENTRY_BYTES;
 
 pub struct Placement {
@@ -335,7 +353,8 @@ pub struct Candidates {
 
 fn encoded_key(object: &ObjectId, page: PageNumber) -> Vec<u8> {
     let mut key = Vec::with_capacity(4 + object.cache.0.len() + 32 + 8);
-    key.extend_from_slice(&(object.cache.0.len() as u32).to_be_bytes());
+    let length = u32::try_from(object.cache.0.len()).expect("validated cache ID fits u32");
+    key.extend_from_slice(&length.to_be_bytes());
     key.extend_from_slice(object.cache.0.as_bytes());
     key.extend_from_slice(&object.key.0);
     key.extend_from_slice(&page.0.to_be_bytes());
@@ -344,10 +363,7 @@ fn encoded_key(object: &ObjectId, page: PageNumber) -> Vec<u8> {
 
 /// Fixed slot independent of object version and membership. Metadata passes page 0.
 pub fn slot(object: &ObjectId, page: PageNumber) -> u32 {
-    let mut digest = hash_domain(b"racer/slot/v1\0");
-    hash_object(&mut digest, object, page);
-    let digest = hash_finish(digest);
-    u32::from_be_bytes(digest[..4].try_into().unwrap()) >> 12
+    ::topology::slot::<Member>(&encoded_key(object, page))
 }
 
 fn candidates(
@@ -367,6 +383,7 @@ fn candidates(
 fn placement_error(error: ::topology::Error) -> Error {
     match error {
         ::topology::Error::Overloaded => Error::Overloaded,
+        ::topology::Error::SamplingExhausted => Error::Internal,
         _ => Error::InvalidConfiguration,
     }
 }
@@ -447,7 +464,10 @@ impl Placement {
 
     /// Warm only already-demanded predecessor slots. Each turn hashes at most
     /// one cold quantum or visits one retained key, with no full-cache sweep.
-    pub fn maintain(&self, membership: &std::sync::Arc<crate::topology::Membership>) -> Result<()> {
+    pub fn maintain(
+        &self,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+    ) -> Result<Maintenance> {
         self.inner
             .maintain(&membership.inner)
             .map_err(placement_error)
@@ -549,6 +569,18 @@ impl Paths {
             peer_admission: None,
             health,
             inner: ::topology::Paths::new(capacity),
+        }
+    }
+    pub fn with_limits(
+        health: Rc<LinkHealth>,
+        cache_entries: usize,
+        cache_bytes: usize,
+        active_searches: usize,
+    ) -> Self {
+        Self {
+            peer_admission: None,
+            health,
+            inner: ::topology::Paths::with_limits(cache_entries, cache_bytes, active_searches),
         }
     }
     #[cfg(test)]
@@ -670,11 +702,12 @@ pub(crate) mod tests {
         use std::num::NonZeroU32;
         use std::sync::Arc;
 
-        // Independent Python hashlib + outgoing-edge BFS vectors. N=1500, source=0,
-        // destination=1499, request=[1;16], shares=1 at multiples of 3 and 4 elsewhere.
-        // Attempts are big-endian u128; V5 intentionally retains the V4 hash domain.
+        // Independent Python hashlib + BFS vectors for the 32-ring overlay.
+        // N=1500, source=0, destination=1499, request=[1;16]; weights 1 at
+        // multiples of 3 and 4 elsewhere; attempts encoded as big-endian u128.
         pub(crate) const V5_NEXT_HOPS: [(u128, usize); 4] =
-            [(0, 1312), (1, 937), (2, 703), (127, 937)];
+            [(0, 1301), (1, 1301), (2, 1301), (127, 251)];
+
         pub(crate) fn member(index: usize, shares: u32) -> Member {
             Member {
                 node: NodeId(format!("node-{index:06}")),
@@ -994,6 +1027,36 @@ pub(crate) mod tests {
                 Err(Error::IncompatibleMembership)
             );
             assert!(Membership::validate(MembershipVersion(1), vec![]).is_ok());
+        }
+
+        #[test]
+        fn retained_bytes_add_only_nested_application_allocations() {
+            let mut node = member(0, 4);
+            node.site = "west".into();
+            node.rails.push(RailMapping {
+                rail: RailId(1),
+                device: "fabric".into(),
+                port: 1,
+                gid: None,
+                numa_node: None,
+            });
+            let old = Membership::validate(MembershipVersion(1), vec![]).unwrap();
+            let membership = Membership::validate(MembershipVersion(2), vec![node])
+                .unwrap()
+                .with_predecessor(&old);
+            let node = &membership.members()[0];
+            let nested = node.node.0.capacity()
+                + node.site.capacity()
+                + node.peer_endpoint.capacity()
+                + node.rails.capacity() * std::mem::size_of::<RailMapping>()
+                + node.rails[0].device.capacity();
+            assert_eq!(
+                membership.retained_bytes(),
+                std::mem::size_of::<Membership>()
+                    + membership.inner.retained_bytes()
+                    + membership.rail_domain.capacity() * std::mem::size_of::<RailId>()
+                    + nested
+            );
         }
 
         #[test]
@@ -1332,7 +1395,7 @@ pub(crate) mod tests {
                 future.as_mut().poll(&mut cx),
                 Poll::Ready(Err(Error::Cancelled))
             ));
-            assert_eq!(scored_members() - before, 256);
+            assert_eq!(scored_members(), before, "ranking uses frozen weights");
         }
 
         #[test]
@@ -1346,12 +1409,26 @@ pub(crate) mod tests {
             let before = scored_members();
             assert!(first.as_mut().poll(&mut cx).is_pending());
             assert!(second.as_mut().poll(&mut cx).is_pending());
-            assert_eq!(scored_members() - before, 512);
+            assert_eq!(scored_members(), before, "ranking uses frozen weights");
+            assert_eq!(
+                futures::executor::block_on(placement.rank_async(
+                    members.clone(),
+                    &object(),
+                    PageNumber(1)
+                ))
+                .unwrap_err(),
+                Error::Overloaded
+            );
+            // Synchronous callers can complete uncached despite pinned entries.
             assert_eq!(
                 placement
                     .rank(members.clone(), &object(), PageNumber(1))
-                    .unwrap_err(),
-                Error::Overloaded
+                    .unwrap()
+                    .ordered,
+                Placement::new(0)
+                    .rank(members.clone(), &object(), PageNumber(1))
+                    .unwrap()
+                    .ordered
             );
             drop(first);
             let ranked = futures::executor::block_on(second).unwrap();
@@ -1377,7 +1454,11 @@ pub(crate) mod tests {
                 .unwrap();
             let before = scored_members();
             uncached.rank(members, &object(), PageNumber(0)).unwrap();
-            assert_eq!(scored_members() - before, 100_000);
+            assert_eq!(
+                scored_members(),
+                before,
+                "uncached ranking uses frozen weights"
+            );
         }
     }
 
@@ -1403,6 +1484,32 @@ pub(crate) mod tests {
             }
         }
         #[test]
+        fn path_search_limit_is_independent_of_cache_and_released_on_drop() {
+            let members = membership(100_000);
+            let source = &members.members()[0].node;
+            let paths = Paths::with_limits(Rc::new(LinkHealth), 0, 1, 1);
+            let request = budget(&members, 80_003, NORMAL_LINKS);
+            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            let mut first = paths.shortest_async(members.clone(), source, &request, &scope);
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+            let other = budget(&members, 80_004, NORMAL_LINKS);
+            assert_eq!(
+                paths.shortest(members.clone(), source, &other).unwrap_err(),
+                Error::Overloaded
+            );
+            drop(first);
+            assert!(paths.shortest(members.clone(), source, &other).is_ok());
+            assert_eq!(
+                map_error(::topology::Error::SamplingExhausted),
+                Error::Internal
+            );
+            assert_eq!(
+                placement_error(::topology::Error::SamplingExhausted),
+                Error::Internal
+            );
+        }
+        #[test]
         fn independent_hash_vectors_cache_reselection_and_snapshot_weights() {
             let mut input = membership(1500).members().to_vec();
             for (i, member) in input.iter_mut().enumerate() {
@@ -1419,6 +1526,7 @@ pub(crate) mod tests {
                 let from = &members.members()[0].node;
                 let actual = cached.shortest(members.clone(), from, &request).unwrap();
                 assert_eq!(actual.nodes[1], members.members()[expected].node);
+                assert!(members.neighbors(from).unwrap().contains(&actual.nodes[1]));
                 let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
                 assert_eq!(
                     actual.nodes,
@@ -1433,7 +1541,17 @@ pub(crate) mod tests {
                 );
             }
             let mut changed = members.members().to_vec();
-            changed[1312].shares = std::num::NonZeroU32::new(u32::MAX).unwrap();
+            let favored = cached
+                .shortest(
+                    members.clone(),
+                    &members.members()[0].node,
+                    &budget(&members, 1499, 4),
+                )
+                .unwrap()
+                .nodes[1]
+                .clone();
+            let favored_index = members.position(&favored).unwrap();
+            changed[favored_index].shares = std::num::NonZeroU32::new(u32::MAX).unwrap();
             let changed = Arc::new(
                 Membership::validate(racer_control_wire::MembershipVersion(2), changed).unwrap(),
             );
@@ -1444,7 +1562,7 @@ pub(crate) mod tests {
                     &budget(&changed, 1499, 4),
                 )
                 .unwrap();
-            assert_eq!(route.nodes[1], changed.members()[1312].node);
+            assert_eq!(route.nodes[1], favored);
             // Private eviction assertions moved to topology::paths tests.
         }
         #[test]

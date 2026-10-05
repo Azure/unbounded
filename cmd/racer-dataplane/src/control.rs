@@ -777,7 +777,7 @@ impl ControlClient {
         match polled? {
             SnapshotResponse::Updated(publication) => {
                 scope.check()?;
-                let prepared = self.snapshots.prepare(publication)?;
+                let prepared = self.snapshots.prepare_async(publication, scope).await?;
                 if self
                     .pending
                     .borrow()
@@ -960,6 +960,24 @@ struct State {
         std::sync::Arc<crate::topology::Membership>,
     )>,
 }
+impl State {
+    fn retire_grace(&mut self, index: usize, retired: &mut Vec<Arc<Membership>>) {
+        let (_, membership) = self.grace.remove(index);
+        if Arc::strong_count(&membership) == 1 {
+            self.memberships
+                .retain(|(version, _)| *version != membership.version);
+        }
+        retired.push(membership);
+    }
+
+    fn expire_grace(&mut self, now: Instant, retired: &mut Vec<Arc<Membership>>) {
+        for index in (0..self.grace.len()).rev() {
+            if self.grace[index].0 <= now {
+                self.retire_grace(index, retired);
+            }
+        }
+    }
+}
 impl PublishedState {
     /// Incoming wire versions resolve here once, then travel as operation leases.
     /// Weak entries never prolong a generation's lifetime and publication prunes
@@ -968,9 +986,11 @@ impl PublishedState {
         &self,
         version: MembershipVersion,
     ) -> Result<std::sync::Arc<crate::topology::Membership>> {
+        // Declared before the guard, so final allocation drops happen unlocked.
+        let mut retired = Vec::new();
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         let now = uring_runtime::environment::now();
-        state.grace.retain(|(until, _)| *until > now);
+        state.expire_grace(now, &mut retired);
         state
             .memberships
             .iter()
@@ -1013,6 +1033,21 @@ pub struct SnapshotStore {
     published: Arc<PublishedState>,
     /// Maximum old live membership generations, in addition to the current one.
     retained_limit: usize,
+    // One CPU preparation job, retained through cancellation and joined at
+    // shutdown. No unbounded thread spawning or queue behind a canceled waiter.
+    preparation: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+impl Drop for SnapshotStore {
+    fn drop(&mut self) {
+        if let Some(job) = self
+            .preparation
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = job.join();
+        }
+    }
 }
 impl SnapshotStore {
     /// Read-only coherent accepted identity; never describes a prepared update.
@@ -1035,6 +1070,7 @@ impl SnapshotStore {
             cluster,
             published,
             retained_limit,
+            preparation: Mutex::new(None),
         }
     }
     /// Cursor advances only after complete validation and atomic acceptance.
@@ -1088,6 +1124,57 @@ impl SnapshotStore {
         let prepared = self.prepare(publication)?;
         self.publish_prepared(&prepared, transition)
     }
+    /// CPU-heavy validation and ring construction run off the I/O owner. A
+    /// canceled waiter abandons delivery, not the single background job slot.
+    /// Input bounds are enforced by wire validation and MAX_MEMBERS; shutdown
+    /// joins the owned job rather than detaching unfinished allocation work.
+    async fn prepare_async(
+        &self,
+        publication: Publication,
+        scope: &RequestScope,
+    ) -> Result<PreparedPublication> {
+        use std::future::Future;
+        scope.check()?;
+        let (sender, mut receiver) = futures::channel::oneshot::channel();
+        {
+            let mut active = self.preparation.lock().map_err(|_| Error::Unavailable)?;
+            if active.as_ref().is_some_and(|job| !job.is_finished()) {
+                return Err(Error::Overloaded);
+            }
+            if let Some(finished) = active.take() {
+                finished.join().map_err(|_| Error::Internal)?;
+            }
+            let store = Self::new(
+                self.cluster.clone(),
+                self.published.clone(),
+                self.retained_limit,
+            );
+            *active = Some(
+                std::thread::Builder::new()
+                    .name("racer-publication".into())
+                    .spawn(move || {
+                        let result = store.prepare(publication);
+                        // A canceled receiver releases rejected results here, off the
+                        // reactor and outside the publication mutex.
+                        let _ = sender.send(result);
+                    })
+                    .map_err(|_| Error::Io)?,
+            );
+        }
+        let prepared = uring_runtime::poll_scoped(scope, |cx| {
+            std::pin::Pin::new(&mut receiver).poll(cx).map(|result| {
+                result
+                    .map_err(|_| Error::Internal)
+                    .and_then(|result| result)
+            })
+        })
+        .await?;
+        scope.check()?;
+        Ok(prepared)
+    }
+
+    /// Synchronous preparation for startup/tests and the owned background job.
+    /// I/O workers must use prepare_async instead.
     pub fn prepare(&self, publication: Publication) -> Result<PreparedPublication> {
         if publication.cluster != self.cluster {
             return Err(Error::Unauthorized);
@@ -1096,25 +1183,41 @@ impl SnapshotStore {
         let (content, membership) = canonical_content(&publication)?;
         let content_hash: [u8; 32] = Sha256::digest(content).into();
         let membership_hash: [u8; 32] = Sha256::digest(membership).into();
-        let current = self.current().ok();
-        let mut validated = Membership::validate(
-            publication.membership_version,
-            publication.members.into_iter().map(Member::from).collect(),
-        )?;
-        if let Some(current) = &current {
-            validated = validated.with_predecessor(&current.membership);
-        }
-        let mut next = Snapshot {
+        let (current, accepted_membership_hash) = {
+            let state = self
+                .published
+                .state
+                .lock()
+                .map_err(|_| Error::Unavailable)?;
+            (state.current.clone(), state.membership_hash)
+        };
+        let membership = if let Some(current) = current
+            .as_ref()
+            .filter(|current| current.membership.version == publication.membership_version)
+        {
+            // Wire validation and canonical hashing still reject malformed or
+            // conflicting same-version content, without constructing a graph.
+            if membership_hash != accepted_membership_hash {
+                return Err(if publication.sequence <= current.sequence {
+                    Error::Replay
+                } else {
+                    Error::IncompatibleMembership
+                });
+            }
+            current.membership.clone()
+        } else {
+            Arc::new(Membership::validate_with_predecessor(
+                publication.membership_version,
+                publication.members.into_iter().map(Member::from).collect(),
+                current.as_ref().map(|current| current.membership.as_ref()),
+            )?)
+        };
+        let next = Snapshot {
             cluster: publication.cluster,
             sequence: publication.sequence,
-            membership: Arc::new(validated),
+            membership,
             caches: publication.caches,
         };
-        if let Some(current) = current {
-            if current.membership.version == next.membership.version {
-                next.membership = current.membership.clone();
-            }
-        }
         let prepared = PreparedPublication {
             snapshot: Arc::new(next),
             content_hash,
@@ -1157,6 +1260,8 @@ impl SnapshotStore {
         prepared: &PreparedPublication,
         transition: Option<Box<dyn CacheTransition>>,
     ) -> Result<std::sync::Arc<crate::control::Snapshot>> {
+        let mut retired = Vec::new();
+        let retired_snapshot;
         let mut state = self
             .published
             .state
@@ -1172,7 +1277,7 @@ impl SnapshotStore {
             return Ok(old.clone());
         }
         let now = uring_runtime::environment::now();
-        state.grace.retain(|(until, _)| *until > now);
+        state.expire_grace(now, &mut retired);
         // Grace-only owners are disposable under the configured generation bound.
         // Externally pinned operations still block replacement rather than revoke.
         while state.memberships.len() > self.retained_limit && !state.grace.is_empty() {
@@ -1183,7 +1288,7 @@ impl SnapshotStore {
             else {
                 break;
             };
-            state.grace.remove(index);
+            state.retire_grace(index, &mut retired);
             state.memberships.retain(|(_, m)| m.strong_count() != 0);
         }
         state.memberships.retain(|(_, m)| m.strong_count() != 0);
@@ -1230,12 +1335,20 @@ impl SnapshotStore {
                             .sum::<usize>()
                             > 128 * 1024 * 1024
                     {
-                        state.grace.remove(0);
+                        state.retire_grace(0, &mut retired);
                     }
                 }
             }
         }
-        state.current = Some(next.clone());
+        let obsolete = state
+            .current
+            .as_ref()
+            .filter(|old| Arc::strong_count(old) == 1 && Arc::strong_count(&old.membership) == 1)
+            .map(|old| old.membership.version);
+        retired_snapshot = state.current.replace(next.clone());
+        if let Some(version) = obsolete {
+            state.memberships.retain(|(v, _)| *v != version);
+        }
         state.memberships.retain(|(_, m)| m.strong_count() != 0);
         if !state
             .memberships
@@ -1248,6 +1361,9 @@ impl SnapshotStore {
         }
         state.content_hash = prepared.content_hash;
         state.membership_hash = prepared.membership_hash;
+        drop(state);
+        drop(retired_snapshot);
+        drop(retired);
         Ok(next)
     }
 }
@@ -2860,6 +2976,98 @@ pub(crate) mod tests {
 
     pub(crate) mod publication_tests {
         use super::*;
+        #[test]
+        fn preparation_reuses_same_version_without_reading_member_weights() {
+            let store = store(2);
+            let first = store.publish(publication(1)).unwrap();
+            let before = crate::topology::scored_members();
+            let mut next = publication(2);
+            next.caches.clear();
+            let prepared = store.prepare(next).unwrap();
+            assert_eq!(
+                crate::topology::scored_members(),
+                before,
+                "no topology constructor for cache-only publication"
+            );
+            assert!(Arc::ptr_eq(
+                &first.membership,
+                &prepared.snapshot.membership
+            ));
+            let mut conflict = publication(2);
+            conflict.members[0].shares = std::num::NonZeroU32::new(99).unwrap();
+            assert!(matches!(
+                store.prepare(conflict),
+                Err(Error::IncompatibleMembership)
+            ));
+            assert_eq!(crate::topology::scored_members(), before);
+        }
+
+        #[test]
+        fn background_preparation_keeps_cpu_work_off_the_polling_thread() {
+            let store = store(2);
+            let scope = testing::scope();
+            let before = crate::topology::scored_members();
+            let prepared =
+                futures::executor::block_on(store.prepare_async(publication(1), &scope)).unwrap();
+            assert_eq!(
+                crate::topology::scored_members(),
+                before,
+                "member snapshots must be constructed off thread"
+            );
+            assert_eq!(store.cursor().unwrap(), None, "preparation cannot publish");
+            store.publish_prepared(&prepared, None).unwrap();
+            assert_eq!(store.cursor().unwrap(), Some(PublicationSequence(1)));
+        }
+
+        #[test]
+        fn background_preparation_admission_and_canceled_scope_are_bounded() {
+            let store = store(2);
+            let (release, wait) = std::sync::mpsc::channel();
+            *store.preparation.lock().unwrap() = Some(std::thread::spawn(move || {
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            let scope = testing::scope();
+            assert!(matches!(
+                futures::executor::block_on(store.prepare_async(publication(1), &scope)),
+                Err(Error::Overloaded)
+            ));
+            scope.cancel().unwrap();
+            assert!(matches!(
+                futures::executor::block_on(store.prepare_async(publication(1), &scope)),
+                Err(Error::Cancelled)
+            ));
+            assert!(store.preparation.lock().unwrap().is_some());
+            release.send(()).unwrap();
+            drop(store); // Joins the still-owned work, including abandoned turns.
+        }
+
+        #[test]
+        fn canceled_background_wait_keeps_job_admission_until_completion() {
+            use std::future::Future;
+            let store = store(2);
+            let scope = testing::scope();
+            // Stall the background job at its snapshot read, never on the
+            // polling thread. No scheduling/timing assumption is required.
+            let published = store.published.clone();
+            let state = published.state.lock().unwrap();
+            let mut prepare = Box::pin(store.prepare_async(publication(1), &scope));
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            assert!(prepare.as_mut().poll(&mut cx).is_pending());
+            scope.cancel().unwrap();
+            assert!(matches!(
+                prepare.as_mut().poll(&mut cx),
+                std::task::Poll::Ready(Err(Error::Cancelled))
+            ));
+            drop(prepare);
+            assert!(matches!(
+                futures::executor::block_on(store.prepare_async(publication(2), &testing::scope())),
+                Err(Error::Overloaded)
+            ));
+            drop(state);
+            drop(store); // Shutdown joins and disposes of the abandoned result.
+            assert!(published.current().is_err());
+        }
+
         fn publication(sequence: u64) -> Publication {
             let mut p = decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),

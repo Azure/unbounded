@@ -652,7 +652,10 @@ pub mod cluster {
                 pipes: count,
                 range_window_pages: count,
                 header_bytes: NonZeroUsize::new(16 * 1024).unwrap(),
-                cached_rankings: count,
+                placement_cache_bytes: NonZeroUsize::new(16 * crate::topology::RANKING_BYTES)
+                    .unwrap(),
+                path_cache_bytes: NonZeroUsize::new(8 * 1024 * 1024).unwrap(),
+                active_path_searches: NonZeroUsize::new(8).unwrap(),
                 cached_paths: count,
                 retained_snapshots: count,
                 metadata_entries: count,

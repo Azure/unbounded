@@ -1529,13 +1529,10 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     ));
     let neighbors = membership.neighbors(&local).unwrap();
     assert!(neighbors.len() < membership.members().len() - 1);
-    assert_eq!(neighbors.len(), 62);
+    assert!(neighbors.len() <= crate::topology::MAX_DEGREE);
     {
-        let radix = crate::topology::RADIX;
         for (index, member) in membership.members().iter().enumerate() {
-            let expected = index != 0
-                && (0..radix)
-                    .any(|digit| digit % 1500 == index || (radix * index + digit) % 1500 == 0);
+            let expected = neighbors.contains(&member.node);
             assert_eq!(
                 network.endpoint(&membership, &member.node).is_ok(),
                 expected,

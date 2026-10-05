@@ -1,211 +1,145 @@
 use crate::{Error, Member, hash};
 use sha2::Digest;
+use std::{mem::size_of, num::NonZeroU32, sync::Arc};
+
+/// Maximum changed IDs retained for incremental computation.
+pub const MAX_INCREMENTAL_CHANGES: usize = 64;
 
 /// Immutable ID-sorted members and bounded predecessor hints.
+///
+/// IDs and weights are snapshotted at construction. The original records remain
+/// accessible for application metadata, but subsequent interior mutation cannot
+/// change placement or topology inputs. Membership is `Send` and `Sync` when `M`
+/// is, even though routing and placement caches remain worker-local.
 #[derive(Debug)]
 pub struct Membership<M: Member> {
     members: Vec<M>,
+    ids: Vec<Box<[u8]>>,
+    weights: Vec<NonZeroU32>,
     identity: [u8; 32],
-    pub(crate) placement_delta: Option<PlacementDelta>,
+    topology_identity: [u8; 32],
+    graph: Arc<Vec<Vec<usize>>>,
+    owned_bytes: usize,
+    pub(crate) delta: Option<MembershipDelta>,
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::num::NonZeroU32;
-
-    #[derive(Clone, Debug)]
-    struct BinaryMember(Vec<u8>, NonZeroU32);
-    impl Member for BinaryMember {
-        const DOMAIN: &'static str = "binary-store";
-        fn id(&self) -> &[u8] {
-            &self.0
-        }
-        fn weight(&self) -> NonZeroU32 {
-            self.1
-        }
-    }
-    fn member(id: &[u8], weight: u32) -> BinaryMember {
-        BinaryMember(id.to_vec(), NonZeroU32::new(weight).unwrap())
-    }
-
-    macro_rules! domain_member {
-        ($name:ident, $domain:expr) => {
-            #[derive(Debug)]
-            struct $name(BinaryMember);
-            impl Member for $name {
-                const DOMAIN: &'static str = $domain;
-                fn id(&self) -> &[u8] {
-                    self.0.id()
-                }
-                fn weight(&self) -> NonZeroU32 {
-                    self.0.weight()
-                }
-            }
-        };
-    }
-
-    #[test]
-    fn domain_member_concatenation_collision_is_rejected() {
-        domain_member!(Plain, "x");
-        domain_member!(
-            Adversarial,
-            concat!("x", "/placement-identity/v1\0", "\0\0\0\x13")
-        );
-        let members = Membership::new(vec![Plain(member(
-            b"/placement-identity",
-            u32::from_be_bytes(*b"/v1\0"),
-        ))])
-        .unwrap();
-        // Without validation, the empty adversarial membership hashes exactly
-        // like the one-member plain membership despite having no valid indices.
-        assert_eq!(
-            members.identity(),
-            hash::finish(hash::domain::<Adversarial>(b"/placement-identity/v1\0"))
-        );
-        let placement = crate::Placement::new(2);
-        assert_eq!(placement.rank(&members, b"key").unwrap(), vec![0]);
-        assert_eq!(
-            Membership::<Adversarial>::new(vec![]).unwrap_err(),
-            Error::InvalidDomain
-        );
-    }
-
-    #[test]
-    fn nul_domains_rejected_for_empty_and_nonempty_memberships() {
-        macro_rules! check {
-            ($domain:expr) => {{
-                domain_member!(Invalid, $domain);
-                for members in [vec![], vec![Invalid(member(b"id", 1))]] {
-                    assert_eq!(Membership::new(members).unwrap_err(), Error::InvalidDomain);
-                }
-            }};
-        }
-        check!("\0");
-        check!("\0prefix");
-        check!("pre\0fix");
-        check!("prefix\0");
-        assert_eq!(
-            Error::InvalidDomain.to_string(),
-            "member domain must not contain NUL"
-        );
-    }
-
-    #[test]
-    fn domains_without_nul_remain_valid() {
-        macro_rules! check {
-            ($domain:expr) => {{
-                domain_member!(Valid, $domain);
-                let empty = Membership::<Valid>::new(vec![]).unwrap();
-                assert!(empty.members().is_empty());
-                let members = Membership::new(vec![Valid(member(b"\0", 1))]).unwrap();
-                assert_eq!(members.position(b"\0"), Some(0));
-                assert_ne!(empty.identity(), members.identity());
-            }};
-        }
-        check!("");
-        check!("racer");
-        check!("x/placement-identity/v1");
-        check!("prefix with spaces/and\ncontrols\x01");
-        check!("存储/é");
-    }
-
-    #[test]
-    fn binary_ids_sorted_duplicate_rejected_and_empty_allowed() {
-        let members = Membership::new(vec![
-            member(&[255, 0], u32::MAX),
-            member(&[], 1),
-            member(&[0], 2),
-        ])
-        .unwrap();
-        assert_eq!(members.position(&[]), Some(0));
-        assert_eq!(members.position(&[0]), Some(1));
-        assert_eq!(members.position(&[255, 0]), Some(2));
-        assert_eq!(members.position(&[255]), None);
-        assert_eq!(members.members()[2].weight().get(), u32::MAX);
-        assert_eq!(
-            Membership::new(vec![member(&[0], 1), member(&[0], 2)]).unwrap_err(),
-            Error::DuplicateMember
-        );
-        let empty = Membership::<BinaryMember>::new(vec![]).unwrap();
-        assert_eq!(empty.position(&[]), None);
-        assert!(empty.members().is_empty());
-        let reordered = Membership::new(vec![
-            member(&[0], 2),
-            member(&[255, 0], u32::MAX),
-            member(&[], 1),
-        ])
-        .unwrap();
-        assert_eq!(members.identity(), reordered.identity());
-    }
-
-    #[test]
-    fn predecessor_delta_preserves_indices_and_caps_changes() {
-        let old = Membership::new(vec![member(b"a", 1), member(b"c", 1), member(b"d", 1)]).unwrap();
-        let new = Membership::new(vec![member(b"b", 1), member(b"c", 2), member(b"d", 1)])
-            .unwrap()
-            .with_predecessor(&old);
-        let delta = new.placement_delta.unwrap();
-        assert_eq!(delta.base, old.identity());
-        assert_eq!(delta.old_count, 3);
-        assert_eq!(
-            delta.changes,
-            vec![(Some(0), None), (None, Some(0)), (Some(1), Some(1))]
-        );
-        let unchanged = Membership::new(old.members().to_vec())
-            .unwrap()
-            .with_predecessor(&old);
-        assert!(unchanged.placement_delta.is_none());
-        let empty = Membership::new(vec![]).unwrap();
-        for count in [64, 65] {
-            let new = Membership::new((0..count).map(|i| member(&[i], 1)).collect())
-                .unwrap()
-                .with_predecessor(&empty);
-            assert_eq!(new.placement_delta.is_some(), count == 64);
-        }
-    }
-}
+mod tests;
 
 #[derive(Debug)]
-pub(crate) struct PlacementDelta {
+pub(crate) struct MembershipDelta {
     pub base: [u8; 32],
     pub old_count: usize,
     pub changes: Vec<(Option<usize>, Option<usize>)>,
 }
 
+fn validate_id_length(length: usize) -> Result<(), Error> {
+    u32::try_from(length)
+        .map(|_| ())
+        .map_err(|_| Error::InvalidMember)
+}
+
 impl<M: Member> Membership<M> {
-    /// Reject NUL-containing domains and duplicate member IDs.
-    pub fn new(mut members: Vec<M>) -> Result<Self, Error> {
+    /// Freeze member IDs and weights, sort by ID, and construct ring adjacency.
+    ///
+    /// Each member accessor is read once. Overlay construction hashes each ID
+    /// 32 times and sorts 32 rings: O(32 * (total ID bytes + N log N)) time and
+    /// O(64 N) adjacency storage, with O(N) temporary ring sorting storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidDomain`] for NUL-containing domains,
+    /// [`Error::DuplicateMember`] for duplicate frozen IDs, or
+    /// [`Error::InvalidMember`] for an ID longer than `u32::MAX` bytes, which
+    /// cannot be encoded in the placement identity v1 hash schema.
+    ///
+    /// # Panics
+    ///
+    /// Propagates panics from application-provided [`Member`] accessors.
+    pub fn new(members: Vec<M>) -> Result<Self, Error> {
+        Self::build(members, None)
+    }
+
+    /// Freeze members and prepare incremental hints, reusing the predecessor's
+    /// immutable graph when the frozen IDs are identical. Weight and metadata
+    /// changes do not rebuild the rings. Changed IDs use the same construction
+    /// as [`Self::new`]. Does not retain the predecessor membership itself.
+    ///
+    /// # Errors
+    /// Returns the same validation errors as [`Self::new`].
+    ///
+    /// # Panics
+    /// Propagates panics from application-provided [`Member`] accessors.
+    pub fn new_with_predecessor(members: Vec<M>, old: &Self) -> Result<Self, Error> {
+        Ok(Self::build(members, Some(old))?.with_predecessor(old))
+    }
+
+    fn build(members: Vec<M>, old: Option<&Self>) -> Result<Self, Error> {
         if M::DOMAIN.as_bytes().contains(&0) {
             return Err(Error::InvalidDomain);
         }
-        members.sort_unstable_by(|a, b| a.id().cmp(b.id()));
-        if members.windows(2).any(|pair| pair[0].id() == pair[1].id()) {
+        // Validate before allocating a snapshot or hashing a truncated length.
+        let mut frozen: Vec<_> = members
+            .into_iter()
+            .map(|member| {
+                let id = member.id();
+                validate_id_length(id.len())?;
+                let id: Box<[u8]> = id.into();
+                let weight = member.weight();
+                Ok((member, id, weight))
+            })
+            .collect::<Result<_, Error>>()?;
+        frozen.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        if frozen.windows(2).any(|pair| pair[0].1 == pair[1].1) {
             return Err(Error::DuplicateMember);
         }
+        let mut members = Vec::with_capacity(frozen.len());
+        let mut ids = Vec::with_capacity(frozen.len());
+        let mut weights = Vec::with_capacity(frozen.len());
         let mut digest = hash::domain::<M>(b"/placement-identity/v1\0");
-        for member in &members {
-            hash::bytes(&mut digest, member.id());
-            digest.update(member.weight().get().to_be_bytes());
+        for (member, id, weight) in frozen {
+            hash::bytes(&mut digest, &id);
+            digest.update(weight.get().to_be_bytes());
+            members.push(member);
+            ids.push(id);
+            weights.push(weight);
         }
-        Ok(Self {
+        let topology_identity = crate::overlay::identity::<M>(&ids);
+        let graph = match old.filter(|old| old.ids == ids) {
+            Some(old) => Arc::clone(&old.graph),
+            None => Arc::new(crate::overlay::build::<M>(&ids)),
+        };
+        let mut membership = Self {
             members,
+            ids,
+            weights,
             identity: hash::finish(digest),
-            placement_delta: None,
-        })
+            topology_identity,
+            graph,
+            owned_bytes: 0,
+            delta: None,
+        };
+        membership.owned_bytes = membership.measure_owned_bytes();
+        Ok(membership)
     }
 
     /// Prepare bounded incremental ranking hints outside request processing.
     /// Larger changes use exact cooperative cold computation on demand.
+    /// Replaces any previous hint, retaining at most [`MAX_INCREMENTAL_CHANGES`]
+    /// changed IDs. Does not retain the predecessor itself.
+    #[must_use]
     pub fn with_predecessor(mut self, old: &Self) -> Self {
+        // Replacing the predecessor must not retain a stale hint, even when the
+        // new predecessor is identical or exceeds the bounded diff budget.
+        self.delta = None;
         if self.identity == old.identity {
             return self;
         }
         let mut changes = Vec::new();
         let (mut a, mut b) = (0, 0);
         while a < old.members.len() || b < self.members.len() {
-            let order = match (old.members.get(a), self.members.get(b)) {
-                (Some(a), Some(b)) => a.id().cmp(b.id()),
+            let order = match (old.ids.get(a), self.ids.get(b)) {
+                (Some(a), Some(b)) => a.cmp(b),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 _ => std::cmp::Ordering::Greater,
             };
@@ -219,18 +153,18 @@ impl<M: Member> Membership<M> {
                     b += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    if old.members[a].weight() != self.members[b].weight() {
+                    if old.weight(a) != self.weight(b) {
                         changes.push((Some(a), Some(b)));
                     }
                     a += 1;
                     b += 1;
                 }
             }
-            if changes.len() > 64 {
+            if changes.len() > MAX_INCREMENTAL_CHANGES {
                 return self;
             }
         }
-        self.placement_delta = Some(PlacementDelta {
+        self.delta = Some(MembershipDelta {
             base: old.identity,
             old_count: old.members.len(),
             changes,
@@ -238,16 +172,110 @@ impl<M: Member> Membership<M> {
         self
     }
 
+    /// Original application records, ordered by their frozen IDs.
+    /// Interior mutation of these records does not alter algorithm snapshots.
+    #[must_use]
     pub fn members(&self) -> &[M] {
         &self.members
     }
 
+    /// Find the position of a frozen ID, or `None` if it is absent.
+    #[must_use]
     pub fn position(&self, id: &[u8]) -> Option<usize> {
-        self.members.binary_search_by(|m| m.id().cmp(id)).ok()
+        self.ids.binary_search_by(|m| m.as_ref().cmp(id)).ok()
     }
 
-    /// Domain, IDs, and weights only, independent of application metadata.
+    /// Placement identity v1 over domain, frozen IDs, and frozen weights only,
+    /// independent of application metadata and the overlay algorithm.
+    #[must_use]
     pub fn identity(&self) -> [u8; 32] {
         self.identity
+    }
+
+    /// Frozen ID at a valid membership position.
+    ///
+    /// # Panics
+    /// Panics if `position` is outside the member slice.
+    #[must_use]
+    pub(crate) fn id(&self, position: usize) -> &[u8] {
+        &self.ids[position]
+    }
+
+    /// Frozen weight at a valid membership position.
+    ///
+    /// # Panics
+    /// Panics if `position` is outside the member slice.
+    #[must_use]
+    pub(crate) fn weight(&self, position: usize) -> NonZeroU32 {
+        self.weights[position]
+    }
+
+    /// Domain, frozen IDs, and overlay algorithm, independent of weights.
+    #[must_use]
+    pub(crate) fn topology_identity(&self) -> [u8; 32] {
+        self.topology_identity
+    }
+
+    /// Sorted, unique, symmetric ID-based ring neighbors. Invalid positions,
+    /// including every position in an empty membership, return an empty list.
+    #[must_use]
+    pub fn neighbors(&self, position: usize) -> Vec<usize> {
+        self.neighbor_slice(position).to_vec()
+    }
+
+    /// Borrow sorted adjacency without allocating; invalid positions return empty.
+    #[must_use]
+    pub(crate) fn neighbor_slice(&self, position: usize) -> &[usize] {
+        self.graph.get(position).map_or(&[], Vec::as_slice)
+    }
+
+    /// Share immutable adjacency with a cooperative search without copying it.
+    #[must_use]
+    pub(crate) fn graph(&self) -> Arc<Vec<Vec<usize>>> {
+        Arc::clone(&self.graph)
+    }
+
+    /// Estimated allocated storage owned by this membership, using capacities
+    /// rather than lengths. Includes the member buffer, frozen inputs, delta,
+    /// and the full shared overlay allocation (count it only once if shared).
+    /// Excludes this inline object, allocator bookkeeping/alignment overhead,
+    /// and heap allocations inside application-owned `M` values. Applications
+    /// should add only those nested allocations, not another member buffer.
+    /// The estimate saturates at `usize::MAX` rather than overflowing. This is
+    /// O(1): immutable storage is measured once at construction; only the bounded
+    /// delta buffer's capacity is consulted on each call.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.owned_bytes
+            .saturating_add(self.delta.as_ref().map_or(0, |delta| {
+                delta
+                    .changes
+                    .capacity()
+                    .saturating_mul(size_of::<(Option<usize>, Option<usize>)>())
+            }))
+    }
+
+    fn measure_owned_bytes(&self) -> usize {
+        let mut bytes = self.members.capacity().saturating_mul(size_of::<M>());
+        bytes = bytes.saturating_add(self.ids.capacity().saturating_mul(size_of::<Box<[u8]>>()));
+        bytes = bytes.saturating_add(
+            self.weights
+                .capacity()
+                .saturating_mul(size_of::<NonZeroU32>()),
+        );
+        for id in &self.ids {
+            bytes = bytes.saturating_add(id.len());
+        }
+        // Arc allocation contains the Vec header and two atomic reference counters.
+        bytes = bytes.saturating_add(size_of::<Vec<Vec<usize>>>() + 2 * size_of::<usize>());
+        bytes = bytes.saturating_add(
+            self.graph
+                .capacity()
+                .saturating_mul(size_of::<Vec<usize>>()),
+        );
+        for neighbors in self.graph.iter() {
+            bytes = bytes.saturating_add(neighbors.capacity().saturating_mul(size_of::<usize>()));
+        }
+        bytes
     }
 }

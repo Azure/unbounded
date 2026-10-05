@@ -601,7 +601,11 @@ mod tests {
             (limits.queue_entries, config.limits.queue_entries),
             (limits.client_connections, config.limits.client_connections),
             (limits.pipes, config.limits.pipes),
-            (limits.cached_rankings, config.limits.cached_rankings),
+            (
+                limits.placement_cache_bytes,
+                config.limits.placement_cache_bytes,
+            ),
+            (limits.path_cache_bytes, config.limits.path_cache_bytes),
             (limits.cached_paths, config.limits.cached_paths),
             (limits.metadata_entries, config.limits.metadata_entries),
             (limits.relay_transfers, config.limits.relay_transfers),

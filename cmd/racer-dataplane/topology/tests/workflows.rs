@@ -1,7 +1,7 @@
 //! Application workflows using only the topology crate's public API.
 use futures::{executor::block_on, task::noop_waker_ref};
 use std::{future::Future, num::NonZeroU32, task::Context};
-use topology::{Error, Member, Membership, PathQuery, Paths, Placement};
+use topology::{Error, Maintenance, Member, Membership, PathQuery, Paths, Placement};
 
 #[derive(Clone, Debug)]
 struct Node([u8; 2]);
@@ -167,13 +167,13 @@ fn replace_membership_during_pending_placement_then_fall_back_for_large_changes(
         block_on(placement.rank_async(&next, key)),
         Err(Error::Overloaded)
     );
-    placement.maintain(&next).unwrap();
-    assert_eq!(placement.maintain(&next), Err(Error::Overloaded));
+    assert_eq!(placement.maintain(&next), Ok(Maintenance::Blocked));
+    assert_eq!(placement.maintain(&next), Ok(Maintenance::Blocked));
 
     // Dropping the old request frees admission. Retry the interrupted maintenance
     // before requesting a rank; an incomplete predecessor must never be reused.
     drop(pending);
-    placement.maintain(&next).unwrap();
+    assert_eq!(placement.maintain(&next), Ok(Maintenance::Progress));
     let ranked = block_on(placement.rank_async(&next, key)).unwrap();
     assert_eq!(ranked, oracle.rank(&next, key).unwrap());
     assert_eq!(ranked.len(), 3);

@@ -18,10 +18,14 @@ pub fn named_domain(name: &[u8]) -> Sha256 {
 }
 
 /// Append a byte field prefixed with its big-endian u32 length. Callers must
-/// bound fields to u32::MAX bytes, as required by the existing hash schema.
+/// bound fields to `u32::MAX` bytes, as required by the existing hash schema.
 pub fn bytes(hash: &mut Sha256, value: &[u8]) {
-    hash.update((value.len() as u32).to_be_bytes());
+    hash.update(field_length(value.len()).to_be_bytes());
     hash.update(value);
+}
+
+fn field_length(length: usize) -> u32 {
+    u32::try_from(length).expect("topology hash fields must fit the u32 length schema")
 }
 
 /// Finalize a domain-separated key without changing the underlying digest.
@@ -32,6 +36,15 @@ pub fn finish(hash: Sha256) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn length_prefix_checks_without_allocating_gigabytes() {
+        assert_eq!(field_length(0), 0);
+        assert_eq!(field_length(u32::MAX as usize), u32::MAX);
+        if let Some(overflow) = (u32::MAX as usize).checked_add(1) {
+            assert!(std::panic::catch_unwind(|| field_length(overflow)).is_err());
+        }
+    }
 
     #[test]
     fn exact_domain_and_length_prefix_bytes() {
