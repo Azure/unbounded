@@ -3028,48 +3028,6 @@ pub(crate) mod tests {
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
     #[test]
-    fn real_partial_sends_preserve_owned_subrange() {
-        use std::os::fd::AsRawFd;
-        let (admission, reactor, io, scope) = setup();
-        let (socket, mut peer) = UnixStream::pair().unwrap();
-        let size: libc::c_int = 4096;
-        // SAFETY: setsockopt synchronously reads this correctly sized integer.
-        assert_eq!(
-            unsafe {
-                libc::setsockopt(
-                    socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    (&size as *const libc::c_int).cast(),
-                    std::mem::size_of_val(&size) as _,
-                )
-            },
-            0
-        );
-        let connection = from_accepted(socket.into(), &admission).unwrap();
-        let length = 1024 * 1024;
-        let thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            let mut received = Vec::new();
-            peer.read_to_end(&mut received).unwrap();
-            let start = received.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-            assert_eq!(received.len() - start, length);
-            assert!(received[start..].iter().all(|b| *b == 91));
-        });
-        let sent = drive(&reactor, io.send_head(connection, response(length), &scope)).unwrap();
-        let mut bytes = io.buffer(length + 4).unwrap();
-        bytes.bytes_mut().unwrap()[2..length + 2].fill(91);
-        let completed = drive(
-            &reactor,
-            io.write_body_range(sent.connection, bytes, 2..length + 2, &scope),
-        )
-        .unwrap();
-        assert_eq!(completed.bytes, length);
-        drop(completed);
-        drain(&reactor);
-        thread.join().unwrap();
-    }
-    #[test]
     fn tcp_pool_reuses_only_finished_exchanges_and_enforces_capacity() {
         let (admission, reactor, io, scope) = setup();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3111,30 +3069,6 @@ pub(crate) mod tests {
         pool.close();
         drain(&reactor);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
-    }
-    #[test]
-    fn head_has_no_body_even_with_large_representation_length() {
-        let (admission, reactor, io, scope) = setup();
-        let (socket, mut peer) = UnixStream::pair().unwrap();
-        let connection = from_accepted(socket.into(), &admission).unwrap();
-        let thread = std::thread::spawn(move || {
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                peer.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n")
-                .unwrap();
-        });
-        let mut received = drive(
-            &reactor,
-            io.exchange_head(connection, request("HEAD"), &scope),
-        )
-        .unwrap();
-        assert_eq!(received.connection.remaining_body(), Some(0));
-        received.connection.finish_exchange().unwrap();
-        thread.join().unwrap();
     }
     #[test]
     fn truncation_and_future_drop_do_not_recycle_live_buffers() {

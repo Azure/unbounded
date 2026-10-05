@@ -869,16 +869,15 @@ async fn disconnect_fenced_exchange<T>(
     exchange: &RequestScope,
     work: impl std::future::Future<Output = crate::error::Result<T>>,
 ) -> crate::error::Result<T> {
-    let watch_scope = RequestScope::new(exchange.request, exchange.deadline.0)?;
     http1::connection::disconnect_fenced(
         io,
         connection,
         parent,
-        &watch_scope,
+        || RequestScope::new(exchange.request, exchange.deadline.0),
         || {
             let _ = exchange.cancel();
         },
-        || {
+        |watch_scope| {
             let _ = watch_scope.cancel();
         },
         work,

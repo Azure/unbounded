@@ -53,26 +53,28 @@ where
 }
 
 /// Observe disconnect or parent cancellation while driving work through its fences.
-/// The caller supplies an independent watch scope and cancellation actions; its
+/// The caller supplies an independent watch-scope factory and cancellation actions; its
 /// exchange must cooperate with cancellation and retain submitted I/O until fenced.
 /// Watch cancellation is fenced before returning any result or reusing a connection.
+/// Parent cancellation subscription precedes watch-scope allocation and its errors.
 pub async fn disconnect_fenced<C: Context, T>(
     io: &HttpIo<C>,
     connection: &ConnectionLease<C>,
     parent: &C::Scope,
-    watch_scope: &C::Scope,
+    watch_scope: impl FnOnce() -> Result<C, C::Scope>,
     cancel_exchange: impl Fn(),
-    cancel_watch: impl Fn(),
+    cancel_watch: impl Fn(&C::Scope),
     work: impl std::future::Future<Output = Result<C, T>>,
 ) -> Result<C, T> {
     let parent_wake = parent.cancellation().map(|c| c.subscribe()).transpose()?;
+    let watch_scope = watch_scope()?;
     let socket = connection.socket();
     let events = (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) as u32;
     let mut watch = Some(io.reactor().readiness_with_lease(
         socket.clone(),
         events,
         connection.slot().cloned(),
-        watch_scope,
+        &watch_scope,
     ));
     let mut work = std::pin::pin!(work);
     let mut failure = None;
@@ -104,7 +106,7 @@ pub async fn disconnect_fenced<C: Context, T>(
         work.as_mut().poll(cx)
     })
     .await;
-    cancel_watch();
+    cancel_watch(&watch_scope);
     if let Some(watch) = watch {
         let _ = watch.await;
     }

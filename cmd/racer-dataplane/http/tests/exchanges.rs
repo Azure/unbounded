@@ -201,9 +201,9 @@ fn disconnect_waits_for_work_cleanup_before_returning_failure() {
             &io,
             &connection,
             &RequestScope,
-            &RequestScope,
+            || Ok(RequestScope),
             || canceled.set(true),
-            || watch_canceled.set(true),
+            |_| watch_canceled.set(true),
             work,
         ),
     );
@@ -249,6 +249,92 @@ fn request(method: &str, length: usize) -> MessageHead {
         },
         length,
     )
+}
+
+/// HEAD representation lengths do not create a response body or prevent reuse.
+#[test]
+fn head_has_no_body_even_with_large_representation_length() {
+    use std::io::{Read, Write};
+    let io = io();
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
+    let thread = std::thread::spawn(move || {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            peer.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n")
+            .unwrap();
+    });
+    let mut received = drive(
+        &io,
+        io.exchange_head(connection, request("HEAD", 0), &RequestScope),
+    )
+    .unwrap();
+    assert_eq!(received.connection.receive_remaining(), Some(0));
+    received.connection.finish_exchange().unwrap();
+    thread.join().unwrap();
+}
+
+/// Real short sends preserve exactly the requested owned subrange.
+#[test]
+fn real_partial_sends_preserve_owned_subrange() {
+    use std::{io::Read, os::fd::AsRawFd};
+    let io = HttpIo::new(
+        Rc::new(Rc::new(Reactor::new(16, ()))),
+        Codec::new(256),
+        Rc::new(Caller),
+        2 * 1024 * 1024,
+        2 * 1024 * 1024,
+    );
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    let size: libc::c_int = 4096;
+    // SAFETY: setsockopt synchronously reads this correctly sized integer.
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as _,
+            )
+        },
+        0
+    );
+    let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
+    let length = 1024 * 1024;
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        let start = received.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(received.len() - start, length);
+        assert!(received[start..].iter().all(|b| *b == 91));
+    });
+    let sent = drive(
+        &io,
+        io.send_head(
+            connection,
+            head(StartLine::Response { status: 200 }, length),
+            &RequestScope,
+        ),
+    )
+    .unwrap();
+    let mut bytes = io.buffer(length + 4).unwrap();
+    bytes.bytes_mut().unwrap()[2..length + 2].fill(91);
+    let completed = drive(
+        &io,
+        io.write_body_range(sent.connection, bytes, 2..length + 2, &RequestScope),
+    )
+    .unwrap();
+    assert_eq!(completed.bytes, length);
+    drop(completed);
+    drive(&io, io.reactor().drain()).unwrap();
+    assert_eq!(io.reactor().in_flight(), 0);
+    thread.join().unwrap();
 }
 
 /// Exercise sequential upload and fetch exchanges and server-directed closure.
