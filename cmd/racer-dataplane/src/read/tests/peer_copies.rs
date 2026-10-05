@@ -259,6 +259,11 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         Arc::new(Default::default()),
     ));
     f.fill = Fill::new(dependencies);
+    f.fill
+        .dependencies
+        .writer
+        .retention()
+        .set_ownership(Rc::new(move |_| rank.is_some()));
     (peers, ordered)
 }
 
@@ -797,7 +802,18 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
                 .iter()
                 .all(|call| call.4 == f.scope.deadline.0)
         );
-        assert_published(&f, &first, false);
+        // The hedge itself is not a sighting; the two independent logical
+        // followers qualify second-sight persistence of the verified winner.
+        assert_published(&f, &first, true);
+        assert_eq!(
+            f.fill
+                .dependencies
+                .writer
+                .retention()
+                .snapshot()
+                .observations,
+            2
+        );
     }
 }
 

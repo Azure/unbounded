@@ -412,6 +412,30 @@ impl Placement {
         Ok(candidates(membership, ranked))
     }
 
+    /// Cache-only retention hint. Never starts or advances a cold ranking.
+    pub fn cached(
+        &self,
+        membership: Arc<Membership>,
+        object: &ObjectId,
+        page: PageNumber,
+    ) -> Option<Candidates> {
+        self.inner
+            .cached(&membership.inner, &encoded_key(object, page))
+            .map(|ranked| candidates(membership, ranked))
+    }
+
+    /// One bounded resident refresh turn: at most 256 scores and 64 CLOCK visits.
+    pub fn refresh(
+        &self,
+        membership: Arc<Membership>,
+        object: &ObjectId,
+        page: PageNumber,
+    ) -> Option<Candidates> {
+        self.inner
+            .refresh(&membership.inner, &encoded_key(object, page))
+            .map(|ranked| candidates(membership, ranked))
+    }
+
     /// Reactor-friendly cold ranking. Concurrent requests for a resident slot
     /// share progress; each poll hashes at most 256 members, with no held borrow
     /// across the yield. Dropped operations release their active-cache admission.

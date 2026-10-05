@@ -1,8 +1,8 @@
 //! Local disk -> ranked peer -> authorized origin acquisition and publication.
 //!
-//! Reserve progress memory/dirty capacity before download. Decrypt each copy once;
+//! Reserve mandatory progress memory before download. Decrypt each copy once;
 //! encrypt origin data once. Publish only verified whole pages, with original
-//! ciphertext queued asynchronously on candidates. Disk failure may discard dirty
+//! ciphertext queued best effort under second-sight policy. Disk failure may discard dirty
 //! bytes. Origin 412 does not prove old copies absent from other permitted caches.
 
 use super::candidates::CandidatePolicy;
@@ -66,6 +66,15 @@ pub struct FillDependencies {
     pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
 }
 type LocalCopies = coalesce::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
+
+/// Optional writes may use half of the aggregate class budget, with a floor
+/// sufficient for one valid page when the configured budget can hold it. Owned
+/// usage counts against this conservative ceiling; quota admission remains the
+/// authority for per-cache fairness and all completion-owned allocations.
+pub(super) fn optional_headroom(limit: usize, used: usize, amount: usize, one_page: usize) -> bool {
+    let ceiling = limit.min((limit / 2).max(one_page));
+    amount <= ceiling && used <= ceiling - amount
+}
 #[derive(Clone)]
 pub struct Fill {
     pub(super) dependencies: FillDependencies,
@@ -192,7 +201,7 @@ impl Fill {
         }
         self.dependencies
             .metadata_owner
-            .acquire(
+            .acquire_unobserved(
                 crate::model::PageId {
                     version,
                     number: first,
@@ -205,14 +214,39 @@ impl Fill {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn accept_selected(
+        &self,
+        copy: crate::memory::CiphertextCopy,
+        scope: &RequestScope,
+    ) -> Result<PageResult> {
+        self.accept_selected_inner(copy, scope, true).await
+    }
+    pub(crate) async fn accept_selected_unobserved(
+        &self,
+        copy: crate::memory::CiphertextCopy,
+        scope: &RequestScope,
+    ) -> Result<PageResult> {
+        self.accept_selected_inner(copy, scope, false).await
+    }
+    async fn accept_selected_inner(
         &self,
         mut copy: crate::memory::CiphertextCopy,
         scope: &RequestScope,
+        observe: bool,
     ) -> Result<PageResult> {
         scope.check()?;
         copy.validate_metadata()?;
         let page = copy.ciphertext.envelope().page.clone();
+        let interest = crate::retention::Interest::default();
+        let observation = if observe {
+            self.dependencies
+                .writer
+                .retention()
+                .observe(&page, &interest)
+        } else {
+            self.dependencies.writer.retention().owned_only(&page)
+        };
         if !self
             .dependencies
             .admission
@@ -240,6 +274,8 @@ impl Fill {
             .decrypt(&page, copy, reservation, scope, DecryptSource::Peer)
             .await?;
         self.publish(result.clone(), None, scope).await?;
+        self.persist_verified(&result, observation);
+        self.refresh_verified_background(&result, observation, scope);
         // Selected subscription pages bypass acquire_inner's source accounting.
         // Count only authenticated, published reception on the stable owner.
         self.metrics.record(Event::PeerHit, 1);
@@ -480,6 +516,10 @@ impl Fill {
         )
     }
     pub fn new(dependencies: FillDependencies) -> Self {
+        dependencies
+            .writer
+            .retention()
+            .set_ownership(dependencies.candidates.ownership_callback());
         Self {
             dependencies,
             metrics: Metrics::default(),
@@ -528,13 +568,34 @@ impl Fill {
     ) -> Operation<'a, PageResult> {
         Box::pin(async move {
             match self
-                .acquire_with_prefetch(page, membership, context, scope, budget, None, true, None)
+                .acquire_with_prefetch(
+                    page, membership, context, scope, budget, None, true, None, true,
+                )
                 .await?
             {
                 AcquiredPage::Plaintext(page) => Ok(page),
                 AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
             }
         })
+    }
+
+    pub(crate) async fn acquire_unobserved(
+        &self,
+        page: PageId,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<PageResult> {
+        match self
+            .acquire_with_prefetch(
+                page, membership, context, scope, budget, None, true, None, false,
+            )
+            .await?
+        {
+            AcquiredPage::Plaintext(page) => Ok(page),
+            AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
+        }
     }
 
     pub(crate) async fn acquire_ordered(
@@ -556,6 +617,7 @@ impl Fill {
                 None,
                 true,
                 Some(guard),
+                true,
             )
             .await?
         {
@@ -574,7 +636,9 @@ impl Fill {
     ) -> Operation<'a, crate::memory::CiphertextCopy> {
         Box::pin(async move {
             Ok(self
-                .acquire_with_prefetch(page, membership, context, scope, budget, None, false, None)
+                .acquire_with_prefetch(
+                    page, membership, context, scope, budget, None, false, None, true,
+                )
                 .await?
                 .copy())
         })
@@ -606,6 +670,7 @@ impl Fill {
                     Some(origin),
                     true,
                     None,
+                    false,
                 )
                 .await?
             {
@@ -625,20 +690,48 @@ impl Fill {
         mut prefetch: Option<crate::origin::OriginPage>,
         plaintext: bool,
         guard: Option<std::sync::Arc<super::range_stream::FixedAcquisition>>,
+        observe: bool,
     ) -> Operation<'a, AcquiredPage> {
         Box::pin(async move {
             scope.check()?;
             if page.version.object != context.object {
                 return Err(Error::InvalidRequest);
             }
+            // Verified memory is already deliverable. Optional cold ownership
+            // ranking must not introduce a yield/deadline failure before it.
+            let interest = crate::retention::Interest::default();
             if let Some(result) = self
                 .metrics
                 .lookup(LookupTier::Plaintext, self.dependencies.memory.get(&page))?
             {
                 result.validate_for(&page)?;
                 self.metrics.record(Event::MemoryHit, 1);
+                let retention = self.dependencies.writer.retention();
+                let observation = if observe {
+                    retention.observe(&page, &interest)
+                } else {
+                    retention.owned_only(&page)
+                };
+                self.persist_verified(&result, observation);
+                self.refresh_verified_background(&result, observation, scope);
                 return Ok(result.into());
             }
+            // Each independent follower observes before joining. Retries inside
+            // this operation reuse this decision, never their own inserted bit.
+            let _ = self
+                .dependencies
+                .candidates
+                .refresh_ownership_scoped(&page, scope)
+                .await;
+            scope.check()?;
+            let observation = if observe {
+                self.dependencies
+                    .writer
+                    .retention()
+                    .observe(&page, &interest)
+            } else {
+                self.dependencies.writer.retention().owned_only(&page)
+            };
             let mut waiter = match self.dependencies.flights.join_for(
                 page.clone(),
                 membership,
@@ -651,6 +744,7 @@ impl Fill {
                     // join checks current UID/key admission before sharing a
                     // completed bundle; registered waiters retain their own rights.
                     result.validate_for(&page)?;
+                    self.persist_verified(&result, observation);
                     return Ok(result.into());
                 }
                 JoinedFlight::Ciphertext(copy) => return Ok(AcquiredPage::Ciphertext(copy)),
@@ -660,6 +754,7 @@ impl Fill {
                 match waiter.wait().await? {
                     AcquisitionEvent::Complete(result) => {
                         result.validate_for(&page)?;
+                        self.persist_verified(&result, observation);
                         return Ok(result.into());
                     }
                     AcquisitionEvent::Ciphertext(copy) => {
@@ -674,6 +769,7 @@ impl Fill {
                             &mut prefetch,
                             plaintext,
                             guard.clone(),
+                            observation,
                         )
                         .await?;
                     }
@@ -685,6 +781,9 @@ impl Fill {
     /// Transfer elected work to the worker driver. The caller only waits for its
     /// remaining budget; dropping that wait cannot release accepted work or the
     /// ordered-selection guard before the operation completes.
+    // Keep the reader's latched observation explicit at the driver handoff rather
+    // than re-observing retries or coupling it to the flight's ownership guards.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_elected_acquisition(
         &self,
         page: &PageId,
@@ -693,6 +792,7 @@ impl Fill {
         prefetch: &mut Option<crate::origin::OriginPage>,
         plaintext: bool,
         completion_guard: Option<Arc<super::range_stream::FixedAcquisition>>,
+        observation: crate::retention::Observation,
     ) -> Result<()> {
         use std::future::Future;
 
@@ -796,6 +896,11 @@ impl Fill {
             operation.complete()?;
             match result {
                 Ok(result) => {
+                    if let AcquiredPage::Plaintext(page) = &result {
+                        // Origin can produce verified plaintext for a ciphertext
+                        // requester. Keep the original reader's latched decision.
+                        fill.persist_verified(page, observation);
+                    }
                     if let AcquiredPage::Ciphertext(copy) = &result {
                         match fill.dependencies.memory.publish_ciphertext(copy.clone()) {
                             Ok(())
@@ -865,15 +970,6 @@ impl Fill {
                     PAGE_BYTES as usize + 16,
                 )
             })?;
-        let dirty = match self.dependencies.admission.reserve(
-            Some(&page.version.object.cache),
-            ResourceClass::DirtyCiphertext,
-            PAGE_BYTES as usize + 16,
-        ) {
-            Ok(reservation) => Some(reservation),
-            Err(flow_control::Error::Overloaded) => None,
-            Err(error) => return Err(error.into()),
-        };
         let (plaintext, ciphertext) = self
             .dependencies
             .crypto
@@ -885,7 +981,7 @@ impl Fill {
             ciphertext,
         };
         result.validate_for(page)?;
-        self.publish(result.clone(), dirty, scope).await?;
+        self.publish(result.clone(), None, scope).await?;
         self.metrics.record(Event::OriginFill, 1);
         Ok(result)
     }
@@ -1151,24 +1247,10 @@ impl Fill {
             .candidates
             .candidates_scoped(membership, &page.version.object, page.number, scope)
             .await?;
-        let persist = self.dependencies.candidates.is_candidate(&candidates);
         // Cipher-only acquisitions reserve no plaintext until origin actually
         // supplies a page. Requester consumers still authenticate before acceptance.
         let mut plaintext = if want_plaintext {
             Some(self.reserve_network_plaintext(scope, page).await?)
-        } else {
-            None
-        };
-        let dirty = if persist {
-            match self.dependencies.admission.reserve(
-                Some(&context.object.cache),
-                ResourceClass::DirtyCiphertext,
-                PAGE_BYTES as usize + 16,
-            ) {
-                Ok(reservation) => Some(reservation),
-                Err(flow_control::Error::Overloaded) => None,
-                Err(error) => return Err(error.into()),
-            }
         } else {
             None
         };
@@ -1218,7 +1300,7 @@ impl Fill {
             {
                 result.validate_for(page)?;
                 scope.check()?;
-                self.publish(result.clone(), dirty, scope).await?;
+                self.publish(result.clone(), None, scope).await?;
                 self.metrics.record(Event::PeerHit, 1);
                 return Ok(result.into());
             }
@@ -1340,7 +1422,7 @@ impl Fill {
         if let AcquiredPage::Plaintext(page) = &result {
             // Origin encryption already produced a verified whole page. Preserve
             // that evidence even when the supplier requested only ciphertext.
-            self.publish(page.clone(), dirty, scope).await?;
+            self.publish(page.clone(), None, scope).await?;
         }
         self.metrics.record(source, 1);
         Ok(result)
@@ -1435,6 +1517,202 @@ impl Fill {
         source.observe(&self.metrics, result)
     }
 
+    /// Only verified results reach this boundary. Publication never re-queries
+    /// Bloom history, and optional write admission cannot change read success.
+    pub(crate) async fn observe_verified_scoped(&self, result: &PageResult, scope: &RequestScope) {
+        if scope.check().is_err() {
+            return;
+        }
+        let _ = self
+            .dependencies
+            .candidates
+            .refresh_ownership_scoped(result.plaintext.page(), scope)
+            .await;
+        if scope.check().is_ok() {
+            self.observe_verified(result, scope);
+        }
+    }
+
+    pub(crate) fn observe_verified(&self, result: &PageResult, _scope: &RequestScope) {
+        let observation = self.dependencies.writer.retention().observe(
+            result.plaintext.page(),
+            &crate::retention::Interest::default(),
+        );
+        self.persist_verified(result, observation);
+    }
+
+    fn refresh_verified_background(
+        &self,
+        result: &PageResult,
+        observation: crate::retention::Observation,
+        scope: &RequestScope,
+    ) {
+        if self
+            .dependencies
+            .writer
+            .retention()
+            .owned_only(result.plaintext.page())
+            .eligible()
+        {
+            return;
+        }
+        let Ok(permit) = uring_runtime::drivers::reserve() else {
+            return;
+        };
+        let fill = self.clone();
+        let result = result.clone();
+        let scope = scope.clone();
+        permit.submit_detached(Box::pin(async move {
+            if scope.check().is_err() {
+                return Ok::<(), Error>(());
+            }
+            let _ = fill
+                .dependencies
+                .candidates
+                .refresh_ownership_scoped(result.plaintext.page(), &scope)
+                .await;
+            if scope.check().is_ok() {
+                // Never query/insert Bloom history twice for the same interest.
+                // Only a now-current owned classification can additionally grant
+                // first-sight persistence; the original second-sight latch stays.
+                let decision = if observation.eligible() {
+                    observation
+                } else {
+                    fill.dependencies
+                        .writer
+                        .retention()
+                        .owned_only(result.plaintext.page())
+                };
+                fill.persist_verified(&result, decision);
+            }
+            Ok(())
+        }));
+    }
+
+    fn persist_verified(&self, result: &PageResult, observation: crate::retention::Observation) {
+        if !observation.eligible() || result.validate_metadata().is_err() {
+            return;
+        }
+        let id = result.plaintext.page();
+        if self
+            .dependencies
+            .writer
+            .copy_only(id)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        if self
+            .dependencies
+            .writer
+            .index()
+            .lookup(id)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        let cache = &result.metadata.version.object.cache;
+        let retention = self.dependencies.writer.retention();
+        // Ownership is current here, but second-sight eligibility remains the
+        // latched observation. Reclassification cannot self-promote Bloom state.
+        let owned = retention.owned_only(id).eligible();
+        let admission = &self.dependencies.admission;
+        let amount = result.ciphertext.bytes().len();
+        if !owned
+            && !optional_headroom(
+                admission.limit(ResourceClass::DirtyCiphertext),
+                admission.used(ResourceClass::DirtyCiphertext),
+                amount,
+                PAGE_BYTES as usize + 16,
+            )
+        {
+            retention.persistence_attempt(false);
+            return;
+        }
+        let reserve_dirty = || {
+            admission
+                .reserve(Some(cache), ResourceClass::DirtyCiphertext, amount)
+                .map_err(Error::from)
+        };
+        let dirty = self.reserve_owned_persistence(
+            id,
+            ResourceClass::DirtyCiphertext,
+            amount,
+            owned,
+            reserve_dirty,
+        );
+        let Ok(dirty) = dirty else {
+            retention.persistence_attempt(false);
+            return;
+        };
+        // No await, new encryption, download, or mandatory resource reservation.
+        let result = self
+            .dependencies
+            .writer
+            .enqueue_reclaiming(result.copy(), dirty, |amount| {
+                // Ciphertext owns both the immutable page and exact padded disk
+                // staging. The one-page floor includes BOTH, even on tiny slabs.
+                let one_page = (PAGE_BYTES as usize + 16).saturating_add(amount);
+                // Idle aligned buffers retain Ciphertext charges after completed
+                // writes. Release that backing before headroom rejection or any
+                // destructive queued-copy reclaim; this is one bounded pool.
+                self.dependencies.writer.slabs().reclaim_idle();
+                if !owned
+                    && !optional_headroom(
+                        admission.limit(ResourceClass::Ciphertext),
+                        admission.used(ResourceClass::Ciphertext),
+                        amount,
+                        one_page,
+                    )
+                {
+                    return Err(Error::Overloaded);
+                }
+                self.reserve_owned_persistence(id, ResourceClass::Ciphertext, amount, owned, || {
+                    admission
+                        .reserve_completion(Some(cache), ResourceClass::Ciphertext, amount)
+                        .map_err(Into::into)
+                })
+            });
+        retention.persistence_attempt(result.is_ok());
+    }
+
+    /// At most one bounded queued-optional scan and one retry. Submitted copies
+    /// remain fenced. Optional writes never evict another queued write to get
+    /// their own dirty/staging reservation; they simply skip persistence.
+    fn reserve_owned_persistence(
+        &self,
+        page: &PageId,
+        class: ResourceClass,
+        amount: usize,
+        owned: bool,
+        reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
+        let result = reserve();
+        if !owned || !matches!(result, Err(Error::Overloaded)) {
+            return result;
+        }
+        let Some((cache, deficit)) =
+            self.dependencies
+                .admission
+                .reclamation(&page.version.object.cache, class, amount)
+        else {
+            return result;
+        };
+        let (dirty, staging) = match class {
+            ResourceClass::DirtyCiphertext => (deficit, 0),
+            ResourceClass::Ciphertext => (0, deficit),
+            _ => return result,
+        };
+        self.dependencies
+            .writer
+            .reclaim_optional_for_owned(page, cache.as_ref(), dirty, staging);
+        reserve()
+    }
+
     pub(super) async fn publish(
         &self,
         result: PageResult,
@@ -1466,7 +1744,7 @@ impl Fill {
             Err(error) => return Err(error),
         }
         if let Some(dirty) = dirty {
-            match self
+            let _ = self
                 .dependencies
                 .writer
                 .enqueue_reclaiming(result.copy(), dirty, |amount| {
@@ -1477,11 +1755,7 @@ impl Fill {
                             .reserve_completion(Some(cache), ResourceClass::Ciphertext, amount)
                             .map_err(Into::into)
                     })
-                }) {
-                Ok(_)
-                | Err(Error::Overloaded | Error::Io | Error::Unavailable | Error::MissingKey) => {}
-                Err(error) => return Err(error),
-            }
+                });
         }
         Ok(())
     }

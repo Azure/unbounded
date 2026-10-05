@@ -24,6 +24,13 @@ const MIB: u64 = 1024 * 1024;
 const MAX_BYTES: u64 = 64 * 1024 * MIB;
 const MAX_ENTRIES: usize = 1_048_576;
 
+/// Disk retention policy only; never changes request admission or authorization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionMode {
+    Disabled,
+    SecondSight,
+}
+
 /// Independent bounded-resource dimensions. Validation precedes resource creation.
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -59,6 +66,10 @@ pub struct Config {
     pub peer_receive: crate::peer::receive::Config,
     pub shares: std::num::NonZeroU32,
     pub disk_page_entries: NonZeroUsize,
+    pub admission_mode: AdmissionMode,
+    /// Node-wide Bloom history, divided by final I/O worker count.
+    pub admission_history_bytes: NonZeroUsize,
+    pub admission_period: Duration,
     pub checkpoint_bytes: NonZeroUsize,
     pub cluster: ClusterId,
     /// Resolved by verified bootstrap/local identity recovery before workers start,
@@ -159,6 +170,11 @@ impl Config {
         let identity_directory =
             text("RACER_IDENTITY_DIRECTORY", Some("/var/lib/racer/identity"))?.into();
         let slab_directory = text("RACER_SLAB_DIRECTORY", Some("/var/lib/racer/slabs"))?.into();
+        let admission_mode = match text("RACER_ADMISSION_MODE", Some("second-sight"))?.as_str() {
+            "disabled" => AdmissionMode::Disabled,
+            "second-sight" => AdmissionMode::SecondSight,
+            _ => return Err(Error::InvalidConfiguration),
+        };
         let mut number = |name: &str, default: u64| -> Result<u64> {
             let value = text(name, Some(&default.to_string()))?;
             env_config::unsigned(&value).map_err(|_| Error::InvalidConfiguration)
@@ -192,6 +208,7 @@ impl Config {
         let reader_stall_timeout =
             Duration::from_millis(number("RACER_READER_STALL_TIMEOUT_MS", 10_000)?);
         let shutdown_timeout = Duration::from_millis(number("RACER_SHUTDOWN_TIMEOUT_MS", 30_000)?);
+        let admission_period = Duration::from_secs(number("RACER_ADMISSION_PERIOD_SECS", 60)?);
         let mut limit = |name: &str, default| {
             env_config::nonzero_usize(number(name, default)?)
                 .map_err(|_| Error::InvalidConfiguration)
@@ -220,6 +237,7 @@ impl Config {
         };
         let origin_connections_per_cache = limit("RACER_ORIGIN_CONNECTIONS_PER_CACHE", 8)?;
         let disk_page_entries = limit("RACER_DISK_PAGE_ENTRIES", 65536)?;
+        let admission_history_bytes = limit("RACER_ADMISSION_HISTORY_BYTES", 4 * MIB)?;
         let checkpoint_bytes = limit("RACER_CHECKPOINT_BYTES", 64 * MIB)?;
         let send_crc_pair = lookup("RACER_SEND_CRC_PAIR")?
             .map(|value| crate::telemetry::Pair::parse(&value))
@@ -231,6 +249,9 @@ impl Config {
             peer_receive,
             shares,
             disk_page_entries,
+            admission_mode,
+            admission_history_bytes,
+            admission_period,
             checkpoint_bytes,
             cluster,
             node: NodeId(UNRESOLVED_NODE_ID.into()),
@@ -271,6 +292,9 @@ impl Config {
         self.peer_admission.validate()?;
         if self.disk_page_entries.get() > MAX_ENTRIES
             || self.checkpoint_bytes.get() > 512 * MIB as usize
+            || !(32..=512 * MIB as usize).contains(&self.admission_history_bytes.get())
+            || self.admission_period < Duration::from_secs(1)
+            || self.admission_period > Duration::from_secs(86_400)
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -413,6 +437,16 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Never round a small share up past the node budget. Retention rounds the
+    /// allocation down to whole 32-byte Bloom units after this partition.
+    pub(crate) fn admission_history_per_worker(&self, workers: usize) -> Result<usize> {
+        self.admission_history_bytes
+            .get()
+            .checked_div(workers)
+            .filter(|bytes| *bytes >= 32)
+            .ok_or(Error::InvalidConfiguration)
     }
 }
 
@@ -956,6 +990,105 @@ mod tests {
         ] {
             assert!(parse(&[("RACER_SEND_CRC_PAIR", invalid)]).is_err());
         }
+    }
+
+    #[test]
+    fn disk_admission_defaults_and_overrides_are_bounded() {
+        let defaults = parse(&[]).unwrap();
+        assert_eq!(defaults.admission_mode, AdmissionMode::SecondSight);
+        assert_eq!(defaults.admission_history_bytes.get(), 4 * MIB as usize);
+        assert_eq!(defaults.admission_period, Duration::from_secs(60));
+        for (mode, expected) in [
+            ("disabled", AdmissionMode::Disabled),
+            ("second-sight", AdmissionMode::SecondSight),
+        ] {
+            let config = parse(&[
+                ("RACER_ADMISSION_MODE", mode),
+                ("RACER_ADMISSION_HISTORY_BYTES", "32"),
+                ("RACER_ADMISSION_PERIOD_SECS", "1"),
+            ])
+            .unwrap();
+            assert_eq!(config.admission_mode, expected);
+            assert_eq!(config.admission_history_per_worker(1), Ok(32));
+            assert!(config.admission_history_per_worker(2).is_err());
+            assert_eq!(config.admission_period, Duration::from_secs(1));
+        }
+        assert!(
+            parse(&[
+                ("RACER_ADMISSION_HISTORY_BYTES", "536870912"),
+                ("RACER_ADMISSION_PERIOD_SECS", "86400"),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn disk_admission_rejects_invalid_values_even_when_disabled() {
+        for value in [
+            "",
+            "second_sight",
+            "SECOND-SIGHT",
+            "auto",
+            " disabled",
+            "disabled ",
+        ] {
+            assert!(
+                parse(&[("RACER_ADMISSION_MODE", value)]).is_err(),
+                "{value}"
+            );
+        }
+        for (name, values) in [
+            (
+                "RACER_ADMISSION_HISTORY_BYTES",
+                ["0", "31", "536870913", "4MiB", "-1", "18446744073709551616"],
+            ),
+            (
+                "RACER_ADMISSION_PERIOD_SECS",
+                ["0", "86401", "1.5", "60s", " 60", "18446744073709551616"],
+            ),
+        ] {
+            for value in values {
+                assert!(
+                    parse(&[(name, value), ("RACER_ADMISSION_MODE", "disabled")]).is_err(),
+                    "{name}={value}"
+                );
+            }
+        }
+        let mut config = parse(&[]).unwrap();
+        config.admission_period = Duration::ZERO;
+        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        config.admission_period = Duration::from_secs(60);
+        config.admission_history_bytes = NonZeroUsize::new(31).unwrap();
+        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+    }
+
+    #[test]
+    fn disk_admission_history_partition_does_not_multiply_node_budget() {
+        let config = parse(&[("RACER_ADMISSION_HISTORY_BYTES", "97")]).unwrap();
+        assert_eq!(config.admission_history_per_worker(3), Ok(32));
+        assert!(config.admission_history_per_worker(4).is_err());
+        assert!(config.admission_history_per_worker(0).is_err());
+        let config = parse(&[]).unwrap();
+        assert_eq!(config.admission_history_per_worker(8), Ok(512 * 1024));
+        for workers in [1, 2, 3, 8, 64] {
+            let share = config.admission_history_per_worker(workers).unwrap();
+            let policy =
+                crate::retention::Retention::configured(share, 1, config.admission_period, true)
+                    .unwrap();
+            let allocated = policy.snapshot().filter_bits / 8;
+            assert_eq!(allocated, share / 32 * 32);
+            assert!(allocated * workers <= config.admission_history_bytes.get());
+        }
+        let maximum_history_workers = config.admission_history_bytes.get() / 32;
+        assert_eq!(
+            config.admission_history_per_worker(maximum_history_workers),
+            Ok(32)
+        );
+        assert!(
+            config
+                .admission_history_per_worker(maximum_history_workers + 1)
+                .is_err()
+        );
     }
 
     #[test]

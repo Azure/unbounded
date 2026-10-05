@@ -257,6 +257,9 @@ impl StoreReader {
             )?;
             ciphertext.expected_checksum(decoded.checksum)?;
             self.clock.mark_read(entry.location.segment)?;
+            self.index
+                .retention()
+                .disk_read(page, u64::from(entry.metadata.page_length(page)?));
             Ok(Some((
                 CiphertextCopy {
                     metadata: entry.metadata.for_pin(),
@@ -281,12 +284,17 @@ impl StoreReader {
 }
 
 struct Dirty {
+    _resident: catalog::Resident,
+    _payload: crate::retention::Payload,
     _metric: ::telemetry::Lease,
     ticket: u64,
     page: CiphertextCopy,
     _reservation: Rc<flow_control::Charge<AdmissionPolicy>>,
     staging: Option<flow_control::Charge<AdmissionPolicy>>,
 }
+/// Foreground queue selection and positional removal inspect only this prefix.
+/// VecDeque::remove shifts the shorter side, so a prefix victim also bounds moves.
+const QUEUE_RECLAIM_CANDIDATES: usize = 64;
 /// Bounded dirty copies persist asynchronously, with publication after full I/O.
 pub struct StoreWriter {
     metrics: crate::telemetry::Metrics,
@@ -307,6 +315,13 @@ pub struct StoreWriter {
     closed: Cell<bool>,
 }
 impl StoreWriter {
+    pub fn retention(&self) -> Rc<crate::retention::Retention> {
+        self.index.retention()
+    }
+    /// Install before read engines capture the shared policy.
+    pub fn set_retention(&self, retention: Rc<crate::retention::Retention>) {
+        self.index.set_retention(retention);
+    }
     pub fn new(
         index: Rc<Index>,
         segments: Rc<Segments>,
@@ -445,14 +460,36 @@ impl StoreWriter {
                 return Err(Error::CorruptRecord);
             }
         }
+        // Zero denotes already durable: no pending ticket or second append.
+        if self.index.lookup(&id)?.is_some() {
+            return Ok(0);
+        }
         let pending = self.pending.borrow();
         if let Some(existing) = pending.get(&id) {
             return Ok(existing.ticket);
         }
-        if pending.len() >= self.capacity.get() {
-            return Err(Error::Overloaded);
-        }
+        let full = pending.len() >= self.capacity.get();
         drop(pending);
+        if full {
+            let retention = self.retention();
+            let victim = self
+                .queue
+                .borrow()
+                .iter()
+                .enumerate()
+                .take(QUEUE_RECLAIM_CANDIDATES)
+                .min_by_key(|(_, page)| retention.score(page))
+                .map(|(position, page)| (position, page.clone(), retention.score(page)));
+            let Some((position, victim, score)) = victim else {
+                return Err(Error::Overloaded);
+            };
+            if retention.score(&id) <= score {
+                return Err(Error::Overloaded);
+            }
+            self.queue.borrow_mut().remove(position);
+            self.pending.borrow_mut().remove(&victim);
+            self.note_discard(1);
+        }
         // Reserve the exact padded staging bytes before queue acceptance. Thus
         // accepted dirty copies never wait for ciphertext holders to release memory.
         let disk_bytes = self.slabs.alignment()?.extent(0, logical)?.length();
@@ -467,6 +504,11 @@ impl StoreWriter {
         self.pending.borrow_mut().insert(
             id.clone(),
             Dirty {
+                _resident: self.index.track(&id)?,
+                _payload: self.retention().payload(
+                    u64::from(page.ciphertext.envelope().plaintext_length),
+                    false,
+                ),
                 _metric: self
                     .metrics
                     .lease(crate::telemetry::Gauge::PendingDiskWrites)?,
@@ -543,7 +585,11 @@ impl StoreWriter {
     pub(crate) fn discard_idle_copy(&self, page: &crate::memory::PageResult) -> usize {
         let id = page.plaintext.page();
         let mut queue = self.queue.borrow_mut();
-        let Some(position) = queue.iter().position(|queued| queued == id) else {
+        let Some(position) = queue
+            .iter()
+            .take(QUEUE_RECLAIM_CANDIDATES)
+            .position(|queued| queued == id)
+        else {
             return 0;
         };
         let mut pending = self.pending.borrow_mut();
@@ -562,6 +608,56 @@ impl StoreWriter {
         0
     }
     /// Release only enough queued ciphertext/staging charges to cover a deficit.
+    /// Ownership-only classification never inserts a sighting or touches heat.
+    pub fn reclaim_optional_for_owned(
+        &self,
+        incoming: &PageId,
+        cache: Option<&CacheId>,
+        dirty_bytes: usize,
+        staging_bytes: usize,
+    ) -> usize {
+        let retention = self.retention();
+        if (dirty_bytes == 0 && staging_bytes == 0) || !retention.owned_only(incoming).eligible() {
+            return 0;
+        }
+        let mut queue = self.queue.borrow_mut();
+        let mut pending = self.pending.borrow_mut();
+        let candidates: Vec<_> = queue
+            .iter()
+            .take(QUEUE_RECLAIM_CANDIDATES)
+            .filter(|id| {
+                cache.is_none_or(|cache| cache == &id.version.object.cache)
+                    && !retention.owned_only(id).eligible()
+            })
+            .cloned()
+            .collect();
+        let (mut dirty_released, mut staging_released, mut removed) = (0usize, 0usize, 0usize);
+        for id in candidates {
+            if dirty_released >= dirty_bytes && staging_released >= staging_bytes {
+                break;
+            }
+            if let Some(dirty) = pending.remove(&id) {
+                dirty_released = dirty_released.saturating_add(dirty._reservation.amount());
+                staging_released = staging_released.saturating_add(
+                    dirty
+                        .staging
+                        .as_ref()
+                        .map_or(0, flow_control::Charge::amount),
+                );
+                removed += 1;
+            }
+            if let Some(position) = queue
+                .iter()
+                .take(QUEUE_RECLAIM_CANDIDATES)
+                .position(|page| page == &id)
+            {
+                queue.remove(position);
+            }
+        }
+        self.note_discard(removed);
+        removed
+    }
+    /// Release only enough queued ciphertext/staging charges to cover a deficit.
     /// Submitted writes are absent from queue and keep all completion-owned charges.
     pub(crate) fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
         let pooled = self.slabs.reclaim_idle();
@@ -571,11 +667,20 @@ impl StoreWriter {
         let mut released = pooled;
         let mut removed = 0;
         let mut pending = self.pending.borrow_mut();
-        self.queue.borrow_mut().retain(|id| {
-            if released >= bytes || cache.is_some_and(|cache| cache != &id.version.object.cache) {
-                return true;
+        let retention = self.retention();
+        let mut queue = self.queue.borrow_mut();
+        let mut candidates: Vec<_> = queue
+            .iter()
+            .take(QUEUE_RECLAIM_CANDIDATES)
+            .filter(|id| cache.is_none_or(|cache| cache == &id.version.object.cache))
+            .map(|id| (retention.score(id), id.clone()))
+            .collect();
+        candidates.sort_by_key(|(score, _)| *score);
+        for (_, id) in candidates {
+            if released >= bytes {
+                break;
             }
-            if let Some(dirty) = pending.remove(id) {
+            if let Some(dirty) = pending.remove(&id) {
                 released = released.saturating_add(
                     dirty
                         .staging
@@ -588,8 +693,16 @@ impl StoreWriter {
                 }
                 removed += 1;
             }
-            false
-        });
+            // Every candidate came from this prefix and removals only move it
+            // closer to the front. Never scan the unselected queue suffix.
+            if let Some(position) = queue
+                .iter()
+                .take(QUEUE_RECLAIM_CANDIDATES)
+                .position(|page| page == &id)
+            {
+                queue.remove(position);
+            }
+        }
         self.note_discard(removed);
         released
     }
@@ -609,10 +722,24 @@ impl StoreWriter {
                     self.discard_unsubmitted();
                     break;
                 }
-                let id = match self.queue.borrow_mut().pop_front() {
-                    Some(id) => id,
-                    None => break,
+                let position = {
+                    let queue = self.queue.borrow();
+                    let retention = self.retention();
+                    // Reverse the tie breaker to keep FIFO within equal value.
+                    queue
+                        .iter()
+                        .enumerate()
+                        .take(QUEUE_RECLAIM_CANDIDATES)
+                        .max_by_key(|(position, id)| {
+                            (retention.score(id), std::cmp::Reverse(*position))
+                        })
+                        .map(|(position, _)| position)
                 };
+                let id =
+                    match position.and_then(|position| self.queue.borrow_mut().remove(position)) {
+                        Some(id) => id,
+                        None => break,
+                    };
                 let page = match self.copy_only(&id)? {
                     Some(p) => p,
                     None => {
@@ -675,6 +802,10 @@ impl StoreWriter {
         page: &CiphertextCopy,
         scope: &RequestScope,
     ) -> Result<()> {
+        // Recovery or another publisher may have installed the mapping since enqueue.
+        if self.index.lookup(id)?.is_some() {
+            return Ok(());
+        }
         // Capacity is owned across the await, including invalidation/replacement.
         let index_ticket = self.index.reserve_page(self.clock.borrow().is_some())?;
         let alignment = self.slabs.alignment()?;
@@ -708,6 +839,7 @@ impl StoreWriter {
             generation: segment.generation(),
             extent,
         };
+        let _publication_guard = self.index.publishing(location.segment);
         let _publication_lease = self.segments.lease(location.segment, location.generation)?;
         let encoded = encode_at(
             page,
@@ -741,6 +873,8 @@ impl StoreWriter {
             )?;
             self.metrics
                 .record(crate::telemetry::Event::DiskPublication, 1);
+            self.retention()
+                .published(id, u64::from(page.ciphertext.envelope().plaintext_length));
         } else if self.pending.borrow().contains_key(id) {
             self.note_discard(1);
         }
