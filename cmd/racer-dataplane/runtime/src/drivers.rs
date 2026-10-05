@@ -45,10 +45,13 @@ pub enum Contender {
 pub trait HedgePolicy<E> {
     /// Poll the caller's alarm for launching the secondary operation.
     fn delay(&mut self, cx: &mut Context<'_>) -> Poll<()>;
+
     /// Whether another contender may still succeed after this failure.
     fn recoverable(&self, error: E) -> bool;
+
     /// Produce the result when neither contender succeeds or fails terminally.
     fn failure(&mut self) -> E;
+
     /// Record the first successful contender, before draining the other one.
     fn won(&mut self, contender: Contender);
 }
@@ -83,22 +86,29 @@ thread_local! {
 /// ```
 pub struct DriverQueue {
     capacity: usize,
+
     drivers: RefCell<VecDeque<Driver>>,
+
     new: RefCell<Vec<Task>>,
+
     count: Cell<usize>,
+
     owner: RefCell<Option<Rc<Waker>>>,
+
     polling: Cell<bool>,
 }
 
 /// A submitted task and its independent wake-gated readiness bit.
 struct Driver {
     operation: Task,
+
     wake: Arc<Runnable>,
 }
 
 /// Per-future readiness with a thread-safe wake path to the polling owner.
 pub struct Runnable {
     ready: AtomicBool,
+
     owner: futures::task::AtomicWaker,
 }
 
@@ -128,10 +138,12 @@ impl Runnable {
 }
 
 impl std::task::Wake for Runnable {
+    /// Forward an owned wake through the shared readiness path.
     fn wake(self: Arc<Self>) {
         self.wake_by_ref();
     }
 
+    /// Publish readiness before notifying the latest polling owner.
     fn wake_by_ref(self: &Arc<Self>) {
         self.ready.store(true, Ordering::Release);
         self.owner.wake();
@@ -149,6 +161,7 @@ pub struct QueueGuard {
 }
 
 impl Drop for QueueGuard {
+    /// Restore the queue selected before entering this stack-nested guard.
     fn drop(&mut self) {
         CURRENT.with(|current| current.replace(self.previous.take()));
     }
@@ -249,10 +262,12 @@ impl DriverQueue {
 /// Releases admission before a completed or panicking future is destroyed.
 struct ActiveDriver<'a> {
     driver: Option<Driver>,
+
     count: &'a Cell<usize>,
 }
 
 impl Drop for ActiveDriver<'_> {
+    /// Return admission before the retained future's destructor can reenter the queue.
     fn drop(&mut self) {
         if self.driver.is_some() {
             self.count.set(self.count.get() - 1);
@@ -269,12 +284,15 @@ impl Drop for ActiveDriver<'_> {
 /// ```
 pub struct Queued<F> {
     queue: Rc<DriverQueue>,
+
     future: Option<Pin<Box<F>>>,
 }
 
 impl<F: Future> Future for Queued<F> {
+    /// Preserve the inner future's output without changing its ownership policy.
     type Output = F::Output;
 
+    /// Select the captured queue for one poll, then restore the caller's selection.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let _queue = this.queue.enter();
@@ -287,6 +305,7 @@ impl<F: Future> Future for Queued<F> {
 }
 
 impl<F> Drop for Queued<F> {
+    /// Destroy the inner future while its original queue is selected.
     fn drop(&mut self) {
         let _queue = self.queue.enter();
         self.future.take();
@@ -306,6 +325,7 @@ fn current() -> Option<Rc<DriverQueue>> {
 /// ```
 pub struct Permit {
     queue: Rc<DriverQueue>,
+
     reserved: bool,
 }
 
@@ -331,8 +351,10 @@ impl Permit {
 struct Detached<F>(F);
 
 impl<F: Future> Future for Detached<F> {
+    /// Detached tasks report results through caller-owned side effects.
     type Output = ();
 
+    /// Discard the output while retaining the pinned future until capacity is returned.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         // SAFETY: the inner future stays pinned until Detached is destroyed.
         unsafe { self.map_unchecked_mut(|this| &mut this.0) }
@@ -342,6 +364,7 @@ impl<F: Future> Future for Detached<F> {
 }
 
 impl Drop for Permit {
+    /// Return only unused reservations; submitted tasks retain their queue capacity.
     fn drop(&mut self) {
         if self.reserved {
             self.queue.count.set(self.queue.count.get() - 1);
@@ -397,6 +420,7 @@ impl<'a> Busy<'a> {
 }
 
 impl Drop for Busy<'_> {
+    /// Release exclusion on normal return and panic unwinding alike.
     fn drop(&mut self) {
         self.0.set(false);
     }
@@ -478,11 +502,13 @@ pub fn drive_local_with<'a, T: 'a, E: Copy + 'a>(
 struct RetryOptions {
     /// Minimum delay between overload attempts; the owner supplies polling turns.
     interval: Duration,
+
     /// Retries after the initial attempt; None leaves the scope as the only bound.
     max_retries: Option<usize>,
 }
 
 impl Default for RetryOptions {
+    /// Use scope-bounded retries at the listener owner's ten-millisecond cadence.
     fn default() -> Self {
         Self {
             interval: Duration::from_millis(10),
@@ -586,10 +612,10 @@ pub async fn race<S: HedgeScope, T>(
             primary_state.cancel();
             secondary_state.cancel();
         }
-        if !primary_state.done
+        if !primary_state.is_done()
             && let Poll::Ready(result) = primary.as_mut().poll(cx)
         {
-            primary_state.done = true;
+            primary_state.phase = ChildPhase::Done;
             record_result(
                 result,
                 Contender::Primary,
@@ -598,23 +624,23 @@ pub async fn race<S: HedgeScope, T>(
                 &mut policy,
             );
             if !launched {
-                secondary_state.done = true;
+                secondary_state.phase = ChildPhase::Done;
             }
         }
         if !launched
-            && !secondary_state.done
+            && !secondary_state.is_done()
             && fatal.is_none()
             && winner.is_none()
             && policy.delay(cx).is_ready()
         {
             launched = true;
         }
-        if launched && !secondary_state.done {
+        if launched && !secondary_state.is_done() {
             if fatal.is_some() || winner.is_some() {
                 secondary_state.cancel();
             }
             if let Poll::Ready(result) = secondary.as_mut().poll(cx) {
-                secondary_state.done = true;
+                secondary_state.phase = ChildPhase::Done;
                 record_result(
                     result,
                     Contender::Secondary,
@@ -628,10 +654,10 @@ pub async fn race<S: HedgeScope, T>(
             primary_state.cancel();
             secondary_state.cancel();
             if !launched {
-                secondary_state.done = true;
+                secondary_state.phase = ChildPhase::Done;
             }
         }
-        if primary_state.done && secondary_state.done {
+        if primary_state.is_done() && secondary_state.is_done() {
             Poll::Ready(if let Some(error) = fatal {
                 Err(error)
             } else {
@@ -647,8 +673,19 @@ pub async fn race<S: HedgeScope, T>(
 /// Tracks one child's fence separately from its one-shot cancellation request.
 struct Child<'a, S> {
     scope: &'a S,
-    done: bool,
-    canceled: bool,
+
+    phase: ChildPhase,
+}
+
+/// Cancellation starts draining; only observing completion ends the child's fence.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ChildPhase {
+    /// The child is incomplete and this race has not requested cancellation.
+    Running,
+    /// Cancellation was requested once, but completion is still required.
+    Draining,
+    /// The child completed or was skipped before launching.
+    Done,
 }
 
 impl<'a, S: HedgeScope> Child<'a, S> {
@@ -656,15 +693,19 @@ impl<'a, S: HedgeScope> Child<'a, S> {
     fn new(scope: &'a S) -> Self {
         Self {
             scope,
-            done: false,
-            canceled: false,
+            phase: ChildPhase::Running,
         }
+    }
+
+    /// Whether this child completed or was skipped before launching.
+    fn is_done(&self) -> bool {
+        self.phase == ChildPhase::Done
     }
 
     /// Request cancellation once; an already completed child needs no request.
     fn cancel(&mut self) {
-        if !self.done && !self.canceled {
-            self.canceled = true;
+        if self.phase == ChildPhase::Running {
+            self.phase = ChildPhase::Draining;
             self.scope.cancel();
         }
     }
@@ -694,10 +735,12 @@ fn record_result<T, E: Copy>(
 struct ThreadWake(thread::Thread, Option<ReactorWake>);
 
 impl Wake for ThreadWake {
+    /// Forward an owned wake through the shared thread and reactor notification path.
     fn wake(self: Arc<Self>) {
         self.wake_by_ref();
     }
 
+    /// Unpark the owner thread and interrupt its optional reactor wait.
     fn wake_by_ref(self: &Arc<Self>) {
         self.0.unpark();
         if let Some(reactor) = &self.1 {
@@ -706,21 +749,28 @@ impl Wake for ThreadWake {
     }
 }
 
+/// Pure queue ownership, capacity, wake gating, and callback reentry regressions.
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::{channel::oneshot, task::noop_waker};
 
+    /// A polling panic returns admission before the task destructor submits a child.
     #[test]
     fn panic_releases_capacity_before_task_drop_and_queue_remains_usable() {
+        /// Panics while polling, then reenters its queue during destruction.
         struct Panics;
         impl Future for Panics {
+            /// This task has no application result.
             type Output = ();
+
+            /// Inject a panic after the queue has transferred execution ownership.
             fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
                 panic!("injected poll panic");
             }
         }
         impl Drop for Panics {
+            /// Verify admission is available before submitting replacement work.
             fn drop(&mut self) {
                 assert_eq!(pending(), 0);
                 reserve().unwrap().submit(Box::pin(async {}));
@@ -739,6 +789,7 @@ mod tests {
         assert_eq!(pending(), 0);
     }
 
+    /// Nested polling cannot steal the outer owner's notifications for ready backlog.
     #[test]
     fn budget_backlog_wakes_outer_owner_and_nested_poll_cannot_replace_it() {
         let queue = Rc::new(DriverQueue::new(2));
@@ -763,15 +814,19 @@ mod tests {
         assert_eq!(outer.count(), 2);
     }
 
+    /// Retired owner wakers can reenter submission and polling without borrow conflicts.
     #[test]
     fn replacing_owner_drops_waker_outside_queue_borrows() {
+        /// Submits replacement work when the queue discards its previous owner.
         struct OnDrop;
         impl std::task::Wake for OnDrop {
+            /// Reject a wake when replacement should only dispose of the owner.
             fn wake(self: Arc<Self>) {
                 panic!("idle queue must not wake its retired owner");
             }
         }
         impl Drop for OnDrop {
+            /// Reenter submission and attempt a nested polling turn.
             fn drop(&mut self) {
                 // Submission reads the owner; nested polling must be rejected
                 // without any owner or driver-table borrow held by its caller.
@@ -786,16 +841,22 @@ mod tests {
         assert_eq!(pending(), 0);
     }
 
+    /// A completed future's panicking destructor cannot retain queue admission.
     #[test]
     fn panicking_completed_task_destructor_does_not_leak_capacity() {
+        /// Completes normally, then panics while releasing its owned resources.
         struct PanicsOnDrop;
         impl Future for PanicsOnDrop {
+            /// Completion carries no application value.
             type Output = ();
+
+            /// Finish immediately so destruction happens through the completion path.
             fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
                 Poll::Ready(())
             }
         }
         impl Drop for PanicsOnDrop {
+            /// Check released admission before injecting the destructor panic.
             fn drop(&mut self) {
                 assert_eq!(pending(), 0);
                 panic!("injected destructor panic");
@@ -814,16 +875,22 @@ mod tests {
         assert!(reserve().is_ok());
     }
 
+    /// Detached results do not destroy their future before queue capacity is returned.
     #[test]
     fn completed_operation_is_dropped_after_releasing_capacity() {
+        /// Completes with an ignored failure and checks admission when destroyed.
         struct Complete;
         impl Future for Complete {
+            /// A deliberately ignored application error exercises detached results.
             type Output = std::result::Result<(), &'static str>;
+
+            /// Return a failure without releasing the future's ownership yet.
             fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
                 Poll::Ready(Err("detached failure"))
             }
         }
         impl Drop for Complete {
+            /// Verify the completed task's slot is available despite other reservations.
             fn drop(&mut self) {
                 assert_eq!(pending(), 1023);
                 assert!(reserve().is_ok());
@@ -838,6 +905,7 @@ mod tests {
         assert_eq!(pending(), 0);
     }
 
+    /// Sleeping tasks receive no extra polls until their own readiness waker fires.
     #[test]
     fn blocked_driver_is_not_repolled_until_its_own_wake() {
         let queue = Rc::new(DriverQueue::new(4));
@@ -864,6 +932,7 @@ mod tests {
         assert_eq!(queue.pending(), 0);
     }
 
+    /// Permits keep their original worker and children wait for its next polling turn.
     #[test]
     fn workers_isolate_permits_children_and_capacity_on_one_thread() {
         let a = Rc::new(DriverQueue::new(2));
@@ -897,6 +966,7 @@ mod tests {
         assert_eq!(a.pending(), 0);
     }
 
+    /// Losing a request receiver does not release or stop its accepted operation.
     #[test]
     fn owned_operation_progresses_after_request_receiver_disappears() {
         let queue = Rc::new(DriverQueue::new(1));
@@ -923,6 +993,7 @@ mod tests {
         assert_eq!(pending(), 0);
     }
 
+    /// Child submission during polling progresses without recursively borrowing the queue.
     #[test]
     fn nested_bootstrap_driver_is_polled_without_recursive_table_borrow() {
         let queue = Rc::new(DriverQueue::new(2));
@@ -947,6 +1018,7 @@ mod tests {
         assert_eq!(pending(), 0);
     }
 
+    /// Admission requires a selected queue and unused permits restore its capacity.
     #[test]
     fn acquisition_requires_an_installed_worker_queue() {
         assert!(matches!(reserve(), Err(Error::InvalidConfiguration)));
@@ -961,6 +1033,7 @@ mod tests {
         assert!(matches!(reserve(), Err(Error::InvalidConfiguration)));
     }
 
+    /// Zero capacity disables admission, and polling budgets preserve reservations.
     #[test]
     fn zero_capacity_budget_and_completion_accounting() {
         let disabled = Rc::new(DriverQueue::new(0));
@@ -986,10 +1059,13 @@ mod tests {
         assert_eq!(pending(), 0);
     }
 
+    /// Scoped polling and destruction restore the previously selected worker queue.
     #[test]
     fn scoped_poll_and_drop_restore_previous_selection() {
+        /// Submits work while verifying the queue selected for future destruction.
         struct OnDrop(Rc<DriverQueue>);
         impl Drop for OnDrop {
+            /// Check the captured queue and submit a replacement task into it.
             fn drop(&mut self) {
                 assert!(Rc::ptr_eq(&current().unwrap(), &self.0));
                 spawn(Box::pin(async {})).unwrap();
@@ -1015,6 +1091,7 @@ mod tests {
         assert_eq!(a.pending(), 0);
     }
 
+    /// Recursive turns defer children and simulated process loss retains unused permits.
     #[test]
     fn recursive_poll_defers_children_and_crash_preserves_unused_permits() {
         let queue = Rc::new(DriverQueue::new(3));
@@ -1037,6 +1114,7 @@ mod tests {
 
     use crate::test_util::WakeCounter as WakeCount;
 
+    /// Runnable ownership follows the latest poll without losing in-poll wakes or force.
     #[test]
     fn runnable_replaces_owner_preserves_in_poll_wake_and_force() {
         let first = Arc::new(WakeCount::default());
@@ -1088,6 +1166,7 @@ mod tests {
         assert_eq!(polls.get(), 4);
     }
 
+    /// Submission notifies the queue's latest polling owner.
     #[test]
     fn submission_wakes_last_polling_owner() {
         let queue = Rc::new(DriverQueue::new(1));
@@ -1099,15 +1178,22 @@ mod tests {
         assert_eq!(wake.count(), 1);
     }
 
+    /// Optional task slots retain pending work and dispose of ready work before delivery.
     #[test]
     fn task_slot_retains_pending_and_drops_ready_before_returning_result() {
+        /// Controlled future that records destruction independently of its result.
         struct Local {
             ready: Rc<Cell<bool>>,
+
             dropped: Rc<Cell<bool>>,
+
             result: Result<usize>,
         }
         impl Future for Local {
+            /// Return the fixture's chosen success or failure value.
             type Output = Result<usize>;
+
+            /// Stay pending until the fixture explicitly permits completion.
             fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
                 if self.ready.get() {
                     Poll::Ready(self.result)
@@ -1117,6 +1203,7 @@ mod tests {
             }
         }
         impl Drop for Local {
+            /// Record disposal so delivery can verify its ordering.
             fn drop(&mut self) {
                 self.dropped.set(true);
             }
@@ -1142,6 +1229,7 @@ mod tests {
     }
 }
 
+/// Cooperative scheduling, scope checks, and resource-driving fence regressions.
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
@@ -1149,6 +1237,7 @@ mod scheduler_tests {
     use crate::test_util::WakeCounter;
     use std::{future::Future, pin::pin, rc::Rc};
 
+    /// A bounded wait wakes a surrounding wake-gated scheduler for the next turn.
     #[test]
     fn driver_composes_with_wake_gated_local_scheduler() {
         let ready = Cell::new(false);
@@ -1179,14 +1268,19 @@ mod scheduler_tests {
         );
     }
 
+    /// Shares cancellation and a caller-controlled admission error across polls.
     #[derive(Clone)]
     struct TestScope {
         cancellation: Option<Cancellation>,
+
         error: Rc<Cell<Option<Error>>>,
     }
 
     impl Scope for TestScope {
+        /// Scheduler fixtures use the runtime's portable failure classifications.
         type Error = Error;
+
+        /// Prefer cancellation over the caller-controlled policy error.
         fn check(&self) -> Result<()> {
             if self
                 .cancellation
@@ -1197,11 +1291,14 @@ mod scheduler_tests {
             }
             self.error.get().map_or(Ok(()), Err)
         }
+
+        /// Supply notification only for fixtures that enable cancellation.
         fn cancellation(&self) -> Option<&Cancellation> {
             self.cancellation.as_ref()
         }
     }
 
+    /// Cooperative yielding suspends and notifies exactly once.
     #[test]
     fn yield_is_pending_once_and_wakes_once() {
         let count = Arc::new(WakeCounter::default());
@@ -1214,6 +1311,7 @@ mod scheduler_tests {
         assert_eq!(count.count(), 1);
     }
 
+    /// Caller policy is checked before invoking work regardless of notification support.
     #[test]
     fn scoped_poll_checks_policy_before_callback_with_or_without_cancellation() {
         for cancellation in [None, Some(Cancellation::new().unwrap())] {
@@ -1237,6 +1335,7 @@ mod scheduler_tests {
         }
     }
 
+    /// Scoped polling retains a cancellation subscription only for its own lifetime.
     #[test]
     fn scoped_poll_wakes_on_cancel_and_releases_registration_on_drop() {
         let cancellation = Cancellation::new().unwrap();
@@ -1261,6 +1360,7 @@ mod scheduler_tests {
         assert_eq!(Arc::strong_count(&count), 2);
     }
 
+    /// Ready results pass through and failed subscription prevents polling application work.
     #[test]
     fn scoped_poll_preserves_ready_results_and_subscription_failure() {
         let cancellation = Cancellation::new().unwrap();
@@ -1289,6 +1389,7 @@ mod scheduler_tests {
         );
     }
 
+    /// Busy guards reject reentry and release exclusion during normal and panic paths.
     #[test]
     fn busy_excludes_reentry_and_releases_on_drop_and_unwind() {
         let flag = Cell::new(false);
@@ -1306,6 +1407,7 @@ mod scheduler_tests {
         drop(Busy::try_enter(&flag).unwrap());
     }
 
+    /// Backend failures retain their first error without truncating operation completion.
     #[test]
     fn driver_retains_operation_and_first_backend_error_until_completion() {
         for fail_poll in [false, true] {
@@ -1342,6 +1444,7 @@ mod scheduler_tests {
         }
     }
 
+    /// An already completed operation preserves its result and never invokes waiting.
     #[test]
     fn driver_preserves_ready_value_and_does_not_wait() {
         for result in [Ok(7), Err(Error::Unavailable)] {
@@ -1360,6 +1463,7 @@ mod scheduler_tests {
         }
     }
 
+    /// Cross-thread notification unparks the thread that created the waker.
     #[test]
     fn thread_waker_targets_creator_from_another_thread() {
         let (send, receive) = std::sync::mpsc::channel();
@@ -1380,6 +1484,7 @@ mod scheduler_tests {
     }
 }
 
+/// Deterministic listener retry timing, exhaustion, and accepted-work fencing.
 #[cfg(all(test, feature = "simulation"))]
 mod retry_tests {
     use super::*;
@@ -1391,15 +1496,20 @@ mod retry_tests {
         task::{Context, Waker},
     };
 
+    /// Exposes a shared caller-controlled scope failure without automatic wakeups.
     #[derive(Clone, Default)]
     struct TestScope(Rc<Cell<Option<Error>>>);
     impl Scope for TestScope {
+        /// Retry fixtures use the runtime error type directly.
         type Error = Error;
+
+        /// Read the failure selected by the fixture without changing its state.
         fn check(&self) -> Result<()> {
             self.0.get().map_or(Ok(()), Err)
         }
     }
 
+    /// Retry bounds and invalid intervals fail without unbounded or immediate resubmission.
     #[test]
     fn configured_retry_limit_interval_zero_and_overflow() {
         let clock = environment::SimulationClock::new(4);
@@ -1444,6 +1554,7 @@ mod retry_tests {
         }
     }
 
+    /// Default retry timing requires owner polling and rechecks policy before resubmission.
     #[test]
     fn retries_only_after_ten_ms_without_self_wakes_and_checks_scope() {
         let clock = environment::SimulationClock::new(45);
@@ -1482,6 +1593,7 @@ mod retry_tests {
         }
     }
 
+    /// Scope failure cannot truncate an accepted operation's completion fence.
     #[test]
     fn accepted_pending_operation_is_not_truncated_by_scope_failure() {
         let scope = TestScope::default();
@@ -1507,21 +1619,27 @@ mod retry_tests {
     }
 }
 
+/// Pure hedge winner precedence, cancellation requests, and separate child fences.
 #[cfg(test)]
 mod hedge_tests {
     use super::*;
     use crate::{Error, deadline::Cancellation};
     use std::{cell::Cell, rc::Rc, task::Waker};
 
+    /// Cancellation-only scope shared by a contender and its controlling fixture.
     #[derive(Clone)]
     struct TestScope(Cancellation);
     impl TestScope {
+        /// Create an independently cancelable child or parent scope.
         fn new() -> Self {
             Self(Cancellation::new().unwrap())
         }
     }
     impl crate::Scope for TestScope {
+        /// Hedge fixtures use portable runtime failures.
         type Error = Error;
+
+        /// Admit the contender unless its scope has been canceled.
         fn check(&self) -> Result<(), Error> {
             if self.0.is_cancelled() {
                 Err(Error::Cancelled)
@@ -1529,22 +1647,29 @@ mod hedge_tests {
                 Ok(())
             }
         }
+
+        /// Supply cancellation wakeups while the parent still owns admission.
         fn cancellation(&self) -> Option<&Cancellation> {
             Some(&self.0)
         }
     }
     impl HedgeScope for TestScope {
+        /// Notify the child without claiming it has reached completion.
         fn cancel(&self) {
             self.0.cancel().unwrap();
         }
     }
 
+    /// Borrowed delay control and outcome observations for a single hedge race.
     struct Hooks<'a> {
         due: &'a Cell<bool>,
+
         won: &'a Cell<Option<Contender>>,
+
         failures: &'a Cell<usize>,
     }
     impl HedgePolicy<Error> for Hooks<'_> {
+        /// Launch the delayed contender only when the fixture marks the alarm due.
         fn delay(&mut self, _: &mut Context<'_>) -> Poll<()> {
             if self.due.get() {
                 Poll::Ready(())
@@ -1552,24 +1677,34 @@ mod hedge_tests {
                 Poll::Pending
             }
         }
+
+        /// Permit another contender to recover only from the fixture's I/O failure.
         fn recoverable(&self, error: Error) -> bool {
             error == Error::Io
         }
+
+        /// Count and report exhaustion when neither contender produced a winner.
         fn failure(&mut self) -> Error {
             self.failures.set(self.failures.get() + 1);
             Error::NotFound
         }
+
+        /// Record the first successful contender before the loser is drained.
         fn won(&mut self, contender: Contender) {
             self.won.set(Some(contender));
         }
     }
+    /// Owns hedge delay state and policy observations without an executor.
     #[derive(Default)]
     struct Fixture {
         due: Cell<bool>,
+
         won: Cell<Option<Contender>>,
+
         failures: Cell<usize>,
     }
     impl Fixture {
+        /// Borrow policy controls for one race while retaining external observations.
         fn hooks(&self) -> Hooks<'_> {
             Hooks {
                 due: &self.due,
@@ -1579,40 +1714,57 @@ mod hedge_tests {
         }
     }
 
+    /// Parent cancellation requests each child once while still classifying drained errors.
     #[test]
     fn hedge_requests_each_cancel_once_and_classifies_drained_errors() {
+        /// Counts cancellation requests independently of the shared cancellation bit.
         #[derive(Clone)]
         struct CountedScope {
             inner: TestScope,
+
             requests: Rc<Cell<usize>>,
         }
         impl crate::Scope for CountedScope {
+            /// Preserve the wrapped scope's runtime failure type.
             type Error = Error;
+
+            /// Delegate caller policy to the underlying cancellation scope.
             fn check(&self) -> Result<()> {
                 self.inner.check()
             }
+
+            /// Share the underlying scope's cancellation subscription source.
             fn cancellation(&self) -> Option<&Cancellation> {
                 self.inner.cancellation()
             }
         }
         impl HedgeScope for CountedScope {
+            /// Count every request before forwarding cancellation to the child.
             fn cancel(&self) {
                 self.requests.set(self.requests.get() + 1);
                 self.inner.cancel();
             }
         }
+        /// Counts classification callbacks while rejecting impossible winning paths.
         struct CountedPolicy<'a>(&'a Cell<usize>);
         impl HedgePolicy<Error> for CountedPolicy<'_> {
+            /// Launch the secondary immediately after the first pending primary poll.
             fn delay(&mut self, _: &mut Context<'_>) -> Poll<()> {
                 Poll::Ready(())
             }
+
+            /// Count classification even while the race drains a prior fatal failure.
             fn recoverable(&self, _: Error) -> bool {
                 self.0.set(self.0.get() + 1);
                 false
             }
+
+            /// Reject exhaustion because parent cancellation must determine the result.
             fn failure(&mut self) -> Error {
                 panic!("parent cancellation must win")
             }
+
+            /// Reject winners because both fixture children complete with failures.
             fn won(&mut self, _: Contender) {
                 panic!("drained errors cannot win")
             }
@@ -1659,6 +1811,7 @@ mod hedge_tests {
         assert_eq!((a.requests.get(), b.requests.get()), (1, 1));
     }
 
+    /// Any immediately ready primary prevents the delayed contender from starting.
     #[test]
     fn hedge_fast_primary_success_or_failure_never_launches_secondary() {
         for result in [
@@ -1696,6 +1849,7 @@ mod hedge_tests {
         }
     }
 
+    /// Cancellation before admission prevents either child from being polled.
     #[test]
     fn hedge_canceled_parent_never_polls_either_future() {
         let fixture = Fixture::default();
@@ -1716,6 +1870,47 @@ mod hedge_tests {
         assert_eq!(fixture.failures.get(), 0);
     }
 
+    /// Cancellation before the delay drains only the primary and never launches new work.
+    #[test]
+    fn hedge_cancellation_before_delay_drains_primary_without_launching_secondary() {
+        let fixture = Fixture::default();
+        let primary_scope = TestScope::new();
+        let secondary_scope = TestScope::new();
+        let parent = TestScope::new();
+        let fenced = Cell::new(false);
+        let primary = std::future::poll_fn(|_| {
+            if fenced.get() {
+                Poll::Ready(Ok(7))
+            } else {
+                Poll::Pending
+            }
+        });
+        let secondary = async { panic!("canceled race launched delayed work") };
+        let mut work = Box::pin(race(
+            primary,
+            secondary,
+            &primary_scope,
+            &secondary_scope,
+            &parent,
+            fixture.hooks(),
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(work.as_mut().poll(&mut cx).is_pending());
+        parent.cancel();
+        fixture.due.set(true);
+        assert!(work.as_mut().poll(&mut cx).is_pending());
+        assert!(primary_scope.0.is_cancelled());
+        assert!(secondary_scope.0.is_cancelled());
+        assert_eq!(fixture.won.get(), None);
+        fenced.set(true);
+        assert_eq!(
+            work.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        );
+        assert_eq!(fixture.failures.get(), 0);
+    }
+
+    /// A secondary winner waits for the primary fence and may lose to parent cancellation.
     #[test]
     fn hedge_secondary_winner_waits_for_fence_and_parent_can_override() {
         for cancel_parent in [false, true] {
@@ -1762,6 +1957,7 @@ mod hedge_tests {
         }
     }
 
+    /// Recoverable and terminal errors select different cancellation and failure paths.
     #[test]
     fn hedge_classification_controls_cancellation_and_empty_failure_hook() {
         for secondary_error in [Error::Io, Error::InvalidInput] {
@@ -1809,6 +2005,7 @@ mod hedge_tests {
         }
     }
 
+    /// Parent cancellation wakes once and waits for both independently completed fences.
     #[test]
     fn hedge_parent_cancellation_wakes_and_drains_both_separate_fences() {
         let fixture = Fixture::default();
@@ -1861,6 +2058,7 @@ mod hedge_tests {
         assert_eq!(fixture.failures.get(), 0);
     }
 
+    /// The primary wins readiness ties without abandoning an already launched secondary.
     #[test]
     fn hedge_simultaneous_readiness_prefers_primary_but_drains_secondary() {
         let fixture = Fixture::default();

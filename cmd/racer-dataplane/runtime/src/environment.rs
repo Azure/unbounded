@@ -40,6 +40,7 @@ pub struct Cancellation {
 /// independent operations may safely register the same executor waker.
 pub struct CancellationRegistration {
     cancellation: Cancellation,
+
     wake: Arc<futures::task::AtomicWaker>,
 }
 
@@ -47,12 +48,14 @@ pub struct CancellationRegistration {
 #[derive(Default)]
 pub struct Registry {
     next: Cell<u64>,
+
     pending: RefCell<BTreeMap<(Instant, u64), Option<Waker>>>,
 }
 
 /// Removes its deadline on drop; expiration is observed only after registry polling.
 pub struct Registration {
     table: Rc<Registry>,
+
     key: (Instant, u64),
 }
 
@@ -60,6 +63,7 @@ pub struct Registration {
 #[derive(Default)]
 pub struct Observer {
     sample: Option<(SystemTime, Instant)>,
+
     epoch: u64,
 }
 
@@ -84,22 +88,17 @@ pub fn require_simulated() -> SimulationRequired {
 pub struct SimulationRequired(bool, PhantomData<Rc<()>>);
 #[cfg(feature = "simulation")]
 impl Drop for SimulationRequired {
+    /// Restore the strictness selected before this thread entered the guard.
     fn drop(&mut self) {
         REQUIRE_SIMULATED.with(|required| required.set(self.0));
     }
 }
-#[cfg(feature = "simulation")]
-/// Reject host time or entropy when a strict simulation scope is active.
-fn check_host_access() {
-    REQUIRE_SIMULATED
-        .with(|required| assert!(!required.get(), "DST escaped into host time/entropy"));
-}
-
 /// A guard belongs to the thread that entered it. Never hold it across an await;
 /// use `Environment::scope` to enter only while polling or dropping a future.
 pub struct Guard {
     #[cfg(feature = "simulation")]
     previous: Environment,
+
     _local: PhantomData<Rc<()>>,
 }
 
@@ -131,6 +130,7 @@ impl Environment {
 }
 
 impl Drop for Guard {
+    /// Restore this thread's previous environment, including during unwinding.
     fn drop(&mut self) {
         #[cfg(feature = "simulation")]
         CURRENT.with(|current| current.replace(std::mem::take(&mut self.previous)));
@@ -140,11 +140,15 @@ impl Drop for Guard {
 /// A future that restores its captured environment for polling and destruction.
 pub struct Scoped<F> {
     environment: Environment,
+
     future: Option<Pin<Box<F>>>,
 }
 
 impl<F: Future> Future for Scoped<F> {
+    /// Preserve the wrapped future's output without imposing application policy.
     type Output = F::Output;
+
+    /// Enter the captured environment for one poll, restoring it on return.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let _environment = this.environment.enter();
@@ -157,6 +161,7 @@ impl<F: Future> Future for Scoped<F> {
 }
 
 impl<F> Drop for Scoped<F> {
+    /// Destroy the inner future before leaving its captured environment.
     fn drop(&mut self) {
         let _environment = self.environment.enter();
         self.future.take();
@@ -174,24 +179,20 @@ pub fn simulation_seed() -> Option<u64> {
 /// Read monotonic time from the selected environment.
 pub fn now() -> Instant {
     #[cfg(feature = "simulation")]
-    if let Some(sim) = Environment::current().simulated {
+    if let Some(sim) = selected_simulation() {
         let clock = sim.clock.0.lock().unwrap();
         return clock.monotonic + clock.elapsed;
     }
-    #[cfg(feature = "simulation")]
-    check_host_access();
     Instant::now()
 }
 
 /// Read wall time, including simulated wall-clock corrections.
 pub fn wall_now() -> SystemTime {
     #[cfg(feature = "simulation")]
-    if let Some(sim) = Environment::current().simulated {
+    if let Some(sim) = selected_simulation() {
         let clock = sim.clock.0.lock().unwrap();
         return clock.wall;
     }
-    #[cfg(feature = "simulation")]
-    check_host_access();
     SystemTime::now()
 }
 
@@ -199,12 +200,10 @@ pub fn wall_now() -> SystemTime {
 /// of a simulated world use the same anchor, including after nested world scopes.
 pub fn clock_anchor() -> (Instant, SystemTime) {
     #[cfg(feature = "simulation")]
-    if let Some(sim) = Environment::current().simulated {
+    if let Some(sim) = selected_simulation() {
         let clock = sim.clock.0.lock().unwrap();
         return (clock.monotonic, clock.wall_origin);
     }
-    #[cfg(feature = "simulation")]
-    check_host_access();
     static ANCHOR: OnceLock<(Instant, SystemTime)> = OnceLock::new();
     *ANCHOR.get_or_init(|| (Instant::now(), SystemTime::now()))
 }
@@ -212,11 +211,9 @@ pub fn clock_anchor() -> (Instant, SystemTime) {
 /// Fill bytes from the host entropy source or the selected replayable role stream.
 pub fn fill_random(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
     #[cfg(feature = "simulation")]
-    if let Some(sim) = Environment::current().simulated {
+    if let Some(sim) = selected_simulation() {
         return sim.entropy.lock().unwrap().fill(bytes);
     }
-    #[cfg(feature = "simulation")]
-    check_host_access();
     getrandom::getrandom(bytes)
 }
 
@@ -225,6 +222,7 @@ pub fn fill_random(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
 /// A world's clock and a role's shared entropy cursor.
 struct Simulated {
     clock: SimulationClock,
+
     entropy: std::sync::Arc<std::sync::Mutex<Entropy>>,
 }
 
@@ -233,10 +231,15 @@ struct Simulated {
 /// A domain-separated, counter-based entropy stream with a partial-block cursor.
 struct Entropy {
     domain: std::sync::Arc<[u8]>,
+
     seed: u64,
+
     stream: u64,
+
     counter: u64,
+
     block: [u8; 32],
+
     offset: usize,
 }
 
@@ -281,9 +284,13 @@ pub struct SimulationClock(std::sync::Arc<std::sync::Mutex<Clock>>);
 /// Clock anchors and mutable elapsed time shared by one simulated world.
 struct Clock {
     seed: u64,
+
     monotonic: Instant,
+
     elapsed: std::time::Duration,
+
     wall_origin: SystemTime,
+
     wall: SystemTime,
 }
 
@@ -495,6 +502,7 @@ impl CancellationRegistration {
 }
 
 impl Drop for CancellationRegistration {
+    /// Remove this subscription without removing other operations' shared wakes.
     fn drop(&mut self) {
         if let Ok(mut entries) = self.cancellation.state.registrations.lock() {
             entries.retain(|entry| {
@@ -599,6 +607,7 @@ impl Registration {
 }
 
 impl Drop for Registration {
+    /// Remove the deadline and release its waiter outside the registry borrow.
     fn drop(&mut self) {
         let removed = self.table.pending.borrow_mut().remove(&self.key);
         drop(removed);
@@ -630,10 +639,23 @@ impl Observer {
     }
 }
 
+/// Select the simulated role, rejecting host fallback inside a strict scope.
+#[cfg(feature = "simulation")]
+fn selected_simulation() -> Option<Simulated> {
+    let simulated = Environment::current().simulated;
+    if simulated.is_none() {
+        REQUIRE_SIMULATED
+            .with(|required| assert!(!required.get(), "DST escaped into host time/entropy"));
+    }
+    simulated
+}
+
 /// Cancellation state shared by handles and their operation registrations.
 struct CancellationState {
     canceled: AtomicBool,
+
     registration_limit: usize,
+
     registrations: Mutex<Vec<Weak<futures::task::AtomicWaker>>>,
 }
 
@@ -647,11 +669,13 @@ pub fn unix_millis(time: SystemTime) -> Result<u64> {
     .map_err(|_| Error::InvalidInput)
 }
 
+/// Deterministic clock, entropy, and nested environment ownership regressions.
 #[cfg(all(test, feature = "simulation"))]
 mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Overflow leaves both clocks unchanged and does not poison later advances.
     #[test]
     fn checked_clock_overflow_is_atomic_and_legacy_panic_does_not_poison() {
         let clock = SimulationClock::new(9);
@@ -668,6 +692,7 @@ mod tests {
         assert_eq!(clock.elapsed(), Duration::from_secs(1));
     }
 
+    /// Explicit entropy domains preserve replay independently of read chunk sizes.
     #[test]
     fn domains_and_multiblock_chunking_are_explicit_and_replayable() {
         let clock = SimulationClock::new(7);
@@ -690,6 +715,7 @@ mod tests {
         assert_ne!(default, replay);
     }
 
+    /// Counter exhaustion reports failure while keeping the cursor usable for checks.
     #[test]
     fn exhausted_entropy_returns_error_without_poisoning_cursor() {
         let clock = SimulationClock::new(1);
@@ -703,6 +729,7 @@ mod tests {
         }
     }
 
+    /// Empty reads do not advance entropy, and partial exhaustion retains copied bytes.
     #[test]
     fn entropy_empty_reads_and_exhausted_partial_blocks_preserve_the_cursor() {
         let clock = SimulationClock::new(1);
@@ -725,6 +752,7 @@ mod tests {
         assert_eq!(entropy.lock().unwrap().counter, u64::MAX);
     }
 
+    /// Cloned roles consume one shared, domain-separated entropy stream.
     #[test]
     fn entropy_domain_and_cloned_cursor_remain_stable() {
         let clock = SimulationClock::new(7);
@@ -751,6 +779,7 @@ mod tests {
         });
     }
 
+    /// Nested strict guards restore the surrounding host-access requirement.
     #[test]
     fn nested_strict_guards_restore_previous_requirement() {
         let _host = Environment::default().enter();
@@ -769,6 +798,7 @@ mod tests {
         assert!(std::panic::catch_unwind(now).is_ok());
     }
 
+    /// Every host time and entropy entry point rejects strict simulation fallback.
     #[test]
     fn strict_simulation_rejects_real_role_fallback() {
         let _strict = require_simulated();
@@ -792,6 +822,7 @@ mod tests {
         }
     }
 
+    /// Pending and dropped scoped futures restore the caller's independent stream.
     #[test]
     fn streams_are_independent_and_scoped_futures_restore_on_pending_and_drop() {
         let clock = SimulationClock::new(42);
@@ -824,10 +855,13 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// Destructors observe their captured environment, even when scopes unwind.
     #[test]
     fn scoped_drop_and_unwind_restore_the_callers_environment() {
+        /// Checks that destruction occurs under the expected wall clock.
         struct OnDrop(SystemTime);
         impl Drop for OnDrop {
+            /// Compare the selected wall clock with the captured expectation.
             fn drop(&mut self) {
                 assert_eq!(wall_now(), self.0);
             }
@@ -854,10 +888,12 @@ mod tests {
     }
 }
 
+/// Host environment behavior independent of simulation support.
 #[cfg(test)]
 mod host_tests {
     use super::*;
 
+    /// Host clock mapping retains one stable process anchor.
     #[test]
     fn host_environment_uses_a_stable_anchor() {
         let _host = Environment::default().enter();
@@ -868,11 +904,13 @@ mod host_tests {
     }
 }
 
+/// Deadline conversion and bounded cancellation subscription regressions.
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
     use crate::test_util::WakeCounter;
 
+    /// Cancellation and registration races preserve notifications and capacity.
     #[test]
     fn caller_selected_registration_bound_and_concurrent_cancel() {
         let disabled = Cancellation::with_registration_limit(0);
@@ -895,6 +933,7 @@ mod deadline_tests {
         }
     }
 
+    /// Millisecond deadlines round-trip on either side of a fractional anchor.
     #[test]
     fn millisecond_mapping_preserves_both_sides_of_fractional_anchor() {
         let mono = Instant::now();
@@ -911,6 +950,7 @@ mod deadline_tests {
         );
     }
 
+    /// Invalid wall times are rejected rather than wrapped or rounded into range.
     #[test]
     fn millisecond_mapping_rejects_pre_epoch_and_overflow() {
         let mono = Instant::now();
@@ -931,6 +971,7 @@ mod deadline_tests {
         assert_eq!(unix_millis(overflow), Err(Error::InvalidInput));
     }
 
+    /// Wall corrections never renew an existing monotonic deadline.
     #[cfg(feature = "simulation")]
     #[test]
     fn deadline_mapping_is_stable_across_simulated_time_and_wall_jumps() {
@@ -949,6 +990,7 @@ mod deadline_tests {
         );
     }
 
+    /// Each subscription owns its capacity even when tasks use the same waker.
     #[test]
     fn operation_registrations_reclaim_capacity_and_do_not_remove_shared_wakes() {
         let cancellation = Cancellation::new().unwrap();
@@ -968,6 +1010,7 @@ mod deadline_tests {
         assert_eq!(count.count(), 1);
     }
 
+    /// Subscription drop releases executor ownership before the shared scope ends.
     #[test]
     fn dropping_subscription_releases_executor_resources_before_scope_ends() {
         let cancellation = Cancellation::new().unwrap();
@@ -988,6 +1031,7 @@ mod deadline_tests {
         assert_eq!(executor.count(), 1);
     }
 
+    /// Dropping one live registration immediately admits its replacement.
     #[test]
     fn live_registration_limit_is_reclaimed_after_drop() {
         let cancellation = Cancellation::new().unwrap();
@@ -1000,22 +1044,27 @@ mod deadline_tests {
     }
 }
 
+/// Pure registry ordering, expiration budgets, and reentrant waker disposal.
 #[cfg(test)]
 mod registry_tests {
     use super::*;
 
+    /// Equal deadlines retain registration order and replace wakers outside borrows.
     #[test]
     fn deadlines_are_ordered_by_time_then_registration_and_drop_is_reentrant() {
         thread_local! {
             static TABLE: RefCell<Option<Rc<Registry>>> = const { RefCell::new(None) };
         }
+        /// Reenters the registry when a retired waker releases its last owner.
         struct OnDrop;
         impl std::task::Wake for OnDrop {
+            /// Reject waking a registration owner that should only be discarded.
             fn wake(self: std::sync::Arc<Self>) {
                 panic!("replaced registration must not wake its retired owner");
             }
         }
         impl Drop for OnDrop {
+            /// Assert registry mutation is available during retired waker disposal.
             fn drop(&mut self) {
                 TABLE.with(|slot| {
                     let table = slot.borrow().as_ref().unwrap().clone();
@@ -1044,6 +1093,7 @@ mod registry_tests {
         TABLE.with(|slot| slot.take());
     }
 
+    /// Zero budgets, dropped entries, and exhausted identifiers preserve accounting.
     #[test]
     fn bounded_poll_drop_and_overflow() {
         let table = Rc::new(Registry::default());
@@ -1065,6 +1115,7 @@ mod registry_tests {
         assert!(table.is_empty());
     }
 
+    /// The next deadline follows removals and partially processed expiration batches.
     #[test]
     fn next_deadline_tracks_order_drop_and_budgeted_expiration() {
         let table = Rc::new(Registry::default());
@@ -1098,6 +1149,7 @@ mod registry_tests {
         assert_eq!(table.next_deadline(), None);
     }
 
+    /// Only the latest waiter wakes, and removing its registration releases ownership.
     #[test]
     fn latest_waker_is_notified_once_and_drop_releases_it() {
         use crate::test_util::WakeCounter;
@@ -1127,13 +1179,16 @@ mod registry_tests {
         assert!(weak.upgrade().is_none());
     }
 
+    /// Wake and drop callbacks can register nested deadlines without borrow conflicts.
     #[test]
     fn waking_and_removing_entries_allow_registry_reentry() {
         thread_local! {
             static TABLE: RefCell<Option<Rc<Registry>>> = const { RefCell::new(None) };
         }
+        /// Mutates the selected registry from both wake and destructor callbacks.
         struct Reentrant;
         impl Reentrant {
+            /// Add and remove a nested deadline while the outer table is empty.
             fn access() {
                 TABLE.with(|slot| {
                     let table = slot.borrow().as_ref().unwrap().clone();
@@ -1145,11 +1200,13 @@ mod registry_tests {
             }
         }
         impl std::task::Wake for Reentrant {
+            /// Exercise registry reentry from notification.
             fn wake(self: std::sync::Arc<Self>) {
                 Self::access();
             }
         }
         impl Drop for Reentrant {
+            /// Exercise registry reentry from disposal.
             fn drop(&mut self) {
                 Self::access();
             }
@@ -1173,10 +1230,12 @@ mod registry_tests {
     }
 }
 
+/// Wall-clock uncertainty detection without application invalidation policy.
 #[cfg(test)]
 mod clock_observer_tests {
     use super::*;
 
+    /// Drift uses a strict threshold and backward samples saturate the epoch counter.
     #[test]
     fn strict_threshold_backwards_samples_and_epoch_saturation() {
         let mut observer = Observer::default();

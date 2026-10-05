@@ -50,6 +50,7 @@ pub mod test_util {
     }
 
     impl std::task::Wake for WakeCounter {
+        /// Count an owned wake; borrowed wakes use the trait's default forwarding.
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
@@ -97,6 +98,7 @@ impl Error {
 }
 
 impl std::fmt::Display for Error {
+    /// Describe the failure without losing raw operating-system diagnostics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Cancelled => "operation canceled",
@@ -145,8 +147,10 @@ pub trait Budget: 'static {
 }
 
 impl Budget for () {
+    /// No accounting guard is needed when the caller disables charging.
     type Charge = ();
 
+    /// Accept every charge without retaining application capacity.
     fn charge(&self, _bytes: usize) -> Result<()> {
         Ok(())
     }
@@ -171,6 +175,7 @@ pub mod mailbox {
     pub struct Completion<V, B> {
         /// Caller-defined result, independent of mailbox delivery status.
         pub value: V,
+
         /// Budget retained through execution and transferred to the consumer.
         pub budget: Option<B>,
     }
@@ -180,7 +185,9 @@ pub mod mailbox {
     /// Active work must be fenced by the caller; mailbox drop is not an I/O fence.
     pub struct Mailbox<W, V, B, S: Scope> {
         capacity: usize,
+
         state: Mutex<State<W, V, B, S>>,
+
         credits: Arc<Credits>,
     }
 
@@ -188,14 +195,19 @@ pub mod mailbox {
     pub struct Command<W, V, B, S: Scope> {
         /// Caller-assigned identity accepted by the reply exactly once.
         pub generation: u64,
+
         /// Work whose ownership was transferred on admission.
         pub work: W,
+
         /// Original caller policy, retained independently of the receipt.
         pub scope: S,
+
         /// Application capacity retained through execution.
         pub budget: Option<B>,
+
         /// Destination for the generation-checked completion.
         pub reply: Arc<Reply<V, B>>,
+
         /// Execution owner; retain every clone until external resources are safe.
         pub permit: Arc<Producer<V, B>>,
     }
@@ -204,16 +216,22 @@ pub mod mailbox {
     /// Use [`Self::poll_completion`] when cancellation must not end the wait early.
     pub struct Receipt<W, V, B, S: Scope> {
         reply: Arc<Reply<V, B>>,
+
         scope: S,
+
         cancellation: Option<CancellationRegistration>,
+
         permit: Arc<Permit>,
+
         work: std::marker::PhantomData<fn() -> W>,
     }
 
     /// A generation-checked, one-shot result slot shared by producer and receipt.
     pub struct Reply<V, B> {
         generation: u64,
+
         abandoned: AtomicBool,
+
         state: Mutex<ReplyState<V, B>>,
     }
 
@@ -221,6 +239,7 @@ pub mod mailbox {
     /// Its loss terminates delivery; it is not itself an I/O fence.
     pub struct Producer<V, B> {
         reply: Arc<Reply<V, B>>,
+
         credit: Arc<Permit>,
     }
 
@@ -237,8 +256,7 @@ pub mod mailbox {
             Ok(Self {
                 capacity,
                 state: Mutex::new(State {
-                    installed: false,
-                    closed: false,
+                    admission: Admission::Uninstalled,
                     queue: VecDeque::new(),
                 }),
                 credits: Arc::new(Credits {
@@ -250,15 +268,15 @@ pub mod mailbox {
         /// Enable admission once; a closed mailbox cannot be reinstalled.
         pub fn install(&self) -> Result<()> {
             let mut state = lock(&self.state);
-            if state.installed || state.closed {
+            if state.admission != Admission::Uninstalled {
                 return Err(Error::InvalidConfiguration);
             }
-            state.installed = true;
+            state.admission = Admission::Open;
             Ok(())
         }
         /// Permanently close admission without discarding queued or executing work.
         pub fn stop_admission(&self) {
-            lock(&self.state).closed = true;
+            lock(&self.state).admission = Admission::Closed;
         }
         /// Count capacity retained by accepted commands and unread receipts.
         pub fn outstanding(&self) -> usize {
@@ -267,11 +285,10 @@ pub mod mailbox {
         /// Close admission and detach only when all retained capacity has returned.
         pub fn uninstall(&self) -> Result<()> {
             let mut state = lock(&self.state);
-            state.closed = true;
+            state.admission = Admission::Closed;
             if self.outstanding() != 0 {
                 return Err(Error::Unavailable);
             }
-            state.installed = false;
             Ok(())
         }
         /// The caller allocates generations, allowing a shared sequence with other
@@ -294,7 +311,7 @@ pub mod mailbox {
             let receipt_scope = scope.clone();
             let queued_scope = Arc::new(scope.clone());
             let mut state = lock(&self.state);
-            if state.closed || !state.installed {
+            if state.admission != Admission::Open {
                 return Err(Error::Unavailable.into());
             }
             if self.outstanding() >= self.capacity {
@@ -384,7 +401,10 @@ pub mod mailbox {
         }
     }
     impl<W, V, B, S: Scope> Future for Receipt<W, V, B, S> {
+        /// Delivery observes caller policy separately from accepted-work ownership.
         type Output = Result<Completion<V, B>, S::Error>;
+
+        /// Register cancellation before checking policy and the one-shot reply.
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             if let Some(cancellation) = &self.cancellation {
                 cancellation.register(cx.waker());
@@ -401,6 +421,7 @@ pub mod mailbox {
         }
     }
     impl<W, V, B, S: Scope> Drop for Receipt<W, V, B, S> {
+        /// Abandon delivery and discard unread output without fencing producer work.
         fn drop(&mut self) {
             self.reply.abandoned.store(true, Ordering::Release);
             let completion = lock(&self.reply.state).completion.take();
@@ -468,6 +489,7 @@ pub mod mailbox {
         }
     }
     impl<V, B> Drop for Producer<V, B> {
+        /// Publish producer loss and return credit only if completion never arrived.
         fn drop(&mut self) {
             let mut state = lock(&self.reply.state);
             if state.status != ReplyStatus::Pending {
@@ -487,29 +509,46 @@ pub mod mailbox {
     type Queued<W, V, B, S> = (Arc<S>, Command<W, V, B, S>);
     /// Admission lifecycle and unstarted work, protected by one queue lock.
     struct State<W, V, B, S: Scope> {
-        installed: bool,
-        closed: bool,
+        admission: Admission,
+
         queue: VecDeque<Queued<W, V, B, S>>,
+    }
+
+    /// Admission only moves forward; closing never permits installation again.
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Admission {
+        /// No driver has installed this mailbox yet.
+        Uninstalled,
+        /// The installed driver accepts work within the shared capacity limit.
+        Open,
+        /// Admission stopped permanently, independently of retained work and receipts.
+        Closed,
     }
 
     /// Mutually exclusive lifecycle outcomes; producer loss is not successful fencing.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ReplyStatus {
+        /// An execution owner may still publish the first completion.
         Pending,
+        /// Completion arrived, even if the consumer abandoned or consumed the value.
         Completed,
+        /// The last execution owner disappeared before publishing completion.
         Lost,
     }
 
     /// Result and waiter state, always detached before invoking caller code.
     struct ReplyState<V, B> {
         completion: Option<Completion<V, B>>,
+
         waker: Option<Waker>,
+
         status: ReplyStatus,
     }
 
     /// Capacity accounting that does not keep the mailbox itself alive.
     struct Credits {
         outstanding: AtomicUsize,
+
         waker: AtomicWaker,
     }
 
@@ -517,6 +556,7 @@ pub mod mailbox {
     /// receipt cannot release capacity while accepted work still owns resources.
     struct Permit {
         credits: Arc<Credits>,
+
         released: AtomicBool,
     }
     impl Permit {
@@ -529,6 +569,7 @@ pub mod mailbox {
         }
     }
     impl Drop for Permit {
+        /// Return retained capacity when the last shared owner disappears.
         fn drop(&mut self) {
             self.release();
         }
@@ -540,11 +581,12 @@ pub mod mailbox {
         mutex.lock().unwrap_or_else(|error| error.into_inner())
     }
 
+    /// Pure ownership, admission, wake-ordering, and reentrant disposal regressions.
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::deadline::Cancellation;
-        use std::{sync::atomic::AtomicUsize, task::Wake};
+        use crate::{deadline::Cancellation, test_util::WakeCounter};
+        use std::sync::atomic::AtomicUsize;
 
         /// Producer loss is terminal even when a surviving reply receives a late result.
         #[test]
@@ -579,7 +621,10 @@ pub mod mailbox {
         #[derive(Clone)]
         struct TestScope(Cancellation);
         impl Scope for TestScope {
+            /// Mailbox fixtures use portable runtime failure classifications.
             type Error = Error;
+
+            /// Admit work only while its shared cancellation scope remains active.
             fn check(&self) -> Result<()> {
                 if self.0.is_cancelled() {
                     Err(Error::Cancelled)
@@ -587,6 +632,8 @@ pub mod mailbox {
                     Ok(())
                 }
             }
+
+            /// Supply the shared cancellation source for receipt wake registration.
             fn cancellation(&self) -> Option<&Cancellation> {
                 Some(&self.0)
             }
@@ -594,15 +641,8 @@ pub mod mailbox {
         /// Counts destruction of the application budget retained by a command.
         struct Tracked(Arc<AtomicUsize>);
         impl Drop for Tracked {
+            /// Record release of the application budget independently of mailbox credit.
             fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        /// Counts wake callbacks without introducing executor scheduling.
-        #[derive(Default)]
-        struct Count(AtomicUsize);
-        impl Wake for Count {
-            fn wake(self: Arc<Self>) {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -615,6 +655,7 @@ pub mod mailbox {
             (mailbox, TestScope(Cancellation::new().unwrap()))
         }
 
+        /// Canceling and dropping delivery retains accepted work and application capacity.
         #[test]
         fn cancellation_and_detachment_do_not_release_accepted_ownership() {
             let (mailbox, scope) = setup();
@@ -623,13 +664,13 @@ pub mod mailbox {
                 .submit(1, "owned".into(), &scope, Some(Tracked(dropped.clone())))
                 .unwrap();
             let mut command = mailbox.pop().unwrap();
-            let count = Arc::new(Count::default());
+            let count = Arc::new(WakeCounter::default());
             let waker = Waker::from(count.clone());
             let mut cx = Context::from_waker(&waker);
             mailbox.register(&waker);
             assert!(Pin::new(&mut receipt).poll(&mut cx).is_pending());
             scope.0.cancel().unwrap();
-            assert!(count.0.load(Ordering::Relaxed) > 0);
+            assert!(count.count() > 0);
             assert!(matches!(
                 Pin::new(&mut receipt).poll(&mut cx),
                 Poll::Ready(Err(Error::Cancelled))
@@ -661,6 +702,7 @@ pub mod mailbox {
             assert_eq!(mailbox.outstanding(), 0);
         }
 
+        /// Generation checks and one-shot completion preserve the first owned result.
         #[test]
         fn stale_and_duplicate_completions_cannot_replace_owned_result() {
             let (mailbox, scope) = setup();
@@ -720,6 +762,7 @@ pub mod mailbox {
             assert_eq!(dropped.load(Ordering::Relaxed), 1);
         }
 
+        /// Completion-only polling ignores cancellation, and unread output releases on drop.
         #[test]
         fn completion_only_poll_fences_cancel_and_unread_drop_reclaims_budget() {
             let (mailbox, scope) = setup();
@@ -771,6 +814,7 @@ pub mod mailbox {
             assert_eq!(mailbox.outstanding(), 0);
         }
 
+        /// Closing admission retains accepted ownership until queued producers are disposed.
         #[test]
         fn admission_close_and_queue_drop_retain_receipt_capacity() {
             assert!(matches!(
@@ -808,12 +852,38 @@ pub mod mailbox {
             assert_eq!(mailbox.install(), Err(Error::InvalidConfiguration));
         }
 
+        /// Closing an uninstalled or idle mailbox is permanent, even after successful detach.
+        #[test]
+        fn admission_never_reopens_after_close_or_uninstall() {
+            let scope = TestScope(Cancellation::new().unwrap());
+            for install_first in [false, true] {
+                for stop_first in [false, true] {
+                    let mailbox = Arc::new(TestMailbox::new(1).unwrap());
+                    if install_first {
+                        mailbox.install().unwrap();
+                    }
+                    if stop_first {
+                        mailbox.stop_admission();
+                    }
+                    mailbox.uninstall().unwrap();
+                    mailbox.uninstall().unwrap();
+                    assert_eq!(mailbox.install(), Err(Error::InvalidConfiguration));
+                    assert!(matches!(
+                        mailbox.submit(1, String::new(), &scope, None),
+                        Err(Error::Unavailable)
+                    ));
+                    assert_eq!(mailbox.outstanding(), 0);
+                }
+            }
+        }
+
+        /// Work and completion notifications cover registration before and after readiness.
         #[test]
         fn cross_thread_notifications_cover_registration_orders() {
             for submit_first in [false, true] {
                 for complete_first in [false, true] {
                     let (mailbox, scope) = setup();
-                    let count = Arc::new(Count::default());
+                    let count = Arc::new(WakeCounter::default());
                     let waker = Waker::from(count.clone());
                     let mut cx = Context::from_waker(&waker);
                     if !submit_first {
@@ -825,7 +895,7 @@ pub mod mailbox {
                     })
                     .join()
                     .unwrap();
-                    assert_eq!(count.0.load(Ordering::Relaxed), usize::from(!submit_first));
+                    assert_eq!(count.count(), usize::from(!submit_first));
                     mailbox.register(&waker);
                     assert!(mailbox.has_queued());
                     if !complete_first {
@@ -843,7 +913,7 @@ pub mod mailbox {
                         )
                         .unwrap();
                     assert_eq!(
-                        count.0.load(Ordering::Relaxed),
+                        count.count(),
                         usize::from(!submit_first) + usize::from(!complete_first)
                     );
                     assert!(matches!(
@@ -856,17 +926,18 @@ pub mod mailbox {
             }
         }
 
+        /// Producer loss wakes both receipt paths and returns admission without a false fence.
         #[test]
         fn producer_loss_wakes_both_wait_paths_and_releases_credit() {
             let (mailbox, scope) = setup();
             let mut receipt = mailbox.submit(1, String::new(), &scope, None).unwrap();
-            let count = Arc::new(Count::default());
+            let count = Arc::new(WakeCounter::default());
             let waker = Waker::from(count.clone());
             let mut cx = Context::from_waker(&waker);
             assert!(receipt.poll_completion(&mut cx).is_pending());
             let command = mailbox.pop().unwrap();
             std::thread::spawn(move || drop(command)).join().unwrap();
-            assert_eq!(count.0.load(Ordering::Relaxed), 1);
+            assert_eq!(count.count(), 1);
             assert!(matches!(
                 receipt.poll_completion(&mut cx),
                 Poll::Ready(Err(Error::Unavailable))
@@ -879,6 +950,7 @@ pub mod mailbox {
             assert!(mailbox.submit(2, String::new(), &scope, None).is_ok());
         }
 
+        /// Caller callbacks run outside queue locks and poisoned state remains disposable.
         #[test]
         fn queued_callbacks_reenter_and_panics_do_not_poison_disposal() {
             let (mailbox, scope) = setup();
@@ -900,16 +972,22 @@ pub mod mailbox {
             assert_eq!(mailbox.outstanding(), 0);
         }
 
+        /// Panicking caller policy clones cannot reserve admission or poison the queue.
         #[test]
         fn panicking_scope_clone_never_reserves_or_locks() {
+            /// Injects failure while copying caller-owned admission policy.
             struct Panics;
             impl Clone for Panics {
+                /// Fail before the mailbox can lock or reserve capacity.
                 fn clone(&self) -> Self {
                     panic!("clone");
                 }
             }
             impl Scope for Panics {
+                /// The fixture uses portable runtime failures.
                 type Error = Error;
+
+                /// Admit work so submission reaches the deliberately panicking clone.
                 fn check(&self) -> Result<()> {
                     Ok(())
                 }
@@ -927,6 +1005,7 @@ pub mod mailbox {
             mailbox.uninstall().unwrap();
         }
 
+        /// Accepted commands retain credit without creating a cycle back to the mailbox.
         #[test]
         fn queued_owners_do_not_keep_mailbox_alive() {
             let (mailbox, scope) = setup();
@@ -944,10 +1023,13 @@ pub mod mailbox {
             ));
         }
 
+        /// Discarding abandoned output permits its destructor to reenter the completed reply.
         #[test]
         fn abandoned_completion_destructor_can_reenter_reply() {
+            /// Checks terminal reply state during application budget destruction.
             struct Reenter(std::sync::Weak<Reply<(), Reenter>>);
             impl Drop for Reenter {
+                /// Reenter the reply lock after completion has detached discarded output.
                 fn drop(&mut self) {
                     let reply = self.0.upgrade().unwrap();
                     assert_eq!(lock(&reply.state).status, ReplyStatus::Completed);
@@ -967,6 +1049,7 @@ pub mod mailbox {
             assert!(lock(&reply.state).completion.is_none());
         }
 
+        /// Cloned execution owners retain both loss notification and capacity until last drop.
         #[test]
         fn producer_clones_retain_loss_notification_until_last_owner() {
             let (mailbox, scope) = setup();
@@ -987,10 +1070,12 @@ pub mod mailbox {
     }
 }
 
+/// Runtime error and shared wake instrumentation contracts.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Shared wake instrumentation counts owned and borrowed notifications equally.
     #[test]
     fn counts_owned_and_borrowed_wakes() {
         let counter = std::sync::Arc::new(test_util::WakeCounter::default());
@@ -1000,6 +1085,7 @@ mod tests {
         assert_eq!(counter.count(), 2);
     }
 
+    /// Common errno values retain classifications while other positive diagnostics survive.
     #[test]
     fn os_errors_preserve_errno_and_existing_classifications() {
         for (errno, expected) in [
@@ -1017,6 +1103,7 @@ mod tests {
         assert_eq!(Error::from_io(std::io::Error::other("opaque")), Error::Io);
     }
 
+    /// Portable failures describe themselves without fabricating nested error sources.
     #[test]
     fn classified_errors_implement_standard_error_without_fabricated_sources() {
         for error in [
