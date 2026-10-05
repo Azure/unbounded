@@ -131,6 +131,7 @@
 #![deny(missing_docs)]
 
 mod segments;
+
 mod slab;
 
 pub use segments::{
@@ -154,18 +155,25 @@ use zeroize::Zeroize;
 pub enum Error {
     /// The filesystem or kernel cannot provide required direct-I/O support.
     Unsupported,
+
     /// Caller configuration or an implementation contract is invalid.
     InvalidConfiguration,
+
     /// A transient lease, freeze, or resource limit prevents progress.
     Busy,
+
     /// An extent or persisted allocator image is malformed.
     Corrupt,
+
     /// A generation, segment state, or table identity is no longer valid.
     Stale,
+
     /// Storage is unopened, locked elsewhere, or has exhausted a generation.
     Unavailable,
+
     /// An I/O completion was short or failed without OS error detail.
     Io,
+
     /// Synchronous OS failure; asynchronous errors retain the runtime's error type.
     SystemIo {
         /// Operation that failed.
@@ -201,6 +209,7 @@ impl fmt::Display for Error {
         })
     }
 }
+
 impl std::error::Error for Error {}
 
 /// Result of an allocator operation before conversion into a caller's scope error.
@@ -269,7 +278,8 @@ impl SegmentGeometry {
     }
 
     /// Compare table dimensions only, not occupancy or alignment compatibility.
-    pub fn matches_segments(&self, segments: &Segments) -> bool {
+    #[cfg(test)]
+    fn matches_segments(&self, segments: &Segments) -> bool {
         segments.capacity_bytes() == self.slab_bytes
             && segments.segment_bytes() == self.segment_bytes
             && segments.count() as u64 == self.segment_count
@@ -281,6 +291,7 @@ pub trait Charge: 'static {
     /// Whether this guard accounts for at least `bytes` live allocation bytes.
     fn covers(&self, bytes: usize) -> bool;
 }
+
 impl Charge for () {
     /// Explicitly opt out of accounting for callers without admission policy.
     fn covers(&self, _bytes: usize) -> bool {
@@ -299,6 +310,7 @@ pub struct Alignment {
 
     length: usize,
 }
+
 /// A nonempty, non-overflowing file range for one bounded I/O transfer.
 #[must_use]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -307,6 +319,7 @@ pub struct Extent {
 
     length: usize,
 }
+
 impl Extent {
     /// Reject empty ranges, offset overflow, and lengths above the transfer cap.
     pub fn new(offset: u64, length: usize) -> Result<Self> {
@@ -318,17 +331,20 @@ impl Extent {
         }
         Ok(Self { offset, length })
     }
+
     /// Starting byte offset in the file.
     #[must_use]
     pub fn offset(self) -> u64 {
         self.offset
     }
+
     /// Transfer length in bytes, including any padding.
     #[must_use]
     pub fn length(self) -> usize {
         self.length
     }
 }
+
 impl Alignment {
     /// Conservative single-transfer limit of 1 GiB.
     ///
@@ -350,21 +366,25 @@ impl Alignment {
             length,
         })
     }
+
     /// Required memory address alignment.
     #[must_use]
     pub fn memory(self) -> usize {
         self.memory
     }
+
     /// Required file offset unit.
     #[must_use]
     pub fn offset(self) -> u64 {
         self.offset
     }
+
     /// Required transfer length unit.
     #[must_use]
     pub fn length(self) -> usize {
         self.length
     }
+
     /// Round up to the least common multiple of offset and length units so the
     /// next appended extent is also offset-aligned. Reject overflow and lengths
     /// above [`Self::MAX_TRANSFER_LENGTH`] before allocating memory.
@@ -392,6 +412,7 @@ impl Alignment {
         }
         Extent::new(offset, length)
     }
+
     /// Allocate zeroed stable storage and retain its primary accounting guard.
     /// Length must be nonzero, length-aligned, covered by `charge`, and no larger
     /// than [`Self::MAX_TRANSFER_LENGTH`]. Allocation failure returns `Busy`.
@@ -417,6 +438,7 @@ impl Alignment {
             pool: Weak::new(),
         })
     }
+
     /// Validate the address, file offset, transfer unit, and exact buffer length.
     pub fn check<C: Charge>(&self, extent: Extent, buffer: &AlignedBuffer<C>) -> Result<()> {
         if !(buffer.allocation().pointer.as_ptr() as usize).is_multiple_of(self.memory)
@@ -440,6 +462,7 @@ struct Allocation<C: Charge> {
 
     retained: Vec<Rc<C>>,
 }
+
 impl<C: Charge> Allocation<C> {
     /// Exclusively borrow the complete initialized allocation with its original size.
     fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -447,6 +470,7 @@ impl<C: Charge> Allocation<C> {
         unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.layout.size()) }
     }
 }
+
 impl<C: Charge> Drop for Allocation<C> {
     /// Erase and free before field destruction releases the accounting guards.
     fn drop(&mut self) {
@@ -476,6 +500,7 @@ pub struct AlignedBuffer<C: Charge> {
 
     pool: Weak<RefCell<Option<Self>>>,
 }
+
 impl<C: Charge> fmt::Debug for AlignedBuffer<C> {
     /// Show storage properties without requiring accounting guards to expose data.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -486,20 +511,24 @@ impl<C: Charge> fmt::Debug for AlignedBuffer<C> {
             .finish_non_exhaustive()
     }
 }
+
 impl<C: Charge> AlignedBuffer<C> {
     /// Borrow the allocation, which is absent only during drop's ownership transfer.
     fn allocation(&self) -> &Allocation<C> {
         self.allocation.as_ref().expect("live buffer allocation")
     }
+
     /// Mutably borrow live backing storage before any drop-time pool transfer.
     fn allocation_mut(&mut self) -> &mut Allocation<C> {
         self.allocation.as_mut().expect("live buffer allocation")
     }
+
     /// Attach a weak return destination without extending the pool's lifetime.
     pub(crate) fn pooled(mut self, pool: &Rc<RefCell<Option<Self>>>) -> Self {
         self.pool = Rc::downgrade(pool);
         self
     }
+
     /// Replace primary accounting only after the new guard covers the full size.
     pub(crate) fn rebind(&mut self, charge: C) -> Result<()> {
         if !charge.covers(self.len()) {
@@ -508,40 +537,48 @@ impl<C: Charge> AlignedBuffer<C> {
         self.allocation_mut().charge = charge;
         Ok(())
     }
+
     /// Retain additional accounting through the final kernel completion.
     pub fn retain(&mut self, charge: Rc<C>) {
         self.allocation_mut().retained.push(charge);
     }
+
     /// Initialized allocation length, including padding.
     #[must_use]
     pub fn len(&self) -> usize {
         self.allocation().layout.size()
     }
+
     /// Always false: construction rejects zero-length buffers.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         false
     }
+
     /// Borrow all initialized bytes without moving or resizing the allocation.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: initialized allocation remains live throughout this borrow.
         unsafe { std::slice::from_raw_parts(self.allocation().pointer.as_ptr(), self.len()) }
     }
+
     /// Exclusively borrow all initialized bytes.
     #[must_use]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.allocation_mut().as_mut_slice()
     }
+
     /// Compatibility accessor matching [`IoBuffer`]; this always succeeds.
     pub fn bytes(&self) -> Result<&[u8]> {
         Ok(self.as_slice())
     }
+
     /// Compatibility accessor matching [`IoBuffer`]; this always succeeds.
     pub fn bytes_mut(&mut self) -> Result<&mut [u8]> {
         Ok(self.as_mut_slice())
     }
 }
+
 impl<C: Charge> Drop for AlignedBuffer<C> {
     /// Zeroize and return storage if possible, otherwise let its owner free it.
     fn drop(&mut self) {
@@ -564,6 +601,7 @@ impl<C: Charge> Drop for AlignedBuffer<C> {
         // pool is gone, occupied, or borrowed. Idle buffers never repool themselves.
     }
 }
+
 // SAFETY: owned aligned backing is initialized, stable, and live until Drop.
 unsafe impl<C: Charge> IoBuffer for AlignedBuffer<C> {
     type Error = Error;
@@ -591,6 +629,7 @@ mod buffer_tests {
 
         bytes: usize,
     }
+
     impl TrackedCharge {
         /// Admit and record a fixed number of live bytes.
         fn new(live: &Rc<Cell<usize>>, bytes: usize) -> Self {
@@ -601,12 +640,14 @@ mod buffer_tests {
             }
         }
     }
+
     impl Charge for TrackedCharge {
         /// Cover only the number of bytes admitted by this guard.
         fn covers(&self, bytes: usize) -> bool {
             self.bytes >= bytes
         }
     }
+
     impl Drop for TrackedCharge {
         /// Return admitted bytes exactly once.
         fn drop(&mut self) {
@@ -619,6 +660,7 @@ mod buffer_tests {
     fn transfer_limit_is_enforced_before_allocation_or_charge_inspection() {
         /// Detects any accounting inspection on a structurally invalid request.
         struct UncheckedCharge;
+
         impl Charge for UncheckedCharge {
             /// Panic when validation reaches accounting in the wrong order.
             fn covers(&self, _: usize) -> bool {
@@ -840,12 +882,14 @@ mod buffer_tests {
     fn retained_guard_can_inspect_pool_before_buffer_is_returned() {
         /// Runs a caller-provided destructor to test reentrant pool inspection.
         struct Guard(Option<Box<dyn FnOnce()>>);
+
         impl Charge for Guard {
             /// Admit all sizes for this destructor-order test.
             fn covers(&self, _: usize) -> bool {
                 true
             }
         }
+
         impl Drop for Guard {
             /// Invoke the callback at most once.
             fn drop(&mut self) {
@@ -881,12 +925,14 @@ mod buffer_tests {
 
             panic: bool,
         }
+
         impl Charge for Guard {
             /// Admit all sizes for the unwind test.
             fn covers(&self, _: usize) -> bool {
                 true
             }
         }
+
         impl Drop for Guard {
             /// Record release before injecting the requested destructor panic.
             fn drop(&mut self) {
