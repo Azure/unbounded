@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -28,6 +29,45 @@ import (
 )
 
 const podCIDRTestNode = "node-a"
+
+func TestAssignmentRejectsStaleSiteSnapshot(t *testing.T) {
+	for _, withLabel := range []bool{false, true} {
+		for _, change := range []string{"node-cidrs", "regex", "priority"} {
+			t.Run(fmt.Sprintf("%s/label=%v", change, withLabel), func(t *testing.T) {
+				h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+				current := h.sites[0].DeepCopy()
+
+				switch change {
+				case "node-cidrs":
+					current.Spec.NodeCidrs = []string{"10.9.0.0/16"}
+				case "regex":
+					current.Spec.PodCidrAssignments[0].NodeRegex = []string{"^different-node$"}
+				case "priority":
+					priority := int32(5)
+					current.Spec.PodCidrAssignments[0].Priority = &priority
+				}
+
+				h.sc.sitesCache = []unboundedv1alpha3.Site{*current}
+				h.sc.updateAssignmentAllocators(h.sc.sitesCache)
+
+				if h.sc.getAssignmentAllocator("site-a", 0) != h.state {
+					t.Fatal("test requires an in-place allocator update")
+				}
+
+				var err error
+				if withLabel {
+					err = h.sc.assignPodCIDRsForNodeWithLabel(t.Context(), h.cached, h.sites, "site-a")
+				} else {
+					err = h.sc.assignPodCIDRsForNode(t.Context(), h.cached, h.sites, "site-a")
+				}
+
+				if err == nil || len(h.patches) != 0 || h.state.allocator.DebugState().AllocatedCount != 0 {
+					t.Fatalf("stale snapshot allowed allocation: err=%v patches=%d", err, len(h.patches))
+				}
+			})
+		}
+	}
+}
 
 func TestAllocatorGenerationHeldThroughPatch(t *testing.T) {
 	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
@@ -156,6 +196,7 @@ func newPodCIDRTestHarness(t *testing.T, liveNode *corev1.Node) *podCIDRTestHarn
 		clientset:            client,
 		nodeLister:           corev1listers.NewNodeLister(nodeIndexer),
 		assignmentAllocators: map[string]*assignmentAllocator{assignmentKey(site.Name, 0): state},
+		sitesCache:           []unboundedv1alpha3.Site{site},
 	}
 	sc.hasSynced.Store(true)
 	sc.allocatorsReady.Store(true)

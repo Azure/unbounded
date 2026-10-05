@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"regexp"
 	"sort"
 	"sync"
@@ -499,6 +500,9 @@ func (sc *SiteController) enqueueSiteChange() {
 
 // updateSitesCache updates the cached list of sites from the informer
 func (sc *SiteController) updateSitesCache() {
+	sc.allocationGenerationLock.Lock()
+	defer sc.allocationGenerationLock.Unlock()
+
 	items := sc.siteInformer.GetStore().List()
 	sites := make([]unboundedv1alpha3.Site, 0, len(items))
 
@@ -528,7 +532,7 @@ func (sc *SiteController) updateSitesCache() {
 	sc.sitesCache = sites
 	sc.sitesCacheLock.Unlock()
 
-	sc.updateAssignmentAllocators(sites)
+	sc.updateAssignmentAllocatorsLocked(sites)
 
 	// Validate that no sites have overlapping CIDRs
 	if err := validateSiteCIDRsNoOverlap(sites); err != nil {
@@ -626,6 +630,11 @@ func (sc *SiteController) updateAssignmentAllocators(sites []unboundedv1alpha3.S
 	sc.allocationGenerationLock.Lock()
 	defer sc.allocationGenerationLock.Unlock()
 
+	sc.updateAssignmentAllocatorsLocked(sites)
+}
+
+// Caller holds allocationGenerationLock for writing.
+func (sc *SiteController) updateAssignmentAllocatorsLocked(sites []unboundedv1alpha3.Site) {
 	enabledAssignments := sc.collectEnabledAssignments(sites)
 
 	desired := make(map[string]assignmentRef, len(enabledAssignments))
@@ -1946,6 +1955,13 @@ func (sc *SiteController) selectAssignmentForNode(site unboundedv1alpha3.Site, n
 }
 
 func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev1.Node, sites []unboundedv1alpha3.Site, siteName string) error {
+	sc.allocationGenerationLock.RLock()
+	defer sc.allocationGenerationLock.RUnlock()
+
+	if err := sc.validateSiteSnapshot(sites); err != nil {
+		return err
+	}
+
 	if !sc.hasSynced.Load() {
 		return fmt.Errorf("informer caches not synced; refusing pod CIDR assignment for node %s", node.Name)
 	}
@@ -1991,7 +2007,7 @@ func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev
 		return nil
 	}
 
-	return sc.allocateAndPatchNodePodCIDRs(ctx, node.Name, state, "")
+	return sc.allocateAndPatchNodePodCIDRsLocked(ctx, node.Name, state, "")
 }
 
 func findDuplicateNodePodCIDRs(nodes []*corev1.Node) map[string][]string {
@@ -2230,6 +2246,11 @@ func (sc *SiteController) allocateAndPatchNodePodCIDRs(ctx context.Context, node
 	sc.allocationGenerationLock.RLock()
 	defer sc.allocationGenerationLock.RUnlock()
 
+	return sc.allocateAndPatchNodePodCIDRsLocked(ctx, nodeName, state, siteName)
+}
+
+// Caller holds allocationGenerationLock for reading.
+func (sc *SiteController) allocateAndPatchNodePodCIDRsLocked(ctx context.Context, nodeName string, state *assignmentAllocator, siteName string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		liveNode, err := sc.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
@@ -2514,6 +2535,13 @@ func (sc *SiteController) patchNodePodCIDRs(ctx context.Context, nodeName, resou
 // assignPodCIDRsForNodeWithLabel combines site labeling and pod CIDR assignment
 // into a single API call for new nodes that need both.
 func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, node *corev1.Node, sites []unboundedv1alpha3.Site, siteName string) error {
+	sc.allocationGenerationLock.RLock()
+	defer sc.allocationGenerationLock.RUnlock()
+
+	if err := sc.validateSiteSnapshot(sites); err != nil {
+		return err
+	}
+
 	if !sc.hasSynced.Load() {
 		return fmt.Errorf("informer caches not synced; refusing pod CIDR assignment for node %s", node.Name)
 	}
@@ -2552,7 +2580,18 @@ func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, no
 		return nil
 	}
 
-	return sc.allocateAndPatchNodePodCIDRs(ctx, node.Name, state, siteName)
+	return sc.allocateAndPatchNodePodCIDRsLocked(ctx, node.Name, state, siteName)
+}
+
+func (sc *SiteController) validateSiteSnapshot(sites []unboundedv1alpha3.Site) error {
+	sc.sitesCacheLock.RLock()
+	defer sc.sitesCacheLock.RUnlock()
+
+	if !reflect.DeepEqual(sites, sc.sitesCache) {
+		return fmt.Errorf("site configuration changed; retry reconciliation")
+	}
+
+	return nil
 }
 
 // markSlicesDirty signals that SiteNodeSlice objects need rebuilding.
