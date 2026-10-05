@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -194,11 +195,7 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 		}
 
 		licenseNames, classifyErr := license.Classify(licenseText)
-		if classifyErr != nil {
-			if licenseIndex(licensePath, licenseText, licensePaths) {
-				continue
-			}
-
+		if classifyErr != nil && !licenseIndex(licensePath, licenseText, licensePaths) {
 			return notice.Entry{}, fmt.Errorf("classifying %s: %w", licensePath, classifyErr)
 		}
 
@@ -255,19 +252,44 @@ func declaredLicenses(expression, link string) []notice.License {
 	return licenses
 }
 
-// Some crates use LICENSE only as an index. Companion texts still fail closed.
+// The rustls family uses this exact index instead of license terms. Only its
+// known subjects and body (apart from whitespace) are accepted. Every referenced
+// companion must exist and is still classified separately. An optional leading
+// attribution is retained by buildEntry, not discarded with the index.
+const rustlsLicenseIndex = `is distributed under the following three licenses:
+- Apache License version 2.0.
+- MIT license.
+- ISC license.
+These are included as LICENSE-APACHE, LICENSE-MIT and LICENSE-ISC
+respectively. You may use this software under the terms of any
+of these licenses, at your option.`
+
+var indexCopyright = regexp.MustCompile(`^Copyright (?:\(c\) |© )?[0-9]{4}(?:-[0-9]{4})? .+$`)
+
 func licenseIndex(path string, text []byte, paths []string) bool {
-	if filepath.Base(path) != "LICENSE" || len(paths) < 2 {
+	if filepath.Base(path) != "LICENSE" {
 		return false
 	}
 
-	for _, companion := range paths {
-		if companion == path {
-			continue
+	body := strings.TrimSpace(string(text))
+	for {
+		line, rest, found := strings.Cut(body, "\n")
+		if !found || !indexCopyright.MatchString(strings.TrimSpace(line)) {
+			break
 		}
 
-		name := filepath.Base(companion)
-		if !strings.HasPrefix(name, "LICENSE-") || !strings.Contains(string(text), name) {
+		body = strings.TrimSpace(rest)
+	}
+
+	body = strings.Join(strings.Fields(body), " ")
+
+	known := strings.Join(strings.Fields(rustlsLicenseIndex), " ")
+	if body != "Rustls "+known && body != "rustls-pemfile "+known {
+		return false
+	}
+
+	for _, name := range []string{"LICENSE-APACHE", "LICENSE-MIT", "LICENSE-ISC"} {
+		if !slices.Contains(paths, filepath.Join(filepath.Dir(path), name)) {
 			return false
 		}
 	}
@@ -346,7 +368,7 @@ func directDependencies(data string) (map[string]dependency, error) {
 }
 
 func collectDependencyTables(tables map[string]any, direct map[string]dependency) error {
-	for _, section := range []string{"dependencies", "build-dependencies"} {
+	for _, section := range []string{"dependencies", "build-dependencies", "dev-dependencies"} {
 		value, exists := tables[section]
 		if !exists {
 			continue
@@ -358,6 +380,24 @@ func collectDependencyTables(tables map[string]any, direct map[string]dependency
 		}
 
 		for alias, value := range deps {
+			// Cargo can implicitly enroll path dependencies as workspace members,
+			// even through development edges. Retain those paths for validation,
+			// but never collect registry development dependencies for NOTICE.
+			if section == "dev-dependencies" {
+				spec, ok := value.(map[string]any)
+				if !ok {
+					continue
+				}
+
+				if _, inherited := spec["workspace"]; inherited {
+					return fmt.Errorf("dependency %s: workspace inheritance is not supported", alias)
+				}
+
+				if _, local := spec["path"]; !local {
+					continue
+				}
+			}
+
 			name := alias
 
 			switch value := value.(type) {

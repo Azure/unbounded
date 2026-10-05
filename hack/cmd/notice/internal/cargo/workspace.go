@@ -104,6 +104,8 @@ func workspaceVersions(root string) (map[string]string, error) {
 			return nil, fmt.Errorf("parsing %s: %w", path, err)
 		}
 
+		// Includes development path edges for membership validation only;
+		// lockedPackageVersions excludes all local paths from registry notices.
 		for _, dep := range direct {
 			if dep.localPath != "" {
 				local := filepath.Clean(filepath.Join(member, dep.localPath))
