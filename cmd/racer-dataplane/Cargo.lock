@@ -606,6 +606,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "peer-wire"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "http1",
+ "racer-control-wire",
+ "racer-crypto",
+ "sha2",
+ "uring-runtime",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -714,6 +726,7 @@ dependencies = [
  "io-uring",
  "libc",
  "page-alloc",
+ "peer-wire",
  "racer-control-wire",
  "racer-crypto",
  "rcgen",

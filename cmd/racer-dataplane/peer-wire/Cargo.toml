@@ -1,0 +1,21 @@
+[package]
+name = "peer-wire"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Signed peer heads, ordered sessions, and forwarding proofs"
+
+[features]
+test-util = []
+
+[dependencies]
+http1 = { path = "../http" }
+racer-crypto = { path = "../crypto" }
+racer-control-wire = { path = "../control-wire" }
+uring-runtime = { path = "../runtime" }
+base64 = "0.22"
+sha2 = "0.10"
+
+[dev-dependencies]
+racer-crypto = { path = "../crypto", features = ["test-util"] }
+uring-runtime = { path = "../runtime", features = ["simulation", "test-util"] }
