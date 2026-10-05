@@ -4,18 +4,24 @@ use super::*;
 use std::ffi::CString;
 use zeroize::Zeroize;
 mod operations;
-pub use operations::{Durability, Replacement};
+pub use operations::{Durability, ReadBuffer, Replacement, ReplacementError};
 mod chunked;
-pub use chunked::publish_new;
+mod publish;
+pub use publish::publish_new;
+#[cfg(test)]
+mod kernel_tests;
 #[cfg(all(test, feature = "simulation"))]
 mod operations_tests;
 pub mod secure;
 #[cfg(all(test, feature = "simulation"))]
 mod secure_tests;
+#[cfg(test)]
+mod test_support;
 
 pub struct Buffer {
     data: Vec<u8>,
     start: usize,
+    end: usize,
     _quota: Charge,
 }
 #[cfg(test)]
@@ -36,6 +42,8 @@ mod partial_tests {
         assert!(r.admission.used(ResourceClass::RequestContext) >= baseline + 6);
         b.advance(2).unwrap();
         assert_eq!(b.bytes().unwrap(), b"cdef");
+        assert_eq!(b.prefix(2).unwrap(), b"cd");
+        assert_eq!(b.prefix(5), Err(Error::Io));
         assert_eq!(b.advance(0), Err(Error::Io));
         assert_eq!(b.advance(5), Err(Error::Io));
         b.advance(4).unwrap();
@@ -110,10 +118,10 @@ mod partial_tests {
 unsafe impl IoBuffer for Buffer {
     type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
-        Ok(&self.data[self.start..])
+        Ok(&self.data[self.start..self.end])
     }
     fn bytes_mut(&mut self) -> Result<&mut [u8]> {
-        Ok(&mut self.data[self.start..])
+        Ok(&mut self.data[self.start..self.end])
     }
 }
 impl Drop for Buffer {
@@ -123,37 +131,83 @@ impl Drop for Buffer {
 }
 impl Buffer {
     pub fn advance(&mut self, n: usize) -> Result<()> {
-        if n == 0 || n > self.data.len() - self.start {
+        if n == 0 || n > self.remaining() {
             return Err(Error::Io);
         }
         self.start += n;
         Ok(())
     }
     pub fn remaining(&self) -> usize {
-        self.data.len() - self.start
+        self.end - self.start
     }
     pub fn prefix(&self, n: usize) -> Result<&[u8]> {
-        self.data.get(..n).ok_or(Error::Io)
+        self.bytes()?.get(..n).ok_or(Error::Io)
     }
 }
-fn value<E: From<Error>>(result: Result<KernelResult, E>) -> Result<i32, E> {
-    match result? {
-        KernelResult::Value(n) if n >= 0 => Ok(n),
-        KernelResult::Value(n) if n == -libc::ENOENT => Err(Error::NotFound.into()),
-        KernelResult::Value(n) if n == -libc::EEXIST => Err(Error::AlreadyExists.into()),
-        KernelResult::Value(n) if n == -libc::ECANCELED => Err(Error::Cancelled.into()),
-        _ => Err(Error::Io.into()),
+// Linux's pathname syscall limit includes the terminating NUL. Filesystems may
+// impose smaller component limits (for example NAME_MAX=255).
+const PATH_BYTES: usize = 4095;
+
+// Unlike CString's Box backing, moving this Vec owner does not retag the pointee.
+// Never resize or expose mutation after an SQE has borrowed its pointer.
+struct PathArg(Vec<u8>);
+#[cfg(test)]
+mod memory_tests;
+
+impl PathArg {
+    fn new(path: CString) -> Self {
+        Self(path.into_bytes_with_nul())
     }
+    fn as_ptr(&self) -> *const libc::c_char {
+        self.0.as_ptr().cast()
+    }
+    #[cfg(feature = "simulation")]
+    fn simulated(&self) -> CString {
+        CString::from_vec_with_nul(self.0.clone()).expect("validated path")
+    }
+}
+
+fn open_flags(flags: i32) -> Result<(i32, u64)> {
+    if flags & libc::O_PATH != 0 {
+        // openat2 rejects access/creation flags and NONBLOCK with O_PATH.
+        if flags & !(libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW) != 0 {
+            return Err(Error::InvalidInput);
+        }
+        return Ok((flags | libc::O_CLOEXEC, 0));
+    }
+    let tmpfile = flags & libc::O_TMPFILE == libc::O_TMPFILE;
+    if (tmpfile && flags & libc::O_ACCMODE == libc::O_RDONLY)
+        || flags & libc::O_ACCMODE == libc::O_ACCMODE
+    {
+        return Err(Error::InvalidInput);
+    }
+    Ok((
+        flags | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        if flags & libc::O_CREAT != 0 || tmpfile {
+            0o600
+        } else {
+            0
+        },
+    ))
+}
+fn value<E: From<Error>>(result: Result<KernelResult, E>) -> Result<i32, E> {
+    result?.value().map_err(Into::into)
 }
 impl<S: Scope, B: Budget> Reactor<S, B> {
     pub fn file_buffer(&self, length: usize) -> Result<Buffer> {
-        if length > 1024 * 1024 {
+        // SQE read/write lengths are u32, not an application-specific 1 MiB cap.
+        if length > u32::MAX as usize {
             return Err(Error::Overloaded);
         }
         let quota = self.charge(length)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(length)
+            .map_err(|_| Error::Overloaded)?;
+        data.resize(length, 0);
         Ok(Buffer {
-            data: vec![0; length],
+            data,
             start: 0,
+            end: length,
             _quota: quota,
         })
     }
@@ -164,6 +218,10 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     }
     /// Open results use the same FD-owning CQE variant as accept, including when
     /// cancellation wins after a successful open. No integer FD can leak on drop.
+    /// This secure convenience API creates owner-only files (0600, reduced by
+    /// umask); callers needing other modes must prepare their descriptor separately.
+    /// O_PATH accepts only DIRECTORY/NOFOLLOW/CLOEXEC, without forced NONBLOCK.
+    /// Linux's 4096-byte path limit includes NUL; filesystem NAME_MAX still applies.
     pub fn file_open<'a>(
         &'a self,
         dir: Option<Rc<Descriptor>>,
@@ -173,21 +231,23 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         scope: &'a S,
     ) -> Operation<'a, Rc<Descriptor>, S::Error> {
         Box::pin(async move {
-            if path.as_bytes().len() > 4096 {
+            if path.as_bytes().len() > PATH_BYTES {
                 return Err(Error::InvalidInput.into());
             }
+            let (flags, mode) = open_flags(flags)?;
             let quota = self.charge(path.as_bytes().len() + 128)?;
+            let path = PathArg::new(path);
             let how = SyscallArg::new(
                 types::OpenHow::new()
-                    .flags((flags | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64)
-                    .mode(if flags & libc::O_CREAT != 0 { 0o600 } else { 0 })
+                    .flags(flags as u64)
+                    .mode(mode)
                     .resolve(resolve),
             );
             let sqe = submission!(
                 self,
                 simulation::Op::Open {
                     dir: dir.clone(),
-                    path: path.clone(),
+                    path: path.simulated(),
                     flags,
                     resolve
                 },
@@ -271,13 +331,23 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         name: CString,
         scope: &'a S,
     ) -> Operation<'a, (), S::Error> {
+        self.file_mkdir_inner(dir, name, false, scope)
+    }
+    fn file_mkdir_inner<'a>(
+        &'a self,
+        dir: Rc<Descriptor>,
+        name: CString,
+        allow_exists: bool,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
             let quota = self.file_path_quota(&[&name])?;
+            let name = PathArg::new(name);
             let sqe = submission!(
                 self,
                 simulation::Op::Mkdir {
                     dir: dir.clone(),
-                    name: name.clone()
+                    name: name.simulated()
                 },
                 opcode::MkDirAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
                     .mode(0o700)
@@ -286,6 +356,11 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             );
             self.submit(sqe, scope, false, move |result| {
                 drop((dir, name, quota));
+                if allow_exists
+                    && matches!(result, Ok(KernelResult::Value(n)) if n == -libc::EEXIST)
+                {
+                    return Ok(());
+                }
                 value(result).map(|_| ())
             })?
             .await
@@ -300,12 +375,14 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
             let quota = self.file_path_quota(&[&from, &to])?;
+            let from = PathArg::new(from);
+            let to = PathArg::new(to);
             let sqe = submission!(
                 self,
                 simulation::Op::Rename {
                     dir: dir.clone(),
-                    from: from.clone(),
-                    to: to.clone()
+                    from: from.simulated(),
+                    to: to.simulated()
                 },
                 opcode::RenameAt::new(
                     types::Fd(dir.as_raw_fd()),
@@ -329,13 +406,23 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         name: CString,
         scope: &'a S,
     ) -> Operation<'a, (), S::Error> {
+        self.file_unlink_inner(dir, name, false, scope)
+    }
+    fn file_unlink_inner<'a>(
+        &'a self,
+        dir: Rc<Descriptor>,
+        name: CString,
+        allow_absent: bool,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
             let quota = self.file_path_quota(&[&name])?;
+            let name = PathArg::new(name);
             let sqe = submission!(
                 self,
                 simulation::Op::Unlink {
                     dir: dir.clone(),
-                    name: name.clone()
+                    name: name.simulated()
                 },
                 opcode::UnlinkAt::new(types::Fd(dir.as_raw_fd()), name.as_ptr())
                     .build()
@@ -343,13 +430,18 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             );
             self.submit(sqe, scope, false, move |result| {
                 drop((dir, name, quota));
+                if allow_absent
+                    && matches!(result, Ok(KernelResult::Value(n)) if n == -libc::ENOENT)
+                {
+                    return Ok(());
+                }
                 value(result).map(|_| ())
             })?
             .await
         })
     }
     fn file_path_quota(&self, paths: &[&CString]) -> Result<Charge> {
-        if paths.iter().any(|p| p.as_bytes().len() > 4096) {
+        if paths.iter().any(|p| p.as_bytes().len() > PATH_BYTES) {
             return Err(Error::InvalidInput);
         }
         self.charge(paths.iter().map(|p| p.as_bytes_with_nul().len()).sum())

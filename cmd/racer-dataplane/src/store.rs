@@ -218,7 +218,7 @@ impl StoreReader {
                 .await
             {
                 Ok(b) => b,
-                Err(error @ (Error::Io | Error::CorruptRecord)) => {
+                Err(error @ (Error::Io | Error::Os(_) | Error::CorruptRecord)) => {
                     if error == Error::CorruptRecord {
                         self.corrupt_miss();
                     }
@@ -653,6 +653,7 @@ impl StoreWriter {
                         error,
                         Error::Overloaded
                             | Error::Io
+                            | Error::Os(_)
                             | Error::Unavailable
                             | Error::MissingKey
                             | Error::Cancelled

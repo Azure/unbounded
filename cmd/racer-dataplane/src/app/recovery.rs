@@ -84,7 +84,44 @@ impl WorkerApplication {
                 cut.publishing = true;
                 let shards = std::mem::take(&mut cut.shards);
                 drop(cut);
-                publication = Some(self.store.checkpoint.publish(shards));
+                publication = Some(Box::pin(async move {
+                    // Drain has fenced the periodic task on every shard. Reuse its
+                    // recovered sequence/slot rather than scanning or publishing
+                    // checkpoint files synchronously on the worker thread.
+                    let (sequence, slot) = {
+                        let mut periodic = node
+                            .periodic_checkpoint
+                            .lock()
+                            .map_err(|_| Error::Unavailable)?;
+                        let sequence = periodic
+                            .last_sequence
+                            .checked_add(1)
+                            .ok_or(Error::Unavailable)?;
+                        let slot = if periodic.last_sequence == 0 {
+                            0
+                        } else {
+                            periodic.last_slot ^ 1
+                        };
+                        periodic.last_sequence = sequence;
+                        (sequence, slot)
+                    };
+                    self.store
+                        .checkpoint
+                        .publish_async(
+                            shards,
+                            self.runtime.reactor.clone(),
+                            deadline.clone(),
+                            sequence,
+                            slot,
+                            self.checkpoint_budget,
+                        )?
+                        .await?;
+                    node.periodic_checkpoint
+                        .lock()
+                        .map_err(|_| Error::Unavailable)?
+                        .last_slot = slot;
+                    Ok(())
+                }));
             }
             cx.waker().wake_by_ref();
             Poll::Pending

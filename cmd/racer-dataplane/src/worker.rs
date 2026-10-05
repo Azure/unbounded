@@ -721,10 +721,19 @@ struct IoService {
 }
 impl Service<RequestScope> for IoService {
     fn set_failure_reporter(&mut self, reporter: FailureReporter<Error>) {
+        if let Ok(service) = &mut self.built {
+            service.set_failure_reporter(reporter.clone());
+        }
         self.reporter = Some(reporter);
     }
     fn waker(&self) -> Result<Waker> {
         driver_waker(Some(&self.runtime))
+    }
+    fn register_driver(&self, waker: &Waker) {
+        self.runtime.crypto.register_driver(waker);
+        if let Ok(service) = &self.built {
+            service.register_driver(waker);
+        }
     }
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         match &mut self.built {
@@ -759,10 +768,28 @@ impl Service<RequestScope> for IoService {
         }
     }
     fn close(&mut self) -> Result<()> {
-        self.runtime.crypto.close_submissions()
+        let inner = match &mut self.built {
+            Ok(service) => service.close(),
+            Err(_) => Ok(()),
+        };
+        let runtime = self.runtime.crypto.close_submissions();
+        inner.and(runtime)
     }
     fn fence<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        fence_runtime(&self.runtime, scope, self.reporter.as_ref())
+        let runtime = fence_runtime(&self.runtime, scope, self.reporter.as_ref());
+        match &mut self.built {
+            Ok(service) => {
+                let inner =
+                    drive_local(service.fence(scope), &self.runtime, self.reporter.as_ref());
+                Box::pin(async move {
+                    // Neither an error nor a pending independent resource may skip
+                    // the other owner's fence. Keep driving both to completion.
+                    let (inner, runtime) = futures::join!(inner, runtime);
+                    inner.and(runtime)
+                })
+            }
+            Err(_) => runtime,
+        }
     }
     fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         match &mut self.built {
@@ -2485,6 +2512,7 @@ mod tests {
             use std::sync::atomic::AtomicUsize;
             use std::sync::atomic::Ordering;
             struct BackendFactory {
+                resources: Resources,
                 sibling_started: Arc<AtomicBool>,
                 sibling_drained: Arc<AtomicBool>,
                 fences: Arc<AtomicUsize>,
@@ -2500,14 +2528,21 @@ mod tests {
             }
             impl Factory<RequestScope> for BackendFactory {
                 fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
-                    Ok(Box::new(BackendService {
-                        sibling_started: self.sibling_started.clone(),
-                        lane,
-                        reporter: None,
-                        sibling_drained: self.sibling_drained.clone(),
-                        fences: self.fences.clone(),
-                        fail_wait: self.fail_wait,
-                    }))
+                    self.resources.build_lane(lane, |_, _| {
+                        Ok(Box::new(BackendService {
+                            sibling_started: self.sibling_started.clone(),
+                            lane,
+                            reporter: None,
+                            sibling_drained: self.sibling_drained.clone(),
+                            fences: self.fences.clone(),
+                            fail_wait: self.fail_wait,
+                        }))
+                    })
+                }
+                fn build_helper(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+                    self.resources.build_helper(lane, |_, runtime| {
+                        Ok(Box::new(crate::security::PageCryptoEngine::new(runtime)))
+                    })
                 }
             }
             impl Service<RequestScope> for BackendService {
@@ -2572,6 +2607,12 @@ mod tests {
             for fail_wait in [false, true] {
                 let cpu = *current_cpus().unwrap().first().unwrap();
                 let factory = Arc::new(BackendFactory {
+                    resources: Resources::new(
+                        crate::test_support::cluster::config(false).limits,
+                        vec![WorkerId(0), WorkerId(1)],
+                        1,
+                    )
+                    .unwrap(),
                     sibling_started: Arc::default(),
                     sibling_drained: Arc::default(),
                     fences: Arc::default(),
@@ -2584,8 +2625,12 @@ mod tests {
                             cpu,
                         })
                         .collect(),
-                    helpers: Vec::new(),
-                    max_threads: 3,
+                    helpers: vec![Helper {
+                        name: "failure-helper".into(),
+                        cpu,
+                        lanes: vec![0, 1],
+                    }],
+                    max_threads: 4,
                 });
                 let scope =
                     RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
@@ -2596,7 +2641,7 @@ mod tests {
                     started.elapsed() < Duration::from_secs(1),
                     "backend failure must not wait for the startup deadline"
                 );
-                assert_eq!(group.stats().done, 2);
+                assert_eq!(group.stats().done, 3);
                 assert_eq!(factory.fences.load(Ordering::SeqCst), 4);
             }
         }
@@ -2607,21 +2652,50 @@ mod tests {
             use std::sync::atomic::AtomicUsize;
             use std::sync::atomic::Ordering;
             struct PendingFactory {
+                resources: Resources,
                 release: Arc<AtomicBool>,
                 fences: Arc<AtomicUsize>,
+                closes: Arc<AtomicUsize>,
+                drivers: Arc<AtomicUsize>,
+                drops: Arc<AtomicUsize>,
+                pending_fence: bool,
             }
             struct PendingDrain {
+                owner: thread::ThreadId,
                 release: Arc<AtomicBool>,
                 fences: Arc<AtomicUsize>,
                 reporter: Option<FailureReporter<Error>>,
+                closes: Arc<AtomicUsize>,
+                drivers: Arc<AtomicUsize>,
+                drops: Arc<AtomicUsize>,
+                pending_fence: bool,
             }
             impl Factory<RequestScope> for PendingFactory {
-                fn build_lane(&self, _: usize) -> Result<Box<dyn Service<RequestScope>>> {
-                    Ok(Box::new(PendingDrain {
-                        release: self.release.clone(),
-                        fences: self.fences.clone(),
-                        reporter: None,
-                    }))
+                fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+                    self.resources.build_lane(lane, |_, _| {
+                        Ok(Box::new(PendingDrain {
+                            owner: thread::current().id(),
+                            release: self.release.clone(),
+                            fences: self.fences.clone(),
+                            reporter: None,
+                            closes: self.closes.clone(),
+                            drivers: self.drivers.clone(),
+                            drops: self.drops.clone(),
+                            pending_fence: self.pending_fence,
+                        }))
+                    })
+                }
+                fn build_helper(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+                    self.resources.build_helper(lane, |_, runtime| {
+                        Ok(Box::new(crate::security::PageCryptoEngine::new(runtime)))
+                    })
+                }
+            }
+            impl Drop for PendingDrain {
+                fn drop(&mut self) {
+                    assert_eq!(thread::current().id(), self.owner);
+                    assert!(self.release.load(Ordering::SeqCst));
+                    self.drops.fetch_add(1, Ordering::SeqCst);
                 }
             }
             impl Service<RequestScope> for PendingDrain {
@@ -2631,10 +2705,16 @@ mod tests {
                 fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
                     Box::pin(async { Ok(()) })
                 }
+                fn register_driver(&self, _: &Waker) {
+                    self.drivers.fetch_add(1, Ordering::SeqCst);
+                }
                 fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                     Ok(())
                 }
                 fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                    if self.pending_fence {
+                        return Box::pin(async { Ok(()) });
+                    }
                     let release = self.release.clone();
                     drive_local_with(
                         Box::pin(std::future::poll_fn(move |_| {
@@ -2650,49 +2730,96 @@ mod tests {
                     )
                 }
                 fn fence<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                    if self.pending_fence {
+                        let release = self.release.clone();
+                        let fences = self.fences.clone();
+                        let reporter = self.reporter.clone();
+                        return Box::pin(std::future::poll_fn(move |_| {
+                            if release.load(Ordering::SeqCst) {
+                                fences.fetch_add(1, Ordering::SeqCst);
+                                Poll::Ready(Ok(()))
+                            } else {
+                                reporter
+                                    .as_ref()
+                                    .expect("forwarded reporter")
+                                    .report(Error::Io);
+                                Poll::Pending
+                            }
+                        }));
+                    }
                     Box::pin(async move {
                         assert!(self.release.load(Ordering::SeqCst));
                         self.fences.fetch_add(1, Ordering::SeqCst);
                         Ok(())
                     })
                 }
+                fn close(&mut self) -> Result<()> {
+                    self.closes.fetch_add(1, Ordering::SeqCst);
+                    // The outer crypto queue must still close on an inner error.
+                    if self.pending_fence {
+                        Ok(())
+                    } else {
+                        Err(Error::Io)
+                    }
+                }
                 fn shutdown<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
                     Box::pin(async { Ok(()) })
                 }
             }
-            let cpu = *current_cpus().unwrap().first().unwrap();
-            let factory = Arc::new(PendingFactory {
-                release: Arc::default(),
-                fences: Arc::default(),
-            });
-            let mut group = Group::new(Plan {
-                lanes: vec![Lane {
-                    name: "pending-drain".into(),
-                    cpu,
-                }],
-                helpers: Vec::new(),
-                max_threads: 2,
-            });
-            let scope =
-                RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
-                    .unwrap();
-            group.start(factory.clone(), &scope).unwrap();
-            let started = Instant::now();
-            let result = group.drain(&scope);
-            let elapsed = started.elapsed();
-            let before = group.stats();
-            let fences_before = factory.fences.load(Ordering::SeqCst);
-            // Release before assertions so a failed regression cannot hang Drop.
-            factory.release.store(true, Ordering::SeqCst);
-            let joined = group.join();
-            assert_eq!(result, Err(Error::Io));
-            assert!(elapsed < Duration::from_secs(1));
-            assert_eq!(before.drained, 0);
-            assert_eq!(before.done, 0);
-            assert_eq!(fences_before, 0);
-            assert_eq!(joined, Err(Error::Io));
-            assert_eq!(factory.fences.load(Ordering::SeqCst), 2);
-            assert_eq!(group.stats().done, 1);
+            for pending_fence in [false, true] {
+                let cpu = *current_cpus().unwrap().first().unwrap();
+                let factory = Arc::new(PendingFactory {
+                    resources: Resources::new(
+                        crate::test_support::cluster::config(false).limits,
+                        vec![WorkerId(0)],
+                        1,
+                    )
+                    .unwrap(),
+                    release: Arc::default(),
+                    fences: Arc::default(),
+                    closes: Arc::default(),
+                    drivers: Arc::default(),
+                    drops: Arc::default(),
+                    pending_fence,
+                });
+                let mut group = Group::new(Plan {
+                    lanes: vec![Lane {
+                        name: "pending-drain".into(),
+                        cpu,
+                    }],
+                    helpers: vec![Helper {
+                        name: "pending-helper".into(),
+                        cpu,
+                        lanes: vec![0],
+                    }],
+                    max_threads: 3,
+                });
+                let scope =
+                    RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
+                        .unwrap();
+                group.start(factory.clone(), &scope).unwrap();
+                let started = Instant::now();
+                let result = group.drain(&scope);
+                let elapsed = started.elapsed();
+                let before = group.stats();
+                let fences_before = factory.fences.load(Ordering::SeqCst);
+                let drops_before = factory.drops.load(Ordering::SeqCst);
+                // Release before assertions so a failed regression cannot hang Drop.
+                factory.release.store(true, Ordering::SeqCst);
+                let joined = group.join();
+                assert_eq!(result, Err(Error::Io));
+                assert!(elapsed < Duration::from_secs(1));
+                assert_eq!(before.drained, 0);
+                assert!(before.done < 2);
+                assert_eq!(fences_before, 0);
+                assert_eq!(drops_before, 0);
+                assert_eq!(joined, Err(Error::Io));
+                assert_eq!(factory.fences.load(Ordering::SeqCst), 2);
+                assert_eq!(group.stats().done, 2);
+                assert_eq!(factory.drops.load(Ordering::SeqCst), 1);
+                assert!(factory.closes.load(Ordering::SeqCst) > 0);
+                assert!(factory.drivers.load(Ordering::SeqCst) > 0);
+            }
         }
 
         #[test]

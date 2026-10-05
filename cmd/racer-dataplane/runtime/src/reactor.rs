@@ -7,8 +7,8 @@
 //! must both finish. Shutdown must fence kernel access before dropping the table.
 //! The worker drives CQEs explicitly. Operation futures never run an executor.
 //!
-//! Degraded shutdown: a fatal driver error during Drop cannot establish a kernel
-//! fence. In that case the bounded ring and its resource owners are deliberately
+//! Degraded shutdown: a fatal driver error or expired Drop wait cannot establish a
+//! kernel fence. In that case the bounded ring and its resource owners are deliberately
 //! leaked for memory safety; shutdown is not successfully fenced. Explicit worker
 //! shutdown must keep driving its fence and report failures rather than rely on Drop.
 
@@ -26,7 +26,8 @@ macro_rules! submission {
     ($reactor:expr, $sim:expr, $real:expr) => {{
         #[cfg(feature = "simulation")]
         {
-            if $reactor.state.borrow().simulation.is_some() {
+            let simulated = $reactor.state.borrow().simulation.is_some();
+            if simulated {
                 Submission::Sim($sim)
             } else {
                 Submission::Real($real)
@@ -109,17 +110,23 @@ impl Drop for SubmissionSlot {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct IoId(pub u64);
+struct IoId(u64);
 
 /// An owned address; the encoded sockaddr remains pinned in the in-flight owner.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SocketAddress {
     Inet(SocketAddr),
+    /// Filesystem pathname only. Abstract Unix addresses are unsupported; empty
+    /// paths and embedded NUL bytes are rejected by both backends.
     Unix(PathBuf),
 }
 
 const CANCEL_BIT: u64 = 1 << 63;
 const MAX_WAIT: Duration = Duration::from_millis(10);
+const DROP_WAIT: Duration = Duration::from_millis(100);
+// At most nine data attempts, each separated by a worker-driven CQE. A positive
+// partial result is never replayed. EAGAIN additionally requires a readiness CQE.
+const DATA_RETRIES: usize = 8;
 // Linux UAPI: the only setup flag enabled by init. Unknown flags fail closed.
 const SETUP_CQSIZE: u32 = 1 << 3;
 
@@ -132,6 +139,8 @@ struct State<S: Scope> {
     submit_attempts: usize,
     #[cfg(test)]
     submit_result: Option<std::io::Result<usize>>,
+    #[cfg(test)]
+    completions: std::collections::VecDeque<(u64, KernelResult)>,
     ring_reservation: Option<Charge>,
     entries: BTreeMap<IoId, Entry<S>>,
     next: u64,
@@ -145,6 +154,11 @@ struct FenceWaiter {
     waker: Waker,
     _reservation: Charge,
 }
+impl FenceWaiter {
+    fn wake(self) {
+        self.waker.wake();
+    }
+}
 
 struct Fence<'a, S: Scope, B: Budget> {
     reactor: &'a Reactor<S, B>,
@@ -157,11 +171,13 @@ impl<S: Scope, B: Budget> Future for Fence<'_, S, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        let cancelled = Error::Cancelled.into();
+        let waker = cx.waker().clone();
         let mut state = this.reactor.state.borrow_mut();
         let pending = match this.target {
             Some(id) => match state.entries.get_mut(&id) {
                 Some(entry) => {
-                    entry.cancel_reason.get_or_insert(Error::Cancelled.into());
+                    entry.cancel_reason.get_or_insert(cancelled);
                     true
                 }
                 None => false,
@@ -172,9 +188,12 @@ impl<S: Scope, B: Budget> Future for Fence<'_, S, B> {
             }
         };
         if !pending {
-            if let Some(id) = this.registration.take() {
-                state.fence_waiters.remove(&(this.target, id));
-            }
+            let removed = this
+                .registration
+                .take()
+                .and_then(|id| state.fence_waiters.remove(&(this.target, id)));
+            drop(state);
+            drop(removed);
             return Poll::Ready(Ok(()));
         }
         if let Some(id) = this.registration {
@@ -182,24 +201,41 @@ impl<S: Scope, B: Budget> Future for Fence<'_, S, B> {
                 .fence_waiters
                 .get_mut(&(this.target, id))
                 .expect("pending fence registration");
-            waiter.waker.clone_from(cx.waker());
+            let old = std::mem::replace(&mut waiter.waker, waker);
+            drop(state);
+            drop(old);
         } else {
             // Separate bounded control registrations support independent callers,
             // including callers using the same executor waker. Drop removes only
             // its own registration. No quota is needed to submit cancellation.
             if state.fence_waiters.len() >= this.reactor.queue_entries {
+                drop(state);
                 return Poll::Ready(Err(Error::Overloaded.into()));
             }
             let Some(next) = state.next_waiter.checked_add(1) else {
+                drop(state);
                 return Poll::Ready(Err(Error::Overloaded.into()));
             };
-            let reservation = this.reactor.charge(std::mem::size_of::<FenceWaiter>())?;
             let id = state.next_waiter;
             state.next_waiter = next;
+            drop(state);
+            let reservation = this.reactor.charge(std::mem::size_of::<FenceWaiter>())?;
+            let mut state = this.reactor.state.borrow_mut();
+            if state.fence_waiters.len() >= this.reactor.queue_entries {
+                drop(state);
+                return Poll::Ready(Err(Error::Overloaded.into()));
+            }
+            let pending = this.target.map_or(!state.entries.is_empty(), |id| {
+                state.entries.contains_key(&id)
+            });
+            if !pending {
+                drop(state);
+                return Poll::Ready(Ok(()));
+            }
             state.fence_waiters.insert(
                 (this.target, id),
                 FenceWaiter {
-                    waker: cx.waker().clone(),
+                    waker,
                     _reservation: reservation,
                 },
             );
@@ -212,11 +248,13 @@ impl<S: Scope, B: Budget> Future for Fence<'_, S, B> {
 impl<S: Scope, B: Budget> Drop for Fence<'_, S, B> {
     fn drop(&mut self) {
         if let Some(id) = self.registration {
-            self.reactor
+            let removed = self
+                .reactor
                 .state
                 .borrow_mut()
                 .fence_waiters
                 .remove(&(self.target, id));
+            drop(removed);
         }
     }
 }
@@ -270,11 +308,19 @@ struct Waiting<T, E> {
 impl<T, E> Future for Waiting<T, E> {
     type Output = Result<T, E>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(result) = self.reply.borrow_mut().result.take() {
+        let result = self.reply.borrow_mut().result.take();
+        if let Some(result) = result {
             Poll::Ready(result)
         } else {
-            *self.signal.waker.borrow_mut() = Some(cx.waker().clone());
-            Poll::Pending
+            let waker = cx.waker().clone();
+            let old = self.signal.waker.borrow_mut().replace(waker);
+            drop(old);
+            // Clone/drop callbacks can drive completions before registration.
+            let result = self.reply.borrow_mut().result.take();
+            match result {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Pending,
+            }
         }
     }
 }
@@ -282,7 +328,8 @@ impl<T, E> Future for Waiting<T, E> {
 impl<T, E> Drop for Waiting<T, E> {
     fn drop(&mut self) {
         self.signal.abandoned.set(true);
-        self.signal.waker.borrow_mut().take();
+        let old = self.signal.waker.borrow_mut().take();
+        drop(old);
     }
 }
 
@@ -292,6 +339,17 @@ enum KernelResult {
 }
 
 impl KernelResult {
+    // Keep errno intact through internal zero-progress retries and the application
+    // error boundary. Never infer retryability from the generic Error::Io.
+    fn io_result(self) -> std::io::Result<i32> {
+        match self {
+            Self::Value(value) if value >= 0 => Ok(value),
+            Self::Value(value) => Err(std::io::Error::from_raw_os_error(
+                value.checked_neg().unwrap_or(libc::EIO),
+            )),
+            Self::Accepted(_) => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        }
+    }
     fn observe_errno(&self, errno: &std::cell::Cell<Option<i32>>) {
         if let Self::Value(value) = self
             && *value < 0
@@ -300,11 +358,7 @@ impl KernelResult {
         }
     }
     fn value(self) -> Result<i32> {
-        match self {
-            Self::Value(value) if value >= 0 => Ok(value),
-            Self::Value(value) if value == -libc::ECANCELED => Err(Error::Cancelled),
-            _ => Err(Error::Io),
-        }
+        self.io_result().map_err(Error::from_io)
     }
 }
 
@@ -314,7 +368,7 @@ struct Entry<S: Scope> {
     // The finish closure owns every FD, buffer, lease and sockaddr backing.
     finish: Finish<S::Error>,
     signal: Rc<Signal>,
-    scope: S,
+    scope: Rc<S>,
     original: Option<KernelResult>,
     accept: bool,
     cancel_reason: Option<S::Error>,
@@ -327,6 +381,9 @@ impl<S: Scope> Entry<S> {
         self.original.is_some() && (!self.cancel_sent || self.cancel_done)
     }
     fn finish(mut self) -> Option<Waker> {
+        if self.cancel_reason.is_none() {
+            self.cancel_reason = self.scope.check().err();
+        }
         let original = self.original.take().expect("original CQE fenced");
         let result = match self.cancel_reason {
             Some(error) => {
@@ -390,6 +447,10 @@ struct InFlight<B: IoBuffer, L: 'static> {
 
 /// Resources return to the caller only after all applicable completion fences.
 /// On error or an abandoned future, the reactor releases them after those fences.
+/// Data I/O retries up to eight zero-progress EINTR/EAGAIN results internally,
+/// retaining owners between attempts. EAGAIN waits for readiness; each attempt
+/// checks scope. Exhaustion returns the last errno and releases the owners.
+/// Positive partial progress returns immediately, never repeats completed bytes.
 pub struct Completion<B: 'static, L: 'static = ()> {
     pub buffer: B,
     pub bytes: usize,
@@ -418,6 +479,8 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 submit_attempts: 0,
                 #[cfg(test)]
                 submit_result: None,
+                #[cfg(test)]
+                completions: Default::default(),
                 ring_reservation: None,
                 entries: BTreeMap::new(),
                 next: 1,
@@ -431,13 +494,14 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
 
     /// Explicit, idempotent kernel resource acquisition. Also called lazily on I/O.
     pub fn init(&self) -> Result<()> {
-        let mut state = self.state.borrow_mut();
+        let state = self.state.borrow();
         if state.stopped {
             return Err(Error::Unavailable);
         }
         if state.ring_reservation.is_some() {
             return Ok(());
         }
+        drop(state);
         let capacity = self.queue_entries;
         if capacity == 0 {
             return Err(Error::InvalidConfiguration);
@@ -456,6 +520,17 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             .and_then(|bytes| bytes.checked_add(8192))
             .ok_or(Error::InvalidConfiguration)?;
         let ring_reservation = self.charge(ring_bytes)?;
+        let mut state = self.state.borrow_mut();
+        // The accounting hook may reenter and initialize or stop the reactor.
+        if state.stopped || state.ring_reservation.is_some() {
+            let stopped = state.stopped;
+            drop(state);
+            return if stopped {
+                Err(Error::Unavailable)
+            } else {
+                Ok(())
+            };
+        }
         #[cfg(feature = "simulation")]
         if state.simulation.is_some() {
             state.ring_reservation = Some(ring_reservation);
@@ -529,14 +604,10 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     ) -> Result<Waiting<T, S::Error>, S::Error> {
         scope.check()?;
         self.init()?;
-        let mut state = self.state.borrow_mut();
-        if state.stopped {
-            return Err(Error::Unavailable.into());
-        }
-        if state.entries.len() >= self.queue_entries {
-            return Err(Error::Overloaded.into());
-        }
+        let scope = Rc::new(scope.clone());
         let bytes = std::mem::size_of::<Entry<S>>()
+            + std::mem::size_of::<S>()
+            + 2 * std::mem::size_of::<usize>()
             + std::mem::size_of::<Reply<T, S::Error>>()
             + std::mem::size_of_val(&finish)
             + std::mem::size_of::<Signal>()
@@ -566,8 +637,22 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             }
             (Rc::new(self.charge(bytes)?), self.ordinary.clone())
         };
+        let mut state = self.state.borrow_mut();
+        if state.stopped {
+            drop(state);
+            return Err(Error::Unavailable.into());
+        }
+        let available = capacity.as_ref().map_or_else(
+            || self.queue_entries - self.reserved.borrow().upgrade().map_or(0, |p| p.capacity),
+            |pool| pool.capacity,
+        );
+        if state.entries.len() >= self.queue_entries || active.get() >= available {
+            drop(state);
+            return Err(Error::Overloaded.into());
+        }
         let id = IoId(state.next);
         if id.0 >= CANCEL_BIT {
+            drop(state);
             return Err(Error::Overloaded.into());
         }
         state.next += 1;
@@ -611,7 +696,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                     waker
                 }),
                 signal: signal.clone(),
-                scope: scope.clone(),
+                scope,
                 original: None,
                 accept,
                 cancel_reason: None,
@@ -622,14 +707,11 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         // SAFETY: the inserted entry owns all SQE backing until both CQEs arrive.
         let published = match sqe {
             #[cfg(feature = "simulation")]
-            Submission::Sim(op) => {
-                state
-                    .simulation
-                    .as_mut()
-                    .expect("simulation selected")
-                    .push(id.0, op);
-                Ok(())
-            }
+            Submission::Sim(op) => state
+                .simulation
+                .as_mut()
+                .expect("simulation selected")
+                .push(id.0, op),
             Submission::Real(sqe) => unsafe {
                 state
                     .ring
@@ -637,16 +719,73 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                     .unwrap()
                     .submission()
                     .push(&sqe.user_data(id.0))
+                    .map_err(|_| ())
             },
         };
         if published.is_err() {
-            state.entries.remove(&id);
+            let entry = state.entries.remove(&id);
+            drop(state);
+            drop(entry);
             return Err(Error::Overloaded.into());
         }
         // Kernel submission is driven by poll_budgeted and by wait before sleeping,
         // including SQEs queued in the intervening service turn. Polling a future
         // only queues work; potentially blocking file operations use ASYNC.
         Ok(Waiting { reply, signal })
+    }
+
+    /// Only read/write/recv/send may use this helper. Connect and filesystem
+    /// mutations have distinct side effects and must not be automatically replayed.
+    async fn retry_data<O: 'static>(
+        &self,
+        mut owned: O,
+        fd: Rc<Descriptor>,
+        scope: &S,
+        capacity: Option<Rc<SubmissionCapacity>>,
+        interest: u32,
+        mut prepare: impl FnMut(&mut O) -> Result<Submission, S::Error>,
+    ) -> Result<(O, usize), S::Error> {
+        for attempt in 0..=DATA_RETRIES {
+            scope.check()?;
+            let sqe = prepare(&mut owned)?;
+            let (returned, result) = self
+                .submit_reserved(sqe, scope, false, capacity.clone(), move |result| {
+                    // Even a failed data CQE returns its owners internally. Scope
+                    // cancellation still wins, but only after both CQE fences.
+                    Ok((owned, result?.value()))
+                })?
+                .await?;
+            owned = returned;
+            let error = match result {
+                Ok(bytes) => return Ok((owned, bytes as usize)),
+                Err(error) => error,
+            };
+            if attempt == DATA_RETRIES || !matches!(error, Error::Os(libc::EINTR | libc::EAGAIN)) {
+                return Err(error.into());
+            }
+            scope.check()?;
+            if error == Error::Os(libc::EAGAIN) {
+                let sqe = submission!(
+                    self,
+                    simulation::Op::Poll {
+                        fd: fd.clone(),
+                        interest
+                    },
+                    opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), interest).build()
+                );
+                // Do not leave the buffer/lease in the waiting future while a
+                // readiness SQE is pending. Abandonment must retain them too.
+                let retained_fd = fd.clone();
+                owned = self
+                    .submit_reserved(sqe, scope, false, capacity.clone(), move |result| {
+                        drop(retained_fd);
+                        result?.value()?;
+                        Ok(owned)
+                    })?
+                    .await?;
+            }
+        }
+        unreachable!("bounded retries return on the final attempt")
     }
 
     fn buffer_io<'a, B: IoBuffer, L: 'static>(
@@ -663,77 +802,94 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     {
         Box::pin(async move {
             scope.check()?;
-            let mut owned = InFlight {
+            if matches!(operation, BufferOperation::Read(offset) | BufferOperation::Write(offset) if offset > i64::MAX as u64)
+            {
+                return Err(Error::InvalidInput.into());
+            }
+            let owned = InFlight {
                 file,
                 buffer,
                 lease,
             };
             // File issue may block on filesystem work; force it off the worker.
             // Socket opcodes use io_uring's native nonblocking issue/poll path.
-            let sqe = submission!(
-                self,
-                {
-                    let bytes = owned.buffer.bytes_mut()?;
-                    u32::try_from(bytes.len()).map_err(|_| Error::InvalidInput)?;
-                    simulation::Op::Buffer {
-                        fd: owned.file.clone(),
-                        operation,
-                        ptr: bytes.as_mut_ptr(),
-                        len: bytes.len(),
-                    }
-                },
-                {
-                    let fd = types::Fd(owned.file.as_raw_fd());
-                    match operation {
-                        BufferOperation::Read(_) | BufferOperation::Recv => {
-                            let bytes = owned.buffer.bytes_mut()?;
-                            let len =
-                                u32::try_from(bytes.len()).map_err(|_| Error::InvalidInput)?;
-                            match operation {
-                                BufferOperation::Read(_) => {
-                                    opcode::Read::new(fd, bytes.as_mut_ptr(), len)
-                                        .offset(offset_or_zero(operation))
-                                        .build()
-                                        .flags(squeue::Flags::ASYNC)
+            let fd = owned.file.clone();
+            let interest = match operation {
+                BufferOperation::Read(_) | BufferOperation::Recv => libc::POLLIN,
+                BufferOperation::Write(_) | BufferOperation::Send => libc::POLLOUT,
+            } as u32;
+            let (owned, bytes) = self
+                .retry_data(owned, fd, scope, capacity, interest, |owned| {
+                    Ok(submission!(
+                        self,
+                        {
+                            let (ptr, len) = match operation {
+                                BufferOperation::Read(_) | BufferOperation::Recv => {
+                                    let bytes = owned.buffer.bytes_mut()?;
+                                    (bytes.as_mut_ptr(), bytes.len())
                                 }
-                                _ => opcode::Recv::new(fd, bytes.as_mut_ptr(), len).build(),
+                                BufferOperation::Write(_) | BufferOperation::Send => {
+                                    let bytes = owned.buffer.bytes()?;
+                                    (bytes.as_ptr().cast_mut(), bytes.len())
+                                }
+                            };
+                            u32::try_from(len).map_err(|_| Error::InvalidInput)?;
+                            simulation::Op::Buffer {
+                                fd: owned.file.clone(),
+                                operation,
+                                ptr,
+                                len,
+                            }
+                        },
+                        {
+                            let fd = types::Fd(owned.file.as_raw_fd());
+                            match operation {
+                                BufferOperation::Read(_) | BufferOperation::Recv => {
+                                    let bytes = owned.buffer.bytes_mut()?;
+                                    let len = u32::try_from(bytes.len())
+                                        .map_err(|_| Error::InvalidInput)?;
+                                    match operation {
+                                        BufferOperation::Read(_) => {
+                                            opcode::Read::new(fd, bytes.as_mut_ptr(), len)
+                                                .offset(offset_or_zero(operation))
+                                                .build()
+                                                .flags(squeue::Flags::ASYNC)
+                                        }
+                                        _ => opcode::Recv::new(fd, bytes.as_mut_ptr(), len).build(),
+                                    }
+                                }
+                                BufferOperation::Write(_) | BufferOperation::Send => {
+                                    let bytes = owned.buffer.bytes()?;
+                                    let len = u32::try_from(bytes.len())
+                                        .map_err(|_| Error::InvalidInput)?;
+                                    match operation {
+                                        BufferOperation::Write(_) => {
+                                            opcode::Write::new(fd, bytes.as_ptr(), len)
+                                                .offset(offset_or_zero(operation))
+                                                .build()
+                                                .flags(squeue::Flags::ASYNC)
+                                        }
+                                        _ => opcode::Send::new(fd, bytes.as_ptr(), len)
+                                            .flags(libc::MSG_NOSIGNAL)
+                                            .build(),
+                                    }
+                                }
                             }
                         }
-                        BufferOperation::Write(_) | BufferOperation::Send => {
-                            let bytes = owned.buffer.bytes()?;
-                            let len =
-                                u32::try_from(bytes.len()).map_err(|_| Error::InvalidInput)?;
-                            match operation {
-                                BufferOperation::Write(_) => {
-                                    opcode::Write::new(fd, bytes.as_ptr(), len)
-                                        .offset(offset_or_zero(operation))
-                                        .build()
-                                        .flags(squeue::Flags::ASYNC)
-                                }
-                                _ => opcode::Send::new(fd, bytes.as_ptr(), len)
-                                    .flags(libc::MSG_NOSIGNAL)
-                                    .build(),
-                            }
-                        }
-                    }
-                }
-            );
-            self.submit_reserved(sqe, scope, false, capacity, move |result| {
-                // Destructure inside the closure to retain the FD even when a
-                // caller drops its own last reference while this I/O is pending.
-                let InFlight {
-                    file,
-                    buffer,
-                    lease,
-                } = owned;
-                drop(file);
-                Ok(Completion {
-                    buffer,
-                    bytes: result?.value()? as usize,
-                    lease,
+                    ))
                 })
-            })?
-            .await
+                .await?;
+            let InFlight {
+                file,
+                buffer,
+                lease,
+            } = owned;
+            drop(file);
+            Ok(Completion {
+                buffer,
+                bytes,
+                lease,
+            })
         })
     }
     /// Transfer the FD, buffer, and any reuse-preventing lease (`()` if none).
@@ -850,31 +1006,40 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         S::Error: From<B::Error>,
     {
         Box::pin(async move {
-            scope.check()?;
-            let bytes = buffer.send_bytes()?;
-            let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidInput)?;
-            let sqe = submission!(
-                self,
-                simulation::Op::Buffer {
-                    fd: fd.clone(),
-                    operation: BufferOperation::Send,
-                    // Simulation creates a shared slice for Send, never a mutable one.
-                    ptr: bytes.as_ptr().cast_mut(),
-                    len: len as usize,
-                },
-                opcode::Send::new(types::Fd(fd.as_raw_fd()), bytes.as_ptr(), len)
-                    .flags(libc::MSG_NOSIGNAL)
-                    .build()
-            );
-            self.submit(sqe, scope, false, move |result| {
-                drop(fd);
-                Ok(Completion {
-                    buffer,
-                    bytes: result?.value()? as usize,
-                    lease,
-                })
-            })?
-            .await
+            let retained_fd = fd.clone();
+            let ((fd, buffer, lease), bytes) = self
+                .retry_data(
+                    (fd, buffer, lease),
+                    retained_fd,
+                    scope,
+                    None,
+                    libc::POLLOUT as u32,
+                    |(fd, buffer, _)| {
+                        let bytes = buffer.send_bytes()?;
+                        let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidInput)?;
+                        let sqe = submission!(
+                            self,
+                            simulation::Op::Buffer {
+                                fd: fd.clone(),
+                                operation: BufferOperation::Send,
+                                // Simulation creates a shared slice for Send, never a mutable one.
+                                ptr: bytes.as_ptr().cast_mut(),
+                                len: len as usize,
+                            },
+                            opcode::Send::new(types::Fd(fd.as_raw_fd()), bytes.as_ptr(), len)
+                                .flags(libc::MSG_NOSIGNAL)
+                                .build()
+                        );
+                        Ok(sqe)
+                    },
+                )
+                .await?;
+            drop(fd);
+            Ok(Completion {
+                buffer,
+                bytes,
+                lease,
+            })
         })
     }
 
@@ -1031,6 +1196,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         }
         let mut finished = Vec::new();
         let mut fence_wakes = Vec::new();
+        let mut failure = None;
         let mut completed = 0;
         while completed < budget {
             let cqe = state.next_completion();
@@ -1038,14 +1204,49 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 break;
             };
             completed += 1;
-            if let Some(entry) = state.complete(tag, result)? {
-                finished.push(entry);
-                fence_wakes.extend(state.take_fence_wakers(Some(IoId(tag & !CANCEL_BIT))));
+            match state.complete(tag, result) {
+                Ok(Some(entry)) => {
+                    finished.push(entry);
+                    fence_wakes.extend(state.take_fence_wakers(Some(IoId(tag & !CANCEL_BIT))));
+                }
+                Ok(None) => (),
+                Err(error) => {
+                    state.stopped = true;
+                    failure = Some(error);
+                    break;
+                }
             }
         }
         if state.entries.is_empty() {
             fence_wakes.extend(state.take_fence_wakers(None));
         }
+        drop(state);
+        // One panicking callback must not discard unrelated completed replies or
+        // notifications. Finish the batch outside all reactor borrows, then unwind.
+        let mut panic = None;
+        for entry in finished {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(waker) = entry.finish() {
+                    waker.wake();
+                }
+            }));
+            if let Err(payload) = result {
+                panic.get_or_insert(payload);
+            }
+        }
+        for waiter in fence_wakes {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waiter.wake()));
+            if let Err(payload) = result {
+                panic.get_or_insert(payload);
+            }
+        }
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let mut state = self.state.borrow_mut();
         let count = budget.min(state.entries.len());
         for _ in 0..count {
             let id = state
@@ -1061,13 +1262,21 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 break;
             };
             state.scan_after = id;
+            let scope = state.entries[&id].scope.clone();
+            drop(state);
+            let cancelled = Error::Cancelled.into();
+            let checked = scope.check().err();
+            drop(scope);
+            state = self.state.borrow_mut();
             let stopped = state.stopped;
-            let entry = state.entries.get_mut(&id).unwrap();
+            let Some(entry) = state.entries.get_mut(&id) else {
+                continue;
+            };
             if entry.cancel_reason.is_none() {
                 entry.cancel_reason = if stopped || entry.signal.abandoned.get() {
-                    Some(Error::Cancelled.into())
+                    Some(cancelled)
                 } else {
-                    entry.scope.check().err()
+                    checked
                 };
             }
             if entry.original.is_none() && entry.cancel_reason.is_some() && !entry.cancel_sent {
@@ -1087,15 +1296,8 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             }
         }
         let submitted = state.submit_pending();
-        drop(state);
-        // Wakers may reenter the worker; never invoke under the reactor RefCell.
-        for entry in finished {
-            if let Some(waker) = entry.finish() {
-                waker.wake();
-            }
-        }
-        for waker in fence_wakes {
-            waker.wake();
+        if submitted.is_err() {
+            state.stopped = true;
         }
         submitted.map(|()| completed)
     }
@@ -1108,7 +1310,10 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         // sleeping so that work can produce the CQEs we wait for. Transient errors
         // defer progress to the next worker turn; completion/cancel budgets stay
         // in poll_budgeted, and an absent ring remains uninitialized.
-        state.submit_pending()?;
+        if let Err(error) = state.submit_pending() {
+            state.stopped = true;
+            return Err(error);
+        }
         #[cfg(feature = "simulation")]
         if state.simulation.is_some() {
             return Ok(());
@@ -1162,7 +1367,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// The worker must drive poll_budgeted. Notification registrations share a
     /// queue_entries bound with drain waiters and charge completion metadata;
     /// admission failure still leaves cancellation requested, but is not a fence.
-    pub fn cancel_and_fence(&self, id: IoId) -> Operation<'_, (), S::Error> {
+    fn cancel_and_fence(&self, id: IoId) -> Operation<'_, (), S::Error> {
         Box::pin(Fence {
             reactor: self,
             target: Some(id),
@@ -1182,20 +1387,54 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         })
     }
 
-    /// Fence the current operations selected by caller-owned scope policy.
+    /// Close admission and drive cancellation for at most `timeout` (host time).
+    /// Callbacks must terminate promptly. An error, including DeadlineExceeded,
+    /// is NEVER a fence: retained owners remain quarantined and this may be retried.
+    /// Drop makes one bounded attempt, then leaks the ring and unfenced owners.
+    pub fn shutdown(&self, timeout: Duration) -> Result<()> {
+        self.state.borrow_mut().stopped = true;
+        let started = std::time::Instant::now();
+        while self.in_flight() != 0 {
+            if started.elapsed() >= timeout {
+                return Err(Error::DeadlineExceeded);
+            }
+            self.poll_budgeted(256)?;
+            if self.in_flight() != 0 {
+                self.wait(timeout.saturating_sub(started.elapsed()).min(MAX_WAIT))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Cancel all current matching operations before awaiting any fence. New work
+    /// submitted by the predicate or after the snapshot is not part of this fence.
+    /// The worker must drive completions; only Ok confirms ownership is released.
     pub fn fence_matching<'a>(
         &'a self,
         matches: impl Fn(&S) -> bool + 'a,
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
-            let ids: Vec<_> = self
+            let scopes: Vec<_> = self
                 .state
                 .borrow()
                 .entries
                 .iter()
-                .filter(|(_, entry)| matches(&entry.scope))
-                .map(|(id, _)| *id)
+                .map(|(id, entry)| (*id, entry.scope.clone()))
                 .collect();
+            let ids: Vec<_> = scopes
+                .into_iter()
+                .filter(|(_, scope)| matches(scope))
+                .map(|(id, _)| id)
+                .collect();
+            let cancelled = Error::Cancelled.into();
+            {
+                let mut state = self.state.borrow_mut();
+                for id in &ids {
+                    if let Some(entry) = state.entries.get_mut(id) {
+                        entry.cancel_reason.get_or_insert(cancelled);
+                    }
+                }
+            }
             for id in ids {
                 self.cancel_and_fence(id).await?;
             }
@@ -1221,6 +1460,10 @@ fn offset_or_zero(operation: BufferOperation) -> u64 {
 
 impl<S: Scope> State<S> {
     fn next_completion(&mut self) -> Option<(u64, KernelResult)> {
+        #[cfg(test)]
+        if let Some(cqe) = self.completions.pop_front() {
+            return Some(cqe);
+        }
         #[cfg(feature = "simulation")]
         if let Some(driver) = &mut self.simulation {
             return driver.pop();
@@ -1229,6 +1472,13 @@ impl<S: Scope> State<S> {
         Some((cqe.user_data(), KernelResult::Value(cqe.result())))
     }
     fn submit_pending(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.ring.is_none()
+            && let Some(result) = self.submit_result.take()
+        {
+            self.submit_attempts += 1;
+            return submission_result(result);
+        }
         #[cfg(feature = "simulation")]
         if let Some(driver) = &self.simulation {
             // This advances simulated kernel execution, not just SQ consumption.
@@ -1260,14 +1510,14 @@ impl<S: Scope> State<S> {
         submission_result(ring.submit())
     }
 
-    fn take_fence_wakers(&mut self, target: Option<IoId>) -> Vec<Waker> {
+    fn take_fence_wakers(&mut self, target: Option<IoId>) -> Vec<FenceWaiter> {
         let keys: Vec<_> = self
             .fence_waiters
             .range((target, 0)..=(target, u64::MAX))
             .map(|(key, _)| *key)
             .collect();
         keys.into_iter()
-            .map(|key| self.fence_waiters.remove(&key).unwrap().waker)
+            .map(|key| self.fence_waiters.remove(&key).unwrap())
             .collect()
     }
 
@@ -1291,10 +1541,6 @@ impl<S: Scope> State<S> {
                 }
                 result => result,
             });
-            // Cancellation/deadline may precede this CQE without a cancel SQE.
-            if entry.cancel_reason.is_none() {
-                entry.cancel_reason = entry.scope.check().err();
-            }
         }
         if entry.fenced() {
             Ok(self.entries.remove(&id))
@@ -1347,18 +1593,15 @@ fn submission_result(result: std::io::Result<usize>) -> Result<()> {
 
 impl<S: Scope, B: Budget> Drop for Reactor<S, B> {
     fn drop(&mut self) {
-        self.state.get_mut().stopped = true;
-        while self.in_flight() != 0 {
-            if self.poll_budgeted(256).is_err() || self.wait(MAX_WAIT).is_err() {
-                // Closing an io_uring FD alone is NOT a synchronous memory fence.
-                // On an unrecoverable driver failure retain the bounded owners and
-                // ring forever rather than free memory the kernel may still use.
-                let state = self.state.get_mut();
-                std::mem::forget(std::mem::take(&mut state.entries));
-                std::mem::forget(state.ring.take());
-                std::mem::forget(state.ring_reservation.take());
-                return;
-            }
+        if std::thread::panicking() || self.shutdown(DROP_WAIT).is_err() {
+            // Closing an io_uring FD alone is NOT a synchronous memory fence.
+            // On an unrecoverable driver failure retain the bounded owners and
+            // ring forever rather than free memory the kernel may still use.
+            let state = self.state.get_mut();
+            std::mem::forget(std::mem::take(&mut state.entries));
+            std::mem::forget(state.ring.take());
+            std::mem::forget(state.ring_reservation.take());
+            return;
         }
         // Every SQE (including cancellation SQEs) has now produced its CQE.
         self.state.get_mut().ring.take();

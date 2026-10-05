@@ -37,6 +37,7 @@ pub fn scope() -> TestScope {
 /// Blocking poll is confined to loopback tests; no io_uring or Racer dependency.
 pub struct FixtureIo;
 impl Io for FixtureIo {
+    type FileBytes = zeroize::Zeroizing<Vec<u8>>;
     type Error = Error;
     type Scope = TestScope;
     type Lease = ();

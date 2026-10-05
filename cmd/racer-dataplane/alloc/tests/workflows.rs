@@ -309,7 +309,9 @@ fn restore_waits_for_freeze_guard_and_abandoned_write_completion_independently()
         let alignment = slab.open_configured(&segments).unwrap();
         let size = alignment.extent(0, 31).unwrap().length();
         let (lease, extent) = segments.append(size).unwrap();
-        simulation.inject("write", Fault::HoldCompletion(8));
+        simulation
+            .inject("write", Fault::HoldCompletion(8))
+            .unwrap();
         let mut write = slab.write(
             &reactor,
             extent,

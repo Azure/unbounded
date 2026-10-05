@@ -28,6 +28,38 @@ use uring_runtime::reactor::simulation::Simulation;
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
 
+/// The application owns this historical replay domain, not the generic runtime.
+trait RacerEntropy {
+    fn racer_environment(&self, stream: u64) -> uring_runtime::environment::Environment;
+}
+impl RacerEntropy for SimulationClock {
+    fn racer_environment(&self, stream: u64) -> uring_runtime::environment::Environment {
+        self.environment_with_entropy_domain(stream, &b"racer.dst.entropy.v1\0"[..])
+    }
+}
+
+#[test]
+fn racer_entropy_preserves_historical_replay_bytes() {
+    let clock = SimulationClock::new(7);
+    let role = clock.racer_environment(11);
+    let mut bytes = [0; 32];
+    for chunk in bytes.chunks_mut(3) {
+        let _role = role.clone().enter();
+        uring_runtime::environment::fill_random(chunk).unwrap();
+    }
+    assert_eq!(
+        bytes,
+        [
+            3, 158, 83, 113, 252, 214, 143, 64, 34, 247, 154, 192, 42, 95, 161, 48, 152, 147, 76,
+            64, 247, 88, 244, 158, 105, 39, 35, 80, 39, 109, 231, 156,
+        ]
+    );
+    let _default = clock.environment(11).enter();
+    let mut neutral = [0; 32];
+    uring_runtime::environment::fill_random(&mut neutral).unwrap();
+    assert_ne!(bytes, neutral);
+}
+
 mod faults {
     //! Fault injection and recovery actions for the generated traffic harness.
     use super::*;
@@ -543,7 +575,7 @@ mod faults {
 
         pub(super) fn crash_pending_write(&mut self) {
             self.update(7);
-            self.sim.inject("write", Fault::Delay(64));
+            self.sim.inject("write", Fault::Delay(64)).unwrap();
             *self.coverage.injected.entry("write".into()).or_default() += 1;
             let mut client = self.request(7, false, false);
             let mut completed = false;
@@ -744,7 +776,7 @@ mod scenarios {
         let sim = Simulation::new();
         let _os = sim.enter();
         let clock = SimulationClock::new(73);
-        let _time = clock.environment(0).enter();
+        let _time = clock.racer_environment(0).enter();
         let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(73, sim, clock, false);
         harness.add(None);
@@ -885,7 +917,7 @@ mod scenarios {
         let sim = Simulation::new();
         let _os = sim.enter();
         let clock = SimulationClock::new(73);
-        let environment = clock.environment(0);
+        let environment = clock.racer_environment(0);
         let _time = environment.enter();
         let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(73, sim, clock, false);
@@ -1009,7 +1041,7 @@ mod scenarios {
         let sim = Simulation::new();
         let _os = sim.enter();
         let clock = SimulationClock::new(73);
-        let environment = clock.environment(0);
+        let environment = clock.racer_environment(0);
         let _time = environment.enter();
         let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(73, sim.clone(), clock.clone(), false);
@@ -1125,7 +1157,7 @@ mod scenarios {
         let sim = Simulation::new();
         let _os = sim.enter();
         let clock = SimulationClock::new(71);
-        let environment = clock.environment(0);
+        let environment = clock.racer_environment(0);
         let _time = environment.enter();
         let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(71, sim, clock, false);
@@ -1171,7 +1203,7 @@ mod scenarios {
         let sim = Simulation::new();
         let _os = sim.enter();
         let clock = SimulationClock::new(73);
-        let environment = clock.environment(0);
+        let environment = clock.racer_environment(0);
         let _time = environment.enter();
         let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(73, sim, clock, false);
@@ -1544,13 +1576,16 @@ mod traffic {
                         "recv"
                     };
                     self.sim
-                        .inject(operation, Fault::Short(1 + self.rng.pick(128)));
+                        .inject(operation, Fault::Short(1 + self.rng.pick(128)))
+                        .unwrap();
                     *self.coverage.injected.entry(operation.into()).or_default() += 1;
                     self.coverage.action("short-io");
                     self.traffic(1, false);
                 }
                 Action::ConnectFailure => {
-                    self.sim.inject("connect", Fault::Errno(libc::ECONNREFUSED));
+                    self.sim
+                        .inject("connect", Fault::Errno(libc::ECONNREFUSED))
+                        .unwrap();
                     *self.coverage.injected.entry("connect".into()).or_default() += 1;
                     // A new version forces an origin connection despite warm peers.
                     self.update(2);
@@ -1560,7 +1595,9 @@ mod traffic {
                     self.recover_origin();
                 }
                 Action::DelayedWrite => {
-                    self.sim.inject("write", Fault::Delay(3 + self.rng.pick(8)));
+                    self.sim
+                        .inject("write", Fault::Delay(3 + self.rng.pick(8)))
+                        .unwrap();
                     *self.coverage.injected.entry("write".into()).or_default() += 1;
                     self.update(3);
                     let client = self.request(3, false, false);
@@ -1608,7 +1645,7 @@ mod traffic {
                     self.coverage.action("old-pin");
                 }
                 Action::FailedDirtyWrite => {
-                    self.sim.inject("write", Fault::Errno(libc::EIO));
+                    self.sim.inject("write", Fault::Errno(libc::EIO)).unwrap();
                     *self.coverage.injected.entry("write".into()).or_default() += 1;
                     self.update(4);
                     let client = self.request(4, false, false);
@@ -2276,7 +2313,7 @@ impl Harness {
         // Restart is a new process incarnation, not a rewind of nonce entropy.
         let role = self
             .clock
-            .environment(1 + id as u64 + (self.generation << 32));
+            .racer_environment(1 + id as u64 + (self.generation << 32));
         let _role = role.enter();
         let device = format!("dst-rnic-{id}");
         let gid = [1 + (id % 254) as u8; 16];
@@ -2367,9 +2404,9 @@ impl Harness {
             crypto,
         }];
         for worker in 1..worker_count {
-            let role = self
-                .clock
-                .environment(1 + id as u64 + (self.generation << 32) + ((worker as u64) << 48));
+            let role = self.clock.racer_environment(
+                1 + id as u64 + (self.generation << 32) + ((worker as u64) << 48),
+            );
             let _role = role.enter();
             let (app, runtime, engine) = crate::app::tests::local_worker_with_fabric(
                 &config,
@@ -2984,7 +3021,7 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
     let sim = Simulation::new();
     let _os = sim.enter();
     let clock = SimulationClock::new(505);
-    let environment = clock.environment(0);
+    let environment = clock.racer_environment(0);
     let _time = environment.enter();
     let mut harness = Harness::new(505, sim, clock, false);
     for object in 0..8 {
@@ -3064,7 +3101,7 @@ fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
         let sim = Simulation::new();
         let _os = sim.enter();
         let clock = SimulationClock::new(106);
-        let environment = clock.environment(0);
+        let environment = clock.racer_environment(0);
         let _time = environment.enter();
         let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(106, sim, clock, native);
@@ -3107,7 +3144,7 @@ fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
         let sim = Simulation::new();
         let _os = sim.enter();
         let clock = SimulationClock::new(118);
-        let environment = clock.environment(0);
+        let environment = clock.racer_environment(0);
         let _time = environment.enter();
         let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(118, sim, clock, true);
@@ -3128,6 +3165,185 @@ fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
         }
         assert_eq!(harness.sim.live_handles(), 0);
         assert_eq!(harness.fabric.live_resources(), 0);
+    }
+}
+
+#[test]
+fn dst_refused_peer_connect_preserves_candidate_fallback() {
+    for native in [false, true] {
+        let sim = Simulation::new();
+        let _os = sim.enter();
+        let clock = SimulationClock::new(119);
+        let environment = clock.racer_environment(0);
+        let _time = environment.enter();
+        let _strict = uring_runtime::environment::require_simulated();
+        let mut harness = Harness::new(119, sim, clock, native);
+        for _ in 0..4 {
+            harness.add(None);
+        }
+        harness.update(2);
+        let ranked = harness.ranked_nodes(&harness.object_id(2));
+        let requester = (0..4).find(|node| !ranked.contains(node)).unwrap();
+        // The first cold request from a noncandidate connects to a peer before
+        // origin. Raw ECONNREFUSED must retain the same fallback as synthetic Io.
+        harness
+            .sim
+            .inject("connect", Fault::Errno(libc::ECONNREFUSED))
+            .unwrap();
+        let client = harness.request_on(2, false, false, requester);
+        harness.exchange(client, false);
+        assert_eq!(harness.coverage.observed.get("connect"), Some(&1));
+        assert_eq!(harness.coverage.success, 1);
+        assert_eq!(harness.coverage.failures, 0);
+        assert!(harness.coverage.relay_turns > 0);
+        while !harness.nodes.is_empty() {
+            harness.remove(0);
+        }
+        assert_eq!(harness.sim.live_handles(), 0);
+        assert_eq!(harness.fabric.live_resources(), 0);
+    }
+}
+
+#[test]
+fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
+    use crate::store::checkpoint::read_candidates;
+    for case in [
+        "empty",
+        "periodic",
+        "write-error",
+        "rename-error",
+        "budget",
+        "overflow",
+        "cancel",
+        "cancel-write",
+    ] {
+        let sim = Simulation::new();
+        let _os = sim.enter();
+        let clock = SimulationClock::new(120);
+        let environment = clock.racer_environment(0);
+        let _time = environment.enter();
+        let _strict = uring_runtime::environment::require_simulated();
+        let mut harness = Harness::new(120, sim, clock, false);
+        harness.rng = Random((0..100).find(|seed| Random(*seed).pick(2) == 1).unwrap());
+        harness.add(None);
+        assert_eq!(harness.nodes[0].workers.len(), 2);
+        harness.settle();
+        if case == "periodic" {
+            harness.clock.advance(Duration::from_secs(6));
+            for _ in 0..128 {
+                harness.tick();
+            }
+        }
+        let node = &mut harness.nodes[0];
+        let state = node.workers[0].app.node.clone();
+        let before = read_candidates(&node.config.slab_directory).unwrap();
+        let sequence = before.first().map_or(0, |(_, image)| image.sequence);
+        assert_eq!(sequence > 0, case == "periodic");
+        if case == "overflow" {
+            state.periodic_checkpoint.lock().unwrap().last_sequence = u64::MAX;
+        }
+        if case == "budget" {
+            node.workers[0].app.checkpoint_budget = 1;
+        }
+        let deadline = scope(Duration::from_secs(30)).unwrap();
+        if case == "cancel" {
+            deadline.cancel().unwrap();
+        }
+        match case {
+            "write-error" => harness
+                .sim
+                .inject("write", Fault::Errno(libc::ENOSPC))
+                .unwrap(),
+            "rename-error" => harness
+                .sim
+                .inject("rename", Fault::Errno(libc::EIO))
+                .unwrap(),
+            "empty" | "periodic" | "cancel-write" => {
+                harness.sim.inject("write", Fault::Delay(32)).unwrap()
+            }
+            _ => (),
+        }
+        harness.sim.take_trace();
+        let mut operations: Vec<_> = node
+            .workers
+            .iter()
+            .map(|worker| Some(Box::pin(worker.app.checkpoint(&deadline))))
+            .collect();
+        let mut results = Vec::new();
+        let mut delayed = false;
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for turn in 0..256 {
+            for worker in &node.workers {
+                worker.runtime.reactor.poll_budgeted(64).unwrap();
+            }
+            for operation in &mut operations {
+                if let Some(task) = operation {
+                    if let Poll::Ready(result) = task.as_mut().poll(&mut cx) {
+                        results.push(result);
+                        *operation = None;
+                    }
+                }
+            }
+            if turn == 16 && matches!(case, "empty" | "periodic" | "cancel-write") {
+                assert!(
+                    results.is_empty(),
+                    "publication did not yield for delayed I/O"
+                );
+                for worker in &node.workers {
+                    assert!(matches!(
+                        futures::executor::block_on(worker.app.store.checkpoint.snapshot_shard()),
+                        Err(Error::Overloaded)
+                    ));
+                }
+                delayed = true;
+                if case == "cancel-write" {
+                    deadline.cancel().unwrap();
+                }
+            }
+            if operations.iter().all(Option::is_none) {
+                break;
+            }
+        }
+        assert_eq!(results.len(), node.workers.len(), "{case}");
+        let expected = match case {
+            "write-error" => Err(Error::Os(libc::ENOSPC)),
+            "rename-error" => Err(Error::RenameUncertain(crate::error::PublicationCause::Os(
+                libc::EIO,
+            ))),
+            "budget" => Err(Error::Overloaded),
+            "overflow" => Err(Error::Unavailable),
+            "cancel" | "cancel-write" => Err(Error::Cancelled),
+            _ => Ok(()),
+        };
+        assert!(
+            results.iter().all(|result| *result == expected),
+            "{case}: {results:?}"
+        );
+        let after = read_candidates(&node.config.slab_directory).unwrap();
+        if expected.is_ok() {
+            assert!(delayed);
+            assert_eq!(after[0].1.sequence, sequence + 1);
+            assert_eq!(after[0].1.shards.len(), node.workers.len());
+            assert_eq!(after[0].0, before.first().map_or(0, |(slot, _)| slot ^ 1));
+            assert!(
+                harness
+                    .sim
+                    .take_trace()
+                    .iter()
+                    .any(|event| event.operation == "complete:rename")
+            );
+        } else {
+            assert_eq!(after.len(), before.len(), "{case}");
+        }
+        drop(operations);
+        for worker in &node.workers {
+            futures::executor::block_on(worker.app.store.checkpoint.snapshot_shard()).unwrap();
+            worker.app.store.checkpoint.finish_snapshot();
+        }
+        // The test directly exercised the final cut. Process-loss cleanup avoids
+        // asking a failed shutdown cut to run again, while fencing all I/O owners.
+        harness.retire(0, true);
+        assert_eq!(harness.sim.live_handles(), 0);
     }
 }
 
@@ -3280,7 +3496,7 @@ fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
     let sim = Simulation::new();
     let _os = sim.enter();
     let clock = SimulationClock::new(seed);
-    let environment = clock.environment(0);
+    let environment = clock.racer_environment(0);
     let _time = environment.enter();
     let _strict = uring_runtime::environment::require_simulated();
     let mut harness = Harness::new(seed, sim, clock, native);

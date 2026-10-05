@@ -69,6 +69,7 @@ pub struct Cancellation {
 
 struct State {
     canceled: AtomicBool,
+    registration_limit: usize,
     registrations: Mutex<Vec<Weak<futures::task::AtomicWaker>>>,
 }
 
@@ -99,13 +100,22 @@ impl Drop for CancellationRegistration {
 }
 
 impl Cancellation {
+    /// Compatibility constructor with a 1024-live-registration limit. Construction
+    /// currently cannot fail; the Result contract is retained for existing callers.
     pub fn new() -> Result<Self> {
-        Ok(Self {
+        Ok(Self::with_registration_limit(1024))
+    }
+
+    /// Caller-selected bound, including zero to disable subscriptions. Canceling
+    /// and querying cancellation remain available when subscription is disabled.
+    pub fn with_registration_limit(registration_limit: usize) -> Self {
+        Self {
             state: Arc::new(State {
                 canceled: AtomicBool::new(false),
+                registration_limit,
                 registrations: Mutex::new(Vec::new()),
             }),
-        })
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -122,7 +132,7 @@ impl Cancellation {
             .lock()
             .map_err(|_| Error::Unavailable)?;
         entries.retain(|entry| entry.strong_count() != 0);
-        if entries.len() >= 1024 {
+        if entries.len() >= self.state.registration_limit {
             return Err(Error::Overloaded);
         }
         entries.push(Arc::downgrade(&wake));
@@ -153,6 +163,28 @@ impl Cancellation {
 mod tests {
     use super::*;
     use crate::test_util::WakeCounter;
+
+    #[test]
+    fn caller_selected_registration_bound_and_concurrent_cancel() {
+        let disabled = Cancellation::with_registration_limit(0);
+        assert!(matches!(disabled.subscribe(), Err(Error::Overloaded)));
+        disabled.cancel().unwrap();
+        assert!(disabled.is_cancelled());
+        for _ in 0..64 {
+            let cancellation = Cancellation::with_registration_limit(1);
+            let registration = cancellation.subscribe().unwrap();
+            assert!(matches!(cancellation.subscribe(), Err(Error::Overloaded)));
+            let count = Arc::new(WakeCounter::default());
+            let waker = Waker::from(count.clone());
+            std::thread::scope(|threads| {
+                threads.spawn(|| cancellation.cancel().unwrap());
+                threads.spawn(|| registration.register(&waker));
+            });
+            assert!(count.count() >= 1);
+            drop(registration);
+            assert!(cancellation.subscribe().is_ok());
+        }
+    }
 
     #[test]
     fn millisecond_mapping_preserves_both_sides_of_fractional_anchor() {

@@ -221,6 +221,22 @@ type CgroupPath = (PathBuf, PathBuf, bool, bool, bool);
 
 fn cgroup_paths(memberships: &str, mounts: &str) -> Result<Vec<CgroupPath>> {
     let mut paths = Vec::new();
+    let memberships = memberships
+        .lines()
+        .map(|line| {
+            let fields = line.splitn(3, ':').collect::<Vec<_>>();
+            if fields.len() != 3
+                || !Path::new(fields[2]).is_absolute()
+                || Path::new(fields[2])
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(Error::InvalidConfiguration);
+            }
+            Ok(fields)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut covered = HashSet::new();
     for line in mounts.lines() {
         let Some((before, after)) = line.split_once(" - ") else {
             continue;
@@ -240,11 +256,7 @@ fn cgroup_paths(memberships: &str, mounts: &str) -> Result<Vec<CgroupPath>> {
         if !cpu && !cpuset {
             continue;
         }
-        for membership in memberships.lines() {
-            let fields = membership.splitn(3, ':').collect::<Vec<_>>();
-            if fields.len() != 3 {
-                return Err(Error::InvalidConfiguration);
-            }
+        for (index, fields) in memberships.iter().enumerate() {
             let matches = if v2 {
                 fields[1].is_empty()
             } else {
@@ -258,19 +270,34 @@ fn cgroup_paths(memberships: &str, mounts: &str) -> Result<Vec<CgroupPath>> {
             let root = PathBuf::from(unescape_mount(before[4]));
             let mount_root = PathBuf::from(unescape_mount(before[3]));
             let membership = PathBuf::from(fields[2]);
-            // A cgroup namespace reports paths relative to its own root. A bind
-            // mount may instead expose a subtree of the host hierarchy.
-            let relative = membership
-                .strip_prefix(&mount_root)
-                .or_else(|_| membership.strip_prefix("/"))
-                .map_err(|_| Error::InvalidConfiguration)?;
-            if relative
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-            {
+            if !root.is_absolute() || !mount_root.is_absolute() {
                 return Err(Error::InvalidConfiguration);
             }
+            // Both proc files report paths in the calling cgroup namespace. A
+            // subtree mount that does not cover membership is not a fallback root.
+            let Ok(relative) = membership.strip_prefix(&mount_root) else {
+                continue;
+            };
+            if v2 {
+                covered.insert((index, ""));
+            }
+            if cpu {
+                covered.insert((index, "cpu"));
+            }
+            if cpuset {
+                covered.insert((index, "cpuset"));
+            }
             paths.push((root.join(relative), root, v2, cpu, cpuset));
+        }
+    }
+    for (index, fields) in memberships.iter().enumerate() {
+        for controller in fields[1].split(',') {
+            if matches!(controller, "" | "cpu" | "cpuset")
+                && !covered.contains(&(index, controller))
+            {
+                // Hidden/unmounted applicable hierarchies are unknown, not unlimited.
+                return Err(Error::InvalidConfiguration);
+            }
         }
     }
     Ok(paths)
@@ -349,6 +376,27 @@ pub fn pin_cpu(cpu: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noncovering_mounts_are_skipped_and_hidden_hierarchies_fail_closed() {
+        let unrelated = "1 0 0:1 /other /unrelated rw - cgroup2 cgroup rw\n";
+        let covering = "2 0 0:1 /tenant /visible\\040group rw - cgroup2 cgroup rw\n";
+        let paths = cgroup_paths("0::/tenant/leaf", &format!("{unrelated}{covering}")).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0, PathBuf::from("/visible group/leaf"));
+        assert!(cgroup_paths("0::/tenant/leaf", unrelated).is_err());
+        assert!(cgroup_paths("0::/tenant/leaf", "").is_err());
+        assert!(cgroup_paths("2:cpu:/tenant/leaf", "").is_err());
+        assert!(cgroup_paths("2:cpuset:/tenant/leaf", "").is_err());
+        assert!(
+            cgroup_paths("2:memory:/tenant/leaf", "")
+                .unwrap()
+                .is_empty()
+        );
+        // A namespace-root mount and membership root resolve without host fallback.
+        let paths = cgroup_paths("0::/", "1 0 0:1 / /visible rw - cgroup2 cgroup rw").unwrap();
+        assert_eq!(paths[0].0, PathBuf::from("/visible"));
+    }
 
     #[test]
     fn cgroup_mounts_and_ancestor_quotas_are_resolved_exactly() {
@@ -510,17 +558,25 @@ mod tests {
         let mounts = "malformed\n1 0 0:1 / /ignored rw - tmpfs tmpfs rw\n\
             2 0 0:2 / /memory rw - cgroup cgroup rw,memory\n\
             3 0 0:3 /host\\040root /group\\040mount rw - cgroup2 cgroup rw\n";
-        for (membership, leaf) in [
-            ("/host root/leaf", "/group mount/leaf"),
-            ("/leaf", "/group mount/leaf"),
-            ("/", "/group mount/"),
+        assert_eq!(
+            cgroup_paths("0::/host root/leaf", mounts).unwrap(),
+            vec![(
+                "/group mount/leaf".into(),
+                "/group mount".into(),
+                true,
+                true,
+                true
+            )]
+        );
+        // Both proc paths use the calling namespace. This subtree mount cannot
+        // establish coverage for memberships outside its reported root.
+        for membership in [
+            "0::/leaf",
+            "0::/",
+            "malformed",
+            "0::relative",
+            "0::/leaf/../escape",
         ] {
-            assert_eq!(
-                cgroup_paths(&format!("0::{membership}"), mounts).unwrap(),
-                vec![(leaf.into(), "/group mount".into(), true, true, true)]
-            );
-        }
-        for membership in ["malformed", "0::relative", "0::/leaf/../escape"] {
             assert_eq!(
                 cgroup_paths(membership, mounts),
                 Err(Error::InvalidConfiguration)

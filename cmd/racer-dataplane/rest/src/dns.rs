@@ -78,7 +78,7 @@ pub async fn resolve<I: Io + ?Sized>(
     let config = io
         .read_file(std::path::Path::new("/etc/resolv.conf"), 64 * 1024, scope)
         .await?;
-    let text = std::str::from_utf8(&config).map_err(|_| Error::InvalidConfiguration)?;
+    let text = std::str::from_utf8(config.as_ref()).map_err(|_| Error::InvalidConfiguration)?;
     let mut servers = Vec::new();
     let mut search = Vec::new();
     let mut ndots = 1;

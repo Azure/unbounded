@@ -55,7 +55,8 @@ pub struct DriverQueue {
     drivers: RefCell<VecDeque<Driver>>,
     new: RefCell<Vec<Task>>,
     count: Cell<usize>,
-    owner: RefCell<Option<Waker>>,
+    owner: RefCell<Option<Rc<Waker>>>,
+    polling: Cell<bool>,
 }
 
 struct Driver {
@@ -80,7 +81,7 @@ impl Runnable {
     /// Poll on first use or after a wake, unless the caller explicitly forces it.
     pub fn poll<T>(
         self: &Arc<Self>,
-        future: Pin<&mut impl Future<Output = T>>,
+        future: Pin<&mut (impl Future<Output = T> + ?Sized)>,
         cx: &mut Context<'_>,
         force: bool,
     ) -> Poll<T> {
@@ -128,6 +129,7 @@ impl DriverQueue {
             new: RefCell::new(Vec::new()),
             count: Cell::new(0),
             owner: RefCell::new(None),
+            polling: Cell::new(false),
         }
     }
 
@@ -160,25 +162,61 @@ impl DriverQueue {
     }
 
     pub fn poll(self: &Rc<Self>, cx: &mut Context<'_>, budget: usize) {
-        let _queue = self.enter();
-        *self.owner.borrow_mut() = Some(cx.waker().clone());
-        // Child operations use a separate inbox. Never recursively poll futures
-        // already borrowed by this worker's outer polling turn.
-        let Ok(mut drivers) = self.drivers.try_borrow_mut() else {
+        // Reject nested turns before touching the outer owner's wake registration.
+        let Ok(_turn) = crate::Busy::try_enter(&self.polling) else {
             return;
         };
-        drivers.extend(self.new.borrow_mut().drain(..).map(|operation| Driver {
-            operation,
-            wake: Runnable::new(),
-        }));
-        for _ in 0..budget.min(drivers.len()) {
-            let Some(mut driver) = drivers.pop_front() else {
+        let _queue = self.enter();
+        let owner = Rc::new(cx.waker().clone());
+        let old = self.owner.replace(Some(owner));
+        drop(old);
+        let new = self.new.take();
+        self.drivers
+            .borrow_mut()
+            .extend(new.into_iter().map(|operation| Driver {
+                operation,
+                wake: Runnable::new(),
+            }));
+        let turns = budget.min(self.drivers.borrow().len());
+        for _ in 0..turns {
+            let Some(driver) = self.drivers.borrow_mut().pop_front() else {
                 break;
             };
+            // Release capacity before destroying a completed or panicking task.
+            let mut active = ActiveDriver {
+                driver: Some(driver),
+                count: &self.count,
+            };
+            let driver = active.driver.as_mut().unwrap();
             match driver.wake.poll(Pin::new(&mut driver.operation), cx, false) {
-                Poll::Ready(()) => self.count.set(self.count.get() - 1),
-                Poll::Pending => drivers.push_back(driver),
+                Poll::Ready(()) => {}
+                Poll::Pending => self
+                    .drivers
+                    .borrow_mut()
+                    .push_back(active.driver.take().unwrap()),
             }
+        }
+        let ready = !self.new.borrow().is_empty()
+            || self
+                .drivers
+                .borrow()
+                .iter()
+                .any(|driver| driver.wake.ready.load(Ordering::Acquire));
+        if budget != 0 && ready {
+            cx.waker().wake_by_ref();
+        }
+    }
+}
+
+struct ActiveDriver<'a> {
+    driver: Option<Driver>,
+    count: &'a Cell<usize>,
+}
+
+impl Drop for ActiveDriver<'_> {
+    fn drop(&mut self) {
+        if self.driver.is_some() {
+            self.count.set(self.count.get() - 1);
         }
     }
 }
@@ -235,7 +273,7 @@ impl Permit {
     /// Discard the outcome, but retain the completed future until queue capacity
     /// has been released. An async wrapper would destroy it during its final poll.
     pub fn submit_detached<F: Future + 'static>(self, driver: F) {
-        self.submit(Box::pin(Detached(Box::pin(driver))));
+        self.submit(Box::pin(Detached(driver)));
     }
 
     pub fn submit(mut self, driver: Task) {
@@ -243,18 +281,21 @@ impl Permit {
         self.reserved = false;
         let waker = self.queue.owner.borrow().clone();
         if let Some(waker) = waker {
-            waker.wake();
+            waker.wake_by_ref();
         }
     }
 }
 
-struct Detached<F>(Pin<Box<F>>);
+struct Detached<F>(F);
 
 impl<F: Future> Future for Detached<F> {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        self.0.as_mut().poll(cx).map(|_| ())
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: the inner future stays pinned until Detached is destroyed.
+        unsafe { self.map_unchecked_mut(|this| &mut this.0) }
+            .poll(cx)
+            .map(|_| ())
     }
 }
 
@@ -299,6 +340,109 @@ pub fn pending() -> usize {
 mod tests {
     use super::*;
     use futures::{channel::oneshot, task::noop_waker};
+
+    #[test]
+    fn panic_releases_capacity_before_task_drop_and_queue_remains_usable() {
+        struct Panics;
+        impl Future for Panics {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                panic!("injected poll panic");
+            }
+        }
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                assert_eq!(pending(), 0);
+                reserve().unwrap().submit(Box::pin(async {}));
+            }
+        }
+        let queue = Rc::new(DriverQueue::new(1));
+        let _owner = queue.enter();
+        reserve().unwrap().submit_detached(Panics);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| queue.poll(&mut cx, 1)))
+                .is_err()
+        );
+        assert_eq!(pending(), 1);
+        queue.poll(&mut cx, 1);
+        assert_eq!(pending(), 0);
+    }
+
+    #[test]
+    fn budget_backlog_wakes_outer_owner_and_nested_poll_cannot_replace_it() {
+        let queue = Rc::new(DriverQueue::new(2));
+        let _owner = queue.enter();
+        let nested = Arc::new(WakeCount::default());
+        let nested_waker = Waker::from(nested.clone());
+        spawn(Box::pin(async move {
+            poll(&mut Context::from_waker(&nested_waker), 1);
+        }))
+        .unwrap();
+        spawn(Box::pin(async {})).unwrap();
+        let outer = Arc::new(WakeCount::default());
+        let waker = Waker::from(outer.clone());
+        let mut cx = Context::from_waker(&waker);
+        queue.poll(&mut cx, 1);
+        assert_eq!(outer.count(), 1);
+        spawn(Box::pin(async {})).unwrap();
+        assert_eq!(outer.count(), 2);
+        assert_eq!(nested.count(), 0);
+        queue.poll(&mut cx, 2);
+        assert_eq!(pending(), 0);
+        assert_eq!(outer.count(), 2);
+    }
+
+    #[test]
+    fn replacing_owner_drops_waker_outside_queue_borrows() {
+        struct OnDrop;
+        impl std::task::Wake for OnDrop {
+            fn wake(self: Arc<Self>) {
+                panic!("idle queue must not wake its retired owner");
+            }
+        }
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                // Submission reads the owner; nested polling must be rejected
+                // without any owner or driver-table borrow held by its caller.
+                spawn(Box::pin(async {})).unwrap();
+                poll(&mut Context::from_waker(Waker::noop()), 1);
+            }
+        }
+        let queue = Rc::new(DriverQueue::new(1));
+        let _owner = queue.enter();
+        queue.poll(&mut Context::from_waker(&Waker::from(Arc::new(OnDrop))), 0);
+        queue.poll(&mut Context::from_waker(Waker::noop()), 1);
+        assert_eq!(pending(), 0);
+    }
+
+    #[test]
+    fn panicking_completed_task_destructor_does_not_leak_capacity() {
+        struct PanicsOnDrop;
+        impl Future for PanicsOnDrop {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                assert_eq!(pending(), 0);
+                panic!("injected destructor panic");
+            }
+        }
+        let queue = Rc::new(DriverQueue::new(1));
+        let _owner = queue.enter();
+        reserve().unwrap().submit_detached(PanicsOnDrop);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                queue.poll(&mut Context::from_waker(Waker::noop()), 1);
+            }))
+            .is_err()
+        );
+        assert_eq!(pending(), 0);
+        assert!(reserve().is_ok());
+    }
 
     #[test]
     fn completed_operation_is_dropped_after_releasing_capacity() {

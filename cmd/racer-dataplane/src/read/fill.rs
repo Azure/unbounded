@@ -924,7 +924,7 @@ impl Fill {
                 Err(Error::CorruptRecord) => {
                     self.metrics.record(Event::CorruptMiss, 1);
                 }
-                Ok(None) | Err(Error::MissingKey | Error::Io) => {}
+                Ok(None) | Err(Error::MissingKey | Error::Io | Error::Os(_)) => {}
                 Err(error) => return Err(error),
             }
             match self.dependencies.flights.join_copy(page, scope)? {
@@ -1034,7 +1034,8 @@ impl Fill {
             Some(copy) => (Some(copy), None),
             None => match self.read_disk_observed(page, scope).await {
                 Ok(Some((copy, token))) => (Some(copy), Some(token)),
-                Ok(None) | Err(Error::CorruptRecord | Error::MissingKey | Error::Io) => {
+                Ok(None)
+                | Err(Error::CorruptRecord | Error::MissingKey | Error::Io | Error::Os(_)) => {
                     (None, None)
                 }
                 Err(error) => return Err(error),

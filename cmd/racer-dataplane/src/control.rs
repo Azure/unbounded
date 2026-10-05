@@ -1452,6 +1452,7 @@ pub struct ReactorControlIo {
     connect_probe: Option<Rc<tests::scenarios::ConnectProbe>>,
 }
 impl rest_client::Io for ReactorControlIo {
+    type FileBytes = uring_runtime::reactor::filesystem::ReadBuffer;
     type Error = Error;
     type Scope = RequestScope;
     type Lease = crate::admission::ConnectionReservation;
@@ -1486,7 +1487,13 @@ impl rest_client::Io for ReactorControlIo {
                 if read { libc::POLLIN } else { 0 } | if write { libc::POLLOUT } else { 0 };
             self.reactor
                 .readiness_with_lease(fd, interest as u32, lease, scope)
-                .await?;
+                .await
+                // This boundary is socket readiness only. Keep availability
+                // retries here, never on the shared filesystem error conversion.
+                .map_err(|error| match error {
+                    Error::Os(_) => Error::Unavailable,
+                    error => error,
+                })?;
             scope.check()
         })
     }
@@ -1509,7 +1516,7 @@ impl rest_client::Io for ReactorControlIo {
         path: &'a std::path::Path,
         limit: usize,
         scope: &'a RequestScope,
-    ) -> Operation<'a, zeroize::Zeroizing<Vec<u8>>> {
+    ) -> Operation<'a, Self::FileBytes> {
         Box::pin(async move { crate::control::read_path(&self.reactor, path, limit, scope).await })
     }
 }
@@ -1529,7 +1536,7 @@ impl ReactorControlIo {
         Box::pin(async move {
             use uring_runtime::reactor::timer::SleepMode;
             #[cfg(test)]
-            let mode = if uring_runtime::reactor::simulation::Simulation::current().is_some() {
+            let mode = if uring_runtime::environment::simulation_seed().is_some() {
                 SleepMode::ClockPoll
             } else {
                 SleepMode::Kernel
@@ -2245,7 +2252,7 @@ pub(crate) async fn read_file(
     limit: usize,
     private: bool,
     scope: &RequestScope,
-) -> Result<Zeroizing<Vec<u8>>> {
+) -> Result<uring_runtime::reactor::filesystem::ReadBuffer> {
     if limit > 1024 * 1024 {
         return Err(Error::Overloaded);
     }
@@ -2267,7 +2274,7 @@ pub(crate) async fn read_path(
     path: &Path,
     limit: usize,
     scope: &RequestScope,
-) -> Result<Zeroizing<Vec<u8>>> {
+) -> Result<uring_runtime::reactor::filesystem::ReadBuffer> {
     let fd = r
         .file_open(
             None,
@@ -2286,7 +2293,7 @@ pub(crate) async fn read_at(
     limit: usize,
     private: bool,
     scope: &RequestScope,
-) -> Result<Zeroizing<Vec<u8>>> {
+) -> Result<uring_runtime::reactor::filesystem::ReadBuffer> {
     let fd = r
         .file_open(
             Some(dir.clone()),
@@ -2326,6 +2333,7 @@ pub(crate) async fn atomic_write(
         scope,
     )
     .await
+    .map_err(Into::into)
 }
 pub(crate) async fn remove(
     r: &Reactor,
@@ -2349,6 +2357,133 @@ pub(crate) mod tests {
     use racer_control_wire::encode_enrollment_request;
     use racer_control_wire::encode_publication;
     use racer_control_wire::validate_definitions;
+
+    #[test]
+    fn socket_readiness_errno_is_transient_but_file_errno_is_not() {
+        use rest_client::Io;
+        use uring_runtime::reactor::simulation::{Fault, Simulation};
+        let sim = Simulation::new();
+        let _os = sim.enter();
+        let r = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
+            crate::admission::AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ),
+        ))));
+        let io = ReactorControlIo::new(r.clone());
+        let scope = testing::scope();
+        let (socket, _peer) = sim.socket_pair();
+        sim.inject("poll", Fault::Errno(libc::EIO)).unwrap();
+        let error =
+            testing::drive(&r, io.ready(Rc::new(socket), true, false, None, &scope)).unwrap_err();
+        assert_eq!(error, Error::Unavailable);
+        assert!(transient(error));
+        sim.write_file(Path::new("/token"), b"token").unwrap();
+        sim.inject("read", Fault::Errno(libc::EIO)).unwrap();
+        let result = testing::drive(&r, io.read_file(Path::new("/token"), 32, &scope));
+        assert!(matches!(result, Err(Error::Os(libc::EIO))));
+        assert!(!transient(Error::Os(libc::EIO)));
+    }
+
+    #[test]
+    fn atomic_write_preserves_cause_and_requires_reconciliation_after_publication() {
+        use crate::error::PublicationCause;
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        use uring_runtime::reactor::simulation::{Fault, Simulation};
+        for case in ["success", "write", "rename", "cancel-rename", "sync"] {
+            let sim = Simulation::new();
+            let _os = sim.enter();
+            let r = Reactor::new(Rc::new(flow_control::Quotas::new(
+                crate::admission::AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                ),
+            )));
+            let scope = testing::scope();
+            sim.write_file(Path::new("/identity"), b"old").unwrap();
+            sim.disk().sync_all().unwrap();
+            let dir = testing::drive(
+                &r,
+                r.file_open(
+                    None,
+                    CString::new("/").unwrap(),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                    &scope,
+                ),
+            )
+            .unwrap();
+            match case {
+                "write" => sim.inject("write", Fault::Errno(libc::ENOSPC)).unwrap(),
+                "rename" => sim.inject("rename", Fault::Errno(libc::EIO)).unwrap(),
+                "cancel-rename" | "sync" => {
+                    sim.inject("rename", Fault::HoldCompletion(20)).unwrap()
+                }
+                _ => (),
+            }
+            let mut operation = Box::pin(atomic_write(&r, &dir, "identity", b"new", &scope));
+            if matches!(case, "cancel-rename" | "sync") {
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                for _ in 0..100 {
+                    assert!(matches!(operation.as_mut().poll(&mut cx), Poll::Pending));
+                    r.poll_budgeted(64).unwrap();
+                    r.wait(Duration::from_millis(1)).unwrap();
+                    if sim
+                        .trace()
+                        .iter()
+                        .any(|event| event.operation == "complete:rename")
+                    {
+                        break;
+                    }
+                }
+                assert_eq!(sim.read_file(Path::new("/identity")).unwrap(), b"new");
+                if case == "cancel-rename" {
+                    scope.cancel().unwrap();
+                } else {
+                    sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
+                }
+            }
+            let result = testing::drive(&r, operation);
+            let expected = match case {
+                "write" => Err(Error::Os(libc::ENOSPC)),
+                "rename" => Err(Error::RenameUncertain(PublicationCause::Os(libc::EIO))),
+                "cancel-rename" => Err(Error::RenameUncertain(PublicationCause::Cancelled)),
+                "sync" => Err(Error::PublishedNotDurable(PublicationCause::Os(libc::EIO))),
+                _ => Ok(()),
+            };
+            assert_eq!(result, expected, "{case}");
+            if let Err(error) = result {
+                // Control must fail closed, not replay a namespace mutation just
+                // because its underlying cause looks transient.
+                assert!(!transient(error), "{case}: {error:?}");
+            }
+            testing::drive(&r, r.file_fence(scope.request)).unwrap();
+            assert_eq!(r.in_flight(), 0);
+            let published = matches!(case, "success" | "cancel-rename" | "sync");
+            let expected_bytes = if published { b"new" } else { b"old" };
+            let recovery = testing::scope();
+            let read = testing::drive(
+                &r,
+                Box::pin(read_at(&r, &dir, "identity", 32, false, &recovery)),
+            )
+            .unwrap();
+            assert_eq!(&*read, expected_bytes);
+            // Reconcile the actual target and certify its namespace durability;
+            // do not issue another replacement to make an ambiguous error vanish.
+            testing::drive(&r, r.file_sync(dir, &recovery)).unwrap();
+            sim.disk().crash().unwrap();
+            assert_eq!(
+                sim.read_file(Path::new("/identity")).unwrap(),
+                expected_bytes
+            );
+            assert_eq!(
+                sim.trace()
+                    .iter()
+                    .filter(|event| event.operation == "submit:rename")
+                    .count(),
+                usize::from(case != "write")
+            );
+        }
+    }
 
     pub(crate) mod bundle_tests {
         use super::*;
@@ -4314,7 +4449,7 @@ pub(crate) mod tests {
             .unwrap();
             assert!(matches!(
                 testing::drive(&r, Box::pin(read_at(&r, &dir, "token", 5, false, &scope))),
-                Err(Error::Io)
+                Err(Error::Os(libc::ELOOP))
             ));
             assert!(matches!(
                 testing::drive(

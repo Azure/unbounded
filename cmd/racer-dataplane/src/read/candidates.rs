@@ -261,6 +261,7 @@ impl CandidatePolicy {
             Err(
                 Error::Unavailable
                 | Error::Io
+                | Error::Os(_)
                 | Error::Overloaded
                 | Error::CorruptRecord
                 | Error::MissingKey
@@ -327,7 +328,7 @@ impl CandidatePolicy {
             .await
         {
             Ok(response) => response,
-            Err(Error::Unavailable | Error::Io | Error::Overloaded) => {
+            Err(Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded) => {
                 budget.note_route_failure();
                 return Ok(None);
             }
@@ -718,7 +719,7 @@ impl CandidatePolicy {
                             }
                         }
                     }
-                    Err(Error::Unavailable | Error::Io) => {
+                    Err(Error::Unavailable | Error::Io | Error::Os(_)) => {
                         evidence.push(ProbeOutcome::Unreachable);
                         saw_transient = true;
                         budget.note_route_failure();
@@ -828,7 +829,7 @@ impl CandidatePolicy {
                                 Err(_) => {}
                             }
                         }
-                        Err(Error::Unavailable | Error::Overloaded | Error::Io) => {
+                        Err(Error::Unavailable | Error::Overloaded | Error::Io | Error::Os(_)) => {
                             transient = true;
                             budget.note_route_failure();
                         }
@@ -1617,7 +1618,7 @@ pub(crate) async fn race(
 fn recoverable(error: Error) -> bool {
     matches!(
         error,
-        Error::Unavailable | Error::Io | Error::Overloaded | Error::CorruptRecord | Error::MissingKey | Error::Cancelled
+        Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded | Error::CorruptRecord | Error::MissingKey | Error::Cancelled
     // Malformed framing is local to that contender, not authority to
     // cancel another independently authenticated usable page.
     | Error::InvalidRequest | Error::HeaderTooLarge

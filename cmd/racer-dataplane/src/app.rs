@@ -1244,6 +1244,7 @@ impl WorkerApplication {
             && !matches!(
                 result,
                 Err(Error::Io
+                    | Error::Os(_)
                     | Error::Unavailable
                     | Error::Overloaded
                     | Error::MissingKey
@@ -1272,6 +1273,8 @@ impl WorkerApplication {
     }
 
     fn poll_control(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        // Raw filesystem errno and uncertain publication outcomes are not blanket
+        // retries: the owner must reconcile namespace state before another mutation.
         self.poll_keyring(cx)?;
         if let Some(result) = poll_task(&mut self.control_task, cx)
             && !matches!(

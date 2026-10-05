@@ -161,12 +161,15 @@ pub fn fill_random(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
         for byte in bytes {
             if entropy.offset == 32 {
                 let mut hash = Sha256::new();
-                hash.update(b"racer.dst.entropy.v1\0");
+                hash.update(&entropy.domain);
                 hash.update(entropy.seed.to_le_bytes());
                 hash.update(entropy.stream.to_le_bytes());
                 hash.update(entropy.counter.to_le_bytes());
                 entropy.block = hash.finalize().into();
-                entropy.counter = entropy.counter.checked_add(1).expect("entropy exhausted");
+                entropy.counter = entropy
+                    .counter
+                    .checked_add(1)
+                    .ok_or(getrandom::Error::UNEXPECTED)?;
                 entropy.offset = 0;
             }
             *byte = entropy.block[entropy.offset];
@@ -189,6 +192,7 @@ struct Simulated {
 #[cfg(feature = "simulation")]
 #[derive(Debug)]
 struct Entropy {
+    domain: std::sync::Arc<[u8]>,
     seed: u64,
     stream: u64,
     counter: u64,
@@ -237,11 +241,25 @@ impl SimulationClock {
 
     /// Creates a fresh entropy stream. Call once per role incarnation and retain
     /// the result; calling again with the same ID intentionally replays its bytes.
+    /// The default domain is `b"uring-runtime.entropy.v1\0"`. Applications with
+    /// persisted replay corpora should own an explicit, versioned domain instead.
     pub fn environment(&self, stream: u64) -> Environment {
+        self.environment_with_entropy_domain(stream, &b"uring-runtime.entropy.v1\0"[..])
+    }
+
+    /// Creates a stream in a caller-selected domain. Bytes are SHA-256 blocks of
+    /// domain || seed_le64 || stream_le64 || counter_le64, starting at counter 0.
+    /// Chunking reads and cloning environments do not change the byte stream.
+    pub fn environment_with_entropy_domain(
+        &self,
+        stream: u64,
+        domain: impl Into<std::sync::Arc<[u8]>>,
+    ) -> Environment {
         Environment {
             simulated: Some(Simulated {
                 clock: self.clone(),
                 entropy: std::sync::Arc::new(std::sync::Mutex::new(Entropy {
+                    domain: domain.into(),
                     seed: self.0.lock().unwrap().seed,
                     stream,
                     counter: 0,
@@ -253,18 +271,29 @@ impl SimulationClock {
     }
 
     pub fn advance(&self, duration: std::time::Duration) {
-        let mut clock = self.0.lock().unwrap();
-        let elapsed = clock.elapsed.checked_add(duration).expect("clock overflow");
+        // Panic only after checked_advance releases the lock, so compatibility
+        // callers can catch overflow without poisoning their simulated world.
+        self.checked_advance(duration).expect("clock overflow");
+    }
+
+    /// Advance atomically or leave both clocks unchanged on overflow.
+    pub fn checked_advance(&self, duration: std::time::Duration) -> crate::Result<()> {
+        let mut clock = self.0.lock().map_err(|_| crate::Error::Unavailable)?;
+        let elapsed = clock
+            .elapsed
+            .checked_add(duration)
+            .ok_or(crate::Error::InvalidInput)?;
         clock
             .monotonic
             .checked_add(elapsed)
-            .expect("monotonic overflow");
+            .ok_or(crate::Error::InvalidInput)?;
         let wall = clock
             .wall
             .checked_add(duration)
-            .expect("wall clock overflow");
+            .ok_or(crate::Error::InvalidInput)?;
         clock.elapsed = elapsed;
         clock.wall = wall;
+        Ok(())
     }
 
     pub fn elapsed(&self) -> std::time::Duration {
@@ -282,6 +311,57 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn checked_clock_overflow_is_atomic_and_legacy_panic_does_not_poison() {
+        let clock = SimulationClock::new(9);
+        let _role = clock.environment(0).enter();
+        let before = (now(), wall_now(), clock.elapsed());
+        assert_eq!(
+            clock.checked_advance(Duration::MAX),
+            Err(crate::Error::InvalidInput)
+        );
+        assert_eq!((now(), wall_now(), clock.elapsed()), before);
+        assert!(std::panic::catch_unwind(|| clock.advance(Duration::MAX)).is_err());
+        assert_eq!((now(), wall_now(), clock.elapsed()), before);
+        clock.checked_advance(Duration::from_secs(1)).unwrap();
+        assert_eq!(clock.elapsed(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn domains_and_multiblock_chunking_are_explicit_and_replayable() {
+        let clock = SimulationClock::new(7);
+        let mut default = [0; 99];
+        {
+            let _role = clock.environment(11).enter();
+            fill_random(&mut default).unwrap();
+        }
+        let role = clock.environment_with_entropy_domain(11, &b"uring-runtime.entropy.v1\0"[..]);
+        let mut replay = [0; 99];
+        for chunk in replay.chunks_mut(7) {
+            let _role = role.clone().enter();
+            fill_random(chunk).unwrap();
+        }
+        assert_eq!(default, replay);
+        let _role = clock
+            .environment_with_entropy_domain(11, &b"test.entropy.v1\0"[..])
+            .enter();
+        fill_random(&mut replay).unwrap();
+        assert_ne!(default, replay);
+    }
+
+    #[test]
+    fn exhausted_entropy_returns_error_without_poisoning_cursor() {
+        let clock = SimulationClock::new(1);
+        let role = clock.environment(0);
+        let entropy = &role.simulated.as_ref().unwrap().entropy;
+        entropy.lock().unwrap().counter = u64::MAX;
+        let _role = role.enter();
+        for _ in 0..2 {
+            assert!(fill_random(&mut [0; 1]).is_err());
+            assert_eq!(entropy.lock().unwrap().offset, 32);
+        }
+    }
+
+    #[test]
     fn entropy_domain_and_cloned_cursor_remain_stable() {
         let clock = SimulationClock::new(7);
         let role = clock.environment(11);
@@ -296,13 +376,15 @@ mod tests {
             let _clone = clone.enter();
             fill_random(&mut bytes[3..]).unwrap();
         }
-        assert_eq!(
-            bytes,
-            [
-                3, 158, 83, 113, 252, 214, 143, 64, 34, 247, 154, 192, 42, 95, 161, 48, 152, 147,
-                76, 64, 247, 88, 244, 158, 105, 39, 35, 80, 39, 109, 231, 156,
-            ]
-        );
+        assert_eq!(bytes, {
+            use sha2::{Digest, Sha256};
+            let mut hash = Sha256::new();
+            hash.update(b"uring-runtime.entropy.v1\0");
+            hash.update(7u64.to_le_bytes());
+            hash.update(11u64.to_le_bytes());
+            hash.update(0u64.to_le_bytes());
+            <[u8; 32]>::from(hash.finalize())
+        });
     }
 
     #[test]

@@ -863,7 +863,7 @@ mod tests {
                 let first = scope();
                 let second =
                     RequestScope::new(crate::model::RequestId([1; 16]), first.deadline.0).unwrap();
-                sim.inject("open", simulation::Fault::Delay(100));
+                sim.inject("open", simulation::Fault::Delay(100)).unwrap();
                 let mut a = reactor.file_open(
                     None,
                     std::ffi::CString::new("/one").unwrap(),
@@ -872,7 +872,7 @@ mod tests {
                     &first,
                 );
                 assert!(poll(&mut a).is_pending());
-                sim.inject("open", simulation::Fault::Delay(100));
+                sim.inject("open", simulation::Fault::Delay(100)).unwrap();
                 let mut b = reactor.file_open(
                     None,
                     std::ffi::CString::new("/two").unwrap(),
@@ -1094,7 +1094,7 @@ mod tests {
                 let pool = crate::http::new_pipe_pool(admission);
                 let mut pipe = pool.acquire().unwrap();
                 let (a, b) = sim.socket_pair();
-                sim.set_stream_capacity(2);
+                sim.set_stream_capacity(2).unwrap();
                 pipe.try_write(b"abc").unwrap();
                 assert_eq!(pipe.try_splice_descriptor(&a, 3).unwrap(), 2);
                 assert_eq!(pipe.buffered(), 1);
@@ -1167,7 +1167,7 @@ mod tests {
                     if offset == 4096 {
                         assert_eq!(result.unwrap().bytes, 4096);
                     } else {
-                        assert!(matches!(result, Err(Error::Io)));
+                        assert!(matches!(result, Err(Error::Os(libc::EINVAL))));
                         assert_eq!(
                             drive(&r, r.file_stat(fd.clone(), &scope)).unwrap().stx_size,
                             0
@@ -1297,7 +1297,7 @@ mod tests {
                     let pointer = page.bytes().as_ptr();
                     let (fd, peer) = sim.socket_pair();
                     let fd = Rc::new(fd);
-                    sim.set_max_chunk(3);
+                    sim.set_max_chunk(3).unwrap();
                     let completed =
                         drive(&r, r.send(fd.clone(), page.clone(), (), &scope)).unwrap();
                     assert_eq!(completed.bytes, 3);
@@ -1308,7 +1308,7 @@ mod tests {
                     assert_eq!(peer.try_recv(&mut received).unwrap(), 3);
                     assert_eq!(received, [2; 3]);
                     drop(completed);
-                    sim.inject("send", Fault::Delay(20));
+                    sim.inject("send", Fault::Delay(20)).unwrap();
                     let mut send = r.send(fd, page, (), &scope);
                     assert!(poll(&mut send).is_pending());
                     drop(send);
@@ -1358,7 +1358,7 @@ mod tests {
                         &r,
                         r.write_at(file, 1, r.file_bytes(b"bad").unwrap(), (), &scope)
                     ),
-                    Err(Error::Io)
+                    Err(Error::Os(libc::EINVAL))
                 ));
                 let file = sim.open(None, path, libc::O_RDONLY).unwrap();
                 assert_eq!(
@@ -1388,7 +1388,7 @@ mod tests {
                     )),
                 )
                 .unwrap();
-                assert_eq!(&**bytes, b"first");
+                assert_eq!(&*bytes, b"first");
                 let private = drive(
                     &r,
                     Box::pin(crate::control::directory(
@@ -1400,7 +1400,7 @@ mod tests {
                     )),
                 )
                 .unwrap();
-                sim.inject("write", Fault::Short(2));
+                sim.inject("write", Fault::Short(2)).unwrap();
                 drive(
                     &r,
                     Box::pin(crate::control::atomic_write(

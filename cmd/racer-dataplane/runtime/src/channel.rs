@@ -104,14 +104,20 @@ impl<T> Sender<T> {
         if !self.shared.receiver_closed.load(Ordering::Acquire) {
             return false;
         }
-        let mut head = self.shared.head.0.load(Ordering::Relaxed);
         let tail = self.shared.tail.0.load(Ordering::Acquire);
-        while head != tail {
+        loop {
+            // A destructor can reenter this method and drain the remaining slots.
+            let head = self.shared.head.0.load(Ordering::Relaxed);
+            if head == tail {
+                break;
+            }
             let item = unsafe {
                 (*self.shared.slots[head % self.shared.slots.len()].get()).assume_init_read()
             };
-            head = advance(head, self.shared.slots.len());
-            self.shared.head.0.store(head, Ordering::Release);
+            self.shared
+                .head
+                .0
+                .store(advance(head, self.shared.slots.len()), Ordering::Release);
             drop(item);
         }
         true
@@ -180,6 +186,11 @@ impl<T> Receiver<T> {
         self.shared.readable.register(waker);
     }
     pub fn receive(&mut self) -> Result<Option<T>> {
+        self.receive_shared()
+    }
+    // Shared access is safe because Receiver is non-Sync, and ownership/cursors
+    // are transferred before invoking any caller waker. Reentry sees the new head.
+    pub(crate) fn receive_shared(&self) -> Result<Option<T>> {
         let head = self.shared.head.0.load(Ordering::Relaxed);
         if head == self.shared.tail.0.load(Ordering::Acquire) {
             return Ok(None);
@@ -195,10 +206,13 @@ impl<T> Receiver<T> {
         Ok(Some(item))
     }
     pub fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
+        self.poll_receive_shared(cx)
+    }
+    pub(crate) fn poll_receive_shared(&self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
         self.shared.readable.register(cx.waker());
-        match self.receive() {
+        match self.receive_shared() {
             Ok(None) if !self.shared.sender_closed.load(Ordering::Acquire) => Poll::Pending,
-            Ok(None) => Poll::Ready(self.receive()),
+            Ok(None) => Poll::Ready(self.receive_shared()),
             result => Poll::Ready(result),
         }
     }
@@ -212,6 +226,30 @@ impl<T> Drop for Receiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn orphan_destructor_can_reenter_cleanup() {
+        use std::rc::{Rc, Weak};
+        struct Item(Weak<Sender<Item>>, Rc<Cell<usize>>);
+        impl Drop for Item {
+            fn drop(&mut self) {
+                self.1.set(self.1.get() + 1);
+                self.0.upgrade().unwrap().discard_closed();
+            }
+        }
+        let (sender, receiver) = bounded(3).unwrap();
+        let sender = Rc::new(sender);
+        let count = Rc::new(Cell::new(0));
+        for _ in 0..3 {
+            assert!(
+                sender
+                    .try_send(Item(Rc::downgrade(&sender), count.clone()))
+                    .is_ok()
+            );
+        }
+        drop(receiver);
+        assert!(sender.discard_closed());
+        assert_eq!(count.get(), 3);
+    }
     #[test]
     fn invalid_capacity_is_rejected_before_allocation() {
         assert!(matches!(bounded::<u8>(0), Err(Error::InvalidConfiguration)));

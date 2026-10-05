@@ -37,6 +37,8 @@ pub trait Io: 'static {
     type Error: Copy + Send + PartialEq + From<Error> + From<uring_runtime::Error> + 'static;
     type Scope: Scope<Error = Self::Error>;
     type Lease: 'static;
+    /// Caller-owned sensitive bytes, retaining any read admission charge.
+    type FileBytes: AsRef<[u8]>;
 
     fn lease(&self) -> Result<Option<Rc<Self::Lease>>, Self::Error>;
     fn ready<'a>(
@@ -58,7 +60,7 @@ pub trait Io: 'static {
         path: &'a Path,
         limit: usize,
         scope: &'a Self::Scope,
-    ) -> Operation<'a, zeroize::Zeroizing<Vec<u8>>, Self::Error>;
+    ) -> Operation<'a, Self::FileBytes, Self::Error>;
 }
 
 pub struct Config {

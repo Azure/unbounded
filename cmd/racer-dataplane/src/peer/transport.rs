@@ -304,7 +304,10 @@ fn extension(name: &str, value: Vec<u8>) -> Header {
 }
 
 fn recoverable(error: Error) -> bool {
-    matches!(error, Error::Unavailable | Error::Io | Error::Overloaded)
+    matches!(
+        error,
+        Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded
+    )
 }
 fn native_scope(scope: &RequestScope) -> RequestScope {
     let mut bounded = scope.clone();
@@ -1808,10 +1811,20 @@ mod tests {
             let native = native_scope(&scope);
             assert!(native.deadline.0 <= scope.deadline.0);
             assert!(native_failure(Error::DeadlineExceeded, &scope));
+            assert!(native_failure(Error::Os(libc::ECONNRESET), &scope));
+            assert!(!native_failure(
+                Error::RenameUncertain(crate::error::PublicationCause::Io),
+                &scope
+            ));
+            assert!(!native_failure(
+                Error::PublishedNotDurable(crate::error::PublicationCause::Os(libc::EIO)),
+                &scope
+            ));
             assert!(!native_failure(Error::Unauthorized, &scope));
             scope.cancel().unwrap();
             assert_eq!(native.check(), Err(Error::Cancelled));
             assert!(!native_failure(Error::DeadlineExceeded, &scope));
+            assert!(!native_failure(Error::Os(libc::ECONNRESET), &scope));
         }
         fn offer_fallback(
             sender_failure: bool,

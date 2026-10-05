@@ -1,12 +1,13 @@
 //! Bounded owned handoffs. Cancellation is notification, never a completion fence.
 use crate::{Error, Result, Scope, deadline::CancellationRegistration};
+use futures::task::AtomicWaker;
 use std::{
     collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
 };
@@ -14,6 +15,12 @@ use std::{
 pub struct Completion<V, B> {
     pub value: V,
     pub budget: Option<B>,
+}
+
+// No user callbacks or payload destruction occur while these locks are held.
+// Poison recovery is safe because mutations preserve the ownership invariants.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 #[cfg(test)]
@@ -183,7 +190,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let Poll::Ready(completion) = receipt.poll_completion(&mut cx) else {
+        let Poll::Ready(Ok(completion)) = receipt.poll_completion(&mut cx) else {
             panic!("missing fence")
         };
         assert_eq!(completion.value, 7);
@@ -239,7 +246,7 @@ mod tests {
         ));
         drop(mailbox.take_queued());
         assert!(!mailbox.has_queued());
-        assert_eq!(mailbox.outstanding(), 1);
+        assert_eq!(mailbox.outstanding(), 0);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(matches!(
             Pin::new(&mut receipt).poll(&mut cx),
@@ -297,6 +304,135 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn producer_loss_wakes_both_wait_paths_and_releases_credit() {
+        let (mailbox, scope) = setup();
+        let mut receipt = mailbox.submit(1, String::new(), &scope, None).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(receipt.poll_completion(&mut cx).is_pending());
+        let command = mailbox.pop().unwrap();
+        std::thread::spawn(move || drop(command)).join().unwrap();
+        assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            receipt.poll_completion(&mut cx),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        assert!(matches!(
+            Pin::new(&mut receipt).poll(&mut cx),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        assert_eq!(mailbox.outstanding(), 0);
+        assert!(mailbox.submit(2, String::new(), &scope, None).is_ok());
+    }
+
+    #[test]
+    fn queued_callbacks_reenter_and_panics_do_not_poison_disposal() {
+        let (mailbox, scope) = setup();
+        let receipt = mailbox.submit(1, String::new(), &scope, None).unwrap();
+        assert_eq!(mailbox.queued_min(|_| mailbox.outstanding()), Some(1));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mailbox.queued_min::<usize>(|_| panic!("callback"));
+            }))
+            .is_err()
+        );
+        // Deliberately poison the internal mutex to exercise Drop recovery too.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mailbox.state.lock().unwrap();
+            panic!("poison");
+        }));
+        drop(mailbox.take_queued());
+        drop(receipt);
+        assert_eq!(mailbox.outstanding(), 0);
+    }
+
+    #[test]
+    fn panicking_scope_clone_never_reserves_or_locks() {
+        struct Panics;
+        impl Clone for Panics {
+            fn clone(&self) -> Self {
+                panic!("clone");
+            }
+        }
+        impl Scope for Panics {
+            type Error = Error;
+            fn check(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mailbox = Arc::new(Mailbox::<(), (), (), Panics>::new(1).unwrap());
+        mailbox.install().unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = mailbox.submit(1, (), &Panics, None);
+            }))
+            .is_err()
+        );
+        assert_eq!(mailbox.outstanding(), 0);
+        assert!(!mailbox.has_queued());
+        mailbox.uninstall().unwrap();
+    }
+
+    #[test]
+    fn queued_owners_do_not_keep_mailbox_alive() {
+        let (mailbox, scope) = setup();
+        let weak = Arc::downgrade(&mailbox);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let receipt = mailbox
+            .submit(1, String::new(), &scope, Some(Tracked(dropped.clone())))
+            .unwrap();
+        drop(mailbox);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            receipt.poll_completion(&mut Context::from_waker(futures::task::noop_waker_ref())),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn abandoned_completion_destructor_can_reenter_reply() {
+        struct Reenter(std::sync::Weak<Reply<(), Reenter>>);
+        impl Drop for Reenter {
+            fn drop(&mut self) {
+                let reply = self.0.upgrade().unwrap();
+                assert!(lock(&reply.state).finished);
+            }
+        }
+        let reply = Arc::new(Reply::new(1));
+        reply.abandoned.store(true, Ordering::Release);
+        reply
+            .complete(
+                1,
+                Completion {
+                    value: (),
+                    budget: Some(Reenter(Arc::downgrade(&reply))),
+                },
+            )
+            .unwrap();
+        assert!(lock(&reply.state).completion.is_none());
+    }
+
+    #[test]
+    fn producer_clones_retain_loss_notification_until_last_owner() {
+        let (mailbox, scope) = setup();
+        let receipt = mailbox.submit(1, String::new(), &scope, None).unwrap();
+        let command = mailbox.pop().unwrap();
+        let producer = command.permit.clone();
+        drop(command);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(receipt.poll_completion(&mut cx).is_pending());
+        assert_eq!(mailbox.outstanding(), 1);
+        drop(producer);
+        assert!(matches!(
+            receipt.poll_completion(&mut cx),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        assert_eq!(mailbox.outstanding(), 0);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,6 +447,7 @@ struct ReplyState<V, B> {
     completion: Option<Completion<V, B>>,
     waker: Option<Waker>,
     finished: bool,
+    lost: bool,
 }
 impl<V, B> Reply<V, B> {
     pub fn new(generation: u64) -> Self {
@@ -321,6 +458,7 @@ impl<V, B> Reply<V, B> {
                 completion: None,
                 waker: None,
                 finished: false,
+                lost: false,
             }),
         }
     }
@@ -332,56 +470,99 @@ impl<V, B> Reply<V, B> {
         generation: u64,
         completion: Completion<V, B>,
     ) -> Result<(), StaleCompletion> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock(&self.state);
         if generation != self.generation || state.finished {
             return Err(StaleCompletion);
         }
         state.finished = true;
-        if !self.is_abandoned() {
+        let discarded = if !self.is_abandoned() {
             state.completion = Some(completion);
-        }
+            None
+        } else {
+            Some(completion)
+        };
         let waker = state.waker.take();
         drop(state);
+        drop(discarded);
         if let Some(waker) = waker {
             waker.wake();
         }
         Ok(())
     }
-    fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Completion<V, B>> {
-        let mut state = self.state.lock().unwrap();
+    fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Result<Completion<V, B>>> {
+        let waker = cx.waker().clone();
+        let mut state = lock(&self.state);
         if let Some(completion) = state.completion.take() {
-            return Poll::Ready(completion);
+            return Poll::Ready(Ok(completion));
         }
-        state.waker = Some(cx.waker().clone());
+        if state.lost {
+            return Poll::Ready(Err(Error::Unavailable));
+        }
+        let old = state.waker.replace(waker);
+        drop(state);
+        drop(old);
         Poll::Pending
     }
 }
 
 /// Owned command queue with capacity shared by commands and unread receipts.
-/// The driver must close admission and reap or take queued commands before
-/// disposal: queued permits hold an Arc back to this mailbox. Active work must
+/// Credits do not retain the mailbox, so queued commands cannot form a cycle.
+/// Active work must
 /// be fenced by the caller; dropping a mailbox is not an I/O completion fence.
 pub struct Mailbox<W, V, B, S: Scope> {
     capacity: usize,
     state: Mutex<State<W, V, B, S>>,
+    credits: Arc<Credits>,
 }
+type Queued<W, V, B, S> = (Arc<S>, Command<W, V, B, S>);
 struct State<W, V, B, S: Scope> {
     installed: bool,
     closed: bool,
-    outstanding: usize,
-    queue: VecDeque<Command<W, V, B, S>>,
-    waker: Option<Waker>,
+    queue: VecDeque<Queued<W, V, B, S>>,
+}
+
+struct Credits {
+    outstanding: AtomicUsize,
+    waker: AtomicWaker,
 }
 
 /// Both the accepted command and its receipt retain this permit. Dropping a
 /// receipt cannot release capacity while accepted work still owns resources.
-pub struct Permit<W, V, B, S: Scope>(Arc<Mailbox<W, V, B, S>>);
-impl<W, V, B, S: Scope> Drop for Permit<W, V, B, S> {
+pub struct Permit {
+    credits: Arc<Credits>,
+    released: AtomicBool,
+}
+impl Permit {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.credits.outstanding.fetch_sub(1, Ordering::AcqRel);
+            self.credits.waker.wake();
+        }
+    }
+}
+impl Drop for Permit {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
-        state.outstanding -= 1;
-        let waker = state.waker.clone();
+        self.release();
+    }
+}
+
+/// Keep this owner through execution and drop only after resources are fenced.
+/// Its loss terminates delivery; it is not itself an I/O fence.
+pub struct Producer<V, B> {
+    reply: Arc<Reply<V, B>>,
+    credit: Arc<Permit>,
+}
+impl<V, B> Drop for Producer<V, B> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.reply.state);
+        if state.finished {
+            return;
+        }
+        state.finished = true;
+        state.lost = true;
+        let waker = state.waker.take();
         drop(state);
+        self.credit.release();
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -395,18 +576,21 @@ pub struct Command<W, V, B, S: Scope> {
     pub scope: S,
     pub budget: Option<B>,
     pub reply: Arc<Reply<V, B>>,
-    pub permit: Arc<Permit<W, V, B, S>>,
+    pub permit: Arc<Producer<V, B>>,
 }
 pub struct Receipt<W, V, B, S: Scope> {
     reply: Arc<Reply<V, B>>,
     scope: S,
     cancellation: Option<CancellationRegistration>,
-    permit: Arc<Permit<W, V, B, S>>,
+    permit: Arc<Permit>,
+    work: std::marker::PhantomData<fn() -> W>,
 }
 impl<W, V, B, S: Scope> Receipt<W, V, B, S> {
     /// Wait for the accepted work's fence, ignoring cancellation as an early
     /// return condition. The caller must check its scope after completion.
-    pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Completion<V, B>> {
+    /// Producer loss returns `Unavailable`, not a successful ownership fence.
+    /// Producers must retain `Command::permit` until external resources are safe.
+    pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Result<Completion<V, B>>> {
         if let Some(cancellation) = &self.cancellation {
             cancellation.register(cx.waker());
         }
@@ -425,16 +609,17 @@ impl<W, V, B, S: Scope> Future for Receipt<W, V, B, S> {
         if self.reply.is_abandoned() {
             return Poll::Ready(Err(Error::Cancelled.into()));
         }
-        self.reply.poll_completion(cx).map(Ok)
+        self.reply
+            .poll_completion(cx)
+            .map(|result| result.map_err(Into::into))
     }
 }
 impl<W, V, B, S: Scope> Drop for Receipt<W, V, B, S> {
     fn drop(&mut self) {
         self.reply.abandoned.store(true, Ordering::Release);
-        let waker = self.permit.0.state.lock().unwrap().waker.clone();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        let completion = lock(&self.reply.state).completion.take();
+        drop(completion);
+        self.permit.credits.waker.wake();
     }
 }
 
@@ -448,14 +633,16 @@ impl<W, V, B, S: Scope> Mailbox<W, V, B, S> {
             state: Mutex::new(State {
                 installed: false,
                 closed: false,
-                outstanding: 0,
                 queue: VecDeque::new(),
-                waker: None,
+            }),
+            credits: Arc::new(Credits {
+                outstanding: AtomicUsize::new(0),
+                waker: AtomicWaker::new(),
             }),
         })
     }
     pub fn install(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock(&self.state);
         if state.installed || state.closed {
             return Err(Error::InvalidConfiguration);
         }
@@ -463,15 +650,15 @@ impl<W, V, B, S: Scope> Mailbox<W, V, B, S> {
         Ok(())
     }
     pub fn stop_admission(&self) {
-        self.state.lock().unwrap().closed = true;
+        lock(&self.state).closed = true;
     }
     pub fn outstanding(&self) -> usize {
-        self.state.lock().unwrap().outstanding
+        self.credits.outstanding.load(Ordering::Acquire)
     }
     pub fn uninstall(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock(&self.state);
         state.closed = true;
-        if state.outstanding != 0 {
+        if self.outstanding() != 0 {
             return Err(Error::Unavailable);
         }
         state.installed = false;
@@ -492,62 +679,79 @@ impl<W, V, B, S: Scope> Mailbox<W, V, B, S> {
             .map(|c| c.subscribe())
             .transpose()
             .map_err(S::Error::from)?;
-        let mut state = self.state.lock().unwrap();
+        // Clone all caller policy before reserving credit or taking a lock.
+        let command_scope = scope.clone();
+        let receipt_scope = scope.clone();
+        let queued_scope = Arc::new(scope.clone());
+        let mut state = lock(&self.state);
         if state.closed || !state.installed {
             return Err(Error::Unavailable.into());
         }
-        if state.outstanding >= self.capacity {
+        if self.outstanding() >= self.capacity {
             return Err(Error::Overloaded.into());
         }
-        state.outstanding += 1;
-        let permit = Arc::new(Permit(self.clone()));
-        let reply = Arc::new(Reply::new(generation));
-        state.queue.push_back(Command {
-            generation,
-            work,
-            scope: scope.clone(),
-            budget,
-            reply: reply.clone(),
-            permit: permit.clone(),
+        state
+            .queue
+            .try_reserve(1)
+            .map_err(|_| S::Error::from(Error::Overloaded))?;
+        self.credits.outstanding.fetch_add(1, Ordering::AcqRel);
+        let permit = Arc::new(Permit {
+            credits: self.credits.clone(),
+            released: AtomicBool::new(false),
         });
-        let waker = state.waker.take();
+        let reply = Arc::new(Reply::new(generation));
+        let producer = Arc::new(Producer {
+            reply: reply.clone(),
+            credit: permit.clone(),
+        });
+        state.queue.push_back((
+            queued_scope,
+            Command {
+                generation,
+                work,
+                scope: command_scope,
+                budget,
+                reply: reply.clone(),
+                permit: producer,
+            },
+        ));
         drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.credits.waker.wake();
         Ok(Receipt {
             reply,
-            scope: scope.clone(),
+            scope: receipt_scope,
             cancellation,
             permit,
+            work: std::marker::PhantomData,
         })
     }
     pub fn register(&self, waker: &Waker) {
-        self.state.lock().unwrap().waker = Some(waker.clone());
+        self.credits.waker.register(waker);
     }
     pub fn pop(&self) -> Option<Command<W, V, B, S>> {
-        self.state.lock().unwrap().queue.pop_front()
+        let entry = lock(&self.state).queue.pop_front();
+        entry.map(|(_, command)| command)
     }
     pub fn has_queued(&self) -> bool {
-        !self.state.lock().unwrap().queue.is_empty()
+        !lock(&self.state).queue.is_empty()
     }
     pub fn abandon_queued(&self) {
-        for command in &self.state.lock().unwrap().queue {
+        for (_, command) in &lock(&self.state).queue {
             command.reply.abandoned.store(true, Ordering::Release);
         }
     }
     pub fn queued_min<T: Ord>(&self, key: impl Fn(&S) -> T) -> Option<T> {
-        self.state
-            .lock()
-            .unwrap()
+        let scopes: Vec<_> = lock(&self.state)
             .queue
             .iter()
-            .map(|command| key(&command.scope))
-            .min()
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        scopes.iter().map(|scope| key(scope)).min()
     }
     /// Remove unstarted commands for caller-defined failure completion or process
     /// loss. Drop outside the lock: permits release against the same mailbox.
     pub fn take_queued(&self) -> VecDeque<Command<W, V, B, S>> {
-        std::mem::take(&mut self.state.lock().unwrap().queue)
+        let queue = std::mem::take(&mut lock(&self.state).queue);
+        queue.into_iter().map(|(_, command)| command).collect()
     }
 }

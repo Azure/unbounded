@@ -9,6 +9,74 @@ pub enum SleepMode {
     ClockPoll,
 }
 
+impl<S: Scope, B: Budget> Reactor<S, B> {
+    /// Sleep under caller-owned scope policy with an owned io_uring timeout.
+    /// `until` must belong to the currently entered clock domain. Instant itself
+    /// carries no domain ID, so an instant copied from another clock is unsupported.
+    /// Kernel mode rejects simulated clocks/drivers, including expired deadlines.
+    /// ClockPoll requires a simulated clock and cooperatively wakes its executor.
+    pub fn sleep_until<'a>(
+        &'a self,
+        until: std::time::Instant,
+        mode: SleepMode,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error> {
+        Box::pin(async move {
+            scope.check()?;
+            #[cfg(feature = "simulation")]
+            match mode {
+                SleepMode::Kernel
+                    if crate::environment::simulation_seed().is_some()
+                        || self.state.borrow().simulation.is_some() =>
+                {
+                    return Err(Error::InvalidConfiguration.into());
+                }
+                SleepMode::ClockPoll if crate::environment::simulation_seed().is_none() => {
+                    return Err(Error::InvalidConfiguration.into());
+                }
+                _ => (),
+            }
+            let duration = until.saturating_duration_since(crate::environment::now());
+            if duration.is_zero() {
+                return Ok(());
+            }
+            match mode {
+                #[cfg(feature = "simulation")]
+                SleepMode::ClockPoll => {
+                    return std::future::poll_fn(|cx| {
+                        scope.check()?;
+                        if crate::environment::now() >= until {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                SleepMode::Kernel => (),
+            }
+            if duration.as_secs() > i64::MAX as u64 {
+                return Err(Error::InvalidInput.into());
+            }
+            let timeout = SyscallArg::new(types::Timespec::from(duration));
+            let sqe = opcode::Timeout::new(timeout.as_ptr()).build();
+            self.submit(Submission::Real(sqe), scope, false, move |result| {
+                drop(timeout);
+                match result? {
+                    KernelResult::Value(value) if value == -libc::ETIME => Ok(()),
+                    other => {
+                        other.value()?;
+                        Ok(())
+                    }
+                }
+            })?
+            .await?;
+            scope.check()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,72 +139,23 @@ mod tests {
             Poll::Ready(Err(Error::Cancelled))
         );
     }
-}
 
-impl<S: Scope, B: Budget> Reactor<S, B> {
-    /// Sleep under caller-owned scope policy, preserving readiness completion fences.
-    /// Backend selection belongs to the caller even when simulation is compiled in.
-    pub fn sleep_until<'a>(
-        &'a self,
-        until: std::time::Instant,
-        mode: SleepMode,
-        scope: &'a S,
-    ) -> Operation<'a, (), S::Error> {
-        Box::pin(async move {
-            scope.check()?;
-            let duration = until.saturating_duration_since(crate::environment::now());
-            if duration.is_zero() {
-                return Ok(());
-            }
-            match mode {
-                #[cfg(feature = "simulation")]
-                SleepMode::ClockPoll => {
-                    return std::future::poll_fn(|cx| {
-                        scope.check()?;
-                        if crate::environment::now() >= until {
-                            Poll::Ready(Ok(()))
-                        } else {
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                    })
-                    .await;
-                }
-                SleepMode::Kernel => (),
-            }
-            // SAFETY: timerfd_create has no pointer arguments; the returned FD is owned.
-            let raw = unsafe {
-                libc::timerfd_create(
-                    libc::CLOCK_MONOTONIC,
-                    libc::TFD_CLOEXEC | libc::TFD_NONBLOCK,
-                )
-            };
-            if raw < 0 {
-                return Err(Error::Io.into());
-            }
-            // SAFETY: raw is a newly created descriptor with no other owner.
-            let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
-            let interval = libc::itimerspec {
-                it_interval: libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                },
-                it_value: libc::timespec {
-                    tv_sec: duration
-                        .as_secs()
-                        .try_into()
-                        .map_err(|_| Error::InvalidInput)?,
-                    tv_nsec: duration.subsec_nanos() as _,
-                },
-            };
-            // SAFETY: interval is initialized and remains valid for the syscall.
-            if unsafe { libc::timerfd_settime(fd.as_raw_fd(), 0, &interval, std::ptr::null_mut()) }
-                != 0
-            {
-                return Err(Error::Io.into());
-            }
-            self.readiness(fd, libc::POLLIN as u32, scope).await?;
-            scope.check()
-        })
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn timer_rejects_mixed_clock_and_backend_even_for_expired_deadlines() {
+        let request = scope();
+        let reactor = Reactor::<crate::reactor::tests::fixtures::RequestScope, ()>::new(2, ());
+        let expired = crate::environment::now();
+        assert_eq!(
+            poll(&mut reactor.sleep_until(expired, SleepMode::ClockPoll, &request)),
+            Poll::Ready(Err(Error::InvalidConfiguration))
+        );
+        let clock = crate::environment::SimulationClock::new(4);
+        let _clock = clock.environment(0).enter();
+        assert_eq!(
+            poll(&mut reactor.sleep_until(expired, SleepMode::Kernel, &request)),
+            Poll::Ready(Err(Error::InvalidConfiguration))
+        );
+        assert_eq!(reactor.in_flight(), 0);
     }
 }

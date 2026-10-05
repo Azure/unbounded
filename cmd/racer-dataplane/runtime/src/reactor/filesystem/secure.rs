@@ -11,14 +11,24 @@ pub const NO_SYMLINKS: u64 = 0x04;
 
 /// Validate byte length and embedded NULs without normalizing the path.
 pub fn path_name(path: &OsStr, limit: usize) -> Result<CString> {
-    if path.as_bytes().len() > limit {
+    validate_path(path, limit)?;
+    CString::new(path.as_bytes()).map_err(|_| Error::InvalidInput)
+}
+
+fn validate_path(path: &OsStr, limit: usize) -> Result<()> {
+    if path.as_bytes().len() > limit.min(PATH_BYTES) || path.as_bytes().contains(&0) {
         return Err(Error::InvalidInput);
     }
-    CString::new(path.as_bytes()).map_err(|_| Error::InvalidInput)
+    Ok(())
 }
 
 /// A single normal component, never a root, parent, current directory or path.
 pub fn component(name: &OsStr, limit: usize) -> Result<CString> {
+    validate_component(name, limit)?;
+    path_name(name, limit)
+}
+
+pub(super) fn validate_component(name: &OsStr, limit: usize) -> Result<()> {
     if !matches!(
         Path::new(name).components().next(),
         Some(Component::Normal(_))
@@ -26,7 +36,7 @@ pub fn component(name: &OsStr, limit: usize) -> Result<CString> {
     {
         return Err(Error::InvalidInput);
     }
-    path_name(name, limit)
+    validate_path(name, limit)
 }
 
 /// Missing metadata is distinct from a failed access requirement so the caller
@@ -71,6 +81,105 @@ pub fn check_regular_size(stat: &libc::statx, limit: u64) -> Result<()> {
         return Err(Error::InvalidInput);
     }
     Ok(())
+}
+
+impl<S: Scope, B: Budget> Reactor<S, B> {
+    /// Walk from `/` or `.`, pinning each directory and rejecting symlinks and
+    /// parent components. Creation uses file_mkdir's owner-only mode. Each mkdir,
+    /// including an existing component, is followed by a parent durability fence.
+    /// Ownership and final-directory permissions are checked separately by callers.
+    pub fn file_directory<'a>(
+        &'a self,
+        path: &'a Path,
+        create: bool,
+        path_limit: usize,
+        scope: &'a S,
+    ) -> Operation<'a, Rc<Descriptor>, S::Error> {
+        Box::pin(async move {
+            validate_path(path.as_os_str(), path_limit)?;
+            // Complete lexical validation before opening or creating anything.
+            if path
+                .components()
+                .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+            {
+                return Err(Error::InvalidConfiguration.into());
+            }
+            let mut fd = self
+                .file_open(
+                    None,
+                    CString::new(if path.is_absolute() { "/" } else { "." }).unwrap(),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    NO_SYMLINKS,
+                    scope,
+                )
+                .await?;
+            for part in path.components() {
+                let Component::Normal(part) = part else {
+                    if matches!(part, Component::RootDir | Component::CurDir) {
+                        continue;
+                    }
+                    return Err(Error::InvalidConfiguration.into());
+                };
+                let name = path_name(part, path_limit)?;
+                if create {
+                    self.file_mkdir_inner(fd.clone(), name.clone(), true, scope)
+                        .await?;
+                    self.file_sync(fd.clone(), scope).await?;
+                }
+                fd = self
+                    .file_open(
+                        Some(fd),
+                        name,
+                        libc::O_RDONLY | libc::O_DIRECTORY,
+                        BENEATH | NO_SYMLINKS,
+                        scope,
+                    )
+                    .await?;
+            }
+            Ok(fd)
+        })
+    }
+
+    /// Remove a caller-validated relative name and sync the parent even if the
+    /// name was absent, restoring the fence after a previously canceled unlink.
+    pub fn file_remove_synced<'a>(
+        &'a self,
+        directory: Rc<Descriptor>,
+        name: CString,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error> {
+        Box::pin(async move {
+            validate_component(OsStr::from_bytes(name.as_bytes()), PATH_BYTES)?;
+            self.file_unlink_inner(directory.clone(), name, true, scope)
+                .await?;
+            self.file_sync(directory, scope).await
+        })
+    }
+
+    /// Remove and fence a stale stage, then create an exclusive owner-only file
+    /// beneath the pinned directory without following symlinks. The caller owns
+    /// stage naming, serialization, publication, and cleanup after failure.
+    pub fn file_stage<'a>(
+        &'a self,
+        directory: Rc<Descriptor>,
+        temporary: &'a OsStr,
+        name_limit: usize,
+        scope: &'a S,
+    ) -> Operation<'a, Rc<Descriptor>, S::Error> {
+        Box::pin(async move {
+            let name = component(temporary, name_limit)?;
+            self.file_remove_synced(directory.clone(), name.clone(), scope)
+                .await?;
+            self.file_open(
+                Some(directory),
+                name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                BENEATH | NO_SYMLINKS,
+                scope,
+            )
+            .await
+        })
+    }
 }
 
 #[cfg(test)]
@@ -171,108 +280,5 @@ mod tests {
             assert_eq!(check_regular_size(&stat, 10), Err(Error::InvalidInput));
             stat.stx_mask ^= bit;
         }
-    }
-}
-
-impl<S: Scope, B: Budget> Reactor<S, B>
-where
-    S::Error: PartialEq,
-{
-    /// Walk from `/` or `.`, pinning each directory and rejecting symlinks and
-    /// parent components. Creation uses file_mkdir's owner-only mode. Each mkdir,
-    /// including an existing component, is followed by a parent durability fence.
-    /// Ownership and final-directory permissions are checked separately by callers.
-    pub fn file_directory<'a>(
-        &'a self,
-        path: &'a Path,
-        create: bool,
-        path_limit: usize,
-        scope: &'a S,
-    ) -> Operation<'a, Rc<Descriptor>, S::Error> {
-        Box::pin(async move {
-            path_name(path.as_os_str(), path_limit)?;
-            let mut fd = self
-                .file_open(
-                    None,
-                    CString::new(if path.is_absolute() { "/" } else { "." }).unwrap(),
-                    libc::O_RDONLY | libc::O_DIRECTORY,
-                    NO_SYMLINKS,
-                    scope,
-                )
-                .await?;
-            for part in path.components() {
-                let Component::Normal(part) = part else {
-                    if matches!(part, Component::RootDir | Component::CurDir) {
-                        continue;
-                    }
-                    return Err(Error::InvalidConfiguration.into());
-                };
-                if create {
-                    match self
-                        .file_mkdir(fd.clone(), path_name(part, path_limit)?, scope)
-                        .await
-                    {
-                        Ok(()) => (),
-                        // A canceled mkdir may have missed the parent fsync.
-                        Err(error) if error == Error::AlreadyExists.into() => (),
-                        Err(error) => return Err(error),
-                    }
-                    self.file_sync(fd.clone(), scope).await?;
-                }
-                fd = self
-                    .file_open(
-                        Some(fd),
-                        path_name(part, path_limit)?,
-                        libc::O_RDONLY | libc::O_DIRECTORY,
-                        BENEATH | NO_SYMLINKS,
-                        scope,
-                    )
-                    .await?;
-            }
-            Ok(fd)
-        })
-    }
-
-    /// Remove a caller-validated relative name and sync the parent even if the
-    /// name was absent, restoring the fence after a previously canceled unlink.
-    pub fn file_remove_synced<'a>(
-        &'a self,
-        directory: Rc<Descriptor>,
-        name: CString,
-        scope: &'a S,
-    ) -> Operation<'a, (), S::Error> {
-        Box::pin(async move {
-            match self.file_unlink(directory.clone(), name, scope).await {
-                Ok(()) => (),
-                Err(error) if error == Error::NotFound.into() => (),
-                Err(error) => return Err(error),
-            }
-            self.file_sync(directory, scope).await
-        })
-    }
-
-    /// Remove and fence a stale stage, then create an exclusive owner-only file
-    /// beneath the pinned directory without following symlinks. The caller owns
-    /// stage naming, serialization, publication, and cleanup after failure.
-    pub fn file_stage<'a>(
-        &'a self,
-        directory: Rc<Descriptor>,
-        temporary: &'a OsStr,
-        name_limit: usize,
-        scope: &'a S,
-    ) -> Operation<'a, Rc<Descriptor>, S::Error> {
-        Box::pin(async move {
-            let name = component(temporary, name_limit)?;
-            self.file_remove_synced(directory.clone(), name.clone(), scope)
-                .await?;
-            self.file_open(
-                Some(directory),
-                name,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                BENEATH | NO_SYMLINKS,
-                scope,
-            )
-            .await
-        })
     }
 }

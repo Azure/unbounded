@@ -116,11 +116,12 @@ mod duplex_release {
             let end = head_end.unwrap();
             assert_eq!(bytes.len(), end + 21);
             // Force the payload's final owned send, execute it, but withhold its CQE.
-            sim.inject("splice", Fault::Errno(libc::EOPNOTSUPP));
-            sim.inject("send", Fault::Errno(libc::EAGAIN));
-            sim.inject("send", Fault::HoldCompletion(40));
+            sim.inject("splice", Fault::Errno(libc::EOPNOTSUPP))
+                .unwrap();
+            sim.inject("send", Fault::Errno(libc::EAGAIN)).unwrap();
+            sim.inject("send", Fault::HoldCompletion(40)).unwrap();
             if mode == "short" {
-                sim.set_max_chunk(2);
+                sim.set_max_chunk(2).unwrap();
             }
             let mut payload = [0; 3];
             let mut received = None;
@@ -137,7 +138,7 @@ mod duplex_release {
             assert_eq!(&payload[..n], &b"abc"[..n]);
             assert!(f.reactor.in_flight() > 0);
             assert_eq!(admission.used(ResourceClass::Pipe), 1);
-            sim.set_max_chunk(usize::MAX);
+            sim.set_max_chunk(usize::MAX).unwrap();
             let mut release = [0; 12];
             release[8..]
                 .copy_from_slice(&(if mode == "malformed" { 2u32 } else { 3 }).to_be_bytes());

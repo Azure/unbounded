@@ -168,7 +168,7 @@ impl<I: Io + ?Sized> Transport<I> {
                 .await?;
             use sha2::Digest;
             let mut epoch = sha2::Sha256::new();
-            epoch.update(&*trust);
+            epoch.update(trust.as_ref());
             if let Some(identity) = identity {
                 for certificate in identity.certificate_chain {
                     epoch.update((certificate.len() as u64).to_be_bytes());
@@ -189,7 +189,7 @@ impl<I: Io + ?Sized> Transport<I> {
                 }
             }
             let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut trust.as_slice()) {
+            for cert in rustls_pemfile::certs(&mut trust.as_ref()) {
                 roots
                     .add(cert.map_err(|_| Error::Unauthorized)?)
                     .map_err(|_| Error::Unauthorized)?;

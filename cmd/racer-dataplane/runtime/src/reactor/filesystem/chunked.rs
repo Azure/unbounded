@@ -1,6 +1,6 @@
 //! Bounded scratch staged writes and synchronous namespace-only publication.
 use super::*;
-use std::{fs, io::Write, num::NonZeroUsize, path::Path, path::PathBuf};
+use std::num::NonZeroUsize;
 
 impl<S: Scope, B: Budget> Reactor<S, B> {
     /// Write a caller-prepared stage using bounded submission scratch, then
@@ -12,54 +12,42 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         bytes: &'a [u8],
         chunk: NonZeroUsize,
         scope: &'a S,
-    ) -> Operation<'a, (), S::Error> {
+    ) -> Operation<'a, (), ReplacementError<S::Error>> {
         Box::pin(async move {
-            let Replacement {
-                directory,
-                staged,
-                temporary,
-                target,
-                durability,
-            } = replacement;
+            let staged = self
+                .prepare_replacement(&replacement, scope)
+                .await
+                .map_err(ReplacementError::BeforeRename)?;
             let mut offset = 0u64;
+            let mut buffer = self
+                .file_buffer(bytes.len().min(chunk.get()))
+                .map_err(|e| ReplacementError::BeforeRename(e.into()))?;
             for bytes in bytes.chunks(chunk.get()) {
-                let mut buffer = self.file_bytes(bytes)?;
-                while buffer.remaining() != 0 {
-                    let completion = self
-                        .write_at(staged.clone(), offset, buffer, (), scope)
-                        .await?;
-                    buffer = completion.buffer;
-                    buffer.advance(completion.bytes)?;
-                    offset += completion.bytes as u64;
-                }
+                buffer.start = 0;
+                buffer.end = bytes.len();
+                buffer.data[..bytes.len()].copy_from_slice(bytes);
+                buffer = self
+                    .write_complete(staged.clone(), buffer, &mut offset, scope)
+                    .await
+                    .map_err(ReplacementError::BeforeRename)?;
             }
-            if matches!(durability, Durability::FileAndDirectory) {
-                self.file_sync(staged.clone(), scope).await?;
-            }
-            // Keep the stage owner through rename, as with the original chunked
-            // publication. Every submitted write additionally owns its FD/buffer.
-            self.file_rename(directory.clone(), temporary, target, scope)
-                .await?;
-            if matches!(durability, Durability::FileAndDirectory) {
-                self.file_sync(directory, scope).await?;
-            }
-            drop(staged);
-            Ok(())
+            self.publish_replacement(replacement, staged, scope).await
         })
     }
 }
 
 #[cfg(all(test, feature = "simulation"))]
 mod tests {
+    use super::super::test_support::{drive, poll};
     use super::*;
     use crate::reactor::{
         simulation::{Fault, Simulation},
         tests::{
-            drive,
             fixtures::{Admission, Limits, Reactor},
-            poll, scope,
+            scope,
         },
     };
+    use std::path::{Path, PathBuf};
 
     fn replacement(r: &Reactor) -> Replacement {
         let open = |path, flags| {
@@ -88,7 +76,7 @@ mod tests {
             })));
             sim.write_file(Path::new("/target"), b"old").unwrap();
             sim.disk().sync_all().unwrap();
-            sim.set_max_chunk(8191);
+            sim.set_max_chunk(8191).unwrap();
             drive(
                 &r,
                 r.file_replace_chunked(
@@ -100,6 +88,16 @@ mod tests {
             )
             .unwrap();
             assert_eq!(sim.read_file(Path::new("/target")).unwrap(), bytes);
+            if !bytes.is_empty() {
+                let writes: Vec<_> = sim
+                    .trace()
+                    .into_iter()
+                    .filter(|e| e.operation == "complete:write")
+                    .map(|e| e.result)
+                    .collect();
+                assert!(writes.contains(&8191), "no actual short completion");
+                assert!(writes.iter().all(|&n| n > 0 && n <= 8191));
+            }
             sim.disk().crash().unwrap();
             assert_eq!(sim.read_file(Path::new("/target")).unwrap(), b"old");
         }
@@ -125,17 +123,31 @@ mod tests {
             );
             match fault {
                 "abandon" => {
-                    sim.inject("write", Fault::Delay(10));
-                    assert!(poll(&mut future).is_pending());
+                    sim.inject("write", Fault::Delay(10)).unwrap();
+                    for _ in 0..100 {
+                        assert!(poll(&mut future).is_pending());
+                        if sim.trace().iter().any(|e| e.operation == "submit:write") {
+                            break;
+                        }
+                        r.poll_budgeted(8).unwrap();
+                        r.wait(Duration::from_millis(1)).unwrap();
+                    }
+                    assert!(sim.trace().iter().any(|e| e.operation == "submit:write"));
                     drop(future);
-                    assert!(weak.upgrade().is_some());
+                    // The original stage is no longer the write description;
+                    // the securely reopened FD and scratch remain in the SQE.
+                    assert!(weak.upgrade().is_none());
+                    assert_eq!(r.in_flight(), 1);
                     drive(&r, r.file_fence(())).unwrap();
                     assert!(weak.upgrade().is_none());
                     assert_eq!(r.in_flight(), 0);
                 }
                 "cancel" => {
                     request.cancel().unwrap();
-                    assert_eq!(drive(&r, future), Err(Error::Cancelled));
+                    assert_eq!(
+                        drive(&r, future).map_err(|e| e.cause()),
+                        Err(Error::Cancelled)
+                    );
                 }
                 fault => {
                     sim.inject(
@@ -145,8 +157,16 @@ mod tests {
                         } else {
                             Fault::Errno(libc::EIO)
                         },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        drive(&r, future).map_err(|e| e.cause()),
+                        Err(if fault == "zero" {
+                            Error::Io
+                        } else {
+                            Error::Os(libc::EIO)
+                        })
                     );
-                    assert_eq!(drive(&r, future), Err(Error::Io));
                 }
             }
             assert_eq!(sim.read_file(Path::new("/target")).unwrap(), b"old");
@@ -163,14 +183,14 @@ mod tests {
         sim.write_file(Path::new("/stale"), b"keep").unwrap();
         sim.disk().sync_all().unwrap();
         assert!(publish_new(directory, target, b"new", [PathBuf::from("/stale")]).is_err());
-        sim.inject("write", Fault::Short(0));
+        sim.inject("write", Fault::Short(0)).unwrap();
         assert!(publish_new(directory, target, b"new", [PathBuf::from("/failed")]).is_err());
         assert!(sim.metadata(Path::new("/failed")).is_err());
-        sim.inject("rename", Fault::Errno(libc::EIO));
+        sim.inject("rename", Fault::Errno(libc::EIO)).unwrap();
         assert!(publish_new(directory, target, b"new", [PathBuf::from("/failed")]).is_err());
         assert!(sim.metadata(Path::new("/failed")).is_err());
         assert_eq!(sim.read_file(target).unwrap(), b"old");
-        sim.set_max_chunk(2);
+        sim.set_max_chunk(2).unwrap();
         publish_new(
             directory,
             target,
@@ -183,71 +203,46 @@ mod tests {
         sim.disk().crash().unwrap();
         assert_eq!(sim.read_file(target).unwrap(), b"old");
     }
-}
 
-/// Synchronous, namespace-only replacement. No fsync is issued. The caller
-/// supplies bounded, same-directory stage candidates and serializes publication.
-/// Existing stage files are skipped, never truncated or removed. Failed writes
-/// and renames remove only the stage created by this invocation, best effort.
-pub fn publish_new(
-    directory: &Path,
-    target: &Path,
-    bytes: &[u8],
-    candidates: impl IntoIterator<Item = PathBuf>,
-) -> std::io::Result<()> {
-    #[cfg(feature = "simulation")]
-    if let Some(sim) = simulation::Simulation::current() {
-        sim.create_dir_all(directory)?;
-        for temporary in candidates {
-            let fd = match sim.open(
-                None,
-                &temporary,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            ) {
-                Ok(fd) => fd,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            };
-            let result = (|| {
-                let handle = fd.as_sim().expect("simulated stage");
-                let mut offset = 0;
-                while offset < bytes.len() {
-                    let written = handle.file_write(offset as u64, &bytes[offset..])?;
-                    if written == 0 {
-                        return Err(std::io::Error::other("zero stage write"));
-                    }
-                    offset += written;
-                }
-                drop(fd);
-                sim.rename(&temporary, target, 0)
-            })();
-            if result.is_err() {
-                let _ = sim.unlink(&temporary);
-            }
-            return result;
+    #[test]
+    fn synchronous_simulation_uses_private_modes_and_validates_before_creation() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let directory = Path::new("/private/child");
+        let target = directory.join("target");
+        assert!(
+            publish_new(
+                directory,
+                &target,
+                b"secret",
+                [directory.join("../outside")]
+            )
+            .is_err()
+        );
+        assert!(sim.metadata(Path::new("/private")).is_err());
+        publish_new(directory, &target, b"secret", [directory.join("stage")]).unwrap();
+        let r = Reactor::new(Rc::new(Admission::new(Limits {
+            queue_entries: NonZeroUsize::new(8).unwrap(),
+        })));
+        for (path, mode) in [
+            (Path::new("/private"), 0o700),
+            (directory, 0o700),
+            (target.as_path(), 0o600),
+        ] {
+            let fd = Rc::new(sim.open(None, path, libc::O_RDONLY).unwrap());
+            let stat = drive(&r, r.file_stat(fd, &scope())).unwrap();
+            assert_eq!(stat.stx_mode & 0o777, mode);
         }
-        return Err(std::io::Error::other("stage candidates exhausted"));
+        sim.symlink(directory, Path::new("/link")).unwrap();
+        assert!(
+            publish_new(
+                Path::new("/link"),
+                Path::new("/link/target"),
+                b"bad",
+                [PathBuf::from("/link/stage")]
+            )
+            .is_err()
+        );
+        assert_eq!(sim.read_file(&target).unwrap(), b"secret");
     }
-    fs::create_dir_all(directory)?;
-    for temporary in candidates {
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        };
-        let result = (|| {
-            file.write_all(bytes)?;
-            drop(file);
-            fs::rename(&temporary, target)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        return result;
-    }
-    Err(std::io::Error::other("stage candidates exhausted"))
 }

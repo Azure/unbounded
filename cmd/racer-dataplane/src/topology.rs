@@ -76,7 +76,7 @@ impl LinkHealth {
         let _probe = self.acquire(endpoint)?;
         let result = operation.await;
         let outcome = match &result {
-            Err(Error::Io | Error::Unavailable) => Some(LinkOutcome::Refused),
+            Err(Error::Io | Error::Os(_) | Error::Unavailable) => Some(LinkOutcome::Refused),
             Err(Error::DeadlineExceeded) => Some(LinkOutcome::Timeout),
             Err(Error::BadGateway | Error::CorruptRecord) => Some(LinkOutcome::ProtocolFailure),
             Err(Error::Cancelled | Error::Overloaded) => None,

@@ -639,7 +639,7 @@ fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
         let bid = b.ciphertext.envelope().page.clone();
         f.enqueue(a).unwrap();
         f.enqueue(b).unwrap();
-        simulation.inject("write", fault);
+        simulation.inject("write", fault).unwrap();
         let scope = scope();
         let mut writes = f.store.writer.progress(8, &scope);
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -2859,7 +2859,7 @@ mod checkpoint {
         sim.write_file(&path.join("checkpoint.1"), &encode(&image(2)).unwrap())
             .unwrap();
         let mut scan = candidates(&path, MAX_CHECKPOINT_BYTES).unwrap();
-        sim.inject("read", Fault::Errno(libc::EIO));
+        sim.inject("read", Fault::Errno(libc::EIO)).unwrap();
         assert_eq!(scan.next().unwrap().1.sequence, 1);
         assert!(scan.next().is_none());
     }

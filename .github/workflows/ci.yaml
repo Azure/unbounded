@@ -159,8 +159,8 @@ jobs:
       - name: Set up pinned Rust
         # Match the Racer builder image in Makefile and images/racer-dataplane/Containerfile.
         run: |
-          rustup toolchain install 1.96.0 --profile minimal --component rustfmt
-          rustup override set 1.96.0
+          timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+          timeout --signal=TERM --kill-after=10s 300s rustup override set 1.96.0
 
       - name: Cache Rust dependencies and build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -172,6 +172,10 @@ jobs:
           key: racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
             racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/**/Cargo.toml') }}-
+
+      - name: Strict runtime clippy and default-feature compile
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s make runtime-check
 
       - name: Check native adapter and complete Rust suite with bounded memory
         # A system service works without a user systemd manager on hosted runners.
@@ -186,6 +190,7 @@ jobs:
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv="TMPDIR=$PWD/tmp" \
             --setenv=CARGO_BUILD_JOBS=2 --setenv=RUST_TEST_THREADS=1 \
             --setenv=PAGE_ALLOC_REQUIRE_REAL_IO=1 \
+            --setenv=RUNTIME_REQUIRE_IO_URING=1 \
             bash "$PWD/hack/scripts/memory-safe-run.sh" -- \
             make racer-dataplane-native-build racer-alloc-test racer-rust-test
 
@@ -218,6 +223,27 @@ jobs:
             --setenv='CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=sudo -n' \
             bash "$PWD/hack/scripts/memory-safe-run.sh" -- \
             make racer-process-restart
+
+  runtime-miri:
+    name: Runtime Miri (${{ matrix.group }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [channel, offload, scheduler, memory]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Miri
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install nightly-2025-11-21 --profile minimal --component miri,rust-src
+
+      - name: Prepare Miri sysroot
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +nightly-2025-11-21 miri setup
+
+      - name: Validate exact pure runtime test group
+        run: timeout --signal=TERM --kill-after=10s 300s make runtime-miri RUNTIME_MIRI_GROUP=${{ matrix.group }}
 
   racer-sdk-age:
     name: Racer SDK Connection Age

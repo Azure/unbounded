@@ -9,6 +9,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
     num::NonZeroUsize,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -85,7 +86,7 @@ pub trait Reserved<I> {
 pub struct ClientPort<I, J, C> {
     handoff: Arc<Handoff<I>>,
     jobs: Sender<J>,
-    completions: RefCell<Receiver<C>>,
+    completions: Receiver<C>,
     last_sequence: Cell<Option<u64>>,
 }
 pub struct WorkerPort<I, J, C> {
@@ -94,12 +95,15 @@ pub struct WorkerPort<I, J, C> {
     completions: Sender<C>,
 }
 
+/// Paired client and worker endpoints sharing fixed admission capacity.
+pub type PortPair<I, J, C> = (ClientPort<I, J, C>, WorkerPort<I, J, C>);
+
 /// Allocate both fixed-capacity queues without starting a service. The sequence
 /// in `identity` is ignored; the first reservation may use any sequence.
 pub fn try_pair<I: Identity, J: Reserved<I>, C: Reserved<I>>(
     identity: I,
     capacity: NonZeroUsize,
-) -> crate::Result<(ClientPort<I, J, C>, WorkerPort<I, J, C>)> {
+) -> crate::Result<PortPair<I, J, C>> {
     let (jobs_tx, jobs_rx) = channel::bounded(capacity.get())?;
     let (results_tx, results_rx) = channel::bounded(capacity.get())?;
     let handoff = Arc::new(Handoff {
@@ -115,7 +119,7 @@ pub fn try_pair<I: Identity, J: Reserved<I>, C: Reserved<I>>(
         ClientPort {
             handoff: handoff.clone(),
             jobs: jobs_tx,
-            completions: RefCell::new(results_rx),
+            completions: results_rx,
             last_sequence: Cell::new(None),
         },
         WorkerPort {
@@ -140,7 +144,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
         self.handoff.closed.load(Ordering::Acquire)
     }
     pub fn completions_closed(&self) -> bool {
-        self.completions.borrow().is_closed()
+        self.completions.is_closed()
     }
     pub fn register_driver(&self, waker: &Waker) {
         self.handoff.client_waker.register(waker);
@@ -198,10 +202,10 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
         Ok(())
     }
     pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<crate::Result<Option<C>>> {
-        self.completions.borrow_mut().poll_receive(cx)
+        self.completions.poll_receive_shared(cx)
     }
     pub fn receive(&self) -> crate::Result<Option<C>> {
-        self.completions.borrow_mut().receive()
+        self.completions.receive_shared()
     }
     /// Discard orphaned jobs only after the unique worker receiver is destroyed.
     pub fn discard_closed(&self) {
@@ -256,8 +260,8 @@ impl<I, J, C> Drop for WorkerPort<I, J, C> {
 
 struct Pending<S> {
     sequence: u64,
-    waker: Waker,
-    scope: S,
+    waker: Rc<Waker>,
+    scope: Rc<S>,
 }
 
 /// Worker-local bounded FIFO before ownership is accepted by an offload port.
@@ -288,6 +292,10 @@ impl<S> AdmissionQueue<S> {
     /// Saturation consumes neither a queue slot nor a sequence. Overflow requires
     /// draining and a new pair generation, never sequence reuse.
     pub fn enter(&self, scope: S, cx: &Context<'_>) -> crate::Result<CapacityWaiter<'_, S>> {
+        // RawWaker clone/drop are caller code, just like wake. Snapshot before
+        // borrowing, then validate capacity/sequence after any reentrant clone.
+        let waker = Rc::new(cx.waker().clone());
+        let scope = Rc::new(scope);
         let mut pending = self.pending.borrow_mut();
         if pending.len() >= self.capacity.get() {
             return Err(crate::Error::Overloaded);
@@ -300,7 +308,7 @@ impl<S> AdmissionQueue<S> {
         self.sequence.set(sequence);
         pending.push_back(Pending {
             sequence,
-            waker: cx.waker().clone(),
+            waker,
             scope,
         });
         Ok(CapacityWaiter {
@@ -308,24 +316,24 @@ impl<S> AdmissionQueue<S> {
             sequence,
         })
     }
-    /// Inspect at most budget entries, rotating across turns, then wake outside
-    /// the queue borrow. The predicate must not mutate this queue.
+    /// Snapshot at most budget entries, rotating across turns. Predicates and all
+    /// waker callbacks run outside the borrow and may reenter this queue.
     pub fn wake_if(&self, budget: usize, mut predicate: impl FnMut(&S) -> bool) {
-        let wakes = {
+        let candidates = {
             let pending = self.pending.borrow();
             let mut wakes = Vec::new();
             for _ in 0..budget.min(pending.len()) {
                 let index = self.cursor.get() % pending.len();
                 self.cursor.set(index + 1);
                 let entry = &pending[index];
-                if predicate(&entry.scope) {
-                    wakes.push(entry.waker.clone());
-                }
+                wakes.push((entry.scope.clone(), entry.waker.clone()));
             }
             wakes
         };
-        for wake in wakes {
-            wake.wake();
+        for (scope, wake) in candidates {
+            if predicate(&scope) {
+                wake.wake_by_ref();
+            }
         }
     }
 }
@@ -347,37 +355,44 @@ impl<S> CapacityWaiter<'_, S> {
         cx: &mut Context<'_>,
         reserve: impl FnOnce(&mut Context<'_>) -> Poll<T>,
     ) -> Poll<T> {
+        let waker = Rc::new(cx.waker().clone());
         let mut pending = self.queue.pending.borrow_mut();
         let entry = pending
             .iter_mut()
             .find(|entry| entry.sequence == self.sequence)
             .expect("live capacity waiter");
-        entry.waker = cx.waker().clone();
-        if pending
+        let old = std::mem::replace(&mut entry.waker, waker);
+        let head = pending
             .front()
-            .is_some_and(|entry| entry.sequence != self.sequence)
-        {
+            .is_none_or(|entry| entry.sequence == self.sequence);
+        drop(pending);
+        drop(old);
+        if !head {
             return Poll::Pending;
         }
-        drop(pending);
         reserve(cx)
     }
 }
 impl<S> Drop for CapacityWaiter<'_, S> {
     fn drop(&mut self) {
-        let wake = {
+        let (removed, wake) = {
             let mut pending = self.queue.pending.borrow_mut();
-            pending.retain(|entry| entry.sequence != self.sequence);
-            pending.front().map(|entry| entry.waker.clone())
+            let removed = pending
+                .iter()
+                .position(|entry| entry.sequence == self.sequence)
+                .and_then(|index| pending.remove(index));
+            (removed, pending.front().map(|entry| entry.waker.clone()))
         };
+        drop(removed);
         if let Some(wake) = wake {
-            wake.wake();
+            wake.wake_by_ref();
         }
     }
 }
 
 struct Waiter<C> {
-    waker: Waker,
+    generation: u64,
+    waker: Rc<Waker>,
     abandoned: bool,
     result: Option<C>,
 }
@@ -386,16 +401,19 @@ struct Waiter<C> {
 pub struct Waiters<I, C> {
     entries: RefCell<BTreeMap<I, Waiter<C>>>,
     cursor: Cell<Option<I>>,
+    generation: Cell<u64>,
 }
 /// Dropping the waiting future abandons delivery; accepted owners stay fenced by
 /// their permits until completion reap or worker loss, independently of this guard.
 pub struct Registration<'a, I: Copy + Ord, C> {
     waiters: &'a Waiters<I, C>,
     id: I,
+    generation: u64,
 }
 impl<I: Copy + Ord, C> Drop for Registration<'_, I, C> {
     fn drop(&mut self) {
-        self.waiters.abandon(self.id);
+        self.waiters
+            .abandon_generation(self.id, Some(self.generation));
     }
 }
 impl<I: Copy + Ord, C> Default for Waiters<I, C> {
@@ -403,6 +421,7 @@ impl<I: Copy + Ord, C> Default for Waiters<I, C> {
         Self {
             entries: RefCell::new(BTreeMap::new()),
             cursor: Cell::new(None),
+            generation: Cell::new(0),
         }
     }
 }
@@ -413,91 +432,126 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
     pub fn is_empty(&self) -> bool {
         self.entries.borrow().is_empty()
     }
-    pub fn register(&self, id: I, waker: &Waker) {
-        self.entries.borrow_mut().insert(
+    /// Identities must not be reused for different accepted jobs. Duplicate live
+    /// registrations are rejected, never replaced. The fallible form permits
+    /// callers to handle misuse without unwinding.
+    pub fn try_register(&self, id: I, waker: &Waker) -> crate::Result<()> {
+        let waker = Rc::new(waker.clone());
+        let mut entries = self.entries.borrow_mut();
+        if entries.contains_key(&id) {
+            return Err(crate::Error::AlreadyExists);
+        }
+        let generation = self
+            .generation
+            .get()
+            .checked_add(1)
+            .ok_or(crate::Error::Unavailable)?;
+        self.generation.set(generation);
+        entries.insert(
             id,
             Waiter {
-                waker: waker.clone(),
+                generation,
+                waker,
                 abandoned: false,
                 result: None,
             },
         );
+        Ok(())
+    }
+    pub fn register(&self, id: I, waker: &Waker) {
+        self.try_register(id, waker)
+            .expect("unique waiter registration");
     }
     pub fn register_guard(&self, id: I, waker: &Waker) -> Registration<'_, I, C> {
         self.register(id, waker);
-        Registration { waiters: self, id }
+        Registration {
+            waiters: self,
+            id,
+            generation: self.generation.get(),
+        }
     }
     /// Remove a registration after rejected submission, before any acceptance.
     pub fn remove(&self, id: I) {
-        self.entries.borrow_mut().remove(&id);
+        let removed = self.entries.borrow_mut().remove(&id);
+        drop(removed);
     }
     pub fn abandon(&self, id: I) {
+        self.abandon_generation(id, None);
+    }
+    fn abandon_generation(&self, id: I, generation: Option<u64>) {
         let mut entries = self.entries.borrow_mut();
+        let mut removed = None;
         if let Some(waiter) = entries.get_mut(&id) {
+            if generation.is_some_and(|generation| generation != waiter.generation) {
+                return;
+            }
             if waiter.result.is_some() {
-                entries.remove(&id);
+                removed = entries.remove(&id);
             } else {
                 waiter.abandoned = true;
             }
         }
+        drop(entries);
+        drop(removed);
     }
     /// A missing registration or abandoned completed result is canceled. Scope
     /// checks belong after Ready: cancellation cannot bypass the completion fence.
     pub fn poll_result(&self, id: I, cx: &mut Context<'_>) -> Poll<crate::Result<C>> {
+        let waker = Rc::new(cx.waker().clone());
         let mut entries = self.entries.borrow_mut();
         let Some(waiter) = entries.get_mut(&id) else {
             return Poll::Ready(Err(crate::Error::Cancelled));
         };
-        waiter.waker = cx.waker().clone();
+        let old = std::mem::replace(&mut waiter.waker, waker);
         if let Some(result) = waiter.result.take() {
             let abandoned = waiter.abandoned;
-            entries.remove(&id);
+            let removed = entries.remove(&id);
+            drop(entries);
+            drop((old, removed));
             if abandoned {
                 Poll::Ready(Err(crate::Error::Cancelled))
             } else {
                 Poll::Ready(Ok(result))
             }
         } else {
+            drop(entries);
+            drop(old);
             Poll::Pending
         }
     }
     /// Unknown or abandoned completions are dropped, never delivered to a new ID.
     pub fn deliver(&self, id: I, completion: C) {
+        let mut completion = Some(completion);
+        let mut removed = None;
         let wake = {
             let mut entries = self.entries.borrow_mut();
             if let Some(waiter) = entries.get_mut(&id) {
                 if waiter.abandoned {
-                    entries.remove(&id).map(|waiter| waiter.waker)
+                    removed = entries.remove(&id);
+                    None
+                } else if waiter.result.is_some() {
+                    // First completion wins. Never overwrite an unread owner.
+                    None
                 } else {
                     let wake = waiter.waker.clone();
-                    waiter.result = Some(completion);
+                    waiter.result = completion.take();
                     Some(wake)
                 }
             } else {
                 None
             }
         };
+        let wake = wake.or_else(|| removed.as_ref().map(|waiter| waiter.waker.clone()));
+        drop((removed, completion));
         if let Some(wake) = wake {
-            wake.wake();
+            wake.wake_by_ref();
         }
     }
     /// Only call with fenced=true after worker loss AND zero outstanding owners.
     /// Bounded round-robin wakes let live futures observe worker loss themselves.
     pub fn worker_closed(&self, budget: usize, fenced: bool) {
         use std::ops::Bound::{Excluded, Unbounded};
-        if fenced {
-            let abandoned: Vec<_> = self
-                .entries
-                .borrow()
-                .iter()
-                .filter(|(_, waiter)| waiter.abandoned)
-                .take(budget)
-                .map(|(id, _)| *id)
-                .collect();
-            for id in abandoned {
-                self.remove(id);
-            }
-        }
+        let mut abandoned = Vec::new();
         let wakes: Vec<_> = {
             let entries = self.entries.borrow();
             let start = self.cursor.get().map_or(Unbounded, Excluded);
@@ -510,12 +564,17 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
                 self.cursor.set(Some(*id));
                 if !waiter.abandoned {
                     wakes.push(waiter.waker.clone());
+                } else if fenced {
+                    abandoned.push(*id);
                 }
             }
             wakes
         };
+        for id in abandoned {
+            self.remove(id);
+        }
         for wake in wakes {
-            wake.wake();
+            wake.wake_by_ref();
         }
     }
     /// Cancel delivery, releasing only completions already fenced by execution.
@@ -531,10 +590,19 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
         for waiter in entries.values_mut() {
             waiter.abandoned = true;
         }
-        entries.retain(|_, waiter| waiter.result.is_none());
+        let completed: Vec<_> = entries
+            .iter()
+            .filter(|(_, waiter)| waiter.result.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        let removed: Vec<_> = completed
+            .into_iter()
+            .filter_map(|id| entries.remove(&id))
+            .collect();
         drop(entries);
+        drop(removed);
         for wake in wakes {
-            wake.wake();
+            wake.wake_by_ref();
         }
     }
 }
@@ -542,6 +610,208 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static CALLBACK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+    fn callback() {
+        CALLBACK.with(|callback| {
+            if let Some(callback) = &*callback.borrow() {
+                callback();
+            }
+        });
+    }
+    // The raw waker contains no thread-local data. Its callbacks inspect only the
+    // current thread's test hook, so cloning/dropping it on any thread is safe.
+    fn callback_waker() -> Waker {
+        use std::task::{RawWaker, RawWakerVTable};
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            callback();
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn wake(_: *const ()) {
+            callback();
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, wake);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+    struct CallbackGuard;
+    impl Drop for CallbackGuard {
+        fn drop(&mut self) {
+            CALLBACK.with(|hook| {
+                let old = hook.borrow_mut().take();
+                drop(old);
+            });
+        }
+    }
+    fn on_callback(hook: impl Fn() + 'static) -> CallbackGuard {
+        CALLBACK.with(|callback| *callback.borrow_mut() = Some(Box::new(hook)));
+        CallbackGuard
+    }
+
+    #[test]
+    fn admission_raw_waker_and_scope_destructors_reenter_without_borrows() {
+        struct ScopeHook(Rc<Cell<usize>>);
+        impl Drop for ScopeHook {
+            fn drop(&mut self) {
+                callback();
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let queue = Rc::new(AdmissionQueue::new(NonZeroUsize::new(2).unwrap()));
+        let reenter = queue.clone();
+        let calls = Rc::new(Cell::new(0));
+        let count = calls.clone();
+        let _hook = on_callback(move || {
+            assert!(reenter.pending.try_borrow_mut().is_ok());
+            reenter.wake_if(0, |_| false);
+            count.set(count.get() + 1);
+        });
+        let drops = Rc::new(Cell::new(0));
+        let waker = callback_waker();
+        let mut cx = Context::from_waker(&waker);
+        let first = queue.enter(ScopeHook(drops.clone()), &cx).unwrap();
+        let second = queue.enter(ScopeHook(drops.clone()), &cx).unwrap();
+        assert!(matches!(
+            queue.enter(ScopeHook(drops.clone()), &cx),
+            Err(crate::Error::Overloaded)
+        ));
+        assert!(first.poll(&mut cx, |_| Poll::<()>::Pending).is_pending());
+        assert!(
+            second
+                .poll(&mut cx, |_| -> Poll<()> { panic!("tail reserved") })
+                .is_pending()
+        );
+        queue.wake_if(2, |_| {
+            callback();
+            true
+        });
+        drop(first);
+        drop(second);
+        assert!(queue.is_empty());
+        assert_eq!(drops.get(), 3);
+        assert!(calls.get() >= 10, "clone/drop/wake hooks must all execute");
+    }
+
+    #[test]
+    fn registry_raw_waker_clone_drop_and_wake_allow_mutating_reentry() {
+        let waiters = Rc::new(Waiters::<u64, ()>::default());
+        let reenter = waiters.clone();
+        let calls = Rc::new(Cell::new(0));
+        let count = calls.clone();
+        let _hook = on_callback(move || {
+            reenter.register(99, futures::task::noop_waker_ref());
+            reenter.remove(99);
+            count.set(count.get() + 1);
+        });
+        let waker = callback_waker();
+        let mut cx = Context::from_waker(&waker);
+        waiters.register(1, &waker);
+        assert_eq!(
+            waiters.try_register(1, &waker),
+            Err(crate::Error::AlreadyExists)
+        );
+        assert!(waiters.poll_result(1, &mut cx).is_pending());
+        waiters.deliver(1, ());
+        assert_eq!(waiters.poll_result(1, &mut cx), Poll::Ready(Ok(())));
+        waiters.register(2, &waker);
+        waiters.worker_closed(1, false);
+        waiters.abandon(2);
+        waiters.deliver(2, ());
+        waiters.register(3, &waker);
+        waiters.deliver(3, ());
+        waiters.abandon_all();
+        assert!(waiters.is_empty());
+        assert!(calls.get() >= 10);
+    }
+
+    #[test]
+    fn client_completion_callbacks_can_receive_and_poll_reentrantly() {
+        let (client, mut worker) = pair(7, 2);
+        let client = Rc::new(client);
+        let reenter = client.clone();
+        let calls = Rc::new(Cell::new(0));
+        let count = calls.clone();
+        let _hook = on_callback(move || {
+            // Nested receive may consume a different completion; the outer receive
+            // has already advanced its cursor before waking the producer.
+            drop(reenter.receive().unwrap());
+            let _ =
+                reenter.poll_completion(&mut Context::from_waker(futures::task::noop_waker_ref()));
+            count.set(count.get() + 1);
+        });
+        let waker = callback_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(client.poll_completion(&mut cx).is_pending());
+        let drops = Arc::new(AtomicUsize::new(0));
+        for sequence in 1..=2 {
+            assert!(worker.complete(message(&client, sequence, &drops)).is_ok());
+        }
+        // Register a producer capacity callback directly to cover receive's wake.
+        let _ = worker.completions.poll_ready(&mut cx);
+        drop(client.receive().unwrap());
+        assert!(calls.get() > 0);
+        assert_eq!(client.outstanding(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn duplicate_registration_and_delivery_preserve_first_owner_and_stale_guard_is_inert() {
+        let waiters = Waiters::<u64, usize>::default();
+        let waker = futures::task::noop_waker_ref();
+        let old = waiters.register_guard(1, waker);
+        assert_eq!(
+            waiters.try_register(1, waker),
+            Err(crate::Error::AlreadyExists)
+        );
+        waiters.deliver(1, 7);
+        waiters.deliver(1, 9);
+        let mut cx = Context::from_waker(waker);
+        assert_eq!(waiters.poll_result(1, &mut cx), Poll::Ready(Ok(7)));
+        let current = waiters.register_guard(1, waker);
+        drop(old);
+        waiters.deliver(1, 11);
+        assert_eq!(waiters.poll_result(1, &mut cx), Poll::Ready(Ok(11)));
+        drop(current);
+    }
+
+    #[test]
+    fn worker_loss_bounds_inspection_not_just_matching_removals() {
+        let waiters = Waiters::<u64, ()>::default();
+        let (count, waker) = wake_counter();
+        for id in 0..100 {
+            waiters.register(id, &waker);
+        }
+        waiters.abandon(99);
+        waiters.worker_closed(0, true);
+        assert_eq!(waiters.cursor.get(), None);
+        for id in 0..99 {
+            waiters.worker_closed(1, true);
+            assert_eq!(waiters.cursor.get(), Some(id));
+            assert_eq!(waiters.len(), 100);
+        }
+        assert_eq!(count.0.load(Ordering::SeqCst), 99);
+        waiters.worker_closed(1, true);
+        assert_eq!(waiters.len(), 99);
+    }
+
+    #[test]
+    fn result_destructors_can_reenter_delivery_registry() {
+        use std::rc::{Rc, Weak};
+        struct Reenter(Weak<Waiters<u64, Reenter>>);
+        impl Drop for Reenter {
+            fn drop(&mut self) {
+                self.0.upgrade().unwrap().remove(99);
+            }
+        }
+        let waiters = Rc::new(Waiters::default());
+        let waker = futures::task::noop_waker_ref();
+        waiters.register(1, waker);
+        waiters.deliver(1, Reenter(Rc::downgrade(&waiters)));
+        waiters.deliver(1, Reenter(Rc::downgrade(&waiters)));
+        waiters.abandon_all();
+        assert!(waiters.is_empty());
+    }
 
     struct WakeCount(AtomicUsize);
     impl std::task::Wake for WakeCount {

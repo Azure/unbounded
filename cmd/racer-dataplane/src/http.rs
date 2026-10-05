@@ -845,7 +845,7 @@ pub(crate) mod tests {
                             }
                             "disconnect" => {
                                 drop(peer);
-                                Error::Io
+                                Error::Os(libc::EPIPE)
                             }
                             _ => Error::DeadlineExceeded,
                         };
@@ -1540,7 +1540,11 @@ pub(crate) mod tests {
         #[test]
         fn pending_http_send_cancellation_disconnect_and_stall_release_all_leases() {
             let (admission, reactor, delivery) = setup(1, Duration::from_millis(25));
-            for failure in [Error::Cancelled, Error::Io, Error::DeadlineExceeded] {
+            for failure in [
+                Error::Cancelled,
+                Error::Os(libc::EPIPE),
+                Error::DeadlineExceeded,
+            ] {
                 let (reader, connection, peer, weak) = blocked_reader(&admission, &delivery);
                 let scope = scope();
                 let original = scope.deadline.0;
@@ -1550,7 +1554,7 @@ pub(crate) mod tests {
                 assert_eq!(reactor.in_flight(), 1);
                 match failure {
                     Error::Cancelled => scope.cancel().unwrap(),
-                    Error::Io => drop(peer),
+                    Error::Os(libc::EPIPE) => drop(peer),
                     _ => {}
                 }
                 assert!(matches!(drive(&reactor, operation), Err(error) if error == failure));
@@ -2268,7 +2272,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
                 let endpoint = Endpoint::Peer("127.0.0.1:9999".into());
-                simulation.inject("connect", Fault::Errno(errno));
+                simulation.inject("connect", Fault::Errno(errno)).unwrap();
                 let mut checkout = checkout_peer(
                     &pool,
                     &endpoint,
@@ -2286,7 +2290,7 @@ pub(crate) mod tests {
                     }
                     reactor.poll_budgeted(32).unwrap();
                 }
-                assert!(matches!(result, Some(Err(Error::Io))));
+                assert!(matches!(result, Some(Err(Error::Os(code))) if code == errno));
                 drop(checkout);
                 drop(permit);
                 assert_eq!(failure.get(), blame);

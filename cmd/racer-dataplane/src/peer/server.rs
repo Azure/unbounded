@@ -77,7 +77,10 @@ impl PeerServer {
         &self,
         fd: uring_runtime::reactor::Descriptor,
     ) -> crate::error::Result<uring_runtime::reactor::Descriptor> {
-        fd.enable_tcp_nodelay(self.tcp_nodelay)?;
+        // False preserves the accepted socket's existing application policy.
+        if self.tcp_nodelay {
+            fd.enable_tcp_nodelay(true)?;
+        }
         Ok(fd)
     }
     pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
@@ -491,6 +494,7 @@ impl PeerServer {
                         Err(
                             Error::Unavailable
                             | Error::Io
+                            | Error::Os(_)
                             | Error::HopBudgetExhausted
                             | Error::IncompatibleMembership,
                         ) => {
@@ -684,6 +688,7 @@ impl PeerServer {
                     Err(
                         Error::Unavailable
                         | Error::Io
+                        | Error::Os(_)
                         | Error::HopBudgetExhausted
                         | Error::IncompatibleMembership,
                     ) => {
@@ -721,9 +726,13 @@ impl PeerServer {
                 Err(Error::Overloaded) => PeerResponse::Overloaded,
                 Err(Error::Unauthorized) => PeerResponse::OriginRejected,
                 Err(Error::OriginForbidden) => PeerResponse::OriginForbidden,
-                Err(Error::Unavailable | Error::Io | Error::MissingKey | Error::CorruptRecord) => {
-                    PeerResponse::Unavailable
-                }
+                Err(
+                    Error::Unavailable
+                    | Error::Io
+                    | Error::Os(_)
+                    | Error::MissingKey
+                    | Error::CorruptRecord,
+                ) => PeerResponse::Unavailable,
                 Err(error) => return Err(error),
             };
             scope.check()?;

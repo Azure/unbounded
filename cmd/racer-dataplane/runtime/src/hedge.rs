@@ -40,45 +40,46 @@ pub async fn race<S: Scope, T>(
     parent.check()?;
     let mut primary = std::pin::pin!(primary);
     let mut secondary = std::pin::pin!(secondary);
-    let registration = parent.cancellation().map(|c| c.subscribe()).transpose()?;
+    let mut registration = parent.cancellation().map(|c| c.subscribe()).transpose()?;
     let mut a_done = false;
     let mut b_done = false;
     let mut launched = false;
     let mut winner = None;
     let mut fatal = None;
+    let mut a_canceled = false;
+    let mut b_canceled = false;
     std::future::poll_fn(|cx| {
+        if let Err(error) = parent.check() {
+            fatal = Some(error);
+            registration.take();
+        }
         if let Some(registration) = &registration {
             registration.register(cx.waker());
         }
-        if let Err(error) = parent.check() {
-            fatal = Some(error);
-        }
         if fatal.is_some() || winner.is_some() {
-            if !a_done {
+            if !a_done && !a_canceled {
+                a_canceled = true;
                 primary_scope.cancel();
             }
-            if !b_done {
+            if !b_done && !b_canceled {
+                b_canceled = true;
                 secondary_scope.cancel();
             }
         }
-        if !a_done {
-            if let Poll::Ready(result) = primary.as_mut().poll(cx) {
-                a_done = true;
-                match result {
-                    Ok(value) if winner.is_none() && fatal.is_none() => {
-                        policy.won(Contender::Primary);
-                        winner = Some(value);
-                    }
-                    Err(error)
-                        if !policy.recoverable(error) && winner.is_none() && fatal.is_none() =>
-                    {
-                        fatal = Some(error);
-                    }
-                    _ => {}
+        if !a_done && let Poll::Ready(result) = primary.as_mut().poll(cx) {
+            a_done = true;
+            match result {
+                Ok(value) if winner.is_none() && fatal.is_none() => {
+                    policy.won(Contender::Primary);
+                    winner = Some(value);
                 }
-                if !launched {
-                    b_done = true;
+                Err(error) if !policy.recoverable(error) && winner.is_none() && fatal.is_none() => {
+                    fatal = Some(error);
                 }
+                _ => {}
+            }
+            if !launched {
+                b_done = true;
             }
         }
         if !launched
@@ -90,7 +91,8 @@ pub async fn race<S: Scope, T>(
             launched = true;
         }
         if launched && !b_done {
-            if fatal.is_some() || winner.is_some() {
+            if (fatal.is_some() || winner.is_some()) && !b_canceled {
+                b_canceled = true;
                 secondary_scope.cancel();
             }
             if let Poll::Ready(result) = secondary.as_mut().poll(cx) {
@@ -110,10 +112,12 @@ pub async fn race<S: Scope, T>(
             }
         }
         if winner.is_some() || fatal.is_some() {
-            if !a_done {
+            if !a_done && !a_canceled {
+                a_canceled = true;
                 primary_scope.cancel();
             }
-            if !b_done {
+            if !b_done && !b_canceled {
+                b_canceled = true;
                 secondary_scope.cancel();
             }
             if !launched {
@@ -388,6 +392,14 @@ mod tests {
         assert_eq!(wake.count(), 1);
         assert!(work.as_mut().poll(&mut cx).is_pending());
         assert!(a.0.is_cancelled() && b.0.is_cancelled());
+        for _ in 0..100 {
+            assert!(work.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(
+            wake.count(),
+            1,
+            "draining canceled children must not busy-wake"
+        );
         a_fence.set(true);
         assert!(work.as_mut().poll(&mut cx).is_pending());
         b_fence.set(true);

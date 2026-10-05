@@ -45,12 +45,12 @@ mod simulated {
         let buffer = drive(&reactor, read()).unwrap();
         assert!(buffer.as_slice().iter().all(|b| *b == 42));
         drop(buffer);
-        sim.inject("read", Fault::Short(512));
+        sim.inject("read", Fault::Short(512)).unwrap();
         assert!(matches!(
             drive(&reactor, read()),
             Err(TestError::Alloc(Error::Io))
         ));
-        sim.inject("write", Fault::Short(512));
+        sim.inject("write", Fault::Short(512)).unwrap();
         let op = slab.write(
             &reactor,
             extent,
@@ -63,10 +63,10 @@ mod simulated {
             Err(TestError::Alloc(Error::Io))
         ));
         assert_eq!(slab.writes_in_flight(), 0);
-        sim.inject("read", Fault::Errno(libc::EIO));
+        sim.inject("read", Fault::Errno(libc::EIO)).unwrap();
         assert!(matches!(
             drive(&reactor, read()),
-            Err(TestError::Runtime(uring_runtime::Error::Io))
+            Err(TestError::Runtime(uring_runtime::Error::Os(libc::EIO)))
         ));
         assert_eq!(reactor.in_flight(), 0);
         segments.begin_evict(SegmentId(0)).unwrap();
@@ -89,7 +89,7 @@ mod simulated {
             let extra = Rc::new(CountingCharge::new(&used, 512));
             let weak = Rc::downgrade(&extra);
             buffer.retain(extra);
-            sim.inject("write", Fault::HoldCompletion(8));
+            sim.inject("write", Fault::HoldCompletion(8)).unwrap();
             let mut op = slab.write(&reactor, extent, buffer, lease, &TestScope);
             assert!(poll(&mut op).is_pending());
             assert_eq!(slab.writes_in_flight(), 1);
@@ -137,7 +137,7 @@ mod simulated {
         drop(op);
         assert_eq!(slab.writes_in_flight(), 0);
         assert_eq!(reactor.in_flight(), 0);
-        sim.inject("read", Fault::HoldCompletion(8));
+        sim.inject("read", Fault::HoldCompletion(8)).unwrap();
         let mut op = slab.read(
             &reactor,
             extent,
@@ -166,9 +166,9 @@ mod simulated {
         drop(conflicting);
         let wrong_size = Slab::<()>::new(PathBuf::from("/virtual/slab.dat"), 16384, 4096, 512);
         assert_eq!(wrong_size.open_now(), Err(Error::InvalidConfiguration));
-        sim.inject("open", Fault::Errno(libc::EOPNOTSUPP));
+        sim.inject("open", Fault::Errno(libc::EOPNOTSUPP)).unwrap();
         assert_eq!(wrong_size.open_now(), Err(Error::Unsupported));
-        sim.inject("open", Fault::Errno(libc::ENOSPC));
+        sim.inject("open", Fault::Errno(libc::ENOSPC)).unwrap();
         assert_eq!(
             wrong_size.open_now(),
             Err(Error::SystemIo {
@@ -197,7 +197,7 @@ mod simulated {
         let (slab, segments) = setup::<()>();
         let reactor = Reactor::<TestScope, ()>::new(16, ());
         let (lease, extent) = segments.append(4096).unwrap();
-        sim.inject("write", Fault::HoldCompletion(8));
+        sim.inject("write", Fault::HoldCompletion(8)).unwrap();
         let mut write = slab.write(
             &reactor,
             extent,

@@ -848,7 +848,8 @@ fn error_head(error: Error) -> Result<MessageHead> {
         Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded | Error::Cancelled | Error::StaleFlight | Error::IncompatibleMembership | Error::HopBudgetExhausted | Error::MissingKey
         // Clock rollback or peer restart can reject an otherwise valid attempt's
         // freshness. It is unavailable to this client, not an internal failure.
-        | Error::Replay | Error::Io => 503,
+        | Error::Replay | Error::Io | Error::Os(_) => 503,
+        Error::RenameUncertain(_) | Error::PublishedNotDurable(_) => 500,
         // A bare unsatisfiable error has lost required version metadata. Never
         // invent a total length to make a syntactically valid but false 416.
         _ => 500,

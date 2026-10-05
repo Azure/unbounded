@@ -6,10 +6,12 @@ use std::rc::Rc;
 use std::task::Waker;
 use std::time::Instant;
 
+type Pending = BTreeMap<(Instant, u64), Rc<RefCell<State>>>;
+
 #[derive(Default)]
 pub struct Registry {
     next: Cell<u64>,
-    pending: RefCell<BTreeMap<(Instant, u64), Rc<RefCell<State>>>>,
+    pending: RefCell<Pending>,
 }
 #[derive(Default)]
 struct State {
@@ -22,6 +24,7 @@ pub struct Registration {
     state: Rc<RefCell<State>>,
 }
 impl Registry {
+    #[cfg(any(test, feature = "test-util"))]
     pub fn with_next_id(next: u64) -> Self {
         Self {
             next: Cell::new(next),
@@ -79,25 +82,69 @@ impl Registry {
 impl Registration {
     /// Scope policy is checked by the caller before consulting this observation.
     pub fn check(&self, waker: &Waker) -> crate::Result<()> {
+        // RawWaker clone/drop callbacks may reenter this registration or registry.
+        let new = waker.clone();
         let mut state = self.state.borrow_mut();
         if state.expired {
+            drop(state);
             return Err(crate::Error::DeadlineExceeded);
         }
-        if state.waker.as_ref().is_none_or(|old| !old.will_wake(waker)) {
-            state.waker = Some(waker.clone());
-        }
+        let old = state.waker.replace(new);
+        drop(state);
+        drop(old);
         Ok(())
     }
 }
 impl Drop for Registration {
     fn drop(&mut self) {
-        self.table.pending.borrow_mut().remove(&self.key);
+        let removed = self.table.pending.borrow_mut().remove(&self.key);
+        drop(removed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadlines_are_ordered_by_time_then_registration_and_drop_is_reentrant() {
+        thread_local! {
+            static STATE: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
+        }
+        struct OnDrop;
+        impl std::task::Wake for OnDrop {
+            fn wake(self: std::sync::Arc<Self>) {
+                panic!("replaced registration must not wake its retired owner");
+            }
+        }
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                STATE.with(|slot| {
+                    let state = slot.borrow().as_ref().unwrap().clone();
+                    assert!(state.try_borrow_mut().is_ok());
+                });
+            }
+        }
+        let table = Rc::new(Registry::default());
+        let now = Instant::now();
+        let late = table
+            .register(now + std::time::Duration::from_secs(1))
+            .unwrap();
+        let first = table.register(now).unwrap();
+        let second = table.register(now).unwrap();
+        STATE.with(|slot| slot.replace(Some(first.state.clone())));
+        first
+            .check(&Waker::from(std::sync::Arc::new(OnDrop)))
+            .unwrap();
+        first.check(Waker::noop()).unwrap();
+        assert_eq!(table.poll(now, 1), 1);
+        assert!(first.check(Waker::noop()).is_err());
+        assert!(second.check(Waker::noop()).is_ok());
+        assert!(late.check(Waker::noop()).is_ok());
+        assert_eq!(table.poll(now, 8), 1);
+        assert!(late.check(Waker::noop()).is_ok());
+        STATE.with(|slot| slot.take());
+    }
     #[test]
     fn bounded_poll_drop_and_overflow() {
         let table = Rc::new(Registry::default());

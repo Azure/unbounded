@@ -280,6 +280,7 @@ impl Checkpointer {
                     &scope,
                 )
                 .await
+                .map_err(Into::into)
         }))
     }
 }

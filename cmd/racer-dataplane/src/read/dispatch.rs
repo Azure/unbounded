@@ -189,15 +189,15 @@ impl WorkerDirectory {
         let receipt = self.submit(owner, Work::Selected(copy), scope, None)?;
         // Cancellation notifies the owner, but selection exclusivity must survive
         // until its accepted crypto and publication work actually completes.
-        let completion = std::future::poll_fn(|cx| receipt.poll_completion(cx)).await;
+        let completion = std::future::poll_fn(|cx| receipt.poll_completion(cx)).await?;
         scope.check()?;
         match completion.value? {
             Value::Page(result) => Ok(result),
             _ => Err(Error::StaleFlight),
         }
     }
-    /// A simulated process loss discards queued messages, including the permit
-    /// whose Arc otherwise forms a mailbox -> command -> mailbox ownership cycle.
+    /// A simulated process loss discards queued messages and their producer permits.
+    /// Remaining receipts observe producer loss, not successful completion fences.
     /// Do not execute commands or mark kernel/NIC operations complete here.
     #[cfg(test)]
     pub(crate) fn simulation_crash(&self) {

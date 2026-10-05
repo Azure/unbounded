@@ -21,6 +21,19 @@ fn traversal_pins_private_directories_and_rejects_parents_symlinks_and_bad_names
     let _environment = sim.enter();
     let r = reactor();
     let request = scope();
+    for path in [
+        "/must-not-create/../child",
+        "/also-absent/child/../../target",
+    ] {
+        let before = sim.trace().len();
+        assert!(matches!(
+            drive(&r, r.file_directory(Path::new(path), true, 4096, &request)),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert_eq!(sim.trace().len(), before);
+    }
+    assert!(sim.metadata(Path::new("/must-not-create")).is_err());
+    assert!(sim.metadata(Path::new("/also-absent")).is_err());
     for path in ["/private/child", "private/./child"] {
         let dir = drive(&r, r.file_directory(Path::new(path), true, 4096, &request)).unwrap();
         let stat = drive(&r, r.file_stat(dir, &request)).unwrap();
@@ -31,7 +44,7 @@ fn traversal_pins_private_directories_and_rejects_parents_symlinks_and_bad_names
     sim.symlink(Path::new("private"), Path::new("/link"))
         .unwrap();
     for (path, limit, error) in [
-        ("/link/child", 4096, Error::Io),
+        ("/link/child", 4096, Error::Os(libc::ELOOP)),
         ("/private/../child", 4096, Error::InvalidConfiguration),
         ("/absent", 4096, Error::NotFound),
         ("/private", 2, Error::InvalidInput),
@@ -58,13 +71,13 @@ fn existing_directory_creation_reestablishes_fsync_and_propagates_failure() {
     let _environment = sim.enter();
     let r = reactor();
     sim.create_dir_all(Path::new("/existing")).unwrap();
-    sim.inject("fsync", Fault::Errno(libc::EIO));
+    sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
     assert!(matches!(
         drive(
             &r,
             r.file_directory(Path::new("/existing"), true, 4096, &scope())
         ),
-        Err(Error::Io)
+        Err(Error::Os(libc::EIO))
     ));
     drive(
         &r,
@@ -73,13 +86,13 @@ fn existing_directory_creation_reestablishes_fsync_and_propagates_failure() {
     .unwrap();
     sim.disk().crash().unwrap();
     assert!(sim.metadata(Path::new("/existing")).is_ok());
-    sim.inject("mkdir", Fault::Errno(libc::EIO));
+    sim.inject("mkdir", Fault::Errno(libc::EIO)).unwrap();
     assert!(matches!(
         drive(
             &r,
             r.file_directory(Path::new("/new"), true, 4096, &scope())
         ),
-        Err(Error::Io)
+        Err(Error::Os(libc::EIO))
     ));
 }
 
@@ -110,17 +123,17 @@ fn stage_removes_only_the_link_and_requires_cleanup_fence_before_exclusive_open(
         Err(Error::InvalidInput)
     ));
     for operation in ["unlink", "fsync", "open"] {
-        sim.inject(operation, Fault::Errno(libc::EIO));
+        sim.inject(operation, Fault::Errno(libc::EIO)).unwrap();
         assert!(matches!(
             drive(
                 &r,
                 r.file_stage(dir.clone(), "stage".as_ref(), 4096, &request)
             ),
-            Err(Error::Io)
+            Err(Error::Os(libc::EIO))
         ));
         assert_eq!(sim.read_file(Path::new("/target")).unwrap(), b"keep");
     }
-    sim.inject("open", Fault::Errno(libc::EEXIST));
+    sim.inject("open", Fault::Errno(libc::EEXIST)).unwrap();
     assert!(matches!(
         drive(
             &r,
@@ -128,16 +141,16 @@ fn stage_removes_only_the_link_and_requires_cleanup_fence_before_exclusive_open(
         ),
         Err(Error::AlreadyExists)
     ));
-    sim.inject("fsync", Fault::Errno(libc::EIO));
+    sim.inject("fsync", Fault::Errno(libc::EIO)).unwrap();
     assert_eq!(
         drive(
             &r,
             r.file_remove_synced(dir.clone(), CString::new("absent").unwrap(), &request)
         ),
-        Err(Error::Io)
+        Err(Error::Os(libc::EIO))
     );
     let mut abandoned = r.file_stage(dir, "stage".as_ref(), 4096, &request);
-    sim.inject("unlink", Fault::Delay(10));
+    sim.inject("unlink", Fault::Delay(10)).unwrap();
     assert!(poll(&mut abandoned).is_pending());
     drop(abandoned);
     drive(&r, r.file_fence(())).unwrap();

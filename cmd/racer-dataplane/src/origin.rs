@@ -399,9 +399,11 @@ fn header(name: &str, value: &[u8]) -> Header {
 
 fn response_error(error: Error) -> Error {
     match error {
-        Error::InvalidRequest | Error::HeaderTooLarge | Error::CorruptRecord | Error::Io => {
-            Error::BadGateway
-        }
+        Error::InvalidRequest
+        | Error::HeaderTooLarge
+        | Error::CorruptRecord
+        | Error::Io
+        | Error::Os(_) => Error::BadGateway,
         other => other,
     }
 }

@@ -84,8 +84,8 @@ pub fn thread_waker(reactor: Option<ReactorWake>) -> Waker {
 ///
 /// Backend failures are reported immediately but do not abandon the operation.
 /// Its completion fence runs to completion, then the first backend error wins.
-/// `wait` must be bounded. After it returns, unpark this thread so a surrounding
-/// thread-parking driver does not add a second sleep before consuming completions.
+/// `wait` must be bounded. After it returns, wake the polling task so a surrounding
+/// driver schedules another turn before sleeping, including non-thread executors.
 pub fn drive_local_with<'a, T: 'a, E: Copy + 'a>(
     mut operation: Operation<'a, T, E>,
     reporter: Option<&'a FailureReporter<E>>,
@@ -109,7 +109,7 @@ pub fn drive_local_with<'a, T: 'a, E: Copy + 'a>(
             }
             error.get_or_insert(failure);
         }
-        thread::current().unpark();
+        cx.waker().wake_by_ref();
         Poll::Pending
     }))
 }
@@ -120,6 +120,36 @@ mod tests {
     use crate::deadline::Cancellation;
     use crate::test_util::WakeCounter;
     use std::{future::Future, pin::pin, rc::Rc};
+
+    #[test]
+    fn driver_composes_with_wake_gated_local_scheduler() {
+        let ready = Cell::new(false);
+        let mut driver = drive_local_with(
+            Box::pin(std::future::poll_fn(|_| {
+                if ready.get() {
+                    Poll::Ready(Ok::<_, Error>(7))
+                } else {
+                    Poll::Pending
+                }
+            })),
+            None,
+            |_| Ok(()),
+            || {
+                ready.set(true);
+                Ok(())
+            },
+        );
+        let runnable = crate::drivers::Runnable::new();
+        let count = Arc::new(WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(runnable.poll(driver.as_mut(), &mut cx, false).is_pending());
+        assert_eq!(count.count(), 1);
+        assert_eq!(
+            runnable.poll(driver.as_mut(), &mut cx, false),
+            Poll::Ready(Ok(7))
+        );
+    }
 
     #[derive(Clone)]
     struct TestScope {

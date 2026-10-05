@@ -40,6 +40,86 @@ pub enum Error {
     MissingKey,
     DirectIoUnsupported,
     Io,
+    Os(i32),
+    /// Rename completion did not certify whether publication occurred. Reconcile first.
+    RenameUncertain(PublicationCause),
+    /// Publication occurred, but directory durability was not certified.
+    PublishedNotDurable(PublicationCause),
+}
+
+/// Root failure of a filesystem publication. Kept separate from `Error` so phase
+/// information stays allocation-free and Copy for lifecycle failure reporters.
+/// Wrapping a publication failure again retains its root cause and outer phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationCause {
+    InvalidConfiguration,
+    InvalidRequest,
+    MethodNotAllowed,
+    HeaderTooLarge,
+    InvalidRange,
+    UnsatisfiableRange,
+    UnsatisfiableRangeWithLength(u64),
+    NotFound,
+    Forbidden,
+    BadGateway,
+    Internal,
+    VersionUnavailable,
+    Unavailable,
+    Overloaded,
+    DeadlineExceeded,
+    Cancelled,
+    StaleFlight,
+    Unauthorized,
+    NodeIdentityChanged,
+    OriginRejected,
+    OriginForbidden,
+    Replay,
+    IncompatibleMembership,
+    HopBudgetExhausted,
+    CorruptRecord,
+    MissingKey,
+    DirectIoUnsupported,
+    Io,
+    Os(i32),
+}
+
+impl From<Error> for PublicationCause {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::InvalidConfiguration => Self::InvalidConfiguration,
+            Error::InvalidRequest => Self::InvalidRequest,
+            Error::MethodNotAllowed => Self::MethodNotAllowed,
+            Error::HeaderTooLarge => Self::HeaderTooLarge,
+            Error::InvalidRange => Self::InvalidRange,
+            Error::UnsatisfiableRange => Self::UnsatisfiableRange,
+            Error::UnsatisfiableRangeWithLength(length) => {
+                Self::UnsatisfiableRangeWithLength(length)
+            }
+            Error::NotFound => Self::NotFound,
+            Error::Forbidden => Self::Forbidden,
+            Error::BadGateway => Self::BadGateway,
+            Error::Internal => Self::Internal,
+            Error::VersionUnavailable => Self::VersionUnavailable,
+            Error::Unavailable => Self::Unavailable,
+            Error::Overloaded => Self::Overloaded,
+            Error::DeadlineExceeded => Self::DeadlineExceeded,
+            Error::Cancelled => Self::Cancelled,
+            Error::StaleFlight => Self::StaleFlight,
+            Error::Unauthorized => Self::Unauthorized,
+            Error::NodeIdentityChanged => Self::NodeIdentityChanged,
+            Error::OriginRejected => Self::OriginRejected,
+            Error::OriginForbidden => Self::OriginForbidden,
+            Error::Replay => Self::Replay,
+            Error::IncompatibleMembership => Self::IncompatibleMembership,
+            Error::HopBudgetExhausted => Self::HopBudgetExhausted,
+            Error::CorruptRecord => Self::CorruptRecord,
+            Error::MissingKey => Self::MissingKey,
+            Error::DirectIoUnsupported => Self::DirectIoUnsupported,
+            Error::Io => Self::Io,
+            Error::Os(errno) => Self::Os(errno),
+            Error::RenameUncertain(cause) | Error::PublishedNotDurable(cause) => cause,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -129,6 +209,18 @@ impl From<uring_runtime::Error> for Error {
             uring_runtime::Error::NotFound => Self::MissingKey,
             uring_runtime::Error::AlreadyExists => Self::Replay,
             uring_runtime::Error::Io => Self::Io,
+            uring_runtime::Error::Os(errno) => Self::Os(errno),
+        }
+    }
+}
+
+impl From<uring_runtime::reactor::filesystem::ReplacementError<Error>> for Error {
+    fn from(error: uring_runtime::reactor::filesystem::ReplacementError<Error>) -> Self {
+        use uring_runtime::reactor::filesystem::ReplacementError;
+        match error {
+            ReplacementError::BeforeRename(cause) => cause,
+            ReplacementError::RenameUncertain(cause) => Self::RenameUncertain(cause.into()),
+            ReplacementError::Published(cause) => Self::PublishedNotDurable(cause.into()),
         }
     }
 }
@@ -232,8 +324,32 @@ mod tests {
             (RuntimeError::NotFound, Error::MissingKey),
             (RuntimeError::AlreadyExists, Error::Replay),
             (RuntimeError::Io, Error::Io),
+            (RuntimeError::Os(libc::EIO), Error::Os(libc::EIO)),
         ] {
             assert_eq!(Error::from(runtime), racer);
         }
+    }
+
+    #[test]
+    fn replacement_outcomes_preserve_publication_phase() {
+        use uring_runtime::reactor::filesystem::ReplacementError;
+        assert_eq!(
+            Error::from(ReplacementError::BeforeRename(Error::Os(libc::ENOSPC))),
+            Error::Os(libc::ENOSPC)
+        );
+        assert_eq!(
+            Error::from(ReplacementError::RenameUncertain(Error::Cancelled)),
+            Error::RenameUncertain(super::PublicationCause::Cancelled)
+        );
+        assert_eq!(
+            Error::from(ReplacementError::Published(Error::Os(libc::EIO))),
+            Error::PublishedNotDurable(super::PublicationCause::Os(libc::EIO))
+        );
+        assert_eq!(
+            Error::from(ReplacementError::Published(Error::RenameUncertain(
+                super::PublicationCause::DeadlineExceeded,
+            ))),
+            Error::PublishedNotDurable(super::PublicationCause::DeadlineExceeded)
+        );
     }
 }

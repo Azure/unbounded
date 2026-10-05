@@ -507,4 +507,55 @@ mod tests {
             assert_eq!(sim.live_resources(), 0);
         }
     }
+
+    #[test]
+    fn wrapper_forwards_reporter_and_lifecycle_errors_through_group() {
+        use uring_runtime::group::{Factory, Group, Lane, Plan};
+        struct Recipe;
+        struct Reporting(Option<FailureReporter<Failure>>);
+        impl Factory<TestScope> for Recipe {
+            fn build_lane(&self, _: usize) -> Result<Box<dyn Service<TestScope>>, Failure> {
+                let (_, native) = crate::pair(1)?;
+                Ok(Box::new(WithNative::new(Reporting(None), native)))
+            }
+        }
+        impl Service<TestScope> for Reporting {
+            fn set_failure_reporter(&mut self, reporter: FailureReporter<Failure>) {
+                self.0 = Some(reporter);
+            }
+            fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+                Box::pin(async { Ok(()) })
+            }
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
+                self.0
+                    .as_ref()
+                    .expect("forwarded reporter")
+                    .report(Failure::Verbs(Error::InvalidConfiguration));
+                Ok(())
+            }
+            fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+                Box::pin(async { Ok(()) })
+            }
+            fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, (), Failure> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let cpu = *uring_runtime::affinity::current_cpus()
+            .unwrap()
+            .first()
+            .unwrap();
+        let mut group = Group::new(Plan {
+            lanes: vec![Lane {
+                name: "native-wrapper".into(),
+                cpu,
+            }],
+            helpers: vec![],
+            max_threads: 1,
+        });
+        assert_eq!(
+            group.run(&Recipe, &TestScope(None)),
+            Err(Failure::Verbs(Error::InvalidConfiguration))
+        );
+        assert_eq!(group.stats().done, 1);
+    }
 }

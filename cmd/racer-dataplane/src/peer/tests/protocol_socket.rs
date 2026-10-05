@@ -861,7 +861,10 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         reactor.poll_budgeted(64).unwrap();
         reactor.wait(Duration::from_millis(1)).unwrap();
     };
-    assert!(matches!(result, Err(Error::Io | Error::Unavailable)));
+    assert!(matches!(
+        result,
+        Err(Error::Os(libc::ECONNREFUSED) | Error::Unavailable)
+    ));
     assert!(!health.available(&NodeId(C.into())).unwrap());
     assert!(health.available(&NodeId(B.into())).unwrap());
     let alternate = paths

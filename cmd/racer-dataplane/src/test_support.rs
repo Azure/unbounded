@@ -699,7 +699,7 @@ pub(crate) async fn projected_file(
     file: &str,
     limit: usize,
     scope: &crate::runtime::RequestScope,
-) -> crate::error::Result<zeroize::Zeroizing<Vec<u8>>> {
+) -> crate::error::Result<uring_runtime::reactor::filesystem::ReadBuffer> {
     use uring_runtime::reactor::filesystem::secure::{BENEATH, NO_MAGICLINKS};
 
     let dir = crate::control::directory(r, path, false, false, scope).await?;
@@ -771,6 +771,11 @@ pub(crate) mod enrollment {
                     Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
                 ) =>
             {
+                assert_ne!(
+                    std::env::var("RUNTIME_REQUIRE_IO_URING").as_deref(),
+                    Ok("1"),
+                    "RUNTIME_REQUIRE_IO_URING=1 but control io_uring unavailable: {e}"
+                );
                 eprintln!("control io_uring unavailable: {e}");
                 return None;
             }
