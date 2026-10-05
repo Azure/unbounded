@@ -217,6 +217,7 @@ impl Application {
         let mut plan = AffinityPlan::discover(&self.config)?;
         log_worker_plan("planned", &plan);
         self.limits = size_workers(&self.config.limits, &mut plan, self.config.enable_rdma)?;
+        self.config.admission_history_per_worker(plan.pairs.len())?;
         log_worker_plan("final", &plan);
         self.node = Arc::new(NodeState::with_peer_admission(
             plan.pairs.iter().map(|p| p.worker).collect(),
@@ -441,6 +442,8 @@ pub struct WorkerApplication {
     checkpoint_completed: u64,
     checkpoint_budget: usize,
     placement: Rc<Placement>,
+    candidates: Rc<CandidatePolicy>,
+    ownership_maintenance: OwnershipMaintenance,
     placement_retry: std::time::Instant,
     placement_warning: Option<std::time::Instant>,
     diagnostic_task: Option<Operation<'static, ()>>,
@@ -461,6 +464,90 @@ pub struct WorkerApplication {
     cache_prepare_task: Option<Operation<'static, ()>>,
     cache_preparing_generation: u64,
     control_scope: Option<RequestScope>,
+}
+
+/// Ownership is optional eviction guidance. Even Progress may mean the ranking
+/// cache is pinned, so do not self-wake continuously or retry within one turn.
+struct OwnershipMaintenance {
+    next: std::time::Instant,
+}
+impl OwnershipMaintenance {
+    fn poll(
+        &mut self,
+        now: std::time::Instant,
+        stopping: bool,
+        refresh: impl FnOnce() -> Result<crate::topology::Maintenance>,
+    ) {
+        if stopping || now < self.next {
+            return;
+        }
+        let delay = match refresh() {
+            Ok(crate::topology::Maintenance::Progress) => Duration::from_millis(1),
+            // Missing publications and unavailable capacity must not fail reads
+            // or permanently prevent a later pass over idle/recovered residents.
+            Ok(crate::topology::Maintenance::Idle | crate::topology::Maintenance::Blocked)
+            | Err(_) => Duration::from_millis(100),
+        };
+        self.next = now + delay;
+    }
+
+    fn wait_timeout(&self, now: std::time::Instant, stopping: bool, maximum: Duration) -> Duration {
+        if stopping {
+            maximum
+        } else {
+            maximum.min(self.next.saturating_duration_since(now))
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_maintenance_tests {
+    use super::*;
+    use crate::topology::Maintenance;
+
+    #[test]
+    fn ownership_maintenance_bounds_progress_and_retries_idle_and_errors() {
+        let start = std::time::Instant::now();
+        let mut maintenance = OwnershipMaintenance { next: start };
+        let calls = std::cell::Cell::new(0);
+        for status in [
+            Ok(Maintenance::Progress),
+            Ok(Maintenance::Idle),
+            Ok(Maintenance::Blocked),
+            Err(Error::Unavailable),
+            Err(Error::Overloaded),
+        ] {
+            let now = maintenance.next;
+            maintenance.poll(now, false, || {
+                calls.set(calls.get() + 1);
+                status
+            });
+            let expected = if status == Ok(Maintenance::Progress) {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(100)
+            };
+            assert_eq!(maintenance.next, now + expected);
+            assert_eq!(
+                maintenance.wait_timeout(now, false, Duration::from_secs(1)),
+                expected
+            );
+            maintenance.poll(now, false, || panic!("same-turn refresh"));
+            maintenance.poll(maintenance.next - Duration::from_nanos(1), false, || {
+                panic!("early refresh")
+            });
+        }
+        assert_eq!(calls.get(), 5);
+        maintenance.poll(maintenance.next, true, || panic!("refresh during shutdown"));
+        assert_eq!(
+            maintenance.wait_timeout(maintenance.next, true, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            maintenance.wait_timeout(maintenance.next, false, Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
 }
 
 impl WorkerApplication {
@@ -783,6 +870,10 @@ impl WorkerApplication {
             checkpoint_completed: 0,
             checkpoint_budget: config.checkpoint_bytes.get(),
             placement,
+            candidates,
+            ownership_maintenance: OwnershipMaintenance {
+                next: uring_runtime::environment::now(),
+            },
             placement_retry: uring_runtime::environment::now(),
             placement_warning: None,
             diagnostic_task: None,
@@ -966,12 +1057,24 @@ impl WorkerApplication {
             )
             .with_metrics(metrics.clone()),
         );
+        let disk_page_entries = (config.disk_page_entries.get() / node.count).max(1);
         writer.configure(
             runtime.admission.clone(),
             eviction.clone(),
             limits.queue_entries.get(),
-            (config.disk_page_entries.get() / node.count).max(1),
+            disk_page_entries,
         )?;
+        // Install once before Fill attaches current-membership ownership. The
+        // writer, index, and segment clock all consult this same worker policy.
+        writer.set_retention(Rc::new(crate::retention::Retention::configured(
+            config.admission_history_per_worker(node.count)?,
+            disk_page_entries
+                .checked_add(limits.queue_entries.get())
+                .ok_or(Error::InvalidConfiguration)?,
+            config.admission_period,
+            config.admission_mode == crate::config::AdmissionMode::SecondSight,
+        )?));
+        metrics.observe_retention(writer.retention().snapshot());
         Ok(Store {
             reader,
             writer,
@@ -1076,6 +1179,11 @@ impl WorkerApplication {
             let status = self.placement.maintain(&snapshot.membership);
             self.observe_placement_maintenance(status, now, cx)?;
         }
+        // Independent of placement.maintain being Idle: recovered residents and
+        // changed membership need periodic refresh even without foreground reads.
+        self.ownership_maintenance.poll(now, self.stopping, || {
+            self.candidates.refresh_ownership(self.store.writer.index())
+        });
         self.poll_checkpoint(cx)?;
         self.poll_ingress(cx, budget)?;
         self.http.poll_waiters(budget);
@@ -1419,6 +1527,11 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
 impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
     fn wait_timeout(&self, maximum: Duration) -> Duration {
         let _environment = self.environment.enter();
+        let maximum = self.ownership_maintenance.wait_timeout(
+            uring_runtime::environment::now(),
+            self.stopping,
+            maximum,
+        );
         self.metadata.next_deadline().map_or(maximum, |deadline| {
             maximum.min(deadline.saturating_duration_since(uring_runtime::environment::now()))
         })
@@ -1863,6 +1976,9 @@ impl WorkerApplication {
     }
     fn observe_health(&self) -> Result<()> {
         let node = &self.node;
+        self.telemetry
+            .metrics
+            .observe_retention(self.store.writer.retention().snapshot());
         let now = uring_runtime::environment::now();
         if self.control.is_some() {
             self.telemetry.metrics.set_gauge(

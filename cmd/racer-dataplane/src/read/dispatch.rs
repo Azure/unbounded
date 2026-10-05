@@ -84,6 +84,7 @@ enum Work {
     ),
     Selected(crate::memory::CiphertextCopy),
     Cached(PageId),
+    Observed(PageResult),
     Resolve(
         MetadataSelector,
         std::sync::Arc<crate::topology::Membership>,
@@ -94,6 +95,7 @@ enum Work {
         std::sync::Arc<crate::topology::Membership>,
         PeerOriginContext,
     ),
+    AcquireUnobserved(PageId, Arc<crate::topology::Membership>, PeerOriginContext),
     Ordered(
         PageId,
         std::sync::Arc<crate::topology::Membership>,
@@ -131,6 +133,46 @@ pub struct WorkerEndpoint {
 }
 
 impl WorkerDirectory {
+    #[cfg(test)]
+    pub(super) fn test_observation_mailbox(&self) -> usize {
+        for mailbox in &self.mailboxes {
+            if !mailbox.has_queued() && mailbox.outstanding() == 0 {
+                let _ = mailbox.install();
+            }
+        }
+        self.mailboxes
+            .iter()
+            .map(|mailbox| mailbox.outstanding())
+            .sum()
+    }
+    /// Scheduler fanout bypasses Fill flights. Count each consuming subscription
+    /// on the stable page owner, retaining its original verified ciphertext.
+    /// A full mailbox only loses an optional retention hint, never a page read.
+    pub(crate) fn observe_verified(&self, page: PageResult, scope: &RequestScope) {
+        let Ok(owner) = self.page_owner(page.plaintext.page()) else {
+            return;
+        };
+        // Reserve bounded worker-owned progress BEFORE retaining a mailbox
+        // receipt. Dropping or delaying this optional task cannot hold delivery.
+        let Ok(permit) = uring_runtime::drivers::reserve() else {
+            return;
+        };
+        if self.is_local(owner) {
+            if let Ok(local) = self.local() {
+                let fill = local.fill.clone();
+                let scope = scope.clone();
+                permit.submit_detached(Box::pin(async move {
+                    fill.observe_verified_scoped(&page, &scope).await;
+                    Ok::<(), Error>(())
+                }));
+            }
+        } else if let Ok(receipt) = self.submit(owner, Work::Observed(page), scope, None) {
+            permit.submit_detached(Box::pin(async move {
+                let _ = receipt.await;
+                Ok::<(), Error>(())
+            }));
+        }
+    }
     pub(crate) async fn cached_page(
         &self,
         page: PageId,
@@ -184,7 +226,11 @@ impl WorkerDirectory {
     ) -> Result<PageResult> {
         let owner = self.page_owner(&copy.ciphertext.envelope().page)?;
         if self.is_local(owner) {
-            return self.local()?.fill.accept_selected(copy, scope).await;
+            return self
+                .local()?
+                .fill
+                .accept_selected_unobserved(copy, scope)
+                .await;
         }
         let receipt = self.submit(owner, Work::Selected(copy), scope, None)?;
         // Cancellation notifies the owner, but selection exclusivity must survive
@@ -406,6 +452,28 @@ impl WorkerDirectory {
                 _ => Err(Error::StaleFlight),
             }
         })
+    }
+    pub(crate) async fn acquire_unobserved(
+        &self,
+        page: PageId,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<PageResult> {
+        let owner = self.page_owner(&page)?;
+        if self.is_local(owner) {
+            return self
+                .local()?
+                .fill
+                .acquire_unobserved(page, membership, context, scope, budget)
+                .await;
+        }
+        let work = Work::AcquireUnobserved(page, membership, self.seal(context, scope)?);
+        match self.budgeted(owner, work, scope, budget).await? {
+            Value::Page(page) => Ok(page),
+            _ => Err(Error::StaleFlight),
+        }
     }
     /// Always enqueue, including local ingress. The command and elected Fill
     /// driver, rather than the detachable receipt, own mixed-mode exclusion.
@@ -733,6 +801,10 @@ async fn execute(
 ) -> Result<Value> {
     scope.check()?;
     match work {
+        Work::Observed(page) => {
+            local.fill.observe_verified_scoped(&page, scope).await;
+            Ok(Value::Published)
+        }
         Work::Select(version, selection, membership, envelope) => {
             let context = local.open_context(envelope)?;
             let page = local
@@ -751,7 +823,7 @@ async fn execute(
         }
         Work::Selected(copy) => local
             .fill
-            .accept_selected(copy, scope)
+            .accept_selected_unobserved(copy, scope)
             .await
             .map(Value::Page),
         Work::Cached(page) => local.fill.cached_page(&page, scope).map(Value::Cached),
@@ -774,6 +846,20 @@ async fn execute(
             local
                 .fill
                 .acquire(
+                    page,
+                    membership,
+                    &context,
+                    scope,
+                    budget.ok_or(Error::StaleFlight)?,
+                )
+                .await
+                .map(Value::Page)
+        }
+        Work::AcquireUnobserved(page, membership, envelope) => {
+            let context = local.open_context(envelope)?;
+            local
+                .fill
+                .acquire_unobserved(
                     page,
                     membership,
                     &context,

@@ -773,7 +773,10 @@ impl RangeStream {
                     self.next_page = None;
                     return Poll::Ready(Ok(()));
                 }
-                Next::Page(result) => self.selected_ready = Some(result),
+                Next::Page(result) => {
+                    self.directory.observe_verified(result.clone(), &scope);
+                    self.selected_ready = Some(result);
+                }
                 Next::Select(selection) => {
                     let child = self.budget.next_page(false)?.ok_or(Error::Overloaded)?;
                     let mut child_scope = scope.clone();
@@ -1181,6 +1184,65 @@ pub(super) mod tests {
         admission.reclaim_buffers();
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         assert!(stream.retained.is_empty());
+    }
+
+    #[test]
+    fn optional_remote_observation_never_blocks_ready_delivery_or_duplicates_on_repoll() {
+        for repoll in [false, true] {
+            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(8));
+            let _queue = queue.enter();
+            let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+            let directory = f.streams.directory();
+            assert_eq!(directory.test_observation_mailbox(), 0);
+            let mut metadata = metadata();
+            metadata.length = 3;
+            let scope = RequestScope::new(
+                RequestId([12; 16]),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+            let mut stream = f.open(
+                &metadata,
+                ByteRange::From(0).resolve(3).unwrap(),
+                scope.clone(),
+            );
+            stream.configure_subscription(1, PAGE_BYTES, false).unwrap();
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let selection = match stream.subscription.as_mut().unwrap().poll_next(&mut cx) {
+                Poll::Ready(Ok(Next::Select(selection))) => selection,
+                _ => panic!("selection expected"),
+            };
+            selection
+                .complete(page_result(&f.admission, &metadata, 0))
+                .unwrap();
+            if repoll {
+                assert!(matches!(
+                    stream.poll_selection(&mut cx),
+                    Poll::Ready(Ok(()))
+                ));
+                assert!(matches!(
+                    stream.poll_selection(&mut cx),
+                    Poll::Ready(Ok(()))
+                ));
+            }
+            // No endpoint is ever polled. A continuous next_slice future must
+            // still deliver immediately with the accepted hint unanswered.
+            let mut next = stream.next_slice();
+            let reader = match next.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(Some(reader))) => reader,
+                _ => panic!("optional owner receipt blocked ready page"),
+            };
+            assert_eq!(reader.slice().length, 3);
+            drop(next);
+            assert_eq!(directory.test_observation_mailbox(), 1);
+            assert_eq!(queue.pending(), 1);
+            scope.cancel().unwrap();
+            queue.poll(&mut cx, 8);
+            assert_eq!(queue.pending(), 0);
+            assert_eq!(reader.slice().length, 3);
+            drop(reader);
+            directory.simulation_crash();
+        }
     }
 
     #[test]

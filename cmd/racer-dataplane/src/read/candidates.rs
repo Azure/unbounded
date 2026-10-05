@@ -32,7 +32,6 @@ use crate::topology::Candidates;
 use crate::topology::Placement;
 use crate::topology::RouteBudget;
 use racer_control_wire::NodeId;
-#[cfg(test)]
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -93,6 +92,13 @@ pub struct CandidatePolicy {
     peers: Rc<Requester>,
     credentials: Rc<CredentialCrypto>,
     published: Arc<crate::control::PublishedState>,
+    ownership_refresh: RefCell<OwnershipRefresh>,
+}
+#[derive(Default)]
+struct OwnershipRefresh {
+    cursor: u64,
+    visited: usize,
+    active: Option<crate::model::PageId>,
 }
 #[derive(Clone, Copy)]
 enum RequestMode {
@@ -371,6 +377,7 @@ impl CandidatePolicy {
             peers,
             credentials,
             published,
+            ownership_refresh: RefCell::default(),
         }
     }
 
@@ -404,6 +411,93 @@ impl CandidatePolicy {
             .iter()
             .take(3)
             .any(|node| node == &self.node)
+    }
+    /// Retention must not own this policy: its requester can retain the writer
+    /// through transport reclamation, closing a cycle back to retention.
+    pub(crate) fn ownership_callback(self: &Rc<Self>) -> Rc<dyn Fn(&crate::model::PageId) -> bool> {
+        let policy = Rc::downgrade(self);
+        Rc::new(move |page| {
+            policy
+                .upgrade()
+                .is_some_and(|policy| policy.owns_current(page))
+        })
+    }
+    /// Retention is a hint from CURRENT publication, not the read's leased route.
+    /// This callback is lookup-only: no cold scoring or cache eviction. Missing
+    /// and obsolete results contribute no bonus, never a storage pin.
+    pub(super) fn owns_current(&self, page: &crate::model::PageId) -> bool {
+        self.published
+            .current()
+            .ok()
+            .and_then(|snapshot| {
+                self.placement.cached(
+                    snapshot.membership.clone(),
+                    &page.version.object,
+                    page.number,
+                )
+            })
+            .is_some_and(|candidates| self.is_candidate(&candidates))
+    }
+
+    /// Call once per worker service turn, also when no reads are arriving.
+    /// Walks one indexed resident at a time (including recovered idle pages),
+    /// with at most 256 member scores and 64 ranking-cache CLOCK visits per turn.
+    /// A completed pass returns Idle; schedule another pass on a bounded timer.
+    /// Publication is reloaded every turn, so obsolete partial results cannot
+    /// classify the new topology. Foreground scoped ranking warms the same cache.
+    pub fn refresh_ownership(
+        &self,
+        index: &crate::store::catalog::Index,
+    ) -> Result<crate::topology::Maintenance> {
+        let snapshot = self.published.current()?;
+        let mut work = self.ownership_refresh.borrow_mut();
+        if work.active.is_none() {
+            // Continuous appends must not keep a pass chasing the moving tail
+            // forever while earlier residents retain missing topology hints.
+            if work.visited >= index.page_capacity() {
+                work.cursor = 0;
+                work.visited = 0;
+                return Ok(crate::topology::Maintenance::Idle);
+            }
+            let (cursor, mut pages) = index.snapshot_pages(work.cursor, 1);
+            work.cursor = cursor;
+            work.active = pages.pop().map(|(page, _)| page);
+            work.visited += usize::from(work.active.is_some());
+        }
+        let Some(page) = &work.active else {
+            work.cursor = 0;
+            work.visited = 0;
+            return Ok(crate::topology::Maintenance::Idle);
+        };
+        if self
+            .placement
+            .refresh(
+                snapshot.membership.clone(),
+                &page.version.object,
+                page.number,
+            )
+            .is_some()
+        {
+            work.active = None;
+        }
+        Ok(crate::topology::Maintenance::Progress)
+    }
+
+    /// Refresh accepted-current ownership before latching a read observation.
+    /// This does not replace the read's leased placement or mint origin authority.
+    pub(crate) fn refresh_ownership_scoped<'a>(
+        &'a self,
+        page: &crate::model::PageId,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        let membership = self.published.current().map(|s| s.membership.clone());
+        let object = page.version.object.clone();
+        let number = page.number;
+        Box::pin(async move {
+            self.candidates_scoped(membership?, &object, number, scope)
+                .await?;
+            Ok(())
+        })
     }
     pub fn maintain(
         &self,
@@ -2121,6 +2215,271 @@ pub(super) mod tests {
             Instant::now() + std::time::Duration::from_secs(60),
         )
         .unwrap()
+    }
+    #[test]
+    fn ownership_refresh_recovers_idle_pages_and_rejects_obsolete_results() {
+        use crate::control::PublishedState;
+        use crate::model::{PageId, VersionMetadata, WorkerId};
+        use crate::store::catalog::{Index, IndexSnapshot, IndexedPage, RecordLocation};
+        use crate::topology::tests::fixtures;
+        let members = fixtures::membership(1000);
+        let page = PageId {
+            version: ObjectVersion {
+                object: object(),
+                etag: StrongEtag::test_value("recovered"),
+            },
+            number: PageNumber(0),
+        };
+        let owner = Placement::new(0)
+            .rank(members.clone(), &page.version.object, page.number)
+            .unwrap()
+            .ordered[0]
+            .clone();
+        let peers = Rc::new(RecordedPeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Unavailable,
+        });
+        let mut policy = policy(owner.clone(), peers.clone());
+        let index = Index::new(WorkerId(0), 8, crate::test_support::availability());
+        index.set_page_capacity(1).unwrap();
+        index
+            .restore(IndexSnapshot {
+                entries: vec![(
+                    page.clone(),
+                    IndexedPage {
+                        location: RecordLocation {
+                            segment: page_alloc::SegmentId(0),
+                            generation: page_alloc::Generation(1),
+                            extent: page_alloc::Extent::new(0, 512).unwrap(),
+                        },
+                        metadata: VersionMetadata {
+                            content_type: None,
+                            version: page.version.clone(),
+                            length: 1,
+                        },
+                        key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                    },
+                )],
+                metadata: vec![],
+            })
+            .unwrap();
+        assert_eq!(index.snapshot_pages(0, 1).1.len(), 1);
+        assert!(!policy.owns_current(&page));
+        assert_eq!(policy.refresh_ownership(&index), Err(Error::Unavailable));
+        policy.published = PublishedState::for_membership(members.clone());
+        for _ in 0..3 {
+            assert_eq!(
+                policy.refresh_ownership(&index),
+                Ok(crate::topology::Maintenance::Progress)
+            );
+            assert!(!policy.owns_current(&page));
+        }
+        policy.refresh_ownership(&index).unwrap();
+        assert!(policy.owns_current(&page));
+        assert_eq!(
+            policy.refresh_ownership(&index),
+            Ok(crate::topology::Maintenance::Idle)
+        );
+        let next = Arc::new(
+            crate::topology::Membership::validate(
+                racer_control_wire::MembershipVersion(2),
+                members
+                    .members()
+                    .iter()
+                    .filter(|m| m.node != owner)
+                    .cloned()
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        policy.published = PublishedState::for_membership(next);
+        assert!(!policy.owns_current(&page));
+        for _ in 0..4 {
+            policy.refresh_ownership(&index).unwrap();
+        }
+        assert!(!policy.owns_current(&page));
+        // Completing a leased obsolete foreground rank never restores ownership.
+        futures::executor::block_on(policy.candidates_scoped(
+            members,
+            &page.version.object,
+            page.number,
+            &scope(),
+        ))
+        .unwrap();
+        assert!(!policy.owns_current(&page));
+        assert!(peers.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn ownership_scoped_refresh_warms_current_only_and_honors_cancellation() {
+        let members = membership();
+        let page = crate::model::PageId {
+            version: ObjectVersion {
+                object: object(),
+                etag: StrongEtag::test_value("v1"),
+            },
+            number: PageNumber(0),
+        };
+        let owner = Placement::new(0)
+            .rank(members.clone(), &object(), page.number)
+            .unwrap()
+            .ordered[0]
+            .clone();
+        let peers = Rc::new(RecordedPeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Unavailable,
+        });
+        let mut policy = policy(owner, peers);
+        policy.published = crate::control::PublishedState::for_membership(members);
+        let cancelled = scope();
+        cancelled.cancel().unwrap();
+        assert_eq!(
+            futures::executor::block_on(policy.refresh_ownership_scoped(&page, &cancelled)),
+            Err(Error::Cancelled)
+        );
+        assert!(!policy.owns_current(&page));
+        futures::executor::block_on(policy.refresh_ownership_scoped(&page, &scope())).unwrap();
+        assert!(policy.owns_current(&page));
+        let mut version = page.clone();
+        version.version.etag = StrongEtag::test_value("v2");
+        assert!(policy.owns_current(&version));
+    }
+
+    #[test]
+    fn ownership_weak_callback_releases_network_reclamation_graph_and_is_neutral_after_drop() {
+        use crate::memory::{BufferPool, MemoryCache};
+        use crate::peer::forwarding::Forwarding;
+        use crate::peer::protocol::{SecurityCodec, Signatures};
+        use crate::peer::transport::Transfers;
+        use crate::store::catalog::Index;
+        use racer_identity::{Certificates, KeyEpochs, Keyring};
+
+        for _ in 0..3 {
+            let config = crate::test_support::cluster::config(false);
+            let admission = Rc::new(flow_control::Quotas::new(
+                crate::admission::AdmissionPolicy::new(config.limits.clone()),
+            ));
+            let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone()));
+            let keys = Rc::new(Keyring::new(
+                config.cluster.clone(),
+                config.node.clone(),
+                Arc::new(KeyEpochs::default()),
+            ));
+            let published = crate::control::PublishedState::for_membership(Arc::new(
+                crate::topology::Membership::validate(
+                    racer_control_wire::MembershipVersion(1),
+                    vec![crate::topology::Member {
+                        node: config.node.clone(),
+                        shares: std::num::NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: "127.0.0.1:7443".into(),
+                        rails: vec![],
+                        site: String::new(),
+                    }],
+                )
+                .unwrap(),
+            ));
+            let availability = Rc::new(crate::control::Availability::new(
+                published.clone(),
+                keys.clone(),
+            ));
+            let buffers = BufferPool::new(admission.clone());
+            let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
+            let index = Rc::new(Index::new(
+                crate::model::WorkerId(0),
+                1,
+                availability.clone(),
+            ));
+            let writer = Rc::new(crate::store::StoreWriter::new(
+                index,
+                Rc::new(page_alloc::Segments::new(config.segment_bytes)),
+                Rc::new(page_alloc::Slab::new(
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("target/ownership-unopened-slab"),
+                    config.slab_bytes,
+                    config.segment_bytes,
+                    crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+                )),
+                admission.clone(),
+                reactor.clone(),
+                availability,
+            ));
+            let retention = writer.retention();
+            let weak_writer = Rc::downgrade(&writer);
+            let weak_memory = Rc::downgrade(&memory);
+            let weak_retention = Rc::downgrade(&retention);
+            let http = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1));
+            let io = Rc::new(crate::http::new_io(
+                reactor,
+                crate::http::Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
+                admission.clone(),
+                crate::model::PAGE_BYTES + 16,
+            ));
+            let signatures = Rc::new(Signatures::new(
+                keys.clone(),
+                Rc::new(Certificates::new(config.cluster, keys.clone())),
+            ));
+            // Real network requester/transport plus the same strong reclamation
+            // captures as production. No I/O or slab file is opened in this test.
+            let transfers = Rc::new(
+                Transfers::new(
+                    http,
+                    io,
+                    None,
+                    admission.clone(),
+                    Rc::new(SecurityCodec::new(admission.clone(), buffers)),
+                    signatures.clone(),
+                )
+                .with_reclamation(move |cache, bytes| {
+                    memory.reclaim_idle(
+                        crate::admission::ResourceClass::Ciphertext,
+                        Some(cache),
+                        bytes,
+                        |page| writer.discard_idle_copy(page),
+                    );
+                    writer.reclaim_ciphertext(Some(cache), bytes);
+                }),
+            );
+            let requester = Rc::new(Requester::new(
+                Rc::new(crate::topology::Paths::new(
+                    Rc::new(crate::topology::LinkHealth),
+                    1,
+                )),
+                Rc::new(Forwarding::new(signatures)),
+                transfers,
+                Rc::new(
+                    crate::peer::PeerNetwork::new(config.node.clone(), published.clone()).unwrap(),
+                ),
+            ));
+            let policy = Rc::new(CandidatePolicy::new(
+                config.node,
+                Rc::new(Placement::new(1)),
+                requester,
+                Rc::new(CredentialCrypto::new(keys, admission)),
+                published,
+            ));
+            let weak_policy = Rc::downgrade(&policy);
+            let callback = policy.ownership_callback();
+            retention.set_ownership(callback.clone());
+            let page = crate::model::PageId {
+                version: ObjectVersion {
+                    object: object(),
+                    etag: StrongEtag::test_value("v1"),
+                },
+                number: PageNumber(0),
+            };
+            assert!(!callback(&page));
+            futures::executor::block_on(policy.refresh_ownership_scoped(&page, &scope())).unwrap();
+            assert!(callback(&page));
+            assert_eq!(Rc::strong_count(&policy), 1);
+            drop(retention);
+            assert!(weak_retention.upgrade().is_some());
+            drop(policy);
+            assert!(weak_policy.upgrade().is_none());
+            assert!(weak_writer.upgrade().is_none());
+            assert!(weak_memory.upgrade().is_none());
+            assert!(weak_retention.upgrade().is_none());
+            assert!(!callback(&page));
+        }
     }
     #[test]
     fn backup_probes_only_predecessors_in_order_before_scoped_origin_authority() {

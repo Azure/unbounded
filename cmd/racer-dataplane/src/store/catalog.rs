@@ -1,4 +1,4 @@
-//! Identity mappings, segment lifecycle, and lease-fenced second-chance eviction.
+//! Identity mappings, segment lifecycle, and lease-fenced bounded value eviction.
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::CurrentVersion;
@@ -8,6 +8,7 @@ use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::VersionMetadata;
 use crate::model::WorkerId;
+use crate::retention::Retention;
 use crate::runtime::HashMap;
 use crate::runtime::HashSet;
 use page_alloc::Extent;
@@ -36,11 +37,14 @@ pub struct Index {
     state: RefCell<State>,
     availability: Rc<crate::control::Availability>,
     reserved: Cell<usize>,
+    residency: Rc<Residency>,
+    victim_cursor: Cell<u64>,
+    active_writes: Rc<RefCell<HashMap<SegmentId, usize>>>,
 }
 #[derive(Default)]
 struct State {
     pages: HashMap<PageId, IndexedPage>,
-    reverse: HashMap<SegmentId, HashSet<PageId>>,
+    reverse: HashMap<SegmentId, BTreeMap<u64, PageId>>,
     versions: HashMap<ObjectVersion, (VersionMetadata, usize)>,
     metadata: HashMap<ObjectVersion, VersionMetadata>,
     order: VecDeque<ObjectVersion>,
@@ -48,6 +52,45 @@ struct State {
     page_order: BTreeMap<u64, PageId>,
     page_age: HashMap<PageId, u64>,
     next_age: u64,
+    residents: HashMap<PageId, Resident>,
+}
+/// One worker's exact union of pending and indexed pages. Guards release heat
+/// only when the final storage owner disappears, including cancellation/drop.
+struct Residency {
+    retention: RefCell<Rc<Retention>>,
+    counts: RefCell<HashMap<PageId, usize>>,
+}
+pub(super) struct Resident {
+    residency: Rc<Residency>,
+    page: PageId,
+    payload: Option<crate::retention::Payload>,
+}
+pub(super) struct PublicationGuard {
+    active: Rc<RefCell<HashMap<SegmentId, usize>>>,
+    segment: SegmentId,
+}
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        let mut active = self.active.borrow_mut();
+        let count = active
+            .get_mut(&self.segment)
+            .expect("active publication owner");
+        *count -= 1;
+        if *count == 0 {
+            active.remove(&self.segment);
+        }
+    }
+}
+impl Drop for Resident {
+    fn drop(&mut self) {
+        let mut counts = self.residency.counts.borrow_mut();
+        let count = counts.get_mut(&self.page).expect("tracked storage owner");
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&self.page);
+            self.residency.retention.borrow().forget(&self.page);
+        }
+    }
 }
 /// Capacity ownership acquired before a disk SQE. Drop releases unused capacity.
 pub struct PageTicket {
@@ -115,6 +158,14 @@ impl Index {
             state: RefCell::new(State::default()),
             availability,
             reserved: Cell::new(0),
+            residency: Rc::new(Residency {
+                retention: RefCell::new(Rc::new(
+                    Retention::new(256 * 1024, 65536 + 64).expect("valid bounded retention"),
+                )),
+                counts: RefCell::new(HashMap::default()),
+            }),
+            victim_cursor: Cell::new(0),
+            active_writes: Rc::new(RefCell::new(HashMap::default())),
         }
     }
     fn available(&self, cache: &racer_control_wire::CacheId) -> bool {
@@ -157,7 +208,62 @@ impl Index {
             Err(Error::Overloaded)
         }
     }
-    /// Reserve one potential new mapping, optionally evicting one oldest mapping.
+    pub fn retention(&self) -> Rc<Retention> {
+        self.residency.retention.borrow().clone()
+    }
+    pub(super) fn publishing(&self, segment: SegmentId) -> PublicationGuard {
+        *self.active_writes.borrow_mut().entry(segment).or_default() += 1;
+        PublicationGuard {
+            active: self.active_writes.clone(),
+            segment,
+        }
+    }
+    pub fn set_retention(&self, retention: Rc<Retention>) {
+        // Startup wiring only: replacing a live policy would invalidate read-side
+        // clones and require a capacity-sized heat migration in a request turn.
+        assert!(
+            self.residency.counts.borrow().is_empty(),
+            "install retention before residency"
+        );
+        *self.residency.retention.borrow_mut() = retention;
+    }
+    pub(super) fn track(&self, page: &PageId) -> Result<Resident> {
+        let mut counts = self.residency.counts.borrow_mut();
+        if !self.retention().track(page) {
+            return Err(Error::Overloaded);
+        }
+        *counts.entry(page.clone()).or_default() += 1;
+        Ok(Resident {
+            residency: self.residency.clone(),
+            page: page.clone(),
+            payload: None,
+        })
+    }
+    /// Scan at most 64 candidates with a separate cursor. Publication ordering is
+    /// never changed by retention, so checkpoint traversal remains monotonic.
+    fn victim(&self, state: &State) -> Option<PageId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let retention = self.retention();
+        let after = self.victim_cursor.get();
+        let mut best = None;
+        for (age, page) in state
+            .page_order
+            .range((Excluded(after), Unbounded))
+            .chain(state.page_order.range(..=after))
+            .take(64)
+        {
+            self.victim_cursor.set(*age);
+            let score = retention.score(page);
+            if best
+                .as_ref()
+                .is_none_or(|(value, oldest, _)| (score, age) < (*value, oldest))
+            {
+                best = Some((score, *age, page.clone()));
+            }
+        }
+        best.map(|(_, _, page)| page)
+    }
+    /// Reserve one potential new mapping, optionally evicting a low-value mapping.
     /// Replacement writes also reserve: concurrent invalidation may remove the old
     /// mapping while the SQE is in flight. No segment bytes are recycled here.
     pub fn reserve_page(self: &Rc<Self>, evict: bool) -> Result<PageTicket> {
@@ -166,11 +272,12 @@ impl Index {
             if !evict {
                 return Err(Error::Overloaded);
             }
-            let victim = state
-                .page_order
-                .first_key_value()
-                .map(|(_, p)| p.clone())
-                .ok_or(Error::Overloaded)?;
+            let victim = self.victim(&state).ok_or(Error::Overloaded)?;
+            self.retention().evicted(
+                &victim,
+                u64::from(state.pages[&victim].metadata.page_length(&victim)?),
+                false,
+            );
             Self::remove_page(&mut state, &victim);
         }
         self.reserved.set(self.reserved.get() + 1);
@@ -188,7 +295,7 @@ impl Index {
             return Ok(());
         }
         Self::validate_descriptor(&entry.metadata)?;
-        entry.metadata.page_length(&page)?;
+        let payload_bytes = u64::from(entry.metadata.page_length(&page)?);
         let mut state = self.state.borrow_mut();
         Self::check_length(&state, &entry.metadata)?;
         if !state.pages.contains_key(&page)
@@ -196,22 +303,27 @@ impl Index {
         {
             return Err(Error::Overloaded);
         }
+        // Fail before removing a mapping or acquiring a residency owner.
+        let age = state.next_age.checked_add(1).ok_or(Error::Unavailable)?;
+        // Acquire first: replacement retains its existing heat without a gap.
+        let mut resident = self.track(&page)?;
+        resident.payload = Some(self.retention().payload(payload_bytes, true));
         Self::remove_page(&mut state, &page);
         let version = state
             .versions
             .entry(page.version.clone())
             .or_insert((entry.metadata.clone(), 0));
         version.1 += 1;
+        state.next_age = age;
         state
             .reverse
             .entry(entry.location.segment)
             .or_default()
-            .insert(page.clone());
-        let age = state.next_age.checked_add(1).ok_or(Error::Unavailable)?;
-        state.next_age = age;
+            .insert(age, page.clone());
         state.page_order.insert(age, page.clone());
         state.page_age.insert(page.clone(), age);
         state.pages.insert(page, entry);
+        state.residents.insert(resident.page.clone(), resident);
         Ok(())
     }
     /// Look in both the standalone catalog and retained page entries for this exact
@@ -340,11 +452,12 @@ impl Index {
     /// Validate identity/length agreement and catalog bounds; clear all freshness.
     pub fn restore(&self, snapshot: IndexSnapshot) -> Result<()> {
         self.validate_snapshot(&snapshot)?;
-        let replacement = Index::new(
+        let mut replacement = Index::new(
             self.worker,
             self.metadata_capacity,
             self.availability.clone(),
         );
+        replacement.residency = self.residency.clone();
         replacement.set_page_capacity(self.page_capacity.get())?;
         for (p, e) in snapshot.entries {
             replacement.publish(p, e)?;
@@ -353,6 +466,7 @@ impl Index {
             replacement.publish_version(m)?;
         }
         *self.state.borrow_mut() = replacement.state.into_inner();
+        self.victim_cursor.set(0);
         Ok(())
     }
     pub fn validate_snapshot(&self, snapshot: &IndexSnapshot) -> Result<()> {
@@ -397,13 +511,35 @@ impl Index {
         s.reverse
             .get(&segment)
             .into_iter()
-            .flatten()
+            .flat_map(|pages| pages.values())
             .take(budget)
             .filter_map(|p| s.pages.get(p).map(|e| (p.clone(), e.location.clone())))
             .collect()
     }
     pub fn segment_empty(&self, segment: SegmentId) -> bool {
         !self.state.borrow().reverse.contains_key(&segment)
+    }
+    /// Sum live payload value, not padded disk size. At most 256 mappings are
+    /// inspected per segment. Larger segments use a conservative upper bound for
+    /// the unseen suffix; this is a preference, never an eviction exemption.
+    fn segment_score(&self, segment: SegmentId) -> u64 {
+        let state = self.state.borrow();
+        let Some(pages) = state.reverse.get(&segment) else {
+            return 0;
+        };
+        let retention = self.retention();
+        let mut score = 0u64;
+        for page in pages.values().take(256) {
+            let entry = &state.pages[page];
+            let bytes = entry
+                .metadata
+                .page_length(page)
+                .unwrap_or(crate::model::PAGE_BYTES as u32);
+            score = score.saturating_add(u64::from(bytes) * u64::from(retention.score(page)));
+        }
+        score.saturating_add(
+            (pages.len().saturating_sub(256) as u64).saturating_mul(crate::model::PAGE_BYTES * 4),
+        )
     }
     pub fn remove_cache(&self, cache: &racer_control_wire::CacheId) {
         let mut s = self.state.borrow_mut();
@@ -442,11 +578,15 @@ impl Index {
     }
     fn remove_page(s: &mut State, page: &PageId) {
         if let Some(old) = s.pages.remove(page) {
-            if let Some(age) = s.page_age.remove(page) {
+            s.residents.remove(page);
+            let age = s.page_age.remove(page);
+            if let Some(age) = age {
                 s.page_order.remove(&age);
             }
             if let Some(set) = s.reverse.get_mut(&old.location.segment) {
-                set.remove(page);
+                if let Some(age) = age {
+                    set.remove(&age);
+                }
                 if set.is_empty() {
                     s.reverse.remove(&old.location.segment);
                 }
@@ -471,7 +611,7 @@ impl Index {
         }
     }
 }
-/// Per-worker bounded second-chance clock, with no payload compaction.
+/// Per-worker bounded value selection, with no payload compaction.
 pub struct SegmentClock {
     index: Rc<Index>,
     free_reserve: usize,
@@ -492,10 +632,19 @@ pub const FOREGROUND_RECLAIM_BUDGET: ReclaimBudget = ReclaimBudget {
     mapping_removals: 256,
 };
 impl page_alloc::SegmentEntries for Index {
+    fn can_evict(&self, segment: SegmentId) -> bool {
+        !self.active_writes.borrow().contains_key(&segment)
+    }
     fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
         let entries = self.segment_entries_bounded(segment, budget);
         let removed = entries.len();
         for (page, location) in entries {
+            // This synchronous bounded traversal cannot interleave with replacement.
+            let bytes = self.state.borrow().pages[&page]
+                .metadata
+                .page_length(&page)
+                .expect("validated indexed page");
+            self.retention().evicted(&page, u64::from(bytes), true);
             self.remove_if_matches(&page, &location);
         }
         removed
@@ -540,14 +689,16 @@ impl SegmentClock {
             )
             .map_err(Into::into)
     }
-    /// At most two rotations. Busy segments remain Evicting until a later poll.
+    /// Rank at most 64 slots before eviction. Busy segments remain Evicting until
+    /// a later poll; ownership and heat cannot prevent eventual reclamation.
     pub fn reclaim_now(&self) -> Result<()> {
         self.clock
-            .reclaim(
+            .reclaim_scored(
                 &*self.index,
                 self.free_reserve,
                 self.budget.segment_visits,
                 self.budget.mapping_removals,
+                |segment| self.index.segment_score(segment),
             )
             .map_err(Into::into)
     }
@@ -647,6 +798,52 @@ mod tests {
         )
     }
     #[test]
+    fn disk_observability_index_lifecycle_and_victims() {
+        use page_alloc::SegmentEntries;
+        let index = Rc::new(index(4));
+        index.set_page_capacity(1).unwrap();
+        let retention = index.retention();
+        let (page, entry) = indexed(descriptor("metrics", 17), 0);
+        index.publish(page.clone(), entry.clone()).unwrap();
+        assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
+        index.publish(page.clone(), entry.clone()).unwrap();
+        index.restore(index.snapshot().unwrap()).unwrap();
+        assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
+        assert_eq!(
+            retention.snapshot().disk[0].published_pages,
+            0,
+            "restore is not writer publication"
+        );
+        let (other, other_entry) = indexed(descriptor("other", 3), 1);
+        assert_eq!(
+            index.publish(other.clone(), other_entry.clone()),
+            Err(Error::Overloaded)
+        );
+        assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
+        retention.set_ownership(Rc::new(|_| true));
+        drop(index.reserve_page(true).unwrap());
+        assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
+        assert_eq!(retention.snapshot().disk[1].index_evicted_payload_bytes, 17);
+        index.publish(other.clone(), other_entry.clone()).unwrap();
+        retention.set_ownership(Rc::new(|_| false));
+        assert_eq!(index.remove_bounded(SegmentId(1), 1), 1);
+        assert_eq!(index.remove_bounded(SegmentId(1), 1), 0);
+        assert_eq!(retention.snapshot().disk[0].segment_evicted_pages, 1);
+        assert_eq!(
+            retention.snapshot().disk[0].segment_evicted_payload_bytes,
+            3
+        );
+        index.publish(other.clone(), other_entry.clone()).unwrap();
+        index.remove_if_matches(&other, &entry.location);
+        assert_eq!(retention.snapshot().indexed_payload_bytes, 3);
+        index.remove_cache(&other.version.object.cache);
+        assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
+        assert_eq!(retention.snapshot().disk[0].segment_evicted_pages, 1);
+        index.publish(page, entry).unwrap();
+        drop(index);
+        assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
+    }
+    #[test]
     fn content_type_is_immutable_including_absence() {
         let legacy = descriptor("v1", 3);
         let mut typed = legacy.clone();
@@ -662,6 +859,243 @@ mod tests {
             conflict.content_type = Some(crate::model::ContentType::parse(b"text/html").unwrap());
             assert_eq!(index.publish_version(conflict), Err(Error::CorruptRecord));
         }
+    }
+    #[test]
+    fn second_sight_index_owned_bias_is_soft_and_snapshot_order_is_unchanged() {
+        for hot_nonowned in [false, true] {
+            let index = Rc::new(index(4));
+            index.set_page_capacity(2).unwrap();
+            let (owned, first) = indexed(descriptor("owned", 17), 0);
+            let (other, second) = indexed(descriptor("other", 17), 1);
+            let owner = owned.clone();
+            let retention = index.retention();
+            retention.set_ownership(Rc::new(move |page| page == &owner));
+            index.publish(owned.clone(), first).unwrap();
+            index.publish(other.clone(), second).unwrap();
+            if hot_nonowned {
+                for _ in 0..3 {
+                    retention.touch(&other);
+                }
+            }
+            let before = index.snapshot_pages(0, 1);
+            let ticket = index.reserve_page(true).unwrap();
+            assert_eq!(index.lookup(&owned).unwrap().is_some(), !hot_nonowned);
+            assert_eq!(index.lookup(&other).unwrap().is_some(), hot_nonowned);
+            if hot_nonowned {
+                let after = index.snapshot_pages(before.0, 2);
+                assert_eq!(after.1.len(), 1);
+                assert_eq!(after.1[0].0, other);
+            }
+            drop(ticket);
+        }
+    }
+    #[test]
+    fn second_sight_index_candidate_cursor_is_bounded_and_ownership_is_current() {
+        let index = Rc::new(index(1));
+        index.set_page_capacity(65).unwrap();
+        let retention = index.retention();
+        let calls = Rc::new(Cell::new(0));
+        let counted = calls.clone();
+        let owned = Rc::new(Cell::new(true));
+        let current = owned.clone();
+        retention.set_ownership(Rc::new(move |_| {
+            counted.set(counted.get() + 1);
+            current.get()
+        }));
+        for i in 0..65 {
+            let (page, entry) = indexed(descriptor(&format!("v{i}"), 17), 0);
+            index.publish(page, entry).unwrap();
+        }
+        let ticket = index.reserve_page(true).unwrap();
+        assert_eq!(
+            calls.get(),
+            65,
+            "64 candidates plus one victim classification"
+        );
+        drop(ticket);
+        let first_cursor = index.victim_cursor.get();
+        let (page, entry) = indexed(descriptor("new", 17), 0);
+        index.publish(page.clone(), entry).unwrap();
+        owned.set(false);
+        let ticket = index.reserve_page(true).unwrap();
+        assert_eq!(calls.get(), 130);
+        assert_ne!(index.victim_cursor.get(), first_cursor);
+        assert_eq!(retention.score(&page), 0);
+        drop(ticket);
+    }
+    #[test]
+    fn second_sight_mixed_segments_use_live_payload_value_not_padding_or_last_read() {
+        let segments = Rc::new(segments(1024, 3));
+        for _ in 0..3 {
+            drop(segments.append(1024).unwrap());
+        }
+        let index = Rc::new(index(8));
+        let retention = index.retention();
+        let (owned, owned_entry) = indexed(descriptor("owned", 100), 0);
+        let (cold, cold_entry) = indexed(descriptor("cold", 800), 0);
+        let (hot, hot_entry) = indexed(descriptor("hot", 100), 1);
+        let (small, small_entry) = indexed(descriptor("small-hot", 10), 2);
+        let owner = owned.clone();
+        let small_owner = small.clone();
+        retention.set_ownership(Rc::new(move |page| page == &owner || page == &small_owner));
+        for (page, entry) in [
+            (owned.clone(), owned_entry),
+            (cold, cold_entry),
+            (hot.clone(), hot_entry),
+            (small.clone(), small_entry),
+        ] {
+            index.publish(page, entry).unwrap();
+        }
+        for _ in 0..3 {
+            retention.touch(&hot);
+        }
+        assert_eq!(index.segment_score(SegmentId(0)), 100);
+        assert_eq!(index.segment_score(SegmentId(1)), 300);
+        assert_eq!(index.segment_score(SegmentId(2)), 10);
+        let clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        clock.mark_read(SegmentId(2)).unwrap();
+        clock.reclaim_now().unwrap();
+        assert!(index.lookup(&small).unwrap().is_none());
+        assert!(index.lookup(&owned).unwrap().is_some());
+        let clock = SegmentClock::new(index.clone(), segments.clone(), 2);
+        clock.reclaim_now().unwrap();
+        assert!(index.lookup(&owned).unwrap().is_none());
+        assert!(index.lookup(&hot).unwrap().is_some());
+    }
+    #[test]
+    fn second_sight_segment_equal_heat_owned_bias_and_bounded_large_segments() {
+        let segments = Rc::new(segments(1024, 2));
+        for _ in 0..2 {
+            drop(segments.append(1024).unwrap());
+        }
+        let index = Rc::new(index(1));
+        let (owned, first) = indexed(descriptor("owned", 17), 0);
+        let (other, second) = indexed(descriptor("other", 17), 1);
+        let owner = owned.clone();
+        let retention = index.retention();
+        retention.set_ownership(Rc::new(move |page| page == &owner));
+        index.publish(owned.clone(), first).unwrap();
+        index.publish(other.clone(), second).unwrap();
+        SegmentClock::new(index.clone(), segments.clone(), 1)
+            .reclaim_now()
+            .unwrap();
+        assert!(index.lookup(&owned).unwrap().is_some());
+        assert!(index.lookup(&other).unwrap().is_none());
+        for i in 0..256 {
+            let (page, entry) = indexed(descriptor(&format!("extra{i}"), 17), 0);
+            index.publish(page, entry).unwrap();
+        }
+        let calls = Rc::new(Cell::new(0));
+        let counted = calls.clone();
+        retention.set_ownership(Rc::new(move |_| {
+            counted.set(counted.get() + 1);
+            true
+        }));
+        assert_eq!(
+            index.segment_score(SegmentId(0)),
+            256 * 17 + crate::model::PAGE_BYTES * 4
+        );
+        assert_eq!(calls.get(), 256);
+        // A conservative suffix is still evictable, and removal respects 256 per turn.
+        let clock = SegmentClock::new(index.clone(), segments.clone(), 2);
+        assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
+        assert_eq!(index.snapshot().unwrap().entries.len(), 1);
+        clock.reclaim_now().unwrap();
+        assert!(index.snapshot().unwrap().entries.is_empty());
+    }
+    #[test]
+    fn second_sight_residency_replacement_restore_purge_and_drop_are_balanced() {
+        let index = index(4);
+        let retention = index.retention();
+        let (page, entry) = indexed(descriptor("resident", 17), 0);
+        let pending = index.track(&page).unwrap();
+        retention.touch(&page);
+        index.publish(page.clone(), entry.clone()).unwrap();
+        assert_eq!(retention.snapshot().heat_entries, 1);
+        assert_eq!(retention.score(&page), 1);
+        let (_, replacement) = indexed(entry.metadata.clone(), 1);
+        index.publish(page.clone(), replacement.clone()).unwrap();
+        assert_eq!(retention.score(&page), 1);
+        index.remove_if_matches(&page, &entry.location);
+        assert_eq!(retention.snapshot().heat_entries, 1);
+        let snapshot = index.snapshot().unwrap();
+        index.restore(snapshot).unwrap();
+        assert_eq!(retention.score(&page), 1);
+        index.remove_cache(&page.version.object.cache);
+        assert_eq!(
+            retention.snapshot().heat_entries,
+            1,
+            "pending still owns heat"
+        );
+        drop(pending);
+        assert_eq!(retention.snapshot().heat_entries, 0);
+        index.publish(page.clone(), entry).unwrap();
+        assert_eq!(retention.score(&page), 0);
+        drop(index);
+        assert_eq!(retention.snapshot().heat_entries, 0);
+    }
+    #[test]
+    fn second_sight_heat_capacity_and_failed_restore_leave_existing_residency_intact() {
+        let index = index(4);
+        let retention = Rc::new(Retention::new(4096, 1).unwrap());
+        index.set_retention(retention.clone());
+        let (page, entry) = indexed(descriptor("resident", 17), 0);
+        index.publish(page.clone(), entry.clone()).unwrap();
+        retention.touch(&page);
+        let (other, other_entry) = indexed(descriptor("other", 17), 1);
+        assert!(matches!(index.track(&other), Err(Error::Overloaded)));
+        assert_eq!(
+            index.publish(other.clone(), other_entry.clone()),
+            Err(Error::Overloaded)
+        );
+        assert_eq!(
+            index.restore(IndexSnapshot {
+                entries: vec![(other, other_entry)],
+                metadata: vec![]
+            }),
+            Err(Error::Overloaded)
+        );
+        assert!(index.lookup(&page).unwrap().is_some());
+        assert_eq!(retention.snapshot().heat_entries, 1);
+        assert_eq!(retention.snapshot().indexed_payload_bytes, 17);
+        assert_eq!(retention.score(&page), 1);
+        index.state.borrow_mut().next_age = u64::MAX;
+        assert_eq!(index.publish(page.clone(), entry), Err(Error::Unavailable));
+        assert!(index.lookup(&page).unwrap().is_some());
+        assert_eq!(retention.score(&page), 1);
+        drop(index);
+        assert_eq!(retention.snapshot().heat_entries, 0);
+    }
+    #[test]
+    fn second_sight_sealed_unpublished_write_is_not_a_victim() {
+        let segments = Rc::new(segments(1024, 3));
+        let index = Rc::new(index(4));
+        let (published, entry) = indexed(descriptor("published", 17), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(published.clone(), entry).unwrap();
+        index.retention().touch(&published);
+        let (write, extent) = segments.append(1024).unwrap();
+        let publication = index.publishing(write.id());
+        let (other_write, _) = segments.append(1024).unwrap();
+        let other_publication = index.publishing(other_write.id());
+        let clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        clock.reclaim_now().unwrap();
+        assert!(index.lookup(&published).unwrap().is_none());
+        assert_eq!(
+            segments.state(write.id()),
+            Ok(page_alloc::SegmentState::Sealed)
+        );
+        segments
+            .validate(write.id(), write.generation(), &extent)
+            .unwrap();
+        let (page, mut entry) = indexed(descriptor("completed", 17), 1);
+        entry.location.extent = extent;
+        index.publish(page.clone(), entry).unwrap();
+        drop(publication);
+        drop(write);
+        assert!(index.lookup(&page).unwrap().is_some());
+        drop(other_publication);
+        drop(other_write);
     }
     #[test]
     fn metadata_only_checkpoint_preserves_empty_and_old_versions_without_freshness() {

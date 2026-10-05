@@ -19,6 +19,7 @@ pub mod origin;
 pub mod peer;
 pub mod rdma;
 pub mod read;
+pub mod retention;
 pub mod runtime;
 pub mod security;
 pub mod store;

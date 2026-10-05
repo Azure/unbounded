@@ -1,6 +1,589 @@
 use crate::read::dispatch::WorkerMap;
 
 #[test]
+fn optional_persistence_reclaims_completed_idle_slab_before_pressure_rejection() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    for owned in [false, true] {
+        let f = cold_disk_fixture();
+        let writer = &f.fill.dependencies.writer;
+        let idle = writer.retained_staging_bytes();
+        assert!(idle > 0);
+        let mut metadata = f.origin.metadata.immutable();
+        metadata.version.etag = StrongEtag::test_value("idle-staging-next");
+        let page = crate::memory::tests::bundle_for(&f.fill.dependencies.admission, metadata);
+        writer.retention().set_ownership(Rc::new(move |_| owned));
+        let admission = &f.fill.dependencies.admission;
+        let staging = writer
+            .slabs()
+            .alignment()
+            .unwrap()
+            .extent(0, crate::store::logical_length(&page.copy()).unwrap())
+            .unwrap()
+            .length();
+        let ceiling = if owned {
+            admission.limit(ResourceClass::Ciphertext)
+        } else {
+            admission.limit(ResourceClass::Ciphertext).min(
+                (admission.limit(ResourceClass::Ciphertext) / 2)
+                    .max(PAGE_BYTES as usize + 16 + staging),
+            )
+        };
+        let held = admission
+            .reserve(
+                Some(&f.context.object.cache),
+                ResourceClass::Ciphertext,
+                ceiling - admission.used(ResourceClass::Ciphertext),
+            )
+            .unwrap();
+        assert_eq!(writer.pending_count(), 0);
+        if !owned {
+            f.fill.observe_verified(&page, &f.scope);
+        }
+        f.fill.observe_verified(&page, &f.scope);
+        assert_eq!(
+            writer.pending_count(),
+            1,
+            "idle staging should fund enqueue, owned={owned}"
+        );
+        assert_eq!(writer.retained_staging_bytes(), 0);
+        assert_eq!(writer.discarded_count(), 0);
+        assert_eq!(page.plaintext.bytes(), &[1; 3]);
+        drop(held);
+    }
+}
+
+#[test]
+fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let page = acquire(&mut f, &mut budget).unwrap();
+    f.fill.dependencies.writer.discard_unsubmitted();
+    let published = Arc::new(crate::control::PublishedState::default());
+    let snapshots =
+        crate::control::SnapshotStore::new(f.keys.cluster().clone(), published.clone(), 2);
+    let mut publication = racer_control_wire::Publication {
+        schema_version: racer_control_wire::SCHEMA_VERSION,
+        cluster: f.keys.cluster().clone(),
+        sequence: racer_control_wire::PublicationSequence(1),
+        membership_version: racer_control_wire::MembershipVersion(1),
+        members: vec![],
+        caches: vec![],
+    };
+    publication.members = (0..1000)
+        .map(|i| racer_control_wire::Member {
+            node: racer_control_wire::NodeId(format!("22222222-2222-4222-8222-{i:012}")),
+            shares: NonZeroU32::new(1).unwrap(),
+            peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+            rails: vec![],
+            site: String::new(),
+        })
+        .collect();
+    snapshots.publish(publication).unwrap();
+    let mut deps = f.fill.dependencies.clone();
+    deps.candidates = Rc::new(CandidatePolicy::new(
+        racer_control_wire::NodeId("22222222-2222-4222-8222-000000000000".into()),
+        Rc::new(Placement::new(16)),
+        NoPeer::requester(),
+        deps.credentials.clone(),
+        published,
+    ));
+    f.fill = Fill::new(deps);
+    let before = f
+        .fill
+        .dependencies
+        .writer
+        .retention()
+        .snapshot()
+        .observations;
+    let mut read = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let result = match read.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(page)) => page,
+        other => panic!(
+            "memory read waited on optional ranking: {}",
+            matches!(other, Poll::Pending)
+        ),
+    };
+    assert_eq!(result.ciphertext.bytes(), page.ciphertext.bytes());
+    drop(read);
+    assert_eq!(
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .snapshot()
+            .observations,
+        before + 1
+    );
+    // The detached refresh may yield over the cold 1000-member publication,
+    // without extending delivery or recording another logical interest.
+    queue.poll(&mut cx, 1);
+    assert_eq!(
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .snapshot()
+            .observations,
+        before + 1
+    );
+    f.scope.cancel().unwrap();
+    queue.poll(&mut cx, 64);
+    assert_eq!(
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .snapshot()
+            .observations,
+        before + 1
+    );
+}
+
+#[test]
+fn optional_persistence_headroom_preserves_one_page_and_half_budget() {
+    use crate::read::fill::optional_headroom;
+    let page = PAGE_BYTES as usize + 16;
+    assert!(optional_headroom(25 * 1024 * 1024, 0, page, page));
+    assert!(!optional_headroom(25 * 1024 * 1024, page, page, page));
+    assert!(optional_headroom(page, 0, page, page));
+    assert!(!optional_headroom(page - 1, 0, page, page));
+    assert!(optional_headroom(19, 0, 19, page));
+    assert!(!optional_headroom(19, 1, 19, page));
+    assert!(optional_headroom(8 * page, 3 * page, page, page));
+    assert!(!optional_headroom(8 * page, 4 * page, 1, page));
+    assert!(!optional_headroom(usize::MAX, usize::MAX, 1, page));
+    let staging = page + crate::store::MAX_HEADER_BYTES + 4096;
+    assert!(optional_headroom(
+        page + staging,
+        page,
+        staging,
+        page + staging
+    ));
+    assert!(!optional_headroom(
+        page + staging - 1,
+        page,
+        staging,
+        page + staging
+    ));
+}
+
+#[test]
+fn optional_persistence_minimum_dirty_budget_is_best_effort() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    for (bytes, succeeds) in [(18, false), (19, true)] {
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.dirty_bytes = std::num::NonZeroUsize::new(bytes).unwrap();
+        let mut f = fixture_with(3, Some(limits));
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .set_ownership(Rc::new(|_| false));
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        let first = acquire(&mut f, &mut budget).unwrap();
+        let second = acquire(&mut f, &mut budget).unwrap();
+        assert_eq!(first.ciphertext.bytes(), second.ciphertext.bytes());
+        assert_eq!(second.plaintext.bytes(), b"abc");
+        assert_eq!(
+            f.fill.dependencies.writer.pending_count(),
+            usize::from(succeeds)
+        );
+        assert_eq!(f.origin.calls.get(), 1);
+    }
+}
+
+#[test]
+fn optional_persistence_owned_dirty_pressure_reclaims_only_optional_queue() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    for queued_owned in [false, true] {
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.dirty_bytes = std::num::NonZeroUsize::new(19).unwrap();
+        let mut f = fixture_with(3, Some(limits));
+        let policy = f.fill.dependencies.writer.retention();
+        policy.set_ownership(Rc::new(|_| false));
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        let first = acquire(&mut f, &mut budget).unwrap();
+        f.fill.observe_verified(&first, &f.scope);
+        assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+        let mut metadata = first.metadata.immutable();
+        metadata.version.etag = StrongEtag::test_value("owned-next");
+        let next = crate::memory::tests::bundle_for(&f.fill.dependencies.admission, metadata);
+        let incoming = next.plaintext.page().clone();
+        let owned = incoming.clone();
+        policy.set_ownership(Rc::new(move |id| queued_owned || id == &owned));
+        f.fill.observe_verified(&next, &f.scope);
+        assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+        assert_eq!(
+            f.fill
+                .dependencies
+                .writer
+                .copy_only(&incoming)
+                .unwrap()
+                .is_some(),
+            !queued_owned
+        );
+        assert_eq!(
+            f.fill
+                .dependencies
+                .writer
+                .copy_only(&f.page)
+                .unwrap()
+                .is_some(),
+            queued_owned
+        );
+        assert_eq!(first.plaintext.bytes(), b"abc");
+        assert_eq!(
+            f.fill
+                .dependencies
+                .admission
+                .used(ResourceClass::DirtyCiphertext),
+            19
+        );
+    }
+}
+
+#[test]
+fn optional_persistence_staging_pressure_skips_without_read_failure() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut f = fixture();
+    let policy = f.fill.dependencies.writer.retention();
+    policy.set_ownership(Rc::new(|_| false));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let first = acquire(&mut f, &mut budget).unwrap();
+    let admission = &f.fill.dependencies.admission;
+    let hold = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            admission.limit(ResourceClass::Ciphertext) - admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    f.fill.observe_verified(&first, &f.scope);
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
+    assert_eq!(admission.used(ResourceClass::DirtyCiphertext), 0);
+    assert_eq!(first.plaintext.bytes(), b"abc");
+    drop(hold);
+    // A later independent memory interest may retry optional persistence.
+    f.fill.observe_verified(&first, &f.scope);
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+    assert_eq!(policy.snapshot().persistence_attempts, 2);
+    assert_eq!(policy.snapshot().persistence_accepted, 1);
+}
+
+#[test]
+fn optional_persistence_owned_staging_pressure_reclaims_one_queued_optional() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut f = fixture();
+    let policy = f.fill.dependencies.writer.retention();
+    policy.set_ownership(Rc::new(|_| false));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let first = acquire(&mut f, &mut budget).unwrap();
+    f.fill.observe_verified(&first, &f.scope);
+    let mut metadata = first.metadata.immutable();
+    metadata.version.etag = StrongEtag::test_value("staging-owned");
+    let next = crate::memory::tests::bundle_for(&f.fill.dependencies.admission, metadata);
+    let incoming = next.plaintext.page().clone();
+    let owned = incoming.clone();
+    policy.set_ownership(Rc::new(move |id| id == &owned));
+    let admission = &f.fill.dependencies.admission;
+    let hold = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            admission.limit(ResourceClass::Ciphertext) - admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    f.fill.observe_verified(&next, &f.scope);
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(&incoming)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+    assert_eq!(first.plaintext.bytes(), b"abc");
+    drop(hold);
+}
+
+#[test]
+fn second_sight_subscription_probe_transfer_and_fanout_count_only_consumers() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut f = fixture();
+    let policy = f.fill.dependencies.writer.retention();
+    policy.set_ownership(Rc::new(|_| false));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_none());
+    let page = drive(
+        f.fill.acquire_unobserved(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_some());
+    let selected = drive(
+        f.fill.accept_selected_unobserved(page.copy(), &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(policy.snapshot().observations, 0);
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
+    // Distinct consumer interests count even when their transport RequestId is
+    // the same. Scheduler selected intervals, not a probabilistic reader map,
+    // ensure this delivery boundary runs once per consumer/page.
+    f.fill.observe_verified(&selected, &f.scope);
+    assert_eq!(policy.snapshot().observations, 1);
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
+    f.fill.observe_verified(&selected, &f.scope);
+    assert_eq!(policy.snapshot().observations, 2);
+    assert_eq!(policy.snapshot().qualified, 1);
+    assert_eq!(policy.snapshot().persistence_accepted, 1);
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+}
+
+#[test]
+fn second_sight_memory_hit_persists_original_ciphertext_and_retry_does_not() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut f = fixture();
+    f.fill
+        .dependencies
+        .writer
+        .retention()
+        .set_ownership(Rc::new(|_| false));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let first = acquire(&mut f, &mut budget).unwrap();
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
+    let again = f.fill.cached_page(&f.page, &f.scope).unwrap().unwrap();
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
+    assert_eq!(
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .snapshot()
+            .observations,
+        1
+    );
+    assert_eq!(first.ciphertext.bytes(), again.ciphertext.bytes());
+    f.scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+    let second = acquire(&mut f, &mut budget).unwrap();
+    let retained = f
+        .fill
+        .dependencies
+        .writer
+        .copy_only(&f.page)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.ciphertext.bytes(), retained.ciphertext.bytes());
+    assert_eq!(first.ciphertext.envelope(), retained.ciphertext.envelope());
+    assert_eq!(second.ciphertext.bytes(), retained.ciphertext.bytes());
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .snapshot()
+            .observations,
+        2
+    );
+}
+
+#[test]
+fn second_sight_selected_and_optional_pressure_preserve_read_success() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    for pressure in [false, true] {
+        let mut f = fixture();
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .set_ownership(Rc::new(|_| false));
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        let first = acquire(&mut f, &mut budget).unwrap();
+        let held = pressure.then(|| {
+            f.fill
+                .dependencies
+                .admission
+                .reserve(
+                    Some(&f.context.object.cache),
+                    ResourceClass::DirtyCiphertext,
+                    f.fill
+                        .dependencies
+                        .admission
+                        .limit(ResourceClass::DirtyCiphertext),
+                )
+                .unwrap()
+        });
+        let scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+        let second = drive(
+            f.fill.accept_selected(first.copy(), &scope),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
+        assert_eq!(first.ciphertext.bytes(), second.ciphertext.bytes());
+        assert_eq!(
+            f.fill.dependencies.writer.pending_count(),
+            usize::from(!pressure)
+        );
+        assert_eq!(f.origin.calls.get(), 1);
+        drop(held);
+    }
+}
+
+#[test]
+fn second_sight_simultaneous_followers_persist_without_second_acquisition() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut f = fixture();
+    f.fill
+        .dependencies
+        .writer
+        .retention()
+        .set_ownership(Rc::new(|_| false));
+    let other = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+    let mut one = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let mut two = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let (a, b) = drive(
+        async {
+            futures::join!(
+                f.fill.acquire(
+                    f.page.clone(),
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope,
+                    &mut one
+                ),
+                f.fill.acquire(
+                    f.page.clone(),
+                    f.membership.clone(),
+                    &f.context,
+                    &other,
+                    &mut two
+                )
+            )
+        },
+        &mut f.engine,
+        &f.crypto,
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a.ciphertext.bytes(), b.ciphertext.bytes());
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+    assert_eq!(
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .snapshot()
+            .observations,
+        2
+    );
+}
+
+#[test]
+fn second_sight_completed_flight_and_current_ownership_promote_verified_copy() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    for owned in [false, true] {
+        let mut f = fixture();
+        let ownership = Rc::new(Cell::new(false));
+        let current = ownership.clone();
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .set_ownership(Rc::new(move |_| current.get()));
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        // Retain a registered waiter; otherwise last-waiter cleanup removes the
+        // completed flight and clearing memory correctly requires a fresh fill.
+        let mut held_budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        let held = f
+            .fill
+            .dependencies
+            .flights
+            .join(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut held_budget,
+            )
+            .unwrap();
+        let first = drive(
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
+        assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
+        f.fill
+            .dependencies
+            .memory
+            .remove_cache(&f.context.object.cache)
+            .unwrap();
+        ownership.set(owned);
+        let next_scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();
+        let second = drive(
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &next_scope,
+                &mut budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
+        assert_eq!(first.ciphertext.bytes(), second.ciphertext.bytes());
+        assert_eq!(f.origin.calls.get(), 1);
+        assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+        drop(held);
+    }
+}
+
+#[test]
 fn network_plaintext_rechecks_pressure_cleared_after_rejection() {
     for (shrink, exhausted) in [(true, false), (false, false), (true, true), (false, true)] {
         let mut limits = crate::test_support::cluster::config(false).limits;
@@ -2200,6 +2783,12 @@ fn fixture_with_caches(
         metadata_owner,
     })
     .with_metrics(metrics);
+    // This isolated fixture has no published control snapshot. Production Fill
+    // classifies against publication; the fixture explicitly supplies its owner.
+    fill.dependencies
+        .writer
+        .retention()
+        .set_ownership(Rc::new(|_| true));
     Fixture {
         keys,
         reactor,
@@ -3486,6 +4075,9 @@ fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
     Arc::get_mut(&mut stale.ciphertext.inner).unwrap().bytes[0] ^= 1;
     let writer = &f.fill.dependencies.writer;
     let old = writer.index().lookup(&f.page).unwrap().unwrap().location;
+    // Enqueue now deduplicates resident pages. Model the invalidation that
+    // permits a replacement while the older read token remains outstanding.
+    f.fill.dependencies.disk.invalidate(&token).unwrap();
     let dirty = f
         .fill
         .dependencies

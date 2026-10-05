@@ -116,6 +116,8 @@ mod index_pressure {
         let index = f.store.writer.index();
         let neighbor = index.lookup(&second).unwrap().unwrap().location;
         let old = index.lookup(&first).unwrap().unwrap().location;
+        // A healthy resident is deduplicated. Only invalidation warrants a rewrite.
+        f.store.reader.invalidate(&token).unwrap();
         persist(&f, 1);
         let replacement = index.lookup(&first).unwrap().unwrap().location;
         assert_ne!(old, replacement);
@@ -321,6 +323,394 @@ mod index_pressure {
     }
 }
 static NEXT: AtomicU64 = AtomicU64::new(0);
+#[test]
+fn disk_observability_publication_read_and_pending_cleanup() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let retention = f.store.writer.retention();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.enqueue(copy).unwrap();
+    f.enqueue(f.copy(1, 113)).unwrap();
+    assert_eq!(retention.snapshot().pending_payload_bytes, 113);
+    assert_eq!(retention.snapshot().disk[0].published_pages, 0);
+    // Ownership is sampled at publication, not captured at queue insertion.
+    retention.set_ownership(Rc::new(|_| true));
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    assert_eq!(retention.snapshot().pending_payload_bytes, 0);
+    assert_eq!(retention.snapshot().indexed_payload_bytes, 113);
+    assert_eq!(retention.snapshot().disk[1].published_pages, 1);
+    assert_eq!(retention.snapshot().disk[1].published_payload_bytes, 113);
+    assert_eq!(f.enqueue(f.copy(1, 113)), Ok(0));
+    assert_eq!(retention.snapshot().disk[1].published_pages, 1);
+    let (_, token) = drive(&f.reactor, f.store.reader.read_with_token(&id, &scope()))
+        .unwrap()
+        .unwrap();
+    retention.set_ownership(Rc::new(|_| false));
+    assert!(
+        drive(&f.reactor, f.store.reader.read(&id, &scope()))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(retention.snapshot().disk[1].read_payload_bytes, 113);
+    assert_eq!(retention.snapshot().disk[0].read_payload_bytes, 113);
+    let canceled = scope();
+    canceled.cancel().unwrap();
+    assert!(drive(&f.reactor, f.store.reader.read(&id, &canceled)).is_err());
+    f.store.reader.invalidate(&token).unwrap();
+    assert!(
+        drive(&f.reactor, f.store.reader.read(&id, &scope()))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(retention.snapshot().disk[0].read_payload_bytes, 113);
+    assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
+    f.enqueue(f.copy(2, 3)).unwrap();
+    f.enqueue(f.copy(3, 7)).unwrap();
+    assert_eq!(retention.snapshot().pending_payload_bytes, 10);
+    assert_eq!(f.store.writer.discard_unsubmitted(), 2);
+    assert_eq!(retention.snapshot().pending_payload_bytes, 0);
+    f.enqueue(f.copy(4, 9)).unwrap();
+    f.store.writer.cancel_pending_writes().unwrap();
+    assert_eq!(retention.snapshot().pending_payload_bytes, 0);
+    assert_eq!(retention.snapshot().disk[0].published_pages, 0);
+}
+#[test]
+fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = drive(&f.reactor, f.store.open()).unwrap();
+    let retention = f.store.writer.retention();
+    f.enqueue(f.copy(1, 3)).unwrap();
+    simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    assert_eq!(retention.snapshot().pending_payload_bytes, 0);
+    assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
+    assert_eq!(retention.snapshot().disk[0].published_pages, 0);
+    let copy = f.copy(2, 7);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.enqueue(copy).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    assert_eq!(retention.snapshot().disk[0].published_payload_bytes, 7);
+    simulation.inject("read", Fault::Errno(libc::EIO)).unwrap();
+    assert!(
+        drive(&f.reactor, f.store.reader.read(&id, &scope()))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(retention.snapshot().disk[0].read_payload_bytes, 0);
+    assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
+    assert_eq!(retention.snapshot().disk[0].index_evicted_pages, 0);
+    assert_eq!(retention.snapshot().disk[0].segment_evicted_pages, 0);
+}
+#[test]
+fn second_sight_queue_owned_bias_hot_nonowned_and_pressure_discard() {
+    for hot_nonowned in [false, true] {
+        let f = Fixture::new();
+        let _ = futures::executor::block_on(f.store.open()).unwrap();
+        f.reactor.init().expect("queue tests require io_uring");
+        let owned = f.copy(1, 113);
+        let other = f.copy(2, 113);
+        let owner = owned.ciphertext.envelope().page.clone();
+        let id = other.ciphertext.envelope().page.clone();
+        let classify = owner.clone();
+        let retention = f.store.writer.retention();
+        retention.set_ownership(Rc::new(move |page| page == &classify));
+        f.enqueue(other).unwrap();
+        f.enqueue(owned).unwrap();
+        if hot_nonowned {
+            for _ in 0..3 {
+                retention.touch(&id);
+            }
+        }
+        drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+        assert_eq!(
+            f.store.writer.index().lookup(&owner).unwrap().is_some(),
+            !hot_nonowned
+        );
+        assert_eq!(
+            f.store.writer.index().lookup(&id).unwrap().is_some(),
+            hot_nonowned
+        );
+        f.store.writer.discard_unsubmitted();
+    }
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    let low = f.copy(1, 113);
+    let high = f.copy(2, 113);
+    let low_id = low.ciphertext.envelope().page.clone();
+    let high_id = high.ciphertext.envelope().page.clone();
+    let retention = f.store.writer.retention();
+    let owner = high_id.clone();
+    retention.set_ownership(Rc::new(move |page| page == &owner));
+    f.enqueue(high).unwrap();
+    f.enqueue(low).unwrap();
+    assert!(f.store.writer.reclaim_ciphertext(None, 1) > 0);
+    assert!(f.store.writer.copy_only(&low_id).unwrap().is_none());
+    assert!(f.store.writer.copy_only(&high_id).unwrap().is_some());
+}
+
+#[test]
+fn second_sight_full_queue_replaces_only_lower_value_unsubmitted_work() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    let first = f.copy(1, 113);
+    let first_id = first.ciphertext.envelope().page.clone();
+    let second = f.copy(2, 113);
+    let second_id = second.ciphertext.envelope().page.clone();
+    let preferred = f.copy(3, 113);
+    let preferred_id = preferred.ciphertext.envelope().page.clone();
+    let owner = preferred_id.clone();
+    f.store
+        .writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    f.enqueue(first).unwrap();
+    f.enqueue(second).unwrap();
+    f.enqueue(preferred).unwrap();
+    assert!(f.store.writer.copy_only(&first_id).unwrap().is_none());
+    assert!(f.store.writer.copy_only(&second_id).unwrap().is_some());
+    assert!(f.store.writer.copy_only(&preferred_id).unwrap().is_some());
+    assert_eq!(f.store.writer.pending_count(), 2);
+    assert_eq!(f.store.writer.discarded_count(), 1);
+    assert_eq!(f.enqueue(f.copy(4, 113)), Err(Error::Overloaded));
+}
+
+#[test]
+fn second_sight_resident_enqueue_does_not_append_or_republish() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().expect("dedup tests require io_uring");
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.enqueue(copy).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    let location = f
+        .store
+        .writer
+        .index()
+        .lookup(&id)
+        .unwrap()
+        .unwrap()
+        .location;
+    let images = f.segments.snapshot();
+    let order = f.store.writer.index().snapshot_pages(0, 8).0;
+    assert_eq!(f.enqueue(f.copy(1, 113)), Ok(0));
+    assert_eq!(f.store.writer.pending_count(), 0);
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap(),
+        0
+    );
+    assert_eq!(f.segments.snapshot(), images);
+    assert_eq!(f.store.writer.index().snapshot_pages(0, 8).0, order);
+    assert_eq!(
+        f.store
+            .writer
+            .index()
+            .lookup(&id)
+            .unwrap()
+            .unwrap()
+            .location,
+        location
+    );
+}
+
+#[test]
+fn second_sight_pressure_never_discards_submitted_owner() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor
+        .init()
+        .expect("submitted fence tests require io_uring");
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.enqueue(copy).unwrap();
+    let request = scope();
+    let mut progress = f.store.writer.progress(1, &request);
+    assert!(
+        progress
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            .is_pending()
+    );
+    assert_eq!(f.store.writer.queued_count(), 0);
+    assert_eq!(f.store.writer.reclaim_ciphertext(None, usize::MAX), 0);
+    assert_eq!(f.store.writer.discard_unsubmitted(), 0);
+    assert_eq!(f.store.writer.pending_count(), 1);
+    drive(&f.reactor, progress).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+    assert_eq!(f.store.writer.discarded_count(), 0);
+}
+
+#[test]
+fn second_sight_reclaim_scans_only_a_fixed_queue_prefix_and_makes_progress() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.store.configure(f.admission.clone(), 128, 128).unwrap();
+    for number in 0..64 {
+        f.enqueue(f.copy(number, 3)).unwrap();
+    }
+    let metadata = f.copy(64, 3).metadata.immutable();
+    let last = crate::memory::tests::bundle_for(&f.admission, metadata);
+    f.enqueue(last.copy()).unwrap();
+    // Arbitrary idle-page reclamation must not walk a capacity-sized suffix.
+    assert_eq!(f.store.writer.discard_idle_copy(&last), 0);
+    assert_eq!(f.store.writer.queued_count(), 65);
+    let calls = Rc::new(Cell::new(0));
+    let counted = calls.clone();
+    f.store.writer.retention().set_ownership(Rc::new(move |_| {
+        counted.set(counted.get() + 1);
+        false
+    }));
+    // A missing cache still cannot scan beyond the inspection prefix.
+    assert_eq!(
+        f.store
+            .writer
+            .reclaim_ciphertext(Some(&CacheId("absent".into())), usize::MAX),
+        0
+    );
+    assert_eq!(calls.get(), 0);
+    assert!(f.store.writer.reclaim_ciphertext(None, usize::MAX) > 0);
+    assert_eq!(calls.get(), QUEUE_RECLAIM_CANDIDATES);
+    assert_eq!(f.store.writer.queued_count(), 1);
+    assert_eq!(f.store.writer.discarded_count(), 64);
+    // Later calls reach the untouched suffix; no queued page becomes pinned.
+    assert!(f.store.writer.discard_idle_copy(&last) > 0);
+    assert_eq!(f.store.writer.pending_count(), 0);
+    assert_eq!(f.store.writer.discarded_count(), 65);
+}
+
+#[test]
+fn second_sight_pending_residency_transfers_to_index_and_releases_on_cancel_or_drop() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().expect("residency tests require io_uring");
+    let retention = f.store.writer.retention();
+    let copy = f.copy(1, 3);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.enqueue(copy).unwrap();
+    assert_eq!(retention.snapshot().heat_entries, 1);
+    retention.touch(&id);
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    assert_eq!(retention.snapshot().heat_entries, 1);
+    assert_eq!(retention.score(&id), 1);
+    f.enqueue(f.copy(1, 3)).unwrap();
+    assert_eq!(retention.snapshot().heat_entries, 1);
+    f.enqueue(f.copy(2, 3)).unwrap();
+    assert_eq!(retention.snapshot().heat_entries, 2);
+    f.store.writer.cancel_pending_writes().unwrap();
+    assert_eq!(retention.snapshot().heat_entries, 1);
+    drop(f);
+    assert_eq!(retention.snapshot().heat_entries, 0);
+}
+#[test]
+fn optional_headroom_reclaim_preserves_owned_submitted_and_index_residency() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.store.configure(f.admission.clone(), 8, 16).unwrap();
+    f.reactor.init().unwrap();
+    let incoming = f.copy(9, 3).ciphertext.envelope().page.clone();
+    let owner = incoming.clone();
+    f.store
+        .writer
+        .retention()
+        .set_ownership(Rc::new(move |id| id == &owner));
+    let active = f.copy(1, 3);
+    let active_id = active.ciphertext.envelope().page.clone();
+    f.enqueue(active).unwrap();
+    let request = scope();
+    let mut progress = f.store.writer.progress(1, &request);
+    assert!(
+        progress
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            .is_pending()
+    );
+    f.enqueue(f.copy(9, 3)).unwrap();
+    let optional = f.copy(2, 3);
+    let optional_id = optional.ciphertext.envelope().page.clone();
+    f.enqueue(optional).unwrap();
+    assert_eq!(
+        f.store
+            .writer
+            .reclaim_optional_for_owned(&active_id, None, usize::MAX, usize::MAX),
+        0
+    );
+    assert_eq!(
+        f.store
+            .writer
+            .reclaim_optional_for_owned(&incoming, Some(&CacheId("other".into())), 1, 1),
+        0
+    );
+    assert_eq!(
+        f.store
+            .writer
+            .reclaim_optional_for_owned(&incoming, None, 0, 0),
+        0
+    );
+    assert_eq!(
+        f.store
+            .writer
+            .reclaim_optional_for_owned(&incoming, None, 1, 1),
+        1
+    );
+    assert!(f.store.writer.copy_only(&optional_id).unwrap().is_none());
+    assert!(f.store.writer.copy_only(&incoming).unwrap().is_some());
+    assert!(f.store.writer.copy_only(&active_id).unwrap().is_some());
+    assert_eq!(
+        f.store
+            .writer
+            .reclaim_optional_for_owned(&incoming, None, usize::MAX, usize::MAX),
+        0
+    );
+    drive(&f.reactor, progress).unwrap();
+    assert!(f.store.writer.index().lookup(&active_id).unwrap().is_some());
+}
+#[test]
+fn optional_headroom_reclaim_bounds_prefix_and_stops_only_after_both_deficits() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.store.configure(f.admission.clone(), 128, 128).unwrap();
+    let incoming = f.copy(99, 3).ciphertext.envelope().page.clone();
+    let owner = incoming.clone();
+    f.store
+        .writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    for number in 0..65 {
+        f.enqueue(f.copy(number, 3)).unwrap();
+    }
+    assert_eq!(
+        f.store
+            .writer
+            .reclaim_optional_for_owned(&incoming, None, 20, 1),
+        2
+    );
+    assert_eq!(f.store.writer.pending_count(), 63);
+    for number in 65..68 {
+        f.enqueue(f.copy(number, 3)).unwrap();
+    }
+    assert_eq!(f.store.writer.pending_count(), 66);
+    assert_eq!(
+        f.store
+            .writer
+            .reclaim_optional_for_owned(&incoming, None, usize::MAX, usize::MAX),
+        64
+    );
+    assert_eq!(f.store.writer.pending_count(), 2);
+    // Classification is current, not an immutable optional bit at enqueue.
+    f.store.writer.retention().set_ownership(Rc::new(|_| true));
+    assert_eq!(
+        f.store
+            .writer
+            .reclaim_optional_for_owned(&incoming, None, usize::MAX, usize::MAX),
+        0
+    );
+    assert_eq!(f.store.writer.pending_count(), 2);
+}
 pub(super) struct Directory(pub(super) PathBuf);
 impl Directory {
     pub(super) fn new() -> Self {
@@ -656,6 +1046,59 @@ fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
         }
         assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
     }
+}
+#[test]
+fn second_sight_delayed_sealed_write_keeps_publication_authority() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = drive(&f.reactor, f.store.open()).unwrap();
+    let first = f.copy(1, 113);
+    let first_id = first.ciphertext.envelope().page.clone();
+    f.enqueue(first).unwrap();
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    f.store.writer.retention().touch(&first_id);
+    let used = f.segments.snapshot()[0].used_bytes;
+    drop(
+        f.segments
+            .append((f.segments.segment_bytes() - used) as usize)
+            .unwrap(),
+    );
+    let delayed = f.copy(2, 113);
+    let id = delayed.ciphertext.envelope().page.clone();
+    let length = f
+        .store
+        .writer
+        .slabs()
+        .alignment()
+        .unwrap()
+        .extent(0, logical_length(&delayed).unwrap())
+        .unwrap()
+        .length();
+    drop(
+        f.segments
+            .append(f.segments.segment_bytes() as usize - length)
+            .unwrap(),
+    );
+    f.enqueue(delayed).unwrap();
+    simulation.inject("write", Fault::Delay(6)).unwrap();
+    let request = scope();
+    let mut progress = f.store.writer.progress(1, &request);
+    assert!(
+        progress
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            .is_pending()
+    );
+    assert_eq!(f.segments.state(SegmentId(1)), Ok(SegmentState::Sealed));
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+    f.store.eviction.reclaim_now().unwrap();
+    assert_eq!(f.segments.state(SegmentId(1)), Ok(SegmentState::Sealed));
+    assert!(f.store.writer.index().lookup(&first_id).unwrap().is_none());
+    drive(&f.reactor, progress).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+    assert_eq!(f.store.writer.discarded_count(), 0);
 }
 
 #[test]
@@ -1096,7 +1539,18 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
         .unwrap();
     assert_eq!(read.ciphertext.bytes(), &[1; 80]);
     drop(read);
-    // An actual same-key replacement remains admissible at capacity.
+    // A resident duplicate consumes neither a write nor a new publication age.
+    assert_eq!(f.enqueue(f.copy(1, 64)), Ok(0));
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+        0
+    );
+    assert_eq!(
+        index.lookup(&first_id).unwrap().unwrap().location,
+        replacement
+    );
+    // Once invalidated, an actual same-key replacement remains admissible.
+    index.remove_if_matches(&first_id, &replacement);
     f.enqueue(f.copy(1, 64)).unwrap();
     drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
     let latest = index.lookup(&first_id).unwrap().unwrap().location;

@@ -285,6 +285,160 @@ fn get(
     Ok(response)
 }
 
+#[cfg(test)]
+mod retention_metric_tests {
+    use super::*;
+
+    #[test]
+    fn disk_observability_aggregates_fixed_classes_and_replaces_gauges() {
+        let workers = Metrics::for_workers(2).unwrap();
+        for (i, worker) in workers.iter().enumerate() {
+            let mut snapshot = crate::retention::Snapshot {
+                pending_payload_bytes: 3,
+                indexed_payload_bytes: 17,
+                ..Default::default()
+            };
+            snapshot.disk[i] = crate::retention::DiskClassSnapshot {
+                published_pages: 1,
+                published_payload_bytes: 17,
+                index_evicted_pages: 2,
+                index_evicted_payload_bytes: 34,
+                segment_evicted_pages: 3,
+                segment_evicted_payload_bytes: 51,
+                read_payload_bytes: u64::MAX,
+            };
+            worker.observe_retention(snapshot);
+            worker.observe_retention(snapshot);
+        }
+        let mut output = String::new();
+        workers[0].write_retention(&mut output).unwrap();
+        for class in ["nonowned", "owned"] {
+            for (name, value) in DISK_CLASS_METRICS
+                .into_iter()
+                .zip([1, 17, 2, 34, 3, 51, u64::MAX])
+            {
+                assert!(output.contains(&format!("# TYPE {name} counter\n")));
+                assert!(
+                    output.contains(&format!("{name}{{classification=\"{class}\"}} {value}\n"))
+                );
+            }
+        }
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.contains("{classification="))
+                .count(),
+            14
+        );
+        assert!(output.contains("racer_disk_pending_payload_bytes 6\n"));
+        assert!(output.contains("racer_disk_indexed_payload_bytes 34\n"));
+        workers[0].observe_retention(crate::retention::Snapshot::default());
+        output.clear();
+        workers[1].write_retention(&mut output).unwrap();
+        assert!(output.contains("racer_disk_pending_payload_bytes 3\n"));
+        assert!(output.contains("racer_disk_indexed_payload_bytes 17\n"));
+    }
+    #[test]
+    fn retention_snapshots_replace_shards_and_aggregate_without_labels() {
+        let workers = Metrics::for_workers(2).unwrap();
+        workers[0].observe_retention(crate::retention::Snapshot {
+            observations: 10,
+            qualified: 4,
+            persistence_attempts: 3,
+            persistence_accepted: 2,
+            filter_set_bits: 7,
+            filter_bits: 256,
+            heat_entries: 1,
+            ..Default::default()
+        });
+        workers[1].observe_retention(crate::retention::Snapshot {
+            observations: 5,
+            filter_set_bits: 2,
+            filter_bits: 256,
+            ..Default::default()
+        });
+        // Repeated health observations must not add cumulative counters again.
+        let snapshot = *workers[0].retention[0].lock().unwrap();
+        workers[0].observe_retention(snapshot);
+        let mut output = String::new();
+        workers[1].write_prometheus(&mut output).unwrap();
+        for sample in [
+            "racer_retention_observations_total 15\n",
+            "racer_retention_qualified_total 4\n",
+            "racer_retention_persistence_attempts_total 3\n",
+            "racer_retention_persistence_accepted_total 2\n",
+            "racer_retention_filter_set_bits 9\n",
+            "racer_retention_filter_bits 512\n",
+            "racer_retention_heat_entries 1\n",
+        ] {
+            assert!(output.contains(sample), "{sample}");
+        }
+        assert!(
+            !output
+                .lines()
+                .any(|line| line.starts_with("racer_retention_") && line.contains('{'))
+        );
+        assert!(output.contains("# TYPE racer_retention_observations_total counter\n"));
+        assert!(output.contains("# TYPE racer_retention_heat_entries gauge\n"));
+    }
+
+    #[test]
+    fn retention_export_saturates_and_propagates_output_failure() {
+        let workers = Metrics::for_workers(2).unwrap();
+        for worker in &workers {
+            worker.observe_retention(crate::retention::Snapshot {
+                observations: u64::MAX,
+                disk: [crate::retention::DiskClassSnapshot {
+                    read_payload_bytes: u64::MAX,
+                    ..Default::default()
+                }; 2],
+                ..Default::default()
+            });
+        }
+        let mut output = String::new();
+        workers[0].write_retention(&mut output).unwrap();
+        assert!(output.contains(&format!(
+            "racer_retention_observations_total {}\n",
+            u64::MAX
+        )));
+        for class in ["owned", "nonowned"] {
+            assert!(output.contains(&format!(
+                "racer_disk_class_read_payload_bytes_total{{classification=\"{class}\"}} {}\n",
+                u64::MAX
+            )));
+        }
+        struct Failed;
+        impl Write for Failed {
+            fn write_str(&mut self, _: &str) -> std::fmt::Result {
+                Err(std::fmt::Error)
+            }
+        }
+        assert!(workers[0].write_retention(&mut Failed).is_err());
+    }
+
+    #[test]
+    fn retention_metrics_endpoint_is_nonconsuming_when_admission_stops() {
+        let telemetry = Telemetry::default();
+        telemetry
+            .metrics
+            .observe_retention(crate::retention::Snapshot {
+                observations: 17,
+                qualified: 5,
+                ..Default::default()
+            });
+        for usable in [true, false, true] {
+            let mut output = String::new();
+            assert!(matches!(
+                get(&telemetry, "/metrics", usable, &mut output),
+                Ok(Response::Metrics)
+            ));
+            assert!(output.contains("racer_retention_observations_total 17\n"));
+            assert!(output.contains("racer_retention_qualified_total 5\n"));
+            assert!(output.len() < MAX_RESPONSE_BYTES);
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Health(::telemetry::health::Health<Resources>);
 pub use ::telemetry::health::State;
@@ -1426,8 +1580,29 @@ pub(crate) enum LookupTier {
 pub struct Metrics {
     core: ::telemetry::Metrics<Event, Gauge>,
     admission: Arc<[OnceLock<(WorkerId, flow_control::SharedQuotas<AdmissionPolicy>)>]>,
+    retention: Arc<[Mutex<crate::retention::Snapshot>]>,
     shard: usize,
 }
+const RETENTION_METRICS: [(&str, &str); 9] = [
+    ("racer_retention_observations_total", "counter"),
+    ("racer_retention_qualified_total", "counter"),
+    ("racer_retention_persistence_attempts_total", "counter"),
+    ("racer_retention_persistence_accepted_total", "counter"),
+    ("racer_retention_filter_set_bits", "gauge"),
+    ("racer_retention_filter_bits", "gauge"),
+    ("racer_retention_heat_entries", "gauge"),
+    ("racer_disk_pending_payload_bytes", "gauge"),
+    ("racer_disk_indexed_payload_bytes", "gauge"),
+];
+const DISK_CLASS_METRICS: [&str; 7] = [
+    "racer_disk_class_publications_total",
+    "racer_disk_class_published_payload_bytes_total",
+    "racer_disk_class_index_evicted_pages_total",
+    "racer_disk_class_index_evicted_payload_bytes_total",
+    "racer_disk_class_segment_evicted_pages_total",
+    "racer_disk_class_segment_evicted_payload_bytes_total",
+    "racer_disk_class_read_payload_bytes_total",
+];
 
 impl Default for Metrics {
     fn default() -> Self {
@@ -1593,6 +1768,58 @@ impl Drop for RequestMetrics {
     }
 }
 impl Metrics {
+    /// Sample on the owning worker's health tick, never on a request hot path.
+    /// Diagnostics aggregate fixed-size copies without accessing worker-local Rc.
+    pub(crate) fn observe_retention(&self, snapshot: crate::retention::Snapshot) {
+        *self.retention[self.shard]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot;
+    }
+
+    fn write_retention(&self, out: &mut impl Write) -> std::fmt::Result {
+        let mut totals = [0u64; RETENTION_METRICS.len()];
+        let mut classes = [[0u64; DISK_CLASS_METRICS.len()]; 2];
+        for shard in self.retention.iter() {
+            let snapshot = *shard.lock().unwrap_or_else(|error| error.into_inner());
+            for (total, value) in totals.iter_mut().zip([
+                snapshot.observations,
+                snapshot.qualified,
+                snapshot.persistence_attempts,
+                snapshot.persistence_accepted,
+                snapshot.filter_set_bits as u64,
+                snapshot.filter_bits as u64,
+                snapshot.heat_entries as u64,
+                snapshot.pending_payload_bytes,
+                snapshot.indexed_payload_bytes,
+            ]) {
+                *total = total.saturating_add(value);
+            }
+            for (totals, class) in classes.iter_mut().zip(snapshot.disk) {
+                for (total, value) in totals.iter_mut().zip([
+                    class.published_pages,
+                    class.published_payload_bytes,
+                    class.index_evicted_pages,
+                    class.index_evicted_payload_bytes,
+                    class.segment_evicted_pages,
+                    class.segment_evicted_payload_bytes,
+                    class.read_payload_bytes,
+                ]) {
+                    *total = total.saturating_add(value);
+                }
+            }
+        }
+        for ((name, kind), value) in RETENTION_METRICS.into_iter().zip(totals) {
+            writeln!(out, "# TYPE {name} {kind}\n{name} {value}")?;
+        }
+        for (i, name) in DISK_CLASS_METRICS.into_iter().enumerate() {
+            writeln!(out, "# TYPE {name} counter")?;
+            for (class, totals) in ["nonowned", "owned"].into_iter().zip(classes) {
+                writeln!(out, "{name}{{classification=\"{class}\"}} {}", totals[i])?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn opaque_relay_body(&self, bytes: usize) -> Option<OpaqueRelayBody<'_>> {
         (bytes != 0).then(|| OpaqueRelayBody {
             metrics: self,
@@ -1653,12 +1880,16 @@ impl Metrics {
             return Err(crate::error::Error::InvalidConfiguration);
         }
         let admission: Arc<[_]> = (0..count).map(|_| OnceLock::new()).collect();
+        let retention: Arc<[_]> = (0..count)
+            .map(|_| Mutex::new(crate::retention::Snapshot::default()))
+            .collect();
         Ok(::telemetry::Metrics::shards(count)
             .into_iter()
             .enumerate()
             .map(|(shard, core)| Self {
                 core,
                 admission: admission.clone(),
+                retention: retention.clone(),
                 shard,
             })
             .collect())
@@ -1700,6 +1931,7 @@ impl Metrics {
     /// Relaxed per-series observations are not a coherent snapshot of all workers.
     pub fn write_prometheus(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         self.core.write_prometheus(out)?;
+        self.write_retention(out)?;
         // Only runtime worker IDs are labels. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
@@ -2535,6 +2767,26 @@ pub(crate) mod tests {
                     metrics
                         .observe_admission(WorkerId(u16::MAX - index as u16), admission.shared())
                         .unwrap();
+                    metrics.observe_retention(crate::retention::Snapshot {
+                        observations: u64::MAX,
+                        qualified: u64::MAX,
+                        persistence_attempts: u64::MAX,
+                        persistence_accepted: u64::MAX,
+                        filter_set_bits: usize::MAX,
+                        filter_bits: usize::MAX,
+                        heat_entries: usize::MAX,
+                        pending_payload_bytes: u64::MAX,
+                        indexed_payload_bytes: u64::MAX,
+                        disk: [crate::retention::DiskClassSnapshot {
+                            published_pages: u64::MAX,
+                            published_payload_bytes: u64::MAX,
+                            index_evicted_pages: u64::MAX,
+                            index_evicted_payload_bytes: u64::MAX,
+                            segment_evicted_pages: u64::MAX,
+                            segment_evicted_payload_bytes: u64::MAX,
+                            read_payload_bytes: u64::MAX,
+                        }; 2],
+                    });
                     admission
                 })
                 .collect();
@@ -2558,6 +2810,14 @@ pub(crate) mod tests {
             }
             let text = diagnostic_text(&telemetry, "/metrics");
             assert!(text.len() < MAX_RESPONSE_BYTES);
+            for (name, kind) in crate::telemetry::RETENTION_METRICS {
+                assert!(text.contains(&format!("# TYPE {name} {kind}\n{name} {}\n", u64::MAX)));
+                assert_eq!(
+                    text.lines().filter(|line| line.starts_with(name)).count(),
+                    1
+                );
+                assert!(!text.contains(&format!("{name}{{")));
+            }
             for name in [
                 "racer_opaque_relay_body_completed_total",
                 "racer_opaque_relay_body_completed_bytes_total",
@@ -3201,7 +3461,7 @@ pub(crate) mod tests {
                     u64::MAX
                 )));
             }
-            assert!(!output.contains('{'), "no identity or content labels");
+            assert_only_disk_class_labels(&output);
             assert_eq!(
                 EVENTS
                     .iter()
@@ -3413,9 +3673,9 @@ pub(crate) mod tests {
             metrics.write_prometheus(&mut output).unwrap();
             assert_eq!(
                 output.lines().filter(|line| !line.starts_with('#')).count(),
-                EVENT_COUNT + GAUGE_COUNT
+                EVENT_COUNT + GAUGE_COUNT + RETENTION_METRICS.len() + DISK_CLASS_METRICS.len() * 2
             );
-            assert!(!output.contains('{'));
+            assert_only_disk_class_labels(&output);
             assert!(output.len() < 64 * 1024);
         }
 
@@ -3481,9 +3741,12 @@ pub(crate) mod tests {
                     reader.write_prometheus(&mut output).unwrap();
                     assert_eq!(
                         output.lines().filter(|line| !line.starts_with('#')).count(),
-                        EVENT_COUNT + GAUGE_COUNT
+                        EVENT_COUNT
+                            + GAUGE_COUNT
+                            + RETENTION_METRICS.len()
+                            + DISK_CLASS_METRICS.len() * 2
                     );
-                    assert!(!output.contains('{'));
+                    assert_only_disk_class_labels(&output);
                 }
             });
             assert_eq!(reader.count(Event::Request), 4000);
@@ -3501,6 +3764,23 @@ pub(crate) mod tests {
                 assert_eq!(workers[0].count(event), u64::MAX);
                 workers[1].record(event, u64::MAX);
                 assert_eq!(workers[1].count(event), u64::MAX);
+            }
+        }
+
+        fn assert_only_disk_class_labels(output: &str) {
+            let labeled: Vec<_> = output.lines().filter(|line| line.contains('{')).collect();
+            assert_eq!(labeled.len(), DISK_CLASS_METRICS.len() * 2);
+            for line in labeled {
+                let (name, rest) = line.split_once('{').unwrap();
+                assert!(DISK_CLASS_METRICS.contains(&name));
+                let (labels, _) = rest.split_once('}').unwrap();
+                assert!(
+                    matches!(
+                        labels,
+                        "classification=\"owned\"" | "classification=\"nonowned\""
+                    ),
+                    "no identity or content labels"
+                );
             }
         }
 
