@@ -36,15 +36,15 @@ placement compares cost/share with UID-order ties. The application adapter is
 `cmd/racer-dataplane/src/topology.rs::Placement::rank`; comparison lives in
 `cmd/racer-dataplane/topology/src/placement.rs` (`Score::compare`), and its
 `integer_log_edges_and_ties` test is in
-`cmd/racer-dataplane/topology/src/placement/tests.rs`. Tie indexes
-follow ID order from `cmd/racer-dataplane/topology/src/membership.rs::Membership::new`,
+`cmd/racer-dataplane/topology/src/placement.rs`. Tie indexes
+follow ID order from `cmd/racer-dataplane/topology/src/lib.rs::Membership::new`,
 using Racer node ID bytes from `cmd/racer-dataplane/src/topology.rs`'s
 `topology::Member` implementation. V5 weights eligible equal-cost next hops
 (`cmd/racer-dataplane/topology/src/paths.rs::select_route`). Uniform
 400/100 scaling preserves placement and expected routing probabilities, not
 necessarily individual hashed next hops. Shares enter placement identity; more
 than 64 changes lose incremental hints
-(`cmd/racer-dataplane/topology/src/membership.rs::Membership::with_predecessor`).
+(`cmd/racer-dataplane/topology/src/lib.rs::Membership::with_predecessor`).
 These current source references do not refresh the plan's historical results.
 In particular, the current stable-ID 32-ring overlay replaces the prior radix
 graph, and current `/next-hop/v5` hashing separately length-prefixes the seed and

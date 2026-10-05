@@ -43,7 +43,8 @@ Racer dataplane component, not a general distributed framework. Its stable-ID
 32-ring overlay replaces radix routing, and its v5 next-hop schema separately
 length-prefixes the seed and endpoint IDs. Placement hash compatibility is
 unchanged, but routing requires a coordinated cluster version transition, not
-assumed safe mixed-version operation. See `cmd/racer-dataplane/topology/README.md`
+assumed safe mixed-version operation. See the crate documentation in
+`cmd/racer-dataplane/topology/src/lib.rs`
 for cache ownership, memory estimates, and compatibility details.
 Live updates call `SnapshotStore::prepare_async` in `src/control.rs`, which owns
 one unfinished off-thread preparation job per store. Canceled waiters do not
