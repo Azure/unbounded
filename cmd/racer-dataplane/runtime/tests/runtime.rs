@@ -43,6 +43,7 @@ mod filesystem {
 
         canceled: Rc<Cell<bool>>,
     }
+
     impl RequestScope {
         /// Construct an independently cancelable request with the supplied deadline.
         fn new(deadline: Instant) -> Self {
@@ -51,11 +52,13 @@ mod filesystem {
                 canceled: Rc::new(Cell::new(false)),
             }
         }
+
         /// Request cancellation without directly releasing any submitted resource.
         fn cancel(&self) {
             self.canceled.set(true);
         }
     }
+
     impl Scope for RequestScope {
         /// Report cancellation and deadline failures using runtime errors.
         type Error = Error;
@@ -71,20 +74,24 @@ mod filesystem {
             }
         }
     }
+
     /// Count retained budget independently through the public accounting callback.
     struct CountingBudget(Rc<Cell<usize>>);
+
     /// Return the exact accounted amount when its owner is dropped.
     struct Charge {
         used: Rc<Cell<usize>>,
 
         amount: usize,
     }
+
     impl Drop for Charge {
         /// Release this charge from the shared budget counter.
         fn drop(&mut self) {
             self.used.set(self.used.get() - self.amount);
         }
     }
+
     impl Budget for CountingBudget {
         /// Retain the accounted amount until the charge is dropped.
         type Charge = Charge;
@@ -98,12 +105,14 @@ mod filesystem {
             })
         }
     }
+
     /// Public reactor plus externally observed budget usage, without private access.
     struct Reactor {
         core: Core<RequestScope, CountingBudget>,
 
         used: Rc<Cell<usize>>,
     }
+
     impl Deref for Reactor {
         /// Expose the wrapped public reactor for filesystem operations.
         type Target = Core<RequestScope, CountingBudget>;
@@ -113,14 +122,17 @@ mod filesystem {
             &self.core
         }
     }
+
     impl Reactor {
         /// Fence current operations without closing admission for subsequent checks.
         fn file_fence(&self) -> Operation<'_, ()> {
             self.fence_matching(|_| true)
         }
     }
+
     /// Own a unique project-local directory and clean it after the test.
     struct Directory(PathBuf);
+
     impl Directory {
         /// Allocate a collision-free directory, also safe for isolated child processes.
         fn new() -> Self {
@@ -136,6 +148,7 @@ mod filesystem {
             Self(path)
         }
     }
+
     impl Drop for Directory {
         /// Remove the test directory and all of its contents.
         fn drop(&mut self) {
@@ -147,16 +160,19 @@ mod filesystem {
     fn name(path: &Path) -> CString {
         CString::new(path.as_os_str().as_bytes()).unwrap()
     }
+
     /// Give each operation group a fresh five-second host deadline.
     fn scope() -> RequestScope {
         RequestScope::new(Instant::now() + Duration::from_secs(5))
     }
+
     /// Poll delivery without implicitly driving kernel progress.
     fn poll<T, E>(future: &mut Operation<'_, T, E>) -> Poll<Result<T, E>> {
         future
             .as_mut()
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
+
     /// Explicitly drive bounded completion turns until the public operation resolves.
     fn drive<T, E>(reactor: &Reactor, mut future: Operation<'_, T, E>) -> Result<T, E> {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -169,6 +185,7 @@ mod filesystem {
             reactor.wait(Duration::from_millis(1)).unwrap();
         }
     }
+
     /// Skip only unsupported or policy-denied io_uring, preserving the required-kernel gate.
     fn kernel_reactor(capacity: usize) -> Option<Reactor> {
         match io_uring::IoUring::new(2) {
@@ -855,6 +872,7 @@ mod reserved_capacity {
     /// Keep cancellation and deadlines out of admission-only scenarios.
     #[derive(Clone)]
     struct OpenScope;
+
     impl Scope for OpenScope {
         /// Use the runtime error type for the always-open scope.
         type Error = Error;
@@ -864,12 +882,14 @@ mod reserved_capacity {
             Ok(())
         }
     }
+
     /// Poll once without driving kernel execution or consuming unrelated replies.
     fn poll<T>(operation: &mut Operation<'_, T>) -> Poll<Result<T>> {
         operation
             .as_mut()
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
+
     /// Complete accepted operations without consuming their waiting replies.
     fn complete(reactor: &Reactor<OpenScope, ()>) {
         for _ in 0..16 {
@@ -1025,8 +1045,10 @@ mod reserved_capacity {
     #[test]
     fn simulated_writes_use_immutable_accessor_like_production() {
         use uring_runtime::reactor::IoBuffer;
+
         /// Stable send storage that rejects all mutable access.
         struct ReadOnly(Vec<u8>);
+
         // SAFETY: private stable Vec; mutation accessor fails without exposing aliases.
         unsafe impl IoBuffer for ReadOnly {
             /// Report attempts to mutate the read-only buffer as runtime errors.
@@ -1144,8 +1166,10 @@ mod reserved_capacity {
     fn reserved_sq_rejection_releases_exact_partition_and_buffer_owner() {
         use std::cell::Cell;
         use uring_runtime::reactor::IoBuffer;
+
         /// Count releases of stable submission storage independently of the reactor.
         struct Owned(Vec<u8>, Rc<Cell<usize>>);
+
         // SAFETY: private non-resizing Vec retains initialized backing across moves.
         unsafe impl IoBuffer for Owned {
             /// Use runtime errors for buffer access results.
@@ -1161,6 +1185,7 @@ mod reserved_capacity {
                 Ok(&mut self.0)
             }
         }
+
         impl Drop for Owned {
             /// Record the release of this owned submission buffer.
             fn drop(&mut self) {

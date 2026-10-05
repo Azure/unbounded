@@ -40,12 +40,14 @@ pub enum Error {
     /// The runtime rejected work because of capacity or availability.
     Runtime(crate::Error),
 }
+
 impl From<crate::Error> for Error {
     /// Preserve the runtime failure as an offload admission or delivery error.
     fn from(error: crate::Error) -> Self {
         Self::Runtime(error)
     }
 }
+
 /// Rejected publication with the original payload still owned by the caller.
 pub struct SendFailure<T> {
     /// The payload whose ownership was not transferred.
@@ -54,6 +56,7 @@ pub struct SendFailure<T> {
     /// Why publication failed.
     pub error: Error,
 }
+
 impl<T> From<channel::SendFailure<T>> for SendFailure<T> {
     /// Translate the error without dropping or replacing the rejected payload.
     fn from(failure: channel::SendFailure<T>) -> Self {
@@ -71,12 +74,14 @@ pub struct Permit<I> {
 
     id: I,
 }
+
 impl<I: Copy> Permit<I> {
     /// Return the accepted ticket identity without transferring its reservation.
     pub fn id(&self) -> I {
         self.id
     }
 }
+
 impl<I> Drop for Permit<I> {
     /// Release one admission credit and notify the sole capacity waiter.
     fn drop(&mut self) {
@@ -102,6 +107,7 @@ pub struct ClientPort<I, J, C> {
 
     last_sequence: Cell<Option<u64>>,
 }
+
 /// Unique worker endpoint that receives jobs and publishes their completions.
 pub struct WorkerPort<I, J, C> {
     handoff: Arc<Handoff<I>>,
@@ -151,30 +157,37 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
     pub fn identity(&self) -> I {
         self.handoff.identity
     }
+
     /// Return the joint limit on jobs and unconsumed completions.
     pub fn capacity(&self) -> usize {
         self.handoff.capacity.get()
     }
+
     /// Count permits still retained by callers, accepted jobs, or completions.
     pub fn outstanding(&self) -> usize {
         self.handoff.outstanding.load(Ordering::Acquire)
     }
+
     /// Whether reservations and submissions have permanently closed.
     pub fn submissions_closed(&self) -> bool {
         self.handoff.closed.load(Ordering::Acquire)
     }
+
     /// Whether the worker closed completion publication, not an ownership fence.
     pub fn completions_closed(&self) -> bool {
         self.completions.is_closed()
     }
+
     /// Replace the local driver's completion and worker-loss notification waker.
     pub fn register_driver(&self, waker: &Waker) {
         self.handoff.client_waker.register(waker);
     }
+
     /// Replace the sole capacity waiter's notification waker before checking it.
     pub fn register_capacity(&self, waker: &Waker) {
         self.handoff.capacity_waker.register(waker);
     }
+
     /// Register before checking capacity. Pending does not consume the sequence.
     pub fn poll_reserve(&self, cx: &mut Context<'_>, id: I) -> Poll<Result<Permit<I>, Error>> {
         self.register_capacity(cx.waker());
@@ -206,6 +219,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
             id,
         }))
     }
+
     /// The hook runs only after pair/close validation, immediately before the
     /// publication attempt, so caller timing excludes reservation waits.
     pub fn try_submit(
@@ -224,14 +238,17 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
         self.handoff.worker_waker.wake();
         Ok(())
     }
+
     /// Poll the sole completion waiter; `None` means publication closed and drained.
     pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<crate::Result<Option<C>>> {
         self.completions.poll_receive_shared(cx)
     }
+
     /// Take one completion without waiting; `None` may mean temporarily empty.
     pub fn receive(&self) -> crate::Result<Option<C>> {
         self.completions.receive_shared()
     }
+
     /// Discard orphaned jobs only after the unique worker receiver is destroyed.
     pub fn discard_closed(&self) {
         if self.completions_closed() {
@@ -239,6 +256,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
         }
     }
 }
+
 impl<I, J, C> ClientPort<I, J, C> {
     /// Permanently reject new work while leaving accepted completions readable.
     pub fn close_submissions(&self) {
@@ -248,17 +266,20 @@ impl<I, J, C> ClientPort<I, J, C> {
         self.handoff.capacity_waker.wake();
     }
 }
+
 impl<I, J, C> Drop for ClientPort<I, J, C> {
     /// Close admission and notify both the worker driver and capacity waiter.
     fn drop(&mut self) {
         self.close_submissions();
     }
 }
+
 impl<I: Identity, J: Reserved<I>, C: Reserved<I>> WorkerPort<I, J, C> {
     /// Replace the worker driver's submission and closure notification waker.
     pub fn register_driver(&self, waker: &Waker) {
         self.handoff.worker_waker.register(waker);
     }
+
     /// None means closed and all accepted jobs consumed, not temporarily empty.
     pub fn poll_job(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<Option<J>>> {
         self.jobs
@@ -266,6 +287,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> WorkerPort<I, J, C> {
             .expect("live worker endpoint")
             .poll_receive(cx)
     }
+
     /// Publish a completion retaining its original permit, or return it unchanged.
     pub fn complete(&mut self, completion: C) -> Result<(), SendFailure<C>> {
         if !Arc::ptr_eq(&self.handoff, &completion.permit().handoff) {
@@ -279,6 +301,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> WorkerPort<I, J, C> {
         Ok(())
     }
 }
+
 impl<I, J, C> Drop for WorkerPort<I, J, C> {
     /// Close admission and reclaim queued jobs before announcing completion EOF.
     fn drop(&mut self) {
@@ -307,6 +330,7 @@ pub struct AdmissionQueue<S> {
 
     cursor: Cell<usize>,
 }
+
 impl<S> AdmissionQueue<S> {
     /// Bound the number of waiting futures independently of accepted work.
     pub fn new(capacity: NonZeroUsize) -> Self {
@@ -317,14 +341,17 @@ impl<S> AdmissionQueue<S> {
             cursor: Cell::new(0),
         }
     }
+
     /// Count futures waiting for admission, excluding accepted work.
     pub fn len(&self) -> usize {
         self.pending.borrow().len()
     }
+
     /// Whether no futures are waiting for admission.
     pub fn is_empty(&self) -> bool {
         self.pending.borrow().is_empty()
     }
+
     /// Admission consumes a sequence even if the guard is subsequently dropped.
     /// Saturation consumes neither a queue slot nor a sequence. Overflow requires
     /// draining and a new pair generation, never sequence reuse.
@@ -353,6 +380,7 @@ impl<S> AdmissionQueue<S> {
             sequence,
         })
     }
+
     /// Snapshot at most budget entries, rotating across turns. Predicates and all
     /// waker callbacks run outside the borrow and may reenter this queue.
     pub fn wake_if(&self, budget: usize, mut predicate: impl FnMut(&S) -> bool) {
@@ -382,11 +410,13 @@ pub struct CapacityWaiter<'a, S> {
 
     sequence: u64,
 }
+
 impl<S> CapacityWaiter<'_, S> {
     /// Return this admission attempt's unique sequence, never reused on drop.
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
+
     /// Only the head may register for port capacity; later waiters cannot steal
     /// its wake or overtake it. Check caller cancellation before invoking this.
     pub fn poll<T>(
@@ -412,6 +442,7 @@ impl<S> CapacityWaiter<'_, S> {
         reserve(cx)
     }
 }
+
 impl<S> Drop for CapacityWaiter<'_, S> {
     /// Remove this FIFO entry and wake its successor outside the queue borrow.
     fn drop(&mut self) {
@@ -439,6 +470,7 @@ pub struct Waiters<I, C> {
 
     generation: Cell<u64>,
 }
+
 /// Dropping the waiting future abandons delivery; accepted owners stay fenced by
 /// their permits until completion reap or worker loss, independently of this guard.
 pub struct Registration<'a, I: Copy + Ord, C> {
@@ -448,6 +480,7 @@ pub struct Registration<'a, I: Copy + Ord, C> {
 
     generation: u64,
 }
+
 impl<I: Copy + Ord, C> Drop for Registration<'_, I, C> {
     /// Abandon only the registered generation, leaving any replacement untouched.
     fn drop(&mut self) {
@@ -455,6 +488,7 @@ impl<I: Copy + Ord, C> Drop for Registration<'_, I, C> {
             .abandon_generation(self.id, Some(self.generation));
     }
 }
+
 impl<I: Copy + Ord, C> Default for Waiters<I, C> {
     /// Initialize an empty local registry with an unused generation sequence.
     fn default() -> Self {
@@ -465,15 +499,18 @@ impl<I: Copy + Ord, C> Default for Waiters<I, C> {
         }
     }
 }
+
 impl<I: Copy + Ord, C> Waiters<I, C> {
     /// Count registered accepted jobs, including abandoned but unfenced jobs.
     pub fn len(&self) -> usize {
         self.entries.borrow().len()
     }
+
     /// Whether there are no retained delivery registrations.
     pub fn is_empty(&self) -> bool {
         self.entries.borrow().is_empty()
     }
+
     /// Insert a unique accepted identity and return its exact registration generation.
     /// Duplicate live registrations are rejected, never replaced; exhausted
     /// generations fail before inserting any entry.
@@ -497,12 +534,14 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
         });
         Ok(generation)
     }
+
     /// Register a unique identity, treating reuse as caller misuse.
     #[cfg(test)]
     fn register(&self, id: I, waker: &Waker) {
         self.try_register(id, waker)
             .expect("unique waiter registration");
     }
+
     /// Register accepted work and return a guard that abandons only this generation.
     /// Panics on a duplicate live identity or exhausted registration generations.
     pub fn register_guard(&self, id: I, waker: &Waker) -> Registration<'_, I, C> {
@@ -515,16 +554,19 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
             generation,
         }
     }
+
     /// Remove a registration after rejected submission, before any acceptance.
     pub fn remove(&self, id: I) {
         let removed = self.entries.borrow_mut().remove(&id);
         drop(removed);
     }
+
     /// Abandon an identity directly when no generation guard is involved.
     #[cfg(test)]
     fn abandon(&self, id: I) {
         self.abandon_generation(id, None);
     }
+
     /// Stop delivery only for the matching generation, retaining unfenced owners.
     fn abandon_generation(&self, id: I, generation: Option<u64>) {
         let mut entries = self.entries.borrow_mut();
@@ -542,6 +584,7 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
         drop(entries);
         drop(removed);
     }
+
     /// A missing registration or abandoned completed result is canceled. Scope
     /// checks belong after Ready: cancellation cannot bypass the completion fence.
     pub fn poll_result(&self, id: I, cx: &mut Context<'_>) -> Poll<crate::Result<C>> {
@@ -567,6 +610,7 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
             Poll::Pending
         }
     }
+
     /// Unknown or abandoned completions are dropped, never delivered to a new ID.
     pub fn deliver(&self, id: I, completion: C) {
         let mut completion = Some(completion);
@@ -595,6 +639,7 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
             wake.wake_by_ref();
         }
     }
+
     /// Only call with fenced=true after worker loss AND zero outstanding owners.
     /// Bounded round-robin wakes let live futures observe worker loss themselves.
     pub fn worker_closed(&self, budget: usize, fenced: bool) {
@@ -626,6 +671,7 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
             wake.wake_by_ref();
         }
     }
+
     /// Cancel delivery, releasing only completions already fenced by execution.
     pub fn abandon_all(&self) {
         // Extract in one ordered pass, but keep all payloads alive until the
@@ -702,6 +748,7 @@ mod tests {
 
             dropped: Rc<RefCell<Vec<u64>>>,
         }
+
         impl Drop for Reenter {
             /// Check retained unfenced work and reenter the now-unborrowed registry.
             fn drop(&mut self) {
@@ -738,6 +785,7 @@ mod tests {
     thread_local! {
         static CALLBACK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
     }
+
     /// Run the current thread's raw-waker callback, if installed.
     fn callback() {
         CALLBACK.with(|callback| {
@@ -746,23 +794,29 @@ mod tests {
             }
         });
     }
+
     /// Build a stateless raw waker that inspects only the executing thread's hook.
     fn callback_waker() -> Waker {
         use std::task::{RawWaker, RawWakerVTable};
+
         /// Invoke the clone hook and return another stateless raw waker.
         unsafe fn clone(_: *const ()) -> RawWaker {
             callback();
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
+
         /// Invoke the hook for owned wakes, borrowed wakes, or destruction.
         unsafe fn wake(_: *const ()) {
             callback();
         }
+
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, wake);
         unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
     }
+
     /// Clear the installed hook when its test scope ends.
     struct CallbackGuard;
+
     impl Drop for CallbackGuard {
         /// Destroy the hook after releasing the thread-local mutable borrow.
         fn drop(&mut self) {
@@ -772,6 +826,7 @@ mod tests {
             });
         }
     }
+
     /// Install a thread-local callback for the duration of the returned guard.
     fn on_callback(hook: impl Fn() + 'static) -> CallbackGuard {
         CALLBACK.with(|callback| *callback.borrow_mut() = Some(Box::new(hook)));
@@ -783,6 +838,7 @@ mod tests {
     fn admission_raw_waker_and_scope_destructors_reenter_without_borrows() {
         /// Scope that invokes the callback and counts its destruction.
         struct ScopeHook(Rc<Cell<usize>>);
+
         impl Drop for ScopeHook {
             /// Reenter the queue before recording scope release.
             fn drop(&mut self) {
@@ -1004,8 +1060,10 @@ mod tests {
     #[test]
     fn result_destructors_can_reenter_delivery_registry() {
         use std::rc::{Rc, Weak};
+
         /// Completion that removes an unrelated registry entry on destruction.
         struct Reenter(Weak<Waiters<u64, Reenter>>);
+
         impl Drop for Reenter {
             /// Reenter the registry after the outer operation releases its borrow.
             fn drop(&mut self) {
@@ -1023,12 +1081,14 @@ mod tests {
 
     /// Atomic wake counter whose value tests may reset between lifecycle transitions.
     struct WakeCount(AtomicUsize);
+
     impl std::task::Wake for WakeCount {
         /// Record an owned wake notification.
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
+
     /// Return shared wake instrumentation and a waker using that counter.
     fn wake_counter() -> (Arc<WakeCount>, Waker) {
         let count = Arc::new(WakeCount(AtomicUsize::new(0)));
@@ -1235,30 +1295,37 @@ mod tests {
     /// Test ticket containing owner, generation, and monotonically increasing sequence.
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     struct Id(u8, u64, u64);
+
     impl Identity for Id {
         /// Small application-owner identity used by the test pair.
         type Owner = u8;
+
         /// Return the test application owner.
         fn owner(self) -> u8 {
             self.0
         }
+
         /// Return the test pair generation.
         fn generation(self) -> u64 {
             self.1
         }
+
         /// Return this ticket's admission sequence.
         fn sequence(self) -> u64 {
             self.2
         }
     }
+
     /// Owned payload with an observable final release count.
     struct Payload(Arc<AtomicUsize>);
+
     impl Drop for Payload {
         /// Record payload release before the surrounding message releases its permit.
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
+
     /// Job and completion fixture that destroys payloads before admission credit.
     struct Message {
         payload: Payload,
@@ -1267,20 +1334,25 @@ mod tests {
 
         permit: Permit<Id>,
     }
+
     impl Reserved<Id> for Message {
         /// Borrow the permit that accompanies this message through execution.
         fn permit(&self) -> &Permit<Id> {
             &self.permit
         }
     }
+
     /// Client endpoint specialized for test messages.
     type Client = ClientPort<Id, Message, Message>;
+
     /// Worker endpoint specialized for test messages.
     type Worker = WorkerPort<Id, Message, Message>;
+
     /// Allocate a bounded test pair with a chosen generation.
     fn pair(generation: u64, capacity: usize) -> (Client, Worker) {
         try_pair(Id(1, generation, 0), NonZeroUsize::new(capacity).unwrap()).unwrap()
     }
+
     /// Reserve a test ticket immediately, failing if capacity is unexpectedly absent.
     fn reserve(client: &Client, sequence: u64) -> Permit<Id> {
         let id = Id(1, client.identity().1, sequence);
@@ -1292,6 +1364,7 @@ mod tests {
             _ => panic!("expected reservation"),
         }
     }
+
     /// Construct a successful test message with its exact accepted permit.
     fn message(client: &Client, sequence: u64, drops: &Arc<AtomicUsize>) -> Message {
         Message {
@@ -1300,6 +1373,7 @@ mod tests {
             permit: reserve(client, sequence),
         }
     }
+
     /// Take an already-published job from the test worker.
     fn dequeue(worker: &mut Worker) -> Message {
         match worker.poll_job(&mut Context::from_waker(futures::task::noop_waker_ref())) {

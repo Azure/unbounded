@@ -33,6 +33,7 @@ struct Image {
 
     symlink: Option<PathBuf>,
 }
+
 impl Image {
     /// Snapshots current inode contents without copying allocated pages.
     fn capture(node: &Node) -> Self {
@@ -43,6 +44,7 @@ impl Image {
             symlink: node.symlink.clone(),
         }
     }
+
     /// Persists a new directory binding without implicitly syncing file data.
     fn initial(node: &Node) -> Self {
         Self {
@@ -52,6 +54,7 @@ impl Image {
             symlink: node.symlink.clone(),
         }
     }
+
     /// Recreates an unlocked live inode after power loss.
     fn restore(&self, inode: u64) -> Node {
         Node {
@@ -78,6 +81,7 @@ pub(super) struct State {
 
     pending: Vec<std::rc::Weak<PendingCrash>>,
 }
+
 /// Records whether a crash affected any path owned by a pending submission.
 #[derive(Debug)]
 pub(super) struct PendingCrash {
@@ -85,6 +89,7 @@ pub(super) struct PendingCrash {
 
     pub(super) crashed: std::cell::Cell<bool>,
 }
+
 impl State {
     /// Watches exact submission paths without retaining finished operations.
     pub(super) fn watch(&mut self, paths: Vec<PathBuf>) -> Rc<PendingCrash> {
@@ -100,6 +105,7 @@ impl State {
         }
         pending
     }
+
     /// Marks live submissions touching the crashed subtree.
     fn invalidate(&mut self, root: &Path) {
         self.pending.retain(|pending| {
@@ -112,6 +118,7 @@ impl State {
             true
         });
     }
+
     /// Reconstructs reachable durable names while avoiding directory cycles.
     fn paths(&self) -> BTreeMap<PathBuf, u64> {
         let mut paths = BTreeMap::new();
@@ -495,6 +502,7 @@ impl World {
         };
         normalize(&base.join(name))
     }
+
     /// Allocates an empty inode with a deterministic identity.
     pub(super) fn node(&mut self, mode: u16) -> Rc<RefCell<Node>> {
         Rc::new(RefCell::new(Node {
@@ -506,6 +514,7 @@ impl World {
             symlink: None,
         }))
     }
+
     /// Traverses symlinks while enforcing the requested openat2 boundary.
     fn resolve(
         &self,
@@ -582,6 +591,7 @@ impl World {
         }
         Ok(prefix)
     }
+
     /// Validates supported openat2 policies and resolves the final pathname.
     pub(super) fn open_path(
         &self,
@@ -629,6 +639,7 @@ impl World {
         )
     }
 }
+
 /// Normalizes fixture names without allowing parent traversal.
 fn normalize(path: &Path) -> io::Result<PathBuf> {
     let mut out = PathBuf::from("/");
@@ -661,6 +672,7 @@ impl Simulation {
         }
         Ok(())
     }
+
     /// Create exactly one directory, unlike the recursive fixture helper.
     pub fn mkdir(&self, path: &Path) -> io::Result<()> {
         let mut w = self.0.borrow_mut();
@@ -679,6 +691,7 @@ impl Simulation {
         w.paths.insert(path, node);
         Ok(())
     }
+
     /// Opens a simulated file using ordinary pathname resolution.
     /// Anonymous O_TMPFILE inodes are unsupported and return EOPNOTSUPP.
     pub fn open(
@@ -689,6 +702,7 @@ impl Simulation {
     ) -> io::Result<Descriptor> {
         self.open_resolved(dir, path, flags, 0)
     }
+
     /// Creates a volatile symbolic link without resolving its target.
     pub fn symlink(&self, target: &Path, path: &Path) -> io::Result<()> {
         let path = normalize(path)?;
@@ -708,6 +722,7 @@ impl Simulation {
         w.record("symlink", 0, 0);
         Ok(())
     }
+
     /// Opens a file under explicit openat2 resolution and creation policies.
     pub(super) fn open_resolved(
         &self,
@@ -788,6 +803,7 @@ impl Simulation {
             opened_path,
         }))
     }
+
     /// Replaces a fixture file, retrying short writes without syncing it.
     pub fn write_file(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         if let Some(parent) = path.parent() {
@@ -805,6 +821,7 @@ impl Simulation {
         }
         Ok(())
     }
+
     /// Materializes a bounded file while honoring short reads and injected faults.
     pub fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         let fd = self.open(None, path, libc::O_RDONLY)?;
@@ -822,6 +839,7 @@ impl Simulation {
         }
         Ok(bytes)
     }
+
     /// Returns a named inode's identity and mode without following symlinks.
     pub fn metadata(&self, path: &Path) -> io::Result<(u64, u16)> {
         let w = self.0.borrow();
@@ -832,6 +850,7 @@ impl Simulation {
             .borrow();
         Ok((node.inode, node.mode))
     }
+
     /// Changes permission bits while preserving the inode's file type.
     pub fn chmod(&self, path: &Path, mode: u32) -> io::Result<()> {
         let mut w = self.0.borrow_mut();
@@ -846,6 +865,7 @@ impl Simulation {
         node.mode = (node.mode & libc::S_IFMT as u16) | (mode as u16 & 0o7777);
         Ok(())
     }
+
     /// Moves or exchanges names, descendants, and open-description crash paths.
     pub fn rename(&self, from: &Path, to: &Path, flags: u32) -> io::Result<()> {
         let mut w = self.0.borrow_mut();
@@ -967,6 +987,7 @@ impl Simulation {
         w.record("rename", 0, 0);
         Ok(())
     }
+
     /// Removes a non-directory name while retaining any open inode owners.
     pub fn unlink(&self, path: &Path) -> io::Result<()> {
         let mut w = self.0.borrow_mut();
@@ -995,6 +1016,7 @@ impl Handle {
             _ => Err(errno(libc::EBADF)),
         }
     }
+
     /// Reports inode metadata and the simulation's direct-I/O alignment.
     pub fn stat(&self) -> io::Result<libc::statx> {
         let (node, _) = self.node()?;
@@ -1011,6 +1033,7 @@ impl Handle {
         stat.stx_gid = 0;
         Ok(stat)
     }
+
     /// Resizes a writable file, clearing truncated data without allocating holes.
     pub fn set_len(&self, length: u64) -> io::Result<()> {
         if length > i64::MAX as u64 {
@@ -1033,6 +1056,7 @@ impl Handle {
         node.length = length;
         Ok(())
     }
+
     /// Acquires an exclusive nonblocking inode lock owned by this descriptor.
     pub fn lock(&self) -> io::Result<()> {
         if matches!(
@@ -1060,6 +1084,7 @@ impl Handle {
         }
         Ok(())
     }
+
     /// Reads a bounded sparse range after validating flags and direct alignment.
     pub fn file_read(&self, offset: u64, bytes: &mut [u8]) -> io::Result<usize> {
         if offset > i64::MAX as u64 {
@@ -1085,6 +1110,7 @@ impl Handle {
         read_pages(&node.pages, offset, &mut bytes[..len]);
         Ok(len)
     }
+
     /// Writes a bounded sparse range without modifying durable shared pages.
     pub(in crate::reactor) fn file_write(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         if offset > i64::MAX as u64 {
@@ -1156,10 +1182,12 @@ mod tests {
         let scope = RequestScope::new((), Instant::now() + Duration::from_secs(30)).unwrap();
         (sim, environment, r, scope)
     }
+
     /// Opens an existing fixture for read/write submissions through the reactor.
     fn open(sim: &Simulation, path: &str) -> Rc<Descriptor> {
         Rc::new(sim.open(None, Path::new(path), libc::O_RDWR).unwrap())
     }
+
     /// Reads a small volatile prefix without allocating a sparse file's logical size.
     fn read(sim: &Simulation, path: &str) -> Vec<u8> {
         sim.disk()

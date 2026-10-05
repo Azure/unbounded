@@ -13,6 +13,7 @@ use std::{
 };
 
 const IDLE_WAIT: Duration = Duration::from_millis(1);
+
 const WORK_BUDGET: usize = 64;
 
 /// One locally driven service and the CPU on which it is constructed.
@@ -24,6 +25,7 @@ pub struct Lane {
     /// Allowed logical CPU ID.
     pub cpu: usize,
 }
+
 /// A pinned thread that cooperatively drives helper services for several lanes.
 #[derive(Clone)]
 pub struct Helper {
@@ -36,6 +38,7 @@ pub struct Helper {
     /// Lane indices in `Plan::lanes`. Each lane has at most one helper service.
     pub lanes: Vec<usize>,
 }
+
 /// Caller-selected placement and whole-process thread limit.
 #[derive(Clone)]
 pub struct Plan {
@@ -129,6 +132,7 @@ pub trait Service<S: Scope> {
 pub struct FailureReporter<E: Copy> {
     control: Arc<Control<E>>,
 }
+
 impl<E: Copy> FailureReporter<E> {
     /// Record the first failure and request that every lane stop admission.
     pub fn report(&self, error: E) {
@@ -166,6 +170,7 @@ pub struct Group<S: Scope + Send> {
 
     coordinator: Option<JoinHandle<()>>,
 }
+
 impl<S: Scope + Send> Group<S> {
     /// Store a placement plan without spawning threads or constructing services.
     pub fn new(plan: Plan) -> Self {
@@ -175,12 +180,14 @@ impl<S: Scope + Send> Group<S> {
             coordinator: None,
         }
     }
+
     /// Snapshot lifecycle progress without exposing mutable coordinator state.
     pub fn stats(&self) -> Stats {
         let mut stats = self.control.lock().stats;
         stats.coordinators = usize::from(self.coordinator.is_some());
         stats
     }
+
     /// Nonmutating preflight for callers allocating resources before startup.
     /// Pass true for `run`/`run_with_scope`, false for `start`. Startup repeats
     /// validation because CPU affinity and owned-thread state may have changed.
@@ -220,6 +227,7 @@ impl<S: Scope + Send> Group<S> {
         }
         Ok(())
     }
+
     /// Validate a new execution and reset its barriers before any construction.
     fn prepare(&mut self, caller_is_lane: bool, check_scope: bool) -> Result<(), S::Error> {
         self.validate(caller_is_lane)?;
@@ -238,6 +246,7 @@ impl<S: Scope + Send> Group<S> {
         }
         Ok(())
     }
+
     /// Spawn the coordinator and wait until every lane and helper is ready.
     /// Startup failure joins the coordinator after its ownership fences finish.
     pub fn start(
@@ -282,15 +291,18 @@ impl<S: Scope + Send> Group<S> {
         }
         result
     }
+
     /// Run on the caller's thread without making the startup scope a run deadline.
     pub fn run(&mut self, factory: &dyn Factory<S>, scope: &S) -> Result<(), S::Error> {
         self.run_inner(factory, scope, false)
     }
+
     /// Also interpret scope expiry as a steady-state stop request. Teardown and
     /// fences remain uninterruptible even when the caller stops waiting.
     pub fn run_with_scope(&mut self, factory: &dyn Factory<S>, scope: &S) -> Result<(), S::Error> {
         self.run_inner(factory, scope, true)
     }
+
     /// Execute lane zero on the caller, optionally checking its steady-state scope.
     fn run_inner(
         &mut self,
@@ -305,6 +317,7 @@ impl<S: Scope + Send> Group<S> {
         );
         self.control.result()
     }
+
     /// Stop admission, drain local work, close submissions, and fence accepted
     /// resources. A failed wait does not truncate the running ownership fences.
     pub fn drain(&mut self, scope: &S) -> Result<(), S::Error> {
@@ -312,6 +325,7 @@ impl<S: Scope + Send> Group<S> {
         self.control
             .wait_for(scope, |s| s.stats.drained == s.stats.total)
     }
+
     /// Request drain followed by shutdown, or release already-drained services.
     /// Scope failure stops only this wait, not the threads or their fences.
     pub fn shutdown(&mut self, scope: &S) -> Result<(), S::Error> {
@@ -319,6 +333,7 @@ impl<S: Scope + Send> Group<S> {
         self.control
             .wait_for(scope, |s| s.stats.done == s.stats.total)
     }
+
     /// Request shutdown and join every owned thread, even after partial startup.
     /// A service that cannot complete its ownership fence can prevent return.
     pub fn join(&mut self) -> Result<(), S::Error> {
@@ -331,6 +346,7 @@ impl<S: Scope + Send> Group<S> {
         self.control.result()
     }
 }
+
 impl<S: Scope + Send> Drop for Group<S> {
     /// Join every owned service thread instead of detaching live resources.
     fn drop(&mut self) {
@@ -345,6 +361,7 @@ enum Phase {
     Drain,
     Shutdown,
 }
+
 /// Barrier progress and the first failure, protected by the coordinator mutex.
 struct State<E> {
     phase: Phase,
@@ -363,12 +380,14 @@ struct State<E> {
 
     check_scope: bool,
 }
+
 /// Shared lifecycle coordination, independent of service-owned resources.
 struct Control<E> {
     state: Mutex<State<E>>,
 
     changed: Condvar,
 }
+
 impl<E: Copy> Control<E> {
     /// Allocate per-lane barriers and initialize execution counters.
     fn new(lanes: usize, helpers: usize, auto_shutdown: bool) -> Self {
@@ -389,20 +408,24 @@ impl<E: Copy> Control<E> {
             changed: Condvar::new(),
         }
     }
+
     /// Recover coordinator state after panic so teardown can still make progress.
     fn lock(&self) -> MutexGuard<'_, State<E>> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+
     /// Return the first recorded error, if any.
     fn result(&self) -> Result<(), E> {
         self.lock().error.map_or(Ok(()), Err)
     }
+
     /// Advance the lifecycle request without allowing it to move backward.
     fn set_phase(&self, phase: Phase) {
         let mut state = self.lock();
         state.phase = state.phase.max(phase);
         self.changed.notify_all();
     }
+
     /// Retain the first error and notify all threads to begin draining.
     fn fail(&self, error: E) {
         let mut state = self.lock();
@@ -410,16 +433,19 @@ impl<E: Copy> Control<E> {
         state.phase = state.phase.max(Phase::Drain);
         self.changed.notify_all();
     }
+
     /// Announce that a lane has closed its helper submissions.
     fn close(&self, lane: usize) {
         self.lock().closed[lane] = true;
         self.changed.notify_all();
     }
+
     /// Announce a completed lane ownership fence to its helper.
     fn fence(&self, lane: usize) {
         self.lock().fenced[lane] = true;
         self.changed.notify_all();
     }
+
     /// Wait for a barrier while checking caller policy outside the state lock.
     fn wait_for<S: Scope<Error = E>>(
         &self,
@@ -449,6 +475,7 @@ impl<E: Copy> Control<E> {
                 .0;
         }
     }
+
     /// Apply optional steady-state scope policy and inspect the stop request.
     fn stopping<S: Scope<Error = E>>(&self, scope: &S) -> bool
     where
@@ -460,6 +487,7 @@ impl<E: Copy> Control<E> {
         }
         self.lock().phase != Phase::Running
     }
+
     /// Publish a completed drain and wait for permission to shut down.
     fn drained(&self) {
         let mut state = self.lock();
@@ -470,12 +498,14 @@ impl<E: Copy> Control<E> {
         }
     }
 }
+
 /// Account thread exit without ever claiming it established an ownership fence.
 struct Exit<E: Copy + From<Error>> {
     control: Arc<Control<E>>,
 
     lane: Option<usize>,
 }
+
 impl<E: Copy + From<Error>> Drop for Exit<E> {
     /// Record thread exit and publication closure, but never claim an ownership fence.
     fn drop(&mut self) {
@@ -489,10 +519,12 @@ impl<E: Copy + From<Error>> Drop for Exit<E> {
         self.control.changed.notify_all();
     }
 }
+
 /// Convert caller panics into lifecycle errors without losing teardown control.
 fn attempt<T, E: From<Error>>(f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(Error::Io.into()))
 }
+
 /// Record an ordinary lifecycle error without interrupting ownership fencing.
 fn record<E: Copy>(control: &Control<E>, result: Result<(), E>) {
     if let Err(error) = result {
@@ -698,6 +730,7 @@ fn rollback_prepared<S: Scope>(
     state.stats.drained = state.stats.total;
     control.changed.notify_all();
 }
+
 /// Spawn scoped peers, drive lane zero, join all peers, and restore caller affinity.
 fn run_prepared<S: Scope + Send>(
     plan: &Plan,
@@ -829,6 +862,7 @@ fn drive<S: Scope>(
         }
     }
 }
+
 /// Poll one bounded service turn and compute its post-poll idle limit.
 fn poll_turn<S: Scope>(
     service: &mut dyn Service<S>,
@@ -1102,6 +1136,7 @@ fn catch_operation<'a, E: From<Error> + 'a>(
         poll_operation(&mut operation, cx)
     }))
 }
+
 /// Drive a lane fence, including fail-closed handling of construction panics.
 fn drive_fence<S: Scope>(
     service: &mut dyn Service<S>,
@@ -1138,6 +1173,7 @@ fn fence_operation<'a, E: Copy + From<Error> + 'a>(
         }
     }))
 }
+
 /// Report expired teardown policy without canceling the underlying future.
 fn diagnose_operation<'a, S: Scope>(
     mut operation: Operation<'a, (), S::Error>,
@@ -1149,6 +1185,7 @@ fn diagnose_operation<'a, S: Scope>(
         operation.as_mut().poll(cx)
     }))
 }
+
 /// Rotate helper polling fairly and retain every future through its final fence.
 fn drive_helpers<E: Copy + From<Error>>(
     operations: Vec<Operation<'_, (), E>>,
@@ -1828,9 +1865,11 @@ mod tests {
     /// Inert lifecycle policy for tests that control shutdown explicitly.
     #[derive(Clone)]
     struct TestScope;
+
     impl Scope for TestScope {
         /// Use portable runtime failures for lifecycle assertions.
         type Error = Error;
+
         /// Leave all lifecycle phases authorized.
         fn check(&self) -> Result<()> {
             Ok(())
@@ -1848,17 +1887,20 @@ mod tests {
 
             panic: bool,
         }
+
         impl Service<TestScope> for Waiting {
             /// Complete startup without external resources.
             fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Verify the lane budget and record a completed service turn.
             fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
                 assert_eq!(budget, WORK_BUDGET);
                 self.polled = true;
                 Ok(())
             }
+
             /// Assert post-poll ordering and optionally inject a wait-policy panic.
             fn wait_timeout(&self, maximum: Duration) -> Duration {
                 assert!(self.polled, "wait policy must observe the completed poll");
@@ -1866,10 +1908,12 @@ mod tests {
                 assert!(!self.panic, "wait hook failure");
                 self.wait
             }
+
             /// Complete drain without retaining any resources.
             fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Complete shutdown without additional work.
             fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
@@ -1958,6 +2002,7 @@ mod tests {
     #[test]
     fn fence_failure_aborts_before_service_drop() {
         use std::os::unix::process::ExitStatusExt;
+
         const CHILD: &str = "RUNTIME_FENCE_FAILURE_CHILD";
         if let Ok(mode) = std::env::var(CHILD) {
             // Do not produce core files for the deliberately fatal child.
@@ -1969,6 +2014,7 @@ mod tests {
                 libc::setrlimit(libc::RLIMIT_CORE, &limit);
                 libc::prctl(libc::PR_SET_DUMPABLE, 0);
             }
+
             /// Service that injects a chosen fence failure and detects unsafe release.
             struct Fatal {
                 mode: String,
@@ -2135,12 +2181,14 @@ mod tests {
     #[test]
     fn failed_scope_clone_rolls_back_all_unstarted_lanes() {
         use std::sync::atomic::AtomicUsize;
+
         /// Policy that fails on a configured clone attempt.
         struct CloneScope {
             clones: Arc<AtomicUsize>,
 
             fail: usize,
         }
+
         impl Clone for CloneScope {
             /// Count this clone and panic at the configured preparation boundary.
             fn clone(&self) -> Self {
@@ -2155,21 +2203,26 @@ mod tests {
                 }
             }
         }
+
         impl Scope for CloneScope {
             /// Use portable runtime failures for rollback assertions.
             type Error = Error;
+
             /// Keep scope checks successful so only cloning fails.
             fn check(&self) -> Result<()> {
                 Ok(())
             }
         }
+
         /// Factory that counts abandoned lanes and rejects unexpected construction.
         struct NeverBuilt(AtomicUsize);
+
         impl Factory<CloneScope> for NeverBuilt {
             /// Fail the test if rollback mistakenly reaches service construction.
             fn build_lane(&self, _: usize) -> Result<Box<dyn Service<CloneScope>>> {
                 panic!("must not build")
             }
+
             /// Count each preallocated lane fenced during rollback.
             fn abandon_lane(&self, _: usize) -> Result<()> {
                 self.0.fetch_add(1, Ordering::SeqCst);
@@ -2197,11 +2250,13 @@ mod tests {
     fn teardown_scope_panic_is_reported_without_cloning_fallback() {
         /// Ordinary service factory with an intentionally panicking teardown policy.
         struct PanickingFactory(Recipe);
+
         impl Factory<TestScope> for PanickingFactory {
             /// Delegate pinned construction to the lifecycle-recording factory.
             fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<TestScope>>> {
                 self.0.build_lane(lane)
             }
+
             /// Inject a failure while obtaining fresh teardown policy.
             fn teardown_scope(&self, _: &TestScope) -> TestScope {
                 panic!("teardown policy");
@@ -2226,43 +2281,53 @@ mod tests {
         /// Scope with successful checks but an intentionally panicking cancellation hook.
         #[derive(Clone)]
         struct PanicScope;
+
         impl Scope for PanicScope {
             /// Use runtime failures to inspect panic translation.
             type Error = Error;
+
             /// Keep ordinary policy checks successful.
             fn check(&self) -> Result<()> {
                 Ok(())
             }
+
             /// Inject failure while accessing caller cancellation policy.
             fn cancellation(&self) -> Option<&crate::environment::Cancellation> {
                 panic!("cancellation hook");
             }
         }
+
         /// Resource-free service and factory used to isolate scope-hook failures.
         struct Empty;
+
         impl Service<PanicScope> for Empty {
             /// Finish startup immediately when construction reaches the future.
             fn start<'a>(&'a mut self, _: &'a PanicScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Perform no work while the group observes the scope failure.
             fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                 Ok(())
             }
+
             /// Complete the resource-free drain despite failed cancellation hooks.
             fn drain<'a>(&'a mut self, _: &'a PanicScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Complete shutdown without consulting cancellation policy.
             fn shutdown<'a>(&'a mut self, _: &'a PanicScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
         }
+
         impl Factory<PanicScope> for Empty {
             /// Construct a resource-free lane on its pinned owner.
             fn build_lane(&self, _: usize) -> Result<Box<dyn Service<PanicScope>>> {
                 Ok(Box::new(Empty))
             }
+
             /// Construct a resource-free helper on its pinned owner.
             fn build_helper(&self, _: usize) -> Result<Box<dyn Service<PanicScope>>> {
                 Ok(Box::new(Empty))
@@ -2290,9 +2355,11 @@ mod tests {
         /// Teardown policy that is expired on every check.
         #[derive(Clone)]
         struct Expired;
+
         impl Scope for Expired {
             /// Use runtime errors to preserve the deadline diagnosis.
             type Error = Error;
+
             /// Report expiry without granting permission to release live ownership.
             fn check(&self) -> Result<()> {
                 Err(Error::DeadlineExceeded)
@@ -2323,16 +2390,20 @@ mod tests {
     #[test]
     fn steady_state_cancellation_hook_panic_fences_constructed_service() {
         use std::sync::atomic::AtomicUsize;
+
         /// Policy that permits the startup hook and panics on its next invocation.
         #[derive(Clone)]
         struct SecondHook(Arc<AtomicUsize>);
+
         impl Scope for SecondHook {
             /// Use runtime errors to inspect the translated hook panic.
             type Error = Error;
+
             /// Keep admission policy checks successful until the hook fails.
             fn check(&self) -> Result<()> {
                 Ok(())
             }
+
             /// Count hooks and inject failure only after startup's subscription attempt.
             fn cancellation(&self) -> Option<&crate::environment::Cancellation> {
                 assert_eq!(
@@ -2343,31 +2414,38 @@ mod tests {
                 None
             }
         }
+
         /// Service and factory that record both ownership fences after admission stops.
         struct Fenced(Arc<AtomicUsize>);
+
         impl Service<SecondHook> for Fenced {
             /// Complete startup before the second cancellation hook runs.
             fn start<'a>(&'a mut self, _: &'a SecondHook) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Reject any steady-state work after the cancellation hook has failed.
             fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                 panic!("admission must stop");
             }
+
             /// Complete drain without adding unrelated failures.
             fn drain<'a>(&'a mut self, _: &'a SecondHook) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Count each required ownership fence.
             fn fence<'a>(&'a mut self, _: &'a SecondHook) -> Operation<'a, ()> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok(()) })
             }
+
             /// Complete shutdown before the second ownership fence.
             fn shutdown<'a>(&'a mut self, _: &'a SecondHook) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
         }
+
         impl Factory<SecondHook> for Fenced {
             /// Construct a local service sharing the fence instrumentation.
             fn build_lane(&self, _: usize) -> Result<Box<dyn Service<SecondHook>>> {
@@ -2392,9 +2470,11 @@ mod tests {
         /// Scope that reenters coordinator diagnostics before panicking.
         #[derive(Clone)]
         struct Reenter(Arc<Control<Error>>);
+
         impl Scope for Reenter {
             /// Use portable errors for the converted policy panic.
             type Error = Error;
+
             /// Reacquire coordinator state to prove policy runs outside its lock.
             fn check(&self) -> Result<()> {
                 assert_eq!(self.0.lock().stats.total, 1);
@@ -2408,6 +2488,7 @@ mod tests {
         );
         assert!(!control.state.is_poisoned());
     }
+
     /// Place one lane on an allowed CPU with a caller-selected thread budget.
     fn plan(max_threads: usize) -> Plan {
         let cpu = *affinity::current_cpus().unwrap().first().unwrap();
@@ -2420,6 +2501,7 @@ mod tests {
             max_threads,
         }
     }
+
     /// Construction policy and shared lifecycle instrumentation for a local service.
     struct Recipe {
         cpu: usize,
@@ -2430,6 +2512,7 @@ mod tests {
 
         stop: Arc<AtomicBool>,
     }
+
     /// Non-Send service that records lifecycle order and verifies owner-thread destruction.
     struct Local {
         events: Arc<Mutex<Vec<&'static str>>>,
@@ -2440,6 +2523,7 @@ mod tests {
 
         stop: Arc<AtomicBool>,
     }
+
     impl Factory<TestScope> for Recipe {
         /// Verify affinity before constructing a thread-confined service.
         fn build_lane(&self, _: usize) -> Result<Box<dyn Service<TestScope>>> {
@@ -2454,11 +2538,13 @@ mod tests {
                 stop: self.stop.clone(),
             }))
         }
+
         /// Reject helper construction because this fixture plans only lanes.
         fn build_helper(&self, _: usize) -> Result<Box<dyn Service<TestScope>>> {
             unreachable!()
         }
     }
+
     impl Drop for Local {
         /// Verify owner-thread destruction and record the final lifecycle event.
         fn drop(&mut self) {
@@ -2466,6 +2552,7 @@ mod tests {
             self.events.lock().unwrap().push("drop");
         }
     }
+
     impl Service<TestScope> for Local {
         /// Record startup when its future is driven.
         fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
@@ -2474,6 +2561,7 @@ mod tests {
                 Ok(())
             })
         }
+
         /// Verify bounded polling and inject either a panic or explicit stop request.
         fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
             assert_eq!(budget, 64);
@@ -2484,11 +2572,13 @@ mod tests {
                 Ok(())
             }
         }
+
         /// Record that admission stops before drain begins.
         fn stop_admission(&mut self) -> Result<()> {
             self.events.lock().unwrap().push("stop");
             Ok(())
         }
+
         /// Record completed draining of accepted work.
         fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
             Box::pin(async {
@@ -2496,11 +2586,13 @@ mod tests {
                 Ok(())
             })
         }
+
         /// Record closure of helper submissions after drain.
         fn close(&mut self) -> Result<()> {
             self.events.lock().unwrap().push("close");
             Ok(())
         }
+
         /// Record each ownership fence in lifecycle order.
         fn fence<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
             Box::pin(async {
@@ -2508,6 +2600,7 @@ mod tests {
                 Ok(())
             })
         }
+
         /// Record shutdown between the two ownership fences.
         fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
             Box::pin(async {
@@ -2516,6 +2609,7 @@ mod tests {
             })
         }
     }
+
     /// Create lifecycle instrumentation for the plan's coordinator lane.
     fn recipe(plan: &Plan, panic_poll: bool) -> Recipe {
         Recipe {
@@ -2525,6 +2619,7 @@ mod tests {
             stop: Arc::default(),
         }
     }
+
     /// Borrowed execution tears down a panicking local service and restores caller affinity.
     #[test]
     fn borrowed_local_panic_drains_fences_and_restores_affinity() {
@@ -2542,6 +2637,7 @@ mod tests {
             ]
         );
     }
+
     /// Dropping an owned group joins its lane after both fences and local destruction.
     #[test]
     fn owned_drop_joins_local_service_without_helpers() {
@@ -2559,6 +2655,7 @@ mod tests {
             ]
         );
     }
+
     /// Reject invalid placement, duplicate helper ownership, and exhausted thread budgets.
     #[test]
     fn plans_reject_invalid_links_and_count_external_caller() {
@@ -2685,6 +2782,7 @@ mod tests {
     #[test]
     fn helper_independent_resources_fence_cooperatively_before_barrier_and_drop() {
         use std::sync::atomic::AtomicUsize;
+
         /// Cross-helper fence-entry, completion, and destruction instrumentation.
         struct Shared {
             entered: [AtomicUsize; 2],
@@ -2693,10 +2791,12 @@ mod tests {
 
             dropped: AtomicUsize,
         }
+
         /// Factory for lanes and helpers sharing cooperative fence state.
         struct Helpers {
             shared: Arc<Shared>,
         }
+
         /// Thread-confined helper with independent resources requiring both fences.
         struct Independent {
             shared: Arc<Shared>,
@@ -2705,13 +2805,16 @@ mod tests {
 
             fences: usize,
         }
+
         /// Resource-free lane used to isolate helper-owned fence behavior.
         struct Empty;
+
         impl Factory<TestScope> for Helpers {
             /// Construct a lane without independent resource dependencies.
             fn build_lane(&self, _: usize) -> Result<Box<dyn Service<TestScope>>> {
                 Ok(Box::new(Empty))
             }
+
             /// Construct a local helper that must fence alongside its sibling.
             fn build_helper(&self, _: usize) -> Result<Box<dyn Service<TestScope>>> {
                 Ok(Box::new(Independent {
@@ -2721,38 +2824,46 @@ mod tests {
                 }))
             }
         }
+
         impl Service<TestScope> for Empty {
             /// Complete the resource-free lane's startup.
             fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Keep the lane idle while helper lifecycles are exercised.
             fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                 Ok(())
             }
+
             /// Finish draining so the helper can begin its independent fence.
             fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Complete the resource-free lane's shutdown.
             fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
         }
+
         impl Service<TestScope> for Independent {
             /// Finish helper startup before cooperative resource fencing.
             fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Verify that each helper shard receives a bounded cooperative turn.
             fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
                 assert_eq!(budget, 1);
                 Ok(())
             }
+
             /// Finish drain while retaining independently fenced helper resources.
             fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
+
             /// Require the sibling to enter the same fence before completing this one.
             fn fence<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 let phase = self.fences;
@@ -2768,6 +2879,7 @@ mod tests {
                     Poll::Ready(Ok(()))
                 }))
             }
+
             /// Verify the first fence barrier and inject an ordinary shutdown failure.
             fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async move {

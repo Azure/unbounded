@@ -773,6 +773,7 @@ mod tests {
     fn panic_releases_capacity_before_task_drop_and_queue_remains_usable() {
         /// Panics while polling, then reenters its queue during destruction.
         struct Panics;
+
         impl Future for Panics {
             /// This task has no application result.
             type Output = ();
@@ -782,6 +783,7 @@ mod tests {
                 panic!("injected poll panic");
             }
         }
+
         impl Drop for Panics {
             /// Verify admission is available before submitting replacement work.
             fn drop(&mut self) {
@@ -832,12 +834,14 @@ mod tests {
     fn replacing_owner_drops_waker_outside_queue_borrows() {
         /// Submits replacement work when the queue discards its previous owner.
         struct OnDrop;
+
         impl std::task::Wake for OnDrop {
             /// Reject a wake when replacement should only dispose of the owner.
             fn wake(self: Arc<Self>) {
                 panic!("idle queue must not wake its retired owner");
             }
         }
+
         impl Drop for OnDrop {
             /// Reenter submission and attempt a nested polling turn.
             fn drop(&mut self) {
@@ -859,6 +863,7 @@ mod tests {
     fn panicking_completed_task_destructor_does_not_leak_capacity() {
         /// Completes normally, then panics while releasing its owned resources.
         struct PanicsOnDrop;
+
         impl Future for PanicsOnDrop {
             /// Completion carries no application value.
             type Output = ();
@@ -868,6 +873,7 @@ mod tests {
                 Poll::Ready(())
             }
         }
+
         impl Drop for PanicsOnDrop {
             /// Check released admission before injecting the destructor panic.
             fn drop(&mut self) {
@@ -893,6 +899,7 @@ mod tests {
     fn completed_operation_is_dropped_after_releasing_capacity() {
         /// Completes with an ignored failure and checks admission when destroyed.
         struct Complete;
+
         impl Future for Complete {
             /// A deliberately ignored application error exercises detached results.
             type Output = std::result::Result<(), &'static str>;
@@ -902,6 +909,7 @@ mod tests {
                 Poll::Ready(Err("detached failure"))
             }
         }
+
         impl Drop for Complete {
             /// Verify the completed task's slot is available despite other reservations.
             fn drop(&mut self) {
@@ -1179,6 +1187,7 @@ mod tests {
     fn scoped_poll_and_drop_restore_previous_selection() {
         /// Submits work while verifying the queue selected for future destruction.
         struct OnDrop(Rc<DriverQueue>);
+
         impl Drop for OnDrop {
             /// Check the captured queue and submit a replacement task into it.
             fn drop(&mut self) {
@@ -1304,6 +1313,7 @@ mod tests {
 
             result: Result<usize>,
         }
+
         impl Future for Local {
             /// Return the fixture's chosen success or failure value.
             type Output = Result<usize>;
@@ -1317,6 +1327,7 @@ mod tests {
                 }
             }
         }
+
         impl Drop for Local {
             /// Record disposal so delivery can verify its ordering.
             fn drop(&mut self) {
@@ -1614,6 +1625,7 @@ mod retry_tests {
     /// Exposes a shared caller-controlled scope failure without automatic wakeups.
     #[derive(Clone, Default)]
     struct TestScope(Rc<Cell<Option<Error>>>);
+
     impl Scope for TestScope {
         /// Retry fixtures use the runtime error type directly.
         type Error = Error;
@@ -1744,12 +1756,14 @@ mod hedge_tests {
     /// Cancellation-only scope shared by a contender and its controlling fixture.
     #[derive(Clone)]
     struct TestScope(Cancellation);
+
     impl TestScope {
         /// Create an independently cancelable child or parent scope.
         fn new() -> Self {
             Self(Cancellation::new().unwrap())
         }
     }
+
     impl crate::Scope for TestScope {
         /// Hedge fixtures use portable runtime failures.
         type Error = Error;
@@ -1768,6 +1782,7 @@ mod hedge_tests {
             Some(&self.0)
         }
     }
+
     impl HedgeScope for TestScope {
         /// Notify the child without claiming it has reached completion.
         fn cancel(&self) {
@@ -1783,6 +1798,7 @@ mod hedge_tests {
 
         failures: &'a Cell<usize>,
     }
+
     impl HedgePolicy<Error> for Hooks<'_> {
         /// Launch the delayed contender only when the fixture marks the alarm due.
         fn delay(&mut self, _: &mut Context<'_>) -> Poll<()> {
@@ -1809,6 +1825,7 @@ mod hedge_tests {
             self.won.set(Some(contender));
         }
     }
+
     /// Owns hedge delay state and policy observations without an executor.
     #[derive(Default)]
     struct Fixture {
@@ -1818,6 +1835,7 @@ mod hedge_tests {
 
         failures: Cell<usize>,
     }
+
     impl Fixture {
         /// Borrow policy controls for one race while retaining external observations.
         fn hooks(&self) -> Hooks<'_> {
@@ -1839,6 +1857,7 @@ mod hedge_tests {
 
             requests: Rc<Cell<usize>>,
         }
+
         impl crate::Scope for CountedScope {
             /// Preserve the wrapped scope's runtime failure type.
             type Error = Error;
@@ -1853,6 +1872,7 @@ mod hedge_tests {
                 self.inner.cancellation()
             }
         }
+
         impl HedgeScope for CountedScope {
             /// Count every request before forwarding cancellation to the child.
             fn cancel(&self) {
@@ -1860,8 +1880,10 @@ mod hedge_tests {
                 self.inner.cancel();
             }
         }
+
         /// Counts classification callbacks while rejecting impossible winning paths.
         struct CountedPolicy<'a>(&'a Cell<usize>);
+
         impl HedgePolicy<Error> for CountedPolicy<'_> {
             /// Launch the secondary immediately after the first pending primary poll.
             fn delay(&mut self, _: &mut Context<'_>) -> Poll<()> {

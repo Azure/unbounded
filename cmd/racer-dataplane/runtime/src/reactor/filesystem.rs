@@ -3,6 +3,7 @@
 use super::*;
 use std::{ffi::CString, num::NonZeroUsize, ops::Deref};
 use zeroize::Zeroize;
+
 pub mod operations;
 
 /// Stable, quota-owning I/O storage with a cursor for partial writes.
@@ -22,6 +23,7 @@ pub struct Buffer {
 pub struct ReadBuffer {
     buffer: Buffer,
 }
+
 impl Deref for ReadBuffer {
     /// The initialized read output exposed to callers.
     type Target = [u8];
@@ -31,6 +33,7 @@ impl Deref for ReadBuffer {
         &self.buffer.data[..self.buffer.end]
     }
 }
+
 impl AsRef<[u8]> for ReadBuffer {
     /// Borrow the completed read without transferring its admission charge.
     fn as_ref(&self) -> &[u8] {
@@ -53,12 +56,14 @@ unsafe impl IoBuffer for Buffer {
         Ok(&mut self.data[self.start..self.end])
     }
 }
+
 impl Drop for Buffer {
     /// Erase the entire allocation before storage and its charge are released.
     fn drop(&mut self) {
         self.data.as_mut_slice().zeroize();
     }
 }
+
 impl Buffer {
     /// Consume a positive, in-bounds completion without moving the allocation.
     pub fn advance(&mut self, n: usize) -> Result<()> {
@@ -68,10 +73,12 @@ impl Buffer {
         self.start += n;
         Ok(())
     }
+
     /// Return the number of unconsumed bytes available to the next operation.
     pub fn remaining(&self) -> usize {
         self.end - self.start
     }
+
     /// Borrow a checked prefix of the unconsumed region after its I/O fence.
     pub fn prefix(&self, n: usize) -> Result<&[u8]> {
         self.bytes()?.get(..n).ok_or(Error::Io)
@@ -102,6 +109,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         }
         Buffer::allocate(length, self.charge(length)?)
     }
+
     /// Copy caller bytes into stable, zeroizing storage charged to this reactor.
     pub fn file_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
         let mut buffer = self.file_buffer(bytes.len())?;
@@ -203,6 +211,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Read basic metadata through an owned descriptor and stable output allocation.
     pub fn file_stat<'a>(
         &'a self,
@@ -237,6 +246,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Sync a file or directory while retaining its descriptor through the CQE fence.
     pub fn file_sync<'a>(
         &'a self,
@@ -258,6 +268,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Rename within a pinned directory; cancellation is not proof it did not execute.
     /// Callers own name validation, namespace serialization, and durability policy.
     pub(super) fn file_rename<'a>(
@@ -294,6 +305,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Unlink relative to a pinned parent without an implicit directory sync.
     pub fn file_unlink<'a>(
         &'a self,
@@ -347,6 +359,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Validate Linux pathname bounds and charge retained NUL-terminated bytes.
     fn file_path_quota(&self, paths: &[&CString]) -> Result<Charge> {
         if paths.iter().any(|p| p.as_bytes().len() > PATH_BYTES) {
@@ -390,15 +403,18 @@ impl NamespaceChange {
 /// Stable pathname backing that preserves pointer provenance across owner moves.
 /// Unlike CString's Box backing, this Vec must never resize after SQE publication.
 struct PathArg(Vec<u8>);
+
 impl PathArg {
     /// Transfer a validated pathname into stable syscall storage.
     fn new(path: CString) -> Self {
         Self(path.into_bytes_with_nul())
     }
+
     /// Borrow a pointer retained by the submission's completion closure.
     fn as_ptr(&self) -> *const libc::c_char {
         self.0.as_ptr().cast()
     }
+
     /// Copy the pathname into the simulator's typed operation.
     #[cfg(feature = "simulation")]
     fn simulated(&self) -> CString {
@@ -468,8 +484,10 @@ pub mod secure {
 
     /// Reject resolution that escapes the supplied directory descriptor.
     pub const BENEATH: u64 = 0x08;
+
     /// Reject magic links such as `/proc/self/fd` entries.
     pub const NO_MAGICLINKS: u64 = 0x02;
+
     /// Reject all symlinks during path resolution.
     pub const NO_SYMLINKS: u64 = 0x04;
 
@@ -957,6 +975,7 @@ mod secure_tests {
         assert_eq!(sim.read_file(Path::new("/target")).unwrap(), b"keep");
     }
 }
+
 #[cfg(all(test, feature = "simulation"))]
 mod test_support {
     //! Bounded explicit driving for filesystem operations with arbitrary errors.
