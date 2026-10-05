@@ -97,15 +97,44 @@ struct PendingIdentity {
 
     enrollment: String,
 
-    private_key: String,
+    private_key: EncodedPrivateKey,
 
     csr: String,
 }
 
-impl Drop for PendingIdentity {
-    /// Erase the persisted private-key encoding before releasing this record.
+/// Own secret text before serde has constructed the surrounding record.
+struct EncodedPrivateKey(Zeroizing<String>);
+
+impl Serialize for EncodedPrivateKey {
+    /// Preserve the persisted base64 string schema.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for EncodedPrivateKey {
+    /// Protect a decoded field immediately, even if a later field is missing.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
+    }
+}
+
+/// Clear all JSON strings, including values not consumed by a failing DTO decode.
+struct PrivateJson(serde_json::Value);
+
+impl Drop for PrivateJson {
+    /// Erase temporary copies while their allocations are still owned.
     fn drop(&mut self) {
-        self.private_key.zeroize();
+        /// Visit every string in a private record's JSON tree.
+        fn clear(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::String(text) => text.zeroize(),
+                serde_json::Value::Array(values) => values.iter_mut().for_each(clear),
+                serde_json::Value::Object(values) => values.values_mut().for_each(clear),
+                _ => (),
+            }
+        }
+        clear(&mut self.0);
     }
 }
 
@@ -120,8 +149,8 @@ struct PersistedIdentity {
 impl PersistedIdentity {
     /// Reject duplicate fields and oversized records before deserializing.
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        serde_json::from_value(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES * 3)?)
-            .map_err(|_| Error::CorruptRecord)
+        let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES * 3)?);
+        Self::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
     }
 
     /// Decode the saved response through the same wire validation as live traffic.
@@ -202,7 +231,7 @@ impl<H: Host> Enrollment<H> {
                 &h[16..20],
                 &h[20..]
             ),
-            private_key: STANDARD.encode(&*private),
+            private_key: EncodedPrivateKey(Zeroizing::new(STANDARD.encode(&*private))),
             csr: STANDARD.encode(csr.der()),
         })
     }
@@ -282,7 +311,7 @@ impl<H: Host> Enrollment<H> {
         }
         let private_material = Zeroizing::new(
             STANDARD
-                .decode(&p.private_key)
+                .decode(&*p.private_key.0)
                 .map_err(|_| Error::CorruptRecord)?,
         );
         let key = crate::SigningKey::from_pkcs8_der(&private_material)
@@ -557,8 +586,8 @@ fn token(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
 
 /// Decode bounded, duplicate-free pending JSON without changing its on-disk schema.
 fn decode_pending(bytes: &[u8]) -> Result<PendingIdentity, Error> {
-    serde_json::from_value(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES)?)
-        .map_err(|_| Error::CorruptRecord)
+    let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES)?);
+    PendingIdentity::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
 }
 
 /// Reject a corrupt or mismatched pending key before submitting its CSR.
@@ -566,7 +595,7 @@ fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error>
     use x509_parser::prelude::FromDer;
     let secret = Zeroizing::new(
         STANDARD
-            .decode(&pending.private_key)
+            .decode(&*pending.private_key.0)
             .map_err(|_| Error::CorruptRecord)?,
     );
     let key = crate::SigningKey::from_pkcs8_der(&secret).map_err(|_| Error::CorruptRecord)?;
@@ -603,6 +632,56 @@ mod tests {
             simulation::{Fault, Simulation},
         },
     };
+
+    std::thread_local! {
+        /// Observe secret-field destruction without reading deallocated memory.
+        static PRIVATE_KEY_DROPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    impl Drop for EncodedPrivateKey {
+        /// The zeroizing field is erased after this test-only observer runs.
+        fn drop(&mut self) {
+            PRIVATE_KEY_DROPS.with(|drops| drops.set(drops.get() + 1));
+        }
+    }
+
+    /// Partial pending and nested persisted records retain zeroizing field ownership.
+    #[test]
+    fn private_fields_drop_on_missing_and_late_invalid_record_fields() {
+        for pending in [
+            r#"{"cluster":"cluster","enrollment":"id","private_key":"secret"}"#,
+            r#"{"cluster":"cluster","enrollment":"id","private_key":"secret","csr":false}"#,
+        ] {
+            // Direct serde parsing exercises input order; production also retains
+            // a wiping JSON tree, whose sorted fields may fail before the key.
+            PRIVATE_KEY_DROPS.with(|drops| drops.set(0));
+            assert!(serde_json::from_str::<PendingIdentity>(pending).is_err());
+            assert_eq!(PRIVATE_KEY_DROPS.with(Cell::get), 1);
+            assert!(matches!(
+                decode_pending(pending.as_bytes()),
+                Err(Error::CorruptRecord)
+            ));
+            let persisted = format!(r#"{{"pending":{pending},"response":"response"}}"#);
+            PRIVATE_KEY_DROPS.with(|drops| drops.set(0));
+            assert!(serde_json::from_str::<PersistedIdentity>(&persisted).is_err());
+            assert_eq!(PRIVATE_KEY_DROPS.with(Cell::get), 1);
+            assert!(matches!(
+                PersistedIdentity::decode(persisted.as_bytes()),
+                Err(Error::CorruptRecord)
+            ));
+        }
+        for tail in ["", r#", "response":false"#] {
+            let persisted = format!(
+                r#"{{"pending":{{"cluster":"cluster","enrollment":"id","private_key":"secret","csr":"csr"}}{tail}}}"#
+            );
+            PRIVATE_KEY_DROPS.with(|drops| drops.set(0));
+            assert!(matches!(
+                PersistedIdentity::decode(persisted.as_bytes()),
+                Err(Error::CorruptRecord)
+            ));
+            assert_eq!(PRIVATE_KEY_DROPS.with(Cell::get), 1);
+        }
+    }
 
     /// Flat cause and publication phase keep test adapter errors lossless.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
