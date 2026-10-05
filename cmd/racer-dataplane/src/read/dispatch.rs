@@ -28,7 +28,6 @@ use crate::security::PeerOriginContext;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
-use std::collections::VecDeque;
 #[cfg(test)]
 use std::future::Future;
 #[cfg(test)]
@@ -39,13 +38,15 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
+#[cfg(test)]
 use std::task::Poll;
 #[cfg(test)]
 use std::task::Waker;
 use uring_runtime::mailbox;
 
+#[cfg(test)]
 type Completion = mailbox::Completion<Result<Value>, AcquisitionBudget>;
-type Reply = mailbox::Reply<Result<Value>, AcquisitionBudget>;
+#[cfg(test)]
 type Command = mailbox::Command<Work, Result<Value>, AcquisitionBudget, RequestScope>;
 type Receipt = mailbox::Receipt<Work, Result<Value>, AcquisitionBudget, RequestScope>;
 type Handoff = mailbox::Mailbox<Work, Result<Value>, AcquisitionBudget, RequestScope>;
@@ -114,22 +115,43 @@ enum Value {
     Retained(Option<VersionMetadata>),
     Peer(PeerResponse),
 }
-struct Active {
-    cancellation: Result<uring_runtime::environment::CancellationRegistration>,
-    runnable: Arc<uring_runtime::drivers::Runnable>,
-    future: Operation<'static, ()>,
-    scope: RequestScope,
-    caller: RequestScope,
-    reply: Arc<Reply>,
+/// Runtime executor specialized to application work results and acquisition credits.
+type Executor = mailbox::executor::Executor<Value, AcquisitionBudget, RequestScope>;
+
+impl mailbox::executor::ExecutionScope for RequestScope {
+    /// Keep the caller's deadline and identity without sharing cancellation authority.
+    fn detached(&self) -> Result<Self> {
+        let mut scope = self.clone();
+        scope.cancellation = Cancellation::new()?;
+        Ok(scope)
+    }
+
+    /// Notify accepted work without replacing its completion fence.
+    fn cancel(&self) -> Result<()> {
+        self.cancel()
+    }
+
+    /// Expose the original acquisition ceiling to the local scheduling loop.
+    fn deadline(&self) -> std::time::Instant {
+        self.deadline.0
+    }
+
+    /// Preserve the application's generation-mismatch classification.
+    fn stale_completion() -> Error {
+        Error::StaleFlight
+    }
 }
 
 /// Worker-owned command driver. Poll it even after ingress requests disconnect.
 /// Active futures are retained until completion; cancel is never a completion fence.
 pub struct WorkerEndpoint {
     directory: Arc<WorkerDirectory>,
+
     mailbox: Arc<Mailbox>,
+
     local: Rc<Coordinator>,
-    active: VecDeque<Active>,
+
+    active: Executor,
 }
 
 impl WorkerDirectory {
@@ -322,7 +344,7 @@ impl WorkerDirectory {
             directory: self.clone(),
             mailbox,
             local,
-            active: VecDeque::new(),
+            active: Executor::default(),
         })
     }
 
@@ -623,7 +645,7 @@ impl WorkerEndpoint {
     pub(crate) fn simulation_crash(&mut self) {
         assert!(uring_runtime::reactor::simulation::Simulation::current().is_some());
         self.directory.simulation_crash();
-        self.active.clear();
+        self.active.simulation_crash();
     }
     pub fn stop_admission(&self) {
         self.mailbox.stop_admission();
@@ -636,106 +658,14 @@ impl WorkerEndpoint {
     pub fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         self.stop_admission();
         Box::pin(std::future::poll_fn(move |cx| {
-            if scope.check().is_err() {
-                for active in &self.active {
-                    let _ = active.scope.cancel();
-                }
-                // Unstarted work is fenced by non-submission, not abandonment:
-                // completion-only waiters must receive an explicit result. Take
-                // ownership before releasing ciphertext, budgets, and permits;
-                // permit release locks this same mailbox.
-                let queued = self.mailbox.take_queued();
-                for mut command in queued {
-                    let _ = command.reply.complete(
-                        command.generation,
-                        Completion {
-                            value: Err(Error::Cancelled),
-                            budget: command.budget.take(),
-                        },
-                    );
-                }
-            }
-            if let Err(error) = self.poll(cx, 64) {
-                return Poll::Ready(Err(error));
-            }
-            if self.is_drained() {
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
-            }
+            self.active
+                .poll_drain(&self.mailbox, scope, cx, self.local.clone())
         }))
     }
     /// Register a reactor waker and execute at most `work_budget` command/poll steps.
     pub fn poll(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        self.mailbox.register(cx.waker());
-        let mut remaining_polls = self.active.len();
-        for _ in 0..work_budget {
-            let command = self.mailbox.pop();
-            if let Some(command) = command {
-                remaining_polls += 1;
-                let local = self.local.clone();
-                let caller = command.scope.clone();
-                let mut scope = caller.clone();
-                scope.cancellation = Cancellation::new()?;
-                let active_scope = scope.clone();
-                let reply = command.reply.clone();
-                self.active.push_back(Active {
-                    cancellation: caller.cancellation.subscribe(),
-                    runnable: uring_runtime::drivers::Runnable::new(),
-                    scope: active_scope,
-                    caller,
-                    reply,
-                    future: Box::pin(async move {
-                        let Command {
-                            generation,
-                            work,
-                            mut budget,
-                            reply,
-                            permit,
-                            ..
-                        } = command;
-                        let value = if reply.is_abandoned() {
-                            Err(Error::Cancelled)
-                        } else {
-                            execute(&local, work, &scope, budget.as_mut()).await
-                        };
-                        // Only actual completion releases command resources. The
-                        // receipt retains the slot until its result is consumed.
-                        let completed = reply.complete(generation, Completion { value, budget });
-                        drop(permit);
-                        completed.map_err(|_| Error::StaleFlight)
-                    }),
-                });
-            }
-            if remaining_polls != 0
-                && let Some(mut active) = self.active.pop_front()
-            {
-                remaining_polls -= 1;
-                if let Ok(cancellation) = &active.cancellation {
-                    cancellation.register(cx.waker());
-                }
-                if active.cancellation.is_err()
-                    || active.reply.is_abandoned()
-                    || active.caller.check().is_err()
-                {
-                    let _ = active.scope.cancel();
-                }
-                let force = active.scope.check().is_err();
-                match active
-                    .runnable
-                    .poll(std::pin::Pin::new(&mut active.future), cx, force)
-                {
-                    Poll::Pending => self.active.push_back(active),
-                    Poll::Ready(result) => result?,
-                }
-            }
-        }
-        // Active length is not runnable work: every future may be blocked. Keep
-        // round-robin order; the bounded worker tick reaches the rest of the set.
-        if work_budget != 0 && self.mailbox.has_queued() {
-            cx.waker().wake_by_ref();
-        }
-        Ok(())
+        self.active
+            .poll(&self.mailbox, cx, work_budget, self.local.clone())
     }
     pub fn poll_budgeted(&mut self, work_budget: usize) -> Result<()> {
         let waker = futures::task::noop_waker();
@@ -744,11 +674,7 @@ impl WorkerEndpoint {
     /// Earliest caller deadline. The I/O loop currently uses its bounded 1 ms tick
     /// to check deadlines rather than scheduling this value directly.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.active
-            .iter()
-            .map(|active| active.caller.deadline.0)
-            .chain(self.mailbox.queued_min(|scope| scope.deadline.0))
-            .min()
+        self.active.next_deadline(&self.mailbox)
     }
     pub fn uninstall(&mut self) -> Result<()> {
         self.stop_admission();
@@ -774,22 +700,19 @@ impl Drop for WorkerEndpoint {
         });
         // Queued work has not started and can be fenced as non-submission. Drop
         // outside the mailbox lock because its permit releases against that lock.
-        let queued = self.mailbox.take_queued();
-        for mut command in queued {
-            let _ = command.reply.complete(
-                command.generation,
-                Completion {
-                    value: Err(Error::Unavailable),
-                    budget: command.budget.take(),
-                },
-            );
-        }
-        // Normal shutdown drains before dropping this owner. If integration
-        // violates that contract, fail closed: never free futures/buffers that
-        // could still be referenced by accepted I/O. No replacement can install.
-        if !self.active.is_empty() {
-            std::mem::forget(std::mem::take(&mut self.active));
-        }
+        Executor::reject_queued(&self.mailbox, Error::Unavailable);
+    }
+}
+
+impl mailbox::executor::Handler<Work, Value, AcquisitionBudget, RequestScope> for Coordinator {
+    /// Dispatch application work without owning the runtime reply or producer credit.
+    fn execute<'a>(
+        &'a self,
+        work: Work,
+        scope: &'a RequestScope,
+        budget: Option<&'a mut AcquisitionBudget>,
+    ) -> Operation<'a, Value> {
+        Box::pin(execute(self, work, scope, budget))
     }
 }
 
@@ -1151,7 +1074,7 @@ mod tests {
                 mailbox: mailbox.clone(),
                 directory: directory.clone(),
                 local: crate::test_support::wake_test_coordinator(),
-                active: VecDeque::new(),
+                active: Executor::default(),
             };
             // Model ingress on the other worker so the real selected handoff is used.
             let _ingress =
@@ -1204,7 +1127,7 @@ mod tests {
                 mailbox: directory.mailboxes[0].clone(),
                 directory: directory.clone(),
                 local: crate::test_support::wake_test_coordinator(),
-                active: VecDeque::new(),
+                active: Executor::default(),
             };
             let caller = scope();
             let mut budget = AcquisitionBudget::new(caller.deadline.0, 4, 8);
@@ -1247,63 +1170,6 @@ mod tests {
             assert!(endpoint.active.is_empty());
             endpoint.uninstall().unwrap();
         }
-    }
-
-    #[test]
-    fn expired_drain_keeps_active_work_until_its_completion_fence() {
-        let directory = Arc::new(directory(1));
-        let mut endpoint = WorkerEndpoint {
-            mailbox: directory.mailboxes[0].clone(),
-            directory: directory.clone(),
-            local: crate::test_support::wake_test_coordinator(),
-            active: VecDeque::new(),
-        };
-        let caller = scope();
-        let receipt = directory
-            .submit(WorkerId(0), Work::Retained(version()), &caller, None)
-            .unwrap();
-        let command = endpoint.mailbox.pop().unwrap();
-        let active_scope = scope();
-        let (finish, fence) = futures::channel::oneshot::channel::<()>();
-        endpoint.active.push_back(Active {
-            cancellation: caller.cancellation.subscribe(),
-            runnable: uring_runtime::drivers::Runnable::new(),
-            scope: active_scope.clone(),
-            caller,
-            reply: command.reply.clone(),
-            // Model accepted work whose cancellation is not a completion fence.
-            future: Box::pin(async move {
-                fence.await.map_err(|_| Error::Unavailable)?;
-                command
-                    .reply
-                    .complete(
-                        command.generation,
-                        Completion {
-                            value: Err(Error::Cancelled),
-                            budget: None,
-                        },
-                    )
-                    .map_err(|_| Error::StaleFlight)?;
-                drop(command);
-                Ok(())
-            }),
-        });
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        endpoint.poll(&mut cx, 1).unwrap();
-        let shutdown = RequestScope::new(RequestId([2; 16]), Instant::now()).unwrap();
-        let mut drain = endpoint.drain(&shutdown);
-        assert!(drain.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(active_scope.check(), Err(Error::Cancelled));
-        assert!(receipt.poll_completion(&mut cx).is_pending());
-        drop(receipt);
-        assert_eq!(directory.mailboxes[0].outstanding(), 1);
-        assert!(drain.as_mut().poll(&mut cx).is_pending());
-        finish.send(()).unwrap();
-        assert_eq!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
-        drop(drain);
-        assert!(endpoint.active.is_empty());
-        assert_eq!(directory.mailboxes[0].outstanding(), 0);
-        endpoint.uninstall().unwrap();
     }
 
     #[test]
@@ -1399,53 +1265,6 @@ mod tests {
     }
 
     #[test]
-    fn blocked_endpoint_is_quiet_and_round_robin_is_budgeted() {
-        let directory = Arc::new(directory(4));
-        let mut endpoint = WorkerEndpoint {
-            mailbox: directory.mailboxes[0].clone(),
-            directory,
-            local: crate::test_support::wake_test_coordinator(),
-            active: VecDeque::new(),
-        };
-        let count = Arc::new(crate::test_support::WakeCounter::default());
-        let waker = Waker::from(count.clone());
-        let mut cx = Context::from_waker(&waker);
-        let order = Rc::new(RefCell::new(Vec::new()));
-        for id in 0..3 {
-            let order = order.clone();
-            let caller = scope();
-            endpoint.active.push_back(Active {
-                cancellation: caller.cancellation.subscribe(),
-                runnable: uring_runtime::drivers::Runnable::new(),
-                scope: scope(),
-                caller,
-                reply: Arc::new(Reply::new(id)),
-                future: Box::pin(std::future::poll_fn(move |_| {
-                    order.borrow_mut().push(id);
-                    Poll::Pending
-                })),
-            });
-        }
-        endpoint.poll(&mut cx, 0).unwrap();
-        assert!(order.borrow().is_empty());
-        for _ in 0..6 {
-            endpoint.poll(&mut cx, 1).unwrap();
-        }
-        assert_eq!(&*order.borrow(), &[0, 1, 2]);
-        assert_eq!(
-            count.count(),
-            0,
-            "active length does not imply runnable work"
-        );
-        for active in &endpoint.active {
-            std::task::Wake::wake_by_ref(&active.runnable);
-        }
-        endpoint.poll(&mut cx, 64).unwrap();
-        assert_eq!(&*order.borrow(), &[0, 1, 2, 0, 1, 2]);
-        endpoint.active.clear(); // Test futures have no accepted I/O to fence.
-    }
-
-    #[test]
     fn mailbox_and_reply_notifications_cover_both_registration_orders() {
         for submit_before_poll in [false, true] {
             for complete_before_poll in [false, true] {
@@ -1454,7 +1273,7 @@ mod tests {
                     mailbox: directory.mailboxes[0].clone(),
                     directory: directory.clone(),
                     local: crate::test_support::wake_test_coordinator(),
-                    active: VecDeque::new(),
+                    active: Executor::default(),
                 };
                 let count = Arc::new(crate::test_support::WakeCounter::default());
                 let waker = Waker::from(count.clone());
