@@ -778,8 +778,8 @@ pub(crate) mod tests {
             let weak = Arc::downgrade(&page.inner);
             let pointer = page.bytes()[7..].as_ptr();
             // Deliberately malformed ranges exercise rejection, not iteration.
-            #[allow(clippy::reversed_empty_ranges)]
-            for range in [8..7, 0..23, usize::MAX..usize::MAX] {
+            let reversed = std::ops::Range { start: 8, end: 7 };
+            for range in [reversed, 0..23, usize::MAX..usize::MAX] {
                 assert!(matches!(
                     PageSendRange::new(page.clone(), range),
                     Err(Error::InvalidRange)
