@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Picks which members own a key, using weighted rendezvous hashing.
 
 use crate::{Error, MAX_INCREMENTAL_CHANGES, Member, MemberChange, Membership, hash};

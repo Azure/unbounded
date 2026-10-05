@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shortest-path routing over the membership graph.
 //!
 //! BFS expansions are limited per poll. Completion, cleanup, cache eviction,

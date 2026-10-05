@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Placement and routing for a set of cluster members.
 //!
 //! This crate answers two questions for the Racer dataplane:

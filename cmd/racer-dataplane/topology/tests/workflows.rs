@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end tests that use only the public API.
 
 use futures::{executor::block_on, task::noop_waker_ref};
