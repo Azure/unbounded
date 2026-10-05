@@ -157,7 +157,10 @@ func (a *Authority) Wait(ctx context.Context, identity NodeIdentity, after *wire
 }
 
 func (a *Authority) TrustContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
-	guard, cancel, err := a.trust.writeContext(ctx)
+	a.trust.mu.RLock()
+	defer a.trust.mu.RUnlock()
+
+	guard, cancel, err := a.trust.writeContextLocked(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -170,7 +173,7 @@ func (a *Authority) TrustContext(ctx context.Context) (context.Context, context.
 
 	epoch := write.authority
 
-	return responseGuard{Context: guard, owner: a, trust: true, epoch: epoch}, cancel, nil
+	return responseGuard{Context: guard, owner: a, trust: true, epoch: epoch, bundle: a.trust.bundle}, cancel, nil
 }
 
 // TrustPool returns an independent pool: TLS callers cannot mutate local trust.
@@ -235,7 +238,7 @@ func (k KeyringHandle) Response() Response {
 		return Response{}
 	}
 
-	return Response{response: publicationResponse{encoded: k.image.encoded}, owner: k.owner, trust: true, epoch: k.epoch}
+	return Response{response: publicationResponse{encoded: k.image.encoded}, owner: k.owner, trust: true, epoch: k.epoch, bundle: k.image}
 }
 
 // Response exposes bounded writing, never an installation proof or mutable bytes.
@@ -245,14 +248,16 @@ type Response struct {
 	image    *committedPublication
 	trust    bool
 	epoch    context.Context
+	bundle   *acceptedKeyring
 }
 
 type responseGuard struct {
 	context.Context
-	owner *Authority
-	image *committedPublication
-	trust bool
-	epoch context.Context
+	owner  *Authority
+	image  *committedPublication
+	trust  bool
+	epoch  context.Context
+	bundle *acceptedKeyring
 }
 
 func (Response) String() string   { return "<redacted authority response>" }
@@ -260,7 +265,7 @@ func (Response) GoString() string { return "<redacted authority response>" }
 
 func (r Response) WriteTo(ctx context.Context, w io.Writer) (int64, error) {
 	guard, ok := ctx.(responseGuard)
-	if !ok || r.owner == nil || guard.owner != r.owner || r.trust && (!guard.trust || r.epoch == nil || r.epoch != guard.epoch) || r.image != nil && guard.image != r.image {
+	if !ok || r.owner == nil || guard.owner != r.owner || r.trust && (!guard.trust || r.epoch == nil || r.epoch != guard.epoch || r.bundle == nil || r.bundle != guard.bundle) || r.image != nil && guard.image != r.image {
 		return 0, wire.Forbidden
 	}
 

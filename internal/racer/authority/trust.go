@@ -113,6 +113,11 @@ func (t *trustStore) writeContext(parent context.Context) (context.Context, cont
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
+	return t.writeContextLocked(parent)
+}
+
+// Caller holds mu so the guard and accepted bundle can be captured atomically.
+func (t *trustStore) writeContextLocked(parent context.Context) (context.Context, context.CancelFunc, error) {
 	if t.roots == nil || t.authority == nil || t.authority.Err() != nil || t.maxAge > 0 && time.Since(t.confirmed) >= t.maxAge {
 		return nil, nil, wire.Unavailable
 	}

@@ -64,6 +64,11 @@ func TestIdentityAndServingHandleProvenance(t *testing.T) {
 func TestKeyringHandleCannotBorrowRecoveredTrust(t *testing.T) {
 	f := newServingFixture(t)
 	a := f.a.authority
+	legacy, stopLegacy, err := a.trust.writeContext(t.Context())
+	require.NoError(t, err)
+
+	defer stopLegacy()
+
 	old, err := a.Keyring()
 	require.NoError(t, err)
 	guard, stop, err := a.TrustContext(t.Context())
@@ -72,6 +77,7 @@ func TestKeyringHandleCannotBorrowRecoveredTrust(t *testing.T) {
 	defer stop()
 
 	a.trust.invalidate()
+	require.ErrorIs(t, legacy.Err(), context.Canceled)
 	require.NoError(t, a.Observe(t.Context()))
 	require.ErrorIs(t, guard.Err(), context.Canceled)
 	fresh, stopFresh, err := a.TrustContext(t.Context())
