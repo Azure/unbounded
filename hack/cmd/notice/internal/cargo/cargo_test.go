@@ -20,7 +20,32 @@ import (
 var workspaceMembers = []string{
 	"runtime", "alloc", "crypto", "verbs", "http", "topology",
 	"telemetry", "flow", "control-wire", "controlplane",
-	"uds-endpoint", "wire-codec",
+	"uds-endpoint", "wire-codec", "peer-wire", "object-wire", "env-config",
+}
+
+// Discover actual manifests independently so two stale explicit lists cannot agree.
+func TestCollectorIncludesRepositoryCrates(t *testing.T) {
+	root := "../../../../.."
+	manifests, err := filepath.Glob(filepath.Join(root, "cmd/racer-dataplane/*/Cargo.toml"))
+	if err != nil || len(manifests) == 0 {
+		t.Fatalf("discover local crates: %v, %v", manifests, err)
+	}
+
+	inputs := make(map[string]string, len(crateInputs))
+	for _, input := range crateInputs {
+		inputs[input.manifestPath] = input.lockPath
+	}
+
+	for _, manifest := range manifests {
+		path, err := filepath.Rel(root, manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if inputs[path] != "cmd/racer-dataplane/Cargo.lock" {
+			t.Errorf("local crate %s must use the workspace lock in notice collection", path)
+		}
+	}
 }
 
 func TestCollectorCollectHermetic(t *testing.T) {
@@ -634,6 +659,9 @@ racer-control-wire = { path = "control-wire" }
 controlplane = { path = "controlplane" }
 uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec" }
+peer-wire = { path = "peer-wire" }
+racer-object-wire = { path = "object-wire" }
+env-config = { path = "env-config" }
 `,
 		"cmd/racer-dataplane/Cargo.lock": "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n",
 	})

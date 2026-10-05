@@ -22,6 +22,12 @@ COPY cmd/racer-dataplane/control-wire/Cargo.toml ./control-wire/Cargo.toml
 COPY cmd/racer-dataplane/control-wire/src ./control-wire/src
 COPY cmd/racer-dataplane/controlplane/Cargo.toml ./controlplane/Cargo.toml
 COPY cmd/racer-dataplane/controlplane/src ./controlplane/src
+COPY cmd/racer-dataplane/peer-wire/Cargo.toml ./peer-wire/Cargo.toml
+COPY cmd/racer-dataplane/peer-wire/src ./peer-wire/src
+COPY cmd/racer-dataplane/object-wire/Cargo.toml ./object-wire/Cargo.toml
+COPY cmd/racer-dataplane/object-wire/src ./object-wire/src
+COPY cmd/racer-dataplane/env-config/Cargo.toml ./env-config/Cargo.toml
+COPY cmd/racer-dataplane/env-config/src ./env-config/src
 COPY cmd/racer-dataplane/runtime/Cargo.toml ./runtime/Cargo.toml
 COPY cmd/racer-dataplane/runtime/src ./runtime/src
 COPY cmd/racer-dataplane/alloc/Cargo.toml ./alloc/Cargo.toml

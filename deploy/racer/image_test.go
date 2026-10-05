@@ -123,3 +123,20 @@ func TestControllerImageBuildMetadata(t *testing.T) {
 	require.Contains(t, image, "-o /out/racer-controller ./cmd/racer-controller")
 	require.Contains(t, image, "COPY --from=builder /out/racer-controller /usr/local/bin/racer-controller")
 }
+
+// Every local crate needs its manifest and sources in the isolated image build.
+func TestDataplaneImageCopiesLocalCrates(t *testing.T) {
+	data, err := os.ReadFile("../../images/racer-dataplane/Containerfile")
+	require.NoError(t, err)
+
+	manifests, err := filepath.Glob("../../cmd/racer-dataplane/*/Cargo.toml")
+	require.NoError(t, err)
+	require.NotEmpty(t, manifests)
+
+	for _, manifest := range manifests {
+		member := filepath.Base(filepath.Dir(manifest))
+		for _, input := range []string{"Cargo.toml", "src"} {
+			require.Contains(t, string(data), "COPY cmd/racer-dataplane/"+member+"/"+input+" ./"+member+"/"+input+"\n")
+		}
+	}
+}
