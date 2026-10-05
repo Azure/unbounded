@@ -1,5 +1,75 @@
 use crate::read::dispatch::WorkerMap;
 
+/// Isolate staging admission from acquisition, publication, and queued-write reclamation.
+#[test]
+fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    for (owned, live, ciphertext) in [
+        (true, false, true),
+        (true, true, true),
+        (false, false, true),
+        (true, false, false),
+    ] {
+        let f = fixture();
+        let deps = &f.fill.dependencies;
+        let admission = &deps.admission;
+        deps.writer
+            .retention()
+            .set_ownership(Rc::new(move |_| owned));
+        let incoming = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
+        let mut metadata = f.origin.metadata.immutable();
+        metadata.version.etag = StrongEtag::test_value("staging-idle");
+        let idle = crate::memory::tests::bundle_for(admission, metadata);
+        let id = idle.plaintext.page().clone();
+        let reader = live.then(|| idle.clone());
+        deps.memory.publish(idle).unwrap();
+        let class = if ciphertext {
+            ResourceClass::Ciphertext
+        } else {
+            ResourceClass::DirtyCiphertext
+        };
+        let amount = if ciphertext {
+            deps.writer
+                .slabs()
+                .alignment()
+                .unwrap()
+                .extent(0, crate::store::logical_length(&incoming.copy()).unwrap())
+                .unwrap()
+                .length()
+        } else {
+            19
+        };
+        let held = admission
+            .reserve(
+                None,
+                class,
+                admission.limit(class) - admission.used(class) - amount + 19,
+            )
+            .unwrap();
+        assert!(
+            admission
+                .reserve_completion(Some(&f.context.object.cache), class, amount)
+                .is_err()
+        );
+        f.fill.observe_verified(&incoming, &f.scope);
+        if !owned {
+            f.fill.observe_verified(&incoming, &f.scope);
+        }
+        let reclaimed = owned && !live && ciphertext;
+        // Optional writes already scan idle memory against their lower ceiling,
+        // but cannot gain enough headroom from this one tiny entry.
+        assert_eq!(deps.memory.get(&id).unwrap().is_none(), !live && ciphertext);
+        assert_eq!(deps.writer.pending_count(), usize::from(reclaimed));
+        assert_eq!(deps.writer.discarded_count(), 0);
+        assert_eq!(incoming.plaintext.bytes(), &[1; 3]);
+        if let Some(reader) = reader {
+            assert_eq!(reader.plaintext.bytes(), &[1; 3]);
+        }
+        drop(held);
+    }
+}
+
 #[test]
 fn optional_persistence_full_page_residency_above_half_budget_makes_progress() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
