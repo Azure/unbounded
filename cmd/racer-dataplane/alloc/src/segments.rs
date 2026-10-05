@@ -158,6 +158,7 @@ pub struct Segments {
     open: Cell<Option<usize>>,
 
     free: RefCell<BTreeSet<usize>>,
+
     evicting: Cell<usize>,
 }
 impl Segments {
@@ -563,6 +564,7 @@ pub trait SegmentEntries {
     fn can_evict(&self, _segment: SegmentId) -> bool {
         true
     }
+
     /// Remove at most budget current mappings, returning the number removed.
     fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize;
 
@@ -762,10 +764,11 @@ impl SegmentClock {
                 return Ok(());
             }
             let id = self.next(count);
-            if !matches!(
-                self.segments.state(id)?,
-                SegmentState::Sealed | SegmentState::Evicting
-            ) {
+            let state = self.segments.state(id)?;
+            if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
+                continue;
+            }
+            if state == SegmentState::Sealed && !entries.can_evict(id) {
                 continue;
             }
             if self.recent.borrow_mut().remove(&id) {
@@ -1161,6 +1164,8 @@ mod clock_tests {
         counts: RefCell<Vec<usize>>,
 
         calls: RefCell<Vec<(SegmentId, usize)>>,
+
+        evictable: Cell<bool>,
     }
     impl Entries {
         /// Populate a synthetic index without changing allocator state.
@@ -1168,10 +1173,16 @@ mod clock_tests {
             Self {
                 counts: RefCell::new(counts),
                 calls: RefCell::new(vec![]),
+                evictable: Cell::new(true),
             }
         }
     }
     impl SegmentEntries for Entries {
+        /// Allow tests to protect unpublished mappings before eviction begins.
+        fn can_evict(&self, _: SegmentId) -> bool {
+            self.evictable.get()
+        }
+
         /// Record and honor each bounded removal request.
         fn remove_bounded(&self, id: SegmentId, budget: usize) -> usize {
             self.calls.borrow_mut().push((id, budget));
@@ -1280,6 +1291,47 @@ mod clock_tests {
         clock.reclaim(&entries, 2, 64, 256).unwrap();
         assert_eq!(segments.free_count(), 2);
         assert_eq!(*entries.counts.borrow(), [0, 0]);
+    }
+
+    /// Sealed vetoes preserve mappings, but cannot strand eviction already in progress.
+    #[test]
+    fn reclaim_honors_sealed_veto_but_drains_existing_eviction() {
+        for mapping_count in [0usize, 2] {
+            let segments = segments(1);
+            let held = segments.append(1024).unwrap().0;
+            let clock = SegmentClock::new(segments.clone());
+            let entries = Entries::new(vec![mapping_count]);
+            entries.evictable.set(false);
+            let before = segments.snapshot();
+            assert_eq!(before[0].state, SegmentState::Sealed);
+
+            assert_eq!(clock.reclaim(&entries, 1, 2, 1), Err(Error::Busy));
+            assert_eq!(segments.snapshot(), before);
+            assert_eq!(*entries.counts.borrow(), [mapping_count]);
+            assert!(entries.calls.borrow().is_empty());
+            assert_eq!(segments.free_count(), 0);
+
+            entries.evictable.set(true);
+            assert_eq!(clock.reclaim(&entries, 1, 1, 1), Err(Error::Busy));
+            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
+            assert_eq!(*entries.counts.borrow(), [mapping_count.saturating_sub(1)]);
+
+            // Once eviction starts, a later veto must not block remaining mappings.
+            entries.evictable.set(false);
+            assert_eq!(clock.reclaim(&entries, 1, 1, 1), Err(Error::Busy));
+            assert_eq!(*entries.counts.borrow(), [0]);
+            assert_eq!(entries.calls.borrow().len(), mapping_count);
+            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
+            assert_eq!(segments.free_count(), 0);
+            assert_eq!(segments.snapshot()[0].generation, Generation(1));
+
+            // The live lease, not the veto, remains the physical reuse fence.
+            drop(held);
+            clock.reclaim(&entries, 1, 1, 0).unwrap();
+            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Free));
+            assert_eq!(segments.free_count(), 1);
+            assert_eq!(segments.snapshot()[0].generation, Generation(2));
+        }
     }
 
     /// Freeze checks precede index side effects, and leases precede physical reuse.
