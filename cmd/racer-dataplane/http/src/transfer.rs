@@ -1158,6 +1158,7 @@ pub mod relay {
                 );
                 Self { hooks, io }
             }
+
             /// Reserve a socket pair and install the requested synthetic framing.
             fn connection(&self, receive: u64, send: u64) -> (ConnectionLease<Hooks>, UnixStream) {
                 let (fd, peer) = UnixStream::pair().unwrap();
@@ -1171,6 +1172,7 @@ pub mod relay {
                 c.set_framing(Some(receive), Some(send), false);
                 (c, peer)
             }
+
             /// Construct a relay with matching framing and both peer endpoints.
             fn relay(
                 &self,
