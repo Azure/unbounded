@@ -822,6 +822,7 @@ impl Transfers {
                 &offer.peer,
                 binding.rail,
                 connection.state().peer_admission.clone(),
+                connection.state().receive_permit.clone(),
                 scope,
             )
             .await
@@ -1167,6 +1168,7 @@ pub enum RelayResponse {
 }
 
 pub struct Transfers {
+    receive_gate: Option<Arc<super::receive::Gate>>,
     reclaim: Option<Rc<ReclaimCiphertext>>,
     signatures: Rc<crate::peer::protocol::Signatures>,
     #[cfg(test)]
@@ -1201,6 +1203,7 @@ impl Transfers {
     ) -> Self {
         Self {
             reclaim: None,
+            receive_gate: None,
             signatures,
             #[cfg(test)]
             native_completions: std::cell::Cell::new(0),
@@ -1219,6 +1222,26 @@ impl Transfers {
         self.native = Some(sessions);
         self
     }
+    pub(crate) fn with_receive_gate(mut self, gate: Arc<super::receive::Gate>) -> Self {
+        self.receive_gate = Some(gate);
+        self
+    }
+    pub(crate) async fn admit_receive(
+        &self,
+        request: &super::protocol::PeerRequest,
+        scope: &RequestScope,
+    ) -> Result<Option<Arc<super::receive::Permit>>> {
+        if matches!(
+            request.operation,
+            super::protocol::Operation::Metadata { .. }
+        ) {
+            return Ok(None);
+        }
+        match &self.receive_gate {
+            Some(gate) => gate.acquire(&self.wire.0, scope).await,
+            None => Ok(None),
+        }
+    }
     pub(crate) fn with_reclamation(
         mut self,
         reclaim: impl Fn(&racer_control_wire::CacheId, usize) + 'static,
@@ -1236,6 +1259,7 @@ impl Transfers {
         membership: Option<std::sync::Arc<crate::topology::Membership>>,
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         peer_admission: Option<std::sync::Arc<super::Permit>>,
+        receive_permit: Option<Arc<super::receive::Permit>>,
         failure: Rc<std::cell::Cell<bool>>,
         mut timing: Option<&'a mut super::PageTiming<'_>>,
         scope: &'a RequestScope,
@@ -1276,15 +1300,19 @@ impl Transfers {
             let mut connection = observer.result(
                 Stage::PeerCheckout,
                 scope,
-                crate::http::checkout_peer(
-                    &self.http,
-                    &endpoint,
-                    relay.clone(),
-                    peer_admission.clone(),
-                    Some(failure.clone()),
-                    scope,
-                )
-                .await,
+                self.http
+                    .checkout_with_state(
+                        &endpoint,
+                        crate::http::State {
+                            relay_reservation: relay.clone(),
+                            peer_admission: peer_admission.clone(),
+                            receive_permit,
+                            connect_failure: Some(failure.clone()),
+                            ..Default::default()
+                        },
+                        scope,
+                    )
+                    .await,
             )?;
             connection.state_mut().peer_admission = peer_admission.clone();
             if let Some(timing) = timing.as_deref_mut() {

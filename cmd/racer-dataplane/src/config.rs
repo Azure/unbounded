@@ -52,6 +52,7 @@ pub struct Config {
     pub send_crc_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::candidates::HedgeConfig,
     pub peer_admission: crate::peer::Config,
+    pub peer_receive: crate::peer::receive::Config,
     pub shares: std::num::NonZeroU32,
     pub disk_page_entries: NonZeroUsize,
     pub checkpoint_bytes: NonZeroUsize,
@@ -183,6 +184,11 @@ impl Config {
             u32::try_from(number("RACER_SHARES", 4)?).map_err(|_| Error::InvalidConfiguration)?,
         )
         .ok_or(Error::InvalidConfiguration)?;
+        let peer_receive = crate::peer::receive::Config {
+            active: to_usize(number("RACER_PEER_RECEIVE_MAX", 0)?)?,
+            queued: to_usize(number("RACER_PEER_RECEIVE_QUEUE_MAX", 256)?)?,
+            wait: Duration::from_millis(number("RACER_PEER_RECEIVE_WAIT_MS", 1000)?),
+        };
         let slab_bytes = number("RACER_SLAB_BYTES", 1024 * MIB)?;
         let segment_bytes = number("RACER_SEGMENT_BYTES", 64 * MIB)?;
         let free_segment_reserve = to_usize(number("RACER_FREE_SEGMENT_RESERVE", 2)?)?;
@@ -230,6 +236,7 @@ impl Config {
             send_crc_pair,
             page_hedge,
             peer_admission,
+            peer_receive,
             shares,
             disk_page_entries,
             checkpoint_bytes,
@@ -268,6 +275,7 @@ impl Config {
             pair.validate()?;
         }
         self.page_hedge.validate()?;
+        self.peer_receive.validate()?;
         self.peer_admission.validate()?;
         if self.disk_page_entries.get() > MAX_ENTRIES
             || self.checkpoint_bytes.get() > 512 * MIB as usize
@@ -747,6 +755,29 @@ mod tests {
             "8816d91d-e896-49bf-ba8a-da97ede93818,8816d91d-e896-49bf-ba8a-da97ede93818",
         ] {
             assert!(parse(&[("RACER_SEND_CRC_PAIR", invalid)]).is_err());
+        }
+    }
+
+    #[test]
+    fn receive_gate_is_opt_in_and_bounded() {
+        assert_eq!(parse(&[]).unwrap().peer_receive.active, 0);
+        let c = parse(&[
+            ("RACER_PEER_RECEIVE_MAX", "8"),
+            ("RACER_PEER_RECEIVE_QUEUE_MAX", "32"),
+            ("RACER_PEER_RECEIVE_WAIT_MS", "500"),
+        ])
+        .unwrap();
+        assert_eq!(c.peer_receive.active, 8);
+        assert_eq!(c.peer_receive.queued, 32);
+        assert_eq!(c.peer_receive.wait, Duration::from_millis(500));
+        for pair in [
+            ("RACER_PEER_RECEIVE_MAX", "65537"),
+            ("RACER_PEER_RECEIVE_QUEUE_MAX", "0"),
+            ("RACER_PEER_RECEIVE_QUEUE_MAX", "65537"),
+            ("RACER_PEER_RECEIVE_WAIT_MS", "0"),
+            ("RACER_PEER_RECEIVE_WAIT_MS", "30001"),
+        ] {
+            assert!(parse(&[pair]).is_err());
         }
     }
 

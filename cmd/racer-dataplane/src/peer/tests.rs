@@ -344,6 +344,7 @@ mod body_progress {
                 None,
                 None,
                 None,
+                None,
                 Rc::new(Cell::new(false)),
                 Some(&mut timing),
                 &scope,
@@ -1290,6 +1291,7 @@ mod encrypted_http {
                         None,
                         None,
                         None,
+                        None,
                         Rc::new(Cell::new(false)),
                         None,
                         turn,
@@ -1481,7 +1483,21 @@ mod requester_safety {
     fn probe_exchange(opaque: bool, case: &str) {
         let signers = crate::peer::tests::signers();
         let fixture = super::SocketFixture::with_body_limit(2, 0);
-        let transfers = fixture.transfers(signers[0].clone());
+        let receive_metrics = Metrics::default();
+        let receive_gate = crate::peer::receive::Gate::with_metrics(
+            crate::peer::receive::Config {
+                active: 1,
+                ..Default::default()
+            },
+            receive_metrics.clone(),
+        )
+        .unwrap();
+        let transfers = Rc::new(
+            Rc::try_unwrap(fixture.transfers(signers[0].clone()))
+                .ok()
+                .unwrap()
+                .with_receive_gate(receive_gate),
+        );
         let super::SocketFixture {
             admission,
             reactor,
@@ -1546,6 +1562,10 @@ mod requester_safety {
         .unwrap();
         request.route.deadline = scope.deadline;
         request.origin.scope = scope.clone();
+        request.operation = crate::peer::protocol::Operation::Bootstrap {
+            object: request.origin.object.clone(),
+            mode: crate::peer::protocol::FetchMode::CopyOnly,
+        };
         if case == "direct" {
             let held = adaptive.acquire(&node).unwrap();
             assert!(!requester.direct_hedge_available(&membership, &node));
@@ -1657,6 +1677,11 @@ mod requester_safety {
                         "headers cannot recover probe"
                     );
                     assert_eq!(metrics.gauge(Gauge::PeerExchanges), 1);
+                    assert_eq!(
+                        receive_metrics.gauge(Gauge::PeerReceiveActive),
+                        1,
+                        "opaque head is not body completion"
+                    );
                     connection.finish_exchange().unwrap();
                     drop(connection);
                 }
@@ -1676,6 +1701,8 @@ mod requester_safety {
             case == "miss" || case == "direct"
         );
         assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
+        assert_eq!(receive_metrics.gauge(Gauge::PeerReceiveActive), 0);
+        assert_eq!(receive_metrics.count(Event::PeerReceiveAdmitted), 1);
     }
 }
 mod subscriptions {
@@ -2664,7 +2691,21 @@ mod timing {
         use std::task::Poll;
         let signers = signers();
         let fixture = SocketFixture::new(1);
-        let transfers = fixture.transfers(signers[0].clone());
+        let receive_metrics = Metrics::default();
+        let gate = crate::peer::receive::Gate::with_metrics(
+            crate::peer::receive::Config {
+                active: 1,
+                ..Default::default()
+            },
+            receive_metrics.clone(),
+        )
+        .unwrap();
+        let transfers = Rc::new(
+            Rc::try_unwrap(fixture.transfers(signers[0].clone()))
+                .ok()
+                .unwrap()
+                .with_receive_gate(gate),
+        );
         let SocketFixture {
             admission,
             reactor,
@@ -2719,6 +2760,15 @@ mod timing {
                         .request(page_request(&admission, attempt), members.clone(), &scope)
                         .await
                 };
+                assert_eq!(
+                    receive_metrics.gauge(crate::telemetry::Gauge::PeerReceiveActive),
+                    0,
+                    "completed socket returns idle without permit"
+                );
+                assert_eq!(
+                    receive_metrics.count(Event::PeerReceiveAdmitted),
+                    attempt as u64 + 1
+                );
                 if attempt < 2 {
                     assert!(matches!(
                         response.unwrap().response(),
@@ -2875,6 +2925,138 @@ pub(super) fn request(
 }
 pub(super) fn codec(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>) -> SecurityCodec {
     SecurityCodec::new(admission.clone(), BufferPool::new(admission.clone()))
+}
+
+#[test]
+fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
+    use crate::telemetry::{Gauge, Metrics};
+    let clock = uring_runtime::environment::SimulationClock::new(920);
+    let _env = clock.environment(0).enter();
+    let fixtures = [SocketFixture::new(1), SocketFixture::new(1)];
+    let metrics = [Metrics::default(), Metrics::default()];
+    let gates: Vec<_> = metrics
+        .iter()
+        .map(|m| {
+            crate::peer::receive::Gate::with_metrics(
+                crate::peer::receive::Config {
+                    active: 1,
+                    wait: Duration::from_millis(10),
+                    ..Default::default()
+                },
+                m.clone(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let signers = signers();
+    let transfers: Vec<_> = fixtures
+        .iter()
+        .zip(&gates)
+        .map(|(f, g)| {
+            Rc::try_unwrap(f.transfers(signers[0].clone()))
+                .ok()
+                .unwrap()
+                .with_receive_gate(g.clone())
+        })
+        .collect();
+    let scope = RequestScope::new(
+        RequestId([20; 16]),
+        uring_runtime::environment::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    let mut requests: Vec<_> = fixtures.iter().map(|f| request(&f.admission, 20)).collect();
+    let original = (
+        requests[0].route.remaining_links,
+        requests[0].route.remaining_attempts,
+        requests[0].route.deadline.0,
+    );
+    let mut held = Vec::new();
+    for (r, t) in requests.iter_mut().zip(&transfers) {
+        r.operation = Operation::Bootstrap {
+            object: r.origin.object.clone(),
+            mode: FetchMode::CopyOnly,
+        };
+        held.push(futures::executor::block_on(t.admit_receive(r, &scope)).unwrap());
+    }
+    // Opposing chains already own their first-hop receive slots. Their next
+    // exchanges queue at saturated receivers, not recursively acquiring a slot.
+    requests[0].operation = Operation::Page {
+        page: PageId {
+            version: ObjectVersion {
+                object: requests[0].origin.object.clone(),
+                etag: StrongEtag::test_value("incast"),
+            },
+            number: PageNumber(0),
+        },
+        mode: FetchMode::CopyOnly,
+    };
+    requests[1].operation = Operation::Subscribe {
+        subscription: super::subscriptions::Subscription {
+            id: [20; 16],
+            sequence: 0,
+            page_budget: 1,
+            byte_budget: PAGE_BYTES + 16,
+            version: ObjectVersion {
+                object: requests[1].origin.object.clone(),
+                etag: StrongEtag::test_value("incast"),
+            },
+            demand: super::subscriptions::Demand::new(vec![super::subscriptions::PageInterval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap(),
+        },
+        mode: FetchMode::CopyOnly,
+    };
+    let mut pending: Vec<_> = transfers
+        .iter()
+        .zip(&requests)
+        .map(|(t, r)| Box::pin(t.admit_receive(r, &scope)))
+        .collect();
+    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    for p in &mut pending {
+        assert!(p.as_mut().poll(&mut cx).is_pending());
+    }
+    for (f, t) in fixtures.iter().zip(&transfers) {
+        let metadata = request(&f.admission, 21);
+        assert!(
+            futures::executor::block_on(t.admit_receive(&metadata, &scope))
+                .unwrap()
+                .is_none(),
+            "metadata bypasses saturated body gate"
+        );
+    }
+    clock.advance(Duration::from_millis(11));
+    for g in &gates {
+        g.poll_deadlines(64);
+    }
+    for p in &mut pending {
+        assert!(matches!(
+            p.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Err(Error::DeadlineExceeded))
+        ));
+    }
+    drop(pending);
+    drop(held);
+    for (t, r) in transfers.iter().zip(&requests) {
+        assert!(
+            futures::executor::block_on(t.admit_receive(r, &scope))
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert_eq!(
+        (
+            requests[0].route.remaining_links,
+            requests[0].route.remaining_attempts,
+            requests[0].route.deadline.0
+        ),
+        original
+    );
+    for m in metrics {
+        assert_eq!(m.gauge(Gauge::PeerReceiveActive), 0);
+        assert_eq!(m.gauge(Gauge::PeerReceiveQueued), 0);
+    }
 }
 
 /// Common signed HTTP plumbing. Scenarios retain their own membership and service.

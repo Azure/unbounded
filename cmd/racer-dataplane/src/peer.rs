@@ -32,6 +32,7 @@ use uring_runtime::environment::now;
 
 pub mod forwarding;
 pub mod protocol;
+pub mod receive;
 pub mod server;
 pub mod subscriptions;
 pub mod transport;
@@ -992,6 +993,7 @@ impl Requester {
             } else {
                 crate::rdma::TransportPlan::Http
             };
+            let receive_permit = transfers.admit_receive(&request.request, &scope).await?;
             let _probe = health.acquire(&next)?;
             let permit = paths
                 .peer_admission
@@ -1008,6 +1010,7 @@ impl Requester {
                     Some(membership.clone()),
                     relay,
                     permit.clone(),
+                    receive_permit,
                     socket_failure.clone(),
                     timing,
                     &scope,

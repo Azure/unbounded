@@ -258,20 +258,21 @@ impl Sessions {
         rail: RailId,
         scope: &'a RequestScope,
     ) -> Operation<'a, PreparedSession> {
-        self.prepare_admitted(peer, rail, None, scope)
+        self.prepare_admitted(peer, rail, None, None, scope)
     }
     pub(crate) fn prepare_admitted<'a>(
         &'a self,
         peer: &'a VerifiedPeer,
         rail: RailId,
         permit: Option<std::sync::Arc<crate::peer::Permit>>,
+        receive: Option<std::sync::Arc<crate::peer::receive::Permit>>,
         scope: &'a crate::runtime::RequestScope,
     ) -> Operation<'a, PreparedSession> {
         #[cfg(test)]
         self.prepare_attempts.set(self.prepare_attempts.get() + 1);
         Box::pin(wait(scope, move |cx| {
             self.register_driver(cx.waker());
-            self.poll_prepare(peer, rail, permit.clone())
+            self.poll_prepare(peer, rail, permit.clone(), receive.clone())
         }))
     }
     fn poll_prepare(
@@ -279,6 +280,7 @@ impl Sessions {
         peer: &VerifiedPeer,
         rail: RailId,
         permit: Option<std::sync::Arc<crate::peer::Permit>>,
+        receive: Option<std::sync::Arc<crate::peer::receive::Permit>>,
     ) -> Poll<Result<PreparedSession>> {
         if !self.ready(rail) {
             return Poll::Ready(Err(Error::Unavailable));
@@ -295,7 +297,11 @@ impl Sessions {
         }
         let qp = std::task::ready!(QueuePairHandle::poll_new_admitted(
             self.devices.select(rail)?.handle,
-            permit.map(|p| p as rdma_verbs::Guard)
+            if receive.is_some() {
+                Some(std::sync::Arc::new((permit, receive)) as rdma_verbs::Guard)
+            } else {
+                permit.map(|p| p as rdma_verbs::Guard)
+            }
         ))?;
         // Bound a peer that opens setup but never completes the exchange. A
         // transfer subsequently replaces this with its original request deadline.
@@ -2629,9 +2635,24 @@ pub(crate) mod tests {
                 .unwrap();
                 let peer = racer_control_wire::NodeId("native-peer".into());
                 let permit = peer_admission.acquire(&peer).unwrap();
+                let receive_quota = flow_control::Quotas::new(AdmissionPolicy::new(
+                    crate::test_support::cluster::config(true).limits,
+                ));
+                let receive_gate = crate::peer::receive::Gate::with_metrics(
+                    crate::peer::receive::Config {
+                        active: 1,
+                        ..Default::default()
+                    },
+                    peer_metrics.clone(),
+                )
+                .unwrap();
+                let receive =
+                    futures::executor::block_on(receive_gate.acquire(&receive_quota, &scope()))
+                        .unwrap()
+                        .unwrap();
                 let qp = immediate(QueuePairHandle::poll_new_admitted(
                     io.device(0),
-                    Some(permit),
+                    Some(std::sync::Arc::new((permit, receive))),
                 ))
                 .unwrap();
                 let writer = claim(&io);
@@ -2769,6 +2790,11 @@ pub(crate) mod tests {
                         peer_admission.acquire(&peer),
                         Err(Error::Overloaded)
                     ));
+                    assert_eq!(
+                        peer_metrics.gauge(crate::telemetry::Gauge::PeerReceiveActive),
+                        1,
+                        "failed native fence retains receive admission"
+                    );
                     native.retry_now(0);
                     native.poll_budgeted(2).unwrap();
                     assert_eq!(charged.get(), 1);
@@ -2777,6 +2803,11 @@ pub(crate) mod tests {
                     native.retry_now(0);
                     native.poll_budgeted(2).unwrap();
                     assert_eq!(io.snapshot(0).state, State::Ready);
+                    assert_eq!(
+                        peer_metrics.gauge(crate::telemetry::Gauge::PeerReceiveActive),
+                        0
+                    );
+                    assert_eq!(receive_quota.used(ResourceClass::RequestContext), 0);
                     assert_eq!(
                         peer_metrics.gauge(crate::telemetry::Gauge::PeerExchanges),
                         0

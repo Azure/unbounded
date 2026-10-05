@@ -1469,6 +1469,11 @@ impl Default for Metrics {
 }
 // Declaration order is the counter index; names are the exported wire contract.
 metrics! { Event, EVENTS, EVENT_COUNT;
+            Self::PeerReceiveAdmitted => "racer_peer_receive_admitted_total",
+            Self::PeerReceiveFull => "racer_peer_receive_full_total",
+            Self::PeerReceiveTimeout => "racer_peer_receive_timeout_total",
+            Self::PeerReceiveCancelled => "racer_peer_receive_canceled_total",
+            Self::PeerReceiveWaitNs => "racer_peer_receive_wait_ns_total",
             Self::PageHedgeStarted => "racer_page_hedges_started_total",
             Self::PageHedgeWon => "racer_page_hedges_won_total",
             Self::PageHedgeSuppressed => "racer_page_hedges_suppressed_total",
@@ -1549,6 +1554,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::OpaqueRelayBodyFailed => "racer_opaque_relay_body_failed_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
+            Self::PeerReceiveActive => "racer_peer_receive_active",
+            Self::PeerReceiveQueued => "racer_peer_receive_queued",
             Self::PeerAdmissionLimit => "racer_peer_admission_limit",
             Self::PeerExchanges => "racer_peer_exchanges_active",
             Self::DiagnosticConnections => "racer_diagnostic_connections",

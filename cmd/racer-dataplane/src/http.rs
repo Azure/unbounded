@@ -85,6 +85,7 @@ impl http1::connection::Context for HttpContext {
 #[derive(Default)]
 pub struct State {
     pub(crate) peer_admission: Option<std::sync::Arc<crate::peer::Permit>>,
+    pub(crate) receive_permit: Option<std::sync::Arc<crate::peer::receive::Permit>>,
     pub(crate) peer_response_verified: bool,
     pub(crate) connect_failure: Option<Rc<std::cell::Cell<bool>>>,
     #[cfg(test)]
@@ -132,6 +133,7 @@ impl http1::connection::State<Error> for State {
     fn attach(&mut self, checkout: Self) {
         self.relay_reservation = checkout.relay_reservation;
         self.peer_admission = checkout.peer_admission;
+        self.receive_permit = checkout.receive_permit;
         self.connect_failure = checkout.connect_failure;
     }
     fn idle(mut self) -> Self {
@@ -268,6 +270,7 @@ pub fn pool_with_limits(
         },
     )
 }
+#[cfg(test)]
 pub(crate) fn checkout_peer<'a>(
     pool: &'a HttpPool,
     endpoint: &'a Endpoint,
@@ -2239,16 +2242,32 @@ pub(crate) mod tests {
             let baseline = admission.used(ResourceClass::RequestContext);
             let pool = new_pool(reactor.clone(), admission.clone(), 1);
             let (listener, endpoint) = Listener::peer();
-            let (connection, peer) = held(&pool, &reactor, &admission, &endpoint, &listener);
+            let (mut connection, peer) = held(&pool, &reactor, &admission, &endpoint, &listener);
             let scope =
                 RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(5))
                     .unwrap();
+            let metrics = crate::telemetry::Metrics::default();
+            let gate = crate::peer::receive::Gate::with_metrics(
+                crate::peer::receive::Config {
+                    active: 1,
+                    ..Default::default()
+                },
+                metrics.clone(),
+            )
+            .unwrap();
+            connection.state_mut().receive_permit =
+                futures::executor::block_on(gate.acquire(&admission, &scope)).unwrap();
             let staging = OwnedBuffer::new(&HttpContext(admission.clone()), 4096).unwrap();
             let mut receive = reactor.recv(connection.socket(), staging, connection, &scope);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(matches!(receive.as_mut().poll(&mut cx), Poll::Pending));
             drop(receive);
             drop(pool);
+            assert_eq!(
+                metrics.gauge(crate::telemetry::Gauge::PeerReceiveActive),
+                1,
+                "abandonment is not a receive fence"
+            );
             assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
             assert!(admission.used(ResourceClass::RequestContext) >= baseline + 4096);
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -2260,6 +2279,7 @@ pub(crate) mod tests {
             drop(peer);
             assert_eq!(admission.used(ResourceClass::Connection), 0);
             assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+            assert_eq!(metrics.gauge(crate::telemetry::Gauge::PeerReceiveActive), 0);
         }
         #[test]
         fn adaptive_connect_errno_preserves_local_exhaustion_as_neutral() {
@@ -2489,8 +2509,19 @@ pub(crate) mod tests {
                     if end == "deadline" {
                         f.scope.deadline.0 = Instant::now() + Duration::from_millis(40);
                     }
-                    let (source, destination, writer, reader) =
+                    let (mut source, destination, writer, reader) =
                         f.connections(16 * 1024 * 1024 + 16);
+                    let metrics = crate::telemetry::Metrics::default();
+                    let gate = crate::peer::receive::Gate::with_metrics(
+                        crate::peer::receive::Config {
+                            active: 1,
+                            ..Default::default()
+                        },
+                        metrics.clone(),
+                    )
+                    .unwrap();
+                    source.state_mut().receive_permit =
+                        futures::executor::block_on(gate.acquire(&f.admission, &f.scope)).unwrap();
                     let pipe = f.pipes.acquire().unwrap();
                     let mut held_writer = Some(writer);
                     let producer = if writing {
@@ -2543,12 +2574,14 @@ pub(crate) mod tests {
                     }
                     drop(work);
                     if end == "drop" && !writing {
+                        assert_eq!(metrics.gauge(crate::telemetry::Gauge::PeerReceiveActive), 1);
                         assert_eq!(f.reactor.in_flight(), 1);
                         assert_eq!(f.admission.used(ResourceClass::Connection), 2);
                         assert_eq!(f.admission.used(ResourceClass::Relay), 1);
                         assert_eq!(f.admission.used(ResourceClass::Pipe), 1);
                     }
                     f.drain();
+                    assert_eq!(metrics.gauge(crate::telemetry::Gauge::PeerReceiveActive), 0);
                     assert_eq!(f.admission.used(ResourceClass::Connection), 0);
                     assert_eq!(f.admission.used(ResourceClass::Relay), 0);
                     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
@@ -3337,7 +3370,25 @@ pub(crate) mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
             let pool = new_pool(reactor.clone(), admission.clone(), 1);
-            let mut future = pool.checkout(&endpoint, &scope);
+            let metrics = crate::telemetry::Metrics::default();
+            let gate = crate::peer::receive::Gate::with_metrics(
+                crate::peer::receive::Config {
+                    active: 1,
+                    ..Default::default()
+                },
+                metrics.clone(),
+            )
+            .unwrap();
+            let receive_permit =
+                futures::executor::block_on(gate.acquire(&admission, &scope)).unwrap();
+            let mut future = pool.checkout_with_state(
+                &endpoint,
+                State {
+                    receive_permit,
+                    ..Default::default()
+                },
+                &scope,
+            );
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(future.as_mut().poll(&mut cx).is_pending());
             assert_eq!(reactor.in_flight(), 1);
@@ -3349,9 +3400,15 @@ pub(crate) mod tests {
             }
             drop(future);
             drop(pool);
+            assert_eq!(
+                metrics.gauge(crate::telemetry::Gauge::PeerReceiveActive),
+                1,
+                "connect cancel/drop must fence before receive readmission"
+            );
             assert_eq!(admission.used(ResourceClass::Connection), 1);
             assert_eq!(reactor.in_flight(), 1);
             drain(&reactor);
+            assert_eq!(metrics.gauge(crate::telemetry::Gauge::PeerReceiveActive), 0);
             assert_eq!(admission.used(ResourceClass::Connection), 0);
             assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
             // No pool sweep exists: prove admission regained the charge rather than leaking it.

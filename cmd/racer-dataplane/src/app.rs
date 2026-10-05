@@ -122,6 +122,7 @@ pub struct NodeState {
     send_crc: crate::telemetry::Samples,
     hedges: std::sync::OnceLock<Arc<crate::read::candidates::Hedges>>,
     peer_admission: Arc<crate::peer::AdaptivePeers>,
+    peer_receive: std::sync::OnceLock<Arc<crate::peer::receive::Gate>>,
     subscriptions: Arc<crate::peer::subscriptions::Subscriptions>,
     ingress: Arc<crate::admission::Ingress>,
     metrics: Vec<(WorkerId, crate::telemetry::Metrics)>,
@@ -170,6 +171,7 @@ impl NodeState {
         let peer_admission = crate::peer::AdaptivePeers::new(peer_config, metrics[0].clone())?;
         Ok(Self {
             peer_admission,
+            peer_receive: Default::default(),
             inventory: Arc::new(crate::rdma::Inventory::default()),
             send_crc: Default::default(),
             hedges: std::sync::OnceLock::new(),
@@ -601,6 +603,13 @@ impl WorkerApplication {
             wire.clone(),
             signatures.clone(),
         )
+        .with_receive_gate({
+            let gate = crate::peer::receive::Gate::with_metrics(
+                config.peer_receive,
+                node.metrics[0].1.clone(),
+            )?;
+            node.peer_receive.get_or_init(|| gate).clone()
+        })
         .with_reclamation(Self::ciphertext_reclaimer(
             admission.clone(),
             memory.clone(),
@@ -1058,6 +1067,9 @@ impl WorkerApplication {
         self.poll_checkpoint(cx)?;
         self.poll_ingress(cx, budget)?;
         self.http.poll_waiters(budget);
+        if let Some(gate) = self.node.peer_receive.get() {
+            gate.poll_deadlines(budget);
+        }
         // Expire metadata before advancing peer/listener tasks.
         self.metadata
             .poll_deadlines(uring_runtime::environment::now(), budget);

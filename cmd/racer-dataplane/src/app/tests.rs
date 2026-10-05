@@ -2792,6 +2792,60 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
 }
 
 #[test]
+fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
+    use futures::Stream;
+    use futures::stream::FuturesUnordered;
+    let clock = uring_runtime::environment::SimulationClock::new(919);
+    let _env = clock.environment(0).enter();
+    let mut config = crate::test_support::cluster::config(false);
+    config.peer_receive.active = 1;
+    config.peer_receive.wait = Duration::from_millis(10);
+    let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 16).unwrap());
+    let (mut first, _, _) = local_worker(&config, &node, 0);
+    let (second, _, _) = local_worker(&config, &node, 1);
+    let gate = node.peer_receive.get().unwrap().clone();
+    assert!(Arc::ptr_eq(&gate, second.node.peer_receive.get().unwrap()));
+    let scope = crate::runtime::RequestScope::new(
+        crate::model::RequestId([19; 16]),
+        uring_runtime::environment::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    let permit = futures::executor::block_on(gate.acquire(&first.runtime.admission, &scope))
+        .unwrap()
+        .unwrap();
+    let pending = async { gate.acquire(&second.runtime.admission, &scope).await };
+    let mut children = FuturesUnordered::new();
+    children.push(Box::pin(pending));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(
+        std::pin::Pin::new(&mut children)
+            .poll_next(&mut cx)
+            .is_pending()
+    );
+    first.started = true;
+    first.stopping = true;
+    clock.advance(Duration::from_millis(11));
+    first.poll_budgeted(&mut cx, 0).unwrap();
+    assert!(
+        std::pin::Pin::new(&mut children)
+            .poll_next(&mut cx)
+            .is_pending()
+    );
+    first.poll_budgeted(&mut cx, 64).unwrap();
+    assert!(matches!(
+        std::pin::Pin::new(&mut children).poll_next(&mut cx),
+        Poll::Ready(Some(Err(Error::DeadlineExceeded)))
+    ));
+    drop(children);
+    drop(permit);
+    assert!(
+        futures::executor::block_on(gate.acquire(&second.runtime.admission, &scope))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn workers_share_configured_page_hedge_slots_and_bytes() {
     let clock = uring_runtime::environment::SimulationClock::new(907);
     let _environment = clock.environment(0).enter();

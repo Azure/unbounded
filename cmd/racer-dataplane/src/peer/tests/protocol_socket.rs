@@ -1465,6 +1465,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
                     Some(membership.clone()),
                     None,
                     None,
+                    None,
                     Rc::new(std::cell::Cell::new(false)),
                     None,
                     &scope,
