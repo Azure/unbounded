@@ -192,7 +192,7 @@ dependencies = [
 ]
 `
 
-	versions, err := lockedDirectVersions(lock, direct)
+	versions, err := lockedDirectVersions(lock, direct, crateName)
 	if err != nil {
 		t.Fatalf("lockedDirectVersions: %v", err)
 	}
@@ -365,5 +365,201 @@ dependencies = [
 
 	if entries[0].License[0].Name != "MIT License" || entries[0].License[1].Name != "Apache License, Version 2.0" {
 		t.Fatalf("licenses = %#v", entries[0].License)
+	}
+}
+
+func TestCollectorFollowsLocalDependencies(t *testing.T) {
+	for _, section := range []string{"dependencies", "build-dependencies", `target.'cfg(unix)'.dependencies`, `target.'cfg(unix)'.build-dependencies`} {
+		t.Run(section, func(t *testing.T) {
+			root := t.TempDir()
+			cargoHome := t.TempDir()
+			testutil.WriteTree(t, root, map[string]string{
+				cratePath + "/Cargo.toml": "[" + section + "]\nrenamed = { package = \"topology\", path = \"topology\" }\n[dev-dependencies]\nignored = { path = \"missing\" }\n",
+				cratePath + "/topology/Cargo.toml": `[dependencies]
+sha2 = "0.10"
+shared = { path = "../shared" }
+[build-dependencies]
+builder = { path = "../shared", package = "shared" }
+[dev-dependencies]
+futures = "0.3"
+`,
+				cratePath + "/shared/Cargo.toml": `[dependencies]
+sha2 = "0.10"
+# A cycle must not cause unbounded traversal.
+topology = { path = "../topology" }
+`,
+				cratePath + "/Cargo.lock": `[[package]]
+name = "racer-dataplane"
+version = "0.1.0"
+dependencies = [
+ "topology",
+]
+[[package]]
+name = "topology"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+ "shared",
+ "futures",
+]
+[[package]]
+name = "shared"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+ "topology",
+]
+[[package]]
+name = "sha2"
+version = "0.10.9"
+dependencies = [
+ "digest",
+]
+[[package]]
+name = "sha2"
+version = "0.9.9"
+[[package]]
+name = "futures"
+version = "0.3.31"
+`,
+			})
+			testutil.WriteTree(t, cargoHome, map[string]string{
+				"registry/src/index/sha2-0.10.9/LICENSE": testutil.MITLicense("Copyright (c) 2026 Example"),
+			})
+
+			c := New(cargoHome)
+			if err := c.Precheck(root); err != nil {
+				t.Fatalf("Precheck: %v", err)
+			}
+
+			entries, err := c.Collect(root)
+			if err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+
+			if len(entries) != 1 || entries[0].Dependency != "sha2" {
+				t.Fatalf("entries = %#v; want only sha2", entries)
+			}
+
+			if got := entries[0].License[0].Link; got != "https://docs.rs/crate/sha2/0.10.9/source/LICENSE" {
+				t.Errorf("license link = %q", got)
+			}
+		})
+	}
+}
+
+func TestCollectorLocalDependencyFailures(t *testing.T) {
+	const (
+		rootLock = `[[package]]
+name = "racer-dataplane"
+version = "0.1.0"
+dependencies = [
+ "topology",
+]
+`
+		topologyLock = `[[package]]
+name = "topology"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+`
+		shaLock = `[[package]]
+name = "sha2"
+version = "0.10.9"
+`
+	)
+
+	for _, tt := range []struct {
+		name     string
+		manifest string
+		lock     string
+		want     string
+	}{
+		{name: "missing manifest", lock: rootLock + topologyLock, want: "topology/Cargo.toml"},
+		{name: "malformed dependency", manifest: "[dependencies]\ninvalid\n", lock: rootLock + topologyLock, want: "invalid dependency line"},
+		{name: "missing local lock entry", manifest: "[dependencies]\n", lock: rootLock, want: "dependency topology has no locked version"},
+		{name: "missing registry lock entry", manifest: "[dependencies]\nsha2 = \"0.10\"\n", lock: rootLock + topologyLock, want: "dependency sha2 has no locked version"},
+		{name: "missing dependency edge", manifest: "[dependencies]\nsha2 = \"0.10\"\n", lock: rootLock + "[[package]]\nname = \"topology\"\nversion = \"0.1.0\"\n" + shaLock, want: "direct dependency sha2 not found in root lock entry"},
+		{name: "ambiguous registry version", manifest: "[dependencies]\nsha2 = \"0.10\"\n", lock: rootLock + topologyLock + shaLock + "[[package]]\nname = \"sha2\"\nversion = \"0.9.9\"\n", want: "dependency sha2 has ambiguous locked versions"},
+		{name: "missing registry cache", manifest: "[dependencies]\nsha2 = \"0.10\"\n", lock: rootLock + topologyLock + shaLock, want: "registry source directory not found"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+
+			files := map[string]string{
+				cratePath + "/Cargo.toml": "[dependencies]\ntopology = { path = \"topology\" }\n",
+				cratePath + "/Cargo.lock": tt.lock,
+			}
+			if tt.manifest != "" {
+				files[cratePath+"/topology/Cargo.toml"] = tt.manifest
+			}
+
+			testutil.WriteTree(t, root, files)
+
+			_, err := New(t.TempDir()).Collect(root)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Collect error = %v; want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestCollectorLocalOnlyDependencies(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		cratePath + "/Cargo.toml":          "[dependencies]\ntopology = { path = \"topology\" }\n",
+		cratePath + "/topology/Cargo.toml": "[dev-dependencies]\nfutures = \"0.3\"\n",
+		cratePath + "/Cargo.lock": `[[package]]
+name = "racer-dataplane"
+version = "0.1.0"
+dependencies = [
+ "topology",
+]
+[[package]]
+name = "topology"
+version = "0.1.0"
+dependencies = [
+ "futures",
+]
+`,
+	})
+
+	entries, err := New(t.TempDir()).Collect(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("Collect = %v, %v; want no entries and no error", entries, err)
+	}
+}
+
+func TestCollectorRejectsConflictingLocalRegistryVersions(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		cratePath + "/Cargo.toml":          "[dependencies]\ntopology = { path = \"topology\" }\nsha2 = \"0.9\"\n",
+		cratePath + "/topology/Cargo.toml": "[dependencies]\nsha2 = \"0.10\"\n",
+		cratePath + "/Cargo.lock": `[[package]]
+name = "racer-dataplane"
+version = "0.1.0"
+dependencies = [
+ "topology",
+ "sha2 0.9.9",
+]
+[[package]]
+name = "topology"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+]
+[[package]]
+name = "sha2"
+version = "0.9.9"
+[[package]]
+name = "sha2"
+version = "0.10.9"
+`,
+	})
+
+	_, err := New(t.TempDir()).Collect(root)
+	if err == nil || !strings.Contains(err.Error(), "dependency sha2 has ambiguous locked versions") {
+		t.Fatalf("Collect error = %v; want conflicting registry version error", err)
 	}
 }

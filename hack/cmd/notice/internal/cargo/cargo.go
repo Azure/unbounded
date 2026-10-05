@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package cargo implements a notice.Collector for direct non-development
-// dependencies of cmd/racer-dataplane.
+// dependencies of cmd/racer-dataplane and its local path dependencies.
 package cargo
 
 import (
@@ -31,6 +31,7 @@ type Collector struct {
 
 type dependency struct {
 	packageName string
+	path        string
 }
 
 // New constructs a Collector. An empty cargoHome uses CARGO_HOME or Cargo's
@@ -89,18 +90,6 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, err
 	}
 
-	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
-
-	manifest, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", manifestPath, err)
-	}
-
-	direct, err := directDependencies(string(manifest))
-	if err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", manifestPath, err)
-	}
-
 	lockPath := filepath.Join(root, cratePath, "Cargo.lock")
 
 	lock, err := os.ReadFile(lockPath)
@@ -108,7 +97,7 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, fmt.Errorf("reading %s: %w", lockPath, err)
 	}
 
-	versions, err := lockedDirectVersions(string(lock), direct)
+	versions, err := localRegistryVersions(filepath.Join(root, cratePath), string(lock))
 	if err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", lockPath, err)
 	}
@@ -124,6 +113,74 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	}
 
 	return entries, nil
+}
+
+// localRegistryVersions follows local crates, but not registry transitives.
+func localRegistryVersions(root, lock string) (map[string]string, error) {
+	versions := map[string]string{}
+	visited := map[string]bool{}
+
+	var visit func(string, string) error
+
+	visit = func(dir, name string) error {
+		manifestPath := filepath.Join(dir, "Cargo.toml")
+
+		canonical, err := filepath.EvalSymlinks(manifestPath)
+		if err != nil {
+			return fmt.Errorf("reading %s: %w", manifestPath, err)
+		}
+
+		if visited[canonical] {
+			return nil
+		}
+
+		visited[canonical] = true
+
+		manifest, err := os.ReadFile(manifestPath)
+		if err != nil {
+			return fmt.Errorf("reading %s: %w", manifestPath, err)
+		}
+
+		direct, err := directDependencies(string(manifest))
+		if err != nil {
+			return fmt.Errorf("parsing %s: %w", manifestPath, err)
+		}
+
+		locked, err := lockedDirectVersions(lock, direct, name)
+		if err != nil {
+			return fmt.Errorf("crate %s: %w", name, err)
+		}
+
+		for _, dep := range direct {
+			if dep.path != "" {
+				path := dep.path
+				if !filepath.IsAbs(path) {
+					path = filepath.Join(dir, path)
+				}
+
+				if err := visit(path, dep.packageName); err != nil {
+					return err
+				}
+
+				continue
+			}
+
+			version := locked[dep.packageName]
+			if previous := versions[dep.packageName]; previous != "" && previous != version {
+				return fmt.Errorf("dependency %s has ambiguous locked versions", dep.packageName)
+			}
+
+			versions[dep.packageName] = version
+		}
+
+		return nil
+	}
+
+	if err := visit(root, crateName); err != nil {
+		return nil, err
+	}
+
+	return versions, nil
 }
 
 // cargoFilesPresent permits an inactive scaffold, but rejects incomplete inputs.
@@ -341,11 +398,11 @@ func directDependencies(data string) (map[string]dependency, error) {
 		name := strings.Trim(strings.TrimSpace(key), `"'`)
 
 		packageName := name
-		if parsed := inlinePackageName(value); parsed != "" {
+		if parsed := inlineField(value, "package"); parsed != "" {
 			packageName = parsed
 		}
 
-		direct[name] = dependency{packageName: packageName}
+		direct[name] = dependency{packageName: packageName, path: inlineField(value, "path")}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -355,10 +412,10 @@ func directDependencies(data string) (map[string]dependency, error) {
 	return direct, nil
 }
 
-func inlinePackageName(value string) string {
+func inlineField(value, name string) string {
 	for _, field := range strings.Split(strings.Trim(value, " {}"), ",") {
 		key, fieldValue, found := strings.Cut(field, "=")
-		if found && strings.TrimSpace(key) == "package" {
+		if found && strings.TrimSpace(key) == name {
 			return quotedValue(strings.TrimSpace(fieldValue))
 		}
 	}
@@ -371,7 +428,7 @@ func dependencySection(section string) bool {
 		(strings.HasPrefix(section, "target.") && (strings.HasSuffix(section, ".dependencies") || strings.HasSuffix(section, ".build-dependencies")))
 }
 
-func lockedDirectVersions(data string, direct map[string]dependency) (map[string]string, error) {
+func lockedDirectVersions(data string, direct map[string]dependency, owner string) (map[string]string, error) {
 	type pkg struct {
 		name, version string
 		dependencies  []string
@@ -429,14 +486,14 @@ func lockedDirectVersions(data string, direct map[string]dependency) (map[string
 	var root *pkg
 
 	for i := range packages {
-		if packages[i].name == crateName {
+		if packages[i].name == owner {
 			root = &packages[i]
 			break
 		}
 	}
 
 	if root == nil {
-		return nil, fmt.Errorf("%s package not found", crateName)
+		return nil, fmt.Errorf("%s package not found", owner)
 	}
 
 	versions := map[string]string{}
