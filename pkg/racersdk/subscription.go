@@ -6,10 +6,12 @@ package racersdk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk/internal/connpool"
@@ -399,6 +401,22 @@ func (s *PageStream) readFull(p []byte) error {
 	return s.readBytes(p, false)
 }
 
+// truncation classifies a read failure after the response head. A clean peer
+// close is truncation. So is a peer reset: a dataplane that abandons a
+// subscription while client credit releases are still unread in its receive
+// queue resets the stream (ECONNRESET on Linux AF_UNIX) instead of closing it
+// cleanly. The reset stays in the chain as the underlying cause.
+func truncation(err error) error {
+	switch {
+	case err == io.EOF:
+		return io.ErrUnexpectedEOF
+	case errors.Is(err, syscall.ECONNRESET):
+		return fmt.Errorf("%w: %w", io.ErrUnexpectedEOF, err)
+	default:
+		return err
+	}
+}
+
 func (s *PageStream) readPayload(p []byte) error {
 	return s.readBytes(p, true)
 }
@@ -416,9 +434,7 @@ func (s *PageStream) readBytes(p []byte, payload bool) error {
 
 		p = p[n:]
 
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
+		err = truncation(err)
 		// A peer may close immediately after the final bytes. Clearing an old
 		// deadline must not discard bytes that were successfully received.
 		_ = s.conn.SetReadDeadline(time.Time{}) //nolint:errcheck // Best-effort cleanup preserves successfully received bytes after peer close.

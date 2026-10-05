@@ -10,13 +10,17 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
 func TestStatAdmissionLeaseLifecycle(t *testing.T) {
@@ -464,6 +468,131 @@ func TestClientContinuationFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A peer that abandons a subscription while a credit release is still unread
+// in its receive queue resets the socket instead of closing it cleanly. That
+// is still post-header truncation, on both the Read and buffered HTTP paths.
+func TestClientPeerResetAfterReleaseIsTruncation(t *testing.T) {
+	for _, path := range []string{"read", "http"} {
+		t.Run(path, func(t *testing.T) {
+			size := uint64(PageSize) + 2
+			socket := filepath.Join(socketDir(t), "socket")
+
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			served := make(chan struct{})
+
+			t.Cleanup(func() { closeBody(listener); <-served })
+
+			go func() {
+				defer close(served)
+
+				conn, err := listener.Accept()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer closeBody(conn)
+
+				if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
+					t.Error(err)
+					return
+				}
+
+				if _, err := io.WriteString(conn, subscriptionHead(size, 0, size)); err != nil {
+					t.Error(err)
+					return
+				}
+
+				if err := fakeSubscriptionFrame(conn, 1, 0, 0, uint32(PageSize)); err != nil {
+					t.Error(err)
+					return
+				}
+
+				if _, err := io.CopyN(conn, repeatedByte('x'), int64(PageSize)); err != nil {
+					t.Error(err)
+					return
+				}
+
+				// Wait until the release is queued, without consuming it, so the
+				// close below deterministically resets the client side.
+				if err := peekCredit(conn.(*net.UnixConn)); err != nil {
+					t.Error(err)
+				}
+			}()
+
+			c := testClient(t, socket, 1)
+
+			var n int64
+
+			if path == "read" {
+				v, getErr := c.Get(context.Background(), Request{})
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+
+				n, err = io.Copy(io.Discard, v)
+			} else {
+				v, getErr := c.GetStreaming(context.Background(), Request{})
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+
+				n, err = v.WriteToHTTP(httptest.NewRecorder())
+			}
+
+			if n != int64(PageSize) {
+				t.Fatal("prefix bytes", n, err)
+			}
+
+			assertKind(t, err, ErrorIO)
+
+			if !errors.Is(err, io.ErrUnexpectedEOF) || !errors.Is(err, syscall.ECONNRESET) {
+				t.Fatalf("reset must be truncation with its cause: %#v", errors.Unwrap(err))
+			}
+		})
+	}
+}
+
+// peekCredit blocks until one 12-byte credit release is readable, leaving it
+// queued.
+func peekCredit(conn *net.UnixConn) error {
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
+
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	var peekErr error
+
+	buffer := make([]byte, wire.CreditSize)
+
+	err = raw.Read(func(fd uintptr) bool {
+		n, _, err := syscall.Recvfrom(int(fd), buffer, syscall.MSG_PEEK)
+		if errors.Is(err, syscall.EAGAIN) || err == nil && n > 0 && n < len(buffer) {
+			return false
+		}
+
+		if err == nil && n == 0 {
+			err = io.ErrUnexpectedEOF
+		}
+
+		peekErr = err
+
+		return true
+	})
+	if err != nil {
+		return err
+	}
+
+	return peekErr
 }
 
 func TestClientContinuationCloseAndContext(t *testing.T) {

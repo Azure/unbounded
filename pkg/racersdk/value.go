@@ -606,11 +606,7 @@ func (h *streamingHTTP) payload(remaining int64) (int64, error) {
 		}
 
 		if readErr != nil {
-			if readErr == io.EOF {
-				readErr = io.ErrUnexpectedEOF
-			}
-
-			return written, ioFailure("subscription payload", readErr)
+			return written, ioFailure("subscription payload", truncation(readErr))
 		}
 
 		if n == 0 {
