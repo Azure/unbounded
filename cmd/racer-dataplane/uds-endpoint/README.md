@@ -1,93 +1,149 @@
 # uds-endpoint
 
-Linux filesystem ownership for Unix stream socket endpoints. This crate depends
-only on libc, not Racer identifiers, control, HTTP, or a runtime.
+Private Linux filesystem-ownership helper for `racer-dataplane`. This unpublished
+crate depends only on `libc`. It does not depend on an application model, runtime,
+protocol, reactor, or service-activation policy. It owns Unix stream socket names
+and a worker-local publication journal, not application readiness or admission.
 
-## API and boundary
+## Platform and trust boundary
 
-- `open_directory(path, mode)` and `child_directory(parent, name, mode)` open or
-  create directories using O_NOFOLLOW. The walk starts at `/` (also for relative
-  input, preserving the extracted behavior). Child names must be single normal
-  components; callers validate their application names.
-- `restrict_directory(directory, remove)` removes only requested permission bits
-  from a directory owned by the effective UID and verifies inode/UID/GID/mode.
-- `file_path`, `same_inode`, and `pin_socket` support operations on pinned inodes.
-  A descriptor pathname remains valid only while its descriptor is retained.
-- `Layout` supplies persistent lock/canonical names, witness prefix, and the
-  temporary-name predicate. Names are caller-validated single components and
-  namespaces must be disjoint and stable across restarts.
-- `EndpointOwner::acquire(directory, layout, lock_mode)` holds a nonblocking
-  exclusive flock on a private single-link regular file. Acquisition refuses
-  group/world-writable or foreign-owned directories. `validate` checks directory
-  and lock-path identity. The lock inode persists on drop; explicit unlock also
-  releases ownership when a fork temporarily retains a descriptor alias.
-- Recovery validates all witness and temporary inodes before deleting any socket
-  pathname. A canonical socket requires a hard-link witness. Every witness must
-  refuse a nonblocking connection; live and foreign sockets are preserved.
-- `BoundSocket::bind(directory, owner, basename, witness)` binds the witness first,
-  hard-links the staging name, and makes the listener nonblocking. It exposes
-  `accept`, `AsRawFd`, `identity`, and a worker-local shared `basename` for the
-  caller's publication transaction. It retains its owner until inode-checked
-  cleanup finishes. Failed pathname removal retains the witness for recovery.
-  The directory must already be covered by the supplied owner. The caller sets
-  socket permissions after bind, using `pin_socket` to reject symlink swaps.
+Linux with procfs mounted at `/proc` is required. Operations use descriptor-relative
+`openat`/`linkat`/`unlinkat`, `O_PATH`, `O_NOFOLLOW`, `flock`, and `renameat2` with
+`RENAME_EXCHANGE`/`RENAME_NOREPLACE`. The filesystem must support socket hard links
+and those rename operations. Missing capabilities are errors, not fallbacks to
+unsafe pathname operations. No additional privileges are needed for owned paths.
 
-Racer retains `/run/racer/<name>/client`, cache definition validation, naming and
-mode policy (directories 0755, lock 0600, socket 0666), retirement, admission,
-readiness, and control transitions. Its simulation remains exclusively cfg(test)
-in the application. The optional `test-util` feature exposes only an inherited
-lock-descriptor clone for the retained root lifecycle test; it does not enable
-simulation or replace production filesystem calls.
+Cooperating effective-UID owners must serialize directory mutation and respect
+the persistent lock. A hostile process with the same UID or root is outside the
+boundary: Linux has no compare-inode-and-unlink syscall. Inode checks prevent
+accidental deletion of already-replaced names, not adversarial races between a
+check and a mutation. Ancestor renames do not redirect retained directory handles.
 
-## Transactional publication
+## Layout and ownership API
 
-`publication::Endpoint` abstracts only inode checks, pinned-directory identity,
-rename, and cleanup-name bookkeeping. `BoundSocket` implements real operations;
-Racer's adapter retains its cfg(test) simulation and rename fault injection.
-The generic journal has no runtime or simulation feature dependency.
+`Layout::new(lock, canonical, witness_prefix, temporary_name)` returns
+`io::Result<Layout>`. All configured names must be normal single components
+(nonempty, not `.`/`..`, no slash or NUL, at most 255 bytes). The lock, canonical,
+witness, and temporary namespaces must be disjoint and stable across restarts.
+Construction checks known overlaps. Because the temporary-name predicate is a
+function, bind and recovery also check each actual temporary and derived witness
+name. A filesystem-valid name can still exceed Linux's Unix socket address limit.
 
-- `Replacement::prepare(next, previous, temporary, canonical)` checks canonical
-  ownership and directory identity, or canonical absence for a new endpoint.
-  No pathname is changed during this precheck.
-- `Publication::publish` rechecks both exchange inodes and uses RENAME_EXCHANGE
-  when replacing an owned endpoint. New endpoints use RENAME_NOREPLACE, which
-  rejects destinations created after prepare. Cleanup basenames change only
-  after a successful rename. Only successful renames enter the journal.
-- `rollback` and Drop restore replacements in reverse order. Foreign canonical
-  or temporary inodes are not exchanged. If canonical is absent, the previous
-  owned staging inode can be restored with RENAME_NOREPLACE. A failed rollback
-  rename leaves cleanup names unchanged and is not retried by Drop.
-- `commit(&mut self)` only disarms rollback: no filesystem operation, allocation,
-  or owner drop. `previous()` lends the retained previous owners so the caller
-  can queue them for deferred cleanup before dropping the journal. New endpoints
-  with no previous owner are removed by final inode-owner cleanup, not rollback
-  rename. After commit/rollback the journal must not be reused for publication.
+- `open_directory(absolute_path, mode)` walks from `/`, opening every component
+  without following symlinks and creating missing directories. Relative paths and
+  explicit `.`/`..` components are rejected before creation. `child_directory`
+  accepts exactly one normal component. Creation modes are subject to umask.
+- `restrict_directory(directory, remove)` only removes permission bits on an
+  effective-user-owned directory; non-permission bits in `remove` are ignored.
+  It verifies inode, UID, GID, and resulting mode. Linux can also clear setgid.
+- `EndpointOwner::acquire(directory, layout)` requires an effective-user-owned
+  directory without group/world write access. There is no caller-selected lock
+  mode. The persistent lock must be a single-link regular file owned by the
+  effective UID, with no execute, special, group, or other permission bits.
+  Restrictive owner permissions, including mode 000, are repaired to 0600 on the
+  pinned inode before nonblocking exclusive `flock`. The lock is never unlinked.
+  `validate` checks directory and lock identity and their permissions.
+- `BoundSocket::bind(Rc<EndpointOwner>, temporary)` derives both directory and
+  witness from the owner: callers cannot bind under an unrelated owner. It binds
+  the witness first, pins the socket, sets mode 0600, makes the listener nonblocking,
+  and hard-links the temporary name. `accept`, `AsFd`/`AsRawFd`, and
+  `identity` expose listener operations. `basename()` returns a read-only `String`
+  snapshot, not mutable publication bookkeeping.
+- `set_mode(mode)` accepts only 000 through 0777 and changes the retained socket
+  inode through procfs, never a replacement path. It validates the owner first.
+  The caller chooses the final client-access policy before publication.
+- `file_path`, `same_inode`, and `pin_socket` support pinned-inode operations.
+  Descriptor paths remain usable only while the descriptor is retained;
+  `pin_socket` rejects non-sockets, foreign ownership, and identity changes.
 
-The caller stages every bind/chmod before publishing, serializes directory access,
-and supplies validated names and the correct endpoint owner. Racer retains cache
-selection/maps, generation changes, cancellation checks and yields, preallocated
-deferred cleanup, retirement, and the infallible CacheTransition commit. Its Drop
-explicitly rolls back before resetting the preparation guard.
+Final socket drop removes only matching inode names, retaining the owner until
+cleanup finishes. Cleanup is best effort. A stat/unlink error on the cleanup name
+retains its witness for recovery. Explicit owner drop unlocks the persistent lock,
+including when an inherited or test-only cloned descriptor aliases it. Callers
+must not continue operating an inherited listener after its owner unlocks.
 
-`ReadyListeners` remains application-owned: the epoll set is still coupled to
-ClientListeners generations, weak BoundListener owners, Racer request scopes,
-and HttpIo reactor leases. A later runtime-owned change could isolate an epoll
-descriptor/index mechanism, but this crate does not extract service admission or
-alter reactor ownership.
+## Crash and recovery ordering
 
-## Focused validation
+The witness is the proof of ownership, not merely a name that refused a
+connection. Binding it before chmod and temporary linking ensures even a crash
+under restrictive umask leaves evidence. Recovery runs while acquiring the lock:
 
-Run from `cmd/racer-dataplane`, with `CARGO_BUILD_JOBS=2` and the repository's
-external timeout wrapper:
+1. Enumerate and validate the complete configured namespace. Every witness must
+   be an effective-user-owned socket with a valid derived name. Every canonical
+   or temporary entry must be a socket hard-linked to a recognized witness.
+   Unknown or foreign entries in those namespaces fail closed, before repair or
+   removal. Unrelated names are not adopted or removed.
+2. Pin and revalidate each witness against the namespace snapshot one at a time,
+   keeping descriptor use bounded independently of the number of witnesses.
+   If a validated witness lacks owner-write permission, add that bit to its pinned
+   inode. This permits recovery after bind-before-chmod crashes. Probe every
+   witness with a nonblocking connection through its pinned procfs path. Only
+   `ECONNREFUSED` proves staleness; success or a busy connection means live, and
+   Permission errors or other syscall errors are not treated as stale.
+   A successful probe can enqueue a connection that immediately closes on the
+   live listener; this is an unavoidable side effect of this liveness check.
+3. Revalidate the owner, remove the matching canonical name first, then temporary
+   names, then witnesses. The persistent lock remains.
+
+Recovery handles witness-only, prepared witness-plus-temporary, published, and
+exchanged-but-uncommitted states. It removes stale owned endpoints; it does not
+restore an application's previous generation. These guarantees concern process
+failure, not power-loss durability: there is no fsync-backed durable journal.
+
+## Publication and its limits
+
+Stage every bind and final mode before publication, retaining `Rc` owners.
+`Replacement::prepare(next, previous, temporary, canonical)` performs no rename.
+It rejects identical names, the same owner `Rc` on both sides, foreign ownership,
+directory mismatch, and names outside the configured layout. With no previous
+owner, the canonical name must be absent.
+
+`Replacement::prepare` allocates cleanup strings; `Publication::publish` rechecks
+ownership and reserves journal storage before mutation. Replacements use
+`RENAME_EXCHANGE`; new endpoints use
+`RENAME_NOREPLACE`, rejecting a destination created after prepare. Successful
+renames update cleanup bookkeeping. Each rename is atomic, but a multi-endpoint
+publication is not globally atomic: readers can observe intermediate states.
+
+`rollback` and Drop attempt reverse-order restoration only once. Owned replacements
+are exchanged back; if canonical is absent, the old owned temporary can be moved
+back without replacement. New endpoints move from canonical back to their vacant
+temporary name even when an external `Rc` keeps the listener alive. Foreign names
+are never knowingly exchanged or overwritten. Failed guards or renames leave
+cleanup names unchanged. Rollback is best effort, has no error result, and does
+not promise full restoration after interference or filesystem failure.
+
+`commit(&mut self)` only disarms rollback: no filesystem calls, allocations, or
+owner drops. `previous()` exposes retained previous owners for deferred cleanup.
+After commit or rollback, further publication returns `PublicationCompleted`.
+Application control-state commit, cancellation, retirement, readiness, and when to
+drop old listeners remain the caller's responsibility.
+
+**Exchange does not migrate the listen backlog.** Connections queued on the old
+listener stay there; new connections to canonical reach the new listener. Already
+accepted streams also remain independent. Callers must retain/drain or deliberately
+retire the old listener according to their service policy.
+
+`publication::Endpoint` is a low-level adapter contract. Successful rename and
+cleanup-name bookkeeping must not unwind after filesystem mutation; bookkeeping
+must not allocate or invoke user code. It is not an alternative public mechanism
+for arbitrary changes to a bound socket's cleanup name.
+
+## Validation
+
+Run from `cmd/racer-dataplane`. No new dependencies or privileged test setup are
+needed. Integration fixtures use Cargo's `CARGO_TARGET_TMPDIR`; cleanup avoids a
+second panic during unwinding. Crash/umask cases run in isolated subprocesses,
+not through process-wide umask changes or fork inside parallel test workers.
 
 ```sh
-timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo test -p uds-endpoint
-timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo test -p uds-endpoint --test publication
-timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo test -p racer-dataplane --lib client::tests::
-timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo check -p racer-dataplane --lib
+timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo test -p uds-endpoint --all-features
+timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo clippy -p uds-endpoint --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+timeout --signal=TERM --kill-after=10s 300s cargo fmt --all --check
 ```
 
-Generic tests use a non-Racer layout and project-local temporary directories.
-Root tests remain intact, including actual HTTP exchange, simulated publication,
-permission and rename fault injection, inherited lock references, and SIGKILL
-recovery of both committed and prepared endpoints.
+The ignored `crash_state_driver` and `descriptor_limit_driver` tests are invoked
+by their parent integration tests with private fixture arguments; do not run them
+directly. The optional `test-util`
+feature exposes only a cloned lock descriptor for lifecycle tests. It does not
+substitute a filesystem model for production syscalls.

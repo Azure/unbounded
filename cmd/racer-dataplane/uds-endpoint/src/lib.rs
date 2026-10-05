@@ -1,81 +1,161 @@
 //! Linux Unix socket filesystem ownership. Application layout and access modes
 //! are supplied by callers; this crate has no runtime or simulation dependency.
+//! Directory mutation must be serialized by cooperating effective-UID owners.
+//! Hostile processes with the same UID (or root) are outside this boundary.
 
+#![cfg(target_os = "linux")]
+
+mod directory;
 pub mod publication;
+#[cfg(test)]
+mod tests;
 
+use directory::{Dir, chmod_pin, component};
 use std::cell::RefCell;
-use std::ffi::CString;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
+/// Semantic failures carried inside `io::Error`. Syscall failures retain errno.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    InvalidName,
+    InvalidLayout,
+    InvalidMode,
+    UnsafeDirectory,
+    UnsafeLock,
+    OwnershipChanged,
+    UnrecognizedSocket,
+    LiveSocket,
+    PublicationCompleted,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidName => "endpoint name must be one normal component of at most 255 bytes",
+            Self::InvalidLayout => {
+                "endpoint layout namespaces overlap or do not recognize the name"
+            }
+            Self::InvalidMode => "socket mode must contain only permission bits",
+            Self::UnsafeDirectory => {
+                "endpoint directory must be effective-user-owned and not group/world writable"
+            }
+            Self::UnsafeLock => {
+                "endpoint lock must be a private effective-user-owned single-link regular file"
+            }
+            Self::OwnershipChanged => "endpoint inode or ownership changed",
+            Self::UnrecognizedSocket => "endpoint socket has no valid ownership witness",
+            Self::LiveSocket => "endpoint witness still has a live or busy listener",
+            Self::PublicationCompleted => "endpoint publication is already completed",
+        })
+    }
+}
+
+impl std::error::Error for Error {}
+
+fn error(reason: Error) -> io::Error {
+    let kind = match reason {
+        Error::InvalidName | Error::InvalidLayout | Error::InvalidMode => ErrorKind::InvalidInput,
+        Error::UnsafeDirectory | Error::UnsafeLock => ErrorKind::PermissionDenied,
+        Error::LiveSocket => ErrorKind::AddrInUse,
+        _ => ErrorKind::Other,
+    };
+    io::Error::new(kind, reason)
+}
+
 fn rejected() -> io::Error {
-    io::Error::other("endpoint ownership validation failed")
+    error(Error::OwnershipChanged)
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
 }
 
 /// Descriptor-backed pathname. The caller must retain the file while using it.
+#[must_use]
 pub fn file_path(file: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
-/// Walk from the filesystem root, creating missing components with `mode`.
-/// Every component is opened with O_NOFOLLOW. Relative paths are also rooted
-/// at `/`, matching the original walk; parent/current components are rejected.
+/// Walk an absolute path from `/`, creating missing components with `mode`.
+/// Reject relative paths and explicit parent/current components before mutation.
+/// Every component is opened with O_NOFOLLOW.
+///
+/// # Errors
+/// Returns `InvalidName` for invalid paths, or the underlying open/mkdir error
+/// for inaccessible components, symlinks, non-directories, or filesystem failures.
 pub fn open_directory(path: &Path, mode: u32) -> io::Result<File> {
+    if !path.is_absolute()
+        || path
+            .as_os_str()
+            .as_encoded_bytes()
+            .split(|b| *b == b'/')
+            .any(|c| c == b"." || c == b"..")
+    {
+        return Err(error(Error::InvalidName));
+    }
+    for c in path.components() {
+        if let Component::Normal(name) = c {
+            component(name.as_encoded_bytes())?;
+        }
+    }
     let mut directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")?;
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                directory = child_directory(&directory, name.as_encoded_bytes(), mode)?;
-            }
-            _ => return Err(io::Error::from(ErrorKind::InvalidInput)),
+    for c in path.components() {
+        if let Component::Normal(name) = c {
+            directory = child_directory(&directory, name.as_encoded_bytes(), mode)?;
         }
     }
     Ok(directory)
 }
 
 /// Open or create a child directory. `name` must be one normal path component.
+///
+/// # Errors
+/// Returns `InvalidName` for malformed names, or the underlying open/mkdir error.
 pub fn child_directory(parent: &File, name: &[u8], mode: u32) -> io::Result<File> {
-    let name = CString::new(name).map_err(|_| io::Error::from(ErrorKind::InvalidInput))?;
-    // SAFETY: C strings are terminated; the parent descriptor remains owned.
-    unsafe {
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let mut fd = libc::openat(parent.as_raw_fd(), name.as_ptr(), flags);
-        if fd < 0 && io::Error::last_os_error().kind() == ErrorKind::NotFound {
-            if libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) != 0
-                && io::Error::last_os_error().kind() != ErrorKind::AlreadyExists
-            {
-                return Err(io::Error::last_os_error());
+    let dir = Dir(parent);
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY;
+    match dir.open(name, flags, 0) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            match dir.mkdir(name, mode) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
             }
-            fd = libc::openat(parent.as_raw_fd(), name.as_ptr(), flags);
+            dir.open(name, flags, 0)
         }
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(File::from_raw_fd(fd))
+        result => result,
     }
 }
 
+#[must_use]
 pub fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
     first.dev() == second.dev() && first.ino() == second.ino()
 }
 
-/// Remove only specified permission bits from an effective-user-owned directory.
-/// Uses the pinned inode, never changes ancestors, and never broadens access.
+/// Remove requested permission bits from a pinned effective-user-owned directory.
+/// Non-permission bits in `remove` are ignored. Linux may additionally clear
+/// setgid when the caller is not a member of the inode's group; that is narrowing.
+///
+/// # Errors
+/// Returns `UnsafeDirectory` for foreign ownership or non-directories,
+/// `OwnershipChanged` if verification fails, or the underlying stat/chmod error.
 pub fn restrict_directory(directory: &File, remove: u32) -> io::Result<()> {
     let before = directory.metadata()?;
-    // SAFETY: geteuid has no preconditions.
-    if !before.is_dir() || before.uid() != unsafe { libc::geteuid() } {
-        return Err(rejected());
+    if !before.is_dir() || before.uid() != effective_uid() {
+        return Err(error(Error::UnsafeDirectory));
     }
+    let remove = remove & 0o7777;
     let mode = before.mode() & 0o7777 & !remove;
     if before.mode() & remove != 0 {
         // SAFETY: directory retains its descriptor throughout fchmod.
@@ -84,44 +164,112 @@ pub fn restrict_directory(directory: &File, remove: u32) -> io::Result<()> {
         }
     }
     let after = directory.metadata()?;
+    let actual = after.mode() & 0o7777;
     if !after.is_dir()
         || after.uid() != before.uid()
         || after.gid() != before.gid()
         || !same_inode(&before, &after)
-        || after.mode() & 0o7777 != mode
+        || (actual != mode && actual != mode & !0o2000)
     {
         return Err(rejected());
     }
     Ok(())
 }
 
-/// Pin and verify a socket before operations through its descriptor pathname.
-/// O_PATH and O_NOFOLLOW prevent a replacement symlink from redirecting chmod.
+/// Pin and verify a socket without following a replacement symlink.
+///
+/// # Errors
+/// Returns `InvalidName` for malformed names, `OwnershipChanged` for a wrong
+/// inode, type, or owner, or the underlying open/stat error.
 pub fn pin_socket(directory: &File, basename: &str, device: u64, inode: u64) -> io::Result<File> {
-    let socket = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(file_path(directory).join(basename))?;
+    let socket = Dir(directory).pin(basename)?;
     let metadata = socket.metadata()?;
-    if metadata.dev() != device || metadata.ino() != inode || !metadata.file_type().is_socket() {
+    if metadata.dev() != device
+        || metadata.ino() != inode
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != effective_uid()
+    {
         return Err(rejected());
     }
     Ok(socket)
 }
 
-/// Caller-defined namespace. Names must be single components. The witness prefix
-/// and temporary predicate must describe a disjoint namespace from the lock and
-/// canonical name. Keep this configuration stable across process restarts.
-#[derive(Clone, Copy)]
+/// Stable caller-defined namespace, checked both at construction and for each
+/// actual temporary/witness name. Arbitrary predicates cannot be proven disjoint.
+#[derive(Clone, Copy, Debug)]
 pub struct Layout {
-    pub lock: &'static str,
-    pub canonical: &'static str,
-    pub witness_prefix: &'static str,
-    pub temporary_name: fn(&str) -> bool,
+    lock: &'static str,
+    canonical: &'static str,
+    witness_prefix: &'static str,
+    temporary_name: fn(&str) -> bool,
+}
+
+impl Layout {
+    /// Construct a stable namespace, checking all statically known overlaps.
+    ///
+    /// # Errors
+    /// Returns `InvalidName` for malformed components or `InvalidLayout` for
+    /// namespace overlaps. Dynamic names are checked later at bind/recovery.
+    pub fn new(
+        lock: &'static str,
+        canonical: &'static str,
+        witness_prefix: &'static str,
+        temporary_name: fn(&str) -> bool,
+    ) -> io::Result<Self> {
+        for name in [lock, canonical, witness_prefix] {
+            component(name.as_bytes())?;
+        }
+        if lock == canonical
+            || lock.starts_with(witness_prefix)
+            || canonical.starts_with(witness_prefix)
+            || temporary_name(lock)
+            || temporary_name(canonical)
+            || temporary_name(witness_prefix)
+        {
+            return Err(error(Error::InvalidLayout));
+        }
+        Ok(Self {
+            lock,
+            canonical,
+            witness_prefix,
+            temporary_name,
+        })
+    }
+
+    #[must_use]
+    pub fn lock(&self) -> &'static str {
+        self.lock
+    }
+    #[must_use]
+    pub fn canonical(&self) -> &'static str {
+        self.canonical
+    }
+    #[must_use]
+    pub fn witness_prefix(&self) -> &'static str {
+        self.witness_prefix
+    }
+
+    fn witness(&self, temporary: &str) -> io::Result<String> {
+        component(temporary.as_bytes())?;
+        let witness = format!("{}{temporary}", self.witness_prefix);
+        component(witness.as_bytes())?;
+        if temporary == self.lock
+            || temporary == self.canonical
+            || temporary.starts_with(self.witness_prefix)
+            || !(self.temporary_name)(temporary)
+            || witness == self.lock
+            || witness == self.canonical
+            || (self.temporary_name)(&witness)
+        {
+            return Err(error(Error::InvalidLayout));
+        }
+        Ok(witness)
+    }
 }
 
 /// Persistent flock ownership. The lock inode is never removed, including on
 /// clean shutdown. Hard-linked sockets are crash witnesses, not connect heuristics.
+#[derive(Debug)]
 pub struct EndpointOwner {
     lock: File,
     directory: File,
@@ -130,46 +278,87 @@ pub struct EndpointOwner {
 
 impl Drop for EndpointOwner {
     fn drop(&mut self) {
-        // Explicit unlock avoids retaining ownership in a concurrent fork before
-        // exec closes CLOEXEC descriptors. Socket owners must clean up first.
+        // Explicit unlock is intentional: inherited or test-util cloned open file
+        // descriptions must not retain the lock after all socket owners are gone.
         // SAFETY: self retains the lock descriptor throughout flock.
         unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
+fn validate_directory(metadata: &fs::Metadata) -> io::Result<()> {
+    if !metadata.is_dir() || metadata.uid() != effective_uid() || metadata.mode() & 0o022 != 0 {
+        return Err(error(Error::UnsafeDirectory));
+    }
+    Ok(())
+}
+
+fn validate_lock(metadata: &fs::Metadata) -> io::Result<()> {
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o7177 != 0
+    {
+        return Err(error(Error::UnsafeLock));
+    }
+    Ok(())
+}
+
 impl EndpointOwner {
     /// Model an inherited open file description without exposing it in production.
+    ///
+    /// # Errors
+    /// Returns the underlying descriptor duplication error.
     #[cfg(feature = "test-util")]
     pub fn clone_lock_for_test(&self) -> io::Result<File> {
         self.lock.try_clone()
     }
 
-    /// Acquire an effective-user-owned, non-group/world-writable directory.
-    /// Lock files must be private regular files with exactly one hard link.
-    /// `lock_mode` is the creation mode (subject to the process umask).
-    pub fn acquire(directory: &File, layout: Layout, lock_mode: u32) -> io::Result<Self> {
-        let metadata = directory.metadata()?;
-        // SAFETY: geteuid has no preconditions.
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
-            return Err(rejected());
+    /// Acquire a private persistent lock in an effective-user-owned directory.
+    /// Creation uses 0600. Pinning before permission repair also recovers a lock
+    /// left with mode 000 by a crash under a restrictive umask.
+    /// Recovery retains a constant number of descriptors, independently of the
+    /// number of stale witnesses. Probing a live listener may enqueue a connection
+    /// which immediately closes; that side effect is inherent in this liveness check.
+    ///
+    /// # Errors
+    /// Returns a typed validation error for unsafe directory/lock metadata,
+    /// malformed recovery names, unrecognized sockets, or live listeners. Lock
+    /// contention and filesystem/probe failures retain their underlying OS errors.
+    /// Permission denial is never accepted as evidence of a dead listener.
+    pub fn acquire(directory: &File, layout: Layout) -> io::Result<Self> {
+        validate_directory(&directory.metadata()?)?;
+        let dir = Dir(directory);
+        let pinned = match dir.pin(layout.lock) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                match dir.open(
+                    layout.lock.as_bytes(),
+                    libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                ) {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => dir.pin(layout.lock)?,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        let metadata = pinned.metadata()?;
+        validate_lock(&metadata)?;
+        if metadata.mode() & 0o7777 != 0o600 {
+            chmod_pin(&pinned, 0o600)?;
         }
+        // This proc link resolves the already validated regular inode, not the
+        // directory name. O_NOFOLLOW would reject the intentional proc link.
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(lock_mode)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(file_path(directory).join(layout.lock))?;
-        let metadata = lock.metadata()?;
-        if !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(file_path(&pinned))?;
+        if !same_inode(&metadata, &lock.metadata()?) {
             return Err(rejected());
         }
-        // SAFETY: lock owns a valid descriptor. The kernel releases on process death.
+        // SAFETY: lock owns a valid descriptor. Kernel releases it on process death.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -183,99 +372,114 @@ impl EndpointOwner {
         Ok(owner)
     }
 
-    /// Reject directory or lock-path replacement while retaining the original lock.
+    /// Reject directory/lock replacement or weakened permissions while retaining
+    /// the original lock. Ancestor renames do not invalidate the pinned directory.
+    ///
+    /// # Errors
+    /// Returns `UnsafeDirectory`, `UnsafeLock`, or `OwnershipChanged` if validation
+    /// fails, or the underlying metadata error when validation cannot complete.
     pub fn validate(&self, directory: &File) -> io::Result<()> {
         let first = self.directory.metadata()?;
         let second = directory.metadata()?;
+        validate_directory(&first)?;
+        validate_directory(&second)?;
         let lock = self.lock.metadata()?;
-        let current = fs::symlink_metadata(file_path(directory).join(self.layout.lock))?;
-        if !same_inode(&first, &second)
-            || !current.is_file()
-            || !same_inode(&lock, &current)
-            || current.nlink() != 1
-        {
+        let current = Dir(directory).metadata(self.layout.lock)?;
+        validate_lock(&lock)?;
+        validate_lock(&current)?;
+        if !same_inode(&first, &second) || !same_inode(&lock, &current) {
             return Err(rejected());
         }
         Ok(())
     }
 
     fn recover(&self) -> io::Result<()> {
-        let directory = file_path(&self.directory);
+        let dir = Dir(&self.directory);
         let mut witnesses = Vec::new();
-        let mut temporary_paths = Vec::new();
-        for entry in fs::read_dir(&directory)? {
+        let mut temporary = Vec::new();
+        for entry in fs::read_dir(file_path(&self.directory))? {
             let entry = entry?;
             let name = entry.file_name();
-            if name.to_str().is_some_and(self.layout.temporary_name) {
-                temporary_paths.push(entry.path());
-                continue;
-            }
-            let Some(name) = name
-                .to_str()
-                .filter(|name| name.starts_with(self.layout.witness_prefix))
-            else {
+            let Some(name) = name.to_str() else {
+                if name
+                    .as_encoded_bytes()
+                    .starts_with(self.layout.witness_prefix.as_bytes())
+                {
+                    return Err(error(Error::InvalidName));
+                }
                 continue;
             };
-            if !(self.layout.temporary_name)(&name[self.layout.witness_prefix.len()..]) {
-                return Err(rejected());
+            if let Some(suffix) = name.strip_prefix(self.layout.witness_prefix) {
+                if self.layout.witness(suffix)? != name {
+                    return Err(error(Error::InvalidLayout));
+                }
+                let metadata = dir.metadata(name)?;
+                if !metadata.file_type().is_socket() || metadata.uid() != effective_uid() {
+                    return Err(error(Error::UnrecognizedSocket));
+                }
+                witnesses.push((name.to_owned(), metadata));
+            } else if (self.layout.temporary_name)(name) {
+                self.layout.witness(name)?;
+                temporary.push((name.to_owned(), dir.metadata(name)?));
             }
-            let metadata = fs::symlink_metadata(entry.path())?;
-            if !metadata.file_type().is_socket() {
-                return Err(rejected());
-            }
-            witnesses.push((name.to_owned(), metadata));
         }
-        let socket = directory.join(self.layout.canonical);
-        let canonical = match fs::symlink_metadata(&socket) {
+        let canonical = match dir.metadata(self.layout.canonical) {
             Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
         };
-        if canonical.as_ref().is_some_and(|canonical| {
-            !canonical.file_type().is_socket()
-                || !witnesses.iter().any(|(_, m)| same_inode(canonical, m))
-        }) {
-            return Err(rejected());
-        }
-        // Validate every witness before touching any path. Noncooperating live
-        // listeners (including inherited FDs) remain protected without their lock.
-        for (name, _) in &witnesses {
-            refused(&directory.join(name))?;
-        }
-        for path in &temporary_paths {
-            let current = fs::symlink_metadata(path)?;
-            if !current.file_type().is_socket()
-                || !witnesses.iter().any(|(_, m)| same_inode(&current, m))
+        // Validate the entire namespace before either repairing permissions or
+        // removing names. Foreign inodes never become recovery evidence.
+        for metadata in canonical
+            .iter()
+            .chain(temporary.iter().map(|(_, metadata)| metadata))
+        {
+            if !metadata.file_type().is_socket()
+                || !witnesses.iter().any(|(_, m)| same_inode(metadata, m))
             {
-                return Err(rejected());
+                return Err(error(Error::UnrecognizedSocket));
             }
         }
-        if canonical.is_some() {
-            fs::remove_file(socket)?;
+        for (name, expected) in &witnesses {
+            // Keep descriptor use constant regardless of the number of stale
+            // generations. Reopening must prove identity against the fully
+            // validated snapshot before any permission repair or connection.
+            let pinned = pin_socket(&self.directory, name, expected.dev(), expected.ino())?;
+            let metadata = pinned.metadata()?;
+            // bind followed by chmod has a crash window. O_PATH pins the socket
+            // even if umask disabled owner write. Repair only that validated inode
+            // before probing it; EACCES is never classified as a dead listener.
+            if metadata.mode() & 0o200 == 0 {
+                chmod_pin(&pinned, (metadata.mode() & 0o777) | 0o200)?;
+            }
+            refused(&file_path(&pinned))?;
         }
-        for path in temporary_paths {
-            fs::remove_file(path)?;
+        self.validate(&self.directory)?;
+        if let Some(metadata) = canonical {
+            dir.unlink_owned(self.layout.canonical, &metadata)?;
         }
-        for (name, _) in witnesses {
-            fs::remove_file(directory.join(name))?;
+        for (name, metadata) in temporary {
+            dir.unlink_owned(&name, &metadata)?;
+        }
+        for (name, metadata) in witnesses {
+            dir.unlink_owned(&name, &metadata)?;
         }
         Ok(())
     }
 }
 
 fn refused(path: &Path) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = path.as_os_str().as_bytes();
+    let bytes = path.as_os_str().as_encoded_bytes();
     // SAFETY: zero is a valid initial representation for sockaddr_un.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     if bytes.len() >= address.sun_path.len() {
-        return Err(rejected());
+        return Err(error(Error::InvalidName));
     }
     address.sun_family = libc::AF_UNIX as _;
     for (target, source) in address.sun_path.iter_mut().zip(bytes) {
         *target = *source as _;
     }
-    // SAFETY: socket has no pointer arguments; File owns the returned descriptor.
+    // SAFETY: socket has no pointer arguments; OwnedFd takes ownership below.
     let fd = unsafe {
         libc::socket(
             libc::AF_UNIX,
@@ -286,7 +490,8 @@ fn refused(path: &Path) -> io::Result<()> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let socket = unsafe { File::from_raw_fd(fd) };
+    // SAFETY: socket returned a new descriptor, transferred exactly once.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
     // SAFETY: address is initialized and its full size is supplied.
     let result = unsafe {
         libc::connect(
@@ -295,66 +500,103 @@ fn refused(path: &Path) -> io::Result<()> {
             std::mem::size_of_val(&address) as _,
         )
     };
-    if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECONNREFUSED) {
-        Ok(())
-    } else {
-        Err(rejected())
+    if result == 0 {
+        return Err(error(Error::LiveSocket));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ECONNREFUSED) => Ok(()),
+        Some(libc::EAGAIN | libc::EINPROGRESS | libc::EALREADY) => Err(error(Error::LiveSocket)),
+        _ => Err(e),
     }
 }
 
-/// A real nonblocking listener and its inode-checked pathname cleanup. Publication
-/// remains caller-owned: update `basename` only after a successful rename. Keep
-/// the owner alive until cleanup completes, including failed bind staging.
+/// Nonblocking listener, pinned inode, and inode-checked pathname cleanup. Its
+/// owner survives until cleanup finishes, including failed bind staging.
+#[derive(Debug)]
 pub struct BoundSocket {
     listener: UnixListener,
-    directory: Rc<File>,
+    pinned: File,
     device: u64,
     inode: u64,
-    basename: Rc<RefCell<String>>,
+    basename: RefCell<String>,
     witness: String,
-    _owner: Rc<EndpointOwner>,
+    owner: Rc<EndpointOwner>,
 }
 
 impl BoundSocket {
-    /// Bind the witness first so a crash at any later step leaves recovery proof.
-    /// The owner must cover `directory`; names must follow its recovery layout.
-    /// Access permissions are deliberately left to the caller after this returns.
-    pub fn bind(
-        directory: impl Into<Rc<File>>,
-        owner: Rc<EndpointOwner>,
-        basename: String,
-        witness: String,
-    ) -> io::Result<Self> {
-        let directory = directory.into();
-        let path = file_path(&directory).join(&basename);
-        let witness_path = file_path(&directory).join(&witness);
-        let listener = UnixListener::bind(&witness_path)?;
-        let metadata = fs::symlink_metadata(&witness_path)?;
+    /// Derive the witness and directory from the owner. Bind the witness first so
+    /// a crash before chmod or linking still leaves recoverable evidence.
+    ///
+    /// # Errors
+    /// Returns name/layout/ownership validation errors or the underlying bind,
+    /// pin, chmod, nonblocking, or link error. Failed staging preserves recovery
+    /// evidence whenever cleanup cannot prove which inode to remove.
+    pub fn bind(owner: Rc<EndpointOwner>, temporary: &str) -> io::Result<Self> {
+        owner.validate(&owner.directory)?;
+        let witness = owner.layout.witness(temporary)?;
+        let basename = RefCell::new(temporary.to_owned());
+        let listener = UnixListener::bind(file_path(&owner.directory).join(&witness))?;
+        // If pin/stat fails, preserve the witness rather than guessing which inode
+        // to unlink. The next owner can recover it after the listener closes.
+        let pinned = Dir(&owner.directory).pin(&witness)?;
+        let metadata = pinned.metadata()?;
+        if !metadata.file_type().is_socket() || metadata.uid() != effective_uid() {
+            return Err(rejected());
+        }
         let bound = Self {
             listener,
-            directory,
+            pinned,
             device: metadata.dev(),
             inode: metadata.ino(),
-            basename: Rc::new(RefCell::new(basename)),
+            basename,
             witness,
-            _owner: owner,
+            owner,
         };
-        fs::hard_link(&witness_path, &path)?;
+        bound.set_mode(0o600)?;
         bound.listener.set_nonblocking(true)?;
+        Dir(&bound.owner.directory).link(&bound.witness, temporary)?;
         Ok(bound)
     }
 
+    /// Accept one queued client without blocking.
+    ///
+    /// # Errors
+    /// Returns `WouldBlock` when no client is queued, or the socket's accept error.
     pub fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
         self.listener.accept()
     }
-
+    #[must_use]
     pub fn identity(&self) -> (u64, u64) {
         (self.device, self.inode)
     }
+    /// Read-only snapshot; publication owns cleanup-name mutation.
+    #[must_use]
+    pub fn basename(&self) -> String {
+        self.basename.borrow().clone()
+    }
 
-    /// Shared with the worker-local publication transaction, not thread-safe.
-    pub fn basename(&self) -> Rc<RefCell<String>> {
-        self.basename.clone()
+    /// Set permission bits on the retained socket inode, never a replacement path.
+    ///
+    /// # Errors
+    /// Returns `InvalidMode` for non-permission bits, owner validation errors,
+    /// `OwnershipChanged` on mode verification failure, or the stat/chmod error.
+    pub fn set_mode(&self, mode: u32) -> io::Result<()> {
+        if mode & !0o777 != 0 {
+            return Err(error(Error::InvalidMode));
+        }
+        self.owner.validate(&self.owner.directory)?;
+        chmod_pin(&self.pinned, mode)?;
+        if self.pinned.metadata()?.mode() & 0o777 != mode {
+            return Err(rejected());
+        }
+        Ok(())
+    }
+}
+
+impl AsFd for BoundSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.listener.as_fd()
     }
 }
 
@@ -366,23 +608,17 @@ impl AsRawFd for BoundSocket {
 
 impl Drop for BoundSocket {
     fn drop(&mut self) {
-        let path = file_path(&self.directory).join(self.basename.borrow().as_str());
-        if fs::symlink_metadata(&path).is_ok_and(|metadata| {
-            metadata.file_type().is_socket()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
-        }) && fs::remove_file(path).is_err()
+        let Ok(metadata) = self.pinned.metadata() else {
+            return;
+        };
+        let dir = Dir(&self.owner.directory);
+        if dir
+            .unlink_owned(self.basename.get_mut(), &metadata)
+            .is_err()
         {
-            // Keep recovery proof if pathname cleanup failed.
+            // Includes stat errors, not only failed unlink. Preserve recovery proof.
             return;
         }
-        let path = file_path(&self.directory).join(&self.witness);
-        if fs::symlink_metadata(&path).is_ok_and(|metadata| {
-            metadata.file_type().is_socket()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
-        }) {
-            let _ = fs::remove_file(path);
-        }
+        let _ = dir.unlink_owned(&self.witness, &metadata);
     }
 }
