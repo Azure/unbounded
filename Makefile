@@ -551,15 +551,15 @@ e2e-playpen: ## Run the kind-based playpen e2e suite
 
 .PHONY: racer-dataplane-fmt racer-dataplane-check racer-dataplane-build racer-dataplane-test racer-runtime-test racer-cargo-fetch
 racer-dataplane-fmt: ## Format the Racer Rust workspace
-	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all
+	$(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all
 
 racer-dataplane-check: ## Check formatting and lint all Racer Rust targets
-	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all -- --check
-	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
+	$(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all -- --check
+	$(RACER_CARGO) clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
 		--target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-targets --all-features -- -D warnings
 
 racer-dataplane-build: ## Build the Racer Rust workspace
-	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) build --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
+	$(RACER_CARGO) build --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
 		--target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace
 
 racer-dataplane-test: ## Run Rust unit, integration, and doc tests (RACER_TEST_ARGS)
@@ -573,7 +573,7 @@ racer-runtime-test: ## Test the native runtime without optional features (requir
 		--target-dir "$(RACER_CARGO_TARGET_DIR)" -p uring-runtime --no-default-features -- $(RACER_TEST_ARGS)
 
 racer-cargo-fetch: ## Populate the locked Cargo source cache for NOTICE generation
-	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml
+	$(RACER_CARGO) fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml
 
 build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...
