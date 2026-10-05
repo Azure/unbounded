@@ -29,6 +29,72 @@ import (
 
 const podCIDRTestNode = "node-a"
 
+func TestAllocatorGenerationHeldThroughPatch(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.client.PrependReactor("patch", "nodes", func(clienttesting.Action) (bool, runtime.Object, error) {
+		if h.sc.allocationGenerationLock.TryLock() {
+			h.sc.allocationGenerationLock.Unlock()
+			t.Error("allocator can retire while the Node patch is in progress")
+		}
+
+		return false, nil, nil
+	})
+
+	if err := h.sc.allocateAndPatchNodePodCIDRs(t.Context(), podCIDRTestNode, h.state, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if !h.sc.allocationGenerationLock.TryLock() {
+		t.Fatal("allocator generation remains locked after patch completion")
+	}
+	h.sc.allocationGenerationLock.Unlock()
+	h.sc.updateAssignmentAllocators(nil)
+}
+
+func TestSyncObservedDifferentCIDRsReleasesReservationCopies(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.failPatches(apierrors.NewTimeoutError("unconfirmed", 1))
+
+	if err := h.sc.allocateAndPatchNodePodCIDRs(t.Context(), podCIDRTestNode, h.state, ""); err == nil {
+		t.Fatal("expected patch failure")
+	}
+
+	site := h.sites[0].DeepCopy()
+	site.Spec.NodeCidrs = []string{"10.0.0.0/16"}
+	copySite := site.DeepCopy()
+	copySite.Name = "site-b"
+	h.sc.updateAssignmentAllocators([]unboundedv1alpha3.Site{*site, *copySite})
+	copyState := h.sc.getAssignmentAllocator("site-b", 0)
+
+	observed := liveNodeWithRV("8", "10.244.7.0/24")
+	observed.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.5"}}
+
+	observed.Labels = map[string]string{}
+	for _, key := range siteLabelKeys() {
+		observed.Labels[key] = site.Name
+	}
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := indexer.Add(observed); err != nil {
+		t.Fatal(err)
+	}
+
+	h.sc.nodeLister = corev1listers.NewNodeLister(indexer)
+
+	h.sc.sitesCache = []unboundedv1alpha3.Site{*site}
+	if err := h.sc.syncNode(t.Context(), observed.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	if h.pending(observed.Name) != nil || h.state.allocator.IsAllocated("10.244.0.0/24") || copyState.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("informer observation of different CIDRs retained stale reservations")
+	}
+
+	if !h.state.allocator.IsAllocated("10.244.7.0/24") {
+		t.Fatal("observed CIDR was not marked allocated")
+	}
+}
+
 type podCIDRTestHarness struct {
 	sc      *SiteController
 	client  *kubefake.Clientset

@@ -145,6 +145,8 @@ type SiteController struct {
 	// Allocators for site pod CIDR assignments
 	assignmentAllocators     map[string]*assignmentAllocator
 	assignmentAllocatorsLock sync.RWMutex
+	// allocationGenerationLock prevents retirement while a worker patches a Node.
+	allocationGenerationLock sync.RWMutex
 
 	// Tracks nodes that have internal IPs but no matching site, to log once
 	loggedNoSiteNodes     map[string]struct{}
@@ -621,6 +623,9 @@ func (sc *SiteController) collectEnabledAssignments(sites []unboundedv1alpha3.Si
 }
 
 func (sc *SiteController) updateAssignmentAllocators(sites []unboundedv1alpha3.Site) {
+	sc.allocationGenerationLock.Lock()
+	defer sc.allocationGenerationLock.Unlock()
+
 	enabledAssignments := sc.collectEnabledAssignments(sites)
 
 	desired := make(map[string]assignmentRef, len(enabledAssignments))
@@ -987,7 +992,7 @@ func (sc *SiteController) syncNode(ctx context.Context, key string) error {
 
 	hasAssignedPodCIDRs := nodeHasPodCIDRs(node)
 	if hasAssignedPodCIDRs {
-		sc.clearPendingPodCIDRs(node.Name)
+		sc.releasePendingPodCIDRs(node.Name, node.UID, nodePodCIDRs(node))
 	}
 
 	internalIPs := getNodeInternalIPStrings(node)
@@ -2222,6 +2227,9 @@ func (sc *SiteController) computePodCIDRsForNode(state *assignmentAllocator) (st
 // releasing would let another node receive the same CIDR. See
 // pendingPodCIDRsForNode for when a pending assignment is released.
 func (sc *SiteController) allocateAndPatchNodePodCIDRs(ctx context.Context, nodeName string, state *assignmentAllocator, siteName string) error {
+	sc.allocationGenerationLock.RLock()
+	defer sc.allocationGenerationLock.RUnlock()
+
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		liveNode, err := sc.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
@@ -2556,7 +2564,7 @@ func (sc *SiteController) markSlicesDirty() {
 // allocator so they are never handed out to another node. Called for nodes that
 // already have CIDRs assigned (e.g., gateway and system nodes).
 func (sc *SiteController) markNodeCIDRsAllocated(node *corev1.Node, sites []unboundedv1alpha3.Site, siteName string) {
-	sc.clearPendingPodCIDRs(node.Name)
+	sc.releasePendingPodCIDRs(node.Name, node.UID, nodePodCIDRs(node))
 
 	var site *unboundedv1alpha3.Site
 

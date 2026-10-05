@@ -173,7 +173,7 @@ Pod CIDR allocation is configured per Site using `spec.podCidrAssignments`.
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--leader-elect` | bool | `false` | Enable leader election for HA. |
+| `--leader-elect` | bool | `true` | Enable leader election for HA. |
 | `--leader-elect-lease-duration` | duration | `30s` | Duration of the leader lease. |
 | `--leader-elect-renew-deadline` | duration | `15s` | Deadline for renewing leadership. |
 | `--leader-elect-retry-period` | duration | `10s` | Retry period for acquiring leadership. |

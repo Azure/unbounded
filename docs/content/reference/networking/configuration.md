@@ -126,7 +126,7 @@ to disable their creation.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--leader-elect` | `false` | Enable leader election for HA. |
+| `--leader-elect` | `true` | Enable leader election for HA. |
 | `--leader-elect-lease-duration` | `30s` | Duration of the leader lease. |
 | `--leader-elect-renew-deadline` | `15s` | Deadline for renewing leadership. |
 | `--leader-elect-retry-period` | `10s` | Retry period for acquiring leadership. |
