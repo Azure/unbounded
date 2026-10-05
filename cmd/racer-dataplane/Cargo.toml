@@ -14,8 +14,7 @@ description = "Racer node-local read-through cache dataplane"
 topology = { path = "topology" }
 uring-runtime = { path = "runtime" }
 
-# Keep debug assertions, overflow checks, and debug info while optimizing the
-# runtime tests and exhaustive topology checks.
+# Keep debug assertions, overflow checks, and debug info while optimizing tests.
 [profile.test]
 opt-level = 1
 
