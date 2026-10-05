@@ -53,8 +53,9 @@ hack/cmd/notice/
 Cargo and native collectors remain registered for the replacement Racer
 implementation. Cargo collection is inactive when neither `Cargo.toml` nor
 `Cargo.lock` exists under `cmd/racer-dataplane`; no Cargo registry cache is
-required for a crate without direct dependencies. The collector is configured
-for a `racer-dataplane` root package.
+required for a workspace without direct registry dependencies. The collector reads
+the root package and its explicitly declared workspace members using the root
+lockfile; no future members or load generator are required.
 Native collection is inactive when neither native version pin is declared in
 `Makefile`. Incomplete inputs remain errors rather than silently omitting notices.
 
@@ -102,7 +103,15 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   dependencies. When the Racer crate has dependencies, populate it with
   `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
   Development dependencies are excluded; normal, target, build, and optional
-  direct dependencies are included.
+  direct dependencies are included. Local path dependencies must be declared
+  workspace members; their registry dependencies are collected separately and
+  deduplicated. Conflicting direct versions fail collection. Member manifests
+  must declare package names. Member-local lockfiles are ignored.
+  The supported workspace layout uses explicit relative member directories,
+  including `.` for the root. Globs, exclusions, workspace-inherited dependencies,
+  and git dependencies are rejected rather than silently omitted. TOML syntax,
+  including multiline member arrays, literal strings, and dependency subtables,
+  is parsed by the existing pinned Go TOML library.
 - Native collection is fully local. Its metadata and canonical license links
   are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
   `OPENSSL_VERSION` in `Makefile`.
