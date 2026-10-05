@@ -9,10 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"strings"
 	"testing"
-	"time"
 )
 
 func assertKind(t *testing.T, err error, kind ErrorKind) {
@@ -52,20 +50,6 @@ func TestCacheName(t *testing.T) {
 
 	for _, s := range []string{"", "A", ".a", "a.", "a..b", "-a", "a-", "a/b", "a_b", strings.Repeat("a", 64), strings.Repeat("a", 63) + "." + strings.Repeat("b", 19)} {
 		_, err := ParseCacheName(s)
-		assertKind(t, err, ErrorInvalidArgument)
-	}
-}
-
-func TestETag(t *testing.T) {
-	for _, s := range []string{`""`, `"a,b"`, `"a\b"`, `"!#~"`, `"` + strings.Repeat("a", 8190) + `"`} {
-		tag, err := ParseETag(s)
-		if err != nil || tag.String() != s {
-			t.Fatalf("valid tag: %v", err)
-		}
-	}
-
-	for _, s := range []string{"", `*`, `W/"v"`, `"a", "b"`, `"a"b"`, `"a b"`, "\"\x80\"", "\"\t\"", `"` + strings.Repeat("a", 8191) + `"`} {
-		_, err := ParseETag(s)
 		assertKind(t, err, ErrorInvalidArgument)
 	}
 }
@@ -118,48 +102,6 @@ func TestOpaqueAndDiagnostics(t *testing.T) {
 
 	if !errors.Is(err, cause) {
 		t.Fatal("lost explicit cause")
-	}
-
-	for _, s := range []string{"", " leading", "trailing ", "a\tb", "a\rb", "a\nb", "a\x00b", "a\x7fb"} {
-		_, err := ParseAuthorization(s)
-		assertKind(t, err, ErrorInvalidArgument)
-		_, err = ParseAdapterMetadata(s)
-		assertKind(t, err, ErrorInvalidArgument)
-	}
-
-	if _, err := ParseAuthorization(strings.Repeat("x", 8192)); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = ParseAuthorization(strings.Repeat("x", 8193))
-	assertKind(t, err, ErrorHeaderLimit)
-}
-
-func TestMetadata(t *testing.T) {
-	tag, err := ParseETag(`""`)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, expiry := range []time.Time{time.UnixMilli(0), time.UnixMilli(math.MaxInt64), time.UnixMilli(123).In(time.FixedZone("offset", 3600))} {
-		m := Metadata{Size: math.MaxInt64, ETag: tag, ExpiresAt: expiry}
-		if err := m.Validate(); err != nil {
-			t.Fatal(err)
-		}
-
-		h, err := metadataHeaders(m)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		parsed, err := decimal(h.Get("Racer-Expires-At"))
-		if err != nil || int64(parsed) != expiry.UnixMilli() {
-			t.Fatal("expiry changed")
-		}
-	}
-
-	for _, m := range []Metadata{{}, {ETag: tag}, {ETag: tag, ExpiresAt: time.UnixMilli(-1)}, {ETag: tag, ExpiresAt: time.Unix(0, 1)}, {ETag: tag, ExpiresAt: time.UnixMilli(math.MaxInt64).Add(time.Millisecond)}, {Size: math.MaxInt64 + 1, ETag: tag, ExpiresAt: time.UnixMilli(0)}} {
-		assertKind(t, m.Validate(), ErrorInvalidArgument)
 	}
 }
 

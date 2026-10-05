@@ -5,13 +5,14 @@ package racersdk
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
 // streamingHTTP owns receive framing exclusively. It never creates page buffers
@@ -208,7 +209,6 @@ func (h *streamingHTTP) transfer() (int64, error) {
 		}
 
 		s.delivered++
-		s.deliveredBytes += uint64(length)
 		// Return even the final credit before waiting for Complete. A one-credit
 		// peer is allowed to wait for this release before emitting Complete.
 		if err := s.release(number, length); err != nil {
@@ -216,13 +216,13 @@ func (h *streamingHTTP) transfer() (int64, error) {
 		}
 	}
 
-	var frame [21]byte
+	var frame [wire.FrameSize]byte
 	if err := s.readFull(frame[:]); err != nil {
 		return written, err
 	}
 
-	if frame[0] != 2 || binary.BigEndian.Uint64(frame[1:9]) != s.pages || binary.BigEndian.Uint64(frame[9:17]) != s.end-s.first || binary.BigEndian.Uint32(frame[17:]) != 0 || s.deliveredBytes != s.end-s.first {
-		return written, failure(ErrorProtocol, "subscription complete", nil)
+	if err := s.validateFrame(wire.DecodeFrame(frame), "subscription complete"); err != nil {
+		return written, err
 	}
 
 	s.mu.Lock()
@@ -240,21 +240,17 @@ func (h *streamingHTTP) transfer() (int64, error) {
 // streamingFrame reserves exactly one ordered page using negotiated credits.
 // Payload is not hashed or buffered for whole-page validation in this mode.
 func (s *PageStream) streamingFrame() (uint64, uint32, error) {
-	var frame [21]byte
+	var frame [wire.FrameSize]byte
 	if err := s.readFull(frame[:]); err != nil {
 		return 0, 0, err
 	}
 
-	number := binary.BigEndian.Uint64(frame[1:9])
-	offset := binary.BigEndian.Uint64(frame[9:17])
-	length := binary.BigEndian.Uint32(frame[17:])
-	expected := s.first/uint64(PageSize) + s.delivered
-	start := max(s.first, expected*uint64(PageSize))
-
-	end := min(s.end, (expected+1)*uint64(PageSize))
-	if frame[0] != 1 || number != expected || offset != start || length == 0 || uint64(length) != end-start {
-		return 0, 0, failure(ErrorProtocol, "subscription frame", nil)
+	f := wire.DecodeFrame(frame)
+	if err := s.validateFrame(f, "subscription frame"); err != nil {
+		return 0, 0, err
 	}
+
+	number, length := f.Number, f.Length
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

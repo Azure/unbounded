@@ -444,8 +444,8 @@ func assertInteropAccounting(t *testing.T, stream *PageStream) {
 		held += uint64(length)
 	}
 
-	if held != stream.bytesHeld || held > stream.byteCredits || len(stream.outstanding) > stream.pageCredits || len(stream.intervals) > 4096 {
-		t.Fatalf("unbounded SDK accounting: bytes=%d pages=%d intervals=%d", held, len(stream.outstanding), len(stream.intervals))
+	if held != stream.bytesHeld || held > stream.byteCredits || len(stream.outstanding) > stream.pageCredits || stream.sequence.Intervals() > 4096 {
+		t.Fatalf("unbounded SDK accounting: bytes=%d pages=%d intervals=%d", held, len(stream.outstanding), stream.sequence.Intervals())
 	}
 }
 

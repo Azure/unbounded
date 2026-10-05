@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racersdk
+package wire
 
 import (
 	"math"
@@ -11,8 +11,8 @@ import (
 func TestRangeResolution(t *testing.T) {
 	for _, tt := range []struct {
 		wire        string
-		size        ByteLength
-		first, last ByteOffset
+		size        uint64
+		first, last uint64
 		kind        ErrorKind
 	}{
 		{"bytes=0-0", 1, 0, 0, 0},
@@ -24,16 +24,16 @@ func TestRangeResolution(t *testing.T) {
 		{"bytes=9223372036854775807-9223372036854775807", math.MaxInt64, 0, 0, ErrorUnsatisfiableRange},
 		{"bytes=0-0", math.MaxInt64 + 1, 0, 0, ErrorInvalidArgument},
 	} {
-		r, err := parseRange(tt.wire)
+		r, err := ParseRange(tt.wire)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if rangeValue(r) != tt.wire {
+		if RangeValue(r) != tt.wire {
 			t.Fatal("range normalized")
 		}
 
-		first, last, err := r.resolve(tt.size)
+		first, last, err := r.Resolve(tt.size)
 		if tt.kind != 0 {
 			assertKind(t, err, tt.kind)
 		} else if err != nil || first != tt.first || last != tt.last {
@@ -42,7 +42,7 @@ func TestRangeResolution(t *testing.T) {
 	}
 
 	for _, s := range []string{"", "bytes=-", "bytes=1-", "bytes=-0", "bytes=-99", "bytes=1-0", "bytes=00-1", "bytes=0-01", "bytes=+1-", "bytes=0-1,2-3", "bytes=0- 1", "bytes=0-9223372036854775808", "Bytes=0-1"} {
-		_, err := parseRange(s)
+		_, err := ParseRange(s)
 		assertKind(t, err, ErrorInvalidArgument)
 	}
 
@@ -53,30 +53,30 @@ func TestRangeResolution(t *testing.T) {
 }
 
 func TestWholePages(t *testing.T) {
-	_, _, err := (Range{}).Resolve(1)
+	_, _, err := (Range{}).ResolvePage(1)
 	assertKind(t, err, ErrorInvalidArgument)
-	_, _, err = bootstrapRange().Resolve(math.MaxInt64 + 1)
+	_, _, err = BootstrapRange().ResolvePage(math.MaxInt64 + 1)
 	assertKind(t, err, ErrorInvalidArgument)
 
-	p := ByteOffset(PageSize)
-	for _, size := range []ByteLength{1, PageSize - 1, PageSize, PageSize + 1, math.MaxInt64} {
+	p := uint64(PageSize)
+	for _, size := range []uint64{1, PageSize - 1, PageSize, PageSize + 1, math.MaxInt64} {
 		start := (uint64(size) - 1) / uint64(PageSize) * uint64(PageSize)
-		for _, end := range []uint64{uint64(size) - 1, nominalPageEnd(start)} {
-			r, err := ClosedRange(ByteOffset(start), ByteOffset(end))
+		for _, end := range []uint64{uint64(size) - 1, NominalPageEnd(start)} {
+			r, err := ClosedRange(start, end)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			first, last, err := r.Resolve(size)
-			if err != nil || uint64(first) != start || last != ByteOffset(size)-1 {
+			first, last, err := r.ResolvePage(size)
+			if err != nil || uint64(first) != start || last != size-1 {
 				t.Fatalf("page %d: %d-%d %v", size, first, last, err)
 			}
 		}
 	}
 
 	for _, tt := range []struct {
-		first, last ByteOffset
-		size        ByteLength
+		first, last uint64
+		size        uint64
 		kind        ErrorKind
 	}{
 		{1, p - 1, PageSize, ErrorInvalidArgument}, {0, p, PageSize + 1, ErrorInvalidArgument}, {0, p - 2, PageSize, ErrorInvalidArgument}, {p, 2*p - 1, PageSize, ErrorUnsatisfiableRange}, {0, p - 1, 0, ErrorUnsatisfiableRange},
@@ -86,7 +86,7 @@ func TestWholePages(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, _, err = r.Resolve(tt.size)
+		_, _, err = r.ResolvePage(tt.size)
 		assertKind(t, err, tt.kind)
 	}
 }
@@ -97,21 +97,21 @@ func FuzzRange(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, s string, n uint64) {
-		r, err := parseRange(s)
+		r, err := ParseRange(s)
 		if err != nil {
 			return
 		}
 
-		if rangeValue(r) != s {
+		if RangeValue(r) != s {
 			t.Fatal("range round trip")
 		}
 
-		first, last, err := r.resolve(ByteLength(n))
+		first, last, err := r.Resolve(n)
 		if err == nil && (first > last || uint64(last) >= n || uint64(last-first)+1 > math.MaxInt64) {
 			t.Fatal("invalid resolved bounds")
 		}
 
-		first, last, err = r.Resolve(ByteLength(n))
+		first, last, err = r.ResolvePage(n)
 		if err == nil && (uint64(first)%uint64(PageSize) != 0 || first > last || uint64(last) >= n || uint64(last-first)+1 > uint64(PageSize)) {
 			t.Fatal("invalid whole-page bounds")
 		}

@@ -6,14 +6,15 @@ package racersdk
 import (
 	"encoding/hex"
 	"fmt"
-	"math"
 	"strings"
 	"time"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
 const (
-	maxHeadBytes    = 32 * 1024
-	maxFieldBytes   = 8192
+	maxHeadBytes    = wire.MaxHeadBytes
+	maxFieldBytes   = wire.MaxFieldBytes
 	socketPathLimit = 107
 )
 
@@ -21,22 +22,8 @@ const (
 type Key [32]byte
 
 func ParseKey(s string) (Key, error) {
-	var key Key
-	if len(s) != hex.EncodedLen(len(key)) {
-		return key, failure(ErrorInvalidArgument, "key", nil)
-	}
-
-	for i := range len(s) {
-		if (s[i] < '0' || s[i] > '9') && (s[i] < 'a' || s[i] > 'f') {
-			return key, failure(ErrorInvalidArgument, "key", nil)
-		}
-	}
-
-	if _, err := hex.Decode(key[:], []byte(s)); err != nil {
-		return Key{}, failure(ErrorInvalidArgument, "key", nil)
-	}
-
-	return key, nil
+	key, err := wire.ParseKey(s)
+	return Key(key), fromWireError(err)
 }
 
 func (k Key) String() string { return hex.EncodeToString(k[:]) }
@@ -80,14 +67,8 @@ func (n CacheName) String() string { return n.value }
 type ETag struct{ value string }
 
 func ParseETag(s string) (ETag, error) {
-	if len(s) < 2 || len(s) > maxFieldBytes || s[0] != '"' || s[len(s)-1] != '"' {
-		return ETag{}, failure(ErrorInvalidArgument, "etag", nil)
-	}
-
-	for i := 1; i < len(s)-1; i++ {
-		if s[i] != 0x21 && (s[i] < 0x23 || s[i] > 0x7e) {
-			return ETag{}, failure(ErrorInvalidArgument, "etag", nil)
-		}
+	if err := wire.ValidateETag(s); err != nil {
+		return ETag{}, fromWireError(err)
 	}
 
 	return ETag{value: s}, nil
@@ -104,21 +85,7 @@ type (
 )
 
 func validateOpaque(s string) error {
-	if len(s) > maxFieldBytes {
-		return failure(ErrorHeaderLimit, "context", nil)
-	}
-
-	if len(s) == 0 || s[0] == ' ' || s[len(s)-1] == ' ' {
-		return failure(ErrorInvalidArgument, "context", nil)
-	}
-
-	for i := range len(s) {
-		if s[i] < 0x20 || s[i] == 0x7f {
-			return failure(ErrorInvalidArgument, "context", nil)
-		}
-	}
-
-	return nil
+	return fromWireError(wire.ValidateOpaque(s))
 }
 
 func ParseAdapterMetadata(s string) (AdapterMetadata, error) {
@@ -216,128 +183,11 @@ type Metadata struct {
 // Validate rejects invalid size, absent tags, pre-epoch or overflowing expiry,
 // and sub-millisecond precision without silently rounding opaque metadata.
 func (m Metadata) Validate() error {
-	if err := validateContentType(m.ContentType); err != nil {
-		return err
-	}
-
-	if m.Size > math.MaxInt64 {
-		return failure(ErrorInvalidArgument, "metadata", nil)
-	}
-
-	if _, err := ParseETag(m.ETag.value); err != nil {
-		return failure(ErrorInvalidArgument, "metadata", nil)
-	}
-
-	sec := m.ExpiresAt.Unix()
-
-	ms := int64(m.ExpiresAt.Nanosecond() / int(time.Millisecond))
-	if sec < 0 || sec > math.MaxInt64/1000 || m.ExpiresAt.Nanosecond()%int(time.Millisecond) != 0 || sec == math.MaxInt64/1000 && ms > math.MaxInt64%1000 {
-		return failure(ErrorInvalidArgument, "metadata", nil)
-	}
-
-	return nil
+	return fromWireError(m.wire().Validate())
 }
 
 func validateContentType(s string) error {
-	if s == "" {
-		return nil
-	}
-
-	if len(s) > 256 || strings.TrimSpace(s) != s {
-		return failure(ErrorInvalidArgument, "content type", nil)
-	}
-
-	for i := range len(s) {
-		if s[i] < 0x20 || s[i] > 0x7e {
-			return failure(ErrorInvalidArgument, "content type", nil)
-		}
-	}
-
-	rest := s
-	token := func() string {
-		i := 0
-		for i < len(rest) && headerToken(rest[i]) {
-			i++
-		}
-
-		value := rest[:i]
-		rest = rest[i:]
-
-		return value
-	}
-	consume := func(b byte) bool {
-		if len(rest) == 0 || rest[0] != b {
-			return false
-		}
-
-		rest = rest[1:]
-
-		return true
-	}
-
-	bad := failure(ErrorInvalidArgument, "content type", nil)
-	if token() == "" || !consume('/') || token() == "" {
-		return bad
-	}
-
-	var parameters []string
-
-	for rest != "" {
-		rest = strings.TrimLeft(rest, " ")
-
-		if !consume(';') {
-			return bad
-		}
-
-		rest = strings.TrimLeft(rest, " ")
-
-		name := token()
-		if name == "" {
-			return bad
-		}
-
-		for _, old := range parameters {
-			if strings.EqualFold(old, name) {
-				return bad
-			}
-		}
-
-		parameters = append(parameters, name)
-		rest = strings.TrimLeft(rest, " ")
-
-		if !consume('=') {
-			return bad
-		}
-
-		rest = strings.TrimLeft(rest, " ")
-
-		if consume('"') {
-			for {
-				if rest == "" {
-					return bad
-				}
-
-				b := rest[0]
-				rest = rest[1:]
-
-				if b == '"' {
-					break
-				}
-
-				if b == '\\' {
-					if rest == "" {
-						return bad
-					}
-
-					rest = rest[1:]
-				}
-			}
-		} else if token() == "" {
-			return bad
-		}
-	}
-
-	return nil
+	return fromWireError(wire.ValidateContentType(s))
 }
 
 // Operation is an origin callback operation. Zero is invalid.

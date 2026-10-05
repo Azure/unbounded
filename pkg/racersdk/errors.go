@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
 // ErrorKind classifies failures without exposing request or callback data.
@@ -202,32 +204,12 @@ func callbackStatus(err error, pinned bool) int {
 }
 
 func statusError(status int) *Error {
-	kind := ErrorProtocol
+	err := fromWireError(wire.StatusError(status))
 
-	switch status {
-	case 400, 405:
-		kind = ErrorInvalidArgument
-	case 401:
-		kind = ErrorUnauthorized
-	case 403:
-		kind = ErrorForbidden
-	case 404:
-		kind = ErrorNotFound
-	case 412:
-		kind = ErrorVersionUnavailable
-	case 416:
-		kind = ErrorUnsatisfiableRange
-	case 431:
-		kind = ErrorHeaderLimit
-	case 500:
-		kind = ErrorInternal
-	case 502:
-		kind = ErrorBadGateway
-	case 503:
-		kind = ErrorUnavailable
-	}
+	var typed *Error
+	errors.As(err, &typed)
 
-	return &Error{kind: kind, operation: "response", status: status}
+	return typed
 }
 
 func ioFailure(op string, err error) error {

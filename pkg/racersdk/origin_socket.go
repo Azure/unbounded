@@ -5,71 +5,35 @@ package racersdk
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/originsock"
 )
 
 func listenOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), error) {
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(path) > socketPathLimit {
-		return nil, nil, failure(ErrorInvalidArgument, "socket path", nil)
+	l, cleanup, err := originsock.Listen(path, mode, false)
+	return l, cleanup, socketError(err)
+}
+
+func listenOwnedOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), error) {
+	l, cleanup, err := originsock.Listen(path, mode, true)
+	return l, cleanup, socketError(err)
+}
+
+func socketError(err error) error {
+	var typed *originsock.Error
+	if !errors.As(err, &typed) {
+		return err
 	}
 
-	parent := string(filepath.Separator)
-
-	parts := strings.Split(strings.TrimPrefix(path, parent), parent)
-	for _, part := range parts[:len(parts)-1] {
-		parent = filepath.Join(parent, part)
-
-		info, err := os.Lstat(parent)
-		if err != nil {
-			return nil, nil, ioFailure("socket directory", err)
-		}
-
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return nil, nil, failure(ErrorInvalidArgument, "socket directory", nil)
-		}
+	if typed.Invalid {
+		return failure(ErrorInvalidArgument, typed.Operation, typed.Cause)
 	}
 
-	if _, err := os.Lstat(path); !os.IsNotExist(err) {
-		if err == nil {
-			err = os.ErrExist
-		}
-
-		return nil, nil, ioFailure("socket exists", err)
-	}
-
-	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
-	if err != nil {
-		return nil, nil, ioFailure("socket bind", err)
-	}
-
-	l.SetUnlinkOnClose(false)
-
-	info, err := os.Lstat(path)
-	if err != nil {
-		closeBody(l)
-		return nil, nil, ioFailure("socket identity", err)
-	}
-
-	cleanup := func() {
-		closeBody(l)
-
-		current, err := os.Lstat(path)
-		if err == nil && current.Mode()&os.ModeSocket != 0 && os.SameFile(info, current) && info.ModTime().Equal(current.ModTime()) {
-			if err := os.Remove(path); err != nil {
-				return
-			}
-		}
-	}
-	if err := os.Chmod(path, mode); err != nil {
-		cleanup()
-		return nil, nil, ioFailure("socket mode", err)
-	}
-
-	return l, cleanup, nil
+	return ioFailure(typed.Operation, typed.Cause)
 }
 
 // Admission happens before Accept, so net/http never spawns an unbounded set of

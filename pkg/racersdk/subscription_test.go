@@ -668,27 +668,6 @@ func TestPageStreamReleaseAfterTerminalAndIntervalBound(t *testing.T) {
 	if err := p.Release(); err != nil {
 		t.Fatal(err)
 	}
-
-	tracking := &PageStream{}
-	for n := uint64(0); n < 8192; n += 2 {
-		if !tracking.record(n) {
-			t.Fatal("interval rejected", n)
-		}
-	}
-
-	if tracking.record(8192) || tracking.record(0) {
-		t.Fatal("unbounded or duplicate interval accepted")
-	}
-
-	for n := uint64(1); n < 8192; n += 2 {
-		if !tracking.record(n) {
-			t.Fatal("merge rejected", n)
-		}
-	}
-
-	if len(tracking.intervals) != 1 || tracking.intervals[0] != (pageInterval{0, 8192}) {
-		t.Fatal("intervals failed to compact")
-	}
 }
 
 func TestDownloadToUnorderedPages(t *testing.T) {
