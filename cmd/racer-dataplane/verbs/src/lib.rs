@@ -61,13 +61,16 @@
 //!
 //! Hardware-free tests: `cargo test -p rdma-verbs --features simulation`.
 mod ffi;
+
 pub use ffi::Endpoint;
+
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;
 
 /// Clean up and sort a list of RDMA ports using sysfs.
 pub mod discovery {
     use crate::PortInfo;
+
     use std::path::Path;
 
     /// True if `device` is a safe sysfs name: 1 to 63 bytes, no path tricks.
@@ -139,27 +142,36 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// Bad pool or selector setup.
     InvalidConfiguration,
+
     /// Bad arguments, or the call is not allowed right now.
     InvalidRequest,
+
     /// Bad length or memory range.
     InvalidRange,
+
     /// No RDMA, pool closed, or slot canceled.
     Unavailable,
+
     /// No free slot, region, or command space.
     Overloaded,
+
     /// The deadline passed.
     DeadlineExceeded,
+
     /// Canceled before it finished.
     Cancelled,
+
     /// An RDMA call failed, or a lock was poisoned.
     Io,
 }
+
 impl std::fmt::Display for Error {
     /// Print the variant name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
     }
 }
+
 impl std::error::Error for Error {}
 
 /// One RDMA port, as shown to the selector.
@@ -348,6 +360,7 @@ impl Endpoint {
 }
 
 use futures::task::AtomicWaker;
+
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -357,6 +370,7 @@ use std::{
     },
     task::{Context, Poll, Waker, ready},
 };
+
 use uring_runtime::{
     Operation, Scope,
     drivers::poll_scoped,
@@ -369,6 +383,7 @@ struct Lease {
 
     shared: Arc<Shared>,
 }
+
 impl Drop for Lease {
     /// Last holder gone: tell the native side to stop and recycle the slot.
     fn drop(&mut self) {
@@ -377,6 +392,7 @@ impl Drop for Lease {
         self.shared.engine.wake();
     }
 }
+
 impl Region {
     /// Take the slot's buffer for `length` bytes. One region per slot.
     pub fn poll_acquire(qp: &QueuePairHandle, length: usize) -> Poll<Result<Rc<Self>>> {
@@ -398,10 +414,12 @@ impl Region {
             length,
         })))
     }
+
     /// Bytes in use, not the full buffer size.
     pub fn length(&self) -> usize {
         self.length
     }
+
     /// Fill the buffer. `bytes` must be exactly [`Region::length`] long.
     /// Fails while a command is queued.
     pub fn poll_copy_from(&self, bytes: &[u8]) -> Poll<Result<()>> {
@@ -420,10 +438,12 @@ impl Region {
         mailbox.bytes[..self.length].copy_from_slice(bytes);
         Poll::Ready(Ok(()))
     }
+
     /// Wake `cx` when the native side makes progress on this slot.
     pub fn register_waiter(&self, cx: &Context<'_>) {
         self.lease.slot.waiter.register(cx.waker());
     }
+
     /// Read the buffer. Fails until the QP has stopped.
     pub fn poll_copy_to(&self, cx: &mut Context<'_>) -> Poll<Result<Vec<u8>>> {
         self.lease.slot.waiter.register(cx.waker());
@@ -433,6 +453,7 @@ impl Region {
         let mailbox = ready!(try_mailbox(&self.lease.slot.mailbox))?;
         Poll::Ready(self.copy_bytes(&mailbox))
     }
+
     /// Copy out `length` bytes.
     fn copy_bytes(&self, mailbox: &Mailbox) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -443,6 +464,7 @@ impl Region {
         Ok(bytes)
     }
 }
+
 /// A ticket's slot hold, its saved result, and the window it binds, if any.
 struct TicketState {
     lease: Rc<Lease>,
@@ -451,6 +473,7 @@ struct TicketState {
 
     window: Option<Rc<Window>>,
 }
+
 impl Ticket {
     /// The result, or `None` if not done yet.
     pub fn result(&self) -> Option<Result<()>> {
@@ -459,6 +482,7 @@ impl Ticket {
             Poll::Pending => None,
         }
     }
+
     /// Take the result from the mailbox and save it. On a good bind, fill in
     /// the window's address and key.
     fn poll_result(&self) -> Poll<Option<Result<()>>> {
@@ -482,6 +506,7 @@ impl Ticket {
         self.0.result.set(Some(result));
         Poll::Ready(Some(result))
     }
+
     /// Wait for the result. Fails if the pool closes first.
     pub fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.0.lease.slot.waiter.register(cx.waker());
@@ -494,6 +519,7 @@ impl Ticket {
         Poll::Pending
     }
 }
+
 impl QueuePairHandle {
     /// Lease a free slot on `device`'s port.
     ///
@@ -548,6 +574,7 @@ impl QueuePairHandle {
             Poll::Ready(Err(Error::Overloaded))
         }
     }
+
     /// Queue a command. The previous one must have finished.
     fn poll_submit(&self, command: Command, window: Option<Rc<Window>>) -> Poll<Result<Ticket>> {
         if self.lease.slot.cancel.load(Ordering::Acquire)
@@ -576,6 +603,7 @@ impl QueuePairHandle {
         self.lease.shared.engine.wake();
         Poll::Ready(Ok(ticket))
     }
+
     /// Start connecting to `remote`. Wait with [`Self::poll_connected`].
     pub fn poll_connect(&self, remote: Endpoint) -> Poll<Result<()>> {
         remote.validate()?;
@@ -586,6 +614,7 @@ impl QueuePairHandle {
             Some(ready!(self.poll_submit(Command::Connect(remote), None))?);
         Poll::Ready(Ok(()))
     }
+
     /// True if connected and not failed, stopping, or closed.
     pub fn ready(&self) -> bool {
         self.connected.get()
@@ -593,14 +622,17 @@ impl QueuePairHandle {
             && !self.lease.shared.closed.load(Ordering::Acquire)
             && !self.lease.slot.cancel.load(Ordering::Acquire)
     }
+
     /// True once the QP has fully stopped.
     pub fn stopped(&self) -> bool {
         self.lease.slot.fenced.load(Ordering::Acquire)
     }
+
     /// Set a deadline. [`Self::progress`] fails and stops the QP after it.
     pub fn expire_at(&self, deadline: std::time::Instant) {
         self.expires.set(Some(deadline));
     }
+
     /// Open `region` to remote writes. Send the window to the peer only after
     /// the ticket succeeds.
     pub fn poll_bind(&self, region: Rc<Region>) -> Poll<Result<(Rc<Window>, Ticket)>> {
@@ -615,6 +647,7 @@ impl QueuePairHandle {
         let ticket = ready!(self.poll_submit(Command::Bind, Some(window.clone())))?;
         Poll::Ready(Ok((window, ticket)))
     }
+
     /// Revoke the window. This does not make the region safe to read; stop the
     /// QP for that.
     pub fn poll_invalidate(
@@ -628,6 +661,7 @@ impl QueuePairHandle {
         }
         self.poll_submit(Command::Invalidate, None)
     }
+
     /// Write `region` to the peer's window at `address` with `key`.
     pub fn poll_write(&self, region: Rc<Region>, address: u64, key: u32) -> Poll<Result<Ticket>> {
         if !self.ready() || !Rc::ptr_eq(&region.lease, &self.lease) {
@@ -635,10 +669,12 @@ impl QueuePairHandle {
         }
         self.poll_submit(Command::Write { address, key }, None)
     }
+
     /// Wake `cx` when the native side makes progress on this slot.
     pub fn register_waiter(&self, cx: &Context<'_>) {
         self.lease.slot.waiter.register(cx.waker());
     }
+
     /// Check state. Returns 1 if the last command finished, else 0.
     ///
     /// On failure, close, or deadline, stops the QP and returns the error.
@@ -675,12 +711,14 @@ impl QueuePairHandle {
         }
         Ok(count)
     }
+
     /// Ask the native side to stop the QP. Returns at once; wait with
     /// [`Self::poll_stopped`].
     pub fn stop(&self) {
         self.lease.slot.cancel.store(true, Ordering::Release);
         self.lease.shared.engine.wake();
     }
+
     /// Stop the QP and wait until it has stopped. Fails if the pool closes
     /// first.
     pub fn poll_stopped(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -694,6 +732,7 @@ impl QueuePairHandle {
             Poll::Pending
         }
     }
+
     /// Wait for [`Self::poll_connect`] to finish.
     pub fn poll_connected(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.progress()?;
@@ -709,6 +748,7 @@ impl QueuePairHandle {
         poll
     }
 }
+
 impl Drop for QueuePairHandle {
     /// Ask the native side to stop the QP. Does not wait.
     fn drop(&mut self) {
@@ -717,12 +757,16 @@ impl Drop for QueuePairHandle {
 }
 
 // Slot states.
+
 /// Not built yet.
 pub(crate) const IDLE: u8 = 0;
+
 /// Built and free to lease.
 pub(crate) const READY: u8 = 1;
+
 /// Leased by the I/O thread.
 pub(crate) const OWNED: u8 = 2;
+
 /// Out of use, waiting to be released or rebuilt.
 pub(crate) const RETIRED: u8 = 3;
 
@@ -730,13 +774,17 @@ pub(crate) const RETIRED: u8 = 3;
 pub(crate) enum Command {
     /// Connect the QP to the peer.
     Connect(Endpoint),
+
     /// Open the region to remote writes.
     Bind,
+
     /// Write the region to the peer's window.
     Write { address: u64, key: u32 },
+
     /// Revoke the window.
     Invalidate,
 }
+
 /// Data passed between the two threads for one slot, behind a mutex.
 pub(crate) struct Mailbox {
     /// Lease permit, held until the QP stops.
@@ -766,6 +814,7 @@ pub(crate) struct Mailbox {
     /// The slot's guard from [`Configuration::guards`].
     pub quota: Option<Arc<GuardOwner>>,
 }
+
 /// One pool slot, shared by both threads.
 pub(crate) struct Slot {
     /// IDLE, READY, OWNED, or RETIRED.
@@ -788,6 +837,7 @@ pub(crate) struct Slot {
     /// Wakes the I/O task waiting on this slot.
     pub waiter: AtomicWaker,
 }
+
 impl Drop for Slot {
     /// If the QP never stopped, leak the lease permit along with it.
     fn drop(&mut self) {
@@ -801,6 +851,7 @@ impl Drop for Slot {
         }
     }
 }
+
 /// State shared by [`IoPort`] and [`NativePort`].
 pub(crate) struct Shared {
     pub slots: Vec<Arc<Slot>>,
@@ -832,8 +883,10 @@ pub(crate) struct Shared {
     /// Activation result waiting for the I/O side.
     activation: Mutex<Option<Result<Vec<Selection>>>>,
 }
+
 /// Picks ports: takes the port list, returns `(tag, index)` pairs.
 type PortSelector = dyn FnOnce(&[PortInfo]) -> Result<Vec<(u32, usize)>> + Send;
+
 impl Drop for NativePort {
     /// Native side is gone: close the pool and wake every waiter.
     fn drop(&mut self) {
@@ -892,6 +945,7 @@ pub fn pair(slots: usize) -> Result<(IoPort, NativePort)> {
         NativePort { shared },
     ))
 }
+
 impl IoPort {
     /// Submit `configuration` and wait for the native side to build the pool.
     ///
@@ -910,12 +964,14 @@ impl IoPort {
             std::future::Future::poll(configure.as_mut(), cx)
         })
         .await?;
+
         /// Closes the pool if dropped before activation finishes.
         struct ActivationGuard<'a> {
             port: &'a IoPort,
 
             completed: bool,
         }
+
         impl Drop for ActivationGuard<'_> {
             /// Close unless activation finished.
             fn drop(&mut self) {
@@ -924,6 +980,7 @@ impl IoPort {
                 }
             }
         }
+
         let mut guard = ActivationGuard {
             port: self,
             completed: false,
@@ -958,18 +1015,22 @@ impl IoPort {
             generation: self.shared.generation.load(Ordering::Acquire),
         })
     }
+
     /// True if the pool is closed.
     pub fn closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)
     }
+
     /// Number of slots.
     pub fn capacity(&self) -> usize {
         self.shared.slots.len()
     }
+
     /// Wake `waker` on activation results and slot changes.
     pub fn register_driver(&self, waker: &Waker) {
         self.shared.io.register(waker);
     }
+
     /// Start a new round after [`Self::close`].
     ///
     /// Fails until the native side has drained. Does nothing if not closed.
@@ -1003,6 +1064,7 @@ impl IoPort {
         self.shared.engine.wake();
         Ok(())
     }
+
     /// Hand `configuration` to the native side. Once per round.
     ///
     /// Does not wait for the pool to be built; use [`Self::activation`] for
@@ -1037,6 +1099,7 @@ impl IoPort {
         })
         .await
     }
+
     /// Take the activation result, or `None` if not ready yet.
     pub fn activation(&self) -> Option<Result<Vec<Selection>>> {
         match self.shared.activation.try_lock() {
@@ -1045,6 +1108,7 @@ impl IoPort {
             Err(std::sync::TryLockError::Poisoned(_)) => Some(Err(Error::Io)),
         }
     }
+
     /// Close the pool and cancel every slot. Does not wait.
     pub fn close(&self) {
         self.shared.drained.store(false, Ordering::Release);
@@ -1055,6 +1119,7 @@ impl IoPort {
         self.shared.engine.wake();
     }
 }
+
 impl Drop for IoPort {
     /// Close the pool.
     fn drop(&mut self) {
@@ -1081,6 +1146,7 @@ struct Resource {
     /// Wait until this time before retrying a failed stop or rebuild.
     next_retry: Option<std::time::Instant>,
 }
+
 /// Activation in progress. Slots are built one per step.
 struct Activation {
     devices: Vec<Rc<ffi::NativeDevice>>,
@@ -1094,13 +1160,16 @@ struct Activation {
     /// Next slot to build.
     next: usize,
 }
+
 /// Outcome of one activation step.
 enum ActivationStep {
     /// More to do.
     Pending,
+
     /// All slots built. Send this to the I/O side.
     Complete(Vec<Selection>),
 }
+
 impl NativeService {
     /// Build the service. Call on the native thread; it captures that thread's
     /// runtime (and simulation, in tests).
@@ -1117,10 +1186,12 @@ impl NativeService {
             simulation: simulation::current(),
         }
     }
+
     /// Wake `waker` when the I/O side has work for the native side.
     pub fn register_driver(&self, waker: &Waker) {
         self.port.shared.engine.register(waker);
     }
+
     /// Find ports and run the selector. Slots are built later, one per step.
     fn begin_activation(&mut self, config: Configuration) -> Result<ActivationStep> {
         #[cfg(any(test, feature = "simulation"))]
@@ -1172,6 +1243,7 @@ impl NativeService {
         });
         Ok(ActivationStep::Pending)
     }
+
     /// Build the next slot: buffer, QP, and a test window. Slots are spread
     /// across the picked ports in turn. None go READY until all are built.
     fn activate_slot(&mut self) -> Result<ActivationStep> {
@@ -1232,6 +1304,7 @@ impl NativeService {
         }
         Ok(ActivationStep::Complete(activation.selected.to_vec()))
     }
+
     /// Do up to `budget` steps of work, then check whether shutdown is done.
     ///
     /// A step is one of: find ports, build one slot, or service one slot
@@ -1340,6 +1413,7 @@ impl NativeService {
         }
         Ok(())
     }
+
     /// Service one slot.
     ///
     /// - Stopping: stop the QP, copy the buffer out, mark it fenced. Then free
@@ -1500,11 +1574,13 @@ impl NativeService {
             self.port.shared.io.wake();
         }
     }
+
     /// Close the pool from the native side.
     pub fn close(&self) {
         self.port.shared.closed.store(true, Ordering::Release);
         self.port.shared.io.wake();
     }
+
     /// True if no activation is running and every slot's native objects are
     /// freed. [`IoPort::reopen`] may still wait on I/O holders or leaks.
     pub fn drained(&self) -> bool {
@@ -1519,6 +1595,7 @@ impl NativeService {
             && self.resources.iter().all(Option::is_none)
     }
 }
+
 impl Drop for NativeService {
     /// Close, then drop QPs before the regions they use.
     fn drop(&mut self) {
@@ -1560,6 +1637,7 @@ impl Window {
     pub fn key(&self) -> u32 {
         self.key.get()
     }
+
     /// Remote address. Set once the bind ticket succeeds.
     pub fn address(&self) -> u64 {
         self.address.get()
@@ -1575,6 +1653,7 @@ impl<T> WithNative<T> {
         }
     }
 }
+
 impl<S: Scope, T: Service<S>> Service<S> for WithNative<T>
 where
     S::Error: From<Error>,
@@ -1583,19 +1662,23 @@ where
     fn set_failure_reporter(&mut self, reporter: FailureReporter<S::Error>) {
         self.inner.set_failure_reporter(reporter);
     }
+
     /// Pass through to the inner service.
     fn waker(&self) -> std::result::Result<Waker, S::Error> {
         self.inner.waker()
     }
+
     /// Register `waker` with both.
     fn register_driver(&self, waker: &Waker) {
         self.inner.register_driver(waker);
         self.native.register_driver(waker);
     }
+
     /// Start the inner service. The native side starts via [`IoPort::activate`].
     fn start<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         self.inner.start(scope)
     }
+
     /// Poll the inner service, then the native side, each with `budget`.
     fn poll_budgeted(
         &mut self,
@@ -1605,10 +1688,12 @@ where
         self.inner.poll_budgeted(cx, budget)?;
         self.native.poll_budgeted(budget).map_err(Into::into)
     }
+
     /// Stop the inner service only. Native work keeps going.
     fn stop_admission(&mut self) -> std::result::Result<(), S::Error> {
         self.inner.stop_admission()
     }
+
     /// Drain the native side fully, then the inner service.
     fn drain<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
@@ -1616,11 +1701,13 @@ where
             self.inner.drain(scope).await
         })
     }
+
     /// Close the native side, then the inner service.
     fn close(&mut self) -> std::result::Result<(), S::Error> {
         self.native.close();
         self.inner.close()
     }
+
     /// Drain the native side fully, then fence the inner service.
     fn fence<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
@@ -1628,11 +1715,13 @@ where
             self.inner.fence(scope).await
         })
     }
+
     /// Pass through to the inner service.
     fn shutdown<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         self.inner.shutdown(scope)
     }
 }
+
 impl NativeService {
     /// Close and poll until drained. Ignores scope deadlines: the NIC must be
     /// stopped before memory is freed.
@@ -1662,6 +1751,7 @@ struct GuardOwner {
     /// A native allocation escaped destruction; this slot must never replenish it.
     quarantined: AtomicBool,
 }
+
 impl GuardOwner {
     /// Wrap `guard`.
     fn new(guard: Guard) -> Arc<Self> {
@@ -1700,18 +1790,23 @@ fn try_mailbox<T>(mailbox: &Mutex<T>) -> Poll<Result<MutexGuard<'_, T>>> {
 #[cfg(feature = "simulation")]
 pub mod testing {
     use super::*;
+
     /// A slot's state.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum State {
         /// Not built yet.
         Idle,
+
         /// Built and free to lease.
         Ready,
+
         /// Leased.
         Owned,
+
         /// Out of use, waiting to be released or rebuilt.
         Retired,
     }
+
     /// A copy of one slot's flags.
     #[derive(Clone, Copy, Debug)]
     pub struct Snapshot {
@@ -1724,15 +1819,19 @@ pub mod testing {
         /// The QP has stopped.
         pub fenced: bool,
     }
+
     /// Which lock [`IoPort::with_contention`] holds.
     pub enum Contention {
         /// One slot's mailbox.
         Slot(usize),
+
         /// The configuration mailbox.
         Configuration,
+
         /// The activation result mailbox.
         Activation,
     }
+
     impl IoPort {
         /// Run `f` while holding the chosen lock, to test the busy path.
         /// `f` must not block on that same lock.
@@ -1752,6 +1851,7 @@ pub mod testing {
                 }
             }
         }
+
         /// Read slot `i`'s flags.
         pub fn snapshot(&self, i: usize) -> Snapshot {
             let slot = &self.shared.slots[i];
@@ -1766,18 +1866,22 @@ pub mod testing {
                 fenced: slot.fenced.load(Ordering::Acquire),
             }
         }
+
         /// True if a configuration was submitted this round.
         pub fn configuration_submitted(&self) -> bool {
             self.shared.configured.load(Ordering::Acquire)
         }
+
         /// True if the pool is drained and can be reopened.
         pub fn pool_drained(&self) -> bool {
             self.shared.drained.load(Ordering::Acquire)
         }
+
         /// Current round number. Bumped by reopen.
         pub fn generation(&self) -> u64 {
             self.shared.generation.load(Ordering::Acquire)
         }
+
         /// True if slot `i` has a command waiting for the native side.
         pub fn command_pending(&self, i: usize) -> bool {
             self.shared.slots[i]
@@ -1788,15 +1892,18 @@ pub mod testing {
                 .is_some()
         }
     }
+
     impl NativeService {
         /// Number of slots that still have native objects.
         pub fn resource_count(&self) -> usize {
             self.resources.iter().flatten().count()
         }
+
         /// True if slot `i` still has native objects.
         pub fn resource_present(&self, i: usize) -> bool {
             self.resources[i].is_some()
         }
+
         /// Skip slot `i`'s retry wait.
         pub fn retry_now(&mut self, i: usize) {
             self.resources[i].as_mut().unwrap().next_retry = None;
@@ -1808,7 +1915,9 @@ pub mod testing {
 mod mailbox_tests {
     //! Hold native mailboxes at each public handoff, independently of thread timing.
     use super::test_guard::ready;
+
     use super::tests::{claim, mark_connected, provision_test};
+
     use super::*;
 
     /// Contention yields, while an outstanding accepted command rejects another.
@@ -1861,7 +1970,9 @@ mod mailbox_tests {
 #[cfg(test)]
 mod test_guard {
     use super::*;
+
     use std::sync::atomic::{AtomicUsize, Ordering};
+
     /// Unwrap an uncontended poll while retaining its success or failure result.
     pub(crate) fn ready<T>(poll: Poll<Result<T>>) -> Result<T> {
         match poll {
@@ -1869,22 +1980,27 @@ mod test_guard {
             Poll::Pending => panic!("unexpected mailbox contention"),
         }
     }
+
     /// Observe how many lifetime charges are still retained.
     pub struct Observer(Arc<AtomicUsize>);
+
     impl Observer {
         /// Read the outstanding charge count.
         pub fn get(&self) -> usize {
             self.0.load(Ordering::Acquire)
         }
     }
+
     /// Decrement the observed count when the last guard owner disappears.
     struct Charge(Arc<AtomicUsize>);
+
     impl Drop for Charge {
         /// Observe final guard release without retaining the original charge.
         fn drop(&mut self) {
             self.0.fetch_sub(1, Ordering::AcqRel);
         }
     }
+
     /// Create one lifetime charge and its independent observer.
     pub fn guard() -> (Guard, Observer) {
         let count = Arc::new(AtomicUsize::new(1));
@@ -1896,7 +2012,9 @@ mod test_guard {
 mod tests {
     //! Private ownership fixtures and operator-selected native regressions.
     use super::test_guard::ready;
+
     use super::*;
+
     use std::task::Context;
 
     /// Install a private ABI fixture while keeping its independent quota observer.
@@ -1923,6 +2041,7 @@ mod tests {
         });
         charged
     }
+
     /// Claim tag zero in the current generation without native discovery.
     pub(super) fn claim(io: &Rc<IoPort>) -> Rc<QueuePairHandle> {
         ready(QueuePairHandle::poll_new(
@@ -1935,6 +2054,7 @@ mod tests {
         ))
         .unwrap()
     }
+
     /// Assert that connection setup runs on native progress, never the I/O caller.
     pub(super) fn mark_connected(qp: &QueuePairHandle, service: &mut NativeService) {
         ready(qp.poll_connect(qp.endpoint)).unwrap();
@@ -1943,6 +2063,7 @@ mod tests {
         qp.progress().unwrap();
         assert!(qp.ready());
     }
+
     /// Reopen waits for native fencing and the last lease, then rejects stale handles.
     #[test]
     fn restart_requires_native_fence_and_last_lease_and_revokes_old_devices() {
@@ -1993,6 +2114,7 @@ mod tests {
         native.poll_budgeted(1).unwrap();
         assert!(native.drained());
     }
+
     /// I/O cancellation does not wait for native progress but fence completion does.
     #[test]
     fn io_cancel_and_poll_do_not_wait_for_native_thread_or_mailbox_lock() {
@@ -2025,6 +2147,7 @@ mod tests {
         assert!(qp.stopped());
         assert!(qp.poll_stopped(&mut cx).is_ready());
     }
+
     /// Contention on one slot does not block cancellation or a sibling session.
     #[test]
     fn mailbox_contention_never_blocks_cancel_or_other_session() {
@@ -2044,6 +2167,7 @@ mod tests {
         assert!(two.progress().is_ok());
         assert!(two.ready());
     }
+
     #[cfg(feature = "native")]
     #[test]
     #[ignore = "requires built native ABI v2 adapter and zero usable type-2B ports"]
@@ -2082,6 +2206,7 @@ mod tests {
         assert_eq!(charged.get(), 0);
         assert!(io.closed());
     }
+
     #[cfg(feature = "native")]
     #[test]
     #[ignore = "requires operator-selected active type-2B provider; real pooled RC loopback"]
@@ -2141,6 +2266,7 @@ mod tests {
         assert!(receiver.ready());
         let target = ready(Region::poll_acquire(&receiver, 17)).unwrap();
         let (window, bind) = ready(receiver.poll_bind(target.clone())).unwrap();
+
         /// Drive a real ticket to completion under the fixture's fixed deadline.
         fn wait(native: &mut NativeService, ticket: &Ticket, until: std::time::Instant) {
             while ticket.result().is_none() {
@@ -2150,6 +2276,7 @@ mod tests {
             }
             ticket.result().unwrap().unwrap();
         }
+
         wait(&mut native, &bind, deadline);
         let source = ready(Region::poll_acquire(&sender, 17)).unwrap();
         ready(source.poll_copy_from(&[0xa5; 17])).unwrap();
@@ -2264,6 +2391,7 @@ mod endpoint_tests {
 #[cfg(test)]
 mod discovery_tests {
     use super::{PortInfo, discovery::*};
+
     use std::path::Path;
 
     /// Construct a port whose provider locality should be replaced by normalization.
@@ -2326,12 +2454,14 @@ mod discovery_tests {
     fn pci_order_and_numa_metadata_are_preserved_without_a_policy_cap() {
         /// Remove the project-local metadata fixture when the test finishes.
         struct Fixture(std::path::PathBuf);
+
         impl Drop for Fixture {
             /// Remove metadata files created inside the project's test directory.
             fn drop(&mut self) {
                 std::fs::remove_dir_all(&self.0).unwrap();
             }
         }
+
         let root = Fixture(
             std::env::current_dir()
                 .unwrap()
