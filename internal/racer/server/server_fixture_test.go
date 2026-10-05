@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package server
 
 import (
 	"bytes"
@@ -11,18 +11,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/racer/server"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -38,6 +34,25 @@ type servingFixture struct {
 	cancel            context.CancelFunc
 }
 
+// Fixed-certificate adapter for socket tests; production always uses the reloader.
+func (s *Server) tlsConfig(ctx context.Context, certificate tls.Certificate) *tls.Config {
+	r := s.installTestServingCertificate(certificate)
+	return s.tlsConfigWithCertificate(ctx, r.getCertificate)
+}
+
+func (s *Server) installTestServingCertificate(certificate tls.Certificate) *servingCertificateReloader {
+	validated, err := validateServingCertificate(certificate, time.Now())
+	if err != nil {
+		panic(err)
+	}
+
+	r := &servingCertificateReloader{}
+	r.current.Store(validated)
+	s.servingCertificate.Store(r)
+
+	return r
+}
+
 func newServingFixture(t *testing.T) *servingFixture {
 	t.Helper()
 	a, status, token := authFixture(t)
@@ -47,7 +62,9 @@ func newServingFixture(t *testing.T) *servingFixture {
 	t.Cleanup(cancel)
 	runKeys(t, a.Keyring)
 	reconcileTopology(t, a.Topology, ctx)
-	startFixtureLifecycle(t, a.Lifecycle, ctx)
+	a.Lifecycle.mu.Lock()
+	a.Lifecycle.process, a.Lifecycle.synced, a.Lifecycle.serving = ctx, true, true
+	a.Lifecycle.mu.Unlock()
 
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -89,7 +106,7 @@ func newServingFixture(t *testing.T) *servingFixture {
 
 	roots := x509.NewCertPool()
 	roots.AddCert(cert)
-	fixtureTLS(t, a.Server, ctx, tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key})
+	a.Server.installTestServingCertificate(tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key})
 
 	return &servingFixture{a: a, token: token, key: key, request: request, certificate: tls.Certificate{Certificate: response.CertificateChain, PrivateKey: key}, serverCertificate: tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, roots: roots, ctx: ctx, cancel: cancel}
 }
@@ -112,7 +129,8 @@ func (f *servingFixture) start(t *testing.T) string {
 	t.Helper()
 
 	s := httptest.NewUnstartedServer(f.a.Server.Handler())
-	s.TLS = fixtureTLS(t, f.a.Server, f.ctx, f.serverCertificate)
+	s.Config.ConnContext = connectionContext
+	s.TLS = f.a.Server.tlsConfig(f.ctx, f.serverCertificate)
 	s.StartTLS()
 	t.Cleanup(s.Close)
 
@@ -150,95 +168,4 @@ func responseBody(t *testing.T, response *http.Response, err error, status int) 
 	}
 
 	return b
-}
-
-func startFixtureLifecycle(t *testing.T, l *server.Lifecycle, ctx context.Context) {
-	t.Helper()
-
-	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan error, 1)
-
-	t.Cleanup(func() {
-		cancel()
-
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Error(err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("fixture lifecycle did not stop")
-		}
-	})
-
-	synced := make(chan struct{})
-
-	l.SetCacheSync(func(context.Context) bool { close(synced); return true })
-
-	go func() { done <- l.Start(ctx) }()
-
-	<-synced
-	l.SetServingReady(true)
-
-	deadline := time.Now().Add(5 * time.Second)
-	for l.Ready(nil) != nil {
-		if ctx.Err() != nil || time.Now().After(deadline) {
-			t.Fatal("fixture lifecycle did not become ready")
-		}
-
-		time.Sleep(time.Millisecond)
-	}
-}
-
-func fixtureTLS(t *testing.T, s *server.Server, ctx context.Context, certificate tls.Certificate) *tls.Config {
-	t.Helper()
-
-	if s.Config.TLSCertificateFile == "/etc/racer/tls/tls.crt" {
-		dir := t.TempDir()
-		s.Config.TLSCertificateFile = filepath.Join(dir, "tls.crt")
-		s.Config.TLSPrivateKeyFile = filepath.Join(dir, "tls.key")
-
-		var chain []byte
-		for _, der := range certificate.Certificate {
-			chain = append(chain, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
-		}
-
-		key, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := os.WriteFile(s.Config.TLSCertificateFile, chain, 0o600); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := os.WriteFile(s.Config.TLSPrivateKeyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	config, err := s.TLSConfig(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return config
-}
-
-type fixtureRequestWriter struct {
-	ctx    context.Context
-	writer io.Writer
-}
-
-func (w fixtureRequestWriter) Write(b []byte) (int, error) {
-	if err := w.ctx.Err(); err != nil {
-		return 0, err
-	}
-
-	n, err := w.writer.Write(b)
-	if err == nil {
-		err = w.ctx.Err()
-	}
-
-	return n, err
 }

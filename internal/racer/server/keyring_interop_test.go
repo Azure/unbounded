@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package server
 
 import (
 	"context"
@@ -56,7 +56,7 @@ func TestRustKeyringInterop(t *testing.T) {
 
 	config, err := json.Marshal(map[string]string{
 		"endpoint": endpoint,
-		"cluster":  string(f.a.Server.Config.Cluster),
+		"cluster":  string(f.a.Topology.Config.Cluster),
 		"node":     testNodeUID,
 		"token":    f.token,
 	})

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package server
 
 import (
 	"testing"
@@ -24,7 +24,7 @@ func TestIdentityAdmission(t *testing.T) {
 }
 
 func TestAdmissionLimitsFrozen(t *testing.T) {
-	s := &Server{Config: testConfig(t)}
+	s := &Server{Config: testConfig(t).ServerConfig}
 	s.Config.Limits.MaxPolls = 1
 	s.Config.Limits.MaxConcurrentBootstrap = 1
 	s.initializeAdmission()

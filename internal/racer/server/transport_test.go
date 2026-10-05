@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package server
 
 import (
 	"crypto/tls"
@@ -277,16 +277,7 @@ func TestTransportProductionLongPollAndIdleAdmission(t *testing.T) {
 func TestTransportLimitsValidation(t *testing.T) {
 	for _, field := range []string{"connections", "handshakes"} {
 		for _, value := range []int{0, -1} {
-			cfg, err := ConfigFromLookup(func(name string) (string, bool) {
-				if name == "RACER_CLUSTER_ID" {
-					return "11111111-1111-4111-8111-111111111111", true
-				}
-
-				return "", false
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			cfg := testConfig(t).ServerConfig
 
 			if field == "connections" {
 				cfg.Limits.MaxConnections = value

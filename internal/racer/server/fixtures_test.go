@@ -1,17 +1,20 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package server
 
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -19,7 +22,6 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
-	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,21 +31,26 @@ import (
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/authority"
-	"github.com/Azure/unbounded/internal/racer/server"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-func testConfig(t *testing.T) Config {
+func testConfig(t *testing.T) fixtureConfig {
 	t.Helper()
-	t.Setenv("RACER_CLUSTER_ID", testOtherUID)
-	t.Setenv("POD_NAMESPACE", "racer")
 
-	cfg, err := LoadConfig()
-	if err != nil {
-		t.Fatal(err)
+	return fixtureConfig{
+		Config: authority.Config{
+			Cluster: testOtherUID, Namespace: "racer", DataplaneServiceAccount: "racer-dataplane",
+			ControllerServiceAccount: "racer-controller", DaemonSetName: "racer-dataplane",
+			CredentialsSecretName: "racer-credentials", VersionConfigMapName: "racer-version",
+			InstallationConfigMapName: "racer-installation", CertificateLifetime: wire.CertificateLifetime,
+			SnapshotMaxAge: 30 * time.Second, MaxTokenBytes: 16 * 1024,
+			Rotation: authority.RotationPolicy{Interval: 24 * time.Hour, PrepareFor: time.Hour, RetainFor: 48 * time.Hour},
+		},
+		PeerPort: 8082, ServerConfig: Config{
+			ControlAddress: ":8443", TLSCertificateFile: "/etc/racer/tls/tls.crt", TLSPrivateKeyFile: "/etc/racer/tls/tls.key", ReplicationServerName: "racer-controller.racer.svc",
+			Limits: Limits{MaxConnections: 2*wire.MaxMembers + 128, MaxConcurrentHandshakes: 32, MaxPolls: wire.MaxMembers, MaxConcurrentWrites: 128, MaxConcurrentBootstrap: 32, HeaderBytes: 16 * 1024, WriteTimeout: 30 * time.Second, ShutdownTimeout: 10 * time.Second},
+		},
 	}
-
-	return cfg
 }
 
 func testTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
@@ -245,7 +252,7 @@ func (d *fixtureDependency) List(ctx context.Context, list client.ObjectList, op
 
 var fixtureDependencies = map[*authority.Authority]*fixtureDependency{}
 
-func assembleFixture(cfg Config, c client.Client, reader client.Reader) *Application {
+func assembleFixture(cfg fixtureConfig, c client.Client, reader client.Reader) *Application {
 	d := &fixtureDependency{Client: c, reader: reader, now: time.Now}
 	a := Assemble(cfg, d, d)
 	// Supply a clock through construction; no setter is exposed by authority.
@@ -253,14 +260,15 @@ func assembleFixture(cfg Config, c client.Client, reader client.Reader) *Applica
 	a.authority = owner
 	a.Topology.authority = owner
 	a.Keyring.authority = owner
-	a.Lifecycle = server.NewLifecycle(owner)
-	a.Server = server.New(cfg.serverConfig(), d, owner, a.Lifecycle, a.Replication)
+	a.Server.authority = owner
 	a.Replication.authority = owner
+	a.Lifecycle.authority = owner
 	a.Topology.Client = c
 	a.Topology.APIReader = reader
 	a.Replication.Client = c
 	a.Replication.APIReader = reader
 	fixtureDependencies[owner] = d
+	fixtureConfigs[owner] = cfg
 
 	return a
 }
@@ -274,6 +282,22 @@ func decodeIssuedResponse(t *testing.T, encoded []byte) wire.BootstrapResponse {
 	}
 
 	return response
+}
+
+func issuanceRequest(t *testing.T, r *KeyringReconciler) (NodeIdentity, wire.BootstrapRequest, ed25519.PublicKey) {
+	t.Helper()
+
+	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return NodeIdentity{}, wire.BootstrapRequest{SchemaVersion: 1, Cluster: r.Config.Cluster, Enrollment: testOtherUID, CSRDER: csr, Shares: wire.DefaultShares}, pub
 }
 
 func fixtureIdentity(t *testing.T, f *servingFixture) NodeIdentity {
@@ -290,68 +314,21 @@ func fixtureIdentity(t *testing.T, f *servingFixture) NodeIdentity {
 	return identity
 }
 
-type podAuthorizationReader struct {
-	client.Reader
-	pod *corev1.Pod
-}
+func invalidateFixtureTrust(t *testing.T, f *servingFixture) {
+	t.Helper()
+	secret, _, _, _ := keyState(t, f.a.Keyring)
 
-func (r podAuthorizationReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	switch value := obj.(type) {
-	case *corev1.Pod:
-		*value = *r.pod.DeepCopy()
-		return nil
-	case *corev1.Node:
-		*value = corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: r.pod.Spec.NodeName, UID: testNodeUID}}
-		return nil
-	default:
-		return r.Reader.Get(ctx, key, obj, opts...)
+	secret.Data["bundle.json"] = []byte(`{}`)
+	if err := f.a.Topology.Update(t.Context(), secret); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.a.authority.Observe(t.Context()); err == nil {
+		t.Fatal("invalid credential observation succeeded")
 	}
 }
 
-type reviewWriter struct {
-	client.Writer
-	status authv1.TokenReviewStatus
-}
-
-func (w reviewWriter) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
-	if review, ok := obj.(*authv1.TokenReview); ok {
-		review.Status = w.status
-		return ctx.Err()
-	}
-
-	return w.Writer.Create(ctx, obj, opts...)
-}
-
-// Preserve authorization-only scenarios through public token authentication.
-func authorizePod(ctx context.Context, reader client.Reader, cfg Config, pod *corev1.Pod, saUID string) error {
-	status := authv1.TokenReviewStatus{Authenticated: true, Audiences: []string{wire.TokenAudience}, User: authv1.UserInfo{Username: "system:serviceaccount:" + cfg.Namespace + ":" + cfg.DataplaneServiceAccount, UID: saUID, Extra: map[string]authv1.ExtraValue{"authentication.kubernetes.io/pod-name": {pod.Name}, "authentication.kubernetes.io/pod-uid": {string(pod.UID)}, "authentication.kubernetes.io/node-name": {pod.Spec.NodeName}, "authentication.kubernetes.io/node-uid": {testNodeUID}}}}
-	if pod.UID == "" {
-		status.User.Extra["authentication.kubernetes.io/pod-uid"] = authv1.ExtraValue{"missing"}
-	}
-
-	a := authority.New(cfg.authorityConfig(), authority.Dependencies{Writer: reviewWriter{status: status}, Reader: podAuthorizationReader{Reader: reader, pod: pod}})
-	token := "header." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"exp":%d}`, time.Now().Add(time.Hour).Unix())) + ".signature"
-	r := httptest.NewRequest(http.MethodGet, wire.KeyringPath, nil)
-	r.Header.Set("Authorization", "Bearer "+token)
-	_, err := a.Authenticate(ctx, r)
-
-	return err
-}
-
-const (
-	installationUIDAnnotation = "racer.unbounded-cloud.io/installation-uid"
-	credentialClaim           = "racer.unbounded-cloud.io/credentials"
-)
-
-func readInstallation(ctx context.Context, reader client.Reader, cfg Config, fresh bool) (*corev1.ConfigMap, error) {
-	var cm corev1.ConfigMap
-
-	err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName}, &cm)
-
-	return &cm, err
-}
-
-func readVersion(ctx context.Context, reader client.Reader, cfg Config) (*corev1.ConfigMap, VersionRecord, error) {
+func readVersion(ctx context.Context, reader client.Reader, cfg fixtureConfig) (*corev1.ConfigMap, VersionRecord, error) {
 	if err := authority.ValidateInstallation(ctx, reader, cfg.Namespace, string(cfg.Cluster)); err != nil {
 		return nil, VersionRecord{}, err
 	}
@@ -374,19 +351,112 @@ func readVersion(ctx context.Context, reader client.Reader, cfg Config) (*corev1
 	return &cm, VersionRecord{Cluster: wire.ClusterID(cm.Data["cluster"]), Sequence: wire.Sequence(seq), MembershipVersion: wire.MembershipVersion(members), ContentHash: cm.Data["content_hash"], MembershipHash: cm.Data["membership_hash"]}, nil
 }
 
-func ensureInstalled(ctx context.Context, writer client.Writer, reader client.Reader, cfg Config) error {
-	return authority.New(cfg.authorityConfig(), authority.Dependencies{Reader: reader, Writer: writer}).Recover(ctx, writer)
-}
+func configureFixtureAge(t *testing.T, f *servingFixture, age time.Duration) {
+	t.Helper()
 
-func containsRoot(b wire.KeyringBundle, id string) bool {
-	for _, root := range b.PeerTrustRoots {
-		sum := sha256.Sum256(root)
-		if hex.EncodeToString(sum[:]) == id {
-			return true
-		}
+	cfg := f.a.Topology.Config
+	cfg.SnapshotMaxAge = age
+	d := fixtureDependencies[f.a.authority]
+	a := authority.New(cfg.authorityConfig(), authority.Dependencies{Writer: d, Reader: d, Now: func() time.Time { return d.now() }})
+	f.a.authority = a
+	f.a.Topology.authority = a
+	f.a.Keyring.authority = a
+	f.a.Server.authority = a
+	f.a.Replication.authority = a
+	f.a.Lifecycle.authority = a
+
+	fixtureDependencies[a] = d
+
+	fixtureConfigs[a] = cfg
+	if err := a.Observe(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 
-	return false
+	reconcileTopology(t, f.a.Topology, f.ctx)
+}
+
+func replaceFixtureCredentials(t *testing.T, f *servingFixture) {
+	t.Helper()
+	other := newServingFixture(t)
+	candidate, _, _, _ := keyState(t, other.a.Keyring)
+	current, bundle, _, _ := keyState(t, f.a.Keyring)
+
+	var (
+		replacement wire.KeyringBundle
+		err         error
+	)
+
+	replacement, err = wire.DecodeBundle(bytes.NewReader(candidate.Data["bundle.json"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replacement.Generation = bundle.Generation + 1
+
+	candidate.Data["bundle.json"], err = wire.EncodeBundle(replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	current.Data = candidate.Data
+	if err := f.a.Topology.Update(t.Context(), current); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.a.authority.Observe(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+var withdrawnSecrets = map[*authority.Authority]*corev1.Secret{}
+
+func withdrawServerTrust(t *testing.T, s *Server) {
+	t.Helper()
+
+	d := fixtureDependencies[s.authority]
+
+	var secret corev1.Secret
+	if err := d.Client.Get(t.Context(), client.ObjectKey{Namespace: fixtureConfigs[s.authority].Namespace, Name: fixtureConfigs[s.authority].CredentialsSecretName}, &secret); err != nil {
+		t.Fatal(err)
+	}
+
+	if withdrawnSecrets[s.authority] == nil {
+		withdrawnSecrets[s.authority] = secret.DeepCopy()
+	}
+
+	secret.Data["bundle.json"] = []byte(`{}`)
+	if err := d.Update(t.Context(), &secret); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.authority.ReconcileCredentials(t.Context()); err == nil {
+		t.Fatal("invalid trust accepted")
+	}
+}
+
+func restoreServerTrust(t *testing.T, s *Server) {
+	t.Helper()
+
+	d := fixtureDependencies[s.authority]
+
+	saved := withdrawnSecrets[s.authority]
+	if saved == nil {
+		return
+	}
+
+	var secret corev1.Secret
+	if err := d.Client.Get(t.Context(), client.ObjectKeyFromObject(saved), &secret); err != nil {
+		t.Fatal(err)
+	}
+
+	secret.Data = saved.DeepCopy().Data
+	if err := d.Update(t.Context(), &secret); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.authority.ReconcileCredentials(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func withdrawPublication(t *testing.T, r *TopologyReconciler) func() {
@@ -434,7 +504,7 @@ func (p capturedResponse) writeTo(ctx context.Context, w io.Writer) (int64, erro
 	var total int64
 
 	for rest := p.encoded; rest != ""; {
-		n, err := fixtureRequestWriter{ctx: ctx, writer: w}.Write([]byte(rest[:min(len(rest), 32768)]))
+		n, err := requestWriter{ctx: ctx, writer: w}.Write([]byte(rest[:min(len(rest), 32768)]))
 
 		total += int64(n)
 		if err != nil {
@@ -447,49 +517,87 @@ func (p capturedResponse) writeTo(ctx context.Context, w io.Writer) (int64, erro
 	return total, ctx.Err()
 }
 
-func versionData(v VersionRecord) map[string]string {
-	return map[string]string{"cluster": string(v.Cluster), "sequence": strconv.FormatUint(uint64(v.Sequence), 10), "membership_version": strconv.FormatUint(uint64(v.MembershipVersion), 10), "content_hash": v.ContentHash, "membership_hash": v.MembershipHash}
+func parseSigning(m signingMaterial) (*x509.Certificate, ed25519.PrivateKey, error) {
+	cert, err := x509.ParseCertificate(m.Certificate)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	key, err := x509.ParsePKCS8PrivateKey(m.PrivateKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return cert, key.(ed25519.PrivateKey), nil
 }
 
-func advanceFixturePublication(t *testing.T, r *TopologyReconciler) {
-	t.Helper()
-
-	members := AcceptedMembers{testNodeUID: {Node: testNodeUID, Shares: 4, PeerEndpoint: "192.0.2.1:8082", RDMANICs: []wire.RDMANIC{}}}
-	replicationSmokePublish(t, t.Context(), r, members)
-}
-
-func testKeyring(t *testing.T) (*KeyringReconciler, *time.Time) {
-	t.Helper()
-
-	cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache", UID: testNodeUID}}
-	r := initializedTopology(t, cache)
-	a := assembleFixture(r.Config, r.Client, r.APIReader)
-	now := time.Now().UTC().Truncate(time.Second)
-	fixtureDependencies[a.authority].now = func() time.Time { return now }
-
-	return a.Keyring, &now
-}
-
-func holdFixtureGate(t *testing.T, f *servingFixture) func() {
-	t.Helper()
-
-	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		_, err := f.a.authority.PublishTopology(t.Context(), func(context.Context) (TopologyObservation, error) {
-			close(entered)
-			<-release
-
-			return TopologyObservation{}, wire.Unavailable
-		})
-		if err == nil {
-			t.Error("failed discovery succeeded")
+func waitFixturePublication(ctx context.Context, a *authority.Authority, after wire.Sequence) (*authority.PublicationHandle, error) {
+	for {
+		p, changed, err := a.CurrentAndSubscribe()
+		if err != nil {
+			return nil, err
 		}
-	}()
 
-	<-entered
+		if p.Sequence() > after {
+			return p, nil
+		}
 
-	return func() { close(release); <-done }
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func rootID(der []byte) string { sum := sha256.Sum256(der); return hex.EncodeToString(sum[:]) }
+func generateIssuer(now time.Time, cfg fixtureConfig) ([]byte, []byte, error) {
+	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cert := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(cfg.Rotation.Interval + cfg.Rotation.PrepareFor + cfg.Rotation.RetainFor + 2*cfg.CertificateLifetime), IsCA: true, BasicConstraintsValid: true, MaxPathLenZero: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
+
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, pub, key)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	encoded, err := x509.MarshalPKCS8PrivateKey(key)
+
+	return der, encoded, err
+}
+
+func largeFixturePublication(t *testing.T, f *servingFixture) {
+	t.Helper()
+
+	members := make(AcceptedMembers, 50000)
+
+	for i := range 50000 {
+		id := wire.NodeID(fmt.Sprintf("33333333-3333-4333-8333-%012d", i))
+		members[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: "192.0.2.1:8082", RDMANICs: []wire.RDMANIC{}}
+	}
+
+	replicationSmokePublish(t, f.ctx, f.a.Topology, members)
+}
+
+func rotateFixtureTrust(t *testing.T, f *servingFixture) {
+	t.Helper()
+	secret, bundle, _, _ := keyState(t, f.a.Keyring)
+	bundle.Generation++
+
+	encoded, err := wire.EncodeBundle(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secret.Data["bundle.json"] = encoded
+	if err := f.a.Topology.Update(t.Context(), secret); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := f.a.authority.ReconcileCredentials(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 }

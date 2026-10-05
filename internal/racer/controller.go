@@ -1,18 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer implements the Racer server using controller-runtime directly.
+// Package racer composes the Racer controllers and replica observer.
 // Constructors compose only; serving requires locally validated replicated state.
-// Run and Assemble in controller.go wire the process and guarded startup.
-// Topology and keyring own leader writes;
-// replication, trust, authentication, and server own replica-local serving.
-// workload.go provides the operator's pure builders; wire owns protocol encoding.
+// Authority owns accepted state, server owns HTTPS serving, members owns workload
+// discovery and builders, and wire owns protocol encoding.
 package racer
 
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"reflect"
 	"slices"
@@ -43,6 +40,8 @@ import (
 	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/authority"
+	"github.com/Azure/unbounded/internal/racer/members"
+	"github.com/Azure/unbounded/internal/racer/server"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -50,8 +49,8 @@ type Application struct {
 	authority   *authority.Authority
 	Topology    *TopologyReconciler
 	Keyring     *KeyringReconciler
-	Server      *Server
-	Lifecycle   *Lifecycle
+	Server      *server.Server
+	Lifecycle   *server.Lifecycle
 	Replication *Replication
 }
 
@@ -61,27 +60,24 @@ type Application struct {
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	cfg = cfg.effective()
 	a := authority.New(cfg.authorityConfig(), authority.Dependencies{Writer: c, Reader: reader})
-	lifecycle := newLifecycle(a)
+	lifecycle := server.NewLifecycle(a)
 	replication := &Replication{Config: cfg, Client: c, APIReader: reader, authority: a}
+	// Freeze observer settings before the server can expose replication.
+	replication.runtimeConfig()
 
 	return &Application{
-		authority: a,
-		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, authority: a},
-		Keyring:   &KeyringReconciler{Config: cfg, authority: a},
-		Server: &Server{
-			writer:      c,
-			authority:   a,
-			Config:      cfg,
-			Lifecycle:   lifecycle,
-			Replication: replication,
-		},
+		authority:   a,
+		Topology:    &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, authority: a},
+		Keyring:     &KeyringReconciler{Config: cfg, authority: a},
+		Server:      server.New(cfg.serverConfig(), c, a, lifecycle, replication),
 		Lifecycle:   lifecycle,
 		Replication: replication,
 	}
 }
 
 func (a *Application) SetupWithManager(mgr ctrl.Manager) error {
-	a.Lifecycle.waitForCacheSync = mgr.GetCache().WaitForCacheSync
+	a.Lifecycle.SetCacheSync(mgr.GetCache().WaitForCacheSync)
+
 	if err := mgr.Add(a.Lifecycle); err != nil {
 		return fmt.Errorf("register serving lifecycle: %w", err)
 	}
@@ -225,16 +221,7 @@ type Config struct {
 	SnapshotMaxAge            time.Duration
 }
 
-type Limits struct {
-	MaxConnections          int
-	MaxConcurrentHandshakes int
-	MaxPolls                int
-	MaxConcurrentWrites     int
-	MaxConcurrentBootstrap  int
-	HeaderBytes             int
-	WriteTimeout            time.Duration
-	ShutdownTimeout         time.Duration
-}
+type Limits = server.Limits
 
 // LoadConfig reads deployment configuration. Initialization state is deliberately
 // not an environment setting: it is read authoritatively on every recovery.
@@ -370,11 +357,12 @@ func (c Config) Validate() error {
 		}
 	}
 
-	if c.VersionConfigMapName == c.InstallationConfigMapName ||
-		c.Limits.MaxConnections <= 0 || c.Limits.MaxConcurrentHandshakes <= 0 ||
-		c.Limits.MaxPolls <= 0 || c.Limits.MaxConcurrentWrites <= 0 || c.Limits.MaxConcurrentBootstrap <= 0 ||
-		c.Limits.HeaderBytes <= 0 || c.Limits.WriteTimeout <= 0 || c.Limits.ShutdownTimeout <= 0 {
+	if c.VersionConfigMapName == c.InstallationConfigMapName {
 		return fmt.Errorf("resource names or limits: %w", wire.InvalidRequest)
+	}
+
+	if err := c.serverConfig().Validate(); err != nil {
+		return err
 	}
 
 	// Two minutes leaves a full poll turn between renewal at two-thirds of the
@@ -401,99 +389,6 @@ func (c Config) validateReplication() error {
 	}
 
 	return nil
-}
-
-// Lifecycle owns process serving, independently of the leader-owned publishers.
-type Lifecycle struct {
-	authority        *authority.Authority
-	mu               sync.Mutex
-	process          context.Context
-	synced           bool
-	serving          bool
-	waitForCacheSync func(context.Context) bool
-}
-
-func newLifecycle(a *authority.Authority) *Lifecycle {
-	return &Lifecycle{authority: a}
-}
-
-func (*Lifecycle) NeedLeaderElection() bool { return false }
-
-// ProcessContext binds a request to the serving process lifetime.
-// Missing or canceled process lifetime returns an already-canceled child.
-func (l *Lifecycle) ProcessContext(parent context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
-	if l == nil {
-		cancel()
-		return ctx, cancel
-	}
-
-	l.mu.Lock()
-	process := l.process
-	l.mu.Unlock()
-
-	if process == nil {
-		cancel()
-		return ctx, cancel
-	}
-
-	stop := context.AfterFunc(process, cancel)
-	if process.Err() != nil {
-		cancel()
-	}
-
-	return ctx, func() { stop(); cancel() }
-}
-
-func (l *Lifecycle) Start(ctx context.Context) error {
-	l.mu.Lock()
-	if l.process != nil {
-		l.mu.Unlock()
-		return wire.Conflict
-	}
-
-	l.process = ctx
-	l.authority.BindProcess(ctx)
-	l.mu.Unlock()
-
-	defer func() {
-		l.mu.Lock()
-		l.synced, l.serving = false, false
-		l.mu.Unlock()
-	}()
-
-	if l.waitForCacheSync == nil || !l.waitForCacheSync(ctx) {
-		if ctx.Err() != nil {
-			return nil
-		}
-
-		return wire.Unavailable
-	}
-
-	l.mu.Lock()
-	l.synced = ctx.Err() == nil
-	l.mu.Unlock()
-	<-ctx.Done()
-
-	return nil
-}
-
-// SetServingReady is set only after the authenticated listener is accepting.
-func (l *Lifecycle) SetServingReady(ready bool) {
-	l.mu.Lock()
-	l.serving = ready
-	l.mu.Unlock()
-}
-
-func (l *Lifecycle) Ready(_ *http.Request) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.process == nil || l.process.Err() != nil || !l.synced || !l.serving {
-		return wire.Unavailable
-	}
-
-	return l.authority.PublicationReady()
 }
 
 const (
@@ -627,4 +522,34 @@ func versionChanges(cfg Config) predicate.Predicate {
 
 		return x.UID == y.UID && reflect.DeepEqual(x.Data, y.Data) && reflect.DeepEqual(x.Annotations, y.Annotations) && reflect.DeepEqual(x.Immutable, y.Immutable) && reflect.DeepEqual(x.DeletionTimestamp, y.DeletionTimestamp)
 	})
+}
+
+func (c Config) serverConfig() server.Config {
+	return server.Config{
+		ControlAddress:        c.ControlAddress,
+		TLSCertificateFile:    c.TLSCertificateFile,
+		TLSPrivateKeyFile:     c.TLSPrivateKeyFile,
+		ReplicationServerName: c.ReplicationServerName,
+		Limits:                c.Limits,
+	}
+}
+
+func (c Config) authorityConfig() authority.Config {
+	return authority.Config{
+		Cluster: c.Cluster, Namespace: c.Namespace,
+		DataplaneServiceAccount: c.DataplaneServiceAccount, ControllerServiceAccount: c.ControllerServiceAccount,
+		DaemonSetName: c.DaemonSetName, CredentialsSecretName: c.CredentialsSecretName,
+		VersionConfigMapName: c.VersionConfigMapName, InstallationConfigMapName: c.InstallationConfigMapName,
+		Rotation: c.Rotation, CertificateLifetime: c.CertificateLifetime, SnapshotMaxAge: c.SnapshotMaxAge,
+		MaxTokenBytes: c.Limits.HeaderBytes,
+	}
+}
+
+type (
+	NodeIdentity      = authority.NodeIdentity
+	PublicationHandle = authority.PublicationHandle
+)
+
+func managedWorkloadNames(cfg Config) []string {
+	return members.ManagedNames(cfg.DaemonSetName)
 }

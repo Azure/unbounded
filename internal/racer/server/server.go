@@ -1,13 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+// Package server serves Racer HTTPS endpoints from locally validated authority.
+package server
 
 import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net"
@@ -22,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/Azure/unbounded/internal/racer/authority"
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -32,7 +36,7 @@ type Server struct {
 	Config             Config
 	config             Config
 	Lifecycle          *Lifecycle
-	Replication        *Replication
+	Leader             Leader
 	once               sync.Once
 	polls              *identityAdmission[wire.NodeID]
 	keyringPolls       *identityAdmission[wire.NodeID]
@@ -229,13 +233,9 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 
 func (s *Server) initializeAdmission() {
 	s.once.Do(func() {
-		s.config = s.Config.effective()
+		s.config = s.Config
 		// Freeze transport settings before exposure. Authority policy was already
 		// copied at construction and cannot be changed through these settings.
-
-		if s.Replication != nil {
-			s.Replication.runtimeConfig()
-		}
 
 		s.polls = newIdentityAdmission[wire.NodeID](s.config.Limits.MaxPolls)
 		s.keyringPolls = newIdentityAdmission[wire.NodeID](s.config.Limits.MaxPolls)
@@ -326,7 +326,7 @@ func (s *Server) Handler() http.Handler {
 		var handler http.HandlerFunc
 
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == replicationPath && s.Replication != nil:
+		case r.Method == http.MethodGet && r.URL.Path == ReplicationPath && s.Leader != nil:
 			if r.TLS == nil || !r.TLS.HandshakeComplete {
 				writeFailure(w, wire.Unauthenticated)
 				return
@@ -446,9 +446,9 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	flushResponse(trustCtx, w)
 }
 
-func (s *Server) authenticateSnapshot(ctx context.Context, state *tls.ConnectionState) (NodeIdentity, error) {
+func (s *Server) authenticateSnapshot(ctx context.Context, state *tls.ConnectionState) (authority.NodeIdentity, error) {
 	if !take(s.authSlots) {
-		return NodeIdentity{}, wire.Overloaded
+		return authority.NodeIdentity{}, wire.Overloaded
 	}
 	defer release(s.authSlots)
 
@@ -748,12 +748,12 @@ func keyringCursor(r *http.Request) (*wire.Generation, error) {
 	return &generation, nil
 }
 
-func (s *Server) authenticateKeyring(r *http.Request) (NodeIdentity, error) {
+func (s *Server) authenticateKeyring(r *http.Request) (authority.NodeIdentity, error) {
 	bearer := len(r.Header.Values("Authorization")) != 0
 
 	certificate := r.TLS != nil && (len(r.TLS.PeerCertificates) != 0 || len(r.TLS.VerifiedChains) != 0)
 	if bearer && certificate {
-		return NodeIdentity{}, wire.Unauthenticated
+		return authority.NodeIdentity{}, wire.Unauthenticated
 	}
 
 	if !bearer {
@@ -761,11 +761,11 @@ func (s *Server) authenticateKeyring(r *http.Request) (NodeIdentity, error) {
 	}
 
 	if s.authority == nil {
-		return NodeIdentity{}, wire.Unavailable
+		return authority.NodeIdentity{}, wire.Unavailable
 	}
 
 	if !take(s.bootstrapSlots) {
-		return NodeIdentity{}, wire.Overloaded
+		return authority.NodeIdentity{}, wire.Overloaded
 	}
 	defer release(s.bootstrapSlots)
 
@@ -893,4 +893,364 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	}
 
 	flushResponse(ctx, w)
+}
+
+func (s *Server) enroll(ctx context.Context, r *http.Request, request wire.BootstrapRequest) ([]byte, error) {
+	response, hint, err := s.authority.EnrollWithHint(ctx, r, request)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithDeadline(ctx, hint.Expires)
+	defer cancel()
+
+	if err := annotateEnrollment(ctx, s.writer, hint); err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+func annotateEnrollment(ctx context.Context, writer client.Writer, hint authority.EnrollmentHint) error {
+	node := hint.Node.DeepCopy()
+	value := strconv.FormatUint(uint64(hint.Shares), 10)
+
+	nics, err := json.Marshal(hint.RDMANICs)
+	if err != nil {
+		return err
+	}
+
+	nicValue := string(nics)
+	if len(hint.RDMANICs) == 0 {
+		nicValue = ""
+	}
+
+	_, nicPresent := node.Annotations[members.EnrolledRDMANICsAnnotation]
+	if node.Annotations[members.EnrolledSharesAnnotation] == value && node.Annotations[members.EnrolledRDMANICsAnnotation] == nicValue && (nicValue != "" || !nicPresent) {
+		return nil
+	}
+
+	before := node.DeepCopy()
+	if node.Annotations == nil {
+		node.Annotations = map[string]string{}
+	}
+
+	node.Annotations[members.EnrolledSharesAnnotation] = value
+	if nicValue == "" {
+		delete(node.Annotations, members.EnrolledRDMANICsAnnotation)
+	} else {
+		node.Annotations[members.EnrolledRDMANICsAnnotation] = nicValue
+	}
+
+	return writer.Patch(ctx, node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+}
+
+// identityAdmission retains identities through response writes and flushes.
+// Each endpoint owns an independent set and fixes its capacity at construction.
+type identityAdmission[T comparable] struct {
+	mu    sync.Mutex
+	limit int
+	held  map[T]struct{}
+}
+
+func newIdentityAdmission[T comparable](limit int) *identityAdmission[T] {
+	return &identityAdmission[T]{limit: limit, held: make(map[T]struct{})}
+}
+
+func (a *identityAdmission[T]) acquire(id T) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, exists := a.held[id]; exists || len(a.held) >= a.limit {
+		return false
+	}
+
+	a.held[id] = struct{}{}
+
+	return true
+}
+
+func (a *identityAdmission[T]) release(id T) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	delete(a.held, id)
+}
+
+func (a *identityAdmission[T]) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return len(a.held)
+}
+
+// Config contains only the HTTPS serving inputs. Values are frozen on first use.
+type Config struct {
+	ControlAddress        string
+	TLSCertificateFile    string
+	TLSPrivateKeyFile     string
+	ReplicationServerName string
+	Limits                Limits
+}
+
+// Validate preserves controller validation: listener paths are checked by Start,
+// and the replication client validates its server name before manager startup.
+func (c Config) Validate() error {
+	if c.Limits.MaxConnections <= 0 || c.Limits.MaxConcurrentHandshakes <= 0 ||
+		c.Limits.MaxPolls <= 0 || c.Limits.MaxConcurrentWrites <= 0 || c.Limits.MaxConcurrentBootstrap <= 0 ||
+		c.Limits.HeaderBytes <= 0 || c.Limits.WriteTimeout <= 0 || c.Limits.ShutdownTimeout <= 0 {
+		return fmt.Errorf("resource names or limits: %w", wire.InvalidRequest)
+	}
+
+	return nil
+}
+
+// Leader is the publisher view needed by the internal replication endpoint.
+type Leader interface {
+	LeaderContext() (context.Context, bool)
+	PollInterval() time.Duration
+	AuthenticateReplica(context.Context, *http.Request) (string, time.Time, error)
+}
+
+const ReplicationPath = "/internal/v1/snapshot"
+
+// New composes serving dependencies without starting work or granting readiness.
+func New(cfg Config, writer client.Writer, auth *authority.Authority, lifecycle *Lifecycle, leader Leader) *Server {
+	return &Server{Config: cfg, writer: writer, authority: auth, Lifecycle: lifecycle, Leader: leader}
+}
+
+func (s *Server) servingAuthority() *authority.Authority { return s.authority }
+
+type Limits struct {
+	MaxConnections          int
+	MaxConcurrentHandshakes int
+	MaxPolls                int
+	MaxConcurrentWrites     int
+	MaxConcurrentBootstrap  int
+	HeaderBytes             int
+	WriteTimeout            time.Duration
+	ShutdownTimeout         time.Duration
+}
+
+// Lifecycle owns process serving, independently of the leader-owned publishers.
+type Lifecycle struct {
+	authority        *authority.Authority
+	mu               sync.Mutex
+	process          context.Context
+	synced           bool
+	serving          bool
+	waitForCacheSync func(context.Context) bool
+}
+
+func NewLifecycle(a *authority.Authority) *Lifecycle {
+	return &Lifecycle{authority: a}
+}
+
+func (*Lifecycle) NeedLeaderElection() bool { return false }
+
+// ProcessContext binds a request to the serving process lifetime.
+// Missing or canceled process lifetime returns an already-canceled child.
+func (l *Lifecycle) ProcessContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	if l == nil {
+		cancel()
+		return ctx, cancel
+	}
+
+	l.mu.Lock()
+	process := l.process
+	l.mu.Unlock()
+
+	if process == nil {
+		cancel()
+		return ctx, cancel
+	}
+
+	stop := context.AfterFunc(process, cancel)
+	if process.Err() != nil {
+		cancel()
+	}
+
+	return ctx, func() { stop(); cancel() }
+}
+
+func (l *Lifecycle) Start(ctx context.Context) error {
+	l.mu.Lock()
+	if l.process != nil {
+		l.mu.Unlock()
+		return wire.Conflict
+	}
+
+	l.process = ctx
+	l.authority.BindProcess(ctx)
+	l.mu.Unlock()
+
+	defer func() {
+		l.mu.Lock()
+		l.synced, l.serving = false, false
+		l.mu.Unlock()
+	}()
+
+	if l.waitForCacheSync == nil || !l.waitForCacheSync(ctx) {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		return wire.Unavailable
+	}
+
+	l.mu.Lock()
+	l.synced = ctx.Err() == nil
+	l.mu.Unlock()
+	<-ctx.Done()
+
+	return nil
+}
+
+// SetServingReady is set only after the authenticated listener is accepting.
+func (l *Lifecycle) SetServingReady(ready bool) {
+	l.mu.Lock()
+	l.serving = ready
+	l.mu.Unlock()
+}
+
+func (l *Lifecycle) Ready(_ *http.Request) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.process == nil || l.process.Err() != nil || !l.synced || !l.serving {
+		return wire.Unavailable
+	}
+
+	return l.authority.PublicationReady()
+}
+
+// SetCacheSync supplies the cache barrier before Start is called.
+func (l *Lifecycle) SetCacheSync(wait func(context.Context) bool) {
+	l.waitForCacheSync = wait
+}
+
+func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) {
+	r := s.Leader
+	if _, ok := r.LeaderContext(); !ok {
+		writeFailure(w, wire.Unavailable)
+		return
+	}
+
+	after, err := snapshotCursor(request)
+	if err != nil {
+		writeFailure(w, err)
+		return
+	}
+
+	if !take(s.bootstrapSlots) {
+		writeFailure(w, wire.Overloaded)
+		return
+	}
+
+	authCtx, cancel := context.WithTimeout(request.Context(), s.config.Limits.WriteTimeout)
+	uid, expires, err := r.AuthenticateReplica(authCtx, request)
+
+	cancel()
+	release(s.bootstrapSlots)
+
+	if err != nil {
+		writeFailure(w, err)
+		return
+	}
+
+	if !s.replicationPolls.acquire(uid) {
+		writeFailure(w, wire.Overloaded)
+
+		return
+	}
+
+	defer s.replicationPolls.release(uid)
+
+	leader, _ := r.LeaderContext()
+
+	ctx, cancel := context.WithDeadline(request.Context(), minTime(expires, time.Now().Add(r.PollInterval())))
+	defer cancel()
+
+	stop := context.AfterFunc(leader, cancel)
+	defer stop()
+
+	responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(r.PollInterval() + s.config.Limits.WriteTimeout)))
+
+	var publication *authority.PublicationHandle
+
+	for {
+		var changed <-chan struct{}
+
+		publication, changed, err = s.servingAuthority().CurrentAndSubscribe()
+		if err != nil || after == nil || publication.Sequence() > *after {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-changed:
+		}
+
+		if err != nil {
+			break
+		}
+	}
+
+	if _, ok := r.LeaderContext(); !ok || !time.Now().Before(expires) {
+		writeFailure(w, wire.Unavailable)
+		return
+	}
+
+	unchanged := errors.Is(err, context.DeadlineExceeded)
+	if unchanged {
+		publication, err = s.servingAuthority().Current()
+	}
+
+	if err != nil {
+		writeFailure(w, err)
+		return
+	}
+
+	if !take(s.writes) {
+		writeFailure(w, wire.Overloaded)
+		return
+	}
+	defer release(s.writes)
+
+	windowCtx, stopWrite := context.WithDeadline(request.Context(), minTime(expires, time.Now().Add(s.config.Limits.WriteTimeout)))
+	defer stopWrite()
+
+	stopLeader := context.AfterFunc(leader, stopWrite)
+	defer stopLeader()
+
+	writeCtx, stopAuthority, err := publication.WriteContext(windowCtx)
+	if err != nil {
+		writeFailure(w, err)
+		return
+	}
+	defer stopAuthority()
+
+	deadline, _ := writeCtx.Deadline()
+
+	stopConnection := boundConnection(writeCtx, deadline)
+	defer stopConnection()
+
+	responseControl(http.NewResponseController(w).SetWriteDeadline(deadline))
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+
+	if unchanged {
+		w.WriteHeader(http.StatusNoContent)
+		flushResponse(writeCtx, w)
+
+		return
+	}
+
+	if _, err := publication.ForBase("").WriteTo(writeCtx, w); err != nil {
+		panic(http.ErrAbortHandler)
+	}
+
+	flushResponse(writeCtx, w)
 }

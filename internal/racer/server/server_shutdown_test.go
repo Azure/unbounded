@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package server
 
 import (
 	"context"
@@ -29,7 +29,7 @@ func TestServeTeardownErrorsAndLateAccept(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		s := &Server{Lifecycle: newLifecycle(nil)}
+		s := &Server{Lifecycle: NewLifecycle(nil)}
 		s.Config.Limits.ShutdownTimeout = time.Second
 
 		accepted, peer := net.Pipe()
@@ -92,7 +92,7 @@ func TestServeTeardownCompletionBound(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		s := &Server{Lifecycle: newLifecycle(nil)}
+		s := &Server{Lifecycle: NewLifecycle(nil)}
 		s.Config.Limits.ShutdownTimeout = time.Second
 		unblock := make(chan struct{})
 

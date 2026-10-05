@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package server
 
 import (
 	"context"
@@ -19,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
@@ -167,7 +168,12 @@ func scaleCache(t *testing.T, r *TopologyReconciler, count int) cache.Cache {
 	mapper.Add(appsv1.SchemeGroupVersion.WithKind("DaemonSet"), meta.RESTScopeNamespace)
 	mapper.Add(racerv1.GroupVersion.WithKind("ClusterCache"), meta.RESTScopeRoot)
 
-	options := managerOptions(r.Config, r.Scheme()).Cache
+	options := cache.Options{ByObject: map[client.Object]cache.ByObject{
+		&corev1.Pod{}:       {Namespaces: map[string]cache.Config{r.Config.Namespace: {}}},
+		&corev1.Secret{}:    {Namespaces: map[string]cache.Config{r.Config.Namespace: {}}, Field: fields.OneTermEqualSelector("metadata.name", r.Config.CredentialsSecretName)},
+		&corev1.ConfigMap{}: {Namespaces: map[string]cache.Config{r.Config.Namespace: {}}},
+		&appsv1.DaemonSet{}: {Namespaces: map[string]cache.Config{r.Config.Namespace: {}}},
+	}}
 	options.Scheme, options.Mapper = r.Scheme(), mapper
 
 	reader, err := cache.New(&rest.Config{Host: source.URL, QPS: 1000, Burst: 1000}, options)
@@ -227,7 +233,7 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 	}
 
 	sequence := current.Sequence()
-	server := &Server{Config: r.Config}
+	server := &Server{Config: r.Config.ServerConfig}
 	server.initializeAdmission()
 
 	waiting, cancel := context.WithCancel(ctx)
@@ -310,4 +316,17 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 
 	awaitServerPolls(t, server, 0)
 	t.Logf("waiters=%d GOMAXPROCS=%d admission=%s install=%s all_delivered=%s heap_delta=%d stack_delta=%d next_bytes=%d", count, runtime.GOMAXPROCS(0), admit, install, fanout, int64(parked.HeapAlloc)-int64(before.HeapAlloc), int64(parked.StackInuse)-int64(before.StackInuse), len(next.encoded))
+}
+
+func eventually(t *testing.T, description string, ready func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for !ready() {
+		if time.Now().After(deadline) {
+			t.Fatal(description)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
 }

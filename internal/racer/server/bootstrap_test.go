@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package server
 
 import (
 	"bytes"
@@ -216,7 +216,7 @@ func TestBootstrapAuthoritativeBindings(t *testing.T) {
 				issued := decodeIssuedResponse(t, responseBody(t, w.Result(), nil, http.StatusOK))
 
 				leaf, err := x509.ParseCertificate(issued.CertificateChain[0])
-				if err != nil || issued.Node != wire.NodeID(testNodeUID) || issued.Cluster != a.Server.Config.Cluster || !leaf.NotAfter.After(time.Now()) {
+				if err != nil || issued.Node != wire.NodeID(testNodeUID) || issued.Cluster != a.Topology.Config.Cluster || !leaf.NotAfter.After(time.Now()) {
 					t.Fatalf("issued identity: %+v %v", issued, err)
 				}
 			} else {

@@ -5,90 +5,17 @@ package racer
 
 import (
 	"bytes"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/racer/authority"
+	"github.com/Azure/unbounded/internal/racer/server"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
-
-func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
-	for _, boundary := range []string{"handler", "tls"} {
-		t.Run(boundary, func(t *testing.T) {
-			f := newServingFixture(t)
-			s := f.a.Server
-			// Pre-use overrides now belong to construction, not mutable engines.
-			s.Config.CertificateLifetime = 2 * time.Minute
-			s.Config.SnapshotMaxAge = 0
-			d := fixtureDependencies[f.a.authority]
-
-			s.authority = authority.New(s.Config.authorityConfig(), authority.Dependencies{Writer: d, Reader: d})
-			if err := s.authority.Observe(f.ctx); err != nil {
-				t.Fatal(err)
-			}
-
-			s.Replication.Config = s.Config
-
-			want := s.Config.effective()
-
-			var handler http.Handler
-			if boundary == "handler" {
-				handler = s.Handler()
-			} else {
-				s.tlsConfigWithCertificate(f.ctx, func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &f.serverCertificate, nil })
-			}
-			// Mutate sequentially, before any request, without calling dependency
-			// getters first: those calls would accidentally hide lazy freezing.
-			s.Config.DataplaneServiceAccount = "wrong-account"
-			s.Config.Cluster = ""
-			s.Config.CertificateLifetime = time.Second
-
-			s.Replication.Config.ControllerServiceAccount = "wrong-controller"
-			if handler == nil {
-				handler = s.Handler()
-			}
-
-			for name, got := range map[string]Config{"server": s.config, "replication": s.Replication.runtimeConfig()} {
-				if got != want {
-					t.Fatalf("%s did not freeze the same effective base before exposure", name)
-				}
-			}
-
-			encoded, err := wire.EncodeBootstrapRequest(f.request)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			request := httptest.NewRequest(http.MethodPost, wire.BootstrapPath, bytes.NewReader(encoded))
-			request.Header.Set("Content-Type", "application/json")
-			request.Header.Set("Authorization", "Bearer "+f.token)
-			request.TLS = &tls.ConnectionState{HandshakeComplete: true}
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, request)
-
-			if w.Code != http.StatusOK {
-				t.Fatal("first request used post-exposure config", w.Code)
-			}
-
-			response := decodeIssuedResponse(t, w.Body.Bytes())
-
-			leaf, err := x509.ParseCertificate(response.CertificateChain[0])
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if response.Cluster != want.Cluster || leaf.NotAfter.Sub(leaf.NotBefore) != want.CertificateLifetime+time.Minute {
-				t.Fatal("first issuance ignored frozen identity/lifetime")
-			}
-		})
-	}
-}
 
 func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
 	f := newServingFixture(t)
@@ -104,9 +31,11 @@ func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
 	a.Replication.observe(f.ctx)
 	handler := a.Server.Handler()
 	// All components have crossed real operational boundaries, not just getters.
-	for _, input := range []*Config{&a.Topology.Config, &a.Keyring.Config, &a.Replication.Config, &a.Server.Config} {
+	for _, input := range []*Config{&a.Topology.Config, &a.Keyring.Config, &a.Replication.Config} {
 		*input = Config{}
 	}
+
+	a.Server.Config = server.Config{}
 
 	runKeys(t, a.Keyring)
 	reconcileTopology(t, a.Topology, f.ctx)
@@ -139,10 +68,47 @@ func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
 func TestComponentConfigFreezesDefaultsAtFirstUse(t *testing.T) {
 	for _, name := range []string{"topology", "keyring", "replication", "bootstrap", "issuer", "server"} {
 		t.Run(name, func(t *testing.T) {
-			// Each scenario owns its serving chain: freezing Server must not
-			// initialize another scenario's Replication before its inputs are set.
+			// Authority policy now belongs to root construction; the server only
+			// freezes transport settings, exercised through its public handler.
+			if name == "bootstrap" || name == "issuer" || name == "server" {
+				cfg := testConfig(t)
+				cfg.CertificateLifetime, cfg.SnapshotMaxAge = 0, 0
+
+				cfg.PeerPort = 9443
+				if err := cfg.Validate(); err != nil {
+					t.Fatal(err)
+				}
+
+				a := Assemble(cfg, nil, nil)
+				if a.Topology.Config != cfg.effective() || a.Server.Config != cfg.serverConfig() {
+					t.Fatal("construction ignored pre-use inputs/defaults")
+				}
+
+				handler := a.Server.Handler()
+				a.Server.Config = server.Config{}
+
+				var readers sync.WaitGroup
+				for range 8 {
+					readers.Go(func() {
+						r := httptest.NewRequest(http.MethodPost, wire.BootstrapPath, nil)
+						r.Header.Set("X-Large", strings.Repeat("x", cfg.Limits.HeaderBytes))
+
+						w := httptest.NewRecorder()
+						handler.ServeHTTP(w, r)
+
+						if w.Code != http.StatusRequestEntityTooLarge {
+							t.Error("runtime reread mutated construction inputs")
+						}
+					})
+				}
+
+				readers.Wait()
+
+				return
+			}
+
 			a := Assemble(Config{}, nil, nil)
-			s := &Server{}
+			a.Replication = &Replication{}
 			component := map[string]struct {
 				input *Config
 				get   func() Config
@@ -150,9 +116,6 @@ func TestComponentConfigFreezesDefaultsAtFirstUse(t *testing.T) {
 				"topology":    {&a.Topology.Config, a.Topology.runtimeConfig},
 				"keyring":     {&a.Keyring.Config, a.Keyring.runtimeConfig},
 				"replication": {&a.Replication.Config, a.Replication.runtimeConfig},
-				"bootstrap":   {&a.Server.Config, a.Server.runtimeFixtureConfig},
-				"issuer":      {&a.Server.Config, a.Server.runtimeFixtureConfig},
-				"server":      {&s.Config, s.runtimeFixtureConfig},
 			}[name]
 			*component.input = testConfig(t)
 			component.input.CertificateLifetime = 0
@@ -188,8 +151,8 @@ func TestDirectComponentConfigDefaults(t *testing.T) {
 	for name, get := range map[string]func() Config{
 		"topology":    (&TopologyReconciler{}).runtimeConfig,
 		"keyring":     (&KeyringReconciler{}).runtimeConfig,
-		"bootstrap":   (&Server{}).runtimeFixtureConfig,
-		"issuer":      (&Server{}).runtimeFixtureConfig,
+		"bootstrap":   func() Config { return Assemble(Config{}, nil, nil).Topology.Config },
+		"issuer":      func() Config { return Assemble(Config{}, nil, nil).Keyring.Config },
 		"replication": (&Replication{}).runtimeConfig,
 	} {
 		t.Run(name, func(t *testing.T) {

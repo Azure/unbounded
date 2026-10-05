@@ -20,15 +20,15 @@ import (
 func TestAssemble(t *testing.T) {
 	// Nil Kubernetes dependencies make unintended constructor API calls fail.
 	a := Assemble(Config{}, nil, nil)
-	if a.Topology.authority != a.Server.authority {
+	if a.Topology.authority != a.authority {
 		t.Fatal("topology and HTTP must share the single publication owner")
 	}
 
-	if a.Server.authority == nil {
+	if a.authority == nil {
 		t.Fatal("bootstrap must have an issuer")
 	}
 
-	if a.Keyring.authority != a.Server.authority || a.Topology.authority != a.Server.authority {
+	if a.Keyring.authority != a.authority || a.Topology.authority != a.authority {
 		t.Fatal("controllers, issuance, and serving must share trust")
 	}
 
@@ -40,13 +40,17 @@ func TestAssemble(t *testing.T) {
 		t.Fatal("serving must share the process readiness gate")
 	}
 
-	for _, cfg := range []Config{a.Server.Config, a.Topology.Config, a.Keyring.Config, a.Replication.Config} {
+	if a.Server.Leader != a.Replication || a.Server.Config != a.Topology.Config.serverConfig() {
+		t.Fatal("serving must use the composed replication owner and transport inputs")
+	}
+
+	for _, cfg := range []Config{a.Topology.Config, a.Keyring.Config, a.Replication.Config} {
 		if cfg.CertificateLifetime != wire.CertificateLifetime || cfg.SnapshotMaxAge != 30*time.Second {
 			t.Fatal("composition did not resolve default lifetimes")
 		}
 	}
 
-	if a.Server.Config.SnapshotMaxAge != a.Topology.Config.SnapshotMaxAge || a.Server.Config.SnapshotMaxAge != a.Keyring.Config.SnapshotMaxAge {
+	if a.Replication.Config.SnapshotMaxAge != a.Topology.Config.SnapshotMaxAge || a.Replication.Config.SnapshotMaxAge != a.Keyring.Config.SnapshotMaxAge {
 		t.Fatal("freshness owners differ from effective configuration")
 	}
 
@@ -56,6 +60,14 @@ func TestAssemble(t *testing.T) {
 
 	if err := a.Server.Ready(nil); !errors.Is(err, wire.Unavailable) {
 		t.Fatalf("uninitialized server became ready: %v", err)
+	}
+
+	// Composition freezes observer inputs before exposing any server entry point.
+	want := a.Replication.Config
+
+	a.Replication.Config = Config{SnapshotMaxAge: time.Hour}
+	if a.Replication.runtimeConfig() != want {
+		t.Fatal("replication settings were not frozen before serving composition")
 	}
 }
 

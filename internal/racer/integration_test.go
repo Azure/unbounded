@@ -579,7 +579,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 	eventually(t, "follower installs replicated snapshot and serves", func() bool { return apps[follower].Server.Ready(nil) == nil })
 
 	for i, app := range apps {
-		response, err := http.Get("http://" + app.Server.Config.ProbeAddress + "/readyz")
+		response, err := http.Get("http://" + app.Topology.Config.ProbeAddress + "/readyz")
 
 		want := 200
 
@@ -671,7 +671,24 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		pollDone <- err
 	}()
 
-	awaitServerPolls(t, apps[leader].Server, 1)
+	// A duplicate authenticated poll observes admission through the public route.
+	eventually(t, "leader parks authenticated poll", func() bool {
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s%s?after=%d", endpoint, wire.SnapshotPath, publication.Sequence), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		duplicate, err := peer.Do(req)
+		if err != nil {
+			return false
+		}
+		defer duplicate.Body.Close()
+
+		return duplicate.StatusCode == http.StatusTooManyRequests
+	})
 
 	lease := &coordv1.Lease{}
 	if err := c.Get(t.Context(), client.ObjectKey{Namespace: cfg.Namespace, Name: "racer-controller"}, lease); err != nil {
@@ -800,8 +817,10 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 		t.Fatal(err)
 	}
 
-	measured := Assemble(a.Server.Config, reader, reader).Server
-	if err := measured.authority.Observe(t.Context()); err != nil {
+	measuredApp := Assemble(a.Topology.Config, reader, reader)
+
+	measured := measuredApp.Server
+	if err := measuredApp.authority.Observe(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -810,16 +829,16 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 		t.Fatal(err)
 	}
 
-	if err := measured.authority.AcceptReplica(t.Context(), t.Context(), image); err != nil {
+	if err := measuredApp.authority.AcceptReplica(t.Context(), t.Context(), image); err != nil {
 		t.Fatal(err)
 	}
 
-	measured.Lifecycle.process, measured.Lifecycle.synced, measured.Lifecycle.serving = t.Context(), true, true
+	startFixtureLifecycle(t, measured.Lifecycle, t.Context())
 	// Positive control on this same owner proves the measurement is connected.
 	requests.Store(0)
 	received.Store(0)
 
-	if err := measured.authority.Observe(t.Context()); err != nil {
+	if err := measuredApp.authority.Observe(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -845,7 +864,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 
 	endpoint := "https://" + listener.Addr().String() + wire.SnapshotPath
 	// The first request includes a real TLS handshake. Neither path may read API state.
-	if err := measured.authority.Observe(t.Context()); err != nil {
+	if err := measuredApp.authority.Observe(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -877,7 +896,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 
 		// This standalone owner has no observer loop. Setup may outlast snapshot
 		// freshness, so refresh outside the measured request window.
-		if err := measured.authority.Observe(t.Context()); err != nil {
+		if err := measuredApp.authority.Observe(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -921,7 +940,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 func integrationEnrollment(t *testing.T, rc *rest.Config, c client.Client, a *Application, ds *appsv1.DaemonSet, roots *x509.CertPool) *http.Client {
 	t.Helper()
 
-	cfg := a.Server.Config
+	cfg := a.Topology.Config
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "server-node"}}
 
 	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: cfg.DataplaneServiceAccount}}
