@@ -523,3 +523,28 @@ func TestWorkloadNetworkPortBounds(t *testing.T) {
 		values["RACER_PEER_PORT"], values["RACER_DIAGNOSTICS_PORT"] = values["RACER_DIAGNOSTICS_PORT"], values["RACER_PEER_PORT"]
 	}
 }
+
+func TestManagedNames(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		want []string
+	}{
+		{DataplaneDaemonSetName, []string{DataplaneDaemonSetName, PodNetworkDaemonSetName}},
+		{"custom-racer", []string{"custom-racer"}},
+		{PodNetworkDaemonSetName, []string{PodNetworkDaemonSetName}},
+		{"", []string{""}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ManagedNames(tt.name)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("ManagedNames(%q) = %v, want %v", tt.name, got, tt.want)
+			}
+
+			got[0] = "mutated"
+
+			if !reflect.DeepEqual(ManagedNames(tt.name), tt.want) {
+				t.Fatal("caller mutation changed managed names")
+			}
+		})
+	}
+}

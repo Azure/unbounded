@@ -21,6 +21,21 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
+const (
+	DataplaneDaemonSetName  = "racer-dataplane"
+	PodNetworkDaemonSetName = "racer-dataplane-podnet"
+)
+
+// ManagedNames includes both fixed operator workloads, even during migration.
+// Custom standalone installations retain their single configured workload.
+func ManagedNames(daemonSetName string) []string {
+	if daemonSetName == DataplaneDaemonSetName {
+		return []string{DataplaneDaemonSetName, PodNetworkDaemonSetName}
+	}
+
+	return []string{daemonSetName}
+}
+
 // Config contains only the inputs needed to build the dataplane DaemonSet.
 // Controller limits, rotation policy, serving TLS, and durable state are independent.
 type Config struct {
