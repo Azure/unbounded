@@ -51,6 +51,7 @@ use std::{
     },
     task::{Context, Poll},
 };
+
 /// The unique producer. Non-Sync also prevents concurrent calls through `&self`.
 pub struct Sender<T> {
     shared: Arc<Shared<T>>,
@@ -59,6 +60,7 @@ pub struct Sender<T> {
     // tail could move more than capacity ahead of this acquired head.
     cached_head: Cell<usize>,
 }
+
 /// The unique consumer. Neither endpoint is cloneable or shareable across threads.
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
@@ -66,6 +68,7 @@ pub struct Receiver<T> {
     // A stale tail only underestimates availability. Refresh at cached empty.
     cached_tail: Cell<usize>,
 }
+
 /// Rejected publication, returning the original value to its caller.
 pub struct SendFailure<T> {
     /// Value whose ownership was not transferred.
@@ -74,6 +77,7 @@ pub struct SendFailure<T> {
     /// Saturation or closure that prevented publication.
     pub error: Error,
 }
+
 /// Allocate a fixed-capacity queue with one non-cloneable endpoint per direction.
 /// Zero or overflowing capacities are invalid; allocation failure is overload.
 pub fn bounded<T>(capacity: usize) -> Result<(Sender<T>, Receiver<T>)> {
@@ -105,6 +109,7 @@ pub fn bounded<T>(capacity: usize) -> Result<(Sender<T>, Receiver<T>)> {
         },
     ))
 }
+
 impl<T> Sender<T> {
     /// Reclaim orphaned messages only after the sole receiver has been destroyed.
     /// Returns false without dropping anything while the receiver is alive.
@@ -143,6 +148,7 @@ impl<T> Sender<T> {
         }
         true
     }
+
     /// Transfer ownership without waiting, or return the original value on error.
     /// A send racing receiver destruction may succeed; such an orphan is reclaimed
     /// by [`Self::discard_closed`] or by final endpoint destruction.
@@ -180,12 +186,14 @@ impl<T> Sender<T> {
         self.shared.readable.wake();
         Ok(())
     }
+
     /// Stop new sends and wake both sides. Already published values remain readable.
     pub fn close(&self) {
         self.shared.sender_closed.store(true, Ordering::Release);
         self.shared.readable.wake();
         self.shared.writable.wake();
     }
+
     /// Wait for capacity or closure with exclusive access to this endpoint.
     ///
     /// Readiness is not a reservation; use [`Self::try_send`] to transfer the value
@@ -244,27 +252,32 @@ impl<T> Sender<T> {
         }
     }
 }
+
 impl<T> Drop for Sender<T> {
     /// Close publication before releasing this endpoint's shared storage owner.
     fn drop(&mut self) {
         self.close();
     }
 }
+
 impl<T> Receiver<T> {
     /// Whether the producer closed publication; queued values may remain readable.
     pub fn is_closed(&self) -> bool {
         self.shared.sender_closed.load(Ordering::Acquire)
     }
+
     /// Register the sole readable waiter before checking data/closure.
     /// Replaces any previous waker, including one from [`Self::poll_receive`].
     /// A caller must not interleave this with another task's outstanding wait.
     pub fn register(&self, waker: &std::task::Waker) {
         self.shared.readable.register(waker);
     }
+
     /// Take one value without waiting; `None` means currently empty, not necessarily EOF.
     pub fn receive(&mut self) -> Result<Option<T>> {
         self.receive_shared()
     }
+
     /// Receive for a local facade that cannot expose an exclusive endpoint borrow.
     /// Non-Sync access and publication before callbacks keep reentry ownership-safe.
     pub(crate) fn receive_shared(&self) -> Result<Option<T>> {
@@ -291,12 +304,14 @@ impl<T> Receiver<T> {
         self.shared.writable.wake();
         Ok(Some(item))
     }
+
     /// Poll the sole readable waiter. Returns `Ready(Ok(None))` only once closed
     /// and drained. Only the last registered waker is notified; the caller must
     /// not alternate outstanding waits from different tasks between polls.
     pub fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
         self.poll_receive_shared(cx)
     }
+
     /// Poll for a local facade obeying the same single-waiter contract as the endpoint.
     pub(crate) fn poll_receive_shared(&self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
         // Internal shared callers must obey the same single-waiter contract.
@@ -310,6 +325,7 @@ impl<T> Receiver<T> {
         }
     }
 }
+
 impl<T> Drop for Receiver<T> {
     /// Transfer orphan ownership to the sender before notifying its waiter.
     fn drop(&mut self) {
@@ -319,6 +335,7 @@ impl<T> Drop for Receiver<T> {
         self.shared.writable.wake();
     }
 }
+
 /// Cache-line-separated ownership cursor, independent of endpoint layout.
 #[repr(align(64))]
 struct Cursor(AtomicUsize);
@@ -363,9 +380,11 @@ impl<T> Shared<T> {
 // arbitrary code: nested operations may have advanced it through a complete wrap.
 // T: Send suffices because ownership, not a shared reference to T, crosses threads.
 unsafe impl<T: Send> Sync for Shared<T> {}
+
 // SAFETY: same ownership-transfer invariant as above. Final Arc destruction has
 // exclusive access to Shared, with no surviving endpoints or in-flight operations.
 unsafe impl<T: Send> Send for Shared<T> {}
+
 impl<T> Drop for Shared<T> {
     /// Destroy remaining initialized slots after both endpoints have gone away.
     fn drop(&mut self) {
@@ -432,6 +451,7 @@ mod tests {
 
     /// Record each payload's identity when ownership is finally released.
     struct Tracked(usize, Rc<RefCell<Vec<usize>>>);
+
     impl Drop for Tracked {
         /// Append this payload to the destruction log.
         fn drop(&mut self) {
@@ -516,9 +536,11 @@ mod tests {
 
     /// One raw-waker event and the thread-local callback it should trigger.
     type Callback = (u8, Box<dyn FnOnce()>);
+
     thread_local! {
         static CALLBACK: RefCell<Option<Callback>> = const { RefCell::new(None) };
     }
+
     /// Take and run the matching hook without retaining its thread-local borrow.
     fn callback(event: u8) {
         let hook = CALLBACK.with(|slot| {
@@ -536,8 +558,10 @@ mod tests {
             hook();
         }
     }
+
     /// Remove an unconsumed callback when a test scope ends.
     struct CallbackGuard;
+
     impl Drop for CallbackGuard {
         /// Release any remaining hook outside its thread-local borrow.
         fn drop(&mut self) {
@@ -545,11 +569,13 @@ mod tests {
             drop(old);
         }
     }
+
     /// Install one hook for cloning, waking, or dropping the test waker.
     fn on_callback(event: u8, hook: impl FnOnce() + 'static) -> CallbackGuard {
         CALLBACK.with(|slot| *slot.borrow_mut() = Some((event, Box::new(hook))));
         CallbackGuard
     }
+
     /// Build a thread-safe raw waker that consults only the executing thread's hook.
     fn callback_waker() -> Waker {
         /// Run the clone hook and return another stateless raw waker.
@@ -557,14 +583,17 @@ mod tests {
             callback(0);
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
+
         /// Run the wake hook without consuming any pointer-backed ownership.
         unsafe fn wake(_: *const ()) {
             callback(1);
         }
+
         /// Run the destruction hook for this stateless waker.
         unsafe fn drop_raw(_: *const ()) {
             callback(2);
         }
+
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop_raw);
         // SAFETY: no pointer or ownership is carried in the waker. Each callback
         // only accesses the current thread's hook, even when moved across threads.
@@ -718,6 +747,7 @@ mod tests {
     #[test]
     fn reentrant_cleanup_after_wrap_and_panic_resumes_from_authoritative_head() {
         use std::rc::Weak;
+
         /// Payload that checks publication ordering and injects nested cleanup failure.
         struct Item {
             id: usize,
@@ -726,6 +756,7 @@ mod tests {
 
             drops: Rc<RefCell<Vec<usize>>>,
         }
+
         impl Drop for Item {
             /// Record removal before reentering cleanup or raising the injected panic.
             fn drop(&mut self) {
@@ -785,8 +816,10 @@ mod tests {
     #[test]
     fn zero_sized_values_still_have_exactly_once_destructors() {
         static DROPS: AtomicUsize = AtomicUsize::new(0);
+
         /// Zero-sized payload with observable destruction.
         struct Zst;
+
         impl Drop for Zst {
             /// Count the release of one logical payload.
             fn drop(&mut self) {
@@ -866,6 +899,7 @@ mod tests {
     fn receiver_drop_racing_send_preserves_ownership() {
         /// Cross-thread payload with an atomic destruction count.
         struct Counted(Arc<AtomicUsize>);
+
         impl Drop for Counted {
             /// Record this payload's final release.
             fn drop(&mut self) {
@@ -929,6 +963,7 @@ mod tests {
 
         wakes: AtomicUsize,
     }
+
     impl RegistrationWake {
         const VTABLE: RawWakerVTable = RawWakerVTable::new(
             Self::clone_raw,
@@ -936,10 +971,12 @@ mod tests {
             Self::wake_by_ref_raw,
             Self::drop_raw,
         );
+
         /// Transfer one shared owner into a raw waker.
         fn raw(this: Arc<Self>) -> RawWaker {
             RawWaker::new(Arc::into_raw(this).cast(), &Self::VTABLE)
         }
+
         /// Clone the shared owner, pausing the first clone at the test barrier.
         unsafe fn clone_raw(data: *const ()) -> RawWaker {
             // SAFETY: each raw waker owns an Arc count. Borrow it without consuming
@@ -952,18 +989,21 @@ mod tests {
             }
             RawWaker::new(data, &Self::VTABLE)
         }
+
         /// Count an owned wake and release its shared owner.
         unsafe fn wake_raw(data: *const ()) {
             // SAFETY: wake consumes the raw waker's owned Arc count exactly once.
             let this = unsafe { Arc::from_raw(data.cast::<Self>()) };
             this.wakes.fetch_add(1, Ordering::Relaxed);
         }
+
         /// Count a borrowed wake without releasing its shared owner.
         unsafe fn wake_by_ref_raw(data: *const ()) {
             // SAFETY: the calling waker keeps its Arc alive throughout this borrow.
             let this = unsafe { &*data.cast::<Self>() };
             this.wakes.fetch_add(1, Ordering::Relaxed);
         }
+
         /// Release the raw waker's shared owner without waking.
         unsafe fn drop_raw(data: *const ()) {
             // SAFETY: drop consumes the raw waker's owned Arc count exactly once.
@@ -993,8 +1033,10 @@ mod tests {
                     // RawWaker ownership contract, with thread-safe shared state.
                     let waker = unsafe { Waker::from_raw(RegistrationWake::raw(state.clone())) };
                     let mut cx = Context::from_waker(&waker);
+
                     /// Normalize readable and writable checks for the timing matrix.
                     type Poller = Box<dyn FnMut(&mut Context<'_>) -> Poll<Result<()>>>;
+
                     /// Change peer state and retain its endpoint until checks finish.
                     type Action = Box<dyn FnOnce() -> Box<dyn Send> + Send>;
                     let (mut poll, action): (Poller, Action) = if writable {
@@ -1074,8 +1116,10 @@ mod tests {
     #[test]
     fn orphan_destructor_can_reenter_cleanup() {
         use std::rc::{Rc, Weak};
+
         /// Orphan payload that recursively requests cleanup when destroyed.
         struct Item(Weak<Sender<Item>>, Rc<Cell<usize>>);
+
         impl Drop for Item {
             /// Count this removal and request cleanup of any remaining orphans.
             fn drop(&mut self) {
@@ -1097,6 +1141,7 @@ mod tests {
         assert!(sender.discard_closed());
         assert_eq!(count.get(), 3);
     }
+
     /// Reject empty and unrepresentable rings before attempting allocation.
     #[test]
     fn invalid_capacity_is_rejected_before_allocation() {
@@ -1110,6 +1155,7 @@ mod tests {
             Err(Error::InvalidConfiguration)
         ));
     }
+
     /// Saturation returns the original payload and closure preserves queued values.
     #[test]
     fn saturation_returns_owner_and_close_drains() {
@@ -1125,6 +1171,7 @@ mod tests {
             Poll::Ready(Ok(None))
         ));
     }
+
     /// Transfer a long FIFO stream between the unique producer and consumer threads.
     #[test]
     fn transfers_fifo_between_threads() {
@@ -1154,6 +1201,7 @@ mod tests {
         }
         producer.join().unwrap();
     }
+
     /// Repeated full-ring wraps work without power-of-two capacity assumptions.
     #[test]
     fn non_power_of_two_capacity_wraps_without_overwriting() {
@@ -1168,6 +1216,7 @@ mod tests {
             }
         }
     }
+
     /// Publication, consumption, and closure each notify their waiting endpoint.
     #[test]
     fn wakeups_cover_capacity_data_and_close() {
@@ -1186,12 +1235,15 @@ mod tests {
         sender.close();
         assert_eq!(counter.count(), 3);
     }
+
     /// Unwinding an orphan destructor cannot leave its slot initialized twice.
     #[test]
     fn orphan_cleanup_advances_before_panicking_destructor() {
         use std::sync::atomic::AtomicUsize;
+
         /// Payload that panics on its first destruction attempt.
         struct Panics(Arc<AtomicUsize>);
+
         impl Drop for Panics {
             /// Count destruction and inject a failure on the first call.
             fn drop(&mut self) {

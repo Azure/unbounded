@@ -1,5 +1,6 @@
 //! Socket, datagram, pipe, and readiness semantics.
 use super::*;
+
 impl Simulation {
     /// Creates an unconnected stream socket labeled by the current endpoint scope.
     pub fn socket(&self, domain: i32) -> io::Result<Descriptor> {
@@ -18,6 +19,7 @@ impl Simulation {
             remote: None,
         }))
     }
+
     /// Binds a datagram endpoint, choosing the lowest free port when given zero.
     pub fn bind_datagram(&self, mut address: std::net::SocketAddr) -> io::Result<Descriptor> {
         if address.port() == 0 {
@@ -42,6 +44,7 @@ impl Simulation {
         self.0.borrow_mut().datagrams.insert(address, h.id);
         Ok(fd)
     }
+
     /// Creates a listener and, for Unix sockets, its volatile filesystem name.
     pub fn listen(&self, address: SocketAddress) -> io::Result<Descriptor> {
         validate_address(&address)?;
@@ -65,6 +68,7 @@ impl Simulation {
         }
         Ok(fd)
     }
+
     /// Creates and connects a stream, failing immediately if it would block.
     pub fn connect(&self, address: SocketAddress) -> io::Result<Descriptor> {
         validate_address(&address)?;
@@ -73,6 +77,7 @@ impl Simulation {
         h.connect(&address)?;
         Ok(fd)
     }
+
     /// Creates two connected Unix stream endpoints in this world.
     pub fn socket_pair(&self) -> (Descriptor, Descriptor) {
         let a = self.socket(libc::AF_UNIX).unwrap();
@@ -92,12 +97,14 @@ impl Simulation {
         }
         (a, b)
     }
+
     /// Creates a fixture pipe after clamping its capacity to the supported range.
     pub fn pipe(&self, capacity: usize) -> (Descriptor, Descriptor) {
         // Compatibility fixture API; use try_pipe for untrusted capacities.
         self.try_pipe(capacity.clamp(1, MAX_ALLOCATION))
             .expect("bounded pipe")
     }
+
     /// Creates a pipe's read and write ends after validating its capacity.
     pub fn try_pipe(&self, capacity: usize) -> io::Result<(Descriptor, Descriptor)> {
         if capacity == 0 || capacity > MAX_ALLOCATION {
@@ -118,6 +125,7 @@ impl Simulation {
         ))
     }
 }
+
 impl Handle {
     /// Sets a datagram destination and filters incoming packets to that peer.
     pub fn connect_datagram(&self, peer: std::net::SocketAddr) -> io::Result<()> {
@@ -136,6 +144,7 @@ impl Handle {
         *target = Some(peer);
         Ok(())
     }
+
     /// Enqueues one bounded packet, preserving its source address and boundaries.
     pub fn send_to(&self, bytes: &[u8], target: std::net::SocketAddr) -> io::Result<usize> {
         let mut w = self.sim.0.borrow_mut();
@@ -170,6 +179,7 @@ impl Handle {
         w.record("send_datagram", self.id, bytes.len() as i64);
         Ok(bytes.len())
     }
+
     /// Receives one packet and discards any tail beyond the supplied buffer.
     pub fn recv_from(&self, bytes: &mut [u8]) -> io::Result<(usize, std::net::SocketAddr)> {
         let mut w = self.sim.0.borrow_mut();
@@ -185,6 +195,7 @@ impl Handle {
         w.record("recv_datagram", self.id, count as i64);
         Ok((count, address))
     }
+
     /// Sends one packet to the previously connected datagram peer.
     pub fn send_datagram(&self, bytes: &[u8]) -> io::Result<usize> {
         let peer = match self.sim.0.borrow().resources.get(&self.id) {
@@ -195,6 +206,7 @@ impl Handle {
         };
         self.send_to(bytes, peer)
     }
+
     /// Rejects descriptors that are not stream sockets.
     pub fn validate_socket(&self) -> io::Result<()> {
         if matches!(
@@ -206,21 +218,25 @@ impl Handle {
             Err(errno(libc::ENOTSOCK))
         }
     }
+
     /// Reports whether an empty stream and its peer are usable for reuse.
     pub fn idle_healthy(&self) -> bool {
         let w = self.sim.0.borrow();
         matches!(w.resources.get(&self.id), Some(Resource::Socket { peer: Some(peer), bytes, read_shutdown: false, write_shutdown: false, .. }) if bytes.is_empty() && matches!(w.resources.get(peer), Some(Resource::Socket { write_shutdown: false, .. })))
     }
+
     /// Reports a missing peer or a peer that shut down both directions.
     pub fn peer_disconnected(&self) -> bool {
         let w = self.sim.0.borrow();
         !matches!(w.resources.get(&self.id), Some(Resource::Socket { peer: Some(peer), .. }) if matches!(w.resources.get(peer), Some(Resource::Socket { read_shutdown, write_shutdown, .. }) if !(*read_shutdown && *write_shutdown)))
     }
+
     /// Reports whether reads will reach EOF after queued bytes are drained.
     pub fn peer_read_closed(&self) -> bool {
         let w = self.sim.0.borrow();
         !matches!(w.resources.get(&self.id), Some(Resource::Socket { peer: Some(peer), .. }) if matches!(w.resources.get(peer), Some(Resource::Socket { write_shutdown: false, .. })))
     }
+
     /// Kernel-style half-close. The peer can drain queued bytes before EOF.
     pub fn shutdown(&self, how: i32) -> io::Result<()> {
         if ![libc::SHUT_RD, libc::SHUT_WR, libc::SHUT_RDWR].contains(&how) {
@@ -247,6 +263,7 @@ impl Handle {
         }
         Ok(())
     }
+
     /// Connects this socket and queues the server endpoint for acceptance.
     pub fn connect(&self, address: &SocketAddress) -> io::Result<()> {
         validate_address(address)?;
@@ -308,6 +325,7 @@ impl Handle {
         w.record("connect", self.id, 0);
         Ok(())
     }
+
     /// Takes ownership of the oldest connection waiting on this listener.
     pub fn accept(&self) -> io::Result<Descriptor> {
         let mut w = self.sim.0.borrow_mut();
@@ -321,6 +339,7 @@ impl Handle {
             id,
         }))
     }
+
     /// Transfers a bounded stream prefix, honoring partitions and half-closes.
     pub fn send(&self, bytes: &[u8]) -> io::Result<usize> {
         let mut w = self.sim.0.borrow_mut();
@@ -374,6 +393,7 @@ impl Handle {
         w.record("send", self.id, count as i64);
         Ok(count)
     }
+
     /// Drains buffered stream bytes before reporting EOF from a closed peer.
     pub fn recv(&self, bytes: &mut [u8]) -> io::Result<usize> {
         let mut w = self.sim.0.borrow_mut();
@@ -417,6 +437,7 @@ impl Handle {
         w.record("recv", self.id, count as i64);
         Ok(count)
     }
+
     /// Computes Linux-style readiness without treating it as a liveness oracle.
     pub(super) fn ready(&self, interest: u32) -> io::Result<i32> {
         let w = self.sim.0.borrow();
@@ -493,6 +514,7 @@ impl Handle {
             Ok(flags as i32)
         }
     }
+
     /// Writes a pipe prefix, preserving PIPE_BUF atomicity and reader-close errors.
     pub fn pipe_write(&self, bytes: &[u8]) -> io::Result<usize> {
         let limit = self.sim.0.borrow_mut().transfer_limit("pipe_write")?;
@@ -524,6 +546,7 @@ impl Handle {
         output.extend(&bytes[..count]);
         Ok(count)
     }
+
     /// Drains a pipe and reports EOF only after its last writer closes.
     pub fn pipe_read(&self, bytes: &mut [u8]) -> io::Result<usize> {
         let limit = self.sim.0.borrow_mut().transfer_limit("pipe_read")?;
@@ -545,6 +568,7 @@ impl Handle {
         std::io::Read::read_exact(&mut *input, &mut bytes[..count])?;
         Ok(count)
     }
+
     /// Moves pipe bytes to a stream, consuming only the successfully sent prefix.
     pub fn splice(&self, socket: &Handle, count: usize) -> io::Result<usize> {
         let count = count.min(self.sim.0.borrow_mut().transfer_limit("splice")?);
@@ -624,15 +648,18 @@ pub(super) mod tests {
             queue_entries: std::num::NonZeroUsize::new(64).unwrap(),
         })))
     }
+
     /// Gives test operations a shared request scope with a bounded deadline.
     pub(in crate::reactor::simulation) fn scope() -> RequestScope {
         RequestScope::new((), Instant::now() + Duration::from_secs(30)).unwrap()
     }
+
     /// Polls an operation once without advancing the reactor or registering a wakeup.
     pub(in crate::reactor::simulation) fn poll<T>(op: &mut Operation<'_, T>) -> Poll<Result<T>> {
         op.as_mut()
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
+
     /// Drives bounded reactor turns until completion, failing if the fixture stalls.
     pub(in crate::reactor::simulation) fn drive<T>(
         r: &Reactor,
@@ -855,6 +882,7 @@ pub(super) mod tests {
 
     /// Counts owner destruction to verify resources survive both completion fences.
     struct Probe(Rc<Cell<usize>>);
+
     impl Drop for Probe {
         /// Count one resource release after its final completion fence.
         fn drop(&mut self) {

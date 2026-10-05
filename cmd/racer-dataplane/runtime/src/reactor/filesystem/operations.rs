@@ -36,6 +36,7 @@ pub enum ReplacementError<E> {
     /// Rename completed successfully; only the parent durability fence failed.
     Published(E),
 }
+
 impl<E: Copy> ReplacementError<E> {
     /// Return the underlying failure without discarding the publication phase.
     pub fn cause(&self) -> E {
@@ -1045,6 +1046,7 @@ mod tests {
     fn output_budget_failure_precedes_any_read() {
         /// Budget that rejects every allocation to exercise admission ordering.
         struct Reject;
+
         impl Budget for Reject {
             /// No charge can be constructed by this rejecting budget.
             type Charge = ();

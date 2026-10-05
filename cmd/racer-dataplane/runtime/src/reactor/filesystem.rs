@@ -3,6 +3,7 @@
 use super::*;
 use std::{ffi::CString, num::NonZeroUsize, ops::Deref};
 use zeroize::Zeroize;
+
 pub mod operations;
 
 /// Stable, quota-owning I/O storage with a cursor for partial writes.
@@ -22,6 +23,7 @@ pub struct Buffer {
 pub struct ReadBuffer {
     buffer: Buffer,
 }
+
 impl Deref for ReadBuffer {
     /// The initialized read output exposed to callers.
     type Target = [u8];
@@ -31,6 +33,7 @@ impl Deref for ReadBuffer {
         &self.buffer.data[..self.buffer.end]
     }
 }
+
 impl AsRef<[u8]> for ReadBuffer {
     /// Borrow the completed read without transferring its admission charge.
     fn as_ref(&self) -> &[u8] {
@@ -53,12 +56,14 @@ unsafe impl IoBuffer for Buffer {
         Ok(&mut self.data[self.start..self.end])
     }
 }
+
 impl Drop for Buffer {
     /// Erase the entire allocation before storage and its charge are released.
     fn drop(&mut self) {
         self.data.as_mut_slice().zeroize();
     }
 }
+
 impl Buffer {
     /// Consume a positive, in-bounds completion without moving the allocation.
     pub fn advance(&mut self, n: usize) -> Result<()> {
@@ -68,10 +73,12 @@ impl Buffer {
         self.start += n;
         Ok(())
     }
+
     /// Return the number of unconsumed bytes available to the next operation.
     pub fn remaining(&self) -> usize {
         self.end - self.start
     }
+
     /// Borrow a checked prefix of the unconsumed region after its I/O fence.
     pub fn prefix(&self, n: usize) -> Result<&[u8]> {
         self.bytes()?.get(..n).ok_or(Error::Io)
@@ -102,6 +109,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
         }
         Buffer::allocate(length, self.charge(length)?)
     }
+
     /// Copy caller bytes into stable, zeroizing storage charged to this reactor.
     pub fn file_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
         let mut buffer = self.file_buffer(bytes.len())?;
@@ -203,6 +211,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Read basic metadata through an owned descriptor and stable output allocation.
     pub fn file_stat<'a>(
         &'a self,
@@ -237,6 +246,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Sync a file or directory while retaining its descriptor through the CQE fence.
     pub fn file_sync<'a>(
         &'a self,
@@ -258,6 +268,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Rename within a pinned directory; cancellation is not proof it did not execute.
     /// Callers own name validation, namespace serialization, and durability policy.
     pub(super) fn file_rename<'a>(
@@ -294,6 +305,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Unlink relative to a pinned parent without an implicit directory sync.
     pub fn file_unlink<'a>(
         &'a self,
@@ -347,6 +359,7 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             .await
         })
     }
+
     /// Validate Linux pathname bounds and charge retained NUL-terminated bytes.
     fn file_path_quota(&self, paths: &[&CString]) -> Result<Charge> {
         if paths.iter().any(|p| p.as_bytes().len() > PATH_BYTES) {
@@ -390,15 +403,18 @@ impl NamespaceChange {
 /// Stable pathname backing that preserves pointer provenance across owner moves.
 /// Unlike CString's Box backing, this Vec must never resize after SQE publication.
 struct PathArg(Vec<u8>);
+
 impl PathArg {
     /// Transfer a validated pathname into stable syscall storage.
     fn new(path: CString) -> Self {
         Self(path.into_bytes_with_nul())
     }
+
     /// Borrow a pointer retained by the submission's completion closure.
     fn as_ptr(&self) -> *const libc::c_char {
         self.0.as_ptr().cast()
     }
+
     /// Copy the pathname into the simulator's typed operation.
     #[cfg(feature = "simulation")]
     fn simulated(&self) -> CString {
@@ -436,8 +452,10 @@ fn value<E: From<Error>>(result: Result<KernelResult, E>) -> Result<i32, E> {
 }
 
 pub mod secure {
-    //! Descriptor-relative traversal and metadata checks without application policy.
-    //! Callers select limits, required ownership/access, and error classification.
+    //! Descriptor-relative traversal, metadata primitives, and secure policy helpers.
+    //! The primitives accept caller-selected bounds and access requirements. Composed
+    //! helpers cap files at 1 MiB and optionally require owner-only permissions and
+    //! a single link for regular files, using the descriptor's actual backend.
     use super::*;
     use std::{
         ffi::OsStr,
@@ -468,8 +486,10 @@ pub mod secure {
 
     /// Reject resolution that escapes the supplied directory descriptor.
     pub const BENEATH: u64 = 0x08;
+
     /// Reject magic links such as `/proc/self/fd` entries.
     pub const NO_MAGICLINKS: u64 = 0x02;
+
     /// Reject all symlinks during path resolution.
     pub const NO_SYMLINKS: u64 = 0x04;
 
@@ -501,14 +521,18 @@ pub mod secure {
     }
 
     impl<H: Host> Host for Rc<H> {
+        /// Preserve the underlying host's cancellation and error policy.
         type Scope = H::Scope;
 
+        /// Preserve the underlying host's retained accounting guards.
         type Budget = H::Budget;
 
+        /// Borrow the same worker-local reactor through shared host ownership.
         fn reactor(&self) -> &Reactor<Self::Scope, Self::Budget> {
             (**self).reactor()
         }
 
+        /// Delegate independent attempt allocation without replacing parent policy.
         fn fresh_scope(
             &self,
             parent: &Self::Scope,
@@ -516,6 +540,7 @@ pub mod secure {
             (**self).fresh_scope(parent)
         }
 
+        /// Retain shared host ownership while the previous attempt is fenced.
         fn fence<'a>(
             &'a self,
             previous: &'a Self::Scope,
@@ -523,6 +548,7 @@ pub mod secure {
             (**self).fence(previous)
         }
 
+        /// Preserve the host's exact missing-file classification.
         fn is_missing(error: <Self::Scope as Scope>::Error) -> bool {
             H::is_missing(error)
         }
@@ -536,6 +562,7 @@ pub mod secure {
     }
 
     impl<S: Scope> Default for Attempts<S> {
+        /// Start an idle namespace owner without a previous attempt to fence.
         fn default() -> Self {
             Self {
                 busy: Cell::new(false),
@@ -563,26 +590,40 @@ pub mod secure {
         }
     }
 
-    /// Check owner-only access using the selected backend's effective owner.
+    /// Check host metadata for owner-only access using the process's effective UID.
+    /// Require one link for regular files. Explicit-owner callers use [`check_access`].
     pub fn check_private(stat: &libc::statx, regular: bool) -> Result<(), AccessError> {
-        #[cfg(feature = "simulation")]
-        let simulated = simulation::Simulation::current().is_some();
-        #[cfg(not(feature = "simulation"))]
-        let simulated = false;
         // SAFETY: geteuid has no memory or lifetime preconditions.
-        let owner = if simulated {
-            0
-        } else {
-            unsafe { libc::geteuid() }
-        };
         check_access(
             stat,
             AccessRequirements {
-                owner,
+                owner: unsafe { libc::geteuid() },
                 forbidden_mode: 0o077,
                 links: regular.then_some(1),
             },
         )
+    }
+
+    /// Check metadata in its descriptor's ownership domain, not the ambient environment.
+    fn check_descriptor_private(
+        fd: &Descriptor,
+        stat: &libc::statx,
+        regular: bool,
+    ) -> Result<(), AccessError> {
+        #[cfg(feature = "simulation")]
+        if fd.as_sim().is_some() {
+            return check_access(
+                stat,
+                AccessRequirements {
+                    owner: 0,
+                    forbidden_mode: 0o077,
+                    links: regular.then_some(1),
+                },
+            );
+        }
+        #[cfg(not(feature = "simulation"))]
+        let _ = fd;
+        check_private(stat, regular)
     }
 
     /// Pin a symlink-free directory, optionally creating and checking private access.
@@ -598,7 +639,7 @@ pub mod secure {
     {
         let fd = r.file_directory(path, create, 4096, scope).await?;
         if private {
-            check_private(&r.file_stat(fd.clone(), scope).await?, false)?;
+            check_descriptor_private(&fd, &r.file_stat(fd.clone(), scope).await?, false)?;
         }
         Ok(fd)
     }
@@ -620,7 +661,7 @@ pub mod secure {
         let stat = r.file_stat(fd.clone(), scope).await?;
         check_regular_size(&stat, limit as u64)?;
         if private {
-            check_private(&stat, true)?;
+            check_descriptor_private(&fd, &stat, true)?;
         }
         r.file_read_bounded(fd, limit, NonZeroUsize::new(16384).unwrap(), scope)
             .await
@@ -893,6 +934,138 @@ pub mod secure {
     mod tests {
         //! Pure validation covers malformed names and incomplete metadata snapshots.
         use super::*;
+
+        /// Serialize namespace use and retain failed or abandoned fences for retry.
+        #[test]
+        fn attempts_retain_previous_scope_until_fence_and_fresh_scope_succeed() {
+            /// Identify independent attempts while allowing parent admission failure.
+            #[derive(Clone)]
+            struct Request(u64, bool);
+
+            impl Scope for Request {
+                /// Keep fixture failures in the runtime boundary.
+                type Error = Error;
+
+                /// Reject canceled parent requests before any host callbacks.
+                fn check(&self) -> Result<()> {
+                    if self.1 {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+
+            /// Record fence order and inject pending, failed, and successful host callbacks.
+            struct Hosting {
+                reactor: Reactor<Request, ()>,
+
+                next: Cell<u64>,
+
+                fences: RefCell<Vec<u64>>,
+
+                ready: Cell<bool>,
+
+                fail_fence: Cell<bool>,
+
+                fail_fresh: Cell<bool>,
+            }
+
+            impl Host for Hosting {
+                /// Preserve attempt identity in each fenced scope.
+                type Scope = Request;
+
+                /// This callback-only fixture owns no I/O allocation charges.
+                type Budget = ();
+
+                /// Expose a lazy reactor without allocating a kernel ring.
+                fn reactor(&self) -> &Reactor<Request, ()> {
+                    &self.reactor
+                }
+
+                /// Allocate a new identity only after successful fencing.
+                fn fresh_scope(&self, _: &Request) -> Result<Request> {
+                    if self.fail_fresh.get() {
+                        return Err(Error::Unavailable);
+                    }
+                    let next = self.next.get() + 1;
+                    self.next.set(next);
+                    Ok(Request(next, false))
+                }
+
+                /// Hold the prior identity until the caller explicitly permits its fence.
+                fn fence<'a>(&'a self, previous: &'a Request) -> Operation<'a, ()> {
+                    self.fences.borrow_mut().push(previous.0);
+                    Box::pin(futures::future::poll_fn(move |_| {
+                        if !self.ready.get() {
+                            Poll::Pending
+                        } else if self.fail_fence.get() {
+                            Poll::Ready(Err(Error::Io))
+                        } else {
+                            Poll::Ready(Ok(()))
+                        }
+                    }))
+                }
+
+                /// Never classify cancellation as missing-file success.
+                fn is_missing(error: Error) -> bool {
+                    error == Error::NotFound
+                }
+            }
+
+            let host = Rc::new(Hosting {
+                reactor: Reactor::new(4, ()),
+                next: Cell::new(0),
+                fences: RefCell::default(),
+                ready: Cell::new(false),
+                fail_fence: Cell::new(false),
+                fail_fresh: Cell::new(false),
+            });
+            assert!(std::ptr::eq(Host::reactor(&host), &host.reactor));
+            assert!(<Rc<Hosting> as Host>::is_missing(Error::NotFound));
+            assert!(!<Rc<Hosting> as Host>::is_missing(Error::Cancelled));
+            let attempts = Attempts::default();
+            let parent = Request(0, false);
+            let (guard, scope) =
+                futures::executor::block_on(attempts.begin(&host, &parent)).unwrap();
+            assert_eq!(scope.0, 1);
+            assert!(matches!(
+                futures::executor::block_on(attempts.begin(&host, &parent)),
+                Err(Error::Overloaded)
+            ));
+            drop(guard);
+            let mut pending = Box::pin(attempts.begin(&host, &parent));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(pending.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(host.next.get(), 1);
+            drop(pending);
+            host.ready.set(true);
+            host.fail_fence.set(true);
+            assert!(matches!(
+                futures::executor::block_on(attempts.begin(&host, &parent)),
+                Err(Error::Io)
+            ));
+            host.fail_fence.set(false);
+            host.fail_fresh.set(true);
+            assert!(matches!(
+                futures::executor::block_on(attempts.begin(&host, &parent)),
+                Err(Error::Unavailable)
+            ));
+            host.fail_fresh.set(false);
+            let (guard, scope) =
+                futures::executor::block_on(attempts.begin(&host, &parent)).unwrap();
+            assert_eq!(scope.0, 2);
+            assert_eq!(&*host.fences.borrow(), &[1, 1, 1, 1]);
+            drop(guard);
+            assert!(matches!(
+                futures::executor::block_on(attempts.begin(&host, &Request(0, true))),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(host.next.get(), 2);
+            let (guard, _) = futures::executor::block_on(attempts.begin(&host, &parent)).unwrap();
+            assert_eq!(host.fences.borrow().last(), Some(&2));
+            drop(guard);
+        }
 
         /// Preserve arbitrary name bytes while rejecting escapes and invalid limits.
         #[test]
@@ -1202,6 +1375,7 @@ mod secure_tests {
         assert_eq!(sim.read_file(Path::new("/target")).unwrap(), b"keep");
     }
 }
+
 #[cfg(all(test, feature = "simulation"))]
 mod test_support {
     //! Bounded explicit driving for filesystem operations with arbitrary errors.

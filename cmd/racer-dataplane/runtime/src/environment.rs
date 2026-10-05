@@ -83,9 +83,11 @@ pub fn require_simulated() -> SimulationRequired {
         PhantomData,
     )
 }
+
 #[cfg(feature = "simulation")]
 /// Restores the thread's previous host-access requirement when dropped.
 pub struct SimulationRequired(bool, PhantomData<Rc<()>>);
+
 #[cfg(feature = "simulation")]
 impl Drop for SimulationRequired {
     /// Restore the strictness selected before this thread entered the guard.
@@ -93,6 +95,7 @@ impl Drop for SimulationRequired {
         REQUIRE_SIMULATED.with(|required| required.set(self.0));
     }
 }
+
 /// A guard belongs to the thread that entered it. Never hold it across an await;
 /// use `Environment::scope` to enter only while polling or dropping a future.
 pub struct Guard {
@@ -204,6 +207,7 @@ pub fn clock_anchor() -> (Instant, SystemTime) {
         let clock = sim.clock.0.lock().unwrap();
         return (clock.monotonic, clock.wall_origin);
     }
+
     static ANCHOR: OnceLock<(Instant, SystemTime)> = OnceLock::new();
     *ANCHOR.get_or_init(|| (Instant::now(), SystemTime::now()))
 }
@@ -860,6 +864,7 @@ mod tests {
     fn scoped_drop_and_unwind_restore_the_callers_environment() {
         /// Checks that destruction occurs under the expected wall clock.
         struct OnDrop(SystemTime);
+
         impl Drop for OnDrop {
             /// Compare the selected wall clock with the captured expectation.
             fn drop(&mut self) {
@@ -1055,14 +1060,17 @@ mod registry_tests {
         thread_local! {
             static TABLE: RefCell<Option<Rc<Registry>>> = const { RefCell::new(None) };
         }
+
         /// Reenters the registry when a retired waker releases its last owner.
         struct OnDrop;
+
         impl std::task::Wake for OnDrop {
             /// Reject waking a registration owner that should only be discarded.
             fn wake(self: std::sync::Arc<Self>) {
                 panic!("replaced registration must not wake its retired owner");
             }
         }
+
         impl Drop for OnDrop {
             /// Assert registry mutation is available during retired waker disposal.
             fn drop(&mut self) {
@@ -1185,8 +1193,10 @@ mod registry_tests {
         thread_local! {
             static TABLE: RefCell<Option<Rc<Registry>>> = const { RefCell::new(None) };
         }
+
         /// Mutates the selected registry from both wake and destructor callbacks.
         struct Reentrant;
+
         impl Reentrant {
             /// Add and remove a nested deadline while the outer table is empty.
             fn access() {
@@ -1199,12 +1209,14 @@ mod registry_tests {
                 });
             }
         }
+
         impl std::task::Wake for Reentrant {
             /// Exercise registry reentry from notification.
             fn wake(self: std::sync::Arc<Self>) {
                 Self::access();
             }
         }
+
         impl Drop for Reentrant {
             /// Exercise registry reentry from disposal.
             fn drop(&mut self) {

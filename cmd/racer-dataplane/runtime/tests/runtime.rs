@@ -43,6 +43,7 @@ mod filesystem {
 
         canceled: Rc<Cell<bool>>,
     }
+
     impl RequestScope {
         /// Construct an independently cancelable request with the supplied deadline.
         fn new(deadline: Instant) -> Self {
@@ -51,11 +52,13 @@ mod filesystem {
                 canceled: Rc::new(Cell::new(false)),
             }
         }
+
         /// Request cancellation without directly releasing any submitted resource.
         fn cancel(&self) {
             self.canceled.set(true);
         }
     }
+
     impl Scope for RequestScope {
         /// Report cancellation and deadline failures using runtime errors.
         type Error = Error;
@@ -71,20 +74,24 @@ mod filesystem {
             }
         }
     }
+
     /// Count retained budget independently through the public accounting callback.
     struct CountingBudget(Rc<Cell<usize>>);
+
     /// Return the exact accounted amount when its owner is dropped.
     struct Charge {
         used: Rc<Cell<usize>>,
 
         amount: usize,
     }
+
     impl Drop for Charge {
         /// Release this charge from the shared budget counter.
         fn drop(&mut self) {
             self.used.set(self.used.get() - self.amount);
         }
     }
+
     impl Budget for CountingBudget {
         /// Retain the accounted amount until the charge is dropped.
         type Charge = Charge;
@@ -98,12 +105,14 @@ mod filesystem {
             })
         }
     }
+
     /// Public reactor plus externally observed budget usage, without private access.
     struct Reactor {
         core: Core<RequestScope, CountingBudget>,
 
         used: Rc<Cell<usize>>,
     }
+
     impl Deref for Reactor {
         /// Expose the wrapped public reactor for filesystem operations.
         type Target = Core<RequestScope, CountingBudget>;
@@ -113,14 +122,17 @@ mod filesystem {
             &self.core
         }
     }
+
     impl Reactor {
         /// Fence current operations without closing admission for subsequent checks.
         fn file_fence(&self) -> Operation<'_, ()> {
             self.fence_matching(|_| true)
         }
     }
+
     /// Own a unique project-local directory and clean it after the test.
     struct Directory(PathBuf);
+
     impl Directory {
         /// Allocate a collision-free directory, also safe for isolated child processes.
         fn new() -> Self {
@@ -136,6 +148,7 @@ mod filesystem {
             Self(path)
         }
     }
+
     impl Drop for Directory {
         /// Remove the test directory and all of its contents.
         fn drop(&mut self) {
@@ -147,16 +160,19 @@ mod filesystem {
     fn name(path: &Path) -> CString {
         CString::new(path.as_os_str().as_bytes()).unwrap()
     }
+
     /// Give each operation group a fresh five-second host deadline.
     fn scope() -> RequestScope {
         RequestScope::new(Instant::now() + Duration::from_secs(5))
     }
+
     /// Poll delivery without implicitly driving kernel progress.
     fn poll<T, E>(future: &mut Operation<'_, T, E>) -> Poll<Result<T, E>> {
         future
             .as_mut()
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
+
     /// Explicitly drive bounded completion turns until the public operation resolves.
     fn drive<T, E>(reactor: &Reactor, mut future: Operation<'_, T, E>) -> Result<T, E> {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -169,6 +185,7 @@ mod filesystem {
             reactor.wait(Duration::from_millis(1)).unwrap();
         }
     }
+
     /// Skip only unsupported or policy-denied io_uring, preserving the required-kernel gate.
     fn kernel_reactor(capacity: usize) -> Option<Reactor> {
         match io_uring::IoUring::new(2) {
@@ -196,6 +213,383 @@ mod filesystem {
         };
         reactor.init().unwrap();
         Some(reactor)
+    }
+
+    /// Preserve the distinction between runtime failures and access-policy rejection.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SecureError {
+        Runtime(Error),
+        Access(secure::AccessError),
+    }
+
+    impl From<Error> for SecureError {
+        /// Preserve the runtime failure without collapsing cancellation or I/O errors.
+        fn from(error: Error) -> Self {
+            Self::Runtime(error)
+        }
+    }
+
+    impl From<secure::AccessError> for SecureError {
+        /// Retain access-policy attribution independently of filesystem failures.
+        fn from(error: secure::AccessError) -> Self {
+            Self::Access(error)
+        }
+    }
+
+    /// Adapt the existing public request policy to the secure helper error boundary.
+    #[derive(Clone)]
+    struct SecureScope(RequestScope);
+
+    impl Scope for SecureScope {
+        /// Both failure classes remain observable by the helper caller.
+        type Error = SecureError;
+
+        /// Reuse cancellation and deadline checks without changing their precedence.
+        fn check(&self) -> Result<(), SecureError> {
+            self.0.check().map_err(Into::into)
+        }
+    }
+
+    /// Drive composed helper futures explicitly with a bounded host deadline.
+    fn drive_secure<T, E>(
+        reactor: &Core<SecureScope, ()>,
+        future: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        let mut future = Box::pin(future);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Poll::Ready(result) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            {
+                return result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "secure helper failed to make progress"
+            );
+            reactor.poll_budgeted(8).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    }
+
+    /// Private helpers follow retained descriptors across ambient simulation changes.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn secure_helpers_use_retained_backend_owner_after_environment_switch() {
+        use uring_runtime::reactor::simulation::Simulation;
+
+        let Some(_kernel) = kernel_reactor(4) else {
+            return;
+        };
+        let root = Directory::new();
+        let path = root.0.join("private");
+        let request = SecureScope(scope());
+        let host = Core::new(16, ());
+        let host_dir =
+            drive_secure(&host, secure::directory(&host, &path, true, true, &request)).unwrap();
+        drive_secure(
+            &host,
+            secure::atomic_write(&host, &host_dir, "value", b"host", &request),
+        )
+        .unwrap();
+        let sim = Simulation::new();
+        let environment = sim.enter();
+        let simulated = Core::new(16, ());
+        let sim_dir = drive_secure(
+            &simulated,
+            secure::directory(&simulated, &path, true, true, &request),
+        )
+        .unwrap();
+        drive_secure(
+            &simulated,
+            secure::atomic_write(&simulated, &sim_dir, "value", b"sim", &request),
+        )
+        .unwrap();
+
+        // The host reactor and descriptors stay host-backed under this simulation guard.
+        let reopened = drive_secure(
+            &host,
+            secure::directory(&host, &path, false, true, &request),
+        )
+        .unwrap();
+        assert_eq!(
+            drive_secure(
+                &host,
+                secure::read_at(&host, &reopened, "value", 4, true, &request)
+            )
+            .unwrap()
+            .as_ref(),
+            b"host"
+        );
+        let stat = drive_secure(&host, host.file_stat(host_dir.clone(), &request)).unwrap();
+        assert_eq!(secure::check_private(&stat, false), Ok(()));
+        let mut foreign = stat;
+        foreign.stx_uid = stat.stx_uid.wrapping_add(1);
+        assert_eq!(
+            secure::check_private(&foreign, false),
+            Err(secure::AccessError::PermissionDenied)
+        );
+        drop(environment);
+
+        // Simulated owner zero must not be compared with the non-root host UID.
+        let reopened = drive_secure(
+            &simulated,
+            secure::directory(&simulated, &path, false, true, &request),
+        )
+        .unwrap();
+        assert_eq!(
+            drive_secure(
+                &simulated,
+                secure::read_at(&simulated, &reopened, "value", 3, true, &request)
+            )
+            .unwrap()
+            .as_ref(),
+            b"sim"
+        );
+        sim.chmod(&path.join("value"), 0o644).unwrap();
+        assert!(matches!(
+            drive_secure(
+                &simulated,
+                secure::read_at(&simulated, &sim_dir, "value", 3, true, &request)
+            ),
+            Err(SecureError::Access(secure::AccessError::PermissionDenied))
+        ));
+        fs::set_permissions(path.join("value"), fs::Permissions::from_mode(0o644)).unwrap();
+        let _environment = sim.enter();
+        assert!(matches!(
+            drive_secure(
+                &host,
+                secure::read_at(&host, &host_dir, "value", 4, true, &request)
+            ),
+            Err(SecureError::Access(secure::AccessError::PermissionDenied))
+        ));
+    }
+
+    /// Exercise secure composition against the host and optional deterministic backend.
+    #[test]
+    fn secure_helpers_compose_private_publication_reads_and_removal() {
+        let Some(_kernel) = kernel_reactor(4) else {
+            return;
+        };
+        for simulated in [false, true] {
+            if simulated && !cfg!(feature = "simulation") {
+                continue;
+            }
+            #[cfg(feature = "simulation")]
+            let sim = uring_runtime::reactor::simulation::Simulation::new();
+            #[cfg(feature = "simulation")]
+            let _environment = simulated.then(|| sim.enter());
+            let root = Directory::new();
+            let path = root.0.join("private");
+            let request = SecureScope(scope());
+            let r = Core::new(16, ());
+            r.init().unwrap();
+            let dir = drive_secure(&r, secure::directory(&r, &path, true, true, &request)).unwrap();
+            drive_secure(
+                &r,
+                secure::atomic_write(&r, &dir, "value", b"secret", &request),
+            )
+            .unwrap();
+            let output =
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 6, true, &request)).unwrap();
+            assert_eq!(output.as_ref(), b"secret");
+            assert!(matches!(
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 5, true, &request)),
+                Err(SecureError::Runtime(Error::InvalidInput))
+            ));
+            assert!(matches!(
+                drive_secure(
+                    &r,
+                    secure::read_at(&r, &dir, "value", 1024 * 1024 + 1, true, &request)
+                ),
+                Err(SecureError::Runtime(Error::Overloaded))
+            ));
+            assert!(matches!(
+                drive_secure(&r, secure::read_at(&r, &dir, "../value", 6, true, &request)),
+                Err(SecureError::Runtime(Error::InvalidInput))
+            ));
+            assert!(matches!(
+                drive_secure(&r, secure::read_file(&r, dir.clone(), 6, false, &request)),
+                Err(SecureError::Runtime(Error::InvalidInput))
+            ));
+            assert!(matches!(
+                drive_secure(
+                    &r,
+                    secure::atomic_write(&r, &dir, "../value", b"bad", &request)
+                ),
+                Err(ReplacementError::BeforeRename(SecureError::Runtime(
+                    Error::InvalidInput
+                )))
+            ));
+            #[cfg(feature = "simulation")]
+            if simulated {
+                sim.symlink(Path::new("value"), &path.join("link")).unwrap();
+                sim.chmod(&path.join("value"), 0o644).unwrap();
+            }
+            if !simulated {
+                symlink("value", path.join("link")).unwrap();
+                fs::set_permissions(path.join("value"), fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            assert!(matches!(
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 6, true, &request)),
+                Err(SecureError::Access(secure::AccessError::PermissionDenied))
+            ));
+            assert!(
+                drive_secure(&r, secure::read_at(&r, &dir, "link", 6, false, &request)).is_err()
+            );
+            assert_eq!(
+                drive_secure(&r, secure::read_path(&r, &path.join("link"), 6, &request))
+                    .unwrap()
+                    .as_ref(),
+                b"secret"
+            );
+            #[cfg(feature = "simulation")]
+            if simulated {
+                sim.inject(
+                    "rename",
+                    uring_runtime::reactor::simulation::Fault::Errno(libc::EIO),
+                )
+                .unwrap();
+                assert!(matches!(
+                    drive_secure(
+                        &r,
+                        secure::atomic_write(&r, &dir, "value", b"next", &request)
+                    ),
+                    Err(ReplacementError::RenameUncertain(SecureError::Runtime(
+                        Error::Os(libc::EIO)
+                    )))
+                ));
+                assert_eq!(sim.read_file(&path.join("value")).unwrap(), b"secret");
+            }
+            drive_secure(&r, secure::atomic_write(&r, &dir, "value", b"", &request)).unwrap();
+            assert!(
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 0, true, &request))
+                    .unwrap()
+                    .is_empty()
+            );
+            for _ in 0..2 {
+                drive_secure(&r, secure::remove(&r, &dir, "value", &request)).unwrap();
+            }
+            assert!(matches!(
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 6, true, &request)),
+                Err(SecureError::Runtime(Error::NotFound))
+            ));
+            assert_eq!(r.in_flight(), 0);
+        }
+    }
+
+    /// Compare failed creation and anonymous-file semantics without namespace changes.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn creation_flags_preserve_namespace_and_tmpfile_is_explicitly_unsupported() {
+        use uring_runtime::reactor::simulation::Simulation;
+        let Some(host) = kernel_reactor(16) else {
+            return;
+        };
+        let root = Directory::new();
+        let existing = root.0.join("existing");
+        let missing = root.0.join("missing");
+        fs::write(&existing, b"keep").unwrap();
+        let request = scope();
+        for path in [&missing, &existing, &root.0] {
+            assert!(matches!(
+                drive(
+                    &host,
+                    host.file_open(
+                        None,
+                        name(path),
+                        libc::O_CREAT | libc::O_DIRECTORY | libc::O_RDWR,
+                        0,
+                        &request
+                    )
+                ),
+                Err(Error::Os(libc::EINVAL))
+            ));
+        }
+        assert!(!missing.exists());
+        assert_eq!(fs::read(&existing).unwrap(), b"keep");
+        let named = drive(
+            &host,
+            host.file_open(None, name(&existing), libc::O_RDONLY, 0, &request),
+        )
+        .unwrap();
+        let stat = drive(&host, host.file_stat(named, &request)).unwrap();
+        assert_eq!(stat.stx_mode as u32 & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(stat.stx_nlink, 1);
+        match drive(
+            &host,
+            host.file_open(
+                None,
+                name(&root.0),
+                libc::O_TMPFILE | libc::O_RDWR,
+                0,
+                &request,
+            ),
+        ) {
+            Ok(anonymous) => {
+                let stat = drive(&host, host.file_stat(anonymous, &request)).unwrap();
+                assert_eq!(stat.stx_mode as u32 & libc::S_IFMT, libc::S_IFREG);
+                assert_eq!(stat.stx_nlink, 0);
+            }
+            Err(Error::Os(libc::EOPNOTSUPP)) => (),
+            other => panic!("unexpected host O_TMPFILE result: {other:?}"),
+        }
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+
+        let sim = Simulation::new();
+        sim.write_file(&existing, b"keep").unwrap();
+        let directory_before = sim.metadata(&root.0).unwrap();
+        let file_before = sim.metadata(&existing).unwrap();
+        let _simulation = sim.enter();
+        let used = Rc::new(Cell::new(0));
+        let simulated = Reactor {
+            core: Core::new(16, CountingBudget(used.clone())),
+            used,
+        };
+        simulated.init().unwrap();
+        for path in [&missing, &existing, &root.0] {
+            assert!(matches!(
+                drive(
+                    &simulated,
+                    simulated.file_open(
+                        None,
+                        name(path),
+                        libc::O_CREAT | libc::O_DIRECTORY | libc::O_RDWR,
+                        0,
+                        &request
+                    )
+                ),
+                Err(Error::Os(libc::EINVAL))
+            ));
+        }
+        for flags in [
+            libc::O_TMPFILE | libc::O_RDWR,
+            libc::O_TMPFILE | libc::O_WRONLY,
+        ] {
+            assert!(matches!(
+                drive(
+                    &simulated,
+                    simulated.file_open(None, name(&root.0), flags, 0, &request)
+                ),
+                Err(Error::Os(libc::EOPNOTSUPP))
+            ));
+        }
+        assert_eq!(
+            sim.metadata(&missing).unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(sim.metadata(&root.0).unwrap(), directory_before);
+        assert_eq!(sim.metadata(&existing).unwrap(), file_before);
+        assert_eq!(sim.read_file(&existing).unwrap(), b"keep");
+        let named = drive(
+            &simulated,
+            simulated.file_open(None, name(&existing), libc::O_RDONLY, 0, &request),
+        )
+        .unwrap();
+        let stat = drive(&simulated, simulated.file_stat(named, &request)).unwrap();
+        assert_eq!(stat.stx_mode as u32 & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(stat.stx_nlink, 1);
     }
 
     /// Check buffer progress, bounds, quota release, and empty reads.
@@ -742,6 +1136,7 @@ mod reserved_capacity {
     /// Keep cancellation and deadlines out of admission-only scenarios.
     #[derive(Clone)]
     struct OpenScope;
+
     impl Scope for OpenScope {
         /// Use the runtime error type for the always-open scope.
         type Error = Error;
@@ -751,12 +1146,14 @@ mod reserved_capacity {
             Ok(())
         }
     }
+
     /// Poll once without driving kernel execution or consuming unrelated replies.
     fn poll<T>(operation: &mut Operation<'_, T>) -> Poll<Result<T>> {
         operation
             .as_mut()
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
+
     /// Complete accepted operations without consuming their waiting replies.
     fn complete(reactor: &Reactor<OpenScope, ()>) {
         for _ in 0..16 {
@@ -912,8 +1309,10 @@ mod reserved_capacity {
     #[test]
     fn simulated_writes_use_immutable_accessor_like_production() {
         use uring_runtime::reactor::IoBuffer;
+
         /// Stable send storage that rejects all mutable access.
         struct ReadOnly(Vec<u8>);
+
         // SAFETY: private stable Vec; mutation accessor fails without exposing aliases.
         unsafe impl IoBuffer for ReadOnly {
             /// Report attempts to mutate the read-only buffer as runtime errors.
@@ -1031,8 +1430,10 @@ mod reserved_capacity {
     fn reserved_sq_rejection_releases_exact_partition_and_buffer_owner() {
         use std::cell::Cell;
         use uring_runtime::reactor::IoBuffer;
+
         /// Count releases of stable submission storage independently of the reactor.
         struct Owned(Vec<u8>, Rc<Cell<usize>>);
+
         // SAFETY: private non-resizing Vec retains initialized backing across moves.
         unsafe impl IoBuffer for Owned {
             /// Use runtime errors for buffer access results.
@@ -1048,6 +1449,7 @@ mod reserved_capacity {
                 Ok(&mut self.0)
             }
         }
+
         impl Drop for Owned {
             /// Record the release of this owned submission buffer.
             fn drop(&mut self) {

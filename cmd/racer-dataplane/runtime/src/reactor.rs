@@ -15,6 +15,7 @@
 use crate::{Budget, Error, Operation, Result, Scope};
 use descriptor::Descriptor;
 use io_uring::{IoUring, opcode, squeue, types};
+
 #[cfg(feature = "simulation")]
 /// Deterministic resource and completion backend for simulation runs.
 pub mod simulation;
@@ -38,6 +39,7 @@ macro_rules! submission {
         }
     }};
 }
+
 /// Control-owned filesystem operations sharing this reactor's completion fences.
 pub mod filesystem;
 use std::{
@@ -82,6 +84,7 @@ pub struct SubmissionCapacity {
 
     capacity: usize,
 }
+
 /// Maximum completion bookkeeping charged to one prepaid submission slot.
 pub const SUBMISSION_BYTES: usize = 4096;
 
@@ -174,22 +177,28 @@ struct SubmissionSlot {
 
     _capacity: Option<Rc<SubmissionCapacity>>,
 }
+
 impl Drop for SubmissionSlot {
     /// Release exactly one admitted slot when its owning fence or reply retires.
     fn drop(&mut self) {
         self.active.set(self.active.get() - 1);
     }
 }
+
 /// Monotonic operation identifier; its high bit is reserved for cancel CQEs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct IoId(u64);
 
 const CANCEL_BIT: u64 = 1 << 63;
+
 const MAX_WAIT: Duration = Duration::from_millis(10);
+
 const DROP_WAIT: Duration = Duration::from_millis(100);
+
 // At most nine data attempts, each separated by a worker-driven CQE. A positive
 // partial result is never replayed. EAGAIN additionally requires a readiness CQE.
 const DATA_RETRIES: usize = 8;
+
 // Linux UAPI: the only setup flag enabled by init. Unknown flags fail closed.
 const SETUP_CQSIZE: u32 = 1 << 3;
 
@@ -232,6 +241,7 @@ struct FenceWaiter {
 
     _reservation: Charge,
 }
+
 impl FenceWaiter {
     /// Consume this registration and notify its executor outside reactor borrows.
     fn wake(self) {
@@ -441,6 +451,7 @@ impl KernelResult {
             Self::Accepted(_) => Err(std::io::Error::from_raw_os_error(libc::EIO)),
         }
     }
+
     /// Record failure attribution without consuming an accepted resource owner.
     fn observe_errno(&self, errno: &std::cell::Cell<Option<i32>>) {
         if let Self::Value(value) = self
@@ -449,6 +460,7 @@ impl KernelResult {
             errno.set(value.checked_neg());
         }
     }
+
     /// Translate a scalar completion into the runtime's error classification.
     fn value(self) -> Result<i32> {
         self.io_result().map_err(Error::from_io)
@@ -1081,6 +1093,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             Ok(owned.complete(bytes))
         })
     }
+
     /// Transfer the FD, buffer, and any reuse-preventing lease (`()` if none).
     /// Owned resources can move from one completed operation to the next:
     /// ```no_run
@@ -1124,6 +1137,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             None,
         )
     }
+
     /// Write at an explicit offset, returning short progress without replaying bytes.
     pub fn write_at<'a, B: IoBuffer, L: 'static>(
         &'a self,
@@ -1261,6 +1275,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     ) -> Operation<'a, u32, S::Error> {
         self.readiness_with_lease(fd, interest, (), scope)
     }
+
     /// Retain progress admission alongside the descriptor until all CQE fences.
     pub fn readiness_with_lease<'a, L: 'static>(
         &'a self,
@@ -1355,6 +1370,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     ) -> Operation<'a, L, S::Error> {
         self.connect_with_observation(fd, address, lease, None, scope)
     }
+
     /// Preserve connect errno locally for attribution, without changing boundary errors.
     pub fn connect_with_observation<'a, L: 'static>(
         &'a self,
@@ -1690,6 +1706,7 @@ impl<S: Scope> State<S> {
         let cqe = self.ring.as_mut()?.completion().next()?;
         Some((cqe.user_data(), KernelResult::Value(cqe.result())))
     }
+
     /// Publish queued SQEs when queue state or kernel flags require an enter call.
     fn submit_pending(&mut self) -> Result<()> {
         #[cfg(test)]
@@ -1838,19 +1855,23 @@ impl<S: Scope> Drop for State<S> {
 /// Stable syscall backing whose pointer provenance survives owner moves.
 /// Do not replace the private one-element Vec with a move-retagged Box.
 struct SyscallArg<T>(Vec<T>);
+
 impl<T> SyscallArg<T> {
     /// Allocate initialized backing before publishing any derived pointer.
     fn new(value: T) -> Self {
         Self(vec![value])
     }
+
     /// Borrow the stable input pointer retained through the completion fence.
     fn as_ptr(&self) -> *const T {
         self.0.as_ptr()
     }
+
     /// Borrow the stable output pointer before transferring ownership to the kernel.
     fn as_mut_ptr(&mut self) -> *mut T {
         self.0.as_mut_ptr()
     }
+
     /// Recover output only after the caller has established its completion fence.
     fn into_inner(mut self) -> T {
         self.0.pop().expect("one syscall argument")
@@ -2001,6 +2022,7 @@ pub mod timer {
         //! Kernel and cooperative timer selection, cancellation, and deadline contracts.
         use super::*;
         use crate::reactor::tests::{drive, kernel_reactor, poll, scope};
+
         #[test]
         /// Check timer completion and cancellation through the actual kernel fence.
         fn kernel_timer_completes_and_cancel_retains_fence() {
@@ -2031,6 +2053,7 @@ pub mod timer {
             assert_eq!(drive(&reactor, future), Err(Error::Cancelled));
             assert_eq!(reactor.in_flight(), 0);
         }
+
         #[cfg(feature = "simulation")]
         #[test]
         /// Verify simulated clock polling wakes cooperatively without submissions.
@@ -2059,6 +2082,7 @@ pub mod timer {
                 Poll::Ready(Err(Error::Cancelled))
             );
         }
+
         #[cfg(feature = "simulation")]
         #[test]
         /// Reject mixed clock domains before even accepting an expired timer.
@@ -2108,6 +2132,7 @@ pub mod descriptor {
                 Kind::Real(_) => None,
             }
         }
+
         /// Extract a simulated resource, returning the unchanged host owner on mismatch.
         #[cfg(feature = "simulation")]
         pub fn into_sim(self) -> std::result::Result<super::simulation::Handle, Self> {
@@ -2116,6 +2141,7 @@ pub mod descriptor {
                 other => Err(Self(other)),
             }
         }
+
         /// Set TCP_NODELAY for TCP callers, including disabling it when false.
         pub fn enable_tcp_nodelay(&self, enabled: bool) -> Result<()> {
             #[cfg(feature = "simulation")]
@@ -2138,6 +2164,7 @@ pub mod descriptor {
             }
             Ok(())
         }
+
         /// Numeric socket identity only, sampled on failure while the owner is live.
         pub fn tcp_tuple(&self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
             #[cfg(feature = "simulation")]
@@ -2150,6 +2177,7 @@ pub mod descriptor {
             });
             Some((socket.local_addr().ok()?, socket.peer_addr().ok()?))
         }
+
         /// The listener must already be nonblocking; accept4 flags apply only to the
         /// accepted socket. EINTR is retried a bounded number of times; other errno
         /// values, including EAGAIN, remain available to caller retry policy.
@@ -2171,6 +2199,7 @@ pub mod descriptor {
             })?;
             Ok(unsafe { Self::from_raw_fd(fd as RawFd) })
         }
+
         /// Explicit extraction for host-only adapters. A simulated handle is rejected.
         pub fn into_host(self) -> std::result::Result<OwnedFd, Self> {
             match self.0 {
@@ -2179,6 +2208,7 @@ pub mod descriptor {
                 other => Err(Self(other)),
             }
         }
+
         /// Bind a nonblocking TCP listener in the currently selected environment.
         pub fn tcp_listener(address: std::net::SocketAddr) -> Result<Self> {
             #[cfg(feature = "simulation")]
@@ -2191,6 +2221,7 @@ pub mod descriptor {
             listener.set_nonblocking(true).map_err(|_| Error::Io)?;
             Ok(listener.into())
         }
+
         /// Create a nonblocking, close-on-exec stream socket for the requested family.
         pub fn socket(domain: i32) -> Result<Self> {
             #[cfg(feature = "simulation")]
@@ -2209,6 +2240,7 @@ pub mod descriptor {
             }
             Ok(unsafe { Self::from_raw_fd(raw) })
         }
+
         /// Enable O_NONBLOCK and FD_CLOEXEC, preserving other status/descriptor flags.
         /// O_NONBLOCK affects duplicated descriptors sharing the open file description;
         /// FD_CLOEXEC is local to this descriptor. Failure may leave partial changes.
@@ -2231,6 +2263,7 @@ pub mod descriptor {
             }
             Ok(())
         }
+
         /// Send without waiting or raising SIGPIPE; preserve short progress and errno.
         /// Only zero-progress EINTR is retried, for at most four attempts.
         pub fn try_send(&self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -2249,6 +2282,7 @@ pub mod descriptor {
                 })
             })
         }
+
         /// Receive without waiting; preserve EOF, short progress, and errno.
         /// Only zero-progress EINTR is retried, for at most four attempts.
         pub fn try_recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -2267,6 +2301,7 @@ pub mod descriptor {
                 })
             })
         }
+
         /// Check for an idle connected socket without consuming any queued byte.
         /// Unexpected data, EOF, and errors all make a pooled socket unsuitable.
         pub fn idle_healthy(&self) -> bool {
@@ -2285,6 +2320,7 @@ pub mod descriptor {
             };
             result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
         }
+
         /// Full peer close, not a write-half shutdown. Consumes no bytes and never
         /// competes with parsing, even during acquisition or response writes.
         pub fn peer_disconnected(&self) -> bool {
@@ -2294,6 +2330,7 @@ pub mod descriptor {
             }
             self.host_closed(0)
         }
+
         /// Unlike POLLHUP, POLLRDHUP notices a peer FIN while our send side is open.
         pub fn peer_read_closed(&self) -> bool {
             #[cfg(feature = "simulation")]
@@ -2302,6 +2339,7 @@ pub mod descriptor {
             }
             self.host_closed(libc::POLLRDHUP)
         }
+
         /// Shut down one or both socket directions without releasing ownership.
         pub fn shutdown(&self, how: i32) -> Result<()> {
             #[cfg(feature = "simulation")]
@@ -2314,6 +2352,7 @@ pub mod descriptor {
             }
             Ok(())
         }
+
         /// Require a stream socket, rejecting files and other socket kinds.
         pub fn validate_socket(&self) -> Result<()> {
             #[cfg(feature = "simulation")]
@@ -2336,6 +2375,7 @@ pub mod descriptor {
             }
             Ok(())
         }
+
         /// Inspect host closure flags without waiting or taking descriptor ownership.
         fn host_closed(&self, interest: i16) -> bool {
             let mut fd = libc::pollfd {
@@ -2359,6 +2399,7 @@ pub mod descriptor {
             }
         }
     }
+
     impl AsFd for Descriptor {
         /// Borrow host ownership for a syscall, rejecting simulated resources.
         fn as_fd(&self) -> BorrowedFd<'_> {
@@ -2369,12 +2410,14 @@ pub mod descriptor {
             }
         }
     }
+
     impl FromRawFd for Descriptor {
         /// Assume sole closing ownership of a live host descriptor.
         unsafe fn from_raw_fd(fd: RawFd) -> Self {
             Self(Kind::Real(unsafe { OwnedFd::from_raw_fd(fd) }))
         }
     }
+
     /// Implement closing-ownership transfer for supported host resource adapters.
     macro_rules! from_host {
         ($($ty:ty),*) => { $(impl From<$ty> for Descriptor {
@@ -2382,6 +2425,7 @@ pub mod descriptor {
             fn from(value: $ty) -> Self { Self(Kind::Real(value.into())) }
         })* };
     }
+
     from_host!(
         OwnedFd,
         std::fs::File,
@@ -2447,6 +2491,7 @@ pub mod descriptor {
     mod tests {
         //! Host descriptor flags, bounded retries, and backend separation contracts.
         use super::*;
+
         #[test]
         /// Preserve short success and errno while bounding interrupted syscall retries.
         fn interrupted_syscalls_retry_boundedly_without_hiding_errno_or_short_success() {
@@ -2475,6 +2520,7 @@ pub mod descriptor {
                 retry_interrupted(|| Err(std::io::Error::from_raw_os_error(libc::EAGAIN)));
             assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
         }
+
         #[test]
         /// Check reversible TCP_NODELAY and nonblocking close-on-exec configuration.
         fn nodelay_can_be_disabled_and_nonblocking_sets_cloexec() {
@@ -2495,6 +2541,7 @@ pub mod descriptor {
                 0
             );
         }
+
         #[test]
         /// Keep the response direction usable after a peer's write-half close.
         fn peer_write_half_close_does_not_imply_full_disconnect() {
@@ -2507,6 +2554,7 @@ pub mod descriptor {
             drop(right);
             assert!(fd.peer_disconnected());
         }
+
         #[cfg(feature = "simulation")]
         #[test]
         /// Prevent simulated owners from crossing host syscall adapter boundaries.
@@ -2562,6 +2610,7 @@ pub mod ready_set {
                 registrations: BTreeMap::new(),
             })
         }
+
         /// Register a host descriptor with a unique caller-chosen index. Remove it
         /// before closing or reusing its FD/index. Closing does not remove an epoll
         /// registration while duplicated aliases retain the open file description.
@@ -2587,6 +2636,7 @@ pub mod ready_set {
             self.registrations.insert(fd, index);
             Ok(())
         }
+
         /// Deregister while `fd` still names the registered open file description,
         /// discarding any cached event. Unknown descriptors return NotFound.
         pub fn remove(&mut self, fd: RawFd) -> Result<(), E> {
@@ -2607,6 +2657,7 @@ pub mod ready_set {
             self.ready.retain(|queued| *queued != index);
             Ok(())
         }
+
         /// Abandon an idle wait and discard cached indices, without deregistration.
         /// Cancel the caller-owned scope first; accepted I/O retains its CQE leases.
         pub fn clear(&mut self) {
@@ -2663,6 +2714,7 @@ pub mod ready_set {
             }
             Ok(None)
         }
+
         /// Consume completed waits before propagating failure, preventing repolling.
         /// With no wait the caller can inspect the level-triggered index immediately.
         fn poll_wait(&mut self, cx: &mut Context<'_>) -> Result<Poll<()>, E> {
@@ -2688,6 +2740,7 @@ pub mod ready_set {
             io::{Read, Write},
             os::unix::net::UnixStream,
         };
+
         #[test]
         /// Consume an immediate idle completion before requesting another refill.
         fn immediately_completed_idle_wait_is_consumed_and_requests_a_refill() {
@@ -2708,6 +2761,7 @@ pub mod ready_set {
             assert!(set.wait.is_some());
             assert_eq!(counter.count(), 1);
         }
+
         #[test]
         /// Verify repeated level readiness without retaining registered socket owners.
         fn indices_are_level_triggered_and_registration_does_not_retain_owners() {
@@ -2742,6 +2796,7 @@ pub mod ready_set {
                 Err(Error::Cancelled)
             );
         }
+
         #[test]
         /// Drain cached readiness before refilling and discard it on clear.
         fn ready_batch_is_drained_before_refilling_and_clear_discards_it() {
@@ -2765,6 +2820,7 @@ pub mod ready_set {
             set.clear();
             assert!(set.ready.is_empty());
         }
+
         #[test]
         /// Keep the epoll owner alive until an abandoned idle operation is fenced.
         fn abandoned_idle_wait_retains_epoll_until_completion_fence() {
@@ -2797,6 +2853,7 @@ pub mod ready_set {
             assert_eq!(reactor.in_flight(), 0);
             assert!(weak.upgrade().is_none());
         }
+
         #[test]
         /// Remove cached events for each independently registered descriptor alias.
         fn remove_discards_cached_events_and_handles_duplicated_fds() {
@@ -2822,6 +2879,7 @@ pub mod ready_set {
                 Ok(None)
             );
         }
+
         #[test]
         /// Retire failed waits so later calls never poll completed futures again.
         fn failed_idle_wait_is_consumed_not_polled_again() {

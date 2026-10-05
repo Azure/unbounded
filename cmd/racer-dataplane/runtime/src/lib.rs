@@ -7,11 +7,17 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod channel;
+
 pub mod drivers;
+
 pub mod environment;
+
 pub mod group;
+
 pub mod offload;
+
 pub mod reactor;
+
 #[cfg(any(test, feature = "test-util"))]
 /// Optional shared wake instrumentation for tests, disabled in production builds.
 pub mod test_util {
@@ -102,6 +108,7 @@ impl std::error::Error for Error {}
 
 /// A runtime result, optionally using an application-owned error type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
 /// Worker-local future; no hidden executor and no Send requirement.
 pub type Operation<'a, T, E = Error> = Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>;
 
@@ -247,6 +254,7 @@ pub mod mailbox {
                 }),
             })
         }
+
         /// Enable admission once; a closed mailbox cannot be reinstalled.
         pub fn install(&self) -> Result<()> {
             let mut state = lock(&self.state);
@@ -256,14 +264,17 @@ pub mod mailbox {
             state.admission = Admission::Open;
             Ok(())
         }
+
         /// Permanently close admission without discarding queued or executing work.
         pub fn stop_admission(&self) {
             lock(&self.state).admission = Admission::Closed;
         }
+
         /// Count capacity retained by accepted commands and unread receipts.
         pub fn outstanding(&self) -> usize {
             self.credits.outstanding.load(Ordering::Acquire)
         }
+
         /// Close admission and detach only when all retained capacity has returned.
         pub fn uninstall(&self) -> Result<()> {
             let mut state = lock(&self.state);
@@ -273,6 +284,7 @@ pub mod mailbox {
             }
             Ok(())
         }
+
         /// The caller allocates generations, allowing a shared sequence with other
         /// application identities. Each reply accepts only its own generation once.
         pub fn submit(
@@ -334,27 +346,43 @@ pub mod mailbox {
                 work: std::marker::PhantomData,
             })
         }
+
         /// Replace the driver's work and capacity notification waker before checking.
         pub fn register(&self, waker: &Waker) {
             self.credits.waker.register(waker);
         }
+
         /// Transfer the oldest queued command to its execution owner without waiting.
         pub fn pop(&self) -> Option<Command<W, V, B, S>> {
             let entry = lock(&self.state).queue.pop_front();
             entry.map(|(_, command)| command)
         }
+
         /// Whether accepted work remains queued rather than executing.
         pub fn has_queued(&self) -> bool {
             !lock(&self.state).queue.is_empty()
         }
+
         /// Mark queued replies abandoned without releasing commands or their capacity.
         /// Delivery may end immediately, but completion-only polling still waits for
         /// actual completion (reported as `Cancelled`) or producer loss (`Unavailable`).
         pub fn abandon_queued(&self) {
-            for (_, command) in &lock(&self.state).queue {
-                command.reply.abandoned.store(true, Ordering::Release);
+            let replies: Vec<_> = lock(&self.state)
+                .queue
+                .iter()
+                .map(|(_, command)| {
+                    command.reply.abandoned.store(true, Ordering::Release);
+                    command.reply.clone()
+                })
+                .collect();
+            for reply in replies {
+                let waker = lock(&reply.state).waker.take();
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
             }
         }
+
         /// Compute a minimum over a scope snapshot, invoking caller policy outside locks.
         pub fn queued_min<T: Ord>(&self, key: impl Fn(&S) -> T) -> Option<T> {
             let scopes: Vec<_> = lock(&self.state)
@@ -364,6 +392,7 @@ pub mod mailbox {
                 .collect();
             scopes.iter().map(|scope| key(scope)).min()
         }
+
         /// Remove unstarted commands for caller-defined failure completion or process
         /// loss. Drop outside the lock: permits release against the same mailbox.
         pub fn take_queued(&self) -> VecDeque<Command<W, V, B, S>> {
@@ -388,6 +417,7 @@ pub mod mailbox {
             self.reply.poll_completion(cx)
         }
     }
+
     impl<W, V, B, S: Scope> Future for Receipt<W, V, B, S> {
         /// Delivery observes caller policy separately from accepted-work ownership.
         type Output = Result<Completion<V, B>, S::Error>;
@@ -403,11 +433,15 @@ pub mod mailbox {
             if self.reply.is_abandoned() {
                 return Poll::Ready(Err(Error::Cancelled.into()));
             }
-            self.reply
-                .poll_completion(cx)
-                .map(|result| result.map_err(Into::into))
+            let result = self.reply.poll_completion(cx);
+            // Abandonment may precede waker registration after the first check.
+            if result.is_pending() && self.reply.is_abandoned() {
+                return Poll::Ready(Err(Error::Cancelled.into()));
+            }
+            result.map(|result| result.map_err(Into::into))
         }
     }
+
     impl<W, V, B, S: Scope> Drop for Receipt<W, V, B, S> {
         /// Abandon delivery and discard unread output without fencing producer work.
         fn drop(&mut self) {
@@ -431,10 +465,12 @@ pub mod mailbox {
                 }),
             }
         }
+
         /// Whether the consumer abandoned delivery, without canceling accepted work.
         pub fn is_abandoned(&self) -> bool {
             self.abandoned.load(Ordering::Acquire)
         }
+
         /// Finish this generation once, discarding abandoned results outside the lock.
         pub fn complete(
             &self,
@@ -461,6 +497,7 @@ pub mod mailbox {
             }
             Ok(())
         }
+
         /// Consume a result or register the sole delivery waiter, ignoring cancellation.
         fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Result<Completion<V, B>>> {
             let waker = cx.waker().clone();
@@ -480,6 +517,7 @@ pub mod mailbox {
             Poll::Pending
         }
     }
+
     impl<V, B> Drop for Producer<V, B> {
         /// Publish producer loss and return credit only if completion never arrived.
         fn drop(&mut self) {
@@ -499,6 +537,7 @@ pub mod mailbox {
 
     /// Independently snapshottable scope paired with its uniquely owned command.
     type Queued<W, V, B, S> = (Arc<S>, Command<W, V, B, S>);
+
     /// Admission lifecycle and unstarted work, protected by one queue lock.
     struct State<W, V, B, S: Scope> {
         admission: Admission,
@@ -553,6 +592,7 @@ pub mod mailbox {
 
         released: AtomicBool,
     }
+
     impl Permit {
         /// Release capacity at most once, notifying the mailbox driver afterward.
         fn release(&self) {
@@ -562,6 +602,7 @@ pub mod mailbox {
             }
         }
     }
+
     impl Drop for Permit {
         /// Return retained capacity when the last shared owner disappears.
         fn drop(&mut self) {
@@ -614,6 +655,7 @@ pub mod mailbox {
         /// Cancellation-only policy for exercising receipt and producer ownership.
         #[derive(Clone)]
         struct TestScope(Cancellation);
+
         impl Scope for TestScope {
             /// Mailbox fixtures use portable runtime failure classifications.
             type Error = Error;
@@ -632,16 +674,20 @@ pub mod mailbox {
                 Some(&self.0)
             }
         }
+
         /// Counts destruction of the application budget retained by a command.
         struct Tracked(Arc<AtomicUsize>);
+
         impl Drop for Tracked {
             /// Record release of the application budget independently of mailbox credit.
             fn drop(&mut self) {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+
         /// One-command fixture carrying owned text and a tracked budget.
         type TestMailbox = Mailbox<String, usize, Tracked, TestScope>;
+
         /// Install a fresh one-slot mailbox with an uncanceled scope.
         fn setup() -> (Arc<TestMailbox>, TestScope) {
             let mailbox = Arc::new(TestMailbox::new(1).unwrap());
@@ -693,6 +739,112 @@ pub mod mailbox {
             assert_eq!(dropped.load(Ordering::Relaxed), 1);
             assert_eq!(mailbox.outstanding(), 1);
             drop(command);
+            assert_eq!(mailbox.outstanding(), 0);
+        }
+
+        /// Abandonment wakes delivery outside locks without fencing accepted ownership.
+        #[test]
+        fn abandoning_pending_delivery_wakes_without_releasing_ownership() {
+            let (mailbox, scope) = setup();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let mut receipt = mailbox
+                .submit(7, String::new(), &scope, Some(Tracked(dropped.clone())))
+                .unwrap();
+
+            /// Reenter both locks from wake to verify notification is detached.
+            struct Reenter {
+                mailbox: Arc<TestMailbox>,
+
+                reply: Arc<Reply<usize, Tracked>>,
+
+                wakes: AtomicUsize,
+            }
+
+            impl std::task::Wake for Reenter {
+                /// Inspect queued ownership and the reply during notification.
+                fn wake(self: Arc<Self>) {
+                    assert!(self.mailbox.state.try_lock().is_ok());
+                    assert!(self.reply.state.try_lock().is_ok());
+                    assert_eq!(self.mailbox.outstanding(), 1);
+                    self.wakes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let counter = Arc::new(Reenter {
+                mailbox: mailbox.clone(),
+                reply: receipt.reply.clone(),
+                wakes: AtomicUsize::new(0),
+            });
+            let waker = Waker::from(counter.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut receipt).poll(&mut cx).is_pending());
+            mailbox.abandon_queued();
+            assert_eq!(counter.wakes.load(Ordering::Relaxed), 1);
+            assert!(matches!(
+                Pin::new(&mut receipt).poll(&mut cx),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+            assert!(mailbox.has_queued());
+            assert_eq!(mailbox.outstanding(), 1);
+            assert_eq!(dropped.load(Ordering::Relaxed), 0);
+            let mut fence_cx = Context::from_waker(Waker::noop());
+            assert!(receipt.poll_completion(&mut fence_cx).is_pending());
+            let mut command = mailbox.pop().unwrap();
+            command
+                .reply
+                .complete(
+                    7,
+                    Completion {
+                        value: 42,
+                        budget: command.budget.take(),
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                receipt.poll_completion(&mut fence_cx),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+            assert_eq!(dropped.load(Ordering::Relaxed), 1);
+            drop(command);
+            assert_eq!(mailbox.outstanding(), 1);
+            drop(receipt);
+            assert_eq!(mailbox.outstanding(), 0);
+        }
+
+        /// Abandonment during registration cannot strand a delivery waiter.
+        #[test]
+        fn abandonment_during_waker_registration_returns_cancellation() {
+            use std::task::{RawWaker, RawWakerVTable};
+            thread_local! {
+                static MAILBOX: std::cell::RefCell<Option<Arc<TestMailbox>>> = const { std::cell::RefCell::new(None) };
+            }
+
+            /// Inject abandonment between the initial check and reply registration.
+            unsafe fn clone_raw(_: *const ()) -> RawWaker {
+                MAILBOX.with(|slot| {
+                    if let Some(mailbox) = slot.borrow_mut().take() {
+                        mailbox.abandon_queued();
+                    }
+                });
+                RawWaker::new(std::ptr::null(), &VTABLE)
+            }
+
+            /// No payload is owned by this stateless waker.
+            unsafe fn noop(_: *const ()) {}
+
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_raw, noop, noop, noop);
+            let (mailbox, scope) = setup();
+            let mut receipt = mailbox.submit(7, String::new(), &scope, None).unwrap();
+            // Isolate reply registration from the separate scope-cancellation waker.
+            receipt.cancellation = None;
+            MAILBOX.with(|slot| *slot.borrow_mut() = Some(mailbox.clone()));
+            // SAFETY: callbacks own no pointer and only access thread-local test state.
+            let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+            assert!(matches!(
+                Pin::new(&mut receipt).poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+            assert_eq!(mailbox.outstanding(), 1);
+            drop(mailbox.take_queued());
             assert_eq!(mailbox.outstanding(), 0);
         }
 
@@ -1121,12 +1273,14 @@ pub mod mailbox {
         fn panicking_scope_clone_never_reserves_or_locks() {
             /// Injects failure while copying caller-owned admission policy.
             struct Panics;
+
             impl Clone for Panics {
                 /// Fail before the mailbox can lock or reserve capacity.
                 fn clone(&self) -> Self {
                     panic!("clone");
                 }
             }
+
             impl Scope for Panics {
                 /// The fixture uses portable runtime failures.
                 type Error = Error;
@@ -1172,6 +1326,7 @@ pub mod mailbox {
         fn abandoned_completion_destructor_can_reenter_reply() {
             /// Checks terminal reply state during application budget destruction.
             struct Reenter(std::sync::Weak<Reply<(), Reenter>>);
+
             impl Drop for Reenter {
                 /// Reenter the reply lock after completion has detached discarded output.
                 fn drop(&mut self) {

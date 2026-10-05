@@ -13,6 +13,7 @@ use std::{
 };
 
 thread_local! { static CURRENT: RefCell<Option<Simulation>> = const { RefCell::new(None) }; }
+
 mod network;
 #[cfg(test)]
 use disk::DiskState;
@@ -27,6 +28,7 @@ pub struct EndpointEnvironment {
 
     previous: Option<SocketAddress>,
 }
+
 impl Drop for EndpointEnvironment {
     /// Restore socket labeling without changing existing endpoint labels.
     fn drop(&mut self) {
@@ -37,10 +39,12 @@ impl Drop for EndpointEnvironment {
 /// Shared deterministic OS state retained by reactors and simulated descriptors.
 #[derive(Clone, Debug)]
 pub struct Simulation(Rc<RefCell<World>>);
+
 /// Restores the previous thread-local simulation when its scope ends.
 pub struct Environment {
     previous: Option<Simulation>,
 }
+
 impl Drop for Environment {
     /// Restore the previous thread-local backend selection.
     fn drop(&mut self) {
@@ -59,6 +63,7 @@ pub struct Event {
 
     pub result: i64,
 }
+
 /// Queued faults match the next submitted operation with this name (or `*`).
 /// `Delay` counts driver submission turns; `Short` caps a single byte transfer.
 /// Synchronous syscalls support Errno/Short; use Delay on reactor submissions.
@@ -107,6 +112,7 @@ struct World {
 
     disk: disk::State,
 }
+
 /// The kernel-side state of an open simulated descriptor.
 #[derive(Debug)]
 enum Resource {
@@ -154,6 +160,7 @@ enum Resource {
         capacity: usize,
     },
 }
+
 /// A sparse inode whose allocated pages are shared with durable snapshots.
 #[derive(Debug)]
 struct Node {
@@ -177,6 +184,7 @@ pub struct Handle {
 
     id: u64,
 }
+
 impl Drop for Handle {
     /// Close this resource and pending accepts, releasing its lock and address bindings.
     fn drop(&mut self) {
@@ -205,8 +213,10 @@ impl Drop for Handle {
 fn errno(n: i32) -> io::Error {
     io::Error::from_raw_os_error(n)
 }
+
 /// Memory ceiling for materialized fixtures and each sparse inode's allocated pages.
 const MAX_ALLOCATION: usize = 64 * 1024 * 1024;
+
 /// Allocates zeroed fixture bytes, reporting oversized requests and allocation failure.
 fn bounded_bytes(length: usize) -> io::Result<Vec<u8>> {
     if length > MAX_ALLOCATION {
@@ -219,22 +229,26 @@ fn bounded_bytes(length: usize) -> io::Result<Vec<u8>> {
     bytes.resize(length, 0);
     Ok(bytes)
 }
+
 impl World {
     /// Checks a symmetric endpoint partition regardless of argument order.
     fn partitioned(&self, a: &SocketAddress, b: &SocketAddress) -> bool {
         self.partitions
             .contains(&endpoint_pair(a.clone(), b.clone()))
     }
+
     /// Checks a stream's endpoint labels; unlabeled streams are never partitioned.
     fn stream_partitioned(&self, id: u64) -> bool {
         matches!(self.resources.get(&id), Some(Resource::Socket { local: Some(a), remote: Some(b), .. }) if self.partitioned(a,b))
     }
+
     /// Reserves the next identifier in this world's deterministic resource sequence.
     fn id(&mut self) -> u64 {
         let id = self.next;
         self.next += 1;
         id
     }
+
     /// Appends a sequenced event, discarding the oldest half when the trace fills.
     fn record(&mut self, op: &str, resource: u64, result: i64) {
         if self.trace.len() == 16384 {
@@ -248,6 +262,7 @@ impl World {
         });
         self.next_event += 1;
     }
+
     /// Consumes the first matching fault unless the driver already selected one.
     fn fault(&mut self, op: &str) -> Option<Fault> {
         if self.executing {
@@ -278,10 +293,12 @@ impl World {
         }
     }
 }
+
 /// Orders two endpoints so both directions share one partition-table key.
 fn endpoint_pair(a: SocketAddress, b: SocketAddress) -> (SocketAddress, SocketAddress) {
     if a <= b { (a, b) } else { (b, a) }
 }
+
 impl Simulation {
     /// Creates an empty world with a durable root directory.
     pub fn new() -> Self {
@@ -307,6 +324,7 @@ impl Simulation {
         sim.disk().sync_all().unwrap();
         sim
     }
+
     /// Selection is worker-thread scoped. Reactors and descriptors retain their
     /// environment independently, including while a nested environment is active.
     pub fn enter(&self) -> Environment {
@@ -314,14 +332,17 @@ impl Simulation {
             previous: CURRENT.with(|s| s.borrow_mut().replace(self.clone())),
         }
     }
+
     /// Returns the simulation selected for the current worker thread.
     pub fn current() -> Option<Self> {
         CURRENT.with(|s| s.borrow().clone())
     }
+
     /// Accesses this world's volatile and durable storage images.
     pub fn disk(&self) -> CrashDisk {
         CrashDisk(self.clone())
     }
+
     /// Labels sockets created in this scope with a node's listening endpoint.
     pub fn enter_endpoint(&self, endpoint: SocketAddress) -> EndpointEnvironment {
         let previous = self.0.borrow_mut().endpoint.replace(endpoint);
@@ -330,6 +351,7 @@ impl Simulation {
             previous,
         }
     }
+
     /// Symmetric blackhole: existing streams and future connects stall until heal
     /// or their normal production deadlines/cancellation. Received bytes remain
     /// readable; a partition does not manufacture EOF or discard accepted bytes.
@@ -338,12 +360,14 @@ impl Simulation {
         w.partitions.insert(endpoint_pair(a, b));
         w.record("partition", 0, 0);
     }
+
     /// Removes a symmetric partition without discarding queued bytes.
     pub fn heal(&self, a: SocketAddress, b: SocketAddress) {
         let mut w = self.0.borrow_mut();
         w.partitions.remove(&endpoint_pair(a, b));
         w.record("heal", 0, 0);
     }
+
     /// Assign labels to a preexisting socket pair or a socket created outside a
     /// node scope. Updates the opposite endpoint too, including pending accepts.
     pub fn label_stream(
@@ -377,6 +401,7 @@ impl Simulation {
         }
         Ok(())
     }
+
     /// Queues a fault for the next matching operation, or any operation for `*`.
     pub fn inject(&self, operation: &str, fault: Fault) -> io::Result<()> {
         if let Fault::Errno(errno) = &fault
@@ -393,18 +418,22 @@ impl Simulation {
             .push_back((operation.into(), fault));
         Ok(())
     }
+
     /// Copies the retained trace without resetting event sequence numbers.
     pub fn trace(&self) -> Vec<Event> {
         self.0.borrow().trace.clone()
     }
+
     /// Drains the retained trace without resetting event sequence numbers.
     pub fn take_trace(&self) -> Vec<Event> {
         std::mem::take(&mut self.0.borrow_mut().trace)
     }
+
     /// Counts open resources, including connections waiting to be accepted.
     pub fn live_handles(&self) -> usize {
         self.0.borrow().resources.len()
     }
+
     /// Reject the next SQ publications before the driver takes pointer ownership.
     /// The reactor must propagate Driver::push's error through its publication path.
     pub fn reject_submissions(&self, count: usize) -> io::Result<()> {
@@ -414,10 +443,12 @@ impl Simulation {
         self.0.borrow_mut().reject_submissions = count;
         Ok(())
     }
+
     /// Allocates a deterministic identifier shared with resource creation.
     pub fn next_sequence(&self) -> u64 {
         self.0.borrow_mut().id()
     }
+
     /// Disconnect an established stream even while production owns both handles.
     /// Already received bytes remain readable, then reads return EOF.
     pub fn disconnect(&self, descriptor: &Descriptor) -> io::Result<()> {
@@ -433,6 +464,7 @@ impl Simulation {
         w.record("disconnect", handle.id, 0);
         Ok(())
     }
+
     /// Sets the bounded receive queue capacity used by every stream.
     pub fn set_stream_capacity(&self, capacity: usize) -> io::Result<()> {
         if capacity == 0 || capacity > MAX_ALLOCATION {
@@ -441,10 +473,12 @@ impl Simulation {
         self.0.borrow_mut().stream_capacity = capacity;
         Ok(())
     }
+
     /// Select cancellation CQE ordering in the simulated kernel.
     pub fn set_cancel_first(&self, cancel_first: bool) {
         self.0.borrow_mut().cancel_first = cancel_first;
     }
+
     /// Caps each stream or file transfer without allocating a buffer.
     pub fn set_max_chunk(&self, bytes: usize) -> io::Result<()> {
         if bytes == 0 {
@@ -453,6 +487,7 @@ impl Simulation {
         self.0.borrow_mut().max_chunk = bytes;
         Ok(())
     }
+
     /// Registers a resource and returns its sole closing owner.
     fn insert(&self, resource: Resource) -> Descriptor {
         let mut w = self.0.borrow_mut();
@@ -472,6 +507,7 @@ impl Default for Simulation {
         Self::new()
     }
 }
+
 impl Handle {
     /// Returns the resource's stable identifier within its simulation.
     pub fn id(&self) -> u64 {
@@ -1347,6 +1383,7 @@ mod tests {
         let dir = sim
             .open(None, Path::new("/root"), libc::O_DIRECTORY)
             .unwrap();
+
         /// Linux openat2 argument layout used to compare path-resolution policies.
         #[repr(C)]
         struct How {
@@ -1519,20 +1556,176 @@ mod tests {
 
     /// Owns a worktree-local differential fixture directory, removed even on panic.
     struct Directory(PathBuf);
+
     impl Directory {
-        /// Creates the host filesystem fixture beneath this worktree's target directory.
+        /// Creates a unique host fixture beneath this worktree's target directory.
         fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
             let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../target")
-                .join(format!("sim-open-differential-{}", std::process::id()));
+                .join(format!(
+                    "sim-open-differential-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
             std::fs::create_dir_all(&root).unwrap();
             Self(root)
         }
     }
+
     impl Drop for Directory {
         /// Remove the host differential fixture even when assertions unwind.
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    /// Parallel fixture instances own distinct paths and clean up independently.
+    #[test]
+    fn differential_directories_are_unique_and_cleanup_is_independent() {
+        let first = Directory::new();
+        let second = std::thread::spawn(Directory::new).join().unwrap();
+        assert_ne!(first.0, second.0);
+        let removed = first.0.clone();
+        std::fs::write(second.0.join("keep"), b"owned").unwrap();
+        drop(first);
+        assert!(!removed.exists());
+        assert_eq!(std::fs::read(second.0.join("keep")).unwrap(), b"owned");
+        let removed = second.0.clone();
+        drop(second);
+        assert!(!removed.exists());
+    }
+
+    /// Compare access modes, directory suffixes, and ignored absolute-path dirfds.
+    #[test]
+    fn linux_open_access_suffix_and_absolute_dirfd_differential() {
+        let directory = Directory::new();
+        std::fs::create_dir(directory.0.join("dir")).unwrap();
+        std::fs::write(directory.0.join("file"), b"data").unwrap();
+        let sim = Simulation::new();
+        sim.mkdir(Path::new("/dir")).unwrap();
+        sim.write_file(Path::new("/file"), b"data").unwrap();
+        for (target, link) in [
+            ("file", "file-link"),
+            ("dir", "dir-link"),
+            ("file/", "file-slash"),
+            ("file/.", "file-dot"),
+            ("dir/", "dir-slash"),
+            ("dir/.", "dir-dot"),
+        ] {
+            std::os::unix::fs::symlink(target, directory.0.join(link)).unwrap();
+            sim.symlink(Path::new(target), &Path::new("/").join(link))
+                .unwrap();
+        }
+        let real_dir = std::fs::File::open(&directory.0).unwrap();
+        let real_file = std::fs::File::open(directory.0.join("file")).unwrap();
+        let sim_dir = sim.open(None, Path::new("/"), libc::O_DIRECTORY).unwrap();
+        let sim_file = sim.open(None, Path::new("/file"), libc::O_RDONLY).unwrap();
+
+        /// Linux openat2 ABI used by the independent host comparison.
+        #[repr(C)]
+        struct How {
+            flags: u64,
+
+            mode: u64,
+
+            resolve: u64,
+        }
+        for name in [
+            "file",
+            "file/",
+            "file/.",
+            "file/./",
+            "dir",
+            "dir/",
+            "dir/.",
+            "file-link/",
+            "file-link/.",
+            "dir-link/",
+            "dir-link/.",
+            "file-slash",
+            "file-dot",
+            "dir-slash",
+            "dir-dot",
+        ] {
+            for flags in [
+                libc::O_RDONLY,
+                libc::O_WRONLY,
+                libc::O_RDWR,
+                libc::O_RDONLY | libc::O_TRUNC,
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+                libc::O_PATH | libc::O_NOFOLLOW,
+            ] {
+                for resolve in [0, 0x08, 0x10] {
+                    for (absolute, regular_dirfd) in [(false, false), (true, false), (true, true)] {
+                        let (host_path, sim_path) = if absolute {
+                            if resolve == 0x10 {
+                                (Path::new("/").join(name), Path::new("/").join(name))
+                            } else {
+                                (directory.0.join(name), Path::new("/").join(name))
+                            }
+                        } else {
+                            (PathBuf::from(name), PathBuf::from(name))
+                        };
+                        // Reset content so every successful truncation has an observable effect.
+                        std::fs::write(directory.0.join("file"), b"data").unwrap();
+                        sim.write_file(Path::new("/file"), b"data").unwrap();
+                        let host_name =
+                            CString::new(host_path.as_os_str().as_encoded_bytes()).unwrap();
+                        let how = How {
+                            flags: flags as u64,
+                            mode: 0,
+                            resolve,
+                        };
+                        let raw = unsafe {
+                            libc::syscall(
+                                libc::SYS_openat2,
+                                if regular_dirfd {
+                                    real_file.as_raw_fd()
+                                } else {
+                                    real_dir.as_raw_fd()
+                                },
+                                host_name.as_ptr(),
+                                &how,
+                                std::mem::size_of::<How>(),
+                            )
+                        };
+                        let expected = if raw < 0 {
+                            Err(io::Error::last_os_error().raw_os_error().unwrap())
+                        } else {
+                            Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
+                        };
+                        let actual = sim
+                            .open_resolved(
+                                Some(if regular_dirfd { &sim_file } else { &sim_dir }),
+                                &sim_path,
+                                flags,
+                                resolve,
+                            )
+                            .map_err(|e| e.raw_os_error().unwrap());
+                        assert_eq!(
+                            actual.as_ref().err(),
+                            expected.as_ref().err(),
+                            "{name} flags={flags:#x} resolve={resolve:#x} absolute={absolute} regular_dirfd={regular_dirfd}"
+                        );
+                        if let (Ok(actual), Ok(expected)) = (actual, expected) {
+                            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                            assert_eq!(unsafe { libc::fstat(expected.as_raw_fd(), &mut stat) }, 0);
+                            assert_eq!(
+                                actual.as_sim().unwrap().stat().unwrap().stx_mode as u32
+                                    & libc::S_IFMT,
+                                stat.st_mode & libc::S_IFMT
+                            );
+                        }
+                        assert_eq!(
+                            sim.read_file(Path::new("/file")).unwrap(),
+                            std::fs::read(directory.0.join("file")).unwrap()
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1556,6 +1749,7 @@ mod tests {
         }
         let real_dir = std::fs::File::open(&directory.0).unwrap();
         let sim_dir = sim.open(None, Path::new("/"), libc::O_DIRECTORY).unwrap();
+
         /// Linux openat2 argument layout used to compare final-symlink handling.
         #[repr(C)]
         struct How {
@@ -1717,6 +1911,7 @@ mod tests {
         assert!(unsafe { libc::poll(&mut pfd, 1, 0) } >= 0);
         pfd.revents as i32
     }
+
     /// Converts simulated EAGAIN to poll's zero-event result for differential checks.
     fn simulated_ready(fd: &Descriptor, interest: i16) -> i32 {
         match fd.as_sim().unwrap().ready(interest as u32) {

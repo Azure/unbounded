@@ -2,6 +2,7 @@
 name = "uring-runtime"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 publish = false
 description = "Explicitly driven worker-local io_uring runtime"
 
