@@ -185,8 +185,9 @@ jobs:
             --property=RuntimeMaxSec=40min --property=TimeoutStopSec=30s \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv="TMPDIR=$PWD/tmp" \
             --setenv=CARGO_BUILD_JOBS=2 --setenv=RUST_TEST_THREADS=1 \
+            --setenv=PAGE_ALLOC_REQUIRE_REAL_IO=1 \
             bash "$PWD/hack/scripts/memory-safe-run.sh" -- \
-            make racer-dataplane-native-build racer-rust-test
+            make racer-dataplane-native-build racer-alloc-test racer-rust-test
 
       - name: Test Go SDK interoperability with Rust
         # Keep the Go fixture compiler and Rust test in the same bounded cgroup.

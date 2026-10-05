@@ -647,6 +647,12 @@ racer-server-test: ## Lint and race-test the Racer server and deployment contrac
 racer-test: racer-server-test ## Check Racer server and committed Rust contracts
 	$(MAKE) racer-rust-test
 
+.PHONY: racer-alloc-test
+racer-alloc-test: ## Test allocator without workspace feature unification (CI requires real I/O)
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		-p page-alloc --no-default-features -- $(RACER_TEST_ARGS)
+
 racer-rust-test: ## Check the complete Rust suite, including integration tests and doctests
 	@# Integration fixtures use this scratch root even with a separate Cargo target-dir.
 	@mkdir -p cmd/racer-dataplane/target
