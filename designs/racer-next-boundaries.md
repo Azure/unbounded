@@ -99,8 +99,8 @@ under `cmd/racer-dataplane/` for these contracts.
 
 Component tests retain private lifetime assertions; the runtime/page-engine
 ownership scenario and real decode/BundleInstaller rotation scenario are in
-`tests/identity_integration.rs`. See the module docs in
-`cmd/racer-dataplane/crypto/src/identity.rs` for focused gates.
+`tests/identity_integration.rs`. See the inline `identity` module docs in
+`cmd/racer-dataplane/crypto/src/lib.rs` for focused gates.
 This component boundary is justified by cohesive ownership, not an invented
 second consumer. The independent performance controller remains wire-only.
 

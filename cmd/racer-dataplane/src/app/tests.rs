@@ -92,6 +92,9 @@ pub(super) struct ControlFixture {
 
     pub held_renewals: Arc<AtomicUsize>,
 
+    /// Delay enrollment handler entry independently of publication handlers.
+    pub pause_renewal: Arc<AtomicBool>,
+
     pub publication_retry_after: Arc<AtomicUsize>,
 
     pub publication_failures: Arc<AtomicUsize>,
@@ -127,6 +130,8 @@ struct EnrollmentHandler {
     held: Arc<AtomicBool>,
 
     waiting: Arc<AtomicUsize>,
+
+    paused: Arc<AtomicBool>,
 
     stopping: Arc<AtomicBool>,
 }
@@ -190,6 +195,11 @@ impl EnrollmentHandler {
         assert!(head.contains("Authorization: Bearer fixture.token"));
         assert!(stream.conn.peer_certificates().is_none());
         let request = state::decode_enrollment_request(body).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while self.paused.load(Ordering::Acquire) && !self.stopping.load(Ordering::Acquire) {
+            assert!(Instant::now() < until, "renewal handler entry not released");
+            thread::sleep(Duration::from_millis(1));
+        }
         self.requests.lock().unwrap().push(request.clone());
         if self.held.load(Ordering::Acquire) {
             self.waiting.fetch_add(1, Ordering::Release);
@@ -413,6 +423,7 @@ impl ControlFixture {
             long_polls: Arc::new(AtomicUsize::new(0)),
             hold_renewal: Arc::new(AtomicBool::new(false)),
             held_renewals: Arc::new(AtomicUsize::new(0)),
+            pause_renewal: Arc::new(AtomicBool::new(false)),
             publication_retry_after: Arc::new(AtomicUsize::new(0)),
             publication_failures: Arc::new(AtomicUsize::new(0)),
             config: Some(config),
@@ -428,6 +439,7 @@ impl ControlFixture {
                 requests: fixture.bootstrap_requests.clone(),
                 held: fixture.hold_renewal.clone(),
                 waiting: fixture.held_renewals.clone(),
+                paused: fixture.pause_renewal.clone(),
                 stopping: fixture.stop.clone(),
             },
             keyring: KeyringHandler {
@@ -1846,6 +1858,17 @@ fn cache_removal_installs_while_renewal_and_next_publication_poll_are_held() {
 /// Local barrier completion must progress during remote Retry-After and held renewal.
 #[test]
 fn cache_removal_ack_installs_during_retry_after_and_held_renewal() {
+    cache_removal_during_retry_after(false);
+}
+
+/// Publication acceptance need not wait for the renewal server to enter its handler.
+#[test]
+fn cache_removal_ack_installs_during_retry_after_before_renewal_handler_entry() {
+    cache_removal_during_retry_after(true);
+}
+
+/// Exercise both server orderings without assuming renewal and publication latency.
+fn cache_removal_during_retry_after(delay_renewal_entry: bool) {
     let mut fixture = ControlFixture::new();
     let (config, node) = fixture.bootstrap_node(1, Duration::from_secs(15));
     let definition = definition();
@@ -1865,8 +1888,13 @@ fn cache_removal_ack_installs_during_retry_after_and_held_renewal() {
     .unwrap();
     worker.control_task.take();
     let control = worker.control.clone().unwrap();
+    assert!(control.identity().unwrap().renewal_due());
+    assert!(control.identity().unwrap().valid_now());
     let accepted = fixture.enrollments.load(Ordering::Acquire);
     fixture.hold_renewal.store(true, Ordering::Release);
+    fixture
+        .pause_renewal
+        .store(delay_renewal_entry, Ordering::Release);
     fixture.publication_retry_after.store(60, Ordering::Release);
     *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![]));
     let turn_scope = scope(Duration::from_secs(15)).unwrap();
@@ -1874,6 +1902,7 @@ fn cache_removal_ack_installs_during_retry_after_and_held_renewal() {
     let until = Instant::now() + Duration::from_secs(5);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut failed_at = None;
+    let mut installed_before_renewal = false;
     loop {
         runtime.reactor.poll_budgeted(64).unwrap();
         engine.poll_budgeted(&mut cx, 64).unwrap();
@@ -1884,8 +1913,12 @@ fn cache_removal_ack_installs_during_retry_after_and_held_renewal() {
         }
         if fixture.publication_failures.load(Ordering::Acquire) != 0 {
             let since = failed_at.get_or_insert_with(Instant::now);
-            // Release only local preparation after the remote backoff is active.
-            if since.elapsed() >= Duration::from_millis(100) {
+            // Release local preparation during remote backoff. In the held
+            // case, explicitly wait for renewal entry instead of assuming the
+            // publication request and renewal handler complete in that order.
+            if since.elapsed() >= Duration::from_millis(100)
+                && (delay_renewal_entry || fixture.held_renewals.load(Ordering::Acquire) != 0)
+            {
                 worker.poll_cache_preparation(&mut cx).unwrap();
             } else {
                 assert_eq!(
@@ -1895,11 +1928,22 @@ fn cache_removal_ack_installs_during_retry_after_and_held_renewal() {
             }
         }
         if worker.snapshots.cursor().unwrap() == Some(wire::PublicationSequence(2)) {
-            break;
+            if delay_renewal_entry && !installed_before_renewal {
+                assert_eq!(fixture.held_renewals.load(Ordering::Acquire), 0);
+                installed_before_renewal = true;
+                fixture.pause_renewal.store(false, Ordering::Release);
+            }
+            if fixture.held_renewals.load(Ordering::Acquire) != 0 {
+                break;
+            }
         }
         assert!(
             Instant::now() < until,
-            "local barrier stalled behind remote Retry-After"
+            "control progress stalled: cursor={:?}, failures={}, held_renewals={}, renewal_error={:?}",
+            worker.snapshots.cursor().unwrap(),
+            fixture.publication_failures.load(Ordering::Acquire),
+            fixture.held_renewals.load(Ordering::Acquire),
+            control.renewal_error(),
         );
         runtime.reactor.wait(Duration::from_millis(1)).unwrap();
     }
@@ -1908,6 +1952,7 @@ fn cache_removal_ack_installs_during_retry_after_and_held_renewal() {
         1,
         "Retry-After must still prevent another fetch"
     );
+    assert_eq!(installed_before_renewal, delay_renewal_entry);
     assert!(fixture.held_renewals.load(Ordering::Acquire) > 0);
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), accepted);
     worker.clients.poll_budgeted(&mut cx, 64).unwrap();
