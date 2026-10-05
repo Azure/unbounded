@@ -13,7 +13,10 @@
 //! 5. Check what happened with [`Simulation::trace`].
 //!
 //! Addresses seen on the wire are fake; they are never host pointers.
+//! Device names must be unique within a discovery view, even for different ports.
+//! A remote QP must already exist in this fabric before its peer connects to it.
 use super::*;
+
 use std::collections::VecDeque;
 
 thread_local! {
@@ -27,6 +30,7 @@ thread_local! {
 #[derive(Clone)]
 pub struct Simulation {
     world: Rc<RefCell<World>>,
+
     devices: Vec<Device>,
 }
 
@@ -34,8 +38,11 @@ pub struct Simulation {
 #[derive(Clone, Debug)]
 pub struct Device {
     pub name: String,
+
     pub gid: [u8; 16],
+
     pub port: u8,
+
     pub numa_node: Option<usize>,
 }
 
@@ -55,6 +62,7 @@ impl Device {
 pub struct Environment {
     previous: Option<Simulation>,
 }
+
 impl Drop for Environment {
     /// Put back the previous view.
     fn drop(&mut self) {
@@ -66,19 +74,33 @@ impl Drop for Environment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
     Discover,
+
     Open,
+
     Close,
+
     Qp,
+
     Connect,
+
     Stop,
+
     QpFree,
+
     Register,
+
     Deregister,
+
     Window,
+
     WindowFree,
+
     Bind,
+
     Invalidate,
+
     Write,
+
     Poll,
 }
 
@@ -87,8 +109,10 @@ pub enum Operation {
 pub enum Fault {
     /// Fail the call itself. Nothing changes.
     Reject,
+
     /// Hold a Bind, Invalidate, or Write for this many polls.
     Delay(usize),
+
     /// Complete a Bind, Invalidate, or Write with this error status (nonzero).
     /// Its effect is skipped.
     Completion(u32),
@@ -98,11 +122,16 @@ pub enum Fault {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Event {
     pub sequence: u64,
+
     pub operation: Operation,
+
     pub resource: u64,
+
     pub work_id: Option<u64>,
+
     /// 0 is success, negative is a rejected call, positive is a completion error.
     pub result: i64,
+
     pub completion: bool,
 }
 
@@ -110,64 +139,96 @@ pub struct Event {
 #[derive(Default)]
 struct World {
     next: u32,
+
     resources: BTreeMap<u32, Resource>,
+
     faults: VecDeque<(Operation, Option<u32>, Fault)>,
+
     rejects: Vec<(Operation, Option<u32>)>,
+
     trace: Vec<Event>,
+
     sequence: u64,
 }
+
 /// A live device, queue pair, region, or window.
 enum Resource {
     Device(Device),
+
     Qp {
         device: u32,
+
         local: Option<Endpoint>,
+
         remote: Option<Endpoint>,
+
         stopped: bool,
+
         work: VecDeque<Work>,
     },
+
     Region {
         device: u32,
+
         bytes: Box<[u8]>,
+
         address: u64,
     },
+
     Window {
         device: u32,
+
         grant: Option<Grant>,
     },
 }
+
 /// A bound window: which QP may write, into which region, how many bytes.
 #[derive(Clone, Copy)]
 struct Grant {
     qp: u32,
+
     region: u32,
+
     length: u32,
 }
+
 /// Queued work on a QP, with its remaining delay and final status.
 struct Work {
     id: u64,
+
     delay: usize,
+
     status: u32,
+
     action: Action,
 }
+
 /// What the work does when it completes successfully.
 #[derive(Clone, Copy)]
 enum Action {
     Bind {
         window: u32,
+
         region: u32,
+
         length: u32,
     },
+
     Invalidate {
         key: u32,
     },
+
     Write {
         region: u32,
+
         address: u64,
+
         key: u32,
+
         length: u32,
     },
 }
+
 impl Action {
     /// The matching `Operation`.
     fn operation(&self) -> Operation {
@@ -177,6 +238,7 @@ impl Action {
             Self::Write { .. } => Operation::Write,
         }
     }
+
     /// The completion opcode `ffi.rs` expects.
     fn opcode(&self) -> u32 {
         match self {
@@ -197,6 +259,7 @@ impl Simulation {
             world.rejects.push((operation, qpn));
         }
     }
+
     /// An empty fabric.
     pub fn new() -> Self {
         Self {
@@ -204,8 +267,10 @@ impl Simulation {
             devices: Vec::new(),
         }
     }
+
     /// A view of the same fabric that discovers `devices`.
-    /// Rejects more than 64 ports, bad names, zero GIDs or ports, and duplicates.
+    /// Rejects more than 64 ports, bad names, zero GIDs or ports, and duplicate
+    /// device names, including entries with the same name but different ports.
     pub fn with_devices(&self, devices: Vec<Device>) -> Result<Self> {
         if devices.len() > 64
             || devices.iter().any(|d| {
@@ -227,16 +292,19 @@ impl Simulation {
             devices,
         })
     }
+
     /// Make this view current on this thread until the guard drops.
     pub fn enter(&self) -> Environment {
         Environment {
             previous: CURRENT.with(|current| current.replace(Some(self.clone()))),
         }
     }
+
     /// Fail the next matching call on any resource.
     pub fn fault(&self, operation: Operation, fault: Fault) {
         self.fault_on(operation, None, fault);
     }
+
     /// Fail the next matching call, optionally only on one QP.
     /// Panics on `Delay`/`Completion` for non-work calls, or `Completion(0)`.
     pub fn fault_on(&self, operation: Operation, qpn: Option<u32>, fault: Fault) {
@@ -253,23 +321,28 @@ impl Simulation {
             .faults
             .push_back((operation, qpn, fault));
     }
+
     /// Copy of the trace so far.
     pub fn trace(&self) -> Vec<Event> {
         self.world.borrow().trace.clone()
     }
+
     /// Take the trace and clear it. Sequence numbers keep counting.
     pub fn take_trace(&self) -> Vec<Event> {
         std::mem::take(&mut self.world.borrow_mut().trace)
     }
+
     /// Resources not yet freed, including ones leaked on purpose.
     pub fn live_resources(&self) -> usize {
         self.world.borrow().resources.len()
     }
+
     /// One-shot faults not yet used. Ignores `reject` rules.
     pub fn pending_faults(&self) -> usize {
         self.world.borrow().faults.len()
     }
 }
+
 impl Default for Simulation {
     /// An empty fabric.
     fn default() -> Self {
@@ -281,6 +354,7 @@ impl Default for Simulation {
 pub(crate) fn current() -> Option<Simulation> {
     CURRENT.with(|current| current.borrow().clone())
 }
+
 /// True if `api` is this fake.
 pub(super) fn is_api(api: &Api) -> bool {
     std::ptr::fn_addr_eq(
@@ -288,6 +362,7 @@ pub(super) fn is_api(api: &Api) -> bool {
         open as unsafe extern "C" fn(*const c_char) -> *mut c_void,
     )
 }
+
 /// The function table `ffi.rs` uses in place of the C library.
 pub(super) fn api() -> Rc<Api> {
     Rc::new(Api {
@@ -315,12 +390,15 @@ pub(super) fn api() -> Rc<Api> {
 /// The fabric owns the resource; `ffi.rs` decides when to free it.
 struct Handle {
     sim: Simulation,
+
     id: u32,
 }
+
 /// Turn a raw pointer back into a handle. The caller keeps it alive.
 unsafe fn handle<'a>(raw: *mut c_void) -> &'a Handle {
     unsafe { &*raw.cast::<Handle>() }
 }
+
 /// Add a resource and return a new handle to it.
 fn allocate(sim: &Simulation, resource: Resource) -> *mut c_void {
     let id = sim.world.borrow_mut().insert(resource);
@@ -330,6 +408,7 @@ fn allocate(sim: &Simulation, resource: Resource) -> *mut c_void {
     }))
     .cast()
 }
+
 /// The NUMA node set on a device.
 pub(super) fn numa_node(raw: NonNull<c_void>) -> Option<usize> {
     let h = unsafe { handle(raw.as_ptr()) };
@@ -338,6 +417,7 @@ pub(super) fn numa_node(raw: NonNull<c_void>) -> Option<usize> {
         _ => None,
     }
 }
+
 /// A region's fake wire address.
 pub(super) fn address(raw: NonNull<c_void>) -> u64 {
     let h = unsafe { handle(raw.as_ptr()) };
@@ -346,6 +426,7 @@ pub(super) fn address(raw: NonNull<c_void>) -> u64 {
         _ => 0,
     }
 }
+
 impl World {
     /// Store a resource under a new id. Ids fit in 24 bits, like real QPNs.
     fn insert(&mut self, resource: Resource) -> u32 {
@@ -357,6 +438,7 @@ impl World {
         self.resources.insert(self.next, resource);
         self.next
     }
+
     /// Add an event to the trace.
     fn record(
         &mut self,
@@ -376,6 +458,7 @@ impl World {
         });
         self.sequence += 1;
     }
+
     /// The fault for this call: a `reject` rule first, else the next one-shot fault.
     fn fault(&mut self, operation: Operation, resource: u32) -> Option<Fault> {
         if self
@@ -390,6 +473,7 @@ impl World {
         })?;
         self.faults.remove(i).map(|(_, _, fault)| fault)
     }
+
     /// Trace a call and report whether it is rejected.
     fn rejected(&mut self, operation: Operation, resource: u32) -> bool {
         let rejected = self.fault(operation, resource) == Some(Fault::Reject);
@@ -402,6 +486,7 @@ impl World {
         );
         rejected
     }
+
     /// The device a resource belongs to.
     fn device(&self, id: u32) -> Option<u32> {
         match self.resources.get(&id)? {
@@ -411,6 +496,7 @@ impl World {
             | Resource::Window { device, .. } => Some(*device),
         }
     }
+
     /// True if a QP is connected and not stopped.
     fn ready(&self, id: u32) -> bool {
         matches!(
@@ -423,6 +509,7 @@ impl World {
             })
         )
     }
+
     /// True if two QPs are connected to each other and not stopped.
     fn paired(&self, id: u32, peer: u32) -> bool {
         match (self.resources.get(&id), self.resources.get(&peer)) {
@@ -443,6 +530,7 @@ impl World {
             _ => false,
         }
     }
+
     /// Check and queue one Bind, Invalidate, or Write. Returns -1 if rejected.
     fn post(&mut self, qp: u32, id: u64, action: Action) -> c_int {
         let op = action.operation();
@@ -489,10 +577,12 @@ impl World {
         self.record(op, qp, Some(id), 0, false);
         0
     }
+
     /// True if `length` is nonzero and fits in the region.
     fn region_fits(&self, region: u32, length: u32) -> bool {
         matches!(self.resources.get(&region), Some(Resource::Region { bytes, .. }) if length > 0 && length as usize <= bytes.len())
     }
+
     /// Run queued work. Returns 0, or a verbs error status with nothing copied.
     fn execute(&mut self, qp: u32, action: &Action) -> u32 {
         match *action {
@@ -596,6 +686,7 @@ unsafe extern "C" fn discover(out: *mut Port, capacity: u32) -> c_int {
     }
     sim.devices.len() as c_int
 }
+
 /// Open a device by name from the current view.
 unsafe extern "C" fn open(name: *const c_char) -> *mut c_void {
     let Some(sim) = current() else {
@@ -610,6 +701,7 @@ unsafe extern "C" fn open(name: *const c_char) -> *mut c_void {
     };
     allocate(&sim, Resource::Device(device.clone()))
 }
+
 /// Create a QP on the device's port. Writes its QPN.
 unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) -> *mut c_void {
     let h = unsafe { handle(device) };
@@ -635,6 +727,7 @@ unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) ->
     }
     raw
 }
+
 /// Connect a QP once. Both endpoints must match real fabric resources.
 unsafe extern "C" fn connect(
     raw: *mut c_void,
@@ -687,6 +780,7 @@ unsafe extern "C" fn connect(
     *theirs = Some(remote);
     0
 }
+
 /// Stop a QP: drop its queued work and unbind its windows.
 unsafe extern "C" fn stop(raw: *mut c_void) -> c_int {
     let h = unsafe { handle(raw) };
@@ -708,6 +802,7 @@ unsafe extern "C" fn stop(raw: *mut c_void) -> c_int {
     }
     0
 }
+
 /// Free a resource. Fails if anything still uses it.
 unsafe fn free(raw: *mut c_void, operation: Operation) -> c_int {
     let h = unsafe { handle(raw) };
@@ -751,22 +846,27 @@ unsafe fn free(raw: *mut c_void, operation: Operation) -> c_int {
     }
     0
 }
+
 /// Close a device. Fails while anything on it is alive.
 unsafe extern "C" fn close(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::Close) }
 }
+
 /// Free a QP. Fails while it has work or bound windows.
 unsafe extern "C" fn qp_free(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::QpFree) }
 }
+
 /// Free a region. Fails while work or a window uses it.
 unsafe extern "C" fn deregister(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::Deregister) }
 }
+
 /// Free a window. Fails while bound or used by queued work.
 unsafe extern "C" fn window_free(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::WindowFree) }
 }
+
 /// Create a zeroed region with a fake wire address.
 unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
     let h = unsafe { handle(device) };
@@ -785,6 +885,7 @@ unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
         },
     )
 }
+
 /// Pointer to a region's bytes. Valid until the region is freed.
 unsafe extern "C" fn bytes(raw: *mut c_void) -> *mut u8 {
     let h = unsafe { handle(raw) };
@@ -793,6 +894,7 @@ unsafe extern "C" fn bytes(raw: *mut c_void) -> *mut u8 {
         _ => std::ptr::null_mut(),
     }
 }
+
 /// Create an unbound window. Its id is its key.
 unsafe extern "C" fn window(device: *mut c_void, key: *mut u32) -> *mut c_void {
     let h = unsafe { handle(device) };
@@ -811,6 +913,7 @@ unsafe extern "C" fn window(device: *mut c_void, key: *mut u32) -> *mut c_void {
     }
     raw
 }
+
 /// Queue a bind. QP, window, and region must share one fabric.
 unsafe extern "C" fn bind(
     qp: *mut c_void,
@@ -837,6 +940,7 @@ unsafe extern "C" fn bind(
         },
     )
 }
+
 /// Queue an invalidate. Checked when it completes.
 unsafe extern "C" fn invalidate(qp: *mut c_void, key: u32, id: u64) -> c_int {
     let q = unsafe { handle(qp) };
@@ -845,6 +949,7 @@ unsafe extern "C" fn invalidate(qp: *mut c_void, key: u32, id: u64) -> c_int {
         .borrow_mut()
         .post(q.id, id, Action::Invalidate { key })
 }
+
 /// Queue a write. The remote key is checked when it completes.
 unsafe extern "C" fn write(
     qp: *mut c_void,
@@ -869,6 +974,7 @@ unsafe extern "C" fn write(
         },
     )
 }
+
 /// Run up to 32 queued requests in order. Stops at a delay or a failure.
 unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) -> c_int {
     let q = unsafe { handle(qp) };
@@ -926,7 +1032,9 @@ unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) 
 mod tests {
     //! Connected DMA, failure ownership, discovery, and safe proxy integration tests.
     use super::*;
+
     use crate::test_guard::ready;
+
     use std::task::{Context, Poll};
 
     /// Build connected native peers with 17-byte transfers in 32-byte allocations.
@@ -1075,7 +1183,9 @@ mod tests {
     /// Inclusive expiry blocks admission but failed fencing still permits late DMA.
     fn expiry_is_inclusive_but_not_a_remote_fence_and_faults_are_ordered() {
         use std::time::Duration;
+
         use uring_runtime::environment::{SimulationClock, now};
+
         for failed_stop in [false, true] {
             let clock = SimulationClock::new(7);
             let environment = clock.environment(0);
@@ -1292,6 +1402,7 @@ mod tests {
             assert_eq!(sim.live_resources(), 0);
             (address, sim.trace())
         }
+
         assert_eq!(run(), run());
     }
 
@@ -1299,6 +1410,7 @@ mod tests {
     /// Paired native services discover separate nodes and copy through safe poll APIs.
     fn native_services_activate_discovered_nodes_and_copy_through_io_proxies() {
         use crate::{Configuration, NativeService, QueuePairHandle, Region, pair};
+
         let sim = Simulation::new();
         let mut charges = Vec::new();
         let mut nodes = Vec::new();

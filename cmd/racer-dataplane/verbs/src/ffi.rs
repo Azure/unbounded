@@ -4,6 +4,7 @@
 //! it on drop. If freeing fails, the object is leaked on purpose, along with
 //! everything it depends on, because the NIC may still be using it.
 use crate::{Error, GuardOwner, Result};
+
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -22,10 +23,15 @@ pub mod simulation;
 #[derive(Clone, Copy)]
 struct Port {
     name: [c_char; 64],
+
     gid: [u8; 16],
+
     mtu: u32,
+
     lid: u16,
+
     port: u8,
+
     link_layer: u8,
 }
 
@@ -35,16 +41,22 @@ struct Port {
 pub struct Endpoint {
     /// Port GID.
     pub gid: [u8; 16],
+
     /// QP number. Nonzero, 24 bits.
     pub qpn: u32,
+
     /// Starting packet sequence number. 24 bits.
     pub psn: u32,
+
     /// MTU code: 1 to 5 for 256 to 4096 bytes.
     pub mtu: u32,
+
     /// InfiniBand local ID.
     pub lid: u16,
+
     /// Port number, from 1.
     pub port: u8,
+
     /// 1 for InfiniBand, 2 for Ethernet (RoCE).
     pub link_layer: u8,
 }
@@ -72,7 +84,9 @@ impl Endpoint {
 #[derive(Default, Clone, Copy)]
 struct Completion {
     id: u64,
+
     status: u32,
+
     opcode: u32,
 }
 
@@ -84,8 +98,13 @@ macro_rules! native_api {
         /// so the library stays loaded.
         struct Api {
             library: Option<NonNull<c_void>>,
-            $($field: $signature,)*
+
+            $(
+                $field: $signature,
+
+            )*
         }
+
         impl Api {
             #[cfg(all(feature = "native", target_os = "linux"))]
             /// Look up every function in `library`.
@@ -103,22 +122,38 @@ macro_rules! native_api {
         }
     };
 }
+
 native_api! {
     discover: unsafe extern "C" fn(*mut Port, u32) -> c_int,
+
     open: unsafe extern "C" fn(*const c_char) -> *mut c_void,
+
     close: unsafe extern "C" fn(*mut c_void) -> c_int,
+
     qp: unsafe extern "C" fn(*mut c_void, u8, u32, *mut u32) -> *mut c_void,
+
     connect: unsafe extern "C" fn(*mut c_void, *const Endpoint, *const Endpoint) -> c_int,
+
     stop: unsafe extern "C" fn(*mut c_void) -> c_int,
+
     qp_free: unsafe extern "C" fn(*mut c_void) -> c_int,
+
     register: unsafe extern "C" fn(*mut c_void, u32) -> *mut c_void,
+
     deregister: unsafe extern "C" fn(*mut c_void) -> c_int,
+
     bytes: unsafe extern "C" fn(*mut c_void) -> *mut u8,
+
     window: unsafe extern "C" fn(*mut c_void, *mut u32) -> *mut c_void,
+
     window_free: unsafe extern "C" fn(*mut c_void) -> c_int,
+
     bind: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u64, u32) -> c_int,
+
     invalidate: unsafe extern "C" fn(*mut c_void, u32, u64) -> c_int,
+
     write: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32) -> c_int,
+
     poll: unsafe extern "C" fn(*mut c_void, *mut Completion, u32) -> c_int,
 }
 
@@ -139,8 +174,10 @@ impl Api {
                 libc::RTLD_NOW | libc::RTLD_LOCAL,
             ))
             .ok_or(Error::Unavailable)?;
+
             /// Unloads the library if we bail out early.
             struct Guard(NonNull<c_void>);
+
             impl Drop for Guard {
                 /// Unload.
                 fn drop(&mut self) {
@@ -149,7 +186,9 @@ impl Api {
                     }
                 }
             }
+
             let guard = Guard(library);
+
             /// Look up one function by name.
             macro_rules! sym {
                 ($name:literal, $ty:ty) => {{
@@ -161,6 +200,7 @@ impl Api {
                     std::mem::transmute::<*mut c_void, $ty>(pointer)
                 }};
             }
+
             let version = sym!("rdma_verbs_abi", unsafe extern "C" fn() -> u32);
             if version() != 2 {
                 return Err(Error::Unavailable);
@@ -171,6 +211,7 @@ impl Api {
         }
     }
 }
+
 impl Drop for Api {
     /// Unload the library. Leaked objects keep it loaded forever.
     fn drop(&mut self) {
@@ -185,11 +226,15 @@ impl Drop for Api {
 /// An open RDMA device.
 pub(crate) struct NativeDevice {
     api: Rc<Api>,
+
     raw: NonNull<c_void>,
+
     pub(crate) name: String,
+
     /// Port info. `qpn` and `psn` are unset.
     pub(crate) endpoint: Endpoint,
 }
+
 impl NativeDevice {
     /// NUMA node from sysfs (or the simulation), if known.
     pub(crate) fn numa_node(&self) -> Option<usize> {
@@ -210,6 +255,7 @@ impl NativeDevice {
         .ok()
     }
 }
+
 impl Drop for NativeDevice {
     /// Close the device. On failure, keep the library loaded.
     fn drop(&mut self) {
@@ -277,14 +323,20 @@ pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
 /// while busy. Holds the slot's guard and leaks it if deregister fails.
 pub(crate) struct NativeRegion {
     device: Rc<NativeDevice>,
+
     raw: NonNull<c_void>,
+
     /// Allocated size.
     length: usize,
+
     /// Bytes in use for the current transfer.
     used: Cell<usize>,
+
     quota: Option<Arc<GuardOwner>>,
+
     busy: Cell<bool>,
 }
+
 impl NativeRegion {
     /// Allocate and register `length` bytes.
     pub(crate) fn new(
@@ -307,6 +359,7 @@ impl NativeRegion {
             busy: Cell::new(false),
         }))
     }
+
     /// The address peers use to write here.
     pub(crate) fn address(&self) -> u64 {
         #[cfg(any(test, feature = "simulation"))]
@@ -315,10 +368,12 @@ impl NativeRegion {
         }
         unsafe { (self.device.api.bytes)(self.raw.as_ptr()) as u64 }
     }
+
     /// Bytes in use.
     pub(crate) fn length(&self) -> usize {
         self.used.get()
     }
+
     /// Set bytes in use. Not while busy.
     pub(crate) fn resize(&self, length: usize) -> Result<()> {
         if self.busy.get() || length == 0 || length > self.length {
@@ -327,6 +382,7 @@ impl NativeRegion {
         self.used.set(length);
         Ok(())
     }
+
     /// Copy the buffer out. Not while busy.
     pub(crate) fn copy_into(&self, bytes: &mut [u8]) -> Result<()> {
         if self.busy.get() || bytes.len() != self.length() {
@@ -341,6 +397,7 @@ impl NativeRegion {
         }
         Ok(())
     }
+
     /// Copy into the buffer. Not while busy.
     pub(crate) fn copy_from(&self, bytes: &[u8]) -> Result<()> {
         if self.busy.get() || bytes.len() != self.length() {
@@ -355,6 +412,7 @@ impl NativeRegion {
         }
         Ok(())
     }
+
     #[cfg(test)]
     /// Copy the buffer out, for tests.
     pub(crate) fn copy_to(&self) -> Result<Vec<u8>> {
@@ -367,11 +425,13 @@ impl NativeRegion {
         .to_vec())
     }
 }
+
 impl Drop for NativeRegion {
     /// Deregister. On failure, leak the device and guard.
     fn drop(&mut self) {
         if unsafe { (self.device.api.deregister)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.device.clone());
+            self.quota.as_ref().unwrap().quarantine();
             std::mem::forget(self.quota.take());
         }
     }
@@ -380,15 +440,20 @@ impl Drop for NativeRegion {
 /// A memory window (MW): lets one peer write into a region.
 pub(crate) struct Window {
     device: Rc<NativeDevice>,
+
     raw: NonNull<c_void>,
+
     /// Remote key for the peer.
     pub(crate) key: u32,
+
     region: Rc<NativeRegion>,
 }
+
 impl Drop for Window {
     /// Free the window. On failure, leak the device and region.
     fn drop(&mut self) {
         if unsafe { (self.device.api.window_free)(self.raw.as_ptr()) } != 0 {
+            self.region.quota.as_ref().unwrap().quarantine();
             std::mem::forget(self.device.clone());
             std::mem::forget(self.region.clone());
         }
@@ -400,9 +465,11 @@ impl Drop for Window {
 struct TicketState {
     result: Cell<Option<Result<()>>>,
 }
+
 /// The result of one posted work request.
 #[derive(Clone)]
 pub(crate) struct Ticket(Rc<TicketState>);
+
 impl Ticket {
     /// The result, or `None` if still in flight.
     pub(crate) fn result(&self) -> Option<Result<()>> {
@@ -414,11 +481,15 @@ impl Ticket {
 /// completes or the QP stops.
 struct Pending {
     ticket: Ticket,
+
     /// Expected completion opcode.
     opcode: u32,
+
     region: Option<Rc<NativeRegion>>,
+
     _window: Option<Rc<Window>>,
 }
+
 impl Pending {
     /// Set the result and mark the region not busy.
     fn finish(self, result: Result<()>) {
@@ -435,32 +506,64 @@ impl Pending {
 /// Tracks posted work (up to 32) and the bound window. [`Self::stop`] is the
 /// only way to be sure the NIC is done with its memory.
 pub(crate) struct NativeQueuePair {
+    /// Keeps every QP, CQ, and probe leak charged to its slot.
+    quota: Arc<GuardOwner>,
+
+    /// Publishes successful DMA stop even when it occurs during destructor retry.
+    stop_observer: Arc<std::sync::atomic::AtomicBool>,
+
     device: Rc<NativeDevice>,
+
     raw: NonNull<c_void>,
+
     pub(crate) endpoint: Endpoint,
+
     /// Stop succeeded. The NIC is done.
     stopped: Cell<bool>,
+
     /// Stop was requested. No new work.
     terminating: Cell<bool>,
+
     connected: Cell<bool>,
+
     /// Next work request ID.
     next: Cell<u64>,
+
     /// Posted work by ID.
     pending: RefCell<BTreeMap<u64, Pending>>,
+
     /// Bound windows. They stay open until stop, even after the bind completes.
     windows: RefCell<Vec<Rc<Window>>>,
+
     #[cfg(test)]
     expires: Cell<Option<std::time::Instant>>,
 }
+
 impl NativeQueuePair {
-    /// Create a QP with a random starting PSN (fixed in simulation).
+    #[cfg(test)]
+    /// Create an independently charged QP for low-level tests.
     pub(crate) fn new(device: Rc<NativeDevice>) -> Result<Rc<Self>> {
+        Self::new_charged(
+            device,
+            GuardOwner::new(Arc::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    /// Create a QP with its slot's charge and a random starting PSN.
+    pub(crate) fn new_charged(
+        device: Rc<NativeDevice>,
+        quota: Arc<GuardOwner>,
+        stop_observer: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Rc<Self>> {
         let mut qpn = 0;
         let raw = NonNull::new(unsafe {
             (device.api.qp)(device.raw.as_ptr(), device.endpoint.port, 64, &mut qpn)
         });
         let Some(raw) = raw else {
             if qpn == u32::MAX {
+                quota.quarantine();
+                std::mem::forget(quota);
                 std::mem::forget(device);
             }
             return Err(Error::Unavailable);
@@ -474,6 +577,8 @@ impl NativeQueuePair {
             psn = qpn.to_be_bytes();
         } else if uring_runtime::environment::fill_random(&mut psn).is_err() {
             if unsafe { (device.api.qp_free)(raw.as_ptr()) } != 0 {
+                quota.quarantine();
+                std::mem::forget(quota);
                 std::mem::forget(device);
             }
             return Err(Error::Io);
@@ -484,6 +589,8 @@ impl NativeQueuePair {
             ..device.endpoint
         };
         Ok(Rc::new(Self {
+            quota,
+            stop_observer,
             device,
             raw,
             endpoint,
@@ -497,6 +604,7 @@ impl NativeQueuePair {
             expires: Cell::new(None),
         }))
     }
+
     /// Connect to `remote`. Once only. On failure, stops the QP.
     pub(crate) fn connect(&self, remote: Endpoint) -> Result<()> {
         remote.validate()?;
@@ -514,11 +622,13 @@ impl NativeQueuePair {
         self.connected.set(true);
         Ok(())
     }
+
     #[cfg(test)]
     /// The QP's device, for tests.
     pub(crate) fn device(&self) -> &Rc<NativeDevice> {
         &self.device
     }
+
     /// Check the device can create memory windows, by making and freeing one.
     pub(crate) fn probe_window(&self) -> Result<()> {
         let mut key = 0;
@@ -526,25 +636,31 @@ impl NativeQueuePair {
             NonNull::new(unsafe { (self.device.api.window)(self.device.raw.as_ptr(), &mut key) })
                 .ok_or(Error::Unavailable)?;
         if unsafe { (self.device.api.window_free)(window.as_ptr()) } != 0 {
+            self.quota.quarantine();
+            std::mem::forget(self.quota.clone());
             std::mem::forget(self.device.clone());
             return Err(Error::Io);
         }
         Ok(())
     }
+
     /// True if connected and not stopping.
     pub(crate) fn ready(&self) -> bool {
         self.connected.get() && !self.stopped.get() && !self.terminating.get()
     }
+
     #[cfg(test)]
     /// True once stop succeeded.
     pub(crate) fn stopped(&self) -> bool {
         self.stopped.get()
     }
+
     #[cfg(test)]
     /// Set a deadline for [`Self::progress`], for tests.
     pub(crate) fn expire_at(&self, deadline: std::time::Instant) {
         self.expires.set(Some(deadline));
     }
+
     /// Record a work request before posting it. Up to 32 at once.
     fn reserve(
         &self,
@@ -572,6 +688,7 @@ impl NativeQueuePair {
         );
         Ok((id, ticket))
     }
+
     /// Check the post result. If the post failed, nothing reached the NIC, so
     /// drop the record.
     fn submitted(&self, id: u64, rc: i32) -> Result<()> {
@@ -583,6 +700,7 @@ impl NativeQueuePair {
         }
         Ok(())
     }
+
     /// Open `region` to remote writes through a new window. One window at a
     /// time. The region stays busy until the QP stops.
     pub(crate) fn bind(&self, region: Rc<NativeRegion>) -> Result<(Rc<Window>, Ticket)> {
@@ -622,6 +740,7 @@ impl NativeQueuePair {
         }
         Ok((window, ticket))
     }
+
     /// Revoke `window`. The region stays busy until the QP stops.
     pub(crate) fn invalidate(&self, window: Rc<Window>) -> Result<Ticket> {
         if !self.windows.borrow().iter().any(|w| Rc::ptr_eq(w, &window)) {
@@ -632,6 +751,7 @@ impl NativeQueuePair {
         self.submitted(id, rc)?;
         Ok(ticket)
     }
+
     /// Write `region` to the peer at `address` with `key`. The region is busy
     /// until the write completes.
     pub(crate) fn write(&self, region: Rc<NativeRegion>, address: u64, key: u32) -> Result<Ticket> {
@@ -657,6 +777,7 @@ impl NativeQueuePair {
         self.submitted(id, rc)?;
         Ok(ticket)
     }
+
     /// Read up to 32 completions without blocking. Returns how many.
     ///
     /// Any failed or unexpected completion stops the QP and returns
@@ -699,6 +820,7 @@ impl NativeQueuePair {
         }
         Ok(n as usize)
     }
+
     /// Stop the QP for good. After success the NIC will not touch its memory
     /// again: pending work is canceled and regions are no longer busy.
     ///
@@ -712,6 +834,8 @@ impl NativeQueuePair {
             return Err(Error::Io);
         }
         self.stopped.set(true);
+        self.stop_observer
+            .store(true, std::sync::atomic::Ordering::Release);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         for (_, pending) in std::mem::take(&mut *self.pending.borrow_mut()) {
             pending.finish(Err(Error::Cancelled));
@@ -722,17 +846,22 @@ impl NativeQueuePair {
         Ok(())
     }
 }
+
 impl Drop for NativeQueuePair {
     /// Stop, then free. If stop fails, leak the QP's work, windows, and
     /// device, since the NIC may still use them.
     fn drop(&mut self) {
         if self.stop().is_err() {
+            self.quota.quarantine();
+            std::mem::forget(self.quota.clone());
             std::mem::forget(std::mem::take(self.pending.get_mut()));
             std::mem::forget(std::mem::take(self.windows.get_mut()));
             std::mem::forget(self.device.clone());
             return;
         }
         if unsafe { (self.device.api.qp_free)(self.raw.as_ptr()) } != 0 {
+            self.quota.quarantine();
+            std::mem::forget(self.quota.clone());
             std::mem::forget(self.device.clone());
         }
     }
@@ -742,6 +871,16 @@ impl Drop for NativeQueuePair {
 mod tests {
     //! Endpoint validation and optional native discovery contracts.
     use super::*;
+
+    /// Require the real adapter's ABI and every symbol without opening any device.
+    #[cfg(all(feature = "native", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires built C adapter on loader path; no RDMA hardware required"]
+    fn required_native_adapter_loads_abi_and_symbols() {
+        let api = Api::load().expect("built native adapter must load with ABI 2 and all symbols");
+        assert!(api.library.is_some(), "must load C adapter, not simulation");
+    }
+
     #[test]
     /// Reject queue pair numbers outside the native 24-bit field.
     fn endpoint_rejects_invalid_native_parameters() {
@@ -758,6 +897,7 @@ mod tests {
         e.qpn = 1 << 24;
         assert_eq!(e.validate(), Err(Error::InvalidRequest));
     }
+
     #[test]
     /// Discovery returns real port descriptions or an explicit unavailable result.
     fn optional_runtime_never_fabricates_a_device() {
@@ -777,36 +917,48 @@ mod tests {
 pub(crate) mod lifetime_tests {
     //! FFI fault injection exercises production ownership, ABI, and quarantine safety.
     use super::*;
+
     #[cfg(feature = "native")]
     use std::time::Duration;
+
     use std::{collections::VecDeque, time::Instant};
 
     /// Scripted native failures, queued completions, and teardown observations.
     #[derive(Default)]
     struct Faults {
         events: Vec<&'static str>,
+
         cq: VecDeque<Completion>,
+
         stop_fails: bool,
+
         post_fails: bool,
+
         poll_fails: bool,
     }
+
     thread_local! { static FAULTS: RefCell<Faults> = RefCell::new(Faults::default()); }
+
     /// Record the order of native ownership releases.
     fn event(value: &'static str) {
         FAULTS.with_borrow_mut(|f| f.events.push(value));
     }
+
     /// Allocate an opaque fixture handle with a stable address.
     fn pointer() -> *mut c_void {
         Box::into_raw(Box::new(0u8)).cast()
     }
+
     /// Report no discoverable ports for the direct ownership fixture.
     unsafe extern "C" fn discover(_: *mut Port, _: u32) -> c_int {
         0
     }
+
     /// Allocate a fixture device context.
     unsafe extern "C" fn open(_: *const c_char) -> *mut c_void {
         pointer()
     }
+
     /// Record and release a fixture device context.
     unsafe extern "C" fn close(p: *mut c_void) -> c_int {
         event("pd-context");
@@ -815,6 +967,7 @@ pub(crate) mod lifetime_tests {
         }
         0
     }
+
     /// Allocate a fixture queue pair with a fixed valid number.
     unsafe extern "C" fn qp(_: *mut c_void, _: u8, _: u32, qpn: *mut u32) -> *mut c_void {
         unsafe {
@@ -822,10 +975,12 @@ pub(crate) mod lifetime_tests {
         }
         pointer()
     }
+
     /// Accept connection setup without a physical peer.
     unsafe extern "C" fn connect(_: *mut c_void, _: *const Endpoint, _: *const Endpoint) -> c_int {
         0
     }
+
     /// Record a terminal fence and apply the scripted failure state.
     unsafe extern "C" fn stop(_: *mut c_void) -> c_int {
         event("stop");
@@ -835,6 +990,7 @@ pub(crate) mod lifetime_tests {
             0
         }
     }
+
     /// Record and release the fixture queue pair and completion queue.
     unsafe extern "C" fn qp_free(p: *mut c_void) -> c_int {
         event("cq");
@@ -843,10 +999,12 @@ pub(crate) mod lifetime_tests {
         }
         0
     }
+
     /// Allocate zeroed fixture memory behind an opaque region handle.
     unsafe extern "C" fn register(_: *mut c_void, length: u32) -> *mut c_void {
         Box::into_raw(Box::new(vec![0u8; length as usize])).cast()
     }
+
     /// Record and release the fixture region's allocation.
     unsafe extern "C" fn deregister(p: *mut c_void) -> c_int {
         event("mr");
@@ -855,10 +1013,12 @@ pub(crate) mod lifetime_tests {
         }
         0
     }
+
     /// Return the fixture region's stable backing allocation.
     unsafe extern "C" fn bytes(p: *mut c_void) -> *mut u8 {
         unsafe { (&mut *p.cast::<Vec<u8>>()).as_mut_ptr() }
     }
+
     /// Allocate a fixture window with a fixed remote key.
     unsafe extern "C" fn window(_: *mut c_void, key: *mut u32) -> *mut c_void {
         unsafe {
@@ -866,6 +1026,7 @@ pub(crate) mod lifetime_tests {
         }
         pointer()
     }
+
     /// Record and release a fixture memory window.
     unsafe extern "C" fn window_free(p: *mut c_void) -> c_int {
         event("mw");
@@ -874,6 +1035,7 @@ pub(crate) mod lifetime_tests {
         }
         0
     }
+
     /// Accept a bind whose completion is injected separately.
     unsafe extern "C" fn bind(
         _: *mut c_void,
@@ -885,10 +1047,12 @@ pub(crate) mod lifetime_tests {
     ) -> c_int {
         0
     }
+
     /// Accept invalidation whose completion is injected separately.
     unsafe extern "C" fn invalidate(_: *mut c_void, _: u32, _: u64) -> c_int {
         0
     }
+
     /// Accept or synchronously reject a write according to the fault script.
     unsafe extern "C" fn write(
         _: *mut c_void,
@@ -904,6 +1068,7 @@ pub(crate) mod lifetime_tests {
             0
         }
     }
+
     /// Drain injected completions unless polling is scripted to fail.
     unsafe extern "C" fn poll(_: *mut c_void, out: *mut Completion, cap: u32) -> c_int {
         FAULTS.with_borrow_mut(|f| {
@@ -919,12 +1084,15 @@ pub(crate) mod lifetime_tests {
             n as c_int
         })
     }
+
     pub(crate) use crate::test_guard::Observer as QuotaObserver;
+
     /// Create a quota owner and an observer of its retained charge.
     pub(crate) fn quota() -> (Arc<GuardOwner>, QuotaObserver) {
         let (guard, observer) = crate::test_guard::guard();
         (GuardOwner::new(guard), observer)
     }
+
     /// Reset faults and create a connected queue pair with charged source memory.
     pub(crate) fn fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
         FAULTS.with_borrow_mut(|f| *f = Faults::default());
@@ -967,14 +1135,17 @@ pub(crate) mod lifetime_tests {
         let region = NativeRegion::new(device, 32, quota).unwrap();
         (qp, region, charged)
     }
+
     /// Queue a completion for the next fixture progress call.
     pub(crate) fn complete(id: u64, status: u32, opcode: u32) {
         FAULTS.with_borrow_mut(|f| f.cq.push_back(Completion { id, status, opcode }));
     }
+
     /// Enable or clear repeated terminal-fence failures.
     pub(crate) fn fail_stop(fail: bool) {
         FAULTS.with_borrow_mut(|f| f.stop_fails = fail);
     }
+
     /// Create an unconnected queue pair alongside charged source memory.
     pub(crate) fn fresh_fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
         let (qp, region, charged) = fixture();
@@ -1189,6 +1360,7 @@ pub(crate) mod lifetime_tests {
         let source = NativeRegion::new(device.clone(), 4096, quota().0).unwrap();
         source.copy_from(&vec![0xa5; 4096]).unwrap();
         let (window, bind) = receiver.bind(destination.clone()).unwrap();
+
         /// Poll a real provider with a bounded completion deadline.
         fn wait(qp: &NativeQueuePair, ticket: &Ticket) {
             let until = Instant::now() + Duration::from_secs(10);
@@ -1199,6 +1371,7 @@ pub(crate) mod lifetime_tests {
             }
             ticket.result().unwrap().unwrap();
         }
+
         wait(&receiver, &bind);
         let write = sender
             .write(source, destination.address(), window.key)
