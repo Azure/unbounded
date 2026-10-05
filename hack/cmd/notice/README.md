@@ -1,7 +1,8 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod` and `frontend/package.json`.
+`go.mod`, `frontend/package.json`, and `cmd/racer-dataplane/Cargo.toml` plus
+the pinned libfabric and OpenSSL source versions in `Makefile`, when present.
 
 ## Usage
 
@@ -42,33 +43,30 @@ hack/cmd/notice/
     gomod/                 # Collector for go.mod direct deps; Go vanity-domain
                            # repo-base heuristics.
     npm/                   # Collector for frontend/package.json direct deps.
-    cargo/                 # Retained Cargo collector and tests; not registered.
+    cargo/                 # Collector for direct non-dev Cargo dependencies.
+    native/                # Collector for Makefile-pinned native dependencies.
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
 
-### Retained Cargo tooling
+### Retained Racer scaffolding
 
-The Cargo collector and its hermetic tests are retained in `internal/cargo/`,
-but the collector is not registered in `main.go`: no active Cargo manifest
-remains after removal of `cmd/unbounded-storage`. NOTICE generation and checks
-therefore use only the Go and npm collectors and do not require the removed crate
-or a Cargo registry cache.
-
-The retained implementation still targets `cmd/unbounded-storage` and the
-`unbounded-storage` root package in `Cargo.lock`. When a new crate is added,
-adjust that path and root-package configuration before registering `cargo.New()`
-in `collectors()`, and populate the Cargo registry source cache for that crate.
+Cargo and native collectors remain registered for the replacement Racer
+implementation. Cargo collection is inactive when neither `Cargo.toml` nor
+`Cargo.lock` exists under `cmd/racer-dataplane`; no Cargo registry cache is then
+required. The collector is configured for a `racer-dataplane` root package.
+Native collection is inactive when neither native version pin is declared in
+`Makefile`. Incomplete inputs remain errors rather than silently omitting notices.
 
 ## Adding a new ecosystem
 
-To add a new ecosystem (e.g. PyPI):
+To add a new ecosystem (e.g. PyPI, Cargo):
 
 1. Create `internal/<name>/` with a `Collector` implementation:
 
    ```go
    type Collector struct { /* injectable runner/fs */ }
    func New(opts ...Option) *Collector { ... }
-   func (c *Collector) Name() string                          // "pypi", ...
+   func (c *Collector) Name() string                          // "pypi", "cargo", ...
    func (c *Collector) Precheck(root string) error            // verify host setup
    func (c *Collector) Collect(root string) ([]notice.Entry, error)
    ```
@@ -86,7 +84,7 @@ To add a new ecosystem (e.g. PyPI):
    trees under `t.TempDir()`. Use the shared canonical license bodies
    (`testutil.MITLicense`, `testutil.Apache2License`, `testutil.BSD3License`)
    so the classifier sees realistic input. Inject fakes for any external
-   tool the collector needs to invoke (`go`, `pip`); see
+   tool the collector needs to invoke (`go`, `pip`, `cargo`); see
    `internal/gomod/gomod_test.go` for the pattern.
 
 4. Append `<name>.New()` to the `collectors()` slice in `main.go`. No other
@@ -98,6 +96,15 @@ To add a new ecosystem (e.g. PyPI):
   sort by `Dependency`.
 - Do not commit fake `node_modules/`, module-cache, or `site-packages/` trees.
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
+- Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
+  reads license files from the local Cargo registry source cache. Once the Racer
+  manifest is present, populate it with
+  `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
+  Development dependencies are excluded; normal, target, build, and optional
+  direct dependencies are included.
+- Native collection is fully local. Its metadata and canonical license links
+  are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
+  `OPENSSL_VERSION` in `Makefile`.
 - License URL forge dispatch (GitHub, GitLab, cs.opensource.google, Bitbucket)
   lives in `license.BuildURL` as a switch on URL prefix. Add a case here when a
   new forge is needed.
