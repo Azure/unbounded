@@ -15,7 +15,7 @@ use crate::topology::Paths;
 use http1::connection::BufferRange;
 use racer_control_wire::CacheId;
 use racer_control_wire::ClusterId;
-use racer_crypto::aead;
+use racer_crypto::{TAG_LEN, open, seal};
 use std::cell::Cell;
 use std::net::TcpListener;
 use std::net::TcpStream;
@@ -823,8 +823,8 @@ mod safety {
 
 // These opaque-transport fixtures intentionally use empty AAD, not page AAD.
 fn seal_fixture(nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8> {
-    let mut output = vec![0; plaintext.len() + aead::TAG_LEN];
-    aead::seal(&[7; 32], nonce, &[], plaintext, &mut output).unwrap();
+    let mut output = vec![0; plaintext.len() + TAG_LEN];
+    seal(&[7; 32], nonce, &[], plaintext, &mut output).unwrap();
     output
 }
 
@@ -832,8 +832,8 @@ fn open_fixture(
     nonce: &[u8; 24],
     sealed: &[u8],
 ) -> std::result::Result<Vec<u8>, racer_crypto::Error> {
-    let mut output = vec![0; sealed.len().saturating_sub(aead::TAG_LEN)];
-    aead::open(&[7; 32], nonce, &[], sealed, &mut output)?;
+    let mut output = vec![0; sealed.len().saturating_sub(TAG_LEN)];
+    open(&[7; 32], nonce, &[], sealed, &mut output)?;
     Ok(output)
 }
 

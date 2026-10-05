@@ -24,7 +24,7 @@ use crate::telemetry::Failure;
 use crate::telemetry::Stage;
 use crate::worker::CryptoRuntime;
 use racer_control_wire::KeyId;
-use racer_crypto::aead;
+use racer_crypto::TAG_LEN;
 use racer_identity::KeyLease;
 use racer_identity::KeyPurpose;
 use racer_identity::Keyring;
@@ -510,7 +510,7 @@ impl PageCryptoEngine {
                 let aad = page_aad(envelope)?;
                 let length = envelope.plaintext_length as usize;
                 if ciphertext.bytes().len() != envelope.ciphertext_length as usize
-                    || length.checked_add(aead::TAG_LEN) != Some(ciphertext.bytes().len())
+                    || length.checked_add(TAG_LEN) != Some(ciphertext.bytes().len())
                 {
                     return Err(Error::CorruptRecord);
                 }
@@ -833,7 +833,7 @@ impl CredentialCrypto {
                 .active(&context.object.cache, KeyPurpose::OriginCredentials)?;
             let nonce = fresh_nonce()?;
             let aad = credential_aad(key.id(), &context.object, scope.request, attempt, metadata)?;
-            let mut bytes = Zeroizing::new(vec![0; raw.len() + aead::TAG_LEN]);
+            let mut bytes = Zeroizing::new(vec![0; raw.len() + TAG_LEN]);
             key.seal_credentials(&context.object.cache, &nonce.0, &aad, raw, &mut bytes)
                 .map_err(Error::from)?;
             Some(EncryptedAuthorization {
@@ -904,7 +904,7 @@ impl CredentialCrypto {
                 KeyPurpose::OriginCredentials,
             )?;
             let aad = credential_aad(key.id(), &context.object, request, attempt, metadata)?;
-            let mut bytes = Zeroizing::new(vec![0; encrypted.ciphertext.len() - aead::TAG_LEN]);
+            let mut bytes = Zeroizing::new(vec![0; encrypted.ciphertext.len() - TAG_LEN]);
             key.open_credentials(
                 &context.object.cache,
                 encrypted.key_id,
@@ -1700,13 +1700,13 @@ mod tests {
                         .as_mut()
                         .unwrap()
                         .ciphertext
-                        .truncate(aead::TAG_LEN - 1),
+                        .truncate(TAG_LEN - 1),
                     _ => sealed
                         .authorization
                         .as_mut()
                         .unwrap()
                         .ciphertext
-                        .truncate(aead::TAG_LEN),
+                        .truncate(TAG_LEN),
                 }
                 assert!(crypto.open_charged(sealed, scope.request, attempt).is_err());
             }
@@ -1786,7 +1786,7 @@ mod tests {
             use crate::telemetry::Event;
             use crate::telemetry::Event::*;
             use crate::telemetry::Metrics;
-            use racer_crypto::aead;
+            use racer_crypto::TAG_LEN;
             use std::rc::Rc;
             use std::time::Duration;
             use std::time::Instant;
@@ -2728,8 +2728,8 @@ mod tests {
                     let page = page();
                     let source = vec![7u8; size];
                     let descriptor = envelope(size);
-                    let mut encrypted = vec![0; size + aead::TAG_LEN];
-                    aead::seal(
+                    let mut encrypted = vec![0; size + TAG_LEN];
+                    racer_crypto::seal(
                         &[7; 32],
                         &descriptor.nonce.0,
                         &page_aad(&descriptor).unwrap(),
@@ -3476,8 +3476,8 @@ mod tests {
         let original = envelope();
         let aad = page_aad(&original).unwrap();
         assert!(aad.starts_with(b"racer/page/aead/v1\0\0\0\0\x24"));
-        let mut bytes = vec![0; 5 + aead::TAG_LEN];
-        aead::seal(&[7; 32], &original.nonce.0, &aad, b"hello", &mut bytes).unwrap();
+        let mut bytes = vec![0; 5 + TAG_LEN];
+        racer_crypto::seal(&[7; 32], &original.nonce.0, &aad, b"hello", &mut bytes).unwrap();
         for index in 0..8 {
             let mut changed = original.clone();
             match index {
@@ -3498,7 +3498,7 @@ mod tests {
             }
             let mut tampered = vec![0; 5];
             assert!(
-                aead::open(
+                racer_crypto::open(
                     &[7; 32],
                     &changed.nonce.0,
                     &page_aad(&changed).unwrap(),
@@ -3511,8 +3511,10 @@ mod tests {
         let mut corrupted = bytes.clone();
         corrupted[0] ^= 1;
         let mut output = vec![0; 5];
-        assert!(aead::open(&[7; 32], &original.nonce.0, &aad, &corrupted, &mut output).is_err());
-        aead::open(&[7; 32], &original.nonce.0, &aad, &bytes, &mut output).unwrap();
+        assert!(
+            racer_crypto::open(&[7; 32], &original.nonce.0, &aad, &corrupted, &mut output).is_err()
+        );
+        racer_crypto::open(&[7; 32], &original.nonce.0, &aad, &bytes, &mut output).unwrap();
         assert_eq!(output, b"hello");
         let mut malformed = original;
         malformed.ciphertext_length += 1;
@@ -3524,8 +3526,8 @@ mod tests {
         // crypto_aead_xchacha20poly1305_ietf_encrypt, not this Rust implementation.
         let mut descriptor = envelope();
         descriptor.key_id = KeyId([1; 16]); // Frozen independent AAD vector, not installed.
-        let mut bytes = vec![0; 5 + aead::TAG_LEN];
-        aead::seal(
+        let mut bytes = vec![0; 5 + TAG_LEN];
+        racer_crypto::seal(
             &[7; 32],
             &[2; 24],
             &page_aad(&descriptor).unwrap(),
@@ -3620,7 +3622,7 @@ mod tests {
                 .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
                 .collect();
             let mut encrypted = vec![0; length + 16];
-            aead::seal(
+            racer_crypto::seal(
                 &[7; 32],
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
@@ -3636,7 +3638,7 @@ mod tests {
             // Exercise the engine with an installable current key ID, while
             // retaining the independent historical AAD known-answer assertion.
             descriptor.key_id = keys.active(cache, KeyPurpose::Page).unwrap().id();
-            aead::seal(
+            racer_crypto::seal(
                 &[7; 32],
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
@@ -3701,8 +3703,8 @@ mod tests {
     fn detached_authentication_failures_do_not_write_output_or_mutate_input() {
         let descriptor = envelope();
         let aad = page_aad(&descriptor).unwrap();
-        let mut encrypted = [0; 5 + aead::TAG_LEN];
-        aead::seal(
+        let mut encrypted = [0; 5 + TAG_LEN];
+        racer_crypto::seal(
             &[7; 32],
             &descriptor.nonce.0,
             &aad,
@@ -3724,7 +3726,7 @@ mod tests {
             // A nonzero sentinel proves authentication precedes any output write,
             // rather than merely observing the zero-initialized production buffer.
             let mut output = [0xa5; 5];
-            assert!(aead::open(&[7; 32], &nonce, &aad, &input, &mut output).is_err());
+            assert!(racer_crypto::open(&[7; 32], &nonce, &aad, &input, &mut output).is_err());
             assert_eq!(output, [0xa5; 5]);
             assert_eq!(input, retained);
         }
@@ -3756,8 +3758,8 @@ mod tests {
             let canceled = sequence == 2;
             let corrupt = sequence >= 3;
             let mut descriptor = descriptor.clone();
-            let mut bytes = vec![0; 5 + aead::TAG_LEN];
-            aead::seal(
+            let mut bytes = vec![0; 5 + TAG_LEN];
+            racer_crypto::seal(
                 &[7; 32],
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
@@ -3945,7 +3947,7 @@ mod tests {
                     assert_eq!(clear.bytes(), b"hello");
                     assert!(nonces.insert(cipher.envelope().nonce.0));
                     let mut decrypted = vec![0; cipher.envelope().plaintext_length as usize];
-                    aead::open(
+                    racer_crypto::open(
                         &[7; 32],
                         &cipher.envelope().nonce.0,
                         &page_aad(cipher.envelope()).unwrap(),
@@ -4060,7 +4062,7 @@ mod tests {
                     assert_eq!(clear.bytes(), b"hello");
                     assert_eq!(clear.bytes().as_ptr(), pointer);
                     let mut bytes = vec![0; encrypted.envelope().plaintext_length as usize];
-                    aead::open(
+                    racer_crypto::open(
                         &[7; 32],
                         &encrypted.envelope().nonce.0,
                         &page_aad(encrypted.envelope()).unwrap(),
@@ -4152,8 +4154,8 @@ mod tests {
             if sequence % 3 == 2 {
                 job_scope.cancel().unwrap();
             }
-            let mut bytes = vec![0; 5 + aead::TAG_LEN];
-            aead::seal(
+            let mut bytes = vec![0; 5 + TAG_LEN];
+            racer_crypto::seal(
                 &[7; 32],
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),

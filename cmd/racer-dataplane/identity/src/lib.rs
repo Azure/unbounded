@@ -29,7 +29,7 @@ pub fn unix_time() -> rustls::pki_types::UnixTime {
     )
 }
 
-use racer_crypto::ed25519::{SigningKey, VerifyingKey};
+use racer_crypto::{SigningKey, VerifyingKey};
 use rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
@@ -483,7 +483,7 @@ impl KeyLease {
         input: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
-        racer_crypto::aead::seal(
+        racer_crypto::seal(
             self.bound_material(cache, self.id(), KeyPurpose::Page)?,
             nonce,
             aad,
@@ -504,7 +504,7 @@ impl KeyLease {
         input: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
-        racer_crypto::aead::open(
+        racer_crypto::open(
             self.bound_material(cache, id, KeyPurpose::Page)?,
             nonce,
             aad,
@@ -522,7 +522,7 @@ impl KeyLease {
         input: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
-        racer_crypto::aead::seal(
+        racer_crypto::seal(
             self.bound_material(cache, self.id(), KeyPurpose::OriginCredentials)?,
             nonce,
             aad,
@@ -543,7 +543,7 @@ impl KeyLease {
         input: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
-        racer_crypto::aead::open(
+        racer_crypto::open(
             self.bound_material(cache, id, KeyPurpose::OriginCredentials)?,
             nonce,
             aad,

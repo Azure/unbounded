@@ -960,7 +960,7 @@ impl Bootstrap {
                     metadata.immutable().validate_page(page.envelope())?;
                     assert_eq!(page.envelope().page.number, PageNumber(0));
                     body = vec![0; page.envelope().plaintext_length as usize];
-                    racer_crypto::aead::open(
+                    racer_crypto::open(
                         &[7; 32],
                         &page.envelope().nonce.0,
                         &racer_dataplane::security::page_aad(page.envelope())?,

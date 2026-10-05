@@ -1006,7 +1006,7 @@ pub(crate) mod security {
             .seal_page(lease.cache(), &[1; 24], b"retained", b"abc", &mut sealed)
             .unwrap();
         let mut opened = [0; 3];
-        racer_crypto::aead::open(expected, &[1; 24], b"retained", &sealed, &mut opened).unwrap();
+        racer_crypto::open(expected, &[1; 24], b"retained", &sealed, &mut opened).unwrap();
         assert_eq!(&opened, b"abc");
     }
     pub(crate) fn keys_for(caches: &[CacheId]) -> Keyring {

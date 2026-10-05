@@ -205,7 +205,7 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     assert_eq!(ciphertext.envelope().key_id, old_id);
     // Public purpose operation, not a private weak-owner escape, checks the bytes.
     let mut opened = [0; 3];
-    racer_crypto::aead::open(
+    racer_crypto::open(
         &[7; 32],
         &ciphertext.envelope().nonce.0,
         &racer_dataplane::security::page_aad(ciphertext.envelope()).unwrap(),

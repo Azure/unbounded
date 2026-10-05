@@ -2223,7 +2223,7 @@ struct Harness {
 }
 impl Harness {
     fn new(seed: u64, sim: Simulation, clock: SimulationClock, native: bool) -> Self {
-        let key = racer_crypto::ed25519::SigningKey::from_seed(&[91; 32])
+        let key = racer_crypto::SigningKey::from_seed(&[91; 32])
             .to_pkcs8_der()
             .unwrap();
         let ca_key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
@@ -2292,7 +2292,7 @@ impl Harness {
     fn identity(&self, config: &Config, id: usize) -> Arc<SigningIdentity> {
         let mut random = Random(self.seed ^ id as u64);
         let seed = std::array::from_fn(|_| random.next() as u8);
-        let key = racer_crypto::ed25519::SigningKey::from_seed(&seed)
+        let key = racer_crypto::SigningKey::from_seed(&seed)
             .to_pkcs8_der()
             .unwrap();
         let pending = PendingIdentity::recover(&key).unwrap();

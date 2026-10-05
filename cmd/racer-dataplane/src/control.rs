@@ -2032,8 +2032,8 @@ impl Enrollment {
                 .decode(&p.private_key)
                 .map_err(|_| Error::CorruptRecord)?,
         );
-        let key = racer_crypto::ed25519::SigningKey::from_pkcs8_der(&secret)
-            .map_err(|_| Error::CorruptRecord)?;
+        let key =
+            racer_crypto::SigningKey::from_pkcs8_der(&secret).map_err(|_| Error::CorruptRecord)?;
         let (_, csr) =
             x509_parser::certification_request::X509CertificationRequest::from_der(&r.csr_der)
                 .map_err(|_| Error::CorruptRecord)?;
@@ -2118,7 +2118,7 @@ impl Enrollment {
                 .decode(&p.private_key)
                 .map_err(|_| Error::CorruptRecord)?,
         );
-        let key = racer_crypto::ed25519::SigningKey::from_pkcs8_der(&private_material)
+        let key = racer_crypto::SigningKey::from_pkcs8_der(&private_material)
             .map_err(|_| Error::CorruptRecord)?;
         if cert.public_key().subject_public_key.data.as_ref() != key.verifying_key().as_bytes() {
             return Err(Error::Unauthorized);

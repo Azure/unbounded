@@ -183,7 +183,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use base64::Engine;
     use racer_control_wire::ClusterId;
     use racer_control_wire::NodeId;
-    use racer_crypto::aead;
+    use racer_crypto::{TAG_LEN, seal};
     use racer_dataplane::model::RequestId;
     use racer_dataplane::model::WorkerId;
     use racer_dataplane::runtime::RequestScope;
@@ -277,8 +277,8 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             }
         } else {
             let plaintext = vec![0xa7; length];
-            let mut bytes = vec![0; length + aead::TAG_LEN];
-            aead::seal(
+            let mut bytes = vec![0; length + TAG_LEN];
+            seal(
                 &[7; 32],
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
