@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package cargo implements a notice.Collector for non-development dependencies
-// of the cmd/racer-dataplane workspace, including registry transitives.
+// Package cargo implements a notice.Collector for direct non-development
+// dependencies of cmd/racer-dataplane and its local path dependencies.
 package cargo
 
 import (
@@ -13,8 +13,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-
-	"github.com/pelletier/go-toml/v2"
 
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/license"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
@@ -34,7 +32,6 @@ type Collector struct {
 type dependency struct {
 	packageName string
 	path        string
-	workspace   bool
 }
 
 // New constructs a Collector. An empty cargoHome uses CARGO_HOME or Cargo's
@@ -105,11 +102,6 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, fmt.Errorf("parsing %s: %w", lockPath, err)
 	}
 
-	versions, err = registryClosure(string(lock), versions)
-	if err != nil {
-		return nil, fmt.Errorf("traversing %s: %w", lockPath, err)
-	}
-
 	entries := make([]notice.Entry, 0, len(versions))
 	for name, version := range versions {
 		entry, err := c.buildEntry(name, version)
@@ -125,18 +117,8 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 
 // localRegistryVersions follows local crates, but not registry transitives.
 func localRegistryVersions(root, lock string) (map[string]string, error) {
-	root, err := filepath.Abs(root)
-	if err != nil {
-		return nil, err
-	}
-
 	versions := map[string]string{}
 	visited := map[string]bool{}
-
-	workspace, err := readManifest(root)
-	if err != nil {
-		return nil, err
-	}
 
 	var visit func(string, string) error
 
@@ -154,40 +136,14 @@ func localRegistryVersions(root, lock string) (map[string]string, error) {
 
 		visited[canonical] = true
 
-		manifest, err := readManifest(dir)
+		manifest, err := os.ReadFile(manifestPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("reading %s: %w", manifestPath, err)
 		}
 
-		if manifest.Package.Name != "" {
-			name = manifest.Package.Name
-		}
-
-		direct, err := manifest.directDependencies()
+		direct, err := directDependencies(string(manifest))
 		if err != nil {
 			return fmt.Errorf("parsing %s: %w", manifestPath, err)
-		}
-
-		for alias, dep := range direct {
-			if dep.workspace {
-				inherited := cargoManifest{dependencyTables: dependencyTables{Dependencies: workspace.Workspace.Dependencies}}
-
-				deps, err := inherited.directDependencies()
-				if err != nil {
-					return err
-				}
-
-				resolved, ok := deps[alias]
-				if !ok || resolved.workspace {
-					return fmt.Errorf("dependency %s missing from workspace.dependencies", alias)
-				}
-
-				if resolved.path != "" && !filepath.IsAbs(resolved.path) {
-					resolved.path = filepath.Join(root, resolved.path)
-				}
-
-				direct[alias] = resolved
-			}
 		}
 
 		locked, err := lockedDirectVersions(lock, direct, name)
@@ -220,48 +176,8 @@ func localRegistryVersions(root, lock string) (map[string]string, error) {
 		return nil
 	}
 
-	// A virtual workspace has no root package or lock entry.
-	if workspace.Package.Name != "" || workspace.Workspace.Members == nil {
-		if err := visit(root, crateName); err != nil {
-			return nil, err
-		}
-	}
-
-	for _, pattern := range workspace.Workspace.Members {
-		members, err := filepath.Glob(filepath.Join(root, pattern))
-		if err != nil || len(members) == 0 {
-			return nil, fmt.Errorf("workspace member pattern %q has no valid matches", pattern)
-		}
-
-		for _, member := range members {
-			excluded := false
-
-			for _, pattern := range workspace.Workspace.Exclude {
-				match, err := filepath.Match(filepath.Join(root, pattern), member)
-				if err != nil {
-					return nil, fmt.Errorf("invalid workspace exclude %q: %w", pattern, err)
-				}
-
-				excluded = excluded || match
-			}
-
-			if excluded {
-				continue
-			}
-
-			manifest, err := readManifest(member)
-			if err != nil {
-				return nil, err
-			}
-
-			if manifest.Package.Name == "" {
-				return nil, fmt.Errorf("workspace member %s has no package name", member)
-			}
-
-			if err := visit(member, manifest.Package.Name); err != nil {
-				return nil, err
-			}
-		}
+	if err := visit(root, crateName); err != nil {
+		return nil, err
 	}
 
 	return versions, nil
@@ -351,8 +267,6 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 	seenLicenses := map[string]bool{}
 	seenCopyrights := map[string]bool{}
 
-	var indexedLicenses []notice.License
-
 	for _, licensePath := range licensePaths {
 		licenseText, readErr := os.ReadFile(licensePath)
 		if readErr != nil {
@@ -361,17 +275,6 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 
 		licenseNames, classifyErr := license.Classify(licenseText)
 		if classifyErr != nil {
-			// Some crates ship a LICENSE index containing only the declared
-			// SPDX expression alongside the full LICENSE-MIT/LICENSE-APACHE.
-			declared := crateLicense(matches[0])
-			text := strings.TrimSpace(string(licenseText))
-
-			isIndex := text == declared || (declared == "Unlicense OR MIT" && text == "This project is dual-licensed under the Unlicense and MIT licenses.\n\nYou may use this code under the terms of either license.")
-			if len(licensePaths) > 1 && isIndex {
-				indexedLicenses = append(indexedLicenses, declaredLicenses(declared, "")...)
-				continue
-			}
-
 			return notice.Entry{}, fmt.Errorf("classifying %s: %w", licensePath, classifyErr)
 		}
 
@@ -394,16 +297,6 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 				entry.Copyright = append(entry.Copyright, copyright)
 				seenCopyrights[copyright] = true
 			}
-		}
-	}
-
-	if len(entry.License) == 0 {
-		return notice.Entry{}, fmt.Errorf("no full license text found in %s", matches[0])
-	}
-
-	for _, indexed := range indexedLicenses {
-		if !seenLicenses[indexed.Name] {
-			return notice.Entry{}, fmt.Errorf("no full license text found for %s in %s", indexed.Name, matches[0])
 		}
 	}
 
@@ -441,7 +334,7 @@ func declaredLicenses(expression, link string) []notice.License {
 func crateLicenseFiles(dir string) ([]string, error) {
 	var paths []string
 
-	for _, pattern := range []string{"LICENSE*", "LICENCE*", "COPYING*", "UNLICENSE"} {
+	for _, pattern := range []string{"LICENSE*", "LICENCE*", "COPYING*"} {
 		matches, err := filepath.Glob(filepath.Join(dir, pattern))
 		if err != nil {
 			return nil, fmt.Errorf("locating license files: %w", err)
@@ -482,117 +375,120 @@ func (c *Collector) home() (string, error) {
 }
 
 func directDependencies(data string) (map[string]dependency, error) {
-	var manifest cargoManifest
-	if err := toml.Unmarshal([]byte(data), &manifest); err != nil {
-		return nil, fmt.Errorf("invalid dependency line or manifest: %w", err)
-	}
-
-	return manifest.directDependencies()
-}
-
-type dependencyTables struct {
-	Dependencies      map[string]any `toml:"dependencies"`
-	BuildDependencies map[string]any `toml:"build-dependencies"`
-}
-
-type cargoManifest struct {
-	dependencyTables
-	Target    map[string]dependencyTables `toml:"target"`
-	Package   struct{ Name string }       `toml:"package"`
-	Workspace struct {
-		Members      []string       `toml:"members"`
-		Exclude      []string       `toml:"exclude"`
-		Dependencies map[string]any `toml:"dependencies"`
-	} `toml:"workspace"`
-}
-
-func readManifest(dir string) (cargoManifest, error) {
-	var manifest cargoManifest
-
-	path := filepath.Join(dir, "Cargo.toml")
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return manifest, fmt.Errorf("reading %s: %w", path, err)
-	}
-
-	if err := toml.Unmarshal(data, &manifest); err != nil {
-		return manifest, fmt.Errorf("invalid dependency line or manifest %s: %w", path, err)
-	}
-
-	return manifest, nil
-}
-
-func (m cargoManifest) directDependencies() (map[string]dependency, error) {
 	direct := map[string]dependency{}
+	section := ""
 
-	tables := []dependencyTables{m.dependencyTables}
-	for _, target := range m.Target {
-		tables = append(tables, target)
+	scanner := bufio.NewScanner(strings.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(strings.SplitN(scanner.Text(), "#", 2)[0])
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+			continue
+		}
+
+		if !dependencySection(section) || line == "" {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			return nil, fmt.Errorf("invalid dependency line %q", line)
+		}
+
+		name := strings.Trim(strings.TrimSpace(key), `"'`)
+
+		packageName := name
+		if parsed := inlineField(value, "package"); parsed != "" {
+			packageName = parsed
+		}
+
+		direct[name] = dependency{packageName: packageName, path: inlineField(value, "path")}
 	}
 
-	for _, table := range tables {
-		for _, deps := range []map[string]any{table.Dependencies, table.BuildDependencies} {
-			for alias, value := range deps {
-				dep := dependency{packageName: alias}
-
-				switch value := value.(type) {
-				case string:
-				case map[string]any:
-					if raw, exists := value["workspace"]; exists {
-						inherited, ok := raw.(bool)
-						if !ok || !inherited {
-							return nil, fmt.Errorf("dependency %s: invalid workspace inheritance", alias)
-						}
-
-						dep.workspace = true
-					}
-
-					for _, field := range []string{"package", "path"} {
-						if raw, exists := value[field]; exists {
-							text, ok := raw.(string)
-							if !ok || text == "" {
-								return nil, fmt.Errorf("dependency %s: invalid %s", alias, field)
-							}
-
-							if field == "package" {
-								dep.packageName = text
-							} else {
-								dep.path = text
-							}
-						}
-					}
-				default:
-					return nil, fmt.Errorf("dependency %s: expected version or table", alias)
-				}
-
-				if previous, exists := direct[alias]; exists && previous != dep {
-					return nil, fmt.Errorf("dependency %s has conflicting declarations", alias)
-				}
-
-				direct[alias] = dep
-			}
-		}
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 
 	return direct, nil
 }
 
+func inlineField(value, name string) string {
+	for _, field := range strings.Split(strings.Trim(value, " {}"), ",") {
+		key, fieldValue, found := strings.Cut(field, "=")
+		if found && strings.TrimSpace(key) == name {
+			return quotedValue(strings.TrimSpace(fieldValue))
+		}
+	}
+
+	return ""
+}
+
+func dependencySection(section string) bool {
+	return section == "dependencies" || section == "build-dependencies" ||
+		(strings.HasPrefix(section, "target.") && (strings.HasSuffix(section, ".dependencies") || strings.HasSuffix(section, ".build-dependencies")))
+}
+
 func lockedDirectVersions(data string, direct map[string]dependency, owner string) (map[string]string, error) {
-	packages, err := lockPackages(data)
-	if err != nil {
+	type pkg struct {
+		name, version string
+		dependencies  []string
+	}
+
+	var (
+		packages []pkg
+		current  *pkg
+	)
+
+	inDependencies := false
+
+	scanner := bufio.NewScanner(strings.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "[[package]]" {
+			packages = append(packages, pkg{})
+			current = &packages[len(packages)-1]
+			inDependencies = false
+
+			continue
+		}
+
+		if current == nil {
+			continue
+		}
+
+		if inDependencies {
+			if line == "]" {
+				inDependencies = false
+				continue
+			}
+
+			if dep := quotedValue(strings.TrimSuffix(line, ",")); dep != "" {
+				current.dependencies = append(current.dependencies, dep)
+			}
+
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(line, "name ="):
+			current.name = quotedValue(strings.TrimSpace(strings.TrimPrefix(line, "name =")))
+		case strings.HasPrefix(line, "version ="):
+			current.version = quotedValue(strings.TrimSpace(strings.TrimPrefix(line, "version =")))
+		case line == "dependencies = [":
+			inDependencies = true
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 
-	var root *lockedPackage
+	var root *pkg
 
 	for i := range packages {
-		if packages[i].Name == owner && packages[i].Source == "" {
-			if root != nil {
-				return nil, fmt.Errorf("%s package has ambiguous lock entries", owner)
-			}
-
+		if packages[i].name == owner {
 			root = &packages[i]
+			break
 		}
 	}
 
@@ -602,22 +498,29 @@ func lockedDirectVersions(data string, direct map[string]dependency, owner strin
 
 	versions := map[string]string{}
 
-	for _, edge := range root.Dependencies {
-		name, _ := lockDependency(edge)
+	for _, dependency := range root.dependencies {
+		name, version := lockDependency(dependency)
 		if !containsPackage(direct, name) {
 			continue
 		}
 
-		pkg, err := resolveLocked(packages, edge)
-		if err != nil {
-			return nil, err
+		if version == "" {
+			for _, candidate := range packages {
+				if candidate.name == name {
+					if version != "" {
+						return nil, fmt.Errorf("dependency %s has ambiguous locked versions", name)
+					}
+
+					version = candidate.version
+				}
+			}
 		}
 
-		if previous := versions[name]; previous != "" && previous != pkg.Version {
-			return nil, fmt.Errorf("dependency %s has ambiguous locked versions", name)
+		if version == "" {
+			return nil, fmt.Errorf("dependency %s has no locked version", name)
 		}
 
-		versions[name] = pkg.Version
+		versions[name] = version
 	}
 
 	for alias, dep := range direct {

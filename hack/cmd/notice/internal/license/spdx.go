@@ -30,7 +30,6 @@ var spdxFriendly = map[string]string{
 	"PostgreSQL":    "PostgreSQL License",
 	"Python-2.0":    "Python License, Version 2.0",
 	"Ruby":          "Ruby License",
-	"Unicode-3.0":   "Unicode License v3",
 }
 
 // SPDXFriendly converts an SPDX license identifier to its long human-readable

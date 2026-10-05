@@ -1,9 +1,8 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod` and `frontend/package.json`, non-development dependencies of the
-`cmd/racer-dataplane` Cargo workspace (including registry transitives), and the
-pinned libfabric and OpenSSL source versions in `Makefile`, when present.
+`go.mod`, `frontend/package.json`, and `cmd/racer-dataplane/Cargo.toml` plus
+the pinned libfabric and OpenSSL source versions in `Makefile`, when present.
 
 ## Usage
 
@@ -13,20 +12,11 @@ notice check    [--repo-root .] [--notice NOTICE]
 ```
 
 The Makefile wraps these as `make notice` and `make notice-check`.
-Both targets automatically run the `racer-cargo-fetch` prerequisite to populate
-the locked Cargo source cache, so **Cargo must be installed and on PATH** (or
-configured with `RACER_CARGO`). Fetching may require network access. Install
-frontend dependencies with `npm ci` in `frontend/` first; the Go module source
-cache must also be populated.
-
-When invoking the CLI directly, first populate the Cargo cache with
-`cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
-The CLI itself reads local files and does not invoke Cargo or fetch dependencies.
 
 ## Output schema
 
 The on-disk `NOTICE` is YAML preceded by a generated-file header comment. Each
-collected dependency contributes one entry:
+direct dependency contributes one entry:
 
 ```yaml
 - dependency: github.com/spf13/cobra      # Module path or npm package name.
@@ -53,7 +43,7 @@ hack/cmd/notice/
     gomod/                 # Collector for go.mod direct deps; Go vanity-domain
                            # repo-base heuristics.
     npm/                   # Collector for frontend/package.json direct deps.
-    cargo/                 # Cargo workspace non-dev dependencies and registry closure.
+    cargo/                 # Collector for direct non-dev Cargo dependencies.
     native/                # Collector for Makefile-pinned native dependencies.
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
@@ -63,11 +53,8 @@ hack/cmd/notice/
 Cargo and native collectors remain registered for the replacement Racer
 implementation. Cargo collection is inactive when neither `Cargo.toml` nor
 `Cargo.lock` exists under `cmd/racer-dataplane`; no Cargo registry cache is
-required for a graph containing only local packages. The collector starts at
-the root package and all workspace members, including virtual workspaces, and
-follows local path dependencies. Workspace member globs, exclusions, and
-`workspace.dependencies` inheritance are supported. Root/member development
-dependencies do not seed registry collection.
+required for a graph containing only local packages. The collector is configured
+for a `racer-dataplane` root package.
 Native collection is inactive when neither native version pin is declared in
 `Makefile`. Incomplete inputs remain errors rather than silently omitting notices.
 
@@ -90,7 +77,7 @@ To add a new ecosystem (e.g. PyPI, Cargo):
    - `notice.AssembleEntry(name, ecosystem, dir, repoBase, ref, declaredLicense)`
      wraps license discovery, classification, copyright extraction, and URL
      construction. Most collectors only need to compute `(dir, repoBase, ref)`
-     for each collected dependency and call this.
+     for each direct dependency and call this.
    - `license.Classify`, `license.ExtractCopyright[FromDir]`, `license.FindFile`,
      `license.BuildURL`, and `license.SPDXFriendly` are ecosystem-agnostic.
 
@@ -111,20 +98,13 @@ To add a new ecosystem (e.g. PyPI, Cargo):
 - Do not commit fake `node_modules/`, module-cache, or `site-packages/` trees.
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
 - Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
-  reads license files from the local Cargo registry source cache. String,
-  inline-table, and table-form dependency declarations are supported. Normal,
-  build, target-specific (across all targets), and optional dependencies are
-  included regardless of the current host or enabled features. Registry
-  collection follows their locked production/build transitive closure, not
-  every package in the lockfile. Development-only dependencies and their
-  transitives are excluded even when all workspace members are considered;
-  dependencies shared with production remain included. Local packages are
-  traversed but do not produce third-party entries.
-- Missing manifests, lock entries, or registry sources are errors, not silent
-  omissions. The current name-keyed output rejects multiple reachable versions
-  of the same crate, ambiguous versions or sources, conflicting declarations,
-  and unsupported non-registry edges in the registry closure rather than
-  choosing an arbitrary notice. Qualified lock versions are honored.
+  reads license files from the local Cargo registry source cache for direct
+  dependencies. When the Racer crate has dependencies, populate it with
+  `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
+  Development dependencies are excluded; normal, target, build, and optional
+  direct dependencies are included.
+  Local path dependencies are traversed to collect their direct registry
+  dependencies; registry transitive dependencies are not traversed.
 - Native collection is fully local. Its metadata and canonical license links
   are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
   `OPENSSL_VERSION` in `Makefile`.

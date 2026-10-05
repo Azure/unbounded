@@ -7,20 +7,14 @@ package license
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/google/licensecheck"
 )
 
-// Classify recognizes the complete Unicode V3 text or runs google/licensecheck
-// against the LICENSE text and returns the
+// Classify runs google/licensecheck against the LICENSE text and returns the
 // friendly names of all matched licenses, in source-text order, deduplicated.
 // Errors out if no license is recognized.
 func Classify(text []byte) ([]string, error) {
-	if strings.Join(strings.Fields(string(text)), " ") == strings.Join(strings.Fields(unicodeV3Text), " ") {
-		return []string{SPDXFriendly("Unicode-3.0")}, nil
-	}
-
 	cov := licensecheck.Scan(text)
 	if len(cov.Match) == 0 {
 		return nil, fmt.Errorf("license not recognized by licensecheck")
