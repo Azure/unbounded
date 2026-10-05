@@ -1520,11 +1520,17 @@ mod tests {
     /// Owns a worktree-local differential fixture directory, removed even on panic.
     struct Directory(PathBuf);
     impl Directory {
-        /// Creates the host filesystem fixture beneath this worktree's target directory.
+        /// Creates a unique host fixture beneath this worktree's target directory.
         fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
             let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../target")
-                .join(format!("sim-open-differential-{}", std::process::id()));
+                .join(format!(
+                    "sim-open-differential-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
             std::fs::create_dir_all(&root).unwrap();
             Self(root)
         }
@@ -1534,6 +1540,22 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    /// Parallel fixture instances own distinct paths and clean up independently.
+    #[test]
+    fn differential_directories_are_unique_and_cleanup_is_independent() {
+        let first = Directory::new();
+        let second = std::thread::spawn(Directory::new).join().unwrap();
+        assert_ne!(first.0, second.0);
+        let removed = first.0.clone();
+        std::fs::write(second.0.join("keep"), b"owned").unwrap();
+        drop(first);
+        assert!(!removed.exists());
+        assert_eq!(std::fs::read(second.0.join("keep")).unwrap(), b"owned");
+        let removed = second.0.clone();
+        drop(second);
+        assert!(!removed.exists());
     }
 
     /// Compare access modes, directory suffixes, and ignored absolute-path dirfds.
