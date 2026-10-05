@@ -700,7 +700,6 @@ dependencies = [
  "racer-identity",
  "rcgen",
  "rdma-verbs",
- "rest-client",
  "rustls",
  "serde",
  "serde_json",
@@ -758,21 +757,6 @@ dependencies = [
  "futures",
  "libc",
  "uring-runtime",
-]
-
-[[package]]
-name = "rest-client"
-version = "0.1.0"
-dependencies = [
- "futures",
- "httparse",
- "libc",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "sha2",
- "uring-runtime",
- "zeroize",
 ]
 
 [[package]]
@@ -1182,6 +1166,17 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "wire-codec"
 version = "0.1.0"
+dependencies = [
+ "futures",
+ "httparse",
+ "libc",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "sha2",
+ "uring-runtime",
+ "zeroize",
+]
 
 [[package]]
 name = "x509-parser"

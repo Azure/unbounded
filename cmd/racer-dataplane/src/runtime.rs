@@ -256,7 +256,7 @@ impl uring_runtime::Scope for RequestScope {
         Some(&self.cancellation.inner)
     }
 }
-impl rest_client::Scope for RequestScope {
+impl wire_codec::rest::Scope for RequestScope {
     fn deadline(&self) -> Instant {
         self.deadline.0
     }
@@ -424,7 +424,7 @@ mod tests {
             use std::time::Duration;
             #[test]
             fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
-                use rest_client::Scope;
+                use wire_codec::rest::Scope;
                 let clock = uring_runtime::environment::SimulationClock::new(102);
                 let _env = clock.environment(0).enter();
                 let start = uring_runtime::environment::now();

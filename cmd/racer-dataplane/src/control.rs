@@ -28,7 +28,6 @@ use racer_control_wire::validate_publication;
 use racer_identity::KeyPurpose;
 use racer_identity::Keyring;
 use racer_identity::unix_time;
-use rest_client::Response;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -56,6 +55,7 @@ use uring_runtime::drivers::Busy;
 use uring_runtime::reactor::descriptor::Descriptor;
 use uring_runtime::reactor::filesystem::secure;
 use uring_runtime::reactor::filesystem::secure::{BENEATH, NO_MAGICLINKS, NO_SYMLINKS};
+use wire_codec::rest::{self, Response};
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
@@ -1451,7 +1451,7 @@ pub struct ReactorControlIo {
     #[cfg(test)]
     connect_probe: Option<Rc<tests::scenarios::ConnectProbe>>,
 }
-impl rest_client::Io for ReactorControlIo {
+impl rest::Io for ReactorControlIo {
     type FileBytes = uring_runtime::reactor::filesystem::ReadBuffer;
     type Error = Error;
     type Scope = RequestScope;
@@ -1508,7 +1508,7 @@ impl rest_client::Io for ReactorControlIo {
             if let Some(probe) = &self.connect_probe {
                 return Ok(probe.addresses.to_vec());
             }
-            rest_client::dns::resolve(self, host, port, scope).await
+            rest::dns::resolve(self, host, port, scope).await
         })
     }
     fn read_file<'a>(
@@ -1551,19 +1551,19 @@ impl ReactorControlIo {
 pub struct ControlTransport {
     health: Rc<crate::topology::LinkHealth>,
     endpoint: racer_control_wire::NodeId,
-    inner: rest_client::Transport<ReactorControlIo>,
+    inner: rest::Transport<ReactorControlIo>,
 }
 pub struct ControlConnection {
     health: Rc<crate::topology::LinkHealth>,
     endpoint: racer_control_wire::NodeId,
-    inner: rest_client::Connection<ReactorControlIo>,
+    inner: rest::Connection<ReactorControlIo>,
 }
 impl ControlTransport {
     pub fn new(endpoint: ControlEndpoint) -> Self {
         Self {
             health: Rc::new(crate::topology::LinkHealth::new(1)),
             endpoint: racer_control_wire::NodeId(endpoint.url.clone()),
-            inner: rest_client::Transport::new(rest_client::Config {
+            inner: rest::Transport::new(rest::Config {
                 url: endpoint.url,
                 trust_bundle: endpoint.trust_bundle,
                 max_trust_bundle: wire::MAX_BUNDLE_BYTES,
@@ -1604,7 +1604,7 @@ impl ControlTransport {
                         if identity.is_some_and(|i| !i.valid_now()) {
                             return Err(Error::Unauthorized);
                         }
-                        let identity = identity.map(|i| rest_client::Identity {
+                        let identity = identity.map(|i| rest::Identity {
                             certificate_chain: i.certificate_chain(),
                             private_key: i.private_key_der(),
                             expires: i.expires_at(),
@@ -1649,8 +1649,8 @@ impl ControlConnection {
                     &self.endpoint,
                     Box::pin(async move {
                         let method = match method {
-                            "GET" => rest_client::Method::Get,
-                            "POST" => rest_client::Method::Post,
+                            "GET" => rest::Method::Get,
+                            "POST" => rest::Method::Post,
                             _ => return Err(Error::InvalidRequest),
                         };
                         if base.is_some_and(|b| {
@@ -1660,7 +1660,7 @@ impl ControlConnection {
                         }
                         self.inner
                             .request(
-                                rest_client::Request {
+                                rest::Request {
                                     method,
                                     path,
                                     bearer: token,
@@ -2361,8 +2361,8 @@ pub(crate) mod tests {
 
     #[test]
     fn socket_readiness_errno_is_transient_but_file_errno_is_not() {
-        use rest_client::Io;
         use uring_runtime::reactor::simulation::{Fault, Simulation};
+        use wire_codec::rest::Io;
         let sim = Simulation::new();
         let _os = sim.enter();
         let r = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(

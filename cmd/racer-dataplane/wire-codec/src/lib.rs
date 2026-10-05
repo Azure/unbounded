@@ -1,4 +1,14 @@
-//! Byte mechanics only: callers choose byte order, bounds, and error mapping.
+//! Bounded byte codecs and optional owner-local REST transport.
+//!
+//! Codec callers choose byte order, bounds, and error mapping. The `rest` feature
+//! adds TLS JSON HTTP on caller-owned readiness, deadlines, and admission leases.
+
+#[cfg(feature = "rest")]
+pub mod rest;
+
+// Shared REST fixtures use the same imports in unit and integration builds.
+#[cfg(all(test, feature = "rest"))]
+extern crate self as wire_codec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

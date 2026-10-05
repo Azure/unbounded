@@ -1,11 +1,11 @@
 //! Socket-level transport contracts exercised through the public client API.
-use rest_client::{Error as RestError, Method, Operation, Transport};
 use std::{
     io::{Read, Write},
     rc::Rc,
     sync::Arc,
     time::Duration,
 };
+use wire_codec::rest::{Error as RestError, Method, Operation, Transport};
 #[path = "support/mod.rs"]
 mod testing;
 use testing::{Error, RotationServer, TestTransport as _, WeeklyCertificates, rotation_request};
@@ -165,8 +165,9 @@ fn tls_fixture(trailing: bool) {
         ControlTransport::new(testing::config(format!("https://127.0.0.1:{port}"), trust));
     transport.attach_io(Rc::new(FixtureIo));
     let scope = testing::scope();
-    let run =
-        |future: Operation<'_, rest_client::Response, Error>| futures::executor::block_on(future);
+    let run = |future: Operation<'_, wire_codec::rest::Response, Error>| {
+        futures::executor::block_on(future)
+    };
     let first = run(Box::pin(async {
         let connection = transport.bootstrap(&scope).await?;
         connection

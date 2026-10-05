@@ -19,7 +19,7 @@ import (
 // Keep fixtures independent of crateInputs so omitted members fail collection tests.
 var workspaceMembers = []string{
 	"runtime", "alloc", "crypto", "verbs", "http", "topology",
-	"telemetry", "flow", "rest", "control-wire", "identity",
+	"telemetry", "flow", "control-wire", "identity",
 	"uds-endpoint", "wire-codec",
 }
 
@@ -630,7 +630,6 @@ http1 = { path = "http" }
 topology = { path = "topology" }
 telemetry = { path = "telemetry" }
 flow-control = { path = "flow" }
-rest-client = { path = "rest" }
 racer-control-wire = { path = "control-wire" }
 racer-identity = { path = "identity" }
 uds-endpoint = { path = "uds-endpoint" }

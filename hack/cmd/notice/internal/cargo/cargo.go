@@ -36,7 +36,6 @@ var crateInputs = []crateInput{
 	{"cmd/racer-dataplane/telemetry/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/verbs/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/flow/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
-	{"cmd/racer-dataplane/rest/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/topology/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/control-wire/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/identity/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},

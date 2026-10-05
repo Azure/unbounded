@@ -1,8 +1,4 @@
 //! Shared loopback I/O and certificate fixtures for public and private invariants.
-use rest_client::{
-    Config, Connection, Error as RestError, Identity, Io, Method, Operation, Request, Scope,
-    Transport,
-};
 use std::{
     io::{Read, Write},
     net::SocketAddr,
@@ -14,6 +10,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
+use wire_codec::rest::{
+    Config, Connection, Error as RestError, Identity, Io, Method, Operation, Request, Scope,
+    Transport,
+};
 
 /// Fixture errors retain transport categories without an orphan conversion impl.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

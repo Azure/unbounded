@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "rest", "control-wire", "identity", "uds-endpoint", "wire-codec"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "control-wire", "identity", "uds-endpoint", "wire-codec"]
 resolver = "3"
 
 [package]
@@ -23,11 +23,10 @@ required-features = ["subscription-interop"]
 
 [dependencies]
 uds-endpoint = { path = "uds-endpoint" }
-wire-codec = { path = "wire-codec" }
+wire-codec = { path = "wire-codec", features = ["rest"] }
 racer-identity = { path = "identity" }
 racer-control-wire = { path = "control-wire" }
 flow-control = { path = "flow" }
-rest-client = { path = "rest" }
 topology = { path = "topology" }
 telemetry = { path = "telemetry" }
 http1 = { path = "http" }
@@ -52,7 +51,7 @@ zeroize = "1"
 racer-identity = { path = "identity", features = ["test-util"] }
 uds-endpoint = { path = "uds-endpoint", features = ["test-util"] }
 flow-control = { path = "flow", features = ["simulation"] }
-rest-client = { path = "rest", features = ["simulation"] }
+wire-codec = { path = "wire-codec", features = ["simulation"] }
 rdma-verbs = { path = "verbs", features = ["simulation"] }
 http1 = { path = "http", features = ["test-util"] }
 page-alloc = { path = "alloc", features = ["simulation"] }

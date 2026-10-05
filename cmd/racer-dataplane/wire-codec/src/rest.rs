@@ -1104,7 +1104,7 @@ fn valid_header(name: &str, value: &str) -> bool {
 
 /// Bounded UDP DNS on caller-owned readiness. TLS, never DNS, authenticates the host.
 pub mod dns {
-    use crate::{Error, Io, Result, Scope};
+    use super::{Error, Io, Result, Scope};
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
         rc::Rc,
@@ -1416,10 +1416,6 @@ pub mod dns {
         }
     }
 }
-
-// Shared test fixtures use the same imports in unit and integration builds.
-#[cfg(test)]
-extern crate self as rest_client;
 
 /// Loopback fixtures shared with public API integration tests.
 #[cfg(test)]

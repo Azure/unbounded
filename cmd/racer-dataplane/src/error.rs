@@ -141,16 +141,16 @@ impl From<flow_control::Error> for Error {
     }
 }
 
-impl From<rest_client::Error> for Error {
-    fn from(error: rest_client::Error) -> Self {
+impl From<wire_codec::rest::Error> for Error {
+    fn from(error: wire_codec::rest::Error) -> Self {
         match error {
-            rest_client::Error::InvalidConfiguration => Self::InvalidConfiguration,
-            rest_client::Error::InvalidRequest => Self::InvalidRequest,
-            rest_client::Error::Unauthorized => Self::Unauthorized,
-            rest_client::Error::Unavailable => Self::Unavailable,
-            rest_client::Error::Overloaded => Self::Overloaded,
-            rest_client::Error::Io => Self::Io,
-            rest_client::Error::Internal => Self::Internal,
+            wire_codec::rest::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            wire_codec::rest::Error::InvalidRequest => Self::InvalidRequest,
+            wire_codec::rest::Error::Unauthorized => Self::Unauthorized,
+            wire_codec::rest::Error::Unavailable => Self::Unavailable,
+            wire_codec::rest::Error::Overloaded => Self::Overloaded,
+            wire_codec::rest::Error::Io => Self::Io,
+            wire_codec::rest::Error::Internal => Self::Internal,
         }
     }
 }
