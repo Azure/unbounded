@@ -248,20 +248,16 @@ func decode(r io.Reader, limit int, v any) error {
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.UseNumber()
 
-	tree, err := readValue(d, 0)
-	if err != nil {
-		return InvalidRequest
+	if err := checkValue(d, reflect.TypeOf(v).Elem(), false, 0); err != nil {
+		return err
 	}
 
 	if _, err = d.Token(); err != io.EOF {
 		return InvalidRequest
 	}
 
-	if err = checkShape(tree, reflect.TypeOf(v).Elem(), false); err != nil {
-		return err
-	}
 	// The original bytes are safe only after duplicate, exact-name, shape, and
-	// primitive checks above. Do not serialize the validation tree a second time.
+	// primitive checks above. No generic JSON tree is retained by validation.
 	if err = json.Unmarshal(b, v); err != nil {
 		return InvalidRequest
 	}
@@ -269,75 +265,112 @@ func decode(r io.Reader, limit int, v any) error {
 	return nil
 }
 
-// readValue checks duplicates in all fields and caps nesting. JSON's
-// default map decoder silently overwrites duplicates and is not suitable here.
-func readValue(d *json.Decoder, depth int) (any, error) {
-	t, err := d.Token()
+// checkValue validates against the wire type while consuming tokens. Reject
+// wrong shapes before descending and oversized arrays before their next element;
+// never accumulate input-sized maps or slices just to validate the document.
+func checkValue(d *json.Decoder, t reflect.Type, quoted bool, depth int) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+
+	v, err := d.Token()
 	if err != nil {
-		return nil, InvalidRequest
+		return InvalidRequest
 	}
 
-	delim, ok := t.(json.Delim)
-	if !ok {
-		return t, nil
+	if _, container := v.(json.Delim); container && depth >= 64 {
+		return InvalidRequest
 	}
 
-	if depth >= 64 {
-		return nil, InvalidRequest
-	}
-
-	switch delim {
-	case '{':
-		m := map[string]any{}
-
-		for d.More() {
-			key, err := d.Token()
-			if err != nil {
-				return nil, InvalidRequest
-			}
-
-			s, ok := key.(string)
-			if !ok {
-				return nil, InvalidRequest
-			}
-
-			if _, exists := m[s]; exists {
-				return nil, InvalidRequest
-			}
-
-			value, err := readValue(d, depth+1)
-			if err != nil {
-				return nil, err
-			}
-
-			m[s] = value
+	switch t.Kind() {
+	case reflect.Struct:
+		if v != json.Delim('{') {
+			return InvalidRequest
 		}
 
-		if end, err := d.Token(); err != nil || end != json.Delim('}') {
-			return nil, InvalidRequest
+		return checkObject(d, t, depth)
+	case reflect.Slice:
+		if t.Elem().Kind() == reflect.Uint8 {
+			return checkPrimitive(v, t, quoted)
 		}
 
-		return m, nil
-	case '[':
-		a := []any{}
+		if v != json.Delim('[') {
+			return InvalidRequest
+		}
 
-		for d.More() {
-			value, err := readValue(d, depth+1)
-			if err != nil {
-				return nil, err
+		for count := 0; d.More(); count++ {
+			if (t.Elem() == reflect.TypeFor[Member]() && count >= MaxMembers) ||
+				(t.Elem() == reflect.TypeFor[RDMANIC]() && count >= MaxRDMANICs) {
+				return TooLarge
 			}
 
-			a = append(a, value)
+			if err := checkValue(d, t.Elem(), false, depth+1); err != nil {
+				return err
+			}
 		}
 
 		if end, err := d.Token(); err != nil || end != json.Delim(']') {
-			return nil, InvalidRequest
+			return InvalidRequest
 		}
 
-		return a, nil
+		return nil
 	default:
-		return nil, InvalidRequest
+		return checkPrimitive(v, t, quoted)
 	}
+}
+
+func checkObject(d *json.Decoder, t reflect.Type, depth int) error {
+	// Tracking is sized by the schema, not by attacker-supplied field names.
+	seen := make([]bool, t.NumField())
+
+	for d.More() {
+		key, err := d.Token()
+		if err != nil {
+			return InvalidRequest
+		}
+
+		index := -1
+
+		for i := range t.NumField() {
+			name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+			if key == name {
+				index = i
+				break
+			}
+		}
+
+		if index < 0 || seen[index] {
+			return InvalidRequest
+		}
+
+		seen[index] = true
+		field := t.Field(index)
+		_, option, _ := strings.Cut(field.Tag.Get("json"), ",")
+
+		if t == reflect.TypeFor[RDMANIC]() && key == "gid" {
+			value, err := d.Token()
+
+			text, ok := value.(string)
+			if err != nil || !ok || text == "" {
+				return InvalidRequest
+			}
+		} else if err := checkValue(d, field.Type, option == "string", depth+1); err != nil {
+			return err
+		}
+	}
+
+	if end, err := d.Token(); err != nil || end != json.Delim('}') {
+		return InvalidRequest
+	}
+
+	for i, present := range seen {
+		_, option, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if !present && option != "omitempty" {
+			return InvalidRequest
+		}
+	}
+
+	return nil
 }
 
 // encoding/json replaces unpaired UTF-16 surrogates with U+FFFD. Reject that
@@ -398,82 +431,18 @@ func validSurrogates(b []byte) bool {
 	return true
 }
 
-// checkShape enforces exact field names, required fields, non-null values and
-// canonical primitive encodings before the standard decoder builds typed state.
-func checkShape(v any, t reflect.Type, quoted bool) error {
-	if t.Kind() == reflect.Pointer {
-		return checkShape(v, t.Elem(), quoted)
-	}
-
+// checkPrimitive rejects null and noncanonical encodings before typed decoding.
+func checkPrimitive(v any, t reflect.Type, quoted bool) error {
 	switch t.Kind() {
-	case reflect.Struct:
-		m, ok := v.(map[string]any)
-		if !ok {
-			return InvalidRequest
-		}
-
-		known := map[string]bool{}
-
-		for i := range t.NumField() {
-			f := t.Field(i)
-			tag := strings.Split(f.Tag.Get("json"), ",")
-			known[tag[0]] = true
-
-			value, exists := m[tag[0]]
-			if !exists && len(tag) > 1 && tag[1] == "omitempty" {
-				continue
-			}
-
-			if !exists {
-				return InvalidRequest
-			}
-
-			if t == reflect.TypeFor[RDMANIC]() && tag[0] == "gid" && value == "" {
-				return InvalidRequest
-			}
-
-			if err := checkShape(value, f.Type, len(tag) > 1 && tag[1] == "string"); err != nil {
-				return err
-			}
-		}
-
-		for key := range m {
-			if !known[key] {
-				return InvalidRequest
-			}
-		}
 	case reflect.Slice:
-		if t.Elem().Kind() == reflect.Uint8 {
-			s, ok := v.(string)
-			if !ok {
-				return InvalidRequest
-			}
-
-			b, err := base64.StdEncoding.Strict().DecodeString(s)
-			if err != nil || base64.StdEncoding.EncodeToString(b) != s {
-				return InvalidRequest
-			}
-
-			return nil
-		}
-
-		a, ok := v.([]any)
-		if !ok {
+		s, ok := v.(string)
+		if !ok || t.Elem().Kind() != reflect.Uint8 {
 			return InvalidRequest
 		}
 
-		if t.Elem() == reflect.TypeFor[Member]() && len(a) > MaxMembers {
-			return TooLarge
-		}
-
-		if t.Elem() == reflect.TypeFor[RDMANIC]() && len(a) > MaxRDMANICs {
-			return TooLarge
-		}
-
-		for _, x := range a {
-			if err := checkShape(x, t.Elem(), false); err != nil {
-				return err
-			}
+		b, err := base64.StdEncoding.Strict().DecodeString(s)
+		if err != nil || base64.StdEncoding.EncodeToString(b) != s {
+			return InvalidRequest
 		}
 	case reflect.String:
 		if _, ok := v.(string); !ok {

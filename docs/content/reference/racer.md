@@ -178,6 +178,16 @@ Readiness also requires the cached serving certificate's DNS SANs to match the
 configured replication server name. A valid certificate for another service is
 not ready; reloading a correctly named certificate restores this readiness gate.
 
+Go wire codec byte limits (64 KiB for bootstrap, 512 KiB for keyring bundles,
+and 64 MiB for publications) bound encoded documents, not total heap usage.
+The decoder buffers the bounded document, validates tokens against the schema,
+then decodes typed state. It rejects unknown or duplicate fields and wrong shapes
+without traversing their contents, and rejects excess members or RDMA NICs before
+consuming the next element. Validation does not retain a generic JSON tree.
+Buffers, individual tokens, base64 validation, typed collections, and subsequent
+semantic validation still allocate memory; the byte cap is not a process memory
+budget or a substitute for concurrency limits.
+
 The operator owns identity/wiring: cluster UUID, URL, images, service accounts, trust,
 replication identity, and durable resource names. These are not tuning keys. Node identity
 comes from verified enrollment/local recovery, not a supplied Node name/UID. Do not reset
