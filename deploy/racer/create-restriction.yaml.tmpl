@@ -15,12 +15,12 @@ spec:
   matchConditions:
     - name: racer-controller
       expression: >-
-        request.userInfo.username == 'system:serviceaccount:{{ .Namespace | default "unbounded-system" }}:racer-controller'
+        request.userInfo.username == {{ printf "system:serviceaccount:%s:racer-controller" (.Namespace | default "unbounded-system") | toJson }}
   validations:
     - expression: >-
         request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':racer-controller' &&
-        ((request.resource.resource == 'configmaps' && object.metadata.name in ['racer-installation', 'racer-version']) ||
-         (request.resource.resource == 'secrets' && object.metadata.name == 'racer-credentials' &&
+        ((request.resource.resource == 'configmaps' && object.metadata.name in [{{ .InstallationConfigMapName | default "racer-installation" | toJson }}, {{ .VersionConfigMapName | default "racer-version" | toJson }}]) ||
+         (request.resource.resource == 'secrets' && object.metadata.name == {{ .CredentialsSecretName | default "racer-credentials" | toJson }} &&
           object.type == 'Opaque' &&
           (!has(object.metadata.annotations) ||
            (!('kubernetes.io/service-account.name' in object.metadata.annotations) &&

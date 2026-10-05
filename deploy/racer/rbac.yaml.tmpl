@@ -51,7 +51,7 @@ rules:
     resources: ["pods", "serviceaccounts"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
+    resources: ["configmaps"]
     verbs: ["get", "list", "watch"]
   # Create cannot be restricted by resourceNames. The fail-closed admission
   # policy must be installed before enabling this RoleBinding or any workload.
@@ -60,11 +60,12 @@ rules:
     verbs: ["create"]
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: ["racer-credentials"]
-    verbs: ["update", "patch"]
+    resourceNames: [{{ .CredentialsSecretName | default "racer-credentials" | quote }}]
+    # List/watch require the matching metadata.name field selector.
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["racer-installation", "racer-version"]
+    resourceNames: [{{ .InstallationConfigMapName | default "racer-installation" | quote }}, {{ .VersionConfigMapName | default "racer-version" | quote }}]
     verbs: ["update", "patch"]
   - apiGroups: ["apps"]
     resources: ["daemonsets"]

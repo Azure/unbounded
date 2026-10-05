@@ -5,7 +5,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ .InstallationConfigMapName | default "racer-installation" }}
+  name: {{ .InstallationConfigMapName | default "racer-installation" | quote }}
   namespace: {{ .Namespace | default "unbounded-system" }}
 immutable: {{ ne (.InitializationState | default "consumed") "fresh" }}
 data:

@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	manifests "github.com/Azure/unbounded/deploy/racer"
+	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 )
 
 // Use an isolated API server with no reconcilers so both allowed names are
@@ -119,6 +120,126 @@ func TestEnvtestRuntimeSecretAdmission(t *testing.T) {
 						}
 					}
 				})
+			}
+		})
+	}
+}
+
+// Exercise the deployed Role, not an expanded test role: admission cannot protect
+// reads, and resourceNames on LIST/WATCH requires an exact name field selector.
+func TestEnvtestRuntimeRBAC(t *testing.T) {
+	assets := os.Getenv("KUBEBUILDER_ASSETS")
+	if assets == "" {
+		t.Skip("set KUBEBUILDER_ASSETS for real API-server RBAC")
+	}
+
+	environment := &envtest.Environment{BinaryAssetsDirectory: assets}
+	rc, err := environment.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, environment.Stop()) })
+
+	for _, custom := range []bool{false, true} {
+		t.Run(map[bool]string{false: "defaults", true: "custom-names"}[custom], func(t *testing.T) {
+			env := testEnv(t)
+			if custom {
+				env.Namespace = "custom-names"
+			}
+
+			env.Client, err = client.New(rc, client.Options{Scheme: env.Scheme})
+			require.NoError(t, err)
+			ctx := t.Context()
+			require.NoError(t, env.Client.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: env.Namespace}}))
+
+			credentials, installation, version := "racer-credentials", "racer-installation", "racer-version"
+			data := map[string]string{"Namespace": env.Namespace}
+
+			if custom {
+				credentials, installation, version = "custom.credentials", "custom.installation", "custom.version"
+				data["CredentialsSecretName"], data["InstallationConfigMapName"], data["VersionConfigMapName"] = credentials, installation, version
+			}
+
+			out := t.TempDir()
+			require.NoError(t, render.Render("../../../../deploy/racer", out, data))
+			objects, err := env.DecodeManifestFiles(os.DirFS(out), []string{"create-restriction.yaml", "rbac.yaml"}, nil)
+			require.NoError(t, err)
+
+			for _, obj := range objects {
+				require.NoError(t, env.ApplyObject(ctx, obj))
+			}
+
+			restricted := rest.CopyConfig(rc)
+			restricted.Impersonate = rest.ImpersonationConfig{UserName: "system:serviceaccount:" + env.Namespace + ":racer-controller"}
+			c, err := client.NewWithWatch(restricted, client.Options{Scheme: env.Scheme})
+			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				err := c.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "not-allowed", Namespace: env.Namespace}}, client.DryRunAll)
+				return apierrors.IsForbidden(err) && strings.Contains(err.Error(), "Racer may only write")
+			}, 30*time.Second, 100*time.Millisecond)
+
+			for _, name := range []string{installation, version} {
+				cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace}}
+				require.NoError(t, c.Create(ctx, cm))
+				before := cm.DeepCopy()
+				cm.Data = map[string]string{"test": "updated"}
+				require.NoError(t, c.Update(ctx, cm))
+				require.NoError(t, c.Patch(ctx, cm, client.MergeFrom(before)))
+			}
+
+			for _, name := range []string{"unrelated", "racer-config"} {
+				err := c.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace}}, client.DryRunAll)
+				require.True(t, apierrors.IsForbidden(err), "%v", err)
+
+				cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace}}
+				require.NoError(t, env.Client.Create(ctx, cm))
+				before := cm.DeepCopy()
+				cm.Data = map[string]string{"test": "denied"}
+				require.True(t, apierrors.IsForbidden(c.Update(ctx, cm)))
+				require.True(t, apierrors.IsForbidden(c.Patch(ctx, cm, client.MergeFrom(before))))
+			}
+
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: credentials, Namespace: env.Namespace}, Type: corev1.SecretTypeOpaque}
+			require.NoError(t, c.Create(ctx, secret))
+			require.NoError(t, c.Get(ctx, objectKey(env, credentials), &corev1.Secret{}))
+
+			before := secret.DeepCopy()
+			secret.Data = map[string][]byte{"issuer.json": []byte("test")}
+			require.NoError(t, c.Update(ctx, secret))
+			require.NoError(t, c.Patch(ctx, secret, client.MergeFrom(before)))
+
+			for _, name := range []string{"racer-controller-tls", "unrelated"} {
+				unrelated := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace}, Data: map[string][]byte{"ca.key": []byte("must-not-be-readable")}}
+				require.NoError(t, env.Client.Create(ctx, unrelated))
+				require.True(t, apierrors.IsForbidden(c.Get(ctx, objectKey(env, name), &corev1.Secret{})))
+
+				before := unrelated.DeepCopy()
+				unrelated.Data["ca.key"] = []byte("denied")
+				require.True(t, apierrors.IsForbidden(c.Update(ctx, unrelated)))
+				require.True(t, apierrors.IsForbidden(c.Patch(ctx, unrelated, client.MergeFrom(before))))
+			}
+
+			for _, name := range []string{credentials, "racer-controller-tls", "unrelated", ""} {
+				opts := []client.ListOption{client.InNamespace(env.Namespace)}
+				if name != "" {
+					opts = append(opts, client.MatchingFields{"metadata.name": name})
+				}
+
+				list := &corev1.SecretList{}
+				listErr := c.List(ctx, list, opts...)
+
+				watch, watchErr := c.Watch(ctx, &corev1.SecretList{}, opts...)
+				if watch != nil {
+					watch.Stop()
+				}
+
+				if name == credentials {
+					require.NoError(t, listErr)
+					require.NoError(t, watchErr)
+					require.Len(t, list.Items, 1)
+					require.Equal(t, credentials, list.Items[0].Name)
+				} else {
+					require.True(t, apierrors.IsForbidden(listErr), "list %q: %v", name, listErr)
+					require.True(t, apierrors.IsForbidden(watchErr), "watch %q: %v", name, watchErr)
+				}
 			}
 		})
 	}

@@ -23,16 +23,42 @@ cluster UUID and absent version state. After startup, retain `consumed` in
 declarative configuration and preserve the marker and version record. Constructors
 do not initialize state; the running controller owns this guard.
 
+Standalone template inputs `InstallationConfigMapName`, `VersionConfigMapName`,
+and `CredentialsSecretName` propagate to runtime configuration, RBAC, and the
+write-restriction admission policy. The marker also records the version name.
+Use valid Kubernetes resource names; never rename durable state in an existing
+installation. Operator-managed installations use fixed names and restore this
+wiring when reconciling configuration.
+
+The controller Pod runs as non-root UID 65532 with RuntimeDefault seccomp, all
+capabilities dropped, privilege escalation disabled, and a read-only root
+filesystem. Each controller requests 100m CPU and 128Mi memory, with limits of
+2 CPUs and 1Gi memory. These are deployment defaults, not a capacity guarantee;
+size operator workload overrides for the installation's topology and request load.
+
 ## Atomic credentials
 
 The controller owns one `racer-credentials` Secret containing `issuer.json`
 (private issuer keys and certificates), `bundle.json` (public roots and cache
 keys), and `rotation.json` (rotation deadlines and issuer roles). Configure its
-name with `RACER_CREDENTIALS_SECRET_NAME`; custom names also require matching RBAC
-and create-restriction policy. Dataplanes never receive or mount this Secret.
+name in standalone templates with `CredentialsSecretName`, which also sets
+`RACER_CREDENTIALS_SECRET_NAME` and the matching RBAC and admission policy.
+Dataplanes never receive or mount this Secret.
 They receive only the validated public-root/cache-key bundle through the control
 API. Every rotation publishes all three entries in one resource-version CAS.
 Only an authoritative postwrite reread can install serving trust.
+
+Secret get/list/watch/update/patch permissions name only the credentials Secret.
+The controller's Secret informer includes the matching `metadata.name` field
+selector required by RBAC for list/watch. It cannot read unrelated Secrets or the
+serving Secret through the API, including its `ca.key`; kubelet projects only the
+serving certificate, leaf key, and public CA bundle into the Pod. Secret creation
+is necessarily namespace-wide in RBAC, so the fail-closed admission policy must
+be installed before the RoleBinding and controller workload.
+
+`make racer-admission-envtest KUBEBUILDER_ASSETS=/path/to/envtest/assets` runs the
+real API-server admission and RBAC regressions with a five-minute command bound.
+CI provisions assets and includes this target in `make racer-envtest-ci`.
 
 The permanent credentials annotation on the version ConfigMap records
 `secretName/initialRootFingerprint`. Its CAS authorizes exactly one Secret Create

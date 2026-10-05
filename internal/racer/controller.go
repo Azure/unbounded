@@ -23,6 +23,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
@@ -220,8 +221,9 @@ func managerOptions(cfg Config, scheme *runtime.Scheme) ctrl.Options {
 		Metrics:                       metricsserver.Options{BindAddress: cfg.MetricsAddress},
 		HealthProbeBindAddress:        cfg.ProbeAddress,
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&corev1.Pod{}:       {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
-			&corev1.Secret{}:    {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
+			&corev1.Pod{}: {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
+			// Named Secret RBAC requires this selector on both LIST and WATCH.
+			&corev1.Secret{}:    {Namespaces: map[string]cache.Config{cfg.Namespace: {}}, Field: fields.OneTermEqualSelector("metadata.name", cfg.CredentialsSecretName)},
 			&corev1.ConfigMap{}: {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
 			&appsv1.DaemonSet{}: {Namespaces: map[string]cache.Config{cfg.Namespace: {}}},
 		}},

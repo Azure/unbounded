@@ -23,11 +23,26 @@ spec:
     spec:
       serviceAccountName: racer-controller
       securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
         # Kubelet needs an explicit UID to own the 0400 projected replication token.
         runAsUser: 65532
       containers:
         - name: controller
           image: {{ .ControllerImage | default "ghcr.io/azure/racer-controller:latest" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
           envFrom:
             - configMapRef:
                 name: racer-config

@@ -444,7 +444,7 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Provision envtest and run real API-server race tests
+      - name: Provision envtest and run API-server, runtime RBAC, and admission race tests
         run: make racer-envtest-ci
 
   # ---------- Orca Integration Tests ----------

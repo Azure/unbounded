@@ -716,18 +716,25 @@ racer-sdk-age: ## Run only SDK connection-age integration with a prebuilt Go fix
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
-	TMPDIR="$(CURDIR)/tmp/envtest-tools" GOBIN="$(CURDIR)/bin" $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
+	TMPDIR="$(CURDIR)/tmp/envtest-tools" GOBIN="$(CURDIR)/bin" timeout --signal=TERM --kill-after=10s 300s $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
 	mv bin/setup-envtest "$(SETUP_ENVTEST)"
 
 racer-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets and require Racer envtest
 	@mkdir -p tmp/racer-envtest
-	@assets=$$(TMPDIR="$(CURDIR)/tmp/racer-envtest" "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
+	@assets=$$(TMPDIR="$(CURDIR)/tmp/racer-envtest" timeout --signal=TERM --kill-after=10s 300s "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
 		$(MAKE) racer-envtest KUBEBUILDER_ASSETS="$$assets"
 
 racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
 	@mkdir -p tmp/racer-envtest
-	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" $(GOTEST) -race ./internal/racer -run '^TestEnvtestServer$$' -count=1 -v -timeout=3m
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/racer -run '^TestEnvtestServer$$' -count=1 -v -timeout=5m
+	$(MAKE) racer-admission-envtest KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)"
+
+.PHONY: racer-admission-envtest
+racer-admission-envtest: ## Verify deployed Racer RBAC and admission with a real API server
+	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
+	@mkdir -p tmp/racer-envtest
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/operator/components/racer -run '^TestEnvtestRuntime' -count=1 -v -timeout=5m
 
 racer-scale: ## Measure 100,000-member reconciliation and publication waiters (not HTTPS capacity)
 	@mkdir -p tmp/racer-scale
