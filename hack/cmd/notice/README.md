@@ -42,8 +42,22 @@ hack/cmd/notice/
     gomod/                 # Collector for go.mod direct deps; Go vanity-domain
                            # repo-base heuristics.
     npm/                   # Collector for frontend/package.json direct deps.
+    cargo/                 # Retained Cargo collector and tests; not registered.
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
+
+### Retained Cargo tooling
+
+The Cargo collector and its hermetic tests are retained in `internal/cargo/`,
+but the collector is not registered in `main.go`: no active Cargo manifest
+remains after removal of `cmd/unbounded-storage`. NOTICE generation and checks
+therefore use only the Go and npm collectors and do not require the removed crate
+or a Cargo registry cache.
+
+The retained implementation still targets `cmd/unbounded-storage` and the
+`unbounded-storage` root package in `Cargo.lock`. When a new crate is added,
+adjust that path and root-package configuration before registering `cargo.New()`
+in `collectors()`, and populate the Cargo registry source cache for that crate.
 
 ## Adding a new ecosystem
 
