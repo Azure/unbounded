@@ -772,7 +772,10 @@ impl MetadataService {
             .candidates
             .remaining_copy(&candidates, context, &operation, scope, budget)
             .await?
-            .ok_or_else(|| self.candidates.origin_miss_error(authority))?;
+            .ok_or_else(|| {
+                self.candidates
+                    .final_origin_miss(authority, &operation, scope, budget)
+            })?;
         match response.response() {
             PeerResponse::Metadata(metadata) => Ok(crate::origin::MetadataReply {
                 metadata: metadata.clone(),

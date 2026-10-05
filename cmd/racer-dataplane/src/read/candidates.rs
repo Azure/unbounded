@@ -24,6 +24,10 @@ use crate::telemetry::Failure;
 use crate::telemetry::Metrics;
 use crate::telemetry::Observer;
 use crate::telemetry::Stage;
+use crate::telemetry::{
+    CandidateAttempt, CandidateFinal, CandidateOperation, CandidateOutcome, CandidateSite,
+    CandidateTrail,
+};
 use crate::topology::Candidates;
 use crate::topology::Placement;
 use crate::topology::RouteBudget;
@@ -65,6 +69,7 @@ fn reserve_hedge_pages(
 }
 
 pub struct OriginAuthority {
+    diagnostic: CandidateTrail,
     membership: std::sync::Arc<crate::topology::Membership>,
     node: NodeId,
     object: ObjectId,
@@ -478,10 +483,69 @@ impl CandidatePolicy {
         operation: PeerOperation,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-        mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
+        validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
         retried: bool,
         continuation: HedgeContinuation,
     ) -> Operation<'a, CandidateResolution<T>> {
+        Box::pin(async move {
+            let mut trail = CandidateTrail {
+                hedge_history_unavailable: continuation.primary_consumed || continuation.stale,
+                ..Default::default()
+            };
+            let page = operation_identity(&operation).1.0;
+            let kind = match &operation {
+                PeerOperation::Page { .. } => CandidateOperation::Page,
+                PeerOperation::Bootstrap { .. } => CandidateOperation::Bootstrap,
+                PeerOperation::Metadata { .. } => CandidateOperation::Metadata,
+                PeerOperation::Subscribe { .. } => CandidateOperation::Subscribe,
+            };
+            let membership = candidates.membership.version.0;
+            let result = self
+                .resolve_epoch_traced(
+                    candidates,
+                    context,
+                    operation,
+                    scope,
+                    budget,
+                    validate,
+                    retried,
+                    continuation,
+                    &mut trail,
+                )
+                .await;
+            if let Err(error) = &result {
+                self.observer.candidate_final(CandidateFinal {
+                    failure: Failure::new(Stage::CandidateExhausted, *error)
+                        .request(scope)
+                        .detail(Detail::Budget {
+                            attempts: budget.remaining_attempts(),
+                            links: budget.remaining_links(),
+                        }),
+                    operation: kind,
+                    page,
+                    membership,
+                    trail,
+                });
+            }
+            result
+        })
+    }
+
+    fn resolve_epoch_traced<'a, 't, T: 'a>(
+        &'a self,
+        candidates: Candidates,
+        context: &'a OriginContext,
+        operation: PeerOperation,
+        scope: &'a RequestScope,
+        budget: &'t mut AcquisitionBudget,
+        mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
+        retried: bool,
+        continuation: HedgeContinuation,
+        trail: &'t mut CandidateTrail,
+    ) -> Operation<'t, CandidateResolution<T>>
+    where
+        'a: 't,
+    {
         Box::pin(async move {
             check_budget(scope, budget)?;
             let (object, page) = operation_identity(&operation);
@@ -493,7 +557,7 @@ impl CandidatePolicy {
                     .refresh_candidates(&candidates, object, page, scope, retried)
                     .await?;
                 return self
-                    .resolve_epoch(
+                    .resolve_epoch_traced(
                         next,
                         context,
                         operation,
@@ -505,6 +569,7 @@ impl CandidatePolicy {
                             bounded_routes: true,
                             ..Default::default()
                         },
+                        trail,
                     )
                     .await;
             }
@@ -560,6 +625,7 @@ impl CandidatePolicy {
                         // Never send an Acquire whose receiving coordinator cannot
                         // probe its predecessors and still exercise origin authority.
                         saw_transient = true;
+                        trail.site = CandidateSite::Funding;
                         break;
                     }
                     let mut child = budget.partition(attempts, links)?;
@@ -574,7 +640,7 @@ impl CandidatePolicy {
                 };
                 let request_budget = bounded.as_mut().unwrap_or(&mut *budget);
                 let response = self
-                    .request_mode(
+                    .request_traced(
                         &candidates.membership,
                         destination,
                         context,
@@ -588,6 +654,7 @@ impl CandidatePolicy {
                         } else {
                             RequestMode::SharedRoute
                         },
+                        Some((trail, index as u8)),
                     )
                     .await;
                 if let Some(bounded) = bounded {
@@ -602,7 +669,7 @@ impl CandidatePolicy {
                             // Preserve the original operation (including ETag),
                             // cancellation/deadline and already spent link/attempt credits.
                             return self
-                                .resolve_epoch(
+                                .resolve_epoch_traced(
                                     next,
                                     context,
                                     operation,
@@ -614,12 +681,15 @@ impl CandidatePolicy {
                                         bounded_routes: continuation.bounded_routes,
                                         ..Default::default()
                                     },
+                                    trail,
                                 )
                                 .await;
                         }
-                        match validated_copy(response, &operation, rank.is_none(), &mut validate)
-                            .await?
-                        {
+                        let validated =
+                            validated_copy(response, &operation, rank.is_none(), &mut validate)
+                                .await;
+                        note_validation(trail, &validated);
+                        match validated? {
                             Ok(copy) => return Ok(CandidateResolution::Copy(copy)),
                             Err(outcome) => {
                                 saw_version |= outcome == ProbeOutcome::VersionUnavailable;
@@ -655,6 +725,7 @@ impl CandidatePolicy {
             check_budget(scope, budget)?;
             if rank.is_some() {
                 Ok(CandidateResolution::Origin(OriginAuthority {
+                    diagnostic: trail.clone(),
                     membership: candidates.membership,
                     node: self.node.clone(),
                     object: object.clone(),
@@ -665,6 +736,9 @@ impl CandidatePolicy {
             } else if saw_version && !saw_transient {
                 Err(Error::VersionUnavailable)
             } else {
+                if !matches!(trail.site, CandidateSite::Funding) {
+                    trail.site = CandidateSite::Exhausted;
+                }
                 self.observer.record(
                     Failure::new(Stage::CandidateExhausted, Error::Unavailable)
                         .request(scope)
@@ -703,51 +777,75 @@ impl CandidatePolicy {
         mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
     ) -> Operation<'a, Option<T>> {
         Box::pin(async move {
-            check_budget(scope, budget)?;
-            let rank = candidates
-                .ordered
-                .iter()
-                .position(|node| node == &self.node)
-                .ok_or(Error::Unauthorized)?;
-            let mut transient = false;
-            for (index, destination) in candidates.ordered.iter().enumerate().skip(rank + 1) {
-                match self
-                    .request(
-                        &candidates.membership,
-                        destination,
-                        context,
-                        operation,
-                        FetchMode::CopyOnly,
-                        scope,
-                        budget,
-                        (candidates.ordered.len() - index) as u32,
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        match validated_copy(response, operation, false, &mut validate).await? {
-                            Ok(copy) => return Ok(Some(copy)),
-                            Err(
-                                ProbeOutcome::Unreachable
-                                | ProbeOutcome::Overloaded
-                                | ProbeOutcome::UnusableCopy,
-                            ) => transient = true,
-                            Err(_) => {}
+            let mut trail = CandidateTrail {
+                site: CandidateSite::RemainingCopy,
+                ..Default::default()
+            };
+            let result = async {
+                check_budget(scope, budget)?;
+                let rank = candidates
+                    .ordered
+                    .iter()
+                    .position(|node| node == &self.node)
+                    .ok_or(Error::Unauthorized)?;
+                let mut transient = false;
+                for (index, destination) in candidates.ordered.iter().enumerate().skip(rank + 1) {
+                    match self
+                        .request_traced(
+                            &candidates.membership,
+                            destination,
+                            context,
+                            operation,
+                            FetchMode::CopyOnly,
+                            scope,
+                            budget,
+                            (candidates.ordered.len() - index) as u32,
+                            RequestMode::SharedRoute,
+                            Some((&mut trail, index as u8)),
+                        )
+                        .await
+                    {
+                        Ok(response) => {
+                            let validated =
+                                validated_copy(response, operation, false, &mut validate).await;
+                            note_validation(&mut trail, &validated);
+                            match validated? {
+                                Ok(copy) => return Ok(Some(copy)),
+                                Err(
+                                    ProbeOutcome::Unreachable
+                                    | ProbeOutcome::Overloaded
+                                    | ProbeOutcome::UnusableCopy,
+                                ) => transient = true,
+                                Err(_) => {}
+                            }
                         }
+                        Err(Error::Unavailable | Error::Overloaded | Error::Io) => {
+                            transient = true;
+                            budget.note_route_failure();
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(Error::Unavailable | Error::Overloaded | Error::Io) => {
-                        transient = true;
-                        budget.note_route_failure();
-                    }
-                    Err(error) => return Err(error),
+                }
+                check_budget(scope, budget)?;
+                if transient {
+                    Err(Error::Unavailable)
+                } else {
+                    Ok(None)
                 }
             }
-            check_budget(scope, budget)?;
-            if transient {
-                Err(Error::Unavailable)
-            } else {
-                Ok(None)
+            .await;
+            if let Err(error) = &result {
+                trail.site = CandidateSite::RemainingCopy;
+                self.record_final(
+                    operation,
+                    candidates.membership.version.0,
+                    scope,
+                    budget,
+                    *error,
+                    trail,
+                );
             }
+            result
         })
     }
 
@@ -805,159 +903,254 @@ impl CandidatePolicy {
         remaining_opportunities: u32,
         request_mode: RequestMode,
     ) -> Result<VerifiedResponse> {
-        check_budget(scope, budget)?;
-        // Reserve the complete permitted route before sending. Lost responses cannot
-        // refund an unknown number of forwarded links. No retry gets fresh credits.
-        let links = budget.route_links();
-        if links == 0 {
-            return Err(Error::HopBudgetExhausted);
+        self.request_traced(
+            membership,
+            destination,
+            context,
+            operation,
+            mode,
+            scope,
+            budget,
+            remaining_opportunities,
+            request_mode,
+            None,
+        )
+        .await
+    }
+    async fn request_traced(
+        &self,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        destination: &NodeId,
+        context: &OriginContext,
+        operation: &PeerOperation,
+        mode: FetchMode,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        remaining_opportunities: u32,
+        request_mode: RequestMode,
+        trail: Option<(&mut CandidateTrail, u8)>,
+    ) -> Result<VerifiedResponse> {
+        let mut remote = [b'?'; 36];
+        if trail.is_some() && racer_identity::canonical_uuid(&destination.0) {
+            remote.copy_from_slice(destination.0.as_bytes());
         }
-        let now = uring_runtime::environment::now();
-        let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
-        // Share bounds idle fallback. A separate nonrenewable local cap bounds
-        // every exchange, even when no alternative is affordable.
-        // Sign the original hard ceiling before sending; it never renews.
-        let deadline = now + (overall - now) / remaining_opportunities.max(1);
-        let attempt_end = now
-            + self
-                .attempt_timeout
-                .min(if matches!(request_mode, RequestMode::DirectHedge) {
-                    (overall - now) / 3
-                } else {
-                    overall - now
-                });
-        // The local exchange may time out before the signed contract. Shortening
-        // the latter per attempt would make a later update renew provider authority.
-        let signed_deadline = overall;
-        // A clone shares cancellation: timing it out would cancel the caller too.
-        let mut attempt_scope = RequestScope::new(scope.request, overall)?;
-        attempt_scope.set_candidate_idle((deadline - now).min(attempt_end - now))?;
-        attempt_scope.set_candidate_total(attempt_end)?;
-        attempt_scope.body_deadlines = Some((overall, deadline));
-        let attempts = if matches!(mode, FetchMode::Acquire) {
-            // Reserve remote acquisition credits from the same original call.
-            // Without a signed response receipt unused remote credits stay spent.
-            let credits = if matches!(request_mode, RequestMode::FundedRoute) {
-                budget.remaining_attempts()
+        let mut facts = CandidateAttempt {
+            destination: remote,
+            membership: membership.version.0,
+            rank: trail.as_ref().map_or(u8::MAX, |(_, rank)| *rank),
+            acquire: matches!(mode, FetchMode::Acquire),
+            attempt: None,
+            site: CandidateSite::Prepare,
+            raw: None,
+            effective: None,
+            stop: None,
+            attempts: budget.remaining_attempts(),
+            links: budget.remaining_links(),
+            overall: if trail.is_some() {
+                crate::telemetry::timestamp(budget.deadline())
             } else {
-                budget
-                    .remaining_attempts()
-                    .div_ceil(remaining_opportunities.max(1))
-            };
-            budget.partition(credits, 0)?.remaining_attempts()
-        } else {
-            0
-        };
-        let mut complete_by = attempt_end;
-        if remaining_opportunities > 1
-            && budget.remaining_attempts() > 0
-            && budget.remaining_links() >= crate::topology::FAILURE_LINKS
-        {
-            // Reserve at most half the original post-share interval for fallback,
-            // including subscription/fixed-page fallback. The local cap may be tighter.
-            let reserve = (deadline - now).min((overall - deadline) / 2);
-            if !reserve.is_zero() {
-                complete_by = complete_by.min(overall - reserve);
-            }
-        }
-        // Observe actual known-length body progress, not checkout/head latency.
-        // Even a last candidate should not occupy the whole budget if its measured
-        // rate cannot finish in time. Healthy bodies may exceed the idle share.
-        let observation = (deadline - now)
-            .min((attempt_end - now) / 3)
-            .max(std::time::Duration::from_nanos(1));
-        attempt_scope.set_candidate_body_budget(observation, complete_by)?;
-        let mut bytes = [0; 16];
-        uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
-        let attempt = AttemptId(bytes);
-        let credentials = &self.credentials;
-        // Sealing is synchronous, but can still use up a very short time share.
-        let mut signed_scope = attempt_scope.clone();
-        signed_scope.deadline.0 = signed_deadline;
-        let origin = credentials.seal(context, attempt, &signed_scope);
-        check_budget(scope, budget)?;
-        let origin = origin.map_err(|error| match error {
-            Error::DeadlineExceeded => Error::Unavailable,
-            error => error,
-        })?;
-        let request = PeerRequest {
-            operation: copy_operation(operation, mode),
-            origin,
-            route: RouteBudget {
-                membership: membership.version,
-                request: scope.request,
-                attempt,
-                destination: destination.clone(),
-                visited: vec![self.node.clone()],
-                remaining_links: links,
-                remaining_attempts: attempts,
-                deadline: Deadline(signed_deadline),
+                0
             },
+            share: 0,
+            cap: 0,
         };
-        let registration = scope.cancellation.subscribe()?;
-        let mut exchange = if matches!(request_mode, RequestMode::DirectHedge) {
-            self.peers
-                .request_direct(request, membership.clone(), &attempt_scope)
-        } else {
-            self.peers
-                .request(request, membership.clone(), &attempt_scope)
-        };
-        let mut stopped = None;
-        let response = std::future::poll_fn(|cx| {
-            registration.register(cx.waker());
-            if stopped.is_none() {
-                stopped = check_budget(scope, budget)
-                    .and_then(|()| attempt_scope.check())
-                    .err();
-                if stopped.is_some() {
-                    let _ = attempt_scope.cancel();
-                }
+        let result = async {
+            check_budget(scope, budget)?;
+            // Reserve the complete permitted route before sending. Lost responses cannot
+            // refund an unknown number of forwarded links. No retry gets fresh credits.
+            let links = budget.route_links();
+            if links == 0 {
+                return Err(Error::HopBudgetExhausted);
             }
-            // Keep polling after cancellation: a timeout is not a completion
-            // fence and must not release accepted I/O before the peer returns.
-            exchange.as_mut().poll(cx)
-        })
-        .await;
-        match &response {
-            Err(error) => self.observer.record(
-                Failure::new(Stage::CandidateExchange, *error)
-                    .request(scope)
-                    .attempt(attempt)
-                    .detail(Detail::Budget {
-                        attempts: budget.remaining_attempts(),
-                        links: budget.remaining_links(),
-                    }),
-            ),
-            Ok(response) => {
-                let error = match response.response() {
-                    PeerResponse::Overloaded => Some(Error::Overloaded),
-                    PeerResponse::Unavailable => Some(Error::Unavailable),
-                    PeerResponse::VersionUnavailable => Some(Error::VersionUnavailable),
-                    PeerResponse::StaleMembership => Some(Error::IncompatibleMembership),
-                    _ => None,
+            let now = uring_runtime::environment::now();
+            let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
+            // Share bounds idle fallback. A separate nonrenewable local cap bounds
+            // every exchange, even when no alternative is affordable.
+            // Sign the original hard ceiling before sending; it never renews.
+            let deadline = now + (overall - now) / remaining_opportunities.max(1);
+            let attempt_end = now
+                + self
+                    .attempt_timeout
+                    .min(if matches!(request_mode, RequestMode::DirectHedge) {
+                        (overall - now) / 3
+                    } else {
+                        overall - now
+                    });
+            // The local exchange may time out before the signed contract. Shortening
+            // the latter per attempt would make a later update renew provider authority.
+            let signed_deadline = overall;
+            if trail.is_some() {
+                facts.overall = crate::telemetry::timestamp(overall);
+                facts.share = crate::telemetry::timestamp(deadline);
+                facts.cap = crate::telemetry::timestamp(attempt_end);
+            }
+            // A clone shares cancellation: timing it out would cancel the caller too.
+            let mut attempt_scope = RequestScope::new(scope.request, overall)?;
+            attempt_scope.set_candidate_idle((deadline - now).min(attempt_end - now))?;
+            attempt_scope.set_candidate_total(attempt_end)?;
+            attempt_scope.body_deadlines = Some((overall, deadline));
+            let attempts = if matches!(mode, FetchMode::Acquire) {
+                // Reserve remote acquisition credits from the same original call.
+                // Without a signed response receipt unused remote credits stay spent.
+                let credits = if matches!(request_mode, RequestMode::FundedRoute) {
+                    budget.remaining_attempts()
+                } else {
+                    budget
+                        .remaining_attempts()
+                        .div_ceil(remaining_opportunities.max(1))
                 };
-                if let Some(error) = error {
-                    self.observer.record(
-                        Failure::new(Stage::CandidateResponse, error)
-                            .request(scope)
-                            .attempt(attempt)
-                            .detail(Detail::Budget {
-                                attempts: budget.remaining_attempts(),
-                                links: budget.remaining_links(),
-                            }),
-                    );
+                budget.partition(credits, 0)?.remaining_attempts()
+            } else {
+                0
+            };
+            let mut complete_by = attempt_end;
+            if remaining_opportunities > 1
+                && budget.remaining_attempts() > 0
+                && budget.remaining_links() >= crate::topology::FAILURE_LINKS
+            {
+                // Reserve at most half the original post-share interval for fallback,
+                // including subscription/fixed-page fallback. The local cap may be tighter.
+                let reserve = (deadline - now).min((overall - deadline) / 2);
+                if !reserve.is_zero() {
+                    complete_by = complete_by.min(overall - reserve);
                 }
             }
+            // Observe actual known-length body progress, not checkout/head latency.
+            // Even a last candidate should not occupy the whole budget if its measured
+            // rate cannot finish in time. Healthy bodies may exceed the idle share.
+            let observation = (deadline - now)
+                .min((attempt_end - now) / 3)
+                .max(std::time::Duration::from_nanos(1));
+            attempt_scope.set_candidate_body_budget(observation, complete_by)?;
+            let mut bytes = [0; 16];
+            uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
+            let attempt = AttemptId(bytes);
+            facts.attempt = Some(attempt);
+            let credentials = &self.credentials;
+            // Sealing is synchronous, but can still use up a very short time share.
+            let mut signed_scope = attempt_scope.clone();
+            signed_scope.deadline.0 = signed_deadline;
+            let origin = credentials.seal(context, attempt, &signed_scope);
+            check_budget(scope, budget)?;
+            let origin = origin.map_err(|error| match error {
+                Error::DeadlineExceeded => Error::Unavailable,
+                error => error,
+            })?;
+            let request = PeerRequest {
+                operation: copy_operation(operation, mode),
+                origin,
+                route: RouteBudget {
+                    membership: membership.version,
+                    request: scope.request,
+                    attempt,
+                    destination: destination.clone(),
+                    visited: vec![self.node.clone()],
+                    remaining_links: links,
+                    remaining_attempts: attempts,
+                    deadline: Deadline(signed_deadline),
+                },
+            };
+            let registration = scope.cancellation.subscribe()?;
+            let mut exchange = if matches!(request_mode, RequestMode::DirectHedge) {
+                self.peers
+                    .request_direct(request, membership.clone(), &attempt_scope)
+            } else {
+                self.peers
+                    .request(request, membership.clone(), &attempt_scope)
+            };
+            let mut stopped = None;
+            facts.site = CandidateSite::Exchange;
+            let response = std::future::poll_fn(|cx| {
+                registration.register(cx.waker());
+                if stopped.is_none() {
+                    stopped = check_budget(scope, budget)
+                        .and_then(|()| attempt_scope.check())
+                        .err();
+                    if stopped.is_some() {
+                        let _ = attempt_scope.cancel();
+                    }
+                }
+                // Keep polling after cancellation: a timeout is not a completion
+                // fence and must not release accepted I/O before the peer returns.
+                exchange.as_mut().poll(cx)
+            })
+            .await;
+            facts.raw = Some(match &response {
+                Err(error) => CandidateOutcome::Error(*error),
+                Ok(response) => match response.response() {
+                    PeerResponse::Miss => CandidateOutcome::Miss,
+                    PeerResponse::Unavailable => {
+                        CandidateOutcome::ResponseError(Error::Unavailable)
+                    }
+                    PeerResponse::Overloaded => CandidateOutcome::ResponseError(Error::Overloaded),
+                    PeerResponse::VersionUnavailable => {
+                        CandidateOutcome::ResponseError(Error::VersionUnavailable)
+                    }
+                    PeerResponse::StaleMembership => {
+                        CandidateOutcome::ResponseError(Error::IncompatibleMembership)
+                    }
+                    PeerResponse::OriginRejected => {
+                        CandidateOutcome::ResponseError(Error::OriginRejected)
+                    }
+                    PeerResponse::OriginForbidden => {
+                        CandidateOutcome::ResponseError(Error::OriginForbidden)
+                    }
+                    PeerResponse::NotFound => CandidateOutcome::ResponseError(Error::NotFound),
+                    _ => CandidateOutcome::Success,
+                },
+            });
+            match &response {
+                Err(error) => self.observer.record(
+                    Failure::new(Stage::CandidateExchange, *error)
+                        .request(scope)
+                        .attempt(attempt)
+                        .detail(Detail::Budget {
+                            attempts: budget.remaining_attempts(),
+                            links: budget.remaining_links(),
+                        }),
+                ),
+                Ok(response) => {
+                    let error = match response.response() {
+                        PeerResponse::Overloaded => Some(Error::Overloaded),
+                        PeerResponse::Unavailable => Some(Error::Unavailable),
+                        PeerResponse::VersionUnavailable => Some(Error::VersionUnavailable),
+                        PeerResponse::StaleMembership => Some(Error::IncompatibleMembership),
+                        _ => None,
+                    };
+                    if let Some(error) = error {
+                        self.observer.record(
+                            Failure::new(Stage::CandidateResponse, error)
+                                .request(scope)
+                                .attempt(attempt)
+                                .detail(Detail::Budget {
+                                    attempts: budget.remaining_attempts(),
+                                    links: budget.remaining_links(),
+                                }),
+                        );
+                    }
+                }
+            }
+            check_budget(scope, budget)?;
+            let stop = stopped.or_else(|| attempt_scope.check().err());
+            facts.stop = stop;
+            match stop {
+                Some(Error::DeadlineExceeded) => Err(Error::Unavailable),
+                Some(error) => Err(error),
+                None => match response {
+                    Err(Error::DeadlineExceeded) => Err(Error::Unavailable),
+                    result => result,
+                },
+            }
         }
-        check_budget(scope, budget)?;
-        match stopped.or_else(|| attempt_scope.check().err()) {
-            Some(Error::DeadlineExceeded) => Err(Error::Unavailable),
-            Some(error) => Err(error),
-            None => match response {
-                Err(Error::DeadlineExceeded) => Err(Error::Unavailable),
-                result => result,
-            },
+        .await;
+        facts.effective = result.as_ref().err().copied();
+        facts.attempts = budget.remaining_attempts();
+        facts.links = budget.remaining_links();
+        if let Some((trail, _)) = trail {
+            trail.site = facts.site;
+            trail.recent.push(facts);
         }
+        result
     }
 
     pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {
@@ -972,6 +1165,116 @@ impl CandidatePolicy {
             Error::VersionUnavailable
         }
     }
+    pub(super) fn final_origin_miss(
+        &self,
+        authority: &OriginAuthority,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &AcquisitionBudget,
+    ) -> Error {
+        let error = self.origin_miss_error(authority);
+        let mut trail = authority.diagnostic.clone();
+        trail.site = CandidateSite::OriginMiss;
+        self.record_final(
+            operation,
+            authority.membership.version.0,
+            scope,
+            budget,
+            error,
+            trail,
+        );
+        error
+    }
+    fn record_final(
+        &self,
+        operation: &PeerOperation,
+        membership: u64,
+        scope: &RequestScope,
+        budget: &AcquisitionBudget,
+        error: Error,
+        trail: CandidateTrail,
+    ) {
+        let kind = match operation {
+            PeerOperation::Page { .. } => CandidateOperation::Page,
+            PeerOperation::Bootstrap { .. } => CandidateOperation::Bootstrap,
+            PeerOperation::Metadata { .. } => CandidateOperation::Metadata,
+            PeerOperation::Subscribe { .. } => CandidateOperation::Subscribe,
+        };
+        self.observer.candidate_final(CandidateFinal {
+            failure: Failure::new(Stage::CandidateExhausted, error)
+                .request(scope)
+                .detail(Detail::Budget {
+                    attempts: budget.remaining_attempts(),
+                    links: budget.remaining_links(),
+                }),
+            operation: kind,
+            page: operation_identity(operation).1.0,
+            membership,
+            trail,
+        });
+    }
+}
+
+fn note_validation<T>(
+    trail: &mut CandidateTrail,
+    result: &Result<std::result::Result<T, ProbeOutcome>>,
+) {
+    let outcome = match result {
+        Err(error) => CandidateOutcome::Error(*error),
+        Ok(Err(ProbeOutcome::UnusableCopy)) => CandidateOutcome::UnusableCopy,
+        _ => return,
+    };
+    if let Some((_, mut facts)) = trail.recent.iter().last() {
+        facts.site = CandidateSite::Validation;
+        facts.raw = Some(outcome);
+        facts.effective = result.as_ref().err().copied();
+        trail.recent.push(facts);
+    }
+    trail.site = CandidateSite::Validation;
+}
+
+#[cfg(test)]
+#[test]
+fn candidate_final_validation_tail_preserves_identity_and_omissions() {
+    let mut trail = CandidateTrail::default();
+    let facts = CandidateAttempt {
+        destination: [b'f'; 36],
+        membership: 9,
+        rank: 2,
+        acquire: true,
+        attempt: Some(AttemptId([7; 16])),
+        site: CandidateSite::Exchange,
+        raw: Some(CandidateOutcome::Success),
+        effective: None,
+        stop: None,
+        attempts: 3,
+        links: 4,
+        overall: 100,
+        share: 50,
+        cap: 75,
+    };
+    trail.recent.push(facts);
+    note_validation::<()>(&mut trail, &Ok(Ok(())));
+    assert_eq!(trail.recent.total(), 1);
+    note_validation::<()>(&mut trail, &Ok(Err(ProbeOutcome::UnusableCopy)));
+    let (_, unusable) = trail.recent.iter().last().unwrap();
+    assert!(matches!(unusable.raw, Some(CandidateOutcome::UnusableCopy)));
+    assert!(unusable.effective.is_none());
+    assert_eq!(unusable.attempt, facts.attempt);
+    assert_eq!(unusable.destination, facts.destination);
+    note_validation::<()>(&mut trail, &Err(Error::Unauthorized));
+    let (_, rejected) = trail.recent.iter().last().unwrap();
+    assert!(matches!(
+        rejected.raw,
+        Some(CandidateOutcome::Error(Error::Unauthorized))
+    ));
+    assert_eq!(rejected.effective, Some(Error::Unauthorized));
+    assert_eq!((rejected.attempts, rejected.links), (3, 4));
+    for _ in 0..3 {
+        trail.recent.push(facts);
+    }
+    assert_eq!(trail.recent.len(), 4);
+    assert_eq!(trail.recent.total() - trail.recent.len() as u64, 2);
 }
 
 fn check_budget(scope: &RequestScope, budget: &AcquisitionBudget) -> Result<()> {
@@ -2004,6 +2307,7 @@ pub(super) mod tests {
         });
         let policy = policy(ranked.ordered[1].clone(), peers);
         let mut authority = OriginAuthority {
+            diagnostic: CandidateTrail::default(),
             membership,
             node: ranked.ordered[1].clone(),
             object: object(),

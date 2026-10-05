@@ -1366,7 +1366,7 @@ mod timeouts {
         }
     }
 
-    fn poll<T>(future: Pin<&mut impl Future<Output = T>>) -> Poll<T> {
+    fn poll<T>(future: Pin<&mut (impl Future<Output = T> + ?Sized)>) -> Poll<T> {
         future.poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
 
@@ -1587,6 +1587,176 @@ mod timeouts {
         assert_eq!(f.budget.remaining_links(), 20);
         assert_eq!(f.budget.remaining_attempts(), 0);
         assert_eq!(f.budget.deadline(), original);
+    }
+
+    #[test]
+    fn candidate_final_early_credits_exhaustion_and_recovered_fallback() {
+        for (credits, stalled, late, fails) in [(0, 0, false, true), (16, 1, true, false)] {
+            let clock = uring_runtime::environment::SimulationClock::new(198);
+            let _env = clock.environment(0).enter();
+            let mut f = Fixture::new(None, stalled, late).bounded(198, 60, 24);
+            f.budget = AcquisitionBudget::new(f.scope.deadline.0, credits, 24);
+            let failures = crate::telemetry::Failures::default();
+            f.policy = f
+                .policy
+                .with_observer(failures.observer(crate::model::WorkerId(4)))
+                .with_attempt_timeout(Duration::from_secs(1));
+            let operation = f.operation();
+            let mut resolve = f.policy.resolve_with_budget(
+                f.candidates,
+                &f.context,
+                operation,
+                &f.scope,
+                &mut f.budget,
+            );
+            if stalled != 0 {
+                assert!(poll(resolve.as_mut()).is_pending());
+                clock.advance(Duration::from_secs(2));
+            }
+            let Poll::Ready(result) = poll(resolve.as_mut()) else {
+                panic!("bounded resolution")
+            };
+            assert_eq!(result.is_err(), fails);
+            drop(resolve);
+            let mut text = String::new();
+            failures.write_candidate_final(&mut text).unwrap();
+            if fails {
+                assert!(matches!(result, Err(Error::Unavailable)));
+                assert!(text.contains("total=1 retained=1"), "{text}");
+                assert!(text.contains("site=Exhausted"), "{text}");
+                assert!(
+                    text.contains("attempt=none site=Prepare raw=None effective=Some(Unavailable)"),
+                    "{text}"
+                );
+                assert!(f.peers.calls.borrow().is_empty());
+                assert_eq!(f.budget.remaining_links(), 24);
+            } else {
+                assert!(text.contains("total=0 retained=0"), "{text}");
+                assert_eq!(f.peers.calls.borrow().len(), 2);
+                assert_eq!(f.budget.remaining_links(), 12);
+            }
+            assert_eq!(f.scope.check(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn candidate_final_preserves_late_success_and_effective_deadline_error() {
+        let clock = uring_runtime::environment::SimulationClock::new(199);
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(None, 3, true).bounded(199, 60, 24);
+        let failures = crate::telemetry::Failures::default();
+        f.policy = f
+            .policy
+            .with_observer(failures.observer(crate::model::WorkerId(4)))
+            .with_attempt_timeout(Duration::from_secs(1));
+        let operation = f.operation();
+        let mut resolve = f.policy.resolve_with_budget(
+            f.candidates,
+            &f.context,
+            operation,
+            &f.scope,
+            &mut f.budget,
+        );
+        for _ in 0..3 {
+            assert!(poll(resolve.as_mut()).is_pending());
+            clock.advance(Duration::from_secs(2));
+        }
+        assert!(matches!(
+            poll(resolve.as_mut()),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        drop(resolve);
+        let mut text = String::new();
+        failures.write_candidate_final(&mut text).unwrap();
+        assert!(text.contains("total=1 retained=1"), "{text}");
+        assert_eq!(
+            text.matches(
+                "raw=Some(Success) effective=Some(Unavailable) stop=Some(DeadlineExceeded)"
+            )
+            .count(),
+            3,
+            "{text}"
+        );
+        assert_eq!(f.budget.remaining_attempts(), 0);
+        assert_eq!(f.budget.remaining_links(), 4);
+        assert_eq!(f.scope.check(), Ok(()));
+    }
+
+    #[test]
+    fn candidate_final_remaining_copy_and_origin_miss_only_at_final_boundary() {
+        let clock = uring_runtime::environment::SimulationClock::new(200);
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(Some(1), 1, true).bounded(200, 60, 24);
+        let failures = crate::telemetry::Failures::default();
+        f.policy = f
+            .policy
+            .with_observer(failures.observer(crate::model::WorkerId(4)))
+            .with_attempt_timeout(Duration::from_secs(1));
+        let operation = PeerOperation::Page {
+            page: crate::model::PageId {
+                version: ObjectVersion {
+                    object: f.context.object.clone(),
+                    etag: StrongEtag::test_value("secret-etag"),
+                },
+                number: PageNumber(0),
+            },
+            mode: FetchMode::Acquire,
+        };
+        let candidates = Candidates {
+            membership: f.candidates.membership.clone(),
+            ordered: f.candidates.ordered.clone(),
+        };
+        let mut resolve = f.policy.resolve_with_budget(
+            candidates,
+            &f.context,
+            match &operation {
+                PeerOperation::Page { page, .. } => PeerOperation::Page {
+                    page: page.clone(),
+                    mode: FetchMode::Acquire,
+                },
+                _ => unreachable!(),
+            },
+            &f.scope,
+            &mut f.budget,
+        );
+        assert!(poll(resolve.as_mut()).is_pending());
+        clock.advance(Duration::from_secs(2));
+        let Poll::Ready(Ok(CandidateResolution::Origin(authority))) = poll(resolve.as_mut()) else {
+            panic!("origin authority")
+        };
+        drop(resolve);
+        let mut text = String::new();
+        failures.write_candidate_final(&mut text).unwrap();
+        assert!(text.contains("total=0 retained=0"));
+        assert_eq!(f.policy.origin_miss_error(&authority), Error::Unavailable);
+        assert_eq!(
+            f.policy
+                .final_origin_miss(&authority, &operation, &f.scope, &f.budget),
+            Error::Unavailable
+        );
+        text.clear();
+        failures.write_candidate_final(&mut text).unwrap();
+        assert!(text.contains("site=OriginMiss"), "{text}");
+        assert!(text.contains("stop=Some(DeadlineExceeded)"), "{text}");
+        assert!(!text.contains("secret-etag"));
+        f.budget = AcquisitionBudget::new(f.scope.deadline.0, 0, 24);
+        let mut remaining = f.policy.remaining_copy(
+            &f.candidates,
+            &f.context,
+            &operation,
+            &f.scope,
+            &mut f.budget,
+        );
+        assert!(matches!(
+            poll(remaining.as_mut()),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        drop(remaining);
+        text.clear();
+        failures.write_candidate_final(&mut text).unwrap();
+        assert!(text.contains("total=2 retained=2"), "{text}");
+        assert!(text.contains("site=RemainingCopy"), "{text}");
+        assert_eq!(f.budget.remaining_links(), 24);
     }
 
     #[test]

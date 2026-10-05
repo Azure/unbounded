@@ -238,7 +238,8 @@ fn get(
         | "/debug/aead"
         | "/debug/send-crc"
         | "/debug/terminal"
-        | "/debug/admission-final" => (Response::Text, "", Event::DiagnosticFailures),
+        | "/debug/admission-final"
+        | "/debug/candidate-final" => (Response::Text, "", Event::DiagnosticFailures),
         _ => return Ok(Response::NotFound),
     };
     telemetry.metrics.record(event, 1);
@@ -259,6 +260,8 @@ fn get(
         telemetry.send_crc.write(&mut output)?;
     } else if path == "/debug/aead" {
         telemetry.failures.write_aead(&mut output)?;
+    } else if path == "/debug/candidate-final" {
+        telemetry.failures.write_candidate_final(&mut output)?;
     } else if path == "/debug/terminal" {
         telemetry.failures.write_protected(false, &mut output)?;
     } else if path == "/debug/admission-final" {
@@ -786,7 +789,96 @@ pub struct Failures(
     Arc<Mutex<AeadRing>>,
     Arc<Mutex<Ring<ProtectedFailure, 64>>>,
     Arc<Mutex<Ring<ProtectedFailure, 64>>>,
+    Arc<Mutex<Ring<(WorkerId, CandidateFinal), 16>>>,
 );
+
+/// Operation-local recent facts, not a client outcome or a transport diagnosis.
+/// Resolve and remaining-copy failures are recorded only after fallback ends.
+/// Origin-miss records retain predecessor events, not later copy-miss events.
+/// Standalone subscription attempts and errors returned directly by hedging are
+/// outside coverage. A resolution after hedging marks its missing prior history.
+/// Four recent events travel with each final record; validation can add a second
+/// event for one attempt. No global ring lookup is needed to reconstruct this tail.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CandidateSite {
+    Resolve,
+    Prepare,
+    Exchange,
+    Funding,
+    Exhausted,
+    Validation,
+    RemainingCopy,
+    OriginMiss,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CandidateOperation {
+    Page,
+    Bootstrap,
+    Metadata,
+    Subscribe,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum CandidateOutcome {
+    Success,
+    Miss,
+    Error(Error),
+    ResponseError(Error),
+    UnusableCopy,
+}
+impl std::fmt::Debug for CandidateOutcome {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success => out.write_str("Success"),
+            Self::Miss => out.write_str("Miss"),
+            Self::Error(error) => out.debug_tuple("Error").field(error).finish(),
+            Self::ResponseError(error) => out.debug_tuple("ResponseError").field(error).finish(),
+            Self::UnusableCopy => out.write_str("UnusableCopy"),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CandidateAttempt {
+    // Ranked destination identity, not necessarily the immediate TCP peer.
+    pub destination: [u8; 36],
+    pub membership: u64,
+    pub rank: u8,
+    pub acquire: bool,
+    pub attempt: Option<AttemptId>,
+    pub site: CandidateSite,
+    pub raw: Option<CandidateOutcome>,
+    pub effective: Option<Error>,
+    // Observed local stop, not a classification of idle versus ETA versus total cap.
+    pub stop: Option<Error>,
+    pub attempts: u32,
+    pub links: u8,
+    pub overall: u64,
+    pub share: u64,
+    pub cap: u64,
+}
+#[derive(Clone)]
+pub(crate) struct CandidateTrail {
+    pub site: CandidateSite,
+    pub hedge_history_unavailable: bool,
+    pub recent: Ring<CandidateAttempt, 4>,
+}
+impl Default for CandidateTrail {
+    fn default() -> Self {
+        Self {
+            site: CandidateSite::Resolve,
+            hedge_history_unavailable: false,
+            recent: Ring::default(),
+        }
+    }
+}
+#[derive(Clone)]
+pub(crate) struct CandidateFinal {
+    pub failure: Failure,
+    pub operation: CandidateOperation,
+    pub page: u64,
+    pub membership: u64,
+    // Membership above is the initial operation version; events carry their own.
+    pub trail: CandidateTrail,
+}
 
 /// Fixed call sites, never user input or identifier labels. Admission records
 /// describe a failed Fill operation, not necessarily the final client outcome.
@@ -814,6 +906,74 @@ struct ProtectedFailure {
 #[derive(Clone, Default)]
 pub struct Observer(Option<(Failures, WorkerId)>);
 impl Failures {
+    pub(crate) fn write_candidate_final(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        let snapshot = self.4.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        writeln!(
+            out,
+            "schema_version=1 total={} retained={} overwritten={} capacity=16 coverage=candidate_operation_final operations=resolve,remaining_copy,origin_miss excluded=standalone_subscribe,hedge_errors origin_miss_trail=predecessors_only trail_capacity=4 trail_unit=events",
+            snapshot.total(),
+            snapshot.len(),
+            snapshot.total().saturating_sub(snapshot.len() as u64)
+        )?;
+        for (sequence, (worker, record)) in snapshot.iter_refs() {
+            let f = record.failure;
+            write!(
+                out,
+                "sequence={sequence} worker={} unix_millis={} request=",
+                worker.0, f.unix_millis
+            )?;
+            if let Some(request) = f.request {
+                hex(out, &request.0)?;
+            } else {
+                write!(out, "none")?;
+            }
+            writeln!(
+                out,
+                " operation={:?} page={} membership={} site={:?} error={:?} budget={:?} hedge_history_unavailable={} omitted={}",
+                record.operation,
+                record.page,
+                record.membership,
+                record.trail.site,
+                f.error,
+                f.detail,
+                record.trail.hedge_history_unavailable,
+                record
+                    .trail
+                    .recent
+                    .total()
+                    .saturating_sub(record.trail.recent.len() as u64)
+            )?;
+            for (index, a) in record.trail.recent.iter() {
+                write!(
+                    out,
+                    " candidate={index} destination={} membership={} rank={} acquire={} attempt=",
+                    std::str::from_utf8(&a.destination).unwrap_or("unknown"),
+                    a.membership,
+                    a.rank,
+                    a.acquire
+                )?;
+                if let Some(attempt) = a.attempt {
+                    hex(out, &attempt.0)?;
+                } else {
+                    write!(out, "none")?;
+                }
+                writeln!(
+                    out,
+                    " site={:?} raw={:?} effective={:?} stop={:?} attempts={} links={} overall={} share={} cap={}",
+                    a.site,
+                    a.raw,
+                    a.effective,
+                    a.stop,
+                    a.attempts,
+                    a.links,
+                    a.overall,
+                    a.share,
+                    a.cap
+                )?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn write_protected(
         &self,
         admission: bool,
@@ -980,6 +1140,15 @@ impl Failures {
     }
 }
 impl Observer {
+    pub(crate) fn candidate_final(&self, record: CandidateFinal) {
+        if let Some((failures, worker)) = &self.0 {
+            failures
+                .4
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((*worker, record));
+        }
+    }
     pub(crate) fn record_aead(&self, id: crate::security::CryptoId, failure: AeadFailure) {
         let Some((failures, _)) = &self.0 else {
             return;
@@ -1046,6 +1215,91 @@ impl Observer {
 #[cfg(test)]
 mod protected_failure_tests {
     use super::*;
+    #[test]
+    fn candidate_final_retention_is_independent_bounded_and_nonconsuming() {
+        let telemetry = Telemetry::default();
+        let observer = telemetry.failures.observer(WorkerId(u16::MAX));
+        let mut trail = CandidateTrail::default();
+        for _ in 0..6 {
+            trail.recent.push(CandidateAttempt {
+                destination: [b'f'; 36],
+                membership: u64::MAX,
+                rank: u8::MAX,
+                acquire: true,
+                attempt: Some(AttemptId([255; 16])),
+                site: CandidateSite::Exchange,
+                raw: Some(CandidateOutcome::Error(
+                    Error::UnsatisfiableRangeWithLength(u64::MAX),
+                )),
+                effective: Some(Error::UnsatisfiableRangeWithLength(u64::MAX)),
+                stop: Some(Error::UnsatisfiableRangeWithLength(u64::MAX)),
+                attempts: u32::MAX,
+                links: u8::MAX,
+                overall: u64::MAX,
+                share: u64::MAX,
+                cap: u64::MAX,
+            });
+        }
+        let mut failure =
+            Failure::new(Stage::CandidateExhausted, Error::Unavailable).detail(Detail::Budget {
+                attempts: u32::MAX,
+                links: u8::MAX,
+            });
+        failure.request = Some(RequestId([255; 16]));
+        failure.unix_millis = u64::MAX;
+        for _ in 0..17 {
+            observer.candidate_final(CandidateFinal {
+                failure,
+                operation: CandidateOperation::Bootstrap,
+                page: u64::MAX,
+                membership: u64::MAX,
+                trail: trail.clone(),
+            });
+        }
+        observer.record(Failure::new(Stage::NextSlice, Error::Unavailable));
+        for _ in 0..4096 {
+            observer.record(Failure::new(Stage::Admission, Error::Overloaded));
+            observer.record(Failure::new(Stage::CandidateExchange, Error::Io));
+        }
+        struct Output<'a> {
+            failures: &'a Failures,
+            text: String,
+            fail: bool,
+        }
+        impl std::fmt::Write for Output<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                assert!(self.failures.4.try_lock().is_ok());
+                if self.fail {
+                    return Err(std::fmt::Error);
+                }
+                self.text.push_str(text);
+                Ok(())
+            }
+        }
+        let mut out = Output {
+            failures: &telemetry.failures,
+            text: String::new(),
+            fail: true,
+        };
+        assert!(get(&telemetry, "/debug/candidate-final", true, &mut out).is_err());
+        out.fail = false;
+        get(&telemetry, "/debug/candidate-final", true, &mut out).unwrap();
+        assert!(
+            out.text
+                .contains("total=17 retained=16 overwritten=1 capacity=16")
+        );
+        assert!(out.text.contains("coverage=candidate_operation_final"));
+        assert_eq!(out.text.matches(" omitted=2").count(), 16);
+        assert_eq!(out.text.matches(" candidate=").count(), 64);
+        assert!(out.text.len() + 512 < MAX_RESPONSE_BYTES);
+        assert!(!out.text.contains("Admission"));
+        let mut terminal = String::new();
+        telemetry
+            .failures
+            .write_protected(false, &mut terminal)
+            .unwrap();
+        assert!(terminal.contains("total=1 retained=1 overwritten=0"));
+    }
     #[test]
     fn protected_endpoints_preserve_records_and_format_outside_locks() {
         let telemetry = Telemetry::default();
@@ -2015,6 +2269,31 @@ pub(crate) mod tests {
             assert_eq!(text.matches(" supplier=").count(), AEAD_CAPACITY);
             assert!(text.contains("total=65 retained=64 overwritten=1 capacity=64"));
             assert!(!text.contains("synthetic"));
+        }
+
+        #[test]
+        fn candidate_final_raw_endpoint_does_not_echo_request_secrets() {
+            let telemetry = Telemetry::default();
+            let observer = telemetry.failures.observer(crate::model::WorkerId(2));
+            observer.candidate_final(CandidateFinal {
+                failure: Failure::new(Stage::CandidateExhausted, Error::Unavailable),
+                operation: CandidateOperation::Page,
+                page: 1,
+                membership: 7,
+                trail: CandidateTrail::default(),
+            });
+            let text = diagnostic_text(&telemetry, "/debug/candidate-final");
+            assert!(
+                text.contains("coverage=candidate_operation_final"),
+                "{text}"
+            );
+            assert!(
+                text.contains("operation=Page page=1 membership=7"),
+                "{text}"
+            );
+            for secret in ["synthetic", "Authorization", "X-Key"] {
+                assert!(!text.contains(secret), "{text}");
+            }
         }
 
         #[test]
