@@ -1144,9 +1144,19 @@ fn placement_maintenance_retries_pressure_without_spinning_or_log_floods() {
 #[test]
 fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
     use uring_runtime::environment::SimulationClock;
-    let mut worker = wake_test_worker();
     let clock = SimulationClock::new(913);
-    worker.environment = clock.environment(0);
+    let worker = {
+        let _environment = clock.environment(0).enter();
+        let mut worker = wake_test_worker();
+        // Settle the independently due ownership timer before isolating metadata
+        // deadlines. Construct every worker timer in the same simulated clock.
+        worker
+            .ownership_maintenance
+            .poll(uring_runtime::environment::now(), false, || {
+                Ok(crate::topology::Maintenance::Idle)
+            });
+        worker
+    };
     let maximum = Duration::from_millis(1);
     let now = {
         let _environment = worker.environment.enter();

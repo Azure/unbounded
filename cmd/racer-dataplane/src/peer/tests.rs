@@ -177,7 +177,11 @@ mod body_progress {
             }
             let auth = Forwarding::new(signers[0].clone());
             let (signed, binding) = auth.sign_request(local).unwrap();
-            let server_scope = RequestScope::new(scope.request, original).unwrap();
+            // The requester owns the deadline under test. Keep the fixture server
+            // alive until the outer watchdog so crossing that deadline between
+            // client and server polls cannot fail an otherwise valid assertion.
+            let server_scope =
+                RequestScope::new(scope.request, start + Duration::from_secs(5)).unwrap();
             Self {
                 idle,
                 telemetry,
