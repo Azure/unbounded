@@ -41,7 +41,7 @@ use uring_runtime::reactor::ready_set::ReadySet;
 enum Listener {
     Real(uds_endpoint::BoundSocket),
     #[cfg(test)]
-    Sim(uring_runtime::reactor::descriptor::Descriptor),
+    Sim(uds_endpoint::simulation::BoundSocket),
 }
 impl Listener {
     fn accept(&self) -> std::io::Result<(uring_runtime::reactor::descriptor::Descriptor, ())> {
@@ -52,33 +52,14 @@ impl Listener {
         match self {
             Self::Real(listener) => listener.accept().map(|(socket, _)| (socket.into(), ())),
             #[cfg(test)]
-            Self::Sim(fd) => fd
-                .as_sim()
-                .expect("simulated listener")
-                .accept()
-                .map(|fd| (fd, ())),
+            Self::Sim(socket) => socket.accept().map(|fd| (fd, ())),
         }
     }
 }
 enum Directory {
     Real(Rc<File>),
     #[cfg(test)]
-    Sim {
-        sim: uring_runtime::reactor::simulation::Simulation,
-        path: PathBuf,
-        inode: u64,
-        basename: RefCell<String>,
-    },
-}
-#[cfg(test)]
-impl Directory {
-    fn anchor(&self) -> PathBuf {
-        match self {
-            Self::Real(file) => file_path(file),
-            #[cfg(test)]
-            Self::Sim { path, .. } => path.clone(),
-        }
-    }
+    Sim,
 }
 
 pub(super) struct BoundListener {
@@ -156,22 +137,7 @@ impl Drop for BoundListener {
     fn drop(&mut self) {
         self.retired
             .store(true, std::sync::atomic::Ordering::Release);
-        #[cfg(test)]
-        if let Directory::Sim {
-            sim,
-            inode,
-            basename,
-            ..
-        } = &self.directory
-        {
-            let path = self.directory.anchor().join(basename.borrow().as_str());
-            if sim.metadata(&path).is_ok_and(|(actual, mode)| {
-                actual == *inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
-            }) {
-                let _ = sim.unlink(&path);
-            }
-        }
-        // The real BoundSocket cleans up before its endpoint owner is released.
+        // Both BoundSocket backends clean up before the endpoint owner is released.
     }
 }
 
@@ -184,18 +150,7 @@ impl BoundListener {
         match &self.listener {
             Listener::Real(socket) => socket.set_mode(mode),
             #[cfg(test)]
-            Listener::Sim(_) => {
-                let Directory::Sim {
-                    sim,
-                    path,
-                    basename,
-                    ..
-                } = &self.directory
-                else {
-                    unreachable!("simulated listener requires simulated directory")
-                };
-                sim.chmod(&path.join(basename.borrow().as_str()), mode as _)
-            }
+            Listener::Sim(socket) => socket.set_mode(mode),
         }
     }
 }
@@ -1304,21 +1259,13 @@ fn bind(
     #[cfg(test)]
     if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
         let directory = root.join(&definition.name).join("client");
-        sim.create_dir_all(&directory).map_err(|_| Error::Io)?;
-        let path = directory.join(basename);
-        let listener = sim
-            .listen(uring_runtime::reactor::SocketAddress::Unix(path.clone()))
-            .map_err(|_| Error::Io)?;
-        let (inode, _) = sim.metadata(&path).map_err(|_| Error::Io)?;
+        let listener =
+            uds_endpoint::simulation::BoundSocket::bind(sim, directory.clone(), basename)
+                .map_err(|_| Error::Io)?;
         let bound = BoundListener {
             definition,
             listener: Listener::Sim(listener),
-            directory: Directory::Sim {
-                sim,
-                path: directory,
-                inode,
-                basename: RefCell::new(basename.into()),
-            },
+            directory: Directory::Sim,
             retired: Arc::new(std::sync::atomic::AtomicBool::default()),
             backlog_allowed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             owner: None,
@@ -1326,10 +1273,7 @@ fn bind(
         if FAIL_CHMOD.with(|fail| fail.replace(false)) {
             return Err(Error::Io);
         }
-        if let Directory::Sim { sim, path, .. } = &bound.directory {
-            sim.chmod(&path.join(basename), 0o666)
-                .map_err(directory_error)?;
-        }
+        bound.set_mode(0o666).map_err(directory_error)?;
         return Ok(bound);
     }
     let root = open_directory(root)?;
@@ -1371,41 +1315,24 @@ impl Endpoint for BoundListener {
     }
 
     fn owns(&self, basename: &str) -> bool {
-        #[cfg(test)]
-        if let Directory::Sim {
-            sim, path, inode, ..
-        } = &self.directory
-        {
-            return sim
-                .metadata(&path.join(basename))
-                .is_ok_and(|(actual, mode)| {
-                    actual == *inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
-                });
-        }
         match &self.listener {
             Listener::Real(socket) => socket
                 .owns_checked(basename)
                 .map_err(directory_error)
                 .unwrap_or(false),
             #[cfg(test)]
-            Listener::Sim(_) => unreachable!("simulation handled before host syscall"),
+            Listener::Sim(socket) => socket.owns(basename),
         }
     }
 
     fn absent(&self, basename: &str) -> bool {
-        #[cfg(test)]
-        if let Directory::Sim { sim, path, .. } = &self.directory {
-            return sim
-                .metadata(&path.join(basename))
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
-        }
         match &self.listener {
             Listener::Real(socket) => socket
                 .absent_checked(basename)
                 .map_err(directory_error)
                 .unwrap_or(false),
             #[cfg(test)]
-            Listener::Sim(_) => unreachable!("simulation handled before host syscall"),
+            Listener::Sim(socket) => socket.absent(basename),
         }
     }
 
@@ -1415,16 +1342,9 @@ impl Endpoint for BoundListener {
                 first.same_directory(second).map_err(directory_error)
             }
             #[cfg(test)]
-            (Listener::Sim(_), Listener::Sim(_)) => match (&self.directory, &other.directory) {
-                (
-                    Directory::Sim {
-                        sim, path: first, ..
-                    },
-                    Directory::Sim { path: second, .. },
-                ) => Ok(sim.metadata(first).map_err(|_| Error::Io)?.0
-                    == sim.metadata(second).map_err(|_| Error::Io)?.0),
-                _ => unreachable!("simulated listener requires simulated directory"),
-            },
+            (Listener::Sim(first), Listener::Sim(second)) => {
+                first.same_directory(second).map_err(|_| Error::Io)
+            }
             #[cfg(test)]
             _ => Ok(false),
         }
@@ -1445,16 +1365,10 @@ impl Endpoint for BoundListener {
         }) {
             return Err(Error::Io);
         }
-        #[cfg(test)]
-        if let Directory::Sim { sim, path, .. } = &self.directory {
-            return sim
-                .rename(&path.join(from), &path.join(to), mode.flags())
-                .map_err(|_| Error::Io);
-        }
         match &self.listener {
             Listener::Real(socket) => socket.rename(from, to, mode).map_err(directory_error),
             #[cfg(test)]
-            Listener::Sim(_) => unreachable!("simulation handled before host syscall"),
+            Listener::Sim(socket) => socket.rename(from, to, mode).map_err(|_| Error::Io),
         }
     }
 
@@ -1462,12 +1376,7 @@ impl Endpoint for BoundListener {
         match &self.listener {
             Listener::Real(socket) => socket.set_basename(basename),
             #[cfg(test)]
-            Listener::Sim(_) => {
-                let Directory::Sim { basename: name, .. } = &self.directory else {
-                    unreachable!("simulated listener requires simulated directory")
-                };
-                *name.borrow_mut() = basename;
-            }
+            Listener::Sim(socket) => socket.set_basename(basename),
         }
     }
 

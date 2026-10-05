@@ -54,7 +54,7 @@ zeroize = "1"
 peer-wire = { path = "peer-wire", features = ["test-util"] }
 racer-object-wire = { path = "object-wire", features = ["test-util"] }
 racer-crypto = { path = "crypto", features = ["test-util"] }
-uds-endpoint = { path = "uds-endpoint", features = ["test-util"] }
+uds-endpoint = { path = "uds-endpoint", features = ["test-util", "simulation"] }
 flow-control = { path = "flow", features = ["simulation"] }
 wire-codec = { path = "wire-codec", features = ["simulation"] }
 rdma-verbs = { path = "verbs", features = ["simulation"] }
