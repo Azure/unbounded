@@ -215,6 +215,177 @@ mod filesystem {
         Some(reactor)
     }
 
+    /// Preserve the distinction between runtime failures and access-policy rejection.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SecureError {
+        Runtime(Error),
+        Access(secure::AccessError),
+    }
+
+    impl From<Error> for SecureError {
+        /// Preserve the runtime failure without collapsing cancellation or I/O errors.
+        fn from(error: Error) -> Self {
+            Self::Runtime(error)
+        }
+    }
+
+    impl From<secure::AccessError> for SecureError {
+        /// Retain access-policy attribution independently of filesystem failures.
+        fn from(error: secure::AccessError) -> Self {
+            Self::Access(error)
+        }
+    }
+
+    /// Adapt the existing public request policy to the secure helper error boundary.
+    #[derive(Clone)]
+    struct SecureScope(RequestScope);
+
+    impl Scope for SecureScope {
+        /// Both failure classes remain observable by the helper caller.
+        type Error = SecureError;
+
+        /// Reuse cancellation and deadline checks without changing their precedence.
+        fn check(&self) -> Result<(), SecureError> {
+            self.0.check().map_err(Into::into)
+        }
+    }
+
+    /// Drive composed helper futures explicitly with a bounded host deadline.
+    fn drive_secure<T, E>(
+        reactor: &Core<SecureScope, ()>,
+        future: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        let mut future = Box::pin(future);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Poll::Ready(result) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            {
+                return result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "secure helper failed to make progress"
+            );
+            reactor.poll_budgeted(8).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    }
+
+    /// Exercise secure composition against the host and optional deterministic backend.
+    #[test]
+    fn secure_helpers_compose_private_publication_reads_and_removal() {
+        let Some(_kernel) = kernel_reactor(4) else {
+            return;
+        };
+        for simulated in [false, true] {
+            if simulated && !cfg!(feature = "simulation") {
+                continue;
+            }
+            #[cfg(feature = "simulation")]
+            let sim = uring_runtime::reactor::simulation::Simulation::new();
+            #[cfg(feature = "simulation")]
+            let _environment = simulated.then(|| sim.enter());
+            let root = Directory::new();
+            let path = root.0.join("private");
+            let request = SecureScope(scope());
+            let r = Core::new(16, ());
+            r.init().unwrap();
+            let dir = drive_secure(&r, secure::directory(&r, &path, true, true, &request)).unwrap();
+            drive_secure(
+                &r,
+                secure::atomic_write(&r, &dir, "value", b"secret", &request),
+            )
+            .unwrap();
+            let output =
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 6, true, &request)).unwrap();
+            assert_eq!(output.as_ref(), b"secret");
+            assert!(matches!(
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 5, true, &request)),
+                Err(SecureError::Runtime(Error::InvalidInput))
+            ));
+            assert!(matches!(
+                drive_secure(
+                    &r,
+                    secure::read_at(&r, &dir, "value", 1024 * 1024 + 1, true, &request)
+                ),
+                Err(SecureError::Runtime(Error::Overloaded))
+            ));
+            assert!(matches!(
+                drive_secure(&r, secure::read_at(&r, &dir, "../value", 6, true, &request)),
+                Err(SecureError::Runtime(Error::InvalidInput))
+            ));
+            assert!(matches!(
+                drive_secure(&r, secure::read_file(&r, dir.clone(), 6, false, &request)),
+                Err(SecureError::Runtime(Error::InvalidInput))
+            ));
+            assert!(matches!(
+                drive_secure(
+                    &r,
+                    secure::atomic_write(&r, &dir, "../value", b"bad", &request)
+                ),
+                Err(ReplacementError::BeforeRename(SecureError::Runtime(
+                    Error::InvalidInput
+                )))
+            ));
+            #[cfg(feature = "simulation")]
+            if simulated {
+                sim.symlink(Path::new("value"), &path.join("link")).unwrap();
+                sim.chmod(&path.join("value"), 0o644).unwrap();
+            }
+            if !simulated {
+                symlink("value", path.join("link")).unwrap();
+                fs::set_permissions(path.join("value"), fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            assert!(matches!(
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 6, true, &request)),
+                Err(SecureError::Access(secure::AccessError::PermissionDenied))
+            ));
+            assert!(
+                drive_secure(&r, secure::read_at(&r, &dir, "link", 6, false, &request)).is_err()
+            );
+            assert_eq!(
+                drive_secure(&r, secure::read_path(&r, &path.join("link"), 6, &request))
+                    .unwrap()
+                    .as_ref(),
+                b"secret"
+            );
+            #[cfg(feature = "simulation")]
+            if simulated {
+                sim.inject(
+                    "rename",
+                    uring_runtime::reactor::simulation::Fault::Errno(libc::EIO),
+                )
+                .unwrap();
+                assert!(matches!(
+                    drive_secure(
+                        &r,
+                        secure::atomic_write(&r, &dir, "value", b"next", &request)
+                    ),
+                    Err(ReplacementError::RenameUncertain(SecureError::Runtime(
+                        Error::Os(libc::EIO)
+                    )))
+                ));
+                assert_eq!(sim.read_file(&path.join("value")).unwrap(), b"secret");
+            }
+            drive_secure(&r, secure::atomic_write(&r, &dir, "value", b"", &request)).unwrap();
+            assert!(
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 0, true, &request))
+                    .unwrap()
+                    .is_empty()
+            );
+            for _ in 0..2 {
+                drive_secure(&r, secure::remove(&r, &dir, "value", &request)).unwrap();
+            }
+            assert!(matches!(
+                drive_secure(&r, secure::read_at(&r, &dir, "value", 6, true, &request)),
+                Err(SecureError::Runtime(Error::NotFound))
+            ));
+            assert_eq!(r.in_flight(), 0);
+        }
+    }
+
     /// Compare failed creation and anonymous-file semantics without namespace changes.
     #[cfg(feature = "simulation")]
     #[test]

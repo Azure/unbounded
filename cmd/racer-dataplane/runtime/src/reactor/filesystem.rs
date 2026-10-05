@@ -519,14 +519,18 @@ pub mod secure {
     }
 
     impl<H: Host> Host for Rc<H> {
+        /// Preserve the underlying host's cancellation and error policy.
         type Scope = H::Scope;
 
+        /// Preserve the underlying host's retained accounting guards.
         type Budget = H::Budget;
 
+        /// Borrow the same worker-local reactor through shared host ownership.
         fn reactor(&self) -> &Reactor<Self::Scope, Self::Budget> {
             (**self).reactor()
         }
 
+        /// Delegate independent attempt allocation without replacing parent policy.
         fn fresh_scope(
             &self,
             parent: &Self::Scope,
@@ -534,6 +538,7 @@ pub mod secure {
             (**self).fresh_scope(parent)
         }
 
+        /// Retain shared host ownership while the previous attempt is fenced.
         fn fence<'a>(
             &'a self,
             previous: &'a Self::Scope,
@@ -541,6 +546,7 @@ pub mod secure {
             (**self).fence(previous)
         }
 
+        /// Preserve the host's exact missing-file classification.
         fn is_missing(error: <Self::Scope as Scope>::Error) -> bool {
             H::is_missing(error)
         }
@@ -554,6 +560,7 @@ pub mod secure {
     }
 
     impl<S: Scope> Default for Attempts<S> {
+        /// Start an idle namespace owner without a previous attempt to fence.
         fn default() -> Self {
             Self {
                 busy: Cell::new(false),
@@ -911,6 +918,138 @@ pub mod secure {
     mod tests {
         //! Pure validation covers malformed names and incomplete metadata snapshots.
         use super::*;
+
+        /// Serialize namespace use and retain failed or abandoned fences for retry.
+        #[test]
+        fn attempts_retain_previous_scope_until_fence_and_fresh_scope_succeed() {
+            /// Identify independent attempts while allowing parent admission failure.
+            #[derive(Clone)]
+            struct Request(u64, bool);
+
+            impl Scope for Request {
+                /// Keep fixture failures in the runtime boundary.
+                type Error = Error;
+
+                /// Reject canceled parent requests before any host callbacks.
+                fn check(&self) -> Result<()> {
+                    if self.1 {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+
+            /// Record fence order and inject pending, failed, and successful host callbacks.
+            struct Hosting {
+                reactor: Reactor<Request, ()>,
+
+                next: Cell<u64>,
+
+                fences: RefCell<Vec<u64>>,
+
+                ready: Cell<bool>,
+
+                fail_fence: Cell<bool>,
+
+                fail_fresh: Cell<bool>,
+            }
+
+            impl Host for Hosting {
+                /// Preserve attempt identity in each fenced scope.
+                type Scope = Request;
+
+                /// This callback-only fixture owns no I/O allocation charges.
+                type Budget = ();
+
+                /// Expose a lazy reactor without allocating a kernel ring.
+                fn reactor(&self) -> &Reactor<Request, ()> {
+                    &self.reactor
+                }
+
+                /// Allocate a new identity only after successful fencing.
+                fn fresh_scope(&self, _: &Request) -> Result<Request> {
+                    if self.fail_fresh.get() {
+                        return Err(Error::Unavailable);
+                    }
+                    let next = self.next.get() + 1;
+                    self.next.set(next);
+                    Ok(Request(next, false))
+                }
+
+                /// Hold the prior identity until the caller explicitly permits its fence.
+                fn fence<'a>(&'a self, previous: &'a Request) -> Operation<'a, ()> {
+                    self.fences.borrow_mut().push(previous.0);
+                    Box::pin(futures::future::poll_fn(move |_| {
+                        if !self.ready.get() {
+                            Poll::Pending
+                        } else if self.fail_fence.get() {
+                            Poll::Ready(Err(Error::Io))
+                        } else {
+                            Poll::Ready(Ok(()))
+                        }
+                    }))
+                }
+
+                /// Never classify cancellation as missing-file success.
+                fn is_missing(error: Error) -> bool {
+                    error == Error::NotFound
+                }
+            }
+
+            let host = Rc::new(Hosting {
+                reactor: Reactor::new(4, ()),
+                next: Cell::new(0),
+                fences: RefCell::default(),
+                ready: Cell::new(false),
+                fail_fence: Cell::new(false),
+                fail_fresh: Cell::new(false),
+            });
+            assert!(std::ptr::eq(Host::reactor(&host), &host.reactor));
+            assert!(<Rc<Hosting> as Host>::is_missing(Error::NotFound));
+            assert!(!<Rc<Hosting> as Host>::is_missing(Error::Cancelled));
+            let attempts = Attempts::default();
+            let parent = Request(0, false);
+            let (guard, scope) =
+                futures::executor::block_on(attempts.begin(&host, &parent)).unwrap();
+            assert_eq!(scope.0, 1);
+            assert!(matches!(
+                futures::executor::block_on(attempts.begin(&host, &parent)),
+                Err(Error::Overloaded)
+            ));
+            drop(guard);
+            let mut pending = Box::pin(attempts.begin(&host, &parent));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(pending.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(host.next.get(), 1);
+            drop(pending);
+            host.ready.set(true);
+            host.fail_fence.set(true);
+            assert!(matches!(
+                futures::executor::block_on(attempts.begin(&host, &parent)),
+                Err(Error::Io)
+            ));
+            host.fail_fence.set(false);
+            host.fail_fresh.set(true);
+            assert!(matches!(
+                futures::executor::block_on(attempts.begin(&host, &parent)),
+                Err(Error::Unavailable)
+            ));
+            host.fail_fresh.set(false);
+            let (guard, scope) =
+                futures::executor::block_on(attempts.begin(&host, &parent)).unwrap();
+            assert_eq!(scope.0, 2);
+            assert_eq!(&*host.fences.borrow(), &[1, 1, 1, 1]);
+            drop(guard);
+            assert!(matches!(
+                futures::executor::block_on(attempts.begin(&host, &Request(0, true))),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(host.next.get(), 2);
+            let (guard, _) = futures::executor::block_on(attempts.begin(&host, &parent)).unwrap();
+            assert_eq!(host.fences.borrow().last(), Some(&2));
+            drop(guard);
+        }
 
         /// Preserve arbitrary name bytes while rejecting escapes and invalid limits.
         #[test]
