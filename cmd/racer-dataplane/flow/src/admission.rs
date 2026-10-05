@@ -420,16 +420,19 @@ mod circuit {
                 return Err(Error::Unavailable);
             }
             let probe = self.states.borrow().contains_key(key);
-            if probe {
+            let key = if probe {
                 if self.probes.borrow().len() >= self.capacity {
                     return Err(Error::Overloaded);
                 }
-                self.probes.borrow_mut().insert(key.clone());
-            }
-            Ok(Probe {
-                health: self,
-                key: probe.then(|| key.clone()),
-            })
+                // Complete application cloning before publishing exclusive ownership.
+                let indexed = key.clone();
+                let owned = key.clone();
+                self.probes.borrow_mut().insert(indexed);
+                Some(owned)
+            } else {
+                None
+            };
+            Ok(Probe { health: self, key })
         }
 
         /// Remove failure state without releasing any owned probe.
@@ -505,6 +508,52 @@ mod circuit {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Failed key cloning must not leave an exclusive probe without an owner.
+        #[test]
+        fn review_regression_probe_clone_panic_allows_acquisition_after_timeout() {
+            use std::{
+                panic::{AssertUnwindSafe, catch_unwind},
+                sync::atomic::{AtomicUsize, Ordering},
+            };
+
+            static CLONES: AtomicUsize = AtomicUsize::new(0);
+            static PANIC_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+            /// A single endpoint with controllable clone failure.
+            #[derive(Eq, Ord, PartialEq, PartialOrd)]
+            struct Key;
+
+            impl Clone for Key {
+                /// Fail at the selected clone during probe acquisition.
+                fn clone(&self) -> Self {
+                    let clone = CLONES.fetch_add(1, Ordering::SeqCst) + 1;
+                    assert_ne!(clone, PANIC_AT.load(Ordering::SeqCst), "key clone failed");
+                    Self
+                }
+            }
+
+            for panic_at in [1, 2] {
+                let now = Instant::now();
+                let timeout = Duration::from_secs(1);
+                let health = Circuits::new(1, timeout);
+                health.failure(&Key, now, |_, _| Duration::ZERO).unwrap();
+                CLONES.store(0, Ordering::SeqCst);
+                PANIC_AT.store(panic_at, Ordering::SeqCst);
+                let result = catch_unwind(AssertUnwindSafe(|| health.acquire(&Key, now)));
+                PANIC_AT.store(usize::MAX, Ordering::SeqCst);
+                assert!(result.is_err());
+                assert_eq!(CLONES.load(Ordering::SeqCst), panic_at);
+                assert!(!health.available(&Key, now));
+                let retry = now + timeout;
+                let probe = health
+                    .acquire(&Key, retry)
+                    .expect("probe must not be stranded");
+                assert!(!health.available(&Key, retry + timeout));
+                drop(probe);
+                assert!(health.acquire(&Key, retry + timeout).is_ok());
+            }
+        }
 
         /// Keep an owned probe exclusive through success and retention changes.
         #[test]
