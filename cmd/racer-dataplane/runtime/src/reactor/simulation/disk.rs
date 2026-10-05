@@ -661,6 +661,7 @@ impl Simulation {
         Ok(())
     }
     /// Opens a simulated file using ordinary pathname resolution.
+    /// Anonymous O_TMPFILE inodes are unsupported and return EOPNOTSUPP.
     pub fn open(
         &self,
         dir: Option<&Descriptor>,
@@ -696,6 +697,20 @@ impl Simulation {
         flags: i32,
         resolve: u64,
     ) -> io::Result<Descriptor> {
+        // Reject invalid creation requests before publishing any namespace entry.
+        if flags & (libc::O_CREAT | libc::O_DIRECTORY) == (libc::O_CREAT | libc::O_DIRECTORY)
+            || flags & libc::O_ACCMODE == libc::O_ACCMODE
+            || (flags & libc::O_TRUNC != 0 && flags & libc::O_ACCMODE == libc::O_RDONLY)
+        {
+            return Err(errno(libc::EINVAL));
+        }
+        if flags & libc::O_TMPFILE == libc::O_TMPFILE {
+            return Err(errno(if flags & libc::O_ACCMODE == libc::O_RDONLY {
+                libc::EINVAL
+            } else {
+                libc::EOPNOTSUPP
+            }));
+        }
         if let Some(dir) = dir {
             self.handle(dir)?;
         }
@@ -737,9 +752,6 @@ impl Simulation {
                 let mut n = node.borrow_mut();
                 if n.mode as u32 & libc::S_IFMT != libc::S_IFREG {
                     return Err(errno(libc::EISDIR));
-                }
-                if flags & libc::O_ACCMODE == libc::O_RDONLY {
-                    return Err(errno(libc::EINVAL));
                 }
                 n.pages.clear();
                 n.length = 0;

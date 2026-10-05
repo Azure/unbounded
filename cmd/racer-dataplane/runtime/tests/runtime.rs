@@ -198,6 +198,119 @@ mod filesystem {
         Some(reactor)
     }
 
+    /// Compare failed creation and anonymous-file semantics without namespace changes.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn creation_flags_preserve_namespace_and_tmpfile_is_explicitly_unsupported() {
+        use uring_runtime::reactor::simulation::Simulation;
+        let Some(host) = kernel_reactor(16) else {
+            return;
+        };
+        let root = Directory::new();
+        let existing = root.0.join("existing");
+        let missing = root.0.join("missing");
+        fs::write(&existing, b"keep").unwrap();
+        let request = scope();
+        for path in [&missing, &existing, &root.0] {
+            assert!(matches!(
+                drive(
+                    &host,
+                    host.file_open(
+                        None,
+                        name(path),
+                        libc::O_CREAT | libc::O_DIRECTORY | libc::O_RDWR,
+                        0,
+                        &request
+                    )
+                ),
+                Err(Error::Os(libc::EINVAL))
+            ));
+        }
+        assert!(!missing.exists());
+        assert_eq!(fs::read(&existing).unwrap(), b"keep");
+        let named = drive(
+            &host,
+            host.file_open(None, name(&existing), libc::O_RDONLY, 0, &request),
+        )
+        .unwrap();
+        let stat = drive(&host, host.file_stat(named, &request)).unwrap();
+        assert_eq!(stat.stx_mode as u32 & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(stat.stx_nlink, 1);
+        match drive(
+            &host,
+            host.file_open(
+                None,
+                name(&root.0),
+                libc::O_TMPFILE | libc::O_RDWR,
+                0,
+                &request,
+            ),
+        ) {
+            Ok(anonymous) => {
+                let stat = drive(&host, host.file_stat(anonymous, &request)).unwrap();
+                assert_eq!(stat.stx_mode as u32 & libc::S_IFMT, libc::S_IFREG);
+                assert_eq!(stat.stx_nlink, 0);
+            }
+            Err(Error::Os(libc::EOPNOTSUPP)) => (),
+            other => panic!("unexpected host O_TMPFILE result: {other:?}"),
+        }
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+
+        let sim = Simulation::new();
+        sim.write_file(&existing, b"keep").unwrap();
+        let directory_before = sim.metadata(&root.0).unwrap();
+        let file_before = sim.metadata(&existing).unwrap();
+        let _simulation = sim.enter();
+        let used = Rc::new(Cell::new(0));
+        let simulated = Reactor {
+            core: Core::new(16, CountingBudget(used.clone())),
+            used,
+        };
+        simulated.init().unwrap();
+        for path in [&missing, &existing, &root.0] {
+            assert!(matches!(
+                drive(
+                    &simulated,
+                    simulated.file_open(
+                        None,
+                        name(path),
+                        libc::O_CREAT | libc::O_DIRECTORY | libc::O_RDWR,
+                        0,
+                        &request
+                    )
+                ),
+                Err(Error::Os(libc::EINVAL))
+            ));
+        }
+        for flags in [
+            libc::O_TMPFILE | libc::O_RDWR,
+            libc::O_TMPFILE | libc::O_WRONLY,
+        ] {
+            assert!(matches!(
+                drive(
+                    &simulated,
+                    simulated.file_open(None, name(&root.0), flags, 0, &request)
+                ),
+                Err(Error::Os(libc::EOPNOTSUPP))
+            ));
+        }
+        assert_eq!(
+            sim.metadata(&missing).unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(sim.metadata(&root.0).unwrap(), directory_before);
+        assert_eq!(sim.metadata(&existing).unwrap(), file_before);
+        assert_eq!(sim.read_file(&existing).unwrap(), b"keep");
+        let named = drive(
+            &simulated,
+            simulated.file_open(None, name(&existing), libc::O_RDONLY, 0, &request),
+        )
+        .unwrap();
+        let stat = drive(&simulated, simulated.file_stat(named, &request)).unwrap();
+        assert_eq!(stat.stx_mode as u32 & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(stat.stx_nlink, 1);
+    }
+
     /// Check buffer progress, bounds, quota release, and empty reads.
     #[test]
     fn partial_completion_preserves_remaining_bytes_and_quota() {
