@@ -1,4 +1,5 @@
 //! Consumer workflows using only public APIs and real, unprivileged socket pairs.
+
 use http1::{
     Codec, Error, Header, MessageHead, StartLine,
     connection::{ConnectionLease, Context, Endpoint, HttpIo, OwnedBuffer},
@@ -19,23 +20,28 @@ use uring_runtime::{
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Failure {
     Http(Error),
+
     Runtime(uring_runtime::Error),
 }
+
 impl From<Error> for Failure {
     /// Preserve an HTTP failure for assertions at the caller boundary.
     fn from(error: Error) -> Self {
         Self::Http(error)
     }
 }
+
 impl From<uring_runtime::Error> for Failure {
     /// Preserve the runtime failure without mapping it to HTTP syntax.
     fn from(error: uring_runtime::Error) -> Self {
         Self::Runtime(error)
     }
 }
+
 /// A live scope for exchanges bounded by the test driver's deadline.
 #[derive(Clone)]
 struct RequestScope;
+
 impl Scope for RequestScope {
     type Error = Failure;
 
@@ -44,17 +50,21 @@ impl Scope for RequestScope {
         Ok(())
     }
 }
+
 /// Wraps a socket address in the caller's endpoint policy.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Address(SocketAddress);
+
 impl Endpoint<Failure> for Address {
     /// Return the endpoint unchanged without name resolution.
     fn address(&self) -> Result<SocketAddress, Failure> {
         Ok(self.0.clone())
     }
 }
+
 /// Supplies permissive resource policy without application dependencies.
 struct Caller;
+
 impl Context for Caller {
     type Error = Failure;
 
@@ -100,6 +110,7 @@ fn io() -> HttpIo<Caller> {
         16,
     )
 }
+
 /// Reserve both ends of a real local stream for HTTP exchanges.
 fn pair() -> (ConnectionLease<Caller>, ConnectionLease<Caller>) {
     let (client, server) = UnixStream::pair().unwrap();
@@ -108,6 +119,7 @@ fn pair() -> (ConnectionLease<Caller>, ConnectionLease<Caller>) {
         ConnectionLease::from_reserved(server.into(), (), ()).unwrap(),
     )
 }
+
 /// Poll one operation and its reactor under a fixed progress deadline.
 fn drive<T>(io: &HttpIo<Caller>, future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
@@ -122,6 +134,7 @@ fn drive<T>(io: &HttpIo<Caller>, future: impl Future<Output = T>) -> T {
         std::thread::yield_now();
     }
 }
+
 /// Construct a fixed-length request or response head.
 fn head(start: StartLine, length: usize) -> MessageHead {
     MessageHead {
@@ -132,6 +145,7 @@ fn head(start: StartLine, length: usize) -> MessageHead {
         }],
     }
 }
+
 /// Construct a request for the shared fixture resource.
 fn request(method: &str, length: usize) -> MessageHead {
     head(

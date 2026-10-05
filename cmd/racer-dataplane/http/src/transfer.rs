@@ -28,6 +28,7 @@ pub mod delivery {
     //! first poll, and consume HTTP framing after success. Authorization, deadline
     //! arithmetic, telemetry, reservation release, and exchange finalization stay with
     //! the caller. This engine neither authorizes bytes nor finishes exchanges.
+
     use crate::connection::{ConnectionLease, Context, OwnedBuffer, Result};
     use flow_control::{PipeLease, Policy, splice_unsupported};
     use std::{io, task::Poll, time::Instant};
@@ -203,8 +204,10 @@ pub mod delivery {
 
     /// Maximum immutable slice considered by one delivery operation.
     const CHUNK_BYTES: usize = 64 * 1024;
+
     /// Accepted bytes allowed before yielding a cooperative turn.
     const TURN_BYTES: usize = 256 * 1024;
+
     /// Successful calls allowed before yielding a cooperative turn.
     const TURN_CALLS: usize = 32;
 
@@ -212,6 +215,7 @@ pub mod delivery {
     enum Buffer<C: Context, V: SendBuffer<Error = C::Error>> {
         /// Admitted scratch populated by a complete pipe drain.
         Pipe(OwnedBuffer<C>),
+
         /// Owning view used after switching to copying.
         View(V),
     }
@@ -284,6 +288,7 @@ pub mod delivery {
 
         /// Permissive context with reference-counted connection admission.
         struct Caller;
+
         impl Context for Caller {
             type Error = Failure;
 
@@ -318,6 +323,7 @@ pub mod delivery {
                 false
             }
         }
+
         /// Script short sends, unsupported splice, backpressure, and drain failures.
         #[derive(Default)]
         struct Pipe {
@@ -335,6 +341,7 @@ pub mod delivery {
 
             short_drain: bool,
         }
+
         impl DeliveryPipe for Pipe {
             /// Report the scripted pipe's exact staged suffix.
             fn buffered(&self) -> usize {
@@ -375,6 +382,7 @@ pub mod delivery {
                 Ok(n)
             }
         }
+
         /// Immutable body owner with independently staged and accepted cursors.
         struct Reader {
             bytes: Rc<Vec<u8>>,
@@ -383,12 +391,14 @@ pub mod delivery {
 
             sent: usize,
         }
+
         /// Owning immutable byte range retained through a runtime send.
         struct View {
             bytes: Rc<Vec<u8>>,
 
             range: std::ops::Range<usize>,
         }
+
         // SAFETY: the immutable Rc backing is retained and cannot be mutated through this view.
         unsafe impl SendBuffer for View {
             type Error = Failure;
@@ -398,6 +408,7 @@ pub mod delivery {
                 Ok(&self.bytes[self.range.clone()])
             }
         }
+
         impl Owner<Caller> for Reader {
             type Pipe = Pipe;
 
@@ -426,6 +437,7 @@ pub mod delivery {
                 })
             }
         }
+
         /// Record callback order and inject scope or completion rejection.
         #[derive(Default)]
         struct Observe {
@@ -437,6 +449,7 @@ pub mod delivery {
 
             times: RefCell<Vec<Instant>>,
         }
+
         impl Observer<Caller> for Observe {
             /// Record the progress clock and optionally reject the next send scope.
             fn scope(&self, stalled_at: Instant) -> Result<Caller, TestScope> {
@@ -471,6 +484,7 @@ pub mod delivery {
                 Ok(())
             }
         }
+
         /// Reserve a socket pair with bounded peer reads and observable slot lifetime.
         fn connection() -> (ConnectionLease<Caller>, UnixStream, std::rc::Weak<()>) {
             let (socket, peer) = UnixStream::pair().unwrap();
@@ -483,6 +497,7 @@ pub mod delivery {
                 weak,
             )
         }
+
         /// Poll a future and its reactor under the delivery watchdog.
         fn drive<T>(reactor: &Reactor<TestScope, ()>, future: impl Future<Output = T>) -> T {
             let mut future = std::pin::pin!(future);
@@ -761,6 +776,7 @@ pub mod relay {
     //! yielding, exchange finish/poison ordering, and reservation release are caller
     //! policy. The `test-util` feature adds deterministic fallback injection; production
     //! unsupported errors trigger fallback without that feature.
+
     use crate::connection::{ConnectionLease, Context, HttpIo, OwnedBuffer, Result};
     use flow_control::{MAX_PIPE_BYTES, PipeLease, Policy, splice_unsupported};
     use std::{io, ops::Range, rc::Rc};
@@ -796,8 +812,10 @@ pub mod relay {
     pub enum Step {
         /// Both body cursors are exhausted; exchange finalization remains caller-owned.
         Complete,
+
         /// The bounded turn ended and the caller should yield cooperatively.
         Yield,
+
         /// Wait for readiness while retaining the complete relay owner.
         Readiness {
             /// Socket to poll, not a substitute for the relay's resource ownership.
@@ -860,7 +878,9 @@ pub mod relay {
         /// Run at most 32 nonblocking actions, retaining pending pipe/copy suffixes.
         /// The caller checks its scope before each step and before finalization.
         pub fn step(&mut self, io: &HttpIo<C>) -> Result<C, Step> {
-            if self.destination.socket().peer_read_closed() {
+            // A requester may finish writing while still reading its response.
+            // Reject only full disconnect here; sends report other write failures.
+            if self.destination.socket().peer_disconnected() {
                 return Err(uring_runtime::Error::Io.into());
             }
             let mut wait = Step::Yield;
@@ -1017,12 +1037,14 @@ pub mod relay {
 
         /// Counted admission returned to its ledger on drop.
         struct Charge(Rc<Cell<usize>>, usize);
+
         impl Drop for Charge {
             /// Release the fixture's retained byte or slot charge.
             fn drop(&mut self) {
                 self.0.set(self.0.get() - self.1);
             }
         }
+
         /// Observable byte and slot admission with injectable allocation rejection.
         #[derive(Default)]
         struct Hooks {
@@ -1032,6 +1054,7 @@ pub mod relay {
 
             reject: Cell<bool>,
         }
+
         impl Context for Hooks {
             type Error = Failure;
 
@@ -1087,6 +1110,7 @@ pub mod relay {
 
             _owner: Rc<()>,
         }
+
         impl Default for Pipe {
             /// Start with an empty pipe and no injected failures.
             fn default() -> Self {
@@ -1100,6 +1124,7 @@ pub mod relay {
                 }
             }
         }
+
         impl RelayPipe for Pipe {
             /// Report the scripted pipe's exact staged suffix.
             fn buffered(&self) -> usize {
@@ -1139,12 +1164,14 @@ pub mod relay {
                 Ok(n)
             }
         }
+
         /// Small HTTP I/O fixture with independently observable admission ledgers.
         struct Fixture {
             hooks: Rc<Hooks>,
 
             io: HttpIo<Hooks>,
         }
+
         impl Fixture {
             /// Create a small reactor and fixed HTTP storage limits.
             fn new() -> Self {
@@ -1158,6 +1185,7 @@ pub mod relay {
                 );
                 Self { hooks, io }
             }
+
             /// Reserve a socket pair and install the requested synthetic framing.
             fn connection(&self, receive: u64, send: u64) -> (ConnectionLease<Hooks>, UnixStream) {
                 let (fd, peer) = UnixStream::pair().unwrap();
@@ -1171,6 +1199,7 @@ pub mod relay {
                 c.set_framing(Some(receive), Some(send), false);
                 (c, peer)
             }
+
             /// Construct a relay with matching framing and both peer endpoints.
             fn relay(
                 &self,
@@ -1209,6 +1238,40 @@ pub mod relay {
                 assert!(!source.is_reusable() && !destination.is_reusable());
                 source.finish_exchange().unwrap();
                 destination.finish_exchange().unwrap();
+            }
+        }
+
+        /// A write-half-closed requester still receives the complete response body.
+        #[test]
+        fn relay_destination_half_close_preserves_response_and_full_close_fails() {
+            for copied in [false, true] {
+                let f = Fixture::new();
+                let (mut relay, mut writer, mut reader) = f.relay(9, Pipe::default());
+                relay.force_fallback(copied, None);
+                reader.shutdown(std::net::Shutdown::Write).unwrap();
+                assert!(relay.destination.socket().peer_read_closed());
+                assert!(!relay.destination.socket().peer_disconnected());
+                writer.write_all(b"abcdefghi").unwrap();
+                assert!(matches!(relay.step(&f.io).unwrap(), Step::Complete));
+                let mut bytes = [0; 9];
+                reader.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, b"abcdefghi");
+                assert_eq!(relay.source.receive_remaining(), Some(0));
+                assert_eq!(relay.destination.send_remaining(), Some(0));
+                drop(relay);
+                f.io.reclaim_buffer();
+                assert_eq!(f.hooks.slots.get(), 0);
+                assert_eq!(f.hooks.bytes.get(), 0);
+
+                let (mut relay, mut writer, reader) = f.relay(3, Pipe::default());
+                relay.force_fallback(copied, None);
+                writer.write_all(b"abc").unwrap();
+                drop(reader);
+                assert!(matches!(
+                    relay.step(&f.io),
+                    Err(Failure::Runtime(uring_runtime::Error::Io))
+                ));
+                assert_eq!(relay.destination.send_remaining(), Some(3));
             }
         }
 
@@ -1410,6 +1473,7 @@ mod fixtures {
     pub(super) enum Failure {
         /// An HTTP framing or syntax failure.
         Http(Error),
+
         /// A runtime transport or admission failure.
         Runtime(uring_runtime::Error),
     }
