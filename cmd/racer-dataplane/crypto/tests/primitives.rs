@@ -549,3 +549,564 @@ fn assert_equivalent(bytes: &[u8]) {
     table.write(bytes);
     assert_eq!(table.sum64(), expected, "table, length={}", bytes.len());
 }
+
+/// Identity workflows exercise the same public boundary used by the dataplane.
+mod identity_workflows {
+    use racer_control_wire::{
+        BundleGeneration, CacheEncryptionKey, CacheId, CacheKeyRef, CacheKeyState, ClusterId,
+        KeyId, KeyringBundle, NodeId, SCHEMA_VERSION,
+    };
+    use racer_crypto::identity::{
+        Certificates, Error, KeyEpochs, KeyPurpose, Keyring, PendingIdentity, SigningIdentity,
+        unix_time,
+    };
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::{
+        rc::Rc,
+        sync::Arc,
+        time::{Duration, UNIX_EPOCH},
+    };
+    use zeroize::Zeroizing;
+
+    /// Canonical cluster for certificate and keyring workflows.
+    const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// Canonical node authenticated by the test certificates.
+    const NODE: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// Canonical cache authorized by the test key epochs.
+    const CACHE: &str = "33333333-3333-4333-8333-333333333333";
+
+    /// TLS time follows the current scope and clamps/truncates epoch offsets.
+    #[test]
+    fn tls_time_uses_current_scoped_wall_clock_clamps_and_truncates() {
+        let clock = uring_runtime::environment::SimulationClock::new(71);
+        let _environment = clock.environment(0).enter();
+        for (wall, seconds) in [
+            (UNIX_EPOCH - Duration::from_nanos(1), 0),
+            (UNIX_EPOCH, 0),
+            (UNIX_EPOCH + Duration::from_millis(1999), 1),
+            (UNIX_EPOCH + Duration::from_secs(10), 10),
+        ] {
+            clock.set_wall_time(wall);
+            assert_eq!(unix_time().as_secs(), seconds);
+        }
+    }
+
+    /// Issuing for an existing key keeps its bytes and caller-specified dates.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn existing_key_and_customized_certificate_contract_are_preserved() {
+        use racer_crypto::identity::test_util::{ca, issue_pending};
+
+        let (ca, ca_key) = ca();
+        let cluster = ClusterId(CLUSTER.into());
+        let node = NodeId(NODE.into());
+        let pending = PendingIdentity::generate().unwrap();
+        let original = pending.export_pkcs8_for_persistence().unwrap();
+        let (pending, chain) = issue_pending(pending, &ca, &ca_key, &cluster, &node, |params| {
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        });
+        assert_eq!(*pending.export_pkcs8_for_persistence().unwrap(), *original);
+        let (_, cert) = x509_parser::parse_x509_certificate(&chain[0]).unwrap();
+        assert_eq!(cert.validity().not_before.timestamp(), 1_577_836_800);
+        assert_eq!(cert.validity().not_after.timestamp(), 1_893_456_000);
+        pending
+            .accept(cluster, node, chain, &[ca.der().to_vec()])
+            .unwrap();
+    }
+
+    /// Recovery, CSR generation, and TLS pairing use the same accepted key.
+    #[test]
+    fn identity_recovery_csr_tls_and_key_pairing() {
+        let (pending, chain, roots) = issued_with(|_| {});
+        assert!(!pending.csr_der().unwrap().is_empty());
+        let bytes = pending.export_pkcs8_for_persistence().unwrap();
+        let identity = pending
+            .accept(
+                ClusterId(CLUSTER.into()),
+                NodeId(NODE.into()),
+                chain.clone(),
+                &roots,
+            )
+            .unwrap();
+        let private = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes.as_slice()));
+        let tls_key = rustls::crypto::ring::sign::any_supported_type(&private).unwrap();
+        let certified = rustls::sign::CertifiedKey::new(
+            identity
+                .certificate_chain()
+                .iter()
+                .cloned()
+                .map(CertificateDer::from)
+                .collect(),
+            tls_key,
+        );
+        assert!(certified.keys_match().is_ok());
+        let recovered = SigningIdentity::from_pkcs8(
+            identity.cluster().clone(),
+            identity.node().clone(),
+            &bytes,
+            chain.clone(),
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(
+            identity.sign(b"exact message").unwrap(),
+            recovered.sign(b"exact message").unwrap()
+        );
+        assert!(
+            PendingIdentity::generate()
+                .unwrap()
+                .accept(
+                    identity.cluster().clone(),
+                    identity.node().clone(),
+                    chain.clone(),
+                    &roots
+                )
+                .is_err()
+        );
+        assert!(
+            SigningIdentity::from_pkcs8(
+                identity.cluster().clone(),
+                NodeId("other".into()),
+                &bytes,
+                chain,
+                &roots
+            )
+            .is_err()
+        );
+    }
+
+    /// Verify canonical node chains and reject malformed or altered signatures.
+    #[test]
+    fn validates_chain_node_and_strict_signature() {
+        let (pending, chain, roots) = issued_with(|_| {});
+        let cluster = ClusterId(CLUSTER.into());
+        let node = NodeId(NODE.into());
+        let secret = pending.export_pkcs8_for_persistence().unwrap();
+        for (cluster, node) in [
+            (ClusterId("other".into()), node.clone()),
+            (cluster.clone(), NodeId("other".into())),
+        ] {
+            assert!(
+                PendingIdentity::recover(&secret)
+                    .unwrap()
+                    .accept(cluster, node, chain.clone(), &roots)
+                    .is_err()
+            );
+        }
+        let identity = pending
+            .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+            .unwrap();
+        let keys = Rc::new(keyring(roots));
+        let certificates = Certificates::new(cluster.clone(), keys.clone());
+        let signature = identity.sign(b"message").unwrap();
+        assert!(
+            certificates
+                .verify_signed(&chain, &node, b"message", &signature)
+                .is_ok()
+        );
+        assert!(
+            certificates
+                .verify_signed(&chain, &node, b"changed", &signature)
+                .is_err()
+        );
+        assert!(
+            certificates
+                .verify_signed(&chain, &node, b"message", &signature[..63])
+                .is_err()
+        );
+        let mut oversized = signature.clone();
+        oversized.push(0);
+        assert!(
+            certificates
+                .verify_signed(&chain, &node, b"message", &oversized)
+                .is_err()
+        );
+        assert!(
+            certificates
+                .verify_signed(&chain, &NodeId("other".into()), b"message", &signature)
+                .is_err()
+        );
+        let foreign = Certificates::new(ClusterId("other".into()), keys);
+        assert!(
+            foreign
+                .verify_signed(&chain, &node, b"message", &signature)
+                .is_err()
+        );
+        let (_, _, foreign_roots) = issued_with(|_| {});
+        let foreign = Certificates::new(cluster, Rc::new(keyring(foreign_roots)));
+        assert!(
+            foreign
+                .verify_signed(&chain, &node, b"message", &signature)
+                .is_err()
+        );
+        let mut bad = chain.clone();
+        bad[0].push(0);
+        assert!(
+            certificates
+                .verify_signed(&bad, &node, b"message", &signature)
+                .is_err()
+        );
+        assert!(
+            certificates
+                .verify_signed(&vec![chain[0].clone(); 9], &node, b"message", &signature)
+                .is_err()
+        );
+    }
+
+    /// Exercise usage, validity, CA-leaf, and ambiguous URI rejection.
+    #[test]
+    fn rejects_missing_usage_ca_expiration_and_ambiguous_identity() {
+        for case in 0..8 {
+            let (pending, chain, roots) = issued_with(|params| match case {
+                0 => params.key_usages.clear(),
+                1 => params.key_usages = vec![rcgen::KeyUsagePurpose::KeyEncipherment],
+                2 => params.extended_key_usages.clear(),
+                3 => params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+                4 => params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained),
+                5 => {
+                    params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+                    params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+                }
+                6 => params
+                    .subject_alt_names
+                    .push(params.subject_alt_names[0].clone()),
+                _ => {
+                    params.subject_alt_names = vec![rcgen::SanType::URI(
+                        format!("spiffe://{CLUSTER}/node/{NODE}/extra")
+                            .try_into()
+                            .unwrap(),
+                    )]
+                }
+            });
+            assert!(
+                pending
+                    .accept(
+                        ClusterId(CLUSTER.into()),
+                        NodeId(NODE.into()),
+                        chain,
+                        &roots
+                    )
+                    .is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    /// Page and credential operations enforce bindings without touching failed output.
+    #[test]
+    fn borrowed_outputs_enforce_purpose_cache_id_and_retained_epoch() {
+        let (_, _, roots) = issued_with(|_| {});
+        let keys = keyring(roots.clone());
+        let cache = CacheId(CACHE.into());
+        let page = keys.active(&cache, KeyPurpose::Page).unwrap();
+        let credentials = keys.active(&cache, KeyPurpose::OriginCredentials).unwrap();
+        let mut sealed = [0; 19];
+        page.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed)
+            .unwrap();
+        let mut out = [42; 3];
+        page.open_page(&cache, page.id(), &[1; 24], b"aad", &sealed, &mut out)
+            .unwrap();
+        assert_eq!(&out, b"abc");
+        out.fill(42);
+        assert_eq!(
+            page.open_page(
+                &cache,
+                credentials.id(),
+                &[1; 24],
+                b"aad",
+                &sealed,
+                &mut out
+            ),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(out, [42; 3]);
+        assert_eq!(
+            page.open_page(
+                &CacheId("wrong".into()),
+                page.id(),
+                &[1; 24],
+                b"aad",
+                &sealed,
+                &mut out
+            ),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(out, [42; 3]);
+        assert_eq!(
+            page.open_page(&cache, page.id(), &[1; 24], b"bad", &sealed, &mut out),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(out, [42; 3]);
+        let original = sealed;
+        assert_eq!(
+            credentials.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(sealed, original);
+        assert_eq!(
+            page.seal_credentials(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(sealed, original);
+        credentials
+            .seal_credentials(&cache, &[2; 24], b"aad", b"abc", &mut sealed)
+            .unwrap();
+        credentials
+            .open_credentials(
+                &cache,
+                credentials.id(),
+                &[2; 24],
+                b"aad",
+                &sealed,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(&out, b"abc");
+        assert_eq!(
+            credentials.open_credentials(
+                &cache,
+                credentials.id(),
+                &[2; 24],
+                b"bad",
+                &sealed,
+                &mut out
+            ),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(&out, b"abc");
+        keys.install(bundle(2, roots)).unwrap();
+        assert!(
+            keys.lease(Some(&cache), page.id(), KeyPurpose::Page)
+                .is_err()
+        );
+        page.seal_page(&cache, &[3; 24], b"aad", b"abc", &mut sealed)
+            .unwrap();
+        page.open_page(&cache, page.id(), &[3; 24], b"aad", &sealed, &mut out)
+            .unwrap();
+        assert_eq!(&out, b"abc");
+    }
+
+    /// Request MAC derivation is domain-separated and enforces the credential epoch.
+    #[test]
+    fn request_mac_derives_internally_and_rejects_wrong_purpose_or_message() {
+        let (_, _, roots) = issued_with(|_| {});
+        let keys = keyring(roots);
+        let cache = CacheId(CACHE.into());
+        let page = keys.active(&cache, KeyPurpose::Page).unwrap();
+        let key = keys.active(&cache, KeyPurpose::OriginCredentials).unwrap();
+        let mut tag = [0; 32];
+        assert_eq!(
+            page.request_mac(&cache, b"message", &mut tag),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(tag, [0; 32]);
+        key.request_mac(&cache, b"message", &mut tag).unwrap();
+        let mut domain = b"racer/request-mac/key/v1\0".to_vec();
+        domain.extend_from_slice(&(cache.0.len() as u32).to_be_bytes());
+        domain.extend_from_slice(cache.0.as_bytes());
+        domain.extend_from_slice(&key.id().0);
+        let derived = Zeroizing::new(racer_crypto::hmac_sha256(&[8; 32], &domain));
+        assert_eq!(tag, racer_crypto::hmac_sha256(&derived, b"message"));
+        key.verify_request_mac(&cache, key.id(), b"message", &tag)
+            .unwrap();
+        assert_eq!(
+            key.verify_request_mac(&cache, key.id(), b"changed", &tag),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            key.verify_request_mac(&cache, page.id(), b"message", &tag),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(
+            key.verify_request_mac(&cache, key.id(), b"message", &tag[..31]),
+            Err(Error::Unauthorized)
+        );
+    }
+
+    /// Shuffled groups and prepared keys use the same ordering for all admission paths.
+    #[test]
+    fn shuffled_epoch_groups_preserve_exact_and_active_admission() {
+        let (_, _, roots) = issued_with(|_| {});
+        let keys = keyring(roots.clone());
+        let mut next = bundle(2, roots);
+        let mut records = Vec::new();
+        for (cache_index, cache) in [CACHE, CLUSTER, NODE].into_iter().enumerate() {
+            for (purpose_index, purpose) in [KeyPurpose::Page, KeyPurpose::OriginCredentials]
+                .into_iter()
+                .enumerate()
+            {
+                for prepared in [false, true] {
+                    let ordinal =
+                        (cache_index * 4 + purpose_index * 2 + usize::from(prepared)) as u32;
+                    records.push(CacheEncryptionKey::new(
+                        CacheKeyRef {
+                            cache: CacheId(cache.into()),
+                            id: KeyId::from_generation(2, ordinal).unwrap(),
+                            purpose,
+                        },
+                        if prepared {
+                            CacheKeyState::Prepared
+                        } else {
+                            CacheKeyState::Active
+                        },
+                        Zeroizing::new([ordinal as u8 + 32; 32]),
+                    ));
+                }
+            }
+        }
+        records.reverse();
+        next.cache_keys = records;
+        let expected: Vec<_> = next
+            .cache_keys
+            .iter()
+            .map(|record| (record.key.clone(), record.state))
+            .collect();
+        keys.install(next).unwrap();
+        for (reference, state) in expected {
+            let leased = keys
+                .lease(Some(&reference.cache), reference.id, reference.purpose)
+                .unwrap();
+            assert_eq!(leased.reference(), &reference);
+            let active = keys.active(&reference.cache, reference.purpose).unwrap();
+            if state == CacheKeyState::Active {
+                assert_eq!(active.reference(), &reference);
+            } else {
+                assert_ne!(active.id(), reference.id);
+            }
+        }
+        assert!(
+            keys.lease(
+                None,
+                KeyId::from_generation(2, 0).unwrap(),
+                KeyPurpose::Page
+            )
+            .is_err()
+        );
+        assert!(
+            keys.active(
+                &CacheId("44444444-4444-4444-8444-444444444444".into()),
+                KeyPurpose::Page
+            )
+            .is_err()
+        );
+    }
+
+    /// Accepted identities and cached peer keys share conservative validity boundaries.
+    #[test]
+    fn accepted_chain_validity_is_enforced_at_expiry_and_after_clock_rollback() {
+        let clock = uring_runtime::environment::SimulationClock::new(97);
+        let _environment = clock.environment(0).enter();
+        clock.set_wall_time(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let (pending, chain, roots) = issued_with(|params| {
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        });
+        let node = NodeId(NODE.into());
+        let cluster = ClusterId(CLUSTER.into());
+        let identity = Arc::new(
+            pending
+                .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+                .unwrap(),
+        );
+        assert_eq!(identity.expires_at_seconds(), 1_893_456_000);
+        let keys = Rc::new(keyring(roots));
+        keys.install_signing_identity(identity.clone()).unwrap();
+        let certificates = Certificates::new(cluster, keys.clone());
+        let signature = identity.sign(b"validity").unwrap();
+        certificates
+            .verify_signed(&chain, &node, b"validity", &signature)
+            .unwrap();
+        clock.set_wall_time(UNIX_EPOCH + Duration::from_secs(1_893_455_999));
+        assert!(keys.signing_identity().is_ok());
+        assert!(identity.sign(b"validity").is_ok());
+        clock.set_wall_time(UNIX_EPOCH + Duration::from_secs(1_893_456_000));
+        assert!(identity.sign(b"validity").is_err());
+        clock.set_wall_time(UNIX_EPOCH + Duration::from_secs(1_893_456_001));
+        assert!(keys.signing_identity().is_err());
+        assert!(identity.sign(b"validity").is_err());
+        assert!(
+            certificates
+                .verify_signed(&chain, &node, b"validity", &signature)
+                .is_err()
+        );
+        clock.set_wall_time(UNIX_EPOCH + Duration::from_secs(1_500_000_000));
+        assert!(keys.signing_identity().is_err());
+        assert!(identity.sign(b"validity").is_err());
+        assert!(
+            certificates
+                .verify_signed(&chain, &node, b"validity", &signature)
+                .is_err()
+        );
+    }
+
+    /// Install one active key per purpose using only the public bundle interface.
+    fn keyring(roots: Vec<Vec<u8>>) -> Keyring {
+        let keys = Keyring::new(
+            ClusterId(CLUSTER.into()),
+            NodeId(NODE.into()),
+            Arc::new(KeyEpochs::default()),
+        );
+        keys.install(bundle(1, roots)).unwrap();
+        keys
+    }
+
+    /// Construct fresh generation-bound keys with distinct purpose-specific material.
+    fn bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
+        KeyringBundle {
+            schema_version: SCHEMA_VERSION,
+            cluster: ClusterId(CLUSTER.into()),
+            generation: BundleGeneration(generation),
+            peer_trust_roots: roots,
+            cache_keys: [KeyPurpose::Page, KeyPurpose::OriginCredentials]
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, purpose)| {
+                    CacheEncryptionKey::new(
+                        CacheKeyRef {
+                            cache: CacheId(CACHE.into()),
+                            id: KeyId::from_generation(generation, ordinal as u32).unwrap(),
+                            purpose,
+                        },
+                        CacheKeyState::Active,
+                        Zeroizing::new([generation as u8 * 2 + 5 + ordinal as u8; 32]),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Issue a customizable certificate without enabling production fixture APIs.
+    fn issued_with(
+        customize: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> (PendingIdentity, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let pending = PendingIdentity::generate().unwrap();
+        let secret = pending.export_pkcs8_for_persistence().unwrap();
+        let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+            &PrivatePkcs8KeyDer::from(secret.as_slice()),
+            &rcgen::PKCS_ED25519,
+        )
+        .unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            format!("spiffe://{CLUSTER}/node/{NODE}")
+                .try_into()
+                .unwrap(),
+        )];
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        customize(&mut params);
+        let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+        (pending, vec![cert.der().to_vec()], vec![ca.der().to_vec()])
+    }
+}
