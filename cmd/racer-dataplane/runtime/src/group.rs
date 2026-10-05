@@ -84,7 +84,7 @@ pub trait Service<S: Scope> {
 
     /// Return the wake handle used to drive this service's lifecycle.
     fn waker(&self) -> Result<Waker, S::Error> {
-        Ok(crate::thread_waker(None))
+        Ok(crate::drivers::thread_waker(None))
     }
 
     /// Arrange notification when locally owned work can make progress.
@@ -509,18 +509,36 @@ fn require_fence<E: Copy>(control: &Control<E>, result: Result<(), E>) {
     }
 }
 
-/// Keep a service alive unless both lifecycle ownership fences have succeeded.
-struct ServiceOwner<S: Scope> {
-    service: std::mem::ManuallyDrop<Box<dyn Service<S>>>,
+/// Ownership evidence, separate from group requests and thread-exit accounting.
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseStage {
+    /// The service may still own externally referenced work.
+    Live,
 
-    releasable: bool,
+    /// The first fence succeeded; shutdown may create more external work.
+    Drained,
+
+    /// The second fence succeeded, but sibling helper fences may still be pending.
+    ShutdownFenced,
+
+    /// All required fences finished and ordinary destruction is now safe.
+    Releasable,
 }
+
+/// Retain a service until its owner explicitly completes both ownership fences.
+/// A live guard aborts before Rust can drop its service, including during unwind.
+struct ServiceOwner<S: Scope> {
+    service: Box<dyn Service<S>>,
+
+    stage: ReleaseStage,
+}
+
 impl<S: Scope> ServiceOwner<S> {
     /// Protect a newly constructed service until explicit lifecycle completion.
     fn new(service: Box<dyn Service<S>>) -> Self {
         Self {
-            service: std::mem::ManuallyDrop::new(service),
-            releasable: false,
+            service,
+            stage: ReleaseStage::Live,
         }
     }
 
@@ -536,31 +554,109 @@ impl<S: Scope> ServiceOwner<S> {
             }),
         );
     }
+
+    /// Drive the lane's first fence before publishing its drain barrier.
+    fn fence_lane(&mut self, scope: &S, control: &Control<S::Error>, waker: &Waker) {
+        assert_eq!(self.stage, ReleaseStage::Live);
+        drive_fence(&mut **self, scope, control, waker);
+        self.stage = ReleaseStage::Drained;
+    }
+
+    /// Record shutdown errors but require a successful second lane fence.
+    fn shutdown_lane(&mut self, scope: &S, control: &Control<S::Error>, waker: &Waker) {
+        assert_eq!(self.stage, ReleaseStage::Drained);
+        record(
+            control,
+            attempt(|| drive(self.shutdown(scope), scope, control, false, waker)),
+        );
+        drive_fence(&mut **self, scope, control, waker);
+        self.stage = ReleaseStage::ShutdownFenced;
+    }
+
+    /// Fence independent helper resources without blocking sibling futures.
+    async fn fence_helper(
+        &mut self,
+        scope: &S,
+        control: &Control<S::Error>,
+        waker: &Waker,
+    ) -> Result<(), S::Error> {
+        assert_eq!(self.stage, ReleaseStage::Live);
+        diagnose_operation(
+            fence_operation(
+                Box::pin(async {
+                    self.register_driver(waker);
+                    self.fence(scope).await
+                }),
+                control,
+            ),
+            scope,
+            control,
+        )
+        .await?;
+        self.stage = ReleaseStage::Drained;
+        Ok(())
+    }
+
+    /// Cooperatively shut down and fence a helper, retaining cohort ownership.
+    fn shutdown_helper<'a>(
+        &'a mut self,
+        scope: &'a S,
+        control: &'a Control<S::Error>,
+        waker: &'a Waker,
+    ) -> Operation<'a, (), S::Error> {
+        diagnose_operation(
+            Box::pin(async move {
+                assert_eq!(self.stage, ReleaseStage::Drained);
+                record(
+                    control,
+                    catch_operation(Box::pin(async {
+                        self.register_driver(waker);
+                        self.shutdown(scope).await
+                    }))
+                    .await,
+                );
+                self.register_driver(waker);
+                fence_operation(self.fence(scope), control).await?;
+                self.stage = ReleaseStage::ShutdownFenced;
+                Ok(())
+            }),
+            scope,
+            control,
+        )
+    }
+
+    /// Permit destruction only after the second fence and the owner's final pass.
+    /// Helpers call this after every sibling finishes, not within a shard future.
+    fn release(&mut self) {
+        assert_eq!(self.stage, ReleaseStage::ShutdownFenced);
+        self.stage = ReleaseStage::Releasable;
+    }
 }
+
 impl<S: Scope> std::ops::Deref for ServiceOwner<S> {
     /// Locally owned service protected by the lifecycle fences.
     type Target = dyn Service<S>;
+
     /// Borrow the service without transferring its destruction authority.
     fn deref(&self) -> &Self::Target {
-        &**self.service
+        &*self.service
     }
 }
+
 impl<S: Scope> std::ops::DerefMut for ServiceOwner<S> {
     /// Mutably borrow the service while retaining the fail-closed owner guard.
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut **self.service
+        &mut *self.service
     }
 }
+
 impl<S: Scope> Drop for ServiceOwner<S> {
     /// Destroy a fenced service or abort rather than unwind through a live owner.
     fn drop(&mut self) {
-        if !self.releasable {
+        if self.stage != ReleaseStage::Releasable {
             std::process::abort();
         }
-        // Both lifecycle fences succeeded. This is the only release path.
-        unsafe {
-            std::mem::ManuallyDrop::drop(&mut self.service);
-        }
+        // Rust drops the service field only after this guard permits release.
     }
 }
 
@@ -776,7 +872,7 @@ fn lane_thread<S: Scope>(
     service.attach_reporter(control);
     let waker = attempt(|| service.waker()).unwrap_or_else(|error| {
         control.fail(error);
-        crate::thread_waker(None)
+        crate::drivers::thread_waker(None)
     });
     let started = attempt(|| drive(service.start(&startup), &startup, control, true, &waker));
     if started.is_ok() {
@@ -816,17 +912,14 @@ fn lane_thread<S: Scope>(
     );
     record(control, attempt(|| service.close()));
     control.close(index);
-    drive_fence(&mut *service, teardown, control, &waker);
+    service.fence_lane(teardown, control, &waker);
     control.fence(index);
     control.drained();
-    record(
-        control,
-        attempt(|| drive(service.shutdown(teardown), teardown, control, false, &waker)),
-    );
-    drive_fence(&mut *service, teardown, control, &waker);
-    service.releasable = true;
+    service.shutdown_lane(teardown, control, &waker);
+    service.release();
     Ok(())
 }
+
 /// Construct and drive helper shards cooperatively on their shared pinned thread.
 fn helper_thread<S: Scope>(
     factory: &dyn Factory<S>,
@@ -842,7 +935,7 @@ fn helper_thread<S: Scope>(
         control.lock().stats.drained += 1;
         return Err(error.into());
     }
-    let waker = crate::thread_waker(None);
+    let waker = crate::drivers::thread_waker(None);
     let mut services = Vec::new();
     for &index in &helper.lanes {
         match attempt(|| factory.build_helper(index)) {
@@ -865,9 +958,7 @@ fn helper_thread<S: Scope>(
     let mut ready = false;
     let operations = services
         .iter_mut()
-        .map(|(index, service)| {
-            helper_service(*index, &mut **service, factory, &startup, control, &waker)
-        })
+        .map(|(index, service)| helper_service(*index, service, factory, &startup, control, &waker))
         .collect();
     drive_helpers(operations, control, &waker, || {
         let mut state = control.lock();
@@ -882,35 +973,19 @@ fn helper_thread<S: Scope>(
     let teardown = teardown.as_ref().unwrap_or(&startup);
     let operations = services
         .iter_mut()
-        .map(|(_, service)| -> Operation<'_, (), S::Error> {
-            diagnose_operation(
-                Box::pin(async {
-                    record(
-                        control,
-                        catch_operation(Box::pin(async {
-                            service.register_driver(&waker);
-                            service.shutdown(teardown).await
-                        }))
-                        .await,
-                    );
-                    service.register_driver(&waker);
-                    fence_operation(service.fence(teardown), control).await
-                }),
-                teardown,
-                control,
-            )
-        })
+        .map(|(_, service)| service.shutdown_helper(teardown, control, &waker))
         .collect();
     drive_helpers(operations, control, &waker, || {});
     for (_, service) in &mut services {
-        service.releasable = true;
+        service.release();
     }
     Ok(())
 }
+
 /// Drive one helper shard until its lane and independent resources are fenced.
 fn helper_service<'a, S: Scope>(
     index: usize,
-    service: &'a mut dyn Service<S>,
+    service: &'a mut ServiceOwner<S>,
     factory: &'a dyn Factory<S>,
     startup: &'a S,
     control: &'a Control<S::Error>,
@@ -985,26 +1060,16 @@ fn helper_service<'a, S: Scope>(
         .await;
         // Helpers can own independent resources, not just lane completions.
         // Fence those before publishing drained, polling sibling futures fairly.
-        diagnose_operation(
-            fence_operation(
-                Box::pin(async {
-                    service.register_driver(waker);
-                    service.fence(teardown).await
-                }),
-                control,
-            ),
-            teardown,
-            control,
-        )
-        .await?;
+        service.fence_helper(teardown, control, waker).await?;
         Ok(())
     })
 }
+
 /// Subscribe to caller cancellation without letting a policy panic bypass teardown.
 fn subscribe_cancellation<S: Scope>(
     scope: &S,
     control: &Control<S::Error>,
-) -> Option<crate::deadline::CancellationRegistration> {
+) -> Option<crate::environment::CancellationRegistration> {
     match attempt(|| {
         scope
             .cancellation()
@@ -1123,8 +1188,7 @@ fn drive_helpers<E: Copy + From<Error>>(
 }
 
 /// Linux CPU, cgroup, NUMA, and NIC discovery and calling-thread affinity.
-/// Placement policy belongs to the caller, not the runtime. The crate-root
-/// `affinity` module remains the compatibility path for existing callers.
+/// Placement policy belongs to the caller, not the runtime.
 pub mod affinity {
     use crate::{Error, Result};
     use std::{
@@ -1840,7 +1904,57 @@ mod tests {
         assert_eq!(control.lock().stats.done, 1);
     }
 
-    /// Lane and helper fence errors or panics abort before service destruction.
+    /// Both drivers retain ownership through the second fence until explicit release.
+    #[test]
+    fn service_owner_requires_both_fences_and_explicit_release() {
+        for helper in [false, true] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut owner = ServiceOwner::new(Box::new(Local {
+                events: events.clone(),
+                owner: Rc::new(thread::current().id()),
+                panic_poll: false,
+                stop: Arc::default(),
+            }));
+            let control = Control::new(1, usize::from(helper), true);
+            let waker = crate::drivers::thread_waker(None);
+            assert_eq!(owner.stage, ReleaseStage::Live);
+            if helper {
+                drive_helpers(
+                    vec![Box::pin(owner.fence_helper(&TestScope, &control, &waker))],
+                    &control,
+                    &waker,
+                    || {},
+                );
+            } else {
+                owner.fence_lane(&TestScope, &control, &waker);
+            }
+            assert_eq!(owner.stage, ReleaseStage::Drained);
+            assert_eq!(*events.lock().unwrap(), ["fence"]);
+            if helper {
+                drive_helpers(
+                    vec![owner.shutdown_helper(&TestScope, &control, &waker)],
+                    &control,
+                    &waker,
+                    || {},
+                );
+            } else {
+                owner.shutdown_lane(&TestScope, &control, &waker);
+            }
+            assert_eq!(owner.stage, ReleaseStage::ShutdownFenced);
+            assert_eq!(*events.lock().unwrap(), ["fence", "shutdown", "fence"]);
+            owner.release();
+            assert_eq!(owner.stage, ReleaseStage::Releasable);
+            assert_eq!(*events.lock().unwrap(), ["fence", "shutdown", "fence"]);
+            drop(owner);
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["fence", "shutdown", "fence", "drop"]
+            );
+            assert_eq!(control.result(), Ok(()));
+        }
+    }
+
+    /// Failed fences and incomplete ownership stages abort before service destruction.
     #[test]
     fn fence_failure_aborts_before_service_drop() {
         use std::os::unix::process::ExitStatusExt;
@@ -1861,33 +1975,43 @@ mod tests {
 
                 fences: usize,
             }
+
             impl Drop for Fatal {
                 /// Exit distinctly if the failed-fence service is ever destroyed.
                 fn drop(&mut self) {
                     std::process::exit(99);
                 }
             }
+
             impl Service<TestScope> for Fatal {
                 /// Finish startup so the test can reach the selected fence.
                 fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                     Box::pin(async { Ok(()) })
                 }
+
                 /// Perform no steady-state work before the injected fence failure.
                 fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                     Ok(())
                 }
+
                 /// Finish drain without masking the injected fence result.
                 fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                     Box::pin(async { Ok(()) })
                 }
+
                 /// Finish shutdown to reach the second fence when requested.
                 fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                     Box::pin(async { Ok(()) })
                 }
+
                 /// Inject construction, polling, or result failure at the chosen fence.
                 fn fence<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                     self.fences += 1;
-                    let fail = self.fences == if self.mode.contains("second") { 2 } else { 1 };
+                    if self.mode.contains("pending") && self.fences == 2 {
+                        return Box::pin(std::future::pending());
+                    }
+                    let fail = !self.mode.starts_with("owner")
+                        && self.fences == if self.mode.contains("second") { 2 } else { 1 };
                     assert!(
                         !(fail && self.mode.contains("construct")),
                         "fence construction"
@@ -1898,8 +2022,10 @@ mod tests {
                     })
                 }
             }
+
             /// Construct a service configured for the child process's failure mode.
             struct FatalFactory(String);
+
             impl Factory<TestScope> for FatalFactory {
                 /// Create a fresh service with neither ownership fence completed.
                 fn build_lane(&self, _: usize) -> Result<Box<dyn Service<TestScope>>> {
@@ -1909,21 +2035,44 @@ mod tests {
                     }))
                 }
             }
-            if mode.starts_with("helper") {
+            if mode.starts_with("owner") {
+                let control = Control::new(1, 0, true);
+                let factory = FatalFactory(mode.clone());
+                let mut owner = ServiceOwner::new(factory.build_lane(0).unwrap());
+                let waker = crate::drivers::thread_waker(None);
+                if !mode.contains("live") {
+                    owner.fence_lane(&TestScope, &control, &waker);
+                }
+                if mode.contains("shutdown-fenced") {
+                    owner.shutdown_lane(&TestScope, &control, &waker);
+                }
+                if mode.contains("unpolled") || mode.contains("pending") {
+                    let mut operation = owner.shutdown_helper(&TestScope, &control, &waker);
+                    if mode.contains("pending") {
+                        let mut cx = Context::from_waker(&waker);
+                        assert!(operation.as_mut().poll(&mut cx).is_pending());
+                    }
+                    drop(operation);
+                    assert_eq!(owner.stage, ReleaseStage::Drained);
+                }
+                if mode.ends_with("release") {
+                    let result = attempt(|| {
+                        owner.release();
+                        Ok::<_, Error>(())
+                    });
+                    assert_eq!(result, Err(Error::Io));
+                }
+                drop(owner);
+            } else if mode.starts_with("helper") {
                 let control = Control::new(1, 1, true);
                 control.close(0);
                 control.fence(0);
                 let factory = FatalFactory(mode.clone());
                 let mut owner = ServiceOwner::new(factory.build_lane(0).unwrap());
-                let waker = crate::thread_waker(None);
+                let waker = crate::drivers::thread_waker(None);
                 drive_helpers(
                     vec![helper_service(
-                        0,
-                        &mut *owner,
-                        &factory,
-                        &TestScope,
-                        &control,
-                        &waker,
+                        0, &mut owner, &factory, &TestScope, &control, &waker,
                     )],
                     &control,
                     &waker,
@@ -1931,10 +2080,7 @@ mod tests {
                 );
                 // Exercise the post-shutdown helper fence as a separate pass.
                 drive_helpers(
-                    vec![Box::pin(async {
-                        owner.shutdown(&TestScope).await?;
-                        fence_operation(owner.fence(&TestScope), &control).await
-                    })],
+                    vec![owner.shutdown_helper(&TestScope, &control, &waker)],
                     &control,
                     &waker,
                     || {},
@@ -1962,6 +2108,13 @@ mod tests {
             "helper-second-error",
             "helper-second-panic",
             "helper-second-construct",
+            "owner-live-drop",
+            "owner-drained-drop",
+            "owner-shutdown-fenced-drop",
+            "owner-live-release",
+            "owner-drained-release",
+            "owner-unpolled-release",
+            "owner-pending-release",
         ] {
             let status = std::process::Command::new("timeout")
                 .args(["--signal=TERM", "--kill-after=1s", "10s"])
@@ -2081,7 +2234,7 @@ mod tests {
                 Ok(())
             }
             /// Inject failure while accessing caller cancellation policy.
-            fn cancellation(&self) -> Option<&crate::deadline::Cancellation> {
+            fn cancellation(&self) -> Option<&crate::environment::Cancellation> {
                 panic!("cancellation hook");
             }
         }
@@ -2155,7 +2308,7 @@ mod tests {
                 Poll::Pending
             }
         }));
-        let waker = crate::thread_waker(None);
+        let waker = crate::drivers::thread_waker(None);
         drive_helpers(
             vec![diagnose_operation(operation, &Expired, &control)],
             &control,
@@ -2181,7 +2334,7 @@ mod tests {
                 Ok(())
             }
             /// Count hooks and inject failure only after startup's subscription attempt.
-            fn cancellation(&self) -> Option<&crate::deadline::Cancellation> {
+            fn cancellation(&self) -> Option<&crate::environment::Cancellation> {
                 assert_eq!(
                     self.0.fetch_add(1, Ordering::SeqCst),
                     0,
@@ -2473,22 +2626,26 @@ mod tests {
     #[test]
     fn helper_start_and_drain_panics_still_poll_until_lane_fence() {
         /// Helper that counts polls while injecting lifecycle future panics.
-        struct PanickingHelper(usize);
+        struct PanickingHelper(Rc<std::cell::Cell<usize>>);
+
         impl Service<TestScope> for PanickingHelper {
             /// Inject a panic when the helper startup future is polled.
             fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { panic!("injected helper start panic") })
             }
+
             /// Count one cooperative turn while checking the single-shard budget.
             fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
                 assert_eq!(budget, 1);
-                self.0 += 1;
+                self.0.set(self.0.get() + 1);
                 Ok(())
             }
+
             /// Inject a panic when the helper drain future is polled.
             fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { panic!("injected helper drain panic") })
             }
+
             /// Finish shutdown without introducing another failure.
             fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
@@ -2496,9 +2653,10 @@ mod tests {
         }
         let plan = plan(2);
         let factory = recipe(&plan, false);
-        let mut service = PanickingHelper(0);
+        let polls = Rc::new(std::cell::Cell::new(0));
+        let mut service = ServiceOwner::new(Box::new(PanickingHelper(polls.clone())));
         let control = Control::new(1, 1, true);
-        let waker = crate::thread_waker(None);
+        let waker = crate::drivers::thread_waker(None);
         let mut cx = Context::from_waker(&waker);
         {
             let mut operation =
@@ -2511,9 +2669,16 @@ mod tests {
             assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
         }
         assert!(
-            service.0 >= 4,
+            polls.get() >= 4,
             "helper keeps driving through both panics and the lane fence"
         );
+        drive_helpers(
+            vec![service.shutdown_helper(&TestScope, &control, &waker)],
+            &control,
+            &waker,
+            || {},
+        );
+        service.release();
     }
 
     /// Sibling helper fences progress cooperatively before drain accounting and destruction.
@@ -2612,11 +2777,13 @@ mod tests {
                 })
             }
         }
+
         impl Drop for Independent {
             /// Verify owner-thread destruction only after both independent fences ran.
             fn drop(&mut self) {
                 assert_eq!(*self.owner, thread::current().id());
                 assert_eq!(self.fences, 2);
+                assert_eq!(self.shared.completed[1].load(Ordering::SeqCst), 2);
                 self.shared.dropped.fetch_add(1, Ordering::SeqCst);
             }
         }
