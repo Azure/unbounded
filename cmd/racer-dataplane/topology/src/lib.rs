@@ -104,8 +104,10 @@
 //! # Threads and caches
 //!
 //! A [`Membership`] can be shared across threads. [`Placement`] and [`Paths`]
-//! cannot: make one per worker thread. Their async methods do a little work
-//! per poll, so a large job never stalls the worker.
+//! cannot: make one per worker thread. Async placement scoring and route searches
+//! advance incrementally across polls. Cache admission and other synchronous work
+//! do not have a fixed per-poll latency bound: placement admission may scan the
+//! whole cache before scoring starts.
 //!
 //! Every cache has a size limit. Byte counts are estimates, not hard memory
 //! limits. [`Membership::retained_bytes`] counts a shared graph in full for
