@@ -16,4 +16,6 @@ description: Refactor Rust code while preserving behavior and using idiomatic ow
   - important, public types/traits at the top.
   - more trivial helper functions at the bottom
   - unit tests below that
+- Prefer designs that allow for strict semantic enforcement of the application's business logic by the Rust compiler. ALWAYS consider how to structure code to better utilize the compiler.
+- Carefully consider concurrency. Pad structures to align with CPU cache lines whenever possible, prefer explicit scoping: code that should be pinned to a specific cpu should not implement clone/copy, etc.
 - MAKE AGGRESSIVE CHANGES WHEN REFACTORING. It's okay to fundamentally re-write code.
