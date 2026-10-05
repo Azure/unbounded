@@ -32,14 +32,19 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// Maximum live connections, including abandoned buffers awaiting their fence.
 pub const MAX_CONNECTIONS: usize = 4;
+
 /// Maximum bytes read while looking for the end of the request headers.
 pub const MAX_REQUEST_BYTES: usize = 1024;
+
 /// Fixed buffer capacity shared by request parsing and response formatting.
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Maximum lifetime of an exchange, further limited by the caller's deadline.
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Buffers plus bounded service/future bookkeeping, acquired before serving.
 pub const RESERVED_BYTES: usize = (MAX_CONNECTIONS + 1) * (MAX_RESPONSE_BYTES + 4096);
+
 /// Prepaid submissions for one accept and one operation per connection.
 pub const CONTROL_SLOTS: usize = MAX_CONNECTIONS + 1;
 
@@ -54,22 +59,29 @@ pub trait Scope: uring_runtime::Scope {
 pub enum Response {
     /// Send the handler's text with a successful status.
     Text,
+
     /// Send the handler's text with the Prometheus exposition content type.
     Metrics,
+
     /// Discard handler output and send the fixed not-found body.
     NotFound,
+
     /// Send the handler's text with a service-unavailable status.
     Unavailable,
 }
+
 /// Fixed transport observations, without request headers or application data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
     /// A socket was accepted, before application admission is attempted.
     Accepted,
+
     /// Admission was denied or a fixed rejection response was selected.
     Rejected,
+
     /// An exchange failed for a reason other than deadline expiry.
     IoError,
+
     /// An exchange exceeded its narrowed deadline.
     Timeout,
 }
@@ -95,6 +107,7 @@ pub struct Server {
 
     serving: Cell<bool>,
 }
+
 /// Reservations retained by every connection buffer through its final fence.
 struct Resources {
     _memory: Box<dyn std::any::Any>,
@@ -103,6 +116,7 @@ struct Resources {
 
     active: Cell<usize>,
 }
+
 impl Server {
     /// The caller reserves CONTROL_SLOTS submissions and RESERVED_BYTES memory
     /// (including submission bookkeeping) through its existing budget authority.
@@ -116,6 +130,7 @@ impl Server {
             serving: Cell::new(false),
         }
     }
+
     /// Admit one connection and allocate its fixed, completion-owned buffer.
     fn buffer<H: Handler>(&self, handler: &H) -> Option<Buffer<H::Connection>> {
         if self.resources.active.get() >= MAX_CONNECTIONS {
@@ -131,6 +146,7 @@ impl Server {
             _connection: connection,
         })
     }
+
     /// Poll alongside the reactor, at least every 10ms during queue pressure.
     /// Dropping this future abandons work, not ownership: drain the reactor.
     pub fn serve<'a, S: Scope, B: Budget, H: Handler>(
@@ -213,6 +229,7 @@ impl Server {
             .await
         })
     }
+
     /// Read one request, scrub it, and send one response under a shared deadline.
     fn exchange<'a, S: Scope, B: Budget, H: Handler>(
         &'a self,
@@ -280,14 +297,17 @@ impl Server {
         })
     }
 }
+
 /// Release the listener guard when serving returns or its future is dropped.
 struct Serving<'a>(&'a Cell<bool>);
+
 impl Drop for Serving<'_> {
     /// Permit a subsequent service future after this one releases its listener.
     fn drop(&mut self) {
         self.0.set(false);
     }
 }
+
 /// Stable allocation and guards moved into the reactor for each operation.
 struct Buffer<C: 'static> {
     bytes: Vec<u8>,
@@ -299,6 +319,7 @@ struct Buffer<C: 'static> {
 
     _connection: C,
 }
+
 impl<C> Buffer<C> {
     /// Consume positive progress within the submitted range, for reads or writes.
     fn advance(&mut self, completed: usize) -> Result<()> {
@@ -309,6 +330,7 @@ impl<C> Buffer<C> {
         Ok(())
     }
 }
+
 impl<C> Drop for Buffer<C> {
     /// Scrub the allocation and release the connection slot after its fence.
     fn drop(&mut self) {
@@ -316,6 +338,7 @@ impl<C> Drop for Buffer<C> {
         self.resources.active.set(self.resources.active.get() - 1);
     }
 }
+
 // SAFETY: private fixed Vec retains its reservation and is not aliased.
 unsafe impl<C: 'static> IoBuffer for Buffer<C> {
     type Error = Error;
@@ -335,10 +358,14 @@ unsafe impl<C: 'static> IoBuffer for Buffer<C> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Route<'a> {
     Get(&'a str),
+
     Method,
+
     BadRequest,
+
     TooLarge,
 }
+
 /// Accept exactly the supported HTTP version, headers, and bodyless GET method.
 fn parse(bytes: &[u8]) -> Route<'_> {
     let mut headers = [httparse::EMPTY_HEADER; 16];
@@ -375,12 +402,14 @@ fn parse(bytes: &[u8]) -> Route<'_> {
     }
     request.path.map(Route::Get).unwrap_or(Route::BadRequest)
 }
+
 /// A formatter that fails rather than growing beyond the caller's slice.
 struct Output<'a> {
     bytes: &'a mut [u8],
 
     used: usize,
 }
+
 impl Write for Output<'_> {
     /// Append all bytes or fail without modifying the written length.
     fn write_str(&mut self, text: &str) -> fmt::Result {
@@ -393,6 +422,7 @@ impl Write for Output<'_> {
         Ok(())
     }
 }
+
 /// Format a complete response, replacing rejected handler output with fixed text.
 fn respond(
     handler: &impl Handler,

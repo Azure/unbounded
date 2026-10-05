@@ -444,10 +444,13 @@ pub mod metrics {
             #[derive(Clone, Copy, Debug, Eq, PartialEq)]
             #[repr(usize)]
             pub enum $kind { $(#[doc = $name] $variant,)* }
+
             /// Number of metrics in this schema.
             pub const $count: usize = [$($name,)*].len();
+
             /// Every metric in registry index order.
             pub const $all: [$kind; $count] = [$($kind::$variant,)*];
+
             impl $kind {
                 /// Every metric in registry index order.
                 pub const ALL: &'static [Self] = &$all;
@@ -457,6 +460,7 @@ pub mod metrics {
                     match self { $(Self::$variant => $name,)* }
                 }
             }
+
             impl $crate::Metric for $kind {
                 const ALL: &'static [Self] = Self::ALL;
 
@@ -540,9 +544,11 @@ pub mod metrics {
             Self::D => "d_total", Self::E => "e_total", Self::F => "f_total",
             Self::G => "g_total", Self::H => "h_total", Self::I => "i_total",
         }
+
         crate::metrics! { Level, LEVELS, LEVEL_COUNT;
             Self::Active => "active", Self::Other => "other",
         }
+
         /// Two counter cache lines and two independently aligned gauges.
         type TestMetrics = Metrics<Event, Level>;
 
@@ -691,12 +697,16 @@ pub mod health {
         /// Initial lifecycle before the caller declares readiness.
         #[default]
         Starting,
+
         /// Ready when the caller's latest resource observation is usable.
         Ready,
+
         /// Not ready, either explicitly or due to an unusable observation.
         Degraded,
+
         /// Shutting down; only draining or stopped transitions remain legal.
         Draining,
+
         /// Final lifecycle; no transition to another state is permitted.
         Stopped,
     }
@@ -711,6 +721,7 @@ pub mod health {
             f.write_str("health unavailable")
         }
     }
+
     impl std::error::Error for Unavailable {}
 
     /// Clones share lifecycle and the latest resource observation. Poisoned locks

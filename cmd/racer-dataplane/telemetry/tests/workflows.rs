@@ -17,9 +17,11 @@ use uring_runtime::{Error, Operation, Scope, environment::Cancellation, reactor:
 telemetry::metrics! { Counter, COUNTERS, COUNTER_COUNT;
     Self::Completed => "completed_total",
 }
+
 telemetry::metrics! { Gauge, GAUGES, GAUGE_COUNT;
     Self::Active => "active",
 }
+
 /// Shared metrics used by both worker lifecycle and HTTP diagnostics tests.
 type Observations = Metrics<Counter, Gauge>;
 
@@ -87,6 +89,7 @@ struct RequestScope {
 
     cancellation: Cancellation,
 }
+
 impl Scope for RequestScope {
     type Error = Error;
 
@@ -106,6 +109,7 @@ impl Scope for RequestScope {
         Some(&self.cancellation)
     }
 }
+
 impl server::Scope for RequestScope {
     /// Preserve cancellation and choose the earlier deadline.
     fn with_deadline(&self, deadline: Instant) -> Self {
@@ -122,6 +126,7 @@ struct Diagnostics {
 
     events: RefCell<Vec<Event>>,
 }
+
 impl Handler for Diagnostics {
     type Connection = Lease;
 
