@@ -860,7 +860,9 @@ pub mod relay {
         /// Run at most 32 nonblocking actions, retaining pending pipe/copy suffixes.
         /// The caller checks its scope before each step and before finalization.
         pub fn step(&mut self, io: &HttpIo<C>) -> Result<C, Step> {
-            if self.destination.socket().peer_read_closed() {
+            // A requester may finish writing while still reading its response.
+            // Reject only full disconnect here; sends report other write failures.
+            if self.destination.socket().peer_disconnected() {
                 return Err(uring_runtime::Error::Io.into());
             }
             let mut wait = Step::Yield;
@@ -1211,6 +1213,40 @@ pub mod relay {
                 assert!(!source.is_reusable() && !destination.is_reusable());
                 source.finish_exchange().unwrap();
                 destination.finish_exchange().unwrap();
+            }
+        }
+
+        /// A write-half-closed requester still receives the complete response body.
+        #[test]
+        fn relay_destination_half_close_preserves_response_and_full_close_fails() {
+            for copied in [false, true] {
+                let f = Fixture::new();
+                let (mut relay, mut writer, mut reader) = f.relay(9, Pipe::default());
+                relay.force_fallback(copied, None);
+                reader.shutdown(std::net::Shutdown::Write).unwrap();
+                assert!(relay.destination.socket().peer_read_closed());
+                assert!(!relay.destination.socket().peer_disconnected());
+                writer.write_all(b"abcdefghi").unwrap();
+                assert!(matches!(relay.step(&f.io).unwrap(), Step::Complete));
+                let mut bytes = [0; 9];
+                reader.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, b"abcdefghi");
+                assert_eq!(relay.source.receive_remaining(), Some(0));
+                assert_eq!(relay.destination.send_remaining(), Some(0));
+                drop(relay);
+                f.io.reclaim_buffer();
+                assert_eq!(f.hooks.slots.get(), 0);
+                assert_eq!(f.hooks.bytes.get(), 0);
+
+                let (mut relay, mut writer, reader) = f.relay(3, Pipe::default());
+                relay.force_fallback(copied, None);
+                writer.write_all(b"abc").unwrap();
+                drop(reader);
+                assert!(matches!(
+                    relay.step(&f.io),
+                    Err(Failure::Runtime(uring_runtime::Error::Io))
+                ));
+                assert_eq!(relay.destination.send_remaining(), Some(3));
             }
         }
 
