@@ -238,12 +238,20 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
             self.jobs.discard_closed();
         }
     }
+}
+impl<I, J, C> ClientPort<I, J, C> {
     /// Permanently reject new work while leaving accepted completions readable.
     pub fn close_submissions(&self) {
         self.handoff.closed.store(true, Ordering::Release);
         self.jobs.close();
         self.handoff.worker_waker.wake();
         self.handoff.capacity_waker.wake();
+    }
+}
+impl<I, J, C> Drop for ClientPort<I, J, C> {
+    /// Close admission and notify both the worker driver and capacity waiter.
+    fn drop(&mut self) {
+        self.close_submissions();
     }
 }
 impl<I: Identity, J: Reserved<I>, C: Reserved<I>> WorkerPort<I, J, C> {
@@ -1400,6 +1408,118 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(client.outstanding(), 1);
         drop(executing);
+        assert_eq!(client.outstanding(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    /// Implicit closure notifies the driver independently of the channel waiter.
+    #[test]
+    fn client_drop_wakes_distinct_worker_channel_and_capacity_waiters() {
+        let (client, mut worker) = pair(7, 1);
+        let permit = reserve(&client, 1);
+        let (driver_count, driver_waker) = wake_counter();
+        let (channel_count, channel_waker) = wake_counter();
+        let (capacity_count, capacity_waker) = wake_counter();
+        worker.register_driver(&driver_waker);
+        let mut channel_cx = Context::from_waker(&channel_waker);
+        assert!(worker.poll_job(&mut channel_cx).is_pending());
+        assert!(
+            client
+                .poll_reserve(&mut Context::from_waker(&capacity_waker), Id(1, 7, 2))
+                .is_pending()
+        );
+        assert_eq!(driver_count.0.load(Ordering::SeqCst), 0);
+        assert_eq!(channel_count.0.load(Ordering::SeqCst), 0);
+        assert_eq!(capacity_count.0.load(Ordering::SeqCst), 0);
+
+        drop(client);
+
+        assert!(permit.handoff.closed.load(Ordering::Acquire));
+        assert_eq!(driver_count.0.load(Ordering::SeqCst), 1);
+        assert_eq!(channel_count.0.load(Ordering::SeqCst), 1);
+        assert_eq!(capacity_count.0.load(Ordering::SeqCst), 1);
+        assert_eq!(permit.handoff.outstanding.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            worker.poll_job(&mut channel_cx),
+            Poll::Ready(Ok(None))
+        ));
+        drop(permit);
+        assert_eq!(worker.handoff.outstanding.load(Ordering::Acquire), 0);
+    }
+
+    /// Client destruction closes publication without reclaiming accepted jobs.
+    #[test]
+    fn client_drop_leaves_accepted_jobs_drainable_before_eof() {
+        let (client, mut worker) = pair(7, 2);
+        let drops = Arc::new(AtomicUsize::new(0));
+        for sequence in 1..=2 {
+            assert!(
+                client
+                    .try_submit(message(&client, sequence, &drops), |_| {})
+                    .is_ok()
+            );
+        }
+        drop(client);
+        assert!(worker.handoff.closed.load(Ordering::Acquire));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        for sequence in 1..=2 {
+            let job = dequeue(&mut worker);
+            assert_eq!(job.permit.id(), Id(1, 7, sequence));
+            assert_eq!(
+                worker.handoff.outstanding.load(Ordering::Acquire),
+                3 - sequence as usize
+            );
+            drop(job);
+        }
+        assert!(matches!(
+            worker.poll_job(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(None))
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert_eq!(worker.handoff.outstanding.load(Ordering::Acquire), 0);
+    }
+
+    /// Closure rejects held permits and new reservations while accepted work drains.
+    #[test]
+    fn close_submissions_rejects_reserved_and_new_work_but_preserves_accepted_jobs() {
+        let (client, mut worker) = pair(7, 2);
+        let drops = Arc::new(AtomicUsize::new(0));
+        assert!(
+            client
+                .try_submit(message(&client, 1, &drops), |_| {})
+                .is_ok()
+        );
+        let reserved = message(&client, 2, &drops);
+        client.close_submissions();
+        client.close_submissions();
+        assert!(client.submissions_closed());
+        let failure = client
+            .try_submit(reserved, |_| {
+                panic!("closed submission ran publication hook")
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.error, Error::Runtime(crate::Error::Unavailable));
+        assert_eq!(failure.command.permit.id(), Id(1, 7, 2));
+        assert_eq!(client.outstanding(), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(failure);
+        assert!(matches!(
+            client.poll_reserve(&mut Context::from_waker(Waker::noop()), Id(1, 7, 3)),
+            Poll::Ready(Err(Error::Runtime(crate::Error::Unavailable)))
+        ));
+        assert_eq!(client.outstanding(), 1);
+        let job = dequeue(&mut worker);
+        assert_eq!(job.permit.id(), Id(1, 7, 1));
+        assert!(matches!(
+            worker.poll_job(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(None))
+        ));
+        assert!(worker.complete(job).is_ok());
+        let completion = client.receive().unwrap().unwrap();
+        assert_eq!(completion.permit.id(), Id(1, 7, 1));
+        assert_eq!(client.outstanding(), 1);
+        drop(completion);
         assert_eq!(client.outstanding(), 0);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
