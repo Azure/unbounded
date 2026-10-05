@@ -38,6 +38,7 @@ impl From<uring_runtime::Error> for Failure {
 struct RequestScope;
 impl Scope for RequestScope {
     type Error = Failure;
+
     /// Allow progress until the surrounding test driver stops polling.
     fn check(&self) -> Result<(), Failure> {
         Ok(())
@@ -56,22 +57,33 @@ impl Endpoint<Failure> for Address {
 struct Caller;
 impl Context for Caller {
     type Error = Failure;
+
     type Scope = RequestScope;
+
     type Budget = ();
+
     type Reactor = Rc<Reactor<RequestScope, ()>>;
+
     type Charge = ();
+
     type Slot = ();
+
     type Opaque = ();
+
     type State = ();
+
     type Endpoint = Address;
+
     /// Admit the bounded storage used by each exchange fixture.
     fn charge(&self, _: usize) -> Result<(), Failure> {
         Ok(())
     }
+
     /// Admit an outbound connection without tracking application quotas.
     fn outbound_slot(&self) -> Result<(), Failure> {
         Ok(())
     }
+
     /// Keep admission open for the lifetime of the fixture.
     fn stopped(&self) -> bool {
         false

@@ -48,9 +48,12 @@
 //! The optional `test-util` feature exposes connection framing, pool inspection,
 //! and deterministic relay fallback helpers without an application dependency.
 
+#![warn(missing_docs)]
+
 pub mod connection;
-pub mod delivery;
-pub mod relay;
+mod transfer;
+
+pub use transfer::{delivery, relay};
 
 use std::marker::PhantomData;
 use zeroize::Zeroize;
@@ -59,6 +62,7 @@ use zeroize::Zeroize;
 pub struct Codec<O: Opaque = ()> {
     /// Maximum encoded head length, including the final empty line.
     header_limit: usize,
+
     /// Selects field policy without storing a policy instance.
     opaque: PhantomData<O>,
 }
@@ -67,6 +71,7 @@ pub struct Codec<O: Opaque = ()> {
 pub struct MessageHead {
     /// The request method and target, or response status.
     pub start: StartLine,
+
     /// Fields in wire order, including permitted duplicates.
     pub headers: Vec<Header>,
 }
@@ -77,6 +82,7 @@ pub enum StartLine {
     Request {
         /// The nonempty HTTP token naming the method.
         method: String,
+
         /// The nonempty visible-ASCII request target.
         target: String,
     },
@@ -91,6 +97,7 @@ pub enum StartLine {
 pub struct Header {
     /// Original field-name spelling; matching is case-insensitive.
     pub name: String,
+
     /// Field bytes after removing at most one separator space during decoding.
     pub value: Vec<u8>,
 }
@@ -464,6 +471,7 @@ pub mod range {
         Closed {
             /// The first requested byte offset.
             first: u64,
+
             /// The last requested byte offset.
             last: u64,
         },
@@ -478,8 +486,10 @@ pub mod range {
     pub struct ContentRange {
         /// First included byte offset.
         pub first: u64,
+
         /// Last included byte offset.
         pub last: u64,
+
         /// Complete representation length, greater than the last offset.
         pub total: u64,
     }
@@ -541,20 +551,14 @@ pub mod range {
     }
 }
 
-/// Recognize kernel splice failures that permit a copying fallback.
-fn splice_unsupported(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
-    )
-}
-
 /// Structural offsets and checked storage shared by decoding and admission.
 struct HeadLayout {
     /// Offset of the first CRLF, which ends the start line.
     first: usize,
+
     /// Number of field descriptors to reserve.
     fields: usize,
+
     /// Checked charge for descriptors, owned bytes, and the head itself.
     allocation: usize,
 }
