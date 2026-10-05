@@ -282,7 +282,7 @@ impl SubscriptionFixture {
             64 * 1024 * 1024,
             crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
         ));
-        slabs.open_now().unwrap();
+        let _ = slabs.open_configured(&segments).unwrap();
         let writer = Rc::new(StoreWriter::new(
             index.clone(),
             segments.clone(),

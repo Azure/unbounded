@@ -2095,8 +2095,8 @@ fn fixture_with_caches(
         64 * 1024 * 1024,
         crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
     ));
-    slabs
-        .open_now()
+    let _ = slabs
+        .open_configured(&segments)
         .expect("read fixture filesystem supports direct slab alignment");
     let clock = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
     let metrics = Metrics::default();
@@ -3152,7 +3152,7 @@ fn cold_disk_fixture() -> Fixture {
     let mut f = fixture();
     f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
     f.reactor.init().unwrap();
-    futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let original = acquire(&mut f, &mut budget).unwrap();
     assert_eq!(
@@ -3185,7 +3185,7 @@ fn local_tail_fixture(length: u64, disk: bool) -> Fixture {
     let mut f = fixture_with(length, None);
     f.page.number = PageNumber(3);
     f.reactor.init().unwrap();
-    futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let original = acquire(&mut f, &mut budget).unwrap();
     if disk {
@@ -3375,7 +3375,7 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
             };
             stored.bytes_mut().unwrap()[offset] ^= 1;
             let lease = writer.lease(&location).unwrap();
-            drive_disk(
+            let _ = drive_disk(
                 &f,
                 writer
                     .slabs()
@@ -3837,7 +3837,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     let mut f = fixture_with(PAGE_BYTES, Some(limits));
     f.scope.deadline.0 = Instant::now() + Duration::from_secs(30);
     f.reactor.init().unwrap();
-    futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let original = acquire(&mut f, &mut budget).unwrap();
     let expected = original.ciphertext.bytes().to_vec();

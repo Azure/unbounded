@@ -440,7 +440,7 @@ mod tests {
                             entries: vec![],
                             metadata: vec![],
                         },
-                        segments: segments.snapshot().unwrap(),
+                        segments: segments.snapshot(),
                     }
                 })
                 .collect(),
@@ -570,7 +570,7 @@ mod tests {
             },
         ));
         drop(append);
-        old.shards[0].segments = segments.snapshot().unwrap();
+        old.shards[0].segments = segments.snapshot();
         let mut standalone = metadata.clone();
         standalone.version.etag = StrongEtag::test_value("head-only");
         standalone.length = 0;
@@ -715,7 +715,7 @@ mod tests {
             app.snapshots
                 .publish(publication(&config, 1, vec![]))
                 .unwrap();
-            futures::executor::block_on(app.store.open()).unwrap();
+            let _ = futures::executor::block_on(app.store.open()).unwrap();
             let shard = futures::executor::block_on(app.store.checkpoint.snapshot_shard()).unwrap();
             let geometry = shard.geometry;
             app.store.checkpoint.finish_snapshot();

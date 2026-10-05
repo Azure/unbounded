@@ -106,8 +106,13 @@ impl From<page_alloc::Error> for Error {
             page_alloc::Error::InvalidConfiguration => Self::InvalidConfiguration,
             page_alloc::Error::Busy => Self::Overloaded,
             page_alloc::Error::Corrupt => Self::CorruptRecord,
-            page_alloc::Error::Unavailable => Self::Unavailable,
+            page_alloc::Error::Stale | page_alloc::Error::Unavailable => Self::Unavailable,
             page_alloc::Error::Io => Self::Io,
+            page_alloc::Error::SystemIo { .. } => {
+                eprintln!("racer: allocator: {error}");
+                Self::Io
+            }
+            _ => Self::Internal,
         }
     }
 }
@@ -189,8 +194,23 @@ mod tests {
             ),
             (AllocError::Busy, Error::Overloaded),
             (AllocError::Corrupt, Error::CorruptRecord),
+            (AllocError::Stale, Error::Unavailable),
             (AllocError::Unavailable, Error::Unavailable),
             (AllocError::Io, Error::Io),
+            (
+                AllocError::SystemIo {
+                    operation: "open",
+                    errno: Some(libc::EACCES),
+                },
+                Error::Io,
+            ),
+            (
+                AllocError::SystemIo {
+                    operation: "statx",
+                    errno: None,
+                },
+                Error::Io,
+            ),
         ] {
             assert_eq!(Error::from(allocator), racer);
         }

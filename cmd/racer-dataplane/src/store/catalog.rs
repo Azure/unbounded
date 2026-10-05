@@ -475,8 +475,22 @@ impl Index {
 pub struct SegmentClock {
     index: Rc<Index>,
     free_reserve: usize,
+    budget: ReclaimBudget,
     clock: page_alloc::SegmentClock,
 }
+
+/// Per-call reactor work limits, selected by the application, not the allocator.
+#[derive(Clone, Copy, Debug)]
+pub struct ReclaimBudget {
+    pub segment_visits: usize,
+    pub mapping_removals: usize,
+}
+
+/// Bound foreground reclamation so a large disk index cannot monopolize a turn.
+pub const FOREGROUND_RECLAIM_BUDGET: ReclaimBudget = ReclaimBudget {
+    segment_visits: 64,
+    mapping_removals: 256,
+};
 impl page_alloc::SegmentEntries for Index {
     fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
         let entries = self.segment_entries_bounded(segment, budget);
@@ -495,9 +509,18 @@ impl SegmentClock {
         self.free_reserve
     }
     pub fn new(index: Rc<Index>, segments: Rc<Segments>, free_reserve: usize) -> Self {
+        Self::with_budget(index, segments, free_reserve, FOREGROUND_RECLAIM_BUDGET)
+    }
+    pub fn with_budget(
+        index: Rc<Index>,
+        segments: Rc<Segments>,
+        free_reserve: usize,
+        budget: ReclaimBudget,
+    ) -> Self {
         Self {
             index,
             free_reserve,
+            budget,
             clock: page_alloc::SegmentClock::new(segments),
         }
     }
@@ -510,15 +533,22 @@ impl SegmentClock {
     /// Its bytes and generation stay intact until normal lease-fenced recycling.
     pub fn reclaim_index_for(&self, page: &PageId) -> Result<()> {
         self.clock
-            .reclaim_index(&*self.index, 64, || {
-                self.index.preflight_capacity(page).is_ok()
-            })
+            .reclaim_index(
+                &*self.index,
+                self.budget.segment_visits.min(self.budget.mapping_removals),
+                || self.index.preflight_capacity(page).is_ok(),
+            )
             .map_err(Into::into)
     }
     /// At most two rotations. Busy segments remain Evicting until a later poll.
     pub fn reclaim_now(&self) -> Result<()> {
         self.clock
-            .reclaim(&*self.index, self.free_reserve, 64, 256)
+            .reclaim(
+                &*self.index,
+                self.free_reserve,
+                self.budget.segment_visits,
+                self.budget.mapping_removals,
+            )
             .map_err(Into::into)
     }
 }
@@ -560,6 +590,28 @@ mod tests {
         drop(held);
         clock.reclaim_now().unwrap();
         assert_eq!(segments.free_count(), 2);
+    }
+
+    #[test]
+    fn caller_selected_zero_budget_preserves_allocations_and_index() {
+        let segments = Rc::new(segments(512, 2));
+        drop(segments.append(512).unwrap());
+        let index = Rc::new(index(1));
+        let clock = SegmentClock::with_budget(
+            index,
+            segments.clone(),
+            2,
+            ReclaimBudget {
+                segment_visits: 0,
+                mapping_removals: 0,
+            },
+        );
+        assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
+        assert_eq!(segments.free_count(), 1);
+        assert_eq!(
+            segments.state(SegmentId(0)).unwrap(),
+            page_alloc::SegmentState::Sealed
+        );
     }
     fn index(capacity: usize) -> Index {
         Index::new(WorkerId(0), capacity, crate::test_support::availability())

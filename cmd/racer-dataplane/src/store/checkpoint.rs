@@ -24,6 +24,7 @@ use crate::runtime::HashSet;
 use crate::runtime::cooperative_turn;
 use page_alloc::Alignment;
 use page_alloc::Extent;
+use page_alloc::FreezeGuard;
 use page_alloc::Generation;
 use page_alloc::SegmentId;
 use page_alloc::SegmentSnapshot;
@@ -34,6 +35,7 @@ use racer_control_wire::KeyId;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -51,7 +53,7 @@ pub struct Checkpointer {
     index: Rc<Index>,
     segments: Rc<Segments>,
     geometry: Cell<Option<CheckpointGeometry>>,
-    frozen: Cell<bool>,
+    frozen: RefCell<Option<FreezeGuard>>,
 }
 
 impl Checkpointer {
@@ -61,14 +63,14 @@ impl Checkpointer {
             index,
             segments,
             geometry: Cell::new(None),
-            frozen: Cell::new(false),
+            frozen: RefCell::new(None),
         }
     }
 
     /// Call after slab opening discovers actual geometry, before taking snapshots.
     pub fn configure_geometry(&self, geometry: CheckpointGeometry) -> Result<()> {
         geometry.validate_live(&self.segments)?;
-        if self.frozen.get() {
+        if self.frozen.borrow().is_some() {
             return Err(Error::Overloaded);
         }
         self.geometry.set(Some(geometry));
@@ -78,23 +80,22 @@ impl Checkpointer {
     pub fn snapshot_shard(&self) -> Operation<'_, ShardImage> {
         Box::pin(async move {
             let geometry = self.geometry.get().ok_or(Error::InvalidConfiguration)?;
-            if self.frozen.get() {
+            if self.frozen.borrow().is_some() {
                 return Err(Error::Overloaded);
             }
-            self.segments.freeze()?;
-            self.frozen.set(true);
+            let frozen = self.segments.freeze()?;
             let snapshot = (|| {
                 let shard = ShardImage {
                     worker: self.index.worker(),
                     geometry,
                     index: self.index.snapshot()?,
-                    segments: self.segments.snapshot()?,
+                    segments: self.segments.snapshot(),
                 };
                 shard.validate()?;
                 Ok(shard)
             })();
-            if snapshot.is_err() {
-                self.finish_snapshot();
+            if snapshot.is_ok() {
+                *self.frozen.borrow_mut() = Some(frozen);
             }
             snapshot
         })
@@ -107,13 +108,13 @@ impl Checkpointer {
         let owner = self.clone();
         Box::pin(async move {
             let geometry = owner.geometry.get().ok_or(Error::InvalidConfiguration)?;
-            if owner.frozen.get() {
+            if owner.frozen.borrow().is_some() {
                 return Err(Error::Overloaded);
             }
-            owner.segments.freeze()?;
-            owner.frozen.set(true);
+            // Keep ownership in the future until success so cancellation also thaws.
+            let frozen = owner.segments.freeze()?;
             let result = async {
-                let segments = owner.segments.snapshot()?;
+                let segments = owner.segments.snapshot();
                 let metadata = owner.index.snapshot_metadata();
                 let mut charged = segments.len() * 128
                     + metadata
@@ -154,8 +155,8 @@ impl Checkpointer {
                 })
             }
             .await;
-            if result.is_err() {
-                owner.finish_snapshot();
+            if result.is_ok() {
+                *owner.frozen.borrow_mut() = Some(frozen);
             }
             result
         })
@@ -164,9 +165,7 @@ impl Checkpointer {
     /// Required on every owning worker after success, failure, or coordinator abort.
     /// Images are Send values, deliberately containing no worker-local lease/Rc.
     pub fn finish_snapshot(&self) {
-        if self.frozen.replace(false) {
-            self.segments.thaw();
-        }
+        self.frozen.borrow_mut().take();
     }
 
     /// One coordinator calls this after all owner-worker snapshots have succeeded.
@@ -366,12 +365,7 @@ impl Recovery {
             let image = match image {
                 Some(image) => image,
                 None => {
-                    let empty = Segments::new(geometry.segment_bytes);
-                    empty.configure(
-                        geometry.slab_bytes,
-                        geometry.segment_count as usize,
-                        geometry.alignment()?,
-                    )?;
+                    let empty = Segments::from_geometry(geometry.allocation_geometry()?)?;
                     ShardImage {
                         worker: self.index.worker(),
                         geometry,
@@ -379,7 +373,7 @@ impl Recovery {
                             entries: vec![],
                             metadata: vec![],
                         },
-                        segments: empty.snapshot()?,
+                        segments: empty.snapshot(),
                     }
                 }
             };
@@ -389,6 +383,8 @@ impl Recovery {
             image.validate()?;
             self.segments.validate_restore(&image.segments)?;
             self.index.validate_snapshot(&image.index)?;
+            // Keep both preflights even though restore validates again: a frozen or
+            // leased table must reject the cut before the index is mutated.
             // Index::restore checks its own standalone metadata capacity before
             // mutation. There is no await between validation and these installs.
             // The coordinator must fence admission for the complete operation.
@@ -574,6 +570,20 @@ pub struct CheckpointGeometry {
     pub length_alignment: u64,
 }
 
+impl From<page_alloc::SegmentGeometry> for CheckpointGeometry {
+    fn from(geometry: page_alloc::SegmentGeometry) -> Self {
+        let alignment = geometry.alignment();
+        Self {
+            slab_bytes: geometry.slab_bytes(),
+            segment_bytes: geometry.segment_bytes(),
+            segment_count: geometry.segment_count(),
+            memory_alignment: alignment.memory() as u64,
+            offset_alignment: alignment.offset(),
+            length_alignment: alignment.length() as u64,
+        }
+    }
+}
+
 impl CheckpointGeometry {
     /// Full-page capacity at actual direct-I/O alignment, conservatively allowing
     /// the largest supported record header. Short records can use tail space.
@@ -610,11 +620,12 @@ impl CheckpointGeometry {
         Ok(geometry)
     }
     pub fn alignment(&self) -> Result<Alignment> {
-        Ok(Alignment::new(
+        Alignment::new(
             usize::try_from(self.memory_alignment).map_err(|_| Error::CorruptRecord)?,
             self.offset_alignment,
             usize::try_from(self.length_alignment).map_err(|_| Error::CorruptRecord)?,
-        )?)
+        )
+        .map_err(|_| Error::CorruptRecord)
     }
     pub fn validate(&self) -> Result<()> {
         self.allocation_geometry()?;
@@ -625,12 +636,13 @@ impl CheckpointGeometry {
         if self.segment_count > MAX_ITEMS as u64 {
             return Err(Error::CorruptRecord);
         }
-        Ok(page_alloc::SegmentGeometry::new(
+        page_alloc::SegmentGeometry::new(
             self.slab_bytes,
             self.segment_bytes,
             self.segment_count,
             alignment,
-        )?)
+        )
+        .map_err(|_| Error::CorruptRecord)
     }
     pub fn matches_alignment(&self, alignment: Alignment) -> bool {
         self.memory_alignment == alignment.memory() as u64
@@ -638,7 +650,7 @@ impl CheckpointGeometry {
             && self.length_alignment == alignment.length() as u64
     }
     pub(crate) fn validate_live(&self, segments: &Segments) -> Result<()> {
-        if !self.allocation_geometry()?.matches_segments(segments) {
+        if segments.geometry() != Some(self.allocation_geometry()?) {
             return Err(Error::InvalidConfiguration);
         }
         Ok(())
@@ -663,15 +675,12 @@ impl ShardImage {
         {
             return Err(Error::CorruptRecord);
         }
-        let segments = Segments::new(self.geometry.segment_bytes);
-        segments.configure(
-            self.geometry.slab_bytes,
-            self.geometry.segment_count as usize,
-            self.geometry.alignment()?,
-        )?;
-        segments.validate_restore(&self.segments)?;
+        let segments = Segments::from_geometry(self.geometry.allocation_geometry()?)
+            .map_err(|_| Error::CorruptRecord)?;
         // Restoring the isolated table seals open segments, exactly as recovery does.
-        segments.restore(self.segments.clone())?;
+        segments
+            .restore(self.segments.clone())
+            .map_err(|_| Error::CorruptRecord)?;
         let mut pages = HashSet::default();
         let mut versions = HashSet::default();
         let mut extents = Vec::with_capacity(self.index.entries.len());
@@ -686,11 +695,13 @@ impl ShardImage {
             if !pages.insert(page) {
                 return Err(Error::CorruptRecord);
             }
-            segments.validate(
-                entry.location.segment,
-                entry.location.generation,
-                &entry.location.extent,
-            )?;
+            segments
+                .validate(
+                    entry.location.segment,
+                    entry.location.generation,
+                    &entry.location.extent,
+                )
+                .map_err(|_| Error::CorruptRecord)?;
             let extent = entry.location.extent;
             extents.push((
                 extent.offset(),

@@ -71,13 +71,7 @@ impl Store {
     pub fn open(&self) -> Operation<'_, Alignment> {
         Box::pin(async move {
             let alignment = self.writer.open().await?;
-            let slabs = self.writer.slabs();
-            let geometry = checkpoint::CheckpointGeometry::new(
-                slabs.capacity_bytes(),
-                slabs.segment_bytes(),
-                slabs.capacity_bytes() / slabs.segment_bytes(),
-                alignment,
-            )?;
+            let geometry = checkpoint::CheckpointGeometry::from(self.writer.slabs().geometry()?);
             self.checkpoint.configure_geometry(geometry)?;
             self.recovery.configure_geometry(geometry)?;
             Ok(alignment)
@@ -364,16 +358,8 @@ impl StoreWriter {
     }
     pub fn open(&self) -> Operation<'_, Alignment> {
         Box::pin(async move {
-            let alignment = self.slabs.open().await?;
-            if self.segments.snapshot()?.is_empty() {
-                self.segments.configure(
-                    self.slabs.capacity_bytes(),
-                    usize::try_from(self.slabs.capacity_bytes() / self.slabs.segment_bytes())
-                        .map_err(|_| Error::InvalidConfiguration)?,
-                    alignment,
-                )?;
-            }
-            Ok(alignment)
+            // Slab discovery is blocking startup work, not asynchronous request I/O.
+            Ok(self.slabs.open_configured(&self.segments)?)
         })
     }
     pub fn slabs(&self) -> &Rc<Slab<flow_control::Charge<AdmissionPolicy>>> {
@@ -729,7 +715,8 @@ impl StoreWriter {
             location.extent.offset(),
             buffer,
         )?;
-        self.slabs
+        let _ = self
+            .slabs
             .write(&self.reactor, extent, encoded.buffer, segment, scope)
             .await?;
         if self.allowed(page)

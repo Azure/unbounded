@@ -929,10 +929,11 @@ impl WorkerApplication {
             availability.clone(),
         ));
         let segments = Rc::new(page_alloc::Segments::new(config.segment_bytes));
-        let eviction = Rc::new(SegmentClock::new(
+        let eviction = Rc::new(SegmentClock::with_budget(
             index.clone(),
             segments.clone(),
             config.free_segment_reserve,
+            crate::store::catalog::FOREGROUND_RECLAIM_BUDGET,
         ));
         let slabs = Rc::new(page_alloc::Slab::new(
             config
@@ -1909,16 +1910,8 @@ impl WorkerApplication {
     }
 
     async fn prepare_storage(&self) -> Result<CheckpointGeometry> {
-        let alignment = self.store.writer.open().await?;
-        let slabs = self.store.writer.slabs();
-        let geometry = CheckpointGeometry::new(
-            slabs.capacity_bytes(),
-            slabs.segment_bytes(),
-            slabs.capacity_bytes() / slabs.segment_bytes(),
-            alignment,
-        )?;
-        self.store.recovery.configure_geometry(geometry)?;
-        self.store.checkpoint.configure_geometry(geometry)?;
+        let _ = self.store.open().await?;
+        let geometry = CheckpointGeometry::from(self.store.writer.slabs().geometry()?);
         let (payload, tail) = geometry.payload_capacity(
             self.store.eviction.reserve(),
             self.store.writer.index().page_capacity(),

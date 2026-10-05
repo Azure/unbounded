@@ -1383,7 +1383,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
         .attach_io(rt0.reactor.clone(), rt0.admission.clone())
         .unwrap();
     for app in [&mut first, &mut second] {
-        futures::executor::block_on(app.store.writer.open()).unwrap();
+        let _ = futures::executor::block_on(app.store.writer.open()).unwrap();
         app.caches = vec![definition()];
     }
     first

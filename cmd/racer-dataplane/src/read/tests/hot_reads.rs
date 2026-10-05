@@ -1529,7 +1529,7 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
     assert_eq!(f.fill.metrics.count(Event::PeerHit), 0);
     assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
     f.reactor.init().unwrap();
-    futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
     drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap();
     drop((result, second, copy, pending));
     assert!(f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap() > 0);

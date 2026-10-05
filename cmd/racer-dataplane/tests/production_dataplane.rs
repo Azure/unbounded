@@ -806,7 +806,7 @@ fn open_fixture_storage(
     writer
         .configure(admission.clone(), eviction, 64, entries)
         .unwrap();
-    futures::executor::block_on(writer.open()).expect("real O_DIRECT slab must open");
+    let _ = futures::executor::block_on(writer.open()).expect("real O_DIRECT slab must open");
     (index, disk, writer)
 }
 
