@@ -670,6 +670,17 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/facebook/react/blob/HEAD/LICENSE
+  - dependency: sha2
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2006-2009 Graydon Hoare
+      - Copyright (c) 2009-2013 Mozilla Foundation
+      - Copyright (c) 2016 Artyom Pavlov
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/sha2/0.10.9/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/sha2/0.10.9/source/LICENSE-MIT
   - dependency: sigs.k8s.io/controller-runtime
     ecosystem: go
     copyright:
