@@ -378,10 +378,12 @@ fn validate_metadata(
     Ok(())
 }
 fn resolve_range(range: ByteRange, length: u64) -> Result<ResolvedRange> {
-    range.resolve(length).map_err(|error| match error {
-        Error::UnsatisfiableRange => Error::UnsatisfiableRangeWithLength(length),
-        other => other,
-    })
+    range
+        .resolve(length)
+        .map_err(|error| match Error::from(error) {
+            Error::UnsatisfiableRange => Error::UnsatisfiableRangeWithLength(length),
+            other => other,
+        })
 }
 fn peer_error(error: Error) -> Result<PeerResponse> {
     match error {

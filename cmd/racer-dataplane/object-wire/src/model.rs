@@ -115,7 +115,7 @@ pub struct AttemptId(pub [u8; 16]);
 /// One page transfer correlation identifier.
 pub struct TransferId(pub [u8; 16]);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Local worker identifier carried with object operations.
 pub struct WorkerId(pub u16);
 

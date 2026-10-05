@@ -9,21 +9,20 @@ use crate::error::Result;
 use crate::http::ConnectionLease;
 use crate::http::Delivery;
 use crate::http::HttpIo;
-use crate::http::MAX_HEAD_BYTES;
 use crate::http::OwnedBuffer;
 use crate::http::ReaderLease;
 use crate::model::ByteRange;
+#[cfg(test)]
 use crate::model::CacheKey;
+#[cfg(test)]
 use crate::model::MAX_FIELD_BYTES;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::PAGE_BYTES;
 use crate::model::PageNumber;
 use crate::model::ResolvedRange;
-use crate::model::StrongEtag;
 use crate::read::ReadResponse;
 use crate::read::range_stream::RangeStream;
-use crate::runtime::HashSet;
 use crate::runtime::RequestScope;
 use crate::security::Authorization;
 use crate::security::OpaqueMetadata;
@@ -31,250 +30,66 @@ use crate::security::OriginContext;
 use crate::telemetry::Observer;
 use http1::Header;
 use http1::MessageHead;
+#[cfg(test)]
 use http1::StartLine;
-use http1::is_token;
-use http1::trim_ows;
 use racer_control_wire::CacheId;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-use std::time::UNIX_EPOCH;
 use uring_runtime::reactor::IoBuffer;
 
 pub mod listener;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReadKind {
-    Head,
-    HeadPinned {
-        etag: StrongEtag,
-    },
-    Subscription {
-        pin: Option<StrongEtag>,
-        range: Option<ByteRange>,
-        page_credits: usize,
-        byte_credits: u64,
-        ordered: bool,
-    },
-}
-
-impl ReadKind {
-    pub fn is_head(&self) -> bool {
-        matches!(self, Self::Head | Self::HeadPinned { .. })
-    }
-
-    pub fn pin(&self) -> Option<&StrongEtag> {
-        match self {
-            Self::HeadPinned { etag } => Some(etag),
-            Self::Subscription { pin, .. } => pin.as_ref(),
-            _ => None,
-        }
-    }
-}
+use racer_object_wire::client::MAX_HEAD_BYTES;
+pub use racer_object_wire::client::ReadKind;
+use racer_object_wire::client::frame;
 
 pub struct ClientRequest {
     pub kind: ReadKind,
+
     pub origin: OriginContext,
 }
 
 #[derive(Clone)]
 pub struct RequestParser {
-    header_limit: usize,
+    wire: racer_object_wire::client::RequestParser,
 }
 impl RequestParser {
     pub fn new(header_limit: usize) -> Self {
         Self {
-            header_limit: header_limit.min(MAX_HEAD_BYTES),
+            wire: racer_object_wire::client::RequestParser::new(header_limit),
         }
     }
     /// Apply this cap to raw HTTP framing before calling the semantic parser.
     pub(crate) fn header_limit(&self) -> usize {
-        self.header_limit
+        self.wire.header_limit()
     }
     /// Codec must validate the raw head and its byte limit before calling this.
     /// In particular, context fields must have exactly one separator space and
     /// must not have their value trimmed by the codec. Decoded fields cannot
     /// reconstruct wire length: unknown fields need not have a separator SP.
     pub fn parse(&self, cache: &CacheId, head: MessageHead) -> Result<ClientRequest> {
-        let StartLine::Request { method, target } = head.start else {
-            return Err(Error::InvalidRequest);
-        };
-        // Bound manually constructed input data as well, without pretending this
-        // is a wire-length check. Framing owns start-line/colon/OWS/CRLF accounting.
-        let mut decoded_bytes = method.len().saturating_add(target.len());
-        let mut seen = HashSet::default();
-        let mut host = None;
-        let mut pin = None;
-        let mut range = None;
-        let mut metadata = None;
-        let mut authorization = None;
-        let mut content_length = false;
-        let mut page_credits = 2;
-        let mut byte_credits = 2 * PAGE_BYTES;
-        let mut ordered = false;
-        for header in head.headers {
-            decoded_bytes = decoded_bytes
-                .saturating_add(header.name.len())
-                .saturating_add(header.value.len());
-            if decoded_bytes > self.header_limit {
-                return Err(Error::HeaderTooLarge);
-            }
-            if header.name.is_empty()
-                || !header.name.bytes().all(is_token)
-                || header
-                    .value
-                    .iter()
-                    .any(|&b| b == 0x7f || (b < 0x20 && b != b'\t'))
-            {
-                return Err(Error::InvalidRequest);
-            }
-            let name = header.name.to_ascii_lowercase();
-            let value = header.value.as_slice();
-            if matches!(
-                name.as_str(),
-                "host"
-                    | "content-length"
-                    | "content-type"
-                    | "content-range"
-                    | "etag"
-                    | "if-match"
-                    | "range"
-                    | "racer-expires-at"
-                    | "racer-content-type"
-                    | "racer-metadata"
-                    | "authorization"
-                    | "racer-page-credits"
-                    | "racer-byte-credits"
-                    | "racer-ordered"
-            ) && !seen.insert(name.clone())
-            {
-                return Err(Error::InvalidRequest);
-            }
-            match name.as_str() {
-                "host" => host = Some(value == b"racer"),
-                "content-length" if value == b"0" => content_length = true,
-                "content-length"
-                | "content-range"
-                | "etag"
-                | "racer-expires-at"
-                | "racer-content-type"
-                | "transfer-encoding"
-                | "content-encoding"
-                | "trailer"
-                | "upgrade"
-                | "expect"
-                | "if-none-match"
-                | "if-modified-since"
-                | "if-unmodified-since"
-                | "if-range" => return Err(Error::InvalidRequest),
-                "connection"
-                    if value
-                        .split(|&b| b == b',')
-                        .any(|token| trim_ows(token).eq_ignore_ascii_case(b"upgrade")) =>
-                {
-                    return Err(Error::InvalidRequest);
-                }
-                "if-match" => {
-                    if value.len() > MAX_FIELD_BYTES {
-                        return Err(Error::HeaderTooLarge);
-                    }
-                    pin = Some(StrongEtag::parse(value)?);
-                }
-                "range" => range = Some(ByteRange::parse(value)?),
-                "racer-page-credits" => page_credits = decimal(value, 1, 64)? as usize,
-                "racer-byte-credits" => {
-                    byte_credits = decimal(value, PAGE_BYTES, 64 * PAGE_BYTES)?;
-                }
-                "racer-ordered" => {
-                    ordered = match value {
-                        b"0" => false,
-                        b"1" => true,
-                        _ => return Err(Error::InvalidRequest),
-                    }
-                }
-                "racer-metadata" => {
-                    validate_opaque(value)?;
-                    metadata = Some(OpaqueMetadata::from_header(value)?);
-                }
-                "authorization" => {
-                    validate_opaque(value)?;
-                    authorization = Some(Authorization::from_header(value)?);
-                }
-                _ => {}
-            }
-        }
-        if decoded_bytes > self.header_limit {
-            return Err(Error::HeaderTooLarge);
-        }
-        if host != Some(true) {
-            return Err(Error::InvalidRequest);
-        }
-        let key = CacheKey::parse_hex(
-            target
-                .strip_prefix("/v2/objects/")
-                .ok_or(Error::InvalidRequest)?
-                .as_bytes(),
-        )?;
-        let kind = match method.as_str() {
-            "HEAD" if range.is_none() => match pin {
-                Some(etag) => ReadKind::HeadPinned { etag },
-                None => ReadKind::Head,
-            },
-            "HEAD" => return Err(Error::InvalidRequest),
-            "POST" if content_length => ReadKind::Subscription {
-                pin,
-                range,
-                page_credits,
-                byte_credits,
-                ordered,
-            },
-            "POST" => return Err(Error::InvalidRequest),
-            _ => return Err(Error::MethodNotAllowed),
-        };
+        let request = self.wire.parse(&head)?;
         Ok(ClientRequest {
-            kind,
+            kind: request.kind,
             origin: OriginContext {
                 object: ObjectId {
                     cache: cache.clone(),
-                    key,
+                    key: request.key,
                 },
-                metadata,
-                authorization,
+                metadata: request
+                    .metadata
+                    .map(OpaqueMetadata::from_header)
+                    .transpose()?,
+                authorization: request
+                    .authorization
+                    .map(Authorization::from_header)
+                    .transpose()?,
             },
         })
     }
-}
-
-fn decimal(value: &[u8], minimum: u64, maximum: u64) -> Result<u64> {
-    if value.is_empty() || value[0] == b'0' || !value.iter().all(u8::is_ascii_digit) {
-        return Err(Error::InvalidRequest);
-    }
-    let number = value
-        .iter()
-        .try_fold(0u64, |n, digit| {
-            n.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
-        })
-        .ok_or(Error::InvalidRequest)?;
-    if !(minimum..=maximum).contains(&number) {
-        return Err(Error::InvalidRequest);
-    }
-    Ok(number)
-}
-
-fn validate_opaque(value: &[u8]) -> Result<()> {
-    if value.len() > MAX_FIELD_BYTES {
-        return Err(Error::HeaderTooLarge);
-    }
-    if value.is_empty()
-        || value.first() == Some(&b' ')
-        || value.last() == Some(&b' ')
-        || value.iter().any(|&b| b < 0x20 || b == 0x7f)
-    {
-        return Err(Error::InvalidRequest);
-    }
-    Ok(())
 }
 
 /// Validate a completed read before committing success headers. Keep this boundary
@@ -363,40 +178,7 @@ fn subscription_head(
     metadata: &ObjectMetadata,
     range: Option<ResolvedRange>,
 ) -> Result<MessageHead> {
-    let mut head = success_head(metadata, None)?;
-    head.headers
-        .retain(|h| !h.name.eq_ignore_ascii_case("Content-Length"));
-    let (start, end, pages) = match range {
-        Some(range) if range.end() <= metadata.length => (
-            range.start(),
-            range.end(),
-            range.last_page().0 - range.first_page().0 + 1,
-        ),
-        None if metadata.length == 0 => (0, 0, 0),
-        _ => return Err(Error::BadGateway),
-    };
-    let length = pages
-        .checked_add(1)
-        .and_then(|n| n.checked_mul(21))
-        .and_then(|n| n.checked_add(end - start))
-        .ok_or(Error::BadGateway)?;
-    head.start = StartLine::Response { status: 200 };
-    head.headers.extend([
-        header("Racer-Object-Length", metadata.length.to_string()),
-        header("Racer-Range-Start", start.to_string()),
-        header("Racer-Range-End", end.to_string()),
-        header("Content-Length", length.to_string()),
-        header("Connection", "close"),
-    ]);
-    Ok(head)
-}
-fn frame(kind: u8, number: u64, offset: u64, length: u32) -> [u8; 21] {
-    let mut bytes = [0; 21];
-    bytes[0] = kind;
-    bytes[1..9].copy_from_slice(&number.to_be_bytes());
-    bytes[9..17].copy_from_slice(&offset.to_be_bytes());
-    bytes[17..].copy_from_slice(&length.to_be_bytes());
-    bytes
+    racer_object_wire::client::subscription_head(metadata, range).map_err(Into::into)
 }
 // A partial release is retained across polls without an unbounded input queue.
 struct Releases {
@@ -854,49 +636,14 @@ fn error_head(error: Error) -> Result<MessageHead> {
         // invent a total length to make a syntactically valid but false 416.
         _ => 500,
     };
-    let mut headers = vec![header("Content-Length", "0")];
-    if status == 405 {
-        headers.push(header("Allow", "HEAD, POST"));
-    }
-    if status == 416 {
-        let Error::UnsatisfiableRangeWithLength(length) = error else {
-            return Err(Error::Internal);
-        };
-        headers.push(header("Content-Range", format!("bytes */{length}")));
-    }
-    Ok(MessageHead {
-        start: StartLine::Response { status },
-        headers,
-    })
+    let length = match error {
+        Error::UnsatisfiableRangeWithLength(length) => Some(length),
+        _ => None,
+    };
+    racer_object_wire::client::error_head(status, length).map_err(Into::into)
 }
 fn success_head(metadata: &ObjectMetadata, range: Option<ResolvedRange>) -> Result<MessageHead> {
-    let expiry = metadata
-        .expires_at
-        .as_system_time()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| Error::BadGateway)?;
-    if metadata.length > i64::MAX as u64
-        || expiry.as_millis() > i64::MAX as u128
-        || expiry.subsec_nanos() % 1_000_000 != 0
-    {
-        return Err(Error::BadGateway);
-    }
-    let mut headers = vec![
-        header("ETag", metadata.version.etag.as_bytes()),
-        header("Racer-Expires-At", expiry.as_millis().to_string()),
-    ];
-    if let Some(content_type) = &metadata.content_type {
-        headers.push(header("Racer-Content-Type", content_type.as_bytes()));
-    }
-    if range.is_some() {
-        return Err(Error::BadGateway);
-    }
-    headers.push(header("Content-Length", metadata.length.to_string()));
-    headers.push(header("Content-Type", "application/octet-stream"));
-    Ok(MessageHead {
-        start: StartLine::Response { status: 200 },
-        headers,
-    })
+    racer_object_wire::client::success_head(metadata, range).map_err(Into::into)
 }
 
 #[cfg(test)]

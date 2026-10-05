@@ -779,7 +779,7 @@ fn object(head: &MessageHead) -> Result<ObjectId> {
     })
 }
 fn etag(head: &MessageHead) -> Result<StrongEtag> {
-    StrongEtag::parse(field(head, "racer-etag")?.as_bytes())
+    StrongEtag::parse(field(head, "racer-etag")?.as_bytes()).map_err(Into::into)
 }
 fn version(head: &MessageHead) -> Result<ObjectVersion> {
     Ok(ObjectVersion {

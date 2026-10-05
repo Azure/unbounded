@@ -434,7 +434,7 @@ fn raw_uds_pinned_head_tags_and_maxint64_ranges() {
         (ByteRange::From(0), 0),
     ] {
         assert!(matches!(
-            range.resolve(size),
+            range.resolve(size).map_err(Error::from),
             Err(Error::UnsatisfiableRange)
         ));
     }

@@ -175,6 +175,30 @@ impl From<uring_runtime::reactor::filesystem::secure::AccessError> for Error {
     }
 }
 
+impl From<racer_object_wire::Error> for Error {
+    fn from(error: racer_object_wire::Error) -> Self {
+        use racer_object_wire::Error as Wire;
+        match error {
+            Wire::InvalidRequest => Self::InvalidRequest,
+            Wire::MethodNotAllowed => Self::MethodNotAllowed,
+            Wire::HeaderTooLarge => Self::HeaderTooLarge,
+            Wire::InvalidRange => Self::InvalidRange,
+            Wire::UnsatisfiableRange => Self::UnsatisfiableRange,
+            Wire::UnsatisfiableRangeWithLength(length) => {
+                Self::UnsatisfiableRangeWithLength(length)
+            }
+            Wire::NotFound => Self::NotFound,
+            Wire::BadGateway => Self::BadGateway,
+            Wire::Internal => Self::Internal,
+            Wire::VersionUnavailable => Self::VersionUnavailable,
+            Wire::Unavailable => Self::Unavailable,
+            Wire::OriginRejected => Self::OriginRejected,
+            Wire::OriginForbidden => Self::OriginForbidden,
+            Wire::CorruptRecord => Self::CorruptRecord,
+        }
+    }
+}
+
 impl From<flow_control::Error> for Error {
     fn from(error: flow_control::Error) -> Self {
         match error {
@@ -325,6 +349,41 @@ mod tests {
             Error::from(AccessError::PermissionDenied),
             Error::Unauthorized
         );
+    }
+
+    /// Wire failures retain their exact application taxonomy at the adapter boundary.
+    #[test]
+    fn object_wire_errors_keep_racer_boundary_meanings() {
+        use racer_object_wire::Error as Wire;
+        for (wire, app) in [
+            (Wire::InvalidRequest, Error::InvalidRequest),
+            (Wire::MethodNotAllowed, Error::MethodNotAllowed),
+            (Wire::HeaderTooLarge, Error::HeaderTooLarge),
+            (Wire::InvalidRange, Error::InvalidRange),
+            (Wire::UnsatisfiableRange, Error::UnsatisfiableRange),
+            (
+                Wire::UnsatisfiableRangeWithLength(0),
+                Error::UnsatisfiableRangeWithLength(0),
+            ),
+            (
+                Wire::UnsatisfiableRangeWithLength(u64::MAX),
+                Error::UnsatisfiableRangeWithLength(u64::MAX),
+            ),
+            (Wire::NotFound, Error::NotFound),
+            (Wire::BadGateway, Error::BadGateway),
+            (Wire::Internal, Error::Internal),
+            (Wire::VersionUnavailable, Error::VersionUnavailable),
+            (Wire::Unavailable, Error::Unavailable),
+            (Wire::OriginRejected, Error::OriginRejected),
+            (Wire::OriginForbidden, Error::OriginForbidden),
+            (Wire::CorruptRecord, Error::CorruptRecord),
+        ] {
+            assert_eq!(Error::from(wire), app);
+            assert_eq!(
+                super::PublicationCause::from(Error::from(wire)),
+                super::PublicationCause::from(app)
+            );
+        }
     }
 
     #[test]

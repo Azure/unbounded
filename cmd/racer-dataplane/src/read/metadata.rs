@@ -720,7 +720,7 @@ impl MetadataService {
                     let Some(descriptor) = self.storage.index.version(&current.version)? else {
                         return Ok(None);
                     };
-                    current.resolve(&descriptor, now)
+                    current.resolve(&descriptor, now).map_err(Into::into)
                 }
                 MetadataSelector::Pinned(etag) => {
                     let version = ObjectVersion {

@@ -1829,6 +1829,7 @@ pub(super) fn validate_copy(copy: &crate::memory::CiphertextCopy, page: &PageId)
     copy.metadata
         .immutable()
         .validate_page(copy.ciphertext.envelope())
+        .map_err(Into::into)
 }
 fn merge_metadata(
     found: &mut Option<VersionMetadata>,
