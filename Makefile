@@ -5,6 +5,9 @@ GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
+RACER_CARGO ?= cargo
+RACER_CARGO_TARGET_DIR ?= $(CURDIR)/bin/racer-cargo
+RACER_TEST_ARGS ?=
 GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./deploy/... ./e2e/... ./hack/... ./internal/... ./pkg/...
 # e2e packages hold nothing but files behind the e2e build tag, so `go list`
 # needs the tag to see them at all. Without it they are silently skipped by
@@ -259,7 +262,12 @@ help: ## Show this help
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
 	@echo "  license-check                    Verify project-owned license declarations"
-	@echo "  notice                           Regenerate NOTICE from Go and npm dependencies"
+	@echo "  racer-dataplane-fmt               Format the Racer Rust workspace"
+	@echo "  racer-dataplane-check             Check Rust formatting and lint all targets"
+	@echo "  racer-dataplane-build             Build the Racer Rust workspace"
+	@echo "  racer-dataplane-test              Run Rust unit, integration, and doc tests"
+	@echo "  racer-runtime-test                Test the native runtime without optional features"
+	@echo "  notice                           Regenerate NOTICE from Go, npm, Cargo, and native dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
 	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
 	@echo "  toolchain-build                  Rebuild the toolchain container image (honors TOOLCHAIN_FLAVOR)"
@@ -541,6 +549,32 @@ e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
+.PHONY: racer-dataplane-fmt racer-dataplane-check racer-dataplane-build racer-dataplane-test racer-runtime-test racer-cargo-fetch
+racer-dataplane-fmt: ## Format the Racer Rust workspace
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all
+
+racer-dataplane-check: ## Check formatting and lint all Racer Rust targets
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all -- --check
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-targets --all-features -- -D warnings
+
+racer-dataplane-build: ## Build the Racer Rust workspace
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) build --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace
+
+racer-dataplane-test: ## Run Rust unit, integration, and doc tests (RACER_TEST_ARGS)
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-features -- $(RACER_TEST_ARGS)
+
+# Keep the production runtime independent of simulation and test-util features.
+# This target requires a Linux host that permits io_uring; never silently skip it.
+racer-runtime-test: ## Test the native runtime without optional features (requires io_uring)
+	timeout --signal=TERM --kill-after=10s 300s env RUNTIME_REQUIRE_IO_URING=1 $(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" -p uring-runtime --no-default-features -- $(RACER_TEST_ARGS)
+
+racer-cargo-fetch: ## Populate the locked Cargo source cache for NOTICE generation
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml
+
 build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
@@ -598,7 +632,7 @@ license-check: ## Verify project-owned source license declarations
 		exit 1; \
 	fi
 
-notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
+notice: racer-cargo-fetch ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -606,7 +640,7 @@ notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
 	fi
 	$(GOCMD) run ./hack/cmd/notice generate --output NOTICE
 
-notice-check: ## Verify NOTICE is in sync with Go, npm, Cargo, and pinned native dependencies
+notice-check: racer-cargo-fetch ## Verify NOTICE is in sync with Go, npm, Cargo, and pinned native dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \

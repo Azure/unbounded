@@ -1,7 +1,20 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
 [package]
 name = "racer-dataplane"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+publish = false
+description = "Racer node-local read-through cache dataplane"
 
 [dependencies]
+
+# Keep debug assertions, overflow checks, and debug info while optimizing tests.
+[profile.test]
+opt-level = 1
+
+[profile.test.package."*"]
+opt-level = 3
