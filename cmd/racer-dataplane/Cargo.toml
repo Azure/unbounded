@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire"]
 resolver = "3"
 
 [package]
@@ -24,6 +24,7 @@ required-features = ["subscription-interop"]
 [dependencies]
 controlplane = { path = "controlplane" }
 peer-wire = { path = "peer-wire" }
+racer-object-wire = { path = "object-wire" }
 uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec", features = ["rest"] }
 racer-control-wire = { path = "control-wire" }
@@ -50,6 +51,7 @@ zeroize = "1"
 
 [dev-dependencies]
 peer-wire = { path = "peer-wire", features = ["test-util"] }
+racer-object-wire = { path = "object-wire", features = ["test-util"] }
 racer-crypto = { path = "crypto", features = ["test-util"] }
 uds-endpoint = { path = "uds-endpoint", features = ["test-util"] }
 flow-control = { path = "flow", features = ["simulation"] }

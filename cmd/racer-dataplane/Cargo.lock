@@ -729,6 +729,7 @@ dependencies = [
  "peer-wire",
  "racer-control-wire",
  "racer-crypto",
+ "racer-object-wire",
  "rcgen",
  "rdma-verbs",
  "rustls",
@@ -742,6 +743,15 @@ dependencies = [
  "wire-codec",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "racer-object-wire"
+version = "0.1.0"
+dependencies = [
+ "http1",
+ "racer-control-wire",
+ "wire-codec",
 ]
 
 [[package]]

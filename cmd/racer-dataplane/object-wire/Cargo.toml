@@ -1,0 +1,15 @@
+[package]
+name = "racer-object-wire"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Racer object values and client/origin protocol codecs"
+
+[features]
+default = []
+test-util = []
+
+[dependencies]
+http1 = { path = "../http" }
+racer-control-wire = { path = "../control-wire" }
+wire-codec = { path = "../wire-codec" }
