@@ -12,6 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use circuit::{Circuits, Probe};
+pub use handoff::{Admission as HandoffAdmission, Admitted, Handoff, Offer};
+pub use hedge::{Hedges, Permit as HedgePermit};
+
 /// Limits and time intervals for shared adaptive admission.
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -33,36 +37,48 @@ pub struct Config {
     /// Minimum idle age before an eligible peer record can be replaced.
     pub retire_after: Duration,
 }
+
 /// Caller-classified evidence, independent of application errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Authenticated successful work provides recovery evidence.
     Verified,
+
     /// A failure attributable to the immediate peer opens its circuit.
     PeerFailure,
+
     /// Local overload reduces aggregate admission without blaming the peer.
     LocalPressure,
+
     /// No evidence should affect admission or peer recovery.
     Neutral,
 }
+
 /// Admission observations emitted synchronously in state-transition order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     /// Aggregate, per-key, or record capacity rejected the attempt.
     Rejected,
+
     /// Peer backoff or an owned probe rejected the attempt.
     CircuitRejected,
+
     /// An operation now owns active admission.
     Accepted,
+
     /// An accepted operation owns the exclusive recovery probe.
     Probe,
+
     /// Caller-reported local pressure was observed.
     LocalPressure,
+
     /// Caller-reported verified success was observed.
     Verified,
+
     /// Caller-reported immediate-link failure was observed.
     LinkFailure,
 }
+
 /// Callbacks run synchronously under the admission lock and must not reenter it.
 pub trait Observer {
     /// Record an admission or outcome event without reentering the owner.
@@ -74,6 +90,7 @@ pub trait Observer {
     /// Publish the current adaptive limit without reentering the owner.
     fn limit(&self, limit: usize);
 }
+
 /// Shared total and per-key admission with generation-fenced peer recovery.
 pub struct Adaptive<K, O> {
     config: Config,
@@ -84,6 +101,7 @@ pub struct Adaptive<K, O> {
 
     now: fn() -> Instant,
 }
+
 /// Mutex-protected aggregate admission and bounded peer records.
 struct State<K> {
     active: usize,
@@ -94,6 +112,7 @@ struct State<K> {
 
     peers: BTreeMap<K, Peer>,
 }
+
 /// Per-key recovery state retained while any permit remains active.
 struct Peer {
     active: usize,
@@ -108,6 +127,7 @@ struct Peer {
 
     updated: Instant,
 }
+
 /// An admitted operation; the final shared owner releases capacity.
 pub struct Permit<K: Ord + Clone, O: Observer> {
     owner: Arc<Adaptive<K, O>>,
@@ -118,6 +138,7 @@ pub struct Permit<K: Ord + Clone, O: Observer> {
 
     probe: bool,
 }
+
 impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
     /// Validate positive limits and publish the initial aggregate ceiling.
     pub fn new(config: Config, observer: O, now: fn() -> Instant) -> Result<Arc<Self>> {
@@ -141,6 +162,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             }),
         }))
     }
+
     /// Hint whether fully recovered limits leave spare speculative capacity.
     pub fn hedge_available(&self, key: &K) -> bool {
         self.state.lock().is_ok_and(|s| {
@@ -154,6 +176,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
                 })
         })
     }
+
     /// Hint whether peer backoff permits an attempt; this does not reserve capacity.
     pub fn available(&self, key: &K) -> bool {
         let now = (self.now)();
@@ -163,6 +186,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
                 .is_none_or(|p| !p.probe && p.retry.is_none_or(|at| now >= at))
         })
     }
+
     /// Admit work or one exclusive recovery probe without waiting.
     pub fn acquire(self: &Arc<Self>, key: &K) -> Result<Arc<Permit<K, O>>> {
         let now = (self.now)();
@@ -223,6 +247,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         }))
     }
 }
+
 impl<K: Ord + Clone, O: Observer> Permit<K, O> {
     /// Apply caller evidence while retaining admission through completion.
     pub fn observe(&self, outcome: Outcome) {
@@ -282,6 +307,7 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
         }
     }
 }
+
 impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
     /// Release final ownership and renew backoff for an unsuccessful probe.
     fn drop(&mut self) {
@@ -305,10 +331,6 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
         self.owner.observer.active(state.active);
     }
 }
-
-pub use circuit::{Circuits, Probe};
-pub use handoff::{Admission as HandoffAdmission, Admitted, Handoff, Offer};
-pub use hedge::{Hedges, Permit as HedgePermit};
 
 /// Bounded worker-local endpoint failure tracking, independent of adaptive limits.
 mod circuit {
@@ -347,6 +369,7 @@ mod circuit {
 
         local: PhantomData<Rc<()>>,
     }
+
     /// Failure history and eligibility for one endpoint.
     struct Circuit {
         failures: u32,
@@ -355,12 +378,21 @@ mod circuit {
 
         probe_until: Option<Instant>,
     }
+
+    impl Circuit {
+        /// Require both retry backoff and any abandoned probe timeout to expire.
+        fn available(&self, now: Instant) -> bool {
+            now >= self.retry_at && self.probe_until.is_none_or(|until| now >= until)
+        }
+    }
+
     /// Local exclusive half-open ownership; healthy acquisitions need no record.
     pub struct Probe<'a, K: Ord> {
         health: &'a Circuits<K>,
 
         key: Option<K>,
     }
+
     impl<K: Ord> Drop for Probe<'_, K> {
         /// Release exclusivity without erasing the probe's timeout.
         fn drop(&mut self) {
@@ -369,6 +401,7 @@ mod circuit {
             }
         }
     }
+
     impl<K: Ord + Clone> Circuits<K> {
         /// Bound failure records and set eligibility delay for abandoned probes.
         pub const fn new(capacity: usize, probe_timeout: Duration) -> Self {
@@ -380,6 +413,7 @@ mod circuit {
                 local: PhantomData,
             }
         }
+
         /// Acquire an exclusive half-open guard, or an untracked healthy guard.
         pub fn acquire(&self, key: &K, now: Instant) -> Result<Probe<'_, K>> {
             if !self.try_acquire(key, now) {
@@ -397,10 +431,12 @@ mod circuit {
                 key: probe.then(|| key.clone()),
             })
         }
+
         /// Remove failure state without releasing any owned probe.
         pub fn success(&self, key: &K) {
             self.states.borrow_mut().remove(key);
         }
+
         /// Record a caller-classified failure using caller-selected retry jitter.
         pub fn failure(
             &self,
@@ -422,13 +458,17 @@ mod circuit {
             state.probe_until = None;
             Ok(())
         }
+
         /// Routing hint only; actual work must acquire an exclusive probe.
         pub fn available(&self, key: &K, now: Instant) -> bool {
             !self.probes.borrow().contains(key)
-                && self.states.borrow().get(key).is_none_or(|s| {
-                    now >= s.retry_at && s.probe_until.is_none_or(|until| now >= until)
-                })
+                && self
+                    .states
+                    .borrow()
+                    .get(key)
+                    .is_none_or(|s| s.available(now))
         }
+
         /// Admit an unowned probe that becomes eligible again after its timeout.
         pub fn try_acquire(&self, key: &K, now: Instant) -> bool {
             if self.probes.borrow().contains(key) {
@@ -438,20 +478,23 @@ mod circuit {
             let Some(state) = states.get_mut(key) else {
                 return true;
             };
-            if now < state.retry_at || state.probe_until.is_some_and(|until| now < until) {
+            if !state.available(now) {
                 return false;
             }
             state.probe_until = Some(now + self.probe_timeout);
             true
         }
+
         /// Forget excluded failure records without releasing owned probes.
         pub fn retain(&self, keys: &[K]) {
             self.states.borrow_mut().retain(|key, _| keys.contains(key));
         }
+
         /// Count retained failure records, not active probes.
         pub fn len(&self) -> usize {
             self.states.borrow().len()
         }
+
         /// Whether no failure records remain, independently of owned probes.
         pub fn is_empty(&self) -> bool {
             self.states.borrow().is_empty()
@@ -462,6 +505,7 @@ mod circuit {
     #[cfg(test)]
     mod tests {
         use super::*;
+
         /// Keep an owned probe exclusive through success and retention changes.
         #[test]
         fn bounded_backoff_and_owned_probe_survive_retention_and_success() {
@@ -489,6 +533,7 @@ mod circuit {
             assert!(health.available(&7, retry));
             assert!(health.is_empty());
         }
+
         /// Abandonment preserves timeout and failure history never overflows.
         #[test]
         fn dropped_probe_preserves_timeout_and_failures_saturate() {
@@ -511,6 +556,30 @@ mod circuit {
                 Circuits::new(0, Duration::ZERO).failure(&(), now, |_, _| Duration::ZERO),
                 Err(Error::Overloaded)
             );
+        }
+
+        /// Probe capacity and failure records remain independent after success.
+        #[test]
+        fn full_probe_set_preserves_rejected_attempt_timeout() {
+            let now = Instant::now();
+            let timeout = Duration::from_secs(1);
+            let health = Circuits::new(1, timeout);
+            health.failure(&7, now, |_, _| Duration::ZERO).unwrap();
+            let held = health.acquire(&7, now).unwrap();
+            health.success(&7);
+            assert!(health.is_empty());
+            assert!(
+                health.acquire(&9, now).is_ok(),
+                "healthy work needs no slot"
+            );
+
+            health.failure(&8, now, |_, _| Duration::ZERO).unwrap();
+            assert!(health.available(&8, now));
+            assert!(matches!(health.acquire(&8, now), Err(Error::Overloaded)));
+            drop(held);
+            assert!(!health.available(&8, now));
+            assert!(matches!(health.acquire(&8, now), Err(Error::Unavailable)));
+            assert!(health.acquire(&8, now + timeout).is_ok());
         }
     }
 }
@@ -536,12 +605,14 @@ mod handoff {
         /// Reserve capacity for one item without waiting.
         fn reserve(&self) -> Result<Self::Reservation>;
     }
+
     /// Payload and reservation remain inseparable while queued or freshly popped.
     pub struct Admitted<T, R> {
         item: T,
 
         reservation: R,
     }
+
     /// Fixed batch whose occupied entries each retain their target reservation.
     type Batch<T, R, const N: usize> = [Option<Admitted<T, R>>; N];
 
@@ -551,6 +622,7 @@ mod handoff {
             (self.item, self.reservation)
         }
     }
+
     /// One target's installed admission, inbox, and wake registration.
     struct Target<A: Admission, T> {
         admission: Option<A>,
@@ -561,14 +633,27 @@ mod handoff {
 
         closed: bool,
     }
+
     /// Stable target slots and the next round-robin scan position.
     struct State<K, A: Admission, T> {
         targets: Vec<(K, Target<A, T>)>,
 
         cursor: usize,
     }
+
+    impl<K: Eq, A: Admission, T> State<K, A, T> {
+        /// Find a stable target without changing its admission or closed state.
+        fn target(&mut self, key: &K) -> Option<&mut Target<A, T>> {
+            self.targets
+                .iter_mut()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, target)| target)
+        }
+    }
+
     /// Shared handoff bounded by admission, not a separate queue-slot limit.
     pub struct Handoff<K, A: Admission, T>(Mutex<State<K, A, T>>);
+
     /// Capacity reserved on a selected target before constructing its payload.
     pub struct Offer<K, A: Admission, T> {
         handoff: Arc<Handoff<K, A, T>>,
@@ -577,6 +662,7 @@ mod handoff {
 
         reservation: A::Reservation,
     }
+
     impl<K: Eq + Clone, A: Admission, T> Handoff<K, A, T> {
         /// Create stable target slots; empty target lists simply reject offers.
         pub fn new(keys: &[K]) -> Self {
@@ -598,21 +684,18 @@ mod handoff {
                 cursor: 0,
             }))
         }
+
         /// Install admission once on a known target that has not closed.
         pub fn install(&self, key: &K, admission: A) -> Result<()> {
             let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
-            let target = &mut state
-                .targets
-                .iter_mut()
-                .find(|(k, _)| k == key)
-                .ok_or(Error::InvalidInput)?
-                .1;
+            let target = state.target(key).ok_or(Error::InvalidInput)?;
             if target.admission.is_some() || target.closed {
                 return Err(Error::InvalidInput);
             }
             target.admission = Some(admission);
             Ok(())
         }
+
         /// Scan open targets fairly and reserve before returning an offer.
         pub fn reserve(self: &Arc<Self>, waker: &Waker) -> Result<Offer<K, A, T>> {
             let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
@@ -637,6 +720,7 @@ mod handoff {
             }
             Err(Error::Overloaded)
         }
+
         /// Pop at most the caller's budget while retaining each item's admission.
         pub fn pop_batch<const N: usize>(
             &self,
@@ -645,12 +729,7 @@ mod handoff {
             budget: usize,
         ) -> Result<Batch<T, A::Reservation, N>> {
             let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
-            let target = &mut state
-                .targets
-                .iter_mut()
-                .find(|(k, _)| k == key)
-                .ok_or(Error::InvalidInput)?
-                .1;
+            let target = state.target(key).ok_or(Error::InvalidInput)?;
             if let Some(old) = &mut target.waker {
                 old.clone_from(waker);
             } else {
@@ -664,11 +743,12 @@ mod handoff {
                 }
             }))
         }
+
         /// Close a target and drop queued ownership outside the shared lock.
         pub fn close(&self, key: &K) {
             let queued = {
                 let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-                let Some((_, target)) = state.targets.iter_mut().find(|(k, _)| k == key) else {
+                let Some(target) = state.target(key) else {
                     return;
                 };
                 target.closed = true;
@@ -677,6 +757,7 @@ mod handoff {
             drop(queued);
         }
     }
+
     impl<K, A: Admission, T> Offer<K, A, T> {
         /// Build only on an open target; the envelope retains admission itself.
         /// The closure executes under the handoff lock and must not reenter it.
@@ -718,6 +799,7 @@ mod hedge {
 
         wake: Option<Waker>,
     }
+
     /// Mutex-protected capacity and monotonically assigned alarm identities.
     #[derive(Default)]
     struct State {
@@ -727,6 +809,7 @@ mod hedge {
 
         alarms: BTreeMap<u64, Alarm>,
     }
+
     /// Process-shared slot and cost limits, independent of worker registries.
     pub struct Hedges {
         slots: usize,
@@ -735,6 +818,7 @@ mod hedge {
 
         state: Mutex<State>,
     }
+
     /// Owns speculative capacity until both contenders reach their fences.
     #[must_use = "retain the permit until both contenders are fenced"]
     pub struct Permit {
@@ -742,6 +826,7 @@ mod hedge {
 
         id: u64,
     }
+
     impl Hedges {
         /// Create shared ceilings; zero slots disable speculative admission.
         pub fn new(slots: usize, capacity: usize) -> Arc<Self> {
@@ -751,6 +836,7 @@ mod hedge {
                 state: Mutex::new(State::default()),
             })
         }
+
         /// Reserve one slot and caller-selected cost until permit drop.
         pub fn acquire(self: &Arc<Self>, cost: usize, due: Instant) -> Result<Permit> {
             let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
@@ -773,6 +859,7 @@ mod hedge {
                 id,
             })
         }
+
         /// Wake due registrations outside the shared lock, once per registration.
         pub fn poll(&self, now: Instant) {
             let wakes: Vec<_> = self
@@ -792,6 +879,7 @@ mod hedge {
             }
         }
     }
+
     impl Permit {
         /// Register the latest waiter until due, without releasing capacity.
         pub fn delay(&self, now: Instant, cx: &mut Context<'_>) -> Poll<()> {
@@ -805,6 +893,7 @@ mod hedge {
             }
         }
     }
+
     impl Drop for Permit {
         /// Remove the alarm and return its cost only at final ownership release.
         fn drop(&mut self) {
@@ -825,15 +914,18 @@ mod hedge {
             task::Wake,
             time::Duration,
         };
+
         /// Count alarm notifications across threads.
         #[derive(Default)]
         struct Counter(AtomicUsize);
+
         impl Wake for Counter {
             /// Record one notification.
             fn wake(self: Arc<Self>) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
+
         /// Slots and bytes stay charged after an alarm fires and across threads.
         #[test]
         fn hedge_shared_slots_costs_and_release_are_independent_of_alarm() {
@@ -862,6 +954,7 @@ mod hedge {
             let _all = max.acquire(usize::MAX, now).unwrap();
             assert!(matches!(max.acquire(1, now), Err(Error::Overloaded)));
         }
+
         /// Only the latest registered waker fires and drop cancels notification.
         #[test]
         fn hedge_alarm_replaces_waker_and_drop_removes_registration() {
@@ -910,6 +1003,7 @@ mod hedge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     /// Synchronous observer recording emitted events and gauges.
     #[derive(Default)]
     struct Counts {
@@ -919,20 +1013,24 @@ mod tests {
 
         limit: Mutex<usize>,
     }
+
     impl Observer for Counts {
         /// Append an event in emission order.
         fn event(&self, event: Event) {
             self.events.lock().unwrap().push(event);
         }
+
         /// Save the latest active-work gauge.
         fn active(&self, active: usize) {
             *self.active.lock().unwrap() = active;
         }
+
         /// Save the latest admission-limit gauge.
         fn limit(&self, limit: usize) {
             *self.limit.lock().unwrap() = limit;
         }
     }
+
     /// Return small limits with independent backoff and recovery intervals.
     fn config() -> Config {
         Config {
@@ -944,6 +1042,7 @@ mod tests {
             retire_after: Duration::from_secs(60),
         }
     }
+
     /// Stale success cannot undo failure and shared fences retain active work.
     #[test]
     fn fences_generation_exclusivity_and_local_pressure() {
@@ -974,6 +1073,7 @@ mod tests {
         work.observe(Outcome::Verified);
         assert_eq!(*owner.observer.limit.lock().unwrap(), 3);
     }
+
     /// Only sufficiently old, idle, eligible peer records may be retired.
     #[test]
     fn capacity_preserves_live_work_and_stale_backoff_then_retires_idle() {
@@ -1010,6 +1110,7 @@ mod tests {
         assert!(owner.acquire(&3).is_ok());
         assert_eq!(owner.state.lock().unwrap().peers.len(), 2);
     }
+
     /// Reject invalid geometry and enforce aggregate and per-key caps.
     #[test]
     fn validation_and_caps() {

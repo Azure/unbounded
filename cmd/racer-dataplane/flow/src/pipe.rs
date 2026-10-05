@@ -21,14 +21,6 @@ use uring_runtime::reactor::descriptor::Descriptor;
 /// Spliced bytes retained by sockets are subject to socket buffer limits instead.
 pub const MAX_PIPE_BYTES: usize = 64 * 1024;
 
-/// Unsupported splice leaves buffered bytes available to a copy fallback.
-pub fn splice_unsupported(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
-    )
-}
-
 /// Worker-local pipe admission and a FIFO of bounded, byte-charged waiters.
 pub struct PipePool<P: Policy> {
     quotas: Rc<Quotas<P>>,
@@ -49,12 +41,14 @@ type Waiters = Rc<RefCell<VecDeque<Rc<RefCell<Option<Waker>>>>>>;
 
 /// Wakes the queue after resource return; holds no reactor reference.
 struct Notify(Waiters);
+
 impl Drop for Notify {
     /// Notify the oldest queued acquisition after lease resources are released.
     fn drop(&mut self) {
         wake_front(&self.0);
     }
 }
+
 /// Wake the FIFO head without holding a queue borrow through the callback.
 fn wake_front(waiters: &Waiters) {
     let wake = waiters
@@ -65,6 +59,7 @@ fn wake_front(waiters: &Waiters) {
         wake.wake();
     }
 }
+
 /// Own a queue registration and its admission through cancellation or completion.
 struct Waiting<P: Policy> {
     queue: Waiters,
@@ -73,6 +68,7 @@ struct Waiting<P: Policy> {
 
     _reservation: Charge<P>,
 }
+
 impl<P: Policy> Drop for Waiting<P> {
     /// Remove exactly this waiter and notify its successor without self-polling.
     fn drop(&mut self) {
@@ -243,16 +239,33 @@ impl<P: Policy> PipePool<P> {
         }
         let reservation = self.quotas.reserve(None, self.pipe_class, 1)?;
         reservation.validate(self.pipe_class, 1)?;
+        Ok(self.lease(PipeResources::new(reservation)?))
+    }
+
+    /// Attach local recycling and notification to uniquely owned resources.
+    fn lease(&self, resources: PipeResources<P>) -> PipeLease<P> {
+        PipeLease {
+            resources: Some(resources),
+            pool: Rc::downgrade(&self.idle),
+            quotas: Rc::downgrade(&self.quotas),
+            _notify: Notify(self.waiting.clone()),
+        }
+    }
+}
+
+impl<P: Policy> PipeResources<P> {
+    /// Create bounded descriptors, closing them before admission on any failure.
+    fn new(reservation: Charge<P>) -> Result<Self> {
         #[cfg(feature = "simulation")]
         if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
             let (read, write) = sim.pipe(MAX_PIPE_BYTES);
-            return Ok(self.lease(PipeResources {
+            return Ok(Self {
                 read,
                 write,
                 capacity: MAX_PIPE_BYTES,
                 buffered: 0,
                 _reservation: reservation,
-            }));
+            });
         }
         let mut fds = [-1; 2];
         // SAFETY: pipe2 initializes exactly two descriptors on success.
@@ -281,23 +294,13 @@ impl<P: Policy> PipePool<P> {
         if capacity <= 0 || capacity as usize > MAX_PIPE_BYTES {
             return Err(Error::Io);
         }
-        Ok(self.lease(PipeResources {
+        Ok(Self {
             read,
             write,
             capacity: capacity as usize,
             buffered: 0,
             _reservation: reservation,
-        }))
-    }
-
-    /// Attach local recycling and notification to uniquely owned resources.
-    fn lease(&self, resources: PipeResources<P>) -> PipeLease<P> {
-        PipeLease {
-            resources: Some(resources),
-            pool: Rc::downgrade(&self.idle),
-            quotas: Rc::downgrade(&self.quotas),
-            _notify: Notify(self.waiting.clone()),
-        }
+        })
     }
 }
 
@@ -324,6 +327,7 @@ impl<P: Policy> PipeLease<P> {
             }
         }
     }
+
     /// Receive opaque socket pages directly into an empty bounded pipe. No user
     /// buffer is borrowed or retained by this synchronous nonblocking syscall.
     /// The descriptor is validated as a nonblocking stream socket. Callers must
@@ -351,6 +355,7 @@ impl<P: Policy> PipeLease<P> {
         pipe.buffered += received;
         Ok(received)
     }
+
     /// Return actual kernel capacity, which may be below the requested ceiling.
     pub fn capacity(&self) -> usize {
         self.resources.as_ref().unwrap().capacity
@@ -414,17 +419,17 @@ impl<P: Policy> PipeLease<P> {
         count: usize,
     ) -> io::Result<usize> {
         #[cfg(feature = "simulation")]
-        if let (Some(pipe), Some(socket)) = (
-            self.resources.as_ref().unwrap().read.as_sim(),
-            socket.as_sim(),
-        ) {
-            let sent = pipe.splice(socket, count.min(self.buffered()))?;
-            self.resources.as_mut().unwrap().buffered -= sent;
-            return Ok(sent);
-        }
-        #[cfg(feature = "simulation")]
-        if socket.as_sim().is_some() || self.resources.as_ref().unwrap().read.as_sim().is_some() {
-            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        {
+            let pipe = self.resources.as_mut().unwrap();
+            match (pipe.read.as_sim(), socket.as_sim()) {
+                (Some(read), Some(socket)) => {
+                    let sent = read.splice(socket, count.min(pipe.buffered))?;
+                    pipe.buffered -= sent;
+                    return Ok(sent);
+                }
+                (None, None) => {}
+                _ => return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            }
         }
         self.try_splice_to(socket, count)
     }
@@ -528,19 +533,20 @@ impl SigpipeGuard {
     fn block() -> io::Result<Self> {
         // SAFETY: all signal set pointers refer to initialized local storage.
         unsafe {
-            let mut guard = Self {
-                previous: std::mem::zeroed(),
-                set: std::mem::zeroed(),
-                was_pending: true,
-            };
-            libc::sigemptyset(&mut guard.set);
-            libc::sigaddset(&mut guard.set, libc::SIGPIPE);
-            let error = libc::pthread_sigmask(libc::SIG_BLOCK, &guard.set, &mut guard.previous);
+            let mut previous = std::mem::zeroed();
+            let mut set = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            let error = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
             if error != 0 {
-                // No mask was installed; do not run the restoring destructor.
-                std::mem::forget(guard);
                 return Err(io::Error::from_raw_os_error(error));
             }
+            // Only a successfully installed mask creates a restoring owner.
+            let mut guard = Self {
+                previous,
+                set,
+                was_pending: true,
+            };
             let mut pending = std::mem::zeroed();
             if libc::sigpending(&mut pending) < 0 {
                 return Err(io::Error::last_os_error());
@@ -586,21 +592,18 @@ fn syscall_count(value: isize) -> io::Result<usize> {
     }
 }
 
+/// Unsupported splice leaves buffered bytes available to a copy fallback.
+pub fn splice_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    )
+}
+
 /// Kernel behavior, admission, cancellation, and simulation ownership contracts.
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Unsupported operation errors never include backpressure or disconnects.
-    #[test]
-    fn unsupported_splice_is_distinct_from_backpressure_and_disconnect() {
-        for code in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
-            assert!(splice_unsupported(&io::Error::from_raw_os_error(code)));
-        }
-        for code in [libc::EAGAIN, libc::EINTR, libc::EPIPE, libc::ECONNRESET] {
-            assert!(!splice_unsupported(&io::Error::from_raw_os_error(code)));
-        }
-        assert!(!splice_unsupported(&io::Error::other("custom")));
-    }
     use std::{
         future::Future,
         sync::{
@@ -614,9 +617,12 @@ mod tests {
     #[derive(Clone, Copy)]
     enum ResourceClass {
         Pipe,
+
         RequestContext,
+
         Plaintext,
     }
+
     impl crate::Class for ResourceClass {
         const COUNT: usize = 3;
 
@@ -625,12 +631,14 @@ mod tests {
             self as usize
         }
     }
+
     /// Independent pipe and context limits without quota-driven wake policy.
     struct TestPolicy {
         pipes: usize,
 
         context: usize,
     }
+
     impl Policy for TestPolicy {
         type Class = ResourceClass;
 
@@ -662,6 +670,7 @@ mod tests {
         /// Rejection facts are not needed by these pipe assertions.
         fn rejected(&self, _: crate::Rejection<ResourceClass>) {}
     }
+
     /// Build a local authority with ample waiter-context capacity.
     fn admission(pipes: usize) -> Rc<Quotas<TestPolicy>> {
         Rc::new(Quotas::new(TestPolicy {
@@ -669,6 +678,7 @@ mod tests {
             context: 32 * 1024 * 1024,
         }))
     }
+
     /// Build an eight-waiter pool using distinct pipe and context classes.
     fn new_pool(quotas: Rc<Quotas<TestPolicy>>) -> PipePool<TestPolicy> {
         PipePool::new(
@@ -678,25 +688,30 @@ mod tests {
             8,
         )
     }
+
     /// Create an acquisition with no cancellation or deadline source.
     fn acquire_wait(
         pool: &PipePool<TestPolicy>,
     ) -> std::pin::Pin<Box<impl Future<Output = Result<PipeLease<TestPolicy>>> + '_>> {
         Box::pin(pool.acquire_wait(|| Ok::<_, Error>(()), || Ok(|_: &Waker| {})))
     }
+
     /// Count progress notifications without requiring an executor.
     #[derive(Default)]
     struct WakeCounter(AtomicUsize);
+
     impl Wake for WakeCounter {
         /// Count an owned wake notification.
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+
         /// Count a borrowed wake notification.
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
+
     impl WakeCounter {
         /// Read the number of observed progress notifications.
         fn count(&self) -> usize {
@@ -708,13 +723,27 @@ mod tests {
     #[derive(Debug, PartialEq)]
     enum GateError {
         Rejected,
+
         Flow(Error),
     }
+
     impl From<Error> for GateError {
         /// Preserve the underlying flow-control failure.
         fn from(error: Error) -> Self {
             Self::Flow(error)
         }
+    }
+
+    /// Unsupported operation errors never include backpressure or disconnects.
+    #[test]
+    fn unsupported_splice_is_distinct_from_backpressure_and_disconnect() {
+        for code in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert!(splice_unsupported(&io::Error::from_raw_os_error(code)));
+        }
+        for code in [libc::EAGAIN, libc::EINTR, libc::EPIPE, libc::ECONNRESET] {
+            assert!(!splice_unsupported(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(!splice_unsupported(&io::Error::other("custom")));
     }
 
     /// Immediate acquisition skips subscription and failed waits roll back fully.
@@ -780,6 +809,7 @@ mod tests {
         use std::cell::Cell;
         /// Count a caller-owned cancellation registration until its closure drops.
         struct Registration(Rc<Cell<usize>>);
+
         impl Drop for Registration {
             /// Release exactly this registration's live count.
             fn drop(&mut self) {
@@ -934,6 +964,40 @@ mod tests {
         drop(pipe);
         assert_eq!(pool.idle_count(), 0);
         assert_eq!(quotas.used(ResourceClass::Pipe), 0);
+    }
+
+    /// Mixed descriptor backends reject splice without consuming buffered bytes.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn mixed_splice_backends_preserve_buffered_suffix() {
+        use std::os::unix::net::UnixStream;
+
+        let pool = new_pool(admission(2));
+        let mut real_pipe = pool.acquire().unwrap();
+        let (real_socket, _peer) = UnixStream::pair().unwrap();
+        real_socket.set_nonblocking(true).unwrap();
+        let real_socket = Descriptor::from(std::os::fd::OwnedFd::from(real_socket));
+        let sim = uring_runtime::reactor::simulation::Simulation::new();
+        let _environment = sim.enter();
+        let mut simulated_pipe = pool.acquire().unwrap();
+        let (simulated_socket, _peer) = sim.socket_pair();
+
+        for (pipe, socket) in [
+            (&mut real_pipe, &simulated_socket),
+            (&mut simulated_pipe, &real_socket),
+        ] {
+            assert_eq!(pipe.try_write(b"pending").unwrap(), 7);
+            assert_eq!(
+                pipe.try_splice_descriptor(socket, 3)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EOPNOTSUPP)
+            );
+            assert_eq!(pipe.buffered(), 7);
+            let mut bytes = [0; 7];
+            assert_eq!(pipe.try_read(&mut bytes).unwrap(), 7);
+            assert_eq!(&bytes, b"pending");
+        }
     }
 
     /// Empty pipes reuse both descriptors while partial payloads are closed.
