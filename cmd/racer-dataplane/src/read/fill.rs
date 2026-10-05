@@ -1661,14 +1661,7 @@ impl Fill {
                 // writes. Release that backing before headroom rejection or any
                 // destructive queued-copy reclaim; this is one bounded pool.
                 self.dependencies.writer.slabs().reclaim_idle();
-                if !owned
-                    && !optional_headroom(
-                        admission.limit(ResourceClass::Ciphertext),
-                        admission.used(ResourceClass::Ciphertext),
-                        amount,
-                        one_page,
-                    )
-                {
+                if !owned && !self.optional_staging_headroom(amount, one_page) {
                     return Err(Error::Overloaded);
                 }
                 self.reserve_owned_persistence(id, ResourceClass::Ciphertext, amount, owned, || {
@@ -1678,6 +1671,34 @@ impl Fill {
                 })
             });
         retention.persistence_attempt(result.is_ok());
+    }
+
+    /// Reclaim against the optional ceiling, not the larger hard quota. One
+    /// bounded idle-only pass advances cursors for later independent interests.
+    /// Never release queued copies or submitted/live owners to admit a write.
+    fn optional_staging_headroom(&self, amount: usize, one_page: usize) -> bool {
+        let admission = &self.dependencies.admission;
+        let class = ResourceClass::Ciphertext;
+        let limit = admission.limit(class);
+        let ceiling = limit.min((limit / 2).max(one_page));
+        if amount > ceiling {
+            return false;
+        }
+        let available_used = ceiling - amount;
+        if admission.used(class) <= available_used {
+            return true;
+        }
+        admission.reclaim_buffers();
+        let deficit = admission.used(class).saturating_sub(available_used);
+        if deficit != 0 {
+            self.dependencies
+                .memory
+                .reclaim_idle(class, None, deficit, |_| 0);
+            // Evicted payloads may have returned backing to the recycler rather
+            // than releasing their charges. Drop those idle allocations too.
+            admission.reclaim_buffers();
+        }
+        optional_headroom(limit, admission.used(class), amount, one_page)
     }
 
     /// At most one bounded queued-optional scan and one retry. Submitted copies
