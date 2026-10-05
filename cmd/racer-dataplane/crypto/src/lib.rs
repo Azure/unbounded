@@ -335,13 +335,11 @@ pub mod identity {
         accepted: Option<AcceptedBundle>,
     }
 
-    /// Accepted canonical content and the roots returned for idempotent delivery.
+    /// Accepted canonical content used to reject conflicting delivery cursors.
     struct AcceptedBundle {
         generation: BundleGeneration,
 
         hash: [u8; 32],
-
-        roots: Vec<Vec<u8>>,
     }
 
     impl BundleInstaller {
@@ -386,23 +384,17 @@ pub mod identity {
             );
             let hash: [u8; 32] = Sha256::digest(&*encoded).into();
             let mut state = self.state.borrow_mut();
-            if let Some(old) = state.accepted.as_ref() {
-                if bundle.generation < old.generation
-                    || bundle.generation == old.generation && hash != old.hash
-                {
-                    return Err(BundleError::Replay);
-                }
-                if bundle.generation == old.generation {
-                    return Ok((old.generation, old.roots.clone()));
-                }
+            if let Some(old) = state.accepted.as_ref()
+                && (bundle.generation < old.generation
+                    || bundle.generation == old.generation && hash != old.hash)
+            {
+                return Err(BundleError::Replay);
             }
+            // Even exact cached delivery must consult current shared epochs.
+            // Another keyring view may have advanced or retired this generation.
             let roots = bundle.peer_trust_roots.clone();
             let generation = state.keys.install(bundle).map_err(BundleError::Identity)?;
-            state.accepted = Some(AcceptedBundle {
-                generation,
-                hash,
-                roots: roots.clone(),
-            });
+            state.accepted = Some(AcceptedBundle { generation, hash });
             Ok((generation, roots))
         }
     }
@@ -1502,6 +1494,49 @@ pub mod identity {
     mod bundle_tests {
         use super::test_util::*;
         use super::*;
+
+        /// Cached delivery cannot return stale roots after another view advances epochs.
+        #[test]
+        fn cached_delivery_revalidates_shared_keyring_epoch() {
+            let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
+            let node = NodeId("22222222-2222-4222-8222-222222222222".into());
+            let epochs = Arc::new(KeyEpochs::default());
+            let keys = Rc::new(Keyring::new(cluster.clone(), node.clone(), epochs.clone()));
+            let other = Keyring::new(cluster.clone(), node, epochs);
+            let installer = BundleInstaller::new(keys.clone());
+            let (old_ca, _) = ca();
+            let (new_ca, _) = ca();
+            let old = racer_control_wire::KeyringBundle {
+                schema_version: SCHEMA_VERSION,
+                cluster,
+                generation: BundleGeneration(2),
+                peer_trust_roots: vec![old_ca.der().to_vec()],
+                cache_keys: vec![],
+            };
+            let accepted = installer.install(old.clone()).unwrap();
+            let original_roots = keys.peer_trust_roots().unwrap();
+            assert_eq!(installer.install(old.clone()).unwrap(), accepted);
+            assert!(Arc::ptr_eq(
+                &keys.peer_trust_roots().unwrap(),
+                &original_roots
+            ));
+            let mut newer = old.clone();
+            newer.generation = BundleGeneration(3);
+            newer.peer_trust_roots = vec![new_ca.der().to_vec()];
+            other.install(newer.clone()).unwrap();
+            assert_eq!(keys.generation().unwrap(), Some(3));
+            assert_eq!(
+                installer.install(old),
+                Err(BundleError::Identity(Error::InvalidConfiguration))
+            );
+            assert_eq!(*keys.peer_trust_roots().unwrap(), newer.peer_trust_roots);
+            assert_eq!(installer.generation(), Some(BundleGeneration(2)));
+            assert_eq!(
+                installer.install(newer.clone()).unwrap(),
+                (BundleGeneration(3), newer.peer_trust_roots)
+            );
+            assert_eq!(installer.generation(), Some(BundleGeneration(3)));
+        }
 
         /// Canonical delivery is idempotent, rejects rollback, and resets with its keyring.
         #[test]
