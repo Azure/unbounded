@@ -348,6 +348,8 @@ pub mod mailbox {
             !lock(&self.state).queue.is_empty()
         }
         /// Mark queued replies abandoned without releasing commands or their capacity.
+        /// Delivery may end immediately, but completion-only polling still waits for
+        /// actual completion (reported as `Cancelled`) or producer loss (`Unavailable`).
         pub fn abandon_queued(&self) {
             for (_, command) in &lock(&self.state).queue {
                 command.reply.abandoned.store(true, Ordering::Release);
@@ -373,8 +375,12 @@ pub mod mailbox {
     impl<W, V, B, S: Scope> Receipt<W, V, B, S> {
         /// Wait for the accepted work's fence, ignoring cancellation as an early
         /// return condition. The caller must check its scope after completion.
+        /// `Cancelled` means actual completion arrived but abandoned delivery discarded
+        /// its output, not merely that cancellation or abandonment was requested.
         /// Producer loss returns `Unavailable`, not a successful ownership fence.
         /// Producers must retain `Command::permit` until external resources are safe.
+        /// Values are consumed once; polling again after a value returns `Pending`,
+        /// not `Cancelled`. Discarded and producer-loss errors remain observable.
         pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Result<Completion<V, B>>> {
             if let Some(cancellation) = &self.cancellation {
                 cancellation.register(cx.waker());
@@ -439,11 +445,12 @@ pub mod mailbox {
             if generation != self.generation || state.status != ReplyStatus::Pending {
                 return Err(StaleCompletion);
             }
-            state.status = ReplyStatus::Completed;
             let discarded = if !self.is_abandoned() {
+                state.status = ReplyStatus::Completed;
                 state.completion = Some(completion);
                 None
             } else {
+                state.status = ReplyStatus::Discarded;
                 Some(completion)
             };
             let waker = state.waker.take();
@@ -463,6 +470,9 @@ pub mod mailbox {
             }
             if state.status == ReplyStatus::Lost {
                 return Poll::Ready(Err(Error::Unavailable));
+            }
+            if state.status == ReplyStatus::Discarded {
+                return Poll::Ready(Err(Error::Cancelled));
             }
             let old = state.waker.replace(waker);
             drop(state);
@@ -512,8 +522,10 @@ pub mod mailbox {
     enum ReplyStatus {
         /// An execution owner may still publish the first completion.
         Pending,
-        /// Completion arrived, even if the consumer abandoned or consumed the value.
+        /// Completion arrived with output, which may already have been consumed.
         Completed,
+        /// Completion arrived but abandoned delivery discarded its output.
+        Discarded,
         /// The last execution owner disappeared before publishing completion.
         Lost,
     }
@@ -684,6 +696,153 @@ pub mod mailbox {
             assert_eq!(mailbox.outstanding(), 0);
         }
 
+        /// Abandonment is not a fence; discarded completion wakes and retains owner credit.
+        #[test]
+        fn abandoned_queued_completion_is_terminal_only_after_completion() {
+            for poll_before_complete in [false, true] {
+                for receipt_dropped_first in [false, true] {
+                    let mailbox =
+                        Arc::new(Mailbox::<(), Tracked, Tracked, TestScope>::new(1).unwrap());
+                    mailbox.install().unwrap();
+                    let scope = TestScope(Cancellation::new().unwrap());
+                    let values = Arc::new(AtomicUsize::new(0));
+                    let budgets = Arc::new(AtomicUsize::new(0));
+                    let mut receipt = mailbox
+                        .submit(7, (), &scope, Some(Tracked(budgets.clone())))
+                        .unwrap();
+                    mailbox.abandon_queued();
+                    let count = Arc::new(WakeCounter::default());
+                    let waker = Waker::from(count.clone());
+                    let mut cx = Context::from_waker(&waker);
+                    assert!(matches!(
+                        Pin::new(&mut receipt).poll(&mut cx),
+                        Poll::Ready(Err(Error::Cancelled))
+                    ));
+                    if poll_before_complete {
+                        assert!(receipt.poll_completion(&mut cx).is_pending());
+                    }
+                    let mut command = mailbox.pop().unwrap();
+                    assert!(command.reply.is_abandoned());
+                    assert_eq!(mailbox.outstanding(), 1);
+                    assert_eq!(budgets.load(Ordering::Relaxed), 0);
+                    assert_eq!(count.count(), 0);
+                    command
+                        .reply
+                        .complete(
+                            7,
+                            Completion {
+                                value: Tracked(values.clone()),
+                                budget: command.budget.take(),
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(count.count(), usize::from(poll_before_complete));
+                    assert_eq!(values.load(Ordering::Relaxed), 1);
+                    assert_eq!(budgets.load(Ordering::Relaxed), 1);
+                    for _ in 0..2 {
+                        assert!(matches!(
+                            receipt.poll_completion(&mut cx),
+                            Poll::Ready(Err(Error::Cancelled))
+                        ));
+                    }
+                    assert_eq!(
+                        command.reply.complete(
+                            7,
+                            Completion {
+                                value: Tracked(values.clone()),
+                                budget: Some(Tracked(budgets.clone())),
+                            },
+                        ),
+                        Err(StaleCompletion)
+                    );
+                    assert_eq!(values.load(Ordering::Relaxed), 2);
+                    assert_eq!(budgets.load(Ordering::Relaxed), 2);
+                    assert_eq!(mailbox.outstanding(), 1);
+                    assert!(matches!(
+                        mailbox.submit(8, (), &scope, None),
+                        Err(Error::Overloaded)
+                    ));
+                    if receipt_dropped_first {
+                        drop(receipt);
+                        assert_eq!(mailbox.outstanding(), 1);
+                        drop(command);
+                    } else {
+                        drop(command);
+                        assert_eq!(mailbox.outstanding(), 1);
+                        assert!(matches!(
+                            receipt.poll_completion(&mut cx),
+                            Poll::Ready(Err(Error::Cancelled))
+                        ));
+                        drop(receipt);
+                    }
+                    assert_eq!(mailbox.outstanding(), 0);
+                    assert_eq!(values.load(Ordering::Relaxed), 2);
+                    assert_eq!(budgets.load(Ordering::Relaxed), 2);
+                }
+            }
+        }
+
+        /// Stale results cannot fence abandoned work; last producer loss remains distinct.
+        #[test]
+        fn abandoned_queued_stale_completion_waits_for_last_producer_loss() {
+            let (mailbox, scope) = setup();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let receipt = mailbox
+                .submit(7, String::new(), &scope, Some(Tracked(dropped.clone())))
+                .unwrap();
+            mailbox.abandon_queued();
+            let count = Arc::new(WakeCounter::default());
+            let waker = Waker::from(count.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(receipt.poll_completion(&mut cx).is_pending());
+            let command = mailbox.pop().unwrap();
+            let reply = command.reply.clone();
+            let producer = command.permit.clone();
+            assert_eq!(
+                reply.complete(
+                    8,
+                    Completion {
+                        value: 0,
+                        budget: Some(Tracked(dropped.clone())),
+                    },
+                ),
+                Err(StaleCompletion)
+            );
+            assert_eq!(dropped.load(Ordering::Relaxed), 1);
+            assert!(receipt.poll_completion(&mut cx).is_pending());
+            assert_eq!(count.count(), 0);
+            assert_eq!(mailbox.outstanding(), 1);
+            drop(command);
+            assert_eq!(dropped.load(Ordering::Relaxed), 2);
+            assert!(receipt.poll_completion(&mut cx).is_pending());
+            assert_eq!(count.count(), 0);
+            assert_eq!(mailbox.outstanding(), 1);
+            drop(producer);
+            assert_eq!(count.count(), 1);
+            assert_eq!(mailbox.outstanding(), 0);
+            assert!(matches!(
+                receipt.poll_completion(&mut cx),
+                Poll::Ready(Err(Error::Unavailable))
+            ));
+            assert_eq!(
+                reply.complete(
+                    7,
+                    Completion {
+                        value: 1,
+                        budget: Some(Tracked(dropped.clone())),
+                    },
+                ),
+                Err(StaleCompletion)
+            );
+            assert_eq!(dropped.load(Ordering::Relaxed), 3);
+            assert!(matches!(
+                receipt.poll_completion(&mut cx),
+                Poll::Ready(Err(Error::Unavailable))
+            ));
+            drop(receipt);
+            assert_eq!(mailbox.outstanding(), 0);
+        }
+
         /// Generation checks and one-shot completion preserve the first owned result.
         #[test]
         fn stale_and_duplicate_completions_cannot_replace_owned_result() {
@@ -738,6 +897,9 @@ pub mod mailbox {
             assert_eq!(completion.value, 42);
             assert!(completion.budget.is_some());
             assert_eq!(dropped.load(Ordering::Relaxed), 0);
+            // A consumed normal value is not a discarded completion or producer loss.
+            assert!(receipt.poll_completion(&mut cx).is_pending());
+            assert!(Pin::new(&mut receipt).poll(&mut cx).is_pending());
             drop(receipt);
             assert_eq!(mailbox.outstanding(), 0);
             drop(completion);
@@ -1014,7 +1176,7 @@ pub mod mailbox {
                 /// Reenter the reply lock after completion has detached discarded output.
                 fn drop(&mut self) {
                     let reply = self.0.upgrade().unwrap();
-                    assert_eq!(lock(&reply.state).status, ReplyStatus::Completed);
+                    assert_eq!(lock(&reply.state).status, ReplyStatus::Discarded);
                 }
             }
             let reply = Arc::new(Reply::new(1));
