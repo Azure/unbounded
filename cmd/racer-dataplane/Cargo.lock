@@ -469,6 +469,7 @@ name = "http1"
 version = "0.1.0"
 dependencies = [
  "flow-control",
+ "futures",
  "httparse",
  "libc",
  "uring-runtime",

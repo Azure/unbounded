@@ -768,13 +768,10 @@ pub mod relay {
     //! still rejects pipelining. EINTR consumes a turn; EAGAIN returns readiness. EOF
     //! and drain errors are terminal, unlike [`crate::delivery`]'s drain retry policy.
     //!
-    //! The caller checks its scope, holds the complete engine in `Rc<RefCell<_>>`, and
-    //! passes that owner to the runtime's `readiness_with_lease`. A readiness descriptor
-    //! alone does not retain connections, pipe, or buffer accounting. Cancellation or
-    //! abandonment must fence the wait before those owners can be released. The engine
-    //! submits no asynchronous I/O itself: deadline clipping, retry, cooperative
-    //! yielding, exchange finish/poison ordering, and reservation release are caller
-    //! policy. The `test-util` feature adds deterministic fallback injection; production
+    //! [`Relay::run`] retains the complete engine through readiness fences and yields
+    //! between bounded turns. Callers supply deadline clipping and timeout policy.
+    //! [`finish`] handles paired exchange completion and poisoning; application
+    //! reservation release remains with the caller. The `test-util` feature adds deterministic fallback injection; production
     //! unsupported errors trigger fallback without that feature.
 
     use crate::connection::{ConnectionLease, Context, HttpIo, OwnedBuffer, Result};
@@ -844,6 +841,55 @@ pub mod relay {
     }
 
     impl<C: Context, P: RelayPipe> Relay<C, P> {
+        /// Drive bounded turns, retaining all resources through every readiness CQE.
+        /// `tick` narrows the caller scope; `retry` identifies an ignorable tick timeout.
+        pub async fn run(
+            self,
+            io: &HttpIo<C>,
+            scope: &C::Scope,
+            tick: impl Fn() -> C::Scope,
+            retry: impl Fn(C::Error) -> bool,
+        ) -> Result<C, Self> {
+            use std::{cell::RefCell, task::Poll};
+            use uring_runtime::Scope;
+            let state = Rc::new(RefCell::new(self));
+            loop {
+                scope.check()?;
+                let step = state.borrow_mut().step(io)?;
+                match step {
+                    Step::Complete => break,
+                    Step::Readiness { socket, interest } => {
+                        match io
+                            .reactor()
+                            .readiness_with_lease(socket, interest as u32, state.clone(), &tick())
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(error) if retry(error) => (),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Step::Yield => {
+                        let mut yielded = false;
+                        std::future::poll_fn(|cx| {
+                            if yielded {
+                                Poll::Ready(())
+                            } else {
+                                yielded = true;
+                                cx.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                    }
+                }
+            }
+            scope.check()?;
+            Ok(Rc::try_unwrap(state)
+                .map_err(|_| uring_runtime::Error::InvalidInput)?
+                .into_inner())
+        }
+
         /// Require equal known body lengths. The caller admits an empty pipe and
         /// validates any application envelope before constructing a nonempty relay.
         pub fn new(
@@ -985,6 +1031,22 @@ pub mod relay {
         pub fn into_destination(self) -> ConnectionLease<C> {
             self.destination
         }
+    }
+
+    /// Finish both HTTP exchanges, poisoning both connections on either failure.
+    pub fn finish<C: Context>(
+        source: &mut ConnectionLease<C>,
+        destination: &mut ConnectionLease<C>,
+    ) -> Result<C, ()> {
+        if let Err(error) = source
+            .finish_exchange()
+            .and_then(|()| destination.finish_exchange())
+        {
+            source.poison();
+            destination.poison();
+            return Err(error);
+        }
+        Ok(())
     }
 
     impl<P: Policy> RelayPipe for PipeLease<P> {
@@ -1273,6 +1335,66 @@ pub mod relay {
                 ));
                 assert_eq!(relay.destination.send_remaining(), Some(3));
             }
+        }
+
+        /// The asynchronous runner retains readiness owners and finishes both cursors.
+        #[test]
+        fn runner_waits_then_finishes_and_abandonment_retains_pipe_until_fence() {
+            for abandon in [false, true] {
+                let f = Fixture::new();
+                f.io.reactor().init().unwrap();
+                let pipe = Pipe::default();
+                let weak = Rc::downgrade(&pipe._owner);
+                let (relay, mut writer, mut reader) = f.relay(3, pipe);
+                let mut run = Box::pin(relay.run(&f.io, &TestScope, || TestScope, |_| false));
+                let mut cx = std::task::Context::from_waker(Waker::noop());
+                assert!(run.as_mut().poll(&mut cx).is_pending());
+                if abandon {
+                    drop(run);
+                    assert!(weak.upgrade().is_some());
+                    assert_eq!(f.hooks.slots.get(), 2);
+                } else {
+                    writer.write_all(b"abc").unwrap();
+                    let until = Instant::now() + Duration::from_secs(2);
+                    let mut relay = loop {
+                        f.io.reactor().poll_budgeted(32).unwrap();
+                        if let Poll::Ready(result) = run.as_mut().poll(&mut cx) {
+                            break result.unwrap();
+                        }
+                        assert!(Instant::now() < until, "relay watchdog");
+                    };
+                    let mut bytes = [0; 3];
+                    reader.read_exact(&mut bytes).unwrap();
+                    assert_eq!(&bytes, b"abc");
+                    let (source, destination) = relay.connections_mut();
+                    finish(source, destination).unwrap();
+                    assert!(source.is_reusable() && destination.is_reusable());
+                    drop((run, relay));
+                }
+                let mut drain = f.io.reactor().drain();
+                let until = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if let Poll::Ready(result) = drain.as_mut().poll(&mut cx) {
+                        result.unwrap();
+                        break;
+                    }
+                    assert!(Instant::now() < until, "drain watchdog");
+                    f.io.reactor().poll_budgeted(32).unwrap();
+                }
+                assert!(weak.upgrade().is_none());
+                assert_eq!(f.hooks.slots.get(), 0);
+            }
+        }
+
+        /// A failed source finish poisons a destination that otherwise could be reused.
+        #[test]
+        fn paired_finish_poisons_both_on_unfinished_body() {
+            let f = Fixture::new();
+            let (mut relay, _writer, _reader) = f.relay(1, Pipe::default());
+            let (source, destination) = relay.connections_mut();
+            assert!(finish(source, destination).is_err());
+            assert!(source.closing() && destination.closing());
+            assert!(!source.is_reusable() && !destination.is_reusable());
         }
 
         /// Excess read-ahead survives forwarding and prevents connection reuse.

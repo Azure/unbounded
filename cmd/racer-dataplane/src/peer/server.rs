@@ -860,34 +860,7 @@ impl PeerServer {
         self.opaque_relay
     }
 }
-/// Drain completed connections without abandoning the outstanding accept, which
-/// may already own a successful result that has not been consumed yet.
-async fn next_accepted<A, C>(
-    accept: A,
-    active: &mut futures::stream::FuturesUnordered<C>,
-    scope: &RequestScope,
-) -> crate::error::Result<uring_runtime::reactor::descriptor::Descriptor>
-where
-    A: std::future::Future<
-            Output = crate::error::Result<uring_runtime::reactor::descriptor::Descriptor>,
-        >,
-    C: std::future::Future,
-{
-    use futures::FutureExt;
-    use futures::StreamExt;
-    let accept = accept.fuse();
-    futures::pin_mut!(accept);
-    loop {
-        scope.check()?;
-        if active.is_empty() {
-            return accept.await;
-        }
-        futures::select_biased! {
-            _ = active.next().fuse() => continue,
-            accepted = accept => return accepted,
-        }
-    }
-}
+use http1::connection::next_accepted;
 /// Cancel an abandoned HTTP exchange without dropping work before its completion fences.
 async fn disconnect_fenced_exchange<T>(
     io: &crate::http::HttpIo,
@@ -896,54 +869,21 @@ async fn disconnect_fenced_exchange<T>(
     exchange: &RequestScope,
     work: impl std::future::Future<Output = crate::error::Result<T>>,
 ) -> crate::error::Result<T> {
-    use std::task::Poll;
-    let parent_wake = parent.cancellation.subscribe()?;
     let watch_scope = RequestScope::new(exchange.request, exchange.deadline.0)?;
-    let socket = connection.socket();
-    let events = (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) as u32;
-    let mut watch = Some(io.reactor().readiness_with_lease(
-        socket.clone(),
-        events,
-        connection.slot().cloned(),
+    http1::connection::disconnect_fenced(
+        io,
+        connection,
+        parent,
         &watch_scope,
-    ));
-    let mut work = std::pin::pin!(work);
-    let mut failure = None;
-    let result = std::future::poll_fn(|cx| {
-        parent_wake.register(cx.waker());
-        if let Err(error) = parent.check() {
-            failure.get_or_insert(error);
-        }
-        if let Some(Poll::Ready(result)) = watch.as_mut().map(|watch| watch.as_mut().poll(cx)) {
-            watch = None;
-            match result {
-                Ok(ready) if ready & events != 0 => {
-                    failure.get_or_insert(Error::Cancelled);
-                }
-                Err(error) => {
-                    failure.get_or_insert(error);
-                }
-                _ => (),
-            }
-        }
-        if socket.peer_read_closed() {
-            failure.get_or_insert(Error::Cancelled);
-        }
-        if failure.is_some() {
+        || {
             let _ = exchange.cancel();
-        }
-        work.as_mut().poll(cx)
-    })
-    .await;
-    // Fence the watch before sending a response or reusing the HTTP connection.
-    let _ = watch_scope.cancel();
-    if let Some(watch) = watch {
-        let _ = watch.await;
-    }
-    match failure {
-        Some(error) => Err(error),
-        None => result,
-    }
+        },
+        || {
+            let _ = watch_scope.cancel();
+        },
+        work,
+    )
+    .await
 }
 
 fn header_scope(

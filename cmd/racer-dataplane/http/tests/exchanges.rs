@@ -120,6 +120,100 @@ fn pair() -> (ConnectionLease<Caller>, ConnectionLease<Caller>) {
     )
 }
 
+/// Ready completions are drained without recreating or losing a pending accept.
+#[test]
+fn accept_retains_one_future_across_completions_and_preserves_errors() {
+    use futures::{channel::oneshot, stream::FuturesUnordered};
+    use std::cell::Cell;
+    for ready in [false, true] {
+        let polls = Cell::new(0);
+        let (send, mut receive) = oneshot::channel::<Result<u8, Failure>>();
+        let accept = std::future::poll_fn(|cx| {
+            polls.set(polls.get() + 1);
+            std::pin::Pin::new(&mut receive)
+                .poll(cx)
+                .map(|result| result.unwrap())
+        });
+        let mut active = FuturesUnordered::new();
+        let (done, completion) = oneshot::channel::<()>();
+        active.push(completion);
+        let mut operation = Box::pin(http1::connection::next_accepted(
+            accept,
+            &mut active,
+            &RequestScope,
+        ));
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        assert!(operation.as_mut().poll(&mut cx).is_pending());
+        let mut send = Some(send);
+        if ready {
+            send.take().unwrap().send(Ok(7)).unwrap();
+        }
+        done.send(()).unwrap();
+        if !ready {
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            send.take().unwrap().send(Ok(7)).unwrap();
+        }
+        assert_eq!(operation.as_mut().poll(&mut cx), Poll::Ready(Ok(7)));
+        drop(operation);
+        assert!(active.is_empty());
+        assert!(polls.get() >= 2);
+    }
+    let mut active = FuturesUnordered::new();
+    active.push(std::future::ready(()));
+    let failure = Failure::Runtime(uring_runtime::Error::Io);
+    assert_eq!(
+        futures::executor::block_on(http1::connection::next_accepted(
+            std::future::ready(Err::<(), _>(failure)),
+            &mut active,
+            &RequestScope,
+        )),
+        Err(failure)
+    );
+    assert!(active.is_empty());
+}
+
+/// Disconnect detection cancels work but still polls it to completion and fences its watch.
+#[test]
+fn disconnect_waits_for_work_cleanup_before_returning_failure() {
+    use std::cell::Cell;
+    let io = io();
+    io.reactor().init().unwrap();
+    let (connection, peer) = pair();
+    drop(peer);
+    let canceled = Cell::new(false);
+    let cleaned = Cell::new(false);
+    let watch_canceled = Cell::new(false);
+    let work = std::future::poll_fn(|cx| {
+        if canceled.get() {
+            if cleaned.replace(true) {
+                Poll::Ready(Ok(7))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        } else {
+            Poll::Pending
+        }
+    });
+    let result = drive(
+        &io,
+        http1::connection::disconnect_fenced(
+            &io,
+            &connection,
+            &RequestScope,
+            &RequestScope,
+            || canceled.set(true),
+            || watch_canceled.set(true),
+            work,
+        ),
+    );
+    assert_eq!(
+        result,
+        Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+    );
+    assert!(canceled.get() && cleaned.get() && watch_canceled.get());
+    assert_eq!(io.reactor().in_flight(), 0);
+}
 /// Poll one operation and its reactor under a fixed progress deadline.
 fn drive<T>(io: &HttpIo<Caller>, future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);

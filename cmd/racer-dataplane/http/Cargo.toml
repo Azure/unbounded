@@ -10,6 +10,7 @@ description = "Strict fixed-length HTTP/1.1 over an explicitly driven uring runt
 test-util = []
 
 [dependencies]
+futures = "0.3"
 flow-control = { path = "../flow" }
 uring-runtime = { path = "../runtime" }
 httparse = "1"

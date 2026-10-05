@@ -46,7 +46,6 @@ use racer_control_wire::NodeId;
 use racer_control_wire::RailId;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 use uring_runtime::reactor::IoBuffer;
 
@@ -1475,7 +1474,7 @@ pub(crate) async fn relay_body(
     if source.receive_remaining() == Some(0) {
         let mut source = source;
         let mut destination = destination;
-        finish_relay(&mut source, &mut destination)?;
+        http1::relay::finish(&mut source, &mut destination)?;
         destination.state_mut().relay_reservation = None;
         return Ok(destination);
     }
@@ -1490,74 +1489,25 @@ pub(crate) async fn relay_body(
         state.force_fallback(copied, fallback_at);
         state
     };
-    let state = Rc::new(std::cell::RefCell::new(state));
-    loop {
-        scope.check()?;
-        let step = state.borrow_mut().step(io)?;
-        let wait = match step {
-            http1::relay::Step::Complete => break,
-            http1::relay::Step::Yield => None,
-            http1::relay::Step::Readiness { socket, interest } => Some((socket, interest)),
-        };
-        wait_relay_progress(io, state.clone(), wait, scope).await?;
-    }
-    scope.check()?;
-    let mut state = Rc::try_unwrap(state)
-        .map_err(|_| Error::Internal)?
-        .into_inner();
+    let mut state = state
+        .run(
+            io,
+            scope,
+            || {
+                let mut tick = scope.clone();
+                tick.deadline.0 = tick
+                    .deadline
+                    .0
+                    .min(uring_runtime::environment::now() + Duration::from_millis(10));
+                tick
+            },
+            |error| error == Error::DeadlineExceeded,
+        )
+        .await?;
     let (source, destination) = state.connections_mut();
-    finish_relay(source, destination)?;
+    http1::relay::finish(source, destination)?;
     destination.state_mut().relay_reservation = None;
     Ok(state.into_destination())
-}
-async fn wait_relay_progress(
-    io: &HttpIo,
-    state: Rc<std::cell::RefCell<Transit>>,
-    wait: Option<(Rc<uring_runtime::reactor::descriptor::Descriptor>, i16)>,
-    scope: &RequestScope,
-) -> Result<()> {
-    if let Some((fd, interest)) = wait {
-        let mut tick = scope.clone();
-        tick.deadline.0 = tick
-            .deadline
-            .0
-            .min(uring_runtime::environment::now() + Duration::from_millis(10));
-        match io
-            .reactor()
-            .readiness_with_lease(fd, interest as u32, state.clone(), &tick)
-            .await
-        {
-            Ok(_) | Err(Error::DeadlineExceeded) => (),
-            Err(error) => return Err(error),
-        }
-    } else {
-        let mut yielded = false;
-        std::future::poll_fn(|cx| {
-            if yielded {
-                Poll::Ready(())
-            } else {
-                yielded = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        })
-        .await;
-    }
-    Ok(())
-}
-fn finish_relay(
-    source: &mut crate::http::ConnectionLease,
-    destination: &mut crate::http::ConnectionLease,
-) -> Result<()> {
-    if let Err(error) = source
-        .finish_exchange()
-        .and_then(|()| destination.finish_exchange())
-    {
-        source.poison();
-        destination.poison();
-        return Err(error);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

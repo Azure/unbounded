@@ -25,6 +25,95 @@ pub type Result<C, T> = std::result::Result<T, <C as Context>::Error>;
 /// An owned, lazy operation retaining resources through runtime completion.
 pub type Operation<'a, C, T> = uring_runtime::Operation<'a, T, <C as Context>::Error>;
 
+/// Drain completed connections while retaining the same outstanding accept.
+/// A ready but unconsumed accepted value remains owned until returned or dropped.
+pub async fn next_accepted<A, F, S, T>(
+    accept: A,
+    active: &mut futures::stream::FuturesUnordered<F>,
+    scope: &S,
+) -> std::result::Result<T, S::Error>
+where
+    A: std::future::Future<Output = std::result::Result<T, S::Error>>,
+    F: std::future::Future,
+    S: Scope,
+{
+    use futures::{FutureExt, StreamExt};
+    let accept = accept.fuse();
+    futures::pin_mut!(accept);
+    loop {
+        scope.check()?;
+        if active.is_empty() {
+            return accept.await;
+        }
+        futures::select_biased! {
+            _ = active.next().fuse() => continue,
+            accepted = accept => return accepted,
+        }
+    }
+}
+
+/// Observe disconnect or parent cancellation while driving work through its fences.
+/// The caller supplies an independent watch scope and cancellation actions; its
+/// exchange must cooperate with cancellation and retain submitted I/O until fenced.
+/// Watch cancellation is fenced before returning any result or reusing a connection.
+pub async fn disconnect_fenced<C: Context, T>(
+    io: &HttpIo<C>,
+    connection: &ConnectionLease<C>,
+    parent: &C::Scope,
+    watch_scope: &C::Scope,
+    cancel_exchange: impl Fn(),
+    cancel_watch: impl Fn(),
+    work: impl std::future::Future<Output = Result<C, T>>,
+) -> Result<C, T> {
+    let parent_wake = parent.cancellation().map(|c| c.subscribe()).transpose()?;
+    let socket = connection.socket();
+    let events = (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) as u32;
+    let mut watch = Some(io.reactor().readiness_with_lease(
+        socket.clone(),
+        events,
+        connection.slot().cloned(),
+        watch_scope,
+    ));
+    let mut work = std::pin::pin!(work);
+    let mut failure = None;
+    let result = poll_fn(|cx| {
+        if let Some(wake) = &parent_wake {
+            wake.register(cx.waker());
+        }
+        if let Err(error) = parent.check() {
+            failure.get_or_insert(error);
+        }
+        if let Some(Poll::Ready(result)) = watch.as_mut().map(|watch| watch.as_mut().poll(cx)) {
+            watch = None;
+            match result {
+                Ok(ready) if ready & events != 0 => {
+                    failure.get_or_insert(uring_runtime::Error::Cancelled.into());
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+                _ => (),
+            }
+        }
+        if socket.peer_read_closed() {
+            failure.get_or_insert(uring_runtime::Error::Cancelled.into());
+        }
+        if failure.is_some() {
+            cancel_exchange();
+        }
+        work.as_mut().poll(cx)
+    })
+    .await;
+    cancel_watch();
+    if let Some(watch) = watch {
+        let _ = watch.await;
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => result,
+    }
+}
+
 /// Caller-owned runtime, admission, and connection policy.
 pub trait Context: 'static {
     /// Common HTTP, runtime, and application error.
