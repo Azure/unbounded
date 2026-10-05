@@ -147,6 +147,10 @@ different size that overlap candidate CIDRs. A pending allocation can move to a
 different allocator only when its IP families, block sizes, and pool containment
 match. Otherwise, reconciliation waits until a changed Node UID or resourceVersion
 proves the previous patch cannot apply before allocating replacement CIDRs.
+Successful patches remain reserved until the Node informer observes their CIDRs,
+even if the original assignment is removed in the meantime. Reservations copied
+into new allocators are tracked and released from every recipient when abandoned,
+unless another Node or pending assignment still owns the CIDR.
 
 ### Health and Monitoring
 

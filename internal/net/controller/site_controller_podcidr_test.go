@@ -308,8 +308,8 @@ func TestAssignPodCIDRsReusesPendingReservationOnNextSync(t *testing.T) {
 		t.Fatal("second sync allocated a new CIDR instead of reusing the pending one")
 	}
 
-	if h.pending(podCIDRTestNode) != nil {
-		t.Fatal("pending assignment was not cleared after a successful patch")
+	if h.pending(podCIDRTestNode) == nil {
+		t.Fatal("reservation was cleared before informer observation")
 	}
 
 	if !h.state.allocator.IsAllocated("10.244.0.0/24") {
@@ -341,8 +341,8 @@ func TestAssignPodCIDRsAdoptsPatchAppliedDespiteError(t *testing.T) {
 		t.Fatalf("second sync: %v", err)
 	}
 
-	if h.pending(podCIDRTestNode) != nil {
-		t.Fatal("pending assignment was not cleared after the node was observed holding it")
+	if h.pending(podCIDRTestNode) == nil {
+		t.Fatal("live observation cleared the reservation before informer observation")
 	}
 
 	if !h.state.allocator.IsAllocated("10.244.0.0/24") {
@@ -698,6 +698,143 @@ func TestAssignPodCIDRsLiveNodeMissing(t *testing.T) {
 
 	if h.state.allocator.IsAllocated("10.244.0.0/24") {
 		t.Fatal("CIDR was allocated for a deleted node")
+	}
+}
+
+func TestConfirmedReservationSurvivesAssignmentRemoval(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	if err := h.sc.allocateAndPatchNodePodCIDRs(t.Context(), podCIDRTestNode, h.state, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	h.sc.updateAssignmentAllocators(nil)
+	site := h.sites[0].DeepCopy()
+	site.Name = "site-b"
+	h.sc.updateAssignmentAllocators([]unboundedv1alpha3.Site{*site})
+
+	state := h.sc.getAssignmentAllocator("site-b", 0)
+	if state == nil || !state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("assignment removal reopened a confirmed but unobserved CIDR")
+	}
+
+	cidr, err := state.allocator.AllocateIPv4()
+	if err != nil || cidr != "10.244.1.0/24" {
+		t.Fatalf("allocation = %q, %v", cidr, err)
+	}
+
+	live, err := h.client.CoreV1().Nodes().Get(t.Context(), podCIDRTestNode, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := indexer.Add(live); err != nil {
+		t.Fatal(err)
+	}
+
+	h.sc.nodeLister = corev1listers.NewNodeLister(indexer)
+	h.sc.markNodeCIDRsAllocated(live, []unboundedv1alpha3.Site{*site}, "site-b")
+
+	if h.pending(podCIDRTestNode) != nil {
+		t.Fatal("reservation retained after informer observation")
+	}
+
+	if !state.allocator.IsAllocated(live.Spec.PodCIDR) {
+		t.Fatal("informer observation released the node's CIDR")
+	}
+
+	h.sc.releaseNodeCIDRs(live)
+
+	if state.allocator.IsAllocated(live.Spec.PodCIDR) {
+		t.Fatal("node deletion left the confirmed CIDR copied in a new allocator")
+	}
+}
+
+func TestReservationCleanupReleasesAllRecipients(t *testing.T) {
+	for _, mode := range []string{"deleted", "different-cidr", "incompatible", "adopted", "other-owner", "other-pending", "list-error"} {
+		t.Run(mode, func(t *testing.T) {
+			h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+			h.failPatches(apierrors.NewTimeoutError("unconfirmed", 1))
+
+			if err := h.sc.allocateAndPatchNodePodCIDRs(t.Context(), podCIDRTestNode, h.state, ""); err == nil {
+				t.Fatal("expected patch failure")
+			}
+
+			site := h.sites[0].DeepCopy()
+			site.Name = "site-b"
+			h.sc.updateAssignmentAllocators(append(h.sites, *site))
+
+			copyState := h.sc.getAssignmentAllocator(site.Name, 0)
+			if copyState == nil || !copyState.allocator.IsAllocated("10.244.0.0/24") {
+				t.Fatal("pending allocation not copied")
+			}
+
+			switch mode {
+			case "deleted":
+				h.sc.releasePendingPodCIDRs(podCIDRTestNode, "", nil)
+			case "different-cidr":
+				h.sc.releasePendingPodCIDRs(podCIDRTestNode, "", []string{"10.244.7.0/24"})
+			case "incompatible":
+				other, err := h.sc.buildAssignmentAllocator(assignmentRef{
+					site:       h.sites[0],
+					assignment: unboundednetv1alpha1.PodCidrAssignment{CidrBlocks: []string{"10.250.0.0/16"}},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				h.sc.assignmentAllocators[assignmentKey("site-a", 0)] = other
+				if _, _, err := h.sc.pendingPodCIDRsForNode(liveNodeWithRV("5"), other); err != nil {
+					t.Fatal(err)
+				}
+			case "adopted":
+				if _, _, err := h.sc.pendingPodCIDRsForNode(liveNodeWithRV("5"), copyState); err != nil {
+					t.Fatal(err)
+				}
+
+				h.sc.releasePendingPodCIDRs(podCIDRTestNode, "", nil)
+			case "other-pending":
+				h.sc.pendingPodCIDRs["other-node"] = &pendingPodCIDRAssignment{
+					podCIDRs: []string{"10.244.0.0/24"}, allocator: copyState.allocator,
+				}
+				h.sc.releasePendingPodCIDRs(podCIDRTestNode, "", nil)
+			case "other-owner":
+				indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+				owner := liveNodeWithRV("8", "10.244.0.0/24")
+
+				owner.Name = "other-node"
+				if err := indexer.Add(owner); err != nil {
+					t.Fatal(err)
+				}
+
+				h.sc.nodeLister = corev1listers.NewNodeLister(indexer)
+				h.sc.releasePendingPodCIDRs(podCIDRTestNode, "", nil)
+			case "list-error":
+				h.sc.nodeLister = inspectingNodeLister{
+					NodeLister: h.sc.nodeLister, beforeList: func() {}, listErr: errors.New("unavailable"),
+				}
+				h.sc.releasePendingPodCIDRs(podCIDRTestNode, "", nil)
+
+				if h.pending(podCIDRTestNode) == nil {
+					t.Fatal("lost reservation on cleanup error")
+				}
+			}
+
+			wantReserved := mode == "other-owner" || mode == "other-pending" || mode == "list-error"
+			for _, state := range []*assignmentAllocator{h.state, copyState} {
+				if got := state.allocator.IsAllocated("10.244.0.0/24"); got != wantReserved {
+					t.Fatalf("recipient retains CIDR = %v, want %v", got, wantReserved)
+				}
+			}
+
+			if mode == "other-pending" {
+				h.sc.releasePendingPodCIDRs("other-node", "", nil)
+
+				if h.state.allocator.IsAllocated("10.244.0.0/24") || copyState.allocator.IsAllocated("10.244.0.0/24") {
+					t.Fatal("last pending owner left copied reservations allocated")
+				}
+			}
+		})
 	}
 }
 
