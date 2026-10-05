@@ -14,13 +14,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/Azure/unbounded/internal/racer/workload"
+	"github.com/Azure/unbounded/internal/racer/members"
 )
 
-func workloadConfig(t *testing.T) workload.Config {
+func workloadConfig(t *testing.T) members.Config {
 	t.Helper()
 
-	return workload.Config{
+	return members.Config{
 		Cluster: "11111111-1111-1111-1111-111111111111", Namespace: "racer",
 		ControlURL: "https://racer-controller.racer.svc:8443", DataplaneImage: "racer:test",
 		BootstrapTrustConfigMap: "racer-bootstrap-trust", PeerPort: 8082,
@@ -34,7 +34,7 @@ func TestWorkloadPeerMembership(t *testing.T) {
 			cfg := workloadConfig(t)
 			cfg.PeerPort = port
 
-			ds, err := workload.DesiredDaemonSet(cfg)
+			ds, err := members.DesiredDaemonSet(cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -51,7 +51,7 @@ func TestWorkloadDefaultsAgreeWithController(t *testing.T) {
 	}
 	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 
-	cfg, err := workload.ConfigFromLookup(lookup)
+	cfg, err := members.ConfigFromLookup(lookup)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,12 +105,12 @@ func assertWorkloadPeerMembership(t *testing.T, ds *appsv1.DaemonSet, peerPort u
 			t.Fatalf("peer listener must bind the exact Pod IP and peer port: %q", listen)
 		}
 
-		members, diagnostics, err := reconcileMembers([]corev1.Node{memberNode()}, map[string][]corev1.Pod{pod.Spec.NodeName: {pod}}, memberOwnership(t, testDaemonSetUID), nil, peerPort)
-		if err != nil || len(diagnostics) != 0 || len(members) != 1 {
+		candidate, diagnostics, err := reconcileMembers([]corev1.Node{memberNode()}, map[string][]corev1.Pod{pod.Spec.NodeName: {pod}}, memberOwnership(t, testDaemonSetUID), nil, peerPort)
+		if err != nil || len(diagnostics) != 0 || len(candidate) != 1 {
 			t.Fatalf("unready Pod with IPs %v must be published: %v, %v", ips, diagnostics, err)
 		}
 
-		if endpoint := members[testNodeUID].PeerEndpoint; endpoint != netip.AddrPortFrom(ip, peerPort).String() {
+		if endpoint := candidate[testNodeUID].PeerEndpoint; endpoint != netip.AddrPortFrom(ip, peerPort).String() {
 			t.Fatalf("membership endpoint %q disagrees with listener %q for Pod IPs %v", endpoint, listen, ips)
 		}
 	}

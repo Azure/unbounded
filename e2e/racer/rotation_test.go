@@ -22,7 +22,6 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/Azure/unbounded/internal/racer"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -99,18 +98,29 @@ data:
                       - {name: RACER_ROTATION_RETAIN_FOR, value: "2m"}
 `
 
+// rotationState mirrors the controller's rotation.json Secret payload. It is the
+// durable on-disk format, so the e2e suite decodes it locally instead of
+// depending on controller internals.
+type rotationState struct {
+	NextRotation   time.Time            `json:"next_rotation"`
+	ActivateAt     time.Time            `json:"activate_at"`
+	ActiveIssuer   string               `json:"active_issuer"`
+	PreparedIssuer string               `json:"prepared_issuer"`
+	Retiring       map[string]time.Time `json:"retiring"` // Root fingerprints only.
+}
+
 // Public synthetic fixture value, never a registry credential. CopyOnly seals
 // this with the active origin key but deliberately never decrypts it remotely.
 const rotationAuthorization = "Bearer racer-e2e-public-rotation-fixture"
 
-func (h *harness) rotationState() (wire.KeyringBundle, racer.RotationState, corev1.Secret) {
+func (h *harness) readRotationState() (wire.KeyringBundle, rotationState, corev1.Secret) {
 	h.t.Helper()
 
 	secret := h.rotationSecret("racer-credentials")
 	bundle, err := wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
 	require.NoError(h.t, err)
 
-	var state racer.RotationState
+	var state rotationState
 	require.NoError(h.t, json.Unmarshal(secret.Data["rotation.json"], &state))
 
 	return bundle, state, secret
@@ -307,7 +317,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 	}
 	beforePods := podState()
 	urls := [2]string{h.racerDiagnostics(nodes[0].pod), h.racerDiagnostics(nodes[1].pod)}
-	initial, initialState, secret := h.rotationState()
+	initial, initialState, secret := h.readRotationState()
 
 	var oldLeaves [2]*x509.Certificate
 
@@ -346,11 +356,11 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 
 	var (
 		prepared      wire.KeyringBundle
-		preparedState racer.RotationState
+		preparedState rotationState
 	)
 
 	require.Eventually(h.t, func() bool {
-		prepared, preparedState, _ = h.rotationState()
+		prepared, preparedState, _ = h.readRotationState()
 		return preparedState.PreparedIssuer != ""
 	}, 10*time.Second, time.Second, "Go controller did not stage replacement credentials")
 	require.Equal(h.t, initialState.ActiveIssuer, preparedState.ActiveIssuer)
@@ -377,11 +387,11 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 
 	var (
 		active      wire.KeyringBundle
-		activeState racer.RotationState
+		activeState rotationState
 	)
 
 	require.Eventually(h.t, func() bool {
-		active, activeState, _ = h.rotationState()
+		active, activeState, _ = h.readRotationState()
 		return activeState.ActiveIssuer != initialState.ActiveIssuer && activeState.PreparedIssuer == ""
 	}, time.Until(preparedState.ActivateAt)+15*time.Second, time.Second, "Go controller did not activate its prepared issuer")
 	require.Equal(h.t, preparedState.PreparedIssuer, activeState.ActiveIssuer)
@@ -486,7 +496,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 			lastRead = time.Now()
 		}
 
-		pruned, _, credentials = h.rotationState()
+		pruned, _, credentials = h.readRotationState()
 
 		return len(pruned.PeerTrustRoots) == 1
 	}, max(15*time.Second, time.Until(activeState.Retiring[initialState.ActiveIssuer])+15*time.Second), time.Second, "Go controller did not prune old root")

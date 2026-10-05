@@ -24,7 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
-	"github.com/Azure/unbounded/internal/racer/membership"
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -115,7 +115,7 @@ func (r *credentials) reconcileKeys(ctx context.Context) (ctrl.Result, error) {
 		return ctrl.Result{}, authorityReadFailure(err)
 	}
 
-	catalog, err := membership.BuildCatalog(caches.Items)
+	catalog, err := members.BuildCatalog(caches.Items)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

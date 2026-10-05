@@ -26,7 +26,7 @@ import (
 	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/racer/authority"
-	"github.com/Azure/unbounded/internal/racer/workload"
+	"github.com/Azure/unbounded/internal/racer/members"
 )
 
 const (
@@ -37,7 +37,7 @@ const (
 	versionName            = "racer-version"
 	configName             = "racer-config"
 	dataplaneConfigName    = "racer-dataplane-config"
-	dataplaneName          = workload.DataplaneDaemonSetName
+	dataplaneName          = members.DataplaneDaemonSetName
 	tlsName                = "racer-controller-tls"
 	trustName              = "racer-bootstrap-trust"
 	managerAnnotation      = "racer.unbounded-cloud.io/manager"
@@ -145,7 +145,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 	var (
 		configHash    string
-		cfg           workload.Config
+		cfg           members.Config
 		prerequisites []component.ObjectRef
 	)
 
@@ -187,7 +187,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 			configHash = component.ConfigMapPayloadHash(cm)
 
-			cfg, err = workload.ConfigFromLookup(func(key string) (string, bool) {
+			cfg, err = members.ConfigFromLookup(func(key string) (string, bool) {
 				if key == "POD_NAMESPACE" {
 					return env.Namespace, true
 				}
@@ -285,7 +285,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
-	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(dataplaneName, workload.PodNetworkDaemonSetName))))
+	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(dataplaneName, members.PodNetworkDaemonSetName))))
 	b.Watches(&corev1.Pod{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetNamespace() == env.Namespace && migrationPod(obj) })))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(startupConfigPredicate(env)))
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(tlsName))))

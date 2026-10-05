@@ -294,7 +294,7 @@ func (h *harness) verifyCacheRecreation(nodes [2]peerNode, fixture *lifecycleOri
 	var generation wire.Generation
 
 	require.Eventually(h.t, func() bool {
-		bundle, _, _ := h.rotationState()
+		bundle, _, _ := h.readRotationState()
 		for _, key := range bundle.CacheKeys {
 			if string(key.Key.Cache) == newUID && key.Key.Purpose == wire.PageKey && key.State == wire.ActiveKey {
 				generation = bundle.Generation

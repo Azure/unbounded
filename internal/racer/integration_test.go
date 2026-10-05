@@ -43,8 +43,8 @@ import (
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/authority"
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
-	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 // Opt-in, but never silently skip when assets were explicitly supplied. envtest
@@ -600,7 +600,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		t.Fatalf("Racer manager created a workload: %v", err)
 	}
 
-	workload, err := workload.DesiredDaemonSet(workload.Config{
+	workload, err := members.DesiredDaemonSet(members.Config{
 		Cluster: cfg.Cluster, Namespace: cfg.Namespace,
 		ControlURL: "https://127.0.0.1:8443", DataplaneImage: "example.invalid/racer:test",
 		BootstrapTrustConfigMap: "racer-bootstrap-trust", PeerPort: cfg.PeerPort,

@@ -19,7 +19,7 @@ import (
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/override"
-	"github.com/Azure/unbounded/internal/racer/workload"
+	"github.com/Azure/unbounded/internal/racer/members"
 )
 
 func gantrySocketPod(t *testing.T, env *component.Env, socketRoot string) *corev1.Pod {
@@ -74,8 +74,8 @@ func gantrySocketPod(t *testing.T, env *component.Env, socketRoot string) *corev
 	return pod
 }
 
-func occupancyConfig(namespace string) workload.Config {
-	return workload.Config{
+func occupancyConfig(namespace string) members.Config {
+	return members.Config{
 		Cluster: "00000000-0000-0000-0000-000000000001", Namespace: namespace,
 		ControlURL: "https://racer-controller:8443", BootstrapTrustConfigMap: "racer-bootstrap-trust",
 		DataplaneImage: "racer-dataplane:test", PeerPort: 8082,
@@ -106,7 +106,7 @@ func TestMigrationGantrySocketClients(t *testing.T) {
 					cfg.PodNetworkNodes = []string{"node-a"}
 				}
 
-				want, err := workload.DesiredDaemonSets(cfg)
+				want, err := members.DesiredDaemonSets(cfg)
 				require.NoError(t, err)
 
 				for _, ds := range want {
@@ -135,7 +135,7 @@ func TestMigrationForeignDataplaneClaims(t *testing.T) {
 			t.Run(claim+"/"+node, func(t *testing.T) {
 				env := testEnv(t)
 				cfg := occupancyConfig(env.Namespace)
-				sets, err := workload.DesiredDaemonSets(cfg)
+				sets, err := members.DesiredDaemonSets(cfg)
 				require.NoError(t, err)
 
 				ds := sets[0]
@@ -149,14 +149,14 @@ func TestMigrationForeignDataplaneClaims(t *testing.T) {
 				case "host-label":
 					pod.Labels["app.kubernetes.io/name"] = dataplaneName
 				case "pod-label":
-					pod.Labels["app.kubernetes.io/name"] = workload.PodNetworkDaemonSetName
+					pod.Labels["app.kubernetes.io/name"] = members.PodNetworkDaemonSetName
 				default:
 					owner := &pod.OwnerReferences[0]
 					owner.Name, owner.UID = dataplaneName, types.UID("stale")
 
 					switch claim {
 					case "pod-owner":
-						owner.Name = workload.PodNetworkDaemonSetName
+						owner.Name = members.PodNetworkDaemonSetName
 					case "wrong-kind":
 						owner.Kind, owner.UID = "Deployment", ds.UID
 					case "wrong-api":

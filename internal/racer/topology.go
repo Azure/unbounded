@@ -20,7 +20,7 @@ import (
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/authority"
-	"github.com/Azure/unbounded/internal/racer/membership"
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -91,7 +91,7 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObser
 		return TopologyObservation{}, err
 	}
 
-	catalog, err := membership.BuildCatalog(caches.Items)
+	catalog, err := members.BuildCatalog(caches.Items)
 	if err != nil {
 		return TopologyObservation{}, err
 	}
@@ -117,7 +117,7 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObser
 		podsByNode[node.Name] = list.Items
 	}
 
-	return TopologyObservation{Nodes: nodes, Catalog: catalog, Input: membership.Input{
+	return TopologyObservation{Nodes: nodes, Catalog: catalog, Input: members.Input{
 		Nodes: nodes.Items, PodsByNode: podsByNode, Ownership: ownership.observed(), PeerPort: cfg.PeerPort,
 	}}, nil
 }
@@ -204,10 +204,10 @@ type workloadIdentity struct {
 	uid  types.UID
 }
 
-func (ids DataplaneWorkloadIdentities) observed() membership.WorkloadIdentities {
-	observed := membership.WorkloadIdentities{Namespace: ids.namespace}
+func (ids DataplaneWorkloadIdentities) observed() members.WorkloadIdentities {
+	observed := members.WorkloadIdentities{Namespace: ids.namespace}
 	for i, workload := range ids.workloads {
-		observed.Workloads[i] = membership.WorkloadIdentity{Name: workload.name, UID: workload.uid}
+		observed.Workloads[i] = members.WorkloadIdentity{Name: workload.name, UID: workload.uid}
 	}
 
 	return observed
@@ -238,7 +238,7 @@ func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cf
 }
 
 const (
-	enrolledSharesAnnotation   = membership.EnrolledSharesAnnotation
-	enrolledRDMANICsAnnotation = membership.EnrolledRDMANICsAnnotation
-	admittedMemberAnnotation   = membership.AdmittedMemberAnnotation
+	enrolledSharesAnnotation   = members.EnrolledSharesAnnotation
+	enrolledRDMANICsAnnotation = members.EnrolledRDMANICsAnnotation
+	admittedMemberAnnotation   = members.AdmittedMemberAnnotation
 )

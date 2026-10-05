@@ -34,7 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	"github.com/Azure/unbounded/internal/racer/membership"
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -114,7 +114,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 	defer cancel()
 
 	f := newServingFixture(t)
-	members := make(AcceptedMembers, count)
+	accepted := make(AcceptedMembers, count)
 	peers := make([]replicationSmokePeer, count)
 	handshakes := make(chan struct{}, 24)
 	setup := time.Now()
@@ -127,7 +127,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 
 	for i := range peers {
 		id := wire.NodeID(fmt.Sprintf("22222222-2222-4222-8222-%012d", i))
-		members[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: fmt.Sprintf("10.%d.%d.%d:8082", i>>16, (i>>8)&255, i&255), RDMANICs: []wire.RDMANIC{}}
+		accepted[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: fmt.Sprintf("10.%d.%d.%d:8082", i>>16, (i>>8)&255, i&255), RDMANICs: []wire.RDMANIC{}}
 
 		pub, key, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
@@ -160,7 +160,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 		peers[i] = replicationSmokePeer{client: &http.Client{Transport: transport, Timeout: 45 * time.Second}, replica: i % 3}
 	}
 
-	base := replicationSmokePublish(t, ctx, f.a.Topology, members)
+	base := replicationSmokePublish(t, ctx, f.a.Topology, accepted)
 
 	var replicas []*replicationSmokeReplica
 
@@ -486,13 +486,13 @@ func replicatedServingSmoke(t *testing.T, count int) {
 			replicationSmokeStats(t, "failure-parked", replicas)
 		}
 
-		for id, member := range members {
+		for id, member := range accepted {
 			member.Shares++
-			members[id] = member
+			accepted[id] = member
 		}
 
 		start = time.Now()
-		base = replicationSmokePublish(t, ctx, f.a.Topology, members)
+		base = replicationSmokePublish(t, ctx, f.a.Topology, accepted)
 
 		image, err := wire.DecodePublication(strings.NewReader(base.encoded))
 		if err != nil {
@@ -516,13 +516,13 @@ func replicationSmokeLifecycle(l *Lifecycle, ctx context.Context) {
 	l.process, l.synced = ctx, true
 }
 
-func replicationSmokePublish(t *testing.T, ctx context.Context, r *TopologyReconciler, members AcceptedMembers) *CommittedPublication {
+func replicationSmokePublish(t *testing.T, ctx context.Context, r *TopologyReconciler, accepted AcceptedMembers) *CommittedPublication {
 	t.Helper()
 
 	_, err := r.authority.PublishTopology(ctx, func(context.Context) (TopologyObservation, error) {
 		nodes := corev1.NodeList{}
 
-		for id, member := range members {
+		for id, member := range accepted {
 			encoded, err := json.Marshal(member)
 			if err != nil {
 				return TopologyObservation{}, err
@@ -531,7 +531,7 @@ func replicationSmokePublish(t *testing.T, ctx context.Context, r *TopologyRecon
 			nodes.Items = append(nodes.Items, corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: string(id), UID: types.UID(id), Annotations: map[string]string{admittedMemberAnnotation: string(encoded), wire.SharesAnnotation: strconv.FormatUint(uint64(member.Shares), 10)}}})
 		}
 
-		return TopologyObservation{Nodes: nodes, Input: membership.Input{Nodes: nodes.Items, PeerPort: r.Config.PeerPort}}, nil
+		return TopologyObservation{Nodes: nodes, Input: members.Input{Nodes: nodes.Items, PeerPort: r.Config.PeerPort}}, nil
 	})
 	if err != nil {
 		t.Fatal(err)

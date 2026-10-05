@@ -21,7 +21,7 @@ import (
 
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 	"github.com/Azure/unbounded/internal/racer"
-	"github.com/Azure/unbounded/internal/racer/workload"
+	"github.com/Azure/unbounded/internal/racer/members"
 )
 
 func TestRenderedDeploymentWorkloadContract(t *testing.T) {
@@ -94,12 +94,12 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			workloadCfg, err := workload.ConfigFromLookup(os.LookupEnv)
+			workloadCfg, err := members.ConfigFromLookup(os.LookupEnv)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			ds, err := workload.DesiredDaemonSet(workloadCfg)
+			ds, err := members.DesiredDaemonSet(workloadCfg)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -17,20 +17,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/operator/component"
-	"github.com/Azure/unbounded/internal/racer/workload"
+	"github.com/Azure/unbounded/internal/racer/members"
 )
 
 // Scheduling state and live occupants are the durable migration checkpoint.
 // Never delete a workload or Pod to advance this state machine.
-func migrationPlan(ctx context.Context, env *component.Env, cfg workload.Config) ([]*appsv1.DaemonSet, component.Result, error) {
-	sets, err := workload.DesiredDaemonSets(cfg)
+func migrationPlan(ctx context.Context, env *component.Env, cfg members.Config) ([]*appsv1.DaemonSet, component.Result, error) {
+	sets, err := members.DesiredDaemonSets(cfg)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
 	live := map[string]*appsv1.DaemonSet{}
 
-	for _, name := range []string{dataplaneName, workload.PodNetworkDaemonSetName} {
+	for _, name := range []string{dataplaneName, members.PodNetworkDaemonSetName} {
 		ds := &appsv1.DaemonSet{}
 		if err := env.LiveReader().Get(ctx, objectKey(env, name), ds); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -48,12 +48,12 @@ func migrationPlan(ctx context.Context, env *component.Env, cfg workload.Config)
 	}
 	// Retain an empty, unschedulable second workload on the return path. Its UID
 	// remains stable and its terminating Pods continue to block the destination.
-	if len(sets) == 1 && live[workload.PodNetworkDaemonSetName] != nil {
+	if len(sets) == 1 && live[members.PodNetworkDaemonSetName] != nil {
 		emptyConfig := cfg
 		emptyConfig.HostNetwork = true
 		emptyConfig.PodNetworkNodes = []string{"racer-migration-blocked"}
 
-		emptySets, err := workload.DesiredDaemonSets(emptyConfig)
+		emptySets, err := members.DesiredDaemonSets(emptyConfig)
 		if err != nil {
 			return nil, component.Result{}, err
 		}
@@ -71,7 +71,7 @@ func migrationPlan(ctx context.Context, env *component.Env, cfg workload.Config)
 	result := component.ReconciledAfter("Racer installation reconciled", time.Hour)
 
 	for _, desired := range sets {
-		sourceName := workload.PodNetworkDaemonSetName
+		sourceName := members.PodNetworkDaemonSetName
 		if desired.Name == sourceName {
 			sourceName = dataplaneName
 		}
@@ -94,7 +94,7 @@ func migrationPlan(ctx context.Context, env *component.Env, cfg workload.Config)
 				result = component.NotReadyAfter("Migrating", "waiting for source controller observation", 5*time.Second)
 			}
 
-			if desired.Name == workload.PodNetworkDaemonSetName {
+			if desired.Name == members.PodNetworkDaemonSetName {
 				for _, node := range cfg.PodNetworkNodes {
 					if permitsNode(source, node) {
 						blocked[node] = true
@@ -334,11 +334,11 @@ func migrationPod(obj client.Object) bool {
 	}
 
 	owner := metav1.GetControllerOf(pod)
-	if owner != nil && (owner.Name == dataplaneName || owner.Name == workload.PodNetworkDaemonSetName) {
+	if owner != nil && (owner.Name == dataplaneName || owner.Name == members.PodNetworkDaemonSetName) {
 		return true
 	}
 
-	if pod.Labels["app.kubernetes.io/name"] == dataplaneName || pod.Labels["app.kubernetes.io/name"] == workload.PodNetworkDaemonSetName {
+	if pod.Labels["app.kubernetes.io/name"] == dataplaneName || pod.Labels["app.kubernetes.io/name"] == members.PodNetworkDaemonSetName {
 		return true
 	}
 

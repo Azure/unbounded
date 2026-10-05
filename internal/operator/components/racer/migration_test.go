@@ -16,7 +16,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/Azure/unbounded/internal/racer/workload"
+	"github.com/Azure/unbounded/internal/racer/members"
 )
 
 func TestMixedPlannerMigration(t *testing.T) {
@@ -45,7 +45,7 @@ func TestMixedPlannerMigration(t *testing.T) {
 
 			sourceName := dataplaneName
 			if reverse {
-				sourceName = workload.PodNetworkDaemonSetName
+				sourceName = members.PodNetworkDaemonSetName
 			}
 
 			source := &appsv1.DaemonSet{}
@@ -65,7 +65,7 @@ func TestMixedPlannerMigration(t *testing.T) {
 
 			destination := dataplaneName
 			if !reverse {
-				destination = workload.PodNetworkDaemonSetName
+				destination = members.PodNetworkDaemonSetName
 			}
 
 			for pass := 0; pass < 3; pass++ {
@@ -114,7 +114,7 @@ func TestMixedPlannerStaleAndReadFailure(t *testing.T) {
 	cm := &corev1.ConfigMap{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
 
-	cfg, err := workload.ConfigFromLookup(func(key string) (string, bool) {
+	cfg, err := members.ConfigFromLookup(func(key string) (string, bool) {
 		if key == "POD_NAMESPACE" {
 			return env.Namespace, true
 		}

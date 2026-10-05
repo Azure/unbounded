@@ -12,8 +12,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
-	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 func TestTerminalPodsCannotReplaceEndpoints(t *testing.T) {
@@ -44,16 +44,16 @@ func TestTerminalPodsCannotReplaceEndpoints(t *testing.T) {
 				node := memberNode()
 				groups := map[string][]corev1.Pod{node.Name: {newest}}
 
-				members, _, err := reconcileMembers([]corev1.Node{node}, groups, ownership, nil, 8082)
-				if err != nil || len(members) != 0 {
-					t.Fatalf("terminal-only Pod admitted a new node: %v, %v", members, err)
+				candidate, _, err := reconcileMembers([]corev1.Node{node}, groups, ownership, nil, 8082)
+				if err != nil || len(candidate) != 0 {
+					t.Fatalf("terminal-only Pod admitted a new node: %v, %v", candidate, err)
 				}
 
 				previous := wire.Member{Node: testNodeUID, Shares: wire.DefaultShares, PeerEndpoint: want}
 
-				members, _, err = reconcileMembers([]corev1.Node{node}, groups, ownership, AcceptedMembers{testNodeUID: previous}, 8082)
-				if err != nil || members[testNodeUID].PeerEndpoint != previous.PeerEndpoint {
-					t.Fatalf("terminal-only gap lost admitted endpoint: %v, %v", members, err)
+				candidate, _, err = reconcileMembers([]corev1.Node{node}, groups, ownership, AcceptedMembers{testNodeUID: previous}, 8082)
+				if err != nil || candidate[testNodeUID].PeerEndpoint != previous.PeerEndpoint {
+					t.Fatalf("terminal-only gap lost admitted endpoint: %v, %v", candidate, err)
 				}
 			} else if err != nil || endpoint != want {
 				t.Fatalf("unready live endpoint: %q, %v", endpoint, err)
@@ -84,7 +84,7 @@ func TestWorkloadNameLabelBounds(t *testing.T) {
 			cfg.DaemonSetName = name
 			valid := len(validation.IsDNS1123Subdomain(name)) == 0 && len(validation.IsValidLabelValue(name)) == 0
 
-			ds, err := workload.DesiredDaemonSet(cfg)
+			ds, err := members.DesiredDaemonSet(cfg)
 			if !valid {
 				if !errors.Is(err, wire.InvalidRequest) || ds != nil {
 					t.Fatalf("invalid name accepted: %v", err)
@@ -104,7 +104,7 @@ func TestWorkloadNameLabelBounds(t *testing.T) {
 	cfg.BootstrapTrustConfigMap = strings.Repeat("a", 63) + ".trust"
 
 	cfg.DataplaneServiceAccount = strings.Repeat("a", 63) + ".account"
-	if _, err := workload.DesiredDaemonSet(cfg); err != nil {
+	if _, err := members.DesiredDaemonSet(cfg); err != nil {
 		t.Fatal(err)
 	}
 }

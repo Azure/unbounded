@@ -14,9 +14,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/Azure/unbounded/internal/racer/membership"
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
-	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 type publisher struct {
@@ -37,14 +36,14 @@ func (r *publisher) suspendInvalidAuthority(err error) {
 }
 
 type (
-	AcceptedMembers = membership.History
+	AcceptedMembers = members.History
 	TopologyHints   struct {
 		Nodes   corev1.NodeList
-		Members membership.History
+		Members members.History
 	}
 	TopologyObservation struct {
 		Nodes   corev1.NodeList
-		Input   membership.Input
+		Input   members.Input
 		Catalog []wire.CacheDefinition
 	}
 )
@@ -102,7 +101,7 @@ func (a *Authority) PublishTopology(ctx context.Context, observe func(context.Co
 		catalog = nil
 	}
 
-	result, err := membership.Reconcile(observation.Input, a.accepted)
+	result, err := members.Reconcile(observation.Input, a.accepted)
 	if err != nil {
 		return TopologyHints{}, err
 	}
@@ -134,9 +133,9 @@ func (a *Authority) PublishTopology(ctx context.Context, observe func(context.Co
 	return TopologyHints{Nodes: *observation.Nodes.DeepCopy(), Members: cloneAccepted(result.Members)}, nil
 }
 
-func cloneAccepted(members AcceptedMembers) AcceptedMembers {
-	copy := make(AcceptedMembers, len(members))
-	for id, member := range members {
+func cloneAccepted(accepted AcceptedMembers) AcceptedMembers {
+	copy := make(AcceptedMembers, len(accepted))
+	for id, member := range accepted {
 		member.RDMANICs = slices.Clone(member.RDMANICs)
 		for i := range member.RDMANICs {
 			if numa := member.RDMANICs[i].NUMANode; numa != nil {
@@ -162,16 +161,16 @@ type (
 	}
 )
 
-func (ids DataplaneWorkloadIdentities) observed() membership.WorkloadIdentities {
-	observed := membership.WorkloadIdentities{Namespace: ids.namespace}
+func (ids DataplaneWorkloadIdentities) observed() members.WorkloadIdentities {
+	observed := members.WorkloadIdentities{Namespace: ids.namespace}
 	for i, workload := range ids.workloads {
-		observed.Workloads[i] = membership.WorkloadIdentity{Name: workload.name, UID: workload.uid}
+		observed.Workloads[i] = members.WorkloadIdentity{Name: workload.name, UID: workload.uid}
 	}
 
 	return observed
 }
 func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool { return ids.observed().Owns(pod) }
-func managedWorkloadNames(cfg Config) []string                    { return workload.ManagedNames(cfg.DaemonSetName) }
+func managedWorkloadNames(cfg Config) []string                    { return members.ManagedNames(cfg.DaemonSetName) }
 func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cfg Config) (DataplaneWorkloadIdentities, error) {
 	ids := DataplaneWorkloadIdentities{namespace: cfg.Namespace}
 	for i, name := range managedWorkloadNames(cfg) {
@@ -195,7 +194,7 @@ func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cf
 }
 
 const (
-	enrolledSharesAnnotation   = membership.EnrolledSharesAnnotation
-	enrolledRDMANICsAnnotation = membership.EnrolledRDMANICsAnnotation
-	admittedMemberAnnotation   = membership.AdmittedMemberAnnotation
+	enrolledSharesAnnotation   = members.EnrolledSharesAnnotation
+	enrolledRDMANICsAnnotation = members.EnrolledRDMANICsAnnotation
+	admittedMemberAnnotation   = members.AdmittedMemberAnnotation
 )

@@ -12,7 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/Azure/unbounded/internal/racer/workload"
+	"github.com/Azure/unbounded/internal/racer/members"
 )
 
 func TestMigrationPendingPartition(t *testing.T) {
@@ -23,7 +23,7 @@ func TestMigrationPendingPartition(t *testing.T) {
 				cfg := occupancyConfig(env.Namespace)
 				cfg.HostNetwork = true
 				cfg.PodNetworkNodes = []string{"pod-node"}
-				sets, err := workload.DesiredDaemonSets(cfg)
+				sets, err := members.DesiredDaemonSets(cfg)
 				require.NoError(t, err)
 
 				for _, ds := range sets {

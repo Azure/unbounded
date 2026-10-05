@@ -22,7 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
-	"github.com/Azure/unbounded/internal/racer/membership"
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -147,7 +147,7 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObser
 		pods[node.Name] = list.Items
 	}
 
-	return TopologyObservation{Nodes: nodes, Catalog: catalog, Input: membership.Input{Nodes: nodes.Items, PodsByNode: pods, Ownership: ids.observed(), PeerPort: 8082}}, nil
+	return TopologyObservation{Nodes: nodes, Catalog: catalog, Input: members.Input{Nodes: nodes.Items, PodsByNode: pods, Ownership: ids.observed(), PeerPort: 8082}}, nil
 }
 
 func (r *TopologyReconciler) annotate(ctx context.Context, update TopologyHints) error {

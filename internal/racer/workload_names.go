@@ -3,8 +3,8 @@
 
 package racer
 
-import "github.com/Azure/unbounded/internal/racer/workload"
+import "github.com/Azure/unbounded/internal/racer/members"
 
 func managedWorkloadNames(cfg Config) []string {
-	return workload.ManagedNames(cfg.DaemonSetName)
+	return members.ManagedNames(cfg.DaemonSetName)
 }
