@@ -360,10 +360,26 @@ mod tests {
             mounts,
         )
         .unwrap();
-        assert_eq!(paths.len(), 3);
-        assert_eq!(paths[0].0, PathBuf::from("/sys/fs/cgroup/tenant/leaf"));
-        assert_eq!(paths[1].0, PathBuf::from("/cpu/leaf"));
-        assert_eq!(paths[2].0, PathBuf::from("/sets/tenant/leaf"));
+        assert_eq!(
+            paths,
+            vec![
+                (
+                    "/sys/fs/cgroup/tenant/leaf".into(),
+                    "/sys/fs/cgroup".into(),
+                    true,
+                    true,
+                    true
+                ),
+                ("/cpu/leaf".into(), "/cpu".into(), false, true, false),
+                (
+                    "/sets/tenant/leaf".into(),
+                    "/sets".into(),
+                    false,
+                    false,
+                    true
+                ),
+            ]
+        );
         let mut quota = parse_v2_quota("400000 100000").unwrap();
         tighten_quota(&mut quota, parse_v1_quota("150000", "100000").unwrap());
         tighten_quota(&mut quota, parse_v2_quota("max 100000").unwrap());
@@ -394,13 +410,123 @@ mod tests {
 
     #[test]
     fn constrained_cpuset_ranges_are_validated() {
+        for value in ["", " \n"] {
+            assert_eq!(parse_cpu_list(value).unwrap(), BTreeSet::new());
+        }
+        assert_eq!(
+            parse_cpu_list(" 3,1-3,2,0,1048575\n").unwrap(),
+            BTreeSet::from([0, 1, 2, 3, 1_048_575])
+        );
         assert_eq!(
             parse_cpu_list("1-3,8,10-11\n").unwrap(),
             BTreeSet::from([1, 2, 3, 8, 10, 11])
         );
-        for value in ["4-1", "-1", "a", "1-2-3", "999999999", "1,,2", "1,"] {
-            assert!(parse_cpu_list(value).is_err(), "{value}");
+        for value in [
+            "4-1",
+            "-1",
+            "a",
+            "1-2-3",
+            "1048576",
+            "999999999",
+            "1,,2",
+            "1,",
+        ] {
+            assert_eq!(
+                parse_cpu_list(value),
+                Err(Error::InvalidConfiguration),
+                "{value}"
+            );
         }
+    }
+
+    #[test]
+    fn quota_formats_validate_fields_and_unlimited_periods() {
+        for (quota, period, expected) in [
+            ("150000", "100000", Some((150000, 100000))),
+            (" 1\n", " 2\n", Some((1, 2))),
+            ("-1", "100000", None),
+        ] {
+            let v1 = parse_v1_quota(quota, period).unwrap();
+            let v2 = parse_v2_quota(&format!(
+                "{} {period}",
+                if quota == "-1" { "max" } else { quota }
+            ))
+            .unwrap();
+            let pair = |value: Option<CpuQuota>| value.map(|q| (q.quota.get(), q.period.get()));
+            assert_eq!(pair(v1), expected);
+            assert_eq!(pair(v2), expected);
+        }
+        for value in [
+            "",
+            "max",
+            "1 2 3",
+            "0 1",
+            "-2 1",
+            "1 0",
+            "max 0",
+            "max nope",
+            "1 -1",
+            "nope 1",
+            "18446744073709551616 1",
+            "1 18446744073709551616",
+        ] {
+            assert!(
+                matches!(parse_v2_quota(value), Err(Error::InvalidConfiguration)),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn quotas_compare_ratios_without_rounding_or_overflow() {
+        let mut quota = None;
+        for (candidate, expected) in [
+            ("max 10", None),
+            ("3 2", Some((3, 2))),
+            ("4 3", Some((4, 3))),
+            ("8 6", Some((4, 3))),
+            ("max 10", Some((4, 3))),
+            (
+                "18446744073709551615 18446744073709551614",
+                Some((u64::MAX, u64::MAX - 1)),
+            ),
+            (
+                "18446744073709551614 18446744073709551615",
+                Some((u64::MAX - 1, u64::MAX)),
+            ),
+            ("2 1", Some((u64::MAX - 1, u64::MAX))),
+        ] {
+            tighten_quota(&mut quota, parse_v2_quota(candidate).unwrap());
+            assert_eq!(
+                quota.map(|q| (q.quota.get(), q.period.get())),
+                expected,
+                "{candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup_namespace_paths_and_mount_escapes_are_resolved() {
+        let mounts = "malformed\n1 0 0:1 / /ignored rw - tmpfs tmpfs rw\n\
+            2 0 0:2 / /memory rw - cgroup cgroup rw,memory\n\
+            3 0 0:3 /host\\040root /group\\040mount rw - cgroup2 cgroup rw\n";
+        for (membership, leaf) in [
+            ("/host root/leaf", "/group mount/leaf"),
+            ("/leaf", "/group mount/leaf"),
+            ("/", "/group mount/"),
+        ] {
+            assert_eq!(
+                cgroup_paths(&format!("0::{membership}"), mounts).unwrap(),
+                vec![(leaf.into(), "/group mount".into(), true, true, true)]
+            );
+        }
+        for membership in ["malformed", "0::relative", "0::/leaf/../escape"] {
+            assert_eq!(
+                cgroup_paths(membership, mounts),
+                Err(Error::InvalidConfiguration)
+            );
+        }
+        assert_eq!(unescape_mount(r"a\040b\011c\012d\134040"), "a b\tc\nd\\040");
     }
 
     #[test]
