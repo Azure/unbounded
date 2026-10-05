@@ -1795,16 +1795,9 @@ impl Metrics {
                 }
             }
         }
-        for ((name, kind), value) in RETENTION_METRICS.into_iter().zip(totals) {
-            writeln!(out, "# TYPE {name} {kind}\n{name} {value}")?;
-        }
-        for (i, name) in DISK_CLASS_METRICS.into_iter().enumerate() {
-            writeln!(out, "# TYPE {name} counter")?;
-            for (class, totals) in ["nonowned", "owned"].into_iter().zip(classes) {
-                writeln!(out, "{name}{{classification=\"{class}\"}} {}", totals[i])?;
-            }
-        }
-        Ok(())
+        ::telemetry::metrics::Exposition::new(RETENTION_METRICS).write(out, totals)?;
+        ::telemetry::metrics::Exposition::new(DISK_CLASS_METRICS.map(|name| (name, "counter")))
+            .write_labeled(out, "classification", ["nonowned", "owned"], classes)
     }
 
     pub(crate) fn opaque_relay_body(&self, bytes: usize) -> Option<OpaqueRelayBody<'_>> {

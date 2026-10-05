@@ -388,6 +388,45 @@ pub mod metrics {
         label: &'static str,
     }
 
+    /// A fixed exposition schema. Identifiers, kinds, and optional labels must be
+    /// trusted static text; no dynamic registration or unbounded label input exists.
+    pub struct Exposition<const N: usize> {
+        series: [(&'static str, &'static str); N],
+    }
+
+    impl<const N: usize> Exposition<N> {
+        /// Define ordered metric names and Prometheus kinds at compile time.
+        pub const fn new(series: [(&'static str, &'static str); N]) -> Self {
+            Self { series }
+        }
+
+        /// Write one unlabeled observation per metric, preserving schema order.
+        pub fn write(&self, out: &mut impl fmt::Write, values: [u64; N]) -> fmt::Result {
+            for ((name, kind), value) in self.series.into_iter().zip(values) {
+                writeln!(out, "# TYPE {name} {kind}\n{name} {value}")?;
+            }
+            Ok(())
+        }
+
+        /// Write fixed-cardinality labeled observations in metric-major order.
+        /// Labels must be trusted static strings without quotes or backslashes.
+        pub fn write_labeled<const L: usize>(
+            &self,
+            out: &mut impl fmt::Write,
+            label: &'static str,
+            labels: [&'static str; L],
+            values: [[u64; N]; L],
+        ) -> fmt::Result {
+            for (index, (name, kind)) in self.series.into_iter().enumerate() {
+                writeln!(out, "# TYPE {name} {kind}")?;
+                for (label_value, values) in labels.into_iter().zip(values) {
+                    writeln!(out, "{name}{{{label}=\"{label_value}\"}} {}", values[index])?;
+                }
+            }
+            Ok(())
+        }
+    }
+
     impl<C: Metric, G: Metric> Metrics<C, G> {
         /// Allocate a fixed registry. Panics if `n` is zero or capacity overflows.
         pub fn shards(n: usize) -> Vec<Self> {
@@ -467,22 +506,10 @@ pub mod metrics {
         /// Writes directly to the caller's sink and propagates capacity errors.
         pub fn write_prometheus(&self, out: &mut impl fmt::Write) -> fmt::Result {
             for &metric in C::ALL {
-                writeln!(
-                    out,
-                    "# TYPE {} counter\n{} {}",
-                    metric.name(),
-                    metric.name(),
-                    self.count(metric)
-                )?;
+                Exposition::new([(metric.name(), "counter")]).write(out, [self.count(metric)])?;
             }
             for &metric in G::ALL {
-                writeln!(
-                    out,
-                    "# TYPE {} gauge\n{} {}",
-                    metric.name(),
-                    metric.name(),
-                    self.gauge(metric)
-                )?;
+                Exposition::new([(metric.name(), "gauge")]).write(out, [self.gauge(metric)])?;
             }
             Ok(())
         }
@@ -601,6 +628,40 @@ pub mod metrics {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Fixed schemas preserve exact order, maxima, empty sets and sink errors.
+        #[test]
+        fn fixed_exposition_preserves_metric_major_layout_and_errors() {
+            let schema = Exposition::new([("requests", "counter"), ("active", "gauge")]);
+            let mut text = String::new();
+            schema.write(&mut text, [u64::MAX, 0]).unwrap();
+            assert_eq!(
+                text,
+                "# TYPE requests counter\nrequests 18446744073709551615\n# TYPE active gauge\nactive 0\n"
+            );
+            text.clear();
+            schema
+                .write_labeled(&mut text, "class", ["a", "b"], [[1, 2], [3, 4]])
+                .unwrap();
+            assert_eq!(
+                text,
+                "# TYPE requests counter\nrequests{class=\"a\"} 1\nrequests{class=\"b\"} 3\n# TYPE active gauge\nactive{class=\"a\"} 2\nactive{class=\"b\"} 4\n"
+            );
+            /// Reject every write to test direct propagation without intermediate strings.
+            struct Full;
+            impl fmt::Write for Full {
+                fn write_str(&mut self, _: &str) -> fmt::Result {
+                    Err(fmt::Error)
+                }
+            }
+            assert!(schema.write(&mut Full, [0, 0]).is_err());
+            assert!(
+                schema
+                    .write_labeled(&mut Full, "class", ["a"], [[0, 0]])
+                    .is_err()
+            );
+            Exposition::new([]).write(&mut Full, []).unwrap();
+        }
 
         /// Exercise ordered numeric labels, maximum values, and empty schemas.
         #[test]
