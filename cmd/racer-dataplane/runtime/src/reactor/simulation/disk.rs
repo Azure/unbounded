@@ -5,7 +5,10 @@
 //! ancestor bindings. Unsynced state never persists implicitly. This is one
 //! deterministic, conservative outcome allowed by the durability contract.
 use super::*;
-use std::ffi::OsString;
+use std::{
+    ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt,
+};
 
 /// Controls persistence, power loss, and byte corruption in one simulated world.
 #[derive(Clone, Debug)]
@@ -513,20 +516,26 @@ impl World {
         follow_final: bool,
     ) -> io::Result<PathBuf> {
         let parts = |path: &Path| {
-            path.components()
-                .filter(|c| {
-                    !matches!(
-                        c,
-                        std::path::Component::RootDir | std::path::Component::CurDir
-                    )
-                })
-                .map(|c| c.as_os_str().to_owned())
-                .collect::<VecDeque<_>>()
+            // Dot and trailing slash require the preceding inode to be a directory.
+            // Path::components normalizes both away, including in symlink targets.
+            let bytes = path.as_os_str().as_bytes();
+            let mut parts: VecDeque<_> = bytes
+                .split(|byte| *byte == b'/')
+                .filter(|part| !part.is_empty())
+                .map(|part| OsStr::from_bytes(part).to_owned())
+                .collect();
+            if bytes.ends_with(b"/") {
+                parts.push_back(OsString::from("."));
+            }
+            parts
         };
         let mut pending = parts(&path);
         let mut prefix = PathBuf::from("/");
         let mut links = 0;
         while let Some(part) = pending.pop_front() {
+            if part == "." {
+                continue;
+            }
             if part == ".." {
                 if boundary == Some(prefix.as_path()) {
                     if !in_root {
@@ -592,10 +601,20 @@ impl World {
         if policy & 0x08 != 0 && path.is_absolute() {
             return Err(errno(libc::EXDEV));
         }
-        let base = self.path(dir, Path::new("."))?;
+        let base = if path.is_absolute() && policy & 0x10 == 0 {
+            PathBuf::from("/")
+        } else {
+            self.path(dir, Path::new("."))?
+        };
         let boundary = (policy & 0x18 != 0).then_some(base.as_path());
         let path = if policy & 0x10 != 0 && path.is_absolute() {
-            base.join(path.strip_prefix("/").unwrap())
+            // Preserve dot and trailing slash components inside the scoped root.
+            let bytes = path.as_os_str().as_bytes();
+            let start = bytes
+                .iter()
+                .position(|byte| *byte != b'/')
+                .unwrap_or(bytes.len());
+            base.join(OsStr::from_bytes(&bytes[start..]))
         } else {
             base.join(path)
         };
@@ -700,7 +719,6 @@ impl Simulation {
         // Reject invalid creation requests before publishing any namespace entry.
         if flags & (libc::O_CREAT | libc::O_DIRECTORY) == (libc::O_CREAT | libc::O_DIRECTORY)
             || flags & libc::O_ACCMODE == libc::O_ACCMODE
-            || (flags & libc::O_TRUNC != 0 && flags & libc::O_ACCMODE == libc::O_RDONLY)
         {
             return Err(errno(libc::EINVAL));
         }
@@ -711,7 +729,7 @@ impl Simulation {
                 libc::EOPNOTSUPP
             }));
         }
-        if let Some(dir) = dir {
+        if let Some(dir) = dir.filter(|_| !path.is_absolute() || resolve & 0x10 != 0) {
             self.handle(dir)?;
         }
         let (node, opened_path) = {
@@ -747,6 +765,11 @@ impl Simulation {
                 && node.borrow().mode as u32 & libc::S_IFMT != libc::S_IFDIR
             {
                 return Err(errno(libc::ENOTDIR));
+            }
+            if node.borrow().mode as u32 & libc::S_IFMT == libc::S_IFDIR
+                && flags & libc::O_ACCMODE != libc::O_RDONLY
+            {
+                return Err(errno(libc::EISDIR));
             }
             if flags & libc::O_TRUNC != 0 {
                 let mut n = node.borrow_mut();

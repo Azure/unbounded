@@ -1536,6 +1536,136 @@ mod tests {
         }
     }
 
+    /// Compare access modes, directory suffixes, and ignored absolute-path dirfds.
+    #[test]
+    fn linux_open_access_suffix_and_absolute_dirfd_differential() {
+        let directory = Directory::new();
+        std::fs::create_dir(directory.0.join("dir")).unwrap();
+        std::fs::write(directory.0.join("file"), b"data").unwrap();
+        let sim = Simulation::new();
+        sim.mkdir(Path::new("/dir")).unwrap();
+        sim.write_file(Path::new("/file"), b"data").unwrap();
+        for (target, link) in [
+            ("file", "file-link"),
+            ("dir", "dir-link"),
+            ("file/", "file-slash"),
+            ("file/.", "file-dot"),
+            ("dir/", "dir-slash"),
+            ("dir/.", "dir-dot"),
+        ] {
+            std::os::unix::fs::symlink(target, directory.0.join(link)).unwrap();
+            sim.symlink(Path::new(target), &Path::new("/").join(link))
+                .unwrap();
+        }
+        let real_dir = std::fs::File::open(&directory.0).unwrap();
+        let real_file = std::fs::File::open(directory.0.join("file")).unwrap();
+        let sim_dir = sim.open(None, Path::new("/"), libc::O_DIRECTORY).unwrap();
+        let sim_file = sim.open(None, Path::new("/file"), libc::O_RDONLY).unwrap();
+        /// Linux openat2 ABI used by the independent host comparison.
+        #[repr(C)]
+        struct How {
+            flags: u64,
+
+            mode: u64,
+
+            resolve: u64,
+        }
+        for name in [
+            "file",
+            "file/",
+            "file/.",
+            "file/./",
+            "dir",
+            "dir/",
+            "dir/.",
+            "file-link/",
+            "file-link/.",
+            "dir-link/",
+            "dir-link/.",
+            "file-slash",
+            "file-dot",
+            "dir-slash",
+            "dir-dot",
+        ] {
+            for flags in [
+                libc::O_RDONLY,
+                libc::O_WRONLY,
+                libc::O_RDWR,
+                libc::O_RDONLY | libc::O_TRUNC,
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+                libc::O_PATH | libc::O_NOFOLLOW,
+            ] {
+                for resolve in [0, 0x08, 0x10] {
+                    for (absolute, regular_dirfd) in [(false, false), (true, false), (true, true)] {
+                        let (host_path, sim_path) = if absolute {
+                            if resolve == 0x10 {
+                                (Path::new("/").join(name), Path::new("/").join(name))
+                            } else {
+                                (directory.0.join(name), Path::new("/").join(name))
+                            }
+                        } else {
+                            (PathBuf::from(name), PathBuf::from(name))
+                        };
+                        // Reset content so every successful truncation has an observable effect.
+                        std::fs::write(directory.0.join("file"), b"data").unwrap();
+                        sim.write_file(Path::new("/file"), b"data").unwrap();
+                        let host_name =
+                            CString::new(host_path.as_os_str().as_encoded_bytes()).unwrap();
+                        let how = How {
+                            flags: flags as u64,
+                            mode: 0,
+                            resolve,
+                        };
+                        let raw = unsafe {
+                            libc::syscall(
+                                libc::SYS_openat2,
+                                if regular_dirfd {
+                                    real_file.as_raw_fd()
+                                } else {
+                                    real_dir.as_raw_fd()
+                                },
+                                host_name.as_ptr(),
+                                &how,
+                                std::mem::size_of::<How>(),
+                            )
+                        };
+                        let expected = if raw < 0 {
+                            Err(io::Error::last_os_error().raw_os_error().unwrap())
+                        } else {
+                            Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
+                        };
+                        let actual = sim
+                            .open_resolved(
+                                Some(if regular_dirfd { &sim_file } else { &sim_dir }),
+                                &sim_path,
+                                flags,
+                                resolve,
+                            )
+                            .map_err(|e| e.raw_os_error().unwrap());
+                        assert_eq!(
+                            actual.as_ref().err(),
+                            expected.as_ref().err(),
+                            "{name} flags={flags:#x} resolve={resolve:#x} absolute={absolute} regular_dirfd={regular_dirfd}"
+                        );
+                        if let (Ok(actual), Ok(expected)) = (actual, expected) {
+                            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                            assert_eq!(unsafe { libc::fstat(expected.as_raw_fd(), &mut stat) }, 0);
+                            assert_eq!(
+                                actual.as_sim().unwrap().stat().unwrap().stx_mode as u32
+                                    & libc::S_IFMT,
+                                stat.st_mode & libc::S_IFMT
+                            );
+                        }
+                        assert_eq!(
+                            sim.read_file(Path::new("/file")).unwrap(),
+                            std::fs::read(directory.0.join("file")).unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     /// Compare final symlink and O_PATH behavior across supported open policies.
     fn linux_final_symlink_and_path_descriptor_differential() {
