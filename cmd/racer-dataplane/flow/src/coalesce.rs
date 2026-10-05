@@ -30,34 +30,9 @@ pub struct CapacityError;
 pub enum Event<V> {
     /// This registration owns the next attempt.
     Lead,
+
     /// The operation finished or the attempt budget was exhausted.
     Complete(V),
-}
-
-/// Election state shared by distinct registrations for the same key.
-struct Cohort<V, S> {
-    next: u64,
-
-    leader: Option<u64>,
-
-    attempts: usize,
-
-    waiters: HashMap<u64, Option<Waker>, S>,
-
-    result: Option<V>,
-}
-
-impl<V, S: Default> Default for Cohort<V, S> {
-    /// Start with no waiters, leadership, attempts, or published result.
-    fn default() -> Self {
-        Self {
-            next: 0,
-            leader: None,
-            attempts: 0,
-            waiters: HashMap::default(),
-            result: None,
-        }
-    }
 }
 
 /// Completed cohorts close admission immediately but continue charging live
@@ -192,11 +167,9 @@ impl<K: Eq + Hash, V, S: BuildHasher> Registration<K, V, S> {
             if state.leader == Some(self.owner.id) {
                 state.leader = None;
             }
-            take_wakers(&mut state)
+            state.take_wakers()
         };
-        for waker in wakers {
-            waker.wake();
-        }
+        wake_all(wakers);
     }
 
     /// Broadcast a caller-owned value and close admission before waking readers.
@@ -206,12 +179,10 @@ impl<K: Eq + Hash, V, S: BuildHasher> Registration<K, V, S> {
             let mut state = self.owner.cohort.borrow_mut();
             state.result = Some(result);
             state.leader = None;
-            take_wakers(&mut state)
+            state.take_wakers()
         };
         self.owner.remove_active();
-        for waker in wakers {
-            waker.wake();
-        }
+        wake_all(wakers);
     }
 }
 
@@ -259,7 +230,7 @@ impl<K: Eq + Hash, V, S: BuildHasher> Drop for RegistrationOwner<K, V, S> {
             state.waiters.remove(&self.id);
             let wakers = if state.leader == Some(self.id) {
                 state.leader = None;
-                take_wakers(&mut state)
+                state.take_wakers()
             } else {
                 Vec::new()
             };
@@ -271,19 +242,48 @@ impl<K: Eq + Hash, V, S: BuildHasher> Drop for RegistrationOwner<K, V, S> {
         if empty {
             self.remove_active();
         }
-        for waker in wakers {
-            waker.wake();
+        wake_all(wakers);
+    }
+}
+
+/// Election state shared by distinct registrations for the same key.
+struct Cohort<V, S> {
+    next: u64,
+
+    leader: Option<u64>,
+
+    attempts: usize,
+
+    waiters: HashMap<u64, Option<Waker>, S>,
+
+    result: Option<V>,
+}
+
+impl<V, S: Default> Default for Cohort<V, S> {
+    /// Start with no waiters, leadership, attempts, or published result.
+    fn default() -> Self {
+        Self {
+            next: 0,
+            leader: None,
+            attempts: 0,
+            waiters: HashMap::default(),
+            result: None,
         }
     }
 }
 
-/// Drain wake targets so callbacks can run after releasing the cohort borrow.
-fn take_wakers<V, S>(state: &mut Cohort<V, S>) -> Vec<Waker> {
-    state
-        .waiters
-        .values_mut()
-        .filter_map(Option::take)
-        .collect()
+impl<V, S> Cohort<V, S> {
+    /// Drain wake targets so callbacks can run after releasing the cohort borrow.
+    fn take_wakers(&mut self) -> Vec<Waker> {
+        self.waiters.values_mut().filter_map(Option::take).collect()
+    }
+}
+
+/// Deliver collected notifications only after the caller releases owner borrows.
+fn wake_all(wakers: Vec<Waker>) {
+    for waker in wakers {
+        waker.wake();
+    }
 }
 
 /// Shared-result cohorts whose callers own execution rather than electing leaders.
@@ -434,10 +434,11 @@ pub mod flight {
     /// Run a synchronous owner transaction, then notify outside its mutable borrow.
     pub fn update<T, R>(owner: &RefCell<T>, f: impl FnOnce(&mut T, &mut Vec<Waker>) -> R) -> R {
         let mut wakes = Vec::new();
-        let result = f(&mut owner.borrow_mut(), &mut wakes);
-        for waker in wakes {
-            waker.wake();
-        }
+        let result = {
+            let mut state = owner.borrow_mut();
+            f(&mut state, &mut wakes)
+        };
+        super::wake_all(wakes);
         result
     }
 
@@ -448,17 +449,6 @@ pub mod flight {
     /// A registration, generation, or operation no longer matches its owner.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct Stale;
-
-    /// Monotonic IDs are never reused, even after an entry is removed.
-    #[derive(Default)]
-    struct Counter(u64);
-    impl Counter {
-        /// Allocate the next identifier without wrapping or reusing an old value.
-        fn next_id(&mut self) -> Result<u64, Exhausted> {
-            self.0 = self.0.checked_add(1).ok_or(Exhausted)?;
-            Ok(self.0)
-        }
-    }
 
     /// Key equality belongs to the adapter; this identity fences owner, incarnation,
     /// and acquisition generation independently of any application key schema.
@@ -473,6 +463,7 @@ pub mod flight {
         /// Acquisition attempt within this incarnation.
         pub generation: u64,
     }
+
     impl Identity {
         /// Compare entry ownership without invalidating waiters across retries.
         pub fn same_registration(&self, current: &Self) -> bool {
@@ -494,24 +485,6 @@ pub mod flight {
             }
             self.generation = self.generation.checked_add(1).ok_or(Exhausted)?;
             Ok(())
-        }
-    }
-
-    /// Stable round-robin selection without a scan, including wrap after removal.
-    #[derive(Default)]
-    struct Cursor(u64);
-    impl Cursor {
-        /// Select the next live identifier, wrapping to the first when necessary.
-        fn next<'a, V>(&mut self, entries: &'a BTreeMap<u64, V>) -> Option<(u64, &'a V)> {
-            let (&id, value) = entries
-                .range((
-                    std::ops::Bound::Excluded(self.0),
-                    std::ops::Bound::Unbounded,
-                ))
-                .next()
-                .or_else(|| entries.first_key_value())?;
-            self.0 = id;
-            Some((id, value))
         }
     }
 
@@ -588,6 +561,7 @@ pub mod flight {
             }
         }
     }
+
     impl<K, E, S> Table<K, E, S> {
         /// Count entries, including those waiting for real operation completion.
         pub fn len(&self) -> usize {
@@ -614,7 +588,7 @@ pub mod flight {
             self.next_operation.next_id()
         }
 
-        /// Whether shutdown has synchronously closed admission.
+        /// Whether shutdown was requested; the adapter must enforce admission closure.
         pub fn is_stopping(&self) -> bool {
             self.stopping
         }
@@ -700,8 +674,8 @@ pub mod flight {
     }
 
     impl<K, E, S> Table<K, E, S> {
-        /// Stop admission synchronously; the adapter chooses the per-entry error and
-        /// settlement hooks, and remains responsible for driving actual completions.
+        /// Mark shutdown and visit each entry synchronously. The adapter must reject
+        /// admission, choose settlement policy, and drive actual operation completions.
         pub fn stop(
             &mut self,
             wakes: &mut Vec<Waker>,
@@ -737,11 +711,12 @@ pub mod flight {
     /// its destructor runs outside the table borrow. Only explicit completion clears
     /// that slot; dropping an external completion token does not touch this owner.
     pub struct Operations<R, S = RandomState> {
-        slots: HashMap<u64, Option<R>, S>,
+        slots: HashMap<u64, OperationSlot<R>, S>,
 
         /// Resource destruction and completion must run on the owning worker.
         local: std::marker::PhantomData<Rc<()>>,
     }
+
     impl<R, S: Default> Default for Operations<R, S> {
         /// Create an empty local resource owner.
         fn default() -> Self {
@@ -751,6 +726,7 @@ pub mod flight {
             }
         }
     }
+
     impl<R, S> Operations<R, S> {
         /// Count retained resources and occupied completion tombstones.
         pub fn len(&self) -> usize {
@@ -766,21 +742,65 @@ pub mod flight {
     impl<R, S: BuildHasher> Operations<R, S> {
         /// Retain resources under a caller-allocated unique operation identifier.
         pub fn insert(&mut self, id: u64, resources: R) {
-            self.slots.insert(id, Some(resources));
+            self.slots.insert(id, OperationSlot::Retained(resources));
         }
 
         /// Take resources for destruction outside the owner borrow, retaining a fence.
         pub fn take(&mut self, id: u64) -> Result<R, Stale> {
-            self.slots.get_mut(&id).and_then(Option::take).ok_or(Stale)
+            let slot = self.slots.get_mut(&id).ok_or(Stale)?;
+            match std::mem::replace(slot, OperationSlot::Completing) {
+                OperationSlot::Retained(resources) => Ok(resources),
+                OperationSlot::Completing => Err(Stale),
+            }
         }
 
         /// Clear a taken slot after the caller has finished resource destruction.
         pub fn complete(&mut self, id: u64) -> Result<(), Stale> {
-            if !matches!(self.slots.get(&id), Some(None)) {
+            if !matches!(self.slots.get(&id), Some(OperationSlot::Completing)) {
                 return Err(Stale);
             }
             self.slots.remove(&id);
             Ok(())
+        }
+    }
+
+    /// An occupied operation owns either resources or their unfinished completion fence.
+    enum OperationSlot<R> {
+        /// Resources must be taken and destroyed before completion is acknowledged.
+        Retained(R),
+
+        /// Resources left the owner, but actual completion has not been confirmed.
+        Completing,
+    }
+
+    /// Monotonic IDs are never reused, even after an entry is removed.
+    #[derive(Default)]
+    struct Counter(u64);
+
+    impl Counter {
+        /// Allocate the next identifier without wrapping or reusing an old value.
+        fn next_id(&mut self) -> Result<u64, Exhausted> {
+            self.0 = self.0.checked_add(1).ok_or(Exhausted)?;
+            Ok(self.0)
+        }
+    }
+
+    /// Stable round-robin selection without a scan, including wrap after removal.
+    #[derive(Default)]
+    struct Cursor(u64);
+
+    impl Cursor {
+        /// Select the next live identifier, wrapping to the first when necessary.
+        fn next<'a, V>(&mut self, entries: &'a BTreeMap<u64, V>) -> Option<(u64, &'a V)> {
+            let (&id, value) = entries
+                .range((
+                    std::ops::Bound::Excluded(self.0),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .or_else(|| entries.first_key_value())?;
+            self.0 = id;
+            Some((id, value))
         }
     }
 
@@ -852,8 +872,10 @@ pub mod flight {
         pub enum Outcome<O, E> {
             /// A publication awaiting settlement and result interpretation.
             Published(O),
+
             /// A terminal error awaiting settlement.
             Failed(E),
+
             /// An attempt that permits another eligible caller after settlement.
             Retry,
         }
@@ -862,12 +884,16 @@ pub mod flight {
         pub enum Phase<C, O, E> {
             /// A leader may acquire and publish a result.
             Acquiring,
+
             /// No retained attempt blocks election of an eligible caller.
             RetryPending,
+
             /// An outcome exists but retained operations may still own resources.
             Draining(Outcome<O, E>),
+
             /// A fully settled complete result is available.
             Complete(C),
+
             /// A fully settled terminal error is available.
             Failed(E),
         }
@@ -876,15 +902,9 @@ pub mod flight {
         pub enum Published<C, P> {
             /// A result that satisfies all callers.
             Complete(C),
+
             /// A reusable intermediate result that may require another acquisition.
             Partial(P),
-        }
-
-        /// Replace a wake target only when it would notify a different task.
-        pub fn store_waker(slot: &mut Option<Waker>, waker: &Waker) {
-            if slot.as_ref().is_none_or(|old| !old.will_wake(waker)) {
-                *slot = Some(waker.clone());
-            }
         }
 
         /// Worker-local waiter index and transition state driven by an owning adapter.
@@ -990,22 +1010,6 @@ pub mod flight {
                 }
             }
 
-            /// Check one caller and enqueue its wake if its policy has failed.
-            fn refresh_waiter(&mut self, id: u64, wakes: &mut Vec<Waker>) {
-                let Some(waiter) = self.waiters.get_mut(&id) else {
-                    return;
-                };
-                if waiter.error.is_none() {
-                    waiter.error = waiter.check();
-                }
-                if waiter.error.is_some() {
-                    self.deadlines.remove(&(waiter.deadline(), id));
-                    if let Some(waker) = waiter.waker.take() {
-                        wakes.push(waker);
-                    }
-                }
-            }
-
             /// Check one caller in round-robin order without scanning the waiter map.
             pub fn sweep_waiter(&mut self, wakes: &mut Vec<Waker>) {
                 if let Some((id, _)) = self.cursor.next(&self.waiters) {
@@ -1021,15 +1025,17 @@ pub mod flight {
                 identity: &mut Identity,
                 limit: u64,
             ) -> Result<bool, Exhausted> {
-                if !matches!(self.phase, Phase::RetryPending)
-                    || !self.waiters.get(&id).is_some_and(Waiter::eligible)
-                {
+                if !matches!(self.phase, Phase::RetryPending) {
                     return Ok(false);
                 }
+                let Some(waiter) = self.waiters.get_mut(&id).filter(|waiter| waiter.eligible())
+                else {
+                    return Ok(false);
+                };
                 identity.advance(limit)?;
                 self.phase = Phase::Acquiring;
                 self.leader = Some(id);
-                self.waiters.get_mut(&id).unwrap().issued = true;
+                waiter.issued = true;
                 Ok(true)
             }
 
@@ -1105,28 +1111,13 @@ pub mod flight {
                 if let Some(id) = self.leader {
                     self.refresh_waiter(id, wakes);
                 }
-                for _ in 0..64 {
-                    let Some((&(deadline, id), _)) = self.deadlines.first_key_value() else {
-                        break;
-                    };
-                    if deadline > now() {
-                        break;
+                self.refresh_expired(&now, wakes);
+                if matches!(self.phase, Phase::Acquiring) {
+                    let leader = self.leader.and_then(|id| self.waiters.get(&id));
+                    if leader.is_none_or(|waiter| waiter.error.is_some()) {
+                        let error = leader.and_then(|waiter| waiter.error).unwrap_or(canceled);
+                        self.revoke(error, wakes);
                     }
-                    self.deadlines.remove(&(deadline, id));
-                    self.refresh_waiter(id, wakes);
-                }
-                if matches!(self.phase, Phase::Acquiring)
-                    && self
-                        .leader
-                        .and_then(|id| self.waiters.get(&id))
-                        .is_none_or(|w| w.error.is_some())
-                {
-                    let error = self
-                        .leader
-                        .and_then(|id| self.waiters.get(&id))
-                        .and_then(|w| w.error)
-                        .unwrap_or(canceled);
-                    self.revoke(error, wakes);
                 }
                 self.settle(idle, unavailable, split, wakes);
                 if matches!(self.phase, Phase::RetryPending)
@@ -1148,6 +1139,43 @@ pub mod flight {
                 self.waiters.clear();
                 self.deadlines.clear();
             }
+
+            /// Check one caller and enqueue its wake if its policy has failed.
+            fn refresh_waiter(&mut self, id: u64, wakes: &mut Vec<Waker>) {
+                let Some(waiter) = self.waiters.get_mut(&id) else {
+                    return;
+                };
+                if waiter.error.is_none() {
+                    waiter.error = waiter.check();
+                }
+                if waiter.error.is_some() {
+                    self.deadlines.remove(&(waiter.deadline(), id));
+                    if let Some(waker) = waiter.waker.take() {
+                        wakes.push(waker);
+                    }
+                }
+            }
+
+            /// Consume at most 64 due deadline entries, independently of leader checks.
+            fn refresh_expired(&mut self, now: &impl Fn() -> Instant, wakes: &mut Vec<Waker>) {
+                for _ in 0..64 {
+                    let Some((&(deadline, id), _)) = self.deadlines.first_key_value() else {
+                        break;
+                    };
+                    if deadline > now() {
+                        break;
+                    }
+                    self.deadlines.remove(&(deadline, id));
+                    self.refresh_waiter(id, wakes);
+                }
+            }
+        }
+
+        /// Replace a wake target only when it would notify a different task.
+        pub fn store_waker(slot: &mut Option<Waker>, waker: &Waker) {
+            if slot.as_ref().is_none_or(|old| !old.will_wake(waker)) {
+                *slot = Some(waker.clone());
+            }
         }
 
         /// Pure transition tests for cancellation, publication, and bounded expiry.
@@ -1167,6 +1195,7 @@ pub mod flight {
 
                 error: Rc<Cell<Option<u8>>>,
             }
+
             impl WaiterPolicy for Policy {
                 type Error = u8;
 
@@ -1315,6 +1344,7 @@ pub mod flight {
             /// Counts wake delivery without changing transition state.
             #[derive(Default)]
             struct Count(AtomicUsize);
+
             impl Wake for Count {
                 /// Record one delivered notification.
                 fn wake(self: Arc<Self>) {
@@ -1392,6 +1422,7 @@ pub mod flight {
 
         /// Count a retained resource until its destructor actually runs.
         struct Resource(Rc<Cell<usize>>);
+
         impl Drop for Resource {
             /// Record actual resource destruction rather than cancellation.
             fn drop(&mut self) {
@@ -1411,6 +1442,7 @@ pub mod flight {
 
             operations: Operations<Resource>,
         }
+
         impl Entry for TestEntry {
             /// Count visits and detach callers when cancellation is observed.
             fn refresh(&mut self, _: &mut Vec<Waker>) {
@@ -1480,6 +1512,7 @@ pub mod flight {
 
             key: u32,
         }
+
         impl Drop for Waiter {
             /// Detach this request and remove its entry only if truly quiescent.
             fn drop(&mut self) {
@@ -1784,6 +1817,7 @@ mod tests {
     /// Counts delivered notifications without running an executor.
     #[derive(Default)]
     struct Counter(AtomicUsize);
+
     impl Wake for Counter {
         /// Record one notification.
         fn wake(self: Arc<Self>) {

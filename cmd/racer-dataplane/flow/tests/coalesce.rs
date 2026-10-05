@@ -1,5 +1,6 @@
 //! Public ownership boundaries and synchronous reentrant notification contracts.
 
+use flow_control::coalesce::flight::state::{Outcome, Phase, Published, State, WaiterPolicy};
 use flow_control::coalesce::flight::{self, Entry, Operations, Stale};
 use flow_control::coalesce::{CapacityError, Event, Limits, Table, shared};
 use futures::executor::block_on;
@@ -8,6 +9,7 @@ use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Instant;
 
 thread_local! {
     /// Callback invoked only by synchronous wakes on the current test worker.
@@ -148,6 +150,31 @@ fn retry_and_final_drop_allow_reentrant_election() {
     }
 }
 
+/// A follower may request notifications without revoking another waiter's leadership.
+#[test]
+fn follower_retry_notifies_without_taking_leadership() {
+    let table = table(2);
+    let leader = table.join(1, 1).unwrap();
+    let follower = table.join(1, 1).unwrap();
+    assert_eq!(leader.event(Waker::noop()), Poll::Ready(Event::Lead));
+    let notified = Rc::new(Cell::new(false));
+    let waker = on_wake({
+        let leader = leader.clone();
+        let follower = follower.clone();
+        let notified = notified.clone();
+        move || {
+            assert!(follower.event(Waker::noop()).is_pending());
+            assert!(leader.event(Waker::noop()).is_pending());
+            notified.set(true);
+        }
+    });
+    assert!(follower.event(&waker).is_pending());
+    follower.retry();
+    assert!(notified.get());
+    leader.retry();
+    assert_eq!(follower.event(Waker::noop()), Poll::Ready(Event::Lead));
+}
+
 /// Completion removes old admission before any reader wake can admit new work.
 #[test]
 fn finish_allows_reentrant_admission_before_old_readers_detach() {
@@ -209,6 +236,33 @@ fn shared_completion_wakes_after_removal_and_keeps_new_owner() {
     );
 }
 
+/// Losing the sender wakes parked readers without removing the indexed work.
+#[test]
+fn shared_sender_drop_wakes_with_entry_still_indexed() {
+    let table = Rc::new(shared::Table::default());
+    let (mut receive, complete) = table.start(1, 99);
+    let notified = Rc::new(Cell::new(false));
+    let waker = on_wake({
+        let table = table.clone();
+        let notified = notified.clone();
+        move || {
+            assert_eq!(table.len(), 1);
+            assert!(table.get(&1).is_some());
+            notified.set(true);
+        }
+    });
+    assert!(
+        std::pin::Pin::new(&mut receive)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(complete);
+    assert!(notified.get());
+    assert_eq!(block_on(receive), 99);
+    assert_eq!(block_on(table.get(&1).unwrap()), 99);
+    assert_eq!(table.len(), 1);
+}
+
 /// Resource whose destructor can synchronously inspect its owning table.
 struct ReentrantResource(Option<Box<dyn FnOnce()>>);
 
@@ -263,7 +317,13 @@ fn completion_tombstone_survives_reentrant_destructor_and_shutdown() {
     flight::update(&table, |table, wakes| table.stop(wakes, |_, _| {}));
     assert!(table.borrow().is_stopping());
     let resource = flight::update(&table, |table, _| {
-        table.get_mut(&1).unwrap().0.take(id).unwrap()
+        let operations = &mut table.get_mut(&1).unwrap().0;
+        let resource = operations.take(id).unwrap();
+        assert!(matches!(operations.take(id), Err(Stale)));
+        assert!(matches!(operations.take(id + 1), Err(Stale)));
+        assert_eq!(operations.complete(id + 1), Err(Stale));
+        assert_eq!(operations.len(), 1);
+        resource
     });
     drop(resource);
     assert!(dropped.get());
@@ -279,8 +339,76 @@ fn completion_tombstone_survives_reentrant_destructor_and_shutdown() {
     });
     flight::update(&table, |table, wakes| {
         table.register_drain(&waker);
-        table.get_mut(&1).unwrap().0.complete(id).unwrap();
+        let operations = &mut table.get_mut(&1).unwrap().0;
+        operations.complete(id).unwrap();
+        assert_eq!(operations.complete(id), Err(Stale));
         table.sweep(1, wakes);
     });
     assert!(notified.get());
+}
+
+/// An expired leader is checked separately from the 64-entry deadline quantum.
+#[test]
+fn expired_leader_does_not_consume_deadline_quantum_or_clear_drain_fence() {
+    let mut state = State::<u32, u32, Published<u32, u32>, CountingPolicy>::default();
+    let mut table = flight::Table::<u32, ()>::default();
+    let mut identity = table.identity(Rc::new(())).unwrap();
+    let now = Instant::now();
+    let checks = Rc::new(Cell::new(0));
+    let error = Rc::new(Cell::new(None));
+    for id in 0..66 {
+        state.register(
+            id,
+            CountingPolicy {
+                due: now,
+                checks: checks.clone(),
+                error: error.clone(),
+            },
+            true,
+            true,
+        );
+    }
+    assert_eq!(state.elect(0, &mut identity, 2), Ok(true));
+    error.set(Some(7));
+    let mut wakes = Vec::new();
+    state.refresh(false, 9, 8, || now, std::convert::identity, &mut wakes);
+    assert_eq!(checks.get(), 65);
+    assert_eq!(state.deadlines.len(), 1);
+    assert_eq!(state.waiters[&0].error, Some(7));
+    assert!(state.waiters[&65].error.is_none());
+    assert!(matches!(state.phase, Phase::Draining(Outcome::Retry)));
+    assert_eq!(state.elect(65, &mut identity, 2), Ok(false));
+    assert_eq!(identity.generation, 1);
+
+    state.refresh(false, 9, 8, || now, std::convert::identity, &mut wakes);
+    assert_eq!(checks.get(), 66);
+    assert!(state.deadlines.is_empty());
+    assert!(matches!(state.phase, Phase::Draining(Outcome::Retry)));
+    state.settle(true, 9, std::convert::identity, &mut wakes);
+    assert!(matches!(state.phase, Phase::Failed(9)));
+}
+
+/// Fixed-deadline policy with observable checks and externally injected failures.
+struct CountingPolicy {
+    due: Instant,
+
+    checks: Rc<Cell<usize>>,
+
+    error: Rc<Cell<Option<u8>>>,
+}
+
+impl WaiterPolicy for CountingPolicy {
+    /// Identify the failure injected into a waiter.
+    type Error = u8;
+
+    /// Count policy evaluation and return the current injected failure.
+    fn check(&self) -> Option<Self::Error> {
+        self.checks.set(self.checks.get() + 1);
+        self.error.get()
+    }
+
+    /// Return the fixed deadline shared by this test's waiters.
+    fn deadline(&self) -> Instant {
+        self.due
+    }
 }
