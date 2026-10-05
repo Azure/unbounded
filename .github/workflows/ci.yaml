@@ -157,7 +157,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/rust-toolchain.toml') }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
+          key: racer-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/rust-toolchain.toml') }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ hashFiles('cmd/racer-dataplane/**/*.rs', 'cmd/racer-dataplane/.cargo/**', 'Makefile') }}
           restore-keys: |
             racer-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmd/racer-dataplane/rust-toolchain.toml') }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
 
