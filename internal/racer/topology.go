@@ -63,10 +63,6 @@ func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 		return ctrl.Result{}, reconcile.TerminalError(ctx.Err())
 	}
 
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return ctrl.Result{}, reconcile.TerminalError(err)
-	}
-
 	if apierrors.IsConflict(err) {
 		return ctrl.Result{RequeueAfter: retryConflictDelay}, nil
 	}
@@ -427,7 +423,7 @@ func ParseAnnotations(node *corev1.Node) (MemberAttributes, error) {
 	return attributes, nil
 }
 
-// selectEndpoint verifies workload ownership, ignores terminating/IP-less Pods,
+// selectEndpoint verifies workload ownership, ignores terminal/terminating/IP-less Pods,
 // and chooses the newest creation time, breaking ties by UID. Readiness is ignored.
 func selectEndpoint(pods []corev1.Pod, ownership DataplaneWorkloadIdentities, nodeName string, port uint16) (string, error) {
 	if nodeName == "" || port == 0 {
@@ -442,6 +438,10 @@ func selectEndpoint(pods []corev1.Pod, ownership DataplaneWorkloadIdentities, no
 	for i := range pods {
 		pod := &pods[i]
 		if pod.Spec.NodeName != nodeName || pod.DeletionTimestamp != nil || pod.UID == "" {
+			continue
+		}
+
+		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
 			continue
 		}
 

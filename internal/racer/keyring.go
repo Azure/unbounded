@@ -12,7 +12,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -79,7 +78,8 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 		r.Trust.invalidate()
 	}
 
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// A dependency's own deadline is retryable while leadership is still live.
+	if ctx.Err() != nil {
 		return ctrl.Result{}, reconcile.TerminalError(err)
 	}
 
@@ -199,7 +199,14 @@ func (c *credentialState) discardStalePreparation(cfg Config, now time.Time) {
 	if s.PreparedIssuer != "" {
 		cert := c.signing[s.PreparedIssuer].certificate
 
-		if now.Add(cfg.Rotation.PrepareFor + cfg.CertificateLifetime).After(cert.NotAfter) {
+		activation := now
+		if s.ActivateAt.After(activation) {
+			activation = s.ActivateAt
+		}
+
+		// This issuer must sign until its replacement activates one full interval
+		// after actual activation, and cover the last leaf's entire lifetime.
+		if activation.Add(cfg.Rotation.Interval + cfg.CertificateLifetime).After(cert.NotAfter) {
 			roots := b.PeerTrustRoots[:0]
 			for _, root := range b.PeerTrustRoots {
 				if rootID(root) != s.PreparedIssuer {

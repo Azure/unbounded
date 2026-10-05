@@ -119,6 +119,11 @@ func (c WorkloadConfig) Validate() error {
 		}
 	}
 
+	// The workload name is also the immutable instance selector label value.
+	if len(validation.IsValidLabelValue(c.DaemonSetName)) != 0 {
+		return fmt.Errorf("DaemonSet name must fit a label value: %w", wire.InvalidRequest)
+	}
+
 	u, err := url.Parse(c.ControlURL)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") || strings.TrimSpace(c.DataplaneImage) == "" {
 		return fmt.Errorf("workload endpoint or image: %w", wire.InvalidRequest)

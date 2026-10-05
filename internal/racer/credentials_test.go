@@ -240,7 +240,7 @@ func TestCredentialsStalePreparationReplacementIsAtomic(t *testing.T) {
 			_, bundle, state, material := keyState(t, r)
 			oldID := state.PreparedIssuer
 			short := editSigningCertificate(t, material.Keys[oldID], func(cert *x509.Certificate) {
-				cert.NotAfter = now.Add(r.Config.Rotation.PrepareFor + r.Config.CertificateLifetime - time.Second)
+				cert.NotAfter = state.ActivateAt.Add(r.Config.Rotation.Interval + r.Config.CertificateLifetime - time.Second)
 			})
 			shortID := rootID(short.Certificate)
 

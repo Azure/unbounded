@@ -77,6 +77,9 @@ func serialNumber() (*big.Int, error) {
 	return n.Add(n, big.NewInt(1)), nil
 }
 
+// Backdate validity starts for modest clock skew without extending expiration.
+const certificateClockSkew = time.Minute
+
 func generateIssuer(now time.Time, cfg Config) ([]byte, []byte, error) {
 	cfg = cfg.effective()
 
@@ -90,7 +93,7 @@ func generateIssuer(now time.Time, cfg Config) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 
-	template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Racer " + string(cfg.Cluster)}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(cfg.Rotation.Interval + cfg.Rotation.PrepareFor + cfg.Rotation.RetainFor + 2*cfg.CertificateLifetime), IsCA: true, BasicConstraintsValid: true, MaxPathLenZero: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
+	template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Racer " + string(cfg.Cluster)}, NotBefore: now.Add(-certificateClockSkew), NotAfter: now.Add(cfg.Rotation.Interval + cfg.Rotation.PrepareFor + cfg.Rotation.RetainFor + 2*cfg.CertificateLifetime), IsCA: true, BasicConstraintsValid: true, MaxPathLenZero: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
 
 	cert, err := x509.CreateCertificate(rand.Reader, template, template, pub, key)
 	if err != nil {
@@ -263,7 +266,7 @@ func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.
 	}
 
 	uri := &url.URL{Scheme: "spiffe", Host: string(identity.cluster), Path: "/node/" + string(identity.node)}
-	template := &x509.Certificate{SerialNumber: serial, NotBefore: now, NotAfter: now.Add(cfg.CertificateLifetime), BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: []*url.URL{uri}}
+	template := &x509.Certificate{SerialNumber: serial, NotBefore: now.Add(-certificateClockSkew), NotAfter: now.Add(cfg.CertificateLifetime), BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: []*url.URL{uri}}
 
 	if err := ctx.Err(); err != nil {
 		return nil, err

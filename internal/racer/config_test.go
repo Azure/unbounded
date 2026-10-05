@@ -87,7 +87,7 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if response.Cluster != want.Cluster || leaf.NotAfter.Sub(leaf.NotBefore) != want.CertificateLifetime {
+			if response.Cluster != want.Cluster || leaf.NotAfter.Sub(leaf.NotBefore) != want.CertificateLifetime+certificateClockSkew {
 				t.Fatal("first issuance ignored frozen identity/lifetime")
 			}
 		})

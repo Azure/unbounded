@@ -316,7 +316,8 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 		identity := h.rotationIdentity(node)
 		leaf, err := x509.ParseCertificate(identity.CertificateChain[0])
 		require.NoError(h.t, err)
-		require.Equal(h.t, 2*time.Minute, leaf.NotAfter.Sub(leaf.NotBefore))
+		// Two minutes of forward lifetime plus one minute of NotBefore skew.
+		require.Equal(h.t, 3*time.Minute, leaf.NotAfter.Sub(leaf.NotBefore))
 		oldLeaves[i] = leaf
 	}
 	// Warm only the serving node, leaving reader pages cold for the rotation.
@@ -465,7 +466,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 			}
 
 			require.NoError(h.t, leaf.CheckSignatureFrom(root))
-			require.Equal(h.t, 2*time.Minute, leaf.NotAfter.Sub(leaf.NotBefore))
+			require.Equal(h.t, 3*time.Minute, leaf.NotAfter.Sub(leaf.NotBefore))
 
 			return h.peerMetrics(urls[i], fmt.Sprintf("renewed-%d", i))["racer_identity_expires_at_seconds"] == uint64(leaf.NotAfter.Unix())
 		}, 100*time.Second, time.Second, "node %s did not install controller-issued renewal", node.name)

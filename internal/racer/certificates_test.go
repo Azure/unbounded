@@ -92,7 +92,7 @@ func TestIssuerCertificateContractAndTrustRotation(t *testing.T) {
 		t.Fatal("response correlation")
 	}
 
-	if cert.IsCA || cert.Subject.CommonName != "" || len(cert.DNSNames) != 0 || len(cert.URIs) != 1 || cert.URIs[0].String() != "spiffe://"+string(identity.Cluster())+"/node/"+string(identity.Node()) || cert.KeyUsage != x509.KeyUsageDigitalSignature || cert.NotAfter.Sub(cert.NotBefore) != wire.CertificateLifetime || !bytes.Equal(cert.PublicKey.(ed25519.PublicKey), pub) {
+	if cert.IsCA || cert.Subject.CommonName != "" || len(cert.DNSNames) != 0 || len(cert.URIs) != 1 || cert.URIs[0].String() != "spiffe://"+string(identity.Cluster())+"/node/"+string(identity.Node()) || cert.KeyUsage != x509.KeyUsageDigitalSignature || !cert.NotAfter.Equal(now.Add(wire.CertificateLifetime)) || !cert.NotBefore.Equal(now.Add(-certificateClockSkew)) || !bytes.Equal(cert.PublicKey.(ed25519.PublicKey), pub) {
 		t.Fatal("certificate identity or policy")
 	}
 
@@ -241,7 +241,7 @@ func TestIssuerShortLifetimeAndRetirement(t *testing.T) {
 	response := decodeIssuedResponse(t, encoded)
 
 	leaf, err := x509.ParseCertificate(response.CertificateChain[0])
-	if err != nil || leaf.NotAfter.Sub(leaf.NotBefore) != 2*time.Minute {
+	if err != nil || !leaf.NotAfter.Equal(now.Add(2*time.Minute)) || !leaf.NotBefore.Equal(now.Add(-certificateClockSkew)) {
 		t.Fatalf("short leaf lifetime: %v", err)
 	}
 
