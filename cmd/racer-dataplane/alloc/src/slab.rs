@@ -48,6 +48,7 @@ pub struct Slab<C: Charge> {
 
     idle_buffer: Rc<RefCell<Option<AlignedBuffer<C>>>>,
 }
+
 impl<C: Charge> Slab<C> {
     /// Describe a worker's file; validation and blocking I/O happen at startup.
     pub fn new(
@@ -66,27 +67,33 @@ impl<C: Charge> Slab<C> {
             idle_buffer: Rc::new(RefCell::new(None)),
         }
     }
+
     /// Logical file capacity, not a reservation of physical disk blocks.
     pub fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
+
     /// Size of each physical segment.
     pub fn segment_bytes(&self) -> u64 {
         self.segment_bytes
     }
+
     /// Accepted writes whose completion guards have not yet been released.
     pub fn writes_in_flight(&self) -> usize {
         self.writes.count.get()
     }
+
     /// Accounted bytes in the single idle buffer slot.
     pub fn idle_bytes(&self) -> usize {
         self.idle_buffer.borrow().as_ref().map_or(0, |b| b.len())
     }
+
     /// Release only idle memory, returning its size without touching live I/O.
     pub fn reclaim_idle(&self) -> usize {
         let idle = self.idle_buffer.borrow_mut().take();
         idle.map_or(0, |b| b.len())
     }
+
     /// Wait for accepted writes to release their runtime completion fences.
     /// This does not call fsync/fdatasync and does NOT promise crash durability.
     /// Drive the reactor concurrently; stop new writes first if quiescence is needed.
@@ -96,6 +103,7 @@ impl<C: Charge> Slab<C> {
             registration: None,
         })
     }
+
     /// Discovered direct-I/O requirements, or Unavailable before startup.
     pub fn alignment(&self) -> Result<Alignment> {
         self.opened
@@ -104,6 +112,7 @@ impl<C: Charge> Slab<C> {
             .map(|o| o.geometry.alignment())
             .ok_or(Error::Unavailable)
     }
+
     /// Physical slab geometry, including the full segment capacity. A bound
     /// table may deliberately expose fewer segments than this physical count.
     pub fn geometry(&self) -> Result<SegmentGeometry> {
@@ -113,6 +122,7 @@ impl<C: Charge> Slab<C> {
             .map(|o| o.geometry)
             .ok_or(Error::Unavailable)
     }
+
     /// Configure an empty table, or validate an already configured partial table,
     /// and permanently bind this slab to that table's identity.
     #[cfg(any(test, feature = "simulation"))]
@@ -150,12 +160,14 @@ impl<C: Charge> Slab<C> {
         slab.table = Some(identity);
         Ok(())
     }
+
     /// Blocking startup helper. Do not invoke on a latency-sensitive worker.
     pub fn open_configured(&self, segments: &Segments) -> Result<Alignment> {
         let alignment = self.open_file()?;
         self.bind(segments)?;
         Ok(alignment)
     }
+
     /// Blocking startup I/O for geometry probing and buffer allocation. Read/write
     /// return `Unavailable` until `configure_segments` succeeds.
     /// Parent directories must be trusted against
@@ -256,6 +268,7 @@ impl<C: Charge> Slab<C> {
         self.publish(file.into(), geometry);
         Ok(a)
     }
+
     /// Publish geometry with its owning file, initially without I/O authority.
     fn publish(&self, file: Descriptor, geometry: SegmentGeometry) {
         *self.opened.borrow_mut() = Some(OpenSlab {
@@ -264,6 +277,7 @@ impl<C: Charge> Slab<C> {
             table: None,
         });
     }
+
     /// Check physical dimensions and padded record size without changing the file.
     fn validate_layout(&self, a: Alignment, size: u64) -> Result<SegmentGeometry> {
         if a.extent(0, self.max_record_bytes)?.length() as u64 > self.segment_bytes
@@ -281,6 +295,7 @@ impl<C: Charge> Slab<C> {
         )
         .map_err(|_| Error::InvalidConfiguration)
     }
+
     /// Borrow-check a request before moving its resources into a submission.
     fn submission(
         &self,
@@ -323,6 +338,7 @@ impl<C: Charge> Slab<C> {
         }
         Ok(slab.file.clone())
     }
+
     /// Consume a checked request so its descriptor, buffer, and lease travel together.
     fn prepare(
         &self,
@@ -338,6 +354,7 @@ impl<C: Charge> Slab<C> {
             lease,
         })
     }
+
     /// Read exactly one checked extent, retaining its buffer and lease until completion.
     /// Dropping the waiting future does not release kernel-owned resources.
     pub fn read<'a, S: Scope, B: Budget>(
@@ -357,6 +374,7 @@ impl<C: Charge> Slab<C> {
                 .await
         })
     }
+
     /// Write exactly one checked extent with completion-owned accounting and lease.
     /// Failed writes do not roll back the space reserved by append.
     pub fn write<'a, S: Scope, B: Budget>(
@@ -376,6 +394,7 @@ impl<C: Charge> Slab<C> {
             submission.write(reactor, scope, fence).await
         })
     }
+
     /// Reuse one exact-size idle buffer. A size mismatch releases the old idle
     /// buffer and its charge, even if the replacement allocation fails.
     pub fn allocate(&self, length: usize, charge: C) -> Result<AlignedBuffer<C>> {
@@ -394,12 +413,14 @@ impl<C: Charge> Slab<C> {
             .allocate(length, charge)?
             .pooled(&self.idle_buffer))
     }
+
     /// Replace the open file for fault-injection tests; geometry remains unchanged.
     #[cfg(feature = "simulation")]
     #[doc(hidden)]
     pub fn replace_file_for_test(&self, file: File) -> Result<()> {
         self.replace_descriptor_for_test(file.into())
     }
+
     /// Also accepts a virtual descriptor from the simulation backend.
     #[cfg(feature = "simulation")]
     #[doc(hidden)]
@@ -415,6 +436,7 @@ impl<C: Charge> Slab<C> {
         Ok(())
     }
 }
+
 /// A file and its geometry own their binding; a closed slab cannot retain authority.
 struct OpenSlab {
     file: Rc<Descriptor>,
@@ -500,6 +522,7 @@ struct WriteState {
 
     waiters: RefCell<Vec<Rc<RefCell<Waker>>>>,
 }
+
 impl WriteState {
     /// Increment before constructing the sole guard responsible for decrementing.
     fn acquire(self: &Rc<Self>) -> Result<WriteFence> {
@@ -508,12 +531,14 @@ impl WriteState {
         Ok(WriteFence(self.clone()))
     }
 }
+
 /// Cancel-safe registration waiting for all currently accepted writes to finish.
 struct FenceWaiter {
     state: Rc<WriteState>,
 
     registration: Option<Rc<RefCell<Waker>>>,
 }
+
 impl Future for FenceWaiter {
     type Output = Result<()>;
 
@@ -539,6 +564,7 @@ impl Future for FenceWaiter {
         Poll::Pending
     }
 }
+
 impl FenceWaiter {
     /// Remove only this waiter's registration, including after cancellation.
     fn unregister(&mut self) {
@@ -550,14 +576,17 @@ impl FenceWaiter {
         }
     }
 }
+
 impl Drop for FenceWaiter {
     /// A canceled wait must not retain its task's waker.
     fn drop(&mut self) {
         self.unregister();
     }
 }
+
 /// Unique write-count decrement authority retained by the reactor completion.
 struct WriteFence(Rc<WriteState>);
+
 impl Drop for WriteFence {
     /// Release the count and wake sleepers outside all registration borrows.
     fn drop(&mut self) {
@@ -572,6 +601,7 @@ impl Drop for WriteFence {
         }
     }
 }
+
 /// Preserve synchronous operating-system diagnostic context.
 fn system_error(operation: &'static str, error: std::io::Error) -> Error {
     Error::SystemIo {
@@ -579,6 +609,7 @@ fn system_error(operation: &'static str, error: std::io::Error) -> Error {
         errno: error.raw_os_error(),
     }
 }
+
 /// Distinguish an already locked file from a failed locking syscall.
 fn lock_error(error: std::io::Error) -> Error {
     if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
@@ -587,6 +618,7 @@ fn lock_error(error: std::io::Error) -> Error {
         system_error("flock", error)
     }
 }
+
 /// Classify explicit direct-I/O capability denials without hiding other failures.
 fn direct_error(operation: &'static str, error: std::io::Error) -> Error {
     match error.raw_os_error() {
@@ -594,10 +626,12 @@ fn direct_error(operation: &'static str, error: std::io::Error) -> Error {
         _ => system_error(operation, error),
     }
 }
+
 /// Discover direct-I/O requirements for an owned file descriptor.
 fn probe(file: &File) -> Result<Alignment> {
     probe_fd(file.as_raw_fd())
 }
+
 /// Ask Linux for descriptor-specific alignment without assuming a page size.
 fn probe_fd(fd: i32) -> Result<Alignment> {
     // SAFETY: initialized statx output and valid empty C path. Invalid FDs are
@@ -621,6 +655,7 @@ fn probe_fd(fd: i32) -> Result<Alignment> {
     }
     alignment_from_stat(&stat)
 }
+
 /// Reject missing alignment capability or invalid values returned by statx.
 fn alignment_from_stat(stat: &libc::statx) -> Result<Alignment> {
     if stat.stx_mask & libc::STATX_DIOALIGN == 0 {
@@ -718,6 +753,7 @@ mod tests {
 
         bytes: usize,
     }
+
     impl CountingCharge {
         /// Admit a fixed number of bytes.
         fn new(used: &Rc<Cell<usize>>, bytes: usize) -> Self {
@@ -728,12 +764,14 @@ mod tests {
             }
         }
     }
+
     impl Charge for CountingCharge {
         /// Cover only bytes actually admitted by this guard.
         fn covers(&self, bytes: usize) -> bool {
             self.bytes >= bytes
         }
     }
+
     impl Drop for CountingCharge {
         /// Release accounting exactly once on destruction.
         fn drop(&mut self) {
@@ -743,6 +781,7 @@ mod tests {
 
     /// Owns and cleans up an isolated directory inside the project build tree.
     struct Directory(PathBuf);
+
     impl Directory {
         /// Create a per-process, per-test directory without touching host temp paths.
         fn new() -> Self {
@@ -755,6 +794,7 @@ mod tests {
             Self(path)
         }
     }
+
     impl Drop for Directory {
         /// Remove only this test's owned directory.
         fn drop(&mut self) {
@@ -985,6 +1025,7 @@ mod tests {
         /// Counts wake notifications without scheduling actual work.
         #[derive(Default)]
         struct WakeCount(AtomicUsize);
+
         impl Wake for WakeCount {
             /// Count an owned notification.
             fn wake(self: Arc<Self>) {

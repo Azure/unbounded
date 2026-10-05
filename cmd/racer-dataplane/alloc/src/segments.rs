@@ -13,21 +13,27 @@ use std::{
 /// Stable slot number within one allocation table, not authority to access it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SegmentId(pub u64);
+
 /// Monotonic reuse counter; zero is invalid in a restored image.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Generation(pub u64);
+
 /// Persisted segment lifecycle, separate from live lease and freeze ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SegmentState {
     /// Available for a new append.
     Free,
+
     /// The sole appendable tail.
     Open,
+
     /// Full or rotated away from; eligible for eviction.
     Sealed,
+
     /// Rejects new leases while existing completion owners drain.
     Evicting,
 }
+
 /// Caller-owned recovery image; restore validates it before publishing any slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentSnapshot {
@@ -68,23 +74,28 @@ pub struct SegmentLease {
 
     end: u64,
 }
+
 impl SegmentLease {
     /// Slot protected against recycling by this lease.
     pub fn id(&self) -> SegmentId {
         self.id
     }
+
     /// Reuse generation captured when the lease was acquired.
     pub fn generation(&self) -> Generation {
         self.generation
     }
+
     /// Borrow the nominal identity without granting table mutation authority.
     pub(crate) fn table_identity(&self) -> TableIdentity {
         self.table.clone()
     }
+
     /// Validated dimensions captured independently of the table's lifetime.
     pub(crate) fn geometry(&self) -> SegmentGeometry {
         self.geometry
     }
+
     /// An existing lease remains valid during eviction, but cannot authorize
     /// bytes appended after it was acquired.
     pub(crate) fn validate_extent(&self, extent: &Extent) -> Result<()> {
@@ -106,18 +117,21 @@ impl SegmentLease {
         Ok(())
     }
 }
+
 impl Drop for SegmentLease {
     /// Release exactly the one lease count acquired during construction.
     fn drop(&mut self) {
         self.count.set(self.count.get() - 1);
     }
 }
+
 /// Mutable recovery image paired with its independently retained lease counter.
 struct Slot {
     image: SegmentSnapshot,
 
     leases: Rc<Cell<usize>>,
 }
+
 /// Holds a freeze independently of the table's lifetime. Dropping it thaws the table.
 ///
 /// A second guard cannot be created by cloning the first:
@@ -128,12 +142,14 @@ struct Slot {
 #[must_use = "keep the guard alive while the table must remain frozen"]
 #[derive(Debug)]
 pub struct FreezeGuard(Rc<Cell<bool>>);
+
 impl Drop for FreezeGuard {
     /// Release mutation exclusion even if the table has already been dropped.
     fn drop(&mut self) {
         self.0.set(false);
     }
 }
+
 /// Non-cloneable worker-local table whose leases and guards can outlive it.
 /// Rc sharing is intentional within a worker; authority cannot cross threads.
 ///
@@ -158,8 +174,10 @@ pub struct Segments {
     open: Cell<Option<usize>>,
 
     free: RefCell<BTreeSet<usize>>,
+
     evicting: Cell<usize>,
 }
+
 impl Segments {
     /// Create an unconfigured table for Slab::open_configured to bind at startup.
     pub fn new(segment_bytes: u64) -> Self {
@@ -175,14 +193,17 @@ impl Segments {
             evicting: Cell::new(0),
         }
     }
+
     /// Fixed size of a physical segment.
     pub fn segment_bytes(&self) -> u64 {
         self.segment_bytes
     }
+
     /// Configured physical capacity, or zero before configuration.
     pub fn capacity_bytes(&self) -> u64 {
         self.geometry.get().map_or(0, SegmentGeometry::slab_bytes)
     }
+
     /// Build an entirely free table, rejecting geometry above the retained slot limit.
     pub fn from_geometry(geometry: SegmentGeometry) -> Result<Self> {
         let segments = Self::new(geometry.segment_bytes());
@@ -193,22 +214,27 @@ impl Segments {
         )?;
         Ok(segments)
     }
+
     /// Whether validated geometry and the slot table have been installed.
     pub fn is_configured(&self) -> bool {
         self.geometry.get().is_some()
     }
+
     /// Configured geometry, which may expose fewer slots than physical capacity.
     pub fn geometry(&self) -> Option<SegmentGeometry> {
         self.geometry.get()
     }
+
     /// Clone identity only, without granting allocation authority.
     pub(crate) fn table_identity(&self) -> TableIdentity {
         self.table.clone()
     }
+
     /// Recovery revision used to invalidate eviction cursor and recent-read state.
     pub(crate) fn restore_epoch(&self) -> u64 {
         self.restore_epoch.get()
     }
+
     /// Install an entirely free bounded table exactly once, unless frozen.
     #[cfg(any(test, feature = "simulation"))]
     pub fn configure(&self, capacity: u64, count: usize, alignment: Alignment) -> Result<()> {
@@ -245,6 +271,7 @@ impl Segments {
         *self.free.borrow_mut() = (0..count).collect();
         Ok(())
     }
+
     /// Reserve an aligned used range. Malformed requests and lease overflow leave
     /// state unchanged. A valid rollover without a free slot seals the open tail
     /// before returning Busy, allowing reclamation to make a retry possible.
@@ -309,6 +336,7 @@ impl Segments {
         }
         Ok((lease, extent))
     }
+
     /// Capture a checked prefix and increment its counter before publishing a lease.
     fn take_lease(&self, slot: &Slot, used_bytes: u64) -> Result<SegmentLease> {
         let start = slot
@@ -331,10 +359,12 @@ impl Segments {
             end,
         })
     }
+
     /// Convert an external slot number without truncation.
     fn position(id: SegmentId) -> Result<usize> {
         usize::try_from(id.0).map_err(|_| Error::Corrupt)
     }
+
     /// Acquire the current used prefix only while the generation is readable.
     pub fn lease(&self, id: SegmentId, generation: Generation) -> Result<SegmentLease> {
         let slots = self.slots.borrow();
@@ -346,6 +376,7 @@ impl Segments {
         }
         self.take_lease(slot, slot.image.used_bytes)
     }
+
     /// Stop new leases for a sealed slot; repeating eviction is harmless.
     #[cfg(any(test, feature = "simulation"))]
     pub fn begin_evict(&self, id: SegmentId) -> Result<()> {
@@ -371,6 +402,7 @@ impl Segments {
         }
         Ok(())
     }
+
     /// Reuse only an evicting, unleased slot, incrementing generation without wrap.
     #[cfg(any(test, feature = "simulation"))]
     pub fn recycle(&self, id: SegmentId) -> Result<()> {
@@ -400,6 +432,7 @@ impl Segments {
         self.free.borrow_mut().insert(Self::position(id)?);
         Ok(())
     }
+
     /// Copy the complete ordered image, including while the table is frozen.
     pub fn snapshot(&self) -> Vec<SegmentSnapshot> {
         self.slots
@@ -408,6 +441,7 @@ impl Segments {
             .map(|s| s.image.clone())
             .collect()
     }
+
     /// Block allocation, eviction, recycling, and restore until the guard drops.
     /// Reads and snapshots remain available; only one guard may exist at a time.
     pub fn freeze(&self) -> Result<FreezeGuard> {
@@ -416,10 +450,12 @@ impl Segments {
         }
         Ok(FreezeGuard(self.frozen.clone()))
     }
+
     /// Check the entire image and current restore eligibility without mutation.
     pub fn validate_restore(&self, images: &[SegmentSnapshot]) -> Result<()> {
         self.validate_restore_epoch(images).map(|_| ())
     }
+
     /// Validate recovery invariants and reserve the next nonwrapping epoch value.
     fn validate_restore_epoch(&self, images: &[SegmentSnapshot]) -> Result<u64> {
         if self.frozen.get() {
@@ -457,6 +493,7 @@ impl Segments {
             .checked_add(1)
             .ok_or(Error::Unavailable)
     }
+
     /// Validate the complete image before publishing it, sealing its open tail.
     /// Frozen tables and outstanding leases return Busy without changing state.
     pub fn restore(&self, images: Vec<SegmentSnapshot>) -> Result<()> {
@@ -480,6 +517,7 @@ impl Segments {
         self.restore_epoch.set(epoch);
         Ok(())
     }
+
     /// Validate a stored mapping against current readable state and used bytes.
     pub fn validate(&self, id: SegmentId, generation: Generation, extent: &Extent) -> Result<()> {
         let slots = self.slots.borrow();
@@ -512,6 +550,7 @@ impl Segments {
         }
         Ok(())
     }
+
     /// Validate a live lease, including table identity and its captured used range.
     /// Existing leases remain usable while their segment is Evicting.
     pub fn validate_lease(&self, lease: &SegmentLease, extent: &Extent) -> Result<()> {
@@ -520,14 +559,17 @@ impl Segments {
         }
         lease.validate_extent(extent)
     }
+
     /// Number of immediately appendable slots, excluding pending eviction.
     pub fn free_count(&self) -> usize {
         self.free.borrow().len()
     }
+
     /// Number of retained slots, which may be less than physical capacity.
     pub fn count(&self) -> usize {
         self.slots.borrow().len()
     }
+
     /// Inspect a valid slot without granting mutation or lease authority.
     pub fn state(&self, id: SegmentId) -> Result<SegmentState> {
         self.slots
@@ -563,6 +605,7 @@ pub trait SegmentEntries {
     fn can_evict(&self, _segment: SegmentId) -> bool {
         true
     }
+
     /// Remove at most budget current mappings, returning the number removed.
     fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize;
 
@@ -762,10 +805,11 @@ impl SegmentClock {
                 return Ok(());
             }
             let id = self.next(count);
-            if !matches!(
-                self.segments.state(id)?,
-                SegmentState::Sealed | SegmentState::Evicting
-            ) {
+            let state = self.segments.state(id)?;
+            if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
+                continue;
+            }
+            if state == SegmentState::Sealed && !entries.can_evict(id) {
                 continue;
             }
             if self.recent.borrow_mut().remove(&id) {
@@ -1161,17 +1205,27 @@ mod clock_tests {
         counts: RefCell<Vec<usize>>,
 
         calls: RefCell<Vec<(SegmentId, usize)>>,
+
+        evictable: Cell<bool>,
     }
+
     impl Entries {
         /// Populate a synthetic index without changing allocator state.
         fn new(counts: Vec<usize>) -> Self {
             Self {
                 counts: RefCell::new(counts),
                 calls: RefCell::new(vec![]),
+                evictable: Cell::new(true),
             }
         }
     }
+
     impl SegmentEntries for Entries {
+        /// Allow tests to protect unpublished mappings before eviction begins.
+        fn can_evict(&self, _: SegmentId) -> bool {
+            self.evictable.get()
+        }
+
         /// Record and honor each bounded removal request.
         fn remove_bounded(&self, id: SegmentId, budget: usize) -> usize {
             self.calls.borrow_mut().push((id, budget));
@@ -1282,6 +1336,47 @@ mod clock_tests {
         assert_eq!(*entries.counts.borrow(), [0, 0]);
     }
 
+    /// Sealed vetoes preserve mappings, but cannot strand eviction already in progress.
+    #[test]
+    fn reclaim_honors_sealed_veto_but_drains_existing_eviction() {
+        for mapping_count in [0usize, 2] {
+            let segments = segments(1);
+            let held = segments.append(1024).unwrap().0;
+            let clock = SegmentClock::new(segments.clone());
+            let entries = Entries::new(vec![mapping_count]);
+            entries.evictable.set(false);
+            let before = segments.snapshot();
+            assert_eq!(before[0].state, SegmentState::Sealed);
+
+            assert_eq!(clock.reclaim(&entries, 1, 2, 1), Err(Error::Busy));
+            assert_eq!(segments.snapshot(), before);
+            assert_eq!(*entries.counts.borrow(), [mapping_count]);
+            assert!(entries.calls.borrow().is_empty());
+            assert_eq!(segments.free_count(), 0);
+
+            entries.evictable.set(true);
+            assert_eq!(clock.reclaim(&entries, 1, 1, 1), Err(Error::Busy));
+            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
+            assert_eq!(*entries.counts.borrow(), [mapping_count.saturating_sub(1)]);
+
+            // Once eviction starts, a later veto must not block remaining mappings.
+            entries.evictable.set(false);
+            assert_eq!(clock.reclaim(&entries, 1, 1, 1), Err(Error::Busy));
+            assert_eq!(*entries.counts.borrow(), [0]);
+            assert_eq!(entries.calls.borrow().len(), mapping_count);
+            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
+            assert_eq!(segments.free_count(), 0);
+            assert_eq!(segments.snapshot()[0].generation, Generation(1));
+
+            // The live lease, not the veto, remains the physical reuse fence.
+            drop(held);
+            clock.reclaim(&entries, 1, 1, 0).unwrap();
+            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Free));
+            assert_eq!(segments.free_count(), 1);
+            assert_eq!(segments.snapshot()[0].generation, Generation(2));
+        }
+    }
+
     /// Freeze checks precede index side effects, and leases precede physical reuse.
     #[test]
     fn busy_lease_and_frozen_table_preserve_reclaim_side_effect_order() {
@@ -1389,6 +1484,7 @@ mod clock_tests {
         assert!(entries.calls.borrow().is_empty());
         assert!(clock.recent.borrow().contains(&SegmentId(0)));
     }
+
     /// Scoring completes before mutation; mapping budgets, freeze, leases and
     /// generation authority remain enforced even when the cheapest slot is busy.
     #[test]
@@ -1431,6 +1527,7 @@ mod clock_tests {
         assert_eq!(segments.free_count(), 1);
         assert_eq!(segments.snapshot()[1].generation, Generation(2));
     }
+
     /// A score callback never turns a soft preference into immunity or a full scan.
     #[test]
     fn scored_eviction_caps_candidates_and_evicts_maximum_scores() {
@@ -1452,6 +1549,7 @@ mod clock_tests {
         assert_eq!(segments.free_count(), 1);
         assert_eq!(clock.hand.get(), 64);
     }
+
     /// Pending leased victims count toward reserve even outside the next sample.
     #[test]
     fn scored_eviction_never_overshoots_reserve_with_multiple_leased_victims() {
@@ -1481,6 +1579,7 @@ mod clock_tests {
     fn removal_contract_violations_return_errors_without_panicking() {
         /// An intentionally broken callback that over-reports every removal.
         struct InvalidEntries;
+
         impl SegmentEntries for InvalidEntries {
             /// Violate the caller contract to test error handling.
             fn remove_bounded(&self, _: SegmentId, budget: usize) -> usize {
