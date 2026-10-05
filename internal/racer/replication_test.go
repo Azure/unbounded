@@ -128,6 +128,7 @@ func TestReplicaObservationsFailClosed(t *testing.T) {
 	r.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
 		return errors.New("offline")
 	}})
+	r.authority.reader = r.APIReader
 	r.observe(f.ctx)
 
 	if f.a.Server.Ready(nil) != nil {
@@ -135,6 +136,7 @@ func TestReplicaObservationsFailClosed(t *testing.T) {
 	}
 
 	r.APIReader = f.a.Topology.APIReader
+	r.authority.reader = r.APIReader
 
 	cm, _, err := readVersion(f.ctx, r.APIReader, r.Config)
 	if err != nil {
@@ -212,6 +214,7 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 
 		return nil
 	}})
+	r.authority.client = r.Client
 
 	for _, unchanged := range []bool{false, true} {
 		for _, fail := range []bool{false, true} {

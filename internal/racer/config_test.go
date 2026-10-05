@@ -22,6 +22,9 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 		t.Run(boundary, func(t *testing.T) {
 			f := newServingFixture(t)
 			s := f.a.Server
+			// Exercise the legacy direct-construction adapter rather than the
+			// immutable operation owner created by Assemble.
+			s.authority = nil
 			// The fixture issued its own test certificate. Replace dependencies
 			// with unused direct constructions so no first request can mask a
 			// missing serving-boundary freeze.

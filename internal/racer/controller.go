@@ -46,6 +46,7 @@ import (
 )
 
 type Application struct {
+	authority   *Authority
 	Topology    *TopologyReconciler
 	Keyring     *KeyringReconciler
 	Server      *Server
@@ -58,36 +59,20 @@ type Application struct {
 // reader must bypass the cache for authorization and durable-state validation.
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	cfg = cfg.effective()
-	publications := NewPublications()
-	publications.maxAge = cfg.SnapshotMaxAge
+	authority := NewAuthority(cfg, c, reader)
+	publications := authority.publications
 	lifecycle := newLifecycle(publications)
-	trust := &Trust{maxAge: cfg.SnapshotMaxAge}
-	issuer := &Issuer{APIReader: reader, Config: cfg, Trust: trust}
-	bootstrap := &Bootstrap{Client: c, APIReader: reader, Config: cfg, Issuer: issuer}
-	// Serialize credential admission/pruning with topology's authoritative read
-	// and publication commit. Informer ordering alone cannot provide this gate.
-	catalogGate := newCatalogGate()
-	issuer.CatalogGate = catalogGate
-	replication := &Replication{Config: cfg, Client: c, APIReader: reader, Publications: publications, Trust: trust, CatalogGate: catalogGate}
+	lifecycle.authority = authority
+	trust := authority.trust
+	bootstrap := authority.bootstrap
+	replication := &Replication{Config: cfg, Client: c, APIReader: reader, Publications: publications, Trust: trust, CatalogGate: authority.gate, authority: authority}
 
 	return &Application{
-		Topology: &TopologyReconciler{
-			Client:       c,
-			APIReader:    reader,
-			Config:       cfg,
-			Publications: publications,
-			Accepted:     make(AcceptedMembers),
-			CatalogGate:  catalogGate,
-			Trust:        trust,
-		},
-		Keyring: &KeyringReconciler{
-			Client:      c,
-			APIReader:   reader,
-			Config:      cfg,
-			CatalogGate: catalogGate,
-			Trust:       trust,
-		},
+		authority: authority,
+		Topology:  authority.publisher,
+		Keyring:   authority.credentials,
 		Server: &Server{
+			authority:    authority,
 			Config:       cfg,
 			Trust:        trust,
 			Bootstrap:    bootstrap,
@@ -195,28 +180,7 @@ func Run(ctx context.Context, cfg Config) error {
 // The writer need not have a running cache; all reads use the authoritative reader
 // supplied to Assemble. Constructors and recovery never grant serving authority.
 func (a *Application) Recover(ctx context.Context, writer client.Writer) error {
-	// Bound the entire guard, including the first authoritative read and writes.
-	// Leave room for the five-second competing-installer wait; an earlier caller
-	// deadline or cancellation still wins.
-	const startupTimeout = 30 * time.Second
-
-	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
-	defer cancel()
-
-	cfg, reader := a.Topology.runtimeConfig(), a.Topology.APIReader
-	if err := cfg.Validate(); err != nil {
-		return err
-	}
-
-	if err := ensureInstalled(ctx, writer, reader, cfg); err != nil {
-		return fmt.Errorf("ensure Racer installation: %w", err)
-	}
-
-	if _, _, err := readVersion(ctx, reader, cfg); err != nil {
-		return fmt.Errorf("recover Racer installation: %w", err)
-	}
-
-	return nil
+	return a.authority.Recover(ctx, writer)
 }
 
 func managerOptions(cfg Config, scheme *runtime.Scheme) ctrl.Options {
@@ -446,6 +410,7 @@ func (c Config) validateReplication() error {
 
 // Lifecycle owns process serving, independently of the leader-owned publishers.
 type Lifecycle struct {
+	authority        *Authority
 	mu               sync.Mutex
 	process          context.Context
 	synced           bool
@@ -494,7 +459,11 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	}
 
 	l.process = ctx
-	l.publications.bindProcess(ctx)
+	if l.authority != nil {
+		l.authority.BindProcess(ctx)
+	} else {
+		l.publications.bindProcess(ctx)
+	}
 	l.mu.Unlock()
 
 	defer func() {
@@ -532,6 +501,10 @@ func (l *Lifecycle) Ready(_ *http.Request) error {
 
 	if l.process == nil || l.process.Err() != nil || !l.synced || !l.serving {
 		return wire.Unavailable
+	}
+
+	if l.authority != nil {
+		return l.authority.PublicationReady()
 	}
 
 	return l.publications.Ready(nil)

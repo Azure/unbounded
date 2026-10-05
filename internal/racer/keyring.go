@@ -32,7 +32,8 @@ import (
 )
 
 type KeyringReconciler struct {
-	settings frozenConfig
+	authority *Authority
+	settings  frozenConfig
 	client.Client
 	APIReader   client.Reader
 	Config      Config
@@ -47,11 +48,32 @@ func (r *KeyringReconciler) runtimeConfig() Config { return r.settings.get(&r.Co
 // stages trust before using a new issuer, and returns RequeueAfter for deadlines.
 // Enforce projected size bounds including overlapping keys before committing.
 func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	if r.CatalogGate != nil {
-		if err := r.CatalogGate.Acquire(ctx); err != nil {
-			return ctrl.Result{}, reconcile.TerminalError(err)
+	a := r.authority
+	if a == nil {
+		a = &Authority{credentials: r, gate: r.CatalogGate}
+	}
+
+	delay, err := a.ReconcileCredentials(ctx)
+	if ctx.Err() != nil {
+		return ctrl.Result{}, reconcile.TerminalError(ctx.Err())
+	}
+
+	if apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err) {
+		return ctrl.Result{RequeueAfter: retryConflictDelay}, nil
+	}
+
+	return ctrl.Result{RequeueAfter: delay}, err
+}
+
+// ReconcileCredentials completes authoritative post-write signing validation
+// before releasing admission. Scheduling and conflict retries belong to root.
+func (a *Authority) ReconcileCredentials(ctx context.Context) (time.Duration, error) {
+	r := a.credentials
+	if a.gate != nil {
+		if err := a.gate.Acquire(ctx); err != nil {
+			return 0, err
 		}
-		defer r.CatalogGate.Release()
+		defer a.gate.Release()
 	}
 
 	result, err := r.reconcileKeys(ctx)
@@ -78,16 +100,7 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 		r.Trust.invalidate()
 	}
 
-	// A dependency's own deadline is retryable while leadership is still live.
-	if ctx.Err() != nil {
-		return ctrl.Result{}, reconcile.TerminalError(err)
-	}
-
-	if apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err) {
-		return ctrl.Result{RequeueAfter: retryConflictDelay}, nil
-	}
-
-	return result, err
+	return result.RequeueAfter, err
 }
 
 func (r *KeyringReconciler) SetupWithManager(mgr ctrl.Manager) error {

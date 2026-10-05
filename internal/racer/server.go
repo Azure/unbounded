@@ -24,6 +24,7 @@ import (
 )
 
 type Server struct {
+	authority *Authority
 	// Config is construction input; runtime settings are frozen on first use.
 	Config             Config
 	config             Config
@@ -99,7 +100,7 @@ func (s *Server) tlsConfigWithCertificate(ctx context.Context, certificate func(
 		}
 		defer release(s.authSlots)
 
-		roots, err := s.Trust.pool()
+		roots, err := s.servingAuthority().TrustPool()
 		if err != nil {
 			// Replication uses a bearer token, not a dataplane certificate. Allow
 			// TLS startup before issuer trust exists to avoid bootstrap deadlock.
@@ -299,7 +300,7 @@ func (s *Server) Ready(r *http.Request) error {
 		return wire.Unavailable
 	}
 
-	if _, err := s.Trust.pool(); err != nil {
+	if err := s.servingAuthority().TrustReady(); err != nil {
 		return err
 	}
 
@@ -413,7 +414,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	trustCtx, cancelTrust, err := s.Trust.writeContext(ctx)
+	trustCtx, cancelTrust, err := s.servingAuthority().TrustContext(ctx)
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -427,7 +428,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 
 	responseControl(http.NewResponseController(w).SetWriteDeadline(trustDeadline))
 
-	encoded, err := s.Bootstrap.Enroll(trustCtx, r, request)
+	encoded, err := s.servingAuthority().Enroll(trustCtx, r, request)
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -463,7 +464,7 @@ func (s *Server) authenticateSnapshot(ctx context.Context, state *tls.Connection
 	ctx, cancel := context.WithTimeout(ctx, s.config.Limits.WriteTimeout)
 	defer cancel()
 
-	return AuthenticateCertificate(ctx, s.Trust, s.config, state)
+	return s.servingAuthority().AuthenticateCertificate(ctx, state)
 }
 
 func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -492,7 +493,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	// fresh bounded write window, capped by the verified chain's expiration.
 	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.expires, time.Now().Add(wire.PollWait+s.config.Limits.WriteTimeout))))
 
-	publication, err := s.Publications.Wait(ctx, identity, after)
+	publication, err := s.servingAuthority().Wait(ctx, identity, after)
 	if !time.Now().Before(identity.expires) {
 		err = wire.Unauthenticated
 	}
@@ -512,7 +513,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Revalidate local trust after waiting: rotation or observed invalidity must
 	// also take effect on pooled connections before returning snapshot bytes.
-	trustCtx, cancelTrust, err := s.Trust.writeContext(ctx)
+	trustCtx, cancelTrust, err := s.servingAuthority().TrustContext(ctx)
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -532,7 +533,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	image := publication
 	if image == nil {
-		image, err = s.Publications.Current()
+		image, err = s.servingAuthority().Current()
 		if err != nil {
 			writeFailure(w, err)
 			return
@@ -544,7 +545,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	// Keep the trust guard visible through the timeout child: context children
 	// otherwise observe authority revocation only after its cancellation callback.
-	writeCtx, cancelWrite, err := image.writeContext(authorityWriteContext{Context: boundedCtx, authority: trustCtx, parent: trustCtx})
+	writeCtx, cancelWrite, err := image.WriteContextWithTrust(boundedCtx, trustCtx)
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -568,7 +569,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if _, err := publication.ForBase(r.Header.Get(wire.DeltaHeader)).writeTo(writeCtx, w); err != nil {
+	if _, err := publication.ForBase(r.Header.Get(wire.DeltaHeader)).WriteTo(writeCtx, w); err != nil {
 		// A partial JSON response cannot be repaired with a protocol error.
 		panic(http.ErrAbortHandler)
 	}
@@ -780,7 +781,7 @@ func (s *Server) authenticateKeyring(r *http.Request) (NodeIdentity, error) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.Limits.WriteTimeout)
 	defer cancel()
 
-	return s.Bootstrap.Authenticate(ctx, r)
+	return s.servingAuthority().Authenticate(ctx, r)
 }
 
 func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
@@ -807,7 +808,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 
 	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.expires, time.Now().Add(wire.PollWait+2*s.config.Limits.WriteTimeout))))
 
-	bundle, err := s.Trust.waitKeyring(ctx, after)
+	bundle, err := s.servingAuthority().WaitKeyring(ctx, after)
 	if !time.Now().Before(identity.expires) {
 		err = wire.Unauthenticated
 	}
@@ -824,7 +825,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	trustCtx, cancelTrust, err := s.Trust.writeContext(ctx)
+	trustCtx, cancelTrust, err := s.servingAuthority().TrustContext(ctx)
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -833,7 +834,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 
 	ctx = trustCtx
 
-	accepted, _, err := s.Trust.keyring()
+	accepted, err := s.servingAuthority().Keyring()
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -859,14 +860,14 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 
 	// Authentication may have waited on the API. Do not deliver an old accepted
 	// encoding if reconciliation invalidated or replaced it in the meantime.
-	current, _, err := s.Trust.keyring()
+	current, err := s.servingAuthority().Keyring()
 	if err != nil || current != accepted || ctx.Err() != nil || s.Ready(r) != nil {
 		writeFailure(w, wire.Unavailable)
 		return
 	}
 
-	if bundle != nil || after != nil && current.generation > *after {
-		bundle = current
+	if bundle != nil || after != nil && current.Generation() > *after {
+		bundle = &current
 	}
 
 	if !take(s.writes) {
@@ -896,7 +897,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	// Copy in bounded chunks so cancellation is observed between writes without
 	// allocating a bundle-sized byte slice for each request.
-	if _, err := io.Copy(requestWriter{ctx: ctx, writer: w}, io.LimitReader(strings.NewReader(bundle.encoded), int64(len(bundle.encoded)))); err != nil {
+	if _, err := bundle.Response().WriteTo(ctx, w); err != nil {
 		panic(http.ErrAbortHandler)
 	}
 

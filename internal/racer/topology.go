@@ -6,6 +6,7 @@ package racer
 import (
 	"context"
 	"encoding/json"
+	"slices"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -24,14 +25,16 @@ import (
 )
 
 type TopologyReconciler struct {
-	settings frozenConfig
+	authority *Authority
+	settings  frozenConfig
 	client.Client
 	APIReader    client.Reader
 	Config       Config
 	Publications *Publications
-	Accepted     AcceptedMembers
-	CatalogGate  *CatalogGate
-	Trust        *Trust
+	// Accepted is a detached legacy test view, never production authority input.
+	Accepted    AcceptedMembers
+	CatalogGate *CatalogGate
+	Trust       *Trust
 }
 
 func (r *TopologyReconciler) runtimeConfig() Config { return r.settings.get(&r.Config) }
@@ -71,20 +74,55 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	return r.annotate(ctx, update)
 }
 
-type topologyUpdate struct {
-	nodes   corev1.NodeList
-	members AcceptedMembers
+// TopologyHints are detached recovery annotations returned after gate release.
+// Mutating them cannot advance the publisher's accepted history.
+type TopologyHints struct {
+	Nodes   corev1.NodeList
+	Members AcceptedMembers
 }
+
+type topologyUpdate = TopologyHints
 
 // publish protects authoritative reads, CAS, and local installation. Annotation
 // writes are recovery hints, not authority, and must not block trust observation.
 func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error) {
+	if r.authority != nil {
+		update, err := r.authority.PublishTopology(ctx, r.observeTopology)
+		if err == nil {
+			r.Accepted = cloneAccepted(update.Members)
+		}
+
+		return update, err
+	}
+	// Whitebox fixtures retain their explicit engines and accepted history.
+	a := &Authority{publisher: r, gate: r.CatalogGate, accepted: r.Accepted}
+
+	update, err := a.PublishTopology(ctx, r.observeTopology)
+	if err == nil {
+		r.Accepted = a.accepted
+	}
+
+	return update, err
+}
+
+// TopologyObservation contains discovery inputs, not accepted history or proofs.
+type TopologyObservation struct {
+	Nodes   corev1.NodeList
+	Input   membership.Input
+	Catalog []wire.CacheDefinition
+}
+
+// PublishTopology invokes discovery under its private gate. History advances only
+// after durable CAS and local installation; returned annotation hints are detached.
+func (a *Authority) PublishTopology(ctx context.Context, observe func(context.Context) (TopologyObservation, error)) (TopologyHints, error) {
+	r := a.publisher
 	cfg := r.runtimeConfig()
-	if r.CatalogGate != nil {
-		if err := r.CatalogGate.Acquire(ctx); err != nil {
+
+	if a.gate != nil {
+		if err := a.gate.Acquire(ctx); err != nil {
 			return topologyUpdate{}, err
 		}
-		defer r.CatalogGate.Release()
+		defer a.gate.Release()
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -97,20 +135,12 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 		return topologyUpdate{}, err
 	}
 
-	var nodes corev1.NodeList
-	if err := r.List(ctx, &nodes); err != nil {
-		return topologyUpdate{}, err
-	}
-
-	var caches racerv1.ClusterCacheList
-	if err := r.APIReader.List(ctx, &caches); err != nil {
-		return topologyUpdate{}, err
-	}
-
-	catalog, err := BuildCatalog(caches.Items)
+	observation, err := observe(ctx)
 	if err != nil {
 		return topologyUpdate{}, err
 	}
+
+	catalog := observation.Catalog
 
 	// The committed keyring is the admission authority. A cache event can arrive
 	// before its keys exist; only the subsequent Secret event may publish it.
@@ -124,7 +154,7 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 
 		keyed := keyedCaches(credentials.bundle)
 
-		accepted := catalog[:0]
+		accepted := make([]wire.CacheDefinition, 0, len(catalog))
 		for _, cache := range catalog {
 			if keyed[cache.ID] {
 				accepted = append(accepted, cache)
@@ -136,30 +166,7 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 		catalog = nil
 	}
 
-	ownership, err := readManagedWorkloadIdentities(ctx, r.APIReader, cfg)
-	if err != nil {
-		return topologyUpdate{}, err
-	}
-	// Indexed namespace-scoped queries avoid scanning unrelated Pods for each
-	// Node. Ownership is still verified against the current DaemonSet UID.
-	podsByNode := make(map[string][]corev1.Pod, len(nodes.Items))
-
-	for _, node := range nodes.Items {
-		if err := ctx.Err(); err != nil {
-			return topologyUpdate{}, err
-		}
-
-		var list corev1.PodList
-		if err := r.List(ctx, &list, client.InNamespace(cfg.Namespace), client.MatchingFields{podNodeIndex: node.Name}); err != nil {
-			return topologyUpdate{}, err
-		}
-
-		podsByNode[node.Name] = list.Items
-	}
-
-	result, err := membership.Reconcile(membership.Input{
-		Nodes: nodes.Items, PodsByNode: podsByNode, Ownership: ownership.observed(), PeerPort: cfg.PeerPort,
-	}, r.Accepted)
+	result, err := membership.Reconcile(observation.Input, a.accepted)
 	if err != nil {
 		return topologyUpdate{}, err
 	}
@@ -186,16 +193,70 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 		return topologyUpdate{}, err
 	}
 
-	r.Accepted = result.Members
+	a.accepted = result.Members
 
-	return topologyUpdate{nodes: nodes, members: result.Members}, nil
+	return TopologyHints{Nodes: *observation.Nodes.DeepCopy(), Members: cloneAccepted(result.Members)}, nil
+}
+
+func cloneAccepted(members AcceptedMembers) AcceptedMembers {
+	copy := make(AcceptedMembers, len(members))
+	for id, member := range members {
+		member.RDMANICs = slices.Clone(member.RDMANICs)
+		copy[id] = member
+	}
+
+	return copy
+}
+
+func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObservation, error) {
+	cfg := r.runtimeConfig()
+
+	var nodes corev1.NodeList
+	if err := r.List(ctx, &nodes); err != nil {
+		return TopologyObservation{}, err
+	}
+
+	var caches racerv1.ClusterCacheList
+	if err := r.APIReader.List(ctx, &caches); err != nil {
+		return TopologyObservation{}, err
+	}
+
+	catalog, err := BuildCatalog(caches.Items)
+	if err != nil {
+		return TopologyObservation{}, err
+	}
+
+	ownership, err := readManagedWorkloadIdentities(ctx, r.APIReader, cfg)
+	if err != nil {
+		return TopologyObservation{}, err
+	}
+	// Indexed namespace-scoped queries avoid scanning unrelated Pods for each
+	// Node. Ownership is still verified against the current DaemonSet UID.
+	podsByNode := make(map[string][]corev1.Pod, len(nodes.Items))
+
+	for _, node := range nodes.Items {
+		if err := ctx.Err(); err != nil {
+			return TopologyObservation{}, err
+		}
+
+		var list corev1.PodList
+		if err := r.List(ctx, &list, client.InNamespace(cfg.Namespace), client.MatchingFields{podNodeIndex: node.Name}); err != nil {
+			return TopologyObservation{}, err
+		}
+
+		podsByNode[node.Name] = list.Items
+	}
+
+	return TopologyObservation{Nodes: nodes, Catalog: catalog, Input: membership.Input{
+		Nodes: nodes.Items, PodsByNode: podsByNode, Ownership: ownership.observed(), PeerPort: cfg.PeerPort,
+	}}, nil
 }
 
 func (r *TopologyReconciler) annotate(ctx context.Context, update topologyUpdate) error {
-	for i := range update.nodes.Items {
-		node := &update.nodes.Items[i]
+	for i := range update.Nodes.Items {
+		node := &update.Nodes.Items[i]
 
-		member, ok := update.members[wire.NodeID(node.UID)]
+		member, ok := update.Members[wire.NodeID(node.UID)]
 		if !ok {
 			if _, excluded := node.Labels[wire.ExclusionLabel]; excluded && node.Annotations[admittedMemberAnnotation] != "" {
 				before := node.DeepCopy()

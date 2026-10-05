@@ -237,6 +237,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 
 		return nil
 	}})
+	leader.a.authority.client = leader.a.Replication.Client
 
 	// Initial publisher installation uses the same canonical/durable validation.
 	image, err := wire.DecodePublication(strings.NewReader(base.encoded))

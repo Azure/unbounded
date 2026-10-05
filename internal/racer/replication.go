@@ -34,6 +34,7 @@ const (
 // Replication observes durable authority on every replica. No request from a
 // dataplane performs these reads. Only the elected publisher supplies image bytes.
 type Replication struct {
+	authority    *Authority
 	settings     frozenConfig
 	Config       Config
 	Client       client.Client
@@ -124,39 +125,61 @@ func replicationSleep(ctx context.Context, delay time.Duration) bool {
 }
 
 func (r *Replication) observe(ctx context.Context) {
-	if err := r.CatalogGate.Acquire(ctx); err != nil {
-		return
+	if err := r.operationAuthority().Observe(ctx); err != nil && ctx.Err() == nil {
+		ctrl.LoggerFrom(ctx).V(1).Info("authority observation retry", "error", err)
 	}
-	defer r.CatalogGate.Release()
+}
 
-	state, err := loadSigning(ctx, r.APIReader, r.runtimeConfig(), time.Now())
+func (r *Replication) operationAuthority() *Authority {
+	if r.authority != nil {
+		return r.authority
+	}
+
+	return &Authority{config: r.runtimeConfig(), client: r.Client, reader: r.APIReader, gate: r.CatalogGate, trust: r.Trust, publications: r.Publications}
+}
+
+// Observe refreshes local serving authority without network replication.
+func (a *Authority) Observe(ctx context.Context) error {
+	if err := a.gate.Acquire(ctx); err != nil {
+		return err
+	}
+	defer a.gate.Release()
+
+	state, err := loadSigning(ctx, a.reader, a.config, time.Now())
 	if err == nil {
-		err = r.Trust.install(ctx, state.roots, state.bundle)
+		err = a.trust.install(ctx, state.roots, state.bundle)
 	}
 
 	if err == nil {
-		_, record, readErr := readVersion(ctx, r.APIReader, r.runtimeConfig())
+		_, record, readErr := readVersion(ctx, a.reader, a.config)
 
 		err = readErr
 		if err == nil {
-			err = r.Publications.confirm(record)
+			err = a.publications.confirm(record)
 		}
 	}
 
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return
+		return err
 	}
 
 	if shouldInvalidateTrust(err) {
-		r.Trust.invalidate()
-		r.Publications.Suspend()
+		a.trust.invalidate()
+		a.publications.Suspend()
 	}
+
+	return err
 }
 
 // installReplica is the alternate proof to publisher CAS: bounded canonical
 // decoding plus exact authoritative durable confirmation, never a trusted hash
 // supplied by the remote peer. No blob is persisted.
 func (r *Replication) installReplica(ctx, process context.Context, image wire.Publication) error {
+	return r.operationAuthority().AcceptReplica(ctx, process, image)
+}
+
+// AcceptReplica installs only canonical bytes matching authoritative durable state.
+func (a *Authority) AcceptReplica(ctx, process context.Context, image wire.Publication) error {
 	encoded, err := wire.EncodePublication(image)
 	if err != nil {
 		return err
@@ -169,23 +192,23 @@ func (r *Replication) installReplica(ctx, process context.Context, image wire.Pu
 
 	want := VersionRecord{Cluster: image.Cluster, Sequence: image.Sequence, MembershipVersion: image.MembershipVersion, ContentHash: content, MembershipHash: membership}
 
-	if err := r.CatalogGate.Acquire(ctx); err != nil {
+	if err := a.gate.Acquire(ctx); err != nil {
 		return err
 	}
-	defer r.CatalogGate.Release()
+	defer a.gate.Release()
 
-	_, record, err := readVersion(ctx, r.APIReader, r.runtimeConfig())
+	_, record, err := readVersion(ctx, a.reader, a.config)
 	if err != nil {
 		if shouldInvalidateTrust(err) {
-			r.Publications.Suspend()
-			r.Trust.invalidate()
+			a.publications.Suspend()
+			a.trust.invalidate()
 		}
 
 		return err
 	}
 
-	if err := r.Publications.confirm(record); err != nil {
-		r.Publications.Suspend()
+	if err := a.publications.confirm(record); err != nil {
+		a.publications.Suspend()
 		return err
 	}
 
@@ -193,7 +216,7 @@ func (r *Replication) installReplica(ctx, process context.Context, image wire.Pu
 		return wire.Unavailable
 	} // Publisher advanced during transfer; retry.
 
-	return r.Publications.Install(&CommittedPublication{owner: r.Publications, record: record, encoded: string(encoded), leadership: process})
+	return a.publications.Install(&CommittedPublication{owner: a.publications, record: record, encoded: string(encoded), leadership: process})
 }
 
 func (r *Replication) leaderAddress(ctx context.Context) (string, error) {
@@ -224,7 +247,11 @@ func (r *Replication) leaderAddress(ctx context.Context) (string, error) {
 }
 
 func (r *Replication) controllerPod(pod *corev1.Pod) bool {
-	return pod.Namespace == r.runtimeConfig().Namespace && pod.UID != "" && pod.DeletionTimestamp == nil && pod.Spec.ServiceAccountName == r.runtimeConfig().ControllerServiceAccount && pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded
+	return controllerPod(r.runtimeConfig(), pod)
+}
+
+func controllerPod(cfg Config, pod *corev1.Pod) bool {
+	return pod.Namespace == cfg.Namespace && pod.UID != "" && pod.DeletionTimestamp == nil && pod.Spec.ServiceAccountName == cfg.ControllerServiceAccount && pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded
 }
 
 func (r *Replication) poll(ctx, process context.Context) error {
@@ -254,8 +281,8 @@ func (r *Replication) poll(ctx, process context.Context) error {
 	httpClient := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 	path := "https://" + address + replicationPath
-	if current, err := r.Publications.Current(); err == nil {
-		path += "?after=" + strconv.FormatUint(uint64(current.record.Sequence), 10)
+	if current, err := r.operationAuthority().Current(); err == nil {
+		path += "?after=" + strconv.FormatUint(uint64(current.Sequence()), 10)
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
@@ -293,41 +320,55 @@ func (r *Replication) poll(ctx, process context.Context) error {
 }
 
 func (r *Replication) authenticate(ctx context.Context, request *http.Request) (string, time.Time, error) {
-	status, token, err := reviewBearer(ctx, r.Client, request, ReplicationAudience, 0)
+	identity, err := r.operationAuthority().AuthenticateReplica(ctx, request)
+	return identity.UID(), identity.Expires(), err
+}
+
+// ReplicaIdentity is verified output, never a caller-supplied authorization fact.
+type ReplicaIdentity struct {
+	uid     string
+	expires time.Time
+}
+
+func (i ReplicaIdentity) UID() string        { return i.uid }
+func (i ReplicaIdentity) Expires() time.Time { return i.expires }
+
+func (a *Authority) AuthenticateReplica(ctx context.Context, request *http.Request) (ReplicaIdentity, error) {
+	status, token, err := reviewBearer(ctx, a.client, request, ReplicationAudience, 0)
 	if err != nil {
-		return "", time.Time{}, err
+		return ReplicaIdentity{}, err
 	}
 
-	if status.User.Username != "system:serviceaccount:"+r.runtimeConfig().Namespace+":"+r.runtimeConfig().ControllerServiceAccount {
-		return "", time.Time{}, wire.Forbidden
+	if status.User.Username != "system:serviceaccount:"+a.config.Namespace+":"+a.config.ControllerServiceAccount {
+		return ReplicaIdentity{}, wire.Forbidden
 	}
 
 	name, uid := singleExtra(status.User, "pod-name"), singleExtra(status.User, "pod-uid")
 	if name == "" || uid == "" || status.User.UID == "" {
-		return "", time.Time{}, wire.Unauthenticated
+		return ReplicaIdentity{}, wire.Unauthenticated
 	}
 
 	var pod corev1.Pod
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.runtimeConfig().Namespace, Name: name}, &pod); err != nil {
-		return "", time.Time{}, authorizationError(err)
+	if err := a.reader.Get(ctx, client.ObjectKey{Namespace: a.config.Namespace, Name: name}, &pod); err != nil {
+		return ReplicaIdentity{}, authorizationError(err)
 	}
 
-	if !r.controllerPod(&pod) || string(pod.UID) != uid {
-		return "", time.Time{}, wire.Forbidden
+	if !controllerPod(a.config, &pod) || string(pod.UID) != uid {
+		return ReplicaIdentity{}, wire.Forbidden
 	}
 
 	var sa corev1.ServiceAccount
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.runtimeConfig().Namespace, Name: r.runtimeConfig().ControllerServiceAccount}, &sa); err != nil {
-		return "", time.Time{}, authorizationError(err)
+	if err := a.reader.Get(ctx, client.ObjectKey{Namespace: a.config.Namespace, Name: a.config.ControllerServiceAccount}, &sa); err != nil {
+		return ReplicaIdentity{}, authorizationError(err)
 	}
 
 	if string(sa.UID) != status.User.UID || sa.DeletionTimestamp != nil {
-		return "", time.Time{}, wire.Forbidden
+		return ReplicaIdentity{}, wire.Forbidden
 	}
 
 	expires, err := tokenExpiration(token)
 
-	return uid, expires, err
+	return ReplicaIdentity{uid: uid, expires: expires}, err
 }
 
 func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) {
@@ -379,13 +420,13 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 
 	responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(r.interval() + s.config.Limits.WriteTimeout)))
 
-	var publication *CommittedPublication
+	var publication *PublicationHandle
 
 	for {
 		var changed <-chan struct{}
 
-		publication, changed, err = s.Publications.CurrentAndSubscribe()
-		if err != nil || after == nil || publication.record.Sequence > *after {
+		publication, changed, err = s.servingAuthority().CurrentAndSubscribe()
+		if err != nil || after == nil || publication.Sequence() > *after {
 			break
 		}
 
@@ -407,7 +448,7 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 
 	unchanged := errors.Is(err, context.DeadlineExceeded)
 	if unchanged {
-		publication, err = s.Publications.Current()
+		publication, err = s.servingAuthority().Current()
 	}
 
 	if err != nil {
@@ -427,7 +468,7 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 	stopLeader := context.AfterFunc(leader, stopWrite)
 	defer stopLeader()
 
-	writeCtx, stopAuthority, err := publication.writeContext(windowCtx)
+	writeCtx, stopAuthority, err := publication.WriteContext(windowCtx)
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -450,7 +491,7 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 		return
 	}
 
-	if _, err := publication.ForBase("").writeTo(writeCtx, w); err != nil {
+	if _, err := publication.ForBase("").WriteTo(writeCtx, w); err != nil {
 		panic(http.ErrAbortHandler)
 	}
 
