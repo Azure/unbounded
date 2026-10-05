@@ -6,7 +6,7 @@ use std::{future::Future, num::NonZeroU32, task::Context};
 
 use topology::{Error, Maintenance, Member, Membership, PathQuery, Paths, Placement};
 
-/// Test member with a 4-byte ID.
+/// Test member with a 2-byte ID.
 #[derive(Clone, Debug)]
 struct Node([u8; 2]);
 
