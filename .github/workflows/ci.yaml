@@ -9,10 +9,8 @@ on:
       # Main is validated before merge by pull_request and merge_group.
       # Keep push validation for supported release branches.
       - release-*
-  pull_request:
-    branches:
-      - main
-      - release-*
+  # Validate stacked PRs as well as PRs targeting main and release branches.
+  pull_request: {}
   merge_group:
     types:
       - checks_requested
