@@ -228,6 +228,18 @@ impl DriverQueue {
                 operation,
                 wake: Runnable::new(),
             }));
+        // Ownership follows the queue's turn, not its task polling budget. Snapshot
+        // handles first: registering can clone/drop/wake caller wakers that reenter
+        // the queue, so no driver-table borrow may span registration.
+        let wakes: Vec<_> = self
+            .drivers
+            .borrow()
+            .iter()
+            .map(|driver| driver.wake.clone())
+            .collect();
+        for wake in wakes {
+            wake.owner.register(cx.waker());
+        }
         let turns = budget.min(self.drivers.borrow().len());
         for _ in 0..turns {
             let Some(driver) = self.drivers.borrow_mut().pop_front() else {
@@ -931,6 +943,108 @@ mod tests {
         assert_eq!(polls.get(), 2);
         queue.simulation_crash();
         assert_eq!(queue.pending(), 0);
+    }
+
+    /// Transfer every sleeping task's wake destination without spending polling budget.
+    fn assert_sleeping_owner_transfer(budget: usize) {
+        let queue = Rc::new(DriverQueue::new(2));
+        let _owner = queue.enter();
+        let polls = Rc::new([Cell::new(0), Cell::new(0)]);
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        for index in 0..2 {
+            let polls = polls.clone();
+            let saved = saved.clone();
+            spawn(Box::pin(std::future::poll_fn(move |cx| {
+                polls[index].set(polls[index].get() + 1);
+                saved.borrow_mut().push(cx.waker().clone());
+                Poll::Pending
+            })))
+            .unwrap();
+        }
+        let first = Arc::new(WakeCount::default());
+        let second = Arc::new(WakeCount::default());
+        let w1 = Waker::from(first.clone());
+        let w2 = Waker::from(second.clone());
+        queue.poll(&mut Context::from_waker(&w1), 2);
+        queue.poll(&mut Context::from_waker(&w2), budget);
+        assert_eq!([polls[0].get(), polls[1].get()], [1, 1]);
+        assert_eq!(first.count(), 0);
+        assert_eq!(second.count(), 0);
+
+        // The second sleeper is outside either transfer budget. Its saved waker
+        // must remain Send and notify B even though its future last polled under A.
+        let wake = saved.borrow()[1].clone();
+        std::thread::spawn(move || wake.wake()).join().unwrap();
+        assert_eq!(first.count(), 0);
+        assert_eq!(second.count(), 1);
+        queue.poll(&mut Context::from_waker(&w2), 2);
+        assert_eq!([polls[0].get(), polls[1].get()], [1, 2]);
+        assert_eq!(queue.pending(), 2);
+    }
+
+    /// A reduced budget cannot strand a sleeper with the retired polling owner.
+    #[test]
+    fn owner_transfer_refreshes_sleepers_outside_poll_budget() {
+        assert_sleeping_owner_transfer(1);
+    }
+
+    /// A zero-budget turn transfers wake ownership without polling any task.
+    #[test]
+    fn zero_budget_transfers_sleeping_task_owners() {
+        assert_sleeping_owner_transfer(0);
+    }
+
+    /// Owner registration callbacks may reenter without queue borrows or nested turns.
+    #[test]
+    fn owner_refresh_callbacks_run_outside_queue_borrows() {
+        use std::task::{RawWaker, RawWakerVTable};
+
+        /// Inspect and reenter the selected queue from arbitrary waker callbacks.
+        fn reenter() {
+            let queue = current().unwrap();
+            assert!(queue.drivers.try_borrow_mut().is_ok());
+            assert!(queue.new.try_borrow_mut().is_ok());
+            assert!(queue.owner.try_borrow_mut().is_ok());
+            drop(reserve().unwrap());
+            assert!(queue.polling.get());
+            queue.poll(&mut Context::from_waker(Waker::noop()), 0);
+        }
+
+        /// Cloning a stateless waker invokes caller code during registration.
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            reenter();
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+
+        /// Waking or retiring a stateless waker can also reenter the queue.
+        unsafe fn callback(_: *const ()) {
+            reenter();
+        }
+
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, callback, callback, callback);
+
+        let queue = Rc::new(DriverQueue::new(3));
+        let _owner = queue.enter();
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        for _ in 0..2 {
+            let saved = saved.clone();
+            spawn(Box::pin(std::future::poll_fn(move |cx| {
+                saved.borrow_mut().push(cx.waker().clone());
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            })))
+            .unwrap();
+        }
+        // SAFETY: callbacks use no raw data and access only this thread's selected
+        // queue. The stateless waker owns no allocation and can be cloned freely.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        queue.poll(&mut Context::from_waker(&waker), 2);
+        queue.poll(&mut Context::from_waker(&waker), 0);
+        queue.poll(&mut Context::from_waker(Waker::noop()), 0);
+        // Drop the caller's copy within a turn as well, matching the fixture's
+        // callback assertions without leaving a raw waker in any sleeping task.
+        let _turn = Busy::try_enter(&queue.polling).unwrap();
+        drop(waker);
     }
 
     /// Permits keep their original worker and children wait for its next polling turn.
