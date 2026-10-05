@@ -51,80 +51,6 @@ use std::{
     },
     task::{Context, Poll},
 };
-#[repr(align(64))]
-struct Cursor(AtomicUsize);
-struct Shared<T> {
-    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
-    head: Cursor,
-    tail: Cursor,
-    sender_closed: AtomicBool,
-    receiver_closed: AtomicBool,
-    readable: AtomicWaker,
-    writable: AtomicWaker,
-}
-fn advance(cursor: usize, capacity: usize) -> usize {
-    if cursor + 1 == capacity * 2 {
-        0
-    } else {
-        cursor + 1
-    }
-}
-fn distance(tail: usize, head: usize, capacity: usize) -> usize {
-    if tail >= head {
-        tail - head
-    } else {
-        capacity * 2 - head + tail
-    }
-}
-fn slot_index(cursor: usize, capacity: usize) -> usize {
-    debug_assert!(cursor < capacity * 2);
-    if cursor >= capacity {
-        cursor - capacity
-    } else {
-        cursor
-    }
-}
-fn is_full(tail: usize, head: usize, capacity: usize) -> bool {
-    // In [0, 2*capacity), equal slot indices mean equal cursors or cursors
-    // exactly capacity apart. Excluding equality distinguishes full from empty.
-    tail != head && slot_index(tail, capacity) == slot_index(head, capacity)
-}
-// SAFETY: endpoints are unique (not Clone), non-Sync, and expose no slot references.
-// Only the sender writes unpublished slots; only the receiver moves out published
-// slots until receiver_closed is acquired. Release/acquire tail publication makes
-// initialization visible to the receiver; release/acquire head publication makes
-// completed reads visible before slot reuse. Cursor distance is at most capacity.
-// Modulo 2*capacity distinguishes empty from full, including non-power-of-two
-// capacities. bounded checks also ensure cursor arithmetic cannot overflow.
-//
-// Once receiver_closed is acquired, only the sender may drain the remaining slots.
-// Endpoint methods invoke arbitrary code (wakers or destructors) only outside the
-// slot access/cursor publication interval. Reentrant calls therefore observe the
-// authoritative owner cursors and already-updated conservative peer caches, never
-// an outstanding reference or partially moved value. No cache is restored after
-// arbitrary code: nested operations may have advanced it through a complete wrap.
-// T: Send suffices because ownership, not a shared reference to T, crosses threads.
-unsafe impl<T: Send> Sync for Shared<T> {}
-// SAFETY: same ownership-transfer invariant as above. Final Arc destruction has
-// exclusive access to Shared, with no surviving endpoints or in-flight operations.
-unsafe impl<T: Send> Send for Shared<T> {}
-impl<T> Drop for Shared<T> {
-    fn drop(&mut self) {
-        let mut head = *self.head.0.get_mut();
-        let tail = *self.tail.0.get_mut();
-        while head != tail {
-            // SAFETY: the last Arc owns all slots in [head, tail). No endpoint can
-            // reenter this Shared, and each initialized slot is visited once. If a
-            // destructor panics, remaining MaybeUninit slots may leak, not redrop.
-            unsafe {
-                self.slots[slot_index(head, self.slots.len())]
-                    .get_mut()
-                    .assume_init_drop();
-            }
-            head = advance(head, self.slots.len());
-        }
-    }
-}
 /// The unique producer. Non-Sync also prevents concurrent calls through `&self`.
 pub struct Sender<T> {
     shared: Arc<Shared<T>>,
@@ -138,10 +64,15 @@ pub struct Receiver<T> {
     // A stale tail only underestimates availability. Refresh at cached empty.
     cached_tail: Cell<usize>,
 }
+/// Rejected publication, returning the original value to its caller.
 pub struct SendFailure<T> {
+    /// Value whose ownership was not transferred.
     pub command: T,
+    /// Saturation or closure that prevented publication.
     pub error: Error,
 }
+/// Allocate a fixed-capacity queue with one non-cloneable endpoint per direction.
+/// Zero or overflowing capacities are invalid; allocation failure is overload.
 pub fn bounded<T>(capacity: usize) -> Result<(Sender<T>, Receiver<T>)> {
     if capacity == 0 || capacity > isize::MAX as usize / std::mem::size_of::<T>().max(1) {
         return Err(Error::InvalidConfiguration);
@@ -320,6 +251,7 @@ impl<T> Drop for Sender<T> {
     }
 }
 impl<T> Receiver<T> {
+    /// Whether the producer closed publication; queued values may remain readable.
     pub fn is_closed(&self) -> bool {
         self.shared.sender_closed.load(Ordering::Acquire)
     }
@@ -329,11 +261,12 @@ impl<T> Receiver<T> {
     pub fn register(&self, waker: &std::task::Waker) {
         self.shared.readable.register(waker);
     }
+    /// Take one value without waiting; `None` means currently empty, not necessarily EOF.
     pub fn receive(&mut self) -> Result<Option<T>> {
         self.receive_shared()
     }
-    // Shared access is safe because Receiver is non-Sync, and ownership/cursors
-    // are transferred before invoking any caller waker. Reentry sees the new head.
+    /// Receive for a local facade that cannot expose an exclusive endpoint borrow.
+    /// Non-Sync access and publication before callbacks keep reentry ownership-safe.
     pub(crate) fn receive_shared(&self) -> Result<Option<T>> {
         let head = self.shared.head.0.load(Ordering::Relaxed);
         let capacity = self.shared.slots.len();
@@ -364,6 +297,7 @@ impl<T> Receiver<T> {
     pub fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
         self.poll_receive_shared(cx)
     }
+    /// Poll for a local facade obeying the same single-waiter contract as the endpoint.
     pub(crate) fn poll_receive_shared(&self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
         // Internal shared callers must obey the same single-waiter contract.
         self.shared.readable.register(cx.waker());
@@ -384,6 +318,91 @@ impl<T> Drop for Receiver<T> {
         self.shared.writable.wake();
     }
 }
+/// Cache-line-separated ownership cursor, independent of endpoint layout.
+#[repr(align(64))]
+struct Cursor(AtomicUsize);
+
+/// Ring storage whose initialized slots belong to exactly one endpoint at a time.
+struct Shared<T> {
+    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    head: Cursor,
+    tail: Cursor,
+    sender_closed: AtomicBool,
+    receiver_closed: AtomicBool,
+    readable: AtomicWaker,
+    writable: AtomicWaker,
+}
+
+// SAFETY: endpoints are unique (not Clone), non-Sync, and expose no slot references.
+// Only the sender writes unpublished slots; only the receiver moves out published
+// slots until receiver_closed is acquired. Release/acquire tail publication makes
+// initialization visible to the receiver; release/acquire head publication makes
+// completed reads visible before slot reuse. Cursor distance is at most capacity.
+// Modulo 2*capacity distinguishes empty from full, including non-power-of-two
+// capacities. bounded checks also ensure cursor arithmetic cannot overflow.
+//
+// Once receiver_closed is acquired, only the sender may drain the remaining slots.
+// Endpoint methods invoke arbitrary code (wakers or destructors) only outside the
+// slot access/cursor publication interval. Reentrant calls therefore observe the
+// authoritative owner cursors and already-updated conservative peer caches, never
+// an outstanding reference or partially moved value. No cache is restored after
+// arbitrary code: nested operations may have advanced it through a complete wrap.
+// T: Send suffices because ownership, not a shared reference to T, crosses threads.
+unsafe impl<T: Send> Sync for Shared<T> {}
+// SAFETY: same ownership-transfer invariant as above. Final Arc destruction has
+// exclusive access to Shared, with no surviving endpoints or in-flight operations.
+unsafe impl<T: Send> Send for Shared<T> {}
+impl<T> Drop for Shared<T> {
+    fn drop(&mut self) {
+        let mut head = *self.head.0.get_mut();
+        let tail = *self.tail.0.get_mut();
+        while head != tail {
+            // SAFETY: the last Arc owns all slots in [head, tail). No endpoint can
+            // reenter this Shared, and each initialized slot is visited once. If a
+            // destructor panics, remaining MaybeUninit slots may leak, not redrop.
+            unsafe {
+                self.slots[slot_index(head, self.slots.len())]
+                    .get_mut()
+                    .assume_init_drop();
+            }
+            head = advance(head, self.slots.len());
+        }
+    }
+}
+
+/// Advance through two laps so equal slots can distinguish full from empty.
+fn advance(cursor: usize, capacity: usize) -> usize {
+    if cursor + 1 == capacity * 2 {
+        0
+    } else {
+        cursor + 1
+    }
+}
+
+/// Count occupied slots using two-lap cursors and a conservative peer observation.
+fn distance(tail: usize, head: usize, capacity: usize) -> usize {
+    if tail >= head {
+        tail - head
+    } else {
+        capacity * 2 - head + tail
+    }
+}
+
+/// Map either cursor lap to its physical slot without requiring power-of-two capacity.
+fn slot_index(cursor: usize, capacity: usize) -> usize {
+    debug_assert!(cursor < capacity * 2);
+    if cursor >= capacity {
+        cursor - capacity
+    } else {
+        cursor
+    }
+}
+
+/// Recognize cursors exactly one capacity apart, excluding the empty equal case.
+fn is_full(tail: usize, head: usize, capacity: usize) -> bool {
+    tail != head && slot_index(tail, capacity) == slot_index(head, capacity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

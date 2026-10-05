@@ -3,7 +3,7 @@
 //! Fail closed: an unsuccessful ownership fence or an unexpected unwind of a
 //! live service aborts the process. Neither an error nor thread exit proves that
 //! external I/O stopped referencing storage. We never detach or drop such owners.
-use crate::{Error, Operation, Result, Scope, affinity};
+use crate::{Error, Operation, Result, Scope};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Condvar, Mutex, MutexGuard},
@@ -15,21 +15,30 @@ use std::{
 const IDLE_WAIT: Duration = Duration::from_millis(1);
 const WORK_BUDGET: usize = 64;
 
+/// One locally driven service and the CPU on which it is constructed.
 #[derive(Clone)]
 pub struct Lane {
+    /// OS thread name, without embedded NUL bytes.
     pub name: String,
+    /// Allowed logical CPU ID.
     pub cpu: usize,
 }
+/// A pinned thread that cooperatively drives helper services for several lanes.
 #[derive(Clone)]
 pub struct Helper {
+    /// OS thread name, without embedded NUL bytes.
     pub name: String,
+    /// Allowed logical CPU ID.
     pub cpu: usize,
     /// Lane indices in `Plan::lanes`. Each lane has at most one helper service.
     pub lanes: Vec<usize>,
 }
+/// Caller-selected placement and whole-process thread limit.
 #[derive(Clone)]
 pub struct Plan {
+    /// Services to run, with lane zero acting as coordinator.
     pub lanes: Vec<Lane>,
+    /// Optional helper threads and their lane assignments.
     pub helpers: Vec<Helper>,
     /// Whole-process execution budget including the external caller of `start`.
     /// `run` instead uses its caller as lane zero and consumes no extra slot.
@@ -39,7 +48,9 @@ pub struct Plan {
 /// Builds run on the pinned owner. Local services and futures need not be Send.
 /// A helper builds one service per associated lane and drives them cooperatively.
 pub trait Factory<S: Scope>: Sync {
+    /// Construct a lane service on its pinned owner thread.
     fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<S>>, S::Error>;
+    /// Construct a helper shard on the lane's assigned helper thread.
     fn build_helper(&self, _lane: usize) -> Result<Box<dyn Service<S>>, S::Error> {
         Err(Error::InvalidConfiguration.into())
     }
@@ -62,27 +73,36 @@ pub trait Service<S: Scope> {
     /// fail while it remains Pending. Reporting wakes group waiters and stops
     /// sibling admission without canceling teardown futures or ownership fences.
     fn set_failure_reporter(&mut self, _reporter: FailureReporter<S::Error>) {}
+    /// Return the wake handle used to drive this service's lifecycle.
     fn waker(&self) -> Result<Waker, S::Error> {
         Ok(crate::thread_waker(None))
     }
+    /// Arrange notification when locally owned work can make progress.
     fn register_driver(&self, _waker: &Waker) {}
+    /// Initialize the service before it is announced ready.
     fn start<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error>;
+    /// Perform at most the caller's budget of steady-state work.
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<(), S::Error>;
     /// Bound the next steady-state wait after polling. Due work returns zero.
     fn wait_timeout(&self, maximum: Duration) -> Duration {
         maximum
     }
+    /// Reject new work before draining accepted work.
     fn stop_admission(&mut self) -> Result<(), S::Error> {
         Ok(())
     }
+    /// Drain accepted work without using cancellation as an ownership fence.
     fn drain<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error>;
     /// Close helper submissions after lane drain has stopped every producer.
     fn close(&mut self) -> Result<(), S::Error> {
         Ok(())
     }
+    /// Prove that external work no longer references service-owned resources.
+    /// Failure or panic aborts the process instead of destroying live owners.
     fn fence<'a>(&'a mut self, _scope: &'a S) -> Operation<'a, (), S::Error> {
         Box::pin(async { Ok(()) })
     }
+    /// Shut down after drain; a second ownership fence runs before destruction.
     fn shutdown<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error>;
 }
 
@@ -92,6 +112,7 @@ pub struct FailureReporter<E: Copy> {
     control: Arc<Control<E>>,
 }
 impl<E: Copy> FailureReporter<E> {
+    /// Record the first failure and request that every lane stop admission.
     pub fn report(&self, error: E) {
         self.control.fail(error);
     }
@@ -102,9 +123,13 @@ impl<E: Copy> FailureReporter<E> {
 /// Use the lifecycle methods to wait for completion rather than polling counts.
 #[derive(Clone, Copy, Default)]
 pub struct Stats {
+    /// Number of planned lane and helper threads.
     pub total: usize,
+    /// Threads whose services finished startup.
     pub ready: usize,
+    /// Threads whose services finished their first ownership fence.
     pub drained: usize,
+    /// Threads that exited, including unstarted threads accounted by rollback.
     pub done: usize,
     /// Owned coordinator handles awaiting join (zero or one), even after exit.
     pub coordinators: usize,
@@ -115,20 +140,21 @@ pub struct Stats {
 pub struct Group<S: Scope + Send> {
     plan: Plan,
     control: Arc<Control<S::Error>>,
-    threads: Vec<JoinHandle<()>>,
+    coordinator: Option<JoinHandle<()>>,
 }
 impl<S: Scope + Send> Group<S> {
+    /// Store a placement plan without spawning threads or constructing services.
     pub fn new(plan: Plan) -> Self {
         Self {
             plan,
             control: Arc::new(Control::new(0, 0, false)),
-            threads: Vec::new(),
+            coordinator: None,
         }
     }
     /// Snapshot lifecycle progress without exposing mutable coordinator state.
     pub fn stats(&self) -> Stats {
         let mut stats = self.control.lock().stats;
-        stats.coordinators = self.threads.len();
+        stats.coordinators = usize::from(self.coordinator.is_some());
         stats
     }
     /// Nonmutating preflight for callers allocating resources before startup.
@@ -143,7 +169,8 @@ impl<S: Scope + Send> Group<S> {
             .checked_add(self.plan.helpers.len())
             .and_then(|n| n.checked_add(usize::from(!caller_is_lane)))
             .ok_or_else(invalid)?;
-        if !self.threads.is_empty() || self.plan.lanes.is_empty() || count > self.plan.max_threads {
+        if self.coordinator.is_some() || self.plan.lanes.is_empty() || count > self.plan.max_threads
+        {
             return Err(invalid());
         }
         let allowed = affinity::current_cpus()?;
@@ -169,6 +196,7 @@ impl<S: Scope + Send> Group<S> {
         }
         Ok(())
     }
+    /// Validate a new execution and reset its barriers before any construction.
     fn prepare(&mut self, caller_is_lane: bool, check_scope: bool) -> Result<(), S::Error> {
         self.validate(caller_is_lane)?;
         self.control = Arc::new(Control::new(
@@ -186,6 +214,8 @@ impl<S: Scope + Send> Group<S> {
         }
         Ok(())
     }
+    /// Spawn the coordinator and wait until every lane and helper is ready.
+    /// Startup failure joins the coordinator after its ownership fences finish.
     pub fn start(
         &mut self,
         factory: Arc<dyn Factory<S> + Send>,
@@ -218,7 +248,7 @@ impl<S: Scope + Send> Group<S> {
                 return Err(error);
             }
         };
-        self.threads.push(handle);
+        self.coordinator = Some(handle);
         let result = self
             .control
             .wait_for(scope, |s| s.stats.ready == s.stats.total);
@@ -237,6 +267,7 @@ impl<S: Scope + Send> Group<S> {
     pub fn run_with_scope(&mut self, factory: &dyn Factory<S>, scope: &S) -> Result<(), S::Error> {
         self.run_inner(factory, scope, true)
     }
+    /// Execute lane zero on the caller, optionally checking its steady-state scope.
     fn run_inner(
         &mut self,
         factory: &dyn Factory<S>,
@@ -268,10 +299,10 @@ impl<S: Scope + Send> Group<S> {
     /// A service that cannot complete its ownership fence can prevent return.
     pub fn join(&mut self) -> Result<(), S::Error> {
         self.control.set_phase(Phase::Shutdown);
-        for handle in self.threads.drain(..) {
-            if handle.join().is_err() {
-                self.control.fail(Error::Io.into());
-            }
+        if let Some(handle) = self.coordinator.take()
+            && handle.join().is_err()
+        {
+            self.control.fail(Error::Io.into());
         }
         self.control.result()
     }
@@ -282,12 +313,14 @@ impl<S: Scope + Send> Drop for Group<S> {
     }
 }
 
+/// Monotonic lifecycle requests shared by all execution threads.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Phase {
     Running,
     Drain,
     Shutdown,
 }
+/// Barrier progress and the first failure, protected by the coordinator mutex.
 struct State<E> {
     phase: Phase,
     stats: Stats,
@@ -298,11 +331,13 @@ struct State<E> {
     auto_shutdown: bool,
     check_scope: bool,
 }
+/// Shared lifecycle coordination, independent of service-owned resources.
 struct Control<E> {
     state: Mutex<State<E>>,
     changed: Condvar,
 }
 impl<E: Copy> Control<E> {
+    /// Allocate per-lane barriers and initialize execution counters.
     fn new(lanes: usize, helpers: usize, auto_shutdown: bool) -> Self {
         Self {
             state: Mutex::new(State {
@@ -321,31 +356,38 @@ impl<E: Copy> Control<E> {
             changed: Condvar::new(),
         }
     }
+    /// Recover coordinator state after panic so teardown can still make progress.
     fn lock(&self) -> MutexGuard<'_, State<E>> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+    /// Return the first recorded error, if any.
     fn result(&self) -> Result<(), E> {
         self.lock().error.map_or(Ok(()), Err)
     }
+    /// Advance the lifecycle request without allowing it to move backward.
     fn set_phase(&self, phase: Phase) {
         let mut state = self.lock();
         state.phase = state.phase.max(phase);
         self.changed.notify_all();
     }
+    /// Retain the first error and notify all threads to begin draining.
     fn fail(&self, error: E) {
         let mut state = self.lock();
         state.error.get_or_insert(error);
         state.phase = state.phase.max(Phase::Drain);
         self.changed.notify_all();
     }
+    /// Announce that a lane has closed its helper submissions.
     fn close(&self, lane: usize) {
         self.lock().closed[lane] = true;
         self.changed.notify_all();
     }
+    /// Announce a completed lane ownership fence to its helper.
     fn fence(&self, lane: usize) {
         self.lock().fenced[lane] = true;
         self.changed.notify_all();
     }
+    /// Wait for a barrier while checking caller policy outside the state lock.
     fn wait_for<S: Scope<Error = E>>(
         &self,
         scope: &S,
@@ -374,6 +416,7 @@ impl<E: Copy> Control<E> {
                 .0;
         }
     }
+    /// Apply optional steady-state scope policy and inspect the stop request.
     fn stopping<S: Scope<Error = E>>(&self, scope: &S) -> bool
     where
         E: From<Error>,
@@ -384,6 +427,7 @@ impl<E: Copy> Control<E> {
         }
         self.lock().phase != Phase::Running
     }
+    /// Publish a completed drain and wait for permission to shut down.
     fn drained(&self) {
         let mut state = self.lock();
         state.stats.drained += 1;
@@ -393,6 +437,7 @@ impl<E: Copy> Control<E> {
         }
     }
 }
+/// Account thread exit without ever claiming it established an ownership fence.
 struct Exit<E: Copy + From<Error>> {
     control: Arc<Control<E>>,
     lane: Option<usize>,
@@ -409,15 +454,18 @@ impl<E: Copy + From<Error>> Drop for Exit<E> {
         self.control.changed.notify_all();
     }
 }
+/// Convert caller panics into lifecycle errors without losing teardown control.
 fn attempt<T, E: From<Error>>(f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(Error::Io.into()))
 }
+/// Record an ordinary lifecycle error without interrupting ownership fencing.
 fn record<E: Copy>(control: &Control<E>, result: Result<(), E>) {
     if let Err(error) = result {
         control.fail(error);
     }
 }
 
+/// Abort on a failed fence rather than unwind through externally owned resources.
 fn require_fence<E: Copy>(control: &Control<E>, result: Result<(), E>) {
     if let Err(error) = result {
         control.fail(error);
@@ -426,11 +474,13 @@ fn require_fence<E: Copy>(control: &Control<E>, result: Result<(), E>) {
     }
 }
 
+/// Keep a service alive unless both lifecycle ownership fences have succeeded.
 struct ServiceOwner<S: Scope> {
     service: std::mem::ManuallyDrop<Box<dyn Service<S>>>,
     releasable: bool,
 }
 impl<S: Scope> ServiceOwner<S> {
+    /// Protect a newly constructed service until explicit lifecycle completion.
     fn new(service: Box<dyn Service<S>>) -> Self {
         Self {
             service: std::mem::ManuallyDrop::new(service),
@@ -461,6 +511,7 @@ impl<S: Scope> Drop for ServiceOwner<S> {
     }
 }
 
+/// Obtain fresh teardown policy, recording failure without cloning a fallback.
 fn teardown_scope<S: Scope>(
     factory: &dyn Factory<S>,
     startup: &S,
@@ -475,12 +526,14 @@ fn teardown_scope<S: Scope>(
     }
 }
 
+/// Fence preallocated endpoints for a lane that never constructed a service.
 fn abandon_lane<S: Scope>(factory: &dyn Factory<S>, index: usize, control: &Control<S::Error>) {
     require_fence(control, attempt(|| factory.abandon_lane(index)));
     control.close(index);
     control.fence(index);
 }
 
+/// Account and fence every unstarted lane after preparation fails.
 fn rollback_prepared<S: Scope>(
     plan: &Plan,
     factory: &dyn Factory<S>,
@@ -496,6 +549,7 @@ fn rollback_prepared<S: Scope>(
     state.stats.drained = state.stats.total;
     control.changed.notify_all();
 }
+/// Spawn scoped peers, drive lane zero, join all peers, and restore caller affinity.
 fn run_prepared<S: Scope + Send>(
     plan: &Plan,
     factory: &dyn Factory<S>,
@@ -593,6 +647,7 @@ fn run_prepared<S: Scope + Send>(
     result.and(restore)
 }
 
+/// Drive a lifecycle future; only startup may stop early for caller cancellation.
 fn drive<S: Scope>(
     mut operation: Operation<'_, (), S::Error>,
     scope: &S,
@@ -626,6 +681,7 @@ fn drive<S: Scope>(
         }
     }
 }
+/// Poll one bounded service turn and compute its post-poll idle limit.
 fn poll_turn<S: Scope>(
     service: &mut dyn Service<S>,
     cx: &mut Context<'_>,
@@ -637,6 +693,7 @@ fn poll_turn<S: Scope>(
     })
 }
 
+/// Run a pinned lane through startup, steady-state work, and both teardown fences.
 fn lane_thread<S: Scope>(
     factory: &dyn Factory<S>,
     lane: &Lane,
@@ -727,39 +784,18 @@ fn lane_thread<S: Scope>(
     );
     record(control, attempt(|| service.close()));
     control.close(index);
-    require_fence(
-        control,
-        attempt(|| {
-            drive(
-                fence_operation(service.fence(teardown), control),
-                teardown,
-                control,
-                false,
-                &waker,
-            )
-        }),
-    );
+    drive_fence(&mut *service, teardown, control, &waker);
     control.fence(index);
     control.drained();
     record(
         control,
         attempt(|| drive(service.shutdown(teardown), teardown, control, false, &waker)),
     );
-    require_fence(
-        control,
-        attempt(|| {
-            drive(
-                fence_operation(service.fence(teardown), control),
-                teardown,
-                control,
-                false,
-                &waker,
-            )
-        }),
-    );
+    drive_fence(&mut *service, teardown, control, &waker);
     service.releasable = true;
     Ok(())
 }
+/// Construct and drive helper shards cooperatively on their shared pinned thread.
 fn helper_thread<S: Scope>(
     factory: &dyn Factory<S>,
     helper: &Helper,
@@ -859,6 +895,7 @@ fn helper_thread<S: Scope>(
     }
     Ok(())
 }
+/// Drive one helper shard until its lane and independent resources are fenced.
 fn helper_service<'a, S: Scope>(
     index: usize,
     service: &'a mut dyn Service<S>,
@@ -951,6 +988,7 @@ fn helper_service<'a, S: Scope>(
         Ok(())
     })
 }
+/// Convert a future's poll panic into an ordinary lifecycle error.
 fn catch_operation<'a, E: From<Error> + 'a>(
     mut operation: Operation<'a, (), E>,
 ) -> Operation<'a, (), E> {
@@ -959,6 +997,28 @@ fn catch_operation<'a, E: From<Error> + 'a>(
             .unwrap_or_else(|_| Poll::Ready(Err(Error::Io.into())))
     }))
 }
+/// Drive a lane fence, including fail-closed handling of construction panics.
+fn drive_fence<S: Scope>(
+    service: &mut dyn Service<S>,
+    scope: &S,
+    control: &Control<S::Error>,
+    waker: &Waker,
+) {
+    require_fence(
+        control,
+        attempt(|| {
+            drive(
+                fence_operation(service.fence(scope), control),
+                scope,
+                control,
+                false,
+                waker,
+            )
+        }),
+    );
+}
+
+/// Abort immediately if a fence future fails or panics while being polled.
 fn fence_operation<'a, E: Copy + From<Error> + 'a>(
     mut operation: Operation<'a, (), E>,
     control: &'a Control<E>,
@@ -977,6 +1037,7 @@ fn fence_operation<'a, E: Copy + From<Error> + 'a>(
         }
     }))
 }
+/// Report expired teardown policy without canceling the underlying future.
 fn diagnose_operation<'a, S: Scope>(
     mut operation: Operation<'a, (), S::Error>,
     scope: &'a S,
@@ -987,6 +1048,7 @@ fn diagnose_operation<'a, S: Scope>(
         operation.as_mut().poll(cx)
     }))
 }
+/// Rotate helper polling fairly and retain every future through its final fence.
 fn drive_helpers<E: Copy + From<Error>>(
     operations: Vec<Operation<'_, (), E>>,
     control: &Control<E>,
@@ -1020,6 +1082,619 @@ fn drive_helpers<E: Copy + From<Error>>(
         if remaining != 0 && passes == WORK_BUDGET {
             thread::park_timeout(IDLE_WAIT);
             passes = 0;
+        }
+    }
+}
+
+/// Linux CPU, cgroup, NUMA, and NIC discovery and calling-thread affinity.
+/// Placement policy belongs to the caller, not the runtime. The crate-root
+/// `affinity` module remains the compatibility path for existing callers.
+pub mod affinity {
+    use crate::{Error, Result};
+    use std::{
+        collections::{BTreeSet, HashSet},
+        fs,
+        num::NonZeroU64,
+        path::{Path, PathBuf},
+    };
+
+    /// Logical CPU identity and its physical placement, without scheduling policy.
+    #[derive(Clone, Debug)]
+    pub struct CpuLocation {
+        /// Logical CPU number accepted by Linux affinity syscalls.
+        pub cpu: usize,
+        /// Physical core IDs are package-local; SMT siblings share this pair.
+        pub package: usize,
+        /// Physical core number within the package.
+        pub core: usize,
+        /// NUMA node when sysfs exposes one.
+        pub numa_node: Option<usize>,
+    }
+
+    /// Tightest applicable effective cgroup CPU-time quota. None means unlimited.
+    #[derive(Clone, Copy, Debug)]
+    pub struct CpuQuota {
+        /// CPU time available during each accounting period, in microseconds.
+        pub quota: NonZeroU64,
+        /// Accounting period in microseconds.
+        pub period: NonZeroU64,
+    }
+
+    /// Discovered local hardware, without application placement policy.
+    #[derive(Clone, Debug)]
+    pub struct NicLocality {
+        /// Network or InfiniBand device name reported by sysfs.
+        pub device: String,
+        /// Device-local NUMA node, if known.
+        pub numa_node: Option<usize>,
+    }
+
+    /// Effective CPU constraints and local devices visible to the calling thread.
+    #[derive(Clone)]
+    pub struct EffectiveTopology {
+        /// Online CPUs intersected with process affinity and effective cpuset.
+        pub cpus: Vec<CpuLocation>,
+        /// Tightest ancestor CPU-time quota, or none when every hierarchy is unlimited.
+        pub quota: Option<CpuQuota>,
+        /// Network and InfiniBand devices, with available NUMA locality.
+        pub nics: Vec<NicLocality>,
+    }
+
+    impl EffectiveTopology {
+        /// Discover constraints from the calling thread's actual Linux namespace.
+        /// Walk every visible ancestor: leaf cpu.max alone misses parent restrictions.
+        pub fn discover() -> Result<Self> {
+            let mut allowed = current_cpus()?;
+            let online = parse_cpu_list(
+                &fs::read_to_string("/sys/devices/system/cpu/online").map_err(|_| Error::Io)?,
+            )?;
+            allowed.retain(|cpu| online.contains(cpu));
+            let mut quota = None;
+            let memberships =
+                fs::read_to_string("/proc/thread-self/cgroup").map_err(|_| Error::Io)?;
+            let mounts = fs::read_to_string("/proc/self/mountinfo").map_err(|_| Error::Io)?;
+            for (leaf, root, v2, cpu, cpuset) in cgroup_paths(&memberships, &mounts)? {
+                // Unresolved membership must never be interpreted as unlimited.
+                if !fs::metadata(&leaf).map_err(|_| Error::Io)?.is_dir() {
+                    return Err(Error::InvalidConfiguration);
+                }
+                for directory in leaf.ancestors().take_while(|path| path.starts_with(&root)) {
+                    if cpu {
+                        let candidate = if v2 {
+                            optional_text(&directory.join("cpu.max"))?
+                                .map(|value| parse_v2_quota(&value))
+                                .transpose()?
+                                .flatten()
+                        } else {
+                            match (
+                                optional_text(&directory.join("cpu.cfs_quota_us"))?,
+                                optional_text(&directory.join("cpu.cfs_period_us"))?,
+                            ) {
+                                (Some(q), Some(p)) => parse_v1_quota(&q, &p)?,
+                                (None, None) => None,
+                                _ => return Err(Error::InvalidConfiguration),
+                            }
+                        };
+                        tighten_quota(&mut quota, candidate);
+                    }
+                    if cpuset {
+                        let names: &[&str] = if v2 {
+                            &["cpuset.cpus.effective", "cpuset.cpus"]
+                        } else {
+                            &["cpuset.effective_cpus", "cpuset.cpus"]
+                        };
+                        for name in names {
+                            if let Some(value) = optional_text(&directory.join(name))?
+                                && !value.trim().is_empty()
+                            {
+                                let set = parse_cpu_list(&value)?;
+                                allowed.retain(|cpu| set.contains(cpu));
+                            }
+                        }
+                    }
+                }
+            }
+            if allowed.is_empty() {
+                return Err(Error::InvalidConfiguration);
+            }
+            let cpus = allowed
+                .into_iter()
+                .map(|cpu| {
+                    let path = PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}"));
+                    Ok(CpuLocation {
+                        cpu,
+                        package: read_number(&path.join("topology/physical_package_id"))?,
+                        core: read_number(&path.join("topology/core_id"))?,
+                        numa_node: fs::read_dir(&path)
+                            .map_err(|_| Error::Io)?
+                            .filter_map(|entry| entry.ok())
+                            .filter_map(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_str()?
+                                    .strip_prefix("node")?
+                                    .parse()
+                                    .ok()
+                            })
+                            .min(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut nics = Vec::new();
+            for directory in ["/sys/class/net", "/sys/class/infiniband"] {
+                let entries = match fs::read_dir(directory) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(Error::Io),
+                };
+                for entry in entries {
+                    let entry = entry.map_err(|_| Error::Io)?;
+                    let numa_node = optional_text(&entry.path().join("device/numa_node"))?
+                        .and_then(|value| value.trim().parse::<usize>().ok());
+                    nics.push(NicLocality {
+                        device: entry.file_name().to_string_lossy().into_owned(),
+                        numa_node,
+                    });
+                }
+            }
+            Ok(Self { cpus, quota, nics })
+        }
+    }
+
+    /// Read the calling thread's allowed logical CPU IDs.
+    pub fn current_cpus() -> Result<BTreeSet<usize>> {
+        let mut mask = vec![0usize; 16];
+        loop {
+            // SAFETY: the kernel receives the size of the writable, word-aligned mask.
+            let result = unsafe {
+                libc::sched_getaffinity(
+                    0,
+                    std::mem::size_of_val(mask.as_slice()),
+                    mask.as_mut_ptr().cast(),
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
+                || mask.len() >= 16384
+            {
+                return Err(Error::Io);
+            }
+            mask.resize(mask.len() * 2, 0);
+        }
+        Ok(mask
+            .iter()
+            .enumerate()
+            .flat_map(|(word, bits)| {
+                (0..usize::BITS as usize)
+                    .filter(move |bit| bits & (1usize << bit) != 0)
+                    .map(move |bit| word * usize::BITS as usize + bit)
+            })
+            .collect())
+    }
+
+    /// Set the calling thread's allowed logical CPU IDs.
+    pub fn set_cpus(cpus: &BTreeSet<usize>) -> Result<()> {
+        let max = *cpus.last().ok_or(Error::InvalidConfiguration)?;
+        if max > 1_048_575 {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut mask = vec![0usize; (max / usize::BITS as usize + 1).max(16)];
+        for cpu in cpus {
+            mask[cpu / usize::BITS as usize] |= 1usize << (cpu % usize::BITS as usize);
+        }
+        // SAFETY: the kernel only reads the sized, word-aligned affinity mask.
+        if unsafe {
+            libc::sched_setaffinity(
+                0,
+                std::mem::size_of_val(mask.as_slice()),
+                mask.as_ptr().cast(),
+            )
+        } != 0
+        {
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+
+    /// Pin the calling thread to one logical CPU.
+    pub fn pin_cpu(cpu: usize) -> Result<()> {
+        set_cpus(&BTreeSet::from([cpu]))
+    }
+
+    /// Read an optional kernel attribute, distinguishing absence from I/O failure.
+    fn optional_text(path: &Path) -> Result<Option<String>> {
+        match fs::read_to_string(path) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(Error::Io),
+        }
+    }
+
+    /// Parse a required nonnegative sysfs topology attribute.
+    fn read_number(path: &Path) -> Result<usize> {
+        fs::read_to_string(path)
+            .map_err(|_| Error::Io)?
+            .trim()
+            .parse()
+            .map_err(|_| Error::InvalidConfiguration)
+    }
+
+    /// Parse Linux's comma-separated CPU ranges, rejecting reversal and huge indices.
+    fn parse_cpu_list(value: &str) -> Result<BTreeSet<usize>> {
+        let mut cpus = BTreeSet::new();
+        if value.trim().is_empty() {
+            return Ok(cpus);
+        }
+        for part in value.trim().split(',') {
+            let (start, end) = part.split_once('-').unwrap_or((part, part));
+            let start = start
+                .parse::<usize>()
+                .map_err(|_| Error::InvalidConfiguration)?;
+            let end = end
+                .parse::<usize>()
+                .map_err(|_| Error::InvalidConfiguration)?;
+            if start > end || end > 1_048_575 {
+                return Err(Error::InvalidConfiguration);
+            }
+            cpus.extend(start..=end);
+        }
+        Ok(cpus)
+    }
+
+    /// Parse exactly two cpu.max fields without allocating an intermediate collection.
+    fn parse_v2_quota(value: &str) -> Result<Option<CpuQuota>> {
+        let mut fields = value.split_whitespace();
+        let (Some(quota), Some(period), None) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Error::InvalidConfiguration);
+        };
+        parse_v1_quota(if quota == "max" { "-1" } else { quota }, period)
+    }
+
+    /// Validate a quota and positive period, including the v1 unlimited sentinel.
+    fn parse_v1_quota(quota: &str, period: &str) -> Result<Option<CpuQuota>> {
+        let period = period
+            .trim()
+            .parse::<NonZeroU64>()
+            .map_err(|_| Error::InvalidConfiguration)?;
+        if quota.trim() == "-1" {
+            return Ok(None);
+        }
+        Ok(Some(CpuQuota {
+            quota: quota
+                .trim()
+                .parse()
+                .map_err(|_| Error::InvalidConfiguration)?,
+            period,
+        }))
+    }
+
+    /// Retain the smaller exact ratio using wide products to avoid rounding or overflow.
+    fn tighten_quota(current: &mut Option<CpuQuota>, candidate: Option<CpuQuota>) {
+        if let Some(candidate) = candidate
+            && current.is_none_or(|old| {
+                u128::from(candidate.quota.get()) * u128::from(old.period.get())
+                    < u128::from(old.quota.get()) * u128::from(candidate.period.get())
+            })
+        {
+            *current = Some(candidate);
+        }
+    }
+
+    /// Membership leaf, mount boundary, unified flag, and CPU/cpuset controller flags.
+    type CgroupPath = (PathBuf, PathBuf, bool, bool, bool);
+
+    /// Resolve only covering cgroup mounts and reject hidden applicable controllers.
+    fn cgroup_paths(memberships: &str, mounts: &str) -> Result<Vec<CgroupPath>> {
+        let mut paths = Vec::new();
+        let memberships = memberships
+            .lines()
+            .map(|line| {
+                let fields = line.splitn(3, ':').collect::<Vec<_>>();
+                if fields.len() != 3
+                    || !Path::new(fields[2]).is_absolute()
+                    || Path::new(fields[2])
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                {
+                    return Err(Error::InvalidConfiguration);
+                }
+                Ok(fields)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut covered = HashSet::new();
+        for line in mounts.lines() {
+            let Some((before, after)) = line.split_once(" - ") else {
+                continue;
+            };
+            let before = before.split_whitespace().collect::<Vec<_>>();
+            let after = after.split_whitespace().collect::<Vec<_>>();
+            if before.len() < 5 || after.len() < 3 {
+                continue;
+            }
+            let v2 = after[0] == "cgroup2";
+            if !v2 && after[0] != "cgroup" {
+                continue;
+            }
+            let controllers = after[2].split(',').collect::<HashSet<_>>();
+            let cpu = v2 || controllers.contains("cpu");
+            let cpuset = v2 || controllers.contains("cpuset");
+            if !cpu && !cpuset {
+                continue;
+            }
+            for (index, fields) in memberships.iter().enumerate() {
+                let matches = if v2 {
+                    fields[1].is_empty()
+                } else {
+                    fields[1]
+                        .split(',')
+                        .any(|controller| controllers.contains(controller))
+                };
+                if !matches {
+                    continue;
+                }
+                let root = PathBuf::from(unescape_mount(before[4]));
+                let mount_root = PathBuf::from(unescape_mount(before[3]));
+                let membership = PathBuf::from(fields[2]);
+                if !root.is_absolute() || !mount_root.is_absolute() {
+                    return Err(Error::InvalidConfiguration);
+                }
+                // Both proc files use the calling namespace. A noncovering subtree
+                // mount must not act as a fallback root for this membership.
+                let Ok(relative) = membership.strip_prefix(&mount_root) else {
+                    continue;
+                };
+                if v2 {
+                    covered.insert((index, ""));
+                }
+                if cpu {
+                    covered.insert((index, "cpu"));
+                }
+                if cpuset {
+                    covered.insert((index, "cpuset"));
+                }
+                paths.push((root.join(relative), root, v2, cpu, cpuset));
+            }
+        }
+        for (index, fields) in memberships.iter().enumerate() {
+            for controller in fields[1].split(',') {
+                if matches!(controller, "" | "cpu" | "cpuset")
+                    && !covered.contains(&(index, controller))
+                {
+                    // Hidden applicable hierarchies are unknown, not unlimited.
+                    return Err(Error::InvalidConfiguration);
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Decode proc mountinfo escapes once, leaving escaped backslashes uninterpreted.
+    fn unescape_mount(value: &str) -> String {
+        value
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn noncovering_mounts_are_skipped_and_hidden_hierarchies_fail_closed() {
+            let unrelated = "1 0 0:1 /other /unrelated rw - cgroup2 cgroup rw\n";
+            let covering = "2 0 0:1 /tenant /visible\\040group rw - cgroup2 cgroup rw\n";
+            let paths = cgroup_paths("0::/tenant/leaf", &format!("{unrelated}{covering}")).unwrap();
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].0, PathBuf::from("/visible group/leaf"));
+            assert!(cgroup_paths("0::/tenant/leaf", unrelated).is_err());
+            assert!(cgroup_paths("0::/tenant/leaf", "").is_err());
+            assert!(cgroup_paths("2:cpu:/tenant/leaf", "").is_err());
+            assert!(cgroup_paths("2:cpuset:/tenant/leaf", "").is_err());
+            assert!(
+                cgroup_paths("2:memory:/tenant/leaf", "")
+                    .unwrap()
+                    .is_empty()
+            );
+            let paths = cgroup_paths("0::/", "1 0 0:1 / /visible rw - cgroup2 cgroup rw").unwrap();
+            assert_eq!(paths[0].0, PathBuf::from("/visible"));
+        }
+
+        #[test]
+        fn cgroup_mounts_and_ancestor_quotas_are_resolved_exactly() {
+            let mounts = "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n\
+                2 0 0:2 /tenant /cpu rw - cgroup cgroup rw,cpu,cpuacct\n\
+                3 0 0:3 / /sets rw - cgroup cgroup rw,cpuset\n";
+            let paths = cgroup_paths(
+                "0::/tenant/leaf\n2:cpu,cpuacct:/tenant/leaf\n3:cpuset:/tenant/leaf\n",
+                mounts,
+            )
+            .unwrap();
+            assert_eq!(
+                paths,
+                vec![
+                    (
+                        "/sys/fs/cgroup/tenant/leaf".into(),
+                        "/sys/fs/cgroup".into(),
+                        true,
+                        true,
+                        true
+                    ),
+                    ("/cpu/leaf".into(), "/cpu".into(), false, true, false),
+                    (
+                        "/sets/tenant/leaf".into(),
+                        "/sets".into(),
+                        false,
+                        false,
+                        true
+                    ),
+                ]
+            );
+            let mut quota = parse_v2_quota("400000 100000").unwrap();
+            tighten_quota(&mut quota, parse_v1_quota("150000", "100000").unwrap());
+            tighten_quota(&mut quota, parse_v2_quota("max 100000").unwrap());
+            tighten_quota(&mut quota, parse_v2_quota("200000 100000").unwrap());
+            assert_eq!(quota.unwrap().quota.get(), 150000);
+            assert!(parse_v2_quota("0 100000").is_err());
+            assert!(parse_v2_quota("max 0").is_err());
+            assert!(parse_v1_quota("-2", "100000").is_err());
+            assert!(cgroup_paths("0::/../escape", mounts).is_err());
+        }
+
+        #[test]
+        fn actual_affinity_is_applied_on_the_calling_thread() {
+            std::thread::spawn(|| {
+                let allowed = current_cpus().unwrap();
+                let cpu = *allowed.first().unwrap();
+                pin_cpu(cpu).unwrap();
+                assert_eq!(current_cpus().unwrap(), BTreeSet::from([cpu]));
+                let discovered = EffectiveTopology::discover().unwrap();
+                assert_eq!(discovered.cpus.len(), 1);
+                assert_eq!(discovered.cpus[0].cpu, cpu);
+                set_cpus(&allowed).unwrap();
+                assert_eq!(current_cpus().unwrap(), allowed);
+            })
+            .join()
+            .unwrap();
+        }
+
+        #[test]
+        fn constrained_cpuset_ranges_are_validated() {
+            for value in ["", " \n"] {
+                assert_eq!(parse_cpu_list(value).unwrap(), BTreeSet::new());
+            }
+            assert_eq!(
+                parse_cpu_list(" 3,1-3,2,0,1048575\n").unwrap(),
+                BTreeSet::from([0, 1, 2, 3, 1_048_575])
+            );
+            assert_eq!(
+                parse_cpu_list("1-3,8,10-11\n").unwrap(),
+                BTreeSet::from([1, 2, 3, 8, 10, 11])
+            );
+            for value in [
+                "4-1",
+                "-1",
+                "a",
+                "1-2-3",
+                "1048576",
+                "999999999",
+                "1,,2",
+                "1,",
+            ] {
+                assert_eq!(
+                    parse_cpu_list(value),
+                    Err(Error::InvalidConfiguration),
+                    "{value}"
+                );
+            }
+        }
+
+        #[test]
+        fn quota_formats_validate_fields_and_unlimited_periods() {
+            for (quota, period, expected) in [
+                ("150000", "100000", Some((150000, 100000))),
+                (" 1\n", " 2\n", Some((1, 2))),
+                ("-1", "100000", None),
+            ] {
+                let v1 = parse_v1_quota(quota, period).unwrap();
+                let v2 = parse_v2_quota(&format!(
+                    "{} {period}",
+                    if quota == "-1" { "max" } else { quota }
+                ))
+                .unwrap();
+                let pair = |value: Option<CpuQuota>| value.map(|q| (q.quota.get(), q.period.get()));
+                assert_eq!(pair(v1), expected);
+                assert_eq!(pair(v2), expected);
+            }
+            for value in [
+                "",
+                "max",
+                "1 2 3",
+                "0 1",
+                "-2 1",
+                "1 0",
+                "max 0",
+                "max nope",
+                "1 -1",
+                "nope 1",
+                "18446744073709551616 1",
+                "1 18446744073709551616",
+            ] {
+                assert!(
+                    matches!(parse_v2_quota(value), Err(Error::InvalidConfiguration)),
+                    "{value}"
+                );
+            }
+        }
+
+        #[test]
+        fn quotas_compare_ratios_without_rounding_or_overflow() {
+            let mut quota = None;
+            for (candidate, expected) in [
+                ("max 10", None),
+                ("3 2", Some((3, 2))),
+                ("4 3", Some((4, 3))),
+                ("8 6", Some((4, 3))),
+                ("max 10", Some((4, 3))),
+                (
+                    "18446744073709551615 18446744073709551614",
+                    Some((u64::MAX, u64::MAX - 1)),
+                ),
+                (
+                    "18446744073709551614 18446744073709551615",
+                    Some((u64::MAX - 1, u64::MAX)),
+                ),
+                ("2 1", Some((u64::MAX - 1, u64::MAX))),
+            ] {
+                tighten_quota(&mut quota, parse_v2_quota(candidate).unwrap());
+                assert_eq!(
+                    quota.map(|q| (q.quota.get(), q.period.get())),
+                    expected,
+                    "{candidate}"
+                );
+            }
+        }
+
+        #[test]
+        fn cgroup_namespace_paths_and_mount_escapes_are_resolved() {
+            let mounts = "malformed\n1 0 0:1 / /ignored rw - tmpfs tmpfs rw\n\
+                2 0 0:2 / /memory rw - cgroup cgroup rw,memory\n\
+                3 0 0:3 /host\\040root /group\\040mount rw - cgroup2 cgroup rw\n";
+            assert_eq!(
+                cgroup_paths("0::/host root/leaf", mounts).unwrap(),
+                vec![(
+                    "/group mount/leaf".into(),
+                    "/group mount".into(),
+                    true,
+                    true,
+                    true,
+                )]
+            );
+            for membership in [
+                "0::/leaf",
+                "0::/",
+                "malformed",
+                "0::relative",
+                "0::/leaf/../escape",
+            ] {
+                assert_eq!(
+                    cgroup_paths(membership, mounts),
+                    Err(Error::InvalidConfiguration)
+                );
+            }
+            assert_eq!(unescape_mount(r"a\040b\011c\012d\134040"), "a b\tc\nd\\040");
+        }
+
+        #[test]
+        fn invalid_affinity_masks_return_generic_errors_without_changing_affinity() {
+            let allowed = current_cpus().unwrap();
+            assert_eq!(set_cpus(&BTreeSet::new()), Err(Error::InvalidConfiguration));
+            assert_eq!(pin_cpu(1_048_576), Err(Error::InvalidConfiguration));
+            assert_eq!(current_cpus().unwrap(), allowed);
         }
     }
 }

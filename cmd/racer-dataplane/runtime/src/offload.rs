@@ -7,7 +7,7 @@ use crate::channel::{self, Receiver, Sender};
 use futures::task::AtomicWaker;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, VecDeque, btree_map::Entry},
     num::NonZeroUsize,
     rc::Rc,
     sync::{
@@ -19,15 +19,22 @@ use std::{
 
 /// Caller-defined ticket identity. Sequences must increase within a generation.
 pub trait Identity: Copy + Ord {
+    /// Application owner that may submit work to this pair.
     type Owner: Eq;
+    /// Return the application owner associated with this ticket.
     fn owner(self) -> Self::Owner;
+    /// Return the pair generation, changed when its sequence space is replaced.
     fn generation(self) -> u64;
+    /// Return the monotonically increasing ticket sequence.
     fn sequence(self) -> u64;
 }
 
+/// Admission or delivery failure without relinquishing a caller-owned payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// The owner, generation, sequence, or pair does not match.
     Stale,
+    /// The runtime rejected work because of capacity or availability.
     Runtime(crate::Error),
 }
 impl From<crate::Error> for Error {
@@ -35,8 +42,11 @@ impl From<crate::Error> for Error {
         Self::Runtime(error)
     }
 }
+/// Rejected publication with the original payload still owned by the caller.
 pub struct SendFailure<T> {
+    /// The payload whose ownership was not transferred.
     pub command: T,
+    /// Why publication failed.
     pub error: Error,
 }
 impl<T> From<channel::SendFailure<T>> for SendFailure<T> {
@@ -48,16 +58,6 @@ impl<T> From<channel::SendFailure<T>> for SendFailure<T> {
     }
 }
 
-struct Handoff<I> {
-    identity: I,
-    capacity: NonZeroUsize,
-    outstanding: AtomicUsize,
-    closed: AtomicBool,
-    capacity_waker: AtomicWaker,
-    worker_waker: AtomicWaker,
-    client_waker: AtomicWaker,
-}
-
 /// Non-cloneable reservation of submission AND completion space.
 /// Keep this after payload fields so their destructors run before credit release.
 pub struct Permit<I> {
@@ -65,6 +65,7 @@ pub struct Permit<I> {
     id: I,
 }
 impl<I: Copy> Permit<I> {
+    /// Return the accepted ticket identity without transferring its reservation.
     pub fn id(&self) -> I {
         self.id
     }
@@ -79,6 +80,7 @@ impl<I> Drop for Permit<I> {
 /// Jobs and completions retain their permit until execution and consumption fence
 /// their payloads. A completion must inherit the accepted job's exact permit.
 pub trait Reserved<I> {
+    /// Borrow the exact permit retained by this job or completion.
     fn permit(&self) -> &Permit<I>;
 }
 
@@ -89,6 +91,7 @@ pub struct ClientPort<I, J, C> {
     completions: Receiver<C>,
     last_sequence: Cell<Option<u64>>,
 }
+/// Unique worker endpoint that receives jobs and publishes their completions.
 pub struct WorkerPort<I, J, C> {
     handoff: Arc<Handoff<I>>,
     jobs: Option<Receiver<J>>,
@@ -96,7 +99,7 @@ pub struct WorkerPort<I, J, C> {
 }
 
 /// Paired client and worker endpoints sharing fixed admission capacity.
-pub type PortPair<I, J, C> = (ClientPort<I, J, C>, WorkerPort<I, J, C>);
+type PortPair<I, J, C> = (ClientPort<I, J, C>, WorkerPort<I, J, C>);
 
 /// Allocate both fixed-capacity queues without starting a service. The sequence
 /// in `identity` is ignored; the first reservation may use any sequence.
@@ -131,24 +134,31 @@ pub fn try_pair<I: Identity, J: Reserved<I>, C: Reserved<I>>(
 }
 
 impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
+    /// Return the pair identity; its initial sequence is not a reservation.
     pub fn identity(&self) -> I {
         self.handoff.identity
     }
+    /// Return the joint limit on jobs and unconsumed completions.
     pub fn capacity(&self) -> usize {
         self.handoff.capacity.get()
     }
+    /// Count permits still retained by callers, accepted jobs, or completions.
     pub fn outstanding(&self) -> usize {
         self.handoff.outstanding.load(Ordering::Acquire)
     }
+    /// Whether reservations and submissions have permanently closed.
     pub fn submissions_closed(&self) -> bool {
         self.handoff.closed.load(Ordering::Acquire)
     }
+    /// Whether the worker closed completion publication, not an ownership fence.
     pub fn completions_closed(&self) -> bool {
         self.completions.is_closed()
     }
+    /// Replace the local driver's completion and worker-loss notification waker.
     pub fn register_driver(&self, waker: &Waker) {
         self.handoff.client_waker.register(waker);
     }
+    /// Replace the sole capacity waiter's notification waker before checking it.
     pub fn register_capacity(&self, waker: &Waker) {
         self.handoff.capacity_waker.register(waker);
     }
@@ -201,9 +211,11 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
         self.handoff.worker_waker.wake();
         Ok(())
     }
+    /// Poll the sole completion waiter; `None` means publication closed and drained.
     pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<crate::Result<Option<C>>> {
         self.completions.poll_receive_shared(cx)
     }
+    /// Take one completion without waiting; `None` may mean temporarily empty.
     pub fn receive(&self) -> crate::Result<Option<C>> {
         self.completions.receive_shared()
     }
@@ -213,6 +225,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
             self.jobs.discard_closed();
         }
     }
+    /// Permanently reject new work while leaving accepted completions readable.
     pub fn close_submissions(&self) {
         self.handoff.closed.store(true, Ordering::Release);
         self.jobs.close();
@@ -221,6 +234,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> ClientPort<I, J, C> {
     }
 }
 impl<I: Identity, J: Reserved<I>, C: Reserved<I>> WorkerPort<I, J, C> {
+    /// Replace the worker driver's submission and closure notification waker.
     pub fn register_driver(&self, waker: &Waker) {
         self.handoff.worker_waker.register(waker);
     }
@@ -231,6 +245,7 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> WorkerPort<I, J, C> {
             .expect("live worker endpoint")
             .poll_receive(cx)
     }
+    /// Publish a completion retaining its original permit, or return it unchanged.
     pub fn complete(&mut self, completion: C) -> Result<(), SendFailure<C>> {
         if !Arc::ptr_eq(&self.handoff, &completion.permit().handoff) {
             return Err(SendFailure {
@@ -258,12 +273,6 @@ impl<I, J, C> Drop for WorkerPort<I, J, C> {
     }
 }
 
-struct Pending<S> {
-    sequence: u64,
-    waker: Rc<Waker>,
-    scope: Rc<S>,
-}
-
 /// Worker-local bounded FIFO before ownership is accepted by an offload port.
 /// A separate bound on pending admissions prevents unbounded parked futures.
 /// Scopes are opaque: callers decide which ones need cancellation/expiry wakes.
@@ -274,6 +283,7 @@ pub struct AdmissionQueue<S> {
     cursor: Cell<usize>,
 }
 impl<S> AdmissionQueue<S> {
+    /// Bound the number of waiting futures independently of accepted work.
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             capacity,
@@ -282,9 +292,11 @@ impl<S> AdmissionQueue<S> {
             cursor: Cell::new(0),
         }
     }
+    /// Count futures waiting for admission, excluding accepted work.
     pub fn len(&self) -> usize {
         self.pending.borrow().len()
     }
+    /// Whether no futures are waiting for admission.
     pub fn is_empty(&self) -> bool {
         self.pending.borrow().is_empty()
     }
@@ -345,6 +357,7 @@ pub struct CapacityWaiter<'a, S> {
     sequence: u64,
 }
 impl<S> CapacityWaiter<'_, S> {
+    /// Return this admission attempt's unique sequence, never reused on drop.
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
@@ -390,12 +403,6 @@ impl<S> Drop for CapacityWaiter<'_, S> {
     }
 }
 
-struct Waiter<C> {
-    generation: u64,
-    waker: Rc<Waker>,
-    abandoned: bool,
-    result: Option<C>,
-}
 /// Worker-local delivery registry. Callers register only after admission; the
 /// retained completion's permit continues charging capacity until consumption.
 pub struct Waiters<I, C> {
@@ -426,42 +433,44 @@ impl<I: Copy + Ord, C> Default for Waiters<I, C> {
     }
 }
 impl<I: Copy + Ord, C> Waiters<I, C> {
+    /// Count registered accepted jobs, including abandoned but unfenced jobs.
     pub fn len(&self) -> usize {
         self.entries.borrow().len()
     }
+    /// Whether there are no retained delivery registrations.
     pub fn is_empty(&self) -> bool {
         self.entries.borrow().is_empty()
     }
     /// Identities must not be reused for different accepted jobs. Duplicate live
     /// registrations are rejected, never replaced. The fallible form permits
     /// callers to handle misuse without unwinding.
-    pub fn try_register(&self, id: I, waker: &Waker) -> crate::Result<()> {
+    fn try_register(&self, id: I, waker: &Waker) -> crate::Result<()> {
         let waker = Rc::new(waker.clone());
         let mut entries = self.entries.borrow_mut();
-        if entries.contains_key(&id) {
+        let Entry::Vacant(entry) = entries.entry(id) else {
             return Err(crate::Error::AlreadyExists);
-        }
+        };
         let generation = self
             .generation
             .get()
             .checked_add(1)
             .ok_or(crate::Error::Unavailable)?;
         self.generation.set(generation);
-        entries.insert(
-            id,
-            Waiter {
-                generation,
-                waker,
-                abandoned: false,
-                result: None,
-            },
-        );
+        entry.insert(Waiter {
+            generation,
+            waker,
+            abandoned: false,
+            result: None,
+        });
         Ok(())
     }
-    pub fn register(&self, id: I, waker: &Waker) {
+    /// Register a unique identity, treating reuse as caller misuse.
+    fn register(&self, id: I, waker: &Waker) {
         self.try_register(id, waker)
             .expect("unique waiter registration");
     }
+    /// Register accepted work and return a guard that abandons only this generation.
+    /// Panics on a duplicate live identity or exhausted registration generations.
     pub fn register_guard(&self, id: I, waker: &Waker) -> Registration<'_, I, C> {
         self.register(id, waker);
         Registration {
@@ -475,9 +484,12 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
         let removed = self.entries.borrow_mut().remove(&id);
         drop(removed);
     }
-    pub fn abandon(&self, id: I) {
+    /// Abandon an identity directly when no generation guard is involved.
+    #[cfg(test)]
+    fn abandon(&self, id: I) {
         self.abandon_generation(id, None);
     }
+    /// Stop delivery only for the matching generation, retaining unfenced owners.
     fn abandon_generation(&self, id: I, generation: Option<u64>) {
         let mut entries = self.entries.borrow_mut();
         let mut removed = None;
@@ -579,27 +591,20 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
     }
     /// Cancel delivery, releasing only completions already fenced by execution.
     pub fn abandon_all(&self) {
-        let wakes: Vec<_> = self
+        // Extract in one ordered pass, but keep all payloads alive until the
+        // borrow ends. Their destructors may reenter and mutate this registry.
+        let removed: Vec<_> = self
             .entries
-            .borrow()
-            .values()
-            .filter(|waiter| waiter.result.is_some())
-            .map(|waiter| waiter.waker.clone())
+            .borrow_mut()
+            .extract_if(.., |_, waiter| {
+                waiter.abandoned = true;
+                waiter.result.is_some()
+            })
             .collect();
-        let mut entries = self.entries.borrow_mut();
-        for waiter in entries.values_mut() {
-            waiter.abandoned = true;
-        }
-        let completed: Vec<_> = entries
+        let wakes: Vec<_> = removed
             .iter()
-            .filter(|(_, waiter)| waiter.result.is_some())
-            .map(|(id, _)| *id)
+            .map(|(_, waiter)| waiter.waker.clone())
             .collect();
-        let removed: Vec<_> = completed
-            .into_iter()
-            .filter_map(|id| entries.remove(&id))
-            .collect();
-        drop(entries);
         drop(removed);
         for wake in wakes {
             wake.wake_by_ref();
@@ -607,9 +612,75 @@ impl<I: Copy + Ord, C> Waiters<I, C> {
     }
 }
 
+/// Pair-wide accounting retained independently by both endpoints and every permit.
+struct Handoff<I> {
+    identity: I,
+    capacity: NonZeroUsize,
+    outstanding: AtomicUsize,
+    closed: AtomicBool,
+    capacity_waker: AtomicWaker,
+    worker_waker: AtomicWaker,
+    client_waker: AtomicWaker,
+}
+
+/// A pre-admission waiter whose callbacks are snapshotted outside queue borrows.
+struct Pending<S> {
+    sequence: u64,
+    waker: Rc<Waker>,
+    scope: Rc<S>,
+}
+
+/// Delivery state for one accepted identity, independent of its waiting future.
+struct Waiter<C> {
+    generation: u64,
+    waker: Rc<Waker>,
+    abandoned: bool,
+    result: Option<C>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bulk abandonment detaches every completed owner before any destructor runs.
+    #[test]
+    fn abandon_all_detaches_completed_entries_before_reentrant_destruction() {
+        struct Reenter {
+            id: u64,
+            waiters: std::rc::Weak<Waiters<u64, Reenter>>,
+            dropped: Rc<RefCell<Vec<u64>>>,
+        }
+        impl Drop for Reenter {
+            fn drop(&mut self) {
+                let waiters = self.waiters.upgrade().unwrap();
+                assert_eq!(waiters.len(), 1, "only unfenced work may remain");
+                assert!(waiters.entries.borrow().get(&3).unwrap().abandoned);
+                self.dropped.borrow_mut().push(self.id);
+                waiters.register(99, Waker::noop());
+                waiters.remove(99);
+            }
+        }
+        let waiters = Rc::new(Waiters::default());
+        let dropped = Rc::new(RefCell::new(Vec::new()));
+        for id in [3, 2, 1] {
+            waiters.register(id, Waker::noop());
+            if id != 3 {
+                waiters.deliver(
+                    id,
+                    Reenter {
+                        id,
+                        waiters: Rc::downgrade(&waiters),
+                        dropped: dropped.clone(),
+                    },
+                );
+            }
+        }
+        waiters.abandon_all();
+        assert_eq!(*dropped.borrow(), [1, 2]);
+        waiters.abandon_all();
+        assert_eq!(*dropped.borrow(), [1, 2], "repeated abandonment is inert");
+        assert_eq!(waiters.len(), 1, "unfenced work remains registered");
+    }
 
     thread_local! {
         static CALLBACK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
