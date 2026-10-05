@@ -51,9 +51,6 @@ jobs:
           rustup show active-toolchain || rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Fetch Rust dependencies
-        run: cargo fetch --manifest-path cmd/unbounded-storage/Cargo.toml --locked
-
       - name: Generate NOTICE
         run: make notice
 
