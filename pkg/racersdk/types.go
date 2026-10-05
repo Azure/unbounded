@@ -21,7 +21,6 @@ import (
 
 const (
 	maxHeadBytes    = wire.MaxHeadBytes
-	maxFieldBytes   = wire.MaxFieldBytes
 	socketPathLimit = 107
 )
 
@@ -222,10 +221,6 @@ type Metadata struct {
 // and sub-millisecond precision without silently rounding opaque metadata.
 func (m Metadata) Validate() error {
 	return fromWireError(m.wire().Validate())
-}
-
-func validateContentType(s string) error {
-	return fromWireError(wire.ValidateContentType(s))
 }
 
 // Operation is an origin callback operation. Zero is invalid.
@@ -480,15 +475,6 @@ func callbackStatus(err error, pinned bool) int {
 	return 500
 }
 
-func statusError(status int) *Error {
-	err := fromWireError(wire.StatusError(status))
-
-	var typed *Error
-	errors.As(err, &typed)
-
-	return typed
-}
-
 func ioFailure(op string, err error) error {
 	if err == nil || err == io.EOF {
 		return err
@@ -528,11 +514,6 @@ func ClosedRange(first, last ByteOffset) (Range, error) {
 	return fromWireRange(r), fromWireError(err)
 }
 
-func (r Range) resolve(size ByteLength) (ByteOffset, ByteOffset, error) {
-	first, last, err := r.wire().Resolve(uint64(size))
-	return ByteOffset(first), ByteOffset(last), fromWireError(err)
-}
-
 // Resolve validates a whole origin page and returns its inclusive bounds in the
 // selected immutable version. The final page is shortened at EOF. An absent range,
 // unaligned start, or partial nonfinal page is invalid; an empty object is unsatisfiable.
@@ -540,11 +521,6 @@ func (r Range) Resolve(size ByteLength) (ByteOffset, ByteOffset, error) {
 	first, last, err := r.wire().ResolvePage(uint64(size))
 	return ByteOffset(first), ByteOffset(last), fromWireError(err)
 }
-
-const (
-	objectPrefix       = wire.ObjectPrefix
-	clientObjectPrefix = wire.ClientObjectPrefix
-)
 
 // fromWireError is the sole translation from protocol classifications to public SDK errors.
 // Translate nested protocol causes too, preserving the public error chain.
@@ -606,11 +582,19 @@ func fromWireMetadata(m wire.Metadata) Metadata {
 }
 
 func (r OriginRequest) wire() wire.Request {
-	return wire.Request{Key: r.key, Operation: wire.Operation(r.operation), Pin: r.pin.value, Range: r.byteRange.wire(), AdapterMetadata: r.context.metadata.value, Authorization: r.context.authorization.value}
+	return wire.Request{
+		Key: r.key, Operation: wire.Operation(r.operation), Pin: r.pin.value, Range: r.byteRange.wire(),
+		AdapterMetadata: r.context.metadata.value, Authorization: r.context.authorization.value,
+	}
 }
 
 func fromWireRequest(r wire.Request) OriginRequest {
-	return OriginRequest{key: r.Key, operation: Operation(r.Operation), pin: ETag{value: r.Pin}, byteRange: fromWireRange(r.Range), context: FetchContext{metadata: AdapterMetadata{value: r.AdapterMetadata}, authorization: Authorization{value: r.Authorization}}}
+	return OriginRequest{
+		key: r.Key, operation: Operation(r.Operation), pin: ETag{value: r.Pin}, byteRange: fromWireRange(r.Range),
+		context: FetchContext{
+			metadata: AdapterMetadata{value: r.AdapterMetadata}, authorization: Authorization{value: r.Authorization},
+		},
+	}
 }
 
 type wireResponse struct {
@@ -623,15 +607,13 @@ type wireResponse struct {
 func fromWireResponse(r wire.Response) wireResponse {
 	return wireResponse{metadata: fromWireMetadata(r.Metadata), first: ByteOffset(r.First), last: ByteOffset(r.Last), length: r.Length, close: r.Close}
 }
-func decimal(s string) (uint64, error) { n, err := wire.Decimal(s); return n, fromWireError(err) }
-func parseRange(s string) (Range, error) {
-	r, err := wire.ParseRange(s)
-	return fromWireRange(r), fromWireError(err)
-}
-func bootstrapRange() Range           { return fromWireRange(wire.BootstrapRange()) }
-func validatePageShape(r Range) error { return fromWireError(wire.ValidatePageShape(r.wire())) }
+
 func (o ReadOptions) wire() wire.SubscriptionOptions {
-	r := wire.SubscriptionOptions{Offset: uint64(o.Offset), Length: uint64(o.Length), PageCredits: o.PageCredits, ByteCredits: uint64(o.ByteCredits), Ordered: o.Ordered, SmallObject: o.SmallObject, Pin: o.Pin.value}
+	r := wire.SubscriptionOptions{
+		Offset: uint64(o.Offset), Length: uint64(o.Length),
+		PageCredits: o.PageCredits, ByteCredits: uint64(o.ByteCredits),
+		Ordered: o.Ordered, SmallObject: o.SmallObject, Pin: o.Pin.value,
+	}
 	if o.Metadata != nil {
 		m := o.Metadata.wire()
 		r.Metadata = &m

@@ -66,7 +66,9 @@ func (c OriginConfig) defaults() (OriginConfig, error) {
 		return c, err
 	}
 
-	if c.MaxConnections < 0 || c.MaxConcurrentRequests < 0 || c.MaxConcurrentHeadRequests < 0 || c.ReadHeaderTimeout < 0 || c.RequestTimeout < 0 || c.WriteTimeout < 0 || c.IdleTimeout < 0 || c.SocketMode & ^os.FileMode(0o777) != 0 {
+	if c.MaxConnections < 0 || c.MaxConcurrentRequests < 0 || c.MaxConcurrentHeadRequests < 0 ||
+		c.ReadHeaderTimeout < 0 || c.RequestTimeout < 0 || c.WriteTimeout < 0 || c.IdleTimeout < 0 ||
+		c.SocketMode & ^os.FileMode(0o777) != 0 {
 		return c, failure(ErrorInvalidArgument, "origin config", nil)
 	}
 

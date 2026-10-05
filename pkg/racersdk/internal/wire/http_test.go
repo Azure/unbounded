@@ -7,7 +7,9 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -15,6 +17,41 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRequestRedaction(t *testing.T) {
+	for _, request := range []Request{
+		{},
+		{Key: [32]byte{1}, Operation: OperationHead, AdapterMetadata: "private-metadata", Authorization: "Bearer private-credential"},
+	} {
+		for _, value := range []any{request, &request} {
+			for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+				if got := fmt.Sprintf(verb, value); got != "Request([redacted])" {
+					t.Fatalf("%s did not redact request: %s", verb, got)
+				}
+			}
+
+			data, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(data, &fields); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, name := range []string{"AdapterMetadata", "Authorization"} {
+				if _, ok := fields[name]; ok {
+					t.Fatalf("JSON contains %s", name)
+				}
+			}
+
+			if strings.Contains(string(data), "private-") {
+				t.Fatal("JSON contains private request data")
+			}
+		}
+	}
+}
 
 func assertKind(t *testing.T, err error, kind ErrorKind) {
 	t.Helper()

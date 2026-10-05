@@ -106,7 +106,8 @@ func (c *Client) OpenPages(ctx context.Context, request Request, options ...Read
 		o.ByteCredits = ByteLength(o.PageCredits) * PageSize
 	}
 
-	if o.PageCredits < 1 || o.PageCredits > 64 || o.ByteCredits < PageSize || o.ByteCredits > 64*PageSize || uint64(o.Offset) > math.MaxInt64 || uint64(o.Length) > math.MaxInt64-uint64(o.Offset) {
+	if o.PageCredits < 1 || o.PageCredits > 64 || o.ByteCredits < PageSize || o.ByteCredits > 64*PageSize ||
+		uint64(o.Offset) > math.MaxInt64 || uint64(o.Length) > math.MaxInt64-uint64(o.Offset) {
 		return nil, failure(ErrorInvalidArgument, "subscription options", nil)
 	}
 
@@ -149,7 +150,10 @@ func (c *Client) OpenPages(ctx context.Context, request Request, options ...Read
 
 	v := &Value{admissionLease: lease}
 
-	s := &PageStream{owner: v, pageCredits: o.PageCredits, byteCredits: uint64(o.ByteCredits), ordered: o.Ordered, outstanding: make(map[uint64]uint32), notify: make(chan struct{}, 1)}
+	s := &PageStream{
+		owner: v, pageCredits: o.PageCredits, byteCredits: uint64(o.ByteCredits), ordered: o.Ordered,
+		outstanding: make(map[uint64]uint32), notify: make(chan struct{}, 1),
+	}
 	if err := s.open(r, o); err != nil {
 		return nil, s.fail(err)
 	}

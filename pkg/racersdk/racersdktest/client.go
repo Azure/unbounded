@@ -20,6 +20,7 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 	"github.com/Azure/unbounded/pkg/racersdk/internal/fakeracer"
 	"github.com/Azure/unbounded/pkg/racersdk/internal/sdkhook"
+	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
 // NewClient returns a real Client backed by a sequential, noncaching fake Racer
@@ -79,6 +80,20 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 		return nil, nil, fmt.Errorf("racersdktest: temporary directory: %w", err)
 	}
 
+	absolute, err := filepath.Abs(dir)
+	if err != nil {
+		removeDir(dir)
+		return nil, nil, fmt.Errorf("racersdktest: absolute temporary directory: %w", err)
+	}
+
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		removeDir(dir)
+		return nil, nil, fmt.Errorf("racersdktest: resolve temporary directory: %w", err)
+	}
+
+	dir = resolved
+
 	originPath, clientPath := filepath.Join(dir, "o"), filepath.Join(dir, "c")
 	if len(originPath) > 107 || len(clientPath) > 107 {
 		removeDir(dir)
@@ -95,7 +110,7 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 	transport := &http.Transport{
 		DisableCompression: true, MaxConnsPerHost: 16, MaxIdleConns: 16, MaxIdleConnsPerHost: 16,
 		ResponseHeaderTimeout: config.RequestTimeout, IdleConnTimeout: config.IdleTimeout,
-		MaxResponseHeaderBytes: int64(sdkhook.MaxHeadBytes),
+		MaxResponseHeaderBytes: int64(wire.MaxHeadBytes),
 		DialContext: func(dialCtx context.Context, _, _ string) (net.Conn, error) {
 			dialCtx, stop := context.WithCancel(dialCtx)
 			defer stop()
@@ -117,7 +132,7 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 	handler := fakeracer.NewHandler(transport)
 	server := &http.Server{
 		ReadHeaderTimeout: config.ReadHeaderTimeout, IdleTimeout: config.IdleTimeout,
-		MaxHeaderBytes: sdkhook.MaxHeadBytes, ErrorLog: log.New(io.Discard, "", 0),
+		MaxHeaderBytes: wire.MaxHeadBytes, ErrorLog: log.New(io.Discard, "", 0),
 		BaseContext: func(net.Listener) context.Context { return ctx },
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()

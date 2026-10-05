@@ -20,7 +20,6 @@ func init() {
 	sdkhook.ServeOriginAt = serveOrigin
 	sdkhook.OriginDefaults = OriginConfig.defaults
 	sdkhook.InvalidOrigin = func() error { return failure(ErrorInvalidArgument, "fake origin", nil) }
-	sdkhook.MaxHeadBytes = maxHeadBytes
 }
 
 // ClientConfig selects a cache and bounds a Client's resources. Zero numeric
@@ -95,7 +94,11 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		return nil, err
 	}
 
-	if config.MaxConnections < 0 || config.MetadataConnections < 0 || config.MaxQueuedRequests < 0 || config.MetadataQueuedRequests < 0 || config.SmallObjectConnections < 0 || config.SmallObjectQueuedRequests < 0 || config.QueueTimeout < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 || config.BodyReadTimeout < 0 || config.IdleConnTimeout < 0 || config.MaxConnAge < 0 {
+	if config.MaxConnections < 0 || config.MetadataConnections < 0 ||
+		config.MaxQueuedRequests < 0 || config.MetadataQueuedRequests < 0 ||
+		config.SmallObjectConnections < 0 || config.SmallObjectQueuedRequests < 0 ||
+		config.QueueTimeout < 0 || config.DialTimeout < 0 || config.ResponseHeaderTimeout < 0 ||
+		config.BodyReadTimeout < 0 || config.IdleConnTimeout < 0 || config.MaxConnAge < 0 {
 		return nil, failure(ErrorInvalidArgument, "client config", nil)
 	}
 
@@ -148,7 +151,12 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Client{active: make(map[*admissionLease]struct{}), slots: make(chan struct{}, config.MaxConnections), queued: make(chan struct{}, config.MaxQueuedRequests), config: config, path: path, ctx: ctx, cancel: cancel}
+	c := &Client{
+		active: make(map[*admissionLease]struct{}),
+		slots:  make(chan struct{}, config.MaxConnections),
+		queued: make(chan struct{}, config.MaxQueuedRequests),
+		config: config, path: path, ctx: ctx, cancel: cancel,
+	}
 	c.bulk.slots = c.slots
 	c.bulk.queued = c.queued
 	c.copySlots = make(chan struct{}, config.MaxConnections)
@@ -187,14 +195,6 @@ func (c *Client) configurePools(config connpool.Config) {
 type connectionPool struct {
 	*connpool.Pool
 	slots, queued chan struct{}
-}
-
-func (c *Client) closeIdleConnections() {
-	for _, pool := range []*connectionPool{&c.bulk, &c.metadataPool, &c.smallPool} {
-		if pool.Pool != nil {
-			pool.CloseIdle()
-		}
-	}
 }
 
 // admit bounds waiters before allocating a Value, derived context, or callback.

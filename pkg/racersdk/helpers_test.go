@@ -24,6 +24,48 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
+// Protocol adapters used only by SDK tests and benchmarks.
+const objectPrefix = wire.ObjectPrefix
+
+func validateContentType(s string) error {
+	return fromWireError(wire.ValidateContentType(s))
+}
+
+func statusError(status int) *Error {
+	err := fromWireError(wire.StatusError(status))
+
+	var typed *Error
+	errors.As(err, &typed)
+
+	return typed
+}
+
+func (r Range) resolve(size ByteLength) (ByteOffset, ByteOffset, error) {
+	first, last, err := r.wire().Resolve(uint64(size))
+	return ByteOffset(first), ByteOffset(last), fromWireError(err)
+}
+
+func decimal(s string) (uint64, error) {
+	n, err := wire.Decimal(s)
+	return n, fromWireError(err)
+}
+
+func parseRange(s string) (Range, error) {
+	r, err := wire.ParseRange(s)
+	return fromWireRange(r), fromWireError(err)
+}
+
+func bootstrapRange() Range           { return fromWireRange(wire.BootstrapRange()) }
+func validatePageShape(r Range) error { return fromWireError(wire.ValidatePageShape(r.wire())) }
+
+func (c *Client) closeIdleConnections() {
+	for _, pool := range []*connectionPool{&c.bulk, &c.metadataPool, &c.smallPool} {
+		if pool.Pool != nil {
+			pool.CloseIdle()
+		}
+	}
+}
+
 // Keep socket and test scratch paths inside this worktree, including under race.
 func socketDir(t testing.TB) string {
 	t.Helper()

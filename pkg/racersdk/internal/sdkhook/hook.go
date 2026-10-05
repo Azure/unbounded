@@ -3,8 +3,8 @@
 
 // Package sdkhook connects racersdktest to private SDK construction seams.
 // It cannot import racersdk without creating an import cycle. The SDK assigns
-// these hooks once in init; consumers import racersdk and assert the exact
-// signatures below, so initialization precedes every use. Do not replace hooks.
+// these hooks once in init; consumers import racersdk and assert the documented
+// signatures of the any-typed hooks. Initialization precedes every use. Do not replace hooks.
 package sdkhook
 
 var (
@@ -16,6 +16,4 @@ var (
 	OriginDefaults any
 	// InvalidOrigin has type func() error; it preserves the former fake's local error.
 	InvalidOrigin func() error
-	// MaxHeadBytes is the SDK's HTTP head limit, assigned with the hooks.
-	MaxHeadBytes int
 )

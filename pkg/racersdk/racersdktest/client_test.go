@@ -449,6 +449,71 @@ func TestTemporarySockets(t *testing.T) {
 	}
 }
 
+func TestTMPDIRCanonicalPaths(t *testing.T) {
+	for _, name := range []string{"relative", "symlink"} {
+		t.Run(name, func(t *testing.T) {
+			base := t.TempDir()
+
+			parent := filepath.Join(base, "real", "tmp")
+			if err := os.MkdirAll(parent, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			if name == "relative" {
+				t.Chdir(base)
+				t.Setenv("TMPDIR", filepath.Join("real", "tmp"))
+			} else {
+				link := filepath.Join(base, "link")
+				if err := os.Symlink(filepath.Join(base, "real"), link); err != nil {
+					t.Fatal(err)
+				}
+
+				t.Setenv("TMPDIR", filepath.Join(link, "tmp"))
+			}
+
+			client, cleanup, err := racersdktest.NewClient(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				return originMeta(5), io.NopCloser(strings.NewReader("hello")), nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(cleanup)
+
+			entries, err := os.ReadDir(parent)
+			if err != nil || len(entries) != 1 {
+				t.Fatal("temporary directory", entries, err)
+			}
+
+			dir := filepath.Join(parent, entries[0].Name())
+			for _, socket := range []string{"o", "c"} {
+				info, err := os.Stat(filepath.Join(dir, socket))
+				if err != nil || info.Mode()&os.ModeSocket == 0 {
+					t.Fatal("missing socket", socket, err)
+				}
+			}
+
+			v, err := client.Get(context.Background(), racersdk.Request{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			data, err := io.ReadAll(v)
+			closeBody(v)
+
+			if err != nil || string(data) != "hello" {
+				t.Fatal("Get round trip", string(data), err)
+			}
+
+			cleanup()
+
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("cleanup retained directory", err)
+			}
+		})
+	}
+}
+
 func TestTemporarySocketFailures(t *testing.T) {
 	for _, name := range []string{"long", "missing"} {
 		t.Run(name, func(t *testing.T) {

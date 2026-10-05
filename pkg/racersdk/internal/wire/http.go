@@ -35,7 +35,15 @@ type Request struct {
 	Operation                      Operation
 	Pin                            string
 	Range                          Range
-	AdapterMetadata, Authorization string
+	AdapterMetadata, Authorization string `json:"-"`
+}
+
+// Format redacts request data using the SDK's diagnostic convention.
+func (r Request) Format(s fmt.State, _ rune) {
+	// fmt.State cannot usefully report a writer error back through Format.
+	if _, err := io.WriteString(s, "Request([redacted])"); err != nil {
+		return
+	}
 }
 
 type Metadata struct {
@@ -214,7 +222,10 @@ func ParseContentRange(s string) (ContentRange, error) {
 }
 
 func ForbiddenHeaders(h http.Header) bool {
-	for _, name := range []string{"Transfer-Encoding", "Content-Encoding", "Trailer", "Upgrade", "Expect", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
+	for _, name := range []string{
+		"Transfer-Encoding", "Content-Encoding", "Trailer", "Upgrade", "Expect",
+		"If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range",
+	} {
 		if _, ok := h[name]; ok {
 			return true
 		}
@@ -729,7 +740,9 @@ func SubscriptionHead(r Request, o SubscriptionOptions) ([]byte, error) {
 		ordered = 1
 	}
 
-	fmt.Fprintf(&b, "POST /v2/objects/%s HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: %d\r\nRacer-Byte-Credits: %d\r\nRacer-Ordered: %d\r\n", hex.EncodeToString(r.Key[:]), o.PageCredits, o.ByteCredits, ordered)
+	fmt.Fprintf(&b, "POST /v2/objects/%s HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"+
+		"Racer-Page-Credits: %d\r\nRacer-Byte-Credits: %d\r\nRacer-Ordered: %d\r\n",
+		hex.EncodeToString(r.Key[:]), o.PageCredits, o.ByteCredits, ordered)
 
 	if o.Offset != 0 || o.Length != 0 {
 		fmt.Fprintf(&b, "Range: bytes=%d-", o.Offset)
@@ -879,11 +892,16 @@ func ParseSubscriptionRequest(r *http.Request) (SubscriptionRequest, error) {
 	bad := failure(ErrorInvalidArgument, "fake subscription", nil)
 
 	const prefix = ClientObjectPrefix
-	if r.Method != http.MethodPost || r.Proto != "HTTP/1.1" || r.Host != "racer" || len(r.RequestURI) != len(prefix)+64 || !strings.HasPrefix(r.RequestURI, prefix) || r.Header.Get("Content-Length") != "0" || len(r.TransferEncoding) != 0 || ForbiddenHeaders(r.Header) {
+	if r.Method != http.MethodPost || r.Proto != "HTTP/1.1" || r.Host != "racer" ||
+		len(r.RequestURI) != len(prefix)+64 || !strings.HasPrefix(r.RequestURI, prefix) ||
+		r.Header.Get("Content-Length") != "0" || len(r.TransferEncoding) != 0 || ForbiddenHeaders(r.Header) {
 		return s, bad
 	}
 
-	for _, name := range []string{"Content-Length", "If-Match", "Range", "Racer-Page-Credits", "Racer-Byte-Credits", "Racer-Ordered", "Racer-Metadata", "Authorization"} {
+	for _, name := range []string{
+		"Content-Length", "If-Match", "Range", "Racer-Page-Credits", "Racer-Byte-Credits",
+		"Racer-Ordered", "Racer-Metadata", "Authorization",
+	} {
 		if len(r.Header.Values(name)) > 1 {
 			return s, bad
 		}
