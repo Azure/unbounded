@@ -192,9 +192,7 @@ pub struct WorkerRuntime {
 }
 /// Send endpoint is moved before construction on the crypto thread. No I/O
 /// reactor, admission authority, or worker-local Rc can be supplied to the engine.
-pub struct CryptoRuntime {
-    pub port: CryptoPort,
-}
+pub use crate::security::CryptoRuntime;
 
 /// Rc-backed factories cannot cross the startup boundary:
 /// ```compile_fail
