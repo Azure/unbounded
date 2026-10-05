@@ -92,7 +92,7 @@ are Racer peer, origin, and control adapters:
   origin operations.
 - `cmd/racer-dataplane/src/control.rs::ControlTransport` and `ControlConnection`
   own controller health.
-- `cmd/racer-dataplane/rest/src/transport.rs::Transport` owns generic transport state,
+- `cmd/racer-dataplane/rest/src/lib.rs::Transport` owns generic transport state,
   not endpoint-circuit policy.
 
 The current local boundary already offers explicit-time observation and boolean
