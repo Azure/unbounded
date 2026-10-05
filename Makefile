@@ -381,7 +381,7 @@ help: ## Show this help
 	@echo "  racer-controller-build           Build the Go controller"
 	@echo "  racer-test | racer-generate | racer-manifests  Test/generate/render Racer artifacts"
 	@echo "  racer-dataplane-build             Build the locked Rust release binary into bin/"
-	@echo "  racer-dataplane-test              Run Rust library and binary unit tests (RACER_TEST_ARGS)"
+	@echo "  racer-dataplane-test              Run Rust unit and uds-endpoint integration tests (RACER_TEST_ARGS)"
 	@echo "  racer-dataplane-dst               Run DST-filtered Rust tests under 16 GiB/no-swap cgroup limits"
 	@echo "  racer-dataplane-dst-10m            Build once, then run a 600-second DST campaign with fresh seeds"
 	@echo "  racer-dataplane-contention        Run metadata contention tests under 16 GiB/no-swap cgroup limits"
@@ -591,9 +591,13 @@ racer-controller-build: ## Build the Racer controller without lint/test
 	$(GOBUILD) -o bin/racer-controller ./cmd/racer-controller
 
 .PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-dst racer-dataplane-dst-10m racer-dataplane-contention racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
-racer-dataplane-test: ## Run Rust unit tests with all features; pass filters/options via RACER_TEST_ARGS
+racer-dataplane-test: ## Run Rust unit and uds-endpoint integration tests with all features (RACER_TEST_ARGS)
 	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
 		--target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-features --lib --bins -- $(RACER_TEST_ARGS)
+	@# --lib --bins excludes integration tests; cover uds-endpoint without the full Racer suite.
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		-p uds-endpoint --all-features --tests -- $(RACER_TEST_ARGS)
 
 # The wrapper starts before Cargo so compilation and all test descendants share
 # the same hard memory limit. It fails before Cargo if enforcement is unavailable.
@@ -660,6 +664,10 @@ racer-rust-test: ## Check the complete Rust suite, including integration tests a
 	@mkdir -p cmd/racer-dataplane/target
 	$(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all --check
 	$(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-targets --all-features
+	@# Keep strict unsafe-block documentation and warning checks scoped to uds-endpoint.
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) clippy --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		-p uds-endpoint --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
 	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-features -- $(RACER_TEST_ARGS)
 
 .PHONY: runtime-check runtime-miri
