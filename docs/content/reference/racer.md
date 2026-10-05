@@ -183,6 +183,13 @@ replication identity, and durable resource names. These are not tuning keys. Nod
 comes from verified enrollment/local recovery, not a supplied Node name/UID. Do not reset
 markers, credentials, or version counters to repair an existing identity.
 
+Before any manager runnable starts, controller startup recovery has a 30-second
+total deadline covering authoritative installation reads, initialization writes,
+and final version validation. Caller cancellation or an earlier caller deadline
+still applies. The competing-installer wait retains its own five-second limit
+within that total budget. Recovery failure aborts startup without granting serving
+authority; a timeout does not authorize resetting durable state.
+
 The **bare binary** defaults `RACER_PEER_LISTEN` to `0.0.0.0:7443` and
 `RACER_DIAGNOSTICS_LISTEN` to `127.0.0.1:9090`. Managed workloads bind both to the Pod IP
 with the ports above. The operator also wires trust/token paths and

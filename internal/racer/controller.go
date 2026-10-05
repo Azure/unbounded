@@ -195,6 +195,14 @@ func Run(ctx context.Context, cfg Config) error {
 // The writer need not have a running cache; all reads use the authoritative reader
 // supplied to Assemble. Constructors and recovery never grant serving authority.
 func (a *Application) Recover(ctx context.Context, writer client.Writer) error {
+	// Bound the entire guard, including the first authoritative read and writes.
+	// Leave room for the five-second competing-installer wait; an earlier caller
+	// deadline or cancellation still wins.
+	const startupTimeout = 30 * time.Second
+
+	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+
 	cfg, reader := a.Topology.runtimeConfig(), a.Topology.APIReader
 	if err := cfg.Validate(); err != nil {
 		return err
