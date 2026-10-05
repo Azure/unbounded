@@ -38,6 +38,33 @@ notices:
         link: https://docs.rs/crate/base64/0.22.1/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/base64/0.22.1/source/LICENSE-MIT
+  - dependency: chacha20poly1305
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2019-2026 The RustCrypto Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/chacha20poly1305/0.11.0/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/chacha20poly1305/0.11.0/source/LICENSE-MIT
+  - dependency: cipher
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016-2025 RustCrypto Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/cipher/0.5.2/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/cipher/0.5.2/source/LICENSE-MIT
+  - dependency: crc64fast
+    ecosystem: cargo
+    copyright:
+      - Copyright 2019 TiKV Project Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/crc64fast/1.1.0/source/LICENSE-Apache
+      - name: MIT License
+        link: https://docs.rs/crate/crc64fast/1.1.0/source/LICENSE-MIT
   - dependency: d3-scale
     ecosystem: npm
     copyright:
@@ -45,6 +72,13 @@ notices:
     license:
       - name: ISC License
         link: https://github.com/d3/d3-scale/blob/HEAD/LICENSE
+  - dependency: ed25519-dalek
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2017-2019 isis agora lovecruft. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://docs.rs/crate/ed25519-dalek/2.2.0/source/LICENSE
   - dependency: futures
     ecosystem: cargo
     copyright:
@@ -727,6 +761,24 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/oras-project/oras-go/blob/v2.6.2/LICENSE
+  - dependency: poly1305
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2015-2026 The RustCrypto Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/poly1305/0.9.1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/poly1305/0.9.1/source/LICENSE-MIT
+  - dependency: rcgen
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2019-2022 est31 <MTest31@outlook.com> and contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/rcgen/0.13.2/source/LICENSE
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/rcgen/0.13.2/source/LICENSE
   - dependency: react
     ecosystem: npm
     copyright:
