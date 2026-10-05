@@ -76,8 +76,8 @@ controller:
     image: ""
   leaderElection:
     enabled: true
-    leaseDuration: 15s
-    renewDeadline: 5s
+    leaseDuration: 30s
+    renewDeadline: 15s
     retryPeriod: 10s
 
 node:
@@ -126,10 +126,31 @@ to disable their creation.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--leader-elect` | `false` | Enable leader election for HA. |
-| `--leader-elect-lease-duration` | `15s` | Duration of the leader lease. |
-| `--leader-elect-renew-deadline` | `5s` | Deadline for renewing leadership. |
+| `--leader-elect` | `true` | Enable leader election for HA. |
+| `--leader-elect-lease-duration` | `30s` | Duration of the leader lease. |
+| `--leader-elect-renew-deadline` | `15s` | Deadline for renewing leadership. |
 | `--leader-elect-retry-period` | `10s` | Retry period for acquiring leadership. |
+
+The node mutating webhook assigns only site labels, including to nodes that already
+have pod CIDRs. It never allocates pod CIDRs. Nodes without a matching site are
+admitted unchanged; reconciliation handles nodes whose internal IPs appear later.
+
+With leader election enabled, the controller allocates pod CIDRs during node sync
+only while it has confirmed it holds the lease: until
+the renew deadline has elapsed since the start of its last successful lease write.
+A leader whose renewals stop succeeding stops allocating before another replica can
+acquire the lease. The lease holder assigns CIDRs after node creation during node sync.
+
+New assignment allocators are seeded before they become available to node workers.
+Seeding preserves existing and unconfirmed allocations, including blocks of a
+different size that overlap candidate CIDRs. A pending allocation can move to a
+different allocator only when its IP families, block sizes, and pool containment
+match. Otherwise, reconciliation waits until a changed Node UID or resourceVersion
+proves the previous patch cannot apply before allocating replacement CIDRs.
+Successful patches remain reserved until the Node informer observes their CIDRs,
+even if the original assignment is removed in the meantime. Reservations copied
+into new allocators are tracked and released from every recipient when abandoned,
+unless another Node or pending assignment still owns the CIDR.
 
 ### Health and Monitoring
 
@@ -373,8 +394,8 @@ resources:
 replicas: 2
 args:
   - --leader-elect=true
-  - --leader-elect-lease-duration=15s
-  - --leader-elect-renew-deadline=5s
+  - --leader-elect-lease-duration=30s
+  - --leader-elect-renew-deadline=15s
 ```
 
 ### Large Clusters (1000+ nodes)

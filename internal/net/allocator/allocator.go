@@ -24,12 +24,13 @@ var (
 
 // Allocator manages CIDR allocation from configured pools.
 type Allocator struct {
-	mu           sync.Mutex
-	ipv4Pools    []*net.IPNet
-	ipv6Pools    []*net.IPNet
-	ipv4MaskSize int
-	ipv6MaskSize int
-	allocated    map[string]bool
+	mu                      sync.Mutex
+	ipv4Pools               []*net.IPNet
+	ipv6Pools               []*net.IPNet
+	ipv4MaskSize            int
+	ipv6MaskSize            int
+	allocated               map[string]bool
+	overlappingReservations map[string]*net.IPNet
 }
 
 // NewAllocator creates a new CIDR allocator with the given pools and mask sizes.
@@ -39,11 +40,12 @@ func NewAllocator(ipv4Pools, ipv6Pools []*net.IPNet, ipv4MaskSize, ipv6MaskSize 
 	klog.V(4).Infof("IPv4 mask size: /%d, IPv6 mask size: /%d", ipv4MaskSize, ipv6MaskSize)
 
 	a := &Allocator{
-		ipv4Pools:    ipv4Pools,
-		ipv6Pools:    ipv6Pools,
-		ipv4MaskSize: ipv4MaskSize,
-		ipv6MaskSize: ipv6MaskSize,
-		allocated:    make(map[string]bool),
+		ipv4Pools:               ipv4Pools,
+		ipv6Pools:               ipv6Pools,
+		ipv4MaskSize:            ipv4MaskSize,
+		ipv6MaskSize:            ipv6MaskSize,
+		allocated:               make(map[string]bool),
+		overlappingReservations: make(map[string]*net.IPNet),
 	}
 
 	// Validate IPv4 mask size
@@ -105,6 +107,19 @@ func (a *Allocator) MarkAllocated(cidr string) {
 	}
 
 	a.allocated[cidr] = true
+	if _, network, err := net.ParseCIDR(cidr); err == nil {
+		mask, _ := network.Mask.Size()
+
+		expected := a.ipv6MaskSize
+		if network.IP.To4() != nil {
+			expected = a.ipv4MaskSize
+		}
+
+		if mask != expected {
+			a.overlappingReservations[cidr] = network
+		}
+	}
+
 	klog.V(3).Infof("Marked CIDR %s as allocated (total allocated: %d)", cidr, len(a.allocated))
 }
 
@@ -120,6 +135,7 @@ func (a *Allocator) Release(cidr string) {
 	}
 
 	delete(a.allocated, cidr)
+	delete(a.overlappingReservations, cidr)
 	klog.Infof("Released CIDR %s (total allocated: %d)", cidr, len(a.allocated))
 }
 
@@ -131,6 +147,7 @@ func (a *Allocator) Reset() {
 
 	count := len(a.allocated)
 	a.allocated = make(map[string]bool)
+	a.overlappingReservations = make(map[string]*net.IPNet)
 
 	klog.Infof("Reset allocator state (cleared %d allocations)", count)
 }
@@ -167,6 +184,56 @@ func (a *Allocator) ContainsCIDR(cidr string) bool {
 	}
 
 	return false
+}
+
+// MatchesAllocation checks exact families, block sizes, and full pool containment.
+func (a *Allocator) MatchesAllocation(cidrs []string) bool {
+	seen4, seen6 := false, false
+
+	for _, cidr := range cidrs {
+		ip, network, err := net.ParseCIDR(cidr)
+		if err != nil || !ip.Equal(network.IP) {
+			return false
+		}
+
+		pools, expected := a.ipv6Pools, a.ipv6MaskSize
+
+		if ip.To4() != nil {
+			if seen4 {
+				return false
+			}
+
+			seen4 = true
+			pools, expected = a.ipv4Pools, a.ipv4MaskSize
+		} else {
+			if seen6 {
+				return false
+			}
+
+			seen6 = true
+		}
+
+		mask, bits := network.Mask.Size()
+		if mask != expected {
+			return false
+		}
+
+		contained := false
+
+		for _, pool := range pools {
+			poolMask, poolBits := pool.Mask.Size()
+			if bits == poolBits && mask >= poolMask && pool.Contains(network.IP) {
+				contained = true
+				break
+			}
+		}
+
+		if !contained {
+			return false
+		}
+	}
+
+	return seen4 == (len(a.ipv4Pools) > 0) && seen6 == (len(a.ipv6Pools) > 0)
 }
 
 // AllocateIPv4 allocates the next available IPv4 CIDR from the pools.
@@ -278,6 +345,19 @@ func (a *Allocator) allocateFromPool(pool *net.IPNet, maskSize int) (string, err
 				klog.V(5).Infof("allocateFromPool: CIDR %s already allocated (skipped %d so far)", cidrStr, skippedCount)
 			}
 
+			continue
+		}
+
+		overlaps := false
+
+		for _, reserved := range a.overlappingReservations {
+			if reserved.Contains(subnet.IP) || subnet.Contains(reserved.IP) {
+				overlaps = true
+				break
+			}
+		}
+
+		if overlaps {
 			continue
 		}
 
