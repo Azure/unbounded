@@ -1,74 +1,76 @@
-//! Bounded RDMA ownership for paired I/O and native threads.
+//! RDMA writes for a two-thread runtime: an I/O thread and a native thread.
 //!
-//! This crate does not spawn threads or drive an executor. Create [`pair`] before
-//! starting either role, move its ports to their threads, and construct
-//! [`NativeService`] on the native thread. Native owners are not `Send`; provider
-//! calls and destruction remain on that thread. Time and randomness come from
-//! the current `uring-runtime` environment.
+//! All RDMA (libibverbs) calls run on the native thread. The I/O thread never
+//! touches RDMA. It talks to the native thread through a fixed pool of slots.
 //!
-//! # Integration
+//! - A slot is one queue pair (QP) plus one registered buffer.
+//! - The I/O thread leases a slot, sends it one command at a time, and reads
+//!   the result.
+//! - The native thread runs the command and owns every RDMA resource.
 //!
-//! Submit a [`Configuration`] with one opaque [`Guard`] per slot, a byte bound,
-//! and a selector. The selector runs on the native thread after discovery and
-//! returns caller tags paired with discovered indices. Duplicate tags, reused
-//! indices, and out-of-range indices are rejected. An intentionally empty plan
-//! can skip discovery and therefore does not require the native adapter.
+//! This crate spawns no threads and runs no executor. Time and randomness come
+//! from the current `uring-runtime` environment.
 //!
-//! Await [`IoPort::activate`], or use [`IoPort::configure`] and
-//! [`IoPort::activation`] with caller-managed cancellation. After submission,
-//! abandoning activation requires closing the I/O port and continuing native
-//! progress. Claim a [`QueuePairHandle`] through an I/O-local [`DeviceHandle`],
-//! exchange authenticated [`Endpoint`] values using the caller's protocol, and
-//! connect before binding a [`Window`] or writing a [`Region`]. A window must not
-//! be published before its bind [`Ticket`] succeeds.
+//! # Basics
 //!
-//! # Fencing and shutdown
+//! 1. Call [`pair`] to get an [`IoPort`] and a [`NativePort`].
+//! 2. On the native thread, build a [`NativeService`] and poll it.
+//! 3. On the I/O thread, call [`IoPort::activate`] with a [`Configuration`].
+//!    The native thread finds RDMA ports, your selector picks some, and every
+//!    slot gets a QP and a buffer.
+//! 4. Get a [`DeviceHandle`] for a selected port, then lease a
+//!    [`QueuePairHandle`] from it.
+//! 5. Swap [`Endpoint`]s with the peer over your own channel, then connect.
+//! 6. Either:
+//!    - Receive: bind a [`Window`] over a [`Region`], send its address and key
+//!      to the peer, and let the peer write into it.
+//!    - Send: fill a [`Region`] and write it to the peer's window.
+//! 7. Stop the QP and wait for [`QueuePairHandle::poll_stopped`]. Only then can
+//!    you read received bytes. Dropping the handle returns the slot.
 //!
-//! Request [`QueuePairHandle::stop`] and await [`QueuePairHandle::poll_stopped`].
-//! Neither a timeout nor an invalidation completion is a terminal DMA fence.
-//! Readback requires the actual native QP fence. Dropping a QP requests
-//! cancellation without blocking I/O. Native ownership and caller guards survive
-//! failed destruction, including intentional bounded quarantine leaks.
+//! # Stopping is the only fence
 //!
-//! Reopening requires native drainage and release of all I/O leases. Caller
-//! `Arc` clones do not affect the internal quarantine reference count. Use
-//! `uring_runtime::drivers::poll_scoped` for caller-scoped operations, but never to truncate
-//! a required native fence. [`WithNative`] preserves native progress after
-//! admission stops and fences native resources before the inner drain/fence.
+//! A timeout or an invalidate does not stop the NIC from writing memory. Only a
+//! finished stop does. Reads of a [`Region`] wait for it.
 //!
-//! # Backends and bounds
+//! If the native side cannot free something, it leaks it on purpose instead of
+//! freeing memory the NIC might still use. Your [`Guard`]s leak with it, so the
+//! leak counts against your limits.
 //!
-//! The `native` feature loads `librdma_verbs.so.1` and checks ABI version 2.
-//! Build `native/verbs.c` against installed libibverbs headers; Rust never
-//! reproduces provider layouts. Without native support or an active simulated
-//! fabric, discovery returns [`Error::Unavailable`]. The `simulation` feature
-//! exposes a deterministic connected fabric and narrow contention/observation
-//! controls. Enter a node's simulation scope before constructing its native
-//! service; owners retain the fabric after the scope exits.
+//! # Shutdown and reuse
 //!
-//! Capacity is 1 through 256 slots, with one region and one pending command per
-//! leased slot. Discovery uses GID index 0 and rejects inventories exceeding 64
-//! ports rather than truncating them. Poll budgets bound steps, not provider wall
-//! time. A stalled provider can stall siblings on the native thread. Mailbox
-//! contention requires periodic driver ticks as well as completion wakes.
-//! Authentication, topology, admission sizing, page-size accounting, retry policy,
-//! and request scopes belong to callers.
+//! [`IoPort::close`] cancels everything. The native side then stops and frees
+//! each slot. Once it has drained, [`IoPort::reopen`] can start a new round.
+//! [`WithNative`] adds a [`NativeService`] to a `uring-runtime` service so
+//! drain and fence also finish the native side.
 //!
-//! Run `cargo test -p rdma-verbs --locked --offline --features simulation` from
-//! the workspace for hardware-free integration checks. Simulated DMA does not
-//! validate the C adapter or a real provider; operator-selected native tests are
-//! ignored by default.
+//! # Backends
+//!
+//! - `native`: loads `librdma_verbs.so.1`, built from `native/verbs.c`.
+//! - `simulation`: an in-process fake fabric for tests.
+//! - Neither: discovery returns [`Error::Unavailable`].
+//!
+//! # Limits
+//!
+//! - 1 to 256 slots. One region and one pending command per slot.
+//! - At most 64 ports. Uses GID index 0.
+//! - Poll budgets count steps, not time. A slow NIC call blocks the thread.
+//! - Mailbox locks are only tried, never waited on. Poll again on a timer as
+//!   well as on wakes.
+//! - The caller owns auth, topology, admission sizing, retries, and timeouts.
+//!
+//! Hardware-free tests: `cargo test -p rdma-verbs --features simulation`.
 mod ffi;
 pub use ffi::Endpoint;
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;
 
-/// Synchronous physical inventory normalization without application rail IDs.
+/// Clean up and sort a list of RDMA ports using sysfs.
 pub mod discovery {
     use crate::PortInfo;
     use std::path::Path;
 
-    /// Check the native name bound and reject invalid sysfs path components.
+    /// True if `device` is a safe sysfs name: 1 to 63 bytes, no path tricks.
     pub fn valid_device(device: &str) -> bool {
         !device.is_empty()
             && device.len() <= 63
@@ -77,12 +79,12 @@ pub mod discovery {
             && device != ".."
     }
 
-    /// Normalize eligible ports using PCI and NUMA metadata below `root`.
+    /// Filter, sort, and dedup ports, reading PCI and NUMA info under `root`.
     ///
-    /// Known PCI paths sort first, then PCI path, port number, and device name.
-    /// Equal entries retain provider order, including the first duplicate GID.
-    /// Missing or invalid NUMA metadata replaces provider locality with unknown.
-    /// The caller applies its own inventory bound and logical identities.
+    /// - Drops bad names, port 0, and all-zero GIDs.
+    /// - Sets `numa_node` from sysfs, or `None` if unreadable.
+    /// - Sorts by PCI address (known first), then port, then name.
+    /// - Keeps the first entry for each (device, port).
     pub fn inventory_at(mut ports: Vec<PortInfo>, root: &Path) -> Vec<PortInfo> {
         ports.retain(|p| valid_device(&p.device) && p.port != 0 && p.gid != [0; 16]);
         let mut ports: Vec<_> = ports
@@ -108,10 +110,10 @@ pub mod discovery {
     }
 }
 
-/// Synchronous pre-enrollment inventory with no lasting native handles.
+/// List RDMA ports on this host. Opens and closes devices on this thread.
 ///
-/// Handles are dropped on this thread. Only owned descriptions leave it;
-/// missing providers return [`Error::Unavailable`]. NUMA normalization is separate.
+/// Returns [`Error::Unavailable`] with no RDMA backend. Use
+/// [`discovery::inventory_at`] to fill in NUMA info.
 pub fn inventory() -> Result<Vec<PortInfo>> {
     Ok(ffi::discover()?
         .iter()
@@ -124,89 +126,94 @@ pub fn inventory() -> Result<Vec<PortInfo>> {
         .collect())
 }
 
-/// Opaque caller-owned lifetime charge whose contents are never inspected.
+/// Any value you want kept alive as long as a slot's RDMA resources live.
+///
+/// Use it to count admission. If a resource is leaked, its guard leaks too.
 pub type Guard = Arc<dyn Send + Sync>;
 
-/// A verbs operation result.
+/// Result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Portable admission, validation, and native-operation failures.
+/// Errors from this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
-    /// The pool or selector configuration is invalid.
+    /// Bad pool or selector setup.
     InvalidConfiguration,
-    /// Operation parameters or state are invalid.
+    /// Bad arguments, or the call is not allowed right now.
     InvalidRequest,
-    /// The requested memory range is invalid.
+    /// Bad length or memory range.
     InvalidRange,
-    /// The provider, connection, or required resource is unavailable.
+    /// No RDMA, pool closed, or slot canceled.
     Unavailable,
-    /// Bounded capacity cannot accept more work.
+    /// No free slot, region, or command space.
     Overloaded,
-    /// The operation's deadline has expired.
+    /// The deadline passed.
     DeadlineExceeded,
-    /// The operation was canceled before successful completion.
+    /// Canceled before it finished.
     Cancelled,
-    /// A provider operation or synchronization primitive failed.
+    /// An RDMA call failed, or a lock was poisoned.
     Io,
 }
 impl std::fmt::Display for Error {
-    /// Render the stable variant name used by the portable error type.
+    /// Print the variant name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
     }
 }
 impl std::error::Error for Error {}
 
-/// Description available to the selector on the native owner thread.
+/// One RDMA port, as shown to the selector.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortInfo {
-    /// Native device name.
+    /// Device name, like `mlx5_0`.
     pub device: String,
-    /// Physical port number.
+    /// Port number on the device.
     pub port: u8,
-    /// Port GID at the adapter's selected index.
+    /// Port GID at index 0.
     pub gid: [u8; 16],
-    /// Known local NUMA node, if available.
+    /// NUMA node, if known.
     pub numa_node: Option<usize>,
 }
 
-/// Caller tag associated with one discovered physical port.
+/// A port the selector picked, with your tag for it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Selection {
-    /// Caller-defined tag used for later slot claims.
+    /// Your name for this port. Pass it to [`IoPort::device`].
     pub tag: u32,
-    /// Index in the selector's discovered inventory.
+    /// Position in the discovered port list.
     pub index: usize,
-    /// Owned description of the selected port.
+    /// The picked port.
     pub port: PortInfo,
 }
 
-/// Owned plan retained while configuration mailboxes are contended.
+/// What [`IoPort::configure`] asks the native side to build.
 pub struct Configuration {
-    /// Skip native discovery for an intentionally empty plan. The selector
-    /// receives an empty slice and must return an empty selection.
+    /// Set false to skip discovery for an empty plan. The selector then sees
+    /// no ports and must pick none.
     pub discover: bool,
-    /// Native-thread selector returning unique caller tags and inventory indices.
+    /// Runs on the native thread. Gets the port list, returns `(tag, index)`
+    /// pairs. Tags and indices must be unique.
     pub selector: Box<PortSelector>,
-    /// One lifetime charge for each pool slot.
+    /// One guard per slot. The length sets the slot count.
     pub guards: Vec<Guard>,
-    /// Staging and registered allocation capacity per slot.
+    /// Buffer size per slot.
     pub bytes: usize,
 }
 
-/// Sendable I/O handoff created before either paired role starts.
+/// The I/O thread's end of the pair. Created by [`pair`].
 pub struct IoPort {
     pub(crate) shared: Arc<Shared>,
 }
 
-/// Sendable handoff consumed on the thread that constructs the native service.
+/// The native thread's end of the pair. Move it there and pass it to
+/// [`NativeService::new`].
 pub struct NativePort {
     shared: Arc<Shared>,
 }
 
-/// Bounded native progress constructed on the owning thread after port handoff.
-/// `Rc` native owners never cross threads, even during cancellation or shutdown.
+/// Runs on the native thread and owns all RDMA resources.
+///
+/// Poll it from that thread's runtime. It is not `Send`.
 pub struct NativeService {
     environment: uring_runtime::environment::Environment,
     port: NativePort,
@@ -217,28 +224,33 @@ pub struct NativeService {
     simulation: Option<simulation::Simulation>,
 }
 
-/// Compose a local service with paired native progress and uncancelable fences.
+/// A `uring-runtime` service with a [`NativeService`] attached.
 ///
-/// Both services receive the budget. Admission stop leaves native progress
-/// available for accepted work. Drain and fence close and fence native resources
-/// one slot per turn before the inner hook, even if the scope has expired.
-/// Close shuts native admission even if the inner close reports a failure.
+/// - Poll: polls both with the same budget.
+/// - Stop admission: only the inner service. Native work keeps going.
+/// - Drain and fence: close and fully drain the native side first, even if
+///   the scope has expired. Then run the inner one.
+/// - Close: closes both, native first.
 pub struct WithNative<T> {
     inner: T,
     native: NativeService,
 }
 
-/// I/O-local caller tag tied to one pool generation.
+/// A port tag on the I/O thread. Lease QPs from it.
+///
+/// Goes stale after [`IoPort::reopen`].
 pub struct DeviceHandle {
     pub(crate) port: Rc<IoPort>,
     pub(crate) rail: u32,
     pub(crate) generation: u64,
 }
 
-/// I/O-local queue pair proxy; native calls run only on the paired service.
+/// A leased slot's QP, seen from the I/O thread.
+///
+/// Each call queues a command for the native thread. Dropping it stops the QP.
 pub struct QueuePairHandle {
     lease: Rc<Lease>,
-    /// Local endpoint to exchange through the caller's authenticated protocol.
+    /// This QP's address. Send it to the peer.
     pub endpoint: Endpoint,
     connecting: RefCell<Option<Ticket>>,
     connected: Cell<bool>,
@@ -247,28 +259,33 @@ pub struct QueuePairHandle {
     expires: Cell<Option<std::time::Instant>>,
 }
 
-/// One leased slot's bounded staging region, readable only after its native fence.
+/// The slot's buffer, seen from the I/O thread.
+///
+/// Fill it before a write. Read it only after the QP has stopped.
 pub struct Region {
     lease: Rc<Lease>,
     length: usize,
 }
 
-/// Remote write capability whose descriptor becomes visible after bind completion.
+/// Lets a peer write into a [`Region`]. Send its address and key to the peer.
+///
+/// Address and key are set once the bind [`Ticket`] succeeds. Do not send them
+/// before that.
 pub struct Window {
     pub(crate) key: Cell<u32>,
     pub(crate) address: Cell<u64>,
     _region: Rc<Region>,
 }
 
-/// Shared observation of one command's native completion, not mere submission.
+/// The result of one command, once the native side has finished it.
 #[derive(Clone)]
 pub struct Ticket(Rc<TicketState>);
 
 impl Endpoint {
-    /// Fixed width of the network-order encoding, independent of native layout.
+    /// Size of the wire encoding.
     pub const ENCODED_LEN: usize = 32;
 
-    /// Encode fields without validation; callers may validate before encoding.
+    /// Encode as 32 big-endian bytes. Does not validate.
     pub fn to_bytes(&self) -> [u8; Self::ENCODED_LEN] {
         let mut bytes = [0; Self::ENCODED_LEN];
         bytes[..16].copy_from_slice(&self.gid);
@@ -281,7 +298,7 @@ impl Endpoint {
         bytes
     }
 
-    /// Decode exactly one endpoint and validate its verbs field bounds.
+    /// Decode 32 bytes and validate the fields.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != Self::ENCODED_LEN {
             return Err(Error::InvalidRequest);
@@ -316,13 +333,13 @@ use uring_runtime::{
     group::{FailureReporter, Service},
 };
 
-/// Keep a slot and its staging alive until the last I/O owner releases it.
+/// The I/O side's hold on a slot. Shared by the QP handle, region, and tickets.
 struct Lease {
     slot: Arc<Slot>,
     shared: Arc<Shared>,
 }
 impl Drop for Lease {
-    /// Request cancellation and release staging admission on the last I/O lease.
+    /// Last holder gone: tell the native side to stop and recycle the slot.
     fn drop(&mut self) {
         self.slot.cancel.store(true, Ordering::Release);
         self.slot.released.store(true, Ordering::Release);
@@ -330,7 +347,7 @@ impl Drop for Lease {
     }
 }
 impl Region {
-    /// Claim the slot's single region, yielding on mailbox contention.
+    /// Take the slot's buffer for `length` bytes. One region per slot.
     pub fn poll_acquire(qp: &QueuePairHandle, length: usize) -> Poll<Result<Rc<Self>>> {
         if length == 0 {
             return Poll::Ready(Err(Error::InvalidRange));
@@ -350,11 +367,12 @@ impl Region {
             length,
         })))
     }
-    /// Return the transfer length, not the pool's registered allocation capacity.
+    /// Bytes in use, not the full buffer size.
     pub fn length(&self) -> usize {
         self.length
     }
-    /// Copy an exact-length payload into staging when no command is queued.
+    /// Fill the buffer. `bytes` must be exactly [`Region::length`] long.
+    /// Fails while a command is queued.
     pub fn poll_copy_from(&self, bytes: &[u8]) -> Poll<Result<()>> {
         if bytes.len() != self.length {
             return Poll::Ready(Err(Error::InvalidRange));
@@ -371,11 +389,11 @@ impl Region {
         mailbox.bytes[..self.length].copy_from_slice(bytes);
         Poll::Ready(Ok(()))
     }
-    /// Register for the leased slot's native progress notifications.
+    /// Wake `cx` when the native side makes progress on this slot.
     pub fn register_waiter(&self, cx: &Context<'_>) {
         self.lease.slot.waiter.register(cx.waker());
     }
-    /// Copy staging after the terminal native fence, yielding on contention.
+    /// Read the buffer. Fails until the QP has stopped.
     pub fn poll_copy_to(&self, cx: &mut Context<'_>) -> Poll<Result<Vec<u8>>> {
         self.lease.slot.waiter.register(cx.waker());
         if !self.lease.slot.fenced.load(Ordering::Acquire) {
@@ -384,7 +402,7 @@ impl Region {
         let mailbox = ready!(try_mailbox(&self.lease.slot.mailbox))?;
         Poll::Ready(self.copy_bytes(&mailbox))
     }
-    /// Allocate an owned copy of the region's exact transfer length.
+    /// Copy out `length` bytes.
     fn copy_bytes(&self, mailbox: &Mailbox) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         bytes
@@ -394,21 +412,22 @@ impl Region {
         Ok(bytes)
     }
 }
-/// Retain the slot and cache one completion independently of later commands.
+/// A ticket's slot hold, its saved result, and the window it binds, if any.
 struct TicketState {
     lease: Rc<Lease>,
     result: Cell<Option<Result<()>>>,
     window: Option<Rc<Window>>,
 }
 impl Ticket {
-    /// Observe a cached completion, or `None` before completion or during contention.
+    /// The result, or `None` if not done yet.
     pub fn result(&self) -> Option<Result<()>> {
         match self.poll_result() {
             Poll::Ready(result) => result,
             Poll::Pending => None,
         }
     }
-    /// Consume and cache the mailbox result, publishing successful bind descriptors.
+    /// Take the result from the mailbox and save it. On a good bind, fill in
+    /// the window's address and key.
     fn poll_result(&self) -> Poll<Option<Result<()>>> {
         if let Some(result) = self.0.result.get() {
             return Poll::Ready(Some(result));
@@ -430,7 +449,7 @@ impl Ticket {
         self.0.result.set(Some(result));
         Poll::Ready(Some(result))
     }
-    /// Register a waiter and await completion, rejecting an unavailable closed pool.
+    /// Wait for the result. Fails if the pool closes first.
     pub fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.0.lease.slot.waiter.register(cx.waker());
         if let Some(result) = self.result() {
@@ -443,7 +462,10 @@ impl Ticket {
     }
 }
 impl QueuePairHandle {
-    /// Claim a ready slot and retain an optional guard until its native fence.
+    /// Lease a free slot on `device`'s port.
+    ///
+    /// `permit` is held until the QP has stopped. Returns
+    /// [`Error::Overloaded`] if no slot is free.
     pub fn poll_new(device: Rc<DeviceHandle>, permit: Option<Guard>) -> Poll<Result<Rc<Self>>> {
         if device.port.shared.closed.load(Ordering::Acquire)
             || device.generation != device.port.shared.generation.load(Ordering::Acquire)
@@ -493,7 +515,7 @@ impl QueuePairHandle {
             Poll::Ready(Err(Error::Overloaded))
         }
     }
-    /// Queue one command after observing the previous completion.
+    /// Queue a command. The previous one must have finished.
     fn poll_submit(&self, command: Command, window: Option<Rc<Window>>) -> Poll<Result<Ticket>> {
         if self.lease.slot.cancel.load(Ordering::Acquire)
             || self.lease.shared.closed.load(Ordering::Acquire)
@@ -521,7 +543,7 @@ impl QueuePairHandle {
         self.lease.shared.engine.wake();
         Poll::Ready(Ok(ticket))
     }
-    /// Validate and submit connection setup; completion requires `poll_connected`.
+    /// Start connecting to `remote`. Wait with [`Self::poll_connected`].
     pub fn poll_connect(&self, remote: Endpoint) -> Poll<Result<()>> {
         remote.validate()?;
         if self.connecting.borrow().is_some() || remote.link_layer != self.endpoint.link_layer {
@@ -531,22 +553,23 @@ impl QueuePairHandle {
             Some(ready!(self.poll_submit(Command::Connect(remote), None))?);
         Poll::Ready(Ok(()))
     }
-    /// Report a connected, uncanceled queue pair without a recorded failure.
+    /// True if connected and not failed, stopping, or closed.
     pub fn ready(&self) -> bool {
         self.connected.get()
             && self.failure.get().is_none()
             && !self.lease.shared.closed.load(Ordering::Acquire)
             && !self.lease.slot.cancel.load(Ordering::Acquire)
     }
-    /// Report whether the native terminal fence has completed.
+    /// True once the QP has fully stopped.
     pub fn stopped(&self) -> bool {
         self.lease.slot.fenced.load(Ordering::Acquire)
     }
-    /// Set the deadline checked by subsequent I/O progress calls.
+    /// Set a deadline. [`Self::progress`] fails and stops the QP after it.
     pub fn expire_at(&self, deadline: std::time::Instant) {
         self.expires.set(Some(deadline));
     }
-    /// Bind this queue pair's region and return its unpublished window and ticket.
+    /// Open `region` to remote writes. Send the window to the peer only after
+    /// the ticket succeeds.
     pub fn poll_bind(&self, region: Rc<Region>) -> Poll<Result<(Rc<Window>, Ticket)>> {
         if !self.ready() || !Rc::ptr_eq(&region.lease, &self.lease) {
             return Poll::Ready(Err(Error::Unavailable));
@@ -559,7 +582,8 @@ impl QueuePairHandle {
         let ticket = ready!(self.poll_submit(Command::Bind, Some(window.clone())))?;
         Poll::Ready(Ok((window, ticket)))
     }
-    /// Submit local invalidation; its completion alone does not permit readback.
+    /// Revoke the window. This does not make the region safe to read; stop the
+    /// QP for that.
     pub fn poll_invalidate(
         &self,
         window: Rc<Window>,
@@ -571,18 +595,20 @@ impl QueuePairHandle {
         }
         self.poll_submit(Command::Invalidate, None)
     }
-    /// Submit this queue pair's region to a caller-authenticated remote capability.
+    /// Write `region` to the peer's window at `address` with `key`.
     pub fn poll_write(&self, region: Rc<Region>, address: u64, key: u32) -> Poll<Result<Ticket>> {
         if !self.ready() || !Rc::ptr_eq(&region.lease, &self.lease) {
             return Poll::Ready(Err(Error::Unavailable));
         }
         self.poll_submit(Command::Write { address, key }, None)
     }
-    /// Register for this queue pair's native progress notifications.
+    /// Wake `cx` when the native side makes progress on this slot.
     pub fn register_waiter(&self, cx: &Context<'_>) {
         self.lease.slot.waiter.register(cx.waker());
     }
-    /// Observe connection/completion state and request stop on failure or expiry.
+    /// Check state. Returns 1 if the last command finished, else 0.
+    ///
+    /// On failure, close, or deadline, stops the QP and returns the error.
     pub fn progress(&self) -> Result<usize> {
         if self.lease.shared.closed.load(Ordering::Acquire) && !self.stopped() {
             self.failure.set(Some(Error::Unavailable));
@@ -616,12 +642,14 @@ impl QueuePairHandle {
         }
         Ok(count)
     }
-    /// Cancellation request only. poll_stopped is the actual asynchronous fence.
+    /// Ask the native side to stop the QP. Returns at once; wait with
+    /// [`Self::poll_stopped`].
     pub fn stop(&self) {
         self.lease.slot.cancel.store(true, Ordering::Release);
         self.lease.shared.engine.wake();
     }
-    /// Request stop and await its actual fence, or report pool unavailability.
+    /// Stop the QP and wait until it has stopped. Fails if the pool closes
+    /// first.
     pub fn poll_stopped(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.lease.slot.waiter.register(cx.waker());
         self.stop();
@@ -633,7 +661,7 @@ impl QueuePairHandle {
             Poll::Pending
         }
     }
-    /// Observe progress and await completion of the submitted connection setup.
+    /// Wait for [`Self::poll_connect`] to finish.
     pub fn poll_connected(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.progress()?;
         let poll = self
@@ -649,58 +677,73 @@ impl QueuePairHandle {
     }
 }
 impl Drop for QueuePairHandle {
-    /// Request cancellation without performing native work on the I/O thread.
+    /// Ask the native side to stop the QP. Does not wait.
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-/// A slot that has not been published for claims.
+// Slot states.
+/// Not built yet.
 pub(crate) const IDLE: u8 = 0;
-/// A provisioned slot available for an I/O claim.
+/// Built and free to lease.
 pub(crate) const READY: u8 = 1;
-/// A slot held by an I/O lease.
+/// Leased by the I/O thread.
 pub(crate) const OWNED: u8 = 2;
-/// A slot awaiting release or successful replenishment.
+/// Out of use, waiting to be released or rebuilt.
 pub(crate) const RETIRED: u8 = 3;
 
-/// One safe operation to execute on the native owning thread.
+/// A request from the I/O thread for the native thread to run.
 pub(crate) enum Command {
-    /// Connect to a validated remote endpoint.
+    /// Connect the QP to the peer.
     Connect(Endpoint),
-    /// Bind the slot's region to a fresh memory window.
+    /// Open the region to remote writes.
     Bind,
-    /// Write the staged transfer using the caller's remote capability.
+    /// Write the region to the peer's window.
     Write { address: u64, key: u32 },
-    /// Revoke the slot's current remote memory-window capability.
+    /// Revoke the window.
     Invalidate,
 }
-/// Bounded staging, command, and completion handoff for one slot.
+/// Data passed between the two threads for one slot, behind a mutex.
 pub(crate) struct Mailbox {
+    /// Lease permit, held until the QP stops.
     pub peer_admission: Option<Guard>,
+    /// This slot's QP address.
     pub endpoint: Option<Endpoint>,
+    /// Tag of the port this slot is on.
     pub rail: u32,
+    /// Region length in use, or 0 if no region.
     pub length: usize,
+    /// Copy of the region, readable by the I/O thread.
     pub bytes: Vec<u8>,
+    /// Command waiting for the native side.
     pub command: Option<Command>,
+    /// Result of the last command.
     pub result: Option<Result<()>>,
+    /// Window address and key after a bind.
     pub descriptor: Option<(u64, u32)>,
+    /// The slot's guard from [`Configuration::guards`].
     pub quota: Option<Arc<GuardOwner>>,
 }
-/// Atomic lease lifecycle and protected I/O/native handoff state.
+/// One pool slot, shared by both threads.
 pub(crate) struct Slot {
+    /// IDLE, READY, OWNED, or RETIRED.
     pub state: AtomicU8,
+    /// I/O side wants the QP stopped.
     pub cancel: AtomicBool,
+    /// I/O side has dropped its lease.
     pub released: AtomicBool,
+    /// Native side has stopped the QP. Safe to read the buffer.
     pub fenced: AtomicBool,
     pub mailbox: Mutex<Mailbox>,
+    /// Wakes the I/O task waiting on this slot.
     pub waiter: AtomicWaker,
 }
 impl Drop for Slot {
-    /// Quarantine an admission guard if native teardown never established a fence.
+    /// If the QP never stopped, leak the lease permit along with it.
     fn drop(&mut self) {
-        // Failed native teardown may intentionally outlive both paired roles.
-        // The bounded admission slot must quarantine with that DMA ownership.
+        // The NIC may still own this slot's memory, so its permit must stay
+        // counted.
         if !self.fenced.load(Ordering::Acquire) {
             let mailbox = self.mailbox.get_mut().unwrap_or_else(|e| e.into_inner());
             if let Some(permit) = mailbox.peer_admission.take() {
@@ -709,23 +752,32 @@ impl Drop for Slot {
         }
     }
 }
-/// Cross-thread pool admission, configuration, and wake state.
+/// State shared by [`IoPort`] and [`NativePort`].
 pub(crate) struct Shared {
     pub slots: Vec<Arc<Slot>>,
+    /// Wakes the native service.
     pub engine: AtomicWaker,
+    /// Wakes the I/O driver.
     pub io: AtomicWaker,
+    /// No new work. Native side is shutting slots down.
     pub closed: AtomicBool,
+    /// Bumped by each reopen. Stale [`DeviceHandle`]s are rejected.
     pub generation: AtomicU64,
+    /// Closed and every slot freed. Reopen is allowed.
     drained: AtomicBool,
+    /// False once the [`NativePort`] is dropped.
     alive: AtomicBool,
+    /// A configuration was submitted this round.
     configured: AtomicBool,
+    /// Configuration waiting for the native side.
     config: Mutex<Option<Configuration>>,
+    /// Activation result waiting for the I/O side.
     activation: Mutex<Option<Result<Vec<Selection>>>>,
 }
-/// Native-thread selection callback mapping inventory indices to caller tags.
+/// Picks ports: takes the port list, returns `(tag, index)` pairs.
 type PortSelector = dyn FnOnce(&[PortInfo]) -> Result<Vec<(u32, usize)>> + Send;
 impl Drop for NativePort {
-    /// Mark the native role gone and notify all remaining I/O waiters.
+    /// Native side is gone: close the pool and wake every waiter.
     fn drop(&mut self) {
         self.shared.alive.store(false, Ordering::Release);
         self.shared.closed.store(true, Ordering::Release);
@@ -736,7 +788,7 @@ impl Drop for NativePort {
     }
 }
 
-/// Create paired ports with a fixed capacity of 1 through 256 slots.
+/// Create the two ends of a pool with `slots` slots (1 to 256).
 pub fn pair(slots: usize) -> Result<(IoPort, NativePort)> {
     if slots == 0 || slots > 256 {
         return Err(Error::InvalidConfiguration);
@@ -782,8 +834,10 @@ pub fn pair(slots: usize) -> Result<(IoPort, NativePort)> {
     ))
 }
 impl IoPort {
-    /// Submit configuration and await activation under the caller's scope.
-    /// Dropping the wait after submission closes admission but does not bypass fences.
+    /// Submit `configuration` and wait for the native side to build the pool.
+    ///
+    /// Returns the picked ports. If the wait is dropped or the scope ends
+    /// first, the pool is closed.
     pub async fn activate<S: Scope>(
         &self,
         configuration: Configuration,
@@ -797,13 +851,13 @@ impl IoPort {
             std::future::Future::poll(configure.as_mut(), cx)
         })
         .await?;
-        /// Close admission if a submitted activation wait is abandoned.
+        /// Closes the pool if dropped before activation finishes.
         struct ActivationGuard<'a> {
             port: &'a IoPort,
             completed: bool,
         }
         impl Drop for ActivationGuard<'_> {
-            /// Close admission unless activation completed successfully.
+            /// Close unless activation finished.
             fn drop(&mut self) {
                 if !self.completed {
                     self.port.close();
@@ -836,7 +890,7 @@ impl IoPort {
         Ok(mappings)
     }
 
-    /// Capture a caller tag and the current pool generation in an I/O handle.
+    /// Get a handle for the port you tagged `tag` in the selector.
     pub fn device(self: &Rc<Self>, tag: u32) -> Rc<DeviceHandle> {
         Rc::new(DeviceHandle {
             port: self.clone(),
@@ -844,20 +898,21 @@ impl IoPort {
             generation: self.shared.generation.load(Ordering::Acquire),
         })
     }
-    /// Report whether I/O admission is closed.
+    /// True if the pool is closed.
     pub fn closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)
     }
-    /// Return the pool's fixed number of slots.
+    /// Number of slots.
     pub fn capacity(&self) -> usize {
         self.shared.slots.len()
     }
-    /// Register the I/O driver for activation and native progress notifications.
+    /// Wake `waker` on activation results and slot changes.
     pub fn register_driver(&self, waker: &Waker) {
         self.shared.io.register(waker);
     }
-    /// Reopen only after the native role has destroyed every device owner and
-    /// all I/O leases have released their fenced staging. No timer is a fence.
+    /// Start a new round after [`Self::close`].
+    ///
+    /// Fails until the native side has drained. Does nothing if not closed.
     pub fn reopen(&self) -> Result<()> {
         if !self.shared.alive.load(Ordering::Acquire) {
             return Err(Error::Unavailable);
@@ -887,8 +942,10 @@ impl IoPort {
         self.shared.engine.wake();
         Ok(())
     }
-    /// Submit an owned plan, retaining it across contention without scope checks.
-    /// After submission, abandoned activation requires close and native progress.
+    /// Hand `configuration` to the native side. Once per round.
+    ///
+    /// Does not wait for the pool to be built; use [`Self::activation`] for
+    /// that. To give up after this, call [`Self::close`].
     pub async fn configure(&self, configuration: Configuration) -> Result<()> {
         let mut configuration = Some(configuration);
         std::future::poll_fn(|cx| {
@@ -919,7 +976,7 @@ impl IoPort {
         })
         .await
     }
-    /// Consume an activation result, returning `None` before publication or on contention.
+    /// Take the activation result, or `None` if not ready yet.
     pub fn activation(&self) -> Option<Result<Vec<Selection>>> {
         match self.shared.activation.try_lock() {
             Ok(mut activation) => activation.take(),
@@ -927,7 +984,7 @@ impl IoPort {
             Err(std::sync::TryLockError::Poisoned(_)) => Some(Err(Error::Io)),
         }
     }
-    /// Close admission and request cancellation without waiting for native fences.
+    /// Close the pool and cancel every slot. Does not wait.
     pub fn close(&self) {
         self.shared.drained.store(false, Ordering::Release);
         self.shared.closed.store(true, Ordering::Release);
@@ -938,39 +995,44 @@ impl IoPort {
     }
 }
 impl Drop for IoPort {
-    /// Close admission when the paired I/O role releases its final port owner.
+    /// Close the pool.
     fn drop(&mut self) {
         self.close();
     }
 }
 
-/// Native owners and retry state for one provisioned slot.
+/// Native RDMA objects for one slot.
 struct Resource {
     device: Rc<ffi::NativeDevice>,
     region: Rc<ffi::NativeRegion>,
     qp: Option<Rc<ffi::NativeQueuePair>>,
     window: Option<Rc<ffi::Window>>,
+    /// The command in flight, if any.
     pending: Option<ffi::Ticket>,
+    /// Shutting this slot's QP down.
     stopping: bool,
+    /// Wait until this time before retrying a failed stop or rebuild.
     next_retry: Option<std::time::Instant>,
 }
-/// Selected devices and guards retained during incremental provisioning.
+/// Activation in progress. Slots are built one per step.
 struct Activation {
     devices: Vec<Rc<ffi::NativeDevice>>,
     selected: Vec<Selection>,
     quotas: std::vec::IntoIter<Guard>,
     bytes: usize,
+    /// Next slot to build.
     next: usize,
 }
-/// Result of one bounded discovery or slot-provisioning step.
+/// Outcome of one activation step.
 enum ActivationStep {
-    /// Keep provisioning, or retry this step after mailbox contention.
+    /// More to do.
     Pending,
-    /// Publish the complete selected-port mapping to the I/O role.
+    /// All slots built. Send this to the I/O side.
     Complete(Vec<Selection>),
 }
 impl NativeService {
-    /// Capture the current runtime and simulation environments on the native thread.
+    /// Build the service. Call on the native thread; it captures that thread's
+    /// runtime (and simulation, in tests).
     pub fn new(port: NativePort) -> Self {
         let resources = (0..port.shared.slots.len()).map(|_| None).collect();
         Self {
@@ -983,11 +1045,11 @@ impl NativeService {
             simulation: simulation::current(),
         }
     }
-    /// Register the native driver for commands and cancellation requests.
+    /// Wake `waker` when the I/O side has work for the native side.
     pub fn register_driver(&self, waker: &Waker) {
         self.port.shared.engine.register(waker);
     }
-    /// Discover and select ports, retaining nonempty plans for provisioning.
+    /// Find ports and run the selector. Slots are built later, one per step.
     fn begin_activation(&mut self, config: Configuration) -> Result<ActivationStep> {
         #[cfg(any(test, feature = "simulation"))]
         let _environment = self.simulation.as_ref().map(simulation::Simulation::enter);
@@ -1038,7 +1100,8 @@ impl NativeService {
         });
         Ok(ActivationStep::Pending)
     }
-    /// Provision one slot and publish readiness only after all slots succeed.
+    /// Build the next slot: buffer, QP, and a test window. Slots are spread
+    /// across the picked ports in turn. None go READY until all are built.
     fn activate_slot(&mut self) -> Result<ActivationStep> {
         if self.port.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Unavailable);
@@ -1059,9 +1122,8 @@ impl NativeService {
                 .next()
                 .ok_or(Error::InvalidConfiguration)?,
         );
-        // Retain a quota observer even if registration/destruction fails. Partial
-        // resources stay IDLE and are fenced by the normal close/retry path when
-        // the I/O activation guard observes an error or is canceled/dropped.
+        // Store the guard first, so it is tracked even if a step below fails.
+        // A failed activation is cleaned up by the normal close path.
         mailbox.quota = Some(quota.clone());
         mailbox
             .bytes
@@ -1088,17 +1150,17 @@ impl NativeService {
         if activation.next != self.resources.len() {
             return Ok(ActivationStep::Pending);
         }
-        // No native work in this publication pass. No slot is claimable until
-        // every slot has successfully provisioned, and I/O awaits the result.
+        // All slots built. Make them leasable at once.
         for slot in &self.port.shared.slots {
             slot.state.store(READY, Ordering::Release);
         }
         Ok(ActivationStep::Complete(activation.selected.to_vec()))
     }
-    /// Run at most budget steps: discovery, one slot's provisioning, or one slot's
-    /// normal progress/fence. Native provider calls (including discovery's bounded
-    /// port scan) cannot be preempted. This is a work bound, not a wall-time bound;
-    /// a provider may stall all siblings on this crypto thread, but not their I/O.
+    /// Do up to `budget` steps of work, then check whether shutdown is done.
+    ///
+    /// A step is one of: find ports, build one slot, or service one slot
+    /// (round-robin). Budget counts steps, not time; one slow RDMA call
+    /// blocks this thread.
     pub fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
         let _environment = self.environment.enter();
         if budget == 0 {
@@ -1132,6 +1194,8 @@ impl NativeService {
             self.cursor = (self.cursor + 1) % self.resources.len();
             self.drive(index);
         }
+        // Drained once closed and all native objects are gone. Then clear
+        // the mailboxes so reopen starts fresh.
         if !self.port.shared.drained.load(Ordering::Acquire)
             && self.port.shared.closed.load(Ordering::Acquire)
             && self.activation.is_none()
@@ -1149,7 +1213,7 @@ impl NativeService {
                     drained = false;
                     continue;
                 }
-                // Backend destruction failures retain another quota owner.
+                // Someone else still holds the guard: a native object was leaked.
                 if mailbox
                     .quota
                     .as_ref()
@@ -1174,7 +1238,11 @@ impl NativeService {
         }
         Ok(())
     }
-    /// Progress a slot's command, terminal fence, or replenishment attempt.
+    /// Service one slot.
+    ///
+    /// - Stopping: stop the QP, copy the buffer out, mark it fenced. Then free
+    ///   the slot (if closed) or build a fresh QP and make it READY again.
+    /// - Leased: check the command in flight, or start the next one.
     fn drive(&mut self, index: usize) {
         let Some(resource) = self.resources[index].as_mut() else {
             return;
@@ -1200,8 +1268,9 @@ impl NativeService {
             {
                 resource.next_retry =
                     Some(uring_runtime::environment::now() + std::time::Duration::from_millis(10));
-                return; // quarantine, retry on next service turn
+                return; // Keep everything; retry later.
             }
+            // Peers may have written into the region; copy it out for reads.
             if resource.window.is_some()
                 && !slot.fenced.load(Ordering::Acquire)
                 && resource
@@ -1213,7 +1282,7 @@ impl NativeService {
             }
             resource.pending = None;
             resource.window = None;
-            resource.qp = None; // CQ destruction on crypto, never I/O
+            resource.qp = None; // Destroyed here, on the native thread.
             slot.fenced.store(true, Ordering::Release);
             mailbox.peer_admission = None;
             mailbox.command = None;
@@ -1223,10 +1292,9 @@ impl NativeService {
             slot.waiter.wake();
             self.port.shared.io.wake();
             if closed {
-                // Only the service owns native region/PD teardown.
+                // Free the native objects. The mailbox copy stays for any
+                // I/O holder that still wants to read it.
                 self.resources[index] = None;
-                // A fenced receiver may still need its staging copy. That copy
-                // and its quota survive with the slot's outstanding I/O leases.
                 if state != OWNED || slot.released.load(Ordering::Acquire) {
                     slot.released.store(true, Ordering::Release);
                 }
@@ -1236,8 +1304,8 @@ impl NativeService {
             if !slot.released.load(Ordering::Acquire) {
                 return;
             }
-            // Replenish the QP outside request turns. MR stays registered for the
-            // entire bounded pool lifetime. Never reuse a QP/remote capability.
+            // Lease returned: build a fresh QP. Never reuse a QP. The region
+            // stays registered for the life of the pool.
             match ffi::NativeQueuePair::new(resource.device.clone()) {
                 Ok(qp) => {
                     mailbox.endpoint = Some(qp.endpoint);
@@ -1267,6 +1335,7 @@ impl NativeService {
             return;
         }
         let qp = resource.qp.as_ref().unwrap();
+        // A command is in flight: check for its completion.
         if let Some(ticket) = &resource.pending {
             if let Err(error) = qp.progress() {
                 mailbox.result = Some(Err(error));
@@ -1281,6 +1350,8 @@ impl NativeService {
             }
             return;
         }
+        // Start the next command. Connect finishes at once; the rest post
+        // work to the NIC and finish later.
         let Some(command) = mailbox.command.take() else {
             return;
         };
@@ -1317,13 +1388,13 @@ impl NativeService {
             self.port.shared.io.wake();
         }
     }
-    /// Close native admission and notify the paired I/O role.
+    /// Close the pool from the native side.
     pub fn close(&self) {
         self.port.shared.closed.store(true, Ordering::Release);
         self.port.shared.io.wake();
     }
-    /// Report that activation and service-owned resources have drained.
-    /// Outstanding leases or quarantine can still prevent [`IoPort::reopen`].
+    /// True if no activation is running and every slot's native objects are
+    /// freed. [`IoPort::reopen`] may still wait on I/O holders or leaks.
     pub fn drained(&self) -> bool {
         self.activation.is_none()
             && self
@@ -1336,11 +1407,10 @@ impl NativeService {
     }
 }
 impl Drop for NativeService {
-    /// Drop queue pairs before other native owners, preserving FFI quarantine rules.
+    /// Close, then drop QPs before the regions they use.
     fn drop(&mut self) {
         self.close();
-        // Drop native QPs before their region owners. On failure the FFI boundary
-        // keeps its own DMA references and quota, even after this service dies.
+        // If a QP fails to stop, it leaks its region and guard on purpose.
         for resource in self.resources.iter_mut().flatten() {
             resource.qp.take();
             resource.window.take();
@@ -1353,18 +1423,18 @@ impl Drop for NativeService {
 }
 
 impl Window {
-    /// Return the key, populated after a successful bind result is observed.
+    /// Remote key. Set once the bind ticket succeeds.
     pub fn key(&self) -> u32 {
         self.key.get()
     }
-    /// Return the address, populated after a successful bind result is observed.
+    /// Remote address. Set once the bind ticket succeeds.
     pub fn address(&self) -> u64 {
         self.address.get()
     }
 }
 
 impl<T> WithNative<T> {
-    /// Attach a port on the thread that will own native resources.
+    /// Wrap `inner`. Call on the native thread.
     pub fn new(inner: T, port: NativePort) -> Self {
         Self {
             inner,
@@ -1376,24 +1446,24 @@ impl<S: Scope, T: Service<S>> Service<S> for WithNative<T>
 where
     S::Error: From<Error>,
 {
-    /// Forward asynchronous failure reporting to the inner service.
+    /// Pass through to the inner service.
     fn set_failure_reporter(&mut self, reporter: FailureReporter<S::Error>) {
         self.inner.set_failure_reporter(reporter);
     }
-    /// Return the inner service's driver waker.
+    /// Pass through to the inner service.
     fn waker(&self) -> std::result::Result<Waker, S::Error> {
         self.inner.waker()
     }
-    /// Register both services for the same runtime driver notifications.
+    /// Register `waker` with both.
     fn register_driver(&self, waker: &Waker) {
         self.inner.register_driver(waker);
         self.native.register_driver(waker);
     }
-    /// Start the inner service; native resources activate through their I/O port.
+    /// Start the inner service. The native side starts via [`IoPort::activate`].
     fn start<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         self.inner.start(scope)
     }
-    /// Drive the inner service first, then native progress with the same work budget.
+    /// Poll the inner service, then the native side, each with `budget`.
     fn poll_budgeted(
         &mut self,
         cx: &mut Context<'_>,
@@ -1402,36 +1472,37 @@ where
         self.inner.poll_budgeted(cx, budget)?;
         self.native.poll_budgeted(budget).map_err(Into::into)
     }
-    /// Stop inner admission while keeping native progress available to accepted work.
+    /// Stop the inner service only. Native work keeps going.
     fn stop_admission(&mut self) -> std::result::Result<(), S::Error> {
         self.inner.stop_admission()
     }
-    /// Fence native resources before invoking the inner drain hook.
+    /// Drain the native side fully, then the inner service.
     fn drain<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
             self.native.close_and_fence().await?;
             self.inner.drain(scope).await
         })
     }
-    /// Close native admission even when the subsequent inner close fails.
+    /// Close the native side, then the inner service.
     fn close(&mut self) -> std::result::Result<(), S::Error> {
         self.native.close();
         self.inner.close()
     }
-    /// Finish native fences before awaiting the inner ownership fence.
+    /// Drain the native side fully, then fence the inner service.
     fn fence<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
             self.native.close_and_fence().await?;
             self.inner.fence(scope).await
         })
     }
-    /// Forward shutdown to the inner service without changing its scope.
+    /// Pass through to the inner service.
     fn shutdown<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
         self.inner.shutdown(scope)
     }
 }
 impl NativeService {
-    /// Drive actual native fences without checking request cancellation.
+    /// Close and poll until drained. Ignores scope deadlines: the NIC must be
+    /// stopped before memory is freed.
     async fn close_and_fence(&mut self) -> Result<()> {
         self.close();
         std::future::poll_fn(|cx| {
@@ -1440,7 +1511,7 @@ impl NativeService {
             if self.drained() {
                 Poll::Ready(Ok(()))
             } else {
-                // Periodic worker ticks retry fences even without a completion wake.
+                // Relies on the runtime's periodic ticks to retry.
                 Poll::Pending
             }
         })
@@ -1448,19 +1519,24 @@ impl NativeService {
     }
 }
 
-/// Unique ownership counter, independent of any caller-retained guard clones.
+/// Our own `Arc` around a caller's [`Guard`].
+///
+/// Its strong count shows whether anything leaked, no matter how many clones
+/// the caller keeps.
 struct GuardOwner {
     _guard: Guard,
 }
 impl GuardOwner {
-    /// Wrap a guard so quarantine ownership can be counted independently.
+    /// Wrap `guard`.
     fn new(guard: Guard) -> Arc<Self> {
         Arc::new(Self { _guard: guard })
     }
 }
 
-/// Try a mailbox without blocking, distinguishing contention from poisoning.
-/// Retain owners across Pending; periodic driver ticks cover unlocks without wakes.
+/// Try to lock a mailbox without blocking.
+///
+/// Busy returns `Pending` with no wake registered, so callers must also be
+/// polled on a timer. Poisoned returns [`Error::Io`].
 fn try_mailbox<T>(mailbox: &Mutex<T>) -> Poll<Result<MutexGuard<'_, T>>> {
     match mailbox.try_lock() {
         Ok(guard) => Poll::Ready(Ok(guard)),
@@ -1469,45 +1545,46 @@ fn try_mailbox<T>(mailbox: &Mutex<T>) -> Poll<Result<MutexGuard<'_, T>>> {
     }
 }
 
-/// Narrow observation and contention controls for deterministic integration tests.
-/// These never expose a mailbox, native owner, pointer, or lock guard.
+/// Test hooks: read slot state and hold locks on purpose.
+///
+/// Nothing here exposes a mailbox, native object, or lock guard.
 #[cfg(feature = "simulation")]
 pub mod testing {
     use super::*;
-    /// Observable lifecycle state of a bounded pool slot.
+    /// A slot's state.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum State {
-        /// Not yet published for claims.
+        /// Not built yet.
         Idle,
-        /// Provisioned and available for a claim.
+        /// Built and free to lease.
         Ready,
-        /// Held by an I/O lease.
+        /// Leased.
         Owned,
-        /// Awaiting release or successful replenishment.
+        /// Out of use, waiting to be released or rebuilt.
         Retired,
     }
-    /// Scalar slot observations without exposing mailbox or native ownership.
+    /// A copy of one slot's flags.
     #[derive(Clone, Copy, Debug)]
     pub struct Snapshot {
-        /// Current claim/replenishment state.
+        /// Slot state.
         pub state: State,
-        /// Whether cancellation has been requested.
+        /// Stop was requested.
         pub cancelled: bool,
-        /// Whether the terminal native fence has completed.
+        /// The QP has stopped.
         pub fenced: bool,
     }
-    /// Mailbox to hold while exercising a nonblocking caller operation.
+    /// Which lock [`IoPort::with_contention`] holds.
     pub enum Contention {
-        /// Hold one slot's command and staging mailbox.
+        /// One slot's mailbox.
         Slot(usize),
-        /// Hold the pool configuration mailbox.
+        /// The configuration mailbox.
         Configuration,
-        /// Hold the activation result mailbox.
+        /// The activation result mailbox.
         Activation,
     }
     impl IoPort {
-        /// Run a closure with the selected mailbox locked for deterministic contention.
-        /// The closure must not invoke an operation that blocks on the same mailbox.
+        /// Run `f` while holding the chosen lock, to test the busy path.
+        /// `f` must not block on that same lock.
         pub fn with_contention<T>(&self, at: Contention, f: impl FnOnce() -> T) -> T {
             match at {
                 Contention::Slot(i) => {
@@ -1524,7 +1601,7 @@ pub mod testing {
                 }
             }
         }
-        /// Read the selected slot's scalar lifecycle state.
+        /// Read slot `i`'s flags.
         pub fn snapshot(&self, i: usize) -> Snapshot {
             let slot = &self.shared.slots[i];
             Snapshot {
@@ -1538,19 +1615,19 @@ pub mod testing {
                 fenced: slot.fenced.load(Ordering::Acquire),
             }
         }
-        /// Report whether this generation has accepted a configuration.
+        /// True if a configuration was submitted this round.
         pub fn configuration_submitted(&self) -> bool {
             self.shared.configured.load(Ordering::Acquire)
         }
-        /// Report the stronger pool-reuse condition, including released I/O leases.
+        /// True if the pool is drained and can be reopened.
         pub fn pool_drained(&self) -> bool {
             self.shared.drained.load(Ordering::Acquire)
         }
-        /// Return the generation used to reject stale device handles.
+        /// Current round number. Bumped by reopen.
         pub fn generation(&self) -> u64 {
             self.shared.generation.load(Ordering::Acquire)
         }
-        /// Inspect whether a slot has a command queued for native submission.
+        /// True if slot `i` has a command waiting for the native side.
         pub fn command_pending(&self, i: usize) -> bool {
             self.shared.slots[i]
                 .mailbox
@@ -1561,15 +1638,15 @@ pub mod testing {
         }
     }
     impl NativeService {
-        /// Count slots still holding service-owned native resources.
+        /// Number of slots that still have native objects.
         pub fn resource_count(&self) -> usize {
             self.resources.iter().flatten().count()
         }
-        /// Report whether a particular slot retains service-owned native resources.
+        /// True if slot `i` still has native objects.
         pub fn resource_present(&self, i: usize) -> bool {
             self.resources[i].is_some()
         }
-        /// Clear a slot's backoff so its next native turn retries immediately.
+        /// Skip slot `i`'s retry wait.
         pub fn retry_now(&mut self, i: usize) {
             self.resources[i].as_mut().unwrap().next_retry = None;
         }

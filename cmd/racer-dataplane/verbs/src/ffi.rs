@@ -1,5 +1,8 @@
-//! Native RDMA unsafe boundary. Used exclusively by the paired native service.
-//! Provider layouts stay in native/verbs.c. Failed teardown retains DMA ownership.
+//! Safe Rust wrappers over the C adapter in `native/verbs.c`.
+//!
+//! Only the native thread uses these. Each type owns one RDMA object and frees
+//! it on drop. If freeing fails, the object is leaked on purpose, along with
+//! everything it depends on, because the NIC may still be using it.
 use crate::{Error, GuardOwner, Result};
 use std::{
     cell::{Cell, RefCell},
@@ -11,11 +14,10 @@ use std::{
 };
 
 #[cfg(any(test, feature = "simulation"))]
-/// Simulated fabric sharing the native ABI and unsafe ownership boundary.
 #[path = "simulation.rs"]
 pub mod simulation;
 
-/// Discovered port layout shared with the native adapter.
+/// One port from `discover`. Matches `struct rdma_verbs_port` in C.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Port {
@@ -27,28 +29,29 @@ struct Port {
     link_layer: u8,
 }
 
-/// Connection parameters exchanged with a remote queue pair.
+/// A QP's address. Swap these with the peer to connect.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Endpoint {
-    /// Global identifier of the local port.
+    /// Port GID.
     pub gid: [u8; 16],
-    /// Nonzero 24-bit queue pair number.
+    /// QP number. Nonzero, 24 bits.
     pub qpn: u32,
-    /// Initial 24-bit packet sequence number.
+    /// Starting packet sequence number. 24 bits.
     pub psn: u32,
-    /// Verbs MTU code: 1, 2, 3, 4, or 5 for 256 through 4096 bytes.
+    /// MTU code: 1 to 5 for 256 to 4096 bytes.
     pub mtu: u32,
-    /// Local identifier used by InfiniBand addressing.
+    /// InfiniBand local ID.
     pub lid: u16,
-    /// One-based physical port number.
+    /// Port number, from 1.
     pub port: u8,
-    /// Verbs link-layer code: 1 for InfiniBand or 2 for Ethernet.
+    /// 1 for InfiniBand, 2 for Ethernet (RoCE).
     pub link_layer: u8,
 }
 
 impl Endpoint {
-    /// Check portable field bounds, without establishing provider compatibility.
+    /// Check that each field is in range. Does not check that the peer is
+    /// reachable.
     pub fn validate(&self) -> Result<()> {
         if self.qpn == 0
             || self.qpn > 0xffffff
@@ -64,7 +67,7 @@ impl Endpoint {
     }
 }
 
-/// One native completion with its work identifier, status, and opcode.
+/// One finished work request from the completion queue.
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 struct Completion {
@@ -73,17 +76,19 @@ struct Completion {
     opcode: u32,
 }
 
-/// Define the fixed-layout ABI table and its version-checked symbol loader.
+/// Build the [`Api`] function table and its symbol loader from a list of
+/// `rdma_verbs_<name>` functions.
 macro_rules! native_api {
     ($($field:ident: $signature:ty),* $(,)?) => {
-        /// Loaded adapter functions, kept alive by every native resource owner.
+        /// The C adapter's functions. Every native object holds an `Rc` to it
+        /// so the library stays loaded.
         struct Api {
             library: Option<NonNull<c_void>>,
             $($field: $signature,)*
         }
         impl Api {
             #[cfg(all(feature = "native", target_os = "linux"))]
-            /// Resolve all required symbols from an already version-checked library.
+            /// Look up every function in `library`.
             unsafe fn symbols(library: NonNull<c_void>) -> Result<Self> {
                 Ok(Self {
                     library: Some(library),
@@ -119,26 +124,25 @@ native_api! {
 
 impl Api {
     #[cfg(not(all(feature = "native", target_os = "linux")))]
-    /// Report that this build cannot load the native adapter.
+    /// No native backend in this build.
     fn load() -> Result<Rc<Self>> {
         Err(Error::Unavailable)
     }
 
     #[cfg(all(feature = "native", target_os = "linux"))]
-    /// Load the administrator-selected adapter and validate its ABI version.
+    /// Load `librdma_verbs.so.1` and check it speaks ABI version 2.
     fn load() -> Result<Rc<Self>> {
-        // The loader search path is administrator-controlled. No peer-supplied
-        // library names or paths are accepted.
+        // Fixed library name, found via the normal loader path.
         unsafe {
             let library = NonNull::new(libc::dlopen(
                 c"librdma_verbs.so.1".as_ptr(),
                 libc::RTLD_NOW | libc::RTLD_LOCAL,
             ))
             .ok_or(Error::Unavailable)?;
-            /// Close the library if loading exits before ownership is transferred.
+            /// Unloads the library if we bail out early.
             struct Guard(NonNull<c_void>);
             impl Drop for Guard {
-                /// Release the library handle after a failed load.
+                /// Unload.
                 fn drop(&mut self) {
                     unsafe {
                         libc::dlclose(self.0.as_ptr());
@@ -146,7 +150,7 @@ impl Api {
                 }
             }
             let guard = Guard(library);
-            /// Resolve a required symbol with its exact native signature.
+            /// Look up one function by name.
             macro_rules! sym {
                 ($name:literal, $ty:ty) => {{
                     let pointer =
@@ -168,7 +172,7 @@ impl Api {
     }
 }
 impl Drop for Api {
-    /// Unload the adapter after all nonquarantined owners release it.
+    /// Unload the library. Leaked objects keep it loaded forever.
     fn drop(&mut self) {
         if let Some(library) = self.library {
             unsafe {
@@ -178,15 +182,16 @@ impl Drop for Api {
     }
 }
 
-/// Owning device context that keeps the adapter loaded for dependent resources.
+/// An open RDMA device.
 pub(crate) struct NativeDevice {
     api: Rc<Api>,
     raw: NonNull<c_void>,
     pub(crate) name: String,
+    /// Port info. `qpn` and `psn` are unset.
     pub(crate) endpoint: Endpoint,
 }
 impl NativeDevice {
-    /// Read the device's NUMA node, or its simulated placement when applicable.
+    /// NUMA node from sysfs (or the simulation), if known.
     pub(crate) fn numa_node(&self) -> Option<usize> {
         #[cfg(any(test, feature = "simulation"))]
         if simulation::is_api(&self.api) {
@@ -206,7 +211,7 @@ impl NativeDevice {
     }
 }
 impl Drop for NativeDevice {
-    /// Close the device, retaining the adapter if native teardown fails.
+    /// Close the device. On failure, keep the library loaded.
     fn drop(&mut self) {
         if unsafe { (self.api.close)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.api.clone());
@@ -214,7 +219,8 @@ impl Drop for NativeDevice {
     }
 }
 
-/// Reject discovery above 64 ports and retain only ports whose contexts open.
+/// List ports and open a device for each. Fails on more than 64 ports.
+/// Skips ports whose device will not open.
 pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
     #[cfg(any(test, feature = "simulation"))]
     let api = match simulation::current() {
@@ -265,18 +271,22 @@ pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
     Ok(devices)
 }
 
-/// Native memory is never referenced while remotely writable or locally in flight.
-/// Quota is attached inside the native owner, including intentional quarantine leaks.
+/// A registered memory buffer (MR) the NIC can read and write.
+///
+/// `busy` is set while the NIC may touch it. The CPU may not copy in or out
+/// while busy. Holds the slot's guard and leaks it if deregister fails.
 pub(crate) struct NativeRegion {
     device: Rc<NativeDevice>,
     raw: NonNull<c_void>,
+    /// Allocated size.
     length: usize,
+    /// Bytes in use for the current transfer.
     used: Cell<usize>,
     quota: Option<Arc<GuardOwner>>,
     busy: Cell<bool>,
 }
 impl NativeRegion {
-    /// Register a nonempty allocation and retain its quota until safe teardown.
+    /// Allocate and register `length` bytes.
     pub(crate) fn new(
         device: Rc<NativeDevice>,
         length: usize,
@@ -297,7 +307,7 @@ impl NativeRegion {
             busy: Cell::new(false),
         }))
     }
-    /// Return the native or simulated wire address of this allocation.
+    /// The address peers use to write here.
     pub(crate) fn address(&self) -> u64 {
         #[cfg(any(test, feature = "simulation"))]
         if simulation::is_api(&self.device.api) {
@@ -305,11 +315,11 @@ impl NativeRegion {
         }
         unsafe { (self.device.api.bytes)(self.raw.as_ptr()) as u64 }
     }
-    /// Return the active transfer length within the registered allocation.
+    /// Bytes in use.
     pub(crate) fn length(&self) -> usize {
         self.used.get()
     }
-    /// Change the transfer length only while the allocation is idle.
+    /// Set bytes in use. Not while busy.
     pub(crate) fn resize(&self, length: usize) -> Result<()> {
         if self.busy.get() || length == 0 || length > self.length {
             return Err(Error::InvalidRange);
@@ -317,7 +327,7 @@ impl NativeRegion {
         self.used.set(length);
         Ok(())
     }
-    /// Copy idle memory into an exact-length caller buffer.
+    /// Copy the buffer out. Not while busy.
     pub(crate) fn copy_into(&self, bytes: &mut [u8]) -> Result<()> {
         if self.busy.get() || bytes.len() != self.length() {
             return Err(Error::Unavailable);
@@ -331,7 +341,7 @@ impl NativeRegion {
         }
         Ok(())
     }
-    /// Fill idle memory from an exact-length caller buffer.
+    /// Copy into the buffer. Not while busy.
     pub(crate) fn copy_from(&self, bytes: &[u8]) -> Result<()> {
         if self.busy.get() || bytes.len() != self.length() {
             return Err(Error::InvalidRequest);
@@ -346,7 +356,7 @@ impl NativeRegion {
         Ok(())
     }
     #[cfg(test)]
-    /// Snapshot idle memory for native ownership tests.
+    /// Copy the buffer out, for tests.
     pub(crate) fn copy_to(&self) -> Result<Vec<u8>> {
         if self.busy.get() {
             return Err(Error::Unavailable);
@@ -358,7 +368,7 @@ impl NativeRegion {
     }
 }
 impl Drop for NativeRegion {
-    /// Deregister memory, retaining the device and quota if deregistration fails.
+    /// Deregister. On failure, leak the device and guard.
     fn drop(&mut self) {
         if unsafe { (self.device.api.deregister)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.device.clone());
@@ -367,15 +377,16 @@ impl Drop for NativeRegion {
     }
 }
 
-/// Native remote-write capability retaining its backing memory.
+/// A memory window (MW): lets one peer write into a region.
 pub(crate) struct Window {
     device: Rc<NativeDevice>,
     raw: NonNull<c_void>,
+    /// Remote key for the peer.
     pub(crate) key: u32,
     region: Rc<NativeRegion>,
 }
 impl Drop for Window {
-    /// Free the capability, retaining its backing owners on teardown failure.
+    /// Free the window. On failure, leak the device and region.
     fn drop(&mut self) {
         if unsafe { (self.device.api.window_free)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.device.clone());
@@ -384,31 +395,32 @@ impl Drop for Window {
     }
 }
 
-/// Completion state shared independently of a submitted operation's lifetime.
+/// Where a work request's result lands.
 #[derive(Default)]
 struct TicketState {
     result: Cell<Option<Result<()>>>,
 }
-/// Observation handle for one native completion.
+/// The result of one posted work request.
 #[derive(Clone)]
 pub(crate) struct Ticket(Rc<TicketState>);
 impl Ticket {
-    /// Return the completion result, or none while native ownership is pending.
+    /// The result, or `None` if still in flight.
     pub(crate) fn result(&self) -> Option<Result<()>> {
         self.0.result.get()
     }
 }
 
-/// Resources retained until a matching completion or successful terminal fence.
+/// A posted work request. Keeps its region and window alive until it
+/// completes or the QP stops.
 struct Pending {
     ticket: Ticket,
+    /// Expected completion opcode.
     opcode: u32,
-    // Ownership survives future cancellation and failed CQ polling.
     region: Option<Rc<NativeRegion>>,
     _window: Option<Rc<Window>>,
 }
 impl Pending {
-    /// Publish completion after releasing local DMA access to the source region.
+    /// Set the result and mark the region not busy.
     fn finish(self, result: Result<()>) {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         if let Some(region) = &self.region {
@@ -418,23 +430,30 @@ impl Pending {
     }
 }
 
-/// Reactor-local queue pair owning outstanding work and active remote grants.
+/// A queue pair (QP) and its completion queue.
+///
+/// Tracks posted work (up to 32) and the bound window. [`Self::stop`] is the
+/// only way to be sure the NIC is done with its memory.
 pub(crate) struct NativeQueuePair {
     device: Rc<NativeDevice>,
     raw: NonNull<c_void>,
     pub(crate) endpoint: Endpoint,
+    /// Stop succeeded. The NIC is done.
     stopped: Cell<bool>,
+    /// Stop was requested. No new work.
     terminating: Cell<bool>,
     connected: Cell<bool>,
+    /// Next work request ID.
     next: Cell<u64>,
+    /// Posted work by ID.
     pending: RefCell<BTreeMap<u64, Pending>>,
-    // Active remote grants persist independently of their bind CQE.
+    /// Bound windows. They stay open until stop, even after the bind completes.
     windows: RefCell<Vec<Rc<Window>>>,
     #[cfg(test)]
     expires: Cell<Option<std::time::Instant>>,
 }
 impl NativeQueuePair {
-    /// Allocate a queue pair and choose its local packet sequence number.
+    /// Create a QP with a random starting PSN (fixed in simulation).
     pub(crate) fn new(device: Rc<NativeDevice>) -> Result<Rc<Self>> {
         let mut qpn = 0;
         let raw = NonNull::new(unsafe {
@@ -478,7 +497,7 @@ impl NativeQueuePair {
             expires: Cell::new(None),
         }))
     }
-    /// Connect once to a validated peer using the same link layer.
+    /// Connect to `remote`. Once only. On failure, stops the QP.
     pub(crate) fn connect(&self, remote: Endpoint) -> Result<()> {
         remote.validate()?;
         if self.stopped.get()
@@ -496,11 +515,11 @@ impl NativeQueuePair {
         Ok(())
     }
     #[cfg(test)]
-    /// Expose the owning device to native test fixtures.
+    /// The QP's device, for tests.
     pub(crate) fn device(&self) -> &Rc<NativeDevice> {
         &self.device
     }
-    /// Verify that the provider can allocate and free a memory window.
+    /// Check the device can create memory windows, by making and freeing one.
     pub(crate) fn probe_window(&self) -> Result<()> {
         let mut key = 0;
         let window =
@@ -512,21 +531,21 @@ impl NativeQueuePair {
         }
         Ok(())
     }
-    /// Report whether this connected queue pair still accepts work.
+    /// True if connected and not stopping.
     pub(crate) fn ready(&self) -> bool {
         self.connected.get() && !self.stopped.get() && !self.terminating.get()
     }
     #[cfg(test)]
-    /// Report whether the terminal native fence has succeeded.
+    /// True once stop succeeded.
     pub(crate) fn stopped(&self) -> bool {
         self.stopped.get()
     }
     #[cfg(test)]
-    /// Set the deadline checked by native test progress calls.
+    /// Set a deadline for [`Self::progress`], for tests.
     pub(crate) fn expire_at(&self, deadline: std::time::Instant) {
         self.expires.set(Some(deadline));
     }
-    /// Reserve one of 32 work entries while retaining its DMA owners.
+    /// Record a work request before posting it. Up to 32 at once.
     fn reserve(
         &self,
         opcode: u32,
@@ -553,10 +572,10 @@ impl NativeQueuePair {
         );
         Ok((id, ticket))
     }
-    /// Release reserved owners when a single work request is rejected immediately.
+    /// Check the post result. If the post failed, nothing reached the NIC, so
+    /// drop the record.
     fn submitted(&self, id: u64, rc: i32) -> Result<()> {
         if rc != 0 {
-            // Exactly one WR was posted, so a synchronous rejection posts none.
             if let Some(pending) = self.pending.borrow_mut().remove(&id) {
                 pending.finish(Err(Error::Io));
             }
@@ -564,7 +583,8 @@ impl NativeQueuePair {
         }
         Ok(())
     }
-    /// Bind the sole active window and block CPU access until the terminal fence.
+    /// Open `region` to remote writes through a new window. One window at a
+    /// time. The region stays busy until the QP stops.
     pub(crate) fn bind(&self, region: Rc<NativeRegion>) -> Result<(Rc<Window>, Ticket)> {
         if !Rc::ptr_eq(&region.device, &self.device)
             || region.busy.get()
@@ -602,7 +622,7 @@ impl NativeQueuePair {
         }
         Ok((window, ticket))
     }
-    /// Submit key revocation without releasing the region's terminal-fence hold.
+    /// Revoke `window`. The region stays busy until the QP stops.
     pub(crate) fn invalidate(&self, window: Rc<Window>) -> Result<Ticket> {
         if !self.windows.borrow().iter().any(|w| Rc::ptr_eq(w, &window)) {
             return Err(Error::InvalidRequest);
@@ -612,7 +632,8 @@ impl NativeQueuePair {
         self.submitted(id, rc)?;
         Ok(ticket)
     }
-    /// Submit the active bytes, checking address overflow against allocation capacity.
+    /// Write `region` to the peer at `address` with `key`. The region is busy
+    /// until the write completes.
     pub(crate) fn write(&self, region: Rc<NativeRegion>, address: u64, key: u32) -> Result<Ticket> {
         if !Rc::ptr_eq(&region.device, &self.device)
             || region.busy.get()
@@ -636,7 +657,10 @@ impl NativeQueuePair {
         self.submitted(id, rc)?;
         Ok(ticket)
     }
-    /// Nonblocking and bounded to 32 CQEs per call. Call on the owning reactor.
+    /// Read up to 32 completions without blocking. Returns how many.
+    ///
+    /// Any failed or unexpected completion stops the QP and returns
+    /// [`Error::Io`].
     pub(crate) fn progress(&self) -> Result<usize> {
         if self.stopped.get() {
             return Ok(0);
@@ -661,7 +685,6 @@ impl NativeQueuePair {
             return Err(Error::Io);
         }
         for c in &completions[..n as usize] {
-            // A failed/unknown completion requires a terminal fence before release.
             let valid = self
                 .pending
                 .borrow()
@@ -676,7 +699,10 @@ impl NativeQueuePair {
         }
         Ok(n as usize)
     }
-    /// Terminal DMA fence. Success permits reuse; failure retains all ownership.
+    /// Stop the QP for good. After success the NIC will not touch its memory
+    /// again: pending work is canceled and regions are no longer busy.
+    ///
+    /// On failure nothing is released. Safe to retry.
     pub(crate) fn stop(&self) -> Result<()> {
         if self.stopped.get() {
             return Ok(());
@@ -697,7 +723,8 @@ impl NativeQueuePair {
     }
 }
 impl Drop for NativeQueuePair {
-    /// Fence before destruction, quarantining all DMA owners if fencing fails.
+    /// Stop, then free. If stop fails, leak the QP's work, windows, and
+    /// device, since the NIC may still use them.
     fn drop(&mut self) {
         if self.stop().is_err() {
             std::mem::forget(std::mem::take(self.pending.get_mut()));

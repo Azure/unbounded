@@ -1,7 +1,18 @@
-//! Connected, thread-local simulated fabric implementing the private native ABI.
-//! Enter a node's discovery scope before constructing NativeService/WithNative.
-//! Handles retain the fabric after the scope exits. No host RNIC or sysfs is used.
-//! Memory and DMA stay behind the FFI unsafe boundary; wire addresses are virtual.
+//! A fake RDMA fabric for tests. No hardware or sysfs needed.
+//!
+//! It implements the same C functions as `native/verbs.c`, so the real
+//! wrappers in `ffi.rs` run on top of it unchanged.
+//!
+//! # Basics
+//!
+//! 1. Create one [`Simulation`] per test thread.
+//! 2. Give each node its own view with [`Simulation::with_devices`].
+//! 3. Call [`Simulation::enter`] before building that node's `NativeService`.
+//!    Handles keep working after the scope ends.
+//! 4. Script failures with [`Simulation::fault`] or [`Simulation::reject`].
+//! 5. Check what happened with [`Simulation::trace`].
+//!
+//! Addresses seen on the wire are fake; they are never host pointers.
 use super::*;
 use std::collections::VecDeque;
 
@@ -9,15 +20,17 @@ thread_local! {
     static CURRENT: RefCell<Option<Simulation>> = const { RefCell::new(None) };
 }
 
-/// One deterministic fabric shared by nodes driven on the same test thread.
-/// `with_devices` changes discovery only, retaining connections to all other nodes.
+/// A fabric shared by every node on one test thread. Deterministic.
+///
+/// Clones and `with_devices` views share the same fabric; only the devices
+/// each view discovers differ.
 #[derive(Clone)]
 pub struct Simulation {
     world: Rc<RefCell<World>>,
     devices: Vec<Device>,
 }
 
-/// Discoverable simulated port and its optional NUMA placement.
+/// A fake port that discovery will report.
 #[derive(Clone, Debug)]
 pub struct Device {
     pub name: String,
@@ -27,7 +40,7 @@ pub struct Device {
 }
 
 impl Device {
-    /// Describe port one of a device without a NUMA preference.
+    /// Port 1 of `name`, with no NUMA node.
     pub fn new(name: impl Into<String>, gid: [u8; 16]) -> Self {
         Self {
             name: name.into(),
@@ -38,18 +51,18 @@ impl Device {
     }
 }
 
-/// Restore nested discovery scopes on drop. Like the native owners, this is !Send.
+/// Scope guard from [`Simulation::enter`]. Restores the previous view on drop.
 pub struct Environment {
     previous: Option<Simulation>,
 }
 impl Drop for Environment {
-    /// Restore the discovery scope that was active before this one.
+    /// Put back the previous view.
     fn drop(&mut self) {
         CURRENT.with(|current| *current.borrow_mut() = self.previous.take());
     }
 }
 
-/// Native ABI operation that can be traced or targeted by a fault rule.
+/// One C function call. Used in traces and to target faults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
     Discover,
@@ -69,30 +82,31 @@ pub enum Operation {
     Poll,
 }
 
-/// Rules are consumed by the next matching call, optionally restricted to a QPN.
+/// A one-shot failure for the next matching call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Fault {
-    /// Reject the synchronous call without submitting work or changing resources.
+    /// Fail the call itself. Nothing changes.
     Reject,
-    /// Defer a Bind/Invalidate/Write and its CQE for this many polls of its QP.
+    /// Hold a Bind, Invalidate, or Write for this many polls.
     Delay(usize),
-    /// Fail a Bind/Invalidate/Write CQE without performing its effect (nonzero status).
+    /// Complete a Bind, Invalidate, or Write with this error status (nonzero).
+    /// Its effect is skipped.
     Completion(u32),
 }
 
-/// Ordered observation of an ABI call or work completion.
+/// One entry in the trace: a call or a completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Event {
     pub sequence: u64,
     pub operation: Operation,
     pub resource: u64,
     pub work_id: Option<u64>,
-    /// 0 means success; negative means synchronous rejection; positive is WC status.
+    /// 0 is success, negative is a rejected call, positive is a completion error.
     pub result: i64,
     pub completion: bool,
 }
 
-/// Shared fabric resources, scripted faults, and deterministic event trace.
+/// Everything in the fabric: resources, scripted faults, and the trace.
 #[derive(Default)]
 struct World {
     next: u32,
@@ -102,7 +116,7 @@ struct World {
     trace: Vec<Event>,
     sequence: u64,
 }
-/// One live device, queue pair, region, or memory window in the fabric.
+/// A live device, queue pair, region, or window.
 enum Resource {
     Device(Device),
     Qp {
@@ -122,21 +136,21 @@ enum Resource {
         grant: Option<Grant>,
     },
 }
-/// Active remote-write permission owned by a window and bound queue pair.
+/// A bound window: which QP may write, into which region, how many bytes.
 #[derive(Clone, Copy)]
 struct Grant {
     qp: u32,
     region: u32,
     length: u32,
 }
-/// Queued operation with its remaining poll delay and injected status.
+/// Queued work on a QP, with its remaining delay and final status.
 struct Work {
     id: u64,
     delay: usize,
     status: u32,
     action: Action,
 }
-/// Deferred memory effect performed when a work request completes successfully.
+/// What the work does when it completes successfully.
 #[derive(Clone, Copy)]
 enum Action {
     Bind {
@@ -155,7 +169,7 @@ enum Action {
     },
 }
 impl Action {
-    /// Map a deferred effect to its trace and fault operation.
+    /// The matching `Operation`.
     fn operation(&self) -> Operation {
         match self {
             Self::Bind { .. } => Operation::Bind,
@@ -163,7 +177,7 @@ impl Action {
             Self::Write { .. } => Operation::Write,
         }
     }
-    /// Return the native completion opcode expected by the production owner.
+    /// The completion opcode `ffi.rs` expects.
     fn opcode(&self) -> u32 {
         match self {
             Self::Bind { .. } => 5,
@@ -174,8 +188,8 @@ impl Action {
 }
 
 impl Simulation {
-    /// Reject every matching operation until explicitly cleared. No native
-    /// effects occur while rejection is active, including during destruction.
+    /// Turn on or off a lasting rule that fails every matching call.
+    /// Applies to teardown calls too.
     pub fn reject(&self, operation: Operation, qpn: Option<u32>, enabled: bool) {
         let mut world = self.world.borrow_mut();
         world.rejects.retain(|rule| *rule != (operation, qpn));
@@ -183,14 +197,15 @@ impl Simulation {
             world.rejects.push((operation, qpn));
         }
     }
-    /// Create an empty fabric with deterministic resource identifiers.
+    /// An empty fabric.
     pub fn new() -> Self {
         Self {
             world: Rc::new(RefCell::new(World::default())),
             devices: Vec::new(),
         }
     }
-    /// Create a discovery view sharing this fabric after validating its ports.
+    /// A view of the same fabric that discovers `devices`.
+    /// Rejects more than 64 ports, bad names, zero GIDs or ports, and duplicates.
     pub fn with_devices(&self, devices: Vec<Device>) -> Result<Self> {
         if devices.len() > 64
             || devices.iter().any(|d| {
@@ -212,17 +227,18 @@ impl Simulation {
             devices,
         })
     }
-    /// Install this discovery view on the current thread until the guard drops.
+    /// Make this view current on this thread until the guard drops.
     pub fn enter(&self) -> Environment {
         Environment {
             previous: CURRENT.with(|current| current.replace(Some(self.clone()))),
         }
     }
-    /// Queue a one-shot fault for the next matching operation on any resource.
+    /// Fail the next matching call on any resource.
     pub fn fault(&self, operation: Operation, fault: Fault) {
         self.fault_on(operation, None, fault);
     }
-    /// Queue a targeted fault, panicking on unsupported delays or zero error status.
+    /// Fail the next matching call, optionally only on one QP.
+    /// Panics on `Delay`/`Completion` for non-work calls, or `Completion(0)`.
     pub fn fault_on(&self, operation: Operation, qpn: Option<u32>, fault: Fault) {
         assert!(
             matches!(fault, Fault::Reject)
@@ -237,42 +253,42 @@ impl Simulation {
             .faults
             .push_back((operation, qpn, fault));
     }
-    /// Snapshot all events recorded so far without consuming them.
+    /// Copy of the trace so far.
     pub fn trace(&self) -> Vec<Event> {
         self.world.borrow().trace.clone()
     }
-    /// Drain recorded events while preserving the fabric's sequence counter.
+    /// Take the trace and clear it. Sequence numbers keep counting.
     pub fn take_trace(&self) -> Vec<Event> {
         std::mem::take(&mut self.world.borrow_mut().trace)
     }
-    /// Count resources still owned or deliberately quarantined by native handles.
+    /// Resources not yet freed, including ones leaked on purpose.
     pub fn live_resources(&self) -> usize {
         self.world.borrow().resources.len()
     }
-    /// Count unconsumed one-shot faults, excluding persistent rejection rules.
+    /// One-shot faults not yet used. Ignores `reject` rules.
     pub fn pending_faults(&self) -> usize {
         self.world.borrow().faults.len()
     }
 }
 impl Default for Simulation {
-    /// Create an empty deterministic fabric.
+    /// An empty fabric.
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Clone the current thread's active discovery view, if any.
+/// The view current on this thread, if any.
 pub(crate) fn current() -> Option<Simulation> {
     CURRENT.with(|current| current.borrow().clone())
 }
-/// Identify this simulated adapter by its open function pointer.
+/// True if `api` is this fake.
 pub(super) fn is_api(api: &Api) -> bool {
     std::ptr::fn_addr_eq(
         api.open,
         open as unsafe extern "C" fn(*const c_char) -> *mut c_void,
     )
 }
-/// Build the ABI table used by the production native ownership layer.
+/// The function table `ffi.rs` uses in place of the C library.
 pub(super) fn api() -> Rc<Api> {
     Rc::new(Api {
         library: None,
@@ -295,17 +311,17 @@ pub(super) fn api() -> Rc<Api> {
     })
 }
 
-/// Opaque ABI handle retaining its fabric and stable resource identifier.
-/// The world owns allocations; production owners control destruction and quarantine.
+/// The opaque pointer handed to `ffi.rs`. Holds the fabric and a resource id.
+/// The fabric owns the resource; `ffi.rs` decides when to free it.
 struct Handle {
     sim: Simulation,
     id: u32,
 }
-/// Borrow a live ABI handle for no longer than its owning native resource lives.
+/// Turn a raw pointer back into a handle. The caller keeps it alive.
 unsafe fn handle<'a>(raw: *mut c_void) -> &'a Handle {
     unsafe { &*raw.cast::<Handle>() }
 }
-/// Insert a fabric resource and allocate its stable opaque handle.
+/// Add a resource and return a new handle to it.
 fn allocate(sim: &Simulation, resource: Resource) -> *mut c_void {
     let id = sim.world.borrow_mut().insert(resource);
     Box::into_raw(Box::new(Handle {
@@ -314,7 +330,7 @@ fn allocate(sim: &Simulation, resource: Resource) -> *mut c_void {
     }))
     .cast()
 }
-/// Read the configured placement from a live simulated device handle.
+/// The NUMA node set on a device.
 pub(super) fn numa_node(raw: NonNull<c_void>) -> Option<usize> {
     let h = unsafe { handle(raw.as_ptr()) };
     match h.sim.world.borrow().resources.get(&h.id) {
@@ -322,7 +338,7 @@ pub(super) fn numa_node(raw: NonNull<c_void>) -> Option<usize> {
         _ => None,
     }
 }
-/// Return a region's deterministic wire address, never its host allocation pointer.
+/// A region's fake wire address.
 pub(super) fn address(raw: NonNull<c_void>) -> u64 {
     let h = unsafe { handle(raw.as_ptr()) };
     match h.sim.world.borrow().resources.get(&h.id) {
@@ -331,7 +347,7 @@ pub(super) fn address(raw: NonNull<c_void>) -> u64 {
     }
 }
 impl World {
-    /// Assign a fresh identifier within the native 24-bit queue pair number space.
+    /// Store a resource under a new id. Ids fit in 24 bits, like real QPNs.
     fn insert(&mut self, resource: Resource) -> u32 {
         self.next = self
             .next
@@ -341,7 +357,7 @@ impl World {
         self.resources.insert(self.next, resource);
         self.next
     }
-    /// Append a call or completion with a monotonically increasing sequence number.
+    /// Add an event to the trace.
     fn record(
         &mut self,
         operation: Operation,
@@ -360,7 +376,7 @@ impl World {
         });
         self.sequence += 1;
     }
-    /// Apply persistent rejection first, otherwise consume the first matching fault.
+    /// The fault for this call: a `reject` rule first, else the next one-shot fault.
     fn fault(&mut self, operation: Operation, resource: u32) -> Option<Fault> {
         if self
             .rejects
@@ -374,7 +390,7 @@ impl World {
         })?;
         self.faults.remove(i).map(|(_, _, fault)| fault)
     }
-    /// Record whether a synchronous operation is rejected by its fault rule.
+    /// Trace a call and report whether it is rejected.
     fn rejected(&mut self, operation: Operation, resource: u32) -> bool {
         let rejected = self.fault(operation, resource) == Some(Fault::Reject);
         self.record(
@@ -386,7 +402,7 @@ impl World {
         );
         rejected
     }
-    /// Resolve a resource to the device context that owns it.
+    /// The device a resource belongs to.
     fn device(&self, id: u32) -> Option<u32> {
         match self.resources.get(&id)? {
             Resource::Device(_) => Some(id),
@@ -395,7 +411,7 @@ impl World {
             | Resource::Window { device, .. } => Some(*device),
         }
     }
-    /// Report whether a queue pair has endpoints and has not been stopped.
+    /// True if a QP is connected and not stopped.
     fn ready(&self, id: u32) -> bool {
         matches!(
             self.resources.get(&id),
@@ -407,7 +423,7 @@ impl World {
             })
         )
     }
-    /// Require live queue pairs with mutually matching local and remote endpoints.
+    /// True if two QPs are connected to each other and not stopped.
     fn paired(&self, id: u32, peer: u32) -> bool {
         match (self.resources.get(&id), self.resources.get(&peer)) {
             (
@@ -427,7 +443,7 @@ impl World {
             _ => false,
         }
     }
-    /// Validate and queue one effect, preserving synchronous rejection semantics.
+    /// Check and queue one Bind, Invalidate, or Write. Returns -1 if rejected.
     fn post(&mut self, qp: u32, id: u64, action: Action) -> c_int {
         let op = action.operation();
         let fault = self.fault(op, qp);
@@ -473,11 +489,11 @@ impl World {
         self.record(op, qp, Some(id), 0, false);
         0
     }
-    /// Check that a nonempty transfer fits its registered allocation.
+    /// True if `length` is nonzero and fits in the region.
     fn region_fits(&self, region: u32, length: u32) -> bool {
         matches!(self.resources.get(&region), Some(Resource::Region { bytes, .. }) if length > 0 && length as usize <= bytes.len())
     }
-    /// Apply a queued effect or return a native protection error without copying.
+    /// Run queued work. Returns 0, or a verbs error status with nothing copied.
     fn execute(&mut self, qp: u32, action: &Action) -> u32 {
         match *action {
             Action::Bind {
@@ -551,7 +567,7 @@ impl World {
     }
 }
 
-/// Write the active discovery view into the caller's bounded port array.
+/// Report the current view's ports. Fails if they do not fit in `capacity`.
 unsafe extern "C" fn discover(out: *mut Port, capacity: u32) -> c_int {
     let Some(sim) = current() else {
         return -1;
@@ -580,7 +596,7 @@ unsafe extern "C" fn discover(out: *mut Port, capacity: u32) -> c_int {
     }
     sim.devices.len() as c_int
 }
-/// Open a named device from the active discovery view unless a fault rejects it.
+/// Open a device by name from the current view.
 unsafe extern "C" fn open(name: *const c_char) -> *mut c_void {
     let Some(sim) = current() else {
         return std::ptr::null_mut();
@@ -594,7 +610,7 @@ unsafe extern "C" fn open(name: *const c_char) -> *mut c_void {
     };
     allocate(&sim, Resource::Device(device.clone()))
 }
-/// Allocate a queue pair on a matching device port and return its unique number.
+/// Create a QP on the device's port. Writes its QPN.
 unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) -> *mut c_void {
     let h = unsafe { handle(device) };
     let mut world = h.sim.world.borrow_mut();
@@ -619,7 +635,7 @@ unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) ->
     }
     raw
 }
-/// Validate both fabric endpoints and assign them to an unconnected queue pair.
+/// Connect a QP once. Both endpoints must match real fabric resources.
 unsafe extern "C" fn connect(
     raw: *mut c_void,
     local: *const Endpoint,
@@ -671,7 +687,7 @@ unsafe extern "C" fn connect(
     *theirs = Some(remote);
     0
 }
-/// Cancel queued work and revoke this queue pair's grants after a successful fence.
+/// Stop a QP: drop its queued work and unbind its windows.
 unsafe extern "C" fn stop(raw: *mut c_void) -> c_int {
     let h = unsafe { handle(raw) };
     let mut world = h.sim.world.borrow_mut();
@@ -692,7 +708,7 @@ unsafe extern "C" fn stop(raw: *mut c_void) -> c_int {
     }
     0
 }
-/// Release a resource only when no live work, grant, or dependent owner refers to it.
+/// Free a resource. Fails if anything still uses it.
 unsafe fn free(raw: *mut c_void, operation: Operation) -> c_int {
     let h = unsafe { handle(raw) };
     let mut world = h.sim.world.borrow_mut();
@@ -735,23 +751,23 @@ unsafe fn free(raw: *mut c_void, operation: Operation) -> c_int {
     }
     0
 }
-/// Close a device once its dependent resources have been released.
+/// Close a device. Fails while anything on it is alive.
 unsafe extern "C" fn close(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::Close) }
 }
-/// Free a queue pair with no outstanding work or grants.
+/// Free a QP. Fails while it has work or bound windows.
 unsafe extern "C" fn qp_free(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::QpFree) }
 }
-/// Release registered memory when no queued work or grant retains it.
+/// Free a region. Fails while work or a window uses it.
 unsafe extern "C" fn deregister(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::Deregister) }
 }
-/// Free a revoked window when no queued work retains its key.
+/// Free a window. Fails while bound or used by queued work.
 unsafe extern "C" fn window_free(raw: *mut c_void) -> c_int {
     unsafe { free(raw, Operation::WindowFree) }
 }
-/// Allocate zeroed registered memory with a deterministic virtual address.
+/// Create a zeroed region with a fake wire address.
 unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
     let h = unsafe { handle(device) };
     let mut world = h.sim.world.borrow_mut();
@@ -769,7 +785,7 @@ unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
         },
     )
 }
-/// Return the stable backing pointer while the native region owner keeps it alive.
+/// Pointer to a region's bytes. Valid until the region is freed.
 unsafe extern "C" fn bytes(raw: *mut c_void) -> *mut u8 {
     let h = unsafe { handle(raw) };
     match h.sim.world.borrow_mut().resources.get_mut(&h.id) {
@@ -777,7 +793,7 @@ unsafe extern "C" fn bytes(raw: *mut c_void) -> *mut u8 {
         _ => std::ptr::null_mut(),
     }
 }
-/// Allocate an unbound window whose resource identifier is its remote key.
+/// Create an unbound window. Its id is its key.
 unsafe extern "C" fn window(device: *mut c_void, key: *mut u32) -> *mut c_void {
     let h = unsafe { handle(device) };
     if h.sim.world.borrow_mut().rejected(Operation::Window, h.id) {
@@ -795,7 +811,7 @@ unsafe extern "C" fn window(device: *mut c_void, key: *mut u32) -> *mut c_void {
     }
     raw
 }
-/// Queue a bind only when the queue pair, window, and region share one fabric.
+/// Queue a bind. QP, window, and region must share one fabric.
 unsafe extern "C" fn bind(
     qp: *mut c_void,
     window: *mut c_void,
@@ -821,7 +837,7 @@ unsafe extern "C" fn bind(
         },
     )
 }
-/// Queue key revocation for validation and execution at completion time.
+/// Queue an invalidate. Checked when it completes.
 unsafe extern "C" fn invalidate(qp: *mut c_void, key: u32, id: u64) -> c_int {
     let q = unsafe { handle(qp) };
     q.sim
@@ -829,7 +845,7 @@ unsafe extern "C" fn invalidate(qp: *mut c_void, key: u32, id: u64) -> c_int {
         .borrow_mut()
         .post(q.id, id, Action::Invalidate { key })
 }
-/// Queue a same-fabric write whose remote permission is checked at completion.
+/// Queue a write. The remote key is checked when it completes.
 unsafe extern "C" fn write(
     qp: *mut c_void,
     region: *mut c_void,
@@ -853,7 +869,7 @@ unsafe extern "C" fn write(
         },
     )
 }
-/// Execute at most 32 ordered requests, stopping on a delay or failed completion.
+/// Run up to 32 queued requests in order. Stops at a delay or a failure.
 unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) -> c_int {
     let q = unsafe { handle(qp) };
     let mut world = q.sim.world.borrow_mut();
@@ -898,8 +914,7 @@ unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) 
             };
         }
         count += 1;
-        // A failed WR terminates successful execution on this QP. The production
-        // owner consumes this CQE and establishes the stop fence before reuse.
+        // After a failure, nothing more runs. `ffi.rs` sees it and stops the QP.
         if status != 0 {
             break;
         }
