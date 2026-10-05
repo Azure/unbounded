@@ -9,7 +9,6 @@ use crate::model::WorkerId;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use ::telemetry::Ring;
-use ::telemetry::SampleBudget;
 use ::telemetry::SampleLimits;
 use ::telemetry::SharedRing;
 use ::telemetry::metrics;
@@ -358,7 +357,7 @@ mod retention_metric_tests {
             ..Default::default()
         });
         // Repeated health observations must not add cumulative counters again.
-        let snapshot = *workers[0].retention[0].lock().unwrap();
+        let snapshot = workers[0].retention.snapshots().next().unwrap();
         workers[0].observe_retention(snapshot);
         let mut output = String::new();
         workers[1].write_prometheus(&mut output).unwrap();
@@ -528,18 +527,14 @@ impl Pair {
         Ok(())
     }
 }
-#[derive(Clone, Default)]
-pub struct Samples(Arc<Mutex<SendCrcState>>);
-struct SendCrcState {
-    budget: SampleBudget,
-    entries: Ring<Arc<Sample>, SEND_CRC_CAPACITY>,
-}
-impl Default for SendCrcState {
+/// Racer's selected sender/receiver sampling policy and diagnostic records.
+#[derive(Clone)]
+pub struct Samples(::telemetry::Sampler<Sample, SEND_CRC_CAPACITY>);
+
+impl Default for Samples {
+    /// Apply Racer's fixed send-checksum sample limits.
     fn default() -> Self {
-        Self {
-            budget: SampleBudget::new(SEND_CRC_LIMITS),
-            entries: Ring::default(),
-        }
+        Self(::telemetry::Sampler::new(SEND_CRC_LIMITS))
     }
 }
 struct Sample {
@@ -558,8 +553,11 @@ struct Data {
 pub(crate) struct Ticket(Arc<Sample>);
 pub(crate) struct Work {
     sample: Arc<Sample>,
-    owner: Samples,
+
+    _lease: ::telemetry::SampleLease<Sample, SEND_CRC_CAPACITY>,
+
     pub facts: Option<AeadFailure>,
+
     pub cached: bool,
 }
 impl Samples {
@@ -605,9 +603,7 @@ impl Samples {
             return None;
         }
         let now = now();
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let sequence = state.budget.acquire(now)?;
-        let sample = Arc::new(Sample {
+        let (sample, lease) = self.0.acquire(now, |sequence| Sample {
             sequence,
             sender: sender.clone(),
             receiver: receiver.clone(),
@@ -618,30 +614,25 @@ impl Samples {
                 error: None,
                 facts: None,
             }),
-        });
-        state.entries.push(sample.clone());
+        })?;
         Some((
             Ticket(sample.clone()),
             Work {
                 sample,
-                owner: self.clone(),
+                _lease: lease,
                 facts: None,
                 cached: false,
             },
         ))
     }
     pub fn write(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let (entries, eligible, sampled, skipped, busy) = {
-            let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            let counts = state.budget.counts();
-            (
-                state.entries.clone(),
-                counts.eligible,
-                counts.sampled,
-                counts.skipped,
-                counts.busy,
-            )
-        };
+        let (entries, counts) = self.0.snapshot();
+        let ::telemetry::SampleCounts {
+            eligible,
+            sampled,
+            skipped,
+            busy,
+        } = counts;
         writeln!(
             out,
             "eligible={eligible} sampled={sampled} skipped={skipped} busy={} retained={} overwritten={} capacity={SEND_CRC_CAPACITY}",
@@ -719,12 +710,6 @@ impl Drop for Work {
                 data.status = "unavailable";
             }
         }
-        self.owner
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .budget
-            .release();
     }
 }
 
@@ -1584,7 +1569,7 @@ pub struct Metrics {
     #[allow(clippy::type_complexity)]
     admission: Arc<[OnceLock<(WorkerId, flow_control::SharedQuotas<AdmissionPolicy>)>]>,
 
-    retention: Arc<[Mutex<crate::retention::Snapshot>]>,
+    retention: ::telemetry::SnapshotShards<crate::retention::Snapshot>,
 
     shard: usize,
 }
@@ -1776,16 +1761,13 @@ impl Metrics {
     /// Sample on the owning worker's health tick, never on a request hot path.
     /// Diagnostics aggregate fixed-size copies without accessing worker-local Rc.
     pub(crate) fn observe_retention(&self, snapshot: crate::retention::Snapshot) {
-        *self.retention[self.shard]
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = snapshot;
+        self.retention.replace(self.shard, snapshot);
     }
 
     fn write_retention(&self, out: &mut impl Write) -> std::fmt::Result {
         let mut totals = [0u64; RETENTION_METRICS.len()];
         let mut classes = [[0u64; DISK_CLASS_METRICS.len()]; 2];
-        for shard in self.retention.iter() {
-            let snapshot = *shard.lock().unwrap_or_else(|error| error.into_inner());
+        for snapshot in self.retention.snapshots() {
             for (total, value) in totals.iter_mut().zip([
                 snapshot.observations,
                 snapshot.qualified,
@@ -1885,9 +1867,7 @@ impl Metrics {
             return Err(crate::error::Error::InvalidConfiguration);
         }
         let admission: Arc<[_]> = (0..count).map(|_| OnceLock::new()).collect();
-        let retention: Arc<[_]> = (0..count)
-            .map(|_| Mutex::new(crate::retention::Snapshot::default()))
-            .collect();
+        let retention = ::telemetry::SnapshotShards::new(count);
         Ok(::telemetry::Metrics::shards(count)
             .into_iter()
             .enumerate()
@@ -3087,9 +3067,9 @@ pub(crate) mod tests {
                     .join()
                     .unwrap()
             );
-            assert!(samples.0.lock().unwrap().budget.counts().busy);
+            assert!(samples.0.counts().busy);
             drop(work);
-            assert!(!samples.0.lock().unwrap().budget.counts().busy);
+            assert!(!samples.0.counts().busy);
             assert!(
                 samples.begin(&p, &p.sender, &p.receiver).is_none(),
                 "burst is one"
@@ -3111,10 +3091,10 @@ pub(crate) mod tests {
             clock.advance(Duration::from_secs(120));
             let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
             assert_eq!(ticket.0.sequence, 1);
-            assert_eq!(samples.0.lock().unwrap().budget.counts().eligible, 1);
+            assert_eq!(samples.0.counts().eligible, 1);
             work.finish(Some(Error::Io));
             drop(work);
-            assert!(!samples.0.lock().unwrap().budget.counts().busy);
+            assert!(!samples.0.counts().busy);
             let mut text = String::new();
             samples.write(&mut text).unwrap();
             assert!(text.contains("status=unavailable error=Some(Io)"));
@@ -3136,7 +3116,7 @@ pub(crate) mod tests {
             assert_eq!(ticket.0.sequence, 2);
             drop(work);
             drop(ticket);
-            let state = samples.0.lock().unwrap().budget.counts();
+            let state = samples.0.counts();
             assert_eq!((state.eligible, state.sampled, state.skipped), (3, 2, 1));
             assert!(!state.busy);
         }
@@ -3152,7 +3132,7 @@ pub(crate) mod tests {
             let weak = Arc::downgrade(&ticket.0);
             work.finish(None);
             drop(work);
-            let snapshot = samples.0.lock().unwrap().entries.clone();
+            let snapshot = samples.0.snapshot().0;
             for _ in 0..SEND_CRC_CAPACITY {
                 clock.advance(Duration::from_millis(500));
                 let (next, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();

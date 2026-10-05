@@ -18,6 +18,109 @@ pub mod server;
 
 pub use metrics::{Lease, Metric, Metrics};
 
+/// Fixed writer shards for caller-defined diagnostic snapshots.
+/// Each read clones one shard under its lock; aggregation never holds a writer lock.
+pub struct SnapshotShards<T>(Arc<[Mutex<T>]>);
+
+impl<T> Clone for SnapshotShards<T> {
+    /// Share the fixed shard collection without copying snapshots.
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: Default + Clone> SnapshotShards<T> {
+    /// Allocate a fixed number of default-valued shards, including zero if desired.
+    pub fn new(count: usize) -> Self {
+        Self((0..count).map(|_| Mutex::new(T::default())).collect())
+    }
+
+    /// Replace one writer's complete observation; panic on an invalid shard index.
+    pub fn replace(&self, shard: usize, value: T) {
+        *self.0[shard].lock().unwrap_or_else(|e| e.into_inner()) = value;
+    }
+
+    /// Copy each observation independently, recovering retained poisoned state.
+    pub fn snapshots(&self) -> impl ExactSizeIterator<Item = T> + '_ {
+        self.0
+            .iter()
+            .map(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+}
+
+/// Shared sampling admission and bounded retention under one lock.
+/// Callers decide eligibility before acquisition and own the record schema.
+pub struct Sampler<T, const N: usize>(Arc<Mutex<SamplerState<T, N>>>);
+
+/// Admission and publication are serialized so snapshots see matching totals.
+struct SamplerState<T, const N: usize> {
+    budget: SampleBudget,
+
+    entries: Ring<Arc<T>, N>,
+}
+
+/// Exclusive sample work ownership. Drop releases admission, never refunds it.
+/// Retained records and reader snapshots may outlive this lease.
+pub struct SampleLease<T, const N: usize>(Sampler<T, N>);
+
+impl<T, const N: usize> Clone for Sampler<T, N> {
+    /// Share admission and retention without copying records or limits.
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T, const N: usize> Sampler<T, N> {
+    /// Create an empty sampler with caller-selected limits and positive retention.
+    pub fn new(limits: SampleLimits) -> Self {
+        Self(Arc::new(Mutex::new(SamplerState {
+            budget: SampleBudget::new(limits),
+            entries: Ring::default(),
+        })))
+    }
+
+    /// Admit and publish one record. The constructor runs under the sampler lock
+    /// and must not reenter this sampler. Rejected attempts do not construct data.
+    pub fn acquire(
+        &self,
+        now: Instant,
+        record: impl FnOnce(u64) -> T,
+    ) -> Option<(Arc<T>, SampleLease<T, N>)> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = state.budget.acquire(now)?;
+        let record = Arc::new(record(sequence));
+        state.entries.push(record.clone());
+        Some((record, SampleLease(self.clone())))
+    }
+
+    /// Copy counters without changing admission or retention.
+    pub fn counts(&self) -> SampleCounts {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .budget
+            .counts()
+    }
+
+    /// Clone retention and its matching counts, releasing the lock before formatting.
+    pub fn snapshot(&self) -> (Ring<Arc<T>, N>, SampleCounts) {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (state.entries.clone(), state.budget.counts())
+    }
+}
+
+impl<T, const N: usize> Drop for SampleLease<T, N> {
+    /// Release the single busy slot even when sampled work is abandoned.
+    fn drop(&mut self) {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .budget
+            .release();
+    }
+}
+
 /// Shared bounded diagnostics with snapshots that never expose the writer lock.
 ///
 /// Cloning shares the writer; snapshotting clones retention under the lock.
@@ -1169,6 +1272,72 @@ mod ring_tests {
 #[cfg(test)]
 mod sampling_tests {
     use super::*;
+
+    /// Snapshot readers never retain writer locks or observe mutable borrowed data.
+    #[test]
+    fn snapshot_shards_replace_and_release_each_writer_lock() {
+        let shards = SnapshotShards::<Vec<u64>>::new(2);
+        shards.replace(0, vec![1]);
+        shards.replace(1, vec![2]);
+        let other = shards.clone();
+        let mut snapshots = shards.snapshots();
+        let first = snapshots.next().unwrap();
+        other.replace(0, vec![3]);
+        other.replace(1, vec![4]);
+        assert_eq!(first, vec![1]);
+        assert_eq!(snapshots.next(), Some(vec![4]));
+        assert_eq!(snapshots.next(), None);
+        assert_eq!(
+            shards.snapshots().collect::<Vec<_>>(),
+            vec![vec![3], vec![4]]
+        );
+        assert_eq!(SnapshotShards::<u64>::new(0).snapshots().len(), 0);
+    }
+
+    /// Admission is shared across threads, while snapshots outlive overwritten records.
+    #[test]
+    fn shared_sampler_releases_abandoned_work_without_refunding_admission() {
+        let now = Instant::now();
+        let sampler = Sampler::<u64, 1>::new(SampleLimits {
+            total: 2,
+            duration: Duration::from_secs(10),
+            interval: Duration::ZERO,
+        });
+        let (first, lease) = sampler.acquire(now, |sequence| sequence).unwrap();
+        let other = sampler.clone();
+        assert!(
+            std::thread::spawn(move || other
+                .acquire(now, |_| panic!("busy constructor"))
+                .is_none())
+            .join()
+            .unwrap()
+        );
+        let (snapshot, counts) = sampler.snapshot();
+        assert_eq!(
+            (counts.eligible, counts.sampled, counts.skipped, counts.busy),
+            (2, 1, 1, true)
+        );
+        drop(lease);
+        assert!(!sampler.counts().busy);
+        let (second, lease) = sampler.acquire(now, |sequence| sequence).unwrap();
+        assert_eq!((*first, *second), (1, 2));
+        assert_eq!(*snapshot.iter_refs().next().unwrap().1.as_ref(), 1);
+        assert_eq!(
+            *sampler.snapshot().0.iter_refs().next().unwrap().1.as_ref(),
+            2
+        );
+        drop(lease);
+        assert!(
+            sampler
+                .acquire(now, |_| panic!("exhausted constructor"))
+                .is_none()
+        );
+        let counts = sampler.counts();
+        assert_eq!(
+            (counts.eligible, counts.sampled, counts.skipped, counts.busy),
+            (4, 2, 2, false)
+        );
+    }
 
     /// Independent count, window, and interval limits for boundary tests.
     fn limits() -> SampleLimits {
