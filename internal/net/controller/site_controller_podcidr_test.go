@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kubefake "k8s.io/client-go/kubernetes/fake"
@@ -470,6 +471,7 @@ func TestAssignPodCIDRsPendingFromPreviousAssignment(t *testing.T) {
 		}
 
 		other := newState(t, "10.250.0.0/16")
+		h.sc.assignmentAllocators[assignmentKey("site-a", 0)] = other
 		h.failPatches(nil)
 
 		if err := h.sc.allocateAndPatchNodePodCIDRs(context.Background(), podCIDRTestNode, other, ""); err == nil {
@@ -496,6 +498,7 @@ func TestAssignPodCIDRsPendingFromPreviousAssignment(t *testing.T) {
 		h.setLiveNode(t, liveNodeWithRV("8"))
 
 		other := newState(t, "10.250.0.0/16")
+		h.sc.assignmentAllocators[assignmentKey("site-a", 0)] = other
 		h.failPatches(nil)
 
 		if err := h.sc.allocateAndPatchNodePodCIDRs(context.Background(), podCIDRTestNode, other, ""); err != nil {
@@ -539,6 +542,146 @@ func TestSeedAllocatorsMarksPendingPodCIDRs(t *testing.T) {
 
 	if !rebuilt.IsAllocated("10.244.0.0/24") {
 		t.Fatal("new allocator was not seeded with pending CIDRs")
+	}
+}
+
+type inspectingNodeLister struct {
+	corev1listers.NodeLister
+	beforeList func()
+	listErr    error
+}
+
+func (l inspectingNodeLister) List(selector labels.Selector) ([]*corev1.Node, error) {
+	l.beforeList()
+
+	if l.listErr != nil {
+		return nil, l.listErr
+	}
+
+	return l.NodeLister.List(selector)
+}
+
+func TestNewAllocatorPublishedOnlyAfterSeeding(t *testing.T) {
+	for _, failSeed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "list-failure"}[failSeed], func(t *testing.T) {
+			h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+			h.failPatches(apierrors.NewTimeoutError("unconfirmed", 1))
+
+			if err := h.sc.allocateAndPatchNodePodCIDRs(t.Context(), podCIDRTestNode, h.state, ""); err == nil {
+				t.Fatal("expected patch failure")
+			}
+
+			// A confirmed patch not yet in the informer cache must also seed
+			// the replacement allocator.
+			h.state.allocator.MarkAllocated("10.244.1.0/24")
+			site := h.sites[0].DeepCopy()
+			disabled := false
+			site.Spec.PodCidrAssignments[0].AssignmentEnabled = &disabled
+			site.Spec.PodCidrAssignments = append(site.Spec.PodCidrAssignments, unboundednetv1alpha1.PodCidrAssignment{
+				CidrBlocks: []string{"10.244.0.0/16"},
+			})
+			key := assignmentKey(site.Name, 1)
+
+			lister := inspectingNodeLister{NodeLister: h.sc.nodeLister, beforeList: func() {
+				if h.sc.assignmentAllocators[key] != nil {
+					t.Error("new allocator published before seeding")
+				}
+
+				if h.sc.pendingPodCIDRsLock.TryLock() {
+					h.sc.pendingPodCIDRsLock.Unlock()
+					t.Error("reservations can change during seeding")
+				}
+			}}
+			if failSeed {
+				lister.listErr = errors.New("list failed")
+			}
+
+			h.sc.nodeLister = lister
+			h.sc.updateAssignmentAllocators([]unboundedv1alpha3.Site{*site})
+
+			state := h.sc.getAssignmentAllocator(site.Name, 1)
+			if failSeed {
+				if state != nil {
+					t.Fatal("published allocator after failed seeding")
+				}
+
+				return
+			}
+
+			if state == nil {
+				t.Fatal("seeded allocator not published")
+			}
+
+			cidr, err := state.allocator.AllocateIPv4()
+			if err != nil || cidr != "10.244.2.0/24" {
+				t.Fatalf("allocation = %q, %v; want 10.244.2.0/24", cidr, err)
+			}
+
+			if _, _, err := h.sc.pendingPodCIDRsForNode(liveNodeWithRV("5"), h.state); err == nil {
+				t.Fatal("worker allocated through a retired allocator pointer")
+			}
+		})
+	}
+}
+
+func TestPendingAssignmentRequiresMatchingAllocationShape(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		blocks     []string
+		mask       int
+		compatible bool
+	}{
+		{name: "compatible", blocks: []string{"10.244.0.0/16"}, mask: 24, compatible: true},
+		{name: "smaller-block", blocks: []string{"10.244.0.0/16"}, mask: 25},
+		{name: "larger-block", blocks: []string{"10.244.0.0/16"}, mask: 23},
+		{name: "dual-stack", blocks: []string{"10.244.0.0/16", "fd00::/48"}, mask: 24},
+		{name: "not-contained", blocks: []string{"10.244.0.0/25"}, mask: 26},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+			if _, _, err := h.sc.pendingPodCIDRsForNode(liveNodeWithRV("4"), h.state); err != nil {
+				t.Fatal(err)
+			}
+
+			state, err := h.sc.buildAssignmentAllocator(assignmentRef{
+				site: h.sites[0],
+				assignment: unboundednetv1alpha1.PodCidrAssignment{
+					CidrBlocks:     tc.blocks,
+					NodeBlockSizes: &unboundednetv1alpha1.NodeBlockSizes{IPv4: tc.mask, IPv6: 64},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			h.sc.assignmentAllocators[assignmentKey("site-a", 0)] = state
+
+			cidr, _, err := h.sc.pendingPodCIDRsForNode(liveNodeWithRV("4"), state)
+			if tc.compatible {
+				if err != nil || cidr != "10.244.0.0/24" {
+					t.Fatalf("compatible adoption = %q, %v", cidr, err)
+				}
+
+				return
+			}
+
+			if err == nil || cidr != "" {
+				t.Fatalf("incompatible adoption = %q, %v", cidr, err)
+			}
+
+			if !h.state.allocator.IsAllocated("10.244.0.0/24") || state.allocator.DebugState().AllocatedCount != 0 {
+				t.Fatal("incompatible attempt released the pending CIDR or allocated another")
+			}
+
+			cidr, cidrs, err := h.sc.pendingPodCIDRsForNode(liveNodeWithRV("5"), state)
+			if err != nil || cidr == "" || !state.allocator.MatchesAllocation(cidrs) {
+				t.Fatalf("changed-version allocation = %v, %v", cidrs, err)
+			}
+
+			if h.state.allocator.IsAllocated("10.244.0.0/24") {
+				t.Fatal("old reservation retained after its patch became impossible")
+			}
+		})
 	}
 }
 
@@ -733,6 +876,7 @@ func TestAssignPodCIDRsKeepsPendingWhenLeaseLapses(t *testing.T) {
 	}
 
 	fence.validUntil = time.Time{}
+
 	h.failPatches(nil)
 
 	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); !errors.Is(err, errLeaseNotHeld) {
@@ -784,6 +928,7 @@ func TestTryAllocateForNodeLeaseFence(t *testing.T) {
 			h.sites[0].Spec.NodeCidrs = []string{"10.0.0.0/16"}
 			h.sc.sitesCache = h.sites
 			h.sc.SetLeaseFence(&fakeLeaseFence{validUntil: validUntil})
+
 			node := liveNodeWithRV("1")
 			node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.5"}}
 

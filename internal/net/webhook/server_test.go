@@ -345,6 +345,7 @@ func TestMutateNodesOnlyLabelsSite(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: tc.labels}}
+
 			node.Spec.PodCIDRs = tc.cidrs
 			if len(tc.cidrs) > 0 {
 				node.Spec.PodCIDR = tc.cidrs[0]
@@ -360,12 +361,14 @@ func TestMutateNodesOnlyLabelsSite(t *testing.T) {
 				Resource: metav1.GroupVersionResource{Version: "v1", Resource: "nodes"},
 				Object:   runtime.RawExtension{Raw: raw}, DryRun: &tc.dryRun,
 			}}
+
 			body, err := json.Marshal(review)
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			resolver := &fakeNodeSiteResolver{siteName: tc.siteName}
+
 			server := &Server{}
 			if !tc.noResolver {
 				server.SetNodeSiteResolver(resolver)
@@ -373,6 +376,7 @@ func TestMutateNodesOnlyLabelsSite(t *testing.T) {
 
 			rec := httptest.NewRecorder()
 			server.handleMutateNodes(rec, httptest.NewRequest(http.MethodPost, "/mutate-nodes", strings.NewReader(string(body))))
+
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 			}
@@ -441,6 +445,7 @@ func TestMutateNodesInvalidRequest(t *testing.T) {
 			server := &Server{nodeSiteResolver: &fakeNodeSiteResolver{siteName: "site-a"}}
 			rec := httptest.NewRecorder()
 			server.handleMutateNodes(rec, httptest.NewRequest(http.MethodPost, "/mutate-nodes", strings.NewReader(body)))
+
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", rec.Code)
 			}

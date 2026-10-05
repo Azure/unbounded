@@ -404,7 +404,7 @@ func (s *Server) handleMutateNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := "pass-through"
+	var result string
 
 	if s.nodeSiteResolver != nil {
 		var node corev1.Node
@@ -418,6 +418,7 @@ func (s *Server) handleMutateNodes(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				klog.Errorf("Failed to build site label admission patch for node %s: %v", node.Name, err)
 				http.Error(w, "failed to build site label patch", http.StatusInternalServerError)
+
 				return
 			}
 

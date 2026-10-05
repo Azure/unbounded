@@ -188,6 +188,13 @@ the renew deadline has elapsed since the start of its last successful lease writ
 A leader whose renewals stop succeeding stops allocating before another replica can
 acquire the lease. The lease holder assigns CIDRs after node creation during node sync.
 
+New assignment allocators are seeded before they become available to node workers.
+Seeding preserves existing and unconfirmed allocations, including blocks of a
+different size that overlap candidate CIDRs. A pending allocation can move to a
+different allocator only when its IP families, block sizes, and pool containment
+match. Otherwise, reconciliation waits until a changed Node UID or resourceVersion
+proves the previous patch cannot apply before allocating replacement CIDRs.
+
 ### Health and Monitoring
 
 | Flag | Type | Default | Description |

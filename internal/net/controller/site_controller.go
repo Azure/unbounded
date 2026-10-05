@@ -627,32 +627,36 @@ func (sc *SiteController) updateAssignmentAllocators(sites []unboundedv1alpha3.S
 		desired[assignmentKey(ref.site.Name, ref.index)] = ref
 	}
 
-	keysToSeed := make(map[string]struct{})
+	newAllocators := make(map[string]*assignmentAllocator)
+
+	// Serialize reservation changes with seeding and publication. Workers may
+	// already hold an allocator pointer, so the map lock alone is insufficient.
+	sc.pendingPodCIDRsLock.Lock()
+	defer sc.pendingPodCIDRsLock.Unlock()
 
 	sc.assignmentAllocatorsLock.Lock()
-	// Remove allocators for assignments that no longer exist
-	for key := range sc.assignmentAllocators {
-		if _, ok := desired[key]; !ok {
-			klog.Infof("Assignment allocator %s: removing (assignment no longer exists)", key)
-			delete(sc.assignmentAllocators, key)
+	defer sc.assignmentAllocatorsLock.Unlock()
+	// Keep retired allocators available for the seeding snapshot.
+	defer func() {
+		for key := range sc.assignmentAllocators {
+			if _, ok := desired[key]; !ok {
+				klog.Infof("Assignment allocator %s: removing (assignment no longer exists)", key)
+				delete(sc.assignmentAllocators, key)
+			}
 		}
-	}
+	}()
 
 	for key, ref := range desired {
 		existing := sc.assignmentAllocators[key]
 		if existing == nil {
 			// New assignment -- needs a fresh allocator and seeding
-			keysToSeed[key] = struct{}{}
-			sc.assignmentAllocatorsLock.Unlock()
 			state, err := sc.buildAssignmentAllocator(ref)
-			sc.assignmentAllocatorsLock.Lock()
 			if err != nil {
 				klog.Errorf("Failed to build allocator for site %s assignment %d: %v", ref.site.Name, ref.index, err)
 				continue
 			}
 
-			klog.Infof("Assignment allocator %s: created", key)
-			sc.assignmentAllocators[key] = state
+			newAllocators[key] = state
 
 			continue
 		}
@@ -672,14 +676,19 @@ func (sc *SiteController) updateAssignmentAllocators(sites []unboundedv1alpha3.S
 		// comparison stable even if unrelated spec fields change)
 		existing.assignment = ref.assignment
 	}
-	sc.assignmentAllocatorsLock.Unlock()
 
-	if len(keysToSeed) == 0 {
+	if len(newAllocators) == 0 {
 		return
 	}
 
-	if err := sc.seedAllocatorsForNodes(keysToSeed); err != nil {
+	if err := sc.seedAssignmentAllocators(newAllocators); err != nil {
 		klog.Errorf("Failed to seed assignment allocators: %v", err)
+		return
+	}
+
+	for key, state := range newAllocators {
+		sc.assignmentAllocators[key] = state
+		klog.Infof("Assignment allocator %s: created and seeded", key)
 	}
 }
 
@@ -780,6 +789,24 @@ func (sc *SiteController) buildAssignmentAllocator(ref assignmentRef) (*assignme
 }
 
 func (sc *SiteController) seedAllocatorsForNodes(keysToSeed map[string]struct{}) error {
+	sc.pendingPodCIDRsLock.Lock()
+	defer sc.pendingPodCIDRsLock.Unlock()
+
+	sc.assignmentAllocatorsLock.RLock()
+	defer sc.assignmentAllocatorsLock.RUnlock()
+
+	states := make(map[string]*assignmentAllocator, len(keysToSeed))
+	for key := range keysToSeed {
+		if state := sc.assignmentAllocators[key]; state != nil {
+			states[key] = state
+		}
+	}
+
+	return sc.seedAssignmentAllocators(states)
+}
+
+// Caller holds both the reservation and allocator-map locks through publication.
+func (sc *SiteController) seedAssignmentAllocators(states map[string]*assignmentAllocator) error {
 	nodes, err := sc.nodeLister.List(labels.Everything())
 	if err != nil {
 		return err
@@ -795,32 +822,20 @@ func (sc *SiteController) seedAllocatorsForNodes(keysToSeed map[string]struct{})
 
 	// Unconfirmed assignments may still be applied, so their CIDRs must stay
 	// reserved in any newly created allocator as well.
-	sc.pendingPodCIDRsLock.Lock()
 	for _, pending := range sc.pendingPodCIDRs {
 		for _, cidr := range pending.podCIDRs {
 			allocatedCIDRs[cidr] = struct{}{}
 		}
 	}
-	sc.pendingPodCIDRsLock.Unlock()
-
-	if len(allocatedCIDRs) == 0 {
-		return nil
-	}
-
-	keys := make([]string, 0, len(keysToSeed))
-	for key := range keysToSeed {
-		keys = append(keys, key)
-	}
-
-	for _, key := range keys {
-		sc.assignmentAllocatorsLock.RLock()
-		state := sc.assignmentAllocators[key]
-		sc.assignmentAllocatorsLock.RUnlock()
-
-		if state == nil {
-			continue
+	// Successful patches may not yet be in the informer cache. Preserve their
+	// reservations from the existing allocators as well.
+	for _, state := range sc.assignmentAllocators {
+		for _, cidr := range state.allocator.DebugState().AllocatedCIDRs {
+			allocatedCIDRs[cidr] = struct{}{}
 		}
+	}
 
+	for _, state := range states {
 		for cidr := range allocatedCIDRs {
 			state.allocator.MarkAllocated(cidr)
 		}
@@ -2266,13 +2281,21 @@ func (sc *SiteController) pendingPodCIDRsForNode(liveNode *corev1.Node, state *a
 	sc.pendingPodCIDRsLock.Lock()
 	defer sc.pendingPodCIDRsLock.Unlock()
 
+	sc.assignmentAllocatorsLock.RLock()
+	current := sc.assignmentAllocators[assignmentKey(state.siteName, state.assignmentIndex)]
+	sc.assignmentAllocatorsLock.RUnlock()
+
+	if current != state {
+		return "", nil, fmt.Errorf("assignment allocator for node %s changed; retry reconciliation", liveNode.Name)
+	}
+
 	if sc.pendingPodCIDRs == nil {
 		sc.pendingPodCIDRs = make(map[string]*pendingPodCIDRAssignment)
 	}
 
 	pending := sc.pendingPodCIDRs[liveNode.Name]
 	if pending != nil {
-		if pending.allocator == state.allocator || allocatorContainsAll(state.allocator, pending.podCIDRs) {
+		if pending.allocator == state.allocator || state.allocator.MatchesAllocation(pending.podCIDRs) {
 			for _, cidr := range pending.podCIDRs {
 				state.allocator.MarkAllocated(cidr)
 			}
@@ -2309,16 +2332,6 @@ func (sc *SiteController) pendingPodCIDRsForNode(liveNode *corev1.Node, state *a
 	}
 
 	return podCIDR, podCIDRs, nil
-}
-
-func allocatorContainsAll(alloc *allocator.Allocator, cidrs []string) bool {
-	for _, cidr := range cidrs {
-		if !alloc.ContainsCIDR(cidr) {
-			return false
-		}
-	}
-
-	return true
 }
 
 // clearPendingPodCIDRs forgets a node's pending assignment after its patch
