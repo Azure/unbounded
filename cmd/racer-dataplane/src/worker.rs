@@ -750,9 +750,15 @@ impl Service<RequestScope> for IoService {
         if let Ok(service) = &mut self.built {
             service.poll_budgeted(cx, budget)?;
         }
-        self.runtime.reactor.wait(IDLE_WAIT)?;
+        // Even a zero wait submits SQEs queued during the service turn.
+        self.runtime.reactor.wait(self.wait_timeout(IDLE_WAIT))?;
         thread::current().unpark();
         Ok(())
+    }
+    fn wait_timeout(&self, maximum: Duration) -> Duration {
+        self.built.as_ref().map_or(maximum, |service| {
+            service.wait_timeout(maximum).min(maximum)
+        })
     }
     fn stop_admission(&mut self) -> Result<()> {
         self.runtime.admission.stop();
@@ -828,6 +834,66 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
 mod tests {
     use super::*;
     use racer_control_wire::CacheId;
+
+    #[test]
+    fn io_wait_forwards_and_observes_post_poll_policy() {
+        use std::cell::Cell;
+        struct Waiting {
+            polled: Rc<Cell<bool>>,
+            observed: Rc<Cell<usize>>,
+        }
+        impl Service<RequestScope> for Waiting {
+            fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+                self.polled.set(true);
+                Ok(())
+            }
+            fn wait_timeout(&self, maximum: Duration) -> Duration {
+                self.observed.set(self.observed.get() + 1);
+                if self.polled.get() {
+                    Duration::ZERO
+                } else {
+                    maximum * 2
+                }
+            }
+            fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn shutdown<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let limits = crate::test_support::cluster::config(false).limits;
+        let (port, _engine) = security::pair(WorkerId(0), 0, limits.queue_entries);
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+        let polled = Rc::new(Cell::new(false));
+        let observed = Rc::new(Cell::new(0));
+        let mut service = IoService {
+            runtime: WorkerRuntime {
+                reactor: Rc::new(Reactor::new(admission.clone())),
+                admission,
+                crypto: Rc::new(CryptoClient::new(port)),
+            },
+            built: Ok(Box::new(Waiting {
+                polled: polled.clone(),
+                observed: observed.clone(),
+            })),
+            reporter: None,
+        };
+        assert_eq!(service.wait_timeout(IDLE_WAIT), IDLE_WAIT);
+        assert_eq!(observed.get(), 1);
+        service
+            .poll_budgeted(&mut Context::from_waker(Waker::noop()), 1)
+            .unwrap();
+        assert!(polled.get());
+        assert_eq!(observed.get(), 2, "the reactor wait queries after polling");
+        assert_eq!(service.wait_timeout(IDLE_WAIT), Duration::ZERO);
+        service.built = Err(Error::Unavailable);
+        assert_eq!(service.wait_timeout(IDLE_WAIT), IDLE_WAIT);
+    }
+
     #[test]
     fn direct_factory_resources_validate_sets_consume_once_and_fence() {
         use uring_runtime::group::Factory;

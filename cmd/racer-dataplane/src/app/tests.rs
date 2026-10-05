@@ -1025,6 +1025,38 @@ fn placement_maintenance_retries_pressure_without_spinning_or_log_floods() {
 }
 
 #[test]
+fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
+    use uring_runtime::environment::SimulationClock;
+    let mut worker = wake_test_worker();
+    let clock = SimulationClock::new(913);
+    worker.environment = clock.environment(0);
+    let maximum = Duration::from_millis(1);
+    let now = {
+        let _environment = worker.environment.enter();
+        uring_runtime::environment::now()
+    };
+    // Require the hook to enter the worker environment, not sample host time.
+    let _required = uring_runtime::environment::require_simulated();
+    assert_eq!(worker.wait_timeout(maximum), maximum);
+    let probes: Vec<_> = (0..65)
+        .map(|_| crate::read::metadata::tests::deadline_probe(&worker.metadata, now + maximum * 2))
+        .collect();
+    assert_eq!(worker.wait_timeout(maximum), maximum);
+    clock.advance(maximum + maximum / 2);
+    assert_eq!(worker.wait_timeout(maximum), maximum / 2);
+    assert_eq!(worker.wait_timeout(Duration::ZERO), Duration::ZERO);
+    clock.advance(maximum / 2);
+    assert_eq!(worker.wait_timeout(maximum), Duration::ZERO);
+    assert_eq!(worker.metadata.poll_deadlines(now + maximum * 2, 64), 64);
+    assert_eq!(worker.wait_timeout(maximum), Duration::ZERO);
+    clock.advance(maximum);
+    assert_eq!(worker.wait_timeout(maximum), Duration::ZERO);
+    assert_eq!(worker.metadata.poll_deadlines(now + maximum * 3, 1), 1);
+    assert_eq!(worker.wait_timeout(maximum), maximum);
+    drop(probes);
+}
+
+#[test]
 fn application_metadata_deadline_hook_is_budgeted_and_precedes_peer_polling() {
     use futures::Stream;
     use futures::stream::FuturesUnordered;
@@ -1062,14 +1094,26 @@ fn application_metadata_deadline_hook_is_budgeted_and_precedes_peer_polling() {
     })));
     worker.poll_budgeted(&mut cx, 0).unwrap();
     assert_eq!(completed.get(), 0);
+    assert_eq!(
+        worker.wait_timeout(Duration::from_millis(1)),
+        Duration::ZERO
+    );
     worker.poll_budgeted(&mut cx, usize::MAX).unwrap();
     assert_eq!(
         completed.get(),
         64,
         "deadline hook clamps before polling peers"
     );
+    assert_eq!(
+        worker.wait_timeout(Duration::from_millis(1)),
+        Duration::ZERO
+    );
     worker.poll_budgeted(&mut cx, 1).unwrap();
     assert_eq!(completed.get(), 65);
+    assert_eq!(
+        worker.wait_timeout(Duration::from_millis(1)),
+        Duration::from_millis(1)
+    );
     let settled = count.count();
     worker.poll_budgeted(&mut cx, 64).unwrap();
     assert_eq!(count.count(), settled);

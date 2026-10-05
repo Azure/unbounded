@@ -1417,6 +1417,12 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
     }
 }
 impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
+    fn wait_timeout(&self, maximum: Duration) -> Duration {
+        let _environment = self.environment.enter();
+        self.metadata.next_deadline().map_or(maximum, |deadline| {
+            maximum.min(deadline.saturating_duration_since(uring_runtime::environment::now()))
+        })
+    }
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         WorkerApplication::start(self, scope)
     }

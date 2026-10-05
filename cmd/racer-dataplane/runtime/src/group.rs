@@ -68,6 +68,10 @@ pub trait Service<S: Scope> {
     fn register_driver(&self, _waker: &Waker) {}
     fn start<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error>;
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<(), S::Error>;
+    /// Bound the next steady-state wait after polling. Due work returns zero.
+    fn wait_timeout(&self, maximum: Duration) -> Duration {
+        maximum
+    }
     fn stop_admission(&mut self) -> Result<(), S::Error> {
         Ok(())
     }
@@ -622,6 +626,17 @@ fn drive<S: Scope>(
         }
     }
 }
+fn poll_turn<S: Scope>(
+    service: &mut dyn Service<S>,
+    cx: &mut Context<'_>,
+) -> Result<Duration, S::Error> {
+    attempt(|| {
+        service.register_driver(cx.waker());
+        service.poll_budgeted(cx, WORK_BUDGET)?;
+        Ok(service.wait_timeout(IDLE_WAIT).min(IDLE_WAIT))
+    })
+}
+
 fn lane_thread<S: Scope>(
     factory: &dyn Factory<S>,
     lane: &Lane,
@@ -688,15 +703,17 @@ fn lane_thread<S: Scope>(
         }
         let mut cx = Context::from_waker(&waker);
         while !control.stopping(&startup) {
-            let result = attempt(|| {
-                service.register_driver(&waker);
-                service.poll_budgeted(&mut cx, WORK_BUDGET)
-            });
-            if let Err(error) = result {
-                control.fail(error);
-                break;
+            match poll_turn(&mut *service, &mut cx) {
+                Ok(wait) => {
+                    if !wait.is_zero() {
+                        thread::park_timeout(wait);
+                    }
+                }
+                Err(error) => {
+                    control.fail(error);
+                    break;
+                }
             }
-            thread::park_timeout(IDLE_WAIT);
         }
     } else {
         record(control, started);
@@ -1023,6 +1040,52 @@ mod tests {
         fn check(&self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn steady_state_wait_is_post_poll_bounded_and_panic_safe() {
+        struct Waiting {
+            polled: bool,
+            wait: Duration,
+            panic: bool,
+        }
+        impl Service<TestScope> for Waiting {
+            fn start<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
+                assert_eq!(budget, WORK_BUDGET);
+                self.polled = true;
+                Ok(())
+            }
+            fn wait_timeout(&self, maximum: Duration) -> Duration {
+                assert!(self.polled, "wait policy must observe the completed poll");
+                assert_eq!(maximum, IDLE_WAIT);
+                assert!(!self.panic, "wait hook failure");
+                self.wait
+            }
+            fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn shutdown<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+        for wait in [Duration::ZERO, IDLE_WAIT / 2, IDLE_WAIT, IDLE_WAIT * 2] {
+            let mut service = Waiting {
+                polled: false,
+                wait,
+                panic: false,
+            };
+            assert_eq!(poll_turn(&mut service, &mut cx), Ok(wait.min(IDLE_WAIT)));
+        }
+        let mut service = Waiting {
+            polled: false,
+            wait: IDLE_WAIT,
+            panic: true,
+        };
+        assert_eq!(poll_turn(&mut service, &mut cx), Err(Error::Io));
     }
 
     #[test]
