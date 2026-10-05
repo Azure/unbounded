@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package authority
 
 import (
 	"bytes"
@@ -26,7 +26,7 @@ import (
 // Trust atomically holds controller-validated public roots and the matching
 // delivery bundle. Requests never refresh this state or fall back to Kubernetes.
 // A failed observation cannot restore withdrawn trust.
-type Trust struct {
+type trustStore struct {
 	mu        sync.RWMutex
 	roots     *x509.CertPool
 	bundle    *acceptedKeyring
@@ -51,7 +51,7 @@ type acceptedKeyring struct {
 func (*acceptedKeyring) String() string   { return "<redacted keyring>" }
 func (*acceptedKeyring) GoString() string { return "<redacted keyring>" }
 
-func (t *Trust) install(ctx context.Context, roots *x509.CertPool, bundle wire.KeyringBundle) error {
+func (t *trustStore) install(ctx context.Context, roots *x509.CertPool, bundle wire.KeyringBundle) error {
 	encoded, err := wire.EncodeBundle(bundle)
 	if err != nil {
 		return err
@@ -93,7 +93,7 @@ func (t *Trust) install(ctx context.Context, roots *x509.CertPool, bundle wire.K
 	return nil
 }
 
-func (t *Trust) notifyLocked() {
+func (t *trustStore) notifyLocked() {
 	if t.changed != nil {
 		close(t.changed)
 	}
@@ -105,7 +105,7 @@ func (t *Trust) notifyLocked() {
 // invalidation permanently revokes that generation, even across recovery. Normal
 // validated rotation allows admitted responses to finish, but neither rotation nor
 // reconfirmation extends their captured freshness deadline.
-func (t *Trust) writeContext(parent context.Context) (context.Context, context.CancelFunc, error) {
+func (t *trustStore) writeContext(parent context.Context) (context.Context, context.CancelFunc, error) {
 	if t == nil {
 		return nil, nil, wire.Unavailable
 	}
@@ -133,7 +133,7 @@ func (t *Trust) writeContext(parent context.Context) (context.Context, context.C
 	return authorityWriteContext{Context: ctx, authority: t.authority, parent: parent}, func() { stop(); cancel() }, nil
 }
 
-func (t *Trust) invalidate() {
+func (t *trustStore) invalidate() {
 	if t != nil {
 		t.mu.Lock()
 		defer t.mu.Unlock()
@@ -147,7 +147,7 @@ func (t *Trust) invalidate() {
 	}
 }
 
-func (t *Trust) keyring() (*acceptedKeyring, <-chan struct{}, error) {
+func (t *trustStore) keyring() (*acceptedKeyring, <-chan struct{}, error) {
 	if t == nil {
 		return nil, nil, wire.Unavailable
 	}
@@ -162,7 +162,7 @@ func (t *Trust) keyring() (*acceptedKeyring, <-chan struct{}, error) {
 	return t.bundle, t.changed, nil
 }
 
-func (t *Trust) waitKeyring(ctx context.Context, after *wire.Generation) (*acceptedKeyring, error) {
+func (t *trustStore) waitKeyring(ctx context.Context, after *wire.Generation) (*acceptedKeyring, error) {
 	timer := time.NewTimer(wire.PollWait)
 	defer timer.Stop()
 
@@ -201,7 +201,7 @@ func (t *Trust) waitKeyring(ctx context.Context, after *wire.Generation) (*accep
 }
 
 // pool is immutable after installation, including when shared with TLS configs.
-func (t *Trust) pool() (*x509.CertPool, error) {
+func (t *trustStore) pool() (*x509.CertPool, error) {
 	if t == nil {
 		return nil, wire.Unavailable
 	}
@@ -252,7 +252,7 @@ func validCredentialClaim(cfg Config, claim string) bool {
 type credentialState struct {
 	secret     *corev1.Secret
 	bundle     wire.KeyringBundle
-	rotation   RotationState
+	rotation   rotationState
 	material   issuerMaterial
 	generation wire.Generation
 	// Parsed once per authoritative read, never used to install candidate trust.
@@ -272,7 +272,7 @@ func readBoundCredentials(ctx context.Context, reader client.Reader, cfg Config,
 	var (
 		secret   corev1.Secret
 		b        wire.KeyringBundle
-		s        RotationState
+		s        rotationState
 		material issuerMaterial
 	)
 
@@ -395,12 +395,12 @@ func (c *credentialState) validateRotation() error {
 
 // CatalogGate serializes authoritative catalog and credential operations while
 // allowing callers to abandon admission when their context is canceled.
-type CatalogGate struct {
+type catalogGate struct {
 	token chan struct{}
 }
 
-func newCatalogGate() *CatalogGate {
-	g := &CatalogGate{token: make(chan struct{}, 1)}
+func newCatalogGate() *catalogGate {
+	g := &catalogGate{token: make(chan struct{}, 1)}
 	g.token <- struct{}{}
 
 	return g
@@ -408,7 +408,7 @@ func newCatalogGate() *CatalogGate {
 
 // Acquire returns ownership only for a live context. A failed acquisition must
 // not be released and does not constitute an observation of invalid authority.
-func (g *CatalogGate) Acquire(ctx context.Context) error {
+func (g *catalogGate) Acquire(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -427,6 +427,6 @@ func (g *CatalogGate) Acquire(ctx context.Context) error {
 }
 
 // Release ends a successfully acquired critical section.
-func (g *CatalogGate) Release() {
+func (g *catalogGate) Release() {
 	g.token <- struct{}{}
 }

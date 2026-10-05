@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package authority
 
 import (
 	"context"
@@ -26,7 +26,7 @@ import (
 // VersionRecord is the only persisted topology bookkeeping. Hashes cover
 // canonical content excluding counters. No member history or publication bytes
 // are stored. ResourceVersion CAS must precede installing a publication.
-type VersionRecord struct {
+type versionRecord struct {
 	Cluster           wire.ClusterID         `json:"cluster"`
 	Sequence          wire.Sequence          `json:"sequence,string"`
 	MembershipVersion wire.MembershipVersion `json:"membership_version,string"`
@@ -36,19 +36,19 @@ type VersionRecord struct {
 
 // PreparedPublication owns encoded candidate bytes. Publishers require CAS;
 // replicas require canonical validation and an authoritative durable confirmation.
-type PreparedPublication struct {
-	owner           *Publications
-	previous        VersionRecord
+type preparedPublication struct {
+	owner           *publicationStore
+	previous        versionRecord
 	resourceVersion string
-	record          VersionRecord
+	record          versionRecord
 	encoded         string
 	delta           string
 	deltaBase       string
 }
 
-type CommittedPublication struct {
-	owner      *Publications
-	record     VersionRecord
+type committedPublication struct {
+	owner      *publicationStore
+	record     versionRecord
 	encoded    string
 	delta      string
 	deltaBase  string
@@ -90,7 +90,7 @@ func (p publicationResponse) writeTo(ctx context.Context, w io.Writer) (int64, e
 // writeContext pins one response to its image's revocable authority and the
 // freshness deadline at write admission. Later confirmations cannot extend an
 // in-flight response, and supersession or suspension permanently revokes it.
-func (p *CommittedPublication) writeContext(parent context.Context) (context.Context, context.CancelFunc, error) {
+func (p *committedPublication) writeContext(parent context.Context) (context.Context, context.CancelFunc, error) {
 	if p == nil || p.owner == nil {
 		return nil, nil, wire.Unavailable
 	}
@@ -139,32 +139,32 @@ func (c authorityWriteContext) Err() error {
 
 // Publications owns only the current immutable publication and one broadcast
 // notification. Older state belongs to dataplanes; poll admission belongs to Server.
-type Publications struct {
+type publicationStore struct {
 	mu        sync.Mutex
-	current   *CommittedPublication
+	current   *committedPublication
 	changed   chan struct{}
 	suspended bool
 	process   context.Context
 	confirmed time.Time
 	maxAge    time.Duration
-	observed  VersionRecord
+	observed  versionRecord
 	revoke    context.CancelFunc
 }
 
-func NewPublications() *Publications {
-	return &Publications{changed: make(chan struct{}), maxAge: 30 * time.Second}
+func newPublications() *publicationStore {
+	return &publicationStore{changed: make(chan struct{}), maxAge: 30 * time.Second}
 }
 
-func (p *Publications) bindProcess(ctx context.Context) {
+func (p *publicationStore) bindProcess(ctx context.Context) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.process = ctx
 }
 
-func (p *Publications) notifyLocked() { close(p.changed); p.changed = make(chan struct{}) }
+func (p *publicationStore) notifyLocked() { close(p.changed); p.changed = make(chan struct{}) }
 
-func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, members AcceptedMembers, caches []wire.CacheDefinition) (*PreparedPublication, error) {
+func (p *publicationStore) Prepare(previous versionRecord, resourceVersion string, members AcceptedMembers, caches []wire.CacheDefinition) (*preparedPublication, error) {
 	if !previous.valid() || resourceVersion == "" {
 		return nil, wire.InvalidRequest
 	}
@@ -212,7 +212,7 @@ func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, m
 		return nil, err
 	}
 
-	prepared := &PreparedPublication{owner: p, previous: previous, resourceVersion: resourceVersion, record: record, encoded: string(encoded)}
+	prepared := &preparedPublication{owner: p, previous: previous, resourceVersion: resourceVersion, record: record, encoded: string(encoded)}
 	v.Sequence, v.MembershipVersion = record.Sequence, record.MembershipVersion
 	// Capture immutable base under the lock, then diff/encode entirely outside it.
 	if current, err := p.Current(); err == nil && current.record == previous && record.Sequence > previous.Sequence {
@@ -228,7 +228,7 @@ func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, m
 
 // CommitVersion mints publisher installable state after a resource-version CAS.
 // Even unchanged content is CAS-confirmed; its counters and bytes remain identical.
-func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPublication) (*CommittedPublication, error) {
+func (r *publisher) CommitVersion(ctx context.Context, p *preparedPublication) (*committedPublication, error) {
 	cfg := r.runtimeConfig()
 
 	if err := ctx.Err(); err != nil {
@@ -263,12 +263,12 @@ func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPubli
 		return nil, err
 	}
 
-	return &CommittedPublication{owner: p.owner, record: p.record, encoded: p.encoded, delta: p.delta, deltaBase: p.deltaBase, leadership: ctx}, nil
+	return &committedPublication{owner: p.owner, record: p.record, encoded: p.encoded, delta: p.delta, deltaBase: p.deltaBase, leadership: ctx}, nil
 }
 
 // ForBase returns a shared bounded delta only for the exact authenticated cursor.
 // Coalesced/skipped updates and controller restarts automatically use the full image.
-func (p *CommittedPublication) ForBase(hash string) publicationResponse {
+func (p *committedPublication) ForBase(hash string) publicationResponse {
 	if hash == "" || hash != p.deltaBase || p.delta == "" {
 		return publicationResponse{encoded: p.encoded}
 	}
@@ -276,7 +276,7 @@ func (p *CommittedPublication) ForBase(hash string) publicationResponse {
 	return publicationResponse{encoded: p.delta}
 }
 
-func (p *Publications) Install(next *CommittedPublication) error {
+func (p *publicationStore) Install(next *committedPublication) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -329,7 +329,7 @@ func (p *Publications) Install(next *CommittedPublication) error {
 	return nil
 }
 
-func (p *Publications) authorizeLocked(next *CommittedPublication) *CommittedPublication {
+func (p *publicationStore) authorizeLocked(next *committedPublication) *committedPublication {
 	if p.revoke != nil {
 		p.revoke()
 	}
@@ -342,7 +342,7 @@ func (p *Publications) authorizeLocked(next *CommittedPublication) *CommittedPub
 
 // confirm never promotes a hash to an image. It only renews the freshness of an
 // already validated image when all durable counters and hashes still match.
-func (p *Publications) confirm(record VersionRecord) error {
+func (p *publicationStore) confirm(record versionRecord) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -360,7 +360,7 @@ func (p *Publications) confirm(record VersionRecord) error {
 // observed is independent of installed bytes, including before the first image.
 // Suspension never forgets this high-water mark. Skipped versions may return to
 // earlier hashes, but counters and unchanged membership versions must agree.
-func (p *Publications) observeLocked(record VersionRecord) error {
+func (p *publicationStore) observeLocked(record versionRecord) error {
 	if !record.valid() {
 		p.suspendLocked()
 		return wire.Conflict
@@ -383,7 +383,7 @@ func (p *Publications) observeLocked(record VersionRecord) error {
 	return nil
 }
 
-func (p *Publications) Current() (*CommittedPublication, error) {
+func (p *publicationStore) Current() (*committedPublication, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -393,7 +393,7 @@ func (p *Publications) Current() (*CommittedPublication, error) {
 // CurrentAndSubscribe atomically reads the current publication and subscribes to
 // changes, including when unavailable. The channel closes on install or suspension;
 // leadership cancellation must be observed separately by the caller.
-func (p *Publications) CurrentAndSubscribe() (*CommittedPublication, <-chan struct{}, error) {
+func (p *publicationStore) CurrentAndSubscribe() (*committedPublication, <-chan struct{}, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -402,7 +402,7 @@ func (p *Publications) CurrentAndSubscribe() (*CommittedPublication, <-chan stru
 	return current, p.changed, err
 }
 
-func (p *Publications) currentLocked() (*CommittedPublication, error) {
+func (p *publicationStore) currentLocked() (*committedPublication, error) {
 	if p.current == nil || p.suspended || time.Since(p.confirmed) >= p.maxAge {
 		return nil, wire.Unavailable
 	}
@@ -417,14 +417,14 @@ func (p *Publications) currentLocked() (*CommittedPublication, error) {
 // Suspend withdraws readiness and wakes polls after failure to validate durable
 // authority. Keep bytes/history for a later successful CAS, never serve them until
 // then. Invalid desired inputs alone do not suspend the last valid publication.
-func (p *Publications) Suspend() {
+func (p *publicationStore) Suspend() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.suspendLocked()
 }
 
-func (p *Publications) suspendLocked() {
+func (p *publicationStore) suspendLocked() {
 	if p.revoke != nil {
 		p.revoke()
 	}
@@ -438,7 +438,7 @@ func (p *Publications) suspendLocked() {
 // Wait rejects invalid identities/cursors and honors context cancellation and
 // certificate expiration. It shares publication bytes and broadcast notifications;
 // callers own admission for the full response lifetime, including writes and flush.
-func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *wire.Sequence) (*CommittedPublication, error) {
+func (p *publicationStore) Wait(ctx context.Context, identity NodeIdentity, after *wire.Sequence) (*committedPublication, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -539,7 +539,7 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 	}
 }
 
-func (p *Publications) Ready(_ *http.Request) error { _, err := p.Current(); return err }
+func (p *publicationStore) Ready(_ *http.Request) error { _, err := p.Current(); return err }
 
 const installationUIDAnnotation = "racer.unbounded-cloud.io/installation-uid"
 
@@ -640,7 +640,7 @@ func ensureInstalled(ctx context.Context, writer client.Writer, reader client.Re
 
 	return writer.Create(ctx, &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Annotations: map[string]string{installationUIDAnnotation: string(marker.UID)}},
-		Data:       versionData(VersionRecord{Cluster: cfg.Cluster, Sequence: 1, MembershipVersion: 1, ContentHash: content, MembershipHash: membership}),
+		Data:       versionData(versionRecord{Cluster: cfg.Cluster, Sequence: 1, MembershipVersion: 1, ContentHash: content, MembershipHash: membership}),
 	})
 }
 
@@ -686,7 +686,7 @@ func waitInstalled(ctx context.Context, reader client.Reader, cfg Config) error 
 	}
 }
 
-func versionData(v VersionRecord) map[string]string {
+func versionData(v versionRecord) map[string]string {
 	return map[string]string{"cluster": string(v.Cluster), "sequence": strconv.FormatUint(uint64(v.Sequence), 10), "membership_version": strconv.FormatUint(uint64(v.MembershipVersion), 10), "content_hash": v.ContentHash, "membership_hash": v.MembershipHash}
 }
 
@@ -695,36 +695,36 @@ func validHash(s string) bool {
 	return err == nil && len(b) == 32 && hex.EncodeToString(b) == s
 }
 
-func (v VersionRecord) valid() bool {
+func (v versionRecord) valid() bool {
 	return wire.ValidUUID(string(v.Cluster)) && v.Sequence > 0 && v.MembershipVersion > 0 && uint64(v.MembershipVersion) <= uint64(v.Sequence) && validHash(v.ContentHash) && validHash(v.MembershipHash)
 }
 
-func parseVersion(cm *corev1.ConfigMap, cluster wire.ClusterID, markerUID types.UID) (VersionRecord, error) {
+func parseVersion(cm *corev1.ConfigMap, cluster wire.ClusterID, markerUID types.UID) (versionRecord, error) {
 	sequence, e1 := strconv.ParseUint(cm.Data["sequence"], 10, 64)
 	membership, e2 := strconv.ParseUint(cm.Data["membership_version"], 10, 64)
 
-	v := VersionRecord{Cluster: wire.ClusterID(cm.Data["cluster"]), Sequence: wire.Sequence(sequence), MembershipVersion: wire.MembershipVersion(membership), ContentHash: cm.Data["content_hash"], MembershipHash: cm.Data["membership_hash"]}
+	v := versionRecord{Cluster: wire.ClusterID(cm.Data["cluster"]), Sequence: wire.Sequence(sequence), MembershipVersion: wire.MembershipVersion(membership), ContentHash: cm.Data["content_hash"], MembershipHash: cm.Data["membership_hash"]}
 	if e1 != nil || e2 != nil || !v.valid() || v.Cluster != cluster || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil || cm.Annotations[installationUIDAnnotation] != string(markerUID) || strconv.FormatUint(sequence, 10) != cm.Data["sequence"] || strconv.FormatUint(membership, 10) != cm.Data["membership_version"] {
-		return VersionRecord{}, fmt.Errorf("durable version state invalid; explicit new-cluster rebootstrap required: %w", wire.Unavailable)
+		return versionRecord{}, fmt.Errorf("durable version state invalid; explicit new-cluster rebootstrap required: %w", wire.Unavailable)
 	}
 
 	return v, nil
 }
 
-func readVersion(ctx context.Context, reader client.Reader, cfg Config) (*corev1.ConfigMap, VersionRecord, error) {
+func readVersion(ctx context.Context, reader client.Reader, cfg Config) (*corev1.ConfigMap, versionRecord, error) {
 	marker, err := readInstallation(ctx, reader, cfg, false)
 	if err != nil {
-		return nil, VersionRecord{}, err
+		return nil, versionRecord{}, err
 	}
 
 	cm := &corev1.ConfigMap{}
 
 	if err := ctx.Err(); err != nil {
-		return nil, VersionRecord{}, err
+		return nil, versionRecord{}, err
 	}
 
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.VersionConfigMapName}, cm); err != nil {
-		return nil, VersionRecord{}, authorityReadFailure(err)
+		return nil, versionRecord{}, authorityReadFailure(err)
 	}
 
 	v, err := parseVersion(cm, cfg.Cluster, marker.UID)

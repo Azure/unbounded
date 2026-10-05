@@ -6,7 +6,6 @@ package racer
 import (
 	"context"
 	"encoding/json"
-	"slices"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -20,21 +19,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/membership"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
 type TopologyReconciler struct {
-	authority *Authority
+	authority *authority.Authority
 	settings  frozenConfig
 	client.Client
-	APIReader    client.Reader
-	Config       Config
-	Publications *Publications
-	// Accepted is a detached legacy test view, never production authority input.
-	Accepted    AcceptedMembers
-	CatalogGate *CatalogGate
-	Trust       *Trust
+	APIReader client.Reader
+	Config    Config
 }
 
 func (r *TopologyReconciler) runtimeConfig() Config { return r.settings.get(&r.Config) }
@@ -76,137 +71,21 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 
 // TopologyHints are detached recovery annotations returned after gate release.
 // Mutating them cannot advance the publisher's accepted history.
-type TopologyHints struct {
-	Nodes   corev1.NodeList
-	Members AcceptedMembers
-}
+type TopologyHints = authority.TopologyHints
 
 type topologyUpdate = TopologyHints
 
 // publish protects authoritative reads, CAS, and local installation. Annotation
 // writes are recovery hints, not authority, and must not block trust observation.
 func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error) {
-	if r.authority != nil {
-		update, err := r.authority.PublishTopology(ctx, r.observeTopology)
-		if err == nil {
-			r.Accepted = cloneAccepted(update.Members)
-		}
-
-		return update, err
-	}
-	// Whitebox fixtures retain their explicit engines and accepted history.
-	a := &Authority{publisher: r, gate: r.CatalogGate, accepted: r.Accepted}
-
-	update, err := a.PublishTopology(ctx, r.observeTopology)
-	if err == nil {
-		r.Accepted = a.accepted
-	}
-
-	return update, err
+	return r.authority.PublishTopology(ctx, r.observeTopology)
 }
 
 // TopologyObservation contains discovery inputs, not accepted history or proofs.
-type TopologyObservation struct {
-	Nodes   corev1.NodeList
-	Input   membership.Input
-	Catalog []wire.CacheDefinition
-}
+type TopologyObservation = authority.TopologyObservation
 
 // PublishTopology invokes discovery under its private gate. History advances only
 // after durable CAS and local installation; returned annotation hints are detached.
-func (a *Authority) PublishTopology(ctx context.Context, observe func(context.Context) (TopologyObservation, error)) (TopologyHints, error) {
-	r := a.publisher
-	cfg := r.runtimeConfig()
-
-	if a.gate != nil {
-		if err := a.gate.Acquire(ctx); err != nil {
-			return topologyUpdate{}, err
-		}
-		defer a.gate.Release()
-	}
-
-	if err := ctx.Err(); err != nil {
-		return topologyUpdate{}, err
-	}
-
-	cm, previous, err := readVersion(ctx, r.APIReader, cfg)
-	if err != nil {
-		r.suspendInvalidAuthority(err)
-		return topologyUpdate{}, err
-	}
-
-	observation, err := observe(ctx)
-	if err != nil {
-		return topologyUpdate{}, err
-	}
-
-	catalog := observation.Catalog
-
-	// The committed keyring is the admission authority. A cache event can arrive
-	// before its keys exist; only the subsequent Secret event may publish it.
-	// Read authoritatively so a stale informer cannot admit rejected growth.
-	if claim := cm.Annotations[credentialClaim]; claim != "" {
-		credentials, err := readBoundCredentials(ctx, r.APIReader, cfg, claim, cm)
-		if err != nil {
-			r.suspendInvalidAuthority(err)
-			return topologyUpdate{}, err
-		}
-
-		keyed := keyedCaches(credentials.bundle)
-
-		accepted := make([]wire.CacheDefinition, 0, len(catalog))
-		for _, cache := range catalog {
-			if keyed[cache.ID] {
-				accepted = append(accepted, cache)
-			}
-		}
-
-		catalog = accepted
-	} else {
-		catalog = nil
-	}
-
-	result, err := membership.Reconcile(observation.Input, a.accepted)
-	if err != nil {
-		return topologyUpdate{}, err
-	}
-
-	for _, d := range result.Diagnostics {
-		ctrl.LoggerFrom(ctx).Info("membership input rejected", "object", d.Object, "field", d.Field, "reason", d.Reason)
-	}
-
-	prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, result.Members, catalog)
-	if err != nil {
-		return topologyUpdate{}, err
-	}
-
-	committed, err := r.CommitVersion(ctx, prepared)
-	if err != nil {
-		return topologyUpdate{}, err
-	}
-
-	if err := ctx.Err(); err != nil {
-		return topologyUpdate{}, err
-	}
-
-	if err := r.Publications.Install(committed); err != nil {
-		return topologyUpdate{}, err
-	}
-
-	a.accepted = result.Members
-
-	return TopologyHints{Nodes: *observation.Nodes.DeepCopy(), Members: cloneAccepted(result.Members)}, nil
-}
-
-func cloneAccepted(members AcceptedMembers) AcceptedMembers {
-	copy := make(AcceptedMembers, len(members))
-	for id, member := range members {
-		member.RDMANICs = slices.Clone(member.RDMANICs)
-		copy[id] = member
-	}
-
-	return copy
-}
 
 func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObservation, error) {
 	cfg := r.runtimeConfig()
@@ -315,13 +194,6 @@ func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(cfg))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
-}
-
-func (r *TopologyReconciler) suspendInvalidAuthority(err error) {
-	if shouldInvalidateTrust(err) {
-		r.Publications.Suspend()
-		r.Trust.invalidate()
-	}
 }
 
 // singleton coalesces input changes without introducing a singleton CR.

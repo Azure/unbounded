@@ -15,6 +15,10 @@ import (
 	"testing/synctest"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -24,28 +28,16 @@ func TestReplicaObservedHighWaterWithoutImage(t *testing.T) {
 			t.Run(initial+"/"+mutation, func(t *testing.T) {
 				f := newServingFixture(t)
 				r := f.a.Replication
-				p := r.Publications
-				base := *p.current
-
+				base := *capturePublication(t, f.a.authority)
 				base.record.Sequence, base.record.MembershipVersion = 10, 5
-				if err := p.Install(&base); err != nil {
-					t.Fatal(err)
-				}
-
-				if initial == "no image" {
-					p.current = nil
-					p.observed = VersionRecord{}
-				}
-
-				if initial == "suspended" {
-					p.Suspend()
-				}
 
 				newer := base.record
 				newer.Sequence = 11
 				newer.ContentHash = strings.Repeat("a", 64)
 				setVersion := func(record VersionRecord) {
-					cm, _, err := readVersion(f.ctx, r.APIReader, r.Config)
+					cm := &corev1.ConfigMap{}
+
+					err := r.APIReader.Get(f.ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.VersionConfigMapName}, cm)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -55,12 +47,39 @@ func TestReplicaObservedHighWaterWithoutImage(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				setVersion(base.record)
+
+				if initial == "no image" {
+					d := fixtureDependencies[f.a.authority]
+					a := authority.New(r.Config.authorityConfig(), authority.Dependencies{Reader: d, Writer: d})
+					f.a.authority = a
+					r.authority = a
+					f.a.Server.authority = a
+					f.a.Topology.authority = a
+					f.a.Keyring.authority = a
+					f.a.Lifecycle.authority = a
+					fixtureDependencies[a] = d
+				} else {
+					image, err := wire.DecodePublication(strings.NewReader(base.encoded))
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					image.Sequence = 10
+
+					image.MembershipVersion = 5
+					if err := r.installReplica(f.ctx, f.ctx, image); err != nil {
+						t.Fatal(err)
+					}
+
+					if initial == "suspended" {
+						restore := withdrawPublication(t, f.a.Topology)
+						restore()
+					}
+				}
+
 				setVersion(newer)
 				r.observe(f.ctx)
-
-				if p.observed != newer {
-					t.Fatal("newer authority forgotten without image")
-				}
 
 				bad := newer
 
@@ -83,15 +102,23 @@ func TestReplicaObservedHighWaterWithoutImage(t *testing.T) {
 				setVersion(bad)
 				r.observe(f.ctx)
 
-				if !p.suspended || p.observed != newer || f.a.Server.Ready(nil) == nil {
+				if f.a.authority.PublicationReady() == nil || f.a.Server.Ready(nil) == nil {
 					t.Fatal("invalid authority failed to suspend or erased high-water")
 				}
 
-				if _, err := r.Trust.pool(); err == nil {
+				if err := r.authority.TrustReady(); err == nil {
 					t.Fatal("invalid authority retained trust")
 				}
 
-				if err := p.Install(&base); err == nil {
+				image, decodeErr := wire.DecodePublication(strings.NewReader(base.encoded))
+				if decodeErr != nil {
+					t.Fatal(decodeErr)
+				}
+
+				image.Sequence = 10
+
+				image.MembershipVersion = 5
+				if err := r.installReplica(f.ctx, f.ctx, image); err == nil {
 					t.Fatal("install bypassed observed high-water")
 				}
 
@@ -169,26 +196,21 @@ func TestPublicationWriteAuthorityRevocation(t *testing.T) {
 					next.record.Sequence++
 
 					next.record.ContentHash = strings.Repeat("a", 64)
-					if err := r.Publications.Install(&next); err != nil {
-						t.Fatal(err)
-					}
-				case "suspend recover":
-					r.Publications.Suspend()
 
-					if err := r.Publications.Install(image); err != nil {
-						t.Fatal(err)
-					}
+					advanceFixturePublication(t, r)
+				case "suspend recover":
+					restore := withdrawPublication(t, r)
+					restore()
+					reconcileTopology(t, r, t.Context())
 				case "confirmation after write admission":
 					time.Sleep(20 * time.Second)
 
-					if err := r.Publications.confirm(image.record); err != nil {
-						t.Fatal(err)
-					}
+					reconcileTopology(t, r, t.Context())
 
 					time.Sleep(11 * time.Second)
 				}
 
-				if r.Publications.Ready(nil) != nil {
+				if r.authority.PublicationReady() != nil {
 					t.Fatal("replacement or confirmed image unavailable")
 				}
 
@@ -205,7 +227,7 @@ func TestPublicationWriteAuthorityRevocation(t *testing.T) {
 func TestSnapshotBlockedWriteClosesAtPinnedFreshness(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newServingFixture(t)
-		f.a.Server.Publications.maxAge = 5 * time.Second
+		configureFixtureAge(t, f, 5*time.Second)
 
 		server, peer := net.Pipe()
 		defer server.Close()
@@ -222,8 +244,7 @@ func TestSnapshotBlockedWriteClosesAtPinnedFreshness(t *testing.T) {
 		synctest.Wait()
 		time.Sleep(3 * time.Second)
 
-		p, _ := f.a.Server.Publications.Current()
-		if err := f.a.Server.Publications.confirm(p.record); err != nil {
+		if err := f.a.authority.Observe(f.ctx); err != nil {
 			t.Fatal(err)
 		}
 
@@ -237,7 +258,7 @@ func TestSnapshotBlockedWriteClosesAtPinnedFreshness(t *testing.T) {
 			t.Fatal("blocked write retained admission")
 		}
 
-		if f.a.Server.Publications.Ready(nil) != nil {
+		if f.a.authority.PublicationReady() != nil {
 			t.Fatal("confirmation should allow a new request")
 		}
 	})
@@ -267,11 +288,9 @@ func TestRevokedDeltaCannotBorrowNewAuthority(t *testing.T) {
 	}
 	defer cancel()
 
-	r.Publications.Suspend()
-
-	if err := r.Publications.Install(p); err != nil {
-		t.Fatal(err)
-	}
+	restore := withdrawPublication(t, r)
+	restore()
+	reconcileTopology(t, r, t.Context())
 
 	<-writeCtx.Done()
 
@@ -289,7 +308,8 @@ func TestSnapshotAuthorityHeldThroughFlush(t *testing.T) {
 		t.Run(action, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newServingFixture(t)
-				f.a.Server.Publications.maxAge = 5 * time.Second
+				configureFixtureAge(t, f, 5*time.Second)
+
 				w := &blockingResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), unblock: make(chan struct{}), blockFlush: true}
 				request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
 				request.TLS = f.requestState(t)
@@ -299,21 +319,19 @@ func TestSnapshotAuthorityHeldThroughFlush(t *testing.T) {
 
 				<-w.entered
 
-				image, err := f.a.Server.Publications.Current()
+				_, err := f.a.authority.Current()
 				if err != nil {
 					t.Fatal(err)
 				}
 
 				if action == "suspend" {
-					f.a.Server.Publications.Suspend()
-
-					if err := f.a.Server.Publications.Install(image); err != nil {
-						t.Fatal(err)
-					}
+					restore := withdrawPublication(t, f.a.Topology)
+					restore()
+					reconcileTopology(t, f.a.Topology, f.ctx)
 				} else {
 					time.Sleep(3 * time.Second)
 
-					if err := f.a.Server.Publications.confirm(image.record); err != nil {
+					if err := f.a.authority.Observe(f.ctx); err != nil {
 						t.Fatal(err)
 					}
 

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package authority
 
 import (
 	"context"
@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +30,8 @@ import (
 
 // NodeIdentity is verified output, never populated from an untrusted request.
 type NodeIdentity struct {
+	owner    *Authority
+	bearer   bool
 	nodeName string
 	cluster  wire.ClusterID
 	node     wire.NodeID
@@ -43,16 +44,17 @@ func (i NodeIdentity) Expires() time.Time      { return i.expires }
 
 // Issuer accesses a controller-only Secret. Its private key is never projected
 // into dataplane Pods or included in a response or diagnostic.
-type Issuer struct {
+type issuer struct {
+	owner       *Authority
 	settings    frozenConfig
 	APIReader   client.Reader
 	Config      Config
-	Trust       *Trust
-	CatalogGate *CatalogGate
+	Trust       *trustStore
+	CatalogGate *catalogGate
 	Now         func() time.Time
 }
 
-func (i *Issuer) runtimeConfig() Config { return i.settings.get(&i.Config) }
+func (i *issuer) runtimeConfig() Config { return i.settings.get(&i.Config) }
 
 type signingMaterial struct {
 	Certificate []byte `json:"certificate"`
@@ -192,7 +194,7 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 	return signingState{certificate: cert, key: key, roots: roots, bundle: credentials.bundle}, nil
 }
 
-func (i *Issuer) now() time.Time {
+func (i *issuer) now() time.Time {
 	if i.Now != nil {
 		return i.Now().UTC().Truncate(time.Second)
 	}
@@ -202,7 +204,7 @@ func (i *Issuer) now() time.Time {
 
 // Issuance can also observe invalid durable authority. It may withdraw trust,
 // but only controller reconciliation can install or restore serving trust.
-func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, error) {
+func (i *issuer) loadSigning(ctx context.Context, now time.Time) (signingState, error) {
 	// Serialize observations with controller installation so an in-flight valid
 	// read cannot restore trust after another operation observes invalidity.
 	if i.CatalogGate != nil {
@@ -225,7 +227,7 @@ func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, 
 // Issue accepts only the identity returned by token authentication. CSR names,
 // extensions and requested usages are discarded. Enrollment is correlation only.
 // It returns an owned, validated JSON response within the bootstrap wire bound.
-func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.BootstrapRequest) ([]byte, error) {
+func (i *issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.BootstrapRequest) ([]byte, error) {
 	cfg := i.runtimeConfig()
 
 	if err := ctx.Err(); err != nil {
@@ -295,7 +297,7 @@ func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.
 // cluster-scoped Node URI SAN, and current validity against local trust. Recheck on
 // every poll: an existing TLS connection must not bypass certificate expiry.
 // Membership and Kubernetes workload state are not certificate authorization.
-func AuthenticateCertificate(ctx context.Context, trust *Trust, cfg Config, state *tls.ConnectionState) (NodeIdentity, error) {
+func authenticateCertificate(ctx context.Context, trust *trustStore, cfg Config, state *tls.ConnectionState) (NodeIdentity, error) {
 	if err := ctx.Err(); err != nil {
 		return NodeIdentity{}, err
 	}
@@ -363,20 +365,21 @@ func AuthenticateCertificate(ctx context.Context, trust *Trust, cfg Config, stat
 	return NodeIdentity{cluster: cfg.Cluster, node: node, expires: expires}, nil
 }
 
-type Bootstrap struct {
+type bootstrap struct {
+	owner     *Authority
 	settings  frozenConfig
-	Client    client.Client
+	Client    client.Writer
 	APIReader client.Reader
 	Config    Config
-	Issuer    *Issuer
+	Issuer    *issuer
 }
 
-func (b *Bootstrap) runtimeConfig() Config { return b.settings.get(&b.Config) }
+func (b *bootstrap) runtimeConfig() Config { return b.settings.get(&b.Config) }
 
 // Authenticate performs TokenReview for racer-control, checks the live bound Pod
 // UID and authorized ServiceAccount/workload, and resolves its assigned Node UID.
 // Token contents, CSR contents, and requested names are not authority on their own.
-func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIdentity, error) {
+func (b *bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIdentity, error) {
 	cfg := b.runtimeConfig()
 
 	if err := ctx.Err(); err != nil {
@@ -387,7 +390,7 @@ func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIden
 		return NodeIdentity{}, wire.Unavailable
 	}
 
-	status, token, err := reviewBearer(ctx, b.Client, r, wire.TokenAudience, cfg.Limits.HeaderBytes)
+	status, token, err := reviewBearer(ctx, b.Client, r, wire.TokenAudience, cfg.MaxTokenBytes)
 	if err != nil {
 		return NodeIdentity{}, err
 	}
@@ -443,7 +446,7 @@ func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIden
 		return NodeIdentity{}, wire.Unauthenticated
 	}
 
-	return NodeIdentity{cluster: cfg.Cluster, node: wire.NodeID(node.UID), nodeName: node.Name, expires: expires}, nil
+	return NodeIdentity{owner: b.owner, bearer: true, cluster: cfg.Cluster, node: wire.NodeID(node.UID), nodeName: node.Name, expires: expires}, nil
 }
 
 func singleExtra(user authv1.UserInfo, key string) string {
@@ -457,7 +460,7 @@ func singleExtra(user authv1.UserInfo, key string) string {
 
 // reviewBearer shares only token parsing and API authentication. Callers retain
 // their distinct workload, service-account, binding, and expiration policies.
-func reviewBearer(ctx context.Context, c client.Client, r *http.Request, audience string, maxBytes int) (authv1.TokenReviewStatus, string, error) {
+func reviewBearer(ctx context.Context, c client.Writer, r *http.Request, audience string, maxBytes int) (authv1.TokenReviewStatus, string, error) {
 	values := r.Header.Values("Authorization")
 	if len(values) != 1 {
 		return authv1.TokenReviewStatus{}, "", wire.Unauthenticated
@@ -511,14 +514,19 @@ func tokenExpiration(token string) (time.Time, error) {
 // token, not caller-provided SANs. Every issuance uses a token, including renewal.
 // Retries correlate by enrollment ID; there is no persistent receipt ledger.
 // The returned bytes are the issuer's bounded, validated JSON response.
-func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.BootstrapRequest) ([]byte, error) {
+func (b *bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.BootstrapRequest) ([]byte, error) {
+	response, _, err := b.enroll(ctx, r, request)
+	return response, err
+}
+
+func (b *bootstrap) enroll(ctx context.Context, r *http.Request, request wire.BootstrapRequest) ([]byte, EnrollmentHint, error) {
 	identity, err := b.Authenticate(ctx, r)
 	if err != nil {
-		return nil, err
+		return nil, EnrollmentHint{}, err
 	}
 
 	if b.Issuer == nil {
-		return nil, wire.Unavailable
+		return nil, EnrollmentHint{}, wire.Unavailable
 	}
 
 	ctx, cancel := context.WithDeadline(ctx, identity.expires)
@@ -526,56 +534,34 @@ func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.Bo
 
 	response, err := b.Issuer.Issue(ctx, identity, request)
 	if err != nil {
-		return nil, err
+		return nil, EnrollmentHint{}, err
 	}
 	// Resolve the same live UID again before persisting an authenticated proposal.
 	// Both annotations are proposals only; explicit administrator values win.
 	var live corev1.Node
 	if err := b.APIReader.Get(ctx, client.ObjectKey{Name: identity.nodeName}, &live); err != nil {
-		return nil, err
+		return nil, EnrollmentHint{}, err
 	}
 
 	node := &live
 	if wire.NodeID(node.UID) == identity.node {
 		if !authorizedNode(node) {
-			return nil, wire.Forbidden
+			return nil, EnrollmentHint{}, wire.Forbidden
 		}
 
-		value := strconv.FormatUint(uint64(request.Shares), 10)
-
-		nics, err := json.Marshal(wire.CanonicalRDMANICs(request.RDMANICs))
-		if err != nil {
-			return nil, err
-		}
-
-		nicValue := string(nics)
-		if len(request.RDMANICs) == 0 {
-			nicValue = ""
-		}
-
-		_, nicPresent := node.Annotations[enrolledRDMANICsAnnotation]
-		if node.Annotations[enrolledSharesAnnotation] != value || node.Annotations[enrolledRDMANICsAnnotation] != nicValue || nicValue == "" && nicPresent {
-			before := node.DeepCopy()
-			if node.Annotations == nil {
-				node.Annotations = map[string]string{}
-			}
-
-			node.Annotations[enrolledSharesAnnotation] = value
-			if nicValue == "" {
-				delete(node.Annotations, enrolledRDMANICsAnnotation)
-			} else {
-				node.Annotations[enrolledRDMANICsAnnotation] = nicValue
-			}
-
-			if err := b.Client.Patch(ctx, node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
-				return nil, err
-			}
-		}
-
-		return response, nil
+		return response, EnrollmentHint{Node: *node, Shares: request.Shares, RDMANICs: wire.CanonicalRDMANICs(request.RDMANICs), Expires: identity.expires}, nil
 	}
 
-	return nil, wire.Forbidden
+	return nil, EnrollmentHint{}, wire.Forbidden
+}
+
+// EnrollmentHint is a detached UID/resource-version-bound proposal, not authority.
+// The root adapter persists it with optimistic concurrency after gate release.
+type EnrollmentHint struct {
+	Node     corev1.Node
+	Shares   uint32
+	RDMANICs []wire.RDMANIC
+	Expires  time.Time
 }
 
 func authorizationError(err error) error {

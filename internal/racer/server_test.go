@@ -523,7 +523,7 @@ func TestPooledTLSRetiredTrustAndNoResumption(t *testing.T) {
 		t.Fatal("new TLS connection accepted retired root")
 	}
 	// A fresh identity reconnects successfully but cannot resume an old session.
-	encoded, err := f.a.Server.Bootstrap.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
+	encoded, err := f.a.authority.Issue(f.ctx, fixtureIdentity(t, f), f.request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,8 +632,7 @@ func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newServingFixture(t)
 				f.a.Server.Config.Limits.MaxPolls = 1
-				f.a.Server.Publications.maxAge = 2 * wire.PollWait
-				f.a.Server.Trust.maxAge = 2 * wire.PollWait
+				configureFixtureAge(t, f, 2*wire.PollWait)
 				f.a.Server.Config.Limits.MaxConcurrentWrites = 1
 				other := *f
 				other.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID })
@@ -643,12 +642,12 @@ func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
 
 				r.TLS = f.requestState(t)
 				if tc.status != http.StatusOK {
-					current, err := f.a.Server.Publications.Current()
+					current, err := f.a.authority.Current()
 					if err != nil {
 						t.Fatal(err)
 					}
 
-					cursor := current.record.Sequence
+					cursor := current.Sequence()
 					if tc.status == http.StatusServiceUnavailable {
 						cursor++
 					}
@@ -727,7 +726,7 @@ func TestHTTPPollAdmissionAndCancellation(t *testing.T) {
 			other.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID })
 			handler := f.a.Server.Handler()
 
-			current, err := f.a.Server.Publications.Current()
+			current, err := f.a.authority.Current()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -735,7 +734,7 @@ func TestHTTPPollAdmissionAndCancellation(t *testing.T) {
 			ctx, cancel := context.WithCancel(f.ctx)
 			defer cancel()
 
-			r := httptest.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s?after=%d", wire.SnapshotPath, current.record.Sequence), nil)
+			r := httptest.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s?after=%d", wire.SnapshotPath, current.Sequence()), nil)
 			r.TLS = f.requestState(t)
 			done := make(chan *httptest.ResponseRecorder, 1)
 
@@ -816,7 +815,7 @@ func TestAdmissionAndAPIDeadlines(t *testing.T) {
 	f.a.Server.Config.Limits.MaxConcurrentBootstrap = 1
 	f.a.Server.Config.Limits.WriteTimeout = 100 * time.Millisecond
 	entered := make(chan struct{}, 1)
-	f.a.Server.Bootstrap.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+	fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
 		entered <- struct{}{}
 
 		<-ctx.Done()

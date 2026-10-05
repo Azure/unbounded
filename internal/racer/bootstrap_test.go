@@ -35,7 +35,7 @@ func authFixture(t *testing.T) (*Application, authv1.TokenReviewStatus, string) 
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker", UID: types.UID(testNodeUID)}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: "worker-pod", UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID, Controller: &controller}}}, Spec: corev1.PodSpec{NodeName: node.Name, ServiceAccountName: sa.Name}, Status: corev1.PodStatus{PodIP: "192.0.2.1"}}
 	r := initializedTopology(t, ds, sa, node, pod)
-	a := Assemble(r.Config, r.Client, r.APIReader)
+	a := assembleFixture(r.Config, r.Client, r.APIReader)
 	status := authv1.TokenReviewStatus{Authenticated: true, Audiences: []string{wire.TokenAudience}, User: authv1.UserInfo{Username: "system:serviceaccount:racer:racer-dataplane", UID: string(sa.UID), Extra: map[string]authv1.ExtraValue{"authentication.kubernetes.io/pod-name": {pod.Name}, "authentication.kubernetes.io/pod-uid": {string(pod.UID)}, "authentication.kubernetes.io/node-name": {node.Name}, "authentication.kubernetes.io/node-uid": {string(node.UID)}}}}
 	token := "header." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"exp":%d}`, time.Now().Add(time.Hour).Unix())) + ".signature"
 
@@ -45,7 +45,7 @@ func authFixture(t *testing.T) (*Application, authv1.TokenReviewStatus, string) 
 func installReview(t *testing.T, a *Application, status authv1.TokenReviewStatus, token string) {
 	t.Helper()
 
-	a.Server.Bootstrap.Client = interceptor.NewClient(a.Topology.Client.(client.WithWatch), interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+	fixtureDependencies[a.authority].Client = interceptor.NewClient(a.Topology.Client.(client.WithWatch), interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 		review, ok := obj.(*authv1.TokenReview)
 		if !ok {
 			return c.Create(ctx, obj, opts...)
@@ -78,7 +78,7 @@ func TestBootstrapRequiresUnambiguousNodeBindings(t *testing.T) {
 				r := httptest.NewRequest(http.MethodGet, wire.KeyringPath, nil)
 				r.Header.Set("Authorization", "Bearer "+token)
 
-				if _, err := a.Server.Bootstrap.Authenticate(t.Context(), r); err == nil {
+				if _, err := a.authority.Authenticate(t.Context(), r); err == nil {
 					t.Fatal("accepted missing or ambiguous node binding")
 				}
 			})
@@ -186,7 +186,7 @@ func TestBootstrapAuthoritativeBindings(t *testing.T) {
 			installReview(t, a, status, token)
 
 			if scenario == "api failure" {
-				a.Server.Bootstrap.APIReader = interceptor.NewClient(a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+				fixtureDependencies[a.authority].reader = interceptor.NewClient(a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
 					return fmt.Errorf("private upstream failure")
 				}})
 			}

@@ -232,7 +232,7 @@ func TestTransportProductionLongPollAndIdleAdmission(t *testing.T) {
 	})
 	client := f.client(t, &f.certificate)
 
-	publication, err := f.a.Server.Publications.Current()
+	publication, err := f.a.authority.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestTransportProductionLongPollAndIdleAdmission(t *testing.T) {
 	requestDone := make(chan error, 1)
 
 	go func() {
-		response, err := client.Get(fmt.Sprintf("https://%s/v1/snapshot?after=%d", listener.Addr(), publication.record.Sequence))
+		response, err := client.Get(fmt.Sprintf("https://%s/v1/snapshot?after=%d", listener.Addr(), publication.Sequence()))
 		if response != nil {
 			response.Body.Close()
 		}

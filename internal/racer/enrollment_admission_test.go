@@ -23,7 +23,7 @@ func TestEnrollmentSaturationPreservesLocalAuthentication(t *testing.T) {
 	s := f.a.Server
 	s.Config.Limits.MaxConcurrentBootstrap = 1
 	entered := make(chan struct{})
-	s.Bootstrap.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{
+	fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{
 		Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
 			close(entered)
 			<-ctx.Done()
@@ -77,7 +77,8 @@ func TestEnrollmentSaturationPreservesLocalAuthentication(t *testing.T) {
 	}
 
 	// Saturation cannot bypass withdrawn trust, even on an established connection.
-	s.Trust.invalidate()
+	fixtureDependencies[f.a.authority].reader = f.a.Topology.Client
+	invalidateFixtureTrust(t, f)
 
 	response, err = peer.Get(endpoint + wire.SnapshotPath)
 	responseBody(t, response, err, http.StatusServiceUnavailable)

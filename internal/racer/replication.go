@@ -23,27 +23,25 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
 const (
 	replicationPath     = "/internal/v1/snapshot"
-	ReplicationAudience = "racer-controller-replication"
+	ReplicationAudience = authority.ReplicationAudience
 )
 
 // Replication observes durable authority on every replica. No request from a
 // dataplane performs these reads. Only the elected publisher supplies image bytes.
 type Replication struct {
-	authority    *Authority
-	settings     frozenConfig
-	Config       Config
-	Client       client.Client
-	APIReader    client.Reader
-	Publications *Publications
-	Trust        *Trust
-	CatalogGate  *CatalogGate
-	mu           sync.Mutex
-	leader       context.Context
+	authority *authority.Authority
+	settings  frozenConfig
+	Config    Config
+	Client    client.Client
+	APIReader client.Reader
+	mu        sync.Mutex
+	leader    context.Context
 }
 
 func (r *Replication) runtimeConfig() Config { return r.settings.get(&r.Config) }
@@ -130,46 +128,9 @@ func (r *Replication) observe(ctx context.Context) {
 	}
 }
 
-func (r *Replication) operationAuthority() *Authority {
-	if r.authority != nil {
-		return r.authority
-	}
-
-	return &Authority{config: r.runtimeConfig(), client: r.Client, reader: r.APIReader, gate: r.CatalogGate, trust: r.Trust, publications: r.Publications}
-}
+func (r *Replication) operationAuthority() *authority.Authority { return r.authority }
 
 // Observe refreshes local serving authority without network replication.
-func (a *Authority) Observe(ctx context.Context) error {
-	if err := a.gate.Acquire(ctx); err != nil {
-		return err
-	}
-	defer a.gate.Release()
-
-	state, err := loadSigning(ctx, a.reader, a.config, time.Now())
-	if err == nil {
-		err = a.trust.install(ctx, state.roots, state.bundle)
-	}
-
-	if err == nil {
-		_, record, readErr := readVersion(ctx, a.reader, a.config)
-
-		err = readErr
-		if err == nil {
-			err = a.publications.confirm(record)
-		}
-	}
-
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
-
-	if shouldInvalidateTrust(err) {
-		a.trust.invalidate()
-		a.publications.Suspend()
-	}
-
-	return err
-}
 
 // installReplica is the alternate proof to publisher CAS: bounded canonical
 // decoding plus exact authoritative durable confirmation, never a trusted hash
@@ -179,45 +140,6 @@ func (r *Replication) installReplica(ctx, process context.Context, image wire.Pu
 }
 
 // AcceptReplica installs only canonical bytes matching authoritative durable state.
-func (a *Authority) AcceptReplica(ctx, process context.Context, image wire.Publication) error {
-	encoded, err := wire.EncodePublication(image)
-	if err != nil {
-		return err
-	}
-
-	content, membership, err := wire.ContentHashes(image)
-	if err != nil {
-		return err
-	}
-
-	want := VersionRecord{Cluster: image.Cluster, Sequence: image.Sequence, MembershipVersion: image.MembershipVersion, ContentHash: content, MembershipHash: membership}
-
-	if err := a.gate.Acquire(ctx); err != nil {
-		return err
-	}
-	defer a.gate.Release()
-
-	_, record, err := readVersion(ctx, a.reader, a.config)
-	if err != nil {
-		if shouldInvalidateTrust(err) {
-			a.publications.Suspend()
-			a.trust.invalidate()
-		}
-
-		return err
-	}
-
-	if err := a.publications.confirm(record); err != nil {
-		a.publications.Suspend()
-		return err
-	}
-
-	if record != want {
-		return wire.Unavailable
-	} // Publisher advanced during transfer; retry.
-
-	return a.publications.Install(&CommittedPublication{owner: a.publications, record: record, encoded: string(encoded), leadership: process})
-}
 
 func (r *Replication) leaderAddress(ctx context.Context) (string, error) {
 	var lease coordv1.Lease
@@ -325,51 +247,6 @@ func (r *Replication) authenticate(ctx context.Context, request *http.Request) (
 }
 
 // ReplicaIdentity is verified output, never a caller-supplied authorization fact.
-type ReplicaIdentity struct {
-	uid     string
-	expires time.Time
-}
-
-func (i ReplicaIdentity) UID() string        { return i.uid }
-func (i ReplicaIdentity) Expires() time.Time { return i.expires }
-
-func (a *Authority) AuthenticateReplica(ctx context.Context, request *http.Request) (ReplicaIdentity, error) {
-	status, token, err := reviewBearer(ctx, a.client, request, ReplicationAudience, 0)
-	if err != nil {
-		return ReplicaIdentity{}, err
-	}
-
-	if status.User.Username != "system:serviceaccount:"+a.config.Namespace+":"+a.config.ControllerServiceAccount {
-		return ReplicaIdentity{}, wire.Forbidden
-	}
-
-	name, uid := singleExtra(status.User, "pod-name"), singleExtra(status.User, "pod-uid")
-	if name == "" || uid == "" || status.User.UID == "" {
-		return ReplicaIdentity{}, wire.Unauthenticated
-	}
-
-	var pod corev1.Pod
-	if err := a.reader.Get(ctx, client.ObjectKey{Namespace: a.config.Namespace, Name: name}, &pod); err != nil {
-		return ReplicaIdentity{}, authorizationError(err)
-	}
-
-	if !controllerPod(a.config, &pod) || string(pod.UID) != uid {
-		return ReplicaIdentity{}, wire.Forbidden
-	}
-
-	var sa corev1.ServiceAccount
-	if err := a.reader.Get(ctx, client.ObjectKey{Namespace: a.config.Namespace, Name: a.config.ControllerServiceAccount}, &sa); err != nil {
-		return ReplicaIdentity{}, authorizationError(err)
-	}
-
-	if string(sa.UID) != status.User.UID || sa.DeletionTimestamp != nil {
-		return ReplicaIdentity{}, wire.Forbidden
-	}
-
-	expires, err := tokenExpiration(token)
-
-	return ReplicaIdentity{uid: uid, expires: expires}, err
-}
 
 func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) {
 	r := s.Replication

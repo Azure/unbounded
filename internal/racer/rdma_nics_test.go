@@ -57,7 +57,7 @@ func TestAuthenticatedRDMANICProposalAndEmptyRemoval(t *testing.T) {
 	req, err := http.NewRequestWithContext(f.ctx, http.MethodPost, wire.BootstrapPath, nil)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+f.token)
-	_, err = f.a.Server.Bootstrap.Enroll(f.ctx, req, f.request)
+	_, err = f.a.Server.enroll(f.ctx, req, f.request)
 	require.NoError(t, err)
 
 	var node corev1.Node
@@ -74,7 +74,7 @@ func TestAuthenticatedRDMANICProposalAndEmptyRemoval(t *testing.T) {
 	require.Empty(t, attributes.RDMANICs)
 	f.request.RDMANICs = nil
 	f.request.Shares = 10
-	_, err = f.a.Server.Bootstrap.Enroll(f.ctx, req, f.request)
+	_, err = f.a.Server.enroll(f.ctx, req, f.request)
 	require.NoError(t, err)
 	require.NoError(t, f.a.Topology.Get(f.ctx, client.ObjectKey{Name: "worker"}, &node))
 	require.NotContains(t, node.Annotations, enrolledRDMANICsAnnotation)
@@ -101,7 +101,7 @@ func TestEnrollmentRDMANICAtomicPatchFailure(t *testing.T) {
 	f.request.RDMANICs = []wire.RDMANIC{{Device: "mlx5_0", Port: 1}}
 	patchFailure := errors.New("patch rejected")
 	patched := false
-	f.a.Server.Bootstrap.Client = interceptor.NewClient(f.a.Server.Bootstrap.Client.(client.WithWatch), interceptor.Funcs{
+	fixtureDependencies[f.a.authority].Client = interceptor.NewClient(fixtureDependencies[f.a.authority].Client.(client.WithWatch), interceptor.Funcs{
 		Patch: func(_ context.Context, _ client.WithWatch, obj client.Object, patch client.Patch, _ ...client.PatchOption) error {
 			patched = true
 			data, err := patch.Data(obj)
@@ -116,7 +116,7 @@ func TestEnrollmentRDMANICAtomicPatchFailure(t *testing.T) {
 	req, err := http.NewRequestWithContext(f.ctx, http.MethodPost, wire.BootstrapPath, nil)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+f.token)
-	_, err = f.a.Server.Bootstrap.Enroll(f.ctx, req, f.request)
+	_, err = f.a.Server.enroll(f.ctx, req, f.request)
 	require.ErrorIs(t, err, patchFailure)
 	require.True(t, patched)
 
@@ -132,7 +132,7 @@ func TestEnrollmentRDMANICLiveNodeRecheck(t *testing.T) {
 			f := newServingFixture(t)
 			f.request.RDMANICs = []wire.RDMANIC{{Device: "mlx5_0", Port: 1}}
 			nodeReads := 0
-			f.a.Server.Bootstrap.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{
+			fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{
 				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 					if err := c.Get(ctx, key, obj, opts...); err != nil {
 						return err
@@ -155,7 +155,7 @@ func TestEnrollmentRDMANICLiveNodeRecheck(t *testing.T) {
 			req, err := http.NewRequestWithContext(f.ctx, http.MethodPost, wire.BootstrapPath, nil)
 			require.NoError(t, err)
 			req.Header.Set("Authorization", "Bearer "+f.token)
-			_, err = f.a.Server.Bootstrap.Enroll(f.ctx, req, f.request)
+			_, err = f.a.Server.enroll(f.ctx, req, f.request)
 			require.ErrorIs(t, err, wire.Forbidden)
 			require.Equal(t, 2, nodeReads)
 

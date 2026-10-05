@@ -35,7 +35,7 @@ func TestReplicaInstallationAndFreshness(t *testing.T) {
 		process, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		follower.Server.Publications.bindProcess(process)
+		follower.authority.BindProcess(process)
 
 		image, err := wire.DecodePublication(strings.NewReader(publication.encoded))
 		if err != nil {
@@ -53,47 +53,58 @@ func TestReplicaInstallationAndFreshness(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		current, err := follower.Server.Publications.Current()
-		if err != nil || current.encoded != publication.encoded {
+		_, err = follower.authority.Current()
+		if err != nil || capturePublication(t, follower.authority).encoded != publication.encoded {
 			t.Fatal("replica did not install canonical image", err)
 		}
 
 		time.Sleep(20 * time.Second)
 
-		if err := follower.Server.Publications.confirm(publication.record); err != nil {
+		if err := follower.authority.AcceptReplica(t.Context(), process, image); err != nil {
 			t.Fatal(err)
 		}
 
 		time.Sleep(20 * time.Second)
 
-		if follower.Server.Publications.Ready(nil) != nil {
+		if follower.authority.PublicationReady() != nil {
 			t.Fatal("unchanged authoritative confirmation did not renew freshness")
 		}
 
 		time.Sleep(11 * time.Second)
 
-		if follower.Server.Publications.Ready(nil) == nil {
+		if follower.authority.PublicationReady() == nil {
 			t.Fatal("expired image still serves")
-		}
-
-		if follower.Server.Publications.current != current {
-			t.Fatal("interruption discarded validated image")
 		}
 
 		if err := follower.Replication.installReplica(t.Context(), process, image); err != nil {
 			t.Fatal(err)
 		}
 
+		if capturePublication(t, follower.authority).encoded != publication.encoded {
+			t.Fatal("interruption discarded validated image")
+		}
+
 		rollback := publication.record
 
 		rollback.ContentHash = strings.Repeat("0", 64)
-		if follower.Server.Publications.confirm(rollback) == nil {
+
+		cm, _, err := readVersion(t.Context(), leader.APIReader, leader.Config)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		cm.Data = versionData(rollback)
+		if err := leader.Update(t.Context(), cm); err != nil {
+			t.Fatal(err)
+		}
+
+		if follower.authority.AcceptReplica(t.Context(), process, image) == nil {
 			t.Fatal("same-counter corruption accepted")
 		}
 
 		cancel()
 
-		if follower.Server.Publications.Ready(nil) == nil {
+		if follower.authority.PublicationReady() == nil {
 			t.Fatal("process cancellation ignored")
 		}
 	})
@@ -101,17 +112,17 @@ func TestReplicaInstallationAndFreshness(t *testing.T) {
 
 func TestReplicaServingSurvivesPublisherCancellation(t *testing.T) {
 	r := initializedTopology(t)
-	r.Publications.bindProcess(t.Context())
+	r.authority.BindProcess(t.Context())
 	publisher, cancel := context.WithCancel(t.Context())
 	publication := reconcileTopology(t, r, publisher)
 
 	cancel()
 
-	if _, err := r.Publications.Current(); err != nil {
+	if _, err := r.authority.Current(); err != nil {
 		t.Fatal("publisher lifetime leaked into serving", err)
 	}
 
-	if publication.leadership.Err() != nil {
+	if _, _, err := publication.writeContext(t.Context()); err != nil {
 		t.Fatal("image bound to publisher instead of process")
 	}
 }
@@ -128,7 +139,7 @@ func TestReplicaObservationsFailClosed(t *testing.T) {
 	r.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
 		return errors.New("offline")
 	}})
-	r.authority.reader = r.APIReader
+	fixtureDependencies[r.authority].reader = r.APIReader
 	r.observe(f.ctx)
 
 	if f.a.Server.Ready(nil) != nil {
@@ -136,7 +147,7 @@ func TestReplicaObservationsFailClosed(t *testing.T) {
 	}
 
 	r.APIReader = f.a.Topology.APIReader
-	r.authority.reader = r.APIReader
+	fixtureDependencies[r.authority].reader = r.APIReader
 
 	cm, _, err := readVersion(f.ctx, r.APIReader, r.Config)
 	if err != nil {
@@ -214,7 +225,7 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 
 		return nil
 	}})
-	r.authority.client = r.Client
+	fixtureDependencies[r.authority].Client = r.Client
 
 	for _, unchanged := range []bool{false, true} {
 		for _, fail := range []bool{false, true} {
@@ -226,12 +237,12 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 				want := http.StatusOK
 
 				if unchanged {
-					p, err := r.Publications.Current()
+					p, err := r.authority.Current()
 					if err != nil {
 						t.Fatal(err)
 					}
 
-					request.URL.RawQuery = fmt.Sprintf("after=%d", p.record.Sequence)
+					request.URL.RawQuery = fmt.Sprintf("after=%d", p.Sequence())
 					want = http.StatusNoContent
 				}
 
@@ -327,7 +338,7 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 	}
 	// TLS must be reachable before public readiness, including before trust is
 	// initialized. Public routes remain unavailable; internal auth is independent.
-	f.a.Server.Trust.invalidate()
+	invalidateFixtureTrust(t, f)
 	endpoint := f.start(t)
 	peer := f.client(t, nil)
 	response, err := peer.Get(endpoint + replicationPath)

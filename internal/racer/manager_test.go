@@ -20,20 +20,19 @@ import (
 func TestAssemble(t *testing.T) {
 	// Nil Kubernetes dependencies make unintended constructor API calls fail.
 	a := Assemble(Config{}, nil, nil)
-	if a.Topology.Publications != a.Server.Publications {
+	if a.Topology.authority != a.Server.authority {
 		t.Fatal("topology and HTTP must share the single publication owner")
 	}
 
-	issuer := a.Server.Bootstrap.Issuer
-	if issuer == nil {
+	if a.Server.authority == nil {
 		t.Fatal("bootstrap must have an issuer")
 	}
 
-	if a.Server.Trust == nil || a.Keyring.Trust != a.Server.Trust || a.Topology.Trust != a.Server.Trust || issuer.Trust != a.Server.Trust {
+	if a.Keyring.authority != a.Server.authority || a.Topology.authority != a.Server.authority {
 		t.Fatal("controllers, issuance, and serving must share trust")
 	}
 
-	if a.Keyring.CatalogGate == nil || a.Topology.CatalogGate != a.Keyring.CatalogGate || issuer.CatalogGate != a.Keyring.CatalogGate {
+	if a.Keyring.authority == nil || a.Topology.authority != a.Keyring.authority {
 		t.Fatal("controllers and issuance must share the catalog gate")
 	}
 
@@ -41,17 +40,17 @@ func TestAssemble(t *testing.T) {
 		t.Fatal("serving must share the process readiness gate")
 	}
 
-	for _, cfg := range []Config{a.Server.Config, a.Topology.Config, a.Keyring.Config, a.Replication.Config, issuer.Config, a.Server.Bootstrap.Config} {
+	for _, cfg := range []Config{a.Server.Config, a.Topology.Config, a.Keyring.Config, a.Replication.Config} {
 		if cfg.CertificateLifetime != wire.CertificateLifetime || cfg.SnapshotMaxAge != 30*time.Second {
 			t.Fatal("composition did not resolve default lifetimes")
 		}
 	}
 
-	if a.Server.Publications.maxAge != a.Server.Config.SnapshotMaxAge || a.Server.Trust.maxAge != a.Server.Config.SnapshotMaxAge {
+	if a.Server.Config.SnapshotMaxAge != a.Topology.Config.SnapshotMaxAge || a.Server.Config.SnapshotMaxAge != a.Keyring.Config.SnapshotMaxAge {
 		t.Fatal("freshness owners differ from effective configuration")
 	}
 
-	if a.Topology.Accepted == nil || a.Server.NeedLeaderElection() || a.Replication.NeedLeaderElection() {
+	if a.authority.PublicationReady() == nil || a.Server.NeedLeaderElection() || a.Replication.NeedLeaderElection() {
 		t.Fatal("missing local accepted state or process-scoped server")
 	}
 

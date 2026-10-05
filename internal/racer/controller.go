@@ -42,11 +42,12 @@ import (
 
 	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
 type Application struct {
-	authority   *Authority
+	authority   *authority.Authority
 	Topology    *TopologyReconciler
 	Keyring     *KeyringReconciler
 	Server      *Server
@@ -59,26 +60,20 @@ type Application struct {
 // reader must bypass the cache for authorization and durable-state validation.
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	cfg = cfg.effective()
-	authority := NewAuthority(cfg, c, reader)
-	publications := authority.publications
-	lifecycle := newLifecycle(publications)
-	lifecycle.authority = authority
-	trust := authority.trust
-	bootstrap := authority.bootstrap
-	replication := &Replication{Config: cfg, Client: c, APIReader: reader, Publications: publications, Trust: trust, CatalogGate: authority.gate, authority: authority}
+	a := authority.New(cfg.authorityConfig(), authority.Dependencies{Writer: c, Reader: reader})
+	lifecycle := newLifecycle(a)
+	replication := &Replication{Config: cfg, Client: c, APIReader: reader, authority: a}
 
 	return &Application{
-		authority: authority,
-		Topology:  authority.publisher,
-		Keyring:   authority.credentials,
+		authority: a,
+		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, authority: a},
+		Keyring:   &KeyringReconciler{Config: cfg, authority: a},
 		Server: &Server{
-			authority:    authority,
-			Config:       cfg,
-			Trust:        trust,
-			Bootstrap:    bootstrap,
-			Publications: publications,
-			Lifecycle:    lifecycle,
-			Replication:  replication,
+			writer:      c,
+			authority:   a,
+			Config:      cfg,
+			Lifecycle:   lifecycle,
+			Replication: replication,
 		},
 		Lifecycle:   lifecycle,
 		Replication: replication,
@@ -410,17 +405,16 @@ func (c Config) validateReplication() error {
 
 // Lifecycle owns process serving, independently of the leader-owned publishers.
 type Lifecycle struct {
-	authority        *Authority
+	authority        *authority.Authority
 	mu               sync.Mutex
 	process          context.Context
 	synced           bool
 	serving          bool
-	publications     *Publications
 	waitForCacheSync func(context.Context) bool
 }
 
-func newLifecycle(p *Publications) *Lifecycle {
-	return &Lifecycle{publications: p}
+func newLifecycle(a *authority.Authority) *Lifecycle {
+	return &Lifecycle{authority: a}
 }
 
 func (*Lifecycle) NeedLeaderElection() bool { return false }
@@ -459,11 +453,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	}
 
 	l.process = ctx
-	if l.authority != nil {
-		l.authority.BindProcess(ctx)
-	} else {
-		l.publications.bindProcess(ctx)
-	}
+	l.authority.BindProcess(ctx)
 	l.mu.Unlock()
 
 	defer func() {
@@ -503,11 +493,7 @@ func (l *Lifecycle) Ready(_ *http.Request) error {
 		return wire.Unavailable
 	}
 
-	if l.authority != nil {
-		return l.authority.PublicationReady()
-	}
-
-	return l.publications.Ready(nil)
+	return l.authority.PublicationReady()
 }
 
 const (

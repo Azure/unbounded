@@ -33,7 +33,7 @@ func TestLifecycleProcessContext(t *testing.T) {
 
 				key := connectionKey{}
 				parent = context.WithValue(parent, key, source)
-				l := newLifecycle(NewPublications())
+				l := newLifecycle(nil)
 				l.process = process
 
 				child, cancel := l.ProcessContext(parent)
@@ -71,7 +71,7 @@ func TestLifecycleProcessContext(t *testing.T) {
 	process, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	for _, l := range []*Lifecycle{nil, newLifecycle(NewPublications()), {process: process}} {
+	for _, l := range []*Lifecycle{nil, newLifecycle(nil), {process: process}} {
 		child, stop := l.ProcessContext(t.Context())
 		if !errors.Is(child.Err(), context.Canceled) {
 			t.Fatal("absent or canceled process did not immediately cancel child")
@@ -88,9 +88,9 @@ func TestLifecycleHTTPReadinessTransitions(t *testing.T) {
 	}{
 		{name: "issuer", set: func(s *Server, ready bool) {
 			if ready {
-				runKeys(t, &KeyringReconciler{Client: s.Bootstrap.Client, APIReader: s.Bootstrap.APIReader, Config: s.Config, Trust: s.Trust})
+				restoreServerTrust(t, s)
 			} else {
-				s.Trust.invalidate()
+				withdrawServerTrust(t, s)
 			}
 		}},
 		{name: "serving", set: func(s *Server, ready bool) { s.Lifecycle.SetServingReady(ready) }},
@@ -136,11 +136,11 @@ func TestLifecycleFollowerWithValidatedPublicationIsReady(t *testing.T) {
 	r := initializedTopology(t)
 	reconcileTopology(t, r, t.Context())
 
-	if err := r.Publications.Ready(nil); err != nil {
+	if err := r.authority.PublicationReady(); err != nil {
 		t.Fatal(err)
 	}
 
-	l := newLifecycle(r.Publications)
+	l := newLifecycle(r.authority)
 	l.process, l.synced = t.Context(), true
 	l.SetServingReady(true)
 
@@ -153,7 +153,7 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := initializedTopology(t)
 
-		l := newLifecycle(r.Publications)
+		l := newLifecycle(r.authority)
 		if l.NeedLeaderElection() || l.Ready(nil) == nil {
 			t.Fatal("follower ready")
 		}
@@ -188,12 +188,13 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		r.Publications.Suspend()
+		restore := withdrawPublication(t, r)
 
 		if l.Ready(nil) == nil {
 			t.Fatal("ready without publication authority")
 		}
 
+		restore()
 		reconcileTopology(t, r, ctx)
 		l.SetServingReady(false)
 
@@ -229,7 +230,7 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 func TestLifecycleRequiresPublicationAndHonorsRequestCancellation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := initializedTopology(t)
-		l := newLifecycle(r.Publications)
+		l := newLifecycle(r.authority)
 		l.waitForCacheSync = func(context.Context) bool { return true }
 
 		ctx, cancel := context.WithCancel(t.Context())
@@ -270,7 +271,7 @@ func TestLifecycleRequiresPublicationAndHonorsRequestCancellation(t *testing.T) 
 
 		require.ErrorIs(t, l.Ready(nil), wire.Unavailable)
 
-		beforeStartup := newLifecycle(r.Publications)
+		beforeStartup := newLifecycle(r.authority)
 		beforeStartup.waitForCacheSync = func(ctx context.Context) bool { return ctx.Err() == nil }
 		require.NoError(t, beforeStartup.Start(ctx))
 		beforeStartup.SetServingReady(true)
@@ -312,7 +313,7 @@ func TestLifecycleHTTPStartupAdmission(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newServingFixture(t)
-				l := newLifecycle(f.a.Server.Publications)
+				l := newLifecycle(f.a.authority)
 				f.a.Server.Lifecycle = l
 				l.SetServingReady(true)
 

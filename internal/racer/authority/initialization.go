@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package authority
 
 import (
 	"bytes"
@@ -76,7 +76,7 @@ func stageInstallation(ctx context.Context, writer client.Writer, reader client.
 		return err
 	}
 
-	data := versionData(VersionRecord{Cluster: cfg.Cluster, Sequence: 1, MembershipVersion: 1, ContentHash: content, MembershipHash: membership})
+	data := versionData(versionRecord{Cluster: cfg.Cluster, Sequence: 1, MembershipVersion: 1, ContentHash: content, MembershipHash: membership})
 	key := client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.VersionConfigMapName}
 
 	candidate := &corev1.ConfigMap{}
@@ -123,7 +123,7 @@ func stageInstallation(ctx context.Context, writer client.Writer, reader client.
 // Commit only a complete generation-one candidate from this installation. The
 // material stays exclusively in the ordinary credentials Secret. No pending
 // private-key copy, second Secret, or new RBAC permission is necessary.
-func (r *KeyringReconciler) commitStagedCredentials(ctx context.Context, version *corev1.ConfigMap, secret *corev1.Secret) (ctrl.Result, error) {
+func (r *credentials) commitStagedCredentials(ctx context.Context, version *corev1.ConfigMap, secret *corev1.Secret) (ctrl.Result, error) {
 	cfg := r.runtimeConfig()
 
 	claim := secret.Annotations[credentialClaim]

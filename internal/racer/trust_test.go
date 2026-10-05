@@ -44,11 +44,9 @@ func TestLocalSnapshotsDuringAPIOutage(t *testing.T) {
 		},
 	})
 	f.a.Topology.APIReader = unavailable
-	f.a.Keyring.APIReader = unavailable
-	f.a.Server.Bootstrap.APIReader = unavailable
-	f.a.Server.Bootstrap.Client = unavailable
+	fixtureDependencies[f.a.authority].reader = unavailable
 
-	f.a.Server.Bootstrap.Issuer.APIReader = unavailable
+	fixtureDependencies[f.a.authority].Client = unavailable
 	if _, err := f.a.Keyring.Reconcile(f.ctx, ctrl.Request{}); err == nil {
 		t.Fatal("reconciliation hid API failure")
 	}
@@ -68,12 +66,12 @@ func TestLocalSnapshotsDuringAPIOutage(t *testing.T) {
 		responseBody(t, response, err, http.StatusOK)
 	}
 
-	current, err := f.a.Server.Publications.Current()
+	current, err := f.a.authority.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	response, err := peer.Get(fmt.Sprintf("%s%s?after=%d", endpoint, wire.SnapshotPath, current.record.Sequence))
+	response, err := peer.Get(fmt.Sprintf("%s%s?after=%d", endpoint, wire.SnapshotPath, current.Sequence()))
 	responseBody(t, response, err, http.StatusServiceUnavailable)
 
 	if calls.Load() != 0 {
@@ -132,7 +130,7 @@ func TestObservedInvalidTrustCannotRecoverFromReadFailure(t *testing.T) {
 			case "keyring":
 				_, err = f.a.Keyring.Reconcile(f.ctx, ctrl.Request{})
 			case "issuance":
-				_, err = f.a.Server.Bootstrap.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
+				_, err = f.a.authority.Issue(f.ctx, fixtureIdentity(t, f), f.request)
 			default:
 				_, err = f.a.Topology.Reconcile(f.ctx, ctrl.Request{})
 			}
@@ -141,9 +139,9 @@ func TestObservedInvalidTrustCannotRecoverFromReadFailure(t *testing.T) {
 				t.Fatal("invalid trust accepted")
 			}
 
-			live := f.a.Keyring.APIReader
+			live := fixtureDependencies[f.a.authority].reader
 
-			f.a.Keyring.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
 				return errors.New("API offline after invalid observation")
 			}})
 			if _, err := f.a.Keyring.Reconcile(f.ctx, ctrl.Request{}); err == nil {
@@ -153,7 +151,7 @@ func TestObservedInvalidTrustCannotRecoverFromReadFailure(t *testing.T) {
 			response, err = peer.Get(endpoint + wire.SnapshotPath)
 			responseBody(t, response, err, http.StatusServiceUnavailable)
 
-			if _, err := f.a.Server.Trust.pool(); err == nil {
+			if err := f.a.authority.TrustReady(); err == nil {
 				t.Fatal("read failure restored invalidated roots")
 			}
 
@@ -165,7 +163,7 @@ func TestObservedInvalidTrustCannotRecoverFromReadFailure(t *testing.T) {
 				t.Fatal("handshake accepted missing local trust")
 			}
 
-			f.a.Keyring.APIReader = live
+			fixtureDependencies[f.a.authority].reader = live
 
 			shared.Data["bundle.json"] = valid
 			if err := f.a.Topology.Update(f.ctx, shared); err != nil {
@@ -191,7 +189,7 @@ func TestTrustReadOutageAtEachAuthorityRead(t *testing.T) {
 			f := newServingFixture(t)
 			reads := 0
 
-			f.a.Keyring.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				if key.Name == resource {
 					reads++
 					return errors.New("API offline")
@@ -224,18 +222,19 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 				_, _, initial, _ := keyState(t, r)
 				*now = initial.NextRotation
 
-				accepted, err := r.Trust.pool()
+				accepted, err := r.authority.TrustPool()
 				if err != nil {
 					t.Fatal(err)
 				}
 
-				acceptedBundle, _, err := r.Trust.keyring()
-				if err != nil || acceptedBundle.generation != 1 {
+				acceptedBundle, err := r.authority.Keyring()
+				if err != nil || acceptedBundle.Generation() != 1 {
 					t.Fatalf("initial delivery state: %v", err)
 				}
 
 				reads := 0
-				r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				d := fixtureDependencies[r.authority]
+				d.reader = interceptor.NewClient(d.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 					if key.Name == resourceName {
 						reads++
 						if reads == 2 {
@@ -268,16 +267,16 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 					t.Fatalf("post-reconcile failure bypassed: %v, reads=%d", err, reads)
 				}
 
-				current, err := r.Trust.pool()
+				current, err := r.authority.TrustPool()
 				if failure == "outage" {
-					if err != nil || current != accepted || !trustReady(r.Trust) {
+					if err != nil || !current.Equal(accepted) || r.authority.TrustReady() != nil {
 						t.Fatalf("read outage replaced accepted trust with candidate roots: %v", err)
 					}
-				} else if err == nil || trustReady(r.Trust) {
+				} else if err == nil || r.authority.TrustReady() == nil {
 					t.Fatal("observed invalid authority retained or installed trust")
 				}
 
-				currentBundle, _, bundleErr := r.Trust.keyring()
+				currentBundle, bundleErr := r.authority.Keyring()
 				if failure == "outage" {
 					if bundleErr != nil || currentBundle != acceptedBundle {
 						t.Fatalf("read outage exposed candidate delivery state: %v", bundleErr)
@@ -286,7 +285,7 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 					t.Fatal("observed invalid authority retained delivery state")
 				}
 
-				r.APIReader = r.Client
+				d.reader = d.Client
 
 				_, staged, _, _ := keyState(t, r)
 				if staged.Generation != 2 || len(staged.PeerTrustRoots) != 2 {
@@ -295,13 +294,13 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 
 				runKeys(t, r)
 
-				current, err = r.Trust.pool()
+				current, err = r.authority.TrustPool()
 				if err != nil || current.Equal(accepted) {
 					t.Fatalf("fresh successful reconciliation did not install staged trust: %v", err)
 				}
 
-				currentBundle, _, bundleErr = r.Trust.keyring()
-				if bundleErr != nil || currentBundle.generation != 2 {
+				currentBundle, bundleErr = r.authority.Keyring()
+				if bundleErr != nil || currentBundle.Generation() != 2 {
 					t.Fatalf("committed delivery not installed with trust: %v", bundleErr)
 				}
 			})
@@ -321,7 +320,8 @@ func TestKeyringCancellationOverridesPostReconcileReadFailure(t *testing.T) {
 			defer cancel()
 
 			reads := 0
-			r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			d := fixtureDependencies[r.authority]
+			d.reader = interceptor.NewClient(d.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				if key.Name == r.Config.CredentialsSecretName {
 					reads++
 					if reads == 2 {
@@ -344,15 +344,15 @@ func TestKeyringCancellationOverridesPostReconcileReadFailure(t *testing.T) {
 				t.Fatalf("post-reconcile cancellation: reads=%d result=%v err=%v", reads, result, err)
 			}
 
-			if _, err := r.Trust.pool(); err == nil {
+			if err := r.authority.TrustReady(); err == nil {
 				t.Fatal("cancellation after admission retained trust or issuer readiness")
 			}
 
-			if _, _, err := r.Trust.keyring(); err == nil {
+			if _, err := r.authority.Keyring(); err == nil {
 				t.Fatal("cancellation after admission retained delivery")
 			}
 
-			r.APIReader = r.Client
+			d.reader = d.Client
 
 			_, staged, _, _ := keyState(t, r)
 			if staged.Generation != 2 || len(staged.PeerTrustRoots) != 2 {
@@ -370,13 +370,14 @@ func TestReconcilerAlreadyExistsHandling(t *testing.T) {
 			_, _, initial, _ := keyState(t, r)
 			*now = initial.NextRotation
 
-			accepted, err := r.Trust.pool()
+			accepted, err := r.authority.TrustPool()
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			writes := 0
-			writer := interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
+			d := fixtureDependencies[r.authority]
+			writer := interceptor.NewClient(d.Client.(client.WithWatch), interceptor.Funcs{Update: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
 				writes++
 				return apierrors.NewAlreadyExists(corev1.Resource("secrets"), obj.GetName())
 			}})
@@ -384,26 +385,25 @@ func TestReconcilerAlreadyExistsHandling(t *testing.T) {
 			var result ctrl.Result
 
 			if operation == "keyring" {
-				r.Client = writer
+				d.Client = writer
 
 				result, err = r.Reconcile(t.Context(), ctrl.Request{})
 				if err != nil || result.RequeueAfter != retryConflictDelay {
 					t.Fatalf("keyring AlreadyExists not requeued: %v %v", result, err)
 				}
 
-				if _, err := r.Trust.pool(); err == nil {
+				if err := r.authority.TrustReady(); err == nil {
 					t.Fatal("keyring write failure retained trust or issuer readiness")
 				}
 			} else {
-				topology := Assemble(r.Config, writer, r.APIReader).Topology
-				topology.Trust = r.Trust
+				topology := Assemble(r.Config, writer, d.reader).Topology
 
 				result, err = topology.Reconcile(t.Context(), ctrl.Request{})
 				if !apierrors.IsAlreadyExists(err) || result != (ctrl.Result{}) {
 					t.Fatalf("topology AlreadyExists treated as Conflict: %v %v", result, err)
 				}
 
-				if current, err := r.Trust.pool(); err != nil || current != accepted {
+				if current, err := r.authority.TrustPool(); err != nil || !current.Equal(accepted) {
 					t.Fatalf("topology publication write failure changed trust: %v", err)
 				}
 			}
@@ -418,12 +418,12 @@ func TestReconcilerAlreadyExistsHandling(t *testing.T) {
 func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 	f := newServingFixture(t)
 
-	current, err := f.a.Server.Publications.Current()
+	current, err := f.a.authority.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("%s?after=%d", wire.SnapshotPath, current.record.Sequence), nil)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("%s?after=%d", wire.SnapshotPath, current.Sequence()), nil)
 	req.TLS = f.requestState(t)
 	handler := f.a.Server.Handler()
 	done := make(chan *httptest.ResponseRecorder, 1)
@@ -452,7 +452,7 @@ func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 		}
 	}
 
-	f.a.Server.Trust.invalidate()
+	withdrawServerTrust(t, f.a.Server)
 
 	node := &corev1.Node{}
 	if err := f.a.Topology.Get(f.ctx, client.ObjectKey{Name: "worker"}, node); err != nil {
@@ -464,7 +464,7 @@ func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reconcileTopology(t, f.a.Topology, f.ctx)
+	_, _ = f.a.Topology.Reconcile(f.ctx, ctrl.Request{})
 
 	select {
 	case w := <-done:
@@ -478,10 +478,9 @@ func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 
 func TestIssuanceTrustObservationLockHonorsDeadline(t *testing.T) {
 	f := newServingFixture(t)
-	if err := f.a.Keyring.CatalogGate.Acquire(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	defer f.a.Keyring.CatalogGate.Release()
+
+	release := holdFixtureGate(t, f)
+	defer release()
 
 	ctx, cancel := context.WithTimeout(f.ctx, 20*time.Millisecond)
 	defer cancel()
@@ -489,7 +488,7 @@ func TestIssuanceTrustObservationLockHonorsDeadline(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := f.a.Server.Bootstrap.Issuer.TrustRoots(ctx)
+		_, err := f.a.authority.Issue(ctx, fixtureIdentity(t, f), f.request)
 		done <- err
 	}()
 
@@ -502,7 +501,7 @@ func TestIssuanceTrustObservationLockHonorsDeadline(t *testing.T) {
 		t.Fatal("gate wait held enrollment admission past deadline")
 	}
 
-	if _, err := f.a.Server.Trust.pool(); err != nil {
+	if err := f.a.authority.TrustReady(); err != nil {
 		t.Fatalf("canceled gate wait invalidated accepted trust: %v", err)
 	}
 }
@@ -513,12 +512,14 @@ func TestCatalogGateCancellationPreservesAcceptedState(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/held=%t", operation, held), func(t *testing.T) {
 				f := newServingFixture(t)
 
-				roots, err := f.a.Server.Trust.pool()
+				identity := fixtureIdentity(t, f)
+
+				roots, err := f.a.authority.TrustPool()
 				if err != nil {
 					t.Fatal(err)
 				}
 
-				publication, err := f.a.Server.Publications.Current()
+				publication, err := f.a.authority.Current()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -531,17 +532,12 @@ func TestCatalogGateCancellationPreservesAcceptedState(t *testing.T) {
 						return wire.Unavailable
 					},
 				})
-				f.a.Topology.APIReader = reader
-				f.a.Keyring.APIReader = reader
-				f.a.Server.Bootstrap.Issuer.APIReader = reader
-
-				gate := f.a.Keyring.CatalogGate
 				if held {
-					if err := gate.Acquire(t.Context()); err != nil {
-						t.Fatal(err)
-					}
-					defer gate.Release()
+					release := holdFixtureGate(t, f)
+					defer release()
 				}
+
+				fixtureDependencies[f.a.authority].reader = reader
 
 				ctx, cancel := context.WithTimeout(f.ctx, 20*time.Millisecond)
 				defer cancel()
@@ -565,7 +561,7 @@ func TestCatalogGateCancellationPreservesAcceptedState(t *testing.T) {
 					case "keyring":
 						_, err = f.a.Keyring.Reconcile(ctx, ctrl.Request{})
 					case "issuance":
-						_, err = f.a.Server.Bootstrap.Issuer.TrustRoots(ctx)
+						_, err = f.a.authority.Issue(ctx, identity, f.request)
 					}
 
 					done <- err
@@ -588,11 +584,11 @@ func TestCatalogGateCancellationPreservesAcceptedState(t *testing.T) {
 					t.Fatalf("canceled admission read authority: %d", reads.Load())
 				}
 
-				if current, err := f.a.Server.Trust.pool(); err != nil || current != roots {
+				if current, err := f.a.authority.TrustPool(); err != nil || !current.Equal(roots) {
 					t.Fatalf("canceled admission changed accepted trust: %v", err)
 				}
 
-				if current, err := f.a.Server.Publications.Current(); err != nil || current != publication {
+				if current, err := f.a.authority.Current(); err != nil || current.Sequence() != publication.Sequence() {
 					t.Fatalf("canceled admission changed publication: %v", err)
 				}
 

@@ -9,7 +9,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -136,11 +135,7 @@ func TestServeTeardownClosesSlowTLSWrite(t *testing.T) {
 			f := newServingFixture(t)
 			f.a.Server.Config.Limits.WriteTimeout = time.Minute
 			f.a.Server.Config.Limits.ShutdownTimeout = time.Second
-			f.a.Server.Publications.mu.Lock()
-			large := *f.a.Server.Publications.current
-			large.encoded += strings.Repeat(" ", 16*1024*1024)
-			f.a.Server.Publications.current = &large
-			f.a.Server.Publications.mu.Unlock()
+			largeFixturePublication(t, f)
 
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {

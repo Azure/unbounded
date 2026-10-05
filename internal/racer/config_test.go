@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -22,25 +23,17 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 		t.Run(boundary, func(t *testing.T) {
 			f := newServingFixture(t)
 			s := f.a.Server
-			// Exercise the legacy direct-construction adapter rather than the
-			// immutable operation owner created by Assemble.
-			s.authority = nil
-			// The fixture issued its own test certificate. Replace dependencies
-			// with unused direct constructions so no first request can mask a
-			// missing serving-boundary freeze.
-			b := s.Bootstrap
-			i := b.Issuer
-			s.Bootstrap = &Bootstrap{
-				Client: b.Client, APIReader: b.APIReader, Config: b.Config,
-				Issuer: &Issuer{APIReader: i.APIReader, Config: i.Config, Trust: i.Trust, CatalogGate: i.CatalogGate},
+			// Pre-use overrides now belong to construction, not mutable engines.
+			s.Config.CertificateLifetime = 2 * time.Minute
+			s.Config.SnapshotMaxAge = 0
+			d := fixtureDependencies[f.a.authority]
+
+			s.authority = authority.New(s.Config.authorityConfig(), authority.Dependencies{Writer: d, Reader: d})
+			if err := s.authority.Observe(f.ctx); err != nil {
+				t.Fatal(err)
 			}
-			r := s.Replication
-			s.Replication = &Replication{Client: r.Client, APIReader: r.APIReader, Config: r.Config, Publications: r.Publications, Trust: r.Trust, CatalogGate: r.CatalogGate}
-			// Matching pre-start overrides are accepted and normalized once.
-			for _, input := range []*Config{&s.Config, &s.Bootstrap.Config, &s.Bootstrap.Issuer.Config, &s.Replication.Config} {
-				input.CertificateLifetime = 2 * time.Minute
-				input.SnapshotMaxAge = 0
-			}
+
+			s.Replication.Config = s.Config
 
 			want := s.Config.effective()
 
@@ -52,16 +45,16 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 			}
 			// Mutate sequentially, before any request, without calling dependency
 			// getters first: those calls would accidentally hide lazy freezing.
-			s.Bootstrap.Config.DataplaneServiceAccount = "wrong-account"
-			s.Bootstrap.Issuer.Config.Cluster = ""
-			s.Bootstrap.Issuer.Config.CertificateLifetime = time.Second
+			s.Config.DataplaneServiceAccount = "wrong-account"
+			s.Config.Cluster = ""
+			s.Config.CertificateLifetime = time.Second
 
 			s.Replication.Config.ControllerServiceAccount = "wrong-controller"
 			if handler == nil {
 				handler = s.Handler()
 			}
 
-			for name, got := range map[string]Config{"server": s.config, "bootstrap": s.Bootstrap.runtimeConfig(), "issuer": s.Bootstrap.Issuer.runtimeConfig(), "replication": s.Replication.runtimeConfig()} {
+			for name, got := range map[string]Config{"server": s.config, "replication": s.Replication.runtimeConfig()} {
 				if got != want {
 					t.Fatalf("%s did not freeze the same effective base before exposure", name)
 				}
@@ -90,7 +83,7 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if response.Cluster != want.Cluster || leaf.NotAfter.Sub(leaf.NotBefore) != want.CertificateLifetime+certificateClockSkew {
+			if response.Cluster != want.Cluster || leaf.NotAfter.Sub(leaf.NotBefore) != want.CertificateLifetime+time.Minute {
 				t.Fatal("first issuance ignored frozen identity/lifetime")
 			}
 		})
@@ -100,11 +93,10 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
 	f := newServingFixture(t)
 	a := f.a
-	b := a.Server.Bootstrap
 	request := httptest.NewRequest(http.MethodGet, wire.KeyringPath, nil)
 	request.Header.Set("Authorization", "Bearer "+f.token)
 
-	identity, err := b.Authenticate(f.ctx, request)
+	identity, err := a.authority.Authenticate(f.ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +104,7 @@ func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
 	a.Replication.observe(f.ctx)
 	handler := a.Server.Handler()
 	// All components have crossed real operational boundaries, not just getters.
-	for _, input := range []*Config{&a.Topology.Config, &a.Keyring.Config, &a.Replication.Config, &a.Server.Config, &b.Config, &b.Issuer.Config} {
+	for _, input := range []*Config{&a.Topology.Config, &a.Keyring.Config, &a.Replication.Config, &a.Server.Config} {
 		*input = Config{}
 	}
 
@@ -120,11 +112,11 @@ func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
 	reconcileTopology(t, a.Topology, f.ctx)
 	a.Replication.observe(f.ctx)
 
-	if _, err := b.Authenticate(f.ctx, request); err != nil {
+	if _, err := a.authority.Authenticate(f.ctx, request); err != nil {
 		t.Fatal("bootstrap reread config", err)
 	}
 
-	encoded, err := b.Issuer.Issue(f.ctx, identity, f.request)
+	encoded, err := a.authority.Issue(f.ctx, identity, f.request)
 	if err != nil {
 		t.Fatal("issuer reread config", err)
 	}
@@ -156,8 +148,8 @@ func TestComponentConfigFreezesDefaultsAtFirstUse(t *testing.T) {
 		"topology":    {&a.Topology.Config, a.Topology.runtimeConfig},
 		"keyring":     {&a.Keyring.Config, a.Keyring.runtimeConfig},
 		"replication": {&a.Replication.Config, a.Replication.runtimeConfig},
-		"bootstrap":   {&a.Server.Bootstrap.Config, a.Server.Bootstrap.runtimeConfig},
-		"issuer":      {&a.Server.Bootstrap.Issuer.Config, a.Server.Bootstrap.Issuer.runtimeConfig},
+		"bootstrap":   {&a.Server.Config, a.Server.runtimeFixtureConfig},
+		"issuer":      {&a.Server.Config, a.Server.runtimeFixtureConfig},
 		"server":      {&s.Config, func() Config { s.initializeAdmission(); return s.config }},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -195,8 +187,8 @@ func TestDirectComponentConfigDefaults(t *testing.T) {
 	for name, get := range map[string]func() Config{
 		"topology":    (&TopologyReconciler{}).runtimeConfig,
 		"keyring":     (&KeyringReconciler{}).runtimeConfig,
-		"bootstrap":   (&Bootstrap{}).runtimeConfig,
-		"issuer":      (&Issuer{}).runtimeConfig,
+		"bootstrap":   (&Server{}).runtimeFixtureConfig,
+		"issuer":      (&Server{}).runtimeFixtureConfig,
 		"replication": (&Replication{}).runtimeConfig,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -290,7 +282,7 @@ func TestConfigShortRotationDurations(t *testing.T) {
 	}
 
 	cfg, err = LoadConfig()
-	if err != nil || cfg.CertificateLifetime != 2*time.Minute || cfg.Rotation != (RotationPolicy{5 * time.Minute, 20 * time.Second, 2 * time.Minute}) {
+	if err != nil || cfg.CertificateLifetime != 2*time.Minute || cfg.Rotation != (RotationPolicy{Interval: 5 * time.Minute, PrepareFor: 20 * time.Second, RetainFor: 2 * time.Minute}) {
 		t.Fatalf("short rotation config: %v", err)
 	}
 
@@ -327,7 +319,7 @@ func TestConfigDurationsUseProvidedLookup(t *testing.T) {
 	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 
 	cfg, err := ConfigFromLookup(lookup)
-	if err != nil || cfg.CertificateLifetime != 2*time.Minute || cfg.Rotation != (RotationPolicy{5 * time.Minute, time.Minute, 2 * time.Minute}) {
+	if err != nil || cfg.CertificateLifetime != 2*time.Minute || cfg.Rotation != (RotationPolicy{Interval: 5 * time.Minute, PrepareFor: time.Minute, RetainFor: 2 * time.Minute}) {
 		t.Fatalf("custom lookup ignored: %v", err)
 	}
 

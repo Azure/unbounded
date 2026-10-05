@@ -6,7 +6,6 @@ package racer
 import (
 	"bytes"
 	"context"
-	"crypto/x509"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -52,12 +51,6 @@ func TestTrustAuthorityImmediateCompletion(t *testing.T) {
 					synctest.Test(t, func(t *testing.T) {
 						f := newServingFixture(t)
 						s := f.a.Server
-						_, bundle, _, _ := keyState(t, f.a.Keyring)
-
-						roots, err := s.Trust.pool()
-						if err != nil {
-							t.Fatal(err)
-						}
 
 						request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
 
@@ -76,8 +69,7 @@ func TestTrustAuthorityImmediateCompletion(t *testing.T) {
 						case "keyring empty":
 							request = httptest.NewRequest(http.MethodGet, wire.KeyringPath+"?after=1", nil)
 							// Keep both stores fresh throughout the no-change poll.
-							s.Trust.maxAge = 2 * wire.PollWait
-							s.Publications.maxAge = 2 * wire.PollWait
+							configureFixtureAge(t, f, 2*wire.PollWait)
 						}
 
 						request.TLS = f.requestState(t)
@@ -86,13 +78,14 @@ func TestTrustAuthorityImmediateCompletion(t *testing.T) {
 							called = true
 
 							if change != "rotate" {
-								s.Trust.invalidate()
+								withdrawServerTrust(t, s)
 							}
 
 							if change != "invalidate" {
-								bundle.Generation++
-								if err := s.Trust.install(t.Context(), roots, bundle); err != nil {
-									t.Fatal(err)
+								if change == "recover" {
+									restoreServerTrust(t, s)
+								} else {
+									rotateFixtureTrust(t, f)
 								}
 							}
 							// Deliberately do not yield or wait for cancellation callbacks.
@@ -138,13 +131,13 @@ func TestTrustAuthorityImmediateCompletion(t *testing.T) {
 func TestTrustAuthoritySynchronousRevocation(t *testing.T) {
 	f := newServingFixture(t)
 
-	ctx, cancel, err := f.a.Server.Trust.writeContext(t.Context())
+	ctx, cancel, err := f.a.authority.TrustContext(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cancel()
 
-	f.a.Server.Trust.invalidate()
+	withdrawServerTrust(t, f.a.Server)
 
 	if ctx.Err() != context.Canceled {
 		t.Fatal("revocation depends on callback scheduling")
@@ -158,13 +151,7 @@ func TestPublicBlockedWriteTrustAuthority(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					f := newServingFixture(t)
 					s := f.a.Server
-					s.Trust.maxAge = 5 * time.Second
-					_, bundle, _, _ := keyState(t, f.a.Keyring)
-
-					roots, err := s.Trust.pool()
-					if err != nil {
-						t.Fatal(err)
-					}
+					configureFixtureAge(t, f, 5*time.Second)
 
 					server, peer := net.Pipe()
 					defer server.Close()
@@ -203,21 +190,22 @@ func TestPublicBlockedWriteTrustAuthority(t *testing.T) {
 
 					switch change {
 					case "invalidate":
-						s.Trust.invalidate()
+						withdrawServerTrust(t, s)
 					case "invalidate recover":
-						s.Trust.invalidate()
-
-						if err := s.Trust.install(t.Context(), roots, bundle); err != nil {
-							t.Fatal(err)
-						}
+						withdrawServerTrust(t, s)
+						restoreServerTrust(t, s)
 					case "expire":
-						time.Sleep(5 * time.Second)
+						time.Sleep(3 * time.Second)
+						reconcileTopology(t, f.a.Topology, f.ctx)
+						time.Sleep(2 * time.Second)
 					case "reconfirm":
 						time.Sleep(3 * time.Second)
 
-						if err := s.Trust.install(t.Context(), roots, bundle); err != nil {
+						if _, err := f.a.authority.ReconcileCredentials(t.Context()); err != nil {
 							t.Fatal(err)
 						}
+
+						reconcileTopology(t, f.a.Topology, f.ctx)
 
 						time.Sleep(2 * time.Second)
 					}
@@ -235,7 +223,7 @@ func TestPublicBlockedWriteTrustAuthority(t *testing.T) {
 						t.Fatalf("trust cancellation took %s, want %s", elapsed, want)
 					}
 
-					if s.Publications.Ready(nil) != nil {
+					if f.a.authority.PublicationReady() != nil {
 						t.Fatal("test must retain fresh publication independently of trust")
 					}
 
@@ -244,7 +232,7 @@ func TestPublicBlockedWriteTrustAuthority(t *testing.T) {
 					}
 
 					if change == "invalidate recover" || change == "reconfirm" {
-						if _, err := s.Trust.pool(); err != nil {
+						if err := f.a.authority.TrustReady(); err != nil {
 							t.Fatal("new requests should have usable trust", err)
 						}
 					}
@@ -256,15 +244,10 @@ func TestPublicBlockedWriteTrustAuthority(t *testing.T) {
 
 func TestTrustRotationKeepsAdmittedResponseBounded(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		trust := &Trust{maxAge: 5 * time.Second}
 		f := newServingFixture(t)
+		configureFixtureAge(t, f, 5*time.Second)
 
-		_, bundle, _, _ := keyState(t, f.a.Keyring)
-		if err := trust.install(t.Context(), x509.NewCertPool(), bundle); err != nil {
-			t.Fatal(err)
-		}
-
-		ctx, cancel, err := trust.writeContext(t.Context())
+		ctx, cancel, err := f.a.authority.TrustContext(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -274,10 +257,7 @@ func TestTrustRotationKeepsAdmittedResponseBounded(t *testing.T) {
 
 		time.Sleep(3 * time.Second)
 
-		bundle.Generation++
-		if err := trust.install(t.Context(), x509.NewCertPool(), bundle); err != nil {
-			t.Fatal(err)
-		}
+		rotateFixtureTrust(t, f)
 
 		if ctx.Err() != nil {
 			t.Fatal("normal rotation revoked admitted response")
@@ -294,7 +274,7 @@ func TestTrustRotationKeepsAdmittedResponseBounded(t *testing.T) {
 			t.Fatal("admitted trust outlived pinned freshness")
 		}
 
-		if _, err := trust.pool(); err != nil {
+		if err := f.a.authority.TrustReady(); err != nil {
 			t.Fatal("rotation should admit fresh requests", err)
 		}
 	})

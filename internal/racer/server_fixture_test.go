@@ -77,9 +77,15 @@ func newServingFixture(t *testing.T) *servingFixture {
 	}
 
 	request := wire.BootstrapRequest{SchemaVersion: 1, Cluster: a.Server.Config.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr, Shares: wire.DefaultShares}
-	identity := NodeIdentity{cluster: request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}
+	authRequest := httptest.NewRequest(http.MethodGet, wire.KeyringPath, nil)
+	authRequest.Header.Set("Authorization", "Bearer "+token)
 
-	encoded, err := a.Server.Bootstrap.Issuer.Issue(ctx, identity, request)
+	identity, err := a.authority.Authenticate(ctx, authRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := a.authority.Issue(ctx, identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}

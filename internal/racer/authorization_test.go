@@ -86,7 +86,7 @@ func TestHTTPSSnapshotDoesNotReadKubernetes(t *testing.T) {
 
 	var reads atomic.Int64
 
-	f.a.Server.Bootstrap.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{
+	fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{
 		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
 			reads.Add(1)
 			return errors.New("unexpected Kubernetes GET")

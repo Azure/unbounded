@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -72,8 +73,8 @@ func TestServerScale(t *testing.T) {
 
 			runtime.ReadMemStats(&after)
 
-			if len(r.Accepted) != count {
-				t.Fatalf("accepted %d of %d", len(r.Accepted), count)
+			if len(acceptedMembers(t, r)) != count {
+				t.Fatalf("accepted %d of %d", len(acceptedMembers(t, r)), count)
 			}
 
 			t.Logf("members=%d cold_reconcile=%s allocated_bytes=%d publication_bytes=%d", count, cold, after.TotalAlloc-before.TotalAlloc, len(first.encoded))
@@ -211,42 +212,28 @@ func scaleCache(t *testing.T, r *TopologyReconciler, count int) cache.Cache {
 func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count int) {
 	t.Helper()
 
-	current, err := r.Publications.Current()
+	current, err := r.authority.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// Keep both realistic full-size encodings alive. Prepare before admission so
 	// fanout measures Install plus delivery, independent of canonical encoding.
 	members := make(AcceptedMembers, count)
 
-	for id, member := range r.Accepted {
+	for id, member := range acceptedMembers(t, r) {
 		member.Shares++
 		members[id] = member
 	}
 
-	prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, members, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	next, err := r.CommitVersion(ctx, prepared)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sequence := current.record.Sequence
+	sequence := current.Sequence()
 	server := &Server{Config: r.Config}
 	server.initializeAdmission()
 
 	waiting, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	results := make(chan *CommittedPublication, count)
+	results := make(chan *authority.PublicationHandle, count)
 	failures := make(chan error, count)
 
 	var wg sync.WaitGroup
@@ -260,8 +247,6 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 	start := time.Now()
 
 	for id := range members {
-		identity := pollIdentity(r.Config, id)
-
 		wg.Go(func() {
 			if !server.admitPoll(id) {
 				results <- nil
@@ -272,7 +257,7 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 			}
 			defer server.releasePoll(id)
 
-			p, err := r.Publications.Wait(waiting, identity, &sequence)
+			p, err := waitFixturePublication(waiting, r.authority, sequence)
 			results <- p
 
 			failures <- err
@@ -305,9 +290,7 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 
 	start = time.Now()
 
-	if err := r.Publications.Install(next); err != nil {
-		t.Fatal(err)
-	}
+	next := replicationSmokePublish(t, ctx, r, members)
 
 	install := time.Since(start)
 
@@ -320,7 +303,7 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 			t.Fatal(err)
 		}
 
-		if <-results != next {
+		if got := <-results; got == nil || got.Sequence() != next.record.Sequence {
 			t.Fatal("waiter missed or copied full publication")
 		}
 	}

@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/wire"
 	"github.com/Azure/unbounded/internal/racer/workload"
 )
@@ -80,9 +81,7 @@ func TestEnvtestServer(t *testing.T) {
 	}
 
 	t.Run("initialization-and-CAS", func(t *testing.T) { integrationInitialization(t, c) })
-	t.Run("staged-initialization", func(t *testing.T) { integrationStagedInitialization(t, c) })
 	t.Run("cache-name-admission", func(t *testing.T) { integrationCacheNameAdmission(t, c) })
-	t.Run("catalog-capacity", func(t *testing.T) { integrationCatalogCapacity(t, c) })
 	t.Run("rotation-crash-recovery", func(t *testing.T) { integrationRotation(t, c) })
 	t.Run("manager-election-HTTPS-failover", func(t *testing.T) { integrationManagers(t, rc, scheme, c) })
 }
@@ -102,7 +101,7 @@ func integrationInstallation(t *testing.T, c client.Client, namespace string) *A
 		}
 	}
 
-	return Assemble(cfg, c, c)
+	return assembleFixture(cfg, c, c)
 }
 
 type interruptedClient struct {
@@ -147,7 +146,7 @@ func integrationInitialization(t *testing.T, c client.Client) {
 			return c.Update(ctx, obj, opts...)
 		}}, c).Topology
 
-		go func() { results <- ensureInstalled(ctx, r.Client, r.APIReader, r.Config) }()
+		go func() { results <- r.authority.Recover(ctx, r.Client) }()
 	}
 
 	for range 2 {
@@ -203,18 +202,14 @@ func integrationInitialization(t *testing.T, c client.Client) {
 		t.Fatalf("installed startup rejected: %v", err)
 	}
 
-	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
+	cm, _, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// Race after CommitVersion's authoritative read, so the API server, rather
 	// than our preliminary resourceVersion comparison, must reject the write.
-	r.Client = interruptedClient{Client: c, update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	writer := interruptedClient{Client: c, update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
 		other := cm.DeepCopy()
 
 		other.Labels = map[string]string{"concurrent": "writer"}
@@ -224,32 +219,29 @@ func integrationInitialization(t *testing.T, c client.Client) {
 
 		return c.Update(ctx, obj, opts...)
 	}}
-	if committed, err := r.CommitVersion(ctx, prepared); !apierrors.IsConflict(err) || committed != nil {
-		t.Fatalf("real CAS failed: committed=%v err=%v", committed != nil, err)
+
+	owner := authority.New(r.Config.authorityConfig(), authority.Dependencies{Reader: c, Writer: writer})
+	if _, err := owner.PublishTopology(ctx, r.observeTopology); !apierrors.IsConflict(err) {
+		t.Fatalf("real CAS failed: err=%v", err)
 	}
 
 	r.Client = c
 
-	cm, previous, err = readVersion(ctx, r.APIReader, r.Config)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	prepared, err = r.Publications.Prepare(previous, cm.ResourceVersion, nil, nil)
+	cm, _, err = readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	leader, cancel := context.WithCancel(ctx)
 
-	committed, err := r.CommitVersion(leader, prepared)
-	if err != nil {
-		t.Fatal(err)
-	}
+	owner = authority.New(r.Config.authorityConfig(), authority.Dependencies{Reader: c, Writer: interruptedClient{Client: c, update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+		err := c.Update(ctx, obj, opts...)
 
-	cancel()
+		cancel()
 
-	if err := r.Publications.Install(committed); !errors.Is(err, context.Canceled) {
+		return err
+	}}})
+	if _, err := owner.PublishTopology(leader, r.observeTopology); !errors.Is(err, context.Canceled) {
 		t.Fatalf("late install: %v", err)
 	}
 
@@ -301,7 +293,8 @@ func integrationRotation(t *testing.T, c client.Client) {
 	r := a.Keyring
 	r.Config.Rotation.Interval = 7 * 24 * time.Hour
 	now := time.Now().UTC().Truncate(time.Second)
-	r.Now = func() time.Time { return now }
+	fixtureDependencies[a.authority].now = func() time.Time { return now }
+
 	runKeys(t, r)
 	_, initial, state, _ := keyState(t, r)
 	now = state.NextRotation
@@ -316,7 +309,7 @@ func integrationRotation(t *testing.T, c client.Client) {
 		boom := errors.New(step.name)
 		failed := false
 
-		r.Client = interruptedClient{Client: c, update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+		fixtureDependencies[a.authority].Client = interruptedClient{Client: c, update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
 			if obj.GetName() != step.secret {
 				return c.Update(ctx, obj, opts...)
 			}
@@ -331,13 +324,14 @@ func integrationRotation(t *testing.T, c client.Client) {
 
 			return boom
 		}}
-		if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !failed || !errors.Is(err, boom) || trustReady(r.Trust) {
+		if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !failed || !errors.Is(err, boom) || r.authority.TrustReady() == nil {
 			t.Fatalf("%s interruption: %v", step.name, err)
 		}
 
 		_, before, beforeState, private := keyState(t, r)
-		recovered := Assemble(r.Config, c, c).Keyring
-		recovered.Now = r.Now
+		recoveredApp := assembleFixture(r.Config, c, c)
+		recovered := recoveredApp.Keyring
+		fixtureDependencies[recovered.authority].now = func() time.Time { return now }
 		runKeys(t, recovered)
 		_, after, next, material := keyState(t, recovered)
 
@@ -652,8 +646,8 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 	}
 	// Establish a real authenticated pending HTTPS request before loss of Lease.
 	eventually(t, "follower receives current image before failover", func() bool {
-		p, err := apps[follower].Server.Publications.Current()
-		return err == nil && p.record.Sequence == publication.Sequence
+		p, err := apps[follower].authority.Current()
+		return err == nil && p.Sequence() == publication.Sequence
 	})
 
 	followerResponse, followerErr := peer.Get("https://" + apps[follower].Server.Config.ControlAddress + wire.SnapshotPath)
@@ -753,7 +747,7 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		t.Fatal("canceled manager did not stop")
 	}
 
-	if _, err := apps[follower].Server.Publications.Current(); !errors.Is(err, context.Canceled) {
+	if _, err := apps[follower].authority.Current(); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled manager still publishes: %v", err)
 	}
 }
@@ -804,8 +798,7 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 	}
 
 	measured := Assemble(a.Server.Config, reader, reader).Server
-	measured.Lifecycle, measured.Publications = a.Lifecycle, a.Server.Publications
-	measured.Trust = a.Server.Trust
+	measured.Lifecycle, measured.authority = a.Lifecycle, a.authority
 
 	config, err := measured.TLSConfig(t.Context())
 	if err != nil {
@@ -914,8 +907,8 @@ func integrationEnrollment(t *testing.T, rc *rest.Config, c client.Client, a *Ap
 	}
 
 	eventually(t, "managed Pod published through informer", func() bool {
-		p, err := a.Server.Publications.Current()
-		return err == nil && strings.Contains(p.encoded, string(node.UID))
+		_, err := a.authority.Current()
+		return err == nil && strings.Contains(capturePublication(t, a.authority).encoded, string(node.UID))
 	})
 
 	kube, err := kubernetes.NewForConfig(rc)

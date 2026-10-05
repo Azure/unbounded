@@ -28,13 +28,13 @@ func TestReconcilerDependencyCancellationRetries(t *testing.T) {
 				for _, cancelParent := range []bool{false, true} {
 					t.Run(fmt.Sprintf("%s/%s/%v/parent=%v", controller, stage, dependencyErr, cancelParent), func(t *testing.T) {
 						topology := initializedTopology(t)
-						app := Assemble(topology.Config, topology.Client, topology.APIReader)
+						app := assembleFixture(topology.Config, topology.Client, topology.APIReader)
 
 						var target reconcile.Reconciler = app.Topology
 						if controller == "keyring" {
 							runKeys(t, app.Keyring)
 							_, _, state, _ := keyState(t, app.Keyring)
-							app.Keyring.Now = func() time.Time { return state.NextRotation }
+							fixtureDependencies[app.authority].now = func() time.Time { return state.NextRotation }
 							target = app.Keyring
 						}
 
@@ -72,7 +72,7 @@ func TestReconcilerDependencyCancellationRetries(t *testing.T) {
 							},
 						})
 						app.Topology.Client, app.Topology.APIReader = wrapped, wrapped
-						app.Keyring.Client, app.Keyring.APIReader = wrapped, wrapped
+						fixtureDependencies[app.authority].Client, fixtureDependencies[app.authority].reader = wrapped, wrapped
 
 						_, err := target.Reconcile(ctx, ctrl.Request{})
 
@@ -87,7 +87,7 @@ func TestReconcilerDependencyCancellationRetries(t *testing.T) {
 
 						// A fresh reconcile succeeds without waiting for another watch event.
 						app.Topology.Client, app.Topology.APIReader = base, base
-						app.Keyring.Client, app.Keyring.APIReader = base, base
+						fixtureDependencies[app.authority].Client, fixtureDependencies[app.authority].reader = base, base
 
 						if _, err := target.Reconcile(t.Context(), ctrl.Request{}); err != nil {
 							t.Fatalf("retry failed: %v", err)

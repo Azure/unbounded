@@ -97,7 +97,7 @@ func TestLeaderCancellationClosesActiveTLSPoll(t *testing.T) {
 
 	c := f.client(t, &f.certificate)
 
-	publication, err := f.a.Server.Publications.Current()
+	publication, err := f.a.authority.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestLeaderCancellationClosesActiveTLSPoll(t *testing.T) {
 	requestDone := make(chan error, 1)
 
 	go func() {
-		response, err := c.Get(fmt.Sprintf("https://%s/v1/snapshot?after=%d", listener.Addr(), publication.record.Sequence))
+		response, err := c.Get(fmt.Sprintf("https://%s/v1/snapshot?after=%d", listener.Addr(), publication.Sequence()))
 		if response != nil {
 			response.Body.Close()
 		}
@@ -147,7 +147,7 @@ func TestTLSPollExpirationAndRequestCancellation(t *testing.T) {
 			endpoint := f.start(t)
 			c := f.client(t, &cert)
 
-			publication, err := f.a.Server.Publications.Current()
+			publication, err := f.a.authority.Current()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -155,7 +155,7 @@ func TestTLSPollExpirationAndRequestCancellation(t *testing.T) {
 			ctx, cancel := context.WithCancel(f.ctx)
 			defer cancel()
 
-			r, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/snapshot?after=%d", endpoint, publication.record.Sequence), nil)
+			r, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/snapshot?after=%d", endpoint, publication.Sequence()), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -261,7 +261,7 @@ func TestBootstrapIssuanceBeforeWriteAdmission(t *testing.T) {
 			}
 
 			reads := 0
-			s.Bootstrap.Issuer.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				reads++
 
 				if len(s.writes) != wantWrites || len(s.bootstrapSlots) != 1 || len(s.authSlots) != 0 {
@@ -355,11 +355,7 @@ func TestTLSSlowSnapshotWriteDeadline(t *testing.T) {
 	f.a.Server.Config.Limits.WriteTimeout = 200 * time.Millisecond
 	// Exercise socket backpressure without constructing a large topology. The
 	// immutable publication remains valid JSON with bounded trailing whitespace.
-	f.a.Server.Publications.mu.Lock()
-	large := *f.a.Server.Publications.current
-	large.encoded += strings.Repeat(" ", 16*1024*1024)
-	f.a.Server.Publications.current = &large
-	f.a.Server.Publications.mu.Unlock()
+	largeFixturePublication(t, f)
 	endpoint := f.start(t)
 
 	conn, err := tls.Dial("tcp", strings.TrimPrefix(endpoint, "https://"), &tls.Config{RootCAs: f.roots, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{f.certificate}})
@@ -404,7 +400,7 @@ func TestTLSNodeExclusionRemovesRoutingMembershipWhilePolling(t *testing.T) {
 	endpoint := f.start(t)
 	c := f.client(t, &f.certificate)
 
-	publication, err := f.a.Server.Publications.Current()
+	publication, err := f.a.authority.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +410,7 @@ func TestTLSNodeExclusionRemovesRoutingMembershipWhilePolling(t *testing.T) {
 	go func() {
 		defer close(done)
 
-		response, err := c.Get(fmt.Sprintf("%s/v1/snapshot?after=%d", endpoint, publication.record.Sequence))
+		response, err := c.Get(fmt.Sprintf("%s/v1/snapshot?after=%d", endpoint, publication.Sequence()))
 		body := responseBody(t, response, err, 200)
 
 		updated, decodeErr := wire.DecodePublication(bytes.NewReader(body))

@@ -51,10 +51,10 @@ func TestMixedControllerBootstrapBindings(t *testing.T) {
 		req := httptest.NewRequest("POST", "https://racer/bootstrap", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
 
-		identity, err := a.Server.Bootstrap.Authenticate(t.Context(), req)
+		identity, err := a.authority.Authenticate(t.Context(), req)
 		if scenario == "success" {
 			require.NoError(t, err)
-			require.Equal(t, wire.NodeID(testNodeUID), identity.node)
+			require.Equal(t, wire.NodeID(testNodeUID), identity.Node())
 		} else {
 			require.ErrorIs(t, err, wire.Forbidden, scenario)
 		}
@@ -68,8 +68,8 @@ func TestMixedControllerTopologyLiveOwnership(t *testing.T) {
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: PodNetworkDaemonSetName, UID: testDaemonSetUID}}
 	r := initializedTopology(t, &node, &pod, ds)
 	reconcileTopology(t, r, t.Context())
-	require.Len(t, r.Accepted, 1)
-	before := r.Accepted[testNodeUID]
+	require.Len(t, acceptedMembers(t, r), 1)
+	before := acceptedMembers(t, r)[testNodeUID]
 	r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*appsv1.DaemonSet); ok {
@@ -81,14 +81,14 @@ func TestMixedControllerTopologyLiveOwnership(t *testing.T) {
 	})
 	_, err := r.Reconcile(t.Context(), ctrl.Request{})
 	require.Error(t, err)
-	require.Equal(t, before, r.Accepted[testNodeUID])
+	require.Equal(t, before, acceptedMembers(t, r)[testNodeUID])
 	r.APIReader = r.Client
 	require.NoError(t, r.Delete(t.Context(), ds))
 	ds.UID, ds.ResourceVersion = "replacement", ""
 	require.NoError(t, r.Create(t.Context(), ds))
 	r = Assemble(r.Config, r.Client, r.APIReader).Topology
 	reconcileTopology(t, r, t.Context())
-	require.Equal(t, before, r.Accepted[testNodeUID])
+	require.Equal(t, before, acceptedMembers(t, r)[testNodeUID])
 }
 
 type mixedFailReader struct{ client.Reader }
@@ -181,7 +181,7 @@ func TestMixedControllerMembership(t *testing.T) {
 	reconcileTopology(t, r, t.Context())
 	require.NoError(t, r.Create(t.Context(), &pod))
 	reconcileTopology(t, r, t.Context())
-	after := r.Accepted
+	after := acceptedMembers(t, r)
 	require.Len(t, after, 1)
 	require.Equal(t, uint32(8), after[testNodeUID].Shares)
 	require.Equal(t, "192.0.2.2:7443", after[testNodeUID].PeerEndpoint)
@@ -192,17 +192,17 @@ func TestMixedControllerMembership(t *testing.T) {
 	require.NoError(t, r.Create(t.Context(), podDS))
 	r = Assemble(r.Config, r.Client, r.APIReader).Topology
 	reconcileTopology(t, r, t.Context())
-	require.Equal(t, after, r.Accepted, "restart retains UID-bound last admitted endpoint")
+	require.Equal(t, after, acceptedMembers(t, r), "restart retains UID-bound last admitted endpoint")
 	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(&node), &node))
 	delete(node.Annotations, admittedMemberAnnotation)
 	require.NoError(t, r.Update(t.Context(), &node))
 	r = Assemble(r.Config, r.Client, r.APIReader).Topology
 	reconcileTopology(t, r, t.Context())
-	require.Empty(t, r.Accepted, "stale owner cannot admit a new member")
+	require.Empty(t, acceptedMembers(t, r), "stale owner cannot admit a new member")
 
 	pod.OwnerReferences[0].UID = hostDS.UID
 	pod.OwnerReferences[0].Name = "arbitrary"
 	require.NoError(t, r.Update(t.Context(), &pod))
 	reconcileTopology(t, r, t.Context())
-	require.Empty(t, r.Accepted, "a live UID with the wrong owner name cannot admit a member")
+	require.Empty(t, acceptedMembers(t, r), "a live UID with the wrong owner name cannot admit a member")
 }

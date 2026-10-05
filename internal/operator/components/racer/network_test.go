@@ -21,7 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/Azure/unbounded/internal/operator/component"
-	racercore "github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -102,7 +102,7 @@ func TestRacerNetworkConfiguration(t *testing.T) {
 
 		return nil
 	}})
-	bootstrap := racercore.Bootstrap{Client: reviewer, APIReader: env.Client, Config: cfg}
+	bootstrap := authority.New(authority.Config{Cluster: cfg.Cluster, Namespace: cfg.Namespace, DaemonSetName: cfg.DaemonSetName, DataplaneServiceAccount: cfg.DataplaneServiceAccount, MaxTokenBytes: cfg.Limits.HeaderBytes}, authority.Dependencies{Writer: reviewer, Reader: env.Client})
 	token := "e30." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(time.Hour).Unix()))) + ".signature"
 	request := httptest.NewRequest("POST", wire.BootstrapPath, nil)
 	request.Header.Set("Authorization", "Bearer "+token)

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package authority
 
 func trustReady(trust *Trust) bool {
 	_, err := trust.pool()

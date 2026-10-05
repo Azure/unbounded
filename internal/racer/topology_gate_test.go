@@ -57,7 +57,7 @@ func TestTopologyAnnotationDoesNotBlockObserver(t *testing.T) {
 				go func() { _, err := r.Reconcile(ctx, ctrl.Request{}); done <- err }()
 
 				<-entered
-				require.EqualValues(t, 7, r.Accepted[testNodeUID].Shares)
+				require.EqualValues(t, 7, acceptedMembers(t, r)[testNodeUID].Shares)
 				// Cross the original freshness deadline while the actual Node patch
 				// remains blocked. The real observer must renew both accepted states.
 				for range 3 {
@@ -98,8 +98,7 @@ func TestTopologyAnnotationDoesNotBlockObserver(t *testing.T) {
 				gateCtx, stop := context.WithTimeout(f.ctx, time.Second)
 				defer stop()
 
-				require.NoError(t, r.CatalogGate.Acquire(gateCtx))
-				r.CatalogGate.Release()
+				require.NoError(t, f.a.authority.Observe(gateCtx))
 			})
 		})
 	}

@@ -73,8 +73,8 @@ func TestTopologyIndexedPodGroups(t *testing.T) {
 
 			result, err := r.Reconcile(ctx, ctrl.Request{})
 			if stage == "success" {
-				if err != nil || result.RequeueAfter != 0 || queries[nodeA.Name] != 1 || queries[nodeB.Name] != 1 || len(r.Accepted) != 2 || r.Accepted[testNodeUID].PeerEndpoint != "192.0.2.1:7443" || r.Accepted[testOtherUID].PeerEndpoint != "192.0.2.2:7443" {
-					t.Fatalf("indexed groups: queries=%v members=%v result=%v err=%v", queries, r.Accepted, result, err)
+				if err != nil || result.RequeueAfter != 0 || queries[nodeA.Name] != 1 || queries[nodeB.Name] != 1 || len(acceptedMembers(t, r)) != 2 || acceptedMembers(t, r)[testNodeUID].PeerEndpoint != "192.0.2.1:7443" || acceptedMembers(t, r)[testOtherUID].PeerEndpoint != "192.0.2.2:7443" {
+					t.Fatalf("indexed groups: queries=%v members=%v result=%v err=%v", queries, acceptedMembers(t, r), result, err)
 				}
 
 				return
@@ -89,11 +89,11 @@ func TestTopologyIndexedPodGroups(t *testing.T) {
 				}
 			}
 
-			if !errors.Is(err, wantErr) || result.RequeueAfter != 0 || len(queries) != 1 || writes != 0 || len(r.Accepted) != 0 {
-				t.Fatalf("failed listing changed state or continued: queries=%v writes=%d members=%v result=%v err=%v", queries, writes, r.Accepted, result, err)
+			if !errors.Is(err, wantErr) || result.RequeueAfter != 0 || len(queries) != 1 || writes != 0 || len(acceptedMembers(t, r)) != 0 {
+				t.Fatalf("failed listing changed state or continued: queries=%v writes=%d members=%v result=%v err=%v", queries, writes, acceptedMembers(t, r), result, err)
 			}
 
-			if _, err := r.Publications.Current(); err == nil {
+			if _, err := r.authority.Current(); err == nil {
 				t.Fatal("installed publication after failed listing")
 			}
 		})
@@ -127,7 +127,7 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 
 			cache := catalogCache("cache-a", testOtherUID)
 			require.NoError(t, r.Create(t.Context(), &cache))
-			require.Same(t, first, reconcileTopology(t, r, t.Context()), "cache waits for committed keys")
+			require.Equal(t, first.encoded, reconcileTopology(t, r, t.Context()).encoded, "cache waits for committed keys")
 			runKeys(t, a.Keyring)
 			withCache := reconcileTopology(t, r, t.Context())
 			published, err := wire.DecodePublication(strings.NewReader(withCache.encoded))
@@ -173,9 +173,9 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			require.NoError(t, r.Create(t.Context(), &invalid))
 			_, err = r.Reconcile(t.Context(), ctrl.Request{})
 			require.ErrorIs(t, err, wire.InvalidRequest)
-			current, err := r.Publications.Current()
+			current, err := r.authority.Current()
 			require.NoError(t, err)
-			require.Same(t, recovered, current)
+			require.Equal(t, recovered.encoded, captureHandle(t, current).encoded)
 			require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(&node), &node))
 			require.Equal(t, history, node.Annotations[admittedMemberAnnotation])
 

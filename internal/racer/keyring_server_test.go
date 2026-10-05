@@ -169,7 +169,7 @@ func TestKeyringBearerLiveBindings(t *testing.T) {
 			switch scenario {
 			case "token", "audience":
 				status = http.StatusUnauthorized
-				f.a.Server.Bootstrap.Client = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
+				fixtureDependencies[f.a.authority].Client = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
 					review := obj.(*authv1.TokenReview)
 					review.Status.Authenticated = scenario == "audience"
 					review.Status.Audiences = []string{"wrong-audience"}
@@ -186,7 +186,7 @@ func TestKeyringBearerLiveBindings(t *testing.T) {
 				obj, key = &corev1.Node{}, client.ObjectKey{Name: "worker"}
 			case "API outage":
 				status = http.StatusServiceUnavailable
-				f.a.Server.Bootstrap.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+				fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
 					return errors.New("offline")
 				}})
 			}
@@ -230,9 +230,8 @@ func TestKeyringMTLSNeverReadsAPI(t *testing.T) {
 				return errors.New("offline")
 			},
 		})
-		f.a.Server.Bootstrap.Client, f.a.Server.Bootstrap.APIReader, f.a.Server.Bootstrap.Issuer.APIReader = unavailable, unavailable, unavailable
+		fixtureDependencies[f.a.authority].Client, fixtureDependencies[f.a.authority].reader = unavailable, unavailable
 
-		f.a.Keyring.APIReader = unavailable
 		if _, err := f.a.Keyring.Reconcile(f.ctx, ctrl.Request{}); err == nil {
 			t.Fatal("outage hidden")
 		}
@@ -270,8 +269,7 @@ func TestKeyringPollWakeAndTermination(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					f := newServingFixture(t)
 					// Isolate poll termination from the default 30-second freshness gate.
-					f.a.Server.Trust.maxAge = time.Minute
-					f.a.Server.Publications.maxAge = time.Minute
+					configureFixtureAge(t, f, time.Minute)
 
 					if scenario == "expired" {
 						if bearer {
@@ -317,10 +315,10 @@ func TestKeyringPollWakeAndTermination(t *testing.T) {
 					case "rotation":
 						want = 200
 						_, _, rotation, _ := keyState(t, f.a.Keyring)
-						f.a.Keyring.Now = func() time.Time { return rotation.NextRotation }
+						fixtureDependencies[f.a.authority].now = func() time.Time { return rotation.NextRotation }
 						runKeys(t, f.a.Keyring)
 					case "invalidation":
-						f.a.Server.Trust.invalidate()
+						invalidateFixtureTrust(t, f)
 					case "leader canceled":
 						f.cancel()
 					case "request canceled":
@@ -347,12 +345,7 @@ func TestKeyringPollWakeAndTermination(t *testing.T) {
 							want = 200
 						}
 
-						_, bundle, _, _ := keyState(t, f.a.Keyring)
-						bundle.Generation++
-						// Install a validated test state with no root for the old leaf.
-						if err := f.a.Server.Trust.install(f.ctx, x509.NewCertPool(), bundle); err != nil {
-							t.Fatal(err)
-						}
+						replaceFixtureCredentials(t, f)
 					}
 
 					select {
@@ -386,8 +379,7 @@ func TestKeyringAdmissionHeldThroughResponse(t *testing.T) {
 					f := newServingFixture(t)
 					f.a.Server.Config.Limits.MaxPolls = 1
 					// Keep authority fresh through the 204 wait and blocked response.
-					f.a.Server.Trust.maxAge = time.Minute
-					f.a.Server.Publications.maxAge = time.Minute
+					configureFixtureAge(t, f, time.Minute)
 					handler := f.a.Server.Handler()
 
 					query := ""
@@ -448,7 +440,7 @@ func TestKeyringBearerAdmissionAndDeadline(t *testing.T) {
 		s := f.a.Server
 		s.Config.Limits.MaxConcurrentBootstrap = 1
 		s.Config.Limits.WriteTimeout = time.Second
-		s.Bootstrap.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+		fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
 			<-ctx.Done()
 			return ctx.Err()
 		}})
@@ -527,7 +519,7 @@ func TestKeyringBearerExpiresDuringReauthentication(t *testing.T) {
 		installReview(t, f.a, status, f.token)
 
 		reads := 0
-		f.a.Server.Bootstrap.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*corev1.Pod); ok {
 				reads++
 				if reads == 2 {

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racer
+package authority
 
 import (
 	"context"
@@ -71,11 +71,13 @@ func TestAuthorityPublicationHistoryIsOperationOwned(t *testing.T) {
 	r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
 		return apierrors.NewConflict(corev1.Resource("configmaps"), "version", wire.Conflict)
 	}})
+	a.publisher.Writer = r.Client
 	_, err = a.PublishTopology(t.Context(), r.observeTopology)
 	require.True(t, apierrors.IsConflict(err))
 	require.Equal(t, before, a.accepted, "failed CAS advanced history")
 
 	r.Client = base
+	a.publisher.Writer = base
 	_, err = a.PublishTopology(t.Context(), r.observeTopology)
 	require.NoError(t, err)
 	require.EqualValues(t, 7, a.accepted[testNodeUID].Shares)
@@ -156,7 +158,7 @@ func TestAuthorityBlockedOperationsHonorCancellation(t *testing.T) {
 				results <- err
 			}()
 			go func() {
-				_, err := a.Issue(blocked, NodeIdentity{cluster: a.config.Cluster, node: testNodeUID, expires: time.Now().Add(time.Hour)}, f.request)
+				_, err := a.Issue(blocked, NodeIdentity{owner: a, bearer: true, cluster: a.config.Cluster, node: testNodeUID, expires: time.Now().Add(time.Hour)}, f.request)
 				results <- err
 			}()
 
@@ -184,7 +186,7 @@ func TestAuthorityBlockedOperationsHonorCancellation(t *testing.T) {
 
 func TestAuthorityConstructorCopiesConfigWithoutIO(t *testing.T) {
 	cfg := testConfig(t)
-	a := NewAuthority(cfg, nil, nil)
+	a := New(cfg, Dependencies{})
 	cfg.Cluster = ""
 	require.NotEqual(t, cfg.Cluster, a.config.Cluster)
 	require.ErrorIs(t, a.PublicationReady(), wire.Unavailable)

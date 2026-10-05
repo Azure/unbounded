@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	"github.com/Azure/unbounded/internal/racer/membership"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -163,9 +165,9 @@ func replicatedServingSmoke(t *testing.T, count int) {
 	var replicas []*replicationSmokeReplica
 
 	for range 3 {
-		a := Assemble(f.a.Server.Config, f.a.Topology.Client, f.a.Topology.APIReader)
+		a := assembleFixture(f.a.Server.Config, f.a.Topology.Client, f.a.Topology.APIReader)
 		process, stop := context.WithCancel(ctx)
-		a.Server.Publications.bindProcess(process)
+		a.authority.BindProcess(process)
 		replicationSmokeLifecycle(a.Lifecycle, process)
 		a.Replication.observe(process)
 
@@ -237,7 +239,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 
 		return nil
 	}})
-	leader.a.authority.client = leader.a.Replication.Client
+	fixtureDependencies[leader.a.authority].Client = leader.a.Replication.Client
 
 	// Initial publisher installation uses the same canonical/durable validation.
 	image, err := wire.DecodePublication(strings.NewReader(base.encoded))
@@ -284,8 +286,8 @@ func replicatedServingSmoke(t *testing.T, count int) {
 				t.Fatal(err)
 			}
 
-			current, err := r.a.Server.Publications.Current()
-			if err != nil || current.encoded != publication.encoded {
+			_, err = r.a.authority.Current()
+			if err != nil || capturePublication(t, r.a.authority).encoded != publication.encoded {
 				t.Fatal("replica diverged", err)
 			}
 		}
@@ -517,26 +519,25 @@ func replicationSmokeLifecycle(l *Lifecycle, ctx context.Context) {
 func replicationSmokePublish(t *testing.T, ctx context.Context, r *TopologyReconciler, members AcceptedMembers) *CommittedPublication {
 	t.Helper()
 
-	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
+	_, err := r.authority.PublishTopology(ctx, func(context.Context) (TopologyObservation, error) {
+		nodes := corev1.NodeList{}
+
+		for id, member := range members {
+			encoded, err := json.Marshal(member)
+			if err != nil {
+				return TopologyObservation{}, err
+			}
+
+			nodes.Items = append(nodes.Items, corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: string(id), UID: types.UID(id), Annotations: map[string]string{admittedMemberAnnotation: string(encoded), wire.SharesAnnotation: strconv.FormatUint(uint64(member.Shares), 10)}}})
+		}
+
+		return TopologyObservation{Nodes: nodes, Input: membership.Input{Nodes: nodes.Items, PeerPort: r.Config.PeerPort}}, nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, members, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	publication, err := r.CommitVersion(ctx, prepared)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := r.Publications.Install(publication); err != nil {
-		t.Fatal(err)
-	}
-
-	return publication
+	return capturePublication(t, r.authority)
 }
 
 func replicationSmokePark(t *testing.T, ctx context.Context, replicas []*replicationSmokeReplica, count int, results <-chan replicationSmokeResult) {

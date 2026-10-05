@@ -135,7 +135,7 @@ func TestRustKeyringInterop(t *testing.T) {
 
 			if parked {
 				_, _, rotation, _ := keyState(t, f.a.Keyring)
-				f.a.Keyring.Now = func() time.Time { return rotation.NextRotation }
+				fixtureDependencies[f.a.authority].now = func() time.Time { return rotation.NextRotation }
 				runKeys(t, f.a.Keyring)
 
 				rotated = true

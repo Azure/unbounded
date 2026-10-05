@@ -25,7 +25,7 @@ import (
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
-	racercore "github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
@@ -110,7 +110,7 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 				return nil, component.Result{}, fmt.Errorf("fresh Racer marker requires absent or bound staged version state (read: %v)", err)
 			}
 		}
-	} else if err := racercore.ValidateInstallation(ctx, env.LiveReader(), env.Namespace, marker.Data["cluster"]); err != nil {
+	} else if err := authority.ValidateInstallation(ctx, env.LiveReader(), env.Namespace, marker.Data["cluster"]); err != nil {
 		// Startup may be in its one-shot Create gap. Do not deploy dataplanes or
 		// repair durable state; a later reconcile can observe successful creation.
 		return nil, component.Result{}, fmt.Errorf("racer durable state: %w", err)

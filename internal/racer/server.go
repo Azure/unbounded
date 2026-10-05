@@ -18,19 +18,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
 type Server struct {
-	authority *Authority
+	authority *authority.Authority
+	writer    client.Writer
 	// Config is construction input; runtime settings are frozen on first use.
 	Config             Config
 	config             Config
-	Trust              *Trust
-	Bootstrap          *Bootstrap
-	Publications       *Publications
 	Lifecycle          *Lifecycle
 	Replication        *Replication
 	once               sync.Once
@@ -62,7 +62,7 @@ func (s *Server) TLSConfig(ctx context.Context) (*tls.Config, error) {
 		return nil, err
 	}
 
-	if s.Bootstrap == nil || s.Bootstrap.Issuer == nil {
+	if s.authority == nil {
 		return nil, wire.Unavailable
 	}
 
@@ -132,7 +132,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return wire.InvalidRequest
 	}
 
-	if s.Lifecycle == nil || s.Publications == nil {
+	if s.Lifecycle == nil || s.authority == nil {
 		return wire.Unavailable
 	}
 
@@ -230,17 +230,8 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 func (s *Server) initializeAdmission() {
 	s.once.Do(func() {
 		s.config = s.Config.effective()
-		// Freeze the entire serving chain before exposing a handler or listener,
-		// not lazily when its first authentication or issuance request arrives.
-		// Each dependency retains its normalized construction inputs, including
-		// pre-start overrides made by direct programmatic callers.
-		if s.Bootstrap != nil {
-			s.Bootstrap.runtimeConfig()
-
-			if s.Bootstrap.Issuer != nil {
-				s.Bootstrap.Issuer.runtimeConfig()
-			}
-		}
+		// Freeze transport settings before exposure. Authority policy was already
+		// copied at construction and cannot be changed through these settings.
 
 		if s.Replication != nil {
 			s.Replication.runtimeConfig()
@@ -428,7 +419,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 
 	responseControl(http.NewResponseController(w).SetWriteDeadline(trustDeadline))
 
-	encoded, err := s.servingAuthority().Enroll(trustCtx, r, request)
+	encoded, err := s.enroll(trustCtx, r, request)
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -480,21 +471,21 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.admitPoll(identity.node) {
+	if !s.admitPoll(identity.Node()) {
 		writeFailure(w, wire.Overloaded)
 
 		return
 	}
-	defer s.releasePoll(identity.node)
+	defer s.releasePoll(identity.Node())
 
-	ctx, cancel := context.WithDeadline(r.Context(), identity.expires)
+	ctx, cancel := context.WithDeadline(r.Context(), identity.Expires())
 	defer cancel()
 	// A long poll does not consume a write slot. Give its eventual response a
 	// fresh bounded write window, capped by the verified chain's expiration.
-	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.expires, time.Now().Add(wire.PollWait+s.config.Limits.WriteTimeout))))
+	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.Expires(), time.Now().Add(wire.PollWait+s.config.Limits.WriteTimeout))))
 
 	publication, err := s.servingAuthority().Wait(ctx, identity, after)
-	if !time.Now().Before(identity.expires) {
+	if !time.Now().Before(identity.Expires()) {
 		err = wire.Unauthenticated
 	}
 
@@ -769,7 +760,7 @@ func (s *Server) authenticateKeyring(r *http.Request) (NodeIdentity, error) {
 		return s.authenticateSnapshot(r.Context(), r.TLS)
 	}
 
-	if s.Bootstrap == nil {
+	if s.authority == nil {
 		return NodeIdentity{}, wire.Unavailable
 	}
 
@@ -797,19 +788,19 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.admitKeyringPoll(identity.node) {
+	if !s.admitKeyringPoll(identity.Node()) {
 		writeFailure(w, wire.Overloaded)
 		return
 	}
-	defer s.releaseKeyringPoll(identity.node)
+	defer s.releaseKeyringPoll(identity.Node())
 
-	ctx, cancel := context.WithDeadline(r.Context(), identity.expires)
+	ctx, cancel := context.WithDeadline(r.Context(), identity.Expires())
 	defer cancel()
 
-	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.expires, time.Now().Add(wire.PollWait+2*s.config.Limits.WriteTimeout))))
+	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.Expires(), time.Now().Add(wire.PollWait+2*s.config.Limits.WriteTimeout))))
 
 	bundle, err := s.servingAuthority().WaitKeyring(ctx, after)
-	if !time.Now().Before(identity.expires) {
+	if !time.Now().Before(identity.Expires()) {
 		err = wire.Unauthenticated
 	}
 
@@ -843,11 +834,11 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	// Recheck local certificate trust or live bearer authorization after waiting.
 	// Never fall back from a rejected certificate to a bearer token.
 	verified, err := s.authenticateKeyring(r.WithContext(ctx))
-	if !time.Now().Before(identity.expires) {
+	if !time.Now().Before(identity.Expires()) {
 		err = wire.Unauthenticated
 	}
 
-	if err == nil && (verified.node != identity.node || verified.cluster != identity.cluster) {
+	if err == nil && (verified.Node() != identity.Node() || verified.Cluster() != identity.Cluster()) {
 		err = wire.Forbidden
 	}
 
@@ -876,7 +867,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release(s.writes)
 
-	deadline := minTime(identity.expires, time.Now().Add(s.config.Limits.WriteTimeout))
+	deadline := minTime(identity.Expires(), time.Now().Add(s.config.Limits.WriteTimeout))
 	if freshness, ok := ctx.Deadline(); ok {
 		deadline = minTime(deadline, freshness)
 	}
