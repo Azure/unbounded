@@ -15,36 +15,44 @@ use uring_runtime::{
     reactor::{IoBuffer, Reactor, SocketAddress},
 };
 
+/// Keeps HTTP syntax failures distinct from transport failures.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Failure {
     Http(Error),
     Runtime(uring_runtime::Error),
 }
 impl From<Error> for Failure {
+    /// Preserve an HTTP failure for assertions at the caller boundary.
     fn from(error: Error) -> Self {
         Self::Http(error)
     }
 }
 impl From<uring_runtime::Error> for Failure {
+    /// Preserve the runtime failure without mapping it to HTTP syntax.
     fn from(error: uring_runtime::Error) -> Self {
         Self::Runtime(error)
     }
 }
+/// A live scope for exchanges bounded by the test driver's deadline.
 #[derive(Clone)]
 struct RequestScope;
 impl Scope for RequestScope {
     type Error = Failure;
+    /// Allow progress until the surrounding test driver stops polling.
     fn check(&self) -> Result<(), Failure> {
         Ok(())
     }
 }
+/// Wraps a socket address in the caller's endpoint policy.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Address(SocketAddress);
 impl Endpoint<Failure> for Address {
+    /// Return the endpoint unchanged without name resolution.
     fn address(&self) -> Result<SocketAddress, Failure> {
         Ok(self.0.clone())
     }
 }
+/// Supplies permissive resource policy without application dependencies.
 struct Caller;
 impl Context for Caller {
     type Error = Failure;
@@ -56,17 +64,21 @@ impl Context for Caller {
     type Opaque = ();
     type State = ();
     type Endpoint = Address;
+    /// Admit the bounded storage used by each exchange fixture.
     fn charge(&self, _: usize) -> Result<(), Failure> {
         Ok(())
     }
+    /// Admit an outbound connection without tracking application quotas.
     fn outbound_slot(&self) -> Result<(), Failure> {
         Ok(())
     }
+    /// Keep admission open for the lifetime of the fixture.
     fn stopped(&self) -> bool {
         false
     }
 }
 
+/// Build a small reactor and explicit head and body limits.
 fn io() -> HttpIo<Caller> {
     HttpIo::new(
         Rc::new(Rc::new(Reactor::new(16, ()))),
@@ -76,6 +88,7 @@ fn io() -> HttpIo<Caller> {
         16,
     )
 }
+/// Reserve both ends of a real local stream for HTTP exchanges.
 fn pair() -> (ConnectionLease<Caller>, ConnectionLease<Caller>) {
     let (client, server) = UnixStream::pair().unwrap();
     (
@@ -83,6 +96,7 @@ fn pair() -> (ConnectionLease<Caller>, ConnectionLease<Caller>) {
         ConnectionLease::from_reserved(server.into(), (), ()).unwrap(),
     )
 }
+/// Poll one operation and its reactor under a fixed progress deadline.
 fn drive<T>(io: &HttpIo<Caller>, future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
     let mut cx = std::task::Context::from_waker(Waker::noop());
@@ -96,6 +110,7 @@ fn drive<T>(io: &HttpIo<Caller>, future: impl Future<Output = T>) -> T {
         std::thread::yield_now();
     }
 }
+/// Construct a fixed-length request or response head.
 fn head(start: StartLine, length: usize) -> MessageHead {
     MessageHead {
         start,
@@ -105,6 +120,7 @@ fn head(start: StartLine, length: usize) -> MessageHead {
         }],
     }
 }
+/// Construct a request for the shared fixture resource.
 fn request(method: &str, length: usize) -> MessageHead {
     head(
         StartLine::Request {
@@ -115,6 +131,7 @@ fn request(method: &str, length: usize) -> MessageHead {
     )
 }
 
+/// Exercise sequential upload and fetch exchanges and server-directed closure.
 #[test]
 fn upload_then_fetch_on_one_connection_and_honor_server_close() {
     let io = io();
@@ -227,6 +244,7 @@ fn upload_then_fetch_on_one_connection_and_honor_server_close() {
     assert_eq!(io.reactor().in_flight(), 0);
 }
 
+/// Reject invalid body operations before submitting transport work.
 #[test]
 fn upload_body_bounds_fail_without_waiting_for_more_peer_traffic() {
     for case in ["collect cap", "empty read", "oversized write"] {
@@ -256,6 +274,7 @@ fn upload_body_bounds_fail_without_waiting_for_more_peer_traffic() {
     }
 }
 
+/// Keep a rejected request writable for an error response but forbid reuse.
 #[test]
 fn response_on_request_only_connection_can_be_rejected_but_never_reused() {
     let io = io();
