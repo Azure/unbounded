@@ -908,12 +908,40 @@ mod codec {
         id: String,
         purpose: String,
         state: String,
-        material: String,
+        material: EncodedKeyMaterial,
     }
-    impl Drop for Key {
+
+    /// Own encoded secrets immediately, including during partial DTO construction.
+    struct EncodedKeyMaterial(zeroize::Zeroizing<String>);
+
+    impl Serialize for EncodedKeyMaterial {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            serializer.serialize_str(&self.0)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for EncodedKeyMaterial {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            String::deserialize(deserializer).map(|value| Self(zeroize::Zeroizing::new(value)))
+        }
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        /// Count field destruction without observing freed secret storage.
+        static MATERIAL_DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    impl Drop for EncodedKeyMaterial {
         fn drop(&mut self) {
-            use zeroize::Zeroize;
-            self.material.zeroize();
+            MATERIAL_DROPS.with(|drops| drops.set(drops.get() + 1));
+            // The Zeroizing field is dropped immediately after this test observer.
         }
     }
     pub fn decode_bundle(b: &[u8]) -> Result<KeyringBundle> {
@@ -947,7 +975,7 @@ mod codec {
             if created > generation.0 {
                 return Err(Error::InvalidRequest);
             }
-            let material = key_material(&k.material)?;
+            let material = key_material(&k.material.0)?;
             if !seen.insert((k.cache.clone(), k.purpose.clone(), id)) {
                 return Err(Error::InvalidRequest);
             }
@@ -1001,7 +1029,9 @@ mod codec {
                         CacheKeyState::Active => "active",
                     }
                     .into(),
-                    material: STANDARD.encode(k.material),
+                    material: EncodedKeyMaterial(zeroize::Zeroizing::new(
+                        STANDARD.encode(k.material),
+                    )),
                 })
                 .collect(),
         };
@@ -1180,6 +1210,47 @@ mod codec {
                     decode_bundle(&serde_json::to_vec(&bundle).unwrap()),
                     Err(Error::InvalidRequest)
                 ));
+            }
+        }
+
+        /// Missing or invalid later fields must drop the already-owned secret field.
+        #[test]
+        fn encoded_material_is_owned_before_key_construction_completes() {
+            for suffix in [
+                "",
+                r#", "state": false"#,
+                r#", "state": "active", "unknown": 1"#,
+            ] {
+                let json = format!(
+                    r#"{{"cache":"cache","id":"id","purpose":"page","material":"secret"{suffix}}}"#
+                );
+                MATERIAL_DROPS.with(|drops| drops.set(0));
+                // Deserialize from Value exactly as decode_bundle does, preserving
+                // material-before-state ordering even with sorted JSON object keys.
+                let value: Value = serde_json::from_str(&json).unwrap();
+                assert!(Key::deserialize(&value).is_err());
+                assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 1);
+            }
+            MATERIAL_DROPS.with(|drops| drops.set(0));
+            let key: Key = serde_json::from_str(r#"{"cache":"cache","id":"id","purpose":"page","material":"secret","state":"active"}"#).unwrap();
+            assert_eq!(key.material.0.as_str(), "secret");
+            assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 0);
+            drop(key);
+            assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 1);
+        }
+
+        /// Public bundle decoding preserves error classification after secret parsing.
+        #[test]
+        fn bundle_rejects_missing_state_and_late_errors_after_material() {
+            for replacement in ["", r#""state":false,"#] {
+                let malformed = BUNDLE.replacen(r#""state":"prepared","#, replacement, 1);
+                assert_ne!(malformed, BUNDLE);
+                MATERIAL_DROPS.with(|drops| drops.set(0));
+                assert!(matches!(
+                    decode_bundle(malformed.as_bytes()),
+                    Err(Error::InvalidRequest)
+                ));
+                assert!(MATERIAL_DROPS.with(|drops| drops.get()) > 0);
             }
         }
         #[test]
