@@ -576,7 +576,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		// Create and start site controller (shares the node informer factory)
 		//
 		// This is fatal rather than logged because the site controller is not
-		// optional: it backs the mutating webhook's CIDR allocator, and the
+		// optional: it backs the mutating webhook's site resolver, and the
 		// Service endpoint this pod publishes is only published once the site
 		// controller reports ready. Continuing without it produces a leader
 		// that holds the lease, passes its probes, and never publishes an
@@ -593,8 +593,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 			siteCtrl.SetLeaseFence(podCIDRFence)
 		}
 
-		// Wire the site controller as CIDR allocator for the mutating webhook
-		webhookServer.SetCIDRAllocator(siteCtrl)
+		webhookServer.SetNodeSiteResolver(siteCtrl)
 
 		// Set informers in health state for efficient lookups in status endpoints
 		healthState.setInformers(siteCtrl.GetNodeLister(), podLister, siteCtrl.GetSiteInformer(), gatewayPoolInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)

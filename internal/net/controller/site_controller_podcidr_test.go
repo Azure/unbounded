@@ -771,33 +771,28 @@ func TestAssignPodCIDRsAllowedWithLease(t *testing.T) {
 }
 
 func TestTryAllocateForNodeLeaseFence(t *testing.T) {
-	cases := map[string]struct {
-		validUntil time.Time
-		wantOK     bool
-	}{
-		"held":       {validUntil: time.Now().Add(time.Minute), wantOK: true},
-		"never-held": {wantOK: false},
-		"expired":    {validUntil: time.Now().Add(-time.Second), wantOK: false},
+	// Admission now resolves sites without allocating, regardless of the fence.
+	cases := map[string]time.Time{
+		"held":       time.Now().Add(time.Minute),
+		"never-held": {},
+		"expired":    time.Now().Add(-time.Second),
 	}
 
-	for name, tc := range cases {
+	for name, validUntil := range cases {
 		t.Run(name, func(t *testing.T) {
 			h := newPodCIDRTestHarness(t, liveNodeWithRV("1"))
 			h.sites[0].Spec.NodeCidrs = []string{"10.0.0.0/16"}
 			h.sc.sitesCache = h.sites
-			h.sc.SetLeaseFence(&fakeLeaseFence{validUntil: tc.validUntil})
+			h.sc.SetLeaseFence(&fakeLeaseFence{validUntil: validUntil})
+			node := liveNodeWithRV("1")
+			node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.5"}}
 
-			podCIDR, _, siteName, ok := h.sc.TryAllocateForNode(podCIDRTestNode, []string{"10.0.0.5"})
-			if ok != tc.wantOK {
-				t.Fatalf("TryAllocateForNode ok = %v, want %v", ok, tc.wantOK)
+			if siteName := h.sc.GetSiteForNode(node); siteName != "site-a" {
+				t.Fatalf("site = %q, want site-a", siteName)
 			}
 
-			if h.state.allocator.IsAllocated("10.244.0.0/24") != tc.wantOK {
-				t.Fatalf("allocator state for 10.244.0.0/24 = %v, want %v", !tc.wantOK, tc.wantOK)
-			}
-
-			if tc.wantOK && (podCIDR != "10.244.0.0/24" || siteName != "site-a") {
-				t.Fatalf("TryAllocateForNode = (%q, %q), want (10.244.0.0/24, site-a)", podCIDR, siteName)
+			if h.state.allocator.IsAllocated("10.244.0.0/24") {
+				t.Fatal("site resolution allocated a pod CIDR")
 			}
 		})
 	}

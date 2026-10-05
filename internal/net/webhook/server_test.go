@@ -20,8 +20,11 @@ import (
 	"testing"
 	"time"
 
+	jsonpatch "github.com/evanphx/json-patch/v5"
+	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -276,7 +279,10 @@ func TestGetClientCAs(t *testing.T) {
 // stamps both the canonical (unbounded-cloud.io/site) and deprecated
 // (net.unbounded-cloud.io/site) site labels during the deprecation window.
 func TestBuildNodeAdmissionPatchDualWritesSiteLabels(t *testing.T) {
-	patch := buildNodeAdmissionPatch("10.0.0.0/24", []string{"10.0.0.0/24"}, "site-a")
+	patch, err := buildNodeAdmissionPatch(&corev1.Node{}, "site-a")
+	if err != nil {
+		t.Fatalf("build patch: %v", err)
+	}
 
 	var ops []map[string]interface{}
 	if err := json.Unmarshal(patch, &ops); err != nil {
@@ -287,6 +293,10 @@ func TestBuildNodeAdmissionPatchDualWritesSiteLabels(t *testing.T) {
 
 	for _, op := range ops {
 		path, _ := op["path"].(string)
+		if !strings.HasPrefix(path, "/metadata/labels") {
+			t.Fatalf("unexpected non-label mutation: %#v", op)
+		}
+
 		if strings.HasPrefix(path, "/metadata/labels/") {
 			labelValues[path] = op["value"]
 		}
@@ -301,5 +311,139 @@ func TestBuildNodeAdmissionPatchDualWritesSiteLabels(t *testing.T) {
 
 	if labelValues[deprecated] != "site-a" {
 		t.Fatalf("deprecated site label not set: %#v", labelValues)
+	}
+}
+
+type fakeNodeSiteResolver struct {
+	siteName string
+	calls    int
+}
+
+func (f *fakeNodeSiteResolver) GetSiteForNode(_ *corev1.Node) string {
+	f.calls++
+	return f.siteName
+}
+
+func TestMutateNodesOnlyLabelsSite(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		labels     map[string]string
+		cidrs      []string
+		siteName   string
+		operation  admissionv1.Operation
+		noResolver bool
+		dryRun     bool
+	}{
+		{name: "absent-labels", siteName: "site-a", operation: admissionv1.Create},
+		{name: "empty-labels", labels: map[string]string{}, siteName: "site-a", operation: admissionv1.Create},
+		{name: "existing-labels", labels: map[string]string{"other": "keep", unboundedv1alpha3.MachineSiteLabelKey: "old"}, siteName: "site-a", operation: admissionv1.Create},
+		{name: "existing-cidrs", cidrs: []string{"10.0.0.0/24", "fd00::/64"}, siteName: "site-a", operation: admissionv1.Create},
+		{name: "dry-run", siteName: "site-a", operation: admissionv1.Create, dryRun: true},
+		{name: "no-match", operation: admissionv1.Create},
+		{name: "no-resolver", operation: admissionv1.Create, noResolver: true},
+		{name: "update", siteName: "site-a", operation: admissionv1.Update},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: tc.labels}}
+			node.Spec.PodCIDRs = tc.cidrs
+			if len(tc.cidrs) > 0 {
+				node.Spec.PodCIDR = tc.cidrs[0]
+			}
+
+			raw, err := json.Marshal(node)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			review := admissionv1.AdmissionReview{Request: &admissionv1.AdmissionRequest{
+				UID: "request-a", Name: node.Name, Operation: tc.operation,
+				Resource: metav1.GroupVersionResource{Version: "v1", Resource: "nodes"},
+				Object:   runtime.RawExtension{Raw: raw}, DryRun: &tc.dryRun,
+			}}
+			body, err := json.Marshal(review)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			resolver := &fakeNodeSiteResolver{siteName: tc.siteName}
+			server := &Server{}
+			if !tc.noResolver {
+				server.SetNodeSiteResolver(resolver)
+			}
+
+			rec := httptest.NewRecorder()
+			server.handleMutateNodes(rec, httptest.NewRequest(http.MethodPost, "/mutate-nodes", strings.NewReader(string(body))))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+			}
+
+			var result admissionv1.AdmissionReview
+			if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+
+			if result.Response == nil || !result.Response.Allowed || result.Response.UID != review.Request.UID {
+				t.Fatalf("invalid admission response: %#v", result.Response)
+			}
+
+			wantPatch := tc.operation == admissionv1.Create && tc.siteName != "" && !tc.noResolver
+			if !wantPatch {
+				if len(result.Response.Patch) != 0 || result.Response.PatchType != nil {
+					t.Fatalf("unexpected mutation: %s", result.Response.Patch)
+				}
+
+				if tc.operation != admissionv1.Create && resolver.calls != 0 {
+					t.Fatal("resolved a site for a non-CREATE request")
+				}
+
+				return
+			}
+
+			if result.Response.PatchType == nil || *result.Response.PatchType != admissionv1.PatchTypeJSONPatch {
+				t.Fatal("missing JSON patch type")
+			}
+
+			patch, err := jsonpatch.DecodePatch(result.Response.Patch)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			mutated, err := patch.Apply(raw)
+			if err != nil {
+				t.Fatalf("apply label patch: %v", err)
+			}
+
+			var got corev1.Node
+			if err := json.Unmarshal(mutated, &got); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, key := range nodeSiteLabelKeys() {
+				if got.Labels[key] != tc.siteName {
+					t.Fatalf("label %s = %q, want %q", key, got.Labels[key], tc.siteName)
+				}
+			}
+
+			if value, ok := tc.labels["other"]; ok && got.Labels["other"] != value {
+				t.Fatal("unrelated label changed")
+			}
+
+			if got.Spec.PodCIDR != node.Spec.PodCIDR || !slices.Equal(got.Spec.PodCIDRs, node.Spec.PodCIDRs) {
+				t.Fatalf("admission changed pod CIDRs: %+v", got.Spec)
+			}
+		})
+	}
+}
+
+func TestMutateNodesInvalidRequest(t *testing.T) {
+	for _, body := range []string{"{", "{}", `{"request":{"operation":"CREATE","resource":{"resource":"nodes"},"object":[]}}`} {
+		t.Run(body, func(t *testing.T) {
+			server := &Server{nodeSiteResolver: &fakeNodeSiteResolver{siteName: "site-a"}}
+			rec := httptest.NewRecorder()
+			server.handleMutateNodes(rec, httptest.NewRequest(http.MethodPost, "/mutate-nodes", strings.NewReader(body)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rec.Code)
+			}
+		})
 	}
 }

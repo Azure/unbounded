@@ -194,9 +194,8 @@ type LeaseFence interface {
 // leader lease is not known to be held.
 var errLeaseNotHeld = errors.New("leader lease not held; refusing pod CIDR allocation")
 
-// SetLeaseFence makes pod CIDR allocation, from both node sync and the mutating
-// webhook, conditional on holding the leader lease. It must be called before
-// Run and before the controller is used as a webhook CIDR allocator.
+// SetLeaseFence makes pod CIDR allocation conditional on holding the leader
+// lease. It must be called before Run.
 func (sc *SiteController) SetLeaseFence(fence LeaseFence) {
 	sc.leaseFence = fence
 }
@@ -2799,82 +2798,6 @@ func validateSiteCIDRsNoOverlap(sites []unboundedv1alpha3.Site) error {
 	}
 
 	return nil
-}
-
-// TryAllocateForNode attempts to allocate pod CIDRs for a node based on its
-// internal IPs. Returns (podCIDR, podCIDRs, true) on success or
-// ("", nil, false) if allocation is not possible.
-func (sc *SiteController) TryAllocateForNode(nodeName string, internalIPs []string) (string, []string, string, bool) {
-	if !sc.allocatorsReady.Load() {
-		return "", nil, "", false
-	}
-
-	// Admit the node without pod CIDRs when the lease is not held; the lease
-	// holder assigns them through node sync instead.
-	if _, err := sc.leaseDeadline(); err != nil {
-		klog.Warningf("Not allocating pod CIDRs for node %s at admission: %v", nodeName, err)
-		return "", nil, "", false
-	}
-
-	sc.sitesCacheLock.RLock()
-	sites := sc.sitesCache
-	sc.sitesCacheLock.RUnlock()
-
-	// Find matching site by checking if any internal IP falls in a site's nodeCidrs
-	siteName := ""
-
-	for _, site := range sites {
-		for _, nodeCidr := range site.Spec.NodeCidrs {
-			_, cidrNet, err := net.ParseCIDR(nodeCidr)
-			if err != nil {
-				continue
-			}
-
-			for _, ip := range internalIPs {
-				if cidrNet.Contains(net.ParseIP(ip)) {
-					siteName = site.Name
-					break
-				}
-			}
-
-			if siteName != "" {
-				break
-			}
-		}
-
-		if siteName != "" {
-			break
-		}
-	}
-
-	if siteName == "" {
-		return "", nil, "", false
-	}
-
-	var site *unboundedv1alpha3.Site
-
-	for i := range sites {
-		if sites[i].Name == siteName {
-			site = &sites[i]
-			break
-		}
-	}
-
-	if site == nil {
-		return "", nil, "", false
-	}
-
-	state := sc.selectAssignmentForNode(*site, nodeName)
-	if state == nil {
-		return "", nil, "", false
-	}
-
-	podCIDR, podCIDRs, err := sc.computePodCIDRsForNode(state)
-	if err != nil {
-		return "", nil, "", false
-	}
-
-	return podCIDR, podCIDRs, siteName, true
 }
 
 // containsFinalizer returns true if the given finalizer is in the list.

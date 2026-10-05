@@ -39,12 +39,9 @@ const (
 	aggregatedAPIVersionPath     = "/apis/status.net.unbounded-cloud.io/v1alpha1"
 )
 
-// CIDRAllocator provides pod CIDR allocation for the mutating webhook.
-type CIDRAllocator interface {
-	// TryAllocateForNode attempts to allocate pod CIDRs for a node.
-	// Returns (podCIDR, podCIDRs, siteName, true) on success or
-	// ("", nil, "", false) if allocation is not possible.
-	TryAllocateForNode(nodeName string, internalIPs []string) (string, []string, string, bool)
+// NodeSiteResolver provides site matching without allocating pod CIDRs.
+type NodeSiteResolver interface {
+	GetSiteForNode(node *corev1.Node) string
 }
 
 // Server is a handler registrar for validating and mutating admission
@@ -60,12 +57,12 @@ type Server struct {
 	aggregatedClientCAs        *x509.CertPool
 	aggregatedClientAllowedCNs map[string]struct{}
 	mux                        *http.ServeMux
-	cidrAllocator              CIDRAllocator
+	nodeSiteResolver           NodeSiteResolver
 }
 
-// SetCIDRAllocator sets the CIDR allocator used by the mutating webhook.
-func (s *Server) SetCIDRAllocator(a CIDRAllocator) {
-	s.cidrAllocator = a
+// SetNodeSiteResolver sets the site resolver used by the mutating webhook.
+func (s *Server) SetNodeSiteResolver(resolver NodeSiteResolver) {
+	s.nodeSiteResolver = resolver
 }
 
 // NewServer creates a webhook handler registrar. It does not start any HTTP
@@ -364,8 +361,8 @@ func parseRequestHeaderAllowedNames(raw string) (map[string]struct{}, error) {
 }
 
 // handleMutateNodes handles mutating admission requests for node objects.
-// It attempts to allocate pod CIDRs for newly created nodes that do not
-// already have CIDRs assigned.
+// It labels newly created nodes with their site. Pod CIDRs are assigned by
+// reconciliation after creation, never by admission.
 func (s *Server) handleMutateNodes(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
@@ -390,6 +387,11 @@ func (s *Server) handleMutateNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if review.Request == nil {
+		http.Error(w, "missing admission request", http.StatusBadRequest)
+		return
+	}
+
 	response := &admissionv1.AdmissionResponse{
 		UID:     review.Request.UID,
 		Allowed: true,
@@ -404,33 +406,30 @@ func (s *Server) handleMutateNodes(w http.ResponseWriter, r *http.Request) {
 
 	result := "pass-through"
 
-	if s.cidrAllocator != nil {
+	if s.nodeSiteResolver != nil {
 		var node corev1.Node
-		if err := json.Unmarshal(review.Request.Object.Raw, &node); err == nil {
-			if len(node.Spec.PodCIDRs) == 0 {
-				var ips []string
+		if err := json.Unmarshal(review.Request.Object.Raw, &node); err != nil {
+			http.Error(w, "failed to unmarshal node", http.StatusBadRequest)
+			return
+		}
 
-				for _, addr := range node.Status.Addresses {
-					if addr.Type == corev1.NodeInternalIP {
-						ips = append(ips, addr.Address)
-					}
-				}
-
-				if podCIDR, podCIDRs, siteName, ok := s.cidrAllocator.TryAllocateForNode(node.Name, ips); ok {
-					patch := buildNodeAdmissionPatch(podCIDR, podCIDRs, siteName)
-					patchType := admissionv1.PatchTypeJSONPatch
-					response.Patch = patch
-					response.PatchType = &patchType
-					result = fmt.Sprintf("allocated podCIDR=%s site=%s", podCIDR, siteName)
-				} else {
-					result = "no-match"
-				}
-			} else {
-				result = "already-has-cidrs"
+		if siteName := s.nodeSiteResolver.GetSiteForNode(&node); siteName != "" {
+			patch, err := buildNodeAdmissionPatch(&node, siteName)
+			if err != nil {
+				klog.Errorf("Failed to build site label admission patch for node %s: %v", node.Name, err)
+				http.Error(w, "failed to build site label patch", http.StatusInternalServerError)
+				return
 			}
+
+			patchType := admissionv1.PatchTypeJSONPatch
+			response.Patch = patch
+			response.PatchType = &patchType
+			result = fmt.Sprintf("labeled site=%s", siteName)
+		} else {
+			result = "no-match"
 		}
 	} else {
-		result = "allocator-not-set"
+		result = "site-resolver-not-set"
 	}
 
 	writeAdmissionResponse(w, review, response)
@@ -440,15 +439,17 @@ func (s *Server) handleMutateNodes(w http.ResponseWriter, r *http.Request) {
 		review.Request.Name, result, dur)
 }
 
-// buildNodeAdmissionPatch creates a JSONPatch that sets podCIDR, podCIDRs,
-// and the site label on a node during admission.
-func buildNodeAdmissionPatch(podCIDR string, podCIDRs []string, siteName string) []byte {
-	patches := []map[string]interface{}{
-		{"op": "add", "path": "/spec/podCIDR", "value": podCIDR},
-		{"op": "add", "path": "/spec/podCIDRs", "value": podCIDRs},
-	}
+// buildNodeAdmissionPatch sets only site labels, preserving unrelated labels.
+func buildNodeAdmissionPatch(node *corev1.Node, siteName string) ([]byte, error) {
+	var patches []map[string]interface{}
 
 	if siteName != "" {
+		if len(node.Labels) == 0 {
+			patches = append(patches, map[string]interface{}{
+				"op": "add", "path": "/metadata/labels", "value": map[string]string{},
+			})
+		}
+
 		// Dual-write the canonical (unbounded-cloud.io/site) and deprecated
 		// (net.unbounded-cloud.io/site) keys during the deprecation window.
 		for _, key := range nodeSiteLabelKeys() {
@@ -458,9 +459,7 @@ func buildNodeAdmissionPatch(podCIDR string, podCIDRs []string, siteName string)
 		}
 	}
 
-	data, _ := json.Marshal(patches) //nolint:errcheck
-
-	return data
+	return json.Marshal(patches)
 }
 
 // nodeSiteLabelKeys are the node site-membership label keys, canonical first.
