@@ -483,11 +483,18 @@ fn roundtrip_short_io_and_runtime_errors() {
     let buffer = drive(&reactor, read()).unwrap();
     assert!(buffer.as_slice().iter().all(|b| *b == 42));
     drop(buffer);
+    // Kernel-written bytes must dirty an initially clean pool allocation.
+    let reused = slab.allocate(extent.length(), ()).unwrap();
+    assert!(reused.as_slice().iter().all(|b| *b == 0));
+    drop(reused);
     sim.inject("read", Fault::Short(512)).unwrap();
     assert!(matches!(
         drive(&reactor, read()),
         Err(TestError::Alloc(Error::Io))
     ));
+    let reused = slab.allocate(extent.length(), ()).unwrap();
+    assert!(reused.as_slice().iter().all(|b| *b == 0));
+    drop(reused);
     sim.inject("write", Fault::Short(512)).unwrap();
     let op = slab.write(
         &reactor,
@@ -581,6 +588,23 @@ fn abandoned_read_and_unpolled_write_release_at_the_correct_fence() {
     drop(op);
     assert_eq!(slab.writes_in_flight(), 0);
     assert_eq!(reactor.in_flight(), 0);
+    // Seed nonzero bytes so a completed but abandoned read tests erasure, not
+    // merely the lifetime of an allocation that happens to remain zero.
+    let mut buffer = slab.allocate(4096, ()).unwrap();
+    buffer.as_mut_slice().fill(42);
+    drop(
+        drive(
+            &reactor,
+            slab.write(
+                &reactor,
+                extent,
+                buffer,
+                segments.lease(SegmentId(0), Generation(1)).unwrap(),
+                &TestScope,
+            ),
+        )
+        .unwrap(),
+    );
     sim.inject("read", Fault::HoldCompletion(8)).unwrap();
     let mut op = slab.read(
         &reactor,
@@ -592,9 +616,13 @@ fn abandoned_read_and_unpolled_write_release_at_the_correct_fence() {
     assert!(poll(&mut op).is_pending());
     reactor.poll_budgeted(1).unwrap();
     drop(op);
+    assert_eq!(slab.idle_bytes(), 0);
+    assert_eq!(slab.reclaim_idle(), 0);
     segments.begin_evict(SegmentId(0)).unwrap();
     assert_eq!(segments.recycle(SegmentId(0)), Err(Error::Busy));
     drive(&reactor, reactor.drain()).unwrap();
+    let reused = slab.allocate(4096, ()).unwrap();
+    assert!(reused.as_slice().iter().all(|b| *b == 0));
     segments.recycle(SegmentId(0)).unwrap();
 }
 
