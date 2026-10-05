@@ -776,6 +776,16 @@ impl Drop for NativeQueuePair {
 mod tests {
     //! Endpoint validation and optional native discovery contracts.
     use super::*;
+
+    /// Require the real adapter's ABI and every symbol without opening any device.
+    #[cfg(all(feature = "native", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires built C adapter on loader path; no RDMA hardware required"]
+    fn required_native_adapter_loads_abi_and_symbols() {
+        let api = Api::load().expect("built native adapter must load with ABI 2 and all symbols");
+        assert!(api.library.is_some(), "must load C adapter, not simulation");
+    }
+
     #[test]
     /// Reject queue pair numbers outside the native 24-bit field.
     fn endpoint_rejects_invalid_native_parameters() {

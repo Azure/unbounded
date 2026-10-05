@@ -269,7 +269,9 @@ pub struct QueuePairHandle {
 
 /// The slot's buffer, seen from the I/O thread.
 ///
-/// Fill it before a write. Read it only after the QP has stopped.
+/// CPU writes fill staging memory only. The native thread copies staging into
+/// registered memory when executing a write, not when binding a receive window.
+/// Read received bytes only after the QP has stopped and readback is published.
 pub struct Region {
     lease: Rc<Lease>,
     length: usize,

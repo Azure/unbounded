@@ -13,6 +13,8 @@
 //! 5. Check what happened with [`Simulation::trace`].
 //!
 //! Addresses seen on the wire are fake; they are never host pointers.
+//! Device names must be unique within a discovery view, even for different ports.
+//! A remote QP must already exist in this fabric before its peer connects to it.
 use super::*;
 use std::collections::VecDeque;
 
@@ -205,7 +207,8 @@ impl Simulation {
         }
     }
     /// A view of the same fabric that discovers `devices`.
-    /// Rejects more than 64 ports, bad names, zero GIDs or ports, and duplicates.
+    /// Rejects more than 64 ports, bad names, zero GIDs or ports, and duplicate
+    /// device names, including entries with the same name but different ports.
     pub fn with_devices(&self, devices: Vec<Device>) -> Result<Self> {
         if devices.len() > 64
             || devices.iter().any(|d| {
