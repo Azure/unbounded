@@ -120,7 +120,7 @@ func configuration(t *testing.T, env *component.Env) racercore.Config {
 func initialize(t *testing.T, env *component.Env) racercore.Config {
 	t.Helper()
 
-	for range 4 {
+	for range 6 {
 		plan := planPass(t, env)
 		require.NotContains(t, plan.Summary(), "DaemonSet/")
 		persist(t, env, plan)
@@ -319,6 +319,12 @@ func TestClaimCrashAndConflict(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			env := testEnv(t, cache("cache"))
 			persist(t, env, planPass(t, env))
+			// Preserve coverage of ambiguous legacy claims; new installations use
+			// the separately tested staged protocol.
+			claim := &corev1.ConfigMap{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, claimName), claim))
+			delete(claim.Data, operatorInitialization)
+			require.NoError(t, env.Client.Update(t.Context(), claim))
 			plan := planPass(t, env)
 			require.Len(t, plan.Operations, 2)
 
@@ -375,7 +381,7 @@ func TestStandaloneAndReadFailure(t *testing.T) {
 
 func TestInitializerDependsOnPrerequisites(t *testing.T) {
 	env := testEnv(t, cache("cache"))
-	for range 3 {
+	for range 5 {
 		persist(t, env, planPass(t, env))
 	}
 
@@ -452,7 +458,7 @@ func TestInitializationFailureStates(t *testing.T) {
 	for _, scenario := range []string{"failed", "foreign", "completed-fresh", "consumed-active", "consumed-missing", "fresh-version"} {
 		t.Run(scenario, func(t *testing.T) {
 			env := testEnv(t, cache("cache"))
-			for range 4 {
+			for range 6 {
 				persist(t, env, planPass(t, env))
 			}
 

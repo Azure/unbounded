@@ -21,10 +21,16 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-// The permanent operator claim authorizes exactly one marker Create. Its CAS is
-// committed before that Create. A crash between them intentionally needs manual
-// recovery with a new identity, rather than risking counter reuse after loss of
-// established state. Never delete or reset either permanent object to retry.
+const (
+	operatorInitialization = "initialization_protocol"
+	operatorStaged         = "staged-v1"
+	operatorMarkerUID      = "marker_uid"
+	operatorPending        = "operator-pending"
+)
+
+// New claims stage a non-startable marker before permanently binding its UID.
+// Legacy claims retain the one-shot Create contract: their ambiguous crash gaps
+// cannot safely be upgraded. Never delete or reset either permanent object.
 func planIdentity(ctx context.Context, env *component.Env, plan *component.Plan) (*corev1.ConfigMap, error) {
 	claim := &corev1.ConfigMap{}
 
@@ -37,7 +43,7 @@ func planIdentity(ctx context.Context, env *component.Env, plan *component.Plan)
 		add(plan, component.OpCreateIfAbsent, &corev1.ConfigMap{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 			ObjectMeta: metav1.ObjectMeta{Name: claimName, Namespace: env.Namespace, Annotations: map[string]string{managerAnnotation: component.FieldOwner}},
-			Data:       map[string]string{"cluster": uuid.NewString(), "state": "reserved"},
+			Data:       map[string]string{"cluster": uuid.NewString(), "state": "reserved", operatorInitialization: operatorStaged},
 		})
 
 		return nil, nil
@@ -49,6 +55,14 @@ func planIdentity(ctx context.Context, env *component.Env, plan *component.Plan)
 
 	if claim.Annotations[managerAnnotation] != component.FieldOwner || claim.UID == "" || claim.ResourceVersion == "" || claim.DeletionTimestamp != nil || !wire.ValidUUID(claim.Data["cluster"]) {
 		return nil, fmt.Errorf("invalid Racer operator claim; restore consistent installation state")
+	}
+
+	if protocol := claim.Data[operatorInitialization]; protocol != "" {
+		if protocol != operatorStaged {
+			return nil, fmt.Errorf("unknown Racer operator initialization protocol")
+		}
+
+		return planStagedIdentity(ctx, env, plan, claim)
 	}
 
 	if claim.Data["state"] == "reserved" && !ptr.Deref(claim.Immutable, false) {
@@ -98,12 +112,22 @@ func claimedMarker(ctx context.Context, env *component.Env, claim *corev1.Config
 		return nil, fmt.Errorf("racer marker does not match the permanent operator claim")
 	}
 
+	if protocol := claim.Data[operatorInitialization]; protocol != "" && (protocol != operatorStaged || claim.Data[operatorMarkerUID] != string(marker.UID) || marker.Data[operatorInitialization] != operatorStaged) {
+		return nil, fmt.Errorf("racer marker UID does not match the permanent operator claim")
+	}
+
 	return marker, nil
 }
 
 // Do not adopt standalone resources or create a new identity over evidence of a
 // previous installation, even when its operator claim has been lost.
 func checkNewInstallation(ctx context.Context, env *component.Env) error {
+	return checkInstallationResources(ctx, env, false)
+}
+
+// A staged marker is the only permitted preexisting resource before claim
+// commitment. It is validated separately, never treated as serving authority.
+func checkInstallationResources(ctx context.Context, env *component.Env, stagedMarker bool) error {
 	// RBAC names are cluster-scoped, so a standalone installation in another
 	// namespace is also a conflict. Never repoint its controller binding.
 	for _, obj := range []client.Object{&rbacv1.ClusterRole{}, &rbacv1.ClusterRoleBinding{}} {
@@ -130,6 +154,10 @@ func checkNewInstallation(ctx context.Context, env *component.Env) error {
 		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: racercore.PodNetworkDaemonSetName}},
 	}
 	for _, obj := range objects {
+		if stagedMarker && obj.GetName() == markerName {
+			continue
+		}
+
 		err := env.LiveReader().Get(ctx, objectKey(env, obj.GetName()), obj)
 		if err == nil {
 			return fmt.Errorf("racer resource %s exists without an operator installation; standalone installations are not adopted and lost claims must be restored", obj.GetName())
@@ -141,4 +169,69 @@ func checkNewInstallation(ctx context.Context, env *component.Env) error {
 	}
 
 	return nil
+}
+
+func planStagedIdentity(ctx context.Context, env *component.Env, plan *component.Plan, claim *corev1.ConfigMap) (*corev1.ConfigMap, error) {
+	if claim.Data["state"] == "consumed" {
+		marker, err := claimedMarker(ctx, env, claim)
+		if err != nil {
+			return nil, err
+		}
+
+		if marker.Data["state"] != operatorPending {
+			return marker, nil
+		}
+
+		if ptr.Deref(marker.Immutable, false) || marker.Data["version_uid"] != "" {
+			return nil, fmt.Errorf("invalid Racer pending marker")
+		}
+		// Only this exact UID has been committed. A stale promotion cannot apply
+		// to a replacement object because the patch uses resourceVersion CAS.
+		marker.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
+		fresh := marker.DeepCopy()
+		fresh.Data["state"] = "fresh"
+		plan.Add(component.Operation{Kind: component.OpMergePatch, Component: name, Base: component.ToUnstructured(marker), Object: component.ToUnstructured(fresh)})
+
+		return nil, nil
+	}
+
+	if claim.Data["state"] != "reserved" || ptr.Deref(claim.Immutable, false) || claim.Data[operatorMarkerUID] != "" {
+		return nil, fmt.Errorf("invalid Racer staged operator claim")
+	}
+
+	if err := checkInstallationResources(ctx, env, true); err != nil {
+		return nil, err
+	}
+
+	marker := &corev1.ConfigMap{}
+
+	err := env.LiveReader().Get(ctx, objectKey(env, markerName), marker)
+	if apierrors.IsNotFound(err) {
+		// The controller rejects operator-pending. This matters even if a stale
+		// Create executes after another installer committed and lost its marker.
+		add(plan, component.OpCreateIfAbsent, &corev1.ConfigMap{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+			ObjectMeta: metav1.ObjectMeta{Name: markerName, Namespace: env.Namespace, Annotations: map[string]string{managerAnnotation: component.FieldOwner, claimAnnotation: string(claim.UID)}},
+			Data:       map[string]string{"cluster": claim.Data["cluster"], "version_configmap": versionName, "state": operatorPending, operatorInitialization: operatorStaged},
+		})
+
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if marker.UID == "" || marker.ResourceVersion == "" || marker.DeletionTimestamp != nil || ptr.Deref(marker.Immutable, false) || marker.Annotations[managerAnnotation] != component.FieldOwner || marker.Annotations[claimAnnotation] != string(claim.UID) || marker.Data["cluster"] != claim.Data["cluster"] || marker.Data["version_configmap"] != versionName || marker.Data["state"] != operatorPending || marker.Data[operatorInitialization] != operatorStaged || marker.Data["version_uid"] != "" {
+		return nil, fmt.Errorf("invalid Racer staged marker; refusing adoption")
+	}
+
+	claim.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
+	committed := claim.DeepCopy()
+	committed.Data["state"] = "consumed"
+	committed.Data[operatorMarkerUID] = string(marker.UID)
+	committed.Immutable = ptr.To(true)
+	plan.Add(component.Operation{Kind: component.OpMergePatch, Component: name, Base: component.ToUnstructured(claim), Object: component.ToUnstructured(committed)})
+
+	return nil, nil
 }

@@ -6,6 +6,18 @@ and RBAC. No initialization Job or `initialize` CLI command is used. Dataplanes
 remain gated on valid, installation-UID-bound version state; normal serving
 readiness still requires validated replicated state.
 
+New operator claims also use `initialization_protocol: staged-v1`. The operator
+creates a marker in `operator-pending`, which controller startup rejects. It then
+freezes the claim with the marker's Kubernetes UID in `marker_uid`, and finally
+promotes that exact marker to `fresh` through resource-version CAS. Each boundary
+is restartable, including uncertain API responses. Workloads and serving TLS are
+not provisioned until the UID-bound marker is promoted. A delayed stale Create can
+leave only a non-startable orphan, never a replacement installation. Once the
+claim is consumed, a missing or different marker UID fails closed. Legacy operator
+claims without this protocol retain one-shot claim-before-Create ordering and
+cannot be upgraded to recover ambiguous missing markers. Preserve both objects;
+never reset claims or rewrite immutable UID commitments.
+
 Every controller replica runs the same startup guard before recovery and manager
 startup. A valid consumed, immutable marker and valid version record require no
 writes. New operator installations and fresh standalone manifests select
