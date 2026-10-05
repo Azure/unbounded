@@ -731,10 +731,10 @@ racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery 
 	$(MAKE) racer-admission-envtest KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)"
 
 .PHONY: racer-admission-envtest
-racer-admission-envtest: ## Verify deployed Racer RBAC and admission with a real API server
+racer-admission-envtest: ## Verify Racer operator RBAC, admission, identity recovery, dataplane and strategy with a real API server
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
 	@mkdir -p tmp/racer-envtest
-	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/operator/components/racer -run '^TestEnvtestRuntime' -count=1 -v -timeout=5m
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/operator/components/racer -run '^Test.*Envtest' -count=1 -v -timeout=5m
 
 racer-scale: ## Measure 100,000-member reconciliation and publication waiters (not HTTPS capacity)
 	@mkdir -p tmp/racer-scale

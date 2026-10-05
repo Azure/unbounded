@@ -82,7 +82,8 @@ is necessarily namespace-wide in RBAC, so the fail-closed admission policy must
 be installed before the RoleBinding and controller workload.
 
 `make racer-admission-envtest KUBEBUILDER_ASSETS=/path/to/envtest/assets` runs the
-real API-server admission and RBAC regressions with a five-minute command bound.
+real API-server operator component regressions for admission, RBAC, identity
+recovery, dataplane apply, and update strategy with a five-minute command bound.
 CI provisions assets and includes this target in `make racer-envtest-ci`.
 
 The permanent credentials annotation on the version ConfigMap records
