@@ -449,7 +449,69 @@ pub struct MemoryCache {
     ciphertext_cursor: RefCell<Option<PageId>>,
     availability: Rc<crate::control::Availability>,
 }
+
+/// One bounded view of the LRU clock. Touches and insertions after this cut are
+/// not chased; another reclaimer cannot move this operation's cursor.
+pub(crate) struct PlaintextReclaim {
+    after: u64,
+    through: u64,
+}
 impl MemoryCache {
+    pub(crate) fn plaintext_reclaim(&self) -> PlaintextReclaim {
+        PlaintextReclaim {
+            after: 0,
+            through: self.entries.borrow().clock,
+        }
+    }
+
+    /// Visit at most 256 entries from the initial clock cut. Return whether that
+    /// cut is exhausted, preserving both plaintext and ciphertext live owners.
+    pub(crate) fn reclaim_plaintext_quantum(
+        &self,
+        cursor: &mut PlaintextReclaim,
+        cache: Option<&CacheId>,
+        bytes: usize,
+        mut release_queued: impl FnMut(&PageResult) -> usize,
+    ) -> bool {
+        let mut entries = self.entries.borrow_mut();
+        let selected: Vec<_> = entries
+            .lru
+            .range((
+                std::ops::Bound::Excluded(cursor.after),
+                std::ops::Bound::Included(cursor.through),
+            ))
+            .take(256)
+            .map(|(tick, id)| (*tick, id.clone()))
+            .collect();
+        let mut released = 0usize;
+        for (tick, id) in selected {
+            cursor.after = tick;
+            let entry = &entries.pages[&id].1;
+            if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache)
+                || Arc::strong_count(&entry.plaintext.inner) != 1
+            {
+                continue;
+            }
+            release_queued(entry);
+            if !idle(entry) {
+                continue;
+            }
+            released = released.saturating_add(entry.plaintext.inner.reservation.amount());
+            entries.remove(&id);
+            if released >= bytes {
+                break;
+            }
+        }
+        entries
+            .lru
+            .range((
+                std::ops::Bound::Excluded(cursor.after),
+                std::ops::Bound::Included(cursor.through),
+            ))
+            .next()
+            .is_none()
+    }
+
     pub fn new(pool: BufferPool, availability: Rc<crate::control::Availability>) -> Self {
         Self {
             pool,

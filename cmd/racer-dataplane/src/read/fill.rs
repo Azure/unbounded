@@ -317,6 +317,50 @@ impl Fill {
     }
 
     /// Observe mandatory acquisition only, never optional persistence or hedges.
+    pub(super) async fn reserve_network_plaintext(
+        &self,
+        scope: &RequestScope,
+        page: &PageId,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
+        let admission = &self.dependencies.admission;
+        let cache = &page.version.object.cache;
+        let amount = PAGE_BYTES as usize;
+        let mut cursor = self.dependencies.memory.plaintext_reclaim();
+        let mut exhausted = false;
+        loop {
+            scope.check()?;
+            let (result, detail) = admission.policy().capture_rejection(|| {
+                admission
+                    .reserve(Some(cache), ResourceClass::Plaintext, amount)
+                    .map_err(Into::into)
+            });
+            if !matches!(result, Err(Error::Overloaded)) {
+                return result;
+            }
+            let deficit = admission.reclamation(cache, ResourceClass::Plaintext, amount);
+            if exhausted || deficit.is_none() {
+                admission.policy().observer().final_fill_admission(
+                    scope,
+                    Some(page.number.0),
+                    FillAdmissionSite::NetworkPlaintext,
+                    detail,
+                );
+                return result;
+            }
+            let (owner, bytes) = deficit.unwrap();
+            exhausted = self.dependencies.memory.reclaim_plaintext_quantum(
+                &mut cursor,
+                owner.as_ref(),
+                bytes,
+                |page| self.dependencies.writer.discard_idle_copy(page),
+            );
+            // Always yield between scan quanta and the next reservation, including
+            // the final retry. Cancellation never extends the original allowance.
+            crate::runtime::cooperative_turn().await;
+        }
+    }
+
+    /// Observe mandatory acquisition only, never optional persistence or hedges.
     pub(super) fn observe_reservation<T>(
         &self,
         scope: &RequestScope,
@@ -1095,12 +1139,7 @@ impl Fill {
         // Cipher-only acquisitions reserve no plaintext until origin actually
         // supplies a page. Requester consumers still authenticate before acceptance.
         let mut plaintext = if want_plaintext {
-            Some(self.observe_reservation(
-                scope,
-                page,
-                FillAdmissionSite::NetworkPlaintext,
-                || self.reserve_bootstrap(&context.object.cache),
-            )?)
+            Some(self.reserve_network_plaintext(scope, page).await?)
         } else {
             None
         };

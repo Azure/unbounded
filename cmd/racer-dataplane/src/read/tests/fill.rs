@@ -1,6 +1,249 @@
 use crate::read::dispatch::WorkerMap;
 
 #[test]
+fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(858_993_459).unwrap();
+    limits.metadata_entries = std::num::NonZeroUsize::new(819).unwrap();
+    let f = fixture_with(3, Some(limits));
+    let admission = &f.fill.dependencies.admission;
+    let cache = &f.fill.dependencies.memory;
+    let mut tiny = Vec::new();
+    let mut large = None;
+    for index in 0..=512 {
+        let length = if index == 512 {
+            PAGE_BYTES as usize
+        } else {
+            1024
+        };
+        let mut metadata = f.origin.metadata.clone();
+        metadata.length = length as u64;
+        metadata.version.etag = StrongEtag::test_value(&format!("idle-{index}"));
+        let id = PageId {
+            version: metadata.version.clone(),
+            number: PageNumber(0),
+        };
+        // Real-sized backing and matching descriptors, not inflated reservations
+        // on tiny payloads. No external reader or writer pins these cache entries.
+        let plaintext = crate::memory::VerifiedPage {
+            inner: Arc::new(crate::memory::VerifiedBytes {
+                page: id.clone(),
+                bytes: vec![1; length],
+                reservation: admission
+                    .reserve(
+                        Some(&f.context.object.cache),
+                        ResourceClass::Plaintext,
+                        length,
+                    )
+                    .unwrap(),
+            }),
+        };
+        let ciphertext = f
+            .fill
+            .dependencies
+            .buffers
+            .ciphertext(
+                admission
+                    .reserve(
+                        Some(&f.context.object.cache),
+                        ResourceClass::Ciphertext,
+                        length + 16,
+                    )
+                    .unwrap(),
+                crate::model::PageEnvelope {
+                    page: id.clone(),
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                    nonce: crate::model::Nonce([2; 24]),
+                    plaintext_length: length as u32,
+                    ciphertext_length: (length + 16) as u32,
+                },
+                vec![2; length + 16],
+            )
+            .unwrap();
+        cache
+            .publish(PageResult {
+                metadata,
+                plaintext,
+                ciphertext,
+            })
+            .unwrap();
+        if index == 512 {
+            large = Some(id);
+        } else {
+            tiny.push(id);
+        }
+    }
+    let pressure = admission
+        .reserve(None, ResourceClass::Plaintext, 828_901_886)
+        .unwrap();
+    assert_eq!(admission.used(ResourceClass::Plaintext), 846_203_390);
+    let mut reserve = Box::pin(f.fill.reserve_network_plaintext(&f.scope, &f.page));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(reserve.as_mut().poll(&mut cx).is_pending());
+    assert!(reserve.as_mut().poll(&mut cx).is_pending());
+    {
+        // Match the captured final failure exactly, then prove the capacity was
+        // available in an idle entry beyond the two visited batches.
+        assert_eq!(admission.used(ResourceClass::Plaintext), 845_679_102);
+        assert_eq!(
+            admission.limit(ResourceClass::Plaintext) - admission.used(ResourceClass::Plaintext),
+            13_314_357
+        );
+        for id in &tiny {
+            assert!(cache.get(id).unwrap().is_none());
+        }
+        assert_eq!(pressure.amount(), 828_901_886);
+    }
+    assert!(reserve.as_mut().poll(&mut cx).is_pending());
+    let Poll::Ready(Ok(result)) = reserve.as_mut().poll(&mut cx) else {
+        panic!("one catalog cycle must reclaim the idle large page");
+    };
+    assert_eq!(result.amount(), PAGE_BYTES as usize);
+    assert!(cache.get(large.as_ref().unwrap()).unwrap().is_none());
+    assert_eq!(pressure.amount(), 828_901_886);
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+#[test]
+fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
+    for mode in ["busy", "cancel", "deadline"] {
+        let cancel = mode != "busy";
+        let clock = uring_runtime::environment::SimulationClock::new(912);
+        let _clock = clock.environment(0).enter();
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.metadata_entries = std::num::NonZeroUsize::new(819).unwrap();
+        let f = fixture_with(3, Some(limits));
+        let admission = &f.fill.dependencies.admission;
+        let mut held = Vec::new();
+        for n in 0..513 {
+            let mut descriptor = f.origin.metadata.immutable();
+            descriptor.version.etag = StrongEtag::test_value(&format!("busy-{n}"));
+            let page = crate::memory::tests::bundle_for(admission, descriptor);
+            f.fill.dependencies.memory.publish(page.clone()).unwrap();
+            held.push(page);
+        }
+        let _pressure = admission
+            .reserve(
+                None,
+                ResourceClass::Plaintext,
+                admission.limit(ResourceClass::Plaintext)
+                    - admission.used(ResourceClass::Plaintext),
+            )
+            .unwrap();
+        let failures = crate::telemetry::Failures::default();
+        admission
+            .policy()
+            .set_observer(failures.observer(WorkerId(0)));
+        let scope = RequestScope::new(
+            f.scope.request,
+            uring_runtime::environment::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut reserve = Box::pin(f.fill.reserve_network_plaintext(&scope, &f.page));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(reserve.as_mut().poll(&mut cx).is_pending());
+        if cancel {
+            let expected = if mode == "deadline" {
+                clock.advance(Duration::from_secs(120));
+                Error::DeadlineExceeded
+            } else {
+                scope.cancel().unwrap();
+                Error::Cancelled
+            };
+            assert!(matches!(
+                reserve.as_mut().poll(&mut cx),
+                Poll::Ready(Err(error)) if error == expected
+            ));
+        } else {
+            assert!(reserve.as_mut().poll(&mut cx).is_pending());
+            assert!(reserve.as_mut().poll(&mut cx).is_pending());
+            assert!(matches!(
+                reserve.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
+        }
+        for page in held {
+            assert_eq!(page.plaintext.bytes(), &[1; 3]);
+        }
+        let mut out = String::new();
+        failures.write_protected(true, &mut out).unwrap();
+        assert!(
+            out.contains(if cancel {
+                "total=0 retained=0"
+            } else {
+                "total=1 retained=1"
+            }),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn cooperative_reclaim_fair_share_keeps_other_cache_and_live_ciphertext() {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
+    let other = CacheId("44444444-4444-4444-8444-444444444444".into());
+    let f = fixture_with_caches(
+        3,
+        Some(limits),
+        vec![
+            CacheId(crate::test_support::security::CACHE.into()),
+            other.clone(),
+        ],
+    );
+    let admission = &f.fill.dependencies.admission;
+    let cache = &f.fill.dependencies.memory;
+    let mut descriptor = f.origin.metadata.immutable();
+    descriptor.version.object.cache = other;
+    let foreign = crate::memory::tests::bundle_for(admission, descriptor);
+    let foreign_id = foreign.plaintext.page().clone();
+    cache.publish(foreign).unwrap();
+    let own = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
+    let ciphertext = own.ciphertext.clone();
+    cache.publish(own).unwrap();
+    let _pressure = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Plaintext,
+            2 * PAGE_BYTES as usize - 3,
+        )
+        .unwrap();
+    let result = futures::executor::block_on(f.fill.reserve_network_plaintext(&f.scope, &f.page));
+    assert!(matches!(result, Err(Error::Overloaded)));
+    assert!(cache.get(&foreign_id).unwrap().is_some());
+    assert!(cache.get(&f.page).unwrap().is_some());
+    assert_eq!(ciphertext.bytes(), &[2; 19]);
+}
+
+#[test]
+fn cooperative_reclaim_clock_cut_ignores_new_touches_and_other_cursors() {
+    let f = fixture();
+    let admission = &f.fill.dependencies.admission;
+    let cache = &f.fill.dependencies.memory;
+    let first = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
+    let id = first.plaintext.page().clone();
+    cache.publish(first).unwrap();
+    let mut scan = cache.plaintext_reclaim();
+    // A fresh lookup moves this entry beyond the captured upper tick.
+    drop(cache.get(&id).unwrap());
+    let mut descriptor = f.origin.metadata.immutable();
+    descriptor.version.etag = StrongEtag::test_value("new");
+    cache
+        .publish(crate::memory::tests::bundle_for(admission, descriptor))
+        .unwrap();
+    assert!(cache.reclaim_plaintext_quantum(&mut scan, None, 1, |_| 0));
+    assert!(cache.get(&id).unwrap().is_some());
+    let mut scan = cache.plaintext_reclaim();
+    assert_eq!(
+        cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
+        3
+    );
+    assert!(cache.reclaim_plaintext_quantum(&mut scan, None, usize::MAX, |_| 0));
+    admission.reclaim_buffers();
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+}
+
+#[test]
 fn final_fill_reclaim_success_and_ignored_writeback_are_silent() {
     let f = fixture();
     let admission = &f.fill.dependencies.admission;
