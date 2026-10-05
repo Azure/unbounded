@@ -1,6 +1,235 @@
 use crate::read::dispatch::WorkerMap;
 
 #[test]
+fn optional_persistence_full_page_residency_above_half_budget_makes_progress() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(8 * PAGE_BYTES as usize).unwrap();
+    limits.ciphertext_bytes = std::num::NonZeroUsize::new(8 * (PAGE_BYTES as usize + 16)).unwrap();
+    let mut f = fixture_with(5 * PAGE_BYTES, Some(limits));
+    f.fill
+        .dependencies
+        .writer
+        .retention()
+        .set_ownership(Rc::new(|_| false));
+    let mut last = None;
+    for number in 0..5 {
+        let page = PageId {
+            version: f.page.version.clone(),
+            number: PageNumber(number),
+        };
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        last = Some(
+            drive(
+                f.fill.acquire_unobserved(
+                    page,
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope,
+                    &mut budget,
+                ),
+                &mut f.engine,
+                &f.crypto,
+            )
+            .unwrap(),
+        );
+        f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    }
+    let last = last.unwrap();
+    let deps = &f.fill.dependencies;
+    let admission = &deps.admission;
+    assert_eq!(deps.writer.pending_count(), 0);
+    assert!(
+        admission.used(ResourceClass::Ciphertext) > admission.limit(ResourceClass::Ciphertext) / 2
+    );
+    f.fill.observe_verified(&last, &f.scope);
+    f.fill.observe_verified(&last, &f.scope);
+    assert_eq!(deps.writer.pending_count(), 1);
+    assert_eq!(deps.writer.retention().snapshot().persistence_accepted, 1);
+    assert!(
+        admission.used(ResourceClass::Ciphertext) <= admission.limit(ResourceClass::Ciphertext) / 2
+    );
+    assert_eq!(
+        admission.retained_buffer_bytes(),
+        0,
+        "evicted full-page backing must release pooled charges"
+    );
+    assert_eq!(last.plaintext.bytes()[0], 4);
+    assert_eq!(deps.writer.discarded_count(), 0);
+}
+
+#[test]
+fn optional_persistence_recycler_pressure_does_not_evict_memory_unnecessarily() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let f = fixture();
+    let deps = &f.fill.dependencies;
+    let admission = &deps.admission;
+    deps.writer.retention().set_ownership(Rc::new(|_| false));
+    let incoming = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
+    let mut metadata = f.origin.metadata.immutable();
+    metadata.version.etag = StrongEtag::test_value("keep-idle");
+    let idle = crate::memory::tests::bundle_for(admission, metadata);
+    let id = idle.plaintext.page().clone();
+    deps.memory.publish(idle).unwrap();
+    let mut recycled = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            1024 * 1024,
+        )
+        .unwrap();
+    let backing = recycled.buffer(1024 * 1024).unwrap();
+    recycled.recycle(backing);
+    drop(recycled);
+    assert_eq!(admission.retained_buffer_bytes(), 1024 * 1024);
+    let ceiling = admission.limit(ResourceClass::Ciphertext) / 2;
+    let held = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            ceiling - admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    f.fill.observe_verified(&incoming, &f.scope);
+    f.fill.observe_verified(&incoming, &f.scope);
+    assert_eq!(deps.writer.pending_count(), 1);
+    assert_eq!(admission.retained_buffer_bytes(), 0);
+    assert!(deps.memory.get(&id).unwrap().is_some());
+    assert!(admission.used(ResourceClass::Ciphertext) <= ceiling);
+    assert_eq!(deps.writer.discarded_count(), 0);
+    drop(held);
+}
+
+#[test]
+fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.metadata_entries = std::num::NonZeroUsize::new(1024).unwrap();
+    limits.ciphertext_bytes = std::num::NonZeroUsize::new(128 * 1024 * 1024).unwrap();
+    let f = fixture_with(3, Some(limits));
+    let deps = &f.fill.dependencies;
+    let admission = &deps.admission;
+    deps.writer.retention().set_ownership(Rc::new(|_| false));
+    let incoming = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
+    let mut ids = Vec::new();
+    for n in 0..300 {
+        let mut metadata = f.origin.metadata.immutable();
+        metadata.version.etag = StrongEtag::test_value(&format!("idle-{n}"));
+        let page = crate::memory::tests::bundle_for(admission, metadata);
+        ids.push(page.plaintext.page().clone());
+        deps.memory.publish(page).unwrap();
+    }
+    let staging = deps
+        .writer
+        .slabs()
+        .alignment()
+        .unwrap()
+        .extent(0, crate::store::logical_length(&incoming.copy()).unwrap())
+        .unwrap()
+        .length();
+    let ceiling = admission.limit(ResourceClass::Ciphertext) / 2;
+    let deficit = 256 * 19 + 1;
+    let held = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            ceiling - staging + deficit - admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    assert!(!crate::read::fill::optional_headroom(
+        admission.limit(ResourceClass::Ciphertext),
+        admission.used(ResourceClass::Ciphertext),
+        staging,
+        PAGE_BYTES as usize + 16 + staging
+    ));
+    // First sight does nothing; one eligible attempt cannot scan all 300 entries.
+    f.fill.observe_verified(&incoming, &f.scope);
+    f.fill.observe_verified(&incoming, &f.scope);
+    assert_eq!(deps.writer.pending_count(), 0);
+    assert_eq!(deps.writer.retention().snapshot().persistence_attempts, 1);
+    assert_eq!(
+        admission.used(ResourceClass::Ciphertext),
+        ceiling - staging + 1
+    );
+    assert_eq!(
+        ids.iter()
+            .filter(|id| deps.memory.get(id).unwrap().is_some())
+            .count(),
+        44
+    );
+    // Cursor progress reaches the remainder, evicting just one more whole page.
+    f.fill.observe_verified(&incoming, &f.scope);
+    assert_eq!(deps.writer.pending_count(), 1);
+    assert_eq!(deps.writer.retention().snapshot().persistence_accepted, 1);
+    assert_eq!(
+        ids.iter()
+            .filter(|id| deps.memory.get(id).unwrap().is_some())
+            .count(),
+        43
+    );
+    assert_eq!(admission.used(ResourceClass::Ciphertext), ceiling - 18);
+    assert_eq!(deps.writer.discarded_count(), 0);
+    drop(held);
+}
+
+#[test]
+fn optional_persistence_idle_reclaim_preserves_active_and_queued_owners() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let f = fixture();
+    let deps = &f.fill.dependencies;
+    let admission = &deps.admission;
+    let policy = deps.writer.retention();
+    policy.set_ownership(Rc::new(|_| false));
+    let incoming = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
+    let mut metadata = f.origin.metadata.immutable();
+    metadata.version.etag = StrongEtag::test_value("active");
+    let active = crate::memory::tests::bundle_for(admission, metadata.clone());
+    deps.memory.publish(active.clone()).unwrap();
+    metadata.version.etag = StrongEtag::test_value("queued");
+    let queued = crate::memory::tests::bundle_for(admission, metadata);
+    let queued_id = queued.plaintext.page().clone();
+    deps.memory.publish(queued.clone()).unwrap();
+    let dirty = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::DirtyCiphertext,
+            19,
+        )
+        .unwrap();
+    deps.writer.enqueue(queued.copy(), dirty).unwrap();
+    drop(queued);
+    let held = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            admission.limit(ResourceClass::Ciphertext) - admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    f.fill.observe_verified(&incoming, &f.scope);
+    f.fill.observe_verified(&incoming, &f.scope);
+    assert_eq!(policy.snapshot().persistence_attempts, 1);
+    assert_eq!(policy.snapshot().persistence_accepted, 0);
+    assert_eq!(deps.writer.pending_count(), 1);
+    assert_eq!(deps.writer.queued_count(), 1);
+    assert_eq!(deps.writer.discarded_count(), 0);
+    assert!(deps.writer.copy_only(&queued_id).unwrap().is_some());
+    assert!(deps.memory.get(&queued_id).unwrap().is_some());
+    assert!(deps.memory.get(active.plaintext.page()).unwrap().is_some());
+    assert_eq!(active.plaintext.bytes(), &[1; 3]);
+    assert_eq!(incoming.plaintext.bytes(), &[1; 3]);
+    assert_eq!(
+        admission.used(ResourceClass::Ciphertext),
+        admission.limit(ResourceClass::Ciphertext)
+    );
+    assert_eq!(admission.used(ResourceClass::DirtyCiphertext), 19);
+    drop(held);
+}
+
+#[test]
 fn optional_persistence_reclaims_completed_idle_slab_before_pressure_rejection() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
