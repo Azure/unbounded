@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/license"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
@@ -275,6 +277,10 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 
 		licenseNames, classifyErr := license.Classify(licenseText)
 		if classifyErr != nil {
+			if licenseIndex(licensePath, licenseText, licensePaths) {
+				continue
+			}
+
 			return notice.Entry{}, fmt.Errorf("classifying %s: %w", licensePath, classifyErr)
 		}
 
@@ -307,6 +313,27 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 	}
 
 	return entry, nil
+}
+
+// Some crates use LICENSE only as an index of their full license files.
+// Every referenced companion is still classified separately, failing closed.
+func licenseIndex(path string, text []byte, paths []string) bool {
+	if filepath.Base(path) != "LICENSE" || len(paths) < 2 {
+		return false
+	}
+
+	for _, companion := range paths {
+		if companion == path {
+			continue
+		}
+
+		name := filepath.Base(companion)
+		if !strings.HasPrefix(name, "LICENSE-") || !strings.Contains(string(text), name) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func declaredLicenses(expression, link string) []notice.License {
@@ -380,7 +407,9 @@ func directDependencies(data string) (map[string]dependency, error) {
 
 	scanner := bufio.NewScanner(strings.NewReader(data))
 	for scanner.Scan() {
-		line := strings.TrimSpace(strings.SplitN(scanner.Text(), "#", 2)[0])
+		line, _, _ := cutUnquoted(scanner.Text(), '#')
+
+		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
 			continue
@@ -398,11 +427,22 @@ func directDependencies(data string) (map[string]dependency, error) {
 		name := strings.Trim(strings.TrimSpace(key), `"'`)
 
 		packageName := name
-		if parsed := inlineField(value, "package"); parsed != "" {
+
+		parsed, err := inlineField(value, "package")
+		if err != nil {
+			return nil, fmt.Errorf("dependency %s: %w", name, err)
+		}
+
+		if parsed != "" {
 			packageName = parsed
 		}
 
-		direct[name] = dependency{packageName: packageName, path: inlineField(value, "path")}
+		path, err := inlineField(value, "path")
+		if err != nil {
+			return nil, fmt.Errorf("dependency %s: %w", name, err)
+		}
+
+		direct[name] = dependency{packageName: packageName, path: path}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -412,15 +452,66 @@ func directDependencies(data string) (map[string]dependency, error) {
 	return direct, nil
 }
 
-func inlineField(value, name string) string {
-	for _, field := range strings.Split(strings.Trim(value, " {}"), ",") {
-		key, fieldValue, found := strings.Cut(field, "=")
-		if found && strings.TrimSpace(key) == name {
-			return quotedValue(strings.TrimSpace(fieldValue))
+// cutUnquoted finds separators outside single-line TOML strings. In literal
+// strings backslashes are ordinary characters; in basic strings they escape.
+func cutUnquoted(value string, separator byte) (string, string, bool) {
+	var quote byte
+
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if quote != 0 {
+			if quote == '"' && ch == '\\' {
+				i++
+			} else if ch == quote {
+				quote = 0
+			}
+
+			continue
+		}
+
+		if ch == separator {
+			return value[:i], value[i+1:], true
+		}
+
+		if ch == '\'' || ch == '"' {
+			quote = ch
 		}
 	}
 
-	return ""
+	return value, "", false
+}
+
+func inlineField(value, name string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "{") {
+		return "", nil
+	}
+
+	if !strings.HasSuffix(value, "}") {
+		return "", fmt.Errorf("invalid inline dependency table %q", value)
+	}
+
+	for rest := value[1 : len(value)-1]; rest != ""; {
+		var field string
+
+		field, rest, _ = cutUnquoted(rest, ',')
+
+		key, fieldValue, found := strings.Cut(field, "=")
+		if found && strings.TrimSpace(key) == name {
+			parsed, err := parseQuotedValue(strings.TrimSpace(fieldValue))
+			if err != nil {
+				return "", fmt.Errorf("invalid %s: %w", name, err)
+			}
+
+			if parsed == "" {
+				return "", fmt.Errorf("empty %s", name)
+			}
+
+			return parsed, nil
+		}
+	}
+
+	return "", nil
 }
 
 func dependencySection(section string) bool {
@@ -556,11 +647,46 @@ func lockDependency(value string) (string, string) {
 }
 
 func quotedValue(value string) string {
-	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+	parsed, err := parseQuotedValue(value)
+	if err != nil {
 		return ""
 	}
 
-	return value[1 : len(value)-1]
+	return parsed
+}
+
+// parseQuotedValue supports single-line TOML 1.0 literal and basic strings,
+// not multiline strings. Restrict Go's unquoter to TOML's escape vocabulary.
+func parseQuotedValue(value string) (string, error) {
+	if len(value) < 2 || (value[0] != '"' && value[0] != '\'') || value[len(value)-1] != value[0] || !utf8.ValidString(value) {
+		return "", fmt.Errorf("expected a single-line quoted string, got %q", value)
+	}
+
+	body := value[1 : len(value)-1]
+	for i := 0; i < len(body); i++ {
+		ch := body[i]
+		if (ch < 0x20 && ch != '\t') || ch == 0x7f || ch == value[0] {
+			return "", fmt.Errorf("invalid character in quoted string %q", value)
+		}
+
+		if value[0] == '"' && ch == '\\' {
+			i++
+			if i == len(body) || !strings.ContainsRune(`btnfr"\uU`, rune(body[i])) {
+				return "", fmt.Errorf("invalid basic string escape in %q", value)
+			}
+		}
+	}
+
+	if value[0] == '\'' {
+		return body, nil
+	}
+
+	parsed, err := strconv.Unquote(value)
+	if err != nil {
+		return "", fmt.Errorf("invalid basic string %q: %w", value, err)
+	}
+
+	return parsed, nil
 }
 
 func crateLicense(dir string) string {

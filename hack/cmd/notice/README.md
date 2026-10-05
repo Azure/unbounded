@@ -105,6 +105,14 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   direct dependencies are included.
   Local path dependencies are traversed to collect their direct registry
   dependencies; registry transitive dependencies are not traversed.
+  Root-reachable workspace members share the dataplane root's lockfile; no
+  hardcoded member list needs updating when adding a local dependency. Members
+  not reachable through non-development path dependencies are not collected.
+  Single-line TOML literal and basic strings (including escapes) are supported
+  for dependency paths and package aliases; malformed fields fail collection.
+  A `LICENSE` index may refer to companion `LICENSE-*` files, which are still
+  individually classified. Unrecognized companion license text remains an error.
+  The separate performance workspace is not collected.
 - Native collection is fully local. Its metadata and canonical license links
   are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
   `OPENSSL_VERSION` in `Makefile`.
