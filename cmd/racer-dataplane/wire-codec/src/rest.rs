@@ -760,7 +760,7 @@ impl<I: Io + ?Sized> Connection<I> {
         };
         let body = match head.framing {
             Framing::Length(length) => {
-                let end = head.header_len + length;
+                let end = length_frame_end(head.header_len, length)?;
                 loop {
                     if received.len() > end {
                         return Err(Error::InvalidRequest.into());
@@ -1054,6 +1054,11 @@ struct CompletedResponse {
 
     /// TLS reader reported WouldBlock rather than EOF or a read failure.
     reusable: bool,
+}
+
+/// Bound the complete frame before receiving or allocating body storage.
+fn length_frame_end(header_len: usize, body_len: usize) -> Result<usize> {
+    header_len.checked_add(body_len).ok_or(Error::Overloaded)
 }
 
 /// Parse framing and reuse metadata together, preserving failure precedence.
@@ -2034,6 +2039,38 @@ mod tests {
             &b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\n"[..],
             &b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 999999\r\n\r\n"[..],
         ] { assert!(parse_head(bytes, 10, 65536).is_err()); }
+    }
+
+    /// Maximum caller limits cannot permit overflowing frame sizes or body allocation.
+    #[test]
+    fn maximum_content_length_rejects_frame_overflow_without_body_allocation() {
+        for status in [200, 429] {
+            // Only a small header is allocated, never the attacker-specified body.
+            let bytes = format!(
+                "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                usize::MAX
+            );
+            let head = parse_head(bytes.as_bytes(), usize::MAX, usize::MAX)
+                .unwrap()
+                .unwrap();
+            let Framing::Length(length) = head.framing else {
+                panic!("expected content length framing");
+            };
+            assert_eq!(length, usize::MAX);
+            assert_eq!(
+                length_frame_end(head.header_len, length),
+                Err(Error::Overloaded)
+            );
+            assert_eq!(
+                length_frame_end(head.header_len, usize::MAX - head.header_len),
+                Ok(usize::MAX)
+            );
+            assert_eq!(length_frame_end(head.header_len, 0), Ok(head.header_len));
+            assert_eq!(
+                length_frame_end(head.header_len, 2),
+                Ok(head.header_len + 2)
+            );
+        }
     }
 
     /// Connection directives are comma-delimited, case-insensitive, and cumulative.
