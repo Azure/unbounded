@@ -92,6 +92,8 @@ func (s *Server) tlsConfigWithCertificate(ctx context.Context, certificate func(
 			return nil, err
 		}
 
+		// Bound trust-pool work independently of the full handshake admission
+		// held by transportListener before any TLS bytes are read.
 		if !take(s.authSlots) {
 			return nil, wire.Overloaded
 		}
@@ -168,27 +170,12 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 
-	var connections sync.Map
-
 	server.ConnContext = connectionContext
-	server.ConnState = func(conn net.Conn, state http.ConnState) {
-		if state == http.StateNew {
-			connections.Store(conn, struct{}{})
-			// Accept may race teardown's connection sweep. Every new connection
-			// must also check cancellation after registering itself.
-			if ctx.Err() != nil {
-				closeTransport(conn)
-			}
-		}
-
-		if state == http.StateClosed {
-			connections.Delete(conn)
-		}
-	}
+	transport := newTransportListener(ctx, listener, config, s.config.Limits)
 
 	done := make(chan error, 1)
 
-	go func(done chan<- error) { done <- server.Serve(tls.NewListener(listener, config)) }(done)
+	go func(done chan<- error) { done <- server.Serve(transport) }(done)
 
 	s.Lifecycle.SetServingReady(true)
 
@@ -202,6 +189,9 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 	}
 
 	s.Lifecycle.SetServingReady(false)
+
+	servingCanceled := ctx.Err() != nil
+
 	cancel()
 
 	shutdown, stop := context.WithTimeout(context.Background(), s.config.Limits.ShutdownTimeout)
@@ -212,15 +202,7 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 	go func(closed chan<- error) {
 		// Force-close TCP before net/http closes TLS connections: close-notify
 		// can otherwise block on a slow reader. No graceful drain is allowed.
-		connections.Range(func(key, _ any) bool {
-			if conn, ok := key.(net.Conn); ok {
-				closeTransport(conn)
-			}
-
-			return true
-		})
-
-		closed <- server.Close()
+		closed <- errors.Join(transport.Close(), server.Close())
 	}(closed)
 
 	var closeErr error
@@ -237,7 +219,7 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 		}
 	}
 
-	if errors.Is(result, http.ErrServerClosed) {
+	if errors.Is(result, http.ErrServerClosed) || servingCanceled && errors.Is(result, net.ErrClosed) {
 		result = nil
 	}
 

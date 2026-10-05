@@ -257,12 +257,14 @@ type Config struct {
 }
 
 type Limits struct {
-	MaxPolls               int
-	MaxConcurrentWrites    int
-	MaxConcurrentBootstrap int
-	HeaderBytes            int
-	WriteTimeout           time.Duration
-	ShutdownTimeout        time.Duration
+	MaxConnections          int
+	MaxConcurrentHandshakes int
+	MaxPolls                int
+	MaxConcurrentWrites     int
+	MaxConcurrentBootstrap  int
+	HeaderBytes             int
+	WriteTimeout            time.Duration
+	ShutdownTimeout         time.Duration
 }
 
 // LoadConfig reads deployment configuration. Initialization state is deliberately
@@ -308,12 +310,14 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		ReplicationServerName:     env("RACER_REPLICATION_SERVER_NAME", "racer-controller."+env("POD_NAMESPACE", "unbounded-system")+".svc"),
 		SnapshotMaxAge:            30 * time.Second,
 		Limits: Limits{
-			MaxPolls:               wire.MaxMembers,
-			MaxConcurrentWrites:    128,
-			MaxConcurrentBootstrap: 32,
-			HeaderBytes:            16 * 1024,
-			WriteTimeout:           30 * time.Second,
-			ShutdownTimeout:        10 * time.Second,
+			MaxConnections:          2*wire.MaxMembers + 128,
+			MaxConcurrentHandshakes: 32,
+			MaxPolls:                wire.MaxMembers,
+			MaxConcurrentWrites:     128,
+			MaxConcurrentBootstrap:  32,
+			HeaderBytes:             16 * 1024,
+			WriteTimeout:            30 * time.Second,
+			ShutdownTimeout:         10 * time.Second,
 		},
 		Rotation: RotationPolicy{
 			Interval:   24 * time.Hour,
@@ -398,6 +402,7 @@ func (c Config) Validate() error {
 	}
 
 	if c.VersionConfigMapName == c.InstallationConfigMapName ||
+		c.Limits.MaxConnections <= 0 || c.Limits.MaxConcurrentHandshakes <= 0 ||
 		c.Limits.MaxPolls <= 0 || c.Limits.MaxConcurrentWrites <= 0 || c.Limits.MaxConcurrentBootstrap <= 0 ||
 		c.Limits.HeaderBytes <= 0 || c.Limits.WriteTimeout <= 0 || c.Limits.ShutdownTimeout <= 0 {
 		return fmt.Errorf("resource names or limits: %w", wire.InvalidRequest)

@@ -163,6 +163,18 @@ also require matching Services, probes, network policy, and monitoring configura
 Duration settings use Go syntax and positive whole seconds. Quiesce traffic for peer-port
 transitions; do not independently override the dataplane listener and published port.
 
+Controller HTTPS admission is per process, including replication traffic. The Go
+`Config.Limits` defaults allow `2 * wire.MaxMembers + 128` open connections (room
+for independent snapshot and keyring polls), 32 concurrent TLS handshakes, 32
+concurrent bearer-authenticated operations, and 128 concurrent response writes.
+These are programmatic limits, not environment tuning keys. A connection retains
+its slot until its socket closes, including silent TCP peers, TLS peers, idle
+keep-alives, and long polls. Handshakes retain a separate slot until success or
+failure and have a 30-second deadline. Excess connections or handshakes are
+closed before HTTP without a queued waiter or overload response. Completed TLS
+connections do not retain handshake slots. Request authentication and poll
+admission remain independent; shutdown forcibly closes all admitted sockets.
+
 The operator owns identity/wiring: cluster UUID, URL, images, service accounts, trust,
 replication identity, and durable resource names. These are not tuning keys. Node identity
 comes from verified enrollment/local recovery, not a supplied Node name/UID. Do not reset
