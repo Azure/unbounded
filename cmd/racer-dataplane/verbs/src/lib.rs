@@ -67,51 +67,7 @@ pub use ffi::Endpoint;
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;
 
-/// Clean up and sort a list of RDMA ports using sysfs.
-pub mod discovery {
-    use crate::PortInfo;
-
-    use std::path::Path;
-
-    /// True if `device` is a safe sysfs name: 1 to 63 bytes, no path tricks.
-    pub fn valid_device(device: &str) -> bool {
-        !device.is_empty()
-            && device.len() <= 63
-            && !device.contains(['/', '\0', '\r', '\n'])
-            && device != "."
-            && device != ".."
-    }
-
-    /// Filter, sort, and dedup ports, reading PCI and NUMA info under `root`.
-    ///
-    /// - Drops bad names, port 0, and all-zero GIDs.
-    /// - Sets `numa_node` from sysfs, or `None` if unreadable.
-    /// - Sorts by PCI address (known first), then port, then name.
-    /// - Keeps the first entry for each (device, port).
-    pub fn inventory_at(mut ports: Vec<PortInfo>, root: &Path) -> Vec<PortInfo> {
-        ports.retain(|p| valid_device(&p.device) && p.port != 0 && p.gid != [0; 16]);
-        let mut ports: Vec<_> = ports
-            .into_iter()
-            .map(|mut port| {
-                let device = root.join(&port.device).join("device");
-                let bdf = std::fs::canonicalize(&device)
-                    .ok()
-                    .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()));
-                port.numa_node = std::fs::read_to_string(device.join("numa_node"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .map(|n| n as usize);
-                (bdf, port)
-            })
-            .collect();
-        ports.sort_by(|(a, x), (b, y)| {
-            (a.is_none(), a, x.port, &x.device).cmp(&(b.is_none(), b, y.port, &y.device))
-        });
-        let mut physical = std::collections::BTreeSet::new();
-        ports.retain(|(_, p)| physical.insert((p.device.clone(), p.port)));
-        ports.into_iter().map(|(_, p)| p).collect()
-    }
-}
+pub mod discovery;
 
 /// List RDMA ports on this host. Opens and closes devices on this thread.
 ///

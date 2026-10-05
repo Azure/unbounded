@@ -35,7 +35,7 @@ use rdma_verbs::QueuePairHandle;
 use rdma_verbs::Region;
 use rdma_verbs::Ticket;
 use rdma_verbs::Window;
-use rdma_verbs::discovery::valid_device;
+use rdma_verbs::discovery::Binding;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
@@ -43,7 +43,6 @@ use std::cell::RefCell;
 use std::future::poll_fn;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Mutex;
 use std::task::Poll;
 use uring_runtime::drivers::poll_scoped;
 use uring_runtime::environment::Deadline;
@@ -871,39 +870,13 @@ pub fn match_publication(
     publication: &[RailMapping],
     discovered: &[PortInfo],
 ) -> Result<Vec<(RailMapping, usize)>> {
-    if publication.len() > 64 || discovered.len() > 64 {
-        return Err(Error::InvalidConfiguration);
-    }
-    let mut result: Vec<(RailMapping, usize)> = Vec::new();
-    for published in publication {
-        if published.device.is_empty() || published.port == 0 {
-            return Err(Error::InvalidConfiguration);
-        }
-        if result
-            .iter()
-            .any(|(r, _)| r.device == published.device && r.port == published.port)
-        {
-            return Err(Error::InvalidConfiguration);
-        }
-        let candidates: Vec<_> = discovered
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| {
-                d.device == published.device
-                    && d.port == published.port
-                    && d.gid != [0; 16]
-                    && published.gid.is_none_or(|gid| d.gid == gid)
-            })
-            .collect();
-        if candidates.len() != 1 || result.iter().any(|(_, index)| *index == candidates[0].0) {
-            return Err(Error::Unavailable);
-        }
-        let mut actual = published.clone();
-        actual.numa_node = published.numa_node.or(candidates[0].1.numa_node);
-        actual.gid = Some(candidates[0].1.gid);
-        result.push((actual, candidates[0].0));
-    }
-    Ok(result)
+    Ok(rdma_verbs::discovery::match_ports(
+        &publication.iter().map(binding).collect::<Vec<_>>(),
+        discovered,
+    )?
+    .into_iter()
+    .map(|(port, index)| (mapping(port), index))
+    .collect())
 }
 impl Default for Devices {
     /// Create an unattached device owner with no selected rails or mappings.
@@ -1086,116 +1059,79 @@ impl Devices {
 // Pre-enrollment inventory and deterministic per-worker physical NIC selection.
 
 /// Shared durable-journal bound for admission, restoration, and enrollment I/O.
-pub const MAX_JOURNAL_BYTES: usize = 64 * 1024;
+pub use rdma_verbs::discovery::MAX_JOURNAL_BYTES;
 
 /// One process-wide inventory, shared by enrollment and every worker. Withdrawn
 /// ports keep their rail reservation: neither outages nor GID changes renumber
 /// surviving ports. Enrollment persists reservations across process restarts.
 #[derive(Default)]
-pub struct Inventory(Mutex<InventoryState>);
-#[derive(Default)]
-struct InventoryState {
-    assigned: Vec<(String, u8, u16)>,
-    snapshot: Snapshot,
-}
+pub struct Inventory(rdma_verbs::discovery::Inventory);
+
+/// Local discovery snapshot translated into Racer publication types.
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub generation: u64,
+
     pub nics: Vec<RailMapping>,
 }
+
 impl Inventory {
+    /// Read the shared physical inventory using Racer's publication types.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        Ok(self
-            .0
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .snapshot
-            .clone())
+        Ok(snapshot(self.0.snapshot()?))
     }
+
+    /// Optional transport discovery failures withdraw RDMA, not HTTP service.
     pub fn refresh(&self) -> Result<Snapshot> {
         self.update(inventory())
     }
-    pub fn update(&self, mut nics: Vec<RailMapping>) -> Result<Snapshot> {
-        let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
-        let mut seen = std::collections::BTreeSet::new();
-        if nics.len() > 64
-            || nics.iter().any(|n| {
-                n.port == 0 || !valid_device(&n.device) || !seen.insert((n.device.clone(), n.port))
-            })
-        {
-            nics.clear();
-        }
-        let mut encoded_bytes = serde_json::to_vec(&state.assigned)
-            .map_err(|_| Error::InvalidConfiguration)?
-            .len();
-        nics.retain_mut(|nic| {
-            let rail = state
-                .assigned
-                .iter()
-                .find(|(d, p, _)| *d == nic.device && *p == nic.port)
-                .map(|(_, _, r)| *r);
-            let rail = match rail {
-                Some(rail) => rail,
-                // Bound retained tombstones and never recycle an old rail.
-                None if state.assigned.len() < 1024 => {
-                    let rail = state.assigned.len() as u16;
-                    // Account for JSON escaping and the separating comma before
-                    // mutating reservations. Full journals withdraw only unknown
-                    // ports; known IDs remain usable and renewals remain writable.
-                    let Ok(entry) = serde_json::to_vec(&(&nic.device, nic.port, rail)) else {
-                        return false;
-                    };
-                    let added = entry.len() + usize::from(!state.assigned.is_empty());
-                    if added > MAX_JOURNAL_BYTES.saturating_sub(encoded_bytes) {
-                        return false;
-                    }
-                    encoded_bytes += added;
-                    state.assigned.push((nic.device.clone(), nic.port, rail));
-                    rail
-                }
-                None => return false,
-            };
-            nic.rail = RailId(rail);
-            true
-        });
-        nics.sort_by_key(|n| n.rail);
-        if state.snapshot.generation == 0 || state.snapshot.nics != nics {
-            state.snapshot.generation += 1;
-            state.snapshot.nics = nics;
-        }
-        Ok(state.snapshot.clone())
+
+    /// Publish discovered ports while preserving their durable physical labels.
+    pub fn update(&self, nics: Vec<RailMapping>) -> Result<Snapshot> {
+        Ok(snapshot(self.0.update(nics.iter().map(binding).collect())?))
     }
+
+    /// Keep the existing enrollment journal representation unchanged.
     pub fn reservations(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(&self.0.lock().map_err(|_| Error::Unavailable)?.assigned)
-            .map_err(|_| Error::InvalidConfiguration)
+        self.0.reservations().map_err(Into::into)
     }
+
     /// Restore before issuance, never discard a corrupt journal and renumber.
     pub fn restore(&self, bytes: &[u8]) -> Result<()> {
-        if bytes.len() > MAX_JOURNAL_BYTES {
-            return Err(Error::CorruptRecord);
-        }
-        let assigned: Vec<(String, u8, u16)> =
-            serde_json::from_slice(bytes).map_err(|_| Error::CorruptRecord)?;
-        let mut seen = std::collections::BTreeSet::new();
-        if assigned.len() > 1024
-            || assigned.iter().enumerate().any(|(i, (d, p, r))| {
-                !valid_device(d) || *p == 0 || usize::from(*r) != i || !seen.insert((d, p))
-            })
-        {
-            return Err(Error::CorruptRecord);
-        }
-        if serde_json::to_vec(&assigned)
-            .map_err(|_| Error::CorruptRecord)?
-            .len()
-            > MAX_JOURNAL_BYTES
-        {
-            return Err(Error::CorruptRecord);
-        }
-        let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
-        state.assigned = assigned;
-        state.snapshot.nics.clear();
-        state.snapshot.generation += 1;
-        Ok(())
+        self.0.restore(bytes).map_err(|error| match error {
+            rdma_verbs::Error::InvalidRequest => Error::CorruptRecord,
+            other => other.into(),
+        })
+    }
+}
+
+/// Erase application rail identity before passing physical bindings to verbs.
+fn binding(nic: &RailMapping) -> Binding {
+    Binding {
+        rail: nic.rail.0,
+        device: nic.device.clone(),
+        port: nic.port,
+        gid: nic.gid,
+        numa_node: nic.numa_node,
+    }
+}
+
+/// Restore application identity after physical discovery, without authorizing it.
+fn mapping(nic: Binding) -> RailMapping {
+    RailMapping {
+        rail: RailId(nic.rail),
+        device: nic.device,
+        port: nic.port,
+        gid: nic.gid,
+        numa_node: nic.numa_node,
+    }
+}
+
+/// Convert the physical snapshot at the application boundary.
+fn snapshot(snapshot: rdma_verbs::discovery::Snapshot) -> Snapshot {
+    Snapshot {
+        generation: snapshot.generation,
+        nics: snapshot.nics.into_iter().map(mapping).collect(),
     }
 }
 
@@ -1231,49 +1167,16 @@ pub fn select_worker(
     numa: Option<usize>,
     capacity: usize,
 ) -> Vec<RailMapping> {
-    let mut rails = std::collections::BTreeMap::<_, Vec<(u8, RailMapping)>>::new();
-    for nic in published {
-        let mut matches = discovered.iter().filter(|d| {
-            d.device == nic.device
-                && d.port == nic.port
-                && nic.gid.is_none_or(|gid| d.gid == Some(gid))
-        });
-        let Some(detected) = matches.next() else {
-            continue;
-        };
-        if matches.next().is_some() {
-            continue;
-        }
-        let mut actual = nic.clone();
-        actual.numa_node = nic.numa_node.or(detected.numa_node);
-        // Bind the chosen physical GID through activation and revalidation.
-        actual.gid = detected.gid;
-        let preference = match (numa, actual.numa_node) {
-            (Some(a), Some(b)) if a == b => 0,
-            (_, None) | (None, _) => 1,
-            _ => 2,
-        };
-        rails
-            .entry(nic.rail)
-            .or_default()
-            .push((preference, actual));
-    }
-    let mut selected = Vec::new();
-    for (_, mut candidates) in rails {
-        candidates.sort_by(|(a, x), (b, y)| (a, &x.device, x.port).cmp(&(b, &y.device, y.port)));
-        let count = candidates
-            .iter()
-            .take_while(|(rank, _)| *rank == candidates[0].0)
-            .count();
-        selected.push(candidates[worker % count].1.clone());
-    }
-    if !selected.is_empty() {
-        let count = selected.len();
-        selected.rotate_left(worker % count);
-        selected.truncate(capacity);
-        selected.sort_by_key(|n| n.rail);
-    }
-    selected
+    rdma_verbs::discovery::select_worker(
+        &published.iter().map(binding).collect::<Vec<_>>(),
+        &discovered.iter().map(binding).collect::<Vec<_>>(),
+        worker,
+        numa,
+        capacity,
+    )
+    .into_iter()
+    .map(mapping)
+    .collect()
 }
 
 // RDMA requires compatible authenticated mappings; discovery can only veto.
