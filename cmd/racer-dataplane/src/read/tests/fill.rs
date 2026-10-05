@@ -1136,14 +1136,16 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
         let plaintext = crate::memory::VerifiedPage {
             inner: Arc::new(crate::memory::VerifiedBytes {
                 page: id.clone(),
-                bytes: vec![1; length],
-                reservation: admission
-                    .reserve(
-                        Some(&f.context.object.cache),
-                        ResourceClass::Plaintext,
-                        length,
-                    )
-                    .unwrap(),
+                storage: flow_control::ChargedBytes {
+                    bytes: vec![1; length],
+                    reservation: admission
+                        .reserve(
+                            Some(&f.context.object.cache),
+                            ResourceClass::Plaintext,
+                            length,
+                        )
+                        .unwrap(),
+                },
             }),
         };
         let ciphertext = f
@@ -2339,10 +2341,12 @@ mod pressure {
             plaintext: crate::memory::VerifiedPage {
                 inner: Arc::new(crate::memory::VerifiedBytes {
                     page: id.clone(),
-                    bytes: vec![1; 3],
-                    reservation: admission
-                        .reserve(Some(cache), ResourceClass::Plaintext, 3)
-                        .unwrap(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: vec![1; 3],
+                        reservation: admission
+                            .reserve(Some(cache), ResourceClass::Plaintext, 3)
+                            .unwrap(),
+                    },
                 }),
             },
             ciphertext: f

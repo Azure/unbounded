@@ -625,10 +625,12 @@ mod destination_disconnect {
             plaintext: VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: page.clone(),
-                    bytes: vec![1, 2, 3],
-                    reservation: admission
-                        .reserve(None, ResourceClass::Plaintext, 3)
-                        .unwrap(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: vec![1, 2, 3],
+                        reservation: admission
+                            .reserve(None, ResourceClass::Plaintext, 3)
+                            .unwrap(),
+                    },
                 }),
             },
             ciphertext: CiphertextPage {
@@ -642,10 +644,12 @@ mod destination_disconnect {
                         plaintext_length: 3,
                         ciphertext_length: 19,
                     },
-                    bytes: vec![7; 19],
-                    reservation: admission
-                        .reserve(None, ResourceClass::Ciphertext, 19)
-                        .unwrap(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: vec![7; 19],
+                        reservation: admission
+                            .reserve(None, ResourceClass::Ciphertext, 19)
+                            .unwrap(),
+                    },
                 }),
             },
         }

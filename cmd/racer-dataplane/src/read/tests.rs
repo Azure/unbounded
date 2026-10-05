@@ -38,10 +38,12 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
         plaintext: VerifiedPage {
             inner: Arc::new(VerifiedBytes {
                 page: page.clone(),
-                bytes: vec![byte],
-                reservation: admission
-                    .reserve(None, ResourceClass::Plaintext, 1)
-                    .unwrap(),
+                storage: flow_control::ChargedBytes {
+                    bytes: vec![byte],
+                    reservation: admission
+                        .reserve(None, ResourceClass::Plaintext, 1)
+                        .unwrap(),
+                },
             }),
         },
         ciphertext: CiphertextPage {
@@ -55,10 +57,12 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
                     plaintext_length: 1,
                     ciphertext_length: 17,
                 },
-                bytes: vec![0; 17],
-                reservation: admission
-                    .reserve(None, ResourceClass::Ciphertext, 17)
-                    .unwrap(),
+                storage: flow_control::ChargedBytes {
+                    bytes: vec![0; 17],
+                    reservation: admission
+                        .reserve(None, ResourceClass::Ciphertext, 17)
+                        .unwrap(),
+                },
             }),
         },
     }
@@ -822,11 +826,13 @@ mod flight {
             plaintext: VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: page.clone(),
-                    bytes: vec![1, 2, 3],
-                    reservation: flights
-                        .admission
-                        .reserve(None, ResourceClass::Plaintext, 3)
-                        .unwrap(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: vec![1, 2, 3],
+                        reservation: flights
+                            .admission
+                            .reserve(None, ResourceClass::Plaintext, 3)
+                            .unwrap(),
+                    },
                 }),
             },
             ciphertext: CiphertextPage {
@@ -840,11 +846,13 @@ mod flight {
                         plaintext_length: 3,
                         ciphertext_length: 19,
                     },
-                    bytes: vec![0; 19],
-                    reservation: flights
-                        .admission
-                        .reserve(None, ResourceClass::Ciphertext, 19)
-                        .unwrap(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: vec![0; 19],
+                        reservation: flights
+                            .admission
+                            .reserve(None, ResourceClass::Ciphertext, 19)
+                            .unwrap(),
+                    },
                 }),
             },
         }

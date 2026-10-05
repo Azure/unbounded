@@ -782,8 +782,10 @@ mod tests {
             inner: Arc::new(crate::memory::CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope,
-                bytes: vec![0; length],
-                reservation: request(5).origin.reservation,
+                storage: flow_control::ChargedBytes {
+                    bytes: vec![0; length],
+                    reservation: request(5).origin.reservation,
+                },
             }),
         }
     }

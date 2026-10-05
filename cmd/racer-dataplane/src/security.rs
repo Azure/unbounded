@@ -562,8 +562,10 @@ impl PageCryptoEngine {
                 let plain = VerifiedPage {
                     inner: Arc::new(VerifiedBytes {
                         page,
-                        bytes: plain.into_vec(),
-                        reservation,
+                        storage: flow_control::ChargedBytes {
+                            bytes: plain.into_vec(),
+                            reservation,
+                        },
                     }),
                 };
                 let encrypted = CiphertextPage {
@@ -571,8 +573,10 @@ impl PageCryptoEngine {
                     inner: Arc::new(CiphertextBytes {
                         checksum: std::sync::OnceLock::from(racer_crypto::crc64(&bytes)),
                         envelope,
-                        bytes: std::mem::take(&mut *bytes),
-                        reservation: ciphertext,
+                        storage: flow_control::ChargedBytes {
+                            bytes: std::mem::take(&mut *bytes),
+                            reservation: ciphertext,
+                        },
                     }),
                 };
                 CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, encrypted))
@@ -587,8 +591,10 @@ impl PageCryptoEngine {
                 let page = VerifiedPage {
                     inner: Arc::new(VerifiedBytes {
                         page: envelope.page,
-                        bytes: std::mem::take(&mut *bytes),
-                        reservation: plaintext,
+                        storage: flow_control::ChargedBytes {
+                            bytes: std::mem::take(&mut *bytes),
+                            reservation: plaintext,
+                        },
                     }),
                 };
                 CryptoOutcome::Completed(CryptoOutput::Decrypted(page, ciphertext))
@@ -4086,10 +4092,12 @@ mod tests {
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope: descriptor.clone(),
-                    bytes,
-                    reservation: admission
-                        .reserve(Some(cache), ResourceClass::Ciphertext, 21)
-                        .unwrap(),
+                    storage: flow_control::ChargedBytes {
+                        bytes,
+                        reservation: admission
+                            .reserve(Some(cache), ResourceClass::Ciphertext, 21)
+                            .unwrap(),
+                    },
                 }),
             };
             let input = CryptoInput::Decrypt {

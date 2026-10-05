@@ -673,10 +673,12 @@ pub(crate) mod tests {
                         },
                         number: PageNumber(0),
                     },
-                    reservation: admission
-                        .reserve(None, ResourceClass::Plaintext, bytes.len().max(1))
-                        .unwrap(),
-                    bytes,
+                    storage: flow_control::ChargedBytes {
+                        reservation: admission
+                            .reserve(None, ResourceClass::Plaintext, bytes.len().max(1))
+                            .unwrap(),
+                        bytes,
+                    },
                 }),
             }
         }

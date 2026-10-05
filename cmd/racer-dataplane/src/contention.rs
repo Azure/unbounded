@@ -1156,8 +1156,10 @@ mod fidelity {
         let plaintext = VerifiedPage {
             inner: Arc::new(VerifiedBytes {
                 page: id.clone(),
-                bytes: bytes.into_vec(),
-                reservation,
+                storage: flow_control::ChargedBytes {
+                    bytes: bytes.into_vec(),
+                    reservation,
+                },
             }),
         };
         let ciphertext = pool

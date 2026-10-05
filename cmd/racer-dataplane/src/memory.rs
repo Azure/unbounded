@@ -50,14 +50,27 @@ unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
 pub struct VerifiedPage {
     pub(crate) inner: Arc<VerifiedBytes>,
 }
+/// Authenticated page identity paired with one recyclable payload owner.
 pub(crate) struct VerifiedBytes {
     pub page: PageId,
-    pub bytes: Vec<u8>,
-    pub reservation: flow_control::Charge<AdmissionPolicy>,
+
+    pub storage: flow_control::ChargedBytes<AdmissionPolicy>,
 }
-impl Drop for VerifiedBytes {
-    fn drop(&mut self) {
-        self.reservation.recycle(std::mem::take(&mut self.bytes));
+
+impl std::ops::Deref for VerifiedBytes {
+    type Target = flow_control::ChargedBytes<AdmissionPolicy>;
+
+    /// Borrow allocation and accounting without exposing mutable verified contents.
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for VerifiedBytes {
+    /// Permit malformed fixture construction without exposing mutable verified bytes.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
     }
 }
 #[derive(Clone)]
@@ -65,15 +78,28 @@ pub struct CiphertextPage {
     pub(crate) inner: Arc<CiphertextBytes>,
     pub(crate) provenance: Option<crate::telemetry::PeerProvenance>,
 }
+/// Ciphertext metadata and checksum cache remain separate from allocation ownership.
 pub(crate) struct CiphertextBytes {
     pub checksum: std::sync::OnceLock<u64>,
+
     pub envelope: PageEnvelope,
-    pub bytes: Vec<u8>,
-    pub reservation: flow_control::Charge<AdmissionPolicy>,
+
+    pub storage: flow_control::ChargedBytes<AdmissionPolicy>,
 }
-impl Drop for CiphertextBytes {
-    fn drop(&mut self) {
-        self.reservation.recycle(std::mem::take(&mut self.bytes));
+
+impl std::ops::Deref for CiphertextBytes {
+    type Target = flow_control::ChargedBytes<AdmissionPolicy>;
+
+    /// Keep existing internal byte and reservation views on the shared owner.
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+impl std::ops::DerefMut for CiphertextBytes {
+    /// Exclusive owners can rehome accounting without copying the allocation.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
     }
 }
 impl BufferPool {
@@ -121,8 +147,7 @@ impl BufferPool {
             inner: Arc::new(CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope,
-                bytes,
-                reservation,
+                storage: flow_control::ChargedBytes { bytes, reservation },
             }),
         })
     }
@@ -200,8 +225,7 @@ impl CiphertextPage {
             inner: Arc::new(CiphertextBytes {
                 checksum: self.inner.checksum.clone(),
                 envelope: self.envelope().clone(),
-                bytes,
-                reservation,
+                storage: flow_control::ChargedBytes { bytes, reservation },
             }),
             provenance: self.provenance,
         })
@@ -1130,10 +1154,12 @@ pub(crate) mod tests {
         let plaintext = VerifiedPage {
             inner: Arc::new(VerifiedBytes {
                 page: page.clone(),
-                bytes: vec![1; 3],
-                reservation: admission
-                    .reserve(Some(cache), ResourceClass::Plaintext, 3)
-                    .unwrap(),
+                storage: flow_control::ChargedBytes {
+                    bytes: vec![1; 3],
+                    reservation: admission
+                        .reserve(Some(cache), ResourceClass::Plaintext, 3)
+                        .unwrap(),
+                },
             }),
         };
         let ciphertext = BufferPool::new(admission.clone())

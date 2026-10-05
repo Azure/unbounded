@@ -2384,10 +2384,12 @@ mod records {
                         plaintext_length: length as u32,
                         ciphertext_length: length as u32 + 16,
                     },
-                    bytes: vec![2; length + 16],
-                    reservation: admission
-                        .reserve(None, ResourceClass::Ciphertext, length + 16)
-                        .unwrap(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: vec![2; length + 16],
+                        reservation: admission
+                            .reserve(None, ResourceClass::Ciphertext, length + 16)
+                            .unwrap(),
+                    },
                 }),
             },
             metadata: metadata.for_pin(),

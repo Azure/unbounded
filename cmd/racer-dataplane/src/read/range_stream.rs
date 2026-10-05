@@ -1099,10 +1099,12 @@ pub(super) mod tests {
             plaintext: VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: page.clone(),
-                    bytes: vec![number as u8; length],
-                    reservation: admission
-                        .reserve(cache, ResourceClass::Plaintext, length)
-                        .unwrap(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: vec![number as u8; length],
+                        reservation: admission
+                            .reserve(cache, ResourceClass::Plaintext, length)
+                            .unwrap(),
+                    },
                 }),
             },
             ciphertext: CiphertextPage {
@@ -1116,10 +1118,12 @@ pub(super) mod tests {
                         plaintext_length: length as u32,
                         ciphertext_length: length as u32 + 16,
                     },
-                    bytes: vec![0; length + 16],
-                    reservation: admission
-                        .reserve(cache, ResourceClass::Ciphertext, length + 16)
-                        .unwrap(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: vec![0; length + 16],
+                        reservation: admission
+                            .reserve(cache, ResourceClass::Ciphertext, length + 16)
+                            .unwrap(),
+                    },
                 }),
             },
         }

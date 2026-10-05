@@ -815,6 +815,24 @@ impl<P: Policy> Quotas<P> {
     }
 }
 
+/// Recyclable vector ownership for caller-validated payloads. This is not an I/O
+/// buffer: callers must keep allocation geometry stable while kernel pointers live.
+/// Class, key, capacity and authority validation remain the caller's responsibility.
+pub struct ChargedBytes<P: Policy> {
+    /// Payload allocation, recycled through its original authority on final drop.
+    pub bytes: Vec<u8>,
+
+    /// The charge retained with the complete allocation.
+    pub reservation: Charge<P>,
+}
+
+impl<P: Policy> Drop for ChargedBytes<P> {
+    /// Wipe and recycle the allocation before releasing its accounting owner.
+    fn drop(&mut self) {
+        self.reservation.recycle(std::mem::take(&mut self.bytes));
+    }
+}
+
 /// Fixed initialized backing paired with its live quota charge.
 pub struct ChargedBuffer<P: Policy> {
     bytes: Vec<u8>,
@@ -1430,6 +1448,40 @@ mod quota_tests {
             0,
             "usage handles must not retain recycled buffers"
         );
+    }
+
+    /// Only the final shared owner recycles, wiping spare capacity and retaining its charge.
+    #[test]
+    fn charged_bytes_recycles_once_after_last_owner_and_preserves_small_release() {
+        let size = 1 << 20;
+        let quotas = Quotas::new(TestPolicy::new(2 * size, 4));
+        let reservation = quotas.reserve(None, Resource::Payload, size).unwrap();
+        let mut bytes = reservation.buffer(size).unwrap();
+        bytes.fill(0xa7);
+        bytes.truncate(1);
+        let owner = Arc::new(ChargedBytes { bytes, reservation });
+        let retained = owner.clone();
+        drop(owner);
+        assert_eq!(quotas.retained_buffer_bytes(), 0);
+        assert_eq!(quotas.used(Resource::Payload), size);
+        std::thread::spawn(move || drop(retained)).join().unwrap();
+        assert_eq!(quotas.retained_buffer_bytes(), size);
+        assert_eq!(quotas.used(Resource::Payload), size);
+        assert!(
+            quotas.buffers.lock().unwrap()[0]
+                .0
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        quotas.reclaim_buffers();
+        assert_eq!(quotas.used(Resource::Payload), 0);
+        let small = ChargedBytes {
+            bytes: vec![7; 3],
+            reservation: quotas.reserve(None, Resource::Payload, 3).unwrap(),
+        };
+        drop(small);
+        assert_eq!(quotas.used(Resource::Payload), 0);
+        assert_eq!(quotas.retained_buffer_bytes(), 0);
     }
 
     /// Key-table pressure reports original facts before successful reclamation.
