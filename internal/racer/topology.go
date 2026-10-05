@@ -4,20 +4,12 @@
 package racer
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"net/netip"
-	"slices"
-	"strconv"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -26,8 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
+	"github.com/Azure/unbounded/internal/racer/membership"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -165,16 +157,18 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 		podsByNode[node.Name] = list.Items
 	}
 
-	candidate, diagnostics, err := reconcileMembers(nodes.Items, podsByNode, ownership, r.Accepted, cfg.PeerPort)
+	result, err := membership.Reconcile(membership.Input{
+		Nodes: nodes.Items, PodsByNode: podsByNode, Ownership: ownership.observed(), PeerPort: cfg.PeerPort,
+	}, r.Accepted)
 	if err != nil {
 		return topologyUpdate{}, err
 	}
 
-	for _, d := range diagnostics {
+	for _, d := range result.Diagnostics {
 		ctrl.LoggerFrom(ctx).Info("membership input rejected", "object", d.Object, "field", d.Field, "reason", d.Reason)
 	}
 
-	prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, candidate, catalog)
+	prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, result.Members, catalog)
 	if err != nil {
 		return topologyUpdate{}, err
 	}
@@ -192,9 +186,9 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 		return topologyUpdate{}, err
 	}
 
-	r.Accepted = candidate
+	r.Accepted = result.Members
 
-	return topologyUpdate{nodes: nodes, members: candidate}, nil
+	return topologyUpdate{nodes: nodes, members: result.Members}, nil
 }
 
 func (r *TopologyReconciler) annotate(ctx context.Context, update topologyUpdate) error {
@@ -299,6 +293,20 @@ type workloadIdentity struct {
 	uid  types.UID
 }
 
+func (ids DataplaneWorkloadIdentities) observed() membership.WorkloadIdentities {
+	observed := membership.WorkloadIdentities{Namespace: ids.namespace}
+	for i, workload := range ids.workloads {
+		observed.Workloads[i] = membership.WorkloadIdentity{Name: workload.name, UID: workload.uid}
+	}
+
+	return observed
+}
+
+// Owns checks only ownership against the observed live workload identities.
+func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
+	return ids.observed().Owns(pod)
+}
+
 // Custom standalone installations retain their single configured workload.
 // Operator installations use both fixed names, never a label-derived allowlist.
 func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cfg Config) (DataplaneWorkloadIdentities, error) {
@@ -323,262 +331,40 @@ func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cf
 	return ids, nil
 }
 
-// Owns checks ownership only. Callers retain their Pod, Node, service-account,
-// token and readiness-independent membership checks.
-func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
-	if pod == nil {
-		return false
-	}
-
-	owner := metav1.GetControllerOf(pod)
-	if owner == nil || owner.APIVersion != "apps/v1" || owner.Kind != "DaemonSet" || owner.UID == "" {
-		return false
-	}
-
-	if pod.Namespace != ids.namespace {
-		return false
-	}
-
-	for _, workload := range ids.workloads {
-		if owner.Name == workload.name && owner.UID == workload.uid {
-			return true
-		}
-	}
-
-	return false
-}
-
 const (
-	enrolledSharesAnnotation   = "racer.unbounded-cloud.io/enrolled-shares"
-	enrolledRDMANICsAnnotation = "racer.unbounded-cloud.io/enrolled-rdma-nics"
-	admittedMemberAnnotation   = "racer.unbounded-cloud.io/last-admitted-member"
+	enrolledSharesAnnotation   = membership.EnrolledSharesAnnotation
+	enrolledRDMANICsAnnotation = membership.EnrolledRDMANICsAnnotation
+	admittedMemberAnnotation   = membership.AdmittedMemberAnnotation
 )
 
-// nodeSite uses only the canonical Machine Site label.
-// Read current labels independently of retained annotations: removal must revoke
-// the old RDMA boundary even when hardware annotations are malformed.
-func nodeSite(node *corev1.Node) string {
-	return node.Labels[machinav1.MachineSiteLabelKey]
-}
-
 // AcceptedMembers is backed by per-Node UID-bound last-admitted annotations.
-type AcceptedMembers map[wire.NodeID]wire.Member
+type AcceptedMembers = membership.History
 
-type MemberAttributes struct {
-	Shares   uint32
-	RDMANICs []wire.RDMANIC
-}
+type MemberAttributes = membership.MemberAttributes
 
-type Diagnostic struct {
-	Object string
-	Field  string
-	Reason string
-}
+type Diagnostic = membership.Diagnostic
 
 // ParseAnnotations distinguishes absent defaults from malformed proposed updates.
 func ParseAnnotations(node *corev1.Node) (MemberAttributes, error) {
-	if node == nil {
-		return MemberAttributes{}, wire.InvalidRequest
-	}
-
-	attributes := MemberAttributes{Shares: wire.DefaultShares, RDMANICs: []wire.RDMANIC{}}
-
-	if _, explicit := node.Annotations[wire.SharesAnnotation]; !explicit {
-		if value := node.Annotations[enrolledSharesAnnotation]; value != "" {
-			shares, err := strconv.ParseUint(value, 10, 32)
-			if err != nil || shares == 0 {
-				return MemberAttributes{}, wire.InvalidRequest
-			}
-
-			attributes.Shares = uint32(shares)
-		}
-	}
-
-	if value, present := node.Annotations[wire.SharesAnnotation]; present {
-		shares, err := strconv.ParseUint(value, 10, 32)
-		if err != nil || shares == 0 || strings.HasPrefix(value, "+") {
-			return MemberAttributes{}, fmt.Errorf("%s: %w", wire.SharesAnnotation, wire.InvalidRequest)
-		}
-
-		attributes.Shares = uint32(shares)
-	}
-
-	field := wire.RDMANICsAnnotation
-
-	value, present := node.Annotations[field]
-	if !present {
-		field = enrolledRDMANICsAnnotation
-		value, present = node.Annotations[field]
-	}
-
-	if present {
-		nics, err := wire.DecodeRDMANICs(strings.NewReader(value))
-		if err != nil {
-			return MemberAttributes{}, fmt.Errorf("%s: %w", field, err)
-		}
-
-		attributes.RDMANICs = nics
-	}
-
-	return attributes, nil
+	return membership.ParseAnnotations(node)
 }
 
-// selectEndpoint verifies workload ownership, ignores terminal/terminating/IP-less Pods,
-// and chooses the newest creation time, breaking ties by UID. Readiness is ignored.
+// selectEndpoint retains the parent test bridge during membership migration.
 func selectEndpoint(pods []corev1.Pod, ownership DataplaneWorkloadIdentities, nodeName string, port uint16) (string, error) {
-	if nodeName == "" || port == 0 {
-		return "", wire.InvalidRequest
-	}
-
-	var (
-		selected *corev1.Pod
-		address  netip.Addr
-	)
-
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Spec.NodeName != nodeName || pod.DeletionTimestamp != nil || pod.UID == "" {
-			continue
-		}
-
-		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
-			continue
-		}
-
-		if !ownership.Owns(pod) {
-			continue
-		}
-
-		ip, err := netip.ParseAddr(pod.Status.PodIP)
-		if err != nil || ip.Zone() != "" {
-			continue
-		}
-
-		if selected == nil || pod.CreationTimestamp.After(selected.CreationTimestamp.Time) ||
-			pod.CreationTimestamp.Equal(&selected.CreationTimestamp) && pod.UID > selected.UID {
-			selected, address = pod, ip
-		}
-	}
-
-	if selected == nil {
-		return "", wire.Unavailable
-	}
-
-	return netip.AddrPortFrom(address, port).String(), nil
+	return membership.SelectEndpoint(pods, ownership.observed(), nodeName, port)
 }
 
-// reconcileMembers preserves admitted values across gaps using UID-bound Node
-// annotations on restart. Never-admitted nodes with unavailable or malformed
-// required inputs are omitted. Deletion and exclusion remove membership.
-// Annotations are accepted as one unit, independently of the endpoint. Site is
-// always derived from current labels, never from admitted history, so a
-// malformed annotation cannot retain a removed or changed RDMA boundary.
-// The caller installs returned history only after the candidate publication commits.
-// Inputs and nested accepted state are never mutated or aliased by the result.
-// Accepted must contain only previously committed results from this function.
-// The caller supplies installation-namespace Pods grouped by assigned node name.
-// Each group is still checked for node assignment and DaemonSet ownership.
+// reconcileMembers retains the parent test bridge during membership migration.
 func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, ownership DataplaneWorkloadIdentities, accepted AcceptedMembers, port uint16) (AcceptedMembers, []Diagnostic, error) {
-	if port == 0 {
-		return nil, nil, wire.InvalidRequest
-	}
+	result, err := membership.Reconcile(membership.Input{
+		Nodes: nodes, PodsByNode: podsByNode, Ownership: ownership.observed(), PeerPort: port,
+	}, accepted)
 
-	nodes = slices.Clone(nodes)
-	slices.SortFunc(nodes, func(a, b corev1.Node) int { return cmp.Compare(a.UID, b.UID) })
-
-	result := make(AcceptedMembers)
-	diagnostics := []Diagnostic{}
-	ids, names := map[types.UID]bool{}, map[string]bool{}
-
-	for i := range nodes {
-		node := &nodes[i]
-		if !wire.ValidUUID(string(node.UID)) || node.Name == "" || ids[node.UID] || names[node.Name] {
-			return nil, nil, fmt.Errorf("node identity: %w", wire.InvalidRequest)
-		}
-
-		ids[node.UID], names[node.Name] = true, true
-		if _, excluded := node.Labels[wire.ExclusionLabel]; excluded {
-			continue
-		}
-
-		id := wire.NodeID(node.UID)
-
-		previous, known := accepted[id]
-		if !known {
-			if saved, err := wire.DecodeAdmittedMember(strings.NewReader(node.Annotations[admittedMemberAnnotation])); err == nil && saved.Node == id {
-				previous, known = saved, true
-			}
-		}
-
-		for _, field := range []string{wire.RailsAnnotation, wire.AlignmentAnnotation} {
-			if _, present := node.Annotations[field]; present {
-				diagnostics = append(diagnostics, Diagnostic{Object: node.Name, Field: field, Reason: "legacy annotation ignored; use " + wire.RDMANICsAnnotation})
-			}
-		}
-
-		attributes, annotationErr := ParseAnnotations(node)
-		if annotationErr != nil {
-			diagnostics = append(diagnostics, Diagnostic{Object: node.Name, Field: "annotations", Reason: annotationErr.Error()})
-
-			if known {
-				attributes = MemberAttributes{Shares: previous.Shares, RDMANICs: previous.RDMANICs}
-			}
-		}
-
-		endpoint, endpointErr := selectEndpoint(podsByNode[node.Name], ownership, node.Name, port)
-		if endpointErr != nil {
-			if !errors.Is(endpointErr, wire.Unavailable) {
-				return nil, nil, endpointErr
-			}
-
-			diagnostics = append(diagnostics, Diagnostic{Object: node.Name, Field: "peer_endpoint", Reason: "no eligible managed Pod endpoint"})
-
-			if known {
-				endpoint = previous.PeerEndpoint
-			}
-		}
-
-		if !known && (annotationErr != nil || endpointErr != nil) {
-			continue
-		}
-
-		member := wire.Member{Node: id, Shares: attributes.Shares, RDMANICs: wire.CanonicalRDMANICs(attributes.RDMANICs), PeerEndpoint: endpoint, Site: nodeSite(node)}
-
-		result[id] = member
-	}
-
-	if len(result) > wire.MaxMembers {
-		return nil, nil, wire.TooLarge
-	}
-
-	return result, diagnostics, nil
+	return result.Members, result.Diagnostics, err
 }
 
 // BuildCatalog derives identities from UIDs and paths from names, sorted by UID.
 // An invalid catalog never partially replaces the currently served publication.
 func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error) {
-	catalog := make([]wire.CacheDefinition, 0, len(caches))
-	ids := make(map[wire.CacheID]bool, len(caches))
-
-	names := make(map[string]bool, len(caches))
-	for _, cache := range caches {
-		id := wire.CacheID(cache.UID)
-		if !wire.ValidUUID(string(id)) || ids[id] || names[cache.Name] {
-			return nil, fmt.Errorf("cache identity: %w", wire.InvalidRequest)
-		}
-
-		client, origin, err := wire.CanonicalSocketPaths(cache.Name)
-		if err != nil {
-			return nil, fmt.Errorf("cache socket paths: %w", err)
-		}
-
-		ids[id], names[cache.Name] = true, true
-		catalog = append(catalog, wire.CacheDefinition{
-			ID: id, Name: cache.Name, ClientSocket: client, OriginSocket: origin,
-		})
-	}
-
-	slices.SortFunc(catalog, func(a, b wire.CacheDefinition) int { return cmp.Compare(a.ID, b.ID) })
-
-	return catalog, nil
+	return membership.BuildCatalog(caches)
 }
