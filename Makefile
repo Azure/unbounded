@@ -588,7 +588,7 @@ racer-controller: racer-server-test racer-controller-build ## Test and build the
 
 racer-controller-build: ## Build the Racer controller without lint/test
 	@mkdir -p bin
-	$(GOBUILD) -o bin/racer-controller ./cmd/racer-controller
+	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controller ./cmd/racer-controller
 
 .PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-dst racer-dataplane-dst-10m racer-dataplane-contention racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
 racer-dataplane-test: ## Run Rust unit and uds-endpoint integration tests with all features (RACER_TEST_ARGS)

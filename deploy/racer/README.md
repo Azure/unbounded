@@ -36,6 +36,11 @@ filesystem. Each controller requests 100m CPU and 128Mi memory, with limits of
 2 CPUs and 1Gi memory. These are deployment defaults, not a capacity guarantee;
 size operator workload overrides for the installation's topology and request load.
 
+The controller logs its version, Git commit, and build time before loading runtime
+configuration. `make racer-controller-build` stamps `VERSION`, `GIT_COMMIT`, and
+`BUILD_TIME`; the controller image accepts the same build arguments. Unstamped
+development builds report `dev` and `unknown` metadata.
+
 ## Atomic credentials
 
 The controller owns one `racer-credentials` Secret containing `issuer.json`

@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/version"
 )
 
 func main() {
@@ -26,6 +27,8 @@ func run() error {
 	if len(os.Args) != 1 {
 		return fmt.Errorf("usage: racer-controller")
 	}
+
+	ctrl.Log.Info("starting racer-controller", "version", version.String())
 
 	cfg, err := racer.LoadConfig()
 	if err != nil {
