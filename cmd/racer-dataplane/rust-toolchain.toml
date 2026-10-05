@@ -1,7 +1,0 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-[toolchain]
-channel = "1.96.0"
-profile = "minimal"
-components = ["rustfmt", "clippy"]

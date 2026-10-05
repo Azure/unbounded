@@ -10,8 +10,10 @@ on:
       # Release branches receive cherry-picked fixes, including security fixes,
       # so they need code scanning as much as main does.
       - release-*
-  # Scan every PR base, including stacked branches.
   pull_request:
+    branches:
+      - main
+      - release-*
   merge_group:
     types:
       - checks_requested
