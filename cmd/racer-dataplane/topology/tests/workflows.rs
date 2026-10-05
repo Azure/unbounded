@@ -1,29 +1,37 @@
 //! Application workflows using only the topology crate's public API.
+
 use futures::{executor::block_on, task::noop_waker_ref};
+
 use std::{future::Future, num::NonZeroU32, task::Context};
+
 use topology::{Error, Maintenance, Member, Membership, PathQuery, Paths, Placement};
 
+/// Application-owned fixed-width identity for placement and forwarding workflows.
 #[derive(Clone, Debug)]
 struct Node([u8; 2]);
 
 impl Member for Node {
     const DOMAIN: &'static str = "workflow-store";
 
+    /// Expose the node's binary identity.
     fn id(&self) -> &[u8] {
         &self.0
     }
 
+    /// Give every workflow node equal selection weight.
     fn weight(&self) -> NonZeroU32 {
         NonZeroU32::new(1).unwrap()
     }
 }
 
+/// Freeze reverse discovery order into canonical membership positions.
 fn members(ids: std::ops::Range<u16>) -> Membership<Node> {
     // Discovery order is intentionally different from membership position order.
     Membership::new(ids.rev().map(|id| Node(id.to_be_bytes())).collect()).unwrap()
 }
 
-fn assert_route(members: &Membership<Node>, query: PathQuery<'_>, route: &[usize]) {
+/// Check endpoints, budget, loop freedom, filters, and public overlay edges.
+fn assert_route<M: Member>(members: &Membership<M>, query: PathQuery<'_>, route: &[usize]) {
     assert_eq!(route.first(), Some(&query.from));
     assert_eq!(route.last(), Some(&query.to));
     assert!(route.len() <= usize::from(query.links) + 1);
@@ -39,6 +47,7 @@ fn assert_route(members: &Membership<Node>, query: PathQuery<'_>, route: &[usize
     }
 }
 
+/// Route toward placement replicas and recover from failures at each relay.
 #[test]
 fn route_to_a_replica_forward_without_loops_and_recover_from_blocked_links() {
     let members = members(0..1000);
@@ -145,6 +154,7 @@ fn route_to_a_replica_forward_without_loops_and_recover_from_blocked_links() {
     assert_eq!(block_on(paths.route(&members, query)).unwrap(), original);
 }
 
+/// Replace snapshots during cooperative placement and recover after cancellation.
 #[test]
 fn replace_membership_during_pending_placement_then_fall_back_for_large_changes() {
     let old = members(0..600);
@@ -200,4 +210,118 @@ fn replace_membership_during_pending_placement_then_fall_back_for_large_changes(
     );
     // Returning to a retained snapshot after eviction is still safe.
     assert_eq!(placement.rank(&old, key).unwrap(), expected_old);
+}
+
+/// A stable identity whose weight may differ between immutable snapshots.
+#[derive(Clone)]
+struct WeightedNode {
+    id: Vec<u8>,
+
+    weight: NonZeroU32,
+}
+
+impl Member for WeightedNode {
+    const DOMAIN: &'static str = "racer";
+
+    /// Return the stable ID shared by predecessor and successor snapshots.
+    fn id(&self) -> &[u8] {
+        &self.id
+    }
+
+    /// Return this snapshot's selection weight.
+    fn weight(&self) -> NonZeroU32 {
+        self.weight
+    }
+}
+
+/// Share search admission across successors, cancel waiters, and reselect hits.
+#[test]
+fn shared_routes_survive_cancellation_and_weight_only_successors() {
+    let old = Membership::new(
+        (0..10_000)
+            .map(|i| WeightedNode {
+                id: format!("node-{i:06}").into_bytes(),
+                weight: NonZeroU32::new(4).unwrap(),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let query = PathQuery {
+        from: 0,
+        to: 9999,
+        links: 4,
+        visited: &[],
+        blocked: &[],
+        seed: b"successor-workflow",
+    };
+    let oracle = Paths::new(0);
+    let expected_old = block_on(oracle.route(&old, query)).unwrap();
+    let alternate = block_on(oracle.route(
+        &old,
+        PathQuery {
+            blocked: &[expected_old[1]],
+            ..query
+        },
+    ))
+    .unwrap();
+    assert_eq!(alternate.len(), expected_old.len());
+    let favored = alternate[1];
+    let mut records = old.members().to_vec();
+    records[favored].weight = NonZeroU32::new(u32::MAX).unwrap();
+    let next = Membership::new_with_predecessor(records, &old).unwrap();
+    assert_ne!(next.identity(), old.identity());
+    let next_query = PathQuery {
+        seed: b"successor-reselection",
+        ..query
+    };
+    let expected_next = block_on(oracle.route(&next, next_query)).unwrap();
+    assert_eq!(expected_next[1], favored);
+    assert_ne!(expected_next[1], expected_old[1]);
+
+    let paths = Paths::with_limits(1, 1024 * 1024, 1);
+    let mut cx = Context::from_waker(noop_waker_ref());
+    let mut canceled = Box::pin(paths.route(&old, query));
+    let mut successor = Box::pin(paths.route(&next, next_query));
+    assert!(canceled.as_mut().poll(&mut cx).is_pending());
+    assert!(successor.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(paths.active_searches(), 1);
+    assert_eq!(
+        block_on(paths.route(&old, PathQuery { links: 5, ..query })),
+        Err(Error::Overloaded)
+    );
+    drop(canceled);
+    assert_eq!(paths.active_searches(), 1);
+    let route = block_on(successor).unwrap();
+    assert_eq!(route, expected_next);
+    assert_route(&next, next_query, &route);
+    assert_eq!(paths.active_searches(), 0);
+    assert_eq!(paths.cached_entries(), 1);
+    let bytes = paths.cached_bytes();
+    assert!(bytes > 0);
+
+    // The same retained alternatives serve the old weights without another poll.
+    let mut old_hit = Box::pin(paths.route(&old, query));
+    assert_eq!(
+        old_hit.as_mut().poll(&mut cx),
+        std::task::Poll::Ready(Ok(expected_old))
+    );
+    assert_eq!(paths.cached_entries(), 1);
+    assert_eq!(paths.cached_bytes(), bytes);
+    assert_eq!(paths.active_searches(), 0);
+
+    // Canceling every waiter frees admission without disturbing the warm entry.
+    let cold = PathQuery { links: 5, ..query };
+    let mut first = Box::pin(paths.route(&old, cold));
+    let mut second = Box::pin(paths.route(&next, cold));
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    drop(second);
+    assert_eq!(paths.active_searches(), 1);
+    drop(first);
+    assert_eq!(paths.active_searches(), 0);
+    assert_eq!(paths.cached_bytes(), bytes);
+    assert_eq!(
+        block_on(paths.route(&next, next_query)).unwrap(),
+        expected_next
+    );
 }
