@@ -43,13 +43,8 @@ use std::thread;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use uring_runtime::affinity::CpuLocation;
-use uring_runtime::affinity::EffectiveTopology;
-use uring_runtime::affinity::NicLocality;
-#[cfg(test)]
-use uring_runtime::affinity::current_cpus;
-use uring_runtime::deadline::Deadline;
-use uring_runtime::drive_local_with;
+use uring_runtime::drivers::drive_local_with;
+use uring_runtime::environment::Deadline;
 use uring_runtime::group::Factory;
 use uring_runtime::group::FailureReporter;
 use uring_runtime::group::Group;
@@ -57,6 +52,11 @@ use uring_runtime::group::Helper;
 use uring_runtime::group::Lane;
 use uring_runtime::group::Plan;
 use uring_runtime::group::Service;
+use uring_runtime::group::affinity::CpuLocation;
+use uring_runtime::group::affinity::EffectiveTopology;
+use uring_runtime::group::affinity::NicLocality;
+#[cfg(test)]
+use uring_runtime::group::affinity::current_cpus;
 
 const WORK_BUDGET: usize = 64;
 const IDLE_WAIT: Duration = Duration::from_millis(1);
@@ -487,7 +487,7 @@ impl Drop for WorkerGroup {
 
 fn driver_waker(runtime: Option<&WorkerRuntime>) -> Result<Waker> {
     let reactor = runtime.map(|runtime| runtime.reactor.waker()).transpose()?;
-    Ok(uring_runtime::thread_waker(reactor))
+    Ok(uring_runtime::drivers::thread_waker(reactor))
 }
 
 /// Independently drive resource completions while a service future borrows its
@@ -811,7 +811,7 @@ impl Service<RequestScope> for IoService {
 
 #[cfg(test)]
 fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
-    let location = uring_runtime::affinity::CpuLocation {
+    let location = uring_runtime::group::affinity::CpuLocation {
         cpu: *current_cpus().unwrap().first().unwrap(),
         package: 0,
         core: 0,
@@ -982,10 +982,10 @@ mod tests {
 
         use crate::worker::*;
         #[cfg(test)]
-        use uring_runtime::affinity::CpuQuota;
-        use uring_runtime::affinity::current_cpus;
-        use uring_runtime::affinity::pin_cpu;
-        use uring_runtime::affinity::set_cpus;
+        use uring_runtime::group::affinity::CpuQuota;
+        use uring_runtime::group::affinity::current_cpus;
+        use uring_runtime::group::affinity::pin_cpu;
+        use uring_runtime::group::affinity::set_cpus;
 
         #[cfg(test)]
         mod tests {

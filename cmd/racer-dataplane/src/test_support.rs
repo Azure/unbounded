@@ -50,7 +50,7 @@ pub mod clock {
     use std::time::Instant;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
-    use uring_runtime::deadline::Deadline;
+    use uring_runtime::environment::Deadline;
 
     /// Pure deadline/freshness fixture. Reactor timers use SimulationClock.
     pub struct Clock {

@@ -279,7 +279,7 @@ impl Subscriptions {
                     // A ready/hot rank must not chain arbitrary endpoint work in
                     // one poll. Also separate the final cold quantum from the
                     // next rank, preserving the per-poll member hash bound.
-                    uring_runtime::yield_now().await;
+                    uring_runtime::drivers::yield_now().await;
                 }
             }
         }

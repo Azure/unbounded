@@ -440,7 +440,7 @@ fn balanced_workload_covers_owners_without_multiplying_pages() {
 
 #[test]
 fn automatic_and_capped_plans_preserve_shared_and_explicit_paired_crypto() {
-    use uring_runtime::affinity::CpuLocation;
+    use uring_runtime::group::affinity::CpuLocation;
     let mut config = default_config();
     let topology = EffectiveTopology {
         cpus: (0..12)
@@ -967,4 +967,4 @@ impl Drop for Brd {
         }
     }
 }
-use uring_runtime::affinity::EffectiveTopology;
+use uring_runtime::group::affinity::EffectiveTopology;

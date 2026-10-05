@@ -41,7 +41,7 @@ use std::task::Poll;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use uring_runtime::deadline::Deadline;
+use uring_runtime::environment::Deadline;
 
 fn reserve_hedge_pages(
     admission: &flow_control::Quotas<crate::admission::AdmissionPolicy>,
@@ -1573,12 +1573,12 @@ impl Permit {
         self.owner.metrics.record(Event::PageHedgeWon, 1);
     }
 }
-impl uring_runtime::hedge::Scope for RequestScope {
+impl uring_runtime::drivers::HedgeScope for RequestScope {
     fn cancel(&self) {
         let _ = RequestScope::cancel(self);
     }
 }
-impl uring_runtime::hedge::Policy<Error> for &Permit {
+impl uring_runtime::drivers::HedgePolicy<Error> for &Permit {
     fn delay(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         Permit::delay(self, cx)
     }
@@ -1588,8 +1588,8 @@ impl uring_runtime::hedge::Policy<Error> for &Permit {
     fn failure(&mut self) -> Error {
         Error::Unavailable
     }
-    fn won(&mut self, contender: uring_runtime::hedge::Contender) {
-        if contender == uring_runtime::hedge::Contender::Secondary {
+    fn won(&mut self, contender: uring_runtime::drivers::Contender) {
+        if contender == uring_runtime::drivers::Contender::Secondary {
             Permit::won(self);
         }
     }
@@ -1605,7 +1605,7 @@ pub(crate) async fn race(
     parent: &crate::runtime::RequestScope,
     permit: &Permit,
 ) -> Result<crate::memory::PageResult> {
-    uring_runtime::hedge::race(
+    uring_runtime::drivers::race(
         primary,
         secondary,
         primary_scope,

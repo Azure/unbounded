@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::deadline::Deadline;
+use uring_runtime::environment::Deadline;
 
 pub use ::topology::MAX_DEGREE;
 pub use ::topology::{Maintenance, SLOT_COUNT};

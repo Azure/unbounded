@@ -41,10 +41,10 @@ use uring_runtime::reactor::ready_set::ReadySet;
 enum Listener {
     Real(uds_endpoint::BoundSocket),
     #[cfg(test)]
-    Sim(uring_runtime::reactor::Descriptor),
+    Sim(uring_runtime::reactor::descriptor::Descriptor),
 }
 impl Listener {
-    fn accept(&self) -> std::io::Result<(uring_runtime::reactor::Descriptor, ())> {
+    fn accept(&self) -> std::io::Result<(uring_runtime::reactor::descriptor::Descriptor, ())> {
         #[cfg(test)]
         if let Some(errno) = FAIL_ACCEPT.with(|fail| fail.take()) {
             return Err(std::io::Error::from_raw_os_error(errno));
@@ -1076,7 +1076,7 @@ pub(super) fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result
     Ok(RequestScope {
         body_deadlines: None,
         request: RequestId(id),
-        deadline: uring_runtime::deadline::Deadline(uring_runtime::environment::now() + timeout),
+        deadline: uring_runtime::environment::Deadline(uring_runtime::environment::now() + timeout),
         cancellation,
     })
 }
@@ -1141,7 +1141,7 @@ impl ReadyListeners {
             let scope = self.scope.clone();
             Box::pin(async move {
                 let scope = scope.ok_or(Error::Internal)?;
-                uring_runtime::retry_listener(&scope, || {
+                uring_runtime::drivers::retry_listener(&scope, || {
                     reactor.readiness_with_lease(
                         fd.clone(),
                         libc::POLLIN as u32,

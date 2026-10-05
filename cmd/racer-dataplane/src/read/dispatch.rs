@@ -113,7 +113,7 @@ enum Value {
     Peer(PeerResponse),
 }
 struct Active {
-    cancellation: Result<uring_runtime::deadline::CancellationRegistration>,
+    cancellation: Result<uring_runtime::environment::CancellationRegistration>,
     runnable: Arc<uring_runtime::drivers::Runnable>,
     future: Operation<'static, ()>,
     scope: RequestScope,

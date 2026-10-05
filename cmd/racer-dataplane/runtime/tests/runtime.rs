@@ -26,7 +26,10 @@ mod filesystem {
         Budget, Error, Operation, Result, Scope,
         reactor::{
             IoBuffer, Reactor as Core,
-            filesystem::{Durability, Replacement, ReplacementError, publish_new, secure},
+            filesystem::{
+                operations::{Durability, Replacement, ReplacementError, publish_new},
+                secure,
+            },
         },
     };
 
@@ -574,7 +577,7 @@ mod affinity {
     use std::{collections::BTreeSet, fs, path::Path, sync::mpsc, thread, time::Duration};
     use uring_runtime::{
         Error,
-        affinity::{EffectiveTopology, current_cpus, pin_cpu, set_cpus},
+        group::affinity::{EffectiveTopology, current_cpus, pin_cpu, set_cpus},
     };
 
     /// Decode procfs independently of the runtime's syscall reader.

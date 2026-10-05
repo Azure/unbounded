@@ -581,7 +581,9 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             let fd = socket
                 .reactor
                 .accept(
-                    Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                        listener,
+                    )),
                     &scope,
                 )
                 .await?;
@@ -1058,7 +1060,9 @@ fn signed_tcp_case(case: &str) {
     let server_work = async {
         let fd = reactor
             .accept(
-                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                    listener,
+                )),
                 &scope,
             )
             .await?;
@@ -1405,7 +1409,9 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         use uring_runtime::reactor::IoBuffer;
         let fd = reactor
             .accept(
-                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                    listener,
+                )),
                 &scope,
             )
             .await?;

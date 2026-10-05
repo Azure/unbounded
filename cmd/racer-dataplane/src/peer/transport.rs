@@ -1614,7 +1614,7 @@ pub(crate) async fn relay_body(
 async fn wait_relay_progress(
     io: &HttpIo,
     state: Rc<std::cell::RefCell<Transit>>,
-    wait: Option<(Rc<uring_runtime::reactor::Descriptor>, i16)>,
+    wait: Option<(Rc<uring_runtime::reactor::descriptor::Descriptor>, i16)>,
     scope: &RequestScope,
 ) -> Result<()> {
     if let Some((fd, interest)) = wait {

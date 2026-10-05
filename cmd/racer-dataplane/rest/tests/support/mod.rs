@@ -13,7 +13,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime},
 };
-use uring_runtime::{Scope as _, reactor::Descriptor};
+use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 
 /// Fixture errors retain transport categories without an orphan conversion impl.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

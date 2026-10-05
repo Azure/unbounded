@@ -3,8 +3,7 @@
 use super::*;
 use std::{ffi::CString, num::NonZeroUsize, ops::Deref};
 use zeroize::Zeroize;
-mod operations;
-pub use operations::{Durability, Replacement, ReplacementError, publish_new};
+pub mod operations;
 
 /// Stable, quota-owning I/O storage with a cursor for partial writes.
 /// The entire allocation is zeroized on drop, including already consumed bytes.

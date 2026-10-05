@@ -312,6 +312,106 @@ mod completion {
     //! Original and cancellation accounting, owner release, and independent fence waiters.
     use super::*;
 
+    /// Valid orderings retire once, and invalid CQEs cannot lose the original result.
+    #[test]
+    fn completion_transitions_reject_unsubmitted_duplicate_and_retired_cqes() {
+        for cancel_first in [false, true] {
+            for original in [7, -libc::EIO] {
+                let mut state = CompletionState::new(CompletionKind::Value);
+                assert!(matches!(state.complete(true, 0.into()), Err(Error::Io)));
+                assert!(state.needs_cancel());
+                state.cancel_submitted();
+                assert!(!state.needs_cancel());
+                let (first, second) = if cancel_first {
+                    ((true, -libc::ENOENT), (false, original))
+                } else {
+                    ((false, original), (true, -libc::ENOENT))
+                };
+                assert!(state.complete(first.0, first.1.into()).unwrap().is_none());
+                assert!(!state.needs_cancel());
+                assert!(matches!(
+                    state.complete(first.0, first.1.into()),
+                    Err(Error::Io)
+                ));
+                let result = state.complete(second.0, second.1.into()).unwrap().unwrap();
+                assert!(matches!(result, KernelResult::Value(value) if value == original));
+                assert!(matches!(state, CompletionState::Retired));
+                for cancel in [false, true] {
+                    assert!(matches!(state.complete(cancel, 0.into()), Err(Error::Io)));
+                }
+            }
+        }
+        let mut state = CompletionState::new(CompletionKind::Value);
+        assert!(matches!(
+            state.complete(false, 3.into()).unwrap(),
+            Some(KernelResult::Value(3))
+        ));
+        assert!(!state.needs_cancel());
+        assert!(matches!(state.complete(false, 3.into()), Err(Error::Io)));
+        assert!(matches!(state.complete(true, 0.into()), Err(Error::Io)));
+    }
+
+    /// Scalar results never own descriptors; descriptor owners survive both fence orders.
+    #[test]
+    fn completion_kind_preserves_descriptor_ownership_through_both_fences() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+
+        for cancel_first in [false, true] {
+            for typed in [false, true] {
+                let (socket, mut peer) = UnixStream::pair().unwrap();
+                peer.set_nonblocking(true).unwrap();
+                let fd = socket.as_raw_fd();
+                let mut scalar = CompletionState::new(CompletionKind::Value);
+                assert!(
+                    matches!(scalar.complete(false, fd.into()).unwrap(), Some(KernelResult::Value(value)) if value == fd)
+                );
+                let original = if typed {
+                    KernelResult::Accepted(socket.into())
+                } else {
+                    KernelResult::Value(socket.into_raw_fd())
+                };
+                let mut state = CompletionState::new(CompletionKind::Descriptor);
+                state.cancel_submitted();
+                let result = if cancel_first {
+                    assert!(
+                        state
+                            .complete(true, (-libc::ENOENT).into())
+                            .unwrap()
+                            .is_none()
+                    );
+                    state.complete(false, original).unwrap().unwrap()
+                } else {
+                    assert!(state.complete(false, original).unwrap().is_none());
+                    assert_eq!(
+                        peer.read(&mut [0]).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    // Reject a duplicate without replacing the retained original owner.
+                    assert!(matches!(
+                        state.complete(false, (-libc::EIO).into()),
+                        Err(Error::Io)
+                    ));
+                    state
+                        .complete(true, (-libc::ENOENT).into())
+                        .unwrap()
+                        .unwrap()
+                };
+                assert!(matches!(result, KernelResult::Accepted(_)));
+                assert_eq!(
+                    peer.read(&mut [0]).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                drop(result);
+                assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+            }
+        }
+        let mut state = CompletionState::new(CompletionKind::Descriptor);
+        assert!(
+            matches!(state.complete(false, (-libc::EMFILE).into()).unwrap(), Some(KernelResult::Value(value)) if value == -libc::EMFILE)
+        );
+    }
+
     #[test]
     /// Release queue and notification borrows before application result destruction.
     fn finish_releases_slot_and_waker_borrow_before_result_destruction() {
@@ -439,11 +539,11 @@ mod completion {
                         waker: RefCell::new(None),
                     }),
                     scope: Rc::new(scope()),
-                    original: None,
-                    accept: false,
+                    completion: CompletionState::Pending {
+                        kind: CompletionKind::Value,
+                        cancellation: CancellationFence::Pending,
+                    },
                     cancel_reason: None,
-                    cancel_sent: true,
-                    cancel_done: false,
                 },
             );
             let counter = Arc::new(Count(AtomicUsize::new(0)));
@@ -506,11 +606,8 @@ mod completion {
                     waker: RefCell::new(None),
                 }),
                 scope: Rc::new(scope()),
-                original: None,
-                accept: false,
+                completion: CompletionState::new(CompletionKind::Value),
                 cancel_reason: None,
-                cancel_sent: false,
-                cancel_done: false,
             },
         );
         let mut first = reactor.cancel_and_fence(IoId(1));
@@ -634,11 +731,11 @@ mod completion {
                     }),
                     scope: Rc::new(scope()),
                     signal,
-                    original: None,
-                    accept: false,
+                    completion: CompletionState::Pending {
+                        kind: CompletionKind::Value,
+                        cancellation: CancellationFence::Pending,
+                    },
                     cancel_reason: Some(Error::Cancelled),
-                    cancel_sent: true,
-                    cancel_done: false,
                 },
             );
             drop(waiting);
@@ -694,11 +791,11 @@ mod completion {
                     abandoned: Cell::new(true),
                     waker: RefCell::new(None),
                 }),
-                original: None,
-                accept: true,
+                completion: CompletionState::Pending {
+                    kind: CompletionKind::Descriptor,
+                    cancellation: CancellationFence::Pending,
+                },
                 cancel_reason: Some(Error::Cancelled),
-                cancel_sent: true,
-                cancel_done: false,
             },
         );
         assert!(
@@ -747,11 +844,8 @@ mod completion {
                         abandoned: Cell::new(false),
                         waker: RefCell::new(None),
                     }),
-                    original: None,
-                    accept: false,
+                    completion: CompletionState::new(CompletionKind::Value),
                     cancel_reason: None,
-                    cancel_sent: false,
-                    cancel_done: false,
                 },
             );
             assert_eq!(delivered.get(), None);
@@ -1114,8 +1208,11 @@ mod socket {
             assert_eq!(ring.submission().len(), 0, "wait must submit queued SQEs");
             assert_eq!(ring.completion().len(), 0, "receive still awaits peer data");
             let entry = state.entries.first_key_value().unwrap().1;
-            assert!(entry.original.is_none());
-            assert!(!entry.cancel_sent, "wait must not scan cancellations");
+            assert!(matches!(entry.completion, CompletionState::Pending { .. }));
+            assert!(
+                entry.completion.needs_cancel(),
+                "wait must not scan cancellations"
+            );
         }
         assert_eq!(reactor.in_flight(), 1);
         assert_eq!(drops.get(), 0);
@@ -1208,7 +1305,7 @@ mod socket {
             loop {
                 match reactor.accept(listener.clone(), &scope).await {
                     Err(Error::Overloaded) => {
-                        crate::yield_now().await;
+                        crate::drivers::yield_now().await;
                     }
                     result => break result,
                 }
@@ -1572,7 +1669,9 @@ mod socket {
         let scope = scope();
         // Linux exposes an unnamed Unix listener's autobound abstract name via
         // getsockname, but SocketAddress::Unix intentionally means a filesystem
-        // path. Use a process-unique socket in the existing build directory.
+        // path. Create a project-local fixture directory even when Cargo uses an
+        // external target directory, keeping the Unix socket pathname short.
+        std::fs::create_dir_all("target").unwrap();
         let path =
             PathBuf::from("target").join(format!("reactor-unix-{}.sock", std::process::id()));
         /// Remove the process-local Unix socket fixture after the test.
@@ -1608,7 +1707,7 @@ mod socket {
         assert_eq!(&received.buffer.bytes().unwrap()[..received.bytes], b"unix");
     }
 }
-use crate::deadline::{Cancellation, Deadline};
+use crate::environment::{Cancellation, Deadline};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{num::NonZeroUsize, os::unix::net::UnixStream, time::Instant};
 
@@ -2093,10 +2192,15 @@ mod retry_regressions {
                 {
                     let mut state = reactor.state.borrow_mut();
                     let (&id, entry) = state.entries.first_key_value().unwrap();
-                    assert!(!entry.cancel_sent);
+                    assert!(entry.completion.needs_cancel());
                     // Model an already-published cancellation whose two CQEs can
                     // report an original error and ENOENT in either order.
-                    state.entries.get_mut(&id).unwrap().cancel_sent = true;
+                    state
+                        .entries
+                        .get_mut(&id)
+                        .unwrap()
+                        .completion
+                        .cancel_submitted();
                     let driver = state.simulation.as_mut().unwrap();
                     driver.inject_completion(id.0, -libc::EIO).unwrap();
                     driver
@@ -2220,7 +2324,12 @@ mod retry_regressions {
             {
                 let mut state = reactor.state.borrow_mut();
                 let id = *state.entries.first_key_value().unwrap().0;
-                state.entries.get_mut(&id).unwrap().cancel_sent = true;
+                state
+                    .entries
+                    .get_mut(&id)
+                    .unwrap()
+                    .completion
+                    .cancel_submitted();
                 let driver = state.simulation.as_mut().unwrap();
                 driver
                     .inject_completion(id.0 | CANCEL_BIT, -libc::ENOENT)
@@ -2526,11 +2635,8 @@ mod review_regressions {
                 waker: RefCell::new(None),
             }),
             scope: Rc::new(scope()),
-            original: None,
-            accept: false,
+            completion: CompletionState::new(CompletionKind::Value),
             cancel_reason: None,
-            cancel_sent: false,
-            cancel_done: false,
         }
     }
 
@@ -2646,8 +2752,14 @@ mod review_regressions {
             drop(lease);
             None
         });
-        pending.cancel_sent = true;
-        pending.cancel_done = true;
+        pending.completion.cancel_submitted();
+        assert!(
+            pending
+                .completion
+                .complete(true, 0.into())
+                .unwrap()
+                .is_none()
+        );
         reactor.state.borrow_mut().entries.insert(IoId(1), pending);
         assert_eq!(
             reactor.shutdown(Duration::ZERO),
@@ -2782,7 +2894,7 @@ mod review_regressions {
                 .borrow()
                 .entries
                 .values()
-                .all(|e| e.cancel_sent)
+                .all(|e| !e.completion.needs_cancel())
         );
         drive(&reactor, reactor.drain()).unwrap();
         for mut receive in receives {

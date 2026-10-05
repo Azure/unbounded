@@ -31,7 +31,7 @@ pub mod delivery {
     use crate::connection::{ConnectionLease, Context, OwnedBuffer, Result};
     use flow_control::{PipeLease, Policy, splice_unsupported};
     use std::{io, task::Poll, time::Instant};
-    use uring_runtime::reactor::{Descriptor, IoBuffer, SendBuffer};
+    use uring_runtime::reactor::{IoBuffer, SendBuffer, descriptor::Descriptor};
 
     /// Nonblocking staging pipe. Writes/drains expose EINTR and EAGAIN; successful
     /// counts must be bounded by the supplied slice or requested count.
@@ -764,7 +764,7 @@ pub mod relay {
     use crate::connection::{ConnectionLease, Context, HttpIo, OwnedBuffer, Result};
     use flow_control::{MAX_PIPE_BYTES, PipeLease, Policy, splice_unsupported};
     use std::{io, ops::Range, rc::Rc};
-    use uring_runtime::reactor::{Descriptor, IoBuffer};
+    use uring_runtime::reactor::{IoBuffer, descriptor::Descriptor};
 
     /// Exact opaque HTTP body transit. Does not finish exchanges or select deadlines.
     pub struct Relay<C: Context, P: RelayPipe> {

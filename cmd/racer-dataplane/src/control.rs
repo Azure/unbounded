@@ -52,8 +52,8 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use uring_runtime::Busy;
-use uring_runtime::reactor::Descriptor;
+use uring_runtime::drivers::Busy;
+use uring_runtime::reactor::descriptor::Descriptor;
 use uring_runtime::reactor::filesystem::secure;
 use uring_runtime::reactor::filesystem::secure::{BENEATH, NO_MAGICLINKS, NO_SYMLINKS};
 use zeroize::Zeroize;
@@ -1161,7 +1161,7 @@ impl SnapshotStore {
                     .map_err(|_| Error::Io)?,
             );
         }
-        let prepared = uring_runtime::poll_scoped(scope, |cx| {
+        let prepared = uring_runtime::drivers::poll_scoped(scope, |cx| {
             std::pin::Pin::new(&mut receiver).poll(cx).map(|result| {
                 result
                     .map_err(|_| Error::Internal)
@@ -2322,12 +2322,13 @@ pub(crate) async fn atomic_write(
         .await?;
     let buffer = r.file_bytes(bytes)?;
     r.file_replace(
-        uring_runtime::reactor::filesystem::Replacement {
+        uring_runtime::reactor::filesystem::operations::Replacement {
             directory: dir.clone(),
             staged: fd,
             temporary: component(&temporary)?,
             target: component(target)?,
-            durability: uring_runtime::reactor::filesystem::Durability::FileAndDirectory,
+            durability:
+                uring_runtime::reactor::filesystem::operations::Durability::FileAndDirectory,
         },
         buffer,
         scope,

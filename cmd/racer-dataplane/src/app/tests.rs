@@ -40,9 +40,9 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
-use uring_runtime::affinity::EffectiveTopology;
 #[cfg(test)]
 use uring_runtime::group::Service;
+use uring_runtime::group::affinity::EffectiveTopology;
 
 pub(super) struct ControlFixture {
     pub bundle: Arc<Mutex<wire::KeyringBundle>>,
@@ -662,7 +662,7 @@ fn topology_budget_partition_preserves_bytes_and_per_worker_search_limit() {
 
 #[test]
 fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
-    use uring_runtime::affinity::CpuLocation;
+    use uring_runtime::group::affinity::CpuLocation;
     use uring_runtime::reactor::simulation::Simulation;
     let config = Config::from_lookup(|name| {
         Ok(match name {
@@ -772,7 +772,7 @@ fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
 
 #[test]
 fn worker_sizing_rejects_four_queue_entries_with_two_threads() {
-    use uring_runtime::affinity::CpuLocation;
+    use uring_runtime::group::affinity::CpuLocation;
     let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -815,8 +815,8 @@ fn worker_sizing_rejects_four_queue_entries_with_two_threads() {
 #[test]
 fn worker_sizing_funds_derived_connection_pools() {
     use crate::admission::ResourceClass;
-    use uring_runtime::affinity::CpuLocation;
-    use uring_runtime::affinity::EffectiveTopology;
+    use uring_runtime::group::affinity::CpuLocation;
+    use uring_runtime::group::affinity::EffectiveTopology;
     let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -2155,7 +2155,7 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
 #[test]
 fn node_replacement_drains_all_workers_and_restart_converges() {
     use crate::worker::WorkerPair;
-    use uring_runtime::affinity::EffectiveTopology;
+    use uring_runtime::group::affinity::EffectiveTopology;
     for renewal_due in [false, true] {
         let mut fixture = ControlFixture::new();
         let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
@@ -3135,7 +3135,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
     let mut serving = app.peers.listen(address, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let reader = Rc::new(uring_runtime::reactor::Descriptor::from(reader));
+    let reader = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(reader));
     let mut pressure = Vec::new();
     for _ in 0..8 {
         let mut wait = runtime
@@ -3435,8 +3435,8 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
 
 #[test]
 fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
-    use uring_runtime::affinity::CpuLocation;
-    use uring_runtime::affinity::EffectiveTopology;
+    use uring_runtime::group::affinity::CpuLocation;
+    use uring_runtime::group::affinity::EffectiveTopology;
     let mut config = crate::test_support::cluster::config(false);
     config.max_threads = 4;
     config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();

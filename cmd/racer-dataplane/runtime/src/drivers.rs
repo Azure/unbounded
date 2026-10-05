@@ -24,7 +24,7 @@ use std::{
 };
 
 /// A local task. The caller must handle its outcome before returning unit.
-pub type Task = Pin<Box<dyn Future<Output = ()> + 'static>>;
+type Task = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
 /// Child scopes must support cancellation requests independently of the parent.
 pub trait HedgeScope: crate::Scope {
@@ -214,7 +214,7 @@ impl DriverQueue {
     /// Recursive calls are ignored and remaining runnable work wakes the owner.
     pub fn poll(self: &Rc<Self>, cx: &mut Context<'_>, budget: usize) {
         // Reject nested turns before touching the outer owner's wake registration.
-        let Ok(_turn) = crate::Busy::try_enter(&self.polling) else {
+        let Ok(_turn) = Busy::try_enter(&self.polling) else {
             return;
         };
         let _queue = self.enter();
@@ -337,7 +337,7 @@ impl Permit {
     }
 
     /// Transfer this reservation to a task and notify the queue's polling owner.
-    pub fn submit(mut self, driver: Task) {
+    fn submit(mut self, driver: Task) {
         self.queue.new.borrow_mut().push(driver);
         self.reserved = false;
         let waker = self.queue.owner.borrow().clone();
@@ -387,7 +387,8 @@ pub fn reserve() -> Result<Permit> {
 }
 
 /// Reserve capacity and submit a task to the currently selected queue.
-pub fn spawn(driver: Task) -> Result<()> {
+#[cfg(test)]
+fn spawn(driver: Task) -> Result<()> {
     reserve()?.submit(driver);
     Ok(())
 }
@@ -1233,7 +1234,7 @@ mod tests {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
-    use crate::deadline::Cancellation;
+    use crate::environment::Cancellation;
     use crate::test_util::WakeCounter;
     use std::{future::Future, pin::pin, rc::Rc};
 
@@ -1623,7 +1624,7 @@ mod retry_tests {
 #[cfg(test)]
 mod hedge_tests {
     use super::*;
-    use crate::{Error, deadline::Cancellation};
+    use crate::{Error, environment::Cancellation};
     use std::{cell::Cell, rc::Rc, task::Waker};
 
     /// Cancellation-only scope shared by a contender and its controlling fixture.

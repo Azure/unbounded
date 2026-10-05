@@ -45,10 +45,10 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::task::Poll;
-use uring_runtime::deadline::Deadline;
+use uring_runtime::drivers::poll_scoped;
+use uring_runtime::environment::Deadline;
 #[cfg(test)]
 use uring_runtime::group::Service;
-use uring_runtime::poll_scoped;
 
 // Match discovered ports to trusted local fabric associations and publication.
 // Fabric strings are opaque labels: a GID or enumeration order is never a label.

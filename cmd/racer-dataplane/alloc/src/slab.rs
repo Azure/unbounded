@@ -26,7 +26,7 @@ use std::{
 };
 use uring_runtime::{
     Budget, Operation, Scope,
-    reactor::{Descriptor, Reactor},
+    reactor::{Reactor, descriptor::Descriptor},
 };
 
 /// One sparse direct-I/O cache file, not a durable storage transaction.

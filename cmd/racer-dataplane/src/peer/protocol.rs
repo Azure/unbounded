@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use uring_runtime::deadline::Deadline;
+use uring_runtime::environment::Deadline;
 
 pub enum FetchMode {
     CopyOnly,
@@ -788,7 +788,7 @@ pub fn push_binary(head: &mut MessageHead, name: &str, bytes: &[u8]) {
     push(head, name, binary(bytes));
 }
 pub fn millis(time: SystemTime) -> Result<u64> {
-    uring_runtime::deadline::unix_millis(time).map_err(Into::into)
+    uring_runtime::environment::unix_millis(time).map_err(Into::into)
 }
 /// Stable environment clock mapping. Decode wire deadlines with `decode_deadline`,
 /// never reconstruct them from a new relative timeout at each hop.
@@ -2310,7 +2310,9 @@ pub(crate) mod tests {
             let pool = crate::http::new_pool(reactor.clone(), admission.clone(), 2);
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-            let listener = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
+            let listener = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                listener,
+            ));
             let scope =
                 RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
                     .unwrap();

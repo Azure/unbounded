@@ -14,7 +14,7 @@ use std::{
     rc::{Rc, Weak},
     task::{Poll, Waker},
 };
-use uring_runtime::reactor::Descriptor;
+use uring_runtime::reactor::descriptor::Descriptor;
 
 /// Maximum kernel buffer capacity per admitted reader. Pipe admission is in pipe
 /// units, so total pipe capacity is bounded by the pipe quota * MAX_PIPE_BYTES.

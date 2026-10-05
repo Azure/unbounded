@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
-use uring_runtime::deadline::CancellationRegistration;
-use uring_runtime::deadline::Deadline;
+use uring_runtime::environment::CancellationRegistration;
+use uring_runtime::environment::Deadline;
 use uring_runtime::reactor::ReactorWake;
 use uring_runtime::reactor::SUBMISSION_BYTES;
 use uring_runtime::reactor::SubmissionCapacity;
@@ -64,7 +64,7 @@ impl std::hash::BuildHasher for HashState {
 /// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]
 pub struct Cancellation {
-    inner: uring_runtime::deadline::Cancellation,
+    inner: uring_runtime::environment::Cancellation,
     state: Arc<CancellationState>,
 }
 struct CancellationState {
@@ -81,7 +81,7 @@ struct CandidateBody {
 impl Cancellation {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            inner: uring_runtime::deadline::Cancellation::new()?,
+            inner: uring_runtime::environment::Cancellation::new()?,
             state: Arc::new(CancellationState {
                 candidate_total: OnceLock::new(),
                 candidate_idle: OnceLock::new(),
@@ -252,7 +252,7 @@ impl uring_runtime::Scope for RequestScope {
         RequestScope::check(self)
     }
 
-    fn cancellation(&self) -> Option<&uring_runtime::deadline::Cancellation> {
+    fn cancellation(&self) -> Option<&uring_runtime::environment::Cancellation> {
         Some(&self.cancellation.inner)
     }
 }
@@ -321,7 +321,7 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// ```compile_fail
 /// use std::rc::Rc;
 /// use racer_dataplane::{memory::CiphertextPage, runtime::{Reactor, RequestScope}};
-/// use uring_runtime::reactor::Descriptor;
+/// use uring_runtime::reactor::descriptor::Descriptor;
 /// fn receive(r: &Reactor, fd: Rc<Descriptor>, page: CiphertextPage, scope: &RequestScope) {
 ///     let _ = r.recv(fd, page, (), scope);
 /// }
@@ -402,7 +402,6 @@ impl Reactor {
     }
 }
 
-pub(crate) use uring_runtime::yield_now as cooperative_turn;
 #[cfg(test)]
 mod tests {
     use super::HashMap;
@@ -712,9 +711,9 @@ mod tests {
             use std::task::Poll;
             use std::time::Duration;
             use std::time::Instant;
-            use uring_runtime::reactor::Descriptor;
             use uring_runtime::reactor::IoBuffer;
             use uring_runtime::reactor::SocketAddress;
+            use uring_runtime::reactor::descriptor::Descriptor;
             use uring_runtime::reactor::simulation;
 
             #[test]
@@ -902,7 +901,7 @@ mod tests {
                 assert!(poll(&mut busy).is_pending());
                 let address = SocketAddress::Unix("/retry-listener".into());
                 let listener = Rc::new(sim.listen(address.clone()).unwrap());
-                let mut accept = uring_runtime::retry_listener(&request, || {
+                let mut accept = uring_runtime::drivers::retry_listener(&request, || {
                     reactor.accept(listener.clone(), &request)
                 });
                 assert!(poll(&mut accept).is_pending());
@@ -1075,10 +1074,10 @@ mod tests {
             use std::path::Path;
             use std::rc::Rc;
             use std::time::Duration;
-            use uring_runtime::reactor::simulation::DiskState;
             use uring_runtime::reactor::simulation::Environment;
             use uring_runtime::reactor::simulation::Fault;
             use uring_runtime::reactor::simulation::Simulation;
+            use uring_runtime::reactor::simulation::disk::DiskState;
             fn reactor() -> Reactor {
                 Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
@@ -1504,9 +1503,9 @@ mod tests {
         use std::task::Poll;
         use std::task::Waker;
         use std::time::Duration;
+        use uring_runtime::drivers::retry_listener as retry;
         use uring_runtime::environment;
         use uring_runtime::environment::SimulationClock;
-        use uring_runtime::retry_listener as retry;
 
         #[test]
         fn repeated_pressure_is_rate_limited_without_self_wakes() {

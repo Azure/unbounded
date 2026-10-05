@@ -1037,7 +1037,7 @@ fn client_listener_readiness_recovers_from_queue_pressure() {
     fixture.reconcile(&[definition()]).unwrap();
     let scope = scope();
     let (reader, _writer) = UnixStream::pair().unwrap();
-    let reader = Rc::new(uring_runtime::reactor::Descriptor::from(reader));
+    let reader = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(reader));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pressure = Vec::new();
     for _ in 0..8 {

@@ -13,7 +13,7 @@
 //! shutdown must keep driving its fence and report failures rather than rely on Drop.
 
 use crate::{Budget, Error, Operation, Result, Scope};
-pub use descriptor::Descriptor;
+use descriptor::Descriptor;
 use io_uring::{IoUring, opcode, squeue, types};
 #[cfg(feature = "simulation")]
 /// Deterministic resource and completion backend for simulation runs.
@@ -467,36 +467,143 @@ struct Entry<S: Scope> {
 
     scope: Rc<S>,
 
-    original: Option<KernelResult>,
-
-    accept: bool,
+    completion: CompletionState,
 
     cancel_reason: Option<S::Error>,
-
-    cancel_sent: bool,
-
-    cancel_done: bool,
 }
 
-impl<S: Scope> Entry<S> {
-    /// Require the original CQE and, if requested, the cancel CQE in either order.
-    fn fenced(&self) -> bool {
-        self.original.is_some() && (!self.cancel_sent || self.cancel_done)
-    }
-    /// Deliver a fenced result with cancellation precedence outside reactor borrows.
-    fn finish(mut self) -> Option<Waker> {
-        if self.cancel_reason.is_none() {
-            self.cancel_reason = self.scope.check().err();
+/// Whether a successful original CQE transfers a descriptor or a scalar value.
+#[derive(Clone, Copy)]
+enum CompletionKind {
+    /// A nonnegative completion is a byte count or syscall status.
+    Value,
+
+    /// A nonnegative host completion transfers one uniquely owned descriptor.
+    Descriptor,
+}
+
+/// Cancellation accounting is independent of the reason delivery was canceled.
+#[derive(Clone, Copy)]
+enum CancellationFence {
+    /// No cancellation SQE was published for this original operation.
+    NotSubmitted,
+
+    /// The cancellation SQE is published but its CQE has not arrived.
+    Pending,
+
+    /// The cancellation CQE arrived before the original CQE.
+    Complete,
+}
+
+/// Own an original result only while its submitted cancellation still needs fencing.
+enum CompletionState {
+    /// The original CQE has not arrived; cancellation can finish independently.
+    Pending {
+        kind: CompletionKind,
+
+        cancellation: CancellationFence,
+    },
+
+    /// The original result is owned, but the published cancellation is still pending.
+    AwaitingCancel(KernelResult),
+
+    /// The original owner was transferred to a fenced retirement capability.
+    Retired,
+}
+
+impl CompletionState {
+    /// Start original completion accounting with its precise ownership interpretation.
+    fn new(kind: CompletionKind) -> Self {
+        Self::Pending {
+            kind,
+            cancellation: CancellationFence::NotSubmitted,
         }
-        let original = self.original.take().expect("original CQE fenced");
-        let result = match self.cancel_reason {
+    }
+
+    /// Cancellation can be published only before the original CQE and only once.
+    fn needs_cancel(&self) -> bool {
+        matches!(
+            self,
+            Self::Pending {
+                cancellation: CancellationFence::NotSubmitted,
+                ..
+            }
+        )
+    }
+
+    /// Record successful cancellation publication without claiming its completion.
+    fn cancel_submitted(&mut self) {
+        let Self::Pending { cancellation, .. } = self else {
+            unreachable!("cancellation requires a pending original")
+        };
+        assert!(matches!(cancellation, CancellationFence::NotSubmitted));
+        *cancellation = CancellationFence::Pending;
+    }
+
+    /// Account one CQE, transferring the original only when every required CQE arrived.
+    fn complete(&mut self, cancel: bool, result: KernelResult) -> Result<Option<KernelResult>> {
+        match self {
+            Self::Pending { cancellation, .. }
+                if cancel && matches!(cancellation, CancellationFence::Pending) =>
+            {
+                // Even ENOENT/EALREADY prove that the cancellation request finished.
+                *cancellation = CancellationFence::Complete;
+                Ok(None)
+            }
+            Self::AwaitingCancel(_) if cancel => {
+                let Self::AwaitingCancel(original) = std::mem::replace(self, Self::Retired) else {
+                    unreachable!("matched original owner")
+                };
+                Ok(Some(original))
+            }
+            Self::Pending { kind, cancellation } if !cancel => {
+                let original = match result {
+                    KernelResult::Value(fd)
+                        if matches!(kind, CompletionKind::Descriptor) && fd >= 0 =>
+                    {
+                        // SAFETY: this original CQE transfers unique descriptor ownership.
+                        KernelResult::Accepted(unsafe { Descriptor::from_raw_fd(fd) })
+                    }
+                    result => result,
+                };
+                if matches!(cancellation, CancellationFence::Pending) {
+                    *self = Self::AwaitingCancel(original);
+                    Ok(None)
+                } else {
+                    *self = Self::Retired;
+                    Ok(Some(original))
+                }
+            }
+            _ => Err(Error::Io),
+        }
+    }
+}
+
+/// Retirement authority carrying the original result after both applicable fences.
+struct FencedEntry<S: Scope> {
+    entry: Entry<S>,
+
+    original: KernelResult,
+}
+
+impl<S: Scope> FencedEntry<S> {
+    /// Deliver a fenced result with cancellation precedence outside reactor borrows.
+    fn finish(self) -> Option<Waker> {
+        let Self {
+            mut entry,
+            original,
+        } = self;
+        if entry.cancel_reason.is_none() {
+            entry.cancel_reason = entry.scope.check().err();
+        }
+        let result = match entry.cancel_reason {
             Some(error) => {
                 drop(original);
                 Err(error)
             }
             None => Ok(original),
         };
-        (self.finish)(result)
+        (entry.finish)(result)
     }
 }
 
@@ -787,11 +894,12 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 }),
                 signal: signal.clone(),
                 scope,
-                original: None,
-                accept,
+                completion: CompletionState::new(if accept {
+                    CompletionKind::Descriptor
+                } else {
+                    CompletionKind::Value
+                }),
                 cancel_reason: None,
-                cancel_sent: false,
-                cancel_done: false,
             },
         );
         // SAFETY: the inserted entry owns all SQE backing until both CQEs arrive.
@@ -977,7 +1085,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// Owned resources can move from one completed operation to the next:
     /// ```no_run
     /// use std::rc::Rc;
-    /// use uring_runtime::{Budget, Scope, Result, reactor::{Descriptor, IoBuffer, Completion, Reactor}};
+    /// use uring_runtime::{Budget, Scope, Result, reactor::{descriptor::Descriptor, IoBuffer, Completion, Reactor}};
     /// async fn copy<S: Scope, Q: Budget, B: IoBuffer, L: 'static>(
     ///     reactor: &Reactor<S,Q>, fd: Rc<Descriptor>, buffer: B,
     ///     lease: L, scope: &S) -> Result<Completion<B,L>, S::Error>
@@ -989,7 +1097,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// The retained lease cannot borrow from the waiting future's caller:
     /// ```compile_fail
     /// use std::rc::Rc;
-    /// use uring_runtime::{Budget, Scope, reactor::{Descriptor, IoBuffer, Reactor}};
+    /// use uring_runtime::{Budget, Scope, reactor::{descriptor::Descriptor, IoBuffer, Reactor}};
     /// fn borrowed<S: Scope, Q: Budget, B: IoBuffer>(
     ///     reactor: &Reactor<S,Q>, fd: Rc<Descriptor>, buffer: B,
     ///     lease: &u8, scope: &S) where S::Error: From<B::Error> {
@@ -1377,11 +1485,16 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                     checked
                 };
             }
-            if entry.original.is_none() && entry.cancel_reason.is_some() && !entry.cancel_sent {
+            if entry.cancel_reason.is_some() && entry.completion.needs_cancel() {
                 #[cfg(feature = "simulation")]
                 if let Some(driver) = &mut state.simulation {
                     driver.cancel(id.0);
-                    state.entries.get_mut(&id).unwrap().cancel_sent = true;
+                    state
+                        .entries
+                        .get_mut(&id)
+                        .unwrap()
+                        .completion
+                        .cancel_submitted();
                     continue;
                 }
                 let sqe = opcode::AsyncCancel::new(id.0)
@@ -1389,7 +1502,12 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                     .user_data(id.0 | CANCEL_BIT);
                 // SAFETY: cancel uses only an ID, and its target entry is retained.
                 if unsafe { state.ring.as_mut().unwrap().submission().push(&sqe) }.is_ok() {
-                    state.entries.get_mut(&id).unwrap().cancel_sent = true;
+                    state
+                        .entries
+                        .get_mut(&id)
+                        .unwrap()
+                        .completion
+                        .cancel_submitted();
                 }
             }
         }
@@ -1625,32 +1743,24 @@ impl<S: Scope> State<S> {
     }
 
     /// Account one CQE and return its owner only after all applicable fences.
-    fn complete(&mut self, tag: u64, result: impl Into<KernelResult>) -> Result<Option<Entry<S>>> {
+    fn complete(
+        &mut self,
+        tag: u64,
+        result: impl Into<KernelResult>,
+    ) -> Result<Option<FencedEntry<S>>> {
         let id = IoId(tag & !CANCEL_BIT);
         let entry = self.entries.get_mut(&id).ok_or(Error::Io)?;
-        if tag & CANCEL_BIT != 0 {
-            if !entry.cancel_sent || entry.cancel_done {
-                return Err(Error::Io);
-            }
-            entry.cancel_done = true; // ENOENT/EALREADY are also cancellation fences.
-        } else {
-            if entry.original.is_some() {
-                return Err(Error::Io);
-            }
-            entry.original = Some(match result.into() {
-                // Raw CQEs supplied by the real backend (and fence tests) transfer
-                // ownership here. Simulated opens already carry a typed owner.
-                KernelResult::Value(fd) if entry.accept && fd >= 0 => {
-                    KernelResult::Accepted(unsafe { Descriptor::from_raw_fd(fd) })
-                }
-                result => result,
-            });
-        }
-        if entry.fenced() {
-            Ok(self.entries.remove(&id))
-        } else {
-            Ok(None)
-        }
+        let Some(original) = entry
+            .completion
+            .complete(tag & CANCEL_BIT != 0, result.into())?
+        else {
+            return Ok(None);
+        };
+        let entry = self
+            .entries
+            .remove(&id)
+            .expect("completed entry remains owned");
+        Ok(Some(FencedEntry { entry, original }))
     }
 }
 

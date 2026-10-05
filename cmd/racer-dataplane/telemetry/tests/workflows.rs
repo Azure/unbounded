@@ -12,7 +12,7 @@ use telemetry::{
     Lease, Metrics, Ring,
     server::{self, Event, Handler, Response, Server},
 };
-use uring_runtime::{Error, Operation, Scope, deadline::Cancellation, reactor::Reactor};
+use uring_runtime::{Error, Operation, Scope, environment::Cancellation, reactor::Reactor};
 
 telemetry::metrics! { Counter, COUNTERS, COUNTER_COUNT;
     Self::Completed => "completed_total",

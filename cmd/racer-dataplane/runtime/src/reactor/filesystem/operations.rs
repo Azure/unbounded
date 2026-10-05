@@ -512,7 +512,7 @@ mod chunked_tests {
     use super::*;
     use crate::reactor::{
         filesystem::{
-            publish_new,
+            operations::publish_new,
             test_support::{drive, poll},
         },
         simulation::{Fault, Simulation},

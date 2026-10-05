@@ -28,7 +28,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::deadline::Deadline;
+use uring_runtime::environment::Deadline;
 use uring_runtime::environment::SimulationClock;
 #[cfg(test)]
 use uring_runtime::group::Service;
@@ -1182,7 +1182,9 @@ mod encrypted_http {
         assert_ne!(pages[0].envelope().nonce, pages[1].envelope().nonce);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let listener = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
+        let listener = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+            listener,
+        ));
         let canceled = RequestScope::new(RequestId([9; 16]), scope.deadline.0).unwrap();
         let accepts = Cell::new(0);
         let prefix_sent = Cell::new(false);
@@ -1590,7 +1592,9 @@ mod requester_safety {
         let server = async {
             let fd = reactor
                 .accept(
-                    Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                        listener,
+                    )),
                     &scope,
                 )
                 .await?;
@@ -2417,7 +2421,9 @@ mod subscriptions {
         let server_work = async {
             let fd = reactor
                 .accept(
-                    Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                        listener,
+                    )),
                     &scope,
                 )
                 .await?;

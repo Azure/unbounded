@@ -14,7 +14,7 @@ use std::{
 };
 use uring_runtime::{
     Budget, Scope,
-    reactor::{Completion, Descriptor, IoBuffer, Reactor, SendBuffer, SocketAddress},
+    reactor::{Completion, IoBuffer, Reactor, SendBuffer, SocketAddress, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
 

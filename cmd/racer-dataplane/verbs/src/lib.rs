@@ -32,7 +32,7 @@
 //!
 //! Reopening requires native drainage and release of all I/O leases. Caller
 //! `Arc` clones do not affect the internal quarantine reference count. Use
-//! `uring_runtime::poll_scoped` for caller-scoped operations, but never to truncate
+//! `uring_runtime::drivers::poll_scoped` for caller-scoped operations, but never to truncate
 //! a required native fence. [`WithNative`] preserves native progress after
 //! admission stops and fences native resources before the inner drain/fence.
 //!
@@ -312,8 +312,8 @@ use std::{
 };
 use uring_runtime::{
     Operation, Scope,
+    drivers::poll_scoped,
     group::{FailureReporter, Service},
-    poll_scoped,
 };
 
 /// Keep a slot and its staging alive until the last I/O owner releases it.

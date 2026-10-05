@@ -167,8 +167,8 @@ mod materialized_pairing {
         let downstream_closed = Cell::new(false);
         let healthy_first = Cell::new(false);
         let overlapped = Cell::new(false);
-        let listener: Rc<uring_runtime::reactor::Descriptor> = Rc::new(listener.into());
-        let destination = |listener: Rc<uring_runtime::reactor::Descriptor>| async {
+        let listener: Rc<uring_runtime::reactor::descriptor::Descriptor> = Rc::new(listener.into());
+        let destination = |listener: Rc<uring_runtime::reactor::descriptor::Descriptor>| async {
             let fd = reactors[2].accept(listener, &scope).await?;
             accepted.set(accepted.get() + 1);
             let conn = crate::http::from_accepted(fd, &admissions[2])?;

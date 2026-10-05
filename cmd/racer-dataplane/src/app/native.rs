@@ -397,8 +397,8 @@ mod tests {
     }
 
     fn four_pair_plan(config: &Config) -> AffinityPlan {
-        use uring_runtime::affinity::CpuLocation;
-        use uring_runtime::affinity::EffectiveTopology;
+        use uring_runtime::group::affinity::CpuLocation;
+        use uring_runtime::group::affinity::EffectiveTopology;
         let plan = AffinityPlan::from_topology(
             config,
             EffectiveTopology {
@@ -422,8 +422,8 @@ mod tests {
 
     #[test]
     fn smt_startup_final_count_partitions_live_budgets_and_obeys_memory_floors() {
-        use uring_runtime::affinity::CpuLocation;
-        use uring_runtime::affinity::EffectiveTopology;
+        use uring_runtime::group::affinity::CpuLocation;
+        use uring_runtime::group::affinity::EffectiveTopology;
         for (allow_smt, expected) in [(false, 3), (true, 5)] {
             let mut config = Config::from_lookup(|name| {
                 Ok(match name {
@@ -497,8 +497,8 @@ mod tests {
 
     #[test]
     fn resource_shortage_reduces_and_regroups_uneven_numa_workers() {
-        use uring_runtime::affinity::CpuLocation;
-        use uring_runtime::affinity::EffectiveTopology;
+        use uring_runtime::group::affinity::CpuLocation;
+        use uring_runtime::group::affinity::EffectiveTopology;
         let mut config = default_config(false);
         let floor = 3 * crate::model::PAGE_BYTES as usize;
         for supported in 1..=10 {

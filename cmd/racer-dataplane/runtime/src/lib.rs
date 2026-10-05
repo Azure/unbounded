@@ -6,28 +6,10 @@
 //! and service-graph ownership belong in application adapters, not this crate.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-pub use group::affinity;
 pub mod channel;
-/// Wall-clock drift observation, implemented alongside the environment clocks.
-pub mod clock_observer {
-    pub use crate::environment::Observer;
-}
-pub use drivers::{Busy, drive_local_with, poll_scoped, retry_listener, thread_waker, yield_now};
-/// Monotonic deadlines and bounded cancellation notification registrations.
-pub mod deadline {
-    pub use crate::environment::{Cancellation, CancellationRegistration, Deadline, unix_millis};
-}
-/// Explicitly driven worker-local deadline registrations and bounded wakeups.
-pub mod deadline_registry {
-    pub use crate::environment::{Registration, Registry};
-}
 pub mod drivers;
 pub mod environment;
 pub mod group;
-/// Primary-first delayed races that drain submitted work before returning.
-pub mod hedge {
-    pub use crate::drivers::{Contender, HedgePolicy as Policy, HedgeScope as Scope, race};
-}
 pub mod offload;
 pub mod reactor;
 #[cfg(any(test, feature = "test-util"))]
@@ -132,7 +114,7 @@ pub trait Scope: Clone + 'static {
     fn check(&self) -> Result<(), Self::Error>;
 
     /// Supply cancellation wakeups, or leave wake scheduling entirely to the owner.
-    fn cancellation(&self) -> Option<&deadline::Cancellation> {
+    fn cancellation(&self) -> Option<&environment::Cancellation> {
         None
     }
 }
@@ -158,7 +140,7 @@ impl Budget for () {
 
 /// Bounded owned handoffs. Cancellation is notification, never a completion fence.
 pub mod mailbox {
-    use crate::{Error, Result, Scope, deadline::CancellationRegistration};
+    use crate::{Error, Result, Scope, environment::CancellationRegistration};
     use futures::task::AtomicWaker;
     use std::{
         collections::VecDeque,
@@ -585,7 +567,7 @@ pub mod mailbox {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::{deadline::Cancellation, test_util::WakeCounter};
+        use crate::{environment::Cancellation, test_util::WakeCounter};
         use std::sync::atomic::AtomicUsize;
 
         /// Producer loss is terminal even when a surviving reply receives a late result.

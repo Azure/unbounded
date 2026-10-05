@@ -1155,7 +1155,7 @@ mod timeouts {
     use std::task::Poll;
     use std::time::Duration;
     use std::time::Instant;
-    use uring_runtime::deadline::Deadline;
+    use uring_runtime::environment::Deadline;
 
     struct Call {
         scope: RequestScope,

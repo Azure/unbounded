@@ -442,9 +442,9 @@ mod scoped {
     };
     use uring_runtime::{
         Operation, Scope,
-        deadline::Cancellation,
+        drivers::poll_scoped,
+        environment::Cancellation,
         group::{FailureReporter, Service},
-        poll_scoped,
     };
 
     /// Preserve runtime and verbs failures as distinct observable outcomes.
@@ -778,7 +778,7 @@ mod scoped {
                 )))
             }
         }
-        let cpu = *uring_runtime::affinity::current_cpus()
+        let cpu = *uring_runtime::group::affinity::current_cpus()
             .unwrap()
             .first()
             .unwrap();

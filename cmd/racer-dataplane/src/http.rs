@@ -19,9 +19,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::task::Waker;
 use std::time::Duration;
-use uring_runtime::reactor::Descriptor;
 use uring_runtime::reactor::SendBuffer;
 use uring_runtime::reactor::SocketAddress;
+use uring_runtime::reactor::descriptor::Descriptor;
 
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
 pub fn new_pipe_pool(
@@ -591,7 +591,7 @@ pub(crate) mod tests {
         use std::task::Context;
         use std::task::Poll;
         use std::time::Instant;
-        use uring_runtime::deadline::Deadline;
+        use uring_runtime::environment::Deadline;
         fn admission(pipes: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
             let small = std::num::NonZeroUsize::new(8).unwrap();
             let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();

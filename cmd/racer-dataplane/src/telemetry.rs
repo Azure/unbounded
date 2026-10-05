@@ -31,9 +31,9 @@ use std::sync::OnceLock;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::deadline::Deadline;
 use uring_runtime::environment;
-use uring_runtime::reactor::Descriptor;
+use uring_runtime::environment::Deadline;
+use uring_runtime::reactor::descriptor::Descriptor;
 
 pub use server::CONNECTION_TIMEOUT;
 pub use server::CONTROL_SLOTS;
@@ -728,7 +728,7 @@ pub struct BodyProgress {
 }
 
 pub(crate) fn timestamp(at: std::time::Instant) -> u64 {
-    crate::peer::protocol::encode_deadline(uring_runtime::deadline::Deadline(at))
+    crate::peer::protocol::encode_deadline(uring_runtime::environment::Deadline(at))
         .unwrap_or_default()
 }
 

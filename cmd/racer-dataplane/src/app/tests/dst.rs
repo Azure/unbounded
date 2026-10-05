@@ -20,8 +20,8 @@ use std::num::NonZeroUsize;
 use uring_runtime::environment::SimulationClock;
 #[cfg(test)]
 use uring_runtime::group::Service;
-use uring_runtime::reactor::Descriptor;
 use uring_runtime::reactor::SocketAddress;
+use uring_runtime::reactor::descriptor::Descriptor;
 use uring_runtime::reactor::simulation::Fault;
 use uring_runtime::reactor::simulation::Simulation;
 
@@ -296,7 +296,7 @@ mod faults {
         }
 
         pub(super) fn disk_corruption(&mut self) {
-            use uring_runtime::reactor::simulation::DiskState;
+            use uring_runtime::reactor::simulation::disk::DiskState;
             self.settle();
             let entries: Vec<_> = self
                 .nodes

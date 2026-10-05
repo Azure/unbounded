@@ -377,7 +377,7 @@ impl Fill {
             );
             // Always yield between scan quanta and the next reservation, including
             // the final retry. Cancellation never extends the original allowance.
-            crate::runtime::cooperative_turn().await;
+            uring_runtime::drivers::yield_now().await;
         }
     }
 

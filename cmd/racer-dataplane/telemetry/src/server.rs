@@ -26,7 +26,7 @@ use std::{
 };
 use uring_runtime::{
     Budget, Error, Operation, Result, environment,
-    reactor::{Descriptor, IoBuffer, Reactor, SubmissionCapacity},
+    reactor::{IoBuffer, Reactor, SubmissionCapacity, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -177,7 +177,7 @@ impl Server {
                     }
                 }
                 if accepting.is_none() && self.resources.active.get() < MAX_CONNECTIONS {
-                    accepting = Some(uring_runtime::retry_listener(scope, || {
+                    accepting = Some(uring_runtime::drivers::retry_listener(scope, || {
                         reactor.accept_reserved(
                             listener.clone(),
                             Some(self.resources.submissions.clone()),
@@ -651,7 +651,7 @@ mod tests {
     struct TestScope {
         deadline: Instant,
 
-        cancellation: uring_runtime::deadline::Cancellation,
+        cancellation: uring_runtime::environment::Cancellation,
     }
 
     impl uring_runtime::Scope for TestScope {
@@ -669,7 +669,7 @@ mod tests {
         }
 
         /// Share the caller's cancellation source with reactor operations.
-        fn cancellation(&self) -> Option<&uring_runtime::deadline::Cancellation> {
+        fn cancellation(&self) -> Option<&uring_runtime::environment::Cancellation> {
             Some(&self.cancellation)
         }
     }
@@ -756,7 +756,7 @@ mod tests {
         };
         let scope = TestScope {
             deadline: environment::now() + Duration::from_secs(10),
-            cancellation: uring_runtime::deadline::Cancellation::new().unwrap(),
+            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -851,7 +851,7 @@ mod tests {
         };
         let scope = TestScope {
             deadline: environment::now() + Duration::from_secs(10),
-            cancellation: uring_runtime::deadline::Cancellation::new().unwrap(),
+            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

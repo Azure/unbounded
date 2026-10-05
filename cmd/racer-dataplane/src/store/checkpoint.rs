@@ -21,7 +21,6 @@ use crate::model::VersionMetadata;
 use crate::model::WorkerId;
 use crate::runtime::HashMap;
 use crate::runtime::HashSet;
-use crate::runtime::cooperative_turn;
 use page_alloc::Alignment;
 use page_alloc::Extent;
 use page_alloc::FreezeGuard;
@@ -44,6 +43,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use uring_runtime::drivers::yield_now;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -145,7 +145,7 @@ impl Checkpointer {
                         break;
                     }
                     cursor = next;
-                    cooperative_turn().await;
+                    yield_now().await;
                 }
                 Ok(ShardImage {
                     worker: owner.index.worker(),
@@ -268,12 +268,13 @@ impl Checkpointer {
                 .await?;
             reactor
                 .file_replace_chunked(
-                    uring_runtime::reactor::filesystem::Replacement {
+                    uring_runtime::reactor::filesystem::operations::Replacement {
                         directory: dir,
                         staged: fd,
                         temporary,
                         target: CString::new(CHECKPOINT_NAMES[slot]).unwrap(),
-                        durability: uring_runtime::reactor::filesystem::Durability::Publish,
+                        durability:
+                            uring_runtime::reactor::filesystem::operations::Durability::Publish,
                     },
                     &bytes,
                     std::num::NonZeroUsize::new(16384).unwrap(),
@@ -302,7 +303,7 @@ fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         directory.join(format!(".checkpoint.{}.{sequence}.tmp", std::process::id()))
     });
-    uring_runtime::reactor::filesystem::publish_new(
+    uring_runtime::reactor::filesystem::operations::publish_new(
         directory,
         &directory.join(CHECKPOINT_NAMES[slot]),
         bytes,
@@ -765,7 +766,7 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
         segments.sort_by_key(|segment| segment.id.0);
         for (i, segment) in segments.into_iter().enumerate() {
             if i % 128 == 0 {
-                cooperative_turn().await;
+                yield_now().await;
             }
             out.u64(segment.id.0)?;
             out.u64(segment.generation.0)?;
@@ -786,7 +787,7 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
         });
         for (i, (page, entry)) in entries.into_iter().enumerate() {
             if i % 128 == 0 {
-                cooperative_turn().await;
+                yield_now().await;
             }
             out.descriptor(&entry.metadata)?;
             out.u64(page.number.0)?;
@@ -802,7 +803,7 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
         metadata.sort_by(|a, b| version_key(&a.version).cmp(&version_key(&b.version)));
         for (i, metadata) in metadata.into_iter().enumerate() {
             if i % 128 == 0 {
-                cooperative_turn().await;
+                yield_now().await;
             }
             out.descriptor(metadata)?;
         }

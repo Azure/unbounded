@@ -75,8 +75,8 @@ pub struct PeerServer {
 impl PeerServer {
     pub(crate) fn configure_accepted(
         &self,
-        fd: uring_runtime::reactor::Descriptor,
-    ) -> crate::error::Result<uring_runtime::reactor::Descriptor> {
+        fd: uring_runtime::reactor::descriptor::Descriptor,
+    ) -> crate::error::Result<uring_runtime::reactor::descriptor::Descriptor> {
         // False preserves the accepted socket's existing application policy.
         if self.tcp_nodelay {
             fd.enable_tcp_nodelay(true)?;
@@ -209,7 +209,8 @@ impl PeerServer {
             use futures::stream::FuturesUnordered;
             scope.check()?;
             let reactor = self.io.reactor();
-            let fd = Rc::new(uring_runtime::reactor::Descriptor::tcp_listener(address)?);
+            let fd =
+                Rc::new(uring_runtime::reactor::descriptor::Descriptor::tcp_listener(address)?);
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
@@ -217,7 +218,7 @@ impl PeerServer {
             loop {
                 scope.check()?;
                 if let AcceptMode::Distributed(ingress) = &self.accept {
-                    uring_runtime::retry_listener(scope, || {
+                    uring_runtime::drivers::retry_listener(scope, || {
                         reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
                     })
                     .await?;
@@ -259,7 +260,9 @@ impl PeerServer {
                     continue;
                 }
                 let accepted = next_accepted(
-                    uring_runtime::retry_listener(scope, || reactor.accept(fd.clone(), scope)),
+                    uring_runtime::drivers::retry_listener(scope, || {
+                        reactor.accept(fd.clone(), scope)
+                    }),
                     &mut active,
                     scope,
                 )
@@ -861,9 +864,11 @@ async fn next_accepted<A, C>(
     accept: A,
     active: &mut futures::stream::FuturesUnordered<C>,
     scope: &RequestScope,
-) -> crate::error::Result<uring_runtime::reactor::Descriptor>
+) -> crate::error::Result<uring_runtime::reactor::descriptor::Descriptor>
 where
-    A: std::future::Future<Output = crate::error::Result<uring_runtime::reactor::Descriptor>>,
+    A: std::future::Future<
+            Output = crate::error::Result<uring_runtime::reactor::descriptor::Descriptor>,
+        >,
     C: std::future::Future,
 {
     use futures::FutureExt;
@@ -988,8 +993,8 @@ mod tests {
             }
         }
     }
-    impl<F: Future<Output = crate::error::Result<uring_runtime::reactor::Descriptor>>> Future
-        for CountedAccept<F>
+    impl<F: Future<Output = crate::error::Result<uring_runtime::reactor::descriptor::Descriptor>>>
+        Future for CountedAccept<F>
     {
         type Output = F::Output;
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1339,7 +1344,9 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
-                let fd = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
+                let fd = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
+                    listener,
+                ));
                 let weak = Rc::downgrade(&fd);
                 let counts = Rc::new(AcceptCounts::default());
                 let accept = CountedAccept::new(reactor.accept(fd, &scope), &counts);

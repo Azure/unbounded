@@ -14,10 +14,11 @@ use std::{
 
 thread_local! { static CURRENT: RefCell<Option<Simulation>> = const { RefCell::new(None) }; }
 mod network;
-use disk::check_direct;
+#[cfg(test)]
+use disk::DiskState;
+use disk::{CrashDisk, check_direct};
 
-mod disk;
-pub use disk::{CrashDisk, DiskState};
+pub mod disk;
 
 /// Labels new outbound streams with their owning node's listening endpoint.
 /// Enter this scope when polling that node; established sockets retain the label.

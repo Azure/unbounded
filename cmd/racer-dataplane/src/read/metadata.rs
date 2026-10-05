@@ -105,13 +105,13 @@ impl RefreshTable {
 
 #[derive(Default)]
 struct IngressDeadlines {
-    inner: Rc<uring_runtime::deadline_registry::Registry>,
+    inner: Rc<uring_runtime::environment::Registry>,
 }
 /// One entry per admitted resolve, shared across its follower and leader waits.
 /// The refresh registration quota bounds these entries. Drivers never own this
 /// guard: ingress expiry must not release their acquisition or completion fences.
 struct IngressDeadline {
-    inner: uring_runtime::deadline_registry::Registration,
+    inner: uring_runtime::environment::Registration,
 }
 impl IngressDeadlines {
     fn register(self: &Rc<Self>, deadline: Instant) -> Result<IngressDeadline> {
@@ -139,7 +139,7 @@ impl IngressDeadline {
 
 #[derive(Default)]
 struct Clock {
-    inner: uring_runtime::clock_observer::Observer,
+    inner: uring_runtime::environment::Observer,
 }
 impl Clock {
     fn observe(&mut self, wall: SystemTime, monotonic: Instant) -> bool {
@@ -889,9 +889,7 @@ pub(crate) mod tests {
         assert_eq!(refreshes.inner.active_count(), 0);
         assert_eq!(refreshes.inner.registration_count(), 0);
         let table = Rc::new(IngressDeadlines {
-            inner: Rc::new(uring_runtime::deadline_registry::Registry::with_next_id(
-                u64::MAX,
-            )),
+            inner: Rc::new(uring_runtime::environment::Registry::with_next_id(u64::MAX)),
         });
         assert!(matches!(table.register(due), Err(Error::Overloaded)));
         assert!(table.inner.is_empty());

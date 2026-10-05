@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 pub use uring_runtime::Operation;
-use uring_runtime::{Scope as _, reactor::Descriptor};
+use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 
 /// Transport failures contain no credentials, headers, or body bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -590,7 +590,7 @@ impl<I: Io + ?Sized> Connection<I> {
     async fn step(&mut self, scope: &I::Scope) -> Result<(), I::Error> {
         self.check(scope)?;
         // Even a continuously readable peer must yield to other owner work.
-        uring_runtime::yield_now().await;
+        uring_runtime::drivers::yield_now().await;
         let mut progress = false;
         if self.tls.wants_write() {
             match self.tls.write_tls(&mut self.stream) {
@@ -1110,7 +1110,7 @@ pub mod dns {
         rc::Rc,
         time::Duration,
     };
-    use uring_runtime::{Scope as _, reactor::Descriptor};
+    use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 
     /// Resolve through bounded owner-local UDP queries and resolv.conf search rules.
     pub async fn resolve<I: Io + ?Sized>(

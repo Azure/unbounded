@@ -214,9 +214,11 @@ impl From<uring_runtime::Error> for Error {
     }
 }
 
-impl From<uring_runtime::reactor::filesystem::ReplacementError<Error>> for Error {
-    fn from(error: uring_runtime::reactor::filesystem::ReplacementError<Error>) -> Self {
-        use uring_runtime::reactor::filesystem::ReplacementError;
+impl From<uring_runtime::reactor::filesystem::operations::ReplacementError<Error>> for Error {
+    fn from(
+        error: uring_runtime::reactor::filesystem::operations::ReplacementError<Error>,
+    ) -> Self {
+        use uring_runtime::reactor::filesystem::operations::ReplacementError;
         match error {
             ReplacementError::BeforeRename(cause) => cause,
             ReplacementError::RenameUncertain(cause) => Self::RenameUncertain(cause.into()),
@@ -332,7 +334,7 @@ mod tests {
 
     #[test]
     fn replacement_outcomes_preserve_publication_phase() {
-        use uring_runtime::reactor::filesystem::ReplacementError;
+        use uring_runtime::reactor::filesystem::operations::ReplacementError;
         assert_eq!(
             Error::from(ReplacementError::BeforeRename(Error::Os(libc::ENOSPC))),
             Error::Os(libc::ENOSPC)
