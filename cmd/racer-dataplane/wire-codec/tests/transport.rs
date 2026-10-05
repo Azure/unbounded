@@ -1,4 +1,5 @@
 //! Socket-level transport contracts exercised through the public client API.
+
 use std::{
     io::{Read, Write},
     rc::Rc,
@@ -6,13 +7,18 @@ use std::{
     time::Duration,
 };
 use wire_codec::rest::{Error as RestError, Method, Operation, Transport};
+
 #[path = "support/mod.rs"]
 mod testing;
+
 use testing::{Error, RotationServer, TestTransport as _, WeeklyCertificates, rotation_request};
 use testing::{FixtureIo, TestIdentity};
+
 /// Concrete transport used by loopback fixtures.
 type ControlTransport = Transport<FixtureIo>;
+
 const SNAPSHOT_PATH: &str = "/snapshot";
+
 const BOOTSTRAP_PATH: &str = "/enroll";
 
 /// Bootstrap and mutual authentication both deliver bounded chunked JSON.
@@ -84,6 +90,7 @@ fn weekly_cross_signed_chains_accept_retained_anchors_only() {
 fn rejects_trailing_tls_plaintext_before_connection_reuse() {
     tls_fixture(true);
 }
+
 /// Exercise bootstrap and mutual TLS, with optional plaintext past the frame.
 fn tls_fixture(trailing: bool) {
     let d = testing::Directory::new();

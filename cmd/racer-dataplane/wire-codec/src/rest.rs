@@ -2,6 +2,7 @@
 //!
 //! Connections and the single idle slot stay on their I/O owner's thread. TLS
 //! authenticates peers; endpoint health and identity admission belong to callers.
+
 use std::{
     cell::RefCell,
     io::{Read, Write},
@@ -12,7 +13,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
+
+/// Owner-local future carrying the caller's transport error type.
 pub use uring_runtime::Operation;
+
 use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 
 /// Transport failures contain no credentials, headers, or body bytes.
@@ -20,16 +24,22 @@ use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 pub enum Error {
     /// The endpoint or local transport configuration is invalid.
     InvalidConfiguration,
+
     /// The request or response violates the supported HTTP contract.
     InvalidRequest,
+
     /// Trust, identity, or TLS authentication failed.
     Unauthorized,
+
     /// No endpoint is available, or TLS admission is temporarily saturated.
     Unavailable,
+
     /// A configured byte or count limit was exceeded.
     Overloaded,
+
     /// Socket or local I/O failed.
     Io,
+
     /// An internal encoding operation failed.
     Internal,
 }
@@ -124,6 +134,7 @@ pub struct Identity<'a> {
 pub enum Method {
     /// Fetch a JSON resource.
     Get,
+
     /// Submit a JSON resource.
     Post,
 }
@@ -151,29 +162,34 @@ pub struct Request<'a> {
 
 /// Owner-local HTTPS transport with at most one idle authenticated connection.
 pub struct Transport<I: Io + ?Sized> {
+    /// Endpoint and byte limits retained across owner attachment.
     config: Config,
 
+    /// Attached readiness owner; never shared across threads.
     io: RefCell<Option<Rc<I>>>,
 
+    /// Single authenticated connection available for exclusive checkout.
     idle: Rc<RefCell<Option<Connection<I>>>>,
 }
 
 /// An exclusive TLS connection, consumed by one request before possible reuse.
 pub struct Connection<I: Io + ?Sized> {
-    charge: Option<Rc<I::Lease>>,
+    /// Socket resources stay together until request or readiness cleanup finishes.
+    socket: Connected<I>,
 
-    stream: Stream,
-
-    fd: Rc<Descriptor>,
-
+    /// Exclusive TLS state for this connection.
     tls: rustls::ClientConnection,
 
+    /// Readiness owner retained even if the transport attaches a new one.
     io: Rc<I>,
 
+    /// Original endpoint authority used for the HTTP Host header.
     host: String,
 
+    /// Bootstrap or authenticated pooling and lifetime policy.
     authentication: Authentication<I>,
 
+    /// Maximum response body size for statuses other than 200.
     max_error_body: usize,
 }
 
@@ -191,37 +207,52 @@ pub struct Response {
 
 /// Bootstrap connections cannot carry authenticated pooling metadata.
 enum Authentication<I: Io + ?Sized> {
+    /// Server-authenticated TLS without a client identity or pool destination.
     Bootstrap,
+
+    /// Client-authenticated TLS with its identity lifetime and pool destination.
     Authenticated(Authenticated<I>),
 }
 
 /// Identity lifetime and trust epoch required for authenticated reuse.
 struct Authenticated<I: Io + ?Sized> {
+    /// Wall-clock identity deadline checked during active I/O.
     expires: SystemTime,
 
+    /// Trust and certificate-chain fingerprint used at checkout.
     epoch: [u8; 32],
 
+    /// Non-owning destination for successful connection recycling.
     idle: std::rc::Weak<RefCell<Option<Connection<I>>>>,
 
+    /// Monotonic start of the current idle interval.
     idle_since: Instant,
 
     /// Redistribution is checked only between requests, never during a long poll.
     retire_at: Instant,
 }
 
+/// Minimum lifetime before an authenticated connection is redistributed.
 const AUTHENTICATED_AGE_MIN: Duration = Duration::from_secs(240);
+
+/// Maximum extra lifetime used to spread reconnections across owners.
 const AUTHENTICATED_AGE_JITTER_MS: u64 = 60_000;
 
 /// Spread authenticated retirement over the inclusive four-to-five-minute range.
 fn authenticated_age(random: u64) -> Duration {
     AUTHENTICATED_AGE_MIN + Duration::from_millis(random % (AUTHENTICATED_AGE_JITTER_MS + 1))
 }
+
 /// A real or simulated nonblocking byte stream owned by this I/O thread.
 enum Stream {
+    /// Kernel TCP stream with readiness tracked by a separate descriptor.
     Real(TcpStream),
+
+    /// Simulated TCP stream and readiness share one owner-local descriptor.
     #[cfg(feature = "simulation")]
     Sim(Rc<Descriptor>),
 }
+
 impl Read for Stream {
     /// Read without waiting; the reactor handles readiness separately.
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -232,6 +263,7 @@ impl Read for Stream {
         }
     }
 }
+
 impl Write for Stream {
     /// Write without waiting; the reactor handles readiness separately.
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -251,6 +283,7 @@ impl Write for Stream {
         }
     }
 }
+
 impl Drop for Response {
     /// Erase response plaintext before releasing its allocation.
     fn drop(&mut self) {
@@ -258,14 +291,19 @@ impl Drop for Response {
         self.body.zeroize();
     }
 }
+
 /// Validated TLS server name, HTTP authority, and connection port.
 struct Endpoint {
+    /// Unbracketed name or IP address used for TLS and resolution.
     host: String,
 
+    /// Original authority, including brackets and any explicit port.
     authority: String,
 
+    /// Validated nonzero TCP port.
     port: u16,
 }
+
 /// Accept only a TLS authority, preserving its spelling for the Host header.
 fn endpoint(url: &str) -> Result<Endpoint> {
     let authority = url
@@ -310,6 +348,7 @@ fn endpoint(url: &str) -> Result<Endpoint> {
         port,
     })
 }
+
 impl<I: Io + ?Sized> Transport<I> {
     /// Create a detached transport; attach its owner before connecting.
     pub fn new(config: Config) -> Self {
@@ -319,11 +358,13 @@ impl<I: Io + ?Sized> Transport<I> {
             idle: Rc::new(RefCell::new(None)),
         }
     }
+
     /// Replace the I/O owner and discard the current idle connection.
     pub fn attach_io(&self, io: Rc<I>) {
         self.idle.borrow_mut().take();
         *self.io.borrow_mut() = Some(io);
     }
+
     /// Retrieve the attached owner or report missing configuration.
     pub fn io(&self) -> Result<Rc<I>, I::Error> {
         self.io
@@ -331,10 +372,12 @@ impl<I: Io + ?Sized> Transport<I> {
             .clone()
             .ok_or_else(|| Error::InvalidConfiguration.into())
     }
+
     /// Drop the idle connection without interrupting checked-out requests.
     pub fn close_idle(&self) {
         self.idle.borrow_mut().take();
     }
+
     /// Reread trust and reuse eligible authenticated TLS, or establish fresh TLS.
     pub fn connect<'a>(
         &'a self,
@@ -355,58 +398,11 @@ impl<I: Io + ?Sized> Transport<I> {
                     scope,
                 )
                 .await?;
-            use sha2::Digest;
-            let mut epoch = sha2::Sha256::new();
-            epoch.update(trust.as_ref());
-            if let Some(identity) = identity {
-                for certificate in identity.certificate_chain {
-                    epoch.update((certificate.len() as u64).to_be_bytes());
-                    epoch.update(certificate);
-                }
-            }
-            let epoch: [u8; 32] = epoch.finalize().into();
-            if let Some(connection) = self.idle.borrow_mut().take()
-                && let Authentication::Authenticated(auth) = &connection.authentication
-                && identity.is_some()
-                && auth.epoch == epoch
-                && connection.within_max_age()
-                && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
-                    < Duration::from_secs(20)
-                && connection.check(scope).is_ok()
-            {
+            let epoch = trust_epoch(trust.as_ref(), identity);
+            if let Some(connection) = self.checkout(identity, epoch, scope) {
                 return Ok(connection);
             }
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut trust.as_ref()) {
-                roots
-                    .add(cert.map_err(|_| Error::Unauthorized)?)
-                    .map_err(|_| Error::Unauthorized)?;
-            }
-            if roots.is_empty() {
-                return Err(Error::Unauthorized.into());
-            }
-            let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| Error::Unauthorized)?
-            .with_root_certificates(roots);
-            let mut config = if let Some(i) = identity {
-                builder
-                    .with_client_auth_cert(
-                        i.certificate_chain
-                            .iter()
-                            .cloned()
-                            .map(rustls::pki_types::CertificateDer::from)
-                            .collect(),
-                        rustls::pki_types::PrivatePkcs8KeyDer::from(i.private_key.to_vec()).into(),
-                    )
-                    .map_err(|_| Error::Unauthorized)?
-            } else {
-                builder.with_no_client_auth()
-            };
-            config.alpn_protocols = vec![b"http/1.1".to_vec()];
-            config.resumption = rustls::client::Resumption::disabled();
+            let config = tls_config(trust.as_ref(), identity)?;
             let addresses = if let Ok(ip) = endpoint.host.parse() {
                 vec![SocketAddr::new(ip, endpoint.port)]
             } else {
@@ -415,31 +411,15 @@ impl<I: Io + ?Sized> Transport<I> {
             if addresses.is_empty() || addresses.len() > 64 {
                 return Err(Error::Unavailable.into());
             }
-            let (stream, fd, charge) = connect_addresses(io.as_ref(), &addresses, scope).await?;
+            let socket = connect_addresses(io.as_ref(), &addresses, scope).await?;
             let server = rustls::pki_types::ServerName::try_from(endpoint.host)
                 .map_err(|_| Error::InvalidConfiguration)?;
             let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
                 .map_err(|_| Error::Unauthorized)?;
             tls.set_buffer_limit(Some(64 * 1024));
-            let authentication = if let Some(identity) = identity {
-                let mut random = [0; 8];
-                uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
-                let retire_at = uring_runtime::environment::now()
-                    + authenticated_age(u64::from_ne_bytes(random));
-                Authentication::Authenticated(Authenticated {
-                    expires: identity.expires,
-                    epoch,
-                    idle: Rc::downgrade(&self.idle),
-                    idle_since: uring_runtime::environment::now(),
-                    retire_at,
-                })
-            } else {
-                Authentication::Bootstrap
-            };
+            let authentication = self.authentication(identity, epoch)?;
             let mut connection = Connection {
-                charge,
-                stream,
-                fd,
+                socket,
                 tls,
                 io,
                 host: endpoint.authority,
@@ -452,9 +432,64 @@ impl<I: Io + ?Sized> Transport<I> {
             Ok(connection)
         })
     }
+
+    /// Consume the idle slot even when its identity, epoch, or age is ineligible.
+    fn checkout(
+        &self,
+        identity: Option<Identity<'_>>,
+        epoch: [u8; 32],
+        scope: &I::Scope,
+    ) -> Option<Connection<I>> {
+        let mut idle = self.idle.borrow_mut();
+        let connection = idle.take()?;
+        if let Authentication::Authenticated(auth) = &connection.authentication
+            && identity.is_some()
+            && auth.epoch == epoch
+            && connection.within_max_age()
+            && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
+                < Duration::from_secs(20)
+            && connection.check(scope).is_ok()
+        {
+            Some(connection)
+        } else {
+            None
+        }
+    }
+
+    /// Create pooling metadata only for authenticated connections, after socket setup.
+    fn authentication(
+        &self,
+        identity: Option<Identity<'_>>,
+        epoch: [u8; 32],
+    ) -> Result<Authentication<I>> {
+        let Some(identity) = identity else {
+            return Ok(Authentication::Bootstrap);
+        };
+        let mut random = [0; 8];
+        uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+        let retire_at =
+            uring_runtime::environment::now() + authenticated_age(u64::from_ne_bytes(random));
+        Ok(Authentication::Authenticated(Authenticated {
+            expires: identity.expires,
+            epoch,
+            idle: Rc::downgrade(&self.idle),
+            idle_since: uring_runtime::environment::now(),
+            retire_at,
+        }))
+    }
 }
+
 /// Connected socket, readiness descriptor, and retained admission charge.
-type Connected<I> = (Stream, Rc<Descriptor>, Option<Rc<<I as Io>::Lease>>);
+struct Connected<I: Io + ?Sized> {
+    /// Admission charge, also retained by outstanding readiness operations.
+    charge: Option<Rc<I::Lease>>,
+
+    /// Owner-local nonblocking socket used by TLS.
+    stream: Stream,
+
+    /// Readiness registration handle for the same socket.
+    fd: Rc<Descriptor>,
+}
 
 /// Try addresses in order while reserving deadline shares for fallback and TLS.
 async fn connect_addresses<I: Io + ?Sized>(
@@ -475,7 +510,11 @@ async fn connect_addresses<I: Io + ?Sized>(
         if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
             if let Ok(fd) = sim.connect(uring_runtime::reactor::SocketAddress::Inet(*address)) {
                 let fd = Rc::new(fd);
-                return Ok((Stream::Sim(fd.clone()), fd, charge));
+                return Ok(Connected {
+                    charge,
+                    stream: Stream::Sim(fd.clone()),
+                    fd,
+                });
             }
             continue;
         }
@@ -498,7 +537,11 @@ async fn connect_addresses<I: Io + ?Sized>(
                 Err(error) => return Err(error),
             }
             if stream.take_error().map_err(|_| Error::Io)?.is_none() {
-                return Ok((Stream::Real(stream), fd, charge));
+                return Ok(Connected {
+                    charge,
+                    stream: Stream::Real(stream),
+                    fd,
+                });
             }
         }
     }
@@ -566,7 +609,35 @@ fn connect_socket(address: SocketAddr) -> Result<TcpStream> {
     }
     Ok(stream)
 }
+
 impl<I: Io + ?Sized> Connection<I> {
+    /// Successful framed requests recycle one connection within its trust/identity epoch.
+    pub fn request<'a>(
+        mut self,
+        request: Request<'a>,
+        scope: &'a I::Scope,
+    ) -> Operation<'a, Response, I::Error> {
+        Box::pin(async move {
+            let Request {
+                method,
+                path,
+                bearer: token,
+                header,
+                body,
+                limit,
+            } = request;
+            let request = request_head(&self.host, method, path, token, body.len(), header)?;
+            self.send(request.as_bytes(), body, scope).await?;
+            let completed = self.receive_response(limit, scope).await?;
+            self.recycle(&completed);
+            Ok(Response {
+                status: completed.head.status,
+                body: completed.body.to_vec(),
+                retry_after: completed.head.retry_after,
+            })
+        })
+    }
+
     /// Check redistribution age only at request boundaries, not during I/O.
     fn within_max_age(&self) -> bool {
         match &self.authentication {
@@ -576,6 +647,7 @@ impl<I: Io + ?Sized> Connection<I> {
             }
         }
     }
+
     /// Check caller cancellation first, then the authenticated identity lifetime.
     fn check(&self, scope: &I::Scope) -> Result<(), I::Error> {
         scope.check()?;
@@ -586,6 +658,7 @@ impl<I: Io + ?Sized> Connection<I> {
         }
         Ok(())
     }
+
     /// Make bounded TLS progress, yielding and waiting on owner-local readiness.
     async fn step(&mut self, scope: &I::Scope) -> Result<(), I::Error> {
         self.check(scope)?;
@@ -593,7 +666,7 @@ impl<I: Io + ?Sized> Connection<I> {
         uring_runtime::drivers::yield_now().await;
         let mut progress = false;
         if self.tls.wants_write() {
-            match self.tls.write_tls(&mut self.stream) {
+            match self.tls.write_tls(&mut self.socket.stream) {
                 Ok(0) => return Err(Error::Io.into()),
                 Ok(_) => progress = true,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
@@ -601,7 +674,7 @@ impl<I: Io + ?Sized> Connection<I> {
             }
         }
         if self.tls.wants_read() {
-            match self.tls.read_tls(&mut self.stream) {
+            match self.tls.read_tls(&mut self.socket.stream) {
                 Ok(0) => return Err(Error::Io.into()),
                 Ok(_) => {
                     self.tls.process_new_packets().map_err(tls_failure)?;
@@ -622,116 +695,104 @@ impl<I: Io + ?Sized> Connection<I> {
             }
             self.io
                 .ready(
-                    self.fd.clone(),
+                    self.socket.fd.clone(),
                     self.tls.wants_read(),
                     self.tls.wants_write(),
-                    self.charge.clone(),
+                    self.socket.charge.clone(),
                     &bounded,
                 )
                 .await?;
         }
         Ok(())
     }
-    /// Successful framed requests recycle one connection within its trust/identity epoch.
-    pub fn request<'a>(
-        mut self,
-        request: Request<'a>,
-        scope: &'a I::Scope,
-    ) -> Operation<'a, Response, I::Error> {
-        Box::pin(async move {
-            let Request {
-                method,
-                path,
-                bearer: token,
-                header,
-                body,
-                limit,
-            } = request;
-            let request = request_head(&self.host, method, path, token, body.len(), header)?;
-            for bytes in [request.as_bytes(), body] {
-                let mut offset = 0;
-                while offset < bytes.len() {
-                    self.check(scope)?;
-                    match self.tls.writer().write(&bytes[offset..]) {
-                        Ok(n) if n != 0 => offset += n,
-                        Ok(_) => (),
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                        Err(_) => return Err(Error::Io.into()),
-                    }
-                    self.step(scope).await?;
+
+    /// Send the already validated head and body, then flush pending TLS records.
+    async fn send(&mut self, head: &[u8], body: &[u8], scope: &I::Scope) -> Result<(), I::Error> {
+        for bytes in [head, body] {
+            let mut offset = 0;
+            while offset < bytes.len() {
+                self.check(scope)?;
+                match self.tls.writer().write(&bytes[offset..]) {
+                    Ok(n) if n != 0 => offset += n,
+                    Ok(_) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(_) => return Err(Error::Io.into()),
                 }
-            }
-            while self.tls.wants_write() {
                 self.step(scope).await?;
             }
-            let mut received = zeroize::Zeroizing::new(Vec::new());
-            let mut scratch = zeroize::Zeroizing::new([0; 16384]);
-            let ResponseHead {
-                status,
-                header_len,
-                framing,
-                retry_after,
-                close,
-            } = loop {
-                if let Some(head) = parse_head(&received, limit, self.max_error_body)? {
-                    break head;
-                }
-                if received.len() >= 16384 {
-                    return Err(Error::Overloaded.into());
-                }
-                self.receive(&mut received, &mut scratch[..], scope).await?;
-            };
-            let body = match framing {
-                Framing::Length(length) => {
-                    if received.len() > header_len + length {
+        }
+        while self.tls.wants_write() {
+            self.step(scope).await?;
+        }
+        Ok(())
+    }
+
+    /// Receive one exact frame and check for plaintext left in the TLS reader.
+    async fn receive_response(
+        &mut self,
+        limit: usize,
+        scope: &I::Scope,
+    ) -> Result<CompletedResponse, I::Error> {
+        let mut received = zeroize::Zeroizing::new(Vec::new());
+        let mut scratch = zeroize::Zeroizing::new([0; 16384]);
+        let head = loop {
+            if let Some(head) = parse_head(&received, limit, self.max_error_body)? {
+                break head;
+            }
+            if received.len() >= 16384 {
+                return Err(Error::Overloaded.into());
+            }
+            self.receive(&mut received, &mut scratch[..], scope).await?;
+        };
+        let body = match head.framing {
+            Framing::Length(length) => {
+                let end = head.header_len + length;
+                loop {
+                    if received.len() > end {
                         return Err(Error::InvalidRequest.into());
                     }
-                    while received.len() < header_len + length {
-                        self.receive(&mut received, &mut scratch[..], scope).await?;
-                        if received.len() > header_len + length {
-                            return Err(Error::InvalidRequest.into());
-                        }
+                    if received.len() == end {
+                        break;
                     }
-                    zeroize::Zeroizing::new(received[header_len..].to_vec())
+                    self.receive(&mut received, &mut scratch[..], scope).await?;
                 }
-                Framing::Chunked => {
-                    let bound = if status == 200 {
-                        limit
-                    } else {
-                        self.max_error_body
-                    };
-                    self.receive_chunked(&received[header_len..], bound, &mut scratch[..], scope)
-                        .await?
-                }
-            };
-            self.check(scope)?;
-            // A TLS record can contain more plaintext than the last bounded
-            // receive consumed. Never recycle a connection with trailing bytes.
-            let reusable = match self.tls.reader().read(&mut scratch[..1]) {
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
-                Ok(0) => false,
-                Ok(_) => return Err(Error::InvalidRequest.into()),
-                Err(_) => false,
-            };
-            // Failed requests (including 429/503) must reselect a Service backend.
-            // An aged connection finishes its in-flight response, then retires.
-            if reusable
-                && !close
-                && matches!(status, 200 | 204)
-                && self.within_max_age()
-                && let Authentication::Authenticated(auth) = &mut self.authentication
-                && let Some(idle) = auth.idle.upgrade()
-            {
-                auth.idle_since = uring_runtime::environment::now();
-                *idle.borrow_mut() = Some(self);
+                zeroize::Zeroizing::new(received[head.header_len..].to_vec())
             }
-            Ok(Response {
-                status,
-                body: body.to_vec(),
-                retry_after,
-            })
+            Framing::Chunked { bound } => {
+                self.receive_chunked(&received[head.header_len..], bound, &mut scratch[..], scope)
+                    .await?
+            }
+        };
+        self.check(scope)?;
+        // A TLS record can contain more plaintext than the last bounded receive.
+        let reusable = match self.tls.reader().read(&mut scratch[..1]) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+            Ok(0) => false,
+            Ok(_) => return Err(Error::InvalidRequest.into()),
+            Err(_) => false,
+        };
+        Ok(CompletedResponse {
+            head,
+            body,
+            reusable,
         })
     }
+
+    /// Recycle only completed successful responses; failures reselect a backend.
+    fn recycle(mut self, completed: &CompletedResponse) {
+        // An aged connection finishes its in-flight response, then retires.
+        if completed.reusable
+            && !completed.head.close
+            && matches!(completed.head.status, 200 | 204)
+            && self.within_max_age()
+            && let Authentication::Authenticated(auth) = &mut self.authentication
+            && let Some(idle) = auth.idle.upgrade()
+        {
+            auth.idle_since = uring_runtime::environment::now();
+            *idle.borrow_mut() = Some(self);
+        }
+    }
+
     /// Decode bounded chunks, rejecting extensions, trailers, and trailing bytes.
     async fn receive_chunked(
         &mut self,
@@ -812,6 +873,7 @@ impl<I: Io + ?Sized> Connection<I> {
         }
     }
 }
+
 /// Validate and bound request headers before copying any bearer credential.
 fn request_head(
     host: &str,
@@ -821,7 +883,9 @@ fn request_head(
     body_length: usize,
     header: Option<(&str, &str)>,
 ) -> Result<zeroize::Zeroizing<String>> {
+    /// Allocation ceiling including fixed syntax and variable header fields.
     const MAX_HEAD: usize = 16384;
+
     if !path.starts_with('/')
         || path.bytes().any(|b| b <= 32 || b >= 127)
         || host.bytes().any(|b| b <= 32 || b >= 127)
@@ -876,6 +940,7 @@ fn append_sensitive(into: &mut zeroize::Zeroizing<Vec<u8>>, bytes: &[u8]) {
     }
     into.extend_from_slice(bytes);
 }
+
 /// Retry Go server admission saturation, but keep certificate/protocol failures terminal.
 fn tls_failure(error: rustls::Error) -> Error {
     match error {
@@ -884,24 +949,96 @@ fn tls_failure(error: rustls::Error) -> Error {
     }
 }
 
+/// Hash trust bytes and length-delimited certificates without copying key material.
+fn trust_epoch(trust: &[u8], identity: Option<Identity<'_>>) -> [u8; 32] {
+    use sha2::Digest;
+    let mut epoch = sha2::Sha256::new();
+    epoch.update(trust);
+    if let Some(identity) = identity {
+        for certificate in identity.certificate_chain {
+            epoch.update((certificate.len() as u64).to_be_bytes());
+            epoch.update(certificate);
+        }
+    }
+    epoch.finalize().into()
+}
+
+/// Build fresh TLS 1.3 trust and optional client authentication without resumption.
+fn tls_config(mut trust: &[u8], identity: Option<Identity<'_>>) -> Result<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut trust) {
+        roots
+            .add(cert.map_err(|_| Error::Unauthorized)?)
+            .map_err(|_| Error::Unauthorized)?;
+    }
+    if roots.is_empty() {
+        return Err(Error::Unauthorized);
+    }
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|_| Error::Unauthorized)?
+    .with_root_certificates(roots);
+    let mut config = if let Some(identity) = identity {
+        builder
+            .with_client_auth_cert(
+                identity
+                    .certificate_chain
+                    .iter()
+                    .cloned()
+                    .map(rustls::pki_types::CertificateDer::from)
+                    .collect(),
+                rustls::pki_types::PrivatePkcs8KeyDer::from(identity.private_key.to_vec()).into(),
+            )
+            .map_err(|_| Error::Unauthorized)?
+    } else {
+        builder.with_no_client_auth()
+    };
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
+}
+
 /// Supported, unambiguous HTTP body boundaries.
 #[derive(Debug, Eq, PartialEq)]
 enum Framing {
+    /// Exact plaintext body length, already checked against its status limit.
     Length(usize),
-    Chunked,
+
+    /// Chunked body carrying the status-specific limit selected by the parser.
+    Chunked { bound: usize },
 }
+
 /// Validated response metadata, including the connection reuse directive.
 #[derive(Debug, Eq, PartialEq)]
 struct ResponseHead {
+    /// Parsed HTTP status used for body limits and pool policy.
     status: u16,
 
+    /// Offset of the first body byte in the accumulated plaintext.
     header_len: usize,
 
+    /// Exact length or chunk limit validated together with the headers.
     framing: Framing,
 
+    /// Server retry hint, already converted to a relative delay.
     retry_after: Option<Duration>,
 
+    /// Whether any Connection header asks to close the socket.
     close: bool,
+}
+
+/// A fully received frame with no trailing plaintext, ready for reuse policy.
+struct CompletedResponse {
+    /// Validated metadata for the fully consumed frame.
+    head: ResponseHead,
+
+    /// Plaintext retained in zeroizing storage until response ownership transfers.
+    body: zeroize::Zeroizing<Vec<u8>>,
+
+    /// TLS reader reported WouldBlock rather than EOF or a read failure.
+    reusable: bool,
 }
 
 /// Parse framing and reuse metadata together, preserving failure precedence.
@@ -997,7 +1134,7 @@ fn parse_head(bytes: &[u8], limit: usize, max_error_body: usize) -> Result<Optio
         status,
         header_len: length,
         framing: if chunked {
-            Framing::Chunked
+            Framing::Chunked { bound }
         } else {
             Framing::Length(size)
         },
@@ -1005,6 +1142,7 @@ fn parse_head(bytes: &[u8], limit: usize, max_error_body: usize) -> Result<Optio
         close,
     }))
 }
+
 /// Decode delta seconds or IMF-fixdate without locale or time-zone globals.
 fn retry_delay(bytes: &[u8]) -> Result<Duration> {
     let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidRequest)?;
@@ -1201,10 +1339,14 @@ pub mod dns {
 
     /// A connected real or simulated DNS datagram socket.
     enum Datagram {
+        /// Connected nonblocking UDP socket owned by this thread.
         Real(UdpSocket),
+
+        /// Simulated socket restricted to one resolver peer.
         #[cfg(feature = "simulation")]
         Sim(Rc<Descriptor>),
     }
+
     impl Datagram {
         /// Bind an ephemeral socket and restrict its peer to the chosen resolver.
         fn connect(server: SocketAddr) -> Result<(Self, Rc<Descriptor>)> {
@@ -1877,6 +2019,72 @@ mod tests {
         assert_eq!(parse_head(b"HTTP/1.1 429 Busy\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n", 10, 20).unwrap().unwrap().framing, Framing::Length(12));
     }
 
+    /// Chunked framing retains its status-specific bound, including zero limits.
+    #[test]
+    fn chunked_framing_carries_the_validated_body_limit() {
+        for (status, limit, max_error_body, bound) in [
+            (200, 10, 20, 10),
+            (429, 10, 20, 20),
+            (503, 10, 0, 0),
+            (200, 0, 20, 0),
+        ] {
+            let bytes = format!(
+                "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+            );
+            assert_eq!(
+                parse_head(bytes.as_bytes(), limit, max_error_body)
+                    .unwrap()
+                    .unwrap()
+                    .framing,
+                Framing::Chunked { bound }
+            );
+        }
+        assert_eq!(
+            parse_head(
+                b"HTTP/1.1 204 Empty\r\nTransfer-Encoding: chunked\r\n\r\n",
+                10,
+                20
+            ),
+            Err(Error::InvalidRequest)
+        );
+    }
+
+    /// Pool epochs bind trust and certificate boundaries, not borrowed key bytes.
+    #[test]
+    fn trust_epochs_preserve_certificate_boundaries() {
+        let chain = vec![b"ab".to_vec(), b"c".to_vec()];
+        let regrouped = vec![b"a".to_vec(), b"bc".to_vec()];
+        let identity = Identity {
+            certificate_chain: &chain,
+            private_key: b"key",
+            expires: std::time::UNIX_EPOCH,
+        };
+        let epoch = trust_epoch(b"trust", Some(identity));
+        assert_eq!(epoch, trust_epoch(b"trust", Some(identity)));
+        assert_ne!(epoch, trust_epoch(b"changed", Some(identity)));
+        assert_ne!(epoch, trust_epoch(b"trust", None));
+        assert_ne!(
+            epoch,
+            trust_epoch(
+                b"trust",
+                Some(Identity {
+                    certificate_chain: &regrouped,
+                    ..identity
+                })
+            )
+        );
+        assert_eq!(
+            epoch,
+            trust_epoch(
+                b"trust",
+                Some(Identity {
+                    private_key: b"different key",
+                    ..identity
+                })
+            )
+        );
+    }
+
     /// Extension headers retain printable values without changing framing.
     #[test]
     fn generic_header_accepts_tokens_and_printable_values() {
@@ -1897,8 +2105,8 @@ mod tests {
         assert!(valid_header("X-Test", " ~"));
     }
 
-    #[test]
     /// Invalid syntax and transport-owned headers cannot be injected.
+    #[test]
     fn generic_header_rejects_injection_and_reserved_overrides() {
         for (name, value) in [
             ("", "ok"),
@@ -1952,8 +2160,8 @@ mod tests {
         }
     }
 
-    #[test]
     /// Header sizes are rejected before credentials enter an allocation.
+    #[test]
     fn generic_header_bounds_name_and_value_before_copying() {
         let large = "a".repeat(16384);
         for header in [Some((large.as_str(), "")), Some(("X-Test", large.as_str()))] {

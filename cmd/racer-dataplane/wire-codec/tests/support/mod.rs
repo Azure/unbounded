@@ -1,4 +1,5 @@
 //! Shared loopback I/O and certificate fixtures for public and private invariants.
+
 use std::{
     io::{Read, Write},
     net::SocketAddr,
@@ -21,26 +22,32 @@ pub enum Error {
     /// A generic transport failure.
     Transport(RestError),
 }
+
 impl Error {
     /// Socket or filesystem failure in the blocking fixture.
     pub const IO: Self = Self::Transport(RestError::Io);
+
     /// Scope deadline or unavailable endpoint.
     pub const UNAVAILABLE: Self = Self::Transport(RestError::Unavailable);
+
     /// The fixture's file byte bound was exceeded.
     pub const OVERLOADED: Self = Self::Transport(RestError::Overloaded);
 }
+
 impl From<RestError> for Error {
     /// Retain the transport's exact error classification.
     fn from(error: RestError) -> Self {
         Self::Transport(error)
     }
 }
+
 /// Results returned by blocking fixture operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A monotonic deadline used by loopback operations.
 #[derive(Clone)]
 pub struct TestScope(Instant);
+
 impl uring_runtime::Scope for TestScope {
     type Error = Error;
 
@@ -53,6 +60,7 @@ impl uring_runtime::Scope for TestScope {
         }
     }
 }
+
 impl Scope for TestScope {
     /// Return the fixture's absolute deadline.
     fn deadline(&self) -> Instant {
@@ -64,12 +72,14 @@ impl Scope for TestScope {
         Self(self.0.min(until))
     }
 }
+
 impl From<uring_runtime::Error> for Error {
     /// Preserve the original fixture's runtime-to-I/O error mapping.
     fn from(_: uring_runtime::Error) -> Self {
         Self::IO
     }
 }
+
 /// Give one fixture operation a bounded loopback deadline.
 pub fn scope() -> TestScope {
     TestScope(Instant::now() + Duration::from_secs(10))
@@ -77,6 +87,7 @@ pub fn scope() -> TestScope {
 
 /// Blocking poll is confined to loopback tests; no io_uring or Racer dependency.
 pub struct FixtureIo;
+
 impl Io for FixtureIo {
     type FileBytes = zeroize::Zeroizing<Vec<u8>>;
 
@@ -150,8 +161,10 @@ impl Io for FixtureIo {
         })
     }
 }
+
 /// Process-unique fixture directory removed on drop.
 pub struct Directory(pub PathBuf);
+
 impl Directory {
     /// Create a directory inside this worktree's target tree.
     pub fn new() -> Self {
@@ -167,12 +180,14 @@ impl Directory {
         Self(path)
     }
 }
+
 impl Drop for Directory {
     /// Clean up trust files, including projected symlinks, after the test.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
 /// Generate an in-memory Ed25519 certificate authority.
 pub fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -184,6 +199,7 @@ pub fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     (params.self_signed(&key).unwrap(), key)
 }
+
 /// Client identity with zeroized private-key storage.
 pub struct TestIdentity {
     chain: Vec<Vec<u8>>,
@@ -192,6 +208,7 @@ pub struct TestIdentity {
 
     expires: SystemTime,
 }
+
 impl TestIdentity {
     /// Issue a client-auth certificate from the supplied fixture CA.
     pub fn new(ca: &rcgen::Certificate, ca_key: &rcgen::KeyPair) -> Self {
@@ -205,6 +222,7 @@ impl TestIdentity {
             expires: SystemTime::now() + Duration::from_secs(86400),
         }
     }
+
     /// Borrow the certificate and key without copying sensitive bytes.
     fn borrowed(&self) -> Identity<'_> {
         Identity {
@@ -214,6 +232,7 @@ impl TestIdentity {
         }
     }
 }
+
 /// Build standard bounded transport configuration for loopback tests.
 pub fn config(url: String, trust_bundle: PathBuf) -> Config {
     Config {
@@ -223,6 +242,7 @@ pub fn config(url: String, trust_bundle: PathBuf) -> Config {
         max_error_body: 65536,
     }
 }
+
 /// Test-only convenience methods, not additions to the production API.
 pub trait TestTransport {
     /// Connect with a borrowed fixture identity.
@@ -236,6 +256,7 @@ pub trait TestTransport {
     fn bootstrap<'a>(&'a self, scope: &'a TestScope)
     -> Operation<'a, Connection<FixtureIo>, Error>;
 }
+
 impl TestTransport for Transport<FixtureIo> {
     /// Connect using the fixture's borrowed client certificate and key.
     fn authenticated<'a>(
@@ -254,6 +275,7 @@ impl TestTransport for Transport<FixtureIo> {
         self.connect(None, scope)
     }
 }
+
 /// Construct a bodyless fixture request with a caller-selected response limit.
 pub fn request<'a>(
     method: Method,
@@ -282,6 +304,7 @@ pub struct WeeklyCertificates {
 
     pub leaf_only_servers: Vec<Arc<rustls::ServerConfig>>,
 }
+
 impl WeeklyCertificates {
     /// Build four generations retaining at most two compatibility bridges.
     pub fn new() -> Self {
@@ -381,6 +404,7 @@ pub struct RotationServer {
 
     thread: Option<std::thread::JoinHandle<()>>,
 }
+
 impl RotationServer {
     /// Start serving connection identifiers using a replaceable TLS config.
     pub fn new(config: Arc<rustls::ServerConfig>) -> Self {
@@ -458,6 +482,7 @@ impl RotationServer {
         transport
     }
 }
+
 impl Drop for RotationServer {
     /// Stop and join the server even when an assertion unwinds.
     fn drop(&mut self) {
