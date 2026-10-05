@@ -104,8 +104,11 @@
 //! # Threads and caches
 //!
 //! A [`Membership`] can be shared across threads. [`Placement`] and [`Paths`]
-//! cannot: make one per worker thread. Their async methods do a little work
-//! per poll, so a large job never stalls the worker.
+//! cannot: make one per worker thread. Their async methods limit BFS expansions
+//! or member-scoring counts per poll, not total work or elapsed time. Completion,
+//! dropping search state, and cache eviction are synchronous. Hashing costs vary
+//! with input lengths, and [`Placement::rank_async`] hashes the key before
+//! returning its future. These methods do not guarantee worker responsiveness.
 //!
 //! Every cache has a size limit. Byte counts are estimates, not hard memory
 //! limits. [`Membership::retained_bytes`] counts a shared graph in full for

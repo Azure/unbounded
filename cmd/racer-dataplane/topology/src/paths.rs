@@ -1,6 +1,7 @@
 //! Shortest-path routing over the membership graph.
 //!
-//! Searches run in small steps so one route never blocks a worker for long.
+//! BFS expansions are limited per poll. Completion, cleanup, cache eviction,
+//! and variable-length hashing are synchronous, so poll time is not bounded.
 
 use crate::{Error, MAX_DEGREE, Member, Membership, hash};
 
@@ -362,9 +363,13 @@ impl Paths {
     /// several routes are equally short, the seed and the first hop's weight
     /// decide which one is returned.
     ///
-    /// The search yields often, so it does not block the worker. Dropping
-    /// the future cancels the search unless another caller is still waiting
-    /// on it.
+    /// Each poll expands at most 32 BFS nodes, each with at most [`MAX_DEGREE`]
+    /// neighbors. This bounds expansion counts, not total work or elapsed time:
+    /// route reconstruction, search-state cleanup, cache eviction, and route
+    /// selection run synchronously. Selection hashes variable-length endpoint
+    /// IDs and the seed. Dropping the future cancels the search unless another
+    /// caller is still waiting on it; freeing the search state is synchronous
+    /// and is not covered by the expansion limit.
     ///
     /// # Errors
     /// - [`Error::InvalidQuery`] if the query breaks a [`PathQuery`] rule.

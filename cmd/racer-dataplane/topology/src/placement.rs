@@ -413,12 +413,16 @@ impl Placement {
         Ok(ranking.candidates())
     }
 
-    /// Like [`Self::rank`], but yields so it does not block the executor.
+    /// Like [`Self::rank`], but yields between batches of member scores.
     ///
-    /// Each poll scores at most 256 members. Adding a cache entry may also do a
-    /// small update from the old membership and may scan the whole cache to
-    /// evict something. Requests for the same slot share work. Dropping the
-    /// future releases its hold on the entry but keeps the work done so far.
+    /// Hashes the entire key synchronously before returning the future. Each
+    /// poll advances the ranking by at most 256 member scores. Adding a cache
+    /// entry may also score changed members from the old membership and may scan
+    /// the whole cache to evict something. Each score hashes a variable-length
+    /// member ID. These counts do not bound total work or elapsed time per poll;
+    /// completion, cache eviction, and cleanup are synchronous. Requests for the
+    /// same slot share work. Dropping the future releases its hold on the entry
+    /// but keeps the work done so far when caching is enabled.
     ///
     /// # Errors
     ///
