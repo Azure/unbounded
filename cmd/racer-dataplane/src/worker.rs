@@ -120,82 +120,30 @@ impl AffinityPlan {
     }
     fn place_with_policy(
         max_threads: usize,
-        topology: EffectiveTopology,
+        mut topology: EffectiveTopology,
         rails: &[RailMapping],
         allow_smt: bool,
     ) -> Result<Self> {
-        if max_threads < 2 || topology.cpus.is_empty() {
-            return Err(Error::InvalidConfiguration);
-        }
-        // Fractional CPU capacity still permits one pair sharing allowed CPUs.
-        let quota = topology.quota.map(|quota| {
-            usize::try_from(quota.quota.get() / quota.period.get())
-                .unwrap_or(usize::MAX)
-                .max(1)
-        });
-        let mut cpus = topology.cpus;
-        cpus.sort_by_key(|cpu| cpu.cpu);
-        if cpus.windows(2).any(|pair| pair[0].cpu == pair[1].cpu) {
-            return Err(Error::InvalidConfiguration);
-        }
-        if !allow_smt {
-            let mut cores = HashSet::new();
-            cpus.retain(|cpu| cores.insert((cpu.package, cpu.core)));
-        }
-        let mut nics = topology.nics;
-        nics.sort_by(|a, b| a.device.cmp(&b.device));
         // NUMA compatibility is a hint, not proof of physical RDMA eligibility.
-        nics.retain(|nic| {
+        topology.nics.retain(|nic| {
             nic.numa_node.is_some()
                 && (rails.is_empty() || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
         });
-        let capacity = quota.unwrap_or(cpus.len()).min(cpus.len());
-        let mut remaining = max_threads;
-        let mut available = capacity;
-        let mut nodes = BTreeMap::<_, Vec<_>>::new();
-        for cpu in cpus {
-            nodes.entry(cpu.numa_node).or_default().push(cpu);
-        }
-        let mut nodes = nodes.into_iter().collect::<Vec<_>>();
-        nodes.sort_by_key(|(node, _)| (!nics.iter().any(|nic| nic.numa_node == *node), *node));
-        let mut pairs = Vec::new();
-        for (node, local) in nodes {
-            if remaining < 2 || available == 0 {
-                break;
-            }
-            // Prefer physical-core diversity among reactors even with SMT.
-            let mut cores = HashSet::new();
-            let mut ordered = local
-                .into_iter()
-                .map(|cpu| (!cores.insert((cpu.package, cpu.core)), cpu))
-                .collect::<Vec<_>>();
-            ordered.sort_by_key(|(sibling, cpu)| (*sibling, cpu.cpu));
-            let mut local = ordered.into_iter().map(|(_, cpu)| cpu).collect::<Vec<_>>();
-            let count = local.len().min(remaining).min(available);
-            local.truncate(count);
-            // Nearest integral 2:1 split, spending both remainder cores for n%3=2.
-            let crypto_count = ((count + 1) / 3).max(1);
-            let io_count = count.saturating_sub(crypto_count).max(1);
-            let crypto = if count == 1 {
-                &local[..]
-            } else {
-                &local[io_count..]
-            };
-            let nic = nics.iter().find(|nic| nic.numa_node == node).cloned();
-            for (index, io) in local[..io_count].iter().enumerate() {
-                if pairs.len() > usize::from(u16::MAX) {
-                    break;
-                }
-                pairs.push(WorkerPair {
-                    worker: WorkerId(pairs.len() as u16),
-                    io: io.clone(),
-                    crypto: crypto[index % crypto.len()].clone(),
-                    nic: nic.clone(),
-                });
-            }
-            remaining -= count.max(2);
-            available -= count;
-        }
+        let pairs = uring_runtime::group::affinity::place(
+            topology,
+            max_threads,
+            usize::from(u16::MAX) + 1,
+            allow_smt,
+        )?
+        .into_iter()
+        .enumerate()
+        .map(|(index, placement)| WorkerPair {
+            worker: WorkerId(index as u16),
+            io: placement.lane,
+            crypto: placement.helper,
+            nic: placement.nic,
+        })
+        .collect();
         Ok(Self { pairs, max_threads })
     }
     /// Deterministic execution groups ordered by crypto CPU, then pair index.
@@ -1009,47 +957,6 @@ mod tests {
                         period: NonZeroU64::new(period).unwrap(),
                     }),
                     nics: vec![],
-                }
-            }
-
-            #[test]
-            fn one_through_nine_fill_eligible_cores_with_local_shared_crypto() {
-                for (cores, io, crypto) in [
-                    (1, 1, 1),
-                    (2, 1, 1),
-                    (3, 2, 1),
-                    (4, 3, 1),
-                    (5, 3, 2),
-                    (6, 4, 2),
-                    (7, 5, 2),
-                    (8, 5, 3),
-                    (9, 6, 3),
-                ] {
-                    for smt in [false, true] {
-                        let plan = AffinityPlan::place_with_policy(
-                            usize::MAX,
-                            topology(cores, None),
-                            &[],
-                            smt,
-                        )
-                        .unwrap();
-                        assert_eq!(plan.pairs.len(), io, "cores={cores}, smt={smt}");
-                        assert_eq!(plan.crypto_groups().len(), crypto);
-                        let assigned = plan
-                            .pairs
-                            .iter()
-                            .flat_map(|pair| [pair.io.cpu, pair.crypto.cpu])
-                            .collect::<BTreeSet<_>>();
-                        assert_eq!(assigned, (0..cores).collect());
-                        assert!(
-                            plan.pairs
-                                .iter()
-                                .all(|pair| pair.io.numa_node == pair.crypto.numa_node)
-                        );
-                        if cores > 1 {
-                            assert!(plan.pairs.iter().all(|pair| pair.io.cpu != pair.crypto.cpu));
-                        }
-                    }
                 }
             }
 

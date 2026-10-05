@@ -1229,7 +1229,7 @@ fn drive_helpers<E: Copy + From<Error>>(
 pub mod affinity {
     use crate::{Error, Result};
     use std::{
-        collections::{BTreeSet, HashSet},
+        collections::{BTreeMap, BTreeSet, HashSet},
         fs,
         num::NonZeroU64,
         path::{Path, PathBuf},
@@ -1282,6 +1282,190 @@ pub mod affinity {
 
         /// Network and InfiniBand devices, with available NUMA locality.
         pub nics: Vec<NicLocality>,
+    }
+
+    /// One lane and its NUMA-local shared helper execution placement.
+    pub struct Placement {
+        /// CPU that owns the lane's local graph.
+        pub lane: CpuLocation,
+
+        /// CPU shared by the lane's helper service.
+        pub helper: CpuLocation,
+
+        /// Optional caller-filtered local device hint.
+        pub nic: Option<NicLocality>,
+    }
+
+    /// Place roughly two lanes per helper within effective CPU and thread budgets.
+    /// Device filtering and lane identity limits remain caller policy.
+    pub fn place(
+        topology: EffectiveTopology,
+        max_threads: usize,
+        max_lanes: usize,
+        allow_smt: bool,
+    ) -> Result<Vec<Placement>> {
+        if max_threads < 2 || topology.cpus.is_empty() {
+            return Err(Error::InvalidConfiguration);
+        }
+        // Fractional CPU capacity still permits two roles sharing one allowed CPU.
+        let quota = topology.quota.map(|quota| {
+            usize::try_from(quota.quota.get() / quota.period.get())
+                .unwrap_or(usize::MAX)
+                .max(1)
+        });
+        let mut cpus = topology.cpus;
+        cpus.sort_by_key(|cpu| cpu.cpu);
+        if cpus.windows(2).any(|pair| pair[0].cpu == pair[1].cpu) {
+            return Err(Error::InvalidConfiguration);
+        }
+        if !allow_smt {
+            let mut cores = HashSet::new();
+            cpus.retain(|cpu| cores.insert((cpu.package, cpu.core)));
+        }
+        let mut nics = topology.nics;
+        nics.sort_by(|a, b| a.device.cmp(&b.device));
+        nics.retain(|nic| nic.numa_node.is_some());
+        let capacity = quota.unwrap_or(cpus.len()).min(cpus.len());
+        let mut remaining = max_threads;
+        let mut available = capacity;
+        let mut nodes = BTreeMap::<_, Vec<_>>::new();
+        for cpu in cpus {
+            nodes.entry(cpu.numa_node).or_default().push(cpu);
+        }
+        let mut nodes = nodes.into_iter().collect::<Vec<_>>();
+        nodes.sort_by_key(|(node, _)| (!nics.iter().any(|nic| nic.numa_node == *node), *node));
+        let mut pairs = Vec::new();
+        for (node, local) in nodes {
+            if remaining < 2 || available == 0 {
+                break;
+            }
+            // Prefer physical-core diversity among lanes even with SMT enabled.
+            let mut cores = HashSet::new();
+            let mut ordered = local
+                .into_iter()
+                .map(|cpu| (!cores.insert((cpu.package, cpu.core)), cpu))
+                .collect::<Vec<_>>();
+            ordered.sort_by_key(|(sibling, cpu)| (*sibling, cpu.cpu));
+            let mut local = ordered.into_iter().map(|(_, cpu)| cpu).collect::<Vec<_>>();
+            let count = local.len().min(remaining).min(available);
+            local.truncate(count);
+            // Nearest integral 2:1 split spends both remainder cores for n%3=2.
+            let helper_count = ((count + 1) / 3).max(1);
+            let lane_count = count.saturating_sub(helper_count).max(1);
+            let helpers = if count == 1 {
+                &local[..]
+            } else {
+                &local[lane_count..]
+            };
+            let nic = nics.iter().find(|nic| nic.numa_node == node).cloned();
+            for (index, lane) in local[..lane_count].iter().enumerate() {
+                if pairs.len() >= max_lanes {
+                    break;
+                }
+                pairs.push(Placement {
+                    lane: lane.clone(),
+                    helper: helpers[index % helpers.len()].clone(),
+                    nic: nic.clone(),
+                });
+            }
+            remaining -= count.max(2);
+            available -= count;
+        }
+        Ok(pairs)
+    }
+
+    /// Placement regressions independent of application worker IDs and rails.
+    #[cfg(test)]
+    mod placement_tests {
+        use super::*;
+
+        /// Nearest integral 2:1 assignment uses every eligible core and keeps helpers local.
+        #[test]
+        fn one_through_nine_fill_eligible_cores_with_local_shared_crypto() {
+            for (cores, lanes, helpers) in [
+                (1, 1, 1),
+                (2, 1, 1),
+                (3, 2, 1),
+                (4, 3, 1),
+                (5, 3, 2),
+                (6, 4, 2),
+                (7, 5, 2),
+                (8, 5, 3),
+                (9, 6, 3),
+            ] {
+                for smt in [false, true] {
+                    let topology = EffectiveTopology {
+                        cpus: (0..cores)
+                            .map(|cpu| CpuLocation {
+                                cpu,
+                                package: 0,
+                                core: cpu,
+                                numa_node: Some(0),
+                            })
+                            .collect(),
+                        quota: None,
+                        nics: vec![],
+                    };
+                    let plan = place(topology, usize::MAX, usize::MAX, smt).unwrap();
+                    assert_eq!(plan.len(), lanes, "cores={cores}, smt={smt}");
+                    assert_eq!(
+                        plan.iter()
+                            .map(|p| p.helper.cpu)
+                            .collect::<BTreeSet<_>>()
+                            .len(),
+                        helpers
+                    );
+                    let assigned = plan
+                        .iter()
+                        .flat_map(|p| [p.lane.cpu, p.helper.cpu])
+                        .collect::<BTreeSet<_>>();
+                    assert_eq!(assigned, (0..cores).collect());
+                    assert!(plan.iter().all(|p| p.lane.numa_node == p.helper.numa_node));
+                    if cores > 1 {
+                        assert!(plan.iter().all(|p| p.lane.cpu != p.helper.cpu));
+                    }
+                }
+            }
+        }
+
+        /// Caller identity limits do not overflow, and malformed CPU sets fail before placement.
+        #[test]
+        fn lane_caps_and_invalid_topology_are_explicit() {
+            let hardware = EffectiveTopology {
+                cpus: (0..9)
+                    .map(|cpu| CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: Some(0),
+                    })
+                    .collect(),
+                quota: None,
+                nics: vec![],
+            };
+            for cap in 0..8 {
+                assert_eq!(
+                    place(hardware.clone(), 9, cap, false).unwrap().len(),
+                    cap.min(6)
+                );
+            }
+            assert!(matches!(
+                place(hardware.clone(), 1, 9, false),
+                Err(Error::InvalidConfiguration)
+            ));
+            let mut duplicate = hardware.clone();
+            duplicate.cpus[1].cpu = 0;
+            assert!(matches!(
+                place(duplicate, 9, 9, true),
+                Err(Error::InvalidConfiguration)
+            ));
+            let mut empty = hardware;
+            empty.cpus.clear();
+            assert!(matches!(
+                place(empty, 9, 9, false),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
     }
 
     impl EffectiveTopology {
