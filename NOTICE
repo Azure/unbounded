@@ -29,6 +29,51 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/TanStack/table/blob/HEAD/LICENSE
+  - dependency: bitflags
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014 The Rust Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/bitflags/2.13.2/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/bitflags/2.13.2/source/LICENSE-MIT
+  - dependency: block-buffer
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2018-2019 The RustCrypto Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/block-buffer/0.10.4/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/block-buffer/0.10.4/source/LICENSE-MIT
+  - dependency: cfg-if
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014 Alex Crichton
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/cfg-if/1.0.5/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/cfg-if/1.0.5/source/LICENSE-MIT
+  - dependency: cpufeatures
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2020-2025 The RustCrypto Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/cpufeatures/0.2.17/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/cpufeatures/0.2.17/source/LICENSE-MIT
+  - dependency: crypto-common
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2021 RustCrypto Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/crypto-common/0.1.7/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/crypto-common/0.1.7/source/LICENSE-MIT
   - dependency: d3-scale
     ecosystem: npm
     copyright:
@@ -36,6 +81,15 @@ notices:
     license:
       - name: ISC License
         link: https://github.com/d3/d3-scale/blob/HEAD/LICENSE
+  - dependency: digest
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2017 Artyom Pavlov
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/digest/0.10.7/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/digest/0.10.7/source/LICENSE-MIT
   - dependency: futures
     ecosystem: cargo
     copyright:
@@ -46,6 +100,93 @@ notices:
         link: https://docs.rs/crate/futures/0.3.34/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/futures/0.3.34/source/LICENSE-MIT
+  - dependency: futures-channel
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures-channel/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures-channel/0.3.34/source/LICENSE-MIT
+  - dependency: futures-core
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures-core/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures-core/0.3.34/source/LICENSE-MIT
+  - dependency: futures-executor
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures-executor/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures-executor/0.3.34/source/LICENSE-MIT
+  - dependency: futures-io
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures-io/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures-io/0.3.34/source/LICENSE-MIT
+  - dependency: futures-macro
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures-macro/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures-macro/0.3.34/source/LICENSE-MIT
+  - dependency: futures-sink
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures-sink/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures-sink/0.3.34/source/LICENSE-MIT
+  - dependency: futures-task
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures-task/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures-task/0.3.34/source/LICENSE-MIT
+  - dependency: futures-util
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016 Alex Crichton
+      - Copyright (c) 2017 The Tokio Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/futures-util/0.3.34/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/futures-util/0.3.34/source/LICENSE-MIT
+  - dependency: generic-array
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2015 Bartłomiej Kamiński
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/generic-array/0.14.7/source/LICENSE
   - dependency: getrandom
     ecosystem: cargo
     copyright:
@@ -681,6 +822,15 @@ notices:
         link: https://docs.rs/crate/libc/0.2.189/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/libc/0.2.189/source/LICENSE-MIT
+  - dependency: memchr
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2015 Andrew Gallant
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/memchr/2.8.3/source/LICENSE-MIT
+      - name: The Unlicense
+        link: https://docs.rs/crate/memchr/2.8.3/source/UNLICENSE
   - dependency: modernc.org/sqlite
     ecosystem: go
     copyright:
@@ -695,6 +845,33 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/oras-project/oras-go/blob/v2.6.2/LICENSE
+  - dependency: pin-project-lite
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/pin-project-lite/0.2.17/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/pin-project-lite/0.2.17/source/LICENSE-MIT
+  - dependency: proc-macro2
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/proc-macro2/1.0.107/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/proc-macro2/1.0.107/source/LICENSE-MIT
+  - dependency: quote
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/quote/1.0.47/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/quote/1.0.47/source/LICENSE-MIT
   - dependency: react
     ecosystem: npm
     copyright:
@@ -742,6 +919,61 @@ notices:
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+  - dependency: slab
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2019 Carl Lerche
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/slab/0.4.12/source/LICENSE
+  - dependency: syn
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/syn/3.0.6/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/syn/3.0.6/source/LICENSE-MIT
+  - dependency: typenum
+    ecosystem: cargo
+    copyright:
+      - Copyright 2014 Paho Lurie-Gregg
+      - Copyright (c) 2014 Paho Lurie-Gregg
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/typenum/1.20.1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/typenum/1.20.1/source/LICENSE-MIT
+  - dependency: unicode-ident
+    ecosystem: cargo
+    copyright:
+      - Copyright © 1991-2023 Unicode, Inc.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/unicode-ident/1.0.26/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/unicode-ident/1.0.26/source/LICENSE-MIT
+      - name: Unicode License v3
+        link: https://docs.rs/crate/unicode-ident/1.0.26/source/LICENSE-UNICODE
+  - dependency: version_check
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2017-2018 Sergio Benitez
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/version_check/0.9.5/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/version_check/0.9.5/source/LICENSE-MIT
+  - dependency: wasi
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/wasi/0.11.1+wasi-snapshot-preview1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/wasi/0.11.1+wasi-snapshot-preview1/source/LICENSE-MIT
   - dependency: zeroize
     ecosystem: cargo
     copyright:

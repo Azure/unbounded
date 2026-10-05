@@ -49,6 +49,7 @@ dependencies = [
 [[package]]
 name = "foo"
 version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 `,
 			})
 			testutil.WriteTree(t, home, map[string]string{"registry/src/index/foo-1.0.0/LICENSE": testutil.MITLicense("Copyright (c) 2026 Example")})

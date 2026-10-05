@@ -114,14 +114,17 @@ test-only = "4"
 [[package]]
 name = "foo"
 version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "build-helper"
 version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "linux-only"
 version = "3.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "test-only"
@@ -245,6 +248,7 @@ func TestCollectorPrecheckReportsMissingCache(t *testing.T) {
 [[package]]
 name = "foo"
 version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "racer-dataplane"
@@ -271,6 +275,7 @@ func TestCollectorRejectsDuplicateRegistrySources(t *testing.T) {
 [[package]]
 name = "foo"
 version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "racer-dataplane"
@@ -303,6 +308,7 @@ func TestCollectorCollectsMultipleLicenseFiles(t *testing.T) {
 [[package]]
 name = "foo"
 version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "racer-dataplane"
@@ -313,8 +319,10 @@ dependencies = [
 `,
 	})
 	testutil.WriteTree(t, cargoHome, map[string]string{
-		"registry/src/index/foo-1.2.3/LICENSE-APACHE": testutil.Apache2License(),
-		"registry/src/index/foo-1.2.3/LICENSE-MIT":    testutil.MITLicense("Copyright (c) 2026 Example"),
+		"registry/src/index/foo-1.2.3/LICENSE-APACHE":  testutil.Apache2License(),
+		"registry/src/index/foo-1.2.3/LICENSE-MIT":     testutil.MITLicense("Copyright (c) 2026 Example"),
+		"registry/src/index/foo-1.2.3/LICENSE":         "MIT OR Apache-2.0\n",
+		"registry/src/index/foo-1.2.3/Cargo.toml.orig": "[package]\nlicense = \"MIT OR Apache-2.0\"\n",
 	})
 
 	entries, err := New(cargoHome).Collect(root)
@@ -341,6 +349,7 @@ func TestCollectorUsesDeclaredLicenseWithoutLicenseFile(t *testing.T) {
 [[package]]
 name = "foo"
 version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "racer-dataplane"
@@ -365,6 +374,26 @@ dependencies = [
 
 	if entries[0].License[0].Name != "MIT License" || entries[0].License[1].Name != "Apache License, Version 2.0" {
 		t.Fatalf("licenses = %#v", entries[0].License)
+	}
+}
+
+func TestCollectorLicenseIndexFailsClosed(t *testing.T) {
+	for _, tt := range []struct{ name, text, other string }{
+		{"unrecognized license", "not a license", testutil.MITLicense("Copyright (c) 2026 Example")},
+		{"indexes without full text", "MIT OR Apache-2.0", "MIT OR Apache-2.0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			testutil.WriteTree(t, home, map[string]string{
+				"registry/src/index/foo-1.0.0/Cargo.toml.orig": "[package]\nlicense = \"MIT OR Apache-2.0\"\n",
+				"registry/src/index/foo-1.0.0/LICENSE":         tt.text,
+				"registry/src/index/foo-1.0.0/LICENSE-MIT":     tt.other,
+			})
+
+			if _, err := New(home).buildEntry("foo", "1.0.0"); err == nil {
+				t.Fatal("expected license classification error")
+			}
+		})
 	}
 }
 
@@ -412,9 +441,14 @@ dependencies = [
 [[package]]
 name = "sha2"
 version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "digest",
 ]
+[[package]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "sha2"
 version = "0.9.9"
@@ -424,7 +458,8 @@ version = "0.3.31"
 `,
 			})
 			testutil.WriteTree(t, cargoHome, map[string]string{
-				"registry/src/index/sha2-0.10.9/LICENSE": testutil.MITLicense("Copyright (c) 2026 Example"),
+				"registry/src/index/sha2-0.10.9/LICENSE":   testutil.MITLicense("Copyright (c) 2026 Example"),
+				"registry/src/index/digest-0.10.7/LICENSE": testutil.MITLicense("Copyright (c) 2026 Example"),
 			})
 
 			c := New(cargoHome)
@@ -437,12 +472,18 @@ version = "0.3.31"
 				t.Fatalf("Collect: %v", err)
 			}
 
-			if len(entries) != 1 || entries[0].Dependency != "sha2" {
-				t.Fatalf("entries = %#v; want only sha2", entries)
+			if len(entries) != 2 {
+				t.Fatalf("entries = %#v; want sha2 and digest", entries)
 			}
 
-			if got := entries[0].License[0].Link; got != "https://docs.rs/crate/sha2/0.10.9/source/LICENSE" {
-				t.Errorf("license link = %q", got)
+			for _, entry := range entries {
+				if entry.Dependency != "sha2" && entry.Dependency != "digest" {
+					t.Fatalf("unexpected dependency %q", entry.Dependency)
+				}
+
+				if entry.Dependency == "sha2" && entry.License[0].Link != "https://docs.rs/crate/sha2/0.10.9/source/LICENSE" {
+					t.Errorf("license link = %q", entry.License[0].Link)
+				}
 			}
 		})
 	}
@@ -467,6 +508,7 @@ dependencies = [
 		shaLock = `[[package]]
 name = "sha2"
 version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 `
 	)
 

@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package cargo implements a notice.Collector for direct non-development
-// dependencies of cmd/racer-dataplane and its local path dependencies.
+// Package cargo implements a notice.Collector for non-development dependencies
+// of the cmd/racer-dataplane workspace, including registry transitives.
 package cargo
 
 import (
@@ -105,6 +105,11 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, fmt.Errorf("parsing %s: %w", lockPath, err)
 	}
 
+	versions, err = registryClosure(string(lock), versions)
+	if err != nil {
+		return nil, fmt.Errorf("traversing %s: %w", lockPath, err)
+	}
+
 	entries := make([]notice.Entry, 0, len(versions))
 	for name, version := range versions {
 		entry, err := c.buildEntry(name, version)
@@ -120,6 +125,11 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 
 // localRegistryVersions follows local crates, but not registry transitives.
 func localRegistryVersions(root, lock string) (map[string]string, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+
 	versions := map[string]string{}
 	visited := map[string]bool{}
 
@@ -341,6 +351,8 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 	seenLicenses := map[string]bool{}
 	seenCopyrights := map[string]bool{}
 
+	var indexedLicenses []notice.License
+
 	for _, licensePath := range licensePaths {
 		licenseText, readErr := os.ReadFile(licensePath)
 		if readErr != nil {
@@ -349,6 +361,17 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 
 		licenseNames, classifyErr := license.Classify(licenseText)
 		if classifyErr != nil {
+			// Some crates ship a LICENSE index containing only the declared
+			// SPDX expression alongside the full LICENSE-MIT/LICENSE-APACHE.
+			declared := crateLicense(matches[0])
+			text := strings.TrimSpace(string(licenseText))
+
+			isIndex := text == declared || (declared == "Unlicense OR MIT" && text == "This project is dual-licensed under the Unlicense and MIT licenses.\n\nYou may use this code under the terms of either license.")
+			if len(licensePaths) > 1 && isIndex {
+				indexedLicenses = append(indexedLicenses, declaredLicenses(declared, "")...)
+				continue
+			}
+
 			return notice.Entry{}, fmt.Errorf("classifying %s: %w", licensePath, classifyErr)
 		}
 
@@ -371,6 +394,16 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 				entry.Copyright = append(entry.Copyright, copyright)
 				seenCopyrights[copyright] = true
 			}
+		}
+	}
+
+	if len(entry.License) == 0 {
+		return notice.Entry{}, fmt.Errorf("no full license text found in %s", matches[0])
+	}
+
+	for _, indexed := range indexedLicenses {
+		if !seenLicenses[indexed.Name] {
+			return notice.Entry{}, fmt.Errorf("no full license text found for %s in %s", indexed.Name, matches[0])
 		}
 	}
 
@@ -408,7 +441,7 @@ func declaredLicenses(expression, link string) []notice.License {
 func crateLicenseFiles(dir string) ([]string, error) {
 	var paths []string
 
-	for _, pattern := range []string{"LICENSE*", "LICENCE*", "COPYING*"} {
+	for _, pattern := range []string{"LICENSE*", "LICENCE*", "COPYING*", "UNLICENSE"} {
 		matches, err := filepath.Glob(filepath.Join(dir, pattern))
 		if err != nil {
 			return nil, fmt.Errorf("locating license files: %w", err)
@@ -546,66 +579,20 @@ func (m cargoManifest) directDependencies() (map[string]dependency, error) {
 }
 
 func lockedDirectVersions(data string, direct map[string]dependency, owner string) (map[string]string, error) {
-	type pkg struct {
-		name, version string
-		dependencies  []string
-	}
-
-	var (
-		packages []pkg
-		current  *pkg
-	)
-
-	inDependencies := false
-
-	scanner := bufio.NewScanner(strings.NewReader(data))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "[[package]]" {
-			packages = append(packages, pkg{})
-			current = &packages[len(packages)-1]
-			inDependencies = false
-
-			continue
-		}
-
-		if current == nil {
-			continue
-		}
-
-		if inDependencies {
-			if line == "]" {
-				inDependencies = false
-				continue
-			}
-
-			if dep := quotedValue(strings.TrimSuffix(line, ",")); dep != "" {
-				current.dependencies = append(current.dependencies, dep)
-			}
-
-			continue
-		}
-
-		switch {
-		case strings.HasPrefix(line, "name ="):
-			current.name = quotedValue(strings.TrimSpace(strings.TrimPrefix(line, "name =")))
-		case strings.HasPrefix(line, "version ="):
-			current.version = quotedValue(strings.TrimSpace(strings.TrimPrefix(line, "version =")))
-		case line == "dependencies = [":
-			inDependencies = true
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
+	packages, err := lockPackages(data)
+	if err != nil {
 		return nil, err
 	}
 
-	var root *pkg
+	var root *lockedPackage
 
 	for i := range packages {
-		if packages[i].name == owner {
+		if packages[i].Name == owner && packages[i].Source == "" {
+			if root != nil {
+				return nil, fmt.Errorf("%s package has ambiguous lock entries", owner)
+			}
+
 			root = &packages[i]
-			break
 		}
 	}
 
@@ -615,29 +602,22 @@ func lockedDirectVersions(data string, direct map[string]dependency, owner strin
 
 	versions := map[string]string{}
 
-	for _, dependency := range root.dependencies {
-		name, version := lockDependency(dependency)
+	for _, edge := range root.Dependencies {
+		name, _ := lockDependency(edge)
 		if !containsPackage(direct, name) {
 			continue
 		}
 
-		if version == "" {
-			for _, candidate := range packages {
-				if candidate.name == name {
-					if version != "" {
-						return nil, fmt.Errorf("dependency %s has ambiguous locked versions", name)
-					}
-
-					version = candidate.version
-				}
-			}
+		pkg, err := resolveLocked(packages, edge)
+		if err != nil {
+			return nil, err
 		}
 
-		if version == "" {
-			return nil, fmt.Errorf("dependency %s has no locked version", name)
+		if previous := versions[name]; previous != "" && previous != pkg.Version {
+			return nil, fmt.Errorf("dependency %s has ambiguous locked versions", name)
 		}
 
-		versions[name] = version
+		versions[name] = pkg.Version
 	}
 
 	for alias, dep := range direct {

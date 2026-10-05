@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// notice generates and verifies the project's NOTICE file from the direct
-// dependencies declared in Go, npm, Cargo, and pinned native source manifests.
+// notice generates and verifies the project's NOTICE file from Go, npm, Cargo,
+// and pinned native source manifests, including Cargo registry transitives.
 //
 // Subcommands:
 //
