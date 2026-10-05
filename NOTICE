@@ -328,6 +328,13 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/dustin/go-humanize/blob/v1.1.0/LICENSE
+  - dependency: github.com/evanphx/json-patch/v5
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2014, Evan Phoenix
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/evanphx/json-patch/blob/v5.9.11/LICENSE
   - dependency: github.com/fatih/color
     ecosystem: go
     copyright:
