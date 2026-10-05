@@ -170,6 +170,9 @@ pub struct Transport<I: Io + ?Sized> {
 
     /// Single authenticated connection available for exclusive checkout.
     idle: Rc<RefCell<Option<Connection<I>>>>,
+
+    /// Only the current attachment keeps its recycling authorization alive.
+    owner: RefCell<Rc<()>>,
 }
 
 /// An exclusive TLS connection, consumed by one request before possible reuse.
@@ -224,6 +227,9 @@ struct Authenticated<I: Io + ?Sized> {
 
     /// Non-owning destination for successful connection recycling.
     idle: std::rc::Weak<RefCell<Option<Connection<I>>>>,
+
+    /// Invalidated on owner replacement, including while connect is awaiting I/O.
+    owner: std::rc::Weak<()>,
 
     /// Monotonic start of the current idle interval.
     idle_since: Instant,
@@ -356,11 +362,13 @@ impl<I: Io + ?Sized> Transport<I> {
             config,
             io: RefCell::new(None),
             idle: Rc::new(RefCell::new(None)),
+            owner: RefCell::new(Rc::new(())),
         }
     }
 
-    /// Replace the I/O owner and discard the current idle connection.
+    /// Replace the owner, discarding idle TLS and invalidating old recycling rights.
     pub fn attach_io(&self, io: Rc<I>) {
+        *self.owner.borrow_mut() = Rc::new(());
         self.idle.borrow_mut().take();
         *self.io.borrow_mut() = Some(io);
     }
@@ -391,6 +399,7 @@ impl<I: Io + ?Sized> Transport<I> {
             }
             let endpoint = endpoint(&self.config.url)?;
             let io = self.io()?;
+            let owner = Rc::downgrade(&self.owner.borrow());
             let trust = io
                 .read_file(
                     &self.config.trust_bundle,
@@ -399,7 +408,9 @@ impl<I: Io + ?Sized> Transport<I> {
                 )
                 .await?;
             let epoch = trust_epoch(trust.as_ref(), identity);
-            if let Some(connection) = self.checkout(identity, epoch, scope) {
+            if owner.upgrade().is_some()
+                && let Some(connection) = self.checkout(identity, epoch, scope)
+            {
                 return Ok(connection);
             }
             let config = tls_config(trust.as_ref(), identity)?;
@@ -417,7 +428,7 @@ impl<I: Io + ?Sized> Transport<I> {
             let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
                 .map_err(|_| Error::Unauthorized)?;
             tls.set_buffer_limit(Some(64 * 1024));
-            let authentication = self.authentication(identity, epoch)?;
+            let authentication = self.authentication(identity, epoch, owner)?;
             let mut connection = Connection {
                 socket,
                 tls,
@@ -445,6 +456,7 @@ impl<I: Io + ?Sized> Transport<I> {
         if let Authentication::Authenticated(auth) = &connection.authentication
             && identity.is_some()
             && auth.epoch == epoch
+            && auth.owner.upgrade().is_some()
             && connection.within_max_age()
             && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
                 < Duration::from_secs(20)
@@ -461,6 +473,7 @@ impl<I: Io + ?Sized> Transport<I> {
         &self,
         identity: Option<Identity<'_>>,
         epoch: [u8; 32],
+        owner: std::rc::Weak<()>,
     ) -> Result<Authentication<I>> {
         let Some(identity) = identity else {
             return Ok(Authentication::Bootstrap);
@@ -473,6 +486,7 @@ impl<I: Io + ?Sized> Transport<I> {
             expires: identity.expires,
             epoch,
             idle: Rc::downgrade(&self.idle),
+            owner,
             idle_since: uring_runtime::environment::now(),
             retire_at,
         }))
@@ -786,6 +800,7 @@ impl<I: Io + ?Sized> Connection<I> {
             && matches!(completed.head.status, 200 | 204)
             && self.within_max_age()
             && let Authentication::Authenticated(auth) = &mut self.authentication
+            && auth.owner.upgrade().is_some()
             && let Some(idle) = auth.idle.upgrade()
         {
             auth.idle_since = uring_runtime::environment::now();
@@ -1665,6 +1680,49 @@ mod tests {
         let second = rotation_request(&transport, None).unwrap();
         assert_ne!(first.body, second);
         assert!(transport.idle.borrow().is_none());
+    }
+
+    /// A checked-out request may finish on A but must never enter B's idle pool.
+    #[test]
+    fn replacing_owner_invalidates_checked_out_connection_recycling() {
+        let d = testing::Directory::new();
+        let (ca, key) = testing::ca();
+        let identity = TestIdentity::new(&ca, &key);
+        let response = || ("/snapshot".to_owned(), 200, b"{}".to_vec());
+        let (endpoint, server) = scripted_server(
+            &d,
+            &ca,
+            &key,
+            vec![vec![response(), response()], vec![response(), response()]],
+        );
+        let transport = Transport::new(endpoint);
+        let owner_a = Rc::new(FixtureIo);
+        let owner_b = Rc::new(FixtureIo);
+        transport.attach_io(owner_a.clone());
+        let scope = testing::scope();
+        let complete = |connection: Connection<FixtureIo>| {
+            futures::executor::block_on(connection.request(
+                testing::request(Method::Get, "/snapshot", None, 1024),
+                &scope,
+            ))
+            .unwrap()
+        };
+        let connect =
+            || futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
+        complete(connect());
+        let old = connect();
+        assert!(Rc::ptr_eq(&old.io, &owner_a));
+        transport.attach_io(owner_b.clone());
+        assert_eq!(complete(old).status, 200);
+        assert!(transport.idle.borrow().is_none());
+        for _ in 0..2 {
+            let current = connect();
+            assert!(Rc::ptr_eq(&current.io, &owner_b));
+            assert_eq!(complete(current).status, 200);
+            assert!(transport.idle.borrow().is_some());
+        }
+        transport.close_idle();
+        server.join().unwrap();
     }
 
     /// Retirement affects request boundaries, while expiry and failure discard TLS.
