@@ -1267,6 +1267,20 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
     rig.adapter.state.lock().unwrap().version = 4;
     check(&rig.bootstrap(0xab), 4, 0, P, P);
     rig.flush();
+    assert!(
+        rig.writer
+            .index()
+            .snapshot()
+            .unwrap()
+            .entries
+            .iter()
+            .any(|(id, _)| id == &page(0xab, 4)),
+        "v4 persistence missing: ciphertext={} plaintext={} pending={} discarded={}",
+        rig.admission.used(ResourceClass::Ciphertext),
+        rig.admission.used(ResourceClass::Plaintext),
+        rig.writer.pending_count(),
+        rig.writer.discarded_count()
+    );
     assert_eq!(rig.writer.discarded_count(), 0);
     assert!(
         rig.admission.used(ResourceClass::Ciphertext)

@@ -562,6 +562,71 @@ fn optional_persistence_owned_staging_pressure_reclaims_one_queued_optional() {
     drop(hold);
 }
 
+/// Staging pressure must not replace an already queued owned write with another.
+#[test]
+fn optional_persistence_owned_staging_preserves_queued_owned_victim() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut f = fixture();
+    let policy = f.fill.dependencies.writer.retention();
+    policy.set_ownership(Rc::new(|_| true));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let first = acquire(&mut f, &mut budget).unwrap();
+    f.fill.observe_verified(&first, &f.scope);
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+    let mut metadata = first.metadata.immutable();
+    metadata.version.etag = StrongEtag::test_value("second-owned-staging");
+    let next = crate::memory::tests::bundle_for(&f.fill.dependencies.admission, metadata);
+    let admission = &f.fill.dependencies.admission;
+    let hold = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            admission.limit(ResourceClass::Ciphertext) - admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    f.fill.observe_verified(&next, &f.scope);
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(&f.page)
+            .unwrap()
+            .is_some(),
+        "queued owned victim was displaced"
+    );
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(next.plaintext.page())
+            .unwrap()
+            .is_none(),
+        "new best-effort write must defer, not evict owned work"
+    );
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+    assert_eq!(first.plaintext.bytes(), b"abc");
+    drop(hold);
+    f.fill.observe_verified(&next, &f.scope);
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(&f.page)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(next.plaintext.page())
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 2);
+}
+
 #[test]
 fn second_sight_subscription_probe_transfer_and_fanout_count_only_consumers() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));

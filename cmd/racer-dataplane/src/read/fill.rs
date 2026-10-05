@@ -1709,7 +1709,36 @@ impl Fill {
         owned: bool,
         reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
-        let result = reserve();
+        // Owned writeback may reclaim idle ciphertext, but never live readers.
+        // Releasing readers must make their cached allocations usable for the
+        // next disk staging reservation, not only a later mandatory acquisition.
+        let reserve_idle = || {
+            if owned && matches!(class, ResourceClass::Ciphertext) {
+                let mut result = reserve();
+                for _ in 0..2 {
+                    if !matches!(result, Err(Error::Overloaded)) {
+                        break;
+                    }
+                    let Some((cache, bytes)) = self.dependencies.admission.reclamation(
+                        &page.version.object.cache,
+                        class,
+                        amount,
+                    ) else {
+                        break;
+                    };
+                    // A zero callback never discards queued writes to make a cache
+                    // entry idle. Only unleased cache allocations may disappear.
+                    self.dependencies
+                        .memory
+                        .reclaim_idle(class, cache.as_ref(), bytes, |_| 0);
+                    result = reserve();
+                }
+                result
+            } else {
+                reserve()
+            }
+        };
+        let result = reserve_idle();
         if !owned || !matches!(result, Err(Error::Overloaded)) {
             return result;
         }
@@ -1728,7 +1757,7 @@ impl Fill {
         self.dependencies
             .writer
             .reclaim_optional_for_owned(page, cache.as_ref(), dirty, staging);
-        reserve()
+        reserve_idle()
     }
 
     pub(super) async fn publish(
