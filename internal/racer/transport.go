@@ -6,6 +6,7 @@ package racer
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -50,12 +51,46 @@ func newTransportListener(ctx context.Context, listener net.Listener, config *tl
 func (l *transportListener) run() {
 	defer close(l.acceptDone)
 
+	var retryDelay time.Duration
+
 	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			l.acceptErr = err
+		if l.ctx.Err() != nil {
+			l.acceptErr = net.ErrClosed
 			return
 		}
+
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			// Retry here, not in net/http: once this pump exits, Accept can
+			// only replay acceptErr and cannot resume accepting sockets.
+			var temporary net.Error
+			if errors.As(err, &temporary) && temporary.Temporary() { //nolint:staticcheck // Match net/http's accept-error retry contract, including EMFILE.
+				if retryDelay == 0 {
+					retryDelay = 5 * time.Millisecond
+				} else {
+					retryDelay = min(2*retryDelay, time.Second)
+				}
+
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-timer.C:
+				case <-l.ctx.Done():
+					timer.Stop()
+
+					l.acceptErr = net.ErrClosed
+
+					return
+				}
+
+				continue
+			}
+
+			l.acceptErr = err
+
+			return
+		}
+
+		retryDelay = 0
 
 		if !take(l.connections) {
 			closeTransport(conn)
