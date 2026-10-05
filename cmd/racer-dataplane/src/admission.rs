@@ -47,33 +47,14 @@ impl flow_control::Class for ResourceClass {
 
 pub struct AdmissionPolicy {
     limits: Limits,
+
     observer: Mutex<Observer>,
-    capture: Mutex<Option<RejectionCapture>>,
-}
-struct RejectionCapture {
-    thread: std::thread::ThreadId,
-    detail: Option<Detail>,
-}
-struct CaptureGuard<'a> {
-    policy: &'a AdmissionPolicy,
-    previous: Option<RejectionCapture>,
-    _local: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-impl Drop for CaptureGuard<'_> {
-    fn drop(&mut self) {
-        *self
-            .policy
-            .capture
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = self.previous.take();
-    }
 }
 impl Clone for AdmissionPolicy {
     fn clone(&self) -> Self {
         Self {
             limits: self.limits.clone(),
             observer: Mutex::new(self.observer()),
-            capture: Mutex::default(),
         }
     }
 }
@@ -82,7 +63,6 @@ impl AdmissionPolicy {
         Self {
             limits,
             observer: Mutex::default(),
-            capture: Mutex::default(),
         }
     }
     pub fn limits(&self) -> &Limits {
@@ -97,41 +77,42 @@ impl AdmissionPolicy {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+}
 
-    /// Capture this synchronous call only. No guard or lock escapes to an async
-    /// caller; nested calls restore the previous sink, including during unwind.
-    pub(crate) fn capture_rejection<T>(
-        &self,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> (Result<T>, Option<Detail>) {
-        let thread = std::thread::current().id();
-        let mut capture = self.capture.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            capture.as_ref().is_none_or(|c| c.thread == thread),
-            "capture is worker-local"
-        );
-        let previous = capture.replace(RejectionCapture {
-            thread,
-            detail: None,
-        });
-        drop(capture);
-        let guard = CaptureGuard {
-            policy: self,
-            previous,
-            _local: std::marker::PhantomData,
-        };
-        let result = operation();
-        let detail = if matches!(result, Err(Error::Overloaded)) {
-            self.capture
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .and_then(|c| c.detail)
-        } else {
-            None
-        };
-        drop(guard);
-        (result, detail)
+/// Translate exact synchronous operation facts into final Racer diagnostics.
+/// Shared admission never observes this worker-local operation's sink.
+pub(crate) fn capture_rejection<T>(
+    admission: &Quotas<AdmissionPolicy>,
+    operation: impl FnOnce() -> Result<T>,
+) -> (Result<T>, Option<Detail>) {
+    let (result, rejection) = admission.observe_rejections(operation);
+    let detail = if matches!(result, Err(Error::Overloaded)) {
+        rejection.map(rejection_detail)
+    } else {
+        None
+    };
+    (result, detail)
+}
+
+/// Keep resource names and telemetry mapping in application policy.
+fn rejection_detail(rejection: Rejection<ResourceClass>) -> Detail {
+    match rejection {
+        Rejection::Keys { used, limit } => Detail::CacheEntries { used, limit },
+        Rejection::Resource {
+            class,
+            used,
+            limit,
+            requested,
+            key_used,
+            key_limit,
+        } => Detail::Resource {
+            class,
+            used,
+            limit,
+            requested,
+            cache_used: key_used,
+            cache_limit: key_limit,
+        },
     }
 }
 impl Policy for AdmissionPolicy {
@@ -192,32 +173,7 @@ impl Policy for AdmissionPolicy {
         matches!(class, ResourceClass::Ciphertext)
     }
     fn rejected(&self, rejection: Rejection<ResourceClass>) {
-        let detail = match rejection {
-            Rejection::Keys { used, limit } => Detail::CacheEntries { used, limit },
-            Rejection::Resource {
-                class,
-                used,
-                limit,
-                requested,
-                key_used,
-                key_limit,
-            } => Detail::Resource {
-                class,
-                used,
-                limit,
-                requested,
-                cache_used: key_used,
-                cache_limit: key_limit,
-            },
-        };
-        {
-            let mut capture = self.capture.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(capture) = capture.as_mut()
-                && capture.thread == std::thread::current().id()
-            {
-                capture.detail = Some(detail);
-            }
-        }
+        let detail = rejection_detail(rejection);
         self.observer()
             .record(Failure::new(Stage::Admission, Error::Overloaded).detail(detail));
     }
@@ -238,13 +194,12 @@ mod capture_tests {
         let quotas = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
-        let policy = quotas.policy();
         let reject = || {
             quotas
                 .reserve(None, ResourceClass::Plaintext, usize::MAX)
                 .map_err(Error::from)
         };
-        let (_, detail) = policy.capture_rejection(reject);
+        let (_, detail) = capture_rejection(&quotas, reject);
         assert!(matches!(
             detail,
             Some(Detail::Resource {
@@ -253,8 +208,8 @@ mod capture_tests {
                 ..
             })
         ));
-        let (_, detail) = policy.capture_rejection(|| {
-            let (_, inner) = policy.capture_rejection(reject);
+        let (_, detail) = capture_rejection(&quotas, || {
+            let (_, inner) = capture_rejection(&quotas, reject);
             assert!(inner.is_some());
             Err::<(), _>(Error::Overloaded)
         });
@@ -262,18 +217,17 @@ mod capture_tests {
             detail.is_none(),
             "nested rejection cannot become outer facts"
         );
-        let clone = policy.clone();
-        let (_, detail) = clone.capture_rejection(|| reject().map(|_| ()));
+        let clone = Quotas::new(quotas.policy().clone());
+        let (_, detail) = capture_rejection(&clone, || reject().map(|_| ()));
         assert!(detail.is_none());
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = policy.capture_rejection::<()>(|| {
+            let _ = capture_rejection::<()>(&quotas, || {
                 let _ = reject();
                 panic!("fixture");
             });
         }));
         assert!(panic.is_err());
-        assert!(policy.capture.lock().unwrap().is_none());
-        let (_, detail) = policy.capture_rejection(|| {
+        let (_, detail) = capture_rejection(&quotas, || {
             let _ = reject();
             Ok(())
         });
@@ -281,7 +235,7 @@ mod capture_tests {
             detail.is_none(),
             "recovered operation must not report final rejection"
         );
-        let (_, detail) = policy.capture_rejection(|| Err::<(), _>(Error::Cancelled));
+        let (_, detail) = capture_rejection(&quotas, || Err::<(), _>(Error::Cancelled));
         assert!(detail.is_none());
     }
 
@@ -298,7 +252,7 @@ mod capture_tests {
         let _b = quotas
             .reserve(Some(&b), ResourceClass::RequestContext, 1)
             .unwrap();
-        let (result, detail) = quotas.policy().capture_rejection(|| {
+        let (result, detail) = capture_rejection(&quotas, || {
             quotas
                 .reserve(Some(&a), ResourceClass::Plaintext, 1)
                 .map_err(Error::from)
@@ -312,7 +266,7 @@ mod capture_tests {
         let _a = quotas
             .reserve(Some(&a), ResourceClass::RequestContext, 1)
             .unwrap();
-        let (result, detail) = quotas.policy().capture_rejection(|| {
+        let (result, detail) = capture_rejection(&quotas, || {
             quotas
                 .reserve(Some(&b), ResourceClass::Plaintext, 1)
                 .map_err(Error::from)

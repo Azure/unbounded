@@ -316,21 +316,20 @@ impl Fill {
         amount: usize,
         reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
-        let mut result = reserve();
         // At most two bounded scans, rechecking cache/global pressure each time.
         // Zero released bytes does not mean exhaustion: the memory cursor may
         // have crossed only busy or other-cache entries. No await allows new
         // local charges to interleave; remote completions can only free bytes.
-        for _ in 0..2 {
-            if !matches!(result, Err(Error::Overloaded)) {
-                break;
+        flow_control::progress::reclaim_retry(2, reserve, |error| {
+            if *error != Error::Overloaded {
+                return false;
             }
             let Some((owner, bytes)) = self
                 .dependencies
                 .admission
                 .reclamation(cache, class, amount)
             else {
-                break;
+                return false;
             };
             let released =
                 self.dependencies
@@ -343,9 +342,8 @@ impl Fill {
                     .writer
                     .reclaim_ciphertext(owner.as_ref(), bytes - released);
             }
-            result = reserve();
-        }
-        result
+            true
+        })
     }
 
     /// Observe mandatory acquisition only, never optional persistence or hedges.
@@ -380,7 +378,8 @@ impl Fill {
         let mut exhausted = false;
         loop {
             scope.check()?;
-            let (mut result, mut detail) = admission.policy().capture_rejection(&mut reserve);
+            let (mut result, mut detail) =
+                crate::admission::capture_rejection(admission, &mut reserve);
             if !matches!(result, Err(Error::Overloaded)) {
                 return result;
             }
@@ -390,7 +389,7 @@ impl Fill {
                 // also means an impossible request, so retry exactly once here,
                 // without restarting the scan or extending the caller's budget.
                 scope.check()?;
-                (result, detail) = admission.policy().capture_rejection(&mut reserve);
+                (result, detail) = crate::admission::capture_rejection(admission, &mut reserve);
                 if !matches!(result, Err(Error::Overloaded)) {
                     return result;
                 }
@@ -425,11 +424,8 @@ impl Fill {
         site: FillAdmissionSite,
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        let (result, detail) = self
-            .dependencies
-            .admission
-            .policy()
-            .capture_rejection(operation);
+        let (result, detail) =
+            crate::admission::capture_rejection(&self.dependencies.admission, operation);
         if matches!(result, Err(Error::Overloaded)) {
             self.dependencies
                 .admission
@@ -468,11 +464,10 @@ impl Fill {
             .dependencies
             .disk
             .read_with_token_reclaim(page, scope, |amount| {
-                let (result, detail) = self
-                    .dependencies
-                    .admission
-                    .policy()
-                    .capture_rejection(|| reserve(amount));
+                let (result, detail) =
+                    crate::admission::capture_rejection(&self.dependencies.admission, || {
+                        reserve(amount)
+                    });
                 rejected.set(detail);
                 result
             })

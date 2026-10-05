@@ -72,12 +72,7 @@ struct CancellationState {
     candidate_idle: OnceLock<Mutex<(std::time::Duration, Instant)>>,
     candidate_body: OnceLock<Mutex<CandidateBody>>,
 }
-struct CandidateBody {
-    observation: std::time::Duration,
-    complete_by: Instant,
-    first: Option<(Instant, usize)>,
-    expired: bool,
-}
+type CandidateBody = flow_control::progress::ProgressBudget;
 impl Cancellation {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -164,12 +159,7 @@ impl RequestScope {
         self.cancellation
             .state
             .candidate_body
-            .set(Mutex::new(CandidateBody {
-                observation,
-                complete_by,
-                first: None,
-                expired: false,
-            }))
+            .set(Mutex::new(CandidateBody::new(observation, complete_by)))
             .map_err(|_| Error::Internal)
     }
 
@@ -184,20 +174,7 @@ impl RequestScope {
         if let Some(body) = self.cancellation.state.candidate_body.get() {
             let now = uring_runtime::environment::now();
             let mut body = body.lock().map_err(|_| Error::Unavailable)?;
-            if received == total {
-                body.first = None;
-                return Ok(());
-            }
-            let (first, initial) = *body.first.get_or_insert((now, received));
-            let elapsed = now.saturating_duration_since(first).as_nanos();
-            let delivered = received.saturating_sub(initial) as u128;
-            let remaining = (total - received) as u128;
-            let available = body.complete_by.saturating_duration_since(now).as_nanos();
-            if now >= body.complete_by
-                || (elapsed >= body.observation.as_nanos()
-                    && remaining.saturating_mul(elapsed) > delivered.saturating_mul(available))
-            {
-                body.expired = true;
+            if !body.advance(now, received, total) {
                 return Err(Error::DeadlineExceeded);
             }
         }
@@ -225,10 +202,7 @@ impl RequestScope {
             }
             if let Some(body) = self.cancellation.state.candidate_body.get() {
                 let body = body.lock().map_err(|_| Error::Unavailable)?;
-                if body.expired
-                    || (body.first.is_some()
-                        && uring_runtime::environment::now() >= body.complete_by)
-                {
+                if body.expired(uring_runtime::environment::now()) {
                     return Err(Error::DeadlineExceeded);
                 }
             }

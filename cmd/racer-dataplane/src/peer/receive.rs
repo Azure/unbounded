@@ -8,9 +8,8 @@ use crate::error::{Error, Result};
 use crate::runtime::RequestScope;
 use crate::telemetry::{Event, Gauge, Metrics};
 use flow_control::{Charge, Quotas};
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use uring_runtime::environment::now;
 
@@ -18,7 +17,9 @@ use uring_runtime::environment::now;
 pub struct Config {
     /// Zero disables the experiment without allocating queue state per request.
     pub active: usize,
+
     pub queued: usize,
+
     pub wait: Duration,
 }
 impl Default for Config {
@@ -47,45 +48,28 @@ impl Config {
 #[repr(align(64))]
 pub(crate) struct Gate {
     config: Config,
+
     state: Mutex<State>,
+
     metrics: Metrics,
 }
-#[derive(Default)]
-struct State {
-    next: u64,
-    active: usize,
-    queue: BTreeMap<u64, Entry>,
-    cursor: Option<u64>,
-}
-struct Entry {
-    waker: Option<Waker>,
-    scope: RequestScope,
-    deadline: Instant,
-}
-impl State {
-    fn wake(&self) -> Option<Waker> {
-        self.queue
-            .first_key_value()
-            .and_then(|(_, entry)| entry.waker.clone())
-    }
-    fn remove(&mut self, id: u64) -> Option<Waker> {
-        self.queue.remove(&id);
-        if self.queue.is_empty() {
-            self.queue = BTreeMap::new();
-        }
-        self.wake()
-    }
-}
+type State = flow_control::fifo::Fifo<RequestScope>;
 pub(crate) struct Ticket {
     gate: Arc<Gate>,
+
     id: u64,
+
     deadline: Instant,
+
     charge: Option<Charge<AdmissionPolicy>>,
+
     started: Instant,
+
     terminal: bool,
 }
 pub(crate) struct Permit {
     gate: Arc<Gate>,
+
     _charge: Charge<AdmissionPolicy>,
 }
 impl Gate {
@@ -113,26 +97,17 @@ impl Gate {
         }
         let deadline = scope.deadline.0.min(now() + self.config.wait);
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
-        if state.queue.len() >= self.config.queued {
+        if state.queued() >= self.config.queued {
             self.metrics.record(Event::PeerReceiveFull, 1);
             return Err(Error::Overloaded);
         }
-        let id = state.next;
-        let next = id.checked_add(1).ok_or(Error::Overloaded)?;
+        let id = state.next().ok_or(Error::Overloaded)?;
         // Covers the queue slot/capacity slack, ticket, permit and wake/registration
         // bookkeeping. Payload and signed envelopes keep their existing charges.
         let charge = admission.reserve(None, ResourceClass::RequestContext, 4096)?;
-        state.next = next;
-        state.queue.insert(
-            id,
-            Entry {
-                waker: None,
-                scope: scope.clone(),
-                deadline,
-            },
-        );
+        state.enqueue(id, scope.clone(), deadline);
         self.metrics
-            .set_gauge(Gauge::PeerReceiveQueued, state.queue.len() as u64);
+            .set_gauge(Gauge::PeerReceiveQueued, state.queued() as u64);
         Ok(Some(Ticket {
             gate: self.clone(),
             id,
@@ -168,25 +143,9 @@ impl Gate {
         }
         let wakes = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let start = state
-                .cursor
-                .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-            let mut last = None;
-            let mut wakes = Vec::new();
-            for (id, entry) in state
-                .queue
-                .range((start, std::ops::Bound::Unbounded))
-                .take(budget)
-            {
-                last = Some(*id);
-                if (now() >= entry.deadline || entry.scope.check().is_err())
-                    && let Some(waker) = &entry.waker
-                {
-                    wakes.push(waker.clone());
-                }
-            }
-            state.cursor = last;
-            wakes
+            state.poll_deadlines(budget, |scope, deadline| {
+                now() >= deadline || scope.check().is_err()
+            })
         };
         for wake in wakes {
             wake.wake();
@@ -228,17 +187,11 @@ impl Ticket {
             Ok(state) => state,
             Err(_) => return Poll::Ready(Err(Error::Unavailable)),
         };
-        if state.active < self.gate.config.active
-            && state
-                .queue
-                .first_key_value()
-                .is_some_and(|(id, _)| *id == self.id)
-        {
+        if state.can_admit(self.id, self.gate.config.active) {
             let Some(charge) = self.charge.take() else {
                 return Poll::Ready(Err(Error::Internal));
             };
-            state.active += 1;
-            let wake = state.remove(self.id);
+            let wake = state.admit(self.id);
             self.terminal = true;
             self.gate.metrics.record(Event::PeerReceiveAdmitted, 1);
             self.gate.metrics.record(
@@ -250,10 +203,10 @@ impl Ticket {
             );
             self.gate
                 .metrics
-                .set_gauge(Gauge::PeerReceiveActive, state.active as u64);
+                .set_gauge(Gauge::PeerReceiveActive, state.active() as u64);
             self.gate
                 .metrics
-                .set_gauge(Gauge::PeerReceiveQueued, state.queue.len() as u64);
+                .set_gauge(Gauge::PeerReceiveQueued, state.queued() as u64);
             drop(state);
             if let Some(wake) = wake {
                 wake.wake();
@@ -263,10 +216,9 @@ impl Ticket {
                 _charge: charge,
             })));
         }
-        let Some(entry) = state.queue.get_mut(&self.id) else {
+        if !state.register(self.id, cx.waker()) {
             return Poll::Ready(Err(Error::Internal));
-        };
-        entry.waker = Some(cx.waker().clone());
+        }
         Poll::Pending
     }
 }
@@ -277,7 +229,7 @@ impl Drop for Ticket {
             let wake = state.remove(self.id);
             self.gate
                 .metrics
-                .set_gauge(Gauge::PeerReceiveQueued, state.queue.len() as u64);
+                .set_gauge(Gauge::PeerReceiveQueued, state.queued() as u64);
             wake
         };
         if !self.terminal {
@@ -292,11 +244,11 @@ impl Drop for Permit {
     fn drop(&mut self) {
         let wake = {
             let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.active -= 1;
+            let wake = state.release();
             self.gate
                 .metrics
-                .set_gauge(Gauge::PeerReceiveActive, state.active as u64);
-            state.wake()
+                .set_gauge(Gauge::PeerReceiveActive, state.active() as u64);
+            wake
         };
         if let Some(wake) = wake {
             wake.wake();
@@ -309,6 +261,7 @@ mod tests {
     use super::*;
     use crate::model::RequestId;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Waker;
     struct Wake(AtomicUsize);
     impl std::task::Wake for Wake {
         fn wake(self: Arc<Self>) {
@@ -421,10 +374,10 @@ mod tests {
             receive_permit: Some(permit),
             ..Default::default()
         });
-        assert_eq!(gate.state.lock().unwrap().active, 1);
+        assert_eq!(gate.state.lock().unwrap().active(), 1);
         let idle = state.idle();
         assert!(idle.receive_permit.is_none());
-        assert_eq!(gate.state.lock().unwrap().active, 0);
+        assert_eq!(gate.state.lock().unwrap().active(), 0);
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);
     }
     #[test]
@@ -468,7 +421,7 @@ mod tests {
         };
         drop((third, permit));
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-        assert_eq!(gate.state.lock().unwrap().active, 0);
+        assert_eq!(gate.state.lock().unwrap().active(), 0);
     }
     #[test]
     fn receive_disabled_cancel_and_expired_ticket_do_not_grant() {
@@ -531,7 +484,7 @@ mod tests {
             gate.enter(&admission, &scope),
             Err(Error::Overloaded)
         ));
-        assert!(gate.state.lock().unwrap().queue.is_empty());
+        assert_eq!(gate.state.lock().unwrap().queued(), 0);
         drop(held);
         let mut first = gate.enter(&admission, &scope).unwrap().unwrap();
         let middle = gate.enter(&admission, &scope).unwrap().unwrap();
@@ -548,6 +501,6 @@ mod tests {
         };
         drop((last, permit));
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-        assert!(gate.state.lock().unwrap().queue.is_empty());
+        assert_eq!(gate.state.lock().unwrap().queued(), 0);
     }
 }

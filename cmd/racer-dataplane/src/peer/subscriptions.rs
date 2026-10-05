@@ -24,11 +24,8 @@ use std::task::Waker;
 
 pub const MAX_DEMAND_INTERVALS: usize = 64;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PageInterval {
-    pub start: u64,
-    pub end: u64,
-}
+pub use flow_control::subscriptions::Interval as PageInterval;
+use flow_control::subscriptions::{Fanout, contains, include as include_page};
 
 /// Canonical intervals, never an expanded list of pages. Adjacent intervals must
 /// be merged by the sender, so one logical demand has one encoding.
@@ -37,10 +34,7 @@ pub struct Demand(Vec<PageInterval>);
 
 impl Demand {
     pub fn new(intervals: Vec<PageInterval>) -> Result<Self> {
-        if intervals.len() > MAX_DEMAND_INTERVALS
-            || intervals.iter().any(|i| i.start >= i.end)
-            || intervals.windows(2).any(|w| w[0].end >= w[1].start)
-        {
+        if !flow_control::subscriptions::canonical(&intervals, MAX_DEMAND_INTERVALS) {
             return Err(Error::InvalidRequest);
         }
         Ok(Self(intervals))
@@ -68,32 +62,47 @@ impl Demand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Subscription {
     pub id: [u8; 16],
+
     pub version: ObjectVersion,
+
     pub demand: Demand,
+
     pub sequence: u64,
+
     pub page_budget: u32,
+
     pub byte_budget: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferGrant {
     pub subscription_id: [u8; 16],
+
     pub sequence: u64,
+
     pub page: PageId,
+
     pub membership: MembershipVersion,
+
     pub receiver: NodeId,
+
     /// Absolute Unix epoch milliseconds, not a renewable relative timeout.
     pub deadline: u64,
+
     pub remaining_page_budget: u32,
+
     pub remaining_byte_budget: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct SubscriptionLimits {
     pub max_entries: usize,
+
     /// Node-wide total, not a per-subscription allocation.
     pub max_completed_intervals: usize,
+
     pub max_inflight: usize,
+
     /// Includes unconsumed completed/error responses, not just active waiters.
     pub max_pending: usize,
 }
@@ -111,53 +120,57 @@ impl Default for SubscriptionLimits {
 
 pub struct Subscriptions {
     limits: SubscriptionLimits,
+
     state: Mutex<State>,
 }
 
 #[derive(Default)]
 struct State {
     now: u64,
-    next: u64,
+
     entries: HashMap<EntryKey, Entry>,
-    flights: HashMap<u64, FlightKey>,
-    pending: HashMap<u64, Pending>,
+
+    fanout: Fanout<FlightKey, EntryKey, Completion, Error>,
+
     completed_intervals: usize,
+
     wake: Vec<Waker>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct EntryKey {
     membership: MembershipVersion,
+
     receiver: NodeId,
+
     id: [u8; 16],
 }
 
 struct Entry {
     subscription: Subscription,
+
     deadline: u64,
+
     completed: Vec<PageInterval>,
+
     pending: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct FlightKey {
     membership: MembershipVersion,
+
     page: PageId,
 }
 
-struct Pending {
-    entry: EntryKey,
-    flight: u64,
-    deadline: u64,
-    result: Option<Result<Completion>>,
-    waker: Option<Waker>,
-    promoted: bool,
-}
+type Pending = flow_control::subscriptions::Pending<EntryKey, Completion, Error>;
 
 #[derive(Clone)]
 pub struct Completion {
     pub metadata: ObjectMetadata,
+
     pub ciphertext: CiphertextPage,
+
     pub grant: TransferGrant,
 }
 
@@ -169,7 +182,9 @@ pub enum Selection {
 /// Unique ownership of acquisition. Dropping it fails the flight, with no refund.
 pub struct Work {
     scheduler: Arc<Subscriptions>,
+
     token: Option<u64>,
+
     page: PageId,
 }
 
@@ -177,6 +192,7 @@ pub struct Work {
 /// this scheduler deliberately owns neither an executor nor a timer service.
 pub struct Waiter {
     scheduler: Arc<Subscriptions>,
+
     token: Option<u64>,
 }
 
@@ -377,7 +393,7 @@ impl Subscriptions {
             if entry.subscription.page_budget == 0 || entry.subscription.byte_budget == 0 {
                 return Err(Error::Unavailable);
             }
-            if state.pending.len() >= self.limits.max_pending {
+            if state.fanout.pending().len() >= self.limits.max_pending {
                 return Err(Error::Overloaded);
             }
             let number = match state.select(key, &eligible) {
@@ -393,44 +409,25 @@ impl Subscriptions {
                 membership: key.membership,
                 page: page.clone(),
             };
-            let existing = state.flights.iter().find_map(|(&token, candidate)| {
-                // Do not attach new authority to an abandoned/expired leader.
-                (candidate == &flight_key
-                    && state
-                        .pending
-                        .values()
-                        .any(|p| p.flight == token && p.result.is_none() && p.deadline > state.now))
-                .then_some(token)
-            });
-            if existing.is_none() && state.flights.len() >= self.limits.max_inflight {
-                return Err(Error::Overloaded);
-            }
-            // Checked tokens prevent stale handles from ever addressing new work.
-            let token = state.next.checked_add(1).ok_or(Error::Overloaded)?;
-            state.next = token;
-            let flight = existing.unwrap_or(token);
-            if existing.is_none() {
-                state.flights.insert(flight, flight_key);
-            }
+            let (token, flight, leader) = state
+                .fanout
+                .attach(
+                    flight_key,
+                    key.clone(),
+                    deadline,
+                    state.now,
+                    self.limits.max_pending,
+                    self.limits.max_inflight,
+                )
+                .ok_or(Error::Overloaded)?;
             let entry = state.entries.get_mut(key).expect("admitted entry");
             entry.subscription.page_budget -= 1;
             entry.pending = Some(token);
-            state.pending.insert(
-                token,
-                Pending {
-                    entry: key.clone(),
-                    flight,
-                    deadline,
-                    result: None,
-                    waker: None,
-                    promoted: false,
-                },
-            );
             let waiter = Waiter {
                 scheduler: self.clone(),
                 token: Some(token),
             };
-            Ok(Ok(if existing.is_some() {
+            Ok(Ok(if !leader {
                 Selection::Follower(waiter)
             } else {
                 Selection::Leader {
@@ -449,14 +446,8 @@ impl Subscriptions {
 impl State {
     fn expire(&mut self, now: u64) {
         self.now = self.now.max(now);
-        for pending in self.pending.values_mut() {
-            if pending.deadline <= self.now {
-                pending.result = Some(Err(Error::DeadlineExceeded));
-                if let Some(waker) = pending.waker.take() {
-                    self.wake.push(waker);
-                }
-            }
-        }
+        self.fanout
+            .expire(self.now, || Error::DeadlineExceeded, &mut self.wake);
         self.entries.retain(|_, entry| {
             // Retain the spent contract for the signature freshness window after
             // expiry. Replaying it on a fresh socket cannot renew its deadline.
@@ -478,55 +469,27 @@ impl State {
         let version = &self.entries[target].subscription.version;
         // Sweep endpoints, not pages. Count distinct receivers, not subscription
         // IDs, so one receiver cannot boost its priority by issuing duplicate IDs.
-        let mut events = Vec::new();
-        for (key, entry) in &self.entries {
+        let demands = self.entries.iter().filter_map(|(key, entry)| {
             if key.membership != target.membership
                 || &entry.subscription.version != version
                 || entry.deadline <= self.now
                 || entry.subscription.byte_budget == 0
                 || (entry.subscription.page_budget == 0 && entry.pending.is_none())
             {
-                continue;
+                return None;
             }
-            for interval in outstanding(&entry.subscription.demand, &entry.completed) {
-                events.push((interval.start, &key.receiver, key == target, true));
-                events.push((interval.end, &key.receiver, key == target, false));
-            }
-        }
-        events.sort_unstable_by_key(|e| e.0);
-        let mut receivers: HashMap<&NodeId, usize> = HashMap::new();
-        let mut active = false;
-        let mut best = None;
-        let mut score = 0;
-        let mut cursor = 0;
-        while cursor < events.len() {
-            let point = events[cursor].0;
-            while cursor < events.len() && events[cursor].0 == point {
-                let (_, receiver, target, start) = events[cursor];
-                if start {
-                    *receivers.entry(receiver).or_default() += 1;
-                } else if let Some(count) = receivers.get_mut(receiver) {
-                    *count -= 1;
-                    if *count == 0 {
-                        receivers.remove(receiver);
-                    }
-                }
-                if target {
-                    active = start;
-                }
-                cursor += 1;
-            }
-            if active && receivers.len() > score && eligible(point).ok_or(point)? {
-                best = Some(point);
-                score = receivers.len();
-            }
-        }
-        Ok(best)
+            Some((
+                &key.receiver,
+                key == target,
+                outstanding(&entry.subscription.demand, &entry.completed),
+            ))
+        });
+        flow_control::subscriptions::select(demands, eligible)
     }
 
     fn remove_pending(&mut self, token: u64) -> Option<Pending> {
-        let pending = self.pending.remove(&token)?;
-        if let Some(entry) = self.entries.get_mut(&pending.entry)
+        let pending = self.fanout.remove(token)?;
+        if let Some(entry) = self.entries.get_mut(&pending.owner)
             && entry.pending == Some(token)
         {
             entry.pending = None;
@@ -535,45 +498,19 @@ impl State {
     }
 
     fn finish(&mut self, flight: u64, result: Result<CiphertextCopy>, limit: usize) {
-        let Some(key) = self.flights.remove(&flight) else {
-            return;
-        };
-        // Bounded by max_pending. No per-flight list accumulates canceled IDs.
-        let mut tokens: Vec<_> = self
-            .pending
-            .iter()
-            .filter_map(|(&token, p)| (p.flight == flight && p.result.is_none()).then_some(token))
-            .collect();
-        tokens.sort_unstable();
         // An origin rejection says nothing about another credential supplier.
         // Elect exactly one retained follower to retry with its own verified
         // request and original route credits. Never clone or refund authority.
-        if matches!(
+        let promote = matches!(
             result,
             Err(Error::OriginRejected | Error::OriginForbidden | Error::Unauthorized)
-        ) {
-            let next = tokens.iter().copied().find(|token| *token != flight);
-            if let Some(next) = next {
-                self.flights.insert(next, key.clone());
-                for token in tokens.iter().copied().filter(|token| *token != flight) {
-                    let pending = self.pending.get_mut(&token).expect("retained follower");
-                    pending.flight = next;
-                    pending.promoted = token == next;
-                    if let Some(waker) = pending.waker.take() {
-                        self.wake.push(waker);
-                    }
-                }
-                tokens.retain(|token| *token == flight);
-            }
-        }
-        for token in tokens {
-            let pending = self.pending.get_mut(&token).expect("pending token");
-            let completion = (|| {
+        );
+        self.fanout.finish(
+            flight,
+            promote,
+            |token, owner, key| {
                 let copy = result.as_ref().map_err(|e| *e)?;
-                let entry = self
-                    .entries
-                    .get_mut(&pending.entry)
-                    .ok_or(Error::DeadlineExceeded)?;
+                let entry = self.entries.get_mut(owner).ok_or(Error::DeadlineExceeded)?;
                 if entry.pending != Some(token) {
                     return Err(Error::StaleFlight);
                 }
@@ -595,22 +532,19 @@ impl State {
                     metadata: copy.metadata.clone(),
                     ciphertext: copy.ciphertext.clone(),
                     grant: TransferGrant {
-                        subscription_id: pending.entry.id,
+                        subscription_id: owner.id,
                         sequence: entry.subscription.sequence,
                         page: key.page.clone(),
-                        membership: pending.entry.membership,
-                        receiver: pending.entry.receiver.clone(),
+                        membership: owner.membership,
+                        receiver: owner.receiver.clone(),
                         deadline: entry.deadline,
                         remaining_page_budget: entry.subscription.page_budget,
                         remaining_byte_budget: remaining,
                     },
                 })
-            })();
-            pending.result = Some(completion);
-            if let Some(waker) = pending.waker.take() {
-                self.wake.push(waker);
-            }
-        }
+            },
+            &mut self.wake,
+        );
     }
 }
 
@@ -667,15 +601,16 @@ impl Waiter {
     pub fn take_work(&mut self, now_ms: u64) -> Option<Work> {
         let token = self.token?;
         self.scheduler.with_state(Some(now_ms), |state| {
-            let pending = state.pending.get_mut(&token)?;
+            let pending = state.fanout.pending_mut(token)?;
             if !pending.promoted || pending.result.is_some() {
                 return None;
             }
             pending.promoted = false;
+            let flight = pending.flight;
             Some(Work {
                 scheduler: self.scheduler.clone(),
-                token: Some(pending.flight),
-                page: state.flights.get(&pending.flight)?.page.clone(),
+                token: Some(flight),
+                page: state.fanout.flights().get(&flight)?.page.clone(),
             })
         })
     }
@@ -696,7 +631,7 @@ impl Waiter {
             return Poll::Ready(Err(Error::StaleFlight));
         };
         let result = self.scheduler.with_state(Some(now_ms), |state| {
-            let Some(pending) = state.pending.get_mut(&token) else {
+            let Some(pending) = state.fanout.pending_mut(token) else {
                 return Poll::Ready(Err(Error::StaleFlight));
             };
             if pending.result.is_some() {
@@ -746,60 +681,8 @@ impl Drop for Waiter {
     }
 }
 
-fn contains(intervals: &[PageInterval], page: u64) -> bool {
-    let index = intervals.partition_point(|i| i.end <= page);
-    intervals.get(index).is_some_and(|i| i.start <= page)
-}
-
 fn outstanding(demand: &Demand, completed: &[PageInterval]) -> Vec<PageInterval> {
-    let mut result = Vec::new();
-    let mut index = 0;
-    for interval in demand.intervals() {
-        let mut start = interval.start;
-        while index < completed.len() && completed[index].end <= start {
-            index += 1;
-        }
-        let mut cursor = index;
-        while cursor < completed.len() && completed[cursor].start < interval.end {
-            let done = completed[cursor];
-            if start < done.start {
-                result.push(PageInterval {
-                    start,
-                    end: done.start,
-                });
-            }
-            start = start.max(done.end);
-            cursor += 1;
-        }
-        if start < interval.end {
-            result.push(PageInterval {
-                start,
-                end: interval.end,
-            });
-        }
-    }
-    result
-}
-
-fn include_page(intervals: &[PageInterval], page: u64) -> Vec<PageInterval> {
-    // Selected pages always lie in a half-open interval, so page < u64::MAX.
-    let mut result = intervals.to_vec();
-    result.push(PageInterval {
-        start: page,
-        end: page + 1,
-    });
-    result.sort_unstable_by_key(|i| i.start);
-    let mut merged: Vec<PageInterval> = Vec::with_capacity(result.len());
-    for interval in result {
-        if let Some(last) = merged.last_mut()
-            && last.end >= interval.start
-        {
-            last.end = last.end.max(interval.end);
-            continue;
-        }
-        merged.push(interval);
-    }
-    merged
+    flow_control::subscriptions::outstanding(demand.intervals(), completed)
 }
 
 #[cfg(test)]
@@ -964,7 +847,7 @@ mod tests {
         work.fail(Error::Unavailable);
         assert!(matches!(first.try_result(2), Err(Error::Unavailable)));
         assert!(matches!(second.try_result(2), Err(Error::Unavailable)));
-        assert!(scheduler.state.lock().unwrap().flights.is_empty());
+        assert!(scheduler.state.lock().unwrap().fanout.flights().is_empty());
     }
     #[test]
     fn budgets_sequences_deadlines_membership_and_capacity_are_finite() {
@@ -1018,29 +901,17 @@ mod tests {
         };
         scheduler.prune(1000);
         assert_eq!(
-            scheduler.state.lock().unwrap().flights.len(),
+            scheduler.state.lock().unwrap().fanout.flights().len(),
             1,
             "expiry cannot release unfenced acquisition owner"
         );
         drop(waiter);
         drop(work);
-        assert!(scheduler.state.lock().unwrap().flights.is_empty());
+        assert!(scheduler.state.lock().unwrap().fanout.flights().is_empty());
         assert!(matches!(
             scheduler.schedule(sub, MembershipVersion(0), NodeId("a".into()), 2000, 1001),
             Err(Error::InvalidRequest)
         ));
-    }
-    #[test]
-    fn completed_intervals_merge_with_bounded_state() {
-        let mut completed = Vec::new();
-        for page in [4, 2, 3, 1, 0] {
-            completed = include_page(&completed, page);
-        }
-        assert_eq!(completed, vec![PageInterval { start: 0, end: 5 }]);
-        assert_eq!(
-            outstanding(&subscription(1, 0, 10).demand, &completed),
-            vec![PageInterval { start: 5, end: 10 }]
-        );
     }
     #[test]
     fn duplicate_receiver_ids_cannot_amplify_transfers_and_expired_contract_cannot_renew() {
@@ -1107,7 +978,7 @@ mod tests {
         );
         last.fail(Error::Unavailable);
         assert!(matches!(third.try_result(2), Err(Error::Unavailable)));
-        assert!(scheduler.state.lock().unwrap().flights.is_empty());
+        assert!(scheduler.state.lock().unwrap().fanout.flights().is_empty());
     }
     #[test]
     fn successful_fanout_shares_allocation_and_charges_each_receiver_once() {
@@ -1208,8 +1079,8 @@ mod tests {
             }
             drop(second);
             let state = scheduler.state.lock().unwrap();
-            assert!(state.flights.is_empty());
-            assert!(state.pending.is_empty());
+            assert!(state.fanout.flights().is_empty());
+            assert!(state.fanout.pending().is_empty());
         }
     }
 }
