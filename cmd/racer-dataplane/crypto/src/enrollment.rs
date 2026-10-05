@@ -2,6 +2,11 @@
 //! The caller persists NIC reservations before preparing a request, supplies current
 //! NICs and shares, and exclusively owns this identity directory. Attempt fencing
 //! must remain bound to the same serving reactor for the lifetime of this owner.
+//!
+//! Prepare persists a retry-stable key before exposing its CSR. Accept validates
+//! the response before durable replacement, and recovery revalidates trust before
+//! returning an identity. Cancellation and abandoned writes are fenced through
+//! the caller's host; transport retries and inventory remain application policy.
 
 use crate::identity;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -31,17 +36,22 @@ use zeroize::{Zeroize, Zeroizing};
 pub enum Error {
     /// Identity correlation, certificate, token, or key pairing failed.
     Unauthorized,
+
     /// Persisted JSON or private key material is corrupt.
     CorruptRecord,
+
     /// The configured cluster is not a canonical UUID.
     InvalidConfiguration,
+
     /// Entropy, serialization, or local key generation failed.
     Io,
+
     /// Preserve the wire codec's exact failure classification.
     Wire(wire::Error),
 }
 
 impl From<wire::Error> for Error {
+    /// Retain the wire failure category without including rejected record bytes.
     fn from(error: wire::Error) -> Self {
         Self::Wire(error)
     }
@@ -93,6 +103,7 @@ struct PendingIdentity {
 }
 
 impl Drop for PendingIdentity {
+    /// Erase the persisted private-key encoding before releasing this record.
     fn drop(&mut self) {
         self.private_key.zeroize();
     }
@@ -605,11 +616,14 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Cause {
         Runtime(uring_runtime::Error),
+
         Enrollment(Error),
+
         Access(secure::AccessError),
     }
 
     impl From<uring_runtime::Error> for Failure {
+        /// Retain the runtime cause before any replacement phase is attached.
         fn from(e: uring_runtime::Error) -> Self {
             Self {
                 cause: Cause::Runtime(e),
@@ -619,6 +633,7 @@ mod tests {
     }
 
     impl From<Error> for Failure {
+        /// Retain enrollment validation failures independently of filesystem causes.
         fn from(e: Error) -> Self {
             Self {
                 cause: Cause::Enrollment(e),
@@ -628,6 +643,7 @@ mod tests {
     }
 
     impl From<secure::AccessError> for Failure {
+        /// Preserve secure access policy failures without flattening their category.
         fn from(e: secure::AccessError) -> Self {
             Self {
                 cause: Cause::Access(e),
@@ -637,6 +653,7 @@ mod tests {
     }
 
     impl From<ReplacementError<Failure>> for Failure {
+        /// Preserve whether replacement failed before, during, or after publication.
         fn from(e: ReplacementError<Failure>) -> Self {
             match e {
                 ReplacementError::BeforeRename(e) => e,
@@ -657,6 +674,7 @@ mod tests {
     impl Scope for Request {
         type Error = Failure;
 
+        /// Stop cancelled requests before admitting more simulated I/O.
         fn check(&self) -> Result<(), Failure> {
             if self.cancellation.is_cancelled() {
                 Err(uring_runtime::Error::Cancelled.into())
@@ -665,6 +683,7 @@ mod tests {
             }
         }
 
+        /// Share parent cancellation with the fresh attempt scope.
         fn cancellation(&self) -> Option<&Cancellation> {
             Some(&self.cancellation)
         }
@@ -682,10 +701,12 @@ mod tests {
 
         type Budget = ();
 
+        /// Keep every attempt bound to this serving reactor.
         fn reactor(&self) -> &Reactor<Request, ()> {
             &self.reactor
         }
 
+        /// Assign a distinct I/O identity while retaining parent cancellation.
         fn fresh_scope(&self, parent: &Request) -> Result<Request, Failure> {
             self.next.set(self.next.get() + 1);
             Ok(Request {
@@ -694,17 +715,22 @@ mod tests {
             })
         }
 
+        /// Drain only the abandoned attempt before a successor can access its files.
         fn fence<'a>(&'a self, previous: &'a Request) -> Operation<'a, (), Failure> {
             self.reactor
                 .fence_matching(move |scope| scope.id == previous.id)
         }
 
+        /// Distinguish absent records from other filesystem and policy failures.
         fn is_missing(error: Failure) -> bool {
             error == uring_runtime::Error::NotFound.into()
         }
     }
 
+    /// Canonical authority used for enrollment correlation in simulation.
     const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// Node identity assigned by the simulated certificate issuer.
     const NODE: &str = "22222222-2222-4222-8222-222222222222";
 
     /// Construct one namespace owner on the active simulation backend.

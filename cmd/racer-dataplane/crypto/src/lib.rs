@@ -312,18 +312,7 @@ pub mod identity {
 
     /// Canonical bundle replay tracking paired with its current keyring owner.
     pub struct BundleInstaller {
-        keys: RefCell<Rc<Keyring>>,
-
-        accepted: RefCell<Option<AcceptedBundle>>,
-    }
-
-    /// Accepted canonical content and the roots returned for idempotent delivery.
-    struct AcceptedBundle {
-        generation: BundleGeneration,
-
-        hash: [u8; 32],
-
-        roots: Vec<Vec<u8>>,
+        state: RefCell<BundleDelivery>,
     }
 
     /// Bundle delivery errors preserve replay, codec, and keyring distinctions.
@@ -339,27 +328,48 @@ pub mod identity {
         Identity(Error),
     }
 
+    /// Owner and replay cursor form one worker-local delivery state.
+    struct BundleDelivery {
+        keys: Rc<Keyring>,
+
+        accepted: Option<AcceptedBundle>,
+    }
+
+    /// Accepted canonical content and the roots returned for idempotent delivery.
+    struct AcceptedBundle {
+        generation: BundleGeneration,
+
+        hash: [u8; 32],
+
+        roots: Vec<Vec<u8>>,
+    }
+
     impl BundleInstaller {
         /// Start delivery tracking for one keyring.
         pub fn new(keys: Rc<Keyring>) -> Self {
             Self {
-                keys: RefCell::new(keys),
-                accepted: RefCell::new(None),
+                state: RefCell::new(BundleDelivery {
+                    keys,
+                    accepted: None,
+                }),
             }
         }
 
         /// Return the last successfully accepted bundle generation.
         pub fn generation(&self) -> Option<BundleGeneration> {
-            self.accepted
+            self.state
                 .borrow()
+                .accepted
                 .as_ref()
                 .map(|accepted| accepted.generation)
         }
 
         /// Replace the keyring and reset delivery tracking for its new owner.
         pub fn bind_keyring(&self, keys: Rc<Keyring>) {
-            *self.keys.borrow_mut() = keys;
-            *self.accepted.borrow_mut() = None;
+            *self.state.borrow_mut() = BundleDelivery {
+                keys,
+                accepted: None,
+            };
         }
 
         /// Canonicalize unordered records, reject replay, and atomically install keys.
@@ -375,7 +385,8 @@ pub mod identity {
                 racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?,
             );
             let hash: [u8; 32] = Sha256::digest(&*encoded).into();
-            if let Some(old) = self.accepted.borrow().as_ref() {
+            let mut state = self.state.borrow_mut();
+            if let Some(old) = state.accepted.as_ref() {
                 if bundle.generation < old.generation
                     || bundle.generation == old.generation && hash != old.hash
                 {
@@ -386,12 +397,8 @@ pub mod identity {
                 }
             }
             let roots = bundle.peer_trust_roots.clone();
-            let generation = self
-                .keys
-                .borrow()
-                .install(bundle)
-                .map_err(BundleError::Identity)?;
-            *self.accepted.borrow_mut() = Some(AcceptedBundle {
+            let generation = state.keys.install(bundle).map_err(BundleError::Identity)?;
+            state.accepted = Some(AcceptedBundle {
                 generation,
                 hash,
                 roots: roots.clone(),
