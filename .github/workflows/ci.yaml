@@ -177,6 +177,9 @@ jobs:
         run: |
           timeout --signal=TERM --kill-after=10s 300s make runtime-check
 
+      - name: Check standalone controlplane crate
+        run: timeout --signal=TERM --kill-after=10s 300s make controlplane-check
+
       - name: Check native adapter and complete Rust suite with bounded memory
         # A system service works without a user systemd manager on hosted runners.
         # Run as the checkout owner, cap the whole build/test tree below VM RAM,

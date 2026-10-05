@@ -15,16 +15,31 @@ timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path 
 
 The independent performance controller consumes this crate through
 `internal/racer-test/control.rs`, without linking the dataplane. The dataplane's
-`src/control.rs` consumes wire publications, enrollment records, cache definitions,
-rail mappings, and codecs directly, without compatibility re-exports or mirror DTOs.
-`SnapshotStore::prepare` converts wire members at `Membership::validate`; the local
+`src/control/publication.rs` adapts wire publications to the generic `controlplane`
+crate's `Codec` and `Target` traits, without compatibility re-exports or mirror DTOs.
+Its topology projection converts wire members at `Membership::validate`; the local
 `src/topology.rs::Member` adapter remains necessary for the external
 `topology::Member` trait under Rust's orphan rules. Rail mappings and cache
 definitions pass through without conversion.
 Key bundles transfer directly into `racer_crypto::identity`, which owns epoch
-validation, certificate identities, and purpose-bound leases. Placement traits, publication
-installation, transport, persistence, and accepted control cursors remain in the
-application. Callers import shared identifiers, including the storage key ID,
+validation, certificate identities, and purpose-bound leases.
+`racer_crypto::enrollment` owns durable node-private enrollment, certificate
+validation, token reads, and identity recovery. It uses
+`uring_runtime::reactor::filesystem::secure` for bounded descriptor-relative I/O,
+private access checks, durable replacement, and fencing abandoned attempts.
+The caller supplies current NIC inventory and shares, persists NIC reservations
+before preparing enrollment, and exclusively owns the identity directory.
+
+`controlplane` owns generic `Feed`/`Sync` synchronization, `Published` immutable
+publication/retention, and generation-tagged `Rollout` barriers. Wire codecs and
+domain validation remain outside that crate. Application adapters own placement,
+cache/resource installation, credential policy, and error classification;
+`wire_codec::rest` owns reusable REST/TLS transport. Only owned preparation jobs
+and immutable shared generations cross threads, not worker-local I/O or credentials.
+See `controlplane/src/lib.rs`, `crypto/src/enrollment.rs`, and
+`runtime/src/reactor/filesystem.rs` for these component APIs.
+
+Callers import shared identifiers, including the storage key ID,
 directly from `racer_control_wire`. The application's `model::key_id_from_generation`
 helper preserves the configuration-error classification for zero generations;
 the wire constructor
@@ -37,3 +52,12 @@ returns secret-bearing bytes, which callers must handle as sensitive data.
 
 Errors contain no input data. The application adapter preserves the existing
 invalid-request, incompatible-version, size-limit, and replay error mappings.
+
+The image explicitly copies each workspace crate's manifest and source; adding a
+workspace member alone does not update its build context or the NOTICE collector's
+crate list. CI runs the workspace suite plus `make controlplane-check`, which
+checks and tests the generic crate without dataplane feature unification:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s make controlplane-check
+```

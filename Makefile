@@ -670,6 +670,11 @@ racer-rust-test: ## Check the complete Rust suite, including integration tests a
 		-p uds-endpoint --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
 	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-features -- $(RACER_TEST_ARGS)
 
+.PHONY: controlplane-check
+controlplane-check: ## Check generic control mechanisms without dataplane feature unification
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" -p controlplane --no-default-features -j 2
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" -p controlplane --no-default-features -j 2 -- $(RACER_TEST_ARGS)
+
 .PHONY: runtime-check runtime-miri
 runtime-check: ## Strict runtime lint plus default-feature production compile
 	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" -p uring-runtime --all-targets --all-features -j 2 -- -D warnings

@@ -33,6 +33,8 @@ func TestNativeRDMAImageContract(t *testing.T) {
 	for _, required := range []string{
 		"libibverbs-dev pkg-config", "libibverbs1 ibverbs-providers",
 		"--no-default-features --features rdma", "librdma_verbs.so.1", "RUN ldconfig",
+		"COPY cmd/racer-dataplane/controlplane/Cargo.toml ./controlplane/Cargo.toml",
+		"COPY cmd/racer-dataplane/controlplane/src ./controlplane/src",
 	} {
 		if !strings.Contains(image, required) {
 			t.Fatalf("native image contract missing %q", required)
