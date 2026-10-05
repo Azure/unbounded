@@ -605,7 +605,16 @@ impl CandidatePolicy {
                     );
                     continue;
                 }
-                let mode = if rank.is_some() {
+                // With only the sender attempt left, a page Acquire would carry
+                // zero remote credits and reject before checking disk/pending copies.
+                // Spend the same last route on local copies, never new acquisition.
+                // This unpartitioned serial branch grants ceil((attempts - 1) /
+                // opportunities), which is zero exactly when attempts == 1.
+                let copy_only = rank.is_some()
+                    || (!continuation.bounded_routes
+                        && budget.remaining_attempts() == 1
+                        && matches!(operation, PeerOperation::Page { .. }));
+                let mode = if copy_only {
                     FetchMode::CopyOnly
                 } else {
                     FetchMode::Acquire
@@ -686,8 +695,7 @@ impl CandidatePolicy {
                                 .await;
                         }
                         let validated =
-                            validated_copy(response, &operation, rank.is_none(), &mut validate)
-                                .await;
+                            validated_copy(response, &operation, !copy_only, &mut validate).await;
                         note_validation(trail, &validated);
                         match validated? {
                             Ok(copy) => return Ok(CandidateResolution::Copy(copy)),
