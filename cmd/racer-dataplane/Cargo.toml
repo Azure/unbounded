@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "rest", "control-wire", "identity", "coalesce", "uds-endpoint", "wire-codec", "env-config"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "rest", "control-wire", "identity", "coalesce", "uds-endpoint", "wire-codec"]
 resolver = "3"
 
 [package]
@@ -25,7 +25,6 @@ required-features = ["subscription-interop"]
 coalesce = { path = "coalesce" }
 uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec" }
-env-config = { path = "env-config" }
 racer-identity = { path = "identity" }
 racer-control-wire = { path = "control-wire" }
 flow-control = { path = "flow" }

@@ -19,7 +19,7 @@ import (
 var workspaceMembers = []string{
 	"runtime", "alloc", "crypto", "verbs", "http", "topology",
 	"telemetry", "flow", "rest", "control-wire", "identity", "coalesce",
-	"uds-endpoint", "wire-codec", "env-config",
+	"uds-endpoint", "wire-codec",
 }
 
 func TestCollectorCollectHermetic(t *testing.T) {
@@ -398,7 +398,6 @@ racer-identity = { path = "identity" }
 coalesce = { path = "coalesce" }
 uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec" }
-env-config = { path = "env-config" }
 `,
 		"cmd/racer-dataplane/Cargo.lock": "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n",
 	})
