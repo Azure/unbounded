@@ -680,6 +680,8 @@ impl Fill {
         })
     }
 
+    /// Acquire one page with the caller's prefetch, budget, and observation policy.
+    #[allow(clippy::too_many_arguments)] // Keep acquisition inputs and borrowed budget explicit.
     fn acquire_with_prefetch<'a>(
         &'a self,
         page: PageId,
@@ -1138,17 +1140,15 @@ impl Fill {
             },
         };
         if let Some(copy) = local {
-            if !want_plaintext {
-                if let Some(token) = &token {
-                    match self.validate_disk_copy(&copy, page, token, scope).await {
-                        Ok(()) => {}
-                        Err(Error::CorruptRecord) => {
-                            self.metrics.record(Event::CorruptMiss, 1);
-                            return Ok(None);
-                        }
-                        Err(Error::MissingKey) => return Ok(None),
-                        Err(error) => return Err(error),
+            if !want_plaintext && let Some(token) = &token {
+                match self.validate_disk_copy(&copy, page, token, scope).await {
+                    Ok(()) => {}
+                    Err(Error::CorruptRecord) => {
+                        self.metrics.record(Event::CorruptMiss, 1);
+                        return Ok(None);
                     }
+                    Err(Error::MissingKey) => return Ok(None),
+                    Err(error) => return Err(error),
                 }
             }
             if !want_plaintext && validate_copy(&copy, page).is_ok() {
@@ -1259,8 +1259,8 @@ impl Fill {
             mode: FetchMode::Acquire,
         };
         let mut hedge_continuation = super::candidates::HedgeContinuation::default();
-        if want_plaintext {
-            if let Some(result) = self
+        if want_plaintext
+            && let Some(result) = self
                 .dependencies
                 .candidates
                 .hedge_page(
@@ -1276,10 +1276,9 @@ impl Fill {
                             let copy = response_copy(response.response(), page)?;
                             if let Some(existing) =
                                 self.retained_metadata(&page.version, &child).await?
+                                && !existing.compatible(&copy.metadata.immutable())
                             {
-                                if !existing.compatible(&copy.metadata.immutable()) {
-                                    return Err(Error::CorruptRecord);
-                                }
+                                return Err(Error::CorruptRecord);
                             }
                             let result =
                                 self.decrypt_response(page, response, None, &child).await?;
@@ -1287,23 +1286,21 @@ impl Fill {
                             // election, not only after a winner has canceled its peer.
                             if let Some(existing) =
                                 self.retained_metadata(&page.version, &child).await?
+                                && !existing.compatible(&result.metadata.immutable())
                             {
-                                if !existing.compatible(&result.metadata.immutable()) {
-                                    return Err(Error::CorruptRecord);
-                                }
+                                return Err(Error::CorruptRecord);
                             }
                             Ok(result)
                         })
                     },
                 )
                 .await?
-            {
-                result.validate_for(page)?;
-                scope.check()?;
-                self.publish(result.clone(), None, scope).await?;
-                self.metrics.record(Event::PeerHit, 1);
-                return Ok(result.into());
-            }
+        {
+            result.validate_for(page)?;
+            scope.check()?;
+            self.publish(result.clone(), None, scope).await?;
+            self.metrics.record(Event::PeerHit, 1);
+            return Ok(result.into());
         }
         // Keep the accepted ranking to probe later cached copies on an origin 412.
         let resolution = self
@@ -1744,10 +1741,9 @@ impl Fill {
         if let Some(existing) = self
             .retained_metadata(&result.metadata.version, scope)
             .await?
+            && !existing.compatible(&result.metadata.immutable())
         {
-            if !existing.compatible(&result.metadata.immutable()) {
-                return Err(Error::CorruptRecord);
-            }
+            return Err(Error::CorruptRecord);
         }
         match self.dependencies.memory.publish(result.clone()) {
             Ok(()) | Err(Error::Overloaded | Error::Unavailable | Error::MissingKey) => {}

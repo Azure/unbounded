@@ -1390,7 +1390,7 @@ mod tests {
                 assert_eq!(&*bytes, b"first");
                 let private = drive(
                     &r,
-                    Box::pin(crate::control::directory(
+                    Box::pin(uring_runtime::reactor::filesystem::secure::directory(
                         &r,
                         Path::new("/private"),
                         true,
@@ -1402,9 +1402,13 @@ mod tests {
                 sim.inject("write", Fault::Short(2)).unwrap();
                 drive(
                     &r,
-                    Box::pin(crate::control::atomic_write(
-                        &r, &private, "identity", b"secret", &scope,
-                    )),
+                    Box::pin(async {
+                        uring_runtime::reactor::filesystem::secure::atomic_write(
+                            &r, &private, "identity", b"secret", &scope,
+                        )
+                        .await
+                        .map_err(Error::from)
+                    }),
                 )
                 .unwrap();
                 assert_eq!(

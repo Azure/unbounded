@@ -1,8 +1,8 @@
 //! Deterministic test-only seams; no fake implementation is linked into production.
 
 use crate::admission::AdmissionPolicy;
-use crate::control::PublishedState;
-use crate::control::SnapshotStore;
+use crate::control::Snapshot;
+use crate::control::publication::PublicationTarget;
 use crate::http::Delivery;
 use crate::memory::BufferPool;
 use crate::memory::MemoryCache;
@@ -31,6 +31,7 @@ use crate::store::catalog::SegmentClock;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::Placement;
 use crate::worker::CryptoRuntime;
+use controlplane::Published;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::Publication;
@@ -161,7 +162,7 @@ pub mod origin {
     //! Controllable adapter boundary shared by read and client scenarios.
     //! The client, HTTP parser, reactor, and plaintext admission remain production code.
     use crate::admission::AdmissionPolicy;
-    use crate::control::SnapshotStore;
+    use crate::control::publication::PublicationTarget;
     use crate::http::Codec;
     use crate::memory::BufferPool;
     use crate::model::ObjectMetadata;
@@ -296,14 +297,14 @@ pub mod origin {
 
         pub fn client(
             &self,
-            snapshots: Rc<SnapshotStore>,
+            snapshots: Rc<PublicationTarget>,
             admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
             reactor: Rc<Reactor>,
             buffers: BufferPool,
         ) -> Rc<OriginClient> {
             Rc::new(
                 OriginClient::new(
-                    snapshots,
+                    snapshots.published.clone(),
                     Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 8)),
                     Rc::new(crate::http::new_io(
                         reactor,
@@ -705,7 +706,8 @@ pub(crate) async fn projected_file(
 ) -> crate::error::Result<uring_runtime::reactor::filesystem::ReadBuffer> {
     use uring_runtime::reactor::filesystem::secure::{BENEATH, NO_MAGICLINKS};
 
-    let dir = crate::control::directory(r, path, false, false, scope).await?;
+    let dir =
+        uring_runtime::reactor::filesystem::secure::directory(r, path, false, false, scope).await?;
     // One openat2 resolves ..data and pins the target directory across rotation.
     // BENEATH rejects absolute/escaping links; NO_MAGICLINKS rejects proc escapes.
     let generation = r
@@ -717,7 +719,8 @@ pub(crate) async fn projected_file(
             scope,
         )
         .await?;
-    crate::control::read_at(r, &generation, file, limit, false, scope).await
+    uring_runtime::reactor::filesystem::secure::read_at(r, &generation, file, limit, false, scope)
+        .await
 }
 
 /// Enrollment I/O and certificate fixtures shared by control and application tests.
@@ -804,6 +807,22 @@ pub(crate) struct ReadWorker {
     cache: racer_control_wire::CacheId,
 }
 
+/// Publish a topology-only fixture through the real generic publication authority.
+pub(crate) fn published_membership(
+    membership: Arc<crate::topology::Membership>,
+) -> Arc<Published<Snapshot>> {
+    let published = Arc::new(Published::new(Snapshot::retention(2)));
+    published
+        .publish(
+            Arc::new(Snapshot::membership_fixture(membership)),
+            uring_runtime::environment::now(),
+            |_, _| Ok::<_, crate::error::Error>(()),
+            || (),
+        )
+        .unwrap();
+    published
+}
+
 impl ReadWorker {
     pub fn new(
         cache: CacheDefinition,
@@ -815,14 +834,14 @@ impl ReadWorker {
     ) -> Self {
         let origin = AdapterOrigin::new(&cache.name, metadata);
         let keys = Rc::new(crate::test_support::security::keys());
-        let publications = Arc::new(PublishedState::default());
+        let publications = Arc::new(Published::new(Snapshot::retention(2)));
         let availability = Rc::new(crate::control::Availability::new(
             publications.clone(),
             keys.clone(),
         ));
-        let snapshots = Rc::new(SnapshotStore::new(keys.cluster().clone(), publications, 2));
+        let snapshots = Rc::new(PublicationTarget::new(keys.cluster().clone(), publications));
         snapshots
-            .publish(Publication {
+            .apply(Publication {
                 schema_version: 1,
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
@@ -881,7 +900,7 @@ impl ReadWorker {
             Rc::new(Placement::new(16)),
             crate::test_support::NoPeers::requester(),
             credentials.clone(),
-            Arc::new(Default::default()),
+            Arc::new(Published::new(Snapshot::retention(2))),
         ));
         let client = origin.client(
             snapshots.clone(),
@@ -917,7 +936,7 @@ impl ReadWorker {
         let streams = Rc::new(RangeStreams::new(directory.clone(), delivery, window));
         let membership = snapshots.current().unwrap().membership.clone();
         let coordinator = Rc::new(Coordinator::new(
-            snapshots,
+            snapshots.published.clone(),
             metadata,
             fill,
             streams.clone(),

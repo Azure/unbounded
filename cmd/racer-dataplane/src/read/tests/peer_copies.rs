@@ -21,17 +21,30 @@ enum Reply {
     Cancel(RequestScope),
     FencedCopy(CiphertextCopy, Rc<Cell<bool>>, Rc<Cell<bool>>),
 }
+/// Scripted peer responses and the route evidence observed by each request.
 struct ScriptedPeers {
     receiver: RefCell<Option<Rc<crate::read::Coordinator>>>,
+
     admission: Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>,
+
     hedge: Cell<bool>,
+
     primary_polls: Cell<usize>,
+
     canceled_primary: Cell<bool>,
+
     advance_primary: RefCell<Option<uring_runtime::environment::SimulationClock>>,
+
     local: usize,
+
     signing: Vec<Forwarding>,
+
     replies: RefCell<VecDeque<(NodeId, Reply)>>,
+
+    // Keep the recorded wire facts directly comparable in fixture assertions.
+    #[allow(clippy::type_complexity)]
     calls: RefCell<Vec<(NodeId, bool, u32, u8, Instant)>>,
+
     local_deadlines: RefCell<Vec<(Instant, Instant)>>,
 }
 impl ScriptedPeers {
@@ -256,7 +269,9 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
             ScriptedPeers::request_direct,
         ),
         dependencies.credentials.clone(),
-        Arc::new(Default::default()),
+        Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        )),
     ));
     f.fill = Fill::new(dependencies);
     f.fill
@@ -476,7 +491,9 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
                     Rc::new(Placement::new(16)),
                     peers.requester(),
                     deps.credentials.clone(),
-                    Arc::new(Default::default()),
+                    Arc::new(controlplane::Published::new(
+                        crate::control::Snapshot::retention(2),
+                    )),
                 )
                 .with_observer(failures.observer(WorkerId(0))),
             );
@@ -543,8 +560,7 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
                 assert!(diagnostics.contains("total=1 retained=1"), "{diagnostics}");
                 let last = diagnostics
                     .lines()
-                    .filter(|line| line.contains("rank=2"))
-                    .last()
+                    .rfind(|line| line.contains("rank=2"))
                     .unwrap();
                 assert!(
                     last.contains(if attempts == 8 {
@@ -843,7 +859,9 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
                 Rc::new(Placement::new(16)),
                 peers.requester(),
                 deps.credentials.clone(),
-                Arc::new(Default::default()),
+                Arc::new(controlplane::Published::new(
+                    crate::control::Snapshot::retention(2),
+                )),
             )
             .with_hedges(hedges),
         );
@@ -1156,7 +1174,9 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
             Rc::new(Placement::new(16)),
             peers.requester(),
             deps.credentials.clone(),
-            Arc::new(Default::default()),
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
         )
         .with_hedges(hedges),
     );
@@ -1247,7 +1267,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                     Rc::new(Placement::new(16)),
                     peers.requester(),
                     deps.credentials.clone(),
-                    crate::control::PublishedState::for_membership(latest.clone()),
+                    crate::test_support::published_membership(latest.clone()),
                 )
                 .with_hedges(deps.candidates.hedge_owner().unwrap().clone()),
             );
@@ -1356,11 +1376,18 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
     let _owner = queue.enter();
     use crate::peer::server::LocalPageService;
     use crate::read::Coordinator;
+    /// In-process peer mesh recording source, destination, and route budgets.
     struct Mesh {
         signing: Vec<Forwarding>,
+
         nodes: RefCell<Vec<Rc<Coordinator>>>,
+
+        // Keep the recorded wire facts directly comparable in fixture assertions.
+        #[allow(clippy::type_complexity)]
         calls: RefCell<Vec<(NodeId, NodeId, bool, u32, u8)>>,
+
         unavailable: RefCell<Vec<NodeId>>,
+
         admissions: Vec<Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>>,
     }
     struct Peer {
@@ -1492,7 +1519,9 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                     Peer::request_direct,
                 ),
                 f.fill.dependencies.credentials.clone(),
-                Arc::new(Default::default()),
+                Arc::new(controlplane::Published::new(
+                    crate::control::Snapshot::retention(2),
+                )),
             );
             if i == source {
                 policy = policy.with_hedges(

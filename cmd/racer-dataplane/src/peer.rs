@@ -190,11 +190,14 @@ impl AdaptivePeers {
 /// Outbound operations route directly from their retained membership lease.
 pub struct PeerNetwork {
     pub local: NodeId,
-    published: Arc<crate::control::PublishedState>,
+    published: Arc<controlplane::Published<crate::control::Snapshot>>,
 }
 
 impl PeerNetwork {
-    pub fn new(local: NodeId, published: Arc<crate::control::PublishedState>) -> Result<Self> {
+    pub fn new(
+        local: NodeId,
+        published: Arc<controlplane::Published<crate::control::Snapshot>>,
+    ) -> Result<Self> {
         if local.0.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
@@ -205,7 +208,9 @@ impl PeerNetwork {
         &self,
         version: MembershipVersion,
     ) -> Result<std::sync::Arc<crate::topology::Membership>> {
-        self.published.membership(version)
+        self.published
+            .resolve(version.0, uring_runtime::environment::now())?
+            .ok_or(Error::IncompatibleMembership)
     }
 
     pub fn endpoint(

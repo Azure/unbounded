@@ -2,7 +2,7 @@
 use super::fill::*;
 use crate::client::ClientRequest;
 use crate::client::ReadKind;
-use crate::control::PublishedState;
+use crate::control::Snapshot;
 use crate::http::Codec;
 use crate::http::Delivery;
 use crate::http::new_pipe_pool;
@@ -19,6 +19,7 @@ use crate::test_support::security::network;
 use crate::test_support::security::node;
 use crate::topology::LinkHealth;
 use crate::topology::Paths;
+use controlplane::Published;
 use racer_control_wire::MembershipVersion;
 
 mod duplex_release {
@@ -660,7 +661,7 @@ pub(super) fn coordinator(
 ) -> (
     Rc<Coordinator>,
     crate::read::dispatch::WorkerEndpoint,
-    Arc<PublishedState>,
+    Arc<Published<Snapshot>>,
 ) {
     let mut deps = f.fill.dependencies.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
@@ -668,7 +669,7 @@ pub(super) fn coordinator(
         Rc::new(Placement::new(64)),
         peers.clone(),
         deps.credentials.clone(),
-        Arc::new(Default::default()),
+        Arc::new(controlplane::Published::new(Snapshot::retention(2))),
     ));
     f.read_graph(
         Rc::new(Fill::new(deps)),
@@ -741,20 +742,20 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     let mut slow_first = None;
     let mut unordered_first = None;
     for _ in 0..1024 {
-        if first.is_none() {
-            if let Poll::Ready(result) = a.next_slice().as_mut().poll(&mut cx) {
-                first = result.unwrap();
-            }
+        if first.is_none()
+            && let Poll::Ready(result) = a.next_slice().as_mut().poll(&mut cx)
+        {
+            first = result.unwrap();
         }
-        if slow_first.is_none() {
-            if let Poll::Ready(result) = slow.next_slice().as_mut().poll(&mut cx) {
-                slow_first = result.unwrap();
-            }
+        if slow_first.is_none()
+            && let Poll::Ready(result) = slow.next_slice().as_mut().poll(&mut cx)
+        {
+            slow_first = result.unwrap();
         }
-        if unordered_first.is_none() {
-            if let Poll::Ready(result) = unordered.next_slice().as_mut().poll(&mut cx) {
-                unordered_first = result.unwrap();
-            }
+        if unordered_first.is_none()
+            && let Poll::Ready(result) = unordered.next_slice().as_mut().poll(&mut cx)
+        {
+            unordered_first = result.unwrap();
         }
         if first.is_some() && slow_first.is_some() && unordered_first.is_some() {
             break;
@@ -799,7 +800,6 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     for _ in 0..32 {
         pump(&mut endpoint);
     }
-    drop(pump);
     endpoint.uninstall().unwrap();
 }
 
@@ -906,7 +906,6 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
         for _ in 0..128 {
             pump(&mut endpoint);
         }
-        drop(pump);
         endpoint.uninstall().unwrap();
     }
 }
@@ -1124,7 +1123,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
         for _ in 0..32 {
             pump(&mut endpoint);
         }
-        drop(pump);
         endpoint.uninstall().unwrap();
     }
 }
@@ -1195,8 +1193,11 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                 Rc::new(Forwarding::new(signers[i].clone())),
                 transfers,
                 Rc::new(
-                    PeerNetwork::new(node(i), PublishedState::for_membership(membership.clone()))
-                        .unwrap(),
+                    PeerNetwork::new(
+                        node(i),
+                        crate::test_support::published_membership(membership.clone()),
+                    )
+                    .unwrap(),
                 ),
             ));
             Requester::scripted(
@@ -1367,15 +1368,15 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     let mut ra = None;
     let mut rb = None;
     for _ in 0..1024 {
-        if ra.is_none() {
-            if let Poll::Ready(value) = wa.as_mut().poll(&mut cx) {
-                ra = Some(value.unwrap().unwrap());
-            }
+        if ra.is_none()
+            && let Poll::Ready(value) = wa.as_mut().poll(&mut cx)
+        {
+            ra = Some(value.unwrap().unwrap());
         }
-        if rb.is_none() {
-            if let Poll::Ready(value) = wb.as_mut().poll(&mut cx) {
-                rb = Some(value.unwrap().unwrap());
-            }
+        if rb.is_none()
+            && let Poll::Ready(value) = wb.as_mut().poll(&mut cx)
+        {
+            rb = Some(value.unwrap().unwrap());
         }
         if ra.is_some() && rb.is_some() {
             break;
@@ -1472,7 +1473,6 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
         "warm read sent a peer request"
     );
     drop((cached, warm));
-    drop(pump);
     serving_scope.cancel().unwrap();
     drop(serving);
     for f in &fixtures {

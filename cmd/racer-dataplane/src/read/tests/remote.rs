@@ -279,8 +279,9 @@ fn live_read_routes_after_cache_only_publication_and_membership_update() {
 fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn: bool) {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    use crate::control::PublishedState;
-    use crate::control::SnapshotStore;
+    use crate::control::Snapshot;
+    use crate::control::publication::PublicationTarget;
+    use controlplane::Published;
     use racer_control_wire::Publication;
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
@@ -289,9 +290,9 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let source_publications = Arc::new(PublishedState::default());
+    let source_publications = Arc::new(Published::new(Snapshot::retention(1)));
     let source_store =
-        SnapshotStore::new(ClusterId(CLUSTER.into()), source_publications.clone(), 1);
+        PublicationTarget::new(ClusterId(CLUSTER.into()), source_publications.clone());
     let mut publication = Publication {
         schema_version: 1,
         cluster: ClusterId(CLUSTER.into()),
@@ -313,9 +314,9 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             })
             .collect(),
     };
-    let first = source_store.publish(publication.clone()).unwrap();
+    let first = source_store.apply(publication.clone()).unwrap();
     publication.sequence.0 = 2;
-    let cache_only = source_store.publish(publication.clone()).unwrap();
+    let cache_only = source_store.apply(publication.clone()).unwrap();
     assert!(Arc::ptr_eq(&first.membership, &cache_only.membership));
     let membership = cache_only.membership.clone();
     let retired = Arc::downgrade(&membership);
@@ -366,7 +367,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let destination_network = Rc::new(
         PeerNetwork::new(
             destination.clone(),
-            PublishedState::for_membership(destination_membership),
+            crate::test_support::published_membership(destination_membership),
         )
         .unwrap(),
     );
@@ -498,7 +499,9 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         placement,
         requester,
         Rc::new(CredentialCrypto::new(a.keys.clone(), admission.clone())),
-        Arc::new(Default::default()),
+        Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        )),
     );
     let context = OriginContext {
         object: object.clone(),
@@ -581,7 +584,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             }
             if churn && !updated {
                 publication.sequence.0 = 3;
-                let cache_only = source_store.publish(publication.clone()).unwrap();
+                let cache_only = source_store.apply(publication.clone()).unwrap();
                 assert!(Arc::ptr_eq(
                     &retired.upgrade().unwrap(),
                     &cache_only.membership
@@ -592,7 +595,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 for member in &mut publication.members {
                     member.peer_endpoint = "127.0.0.1:1".into();
                 }
-                source_store.publish(publication.clone()).unwrap();
+                source_store.apply(publication.clone()).unwrap();
                 assert!(
                     retired.upgrade().is_some(),
                     "pending read must retain old routing"
@@ -615,7 +618,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         );
         publication.sequence.0 = 5;
         publication.membership_version.0 = 3;
-        source_store.publish(publication).unwrap();
+        source_store.apply(publication).unwrap();
     }
     if ingress.is_none() {
         assert_eq!(
@@ -884,6 +887,8 @@ fn metadata_coordinator(
     )
 }
 
+/// Build a metadata fixture with an optional newer accepted publication.
+#[allow(clippy::too_many_arguments)] // Keep independently varied fixture inputs visible at call sites.
 fn metadata_coordinator_with_newer_publication(
     node: &NodeId,
     membership: &Arc<Membership>,
@@ -894,8 +899,8 @@ fn metadata_coordinator_with_newer_publication(
     adapter: Rc<AdapterOrigin>,
     newer_publication: bool,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
-    use crate::control::PublishedState;
-    use crate::control::SnapshotStore;
+    use crate::control::Snapshot;
+    use crate::control::publication::PublicationTarget;
     use crate::http::Delivery;
     use crate::http::new_pipe_pool;
     use crate::memory::MemoryCache;
@@ -906,13 +911,14 @@ fn metadata_coordinator_with_newer_publication(
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;
     use crate::store::catalog::SegmentClock;
+    use controlplane::Published;
     use racer_control_wire::Publication;
-    let published = Arc::new(PublishedState::default());
+    let published = Arc::new(Published::new(Snapshot::retention(4)));
     let availability = Rc::new(crate::control::Availability::new(
         published.clone(),
         keys.clone(),
     ));
-    let snapshots = Rc::new(SnapshotStore::new(ClusterId(CLUSTER.into()), published, 4));
+    let snapshots = Rc::new(PublicationTarget::new(ClusterId(CLUSTER.into()), published));
     let mut publication = Publication {
         schema_version: SCHEMA_VERSION,
         cluster: ClusterId(CLUSTER.into()),
@@ -931,12 +937,12 @@ fn metadata_coordinator_with_newer_publication(
             origin_socket: "/run/racer/remote/origin/socket".into(),
         }],
     };
-    snapshots.publish(publication.clone()).unwrap();
+    snapshots.apply(publication.clone()).unwrap();
     if newer_publication {
         publication.sequence.0 += 1;
         publication.membership_version.0 += 1;
         publication.members.clear();
-        snapshots.publish(publication).unwrap();
+        snapshots.apply(publication).unwrap();
         // Peer acquisition must use the ingress lease, even when current
         // membership has advanced and no longer includes this candidate.
     }
@@ -972,7 +978,9 @@ fn metadata_coordinator_with_newer_publication(
         Rc::new(Placement::new(16)),
         peers.clone(),
         credentials.clone(),
-        Arc::new(Default::default()),
+        Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        )),
     ));
     let origin = adapter.client(
         snapshots.clone(),
@@ -1029,7 +1037,7 @@ fn metadata_coordinator_with_newer_publication(
         2,
     ));
     let coordinator = Rc::new(super::Coordinator::new(
-        snapshots,
+        snapshots.published.clone(),
         metadata,
         fill,
         streams,

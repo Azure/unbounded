@@ -2346,12 +2346,17 @@ fn retirement_waits_for_admission_but_expires_without_capacity() {
 
 #[test]
 fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
-    use crate::control::{Availability, PublishedState, SnapshotStore};
+    use crate::control::publication::PublicationTarget;
+    use crate::control::{Availability, Snapshot};
+    use controlplane::Published;
     use racer_control_wire::{MembershipVersion, Publication, PublicationSequence};
     let mut fixture = Fixture::new();
     let keys = Rc::new(crate::test_support::security::keys());
-    let state = Arc::new(PublishedState::default());
-    let snapshots = Rc::new(SnapshotStore::new(keys.cluster().clone(), state.clone(), 2));
+    let state = Arc::new(Published::new(Snapshot::retention(2)));
+    let snapshots = Rc::new(PublicationTarget::new(
+        keys.cluster().clone(),
+        state.clone(),
+    ));
     let mut publication = Publication {
         schema_version: 1,
         cluster: keys.cluster().clone(),
@@ -2366,10 +2371,10 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
         }],
         caches: vec![definition()],
     };
-    snapshots.publish(publication.clone()).unwrap();
+    snapshots.apply(publication.clone()).unwrap();
     let reads = &fixture.listeners.reads;
     fixture.listeners.reads = Rc::new(crate::read::Coordinator::new(
-        snapshots.clone(),
+        snapshots.published.clone(),
         reads.metadata.clone(),
         reads.fill.clone(),
         fixture.worker.as_ref().unwrap().streams.clone(),
@@ -2381,12 +2386,11 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     socket.write_all(&request("HEAD", "")).unwrap();
     publication.sequence = PublicationSequence(2);
     publication.caches[0].id = CacheId("00000000-0000-4000-8000-000000000003".into());
-    let prepared = snapshots.prepare(publication.clone()).unwrap();
     let transition =
         futures::executor::block_on(fixture.listeners.prepare(&publication.caches, &scope()))
             .unwrap();
     snapshots
-        .publish_prepared(&prepared, Some(Box::new(transition)))
+        .apply_staged(publication.clone(), Some(Box::new(transition)))
         .unwrap();
     assert_eq!(snapshots.current().unwrap().caches, publication.caches);
     let response = fixture.receive(&mut socket, true);

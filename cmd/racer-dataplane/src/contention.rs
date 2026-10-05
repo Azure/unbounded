@@ -169,6 +169,8 @@ struct Active {
     sending_until: Option<u64>,
     queued: bool,
 }
+/// One scheduled event in the deterministic contention simulation.
+#[allow(clippy::large_enum_variant)] // Preserve inline simulation ownership without per-event boxing.
 enum Event {
     Arrive(usize, Request),
     Pump(usize),
@@ -589,22 +591,22 @@ impl Simulator {
             active.outstanding += 1;
             active.attempts = 0;
         }
-        if active.sending_until.is_none() {
-            if let Some(plain) = active.ready.remove(&active.send_next) {
-                let rate = active
-                    .request
-                    .reader_bytes_per_tick
-                    .unwrap_or(self.config.reader_bytes_per_tick);
-                let node = active.request.node;
-                let finish = self.now.max(self.nodes[node].nic_free)
-                    + PAGE_BYTES
-                        .div_ceil(rate)
-                        .max(PAGE_BYTES.div_ceil(self.config.network_bytes_per_tick))
-                    + self.config.completion_ticks;
-                self.nodes[node].nic_free = finish;
-                active.sending_until = Some(finish);
-                self.schedule(finish, Event::Sent(id, plain));
-            }
+        if active.sending_until.is_none()
+            && let Some(plain) = active.ready.remove(&active.send_next)
+        {
+            let rate = active
+                .request
+                .reader_bytes_per_tick
+                .unwrap_or(self.config.reader_bytes_per_tick);
+            let node = active.request.node;
+            let finish = self.now.max(self.nodes[node].nic_free)
+                + PAGE_BYTES
+                    .div_ceil(rate)
+                    .max(PAGE_BYTES.div_ceil(self.config.network_bytes_per_tick))
+                + self.config.completion_ticks;
+            self.nodes[node].nic_free = finish;
+            active.sending_until = Some(finish);
+            self.schedule(finish, Event::Sent(id, plain));
         }
         // Progress events will retry prefetch pressure; do not fail a request
         // merely because its own bounded window currently pins every buffer.
@@ -1602,7 +1604,9 @@ mod fidelity {
                 Rc::new(Placement::new(8)),
                 peers,
                 Rc::new(CredentialCrypto::new(keys.clone(), real.clone())),
-                Arc::new(Default::default()),
+                Arc::new(controlplane::Published::new(
+                    crate::control::Snapshot::retention(2),
+                )),
             )),
             flights: Rc::new(Flights::new(real.clone(), availability)),
             crypto: Rc::new(PageCrypto::new(keys.clone(), client.clone())),

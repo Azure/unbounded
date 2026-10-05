@@ -137,18 +137,18 @@ impl WorkerApplication {
             return Ok(());
         }
         let now = uring_runtime::environment::now();
-        if let Some(task) = self.checkpoint_task.as_mut() {
-            if let Poll::Ready(result) = task.as_mut().poll(cx) {
-                self.checkpoint_task = None;
-                let mut cut = node
-                    .periodic_checkpoint
-                    .lock()
-                    .map_err(|_| Error::Unavailable)?;
-                if result.is_ok() {
-                    cut.last_slot ^= 1;
-                }
-                cut.result = Some(result);
+        if let Some(task) = self.checkpoint_task.as_mut()
+            && let Poll::Ready(result) = task.as_mut().poll(cx)
+        {
+            self.checkpoint_task = None;
+            let mut cut = node
+                .periodic_checkpoint
+                .lock()
+                .map_err(|_| Error::Unavailable)?;
+            if result.is_ok() {
+                cut.last_slot ^= 1;
             }
+            cut.result = Some(result);
         }
         let mut cut = node
             .periodic_checkpoint
@@ -750,7 +750,7 @@ mod tests {
             let node = Arc::new(NodeState::new(vec![WorkerId(0)], 16).unwrap());
             let (app, _runtime, _crypto) = local_worker(&config, &node, 0);
             app.snapshots
-                .publish(publication(&config, 1, vec![]))
+                .apply(publication(&config, 1, vec![]))
                 .unwrap();
             let _ = futures::executor::block_on(app.store.open()).unwrap();
             let shard = futures::executor::block_on(app.store.checkpoint.snapshot_shard()).unwrap();

@@ -5,7 +5,7 @@
 //! persist headers or retain them in pooled connections after an operation ends.
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
-use crate::control::SnapshotStore;
+use crate::control::Snapshot;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -27,6 +27,7 @@ use crate::model::StrongEtag;
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
+use controlplane::Published;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
@@ -70,7 +71,7 @@ pub trait Origin {
 }
 pub struct OriginClient {
     health: crate::topology::LinkHealth,
-    snapshots: Rc<SnapshotStore>,
+    snapshots: std::sync::Arc<Published<Snapshot>>,
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -85,7 +86,7 @@ impl OriginClient {
     /// the caller provisions and owns the directories (including any symlink policy).
     /// The complete resolved endpoint is checked against Linux's 107-byte UDS cap.
     pub fn new(
-        snapshots: Rc<SnapshotStore>,
+        snapshots: std::sync::Arc<Published<Snapshot>>,
         pool: Rc<HttpPool>,
         io: Rc<HttpIo>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -178,7 +179,7 @@ impl OriginClient {
     }
 
     fn endpoint(&self, context: &OriginContext) -> Result<Endpoint> {
-        let snapshot = self.snapshots.current()?;
+        let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
         let cache = snapshot
             .caches
             .iter()
@@ -225,10 +226,10 @@ impl OriginClient {
             matches!(selector, MetadataSelector::Pinned(_)),
         )?;
         let metadata = validate_metadata(&response.value, &context.object)?;
-        if let MetadataSelector::Pinned(etag) = selector {
-            if metadata.version.etag != etag {
-                return Err(Error::BadGateway);
-            }
+        if let MetadataSelector::Pinned(etag) = selector
+            && metadata.version.etag != etag
+        {
+            return Err(Error::BadGateway);
         }
         scope.check()?;
         response
@@ -579,15 +580,14 @@ fn validate_response(head: &MessageHead, pinned: bool) -> Result<(u16, u64)> {
         field(head, name)?;
     }
     for name in ["Racer-Metadata", "Authorization"] {
-        if let Some(value) = field(head, name)? {
-            if value.is_empty()
+        if let Some(value) = field(head, name)?
+            && (value.is_empty()
                 || value.len() > 8192
                 || value.first() == Some(&b' ')
                 || value.last() == Some(&b' ')
-                || value.iter().any(|byte| *byte < 32 || *byte == 127)
-            {
-                return Err(Error::BadGateway);
-            }
+                || value.iter().any(|byte| *byte < 32 || *byte == 127))
+        {
+            return Err(Error::BadGateway);
         }
     }
     absent(

@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::Limits;
-use crate::control::PublishedState;
+use crate::control::Snapshot;
+use crate::control::publication::PublicationTarget;
 use crate::http::Codec;
 use crate::model::CacheKey;
 use crate::model::ObjectId;
@@ -9,6 +10,7 @@ use crate::model::StrongEtag;
 use crate::runtime::Reactor;
 use crate::security::Authorization;
 use crate::security::OpaqueMetadata;
+use controlplane::Published;
 use futures::executor::block_on;
 use racer_control_wire::CacheId;
 use racer_control_wire::ClusterId;
@@ -142,11 +144,7 @@ fn client() -> (
         admission.clone(),
         PAGE_BYTES,
     ));
-    let snapshots = Rc::new(SnapshotStore::new(
-        ClusterId("cluster".into()),
-        Arc::new(PublishedState::default()),
-        2,
-    ));
+    let snapshots = Arc::new(Published::new(Snapshot::retention(2)));
     let buffers = BufferPool::new(admission.clone());
     (
         OriginClient::new(
@@ -175,12 +173,9 @@ fn published_client() -> (
         "/../../internal/racer/wire/testdata/publication.json"
     )))
     .unwrap();
-    client.snapshots = Rc::new(SnapshotStore::new(
-        publication.cluster.clone(),
-        Arc::new(PublishedState::default()),
-        2,
-    ));
-    let snapshot = client.snapshots.publish(publication).unwrap();
+    client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    let target = PublicationTarget::new(publication.cluster.clone(), client.snapshots.clone());
+    let snapshot = target.apply(publication).unwrap();
     (client, admission, reactor, snapshot)
 }
 
@@ -313,7 +308,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
         Rc::new(Placement::new(2)),
         NoPeers::requester(),
         credentials(admission.clone()),
-        Arc::new(PublishedState::default()),
+        Arc::new(Published::new(Snapshot::retention(2))),
     );
     let scope = scope();
     let CandidateResolution::Origin(authority) = block_on(policy.resolve(
@@ -488,12 +483,9 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     )))
     .unwrap();
     publication.sequence.0 = 1;
-    client.snapshots = Rc::new(SnapshotStore::new(
-        publication.cluster.clone(),
-        Arc::new(PublishedState::default()),
-        2,
-    ));
-    let snapshot = client.snapshots.publish(publication.clone()).unwrap();
+    client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    let target = PublicationTarget::new(publication.cluster.clone(), client.snapshots.clone());
+    let snapshot = target.apply(publication.clone()).unwrap();
     let client = remap(client, root).unwrap();
     let mut old_context = context();
     old_context.object.cache = snapshot.caches[0].id.clone();
@@ -534,7 +526,7 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     new_context.object.cache = publication.caches[0].id.clone();
     new_context.authorization =
         Some(Authorization::from_header(b"replacement-credential").unwrap());
-    client.snapshots.publish(publication).unwrap();
+    target.apply(publication).unwrap();
     let new_endpoint = client.endpoint(&new_context).unwrap();
     assert_ne!(old_endpoint, new_endpoint);
     let replacement = thread::spawn(move || {
@@ -704,14 +696,14 @@ fn distinct_cold_requests_wait_for_origin_slots_and_finish_complete_bodies() {
         scope.check().unwrap();
         client.pool.poll_waiters(2);
         for (index, request) in pending.iter_mut().enumerate() {
-            if let Some(future) = request {
-                if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
-                    let result = result.unwrap();
-                    assert_eq!(result.metadata.version.object, contexts[index].object);
-                    assert_eq!(result.page_zero.unwrap().plaintext.bytes().unwrap(), b"abc");
-                    *request = None;
-                    completed += 1;
-                }
+            if let Some(future) = request
+                && let Poll::Ready(result) = future.as_mut().poll(&mut cx)
+            {
+                let result = result.unwrap();
+                assert_eq!(result.metadata.version.object, contexts[index].object);
+                assert_eq!(result.page_zero.unwrap().plaintext.bytes().unwrap(), b"abc");
+                *request = None;
+                completed += 1;
             }
         }
         reactor.poll_budgeted(128).unwrap();
@@ -972,7 +964,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         Rc::new(Placement::new(2)),
         NoPeers::requester(),
         credentials(client().1),
-        Arc::new(PublishedState::default()),
+        Arc::new(Published::new(Snapshot::retention(2))),
     );
     let context = context();
     let scope = scope();

@@ -44,67 +44,137 @@ use std::time::Instant;
 use uring_runtime::group::Service;
 use uring_runtime::group::affinity::EffectiveTopology;
 
+/// Controllable TLS endpoints and observations for application lifecycle tests.
 pub(super) struct ControlFixture {
     pub bundle: Arc<Mutex<wire::KeyringBundle>>,
+
+    // Keep the optional status/body override explicit without a fixture-only alias.
+    #[allow(clippy::type_complexity)]
     pub keyring_override: Arc<Mutex<Option<(usize, Vec<u8>)>>>,
+
     pub keyring_tokens: Arc<Mutex<Vec<String>>>,
+
     pub reject_keyring_mtls: Arc<AtomicBool>,
+
     pub handshake_alerts: Arc<Mutex<VecDeque<u8>>>,
+
     pub directory: PathBuf,
+
     pub stop: Arc<AtomicBool>,
+
     pub server: Option<thread::JoinHandle<()>>,
+
     pub config: Option<Config>,
+
     pub enrollments: Arc<AtomicUsize>,
+
     pub polls: Arc<AtomicUsize>,
+
     pub binding: Arc<Mutex<NodeId>>,
+
     pub bootstrap_status: Arc<AtomicUsize>,
+
     pub poll_status: Arc<AtomicUsize>,
+
     pub certificate_age: Arc<AtomicUsize>,
+
     pub publication: Arc<Mutex<Option<state::Publication>>>,
+
     pub bootstrap_requests: Arc<Mutex<Vec<state::EnrollmentRequest>>>,
+
     pub poll_certificates: Arc<Mutex<Vec<Vec<u8>>>>,
+
     pub hold_long_poll: Arc<AtomicBool>,
+
     pub long_polls: Arc<AtomicUsize>,
+
+    pub hold_renewal: Arc<AtomicBool>,
+
+    pub held_renewals: Arc<AtomicUsize>,
+
+    pub publication_retry_after: Arc<AtomicUsize>,
+
+    pub publication_failures: Arc<AtomicUsize>,
 }
 
 /// Each accepted TLS socket gets the same independently controllable endpoints.
 #[derive(Clone)]
 struct ControlHandlers {
     enrollment: EnrollmentHandler,
+
     keyring: KeyringHandler,
+
     publication: PublicationHandler,
 }
+
+/// Certificate issuance controls and captured requests shared by fixture sockets.
 #[derive(Clone)]
 struct EnrollmentHandler {
     ca: Arc<rcgen::Certificate>,
+
     ca_key: Arc<rcgen::KeyPair>,
+
     binding: Arc<Mutex<NodeId>>,
+
     status: Arc<AtomicUsize>,
+
     age: Arc<AtomicUsize>,
+
     issued: Arc<AtomicUsize>,
+
     requests: Arc<Mutex<Vec<state::EnrollmentRequest>>>,
+
+    held: Arc<AtomicBool>,
+
+    waiting: Arc<AtomicUsize>,
+
+    stopping: Arc<AtomicBool>,
 }
+
+/// Shared key response and authentication controls for each accepted socket.
 #[derive(Clone)]
 struct KeyringHandler {
     bundle: Arc<Mutex<wire::KeyringBundle>>,
+
+    // Match the fixture's optional wire status/body override directly.
+    #[allow(clippy::type_complexity)]
     response: Arc<Mutex<Option<(usize, Vec<u8>)>>>,
+
     tokens: Arc<Mutex<Vec<String>>>,
+
     reject_mtls: Arc<AtomicBool>,
 }
+
+/// Publication responses and long-poll controls shared by fixture sockets.
 #[derive(Clone)]
 struct PublicationHandler {
     initial: state::Publication,
+
     published: Arc<Mutex<Option<state::Publication>>>,
+
     binding: Arc<Mutex<NodeId>>,
+
     status: Arc<AtomicUsize>,
+
     certificates: Arc<Mutex<Vec<Vec<u8>>>>,
+
     polls: Arc<AtomicUsize>,
+
     waiting: Arc<AtomicUsize>,
+
     held: Arc<AtomicBool>,
+
     stopping: Arc<AtomicBool>,
+
+    retry_after: Arc<AtomicUsize>,
+
+    failures: Arc<AtomicUsize>,
 }
+
+/// Blocking server-side TLS stream used by the fixture handlers.
 type ControlStream = rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>;
 
+/// Encode the fixture's supported structured failure statuses.
 fn error_response(status: usize) -> (usize, Vec<u8>) {
     let code = if status == 503 {
         "unavailable"
@@ -115,11 +185,20 @@ fn error_response(status: usize) -> (usize, Vec<u8>) {
 }
 
 impl EnrollmentHandler {
+    /// Validate the request and issue a certificate after any configured hold.
     fn respond(&self, head: &str, body: &[u8], stream: &ControlStream) -> (usize, Vec<u8>) {
         assert!(head.contains("Authorization: Bearer fixture.token"));
         assert!(stream.conn.peer_certificates().is_none());
         let request = state::decode_enrollment_request(body).unwrap();
         self.requests.lock().unwrap().push(request.clone());
+        if self.held.load(Ordering::Acquire) {
+            self.waiting.fetch_add(1, Ordering::Release);
+            let until = Instant::now() + Duration::from_secs(10);
+            while self.held.load(Ordering::Acquire) && !self.stopping.load(Ordering::Acquire) {
+                assert!(Instant::now() < until, "renewal fixture not released");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
         let status = self.status.load(Ordering::Acquire);
         if status != 200 {
             return error_response(status);
@@ -141,7 +220,9 @@ impl EnrollmentHandler {
         )
     }
 }
+
 impl KeyringHandler {
+    /// Return the configured keyring response or close the socket on demand.
     fn respond(&self, head: &str, stream: &ControlStream) -> Option<(usize, Vec<u8>)> {
         let mtls = stream.conn.peer_certificates().is_some();
         assert!(mtls || head.contains("Authorization: Bearer fixture.token"));
@@ -168,10 +249,13 @@ impl KeyringHandler {
         }
     }
 }
+
 impl PublicationHandler {
+    /// Record client authentication and serve the current publication or long poll.
     fn respond(&self, head: &str, stream: &ControlStream) -> (usize, Vec<u8>) {
         let status = self.status.load(Ordering::Acquire);
         if status != 200 {
+            self.failures.fetch_add(1, Ordering::Release);
             return error_response(status);
         }
         let mut publication = self
@@ -203,7 +287,9 @@ impl PublicationHandler {
         }
     }
 }
+
 impl ControlHandlers {
+    /// Read and dispatch one HTTP request over an accepted TLS socket.
     fn serve(&self, tls: Arc<rustls::ServerConfig>, socket: std::net::TcpStream) {
         let mut stream =
             rustls::StreamOwned::new(rustls::ServerConnection::new(tls).unwrap(), socket);
@@ -240,8 +326,16 @@ impl ControlHandlers {
         let Some((status, body)) = response else {
             return;
         };
+        let retry = if head.starts_with("GET /v1/snapshot") && status == 503 {
+            format!(
+                "Retry-After: {}\r\n",
+                self.publication.retry_after.load(Ordering::Acquire)
+            )
+        } else {
+            String::new()
+        };
         let response = format!(
-            "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} Result\r\n{retry}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         let _ = stream
@@ -317,6 +411,10 @@ impl ControlFixture {
             poll_certificates: Arc::new(Mutex::new(Vec::new())),
             hold_long_poll: Arc::new(AtomicBool::new(false)),
             long_polls: Arc::new(AtomicUsize::new(0)),
+            hold_renewal: Arc::new(AtomicBool::new(false)),
+            held_renewals: Arc::new(AtomicUsize::new(0)),
+            publication_retry_after: Arc::new(AtomicUsize::new(0)),
+            publication_failures: Arc::new(AtomicUsize::new(0)),
             config: Some(config),
         };
         let handlers = ControlHandlers {
@@ -328,6 +426,9 @@ impl ControlFixture {
                 age: fixture.certificate_age.clone(),
                 issued: fixture.enrollments.clone(),
                 requests: fixture.bootstrap_requests.clone(),
+                held: fixture.hold_renewal.clone(),
+                waiting: fixture.held_renewals.clone(),
+                stopping: fixture.stop.clone(),
             },
             keyring: KeyringHandler {
                 bundle: fixture.bundle.clone(),
@@ -345,6 +446,8 @@ impl ControlFixture {
                 waiting: fixture.long_polls.clone(),
                 held: fixture.hold_long_poll.clone(),
                 stopping: fixture.stop.clone(),
+                retry_after: fixture.publication_retry_after.clone(),
+                failures: fixture.publication_failures.clone(),
             },
         };
         let stopping = fixture.stop.clone();
@@ -1138,7 +1241,13 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         let _engine = application
             .build_crypto(WorkerId(0), CryptoRuntime { port: engine })
             .unwrap();
-        let node = Arc::new(NodeState::default());
+        let state = NodeState {
+            publications: Arc::new(Published::new(Snapshot::retention(
+                config.limits.retained_snapshots.get(),
+            ))),
+            ..NodeState::default()
+        };
+        let node = Arc::new(state);
         let mut worker =
             WorkerApplication::assemble(&config, node.clone(), WorkerId(0), runtime, Vec::new())
                 .expect("valid side-effect-free worker composition");
@@ -1198,13 +1307,13 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         for version in 1..=config.limits.retained_snapshots.get() + 1 {
             publication.sequence.0 = version as u64;
             publication.membership_version.0 = version as u64;
-            let snapshot = worker.snapshots.publish(publication.clone()).unwrap();
+            let snapshot = worker.snapshots.apply(publication.clone()).unwrap();
             requests.push(snapshot.membership.clone());
         }
         publication.sequence.0 += 1;
         publication.membership_version.0 += 1;
         assert!(matches!(
-            worker.snapshots.publish(publication),
+            worker.snapshots.apply(publication),
             Err(Error::Overloaded)
         ));
     }
@@ -1228,8 +1337,8 @@ fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     .unwrap();
     let local = publication.members[0].node.clone();
     let neighbor = publication.members[1].node.clone();
-    let published = Arc::new(PublishedState::default());
-    let store = SnapshotStore::new(publication.cluster.clone(), published.clone(), 1);
+    let published = Arc::new(Published::new(Snapshot::retention(1)));
+    let store = PublicationTarget::new(publication.cluster.clone(), published.clone());
     let networks = [
         PeerNetwork::new(local.clone(), published.clone()).unwrap(),
         PeerNetwork::new(local, published).unwrap(),
@@ -1237,7 +1346,7 @@ fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     let mut publish = |sequence, version| {
         publication.sequence.0 = sequence;
         publication.membership_version.0 = version;
-        store.publish(publication.clone())
+        store.apply(publication.clone())
     };
     let first = publish(1, 1).unwrap();
     // A delayed worker holds a publication, while a read starts from the
@@ -1304,7 +1413,7 @@ fn removal_visibility_changes_without_worker_or_checkpoint_barriers() {
     for (sequence, present) in [(1, true), (2, false), (3, true)] {
         worker
             .snapshots
-            .publish(publication(
+            .apply(publication(
                 &config,
                 sequence,
                 if present { vec![cache.clone()] } else { vec![] },
@@ -1322,7 +1431,7 @@ fn non_listener_worker_installs_nonempty_cache_set_without_binding_paths() {
     let definition = definition();
     worker
         .snapshots
-        .publish(publication(&config, 1, vec![definition.clone()]))
+        .apply(publication(&config, 1, vec![definition.clone()]))
         .unwrap();
     worker
         .refresh_snapshot(&scope(Duration::from_secs(1)).unwrap())
@@ -1347,7 +1456,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     );
     worker
         .snapshots
-        .publish(publication(&config, 1, vec![original.clone()]))
+        .apply(publication(&config, 1, vec![original.clone()]))
         .unwrap();
     worker.refresh_snapshot(&current_scope).unwrap();
     assert_eq!(worker.caches, vec![original.clone()]);
@@ -1386,13 +1495,13 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     // Skip the empty publication: the next refresh must still retire the old UID.
     worker
         .snapshots
-        .publish(publication(&config, 2, vec![]))
+        .apply(publication(&config, 2, vec![]))
         .unwrap();
     let mut replacement = original.clone();
     replacement.id = racer_control_wire::CacheId("55555555-5555-4555-8555-555555555555".into());
     worker
         .snapshots
-        .publish(publication(&config, 3, vec![replacement.clone()]))
+        .apply(publication(&config, 3, vec![replacement.clone()]))
         .unwrap();
     assert_eq!(retained_plaintext.strong_count(), 1);
     assert_eq!(retained_ciphertext.strong_count(), 1);
@@ -1432,7 +1541,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     }
     first
         .snapshots
-        .publish(publication(&config, 1, vec![definition()]))
+        .apply(publication(&config, 1, vec![definition()]))
         .unwrap();
     first
         .keys
@@ -1457,6 +1566,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     first.memory.publish(late0.clone()).unwrap();
     second.memory.publish(late1.clone()).unwrap();
     let adapter = CachePublication {
+        proposal: RefCell::new(None),
         node: node.clone(),
         listeners: first.prepared_listeners.clone(),
         capacity: config.limits.metadata_entries.get(),
@@ -1496,7 +1606,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     let mut invalid = publication(&config, 2, vec![]);
     invalid.members[0].peer_endpoint = "127.0.0.1:7444".into();
     assert!(matches!(
-        first.snapshots.publish_staged(invalid, Some(rejected)),
+        first.snapshots.apply_staged(invalid, Some(rejected)),
         Err(Error::IncompatibleMembership)
     ));
     assert_eq!(
@@ -1510,7 +1620,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     }
     first
         .snapshots
-        .publish_staged(
+        .apply_staged(
             publication(&config, 2, vec![]),
             Some(adapter.stage(&[]).unwrap()),
         )
@@ -1644,8 +1754,174 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
     assert!(fixture.hold_long_poll.load(Ordering::Acquire));
     assert_eq!(fixture.long_polls.load(Ordering::Acquire), 1);
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 2);
-    assert!(node.cache_cut.lock().unwrap().committed);
+    assert!(node.cache_rollout.pending(&WorkerId(0)).unwrap().is_none());
+    assert!(node.cache_rollout.pending(&WorkerId(1)).unwrap().is_none());
     fixture.hold_long_poll.store(false, Ordering::Release);
+}
+
+/// A held renewal cannot stop acceptance of an already received cache removal.
+#[test]
+fn cache_removal_installs_while_renewal_and_next_publication_poll_are_held() {
+    let mut fixture = ControlFixture::new();
+    let (config, node) = fixture.bootstrap_node(1, Duration::from_secs(15));
+    let definition = definition();
+    *fixture.publication.lock().unwrap() = Some(publication(&config, 1, vec![definition.clone()]));
+    fixture
+        .certificate_age
+        .store(16 * 3600 + 60, Ordering::Release);
+    let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
+    Rc::get_mut(&mut worker.clients)
+        .unwrap()
+        .set_root(fixture.directory.join("sockets"));
+    drive(
+        &runtime,
+        &mut engine,
+        worker.start(&scope(Duration::from_secs(15)).unwrap()),
+    )
+    .unwrap();
+    worker.control_task.take();
+    let control = worker.control.clone().unwrap();
+    assert!(control.identity().unwrap().renewal_due());
+    assert!(control.identity().unwrap().valid_now());
+    let accepted = fixture.enrollments.load(Ordering::Acquire);
+    let baseline_polls = fixture.long_polls.load(Ordering::Acquire);
+    fixture.hold_renewal.store(true, Ordering::Release);
+    fixture.hold_long_poll.store(true, Ordering::Release);
+    *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![]));
+    let turn_scope = scope(Duration::from_secs(15)).unwrap();
+    let mut progress = control.progress(&turn_scope);
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    loop {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        engine.poll_budgeted(&mut cx, 64).unwrap();
+        runtime.crypto.poll_budgeted(64).unwrap();
+        worker.poll_cache_preparation(&mut cx).unwrap();
+        assert!(progress.as_mut().poll(&mut cx).is_pending());
+        if worker.snapshots.cursor().unwrap() == Some(wire::PublicationSequence(2))
+            && fixture.held_renewals.load(Ordering::Acquire) != 0
+            && fixture.long_polls.load(Ordering::Acquire) > baseline_polls
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "cache removal stalled behind held renewal"
+        );
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    assert!(worker.snapshots.current().unwrap().caches.is_empty());
+    // Atomic commit retires admission; the listener worker performs pathname
+    // cleanup on its next poll, still independently of the held renewal.
+    worker.clients.poll_budgeted(&mut cx, 64).unwrap();
+    assert!(
+        !fixture
+            .directory
+            .join("sockets")
+            .join(&definition.name)
+            .join("client/socket")
+            .exists(),
+        "removal must close listener admission before renewal completes"
+    );
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), accepted);
+    let held_polls = fixture.long_polls.load(Ordering::Acquire);
+    fixture.hold_renewal.store(false, Ordering::Release);
+    while fixture.enrollments.load(Ordering::Acquire) == accepted {
+        assert!(progress.as_mut().poll(&mut cx).is_pending());
+        runtime.reactor.poll_budgeted(64).unwrap();
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+        assert!(Instant::now() < until);
+    }
+    // Renewal completion must not cancel/recreate the active publication long poll.
+    for _ in 0..16 {
+        assert!(progress.as_mut().poll(&mut cx).is_pending());
+        runtime.reactor.poll_budgeted(64).unwrap();
+    }
+    assert_eq!(fixture.long_polls.load(Ordering::Acquire), held_polls);
+    fixture.hold_long_poll.store(false, Ordering::Release);
+    drive(&runtime, &mut engine, progress).unwrap();
+    stop_worker(&mut worker, &runtime, &mut engine);
+}
+
+/// Local barrier completion must progress during remote Retry-After and held renewal.
+#[test]
+fn cache_removal_ack_installs_during_retry_after_and_held_renewal() {
+    let mut fixture = ControlFixture::new();
+    let (config, node) = fixture.bootstrap_node(1, Duration::from_secs(15));
+    let definition = definition();
+    *fixture.publication.lock().unwrap() = Some(publication(&config, 1, vec![definition.clone()]));
+    fixture
+        .certificate_age
+        .store(16 * 3600 + 60, Ordering::Release);
+    let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
+    Rc::get_mut(&mut worker.clients)
+        .unwrap()
+        .set_root(fixture.directory.join("sockets"));
+    drive(
+        &runtime,
+        &mut engine,
+        worker.start(&scope(Duration::from_secs(15)).unwrap()),
+    )
+    .unwrap();
+    worker.control_task.take();
+    let control = worker.control.clone().unwrap();
+    let accepted = fixture.enrollments.load(Ordering::Acquire);
+    fixture.hold_renewal.store(true, Ordering::Release);
+    fixture.publication_retry_after.store(60, Ordering::Release);
+    *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![]));
+    let turn_scope = scope(Duration::from_secs(15)).unwrap();
+    let mut progress = control.progress(&turn_scope);
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut failed_at = None;
+    loop {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        engine.poll_budgeted(&mut cx, 64).unwrap();
+        runtime.crypto.poll_budgeted(64).unwrap();
+        assert!(progress.as_mut().poll(&mut cx).is_pending());
+        if control.membership_diagnostic().unwrap().pending_sequence == 2 {
+            fixture.poll_status.store(503, Ordering::Release);
+        }
+        if fixture.publication_failures.load(Ordering::Acquire) != 0 {
+            let since = failed_at.get_or_insert_with(Instant::now);
+            // Release only local preparation after the remote backoff is active.
+            if since.elapsed() >= Duration::from_millis(100) {
+                worker.poll_cache_preparation(&mut cx).unwrap();
+            } else {
+                assert_eq!(
+                    worker.snapshots.cursor().unwrap(),
+                    Some(wire::PublicationSequence(1))
+                );
+            }
+        }
+        if worker.snapshots.cursor().unwrap() == Some(wire::PublicationSequence(2)) {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "local barrier stalled behind remote Retry-After"
+        );
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    assert_eq!(
+        fixture.publication_failures.load(Ordering::Acquire),
+        1,
+        "Retry-After must still prevent another fetch"
+    );
+    assert!(fixture.held_renewals.load(Ordering::Acquire) > 0);
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), accepted);
+    worker.clients.poll_budgeted(&mut cx, 64).unwrap();
+    assert!(
+        !fixture
+            .directory
+            .join("sockets")
+            .join(&definition.name)
+            .join("client/socket")
+            .exists()
+    );
+    drop(progress);
+    fixture.hold_renewal.store(false, Ordering::Release);
+    stop_worker(&mut worker, &runtime, &mut engine);
 }
 
 #[test]
@@ -1661,10 +1937,17 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
         worker: &mut WorkerApplication,
         runtime: &WorkerRuntime,
         engine: &mut PageCryptoEngine,
+        clock: Option<&SimulationClock>,
     ) {
         let done = Rc::new(std::cell::Cell::new(false));
         let completed = done.clone();
         let control = worker.control.clone().unwrap();
+        if let Some(clock) = clock
+            && control.identity().is_some_and(|i| i.valid_now())
+            && let Some(next) = control.next_attempt()
+        {
+            clock.advance(next.saturating_duration_since(now()));
+        }
         let request_scope = scope(Duration::from_secs(40)).unwrap();
         assert!(worker.control_task.is_none());
         worker.control_task = Some(Box::pin(async move {
@@ -1709,7 +1992,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     assert!(node.observations.health.ready());
     // Retained-publication startup completes staging without another HTTP turn.
     // Establish a successful control turn before measuring renewal-only backoff.
-    turn(&mut worker, &runtime, &mut engine);
+    turn(&mut worker, &runtime, &mut engine, None);
     let control = worker.control.clone().unwrap();
     let old = control.identity().unwrap();
     assert!(old.renewal_due() && old.valid_now());
@@ -1722,7 +2005,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     let environment = clock.environment(0);
     let _clock = environment.enter();
     fixture.bootstrap_status.store(503, Ordering::Release);
-    turn(&mut worker, &runtime, &mut engine);
+    turn(&mut worker, &runtime, &mut engine, Some(&clock));
     assert_eq!(control.renewal_error(), Some(Error::Unavailable));
     assert_eq!(
         fixture.bootstrap_requests.lock().unwrap().len(),
@@ -1732,10 +2015,11 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     let pending = std::fs::read(config.identity_directory.join("pending.json")).unwrap();
 
     // Even many successful 204 polls must neither reset renewal backoff nor
-    // replace the accepted certificate. Check both sides of the 1-second retry.
-    clock.advance(Duration::from_millis(999));
+    // replace the accepted certificate. Each successful feed turn now has a real
+    // 10ms tick; leave room for those ticks before the independent issuance retry.
+    clock.advance(Duration::from_millis(500));
     for _ in 0..16 {
-        turn(&mut worker, &runtime, &mut engine);
+        turn(&mut worker, &runtime, &mut engine, Some(&clock));
         assert!(node.observations.health.ready());
         assert!(old.valid_now());
         assert!(Arc::ptr_eq(
@@ -1753,8 +2037,13 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
         baseline + 1
     );
     assert_eq!(fixture.polls.load(Ordering::Acquire), polls + 17);
-    clock.advance(Duration::from_millis(1));
-    turn(&mut worker, &runtime, &mut engine);
+    clock.advance(
+        control
+            .renewal_attempt()
+            .unwrap()
+            .saturating_duration_since(now()),
+    );
+    turn(&mut worker, &runtime, &mut engine, Some(&clock));
     assert_eq!(
         fixture.bootstrap_requests.lock().unwrap().len(),
         baseline + 2
@@ -1763,8 +2052,10 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     // This seed selects a second jittered delay greater than one second.
     // Successful polls must retain the failure count so retries grow rather
     // than restarting at the first-failure delay on every turn.
-    clock.advance(Duration::from_secs(1));
-    turn(&mut worker, &runtime, &mut engine);
+    let retry = control.renewal_attempt().unwrap();
+    assert!(retry.duration_since(now()) > Duration::from_secs(1));
+    clock.advance(Duration::from_millis(500));
+    turn(&mut worker, &runtime, &mut engine, Some(&clock));
     assert_eq!(
         fixture.bootstrap_requests.lock().unwrap().len(),
         baseline + 2
@@ -1797,27 +2088,24 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
         drive(
             &runtime,
             &mut engine,
-            control.poll(
-                wire::SnapshotRequest { after: None },
-                &scope(Duration::from_secs(10)).unwrap()
-            )
+            control.progress(&scope(Duration::from_secs(10)).unwrap())
         ),
-        Err(Error::Unauthorized)
+        Err(Error::Unavailable)
     ));
-    turn(&mut worker, &runtime, &mut engine);
+    turn(&mut worker, &runtime, &mut engine, Some(&clock));
     assert_eq!(
         fixture.bootstrap_requests.lock().unwrap().len(),
         baseline + 3
     );
     assert_eq!(fixture.polls.load(Ordering::Acquire), polls_at_expiry);
     assert_eq!(control.renewal_error(), Some(Error::Unavailable));
-    let retry = control.next_attempt().unwrap();
+    let retry = control.renewal_attempt().unwrap();
     assert!(
         (Duration::from_secs(1)..=Duration::from_secs(30)).contains(&retry.duration_since(now()))
     );
     clock.advance(retry.duration_since(now()) - Duration::from_millis(1));
     for _ in 0..16 {
-        turn(&mut worker, &runtime, &mut engine);
+        turn(&mut worker, &runtime, &mut engine, Some(&clock));
         assert!(!node.observations.health.ready());
     }
     assert_eq!(
@@ -1833,7 +2121,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     fixture.certificate_age.store(1, Ordering::Release);
     fixture.bootstrap_status.store(200, Ordering::Release);
     clock.advance(Duration::from_millis(1));
-    turn(&mut worker, &runtime, &mut engine);
+    turn(&mut worker, &runtime, &mut engine, Some(&clock));
     let fresh = control.identity().unwrap();
     assert_eq!(fresh.node(), old.node());
     assert!(fresh.valid_now() && !fresh.renewal_due());
@@ -1844,7 +2132,11 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
         fresh.certificate_chain()
     );
     assert_eq!(control.renewal_error(), None);
-    assert_eq!(control.next_attempt(), Some(now()));
+    assert!(control.renewal_attempt().is_none());
+    assert_eq!(
+        control.next_attempt(),
+        Some(now() + Duration::from_millis(10))
+    );
     assert!(node.observations.health.ready());
     assert!(!config.identity_directory.join("pending.json").exists());
     assert_ne!(
@@ -1862,7 +2154,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     }
     assert_ne!(requests[baseline].csr_der, requests[baseline - 1].csr_der);
     drop(requests);
-    turn(&mut worker, &runtime, &mut engine);
+    turn(&mut worker, &runtime, &mut engine, Some(&clock));
     assert_eq!(
         fixture.bootstrap_requests.lock().unwrap().len(),
         baseline + 4
@@ -1958,7 +2250,12 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     *fixture.publication.lock().unwrap() = Some(next);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let until = Instant::now() + Duration::from_secs(10);
-    while node.cache_cut.lock().unwrap().definitions.len() != 1 {
+    while node
+        .cache_rollout
+        .pending(&WorkerId(0))
+        .unwrap()
+        .is_none_or(|p| p.value.len() != 1)
+    {
         runtime.reactor.poll_budgeted(64).unwrap();
         worker.poll_control(&mut cx).unwrap();
         runtime.reactor.wait(Duration::from_millis(1)).unwrap();
@@ -2529,7 +2826,16 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
         &mut engine,
         Box::pin(std::future::poll_fn(|cx| {
             assert!(topology.as_mut().poll(cx).is_pending());
-            rotation.as_mut().poll(cx)
+            if let Poll::Ready(result) = rotation.as_mut().poll(cx) {
+                result?;
+                rotation = control.keyring_progress(&key_scope);
+            }
+            if worker.keys.active(&cache, KeyPurpose::Page)?.id() != old_id {
+                Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
         })),
     )
     .unwrap();
@@ -2559,6 +2865,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     drop(topology);
     fixture.hold_long_poll.store(false, Ordering::Release);
     let accepted = worker.keys.active(&cache, KeyPurpose::Page).unwrap().id();
+    drop(rotation);
     for response in [
         (200, b"{}".to_vec()),
         (200, vec![b' '; wire::MAX_BUNDLE_BYTES + 1]),
@@ -2595,12 +2902,26 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
             crate::test_support::security::rotation_bundle(3, bundle.peer_trust_roots.clone());
         bundle.cluster = config.cluster.clone();
     }
+    let recovery_scope = scope(Duration::from_secs(40)).unwrap();
+    let mut recovery = control.keyring_progress(&recovery_scope);
     drive(
         &runtime,
         &mut engine,
-        control.keyring_progress(&scope(Duration::from_secs(40)).unwrap()),
+        Box::pin(std::future::poll_fn(|cx| {
+            if let Poll::Ready(result) = recovery.as_mut().poll(cx) {
+                result?;
+                recovery = control.keyring_progress(&recovery_scope);
+            }
+            if worker.keys.active(&cache, KeyPurpose::Page)?.id() != accepted {
+                Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })),
     )
     .unwrap();
+    drop(recovery);
     assert_eq!(control.projection_error(), None);
     assert_eq!(
         fixture.keyring_tokens.lock().unwrap().last().unwrap(),
@@ -2898,10 +3219,10 @@ fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
         let mut inbound = None;
         let until = Instant::now() + Duration::from_secs(3);
         while outbound.is_none() || inbound.is_none() {
-            if outbound.is_none() {
-                if let Poll::Ready(result) = connecting.as_mut().poll(&mut cx) {
-                    outbound = Some(result.unwrap());
-                }
+            if outbound.is_none()
+                && let Poll::Ready(result) = connecting.as_mut().poll(&mut cx)
+            {
+                outbound = Some(result.unwrap());
             }
             assert!(serving.as_mut().poll(&mut cx).is_pending());
             runtime.reactor.poll_budgeted(64).unwrap();
@@ -3612,6 +3933,7 @@ mod cache_publication {
         let (mut worker, _, _) = crate::app::tests::local_worker(&config, &node, 0);
         let (mut second, _, _) = crate::app::tests::local_worker(&config, &node, 1);
         let adapter = CachePublication {
+            proposal: RefCell::new(None),
             node: node.clone(),
             listeners: worker.prepared_listeners.clone(),
             capacity: config.limits.metadata_entries.get(),
@@ -3625,9 +3947,14 @@ mod cache_publication {
         drop(adapter.stage(&[]).unwrap());
         assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
         worker.poll_cache_preparation(&mut cx).unwrap();
+        second.poll_cache_preparation(&mut cx).unwrap();
         for _ in 0..2 {
             adapter.stage(&[]).unwrap().commit();
-            assert!(node.cache_cut.lock().unwrap().committed);
+            assert!(
+                node.cache_rollout
+                    .committed(adapter.proposal.borrow().as_ref().unwrap().0)
+                    .unwrap()
+            );
         }
     }
     #[test]
@@ -3635,32 +3962,33 @@ mod cache_publication {
         let config = crate::test_support::cluster::config(false);
         let node = Arc::new(NodeState::default());
         let definition = crate::app::tests::definition();
-        let store = SnapshotStore::new(config.cluster.clone(), node.publications.clone(), 16);
+        let store = PublicationTarget::new(config.cluster.clone(), node.publications.clone());
         store
-            .publish(crate::app::tests::publication(
+            .apply(crate::app::tests::publication(
                 &config,
                 1,
                 vec![definition.clone()],
             ))
             .unwrap();
         let mut adapter = CachePublication {
+            proposal: RefCell::new(None),
             node: node.clone(),
             listeners: Rc::new(RefCell::new(None)),
             capacity: 0,
         };
         assert!(matches!(
-            adapter.stage(&[definition.clone()]),
+            adapter.stage(std::slice::from_ref(&definition)),
             Err(Error::Overloaded)
         ));
-        assert_eq!(node.cache_cut.lock().unwrap().generation, 0);
+        assert!(adapter.proposal.borrow().is_none());
         adapter.capacity = 16;
         assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
-        let previous = node.cache_cut.lock().unwrap().generation;
+        let previous = adapter.proposal.borrow().as_ref().unwrap().0;
         assert!(matches!(
             adapter.stage(&[definition]),
             Err(Error::Unavailable)
         ));
-        assert_eq!(node.cache_cut.lock().unwrap().generation, previous + 1);
+        assert_eq!(adapter.proposal.borrow().as_ref().unwrap().0, previous + 1);
         assert_eq!(
             store.cursor().unwrap(),
             Some(racer_control_wire::PublicationSequence(1))

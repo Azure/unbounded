@@ -378,7 +378,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::PublishedState::for_membership(membership),
+            crate::test_support::published_membership(membership),
         )
         .unwrap(),
     );
@@ -411,7 +411,9 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     let local = request(&admission, 1);
     let scope = local.origin.scope().clone();
     let (mut forged, _) = sender.sign_request(local).unwrap();
-    Arc::get_mut(&mut forged.authentication.original).map(|head| head.signature[0] ^= 1);
+    if let Some(head) = Arc::get_mut(&mut forged.authentication.original) {
+        head.signature[0] ^= 1;
+    }
     // The binding also retains the original Arc, so mutate the logical fields.
     forged.request.route.destination = NodeId(B.into());
     assert!(futures::executor::block_on(server.dispatch(forged, &scope)).is_err());
@@ -458,7 +460,7 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::PublishedState::for_membership(membership),
+            crate::test_support::published_membership(membership),
         )
         .unwrap(),
     );
@@ -555,7 +557,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(B.into()),
-                crate::control::PublishedState::for_membership(membership.clone()),
+                crate::test_support::published_membership(membership.clone()),
             )
             .unwrap(),
         );
@@ -804,7 +806,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         Rc::new(
             PeerNetwork::new(
                 NodeId(A.into()),
-                crate::control::PublishedState::for_membership(members.clone()),
+                crate::test_support::published_membership(members.clone()),
             )
             .unwrap(),
         ),
@@ -976,14 +978,14 @@ fn signed_tcp_case(case: &str) {
     let source_network = Rc::new(
         PeerNetwork::new(
             NodeId(A.into()),
-            crate::control::PublishedState::for_membership(membership.clone()),
+            crate::test_support::published_membership(membership.clone()),
         )
         .unwrap(),
     );
     let destination_network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::PublishedState::for_membership(membership.clone()),
+            crate::test_support::published_membership(membership.clone()),
         )
         .unwrap(),
     );
@@ -1156,7 +1158,13 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let outbound = NoOutbound::new(
             signers[2].clone(),
             Rc::new(
-                PeerNetwork::new(signers[2].node().clone(), Arc::new(Default::default())).unwrap(),
+                PeerNetwork::new(
+                    signers[2].node().clone(),
+                    Arc::new(controlplane::Published::new(
+                        crate::control::Snapshot::retention(2),
+                    )),
+                )
+                .unwrap(),
             ),
         );
         let relay = Rc::new(Relay::new(
@@ -1165,7 +1173,13 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             outbound.requester.clone(),
             admission.clone(),
             Rc::new(
-                PeerNetwork::new(signers[2].node().clone(), Arc::new(Default::default())).unwrap(),
+                PeerNetwork::new(
+                    signers[2].node().clone(),
+                    Arc::new(controlplane::Published::new(
+                        crate::control::Snapshot::retention(2),
+                    )),
+                )
+                .unwrap(),
             ),
         ));
         let mut server = server::PeerServer::for_test(
@@ -1529,7 +1543,9 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     let local = membership.members()[0].node.clone();
     let network = PeerNetwork::new(
         local.clone(),
-        Arc::new(crate::control::PublishedState::default()),
+        Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        )),
     )
     .unwrap();
     assert!(matches!(
@@ -1651,7 +1667,7 @@ mod established_sessions {
             let network = Rc::new(
                 PeerNetwork::new(
                     NodeId(C.into()),
-                    crate::control::PublishedState::for_membership(membership),
+                    crate::test_support::published_membership(membership),
                 )
                 .unwrap(),
             );

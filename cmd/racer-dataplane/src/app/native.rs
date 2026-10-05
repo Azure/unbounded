@@ -133,16 +133,16 @@ impl WorkerApplication {
             return Ok(());
         }
         self.refresh_inventory()?;
-        if let Some(task) = self.native_task.as_mut() {
-            if let Poll::Ready(result) = task.as_mut().poll(cx) {
-                self.native_task = None;
-                self.native_retry = uring_runtime::environment::now() + Duration::from_secs(1);
-                match result {
-                    Ok(actual) => self.actual_rails = actual,
-                    Err(_) => {
-                        if let Some(devices) = &self.devices {
-                            devices.close();
-                        }
+        if let Some(task) = self.native_task.as_mut()
+            && let Poll::Ready(result) = task.as_mut().poll(cx)
+        {
+            self.native_task = None;
+            self.native_retry = uring_runtime::environment::now() + Duration::from_secs(1);
+            match result {
+                Ok(actual) => self.actual_rails = actual,
+                Err(_) => {
+                    if let Some(devices) = &self.devices {
+                        devices.close();
                     }
                 }
             }
@@ -250,7 +250,7 @@ mod tests {
             }],
             caches: vec![],
         };
-        worker.snapshots.publish(publication.clone()).unwrap();
+        worker.snapshots.apply(publication.clone()).unwrap();
         app.node.inventory.update(vec![]).unwrap();
         worker.poll_native(&mut cx).unwrap();
         assert!(worker.native_publication().unwrap().is_empty());
@@ -299,7 +299,7 @@ mod tests {
         publication.sequence.0 += 1;
         publication.membership_version.0 += 1;
         publication.members[0].rails[0].gid = Some([2; 16]);
-        worker.snapshots.publish(publication).unwrap();
+        worker.snapshots.apply(publication).unwrap();
         assert!(worker.native_publication().unwrap().is_empty());
         drop(service);
         assert_eq!(sim.live_resources(), 0);
@@ -822,7 +822,7 @@ mod tests {
         worker.discovered_nics = app.discovered_nics.clone();
         worker
             .snapshots
-            .publish(Publication {
+            .apply(Publication {
                 schema_version: 1,
                 cluster: app.config.cluster.clone(),
                 sequence: PublicationSequence(1),
@@ -894,7 +894,7 @@ mod tests {
         );
         worker
             .snapshots
-            .publish(Publication {
+            .apply(Publication {
                 schema_version: 1,
                 cluster: app.config.cluster.clone(),
                 sequence: PublicationSequence(2),
@@ -962,7 +962,7 @@ mod tests {
         let (mut worker, _engine) = worker(&app, true, true);
         worker
             .snapshots
-            .publish(Publication {
+            .apply(Publication {
                 schema_version: 1,
                 cluster: app.config.cluster.clone(),
                 sequence: PublicationSequence(2),

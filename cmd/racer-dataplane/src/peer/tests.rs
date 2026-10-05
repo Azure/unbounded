@@ -704,7 +704,7 @@ mod destination_disconnect {
             let network = Rc::new(
                 PeerNetwork::new(
                     NodeId(C.into()),
-                    crate::control::PublishedState::for_membership(membership.clone()),
+                    crate::test_support::published_membership(membership.clone()),
                 )
                 .unwrap(),
             );
@@ -1444,7 +1444,7 @@ mod requester_safety {
         let network = Rc::new(
             crate::peer::PeerNetwork::new(
                 local.clone(),
-                crate::control::PublishedState::for_membership(members.clone()),
+                crate::test_support::published_membership(members.clone()),
             )
             .unwrap(),
         );
@@ -1551,7 +1551,7 @@ mod requester_safety {
             Rc::new(
                 crate::peer::PeerNetwork::new(
                     signers[0].node().clone(),
-                    crate::control::PublishedState::for_membership(membership.clone()),
+                    crate::test_support::published_membership(membership.clone()),
                 )
                 .unwrap(),
             ),
@@ -1862,7 +1862,7 @@ mod subscriptions {
             let network = Rc::new(
                 PeerNetwork::new(
                     NodeId(C.into()),
-                    crate::control::PublishedState::for_membership(membership),
+                    crate::test_support::published_membership(membership),
                 )
                 .unwrap(),
             );
@@ -2035,7 +2035,7 @@ mod subscriptions {
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(C.into()),
-                crate::control::PublishedState::for_membership(membership),
+                crate::test_support::published_membership(membership),
             )
             .unwrap(),
         );
@@ -2385,7 +2385,7 @@ mod subscriptions {
             Rc::new(
                 PeerNetwork::new(
                     NodeId(node.into()),
-                    crate::control::PublishedState::for_membership(membership.clone()),
+                    crate::test_support::published_membership(membership.clone()),
                 )
                 .unwrap(),
             )
@@ -2777,7 +2777,7 @@ mod timing {
             Rc::new(
                 PeerNetwork::new(
                     NodeId(A.into()),
-                    crate::control::PublishedState::for_membership(members.clone()),
+                    crate::test_support::published_membership(members.clone()),
                 )
                 .unwrap(),
             ),

@@ -2,10 +2,10 @@
 //! immutable identity leases, and completion-retained page crypto work.
 use racer_control_wire as wire;
 use racer_control_wire::*;
+use racer_crypto::identity::BundleInstaller;
 use racer_dataplane::admission::AdmissionPolicy;
 use racer_dataplane::admission::ResourceClass;
 use racer_dataplane::config::Config;
-use racer_dataplane::control::BundleInstaller;
 use racer_dataplane::error::Error;
 use racer_dataplane::memory::BufferPool;
 use racer_dataplane::model::CacheKey;
@@ -162,7 +162,9 @@ fn install_decoded(
     bundle: &KeyringBundle,
 ) -> racer_dataplane::error::Result<(BundleGeneration, Vec<Vec<u8>>)> {
     let encoded = zeroize::Zeroizing::new(wire::encode_bundle(bundle).unwrap());
-    installer.install(wire::decode_bundle(&encoded).unwrap())
+    installer
+        .install(wire::decode_bundle(&encoded).unwrap())
+        .map_err(Into::into)
 }
 
 #[test]

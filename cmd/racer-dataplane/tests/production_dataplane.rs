@@ -1,6 +1,7 @@
 //! Single-node production graph validation. Only control publication, origin data,
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
 use base64::Engine;
+use controlplane::Published;
 use racer_control_wire as wire;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::Publication;
@@ -12,8 +13,8 @@ use racer_dataplane::admission::ResourceClass;
 use racer_dataplane::client::RequestParser;
 use racer_dataplane::client::Responses;
 use racer_dataplane::config::Limits;
-use racer_dataplane::control::PublishedState;
-use racer_dataplane::control::SnapshotStore;
+use racer_dataplane::control::Snapshot;
+use racer_dataplane::control::publication::PublicationTarget;
 use racer_dataplane::error::Error;
 use racer_dataplane::error::Operation;
 use racer_dataplane::error::Result;
@@ -469,7 +470,7 @@ impl Rig {
         ));
         let buffers = BufferPool::new(admission.clone());
         let (keys, sender_keys) = fixture_keys();
-        let published = Arc::new(PublishedState::default());
+        let published = Arc::new(Published::new(Snapshot::retention(4)));
         let availability = Rc::new(racer_dataplane::control::Availability::new(
             published.clone(),
             keys.clone(),
@@ -485,12 +486,14 @@ impl Rig {
             buffers.clone(),
             availability,
         );
-        let snapshots = Rc::new(SnapshotStore::new(
+        let snapshots = Rc::new(PublicationTarget::new(
             ClusterId(CLUSTER.into()),
             published.clone(),
-            4,
         ));
-        let snapshot = snapshots.publish(fixture_publication()).unwrap();
+        let document = Arc::new(fixture_publication());
+        let snapshot =
+            controlplane::Target::prepare(snapshots.as_ref(), document.clone()).unwrap()().unwrap();
+        controlplane::Target::install(snapshots.as_ref(), &document, &snapshot).unwrap();
         let network = Rc::new(PeerNetwork::new(NodeId(NODE.into()), published.clone()).unwrap());
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), keys.clone()));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates));
@@ -518,11 +521,11 @@ impl Rig {
             Rc::new(Placement::new(64)),
             peers.clone(),
             credentials.clone(),
-            Arc::new(Default::default()),
+            published.clone(),
         ));
         let origin = Rc::new(
             OriginClient::new(
-                snapshots.clone(),
+                published.clone(),
                 http,
                 io.clone(),
                 admission.clone(),
@@ -587,7 +590,7 @@ impl Rig {
         ));
         let streams = Rc::new(RangeStreams::new(directory.clone(), delivery.clone(), 2));
         let coordinator = Rc::new(Coordinator::new(
-            snapshots,
+            published,
             metadata,
             fill,
             streams,
@@ -643,11 +646,11 @@ impl Rig {
         self.endpoint.borrow_mut().poll(&mut cx, 64).unwrap();
         self.flights.poll_with_context(&mut cx, 64).unwrap();
         let mut task = self.writer_task.borrow_mut();
-        if let Some(write) = task.as_mut() {
-            if let Poll::Ready(result) = write.as_mut().poll(&mut cx) {
-                result.expect("dirty persistence");
-                *task = None;
-            }
+        if let Some(write) = task.as_mut()
+            && let Poll::Ready(result) = write.as_mut().poll(&mut cx)
+        {
+            result.expect("dirty persistence");
+            *task = None;
         }
         if task.is_none() && self.writer.pending_count() > 0 {
             let writer = self.writer.clone();
@@ -767,6 +770,8 @@ struct Bootstrap {
     membership: std::sync::Arc<racer_dataplane::topology::Membership>,
 }
 
+/// Open fixture storage with independently supplied worker resources and limits.
+#[allow(clippy::too_many_arguments)] // Keep fixture composition explicit without an adapter type.
 fn open_fixture_storage(
     worker: WorkerId,
     path: PathBuf,
@@ -869,7 +874,7 @@ fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
 
 fn identities(bundle: &mut serde_json::Value, keys: &Keyring) -> Rc<Keyring> {
     let (ca, ca_key) = fixture_io::ca();
-    let roots = vec![ca.der().to_vec()];
+    let roots = [ca.der().to_vec()];
     bundle["peer_trust_roots"] =
         serde_json::json!([base64::engine::general_purpose::STANDARD.encode(&roots[0])]);
     let sender = Rc::new(Keyring::new(

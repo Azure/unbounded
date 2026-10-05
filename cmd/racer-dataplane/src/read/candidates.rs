@@ -91,7 +91,7 @@ pub struct CandidatePolicy {
     placement: Rc<Placement>,
     peers: Rc<Requester>,
     credentials: Rc<CredentialCrypto>,
-    published: Arc<crate::control::PublishedState>,
+    published: Arc<controlplane::Published<crate::control::Snapshot>>,
     ownership_refresh: RefCell<OwnershipRefresh>,
 }
 #[derive(Default)]
@@ -121,6 +121,8 @@ impl CandidatePolicy {
     }
     /// Only Fill's plaintext fixed-page path calls this. Direct HTTP destinations
     /// prove independent first hops. Drain both attempts before releasing escrow.
+    /// Hedge a page request while sharing its acquisition budget and validation.
+    #[allow(clippy::too_many_arguments)] // The hedge borrows the caller's distinct policy inputs.
     pub(crate) async fn hedge_page<'a>(
         &'a self,
         candidates: &Candidates,
@@ -280,6 +282,8 @@ impl CandidatePolicy {
     /// One admitted selection, one transfer grant. Routing chooses the primary of
     /// the oldest demanded page; the provider can choose any demanded page for
     /// which it is also primary. Backups are not speculatively contacted.
+    /// Subscribe to candidate copies under the caller's demand and route budget.
+    #[allow(clippy::too_many_arguments)] // Keep demand, validation, and budget inputs explicit.
     pub(crate) async fn subscribe(
         &self,
         version: crate::model::ObjectVersion,
@@ -366,7 +370,7 @@ impl CandidatePolicy {
         placement: Rc<Placement>,
         peers: Rc<Requester>,
         credentials: Rc<CredentialCrypto>,
-        published: Arc<crate::control::PublishedState>,
+        published: Arc<controlplane::Published<crate::control::Snapshot>>,
     ) -> Self {
         Self {
             hedge: None,
@@ -429,6 +433,7 @@ impl CandidatePolicy {
         self.published
             .current()
             .ok()
+            .flatten()
             .and_then(|snapshot| {
                 self.placement.cached(
                     snapshot.membership.clone(),
@@ -449,7 +454,7 @@ impl CandidatePolicy {
         &self,
         index: &crate::store::catalog::Index,
     ) -> Result<crate::topology::Maintenance> {
-        let snapshot = self.published.current()?;
+        let snapshot = self.published.current()?.ok_or(Error::Unavailable)?;
         let mut work = self.ownership_refresh.borrow_mut();
         if work.active.is_none() {
             // Continuous appends must not keep a pass chasing the moving tail
@@ -490,7 +495,11 @@ impl CandidatePolicy {
         page: &crate::model::PageId,
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
-        let membership = self.published.current().map(|s| s.membership.clone());
+        let membership = self
+            .published
+            .current()
+            .map_err(Error::from)
+            .and_then(|s| s.map(|s| s.membership.clone()).ok_or(Error::Unavailable));
         let object = page.version.object.clone();
         let number = page.number;
         Box::pin(async move {
@@ -550,6 +559,8 @@ impl CandidatePolicy {
         )
     }
 
+    /// Continue candidate resolution using the completed hedge's evidence.
+    #[allow(clippy::too_many_arguments)] // Preserve the shared budget and continuation boundary.
     pub(crate) fn resolve_after_hedge<'a>(
         &'a self,
         candidates: Candidates,
@@ -572,6 +583,8 @@ impl CandidatePolicy {
         )
     }
 
+    /// Resolve candidates within one membership epoch.
+    #[allow(clippy::too_many_arguments)] // Forward explicit acquisition inputs without repackaging.
     fn resolve_epoch<'a, T: 'a>(
         &'a self,
         candidates: Candidates,
@@ -627,6 +640,8 @@ impl CandidatePolicy {
         })
     }
 
+    /// Resolve one membership epoch while recording candidate evidence.
+    #[allow(clippy::too_many_arguments)] // Keep the borrowed trace separate from acquisition state.
     fn resolve_epoch_traced<'a, 't, T: 'a>(
         &'a self,
         candidates: Candidates,
@@ -827,7 +842,7 @@ impl CandidatePolicy {
                 }
             }
             check_budget(scope, budget)?;
-            if rank.is_some() {
+            if let Some(rank) = rank {
                 Ok(CandidateResolution::Origin(OriginAuthority {
                     diagnostic: trail.clone(),
                     membership: candidates.membership,
@@ -835,7 +850,7 @@ impl CandidatePolicy {
                     object: object.clone(),
                     page,
                     predecessor_evidence: evidence,
-                    rank: rank.expect("candidate checked"),
+                    rank,
                 }))
             } else if saw_version && !saw_transient {
                 Err(Error::VersionUnavailable)
@@ -964,13 +979,20 @@ impl CandidatePolicy {
         if retried {
             return Err(Error::IncompatibleMembership);
         }
-        let latest = self.published.current()?.membership.clone();
+        let latest = self
+            .published
+            .current()?
+            .ok_or(Error::Unavailable)?
+            .membership
+            .clone();
         if latest.version.0 <= previous.membership.version.0 {
             return Err(Error::IncompatibleMembership);
         }
         self.candidates_scoped(latest, object, page, scope).await
     }
 
+    /// Request a peer copy using the accepted membership and remaining budget.
+    #[allow(clippy::too_many_arguments)] // Preserve explicit route and request authorization inputs.
     pub(super) async fn request(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
@@ -995,6 +1017,8 @@ impl CandidatePolicy {
         )
         .await
     }
+    /// Request a peer copy using the selected delivery mode.
+    #[allow(clippy::too_many_arguments)] // Forward route policy without introducing a parameter shim.
     async fn request_mode(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
@@ -1021,6 +1045,8 @@ impl CandidatePolicy {
         )
         .await
     }
+    /// Request a peer copy and record its route evidence when tracing is enabled.
+    #[allow(clippy::too_many_arguments)] // Keep the optional borrowed trace separate from route state.
     async fn request_traced(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
@@ -1390,8 +1416,11 @@ fn check_budget(scope: &RequestScope, budget: &AcquisitionBudget) -> Result<()> 
     }
 }
 
+/// A validated peer copy or the evidence authorizing an origin request.
+#[allow(clippy::large_enum_variant)] // Keep origin evidence inline without allocating per resolution.
 pub enum CandidateResolution<T = VerifiedResponse> {
     Copy(T),
+
     Origin(OriginAuthority),
 }
 
@@ -1551,10 +1580,10 @@ fn classify(
             PeerOperation::Metadata {
                 object, selector, ..
             } if &metadata.version.object == object => {
-                if let MetadataSelector::Pinned(etag) = selector {
-                    if &metadata.version.etag != etag {
-                        return Err(Error::CorruptRecord);
-                    }
+                if let MetadataSelector::Pinned(etag) = selector
+                    && &metadata.version.etag != etag
+                {
+                    return Err(Error::CorruptRecord);
                 }
                 Ok(None)
             }
@@ -1772,7 +1801,9 @@ pub(super) mod tests {
                 Routes::request_direct,
             ),
             credentials,
-            Arc::new(Default::default()),
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(
@@ -1932,7 +1963,9 @@ pub(super) mod tests {
                 ProbePeer::request_direct,
             ),
             credentials,
-            Arc::new(Default::default()),
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
         );
         let candidates = policy
             .candidates(membership, &context.object, PageNumber(0))
@@ -1986,7 +2019,9 @@ pub(super) mod tests {
                 ProbePeer::request_direct,
             ),
             credentials.clone(),
-            Arc::new(Default::default()),
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
         let result = futures::executor::block_on(
@@ -2019,7 +2054,9 @@ pub(super) mod tests {
                 ProbePeer::request_direct,
             ),
             credentials,
-            Arc::new(Default::default()),
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(
@@ -2195,7 +2232,7 @@ pub(super) mod tests {
             node.clone(),
             std::sync::Arc::new(KeyEpochs::default()),
         ));
-        let policy = CandidatePolicy::new(
+        CandidatePolicy::new(
             node,
             Rc::new(Placement::new(8)),
             Requester::scripted(
@@ -2205,9 +2242,10 @@ pub(super) mod tests {
                 RecordedPeer::request_direct,
             ),
             Rc::new(CredentialCrypto::new(keys, admission)),
-            Arc::new(Default::default()),
-        );
-        policy
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
+        )
     }
     fn scope() -> RequestScope {
         RequestScope::new(
@@ -2218,7 +2256,6 @@ pub(super) mod tests {
     }
     #[test]
     fn ownership_refresh_recovers_idle_pages_and_rejects_obsolete_results() {
-        use crate::control::PublishedState;
         use crate::model::{PageId, VersionMetadata, WorkerId};
         use crate::store::catalog::{Index, IndexSnapshot, IndexedPage, RecordLocation};
         use crate::topology::tests::fixtures;
@@ -2266,7 +2303,7 @@ pub(super) mod tests {
         assert_eq!(index.snapshot_pages(0, 1).1.len(), 1);
         assert!(!policy.owns_current(&page));
         assert_eq!(policy.refresh_ownership(&index), Err(Error::Unavailable));
-        policy.published = PublishedState::for_membership(members.clone());
+        policy.published = crate::test_support::published_membership(members.clone());
         for _ in 0..3 {
             assert_eq!(
                 policy.refresh_ownership(&index),
@@ -2292,7 +2329,7 @@ pub(super) mod tests {
             )
             .unwrap(),
         );
-        policy.published = PublishedState::for_membership(next);
+        policy.published = crate::test_support::published_membership(next);
         assert!(!policy.owns_current(&page));
         for _ in 0..4 {
             policy.refresh_ownership(&index).unwrap();
@@ -2330,7 +2367,7 @@ pub(super) mod tests {
             error: Error::Unavailable,
         });
         let mut policy = policy(owner, peers);
-        policy.published = crate::control::PublishedState::for_membership(members);
+        policy.published = crate::test_support::published_membership(members);
         let cancelled = scope();
         cancelled.cancel().unwrap();
         assert_eq!(
@@ -2365,7 +2402,7 @@ pub(super) mod tests {
                 config.node.clone(),
                 Arc::new(KeyEpochs::default()),
             ));
-            let published = crate::control::PublishedState::for_membership(Arc::new(
+            let published = crate::test_support::published_membership(Arc::new(
                 crate::topology::Membership::validate(
                     racer_control_wire::MembershipVersion(1),
                     vec![crate::topology::Member {

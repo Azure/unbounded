@@ -635,6 +635,7 @@ mod faults {
             for node in &mut self.nodes {
                 node.workers[0].app.control = node.control.clone();
                 staged.push(CachePublication {
+                    proposal: RefCell::new(None),
                     node: node.workers[0].app.node.clone(),
                     listeners: node.workers[0].app.prepared_listeners.clone(),
                     capacity: node.config.limits.metadata_entries.get(),
@@ -659,7 +660,7 @@ mod faults {
                             node.workers[0]
                                 .app
                                 .snapshots
-                                .publish_staged(publication, Some(transition))
+                                .apply_staged(publication, Some(transition))
                                 .unwrap();
                             committed[index] = true;
                         }
@@ -2142,7 +2143,7 @@ struct Node {
     config: Config,
     workers: Vec<LocalWorker>,
     adapter: Adapter,
-    control: Option<Rc<ControlClient>>,
+    control: Option<Rc<Session>>,
 }
 struct LocalWorker {
     app: WorkerApplication,
@@ -2153,7 +2154,10 @@ impl Node {
     fn poll(&mut self, budget: usize) {
         for worker in &mut self.workers {
             if worker.app.control.is_some() {
+                // This harness supplies accepted publications and keys directly.
+                // Keep listener-owner semantics without starting either live feed.
                 worker.app.control_task = Some(Box::pin(std::future::pending()));
+                worker.app.keyring_task = Some(Box::pin(std::future::pending()));
             }
             let _local = worker
                 .app
@@ -2194,6 +2198,9 @@ impl Node {
 }
 
 struct Harness {
+    /// Shared publication retention selected before constructing any worker graph.
+    retained_snapshots: usize,
+
     seed: u64,
     rng: Random,
     sim: Simulation,
@@ -2239,6 +2246,7 @@ impl Harness {
         ];
         let ca = params.self_signed(&ca_key).unwrap();
         Self {
+            retained_snapshots: 64,
             seed,
             rng: Random(seed),
             sim,
@@ -2338,7 +2346,7 @@ impl Harness {
         config.limits.connections_per_neighbor = NonZeroUsize::new(2).unwrap();
         config.limits.range_window_pages = NonZeroUsize::new(2).unwrap();
         config.limits.metadata_entries = NonZeroUsize::new(128).unwrap();
-        config.limits.retained_snapshots = NonZeroUsize::new(64).unwrap();
+        config.limits.retained_snapshots = NonZeroUsize::new(self.retained_snapshots).unwrap();
         // Match one quarter of the production node budget, including peer envelope
         // staging. This fixture assembles workers directly, bypassing size_workers.
         config.limits.request_context_bytes = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
@@ -2358,7 +2366,12 @@ impl Harness {
             self.generation
         ));
         let worker_ids: Vec<_> = (0..worker_count).map(|i| WorkerId(i as u16)).collect();
-        let node = Arc::new(NodeState::new(worker_ids.clone(), 64).unwrap());
+        let mut state = NodeState::new(worker_ids.clone(), 64).unwrap();
+        // Retention belongs to the shared publication authority, not worker handles.
+        state.publications = Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(config.limits.retained_snapshots.get()),
+        ));
+        let node = Arc::new(state);
         if self.native {
             node.native
                 .prepare(worker_ids.into_iter(), &config.limits)
@@ -2396,7 +2409,7 @@ impl Harness {
         publication.membership_version = MembershipVersion(self.generation);
         publication.members = self.members().into_iter().map(Into::into).collect();
         publication.members.push(member(&config).into());
-        app.snapshots.publish(publication).unwrap();
+        app.snapshots.apply(publication).unwrap();
         let startup = scope(Duration::from_secs(30)).unwrap();
         let mut workers = vec![LocalWorker {
             app,
@@ -2544,7 +2557,7 @@ impl Harness {
                 crate::app::tests::publication(&node.config, self.generation, vec![definition]);
             p.membership_version = MembershipVersion(self.generation);
             p.members = members.iter().cloned().map(Into::into).collect();
-            node.workers[0].app.snapshots.publish(p).unwrap();
+            node.workers[0].app.snapshots.apply(p).unwrap();
         }
     }
     fn tick(&mut self) {
@@ -3024,22 +3037,15 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
     let environment = clock.racer_environment(0);
     let _time = environment.enter();
     let mut harness = Harness::new(505, sim, clock, false);
+    harness.retained_snapshots = 2;
     for object in 0..8 {
         harness.update(object);
     }
     for _ in 0..4 {
         harness.add(None);
     }
-    // Replace only the store's admission policy, retaining each real node's
-    // registry and all production peer/read dependencies.
-    for node in &mut harness.nodes {
-        let published = node.workers[0].app.node.publications.clone();
-        node.workers[0].app.snapshots = Rc::new(SnapshotStore::new(
-            node.config.cluster.clone(),
-            published,
-            2,
-        ));
-    }
+    // Retention is fixed when the node-wide authority is constructed. The shared
+    // policy already retains the delayed topology; never replace a worker's view.
     let old = harness.nodes[0].workers[0]
         .app
         .snapshots
@@ -3058,14 +3064,15 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
         );
         p.membership_version = MembershipVersion(harness.generation);
         p.members = members.iter().cloned().map(Into::into).collect();
-        node.workers[0].app.snapshots.publish(p).unwrap();
+        node.workers[0].app.snapshots.apply(p).unwrap();
         assert!(
             node.workers[0]
                 .app
                 .node
                 .publications
-                .membership(old)
-                .is_ok()
+                .resolve(old.0, uring_runtime::environment::now())
+                .unwrap()
+                .is_some()
         );
     }
     let client = harness.request_on(2, false, false, 0);
@@ -3277,11 +3284,11 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
                 worker.runtime.reactor.poll_budgeted(64).unwrap();
             }
             for operation in &mut operations {
-                if let Some(task) = operation {
-                    if let Poll::Ready(result) = task.as_mut().poll(&mut cx) {
-                        results.push(result);
-                        *operation = None;
-                    }
+                if let Some(task) = operation
+                    && let Poll::Ready(result) = task.as_mut().poll(&mut cx)
+                {
+                    results.push(result);
+                    *operation = None;
                 }
             }
             if turn == 16 && matches!(case, "empty" | "periodic" | "cancel-write") {
@@ -3585,14 +3592,13 @@ fn lifecycle(workers: &mut [LocalWorker], scope: &RequestScope, phase: Lifecycle
                 )
                 .unwrap();
             runtime.crypto.poll_budgeted(64).unwrap();
-            if let Some(op) = operation {
-                if let Poll::Ready(result) = op
+            if let Some(op) = operation
+                && let Poll::Ready(result) = op
                     .as_mut()
                     .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
-                {
-                    result.unwrap();
-                    *operation = None;
-                }
+            {
+                result.unwrap();
+                *operation = None;
             }
         }
         if pending.iter().all(|(_, _, op)| op.is_none()) {

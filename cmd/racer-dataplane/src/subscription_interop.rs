@@ -201,8 +201,9 @@ impl SubscriptionFixture {
         use client::RequestParser;
         use client::Responses;
         use client::listener::ClientListeners;
-        use control::PublishedState;
-        use control::SnapshotStore;
+        use control::Snapshot;
+        use control::publication::PublicationTarget;
+        use controlplane::Published;
         use http::Delivery;
         use http::new_pipe_pool;
         use memory::BufferPool;
@@ -239,9 +240,9 @@ impl SubscriptionFixture {
         reactor.init().unwrap();
         let buffers = BufferPool::new(admission.clone());
         let keys = Rc::new(interop_keys());
-        let published = Arc::new(PublishedState::default());
+        let published = Arc::new(Published::new(Snapshot::retention(2)));
         let availability = Rc::new(control::Availability::new(published.clone(), keys.clone()));
-        let snapshots = Rc::new(SnapshotStore::new(keys.cluster().clone(), published, 2));
+        let snapshots = Rc::new(PublicationTarget::new(keys.cluster().clone(), published));
         let (client_socket, origin_socket) =
             racer_control_wire::canonical_socket_paths("interop").unwrap();
         let cache = CacheDefinition {
@@ -251,7 +252,7 @@ impl SubscriptionFixture {
             origin_socket,
         };
         snapshots
-            .publish(Publication {
+            .apply(Publication {
                 schema_version: 1,
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
@@ -315,7 +316,7 @@ impl SubscriptionFixture {
             Rc::new(topology::Placement::new(16)),
             peers.clone(),
             credentials.clone(),
-            Arc::new(Default::default()),
+            Arc::new(Published::new(Snapshot::retention(2))),
         ));
         let origin = Rc::new(GeneratedOrigin(buffers.clone()));
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
@@ -350,7 +351,7 @@ impl SubscriptionFixture {
         ));
         let streams = Rc::new(RangeStreams::new(directory.clone(), delivery.clone(), 2));
         let coordinator = Rc::new(Coordinator::new(
-            snapshots,
+            snapshots.published.clone(),
             metadata,
             fill,
             streams,
@@ -378,7 +379,8 @@ impl SubscriptionFixture {
             Instant::now() + Duration::from_secs(180),
         )
         .unwrap();
-        futures::executor::block_on(clients.reconcile(&[cache.clone()], &scope)).unwrap();
+        futures::executor::block_on(clients.reconcile(std::slice::from_ref(&cache), &scope))
+            .unwrap();
         std::fs::write(root.join("ready"), b"ready").unwrap();
         let drivers = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         Self {

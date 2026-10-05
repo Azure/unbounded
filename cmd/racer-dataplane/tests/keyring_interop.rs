@@ -9,14 +9,14 @@ use racer_dataplane as dataplane;
 mod enrollment_io;
 use racer_control_wire as state;
 use racer_control_wire::ClusterId;
-use racer_dataplane::control::ControlEndpoint;
-use racer_dataplane::control::Enrollment;
+use racer_crypto::enrollment::Enrollment;
 use racer_dataplane::control::*;
 use racer_dataplane::model::RequestId;
 use racer_dataplane::runtime::RequestScope;
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
+use wire_codec::rest;
 
 #[test]
 #[ignore = "run RACER_RUST_INTEROP=1 go test ./internal/racer -run '^TestRustKeyringInterop$' -timeout=5m under the required external timeout"]
@@ -30,18 +30,27 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
         serde_json::from_slice(&config_bytes).unwrap();
     let token = zeroize::Zeroizing::new(config.remove("token").unwrap());
     let cluster = ClusterId(config["cluster"].clone());
+    let reactor = enrollment_io::reactor();
+    let io = Rc::new(ReactorControlIo::new(reactor.clone()));
+    let journal = racer_dataplane::control::rails::RailJournal::new(
+        std::sync::Arc::new(Default::default()),
+        directory.join("identity"),
+        io.clone(),
+    );
     let enrollment = Enrollment::new(
         cluster.clone(),
         directory.join("unused-token"),
         directory.join("identity"),
+        io.clone(),
     );
-    let transport = ControlTransport::new(ControlEndpoint {
+    let transport = rest::Transport::new(rest::Config {
         url: config["endpoint"].clone(),
         trust_bundle: directory.join("trust.pem"),
+        max_trust_bundle: wire::MAX_BUNDLE_BYTES,
+        max_error_body: wire::MAX_ENROLLMENT_BYTES,
     });
     assert!(config["endpoint"].starts_with("https://127.0.0.1:"));
-    let reactor = enrollment_io::reactor();
-    transport.attach_io(Rc::new(ReactorControlIo::new(reactor.clone())));
+    transport.attach_io(io);
     let scope =
         RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(90)).unwrap();
 
@@ -50,15 +59,18 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
         async {
             for credential in [None, Some("")] {
                 let response = transport
-                    .bootstrap(&scope)
+                    .connect(None, &scope)
                     .await
                     .unwrap()
                     .request(
-                        "GET",
-                        wire::KEYRING_PATH,
-                        credential,
-                        &[],
-                        wire::MAX_BUNDLE_BYTES,
+                        rest::Request {
+                            method: rest::Method::Get,
+                            path: wire::KEYRING_PATH,
+                            bearer: credential,
+                            header: None,
+                            body: &[],
+                            limit: wire::MAX_BUNDLE_BYTES,
+                        },
                         &scope,
                     )
                     .await
@@ -67,15 +79,18 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
                 wire::decode_error(response.body.as_slice()).unwrap();
             }
             let response = transport
-                .bootstrap(&scope)
+                .connect(None, &scope)
                 .await
                 .unwrap()
                 .request(
-                    "GET",
-                    wire::KEYRING_PATH,
-                    Some(&token),
-                    &[],
-                    wire::MAX_BUNDLE_BYTES,
+                    rest::Request {
+                        method: rest::Method::Get,
+                        path: wire::KEYRING_PATH,
+                        bearer: Some(&token),
+                        header: None,
+                        body: &[],
+                        limit: wire::MAX_BUNDLE_BYTES,
+                    },
                     &scope,
                 )
                 .await
@@ -89,26 +104,32 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
             enrollment
                 .set_peer_trust_roots(initial.peer_trust_roots.clone())
                 .unwrap();
-            enrollment.attach_reactor(reactor.clone());
-            let request = enrollment.prepare(&scope).await.unwrap();
+            let nics = journal.persist(&scope).await.unwrap();
+            let request = enrollment
+                .prepare(nics, std::num::NonZeroU32::new(4).unwrap(), &scope)
+                .await
+                .unwrap();
             let body = state::encode_enrollment_request(&request).unwrap();
             let response = transport
-                .bootstrap(&scope)
+                .connect(None, &scope)
                 .await
                 .unwrap()
                 .request(
-                    "POST",
-                    wire::BOOTSTRAP_PATH,
-                    Some(&token),
-                    &body,
-                    wire::MAX_ENROLLMENT_BYTES,
+                    rest::Request {
+                        method: rest::Method::Post,
+                        path: wire::BOOTSTRAP_PATH,
+                        bearer: Some(&token),
+                        header: None,
+                        body: &body,
+                        limit: wire::MAX_ENROLLMENT_BYTES,
+                    },
                     &scope,
                 )
                 .await
                 .unwrap();
             assert_eq!(response.status, 200);
             let identity = enrollment
-                .accept_response_async(
+                .accept_response(
                     wire::decode_enrollment_response(response.body.as_slice()).unwrap(),
                     &scope,
                 )
@@ -117,15 +138,25 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
             assert_eq!(identity.node().0, config["node"]);
 
             let response = transport
-                .authenticated(&identity, &scope)
+                .connect(
+                    Some(rest::Identity {
+                        certificate_chain: identity.certificate_chain(),
+                        private_key: identity.private_key_der(),
+                        expires: identity.expires_at(),
+                    }),
+                    &scope,
+                )
                 .await
                 .unwrap()
                 .request(
-                    "GET",
-                    wire::KEYRING_PATH,
-                    None,
-                    &[],
-                    wire::MAX_BUNDLE_BYTES,
+                    rest::Request {
+                        method: rest::Method::Get,
+                        path: wire::KEYRING_PATH,
+                        bearer: None,
+                        header: None,
+                        body: &[],
+                        limit: wire::MAX_BUNDLE_BYTES,
+                    },
                     &scope,
                 )
                 .await
@@ -143,10 +174,27 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
                 (wire::KEYRING_PATH, Some(token.as_str()), 401),
             ] {
                 let response = transport
-                    .authenticated(&identity, &scope)
+                    .connect(
+                        Some(rest::Identity {
+                            certificate_chain: identity.certificate_chain(),
+                            private_key: identity.private_key_der(),
+                            expires: identity.expires_at(),
+                        }),
+                        &scope,
+                    )
                     .await
                     .unwrap()
-                    .request("GET", path, credential, &[], wire::MAX_BUNDLE_BYTES, &scope)
+                    .request(
+                        rest::Request {
+                            method: rest::Method::Get,
+                            path,
+                            bearer: credential,
+                            header: None,
+                            body: &[],
+                            limit: wire::MAX_BUNDLE_BYTES,
+                        },
+                        &scope,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(response.status, status);
@@ -154,10 +202,27 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
             }
             let started = Instant::now();
             let response = transport
-                .authenticated(&identity, &scope)
+                .connect(
+                    Some(rest::Identity {
+                        certificate_chain: identity.certificate_chain(),
+                        private_key: identity.private_key_der(),
+                        expires: identity.expires_at(),
+                    }),
+                    &scope,
+                )
                 .await
                 .unwrap()
-                .request("GET", &cursor, None, &[], wire::MAX_BUNDLE_BYTES, &scope)
+                .request(
+                    rest::Request {
+                        method: rest::Method::Get,
+                        path: &cursor,
+                        bearer: None,
+                        header: None,
+                        body: &[],
+                        limit: wire::MAX_BUNDLE_BYTES,
+                    },
+                    &scope,
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status, 204);
@@ -166,10 +231,27 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
 
             std::fs::write(directory.join("rotate"), []).unwrap();
             let response = transport
-                .authenticated(&identity, &scope)
+                .connect(
+                    Some(rest::Identity {
+                        certificate_chain: identity.certificate_chain(),
+                        private_key: identity.private_key_der(),
+                        expires: identity.expires_at(),
+                    }),
+                    &scope,
+                )
                 .await
                 .unwrap()
-                .request("GET", &cursor, None, &[], wire::MAX_BUNDLE_BYTES, &scope)
+                .request(
+                    rest::Request {
+                        method: rest::Method::Get,
+                        path: &cursor,
+                        bearer: None,
+                        header: None,
+                        body: &[],
+                        limit: wire::MAX_BUNDLE_BYTES,
+                    },
+                    &scope,
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status, 200);
@@ -182,15 +264,25 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
             );
 
             let response = transport
-                .authenticated(&identity, &scope)
+                .connect(
+                    Some(rest::Identity {
+                        certificate_chain: identity.certificate_chain(),
+                        private_key: identity.private_key_der(),
+                        expires: identity.expires_at(),
+                    }),
+                    &scope,
+                )
                 .await
                 .unwrap()
                 .request(
-                    "GET",
-                    wire::SNAPSHOT_PATH,
-                    None,
-                    &[],
-                    wire::MAX_PUBLICATION_BYTES,
+                    rest::Request {
+                        method: rest::Method::Get,
+                        path: wire::SNAPSHOT_PATH,
+                        bearer: None,
+                        header: None,
+                        body: &[],
+                        limit: wire::MAX_PUBLICATION_BYTES,
+                    },
                     &scope,
                 )
                 .await

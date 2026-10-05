@@ -661,7 +661,7 @@ mod safety {
             let (verified, encrypted) = drive(
                 &f.reactors,
                 cryptos[1].encrypt(page, plain, output, &f.scope),
-                &poll_crypto,
+                poll_crypto,
             )
             .unwrap();
             assert!(verified.bytes().iter().all(|b| *b == 31 + index));
@@ -805,7 +805,7 @@ mod safety {
         .unwrap();
         f.pool.close();
         for reactor in &f.reactors {
-            drive(&f.reactors, reactor.drain(), &poll_crypto).unwrap();
+            drive(&f.reactors, reactor.drain(), poll_crypto).unwrap();
         }
         assert!(clients.iter().all(|client| client.outstanding() == 0));
         assert_eq!(relay_metrics.count(Event::OpaqueRelayBodyCompleted), 2);
@@ -1105,7 +1105,7 @@ impl RelayFixture {
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(B.into()),
-                crate::control::PublishedState::for_membership(membership),
+                crate::test_support::published_membership(membership),
             )
             .unwrap(),
         );

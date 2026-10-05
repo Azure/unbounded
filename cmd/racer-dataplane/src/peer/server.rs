@@ -287,6 +287,8 @@ impl PeerServer {
             }
         })
     }
+    /// Assemble the peer server from worker-owned services and transport policy.
+    #[allow(clippy::too_many_arguments)] // Composition keeps independently owned services explicit.
     pub(crate) fn new(
         io: Rc<crate::http::HttpIo>,
         forwarding: Rc<Forwarding>,
@@ -483,10 +485,10 @@ impl PeerServer {
                                 &request_scope,
                             )
                             .await;
-                            if result.is_ok() {
-                                if let Some(observation) = &mut observation {
-                                    observation.complete();
-                                }
+                            if result.is_ok()
+                                && let Some(observation) = &mut observation
+                            {
+                                observation.complete();
                             }
                             return result;
                         }
@@ -537,7 +539,7 @@ impl PeerServer {
             if let (Some(admitted), Ok(membership)) = (admitted, &membership) {
                 let (returned, sent) = self
                     .transfers
-                    .send_native(connection, &response, admitted, &membership, &request_scope)
+                    .send_native(connection, &response, admitted, membership, &request_scope)
                     .await?;
                 connection = returned;
                 if sent {
@@ -1552,7 +1554,9 @@ mod tests {
                     Rc::new(
                         super::super::PeerNetwork::new(
                             signers[1].node().clone(),
-                            std::sync::Arc::new(Default::default()),
+                            std::sync::Arc::new(controlplane::Published::new(
+                                crate::control::Snapshot::retention(2),
+                            )),
                         )
                         .unwrap(),
                     ),
@@ -1565,7 +1569,9 @@ mod tests {
                     Rc::new(
                         super::super::PeerNetwork::new(
                             signers[1].node().clone(),
-                            std::sync::Arc::new(Default::default()),
+                            std::sync::Arc::new(controlplane::Published::new(
+                                crate::control::Snapshot::retention(2),
+                            )),
                         )
                         .unwrap(),
                     ),

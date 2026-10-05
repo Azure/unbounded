@@ -290,9 +290,13 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let page = acquire(&mut f, &mut budget).unwrap();
     f.fill.dependencies.writer.discard_unsubmitted();
-    let published = Arc::new(crate::control::PublishedState::default());
-    let snapshots =
-        crate::control::SnapshotStore::new(f.keys.cluster().clone(), published.clone(), 2);
+    let published = Arc::new(controlplane::Published::new(
+        crate::control::Snapshot::retention(2),
+    ));
+    let snapshots = crate::control::publication::PublicationTarget::new(
+        f.keys.cluster().clone(),
+        published.clone(),
+    );
     let mut publication = racer_control_wire::Publication {
         schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: f.keys.cluster().clone(),
@@ -310,7 +314,7 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
             site: String::new(),
         })
         .collect();
-    snapshots.publish(publication).unwrap();
+    snapshots.apply(publication).unwrap();
     let mut deps = f.fill.dependencies.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
         racer_control_wire::NodeId("22222222-2222-4222-8222-000000000000".into()),
@@ -2741,32 +2745,32 @@ impl Fixture {
     ) -> (
         Rc<crate::read::Coordinator>,
         crate::read::dispatch::WorkerEndpoint,
-        Arc<crate::control::PublishedState>,
+        Arc<controlplane::Published<crate::control::Snapshot>>,
     ) {
         use crate::control::Availability;
-        use crate::control::PublishedState;
-        use crate::control::SnapshotStore;
+        use crate::control::Snapshot;
+        use crate::control::publication::PublicationTarget;
         use crate::http::Delivery;
         use crate::http::new_pipe_pool;
         use crate::read::Coordinator;
         use crate::read::metadata::MetadataDependencies;
         use crate::read::metadata::MetadataService;
         use crate::read::range_stream::RangeStreams;
+        use controlplane::Published;
         use racer_control_wire::CacheDefinition;
         use racer_control_wire::Publication;
         use racer_control_wire::PublicationSequence;
         use racer_control_wire::SCHEMA_VERSION;
-        let published = Arc::new(PublishedState::default());
+        let published = Arc::new(Published::new(Snapshot::retention(settings.snapshots)));
         let availability = Rc::new(Availability::new(published.clone(), self.keys.clone()));
-        let snapshots = Rc::new(SnapshotStore::new(
+        let snapshots = Rc::new(PublicationTarget::new(
             self.keys.cluster().clone(),
             published.clone(),
-            settings.snapshots,
         ));
         let (client_socket, origin_socket) =
             racer_control_wire::canonical_socket_paths(settings.name).unwrap();
         snapshots
-            .publish(Publication {
+            .apply(Publication {
                 schema_version: SCHEMA_VERSION,
                 cluster: self.keys.cluster().clone(),
                 sequence: PublicationSequence(1),
@@ -2811,7 +2815,7 @@ impl Fixture {
         ));
         let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, settings.window));
         let local = Rc::new(Coordinator::new(
-            snapshots,
+            snapshots.published.clone(),
             metadata,
             fill.clone(),
             streams,
@@ -2985,7 +2989,9 @@ fn fixture_with_caches(
         Rc::new(Placement::new(16)),
         peers.clone(),
         credentials.clone(),
-        Arc::new(Default::default()),
+        Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        )),
     ));
     // Deliberately uninstalled catalog owner: publication must retain page-local
     // metadata and still complete when the optional catalog is unavailable.
@@ -3063,20 +3069,20 @@ fn adapter_client(
     f: &Fixture,
     adapter: &crate::test_support::origin::AdapterOrigin,
 ) -> Rc<crate::origin::OriginClient> {
-    use crate::control::PublishedState;
-    use crate::control::SnapshotStore;
+    use crate::control::Snapshot;
+    use crate::control::publication::PublicationTarget;
+    use controlplane::Published;
     use racer_control_wire::Publication;
     use racer_control_wire::PublicationSequence;
     use racer_control_wire::SCHEMA_VERSION;
-    let snapshots = Rc::new(SnapshotStore::new(
+    let snapshots = Rc::new(PublicationTarget::new(
         f.keys.cluster().clone(),
-        Arc::new(PublishedState::default()),
-        2,
+        Arc::new(Published::new(Snapshot::retention(2))),
     ));
     let (client_socket, origin_socket) =
         racer_control_wire::canonical_socket_paths("fixture").unwrap();
     snapshots
-        .publish(Publication {
+        .apply(Publication {
             schema_version: SCHEMA_VERSION,
             cluster: f.keys.cluster().clone(),
             sequence: PublicationSequence(1),

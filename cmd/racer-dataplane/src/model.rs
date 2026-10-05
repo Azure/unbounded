@@ -117,7 +117,7 @@ pub struct RequestId(pub [u8; 16]);
 pub struct AttemptId(pub [u8; 16]);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TransferId(pub [u8; 16]);
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WorkerId(pub u16);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

@@ -1067,9 +1067,9 @@ fn enrolled_identity(
     scratch: &Scratch,
     control: &control::Control,
     processes: usize,
-) -> racer_dataplane::control::LocalSigningIdentity {
+) -> racer_crypto::enrollment::LocalSigningIdentity {
     use racer_control_wire::ClusterId;
-    use racer_dataplane::control::Enrollment;
+    use racer_crypto::enrollment::Enrollment;
     assert_eq!(
         control.enrollments.load(Ordering::Acquire),
         2 * processes,
@@ -1079,10 +1079,14 @@ fn enrolled_identity(
         !scratch.0.join("identity/pending.json").exists(),
         "readiness requires committed enrollment and completed pending cleanup"
     );
+    let reactor = enrollment_io::reactor();
     let enrollment = Enrollment::new(
         ClusterId(CLUSTER.into()),
         scratch.0.join("token"),
         scratch.0.join("identity"),
+        std::rc::Rc::new(racer_dataplane::control::ReactorControlIo::new(
+            reactor.clone(),
+        )),
     );
     let bundle = racer_control_wire::decode_bundle(&control.bundle).unwrap();
     enrollment
@@ -1090,14 +1094,12 @@ fn enrolled_identity(
         .unwrap();
     // Verify the persisted certificate's chain, SAN, validity, request correlation,
     // and local key pairing rather than comparing opaque identity.json bytes.
-    let reactor = enrollment_io::reactor();
-    enrollment.attach_reactor(reactor.clone());
     let scope = racer_dataplane::runtime::RequestScope::new(
         racer_dataplane::model::RequestId([9; 16]),
         Instant::now() + Duration::from_secs(15),
     )
     .unwrap();
-    let identity = enrollment_io::drive(&reactor, enrollment.load_identity_async(&scope))
+    let identity = enrollment_io::drive(&reactor, enrollment.load_identity(&scope))
         .unwrap()
         .unwrap();
     assert_eq!(identity.cluster().0, CLUSTER);

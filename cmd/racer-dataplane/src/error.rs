@@ -130,6 +130,51 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<controlplane::Error> for Error {
+    fn from(error: controlplane::Error) -> Self {
+        match error {
+            controlplane::Error::Replay => Self::Replay,
+            controlplane::Error::Conflict => Self::IncompatibleMembership,
+            controlplane::Error::Capacity => Self::Overloaded,
+            controlplane::Error::Stale => Self::StaleFlight,
+            controlplane::Error::Pending => Self::Unavailable,
+            controlplane::Error::Internal => Self::Internal,
+        }
+    }
+}
+
+impl From<racer_crypto::identity::BundleError> for Error {
+    fn from(error: racer_crypto::identity::BundleError) -> Self {
+        match error {
+            racer_crypto::identity::BundleError::Replay => Self::Replay,
+            racer_crypto::identity::BundleError::Wire(error) => error.into(),
+            racer_crypto::identity::BundleError::Identity(error) => error.into(),
+        }
+    }
+}
+
+impl From<racer_crypto::enrollment::Error> for Error {
+    fn from(error: racer_crypto::enrollment::Error) -> Self {
+        match error {
+            racer_crypto::enrollment::Error::Unauthorized => Self::Unauthorized,
+            racer_crypto::enrollment::Error::CorruptRecord => Self::CorruptRecord,
+            racer_crypto::enrollment::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            racer_crypto::enrollment::Error::Io => Self::Io,
+            racer_crypto::enrollment::Error::Wire(error) => error.into(),
+        }
+    }
+}
+
+impl From<uring_runtime::reactor::filesystem::secure::AccessError> for Error {
+    fn from(error: uring_runtime::reactor::filesystem::secure::AccessError) -> Self {
+        use uring_runtime::reactor::filesystem::secure::AccessError;
+        match error {
+            AccessError::MissingMetadata => Self::Io,
+            AccessError::PermissionDenied => Self::Unauthorized,
+        }
+    }
+}
+
 impl From<flow_control::Error> for Error {
     fn from(error: flow_control::Error) -> Self {
         match error {
@@ -231,6 +276,56 @@ impl From<uring_runtime::reactor::filesystem::operations::ReplacementError<Error
 mod tests {
     use super::Error;
     use super::Operation;
+
+    /// Foundation errors retain authentication and wire distinctions.
+    #[test]
+    fn control_foundation_errors_preserve_boundary_meanings() {
+        use racer_crypto::enrollment::Error as Enrollment;
+        use racer_crypto::identity::BundleError;
+        use uring_runtime::reactor::filesystem::secure::AccessError;
+        for (source, expected) in [
+            (controlplane::Error::Replay, Error::Replay),
+            (controlplane::Error::Conflict, Error::IncompatibleMembership),
+            (controlplane::Error::Capacity, Error::Overloaded),
+            (controlplane::Error::Stale, Error::StaleFlight),
+            (controlplane::Error::Pending, Error::Unavailable),
+            (controlplane::Error::Internal, Error::Internal),
+        ] {
+            assert_eq!(Error::from(source), expected);
+        }
+        for (source, expected) in [
+            (Enrollment::Unauthorized, Error::Unauthorized),
+            (Enrollment::CorruptRecord, Error::CorruptRecord),
+            (
+                Enrollment::InvalidConfiguration,
+                Error::InvalidConfiguration,
+            ),
+            (Enrollment::Io, Error::Io),
+        ] {
+            assert_eq!(Error::from(source), expected);
+        }
+        for wire in [
+            racer_control_wire::Error::InvalidRequest,
+            racer_control_wire::Error::IncompatibleMembership,
+            racer_control_wire::Error::Overloaded,
+            racer_control_wire::Error::Replay,
+        ] {
+            assert_eq!(Error::from(Enrollment::Wire(wire)), Error::from(wire));
+            assert_eq!(Error::from(BundleError::Wire(wire)), Error::from(wire));
+        }
+        assert_eq!(Error::from(BundleError::Replay), Error::Replay);
+        assert_eq!(
+            Error::from(BundleError::Identity(
+                racer_crypto::identity::Error::Unauthorized
+            )),
+            Error::Unauthorized
+        );
+        assert_eq!(Error::from(AccessError::MissingMetadata), Error::Io);
+        assert_eq!(
+            Error::from(AccessError::PermissionDenied),
+            Error::Unauthorized
+        );
+    }
 
     #[test]
     fn operation_preserves_local_borrows_and_racer_results() {

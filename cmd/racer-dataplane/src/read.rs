@@ -8,7 +8,7 @@ use self::range_stream::RangeStream;
 use self::range_stream::RangeStreams;
 use crate::client::ClientRequest;
 use crate::client::ReadKind;
-use crate::control::SnapshotStore;
+use crate::control::Snapshot;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -27,6 +27,7 @@ use crate::security::ChargedOriginContext;
 use crate::security::CredentialCrypto;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
+use controlplane::Published;
 use std::rc::Rc;
 
 pub mod candidates;
@@ -42,7 +43,7 @@ pub struct ReadResponse {
     pub body: Option<RangeStream>,
 }
 pub struct Coordinator {
-    snapshots: Rc<SnapshotStore>,
+    snapshots: std::sync::Arc<Published<Snapshot>>,
     pub(super) metadata: Rc<MetadataService>,
     pub(super) fill: Rc<Fill>,
     streams: Rc<RangeStreams>,
@@ -81,7 +82,7 @@ impl Coordinator {
         self.fill.hedge_owner()
     }
     pub fn new(
-        snapshots: Rc<SnapshotStore>,
+        snapshots: std::sync::Arc<Published<Snapshot>>,
         metadata: Rc<MetadataService>,
         fill: Rc<Fill>,
         streams: Rc<RangeStreams>,
@@ -110,7 +111,7 @@ impl Coordinator {
     ) -> Operation<'a, ReadResponse> {
         Box::pin(async move {
             scope.check()?;
-            let snapshot = self.snapshots.current()?;
+            let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
             if !snapshot
                 .caches
                 .iter()
@@ -227,6 +228,7 @@ impl LocalPageService for Coordinator {
             if !self
                 .snapshots
                 .current()?
+                .ok_or(Error::Unavailable)?
                 .caches
                 .iter()
                 .any(|c| c.id == object.cache)
@@ -368,10 +370,10 @@ fn validate_metadata(
     if &metadata.version.object != object {
         return Err(Error::CorruptRecord);
     }
-    if let MetadataSelector::Pinned(etag) = selector {
-        if &metadata.version.etag != etag {
-            return Err(Error::VersionUnavailable);
-        }
+    if let MetadataSelector::Pinned(etag) = selector
+        && &metadata.version.etag != etag
+    {
+        return Err(Error::VersionUnavailable);
     }
     Ok(())
 }

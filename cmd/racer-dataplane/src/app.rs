@@ -18,14 +18,13 @@ use crate::client::listener::ClientListeners;
 use crate::client::listener::PreparedListeners;
 use crate::config::Config;
 use crate::config::Limits;
-use crate::control::BundleInstaller;
 use crate::control::CacheTransition;
-use crate::control::ControlClient;
 use crate::control::ControlEndpoint;
-use crate::control::Enrollment;
-use crate::control::PublishedState;
 use crate::control::ReactorControlIo;
-use crate::control::SnapshotStore;
+use crate::control::Snapshot;
+use crate::control::publication::PublicationTarget;
+use crate::control::rails::RailJournal;
+use crate::control::session::Session;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -58,7 +57,6 @@ use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
 use crate::runtime::HashMap;
-use crate::runtime::HashSet;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use crate::security::CredentialCrypto;
@@ -85,8 +83,11 @@ use crate::worker::AffinityPlan;
 use crate::worker::CryptoRuntime;
 use crate::worker::WorkerGroup;
 use crate::worker::WorkerRuntime;
+use controlplane::Published;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::NodeId;
+use racer_crypto::enrollment::Enrollment;
+use racer_crypto::identity::BundleInstaller;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::KeyPurpose;
@@ -109,11 +110,16 @@ use uring_runtime::drivers::poll_task;
 mod native;
 mod recovery;
 
+/// Node-level composition and startup owner for the worker service group.
 pub struct Application {
     resources: std::sync::OnceLock<crate::worker::Resources>,
+
     config: Arc<Config>,
+
     node: Arc<NodeState>,
+
     limits: Limits,
+
     discovered_nics: Vec<racer_control_wire::RailMapping>,
 }
 
@@ -121,47 +127,81 @@ pub struct Application {
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
     inventory: Arc<crate::rdma::Inventory>,
+
     send_crc: crate::telemetry::Samples,
+
     hedges: std::sync::OnceLock<Arc<crate::read::candidates::Hedges>>,
+
     peer_admission: Arc<crate::peer::AdaptivePeers>,
+
     peer_receive: std::sync::OnceLock<Arc<crate::peer::receive::Gate>>,
+
     subscriptions: Arc<crate::peer::subscriptions::Subscriptions>,
+
     ingress: Arc<crate::admission::Ingress>,
+
     metrics: Vec<(WorkerId, crate::telemetry::Metrics)>,
+
     failures: crate::telemetry::Failures,
-    publications: Arc<PublishedState>,
+
+    publications: Arc<Published<Snapshot>>,
+
     keys: Arc<KeyEpochs>,
+
     control_worker: WorkerId,
+
     workers: Arc<WorkerDirectory>,
+
     count: usize,
+
     prepared: AtomicUsize,
+
     checkpoint: Mutex<CheckpointCut>,
+
     periodic_checkpoint: Mutex<CheckpointCut>,
+
     recovery: Mutex<recovery::RecoveryCut>,
+
     observations: Observations,
+
     native: native::NativePairs,
-    cache_cut: Mutex<CacheCut>,
+
+    cache_rollout: controlplane::Rollout<WorkerId, Vec<CacheDefinition>>,
 }
+
+/// Shared progress for collecting and durably publishing a worker checkpoint cut.
 #[derive(Default)]
 struct CheckpointCut {
     shards: Vec<ShardImage>,
+
     result: Option<Result<()>>,
+
     publishing: bool,
+
     periodic_generation: u64,
+
     periodic_started: Option<std::time::Instant>,
+
     periodic_finished: usize,
+
     last_sequence: u64,
+
     last_slot: usize,
 }
+
 impl Default for NodeState {
     fn default() -> Self {
         Self::new(vec![WorkerId(0), WorkerId(1)], 16).expect("valid default worker map")
     }
 }
+
 impl NodeState {
+    /// Allocate shared state with default peer admission for the registered workers.
     fn new(workers: Vec<WorkerId>, capacity: usize) -> Result<Self> {
         Self::with_peer_admission(workers, capacity, Default::default())
     }
+
+    /// Allocate node-wide authorities and partitioned metrics for the worker set.
     fn with_peer_admission(
         workers: Vec<WorkerId>,
         capacity: usize,
@@ -181,11 +221,12 @@ impl NodeState {
             subscriptions: Arc::new(crate::peer::subscriptions::Subscriptions::new(
                 Default::default(),
             )?),
-            publications: Arc::new(PublishedState::default()),
+            publications: Arc::new(Published::new(Snapshot::retention(2))),
             metrics: workers.iter().copied().zip(metrics).collect(),
             failures: crate::telemetry::Failures::default(),
             keys: Arc::new(KeyEpochs::default()),
             control_worker: WorkerId(0),
+            cache_rollout: controlplane::Rollout::new(workers.iter().copied()),
             workers: Arc::new(WorkerDirectory::new(map, workers, capacity)?),
             count,
             prepared: AtomicUsize::new(0),
@@ -194,7 +235,6 @@ impl NodeState {
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: Observations::default(),
             native: native::NativePairs::default(),
-            cache_cut: Mutex::new(CacheCut::default()),
         })
     }
 }
@@ -211,6 +251,7 @@ impl Application {
         })
     }
 
+    /// Discover resources, enroll the node, and run its worker group until shutdown.
     pub fn run(mut self) -> Result<()> {
         self.config.validate()?;
         self.discovered_nics = crate::rdma::inventory();
@@ -224,6 +265,11 @@ impl Application {
             self.limits.queue_entries.get(),
             self.config.peer_admission,
         )?);
+        Arc::get_mut(&mut self.node)
+            .ok_or(Error::Internal)?
+            .publications = Arc::new(Published::new(Snapshot::retention(
+            self.config.limits.retained_snapshots.get(),
+        )));
         self.node.inventory.update(self.discovered_nics.clone())?;
         if self.config.enable_rdma {
             self.node.native.place(&plan)?;
@@ -248,6 +294,7 @@ impl Application {
     }
 }
 
+/// Create a bounded scope for application-owned lifecycle operations.
 fn scope(timeout: Duration) -> Result<RequestScope> {
     RequestScope::new(
         RequestId([0; 16]),
@@ -283,10 +330,9 @@ fn bootstrap(
         config,
         reactor.clone(),
         unresolved,
-        Rc::new(SnapshotStore::new(
+        Rc::new(PublicationTarget::new(
             config.cluster.clone(),
             node.publications.clone(),
-            config.limits.retained_snapshots.get(),
         )),
         node.inventory.clone(),
     );
@@ -339,6 +385,17 @@ fn bootstrap(
         }
     };
     drop(operation);
+    // Fence CPU preparation before draining the reactor, on success and failure.
+    let shutdown_scope = scope(config.shutdown_timeout)?;
+    let mut shutdown = control.shutdown(&shutdown_scope);
+    let shutdown_result = loop {
+        if let Poll::Ready(result) = shutdown.as_mut().poll(&mut cx) {
+            break result;
+        }
+        reactor.poll_budgeted(64)?;
+        reactor.wait(Duration::from_millis(1))?;
+    };
+    drop(shutdown);
     // Dropped TLS waits can still own CQEs. Cancellation is not their fence.
     let _ = startup.cancel();
     let mut drain = reactor.drain();
@@ -350,17 +407,23 @@ fn bootstrap(
         }
         reactor.wait(Duration::from_millis(1))?;
     }
-    result
+    result.and_then(|identity| shutdown_result.map(|()| identity))
 }
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Record a process stop request using only a signal-safe atomic store.
 extern "C" fn request_stop(_: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Relaxed);
 }
+
+/// Restore the original process signal handlers when application ownership ends.
 struct SignalGuard {
     previous: Vec<(libc::c_int, libc::sigaction)>,
 }
+
 impl SignalGuard {
+    /// Install stop handlers while retaining each previous process handler.
     fn install() -> Result<Self> {
         STOP_REQUESTED.store(false, Ordering::Relaxed);
         let mut guard = Self {
@@ -381,10 +444,13 @@ impl SignalGuard {
         }
         Ok(guard)
     }
+
+    /// Check whether a handled process signal requested shutdown.
     fn requested(&self) -> bool {
         STOP_REQUESTED.load(Ordering::Relaxed)
     }
 }
+
 impl Drop for SignalGuard {
     fn drop(&mut self) {
         for (signal, previous) in self.previous.iter().rev() {
@@ -402,67 +468,129 @@ impl Drop for SignalGuard {
 pub struct WorkerApplication {
     #[cfg(test)]
     peer_requester: Rc<Requester>,
+
     ingress_peers: futures::stream::FuturesUnordered<Operation<'static, ()>>,
+
     next_health: std::time::Instant,
+
     environment: uring_runtime::environment::Environment,
+
     drivers: Rc<uring_runtime::drivers::DriverQueue>,
+
     http: Rc<HttpPool>,
+
+    /// Worker identity used for routing and rollout acknowledgments.
     pub worker: WorkerId,
+
     runtime: WorkerRuntime,
-    control: Option<Rc<ControlClient>>,
-    snapshots: Rc<SnapshotStore>,
+
+    control: Option<Rc<Session>>,
+
+    snapshots: Rc<PublicationTarget>,
+
     keys: Rc<Keyring>,
+
     store: Store,
+
     clients: Rc<ClientListeners>,
+
     peers: Rc<PeerServer>,
+
     coordinator: Rc<Coordinator>,
+
     metadata: Rc<MetadataService>,
+
     /// Same table as Fill; the worker drives abandoned work without user futures.
     flights: Rc<Flights>,
+
     rdma: Option<Rc<Sessions>>,
+
     devices: Option<Rc<Devices>>,
+
     discovered_nics: Vec<racer_control_wire::RailMapping>,
+
     actual_rails: Vec<racer_control_wire::RailMapping>,
+
     inventory_generation: u64,
+
     native_numa: Option<native::NativePlacement>,
+
     native_task: Option<Operation<'static, Vec<racer_control_wire::RailMapping>>>,
+
     native_retry: std::time::Instant,
+
     telemetry: Rc<Telemetry>,
+
     directory: Arc<WorkerDirectory>,
+
     node: Arc<NodeState>,
+
     endpoint: Option<WorkerEndpoint>,
+
     control_task: Option<Operation<'static, ()>>,
+
     keyring_task: Option<Operation<'static, ()>>,
+
     keyring_scope: Option<RequestScope>,
+
     peer_task: Option<Operation<'static, ()>>,
+
     writer_task: Option<Operation<'static, ()>>,
+
     checkpoint_task: Option<Operation<'static, ()>>,
+
     checkpoint_snapshot: Option<Operation<'static, ShardImage>>,
+
     checkpoint_generation: u64,
+
     checkpoint_completed: u64,
+
     checkpoint_budget: usize,
+
     placement: Rc<Placement>,
+
     candidates: Rc<CandidatePolicy>,
+
     ownership_maintenance: OwnershipMaintenance,
+
     placement_retry: std::time::Instant,
+
     placement_warning: Option<std::time::Instant>,
+
     diagnostic_task: Option<Operation<'static, ()>>,
+
     diagnostic_scope: Option<RequestScope>,
+
     diagnostics_address: std::net::SocketAddr,
+
     listener_scope: Option<RequestScope>,
+
     task_scope: Option<RequestScope>,
+
     peer_address: std::net::SocketAddr,
+
     timeout: Duration,
+
     shutdown_timeout: Duration,
+
     started: bool,
+
     stopping: bool,
+
     snapshot_sequence: Option<racer_control_wire::PublicationSequence>,
+
     memory: Rc<MemoryCache>,
+
     caches: Vec<racer_control_wire::CacheDefinition>,
+
     slab_directory: std::path::PathBuf,
+
     prepared_listeners: Rc<std::cell::RefCell<Option<crate::client::listener::PreparedListeners>>>,
+
     cache_prepare_task: Option<Operation<'static, ()>>,
+
     cache_preparing_generation: u64,
+
     control_scope: Option<RequestScope>,
 }
 
@@ -471,7 +599,9 @@ pub struct WorkerApplication {
 struct OwnershipMaintenance {
     next: std::time::Instant,
 }
+
 impl OwnershipMaintenance {
+    /// Advance eviction guidance at most once per scheduled maintenance turn.
     fn poll(
         &mut self,
         now: std::time::Instant,
@@ -491,6 +621,7 @@ impl OwnershipMaintenance {
         self.next = now + delay;
     }
 
+    /// Limit idle waiting by the next maintenance turn unless shutdown has begun.
     fn wait_timeout(&self, now: std::time::Instant, stopping: bool, maximum: Duration) -> Duration {
         if stopping {
             maximum
@@ -502,6 +633,8 @@ impl OwnershipMaintenance {
 
 #[cfg(test)]
 mod ownership_maintenance_tests {
+    //! Maintenance scheduling keeps progress bounded and shutdown idle.
+
     use super::*;
     use crate::topology::Maintenance;
 
@@ -589,10 +722,9 @@ impl WorkerApplication {
         node.ingress.install(worker, &admission)?;
         let reactor = runtime.reactor.clone();
         let limits = admission.policy().limits();
-        let snapshots = Rc::new(SnapshotStore::new(
+        let snapshots = Rc::new(PublicationTarget::new(
             config.cluster.clone(),
             node.publications.clone(),
-            config.limits.retained_snapshots.get(),
         ));
         let keys = Rc::new(Keyring::new(
             config.cluster.clone(),
@@ -738,7 +870,7 @@ impl WorkerApplication {
             .with_observer(admission.policy().observer()),
         );
         let origin: Rc<dyn Origin> = Rc::new(OriginClient::new(
-            snapshots.clone(),
+            node.publications.clone(),
             http.clone(),
             Rc::new(
                 io.capped(
@@ -898,10 +1030,11 @@ impl WorkerApplication {
         })
     }
 
+    /// Connect shared publication state to worker-local read and metadata services.
     fn assemble_reads(
         config: &Config,
         node: &NodeState,
-        snapshots: Rc<SnapshotStore>,
+        snapshots: Rc<PublicationTarget>,
         availability: Rc<crate::control::Availability>,
         delivery: Rc<Delivery>,
         metrics: &crate::telemetry::Metrics,
@@ -930,7 +1063,7 @@ impl WorkerApplication {
             config.limits.range_window_pages.get(),
         ));
         let coordinator = Rc::new(Coordinator::new(
-            snapshots,
+            snapshots.published.clone(),
             metadata.clone(),
             fill,
             streams,
@@ -940,6 +1073,7 @@ impl WorkerApplication {
         (coordinator, metadata)
     }
 
+    /// Compose client framing and optional distributed ingress without binding sockets.
     fn assemble_clients(
         config: &Config,
         node: &NodeState,
@@ -973,37 +1107,42 @@ impl WorkerApplication {
         })
     }
 
+    /// Bind independent control feeds and durable enrollment to the serving reactor.
     fn assemble_control(
         config: &Config,
         reactor: Rc<Reactor>,
         keys: Rc<Keyring>,
-        snapshots: Rc<SnapshotStore>,
+        snapshots: Rc<PublicationTarget>,
         inventory: Arc<crate::rdma::Inventory>,
-    ) -> Rc<ControlClient> {
-        let enrollment = Rc::new(
-            Enrollment::new(
-                config.cluster.clone(),
-                config.service_account_token.clone(),
-                config.identity_directory.clone(),
-            )
-            .with_inventory(inventory),
-        );
-        enrollment.set_shares(config.shares);
+    ) -> Rc<Session> {
+        let io = Rc::new(ReactorControlIo::new(reactor));
+        let rails = RailJournal::new(inventory, config.identity_directory.clone(), io.clone());
+        let enrollment = Rc::new(Enrollment::new(
+            config.cluster.clone(),
+            config.service_account_token.clone(),
+            config.identity_directory.clone(),
+            io.clone(),
+        ));
         let secrets = BundleInstaller::new(keys.clone());
-        let control = Rc::new(ControlClient::new(
+        let control = Rc::new(Session::new(
             ControlEndpoint {
                 url: config.control_endpoint.clone(),
                 trust_bundle: config.trust_bundle.clone(),
             },
             enrollment,
+            rails,
+            config.shares,
             keys,
             secrets,
             snapshots,
         ));
-        control.attach_io(Rc::new(ReactorControlIo::new(reactor)));
+        control
+            .attach_io(io)
+            .expect("valid static feed configuration");
         control
     }
 
+    /// Compose worker storage, checkpointing, and retention without opening files.
     fn assemble_storage(
         config: &Config,
         node: &NodeState,
@@ -1088,6 +1227,7 @@ impl WorkerApplication {
         })
     }
 
+    /// Reclaim idle ciphertext owners before returning unused pool buffers.
     fn ciphertext_reclaimer(
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         memory: Rc<MemoryCache>,
@@ -1110,6 +1250,7 @@ impl WorkerApplication {
         }
     }
 
+    /// Apply accepted cache removals and retire incompatible local native resources.
     fn refresh_snapshot(&mut self, current_scope: &RequestScope) -> Result<()> {
         self.refresh_inventory()?;
         let snapshot = self.snapshots.current()?;
@@ -1160,6 +1301,7 @@ impl WorkerApplication {
         Ok(())
     }
 
+    /// Advance bounded service work under this worker's environment and driver queue.
     fn poll_services(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         let _environment = self.environment.enter();
         let _queue = self.drivers.enter();
@@ -1210,6 +1352,7 @@ impl WorkerApplication {
         Ok(())
     }
 
+    /// Schedule placement progress or back off pinned capacity with a bounded warning rate.
     fn observe_placement_maintenance(
         &mut self,
         status: Result<crate::topology::Maintenance>,
@@ -1239,6 +1382,7 @@ impl WorkerApplication {
         Ok(())
     }
 
+    /// Admit a bounded batch of handed-off connections and poll active peer work.
     fn poll_ingress(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         {
             for accepted in self
@@ -1297,6 +1441,7 @@ impl WorkerApplication {
         Ok(())
     }
 
+    /// Advance listeners, read flights, and native transfers while observing failures.
     fn poll_listeners(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         if let Some(result) = poll_task(&mut self.diagnostic_task, cx) {
             if let Err(error) = &result
@@ -1361,6 +1506,7 @@ impl WorkerApplication {
         Ok(())
     }
 
+    /// Drive queued writes unless a periodic checkpoint is waiting for its cut.
     fn poll_writer(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if let Some(result) = poll_task(&mut self.writer_task, cx)
             && !matches!(
@@ -1394,6 +1540,7 @@ impl WorkerApplication {
         Ok(())
     }
 
+    /// Advance publication and renewal work without blocking the independent key feed.
     fn poll_control(&mut self, cx: &mut Context<'_>) -> Result<()> {
         // Raw filesystem errno and uncertain publication outcomes are not blanket
         // retries: the owner must reconcile namespace state before another mutation.
@@ -1416,6 +1563,8 @@ impl WorkerApplication {
         }
         Ok(())
     }
+
+    /// Keep one scoped keyring turn active and preserve nontransient failures.
     fn poll_keyring(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if let Some(result) = poll_task(&mut self.keyring_task, cx)
             && !matches!(
@@ -1438,10 +1587,16 @@ impl WorkerApplication {
         Ok(())
     }
 
-    pub fn shutdown<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
+    /// Fence control preparation and release this worker's remaining service owners.
+    pub fn shutdown<'a>(&'a mut self, shutdown_scope: &'a RequestScope) -> Operation<'a, ()> {
         let environment = self.environment.clone();
         let drivers = self.drivers.clone();
         Box::pin(environment.scope(drivers.scope(async move {
+            self.control_task.take();
+            self.keyring_task.take();
+            if let Some(control) = &self.control {
+                control.shutdown(shutdown_scope).await?;
+            }
             if let Some(endpoint) = &mut self.endpoint {
                 endpoint.uninstall()?;
             }
@@ -1457,6 +1612,7 @@ impl WorkerApplication {
 }
 
 impl Application {
+    /// Allocate paired worker resources once before building service lanes.
     fn prepare_workers(&self) -> Result<()> {
         let resources = crate::worker::Resources::new(
             self.limits.clone(),
@@ -1471,6 +1627,8 @@ impl Application {
             .set(resources)
             .map_err(|_| Error::InvalidConfiguration)
     }
+
+    /// Build one worker-local service graph from the node's shared authorities.
     fn build(
         &self,
         worker: WorkerId,
@@ -1485,6 +1643,8 @@ impl Application {
         )?;
         Ok(Box::new(application))
     }
+
+    /// Build the crypto service and attach any configured native resources.
     fn build_crypto(
         &self,
         worker: WorkerId,
@@ -1495,6 +1655,7 @@ impl Application {
             .crypto(worker, PageCryptoEngine::new(runtime))
     }
 }
+
 impl uring_runtime::group::Factory<RequestScope> for Application {
     fn build_lane(
         &self,
@@ -1505,6 +1666,7 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
             .ok_or(Error::InvalidConfiguration)?
             .build_lane(lane, |worker, runtime| self.build(worker, runtime))
     }
+
     fn build_helper(
         &self,
         lane: usize,
@@ -1514,16 +1676,19 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
             .ok_or(Error::InvalidConfiguration)?
             .build_helper(lane, |worker, runtime| self.build_crypto(worker, runtime))
     }
+
     fn abandon_lane(&self, lane: usize) -> Result<()> {
         self.resources
             .get()
             .ok_or(Error::InvalidConfiguration)?
             .abandon_lane(lane)
     }
+
     fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
         scope(Duration::from_secs(30)).unwrap_or_else(|_| startup.clone())
     }
 }
+
 impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
     fn wait_timeout(&self, maximum: Duration) -> Duration {
         let _environment = self.environment.enter();
@@ -1536,9 +1701,11 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
             maximum.min(deadline.saturating_duration_since(uring_runtime::environment::now()))
         })
     }
+
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         WorkerApplication::start(self, scope)
     }
+
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         if !self.started {
             return Err(Error::Unavailable);
@@ -1548,6 +1715,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
         }
         self.poll_services(cx, work_budget)
     }
+
     fn stop_admission(&mut self) -> Result<()> {
         let _environment = self.environment.enter();
         let _queue = self.drivers.enter();
@@ -1571,7 +1739,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
             scope.cancel()?;
         }
         if let Some(control) = &self.control {
-            control.shutdown()?;
+            control.stop();
         }
         self.control_task.take();
         if let Some(scope) = self.keyring_scope.take() {
@@ -1580,12 +1748,16 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
         self.keyring_task.take();
         Ok(())
     }
+
     fn drain<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
         let environment = self.environment.clone();
         let drivers = self.drivers.clone();
         Box::pin(environment.scope(drivers.scope(async move {
             self.stop_admission()?;
             let deadline = scope(self.shutdown_timeout)?;
+            if let Some(control) = &self.control {
+                control.shutdown(&deadline).await?;
+            }
             let clients = self.clients.clone();
             let flights = self.flights.clone();
             let fence_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
@@ -1676,106 +1848,93 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
             Ok(())
         })))
     }
+
     fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         WorkerApplication::shutdown(self, scope)
     }
 }
 
-#[derive(Default)]
-struct CacheCut {
-    generation: u64,
-    definitions: Vec<CacheDefinition>,
-    prepared: HashSet<WorkerId>,
-    committed: bool,
-}
+/// Control-worker projection and local resources for a registered-worker rollout.
 pub(crate) struct CachePublication {
     node: Arc<NodeState>,
+
     listeners: Rc<RefCell<Option<PreparedListeners>>>,
+
     capacity: usize,
+
+    proposal: RefCell<Option<(u64, Arc<Vec<CacheDefinition>>)>>,
 }
-struct Transition {
-    node: Arc<NodeState>,
-    generation: u64,
+
+/// Reserved worker barrier and the control worker's prepared listeners.
+struct Transition<'a> {
+    guard: Option<controlplane::rollout::Guard<'a, WorkerId, Vec<CacheDefinition>>>,
+
     listeners: Option<PreparedListeners>,
-    committed: bool,
 }
-impl CacheTransition for Transition {
+
+impl CacheTransition for Transition<'_> {
     fn commit(mut self: Box<Self>) {
         if let Some(listeners) = self.listeners.take() {
             listeners.commit();
         }
-        let mut cut = self
-            .node
-            .cache_cut
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(cut.generation, self.generation);
-        cut.committed = true;
-        self.committed = true;
-    }
-}
-impl Drop for Transition {
-    fn drop(&mut self) {
-        if !self.committed {
-            let mut cut = self
-                .node
-                .cache_cut
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if cut.generation == self.generation && !cut.committed {
-                cut.prepared.remove(&self.node.control_worker);
-            }
+        if let Some(guard) = self.guard.take() {
+            guard.commit();
         }
     }
 }
+
 impl CachePublication {
+    /// Propose changed definitions or reserve the acknowledged cut for atomic commit.
     pub(crate) fn stage(
         &self,
         definitions: &[CacheDefinition],
-    ) -> Result<Box<dyn CacheTransition>> {
+    ) -> Result<Box<dyn CacheTransition + '_>> {
         racer_control_wire::validate_definitions(definitions)?;
-        let mut cut = self.node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
-        if cut.generation == 0 || cut.definitions != definitions {
+        let mut proposal = self.proposal.borrow_mut();
+        if proposal
+            .as_ref()
+            .is_none_or(|(_, old)| old.as_slice() != definitions)
+        {
             if definitions.len() > self.capacity {
                 return Err(Error::Overloaded);
             }
+            let value = Arc::new(definitions.to_vec());
+            let generation = self.node.cache_rollout.propose(value.clone())?;
             self.listeners.borrow_mut().take();
-            cut.generation = cut.generation.checked_add(1).ok_or(Error::Unavailable)?;
-            cut.definitions = definitions.to_vec();
-            cut.prepared.clear();
-            cut.committed = false;
+            *proposal = Some((generation, value));
             return Err(Error::Unavailable);
         }
-        if cut.prepared.len() != self.node.count {
+        let generation = proposal.as_ref().ok_or(Error::Internal)?.0;
+        if self.node.cache_rollout.committed(generation)? {
+            return Ok(Box::new(Transition {
+                guard: None,
+                listeners: None,
+            }));
+        }
+        let guard = self.node.cache_rollout.stage(generation)?;
+        let listeners = self
+            .listeners
+            .borrow_mut()
+            .take()
+            .ok_or(Error::Unavailable)?;
+        if listeners.definitions() != definitions {
             return Err(Error::Unavailable);
         }
-        let listeners = if cut.committed {
-            None
-        } else {
-            let listeners = self
-                .listeners
-                .borrow_mut()
-                .take()
-                .ok_or(Error::Unavailable)?;
-            if listeners.definitions() != definitions {
-                return Err(Error::Unavailable);
-            }
-            Some(listeners)
-        };
         Ok(Box::new(Transition {
-            node: self.node.clone(),
-            generation: cut.generation,
-            listeners,
-            committed: false,
+            guard: Some(guard),
+            listeners: Some(listeners),
         }))
     }
 }
+
 impl WorkerApplication {
+    /// Attach cache rollout policy only on the worker that owns control feeds.
     fn attach_cache_adapter(&self) {
         if let Some(control) = &self.control {
             control.attach_cache_publication(Rc::new(CachePublication {
                 node: self.node.clone(),
                 listeners: self.prepared_listeners.clone(),
+                proposal: RefCell::new(None),
                 capacity: self
                     .runtime
                     .admission
@@ -1786,37 +1945,19 @@ impl WorkerApplication {
             }));
         }
     }
+
+    /// Prepare local resources and acknowledge only the current rollout generation.
     fn poll_cache_preparation(&mut self, cx: &mut Context<'_>) -> Result<()> {
         let node = self.node.clone();
-        let (generation, definitions) = {
-            let cut = node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
-            if cut.generation == 0 || cut.committed || cut.prepared.contains(&self.worker) {
-                return Ok(());
-            }
-            (
-                cut.generation,
-                if self.cache_prepare_task.is_none()
-                    || self.cache_preparing_generation != cut.generation
-                {
-                    cut.definitions.clone()
-                } else {
-                    Vec::new()
-                },
-            )
+        let Some(proposal) = node.cache_rollout.pending(&self.worker)? else {
+            return Ok(());
         };
+        let generation = proposal.generation;
+        let definitions = proposal.value;
         if self.cache_preparing_generation != generation {
             self.cache_prepare_task.take();
             self.prepared_listeners.borrow_mut().take();
             self.cache_preparing_generation = generation;
-        }
-        if node
-            .cache_cut
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .prepared
-            .contains(&self.worker)
-        {
-            return Ok(());
         }
         // Reject publications exceeding this worker's metadata catalog.
         if definitions.len()
@@ -1856,9 +1997,9 @@ impl WorkerApplication {
                 return Ok(());
             }
         }
-        let mut cut = node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
-        if cut.generation == generation {
-            cut.prepared.insert(self.worker);
+        match node.cache_rollout.ack(self.worker, generation) {
+            Ok(()) | Err(controlplane::Error::Stale) => (),
+            Err(error) => return Err(error.into()),
         }
         Ok(())
     }
@@ -1868,13 +2009,18 @@ impl WorkerApplication {
 #[derive(Default)]
 struct Observations {
     pub health: Health,
+
     workers: Mutex<HashMap<WorkerId, (Resources, Option<racer_control_wire::PublicationSequence>)>>,
 }
+
 impl Observations {
+    /// Record fixture readiness without an accepted publication cursor.
     #[cfg(test)]
     fn record(&self, worker: WorkerId, resources: Resources, count: usize) -> Result<()> {
         self.record_snapshot(worker, resources, count, None)
     }
+
+    /// Combine fresh worker observations into node-wide readiness.
     fn record_snapshot(
         &self,
         worker: WorkerId,
@@ -1922,6 +2068,8 @@ impl Observations {
         }
         Ok(())
     }
+
+    /// Count fresh worker observations matching the accepted publication.
     fn membership_workers(
         &self,
         diagnostic: &mut crate::telemetry::MembershipDiagnostic,
@@ -1943,6 +2091,7 @@ impl Observations {
 }
 
 impl WorkerApplication {
+    /// Start diagnostics on the control worker using its live publication observer.
     fn start_diagnostics(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if self.control.is_none() {
             return Ok(());
@@ -1974,6 +2123,8 @@ impl WorkerApplication {
         }
         Ok(())
     }
+
+    /// Report this worker's current resources and credential lifetime.
     fn observe_health(&self) -> Result<()> {
         let node = &self.node;
         self.telemetry
@@ -2018,6 +2169,8 @@ impl WorkerApplication {
             self.snapshot_sequence,
         )
     }
+
+    /// Recover storage and accept initial control state before opening listeners.
     pub fn start<'a>(&'a mut self, startup: &'a RequestScope) -> Operation<'a, ()> {
         let environment = self.environment.clone();
         let drivers = self.drivers.clone();
@@ -2048,6 +2201,7 @@ impl WorkerApplication {
         })))
     }
 
+    /// Open storage and publish the effective disk capacity metrics.
     async fn prepare_storage(&self) -> Result<CheckpointGeometry> {
         let _ = self.store.open().await?;
         let geometry = CheckpointGeometry::from(self.store.writer.slabs().geometry()?);
@@ -2068,6 +2222,7 @@ impl WorkerApplication {
         Ok(geometry)
     }
 
+    /// Drive enrollment and local installation until the first publication is accepted.
     async fn accept_initial_publication(&mut self, startup: &RequestScope) -> Result<()> {
         if let Some(control) = self.control.clone() {
             let identity = loop {
@@ -2142,6 +2297,7 @@ impl WorkerApplication {
         Ok(())
     }
 
+    /// Keep rollout preparation moving until every registered worker is ready.
     async fn wait_for_prepared_workers(&mut self, startup: &RequestScope) -> Result<()> {
         let node = self.node.clone();
         std::future::poll_fn(|cx| {
@@ -2162,6 +2318,7 @@ impl WorkerApplication {
         .await
     }
 
+    /// Start diagnostics and bind the control worker's peer listener before readiness.
     async fn start_listeners(&mut self) -> Result<()> {
         std::future::poll_fn(|cx| Poll::Ready(self.start_diagnostics(cx))).await?;
         self.task_scope = Some(scope(Duration::from_secs(365 * 24 * 3600))?);
@@ -2187,6 +2344,7 @@ impl WorkerApplication {
     }
 }
 
+/// Divide node quotas and report the first resource that cannot fund worker progress.
 fn partition_limits_with_cause(
     node: &Limits,
     workers: usize,
@@ -2269,6 +2427,7 @@ fn partition_limits_with_cause(
     Ok(limits)
 }
 
+/// Report worker counts and CPU placement for one startup planning stage.
 fn log_worker_plan(stage: &str, plan: &AffinityPlan) {
     let groups = plan.crypto_groups();
     eprintln!(
@@ -2292,6 +2451,7 @@ fn log_worker_plan(stage: &str, plan: &AffinityPlan) {
     }
 }
 
+/// Reduce worker count until each shard can fund its required progress resources.
 fn size_workers(node: &Limits, plan: &mut AffinityPlan, rdma: bool) -> Result<Limits> {
     // Reduce shards to fund progress, then rebalance shared crypto execution.
     let mut count = plan.pairs.len();

@@ -1348,7 +1348,9 @@ mod timeouts {
                     Peers::request_direct,
                 ),
                 credentials,
-                Arc::new(Default::default()),
+                Arc::new(controlplane::Published::new(
+                    crate::control::Snapshot::retention(2),
+                )),
             );
             let scope =
                 RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(1))
