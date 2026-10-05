@@ -497,7 +497,14 @@ version = "0.10.9"
 
 			testutil.WriteTree(t, root, files)
 
-			_, err := New(t.TempDir()).Collect(root)
+			c := New(filepath.Join(t.TempDir(), "nonexistent-cache"))
+			if tt.name == "missing registry cache" {
+				if err := c.Precheck(root); err == nil || !strings.Contains(err.Error(), "cargo fetch") {
+					t.Fatalf("Precheck error = %v; want fetch guidance", err)
+				}
+			}
+
+			_, err := c.Collect(root)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("Collect error = %v; want %q", err, tt.want)
 			}
@@ -525,7 +532,12 @@ dependencies = [
 `,
 	})
 
-	entries, err := New(t.TempDir()).Collect(root)
+	c := New(filepath.Join(t.TempDir(), "nonexistent-cache"))
+	if err := c.Precheck(root); err != nil {
+		t.Fatalf("Precheck local-only graph: %v", err)
+	}
+
+	entries, err := c.Collect(root)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("Collect = %v, %v; want no entries and no error", entries, err)
 	}

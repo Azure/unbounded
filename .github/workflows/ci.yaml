@@ -9,10 +9,8 @@ on:
       # Main is validated before merge by pull_request and merge_group.
       # Keep push validation for supported release branches.
       - release-*
-  pull_request:
-    branches:
-      - main
-      - release-*
+  # Validate stacked PRs as well as PRs targeting main and release branches.
+  pull_request: {}
   merge_group:
     types:
       - checks_requested
@@ -169,6 +167,7 @@ jobs:
         run: timeout --signal=TERM --kill-after=10s 300s make racer-dataplane-build
 
       - name: Test runtime without simulation or test utilities
+        if: hashFiles('cmd/racer-dataplane/runtime/Cargo.toml') != ''
         run: timeout --signal=TERM --kill-after=10s 300s make racer-runtime-test
 
       - name: Run unit, integration, and documentation tests
