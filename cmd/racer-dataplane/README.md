@@ -53,3 +53,25 @@ timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manife
 The production gate requires real io_uring and direct-I/O support: capability
 skips fail when `PAGE_ALLOC_REQUIRE_REAL_IO=1`. CI also checks all targets and
 runs strict Clippy for each allocator mode.
+
+The `flow-control` library provides policy-driven quotas, charged buffers, bounded
+kernel pipes, adaptive admission, and worker-local coalescing. Application policy
+and real operation completion remain the caller's responsibility. Its crate docs
+describe ownership and admission contracts; generate them with:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 doc --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p flow-control --no-deps
+```
+
+Validate flow separately so workspace feature unification cannot enable simulation
+in its production gate:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p flow-control --no-default-features -j 2 -- --test-threads=1
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p flow-control --no-default-features --features simulation -j 2 -- --test-threads=1
+```
+
+The flow production tests require Linux kernel pipes, Unix sockets, and splice.
+They exercise real I/O and fail rather than skipping unsupported operations.
+Simulation adds simulated and mixed-descriptor contracts without removing the
+real pipe tests. CI checks all targets and runs strict Clippy in each mode.
