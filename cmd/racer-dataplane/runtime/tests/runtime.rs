@@ -273,6 +273,99 @@ mod filesystem {
         }
     }
 
+    /// Private helpers follow retained descriptors across ambient simulation changes.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn secure_helpers_use_retained_backend_owner_after_environment_switch() {
+        use uring_runtime::reactor::simulation::Simulation;
+
+        let Some(_kernel) = kernel_reactor(4) else {
+            return;
+        };
+        let root = Directory::new();
+        let path = root.0.join("private");
+        let request = SecureScope(scope());
+        let host = Core::new(16, ());
+        let host_dir =
+            drive_secure(&host, secure::directory(&host, &path, true, true, &request)).unwrap();
+        drive_secure(
+            &host,
+            secure::atomic_write(&host, &host_dir, "value", b"host", &request),
+        )
+        .unwrap();
+        let sim = Simulation::new();
+        let environment = sim.enter();
+        let simulated = Core::new(16, ());
+        let sim_dir = drive_secure(
+            &simulated,
+            secure::directory(&simulated, &path, true, true, &request),
+        )
+        .unwrap();
+        drive_secure(
+            &simulated,
+            secure::atomic_write(&simulated, &sim_dir, "value", b"sim", &request),
+        )
+        .unwrap();
+
+        // The host reactor and descriptors stay host-backed under this simulation guard.
+        let reopened = drive_secure(
+            &host,
+            secure::directory(&host, &path, false, true, &request),
+        )
+        .unwrap();
+        assert_eq!(
+            drive_secure(
+                &host,
+                secure::read_at(&host, &reopened, "value", 4, true, &request)
+            )
+            .unwrap()
+            .as_ref(),
+            b"host"
+        );
+        let stat = drive_secure(&host, host.file_stat(host_dir.clone(), &request)).unwrap();
+        assert_eq!(secure::check_private(&stat, false), Ok(()));
+        let mut foreign = stat;
+        foreign.stx_uid = stat.stx_uid.wrapping_add(1);
+        assert_eq!(
+            secure::check_private(&foreign, false),
+            Err(secure::AccessError::PermissionDenied)
+        );
+        drop(environment);
+
+        // Simulated owner zero must not be compared with the non-root host UID.
+        let reopened = drive_secure(
+            &simulated,
+            secure::directory(&simulated, &path, false, true, &request),
+        )
+        .unwrap();
+        assert_eq!(
+            drive_secure(
+                &simulated,
+                secure::read_at(&simulated, &reopened, "value", 3, true, &request)
+            )
+            .unwrap()
+            .as_ref(),
+            b"sim"
+        );
+        sim.chmod(&path.join("value"), 0o644).unwrap();
+        assert!(matches!(
+            drive_secure(
+                &simulated,
+                secure::read_at(&simulated, &sim_dir, "value", 3, true, &request)
+            ),
+            Err(SecureError::Access(secure::AccessError::PermissionDenied))
+        ));
+        fs::set_permissions(path.join("value"), fs::Permissions::from_mode(0o644)).unwrap();
+        let _environment = sim.enter();
+        assert!(matches!(
+            drive_secure(
+                &host,
+                secure::read_at(&host, &host_dir, "value", 4, true, &request)
+            ),
+            Err(SecureError::Access(secure::AccessError::PermissionDenied))
+        ));
+    }
+
     /// Exercise secure composition against the host and optional deterministic backend.
     #[test]
     fn secure_helpers_compose_private_publication_reads_and_removal() {

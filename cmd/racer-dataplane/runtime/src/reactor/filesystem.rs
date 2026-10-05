@@ -452,8 +452,10 @@ fn value<E: From<Error>>(result: Result<KernelResult, E>) -> Result<i32, E> {
 }
 
 pub mod secure {
-    //! Descriptor-relative traversal and metadata checks without application policy.
-    //! Callers select limits, required ownership/access, and error classification.
+    //! Descriptor-relative traversal, metadata primitives, and secure policy helpers.
+    //! The primitives accept caller-selected bounds and access requirements. Composed
+    //! helpers cap files at 1 MiB and optionally require owner-only permissions and
+    //! a single link for regular files, using the descriptor's actual backend.
     use super::*;
     use std::{
         ffi::OsStr,
@@ -588,26 +590,40 @@ pub mod secure {
         }
     }
 
-    /// Check owner-only access using the selected backend's effective owner.
+    /// Check host metadata for owner-only access using the process's effective UID.
+    /// Require one link for regular files. Explicit-owner callers use [`check_access`].
     pub fn check_private(stat: &libc::statx, regular: bool) -> Result<(), AccessError> {
-        #[cfg(feature = "simulation")]
-        let simulated = simulation::Simulation::current().is_some();
-        #[cfg(not(feature = "simulation"))]
-        let simulated = false;
         // SAFETY: geteuid has no memory or lifetime preconditions.
-        let owner = if simulated {
-            0
-        } else {
-            unsafe { libc::geteuid() }
-        };
         check_access(
             stat,
             AccessRequirements {
-                owner,
+                owner: unsafe { libc::geteuid() },
                 forbidden_mode: 0o077,
                 links: regular.then_some(1),
             },
         )
+    }
+
+    /// Check metadata in its descriptor's ownership domain, not the ambient environment.
+    fn check_descriptor_private(
+        fd: &Descriptor,
+        stat: &libc::statx,
+        regular: bool,
+    ) -> Result<(), AccessError> {
+        #[cfg(feature = "simulation")]
+        if fd.as_sim().is_some() {
+            return check_access(
+                stat,
+                AccessRequirements {
+                    owner: 0,
+                    forbidden_mode: 0o077,
+                    links: regular.then_some(1),
+                },
+            );
+        }
+        #[cfg(not(feature = "simulation"))]
+        let _ = fd;
+        check_private(stat, regular)
     }
 
     /// Pin a symlink-free directory, optionally creating and checking private access.
@@ -623,7 +639,7 @@ pub mod secure {
     {
         let fd = r.file_directory(path, create, 4096, scope).await?;
         if private {
-            check_private(&r.file_stat(fd.clone(), scope).await?, false)?;
+            check_descriptor_private(&fd, &r.file_stat(fd.clone(), scope).await?, false)?;
         }
         Ok(fd)
     }
@@ -645,7 +661,7 @@ pub mod secure {
         let stat = r.file_stat(fd.clone(), scope).await?;
         check_regular_size(&stat, limit as u64)?;
         if private {
-            check_private(&stat, true)?;
+            check_descriptor_private(&fd, &stat, true)?;
         }
         r.file_read_bounded(fd, limit, NonZeroUsize::new(16384).unwrap(), scope)
             .await
