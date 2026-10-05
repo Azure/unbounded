@@ -41,7 +41,7 @@ use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::PublicationSequence;
 use racer_control_wire::SCHEMA_VERSION;
-use racer_identity::Keyring;
+use racer_crypto::identity::Keyring;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::net::TcpListener;

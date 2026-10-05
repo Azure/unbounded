@@ -24,7 +24,7 @@ use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::RailId;
 use racer_control_wire::RailMapping;
-use racer_identity::VerifiedPeer;
+use racer_crypto::identity::VerifiedPeer;
 use rdma_verbs::DeviceHandle;
 use rdma_verbs::Endpoint;
 use rdma_verbs::IoPort;
@@ -1372,9 +1372,9 @@ pub(crate) mod tests {
             use racer_control_wire::ClusterId;
             use racer_control_wire::KeyringBundle;
             use racer_control_wire::SCHEMA_VERSION;
-            use racer_identity::Certificates;
-            use racer_identity::KeyEpochs;
-            use racer_identity::Keyring;
+            use racer_crypto::identity::Certificates;
+            use racer_crypto::identity::KeyEpochs;
+            use racer_crypto::identity::Keyring;
             use std::sync::Arc;
             let (pending, chain, roots) = issued();
             let cluster = ClusterId(CLUSTER.into());
@@ -2721,7 +2721,7 @@ pub(crate) mod tests {
             use crate::worker::CryptoRuntime;
 
             use crate::security::PageCryptoEngine;
-            use racer_identity::KeyPurpose;
+            use racer_crypto::identity::KeyPurpose;
             use rdma_verbs::testing::Contention;
             use rdma_verbs::testing::State;
             use simulation::Fault;

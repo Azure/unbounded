@@ -1035,7 +1035,7 @@ impl CandidatePolicy {
         trail: Option<(&mut CandidateTrail, u8)>,
     ) -> Result<VerifiedResponse> {
         let mut remote = [b'?'; 36];
-        if trail.is_some() && racer_identity::canonical_uuid(&destination.0) {
+        if trail.is_some() && racer_crypto::identity::canonical_uuid(&destination.0) {
             remote.copy_from_slice(destination.0.as_bytes());
         }
         let mut facts = CandidateAttempt {
@@ -1865,8 +1865,8 @@ pub(super) mod tests {
         use crate::topology::Membership;
         use racer_control_wire::ClusterId;
         use racer_control_wire::MembershipVersion;
-        use racer_identity::KeyEpochs;
-        use racer_identity::Keyring;
+        use racer_crypto::identity::KeyEpochs;
+        use racer_crypto::identity::Keyring;
         let membership = std::sync::Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -2184,8 +2184,8 @@ pub(super) mod tests {
         )
     }
     fn policy(node: NodeId, peers: Rc<RecordedPeer>) -> CandidatePolicy {
-        use racer_identity::KeyEpochs;
-        use racer_identity::Keyring;
+        use racer_crypto::identity::KeyEpochs;
+        use racer_crypto::identity::Keyring;
         let config = crate::test_support::cluster::config(false);
         let admission = Rc::new(flow_control::Quotas::new(
             crate::admission::AdmissionPolicy::new(config.limits),
@@ -2352,7 +2352,7 @@ pub(super) mod tests {
         use crate::peer::protocol::{SecurityCodec, Signatures};
         use crate::peer::transport::Transfers;
         use crate::store::catalog::Index;
-        use racer_identity::{Certificates, KeyEpochs, Keyring};
+        use racer_crypto::identity::{Certificates, KeyEpochs, Keyring};
 
         for _ in 0..3 {
             let config = crate::test_support::cluster::config(false);

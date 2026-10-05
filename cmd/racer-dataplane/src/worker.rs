@@ -1471,8 +1471,8 @@ mod tests {
         use crate::security::CryptoInput;
         use crate::security::CryptoOutput;
         use crate::security::PageCryptoEngine;
-        use racer_identity::KeyPurpose;
-        use racer_identity::Keyring;
+        use racer_crypto::identity::KeyPurpose;
+        use racer_crypto::identity::Keyring;
         use std::sync::atomic::AtomicBool;
         use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;

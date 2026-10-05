@@ -20,8 +20,6 @@ COPY cmd/racer-dataplane/Cargo.toml cmd/racer-dataplane/Cargo.lock ./
 COPY cmd/racer-dataplane/src ./src
 COPY cmd/racer-dataplane/control-wire/Cargo.toml ./control-wire/Cargo.toml
 COPY cmd/racer-dataplane/control-wire/src ./control-wire/src
-COPY cmd/racer-dataplane/identity/Cargo.toml ./identity/Cargo.toml
-COPY cmd/racer-dataplane/identity/src ./identity/src
 COPY cmd/racer-dataplane/runtime/Cargo.toml ./runtime/Cargo.toml
 COPY cmd/racer-dataplane/runtime/src ./runtime/src
 COPY cmd/racer-dataplane/alloc/Cargo.toml ./alloc/Cargo.toml

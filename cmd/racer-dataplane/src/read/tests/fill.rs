@@ -2449,7 +2449,7 @@ impl Origin for TestOrigin {
 pub(super) struct Fixture {
     pub(super) fill: Fill,
     pub(super) reactor: Rc<Reactor>,
-    pub(super) keys: Rc<racer_identity::Keyring>,
+    pub(super) keys: Rc<racer_crypto::identity::Keyring>,
     pub(super) origin: Rc<TestOrigin>,
     pub(super) crypto: Rc<CryptoClient>,
     pub(super) engine: PageCryptoEngine,
@@ -3327,7 +3327,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::test_support::security::rotation_bundle;
-    use racer_identity::KeyPurpose;
+    use racer_crypto::identity::KeyPurpose;
     let mut f = fixture_with(3, None);
     let flights = f.fill.dependencies.flights.clone();
     let mut held_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);

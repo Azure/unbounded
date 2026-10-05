@@ -1,8 +1,12 @@
-//! Small cryptographic primitives with caller-supplied keys, nonces, and buffers.
-//! No entropy source, protocol framing, identity policy, or key derivation policy.
+//! Cryptographic primitives and Racer certificate identities and key epochs.
 //!
-//! Callers supply entropy, ensure nonce uniqueness for each key, and choose domain
-//! separation. AEAD operations borrow input and write directly to caller-owned
+//! The root primitive APIs use caller-supplied keys, nonces, and buffers, with no
+//! entropy source, protocol framing, identity policy, or key derivation policy.
+//! The [`identity`] module owns scoped key generation, certificate validation,
+//! atomic key epochs, and immutable purpose-bound leases.
+//!
+//! Primitive callers supply entropy, ensure nonce uniqueness for each key, and
+//! choose domain separation. AEAD operations borrow input and write directly to caller-owned
 //! output without allocating or staging plaintext. Public-key parsing does not
 //! establish identity or trust. CRC detects accidental corruption, not forgery.
 //!
@@ -14,13 +18,16 @@
 //! Integration tests cover reusable buffers, shared-key messages, standard
 //! vectors, rejection cases, persisted signing keys, and an independent CRC
 //! reference. They do not establish timing or secret-erasure guarantees. Protocol
-//! trust, replay, rotation, and admitted-buffer lifetimes belong to callers.
+//! trust and key rotation are covered by the identity module's tests. Application
+//! replay admission and admitted-buffer lifetimes remain outside this crate.
 //! Run `cargo test -p racer-crypto` from the parent workspace. Select ignored CRC
 //! hardware tests individually on supported x86 or AArch64 hosts; they fail on
 //! unsupported hardware rather than silently skipping.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+pub mod identity;
 
 use chacha20poly1305::{
     KeyInit, Tag, XChaCha20Poly1305,

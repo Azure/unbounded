@@ -973,11 +973,11 @@ pub(crate) mod security {
     use racer_control_wire::KeyringBundle;
     use racer_control_wire::NodeId;
     use racer_control_wire::SCHEMA_VERSION;
-    use racer_identity::Certificates;
-    use racer_identity::KeyEpochs;
-    use racer_identity::KeyLease;
-    use racer_identity::Keyring;
-    use racer_identity::PendingIdentity;
+    use racer_crypto::identity::Certificates;
+    use racer_crypto::identity::KeyEpochs;
+    use racer_crypto::identity::KeyLease;
+    use racer_crypto::identity::Keyring;
+    use racer_crypto::identity::PendingIdentity;
     use std::rc::Rc;
     use std::sync::Arc;
 
@@ -1192,11 +1192,11 @@ pub(crate) mod security {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use racer_identity::KeyPurpose;
+        use racer_crypto::identity::KeyPurpose;
         #[test]
         fn complete_component_error_mapping_preserves_application_meanings() {
             use crate::error::Error as App;
-            use racer_identity::Error as Identity;
+            use racer_crypto::identity::Error as Identity;
             for (component, application) in [
                 (Identity::InvalidRequest, App::InvalidRequest),
                 (Identity::InvalidConfiguration, App::InvalidConfiguration),

@@ -25,9 +25,9 @@ use racer_control_wire::SnapshotRequest;
 use racer_control_wire::SnapshotResponse;
 use racer_control_wire::canonical_content;
 use racer_control_wire::validate_publication;
-use racer_identity::KeyPurpose;
-use racer_identity::Keyring;
-use racer_identity::unix_time;
+use racer_crypto::identity::KeyPurpose;
+use racer_crypto::identity::Keyring;
+use racer_crypto::identity::unix_time;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -2177,8 +2177,8 @@ impl LocalSigningIdentity {
     pub fn signing_identity(
         &self,
         roots: &[Vec<u8>],
-    ) -> Result<Arc<racer_identity::SigningIdentity>> {
-        racer_identity::SigningIdentity::from_pkcs8(
+    ) -> Result<Arc<racer_crypto::identity::SigningIdentity>> {
+        racer_crypto::identity::SigningIdentity::from_pkcs8(
             self.cluster.clone(),
             self.node.clone(),
             &self.private_material,
@@ -2492,8 +2492,8 @@ pub(crate) mod tests {
         use std::sync::Arc;
         #[test]
         fn bundle_installation_is_idempotent_and_rejects_rollback() {
-            use racer_identity::KeyEpochs;
-            use racer_identity::KeyPurpose;
+            use racer_crypto::identity::KeyEpochs;
+            use racer_crypto::identity::KeyPurpose;
             let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../internal/racer/wire/testdata/publication.json"
@@ -2582,7 +2582,7 @@ pub(crate) mod tests {
         use crate::test_support::enrollment as testing;
         use racer_control_wire::ClusterId;
         use racer_control_wire::NodeId;
-        use racer_identity::KeyEpochs;
+        use racer_crypto::identity::KeyEpochs;
         use std::sync::Arc;
         #[test]
         fn busy_guard_rejects_overlap_without_releasing_the_owner() {
@@ -2943,7 +2943,7 @@ pub(crate) mod tests {
                     .borrow()
                     .active(
                         &bundle.cache_keys[0].key.cache,
-                        racer_identity::KeyPurpose::Page
+                        racer_crypto::identity::KeyPurpose::Page
                     )
                     .is_ok()
             );

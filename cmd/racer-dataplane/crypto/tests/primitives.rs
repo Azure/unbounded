@@ -2,6 +2,53 @@
 
 use racer_crypto::{SigningKey, TAG_LEN, VerifyingKey, crc64, ct_eq, hmac_sha256, open, seal};
 
+/// The identity module keeps its public types and classified errors beside primitives.
+#[test]
+fn identity_module_public_api_preserves_key_and_error_contracts() {
+    use racer_control_wire::{CacheId, ClusterId, NodeId};
+    use racer_crypto::identity::{
+        Certificates, Error as IdentityError, KeyEpochs, KeyLease, KeyPurpose, Keyring,
+        PendingIdentity, Result as IdentityResult, SigningIdentity, VerifiedPeer, canonical_uuid,
+        unix_time,
+    };
+    use std::{rc::Rc, sync::Arc};
+
+    let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
+    let node = NodeId("22222222-2222-4222-8222-222222222222".into());
+    let cache = CacheId("33333333-3333-4333-8333-333333333333".into());
+    assert!(canonical_uuid(&cluster.0));
+    let keys = Rc::new(Keyring::new(
+        cluster.clone(),
+        node.clone(),
+        Arc::new(KeyEpochs::default()),
+    ));
+    let lease: IdentityResult<KeyLease> = keys.active(&cache, KeyPurpose::Page);
+    assert!(matches!(lease, Err(IdentityError::MissingKey)));
+    let identity: IdentityResult<Arc<SigningIdentity>> = keys.signing_identity();
+    assert!(matches!(identity, Err(IdentityError::MissingKey)));
+    let certificates = Certificates::new(cluster, keys);
+    let peer: IdentityResult<VerifiedPeer> =
+        certificates.verify_signed(&[], &node, b"message", &[]);
+    assert!(matches!(peer, Err(IdentityError::MissingKey)));
+    let _time = unix_time();
+
+    let key = SigningKey::from_seed(&[42; 32]);
+    let encoded = key.to_pkcs8_der().unwrap();
+    let pending = PendingIdentity::recover(&encoded).unwrap();
+    assert_eq!(*pending.export_pkcs8_for_persistence().unwrap(), *encoded);
+    assert!(!pending.csr_der().unwrap().is_empty());
+    assert!(matches!(
+        PendingIdentity::recover(&[0; 4097]),
+        Err(IdentityError::InvalidRequest)
+    ));
+    assert!(matches!(
+        PendingIdentity::recover(b"invalid"),
+        Err(IdentityError::Unauthorized)
+    ));
+    let primitive: Result<SigningKey, racer_crypto::Error> = SigningKey::from_pkcs8_der(b"invalid");
+    assert!(primitive.is_err());
+}
+
 /// Exchange records in reused slices while preserving surrounding and rejected output.
 #[test]
 fn exchange_records_with_reusable_caller_buffers() {

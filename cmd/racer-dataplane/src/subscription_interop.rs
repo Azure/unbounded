@@ -34,8 +34,8 @@ use racer_control_wire::CacheKeyState;
 use racer_control_wire::KeyringBundle;
 use racer_control_wire::SCHEMA_VERSION;
 use racer_control_wire::{CacheId, ClusterId, NodeId};
-use racer_identity::KeyEpochs;
-use racer_identity::Keyring;
+use racer_crypto::identity::KeyEpochs;
+use racer_crypto::identity::Keyring;
 use runtime::Reactor;
 use runtime::RequestScope;
 use security::OriginContext;
@@ -487,7 +487,7 @@ fn interop_limits() -> Limits {
     }
 }
 
-fn interop_keys() -> racer_identity::Keyring {
+fn interop_keys() -> racer_crypto::identity::Keyring {
     let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
     let keys = Keyring::new(
         cluster.clone(),

@@ -82,7 +82,7 @@ pub fn fields(head: &str) -> std::collections::BTreeMap<String, String> {
 }
 
 #[allow(unused_imports)]
-pub use racer_identity::test_util::ca;
+pub use racer_crypto::identity::test_util::ca;
 
 pub fn issue(
     request: &racer_control_wire::EnrollmentRequest,
@@ -128,14 +128,20 @@ pub fn issue_at(
 }
 
 pub fn signing_identity(
-    pending: racer_identity::PendingIdentity,
+    pending: racer_crypto::identity::PendingIdentity,
     ca: &rcgen::Certificate,
     ca_key: &rcgen::KeyPair,
     cluster: racer_control_wire::ClusterId,
     node: racer_control_wire::NodeId,
-) -> std::sync::Arc<racer_identity::SigningIdentity> {
-    let (pending, chain) =
-        racer_identity::test_util::issue_pending(pending, ca, ca_key, &cluster, &node, |_| {});
+) -> std::sync::Arc<racer_crypto::identity::SigningIdentity> {
+    let (pending, chain) = racer_crypto::identity::test_util::issue_pending(
+        pending,
+        ca,
+        ca_key,
+        &cluster,
+        &node,
+        |_| {},
+    );
     std::sync::Arc::new(
         pending
             .accept(cluster, node, chain, &[ca.der().to_vec()])

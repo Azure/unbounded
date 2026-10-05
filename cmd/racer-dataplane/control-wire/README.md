@@ -21,8 +21,8 @@ rail mappings, and codecs directly, without compatibility re-exports or mirror D
 `src/topology.rs::Member` adapter remains necessary for the external
 `topology::Member` trait under Rust's orphan rules. Rail mappings and cache
 definitions pass through without conversion.
-Key bundles transfer directly into `racer-identity`, which owns epoch validation,
-certificate identities, and purpose-bound leases. Placement traits, publication
+Key bundles transfer directly into `racer_crypto::identity`, which owns epoch
+validation, certificate identities, and purpose-bound leases. Placement traits, publication
 installation, transport, persistence, and accepted control cursors remain in the
 application. Callers import shared identifiers, including the storage key ID,
 directly from `racer_control_wire`. The application's `model::key_id_from_generation`

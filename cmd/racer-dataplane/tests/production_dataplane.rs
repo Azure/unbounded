@@ -64,13 +64,13 @@ use racer_dataplane::store::catalog::Index;
 use racer_dataplane::store::catalog::SegmentClock;
 use racer_dataplane::topology::LinkHealth;
 
+use racer_crypto::identity::Certificates;
+use racer_crypto::identity::KeyEpochs;
+use racer_crypto::identity::Keyring;
+use racer_crypto::identity::PendingIdentity;
 use racer_dataplane::topology::Paths;
 use racer_dataplane::topology::Placement;
 use racer_dataplane::topology::RouteBudget;
-use racer_identity::Certificates;
-use racer_identity::KeyEpochs;
-use racer_identity::Keyring;
-use racer_identity::PendingIdentity;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;

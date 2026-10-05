@@ -93,8 +93,8 @@ fn credentials(
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 ) -> Rc<crate::security::CredentialCrypto> {
     use crate::security::CredentialCrypto;
-    use racer_identity::KeyEpochs;
-    use racer_identity::Keyring;
+    use racer_crypto::identity::KeyEpochs;
+    use racer_crypto::identity::Keyring;
     Rc::new(CredentialCrypto::new(
         Rc::new(Keyring::new(
             ClusterId("cluster".into()),

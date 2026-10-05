@@ -1878,7 +1878,7 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
     use crate::memory::tests::bundle_for;
     use crate::test_support::security::keys;
     use crate::test_support::security::rotation_bundle;
-    use racer_identity::KeyPurpose;
+    use racer_crypto::identity::KeyPurpose;
     use std::sync::Arc;
     let keys = Rc::new(keys());
     let roots = (*keys.peer_trust_roots().unwrap()).clone();

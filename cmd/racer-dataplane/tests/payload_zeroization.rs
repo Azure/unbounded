@@ -183,6 +183,9 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use base64::Engine;
     use racer_control_wire::ClusterId;
     use racer_control_wire::NodeId;
+    use racer_crypto::identity::KeyEpochs;
+    use racer_crypto::identity::KeyPurpose;
+    use racer_crypto::identity::Keyring;
     use racer_crypto::{TAG_LEN, seal};
     use racer_dataplane::model::RequestId;
     use racer_dataplane::model::WorkerId;
@@ -192,9 +195,6 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use racer_dataplane::security::PageCryptoEngine;
     use racer_dataplane::security::page_aad;
     use racer_dataplane::security::pair;
-    use racer_identity::KeyEpochs;
-    use racer_identity::KeyPurpose;
-    use racer_identity::Keyring;
     use std::sync::Arc;
     use std::task::Context;
     use std::task::Poll;

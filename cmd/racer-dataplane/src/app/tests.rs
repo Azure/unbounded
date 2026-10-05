@@ -559,7 +559,7 @@ pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
                 page: id,
                 key_id: app
                     .keys
-                    .active(&definition().id, racer_identity::KeyPurpose::Page)
+                    .active(&definition().id, racer_crypto::identity::KeyPurpose::Page)
                     .map(|key| key.id())
                     .unwrap_or_else(|_| crate::model::key_id_from_generation(2, 7).unwrap()),
                 nonce: Nonce([2; 24]),

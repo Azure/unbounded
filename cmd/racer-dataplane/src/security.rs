@@ -25,9 +25,9 @@ use crate::telemetry::Stage;
 use crate::worker::CryptoRuntime;
 use racer_control_wire::KeyId;
 use racer_crypto::TAG_LEN;
-use racer_identity::KeyLease;
-use racer_identity::KeyPurpose;
-use racer_identity::Keyring;
+use racer_crypto::identity::KeyLease;
+use racer_crypto::identity::KeyPurpose;
+use racer_crypto::identity::Keyring;
 use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -43,15 +43,15 @@ use uring_runtime::offload;
 use uring_runtime::reactor::IoBuffer;
 use zeroize::Zeroizing;
 
-impl From<racer_identity::Error> for crate::error::Error {
-    fn from(error: racer_identity::Error) -> Self {
+impl From<racer_crypto::identity::Error> for crate::error::Error {
+    fn from(error: racer_crypto::identity::Error) -> Self {
         match error {
-            racer_identity::Error::InvalidRequest => Self::InvalidRequest,
-            racer_identity::Error::InvalidConfiguration => Self::InvalidConfiguration,
-            racer_identity::Error::Unauthorized => Self::Unauthorized,
-            racer_identity::Error::Unavailable => Self::Unavailable,
-            racer_identity::Error::MissingKey => Self::MissingKey,
-            racer_identity::Error::CorruptRecord => Self::CorruptRecord,
+            racer_crypto::identity::Error::InvalidRequest => Self::InvalidRequest,
+            racer_crypto::identity::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            racer_crypto::identity::Error::Unauthorized => Self::Unauthorized,
+            racer_crypto::identity::Error::Unavailable => Self::Unavailable,
+            racer_crypto::identity::Error::MissingKey => Self::MissingKey,
+            racer_crypto::identity::Error::CorruptRecord => Self::CorruptRecord,
         }
     }
 }
@@ -187,7 +187,7 @@ pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
 /// (length:u32 BE, bytes), page:u64 BE, key ID, nonce, lengths:u32 BE.
 pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
     envelope.validate()?;
-    if !racer_identity::canonical_uuid(&envelope.page.version.object.cache.0)
+    if !racer_crypto::identity::canonical_uuid(&envelope.page.version.object.cache.0)
         || envelope.page.version.etag.as_bytes().len() > crate::model::MAX_FIELD_BYTES
     {
         return Err(Error::CorruptRecord);
@@ -432,7 +432,7 @@ impl PageCryptoEngine {
     /// Borrow every quota owner until crypto and the final cancellation check succeed.
     fn prepare(
         input: &CryptoInput,
-        key: &racer_identity::KeyLease,
+        key: &racer_crypto::identity::KeyLease,
         scope: &RequestScope,
         permit: &mut CryptoPermit,
     ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
@@ -705,7 +705,7 @@ fn credential_bounds(
     metadata: Option<&[u8]>,
     credential_length: usize,
 ) -> Result<usize> {
-    if !racer_identity::canonical_uuid(&object.cache.0)
+    if !racer_crypto::identity::canonical_uuid(&object.cache.0)
         || metadata.is_some_and(|m| m.len() > crate::model::MAX_FIELD_BYTES)
         || credential_length > crate::model::MAX_FIELD_BYTES + 16
     {
@@ -1872,7 +1872,7 @@ mod tests {
                     .unwrap();
                     let job = permit.job(
                         input,
-                        keys.active(cache, racer_identity::KeyPurpose::Page)
+                        keys.active(cache, racer_crypto::identity::KeyPurpose::Page)
                             .unwrap(),
                         scope.clone(),
                     );
@@ -1963,7 +1963,7 @@ mod tests {
                         let output = client
                             .execute(
                                 input,
-                                keys.active(cache, racer_identity::KeyPurpose::Page)
+                                keys.active(cache, racer_crypto::identity::KeyPurpose::Page)
                                     .unwrap(),
                                 &scope,
                             )
@@ -2077,7 +2077,7 @@ mod tests {
                             "00000000-0000-4000-8000-000000000003".into(),
                         );
                         let lease = || {
-                            keys.active(&cache, racer_identity::KeyPurpose::Page)
+                            keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
                                 .unwrap()
                         };
                         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2208,7 +2208,7 @@ mod tests {
                 let cache =
                     racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
-                    keys.active(&cache, racer_identity::KeyPurpose::Page)
+                    keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
                         .unwrap()
                 };
                 let scope = RequestScope::new(
@@ -2328,7 +2328,7 @@ mod tests {
                     }
                     let cache = page.envelope().page.version.object.cache.clone();
                     let lease = keys
-                        .active(&cache, racer_identity::KeyPurpose::Page)
+                        .active(&cache, racer_crypto::identity::KeyPurpose::Page)
                         .unwrap();
                     let scope = RequestScope::new(
                         crate::model::RequestId([7; 16]),
@@ -2443,7 +2443,7 @@ mod tests {
                 let cache =
                     racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
-                    keys.active(&cache, racer_identity::KeyPurpose::Page)
+                    keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
                         .unwrap()
                 };
                 let events = measurement_events(decrypt);
@@ -3151,18 +3151,18 @@ mod tests {
                 keyring()
                     .active(
                         &racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into()),
-                        racer_identity::KeyPurpose::Page,
+                        racer_crypto::identity::KeyPurpose::Page,
                     )
                     .unwrap()
             }
 
-            pub(super) fn keyring() -> racer_identity::Keyring {
+            pub(super) fn keyring() -> racer_crypto::identity::Keyring {
                 use racer_control_wire::CacheId;
                 use racer_control_wire::ClusterId;
                 use racer_control_wire::NodeId;
                 use racer_control_wire::*;
-                use racer_identity::KeyEpochs;
-                use racer_identity::Keyring;
+                use racer_crypto::identity::KeyEpochs;
+                use racer_crypto::identity::Keyring;
                 let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
                 let mut params = rcgen::CertificateParams::default();
                 params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);

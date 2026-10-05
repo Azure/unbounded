@@ -60,8 +60,8 @@ is introduced.
 
 ## Identity: cohesive component ownership
 
-`racer-identity` now owns CSR/recovery, signing identity and peer certificate
-validation, atomic key epochs, and immutable purpose-bound leases. It consumes
+The `racer_crypto::identity` module owns CSR/recovery, signing identity and peer
+certificate validation, atomic key epochs, and immutable purpose-bound leases. It consumes
 wire bundles directly, with private zeroizing validation staging. Application
 secret DTO duplication is removed. The wire storage KeyId is shared; the
 application configuration helper explicitly maps its constructor failure, and
@@ -76,8 +76,8 @@ Worker-local certificate caches retain Rc/RefCell ownership.
 
 Component tests retain private lifetime assertions; the runtime/page-engine
 ownership scenario and real decode/BundleInstaller rotation scenario are in
-`tests/identity_integration.rs`. See the crate docs in
-`cmd/racer-dataplane/identity/src/lib.rs` for focused gates.
+`tests/identity_integration.rs`. See the module docs in
+`cmd/racer-dataplane/crypto/src/identity.rs` for focused gates.
 This component boundary is justified by cohesive ownership, not an invented
 second consumer. The independent performance controller remains wire-only.
 

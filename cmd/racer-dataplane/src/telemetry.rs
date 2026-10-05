@@ -520,8 +520,8 @@ impl Pair {
     }
     pub fn validate(&self) -> Result<()> {
         if self.sender == self.receiver
-            || !racer_identity::canonical_uuid(&self.sender.0)
-            || !racer_identity::canonical_uuid(&self.receiver.0)
+            || !racer_crypto::identity::canonical_uuid(&self.sender.0)
+            || !racer_crypto::identity::canonical_uuid(&self.receiver.0)
         {
             return Err(Error::InvalidConfiguration);
         }

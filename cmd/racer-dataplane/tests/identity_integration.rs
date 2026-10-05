@@ -23,10 +23,10 @@ use racer_dataplane::security::CryptoInput;
 use racer_dataplane::security::CryptoOutput;
 use racer_dataplane::worker::CryptoRuntime;
 
+use racer_crypto::identity::KeyEpochs;
+use racer_crypto::identity::KeyPurpose;
+use racer_crypto::identity::Keyring;
 use racer_dataplane::security::PageCryptoEngine;
-use racer_identity::KeyEpochs;
-use racer_identity::KeyPurpose;
-use racer_identity::Keyring;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,8 +51,9 @@ fn shared_identity_publication_revalidates_trust_without_revoking_held_owners() 
     assert!(worker.signing_identity().is_err());
     assert!(worker.peer_trust_roots().is_err());
 
-    let (ca, ca_key) = racer_identity::test_util::ca();
-    let (pending, chain) = racer_identity::test_util::issue(&ca, &ca_key, &cluster, &node, |_| {});
+    let (ca, ca_key) = racer_crypto::identity::test_util::ca();
+    let (pending, chain) =
+        racer_crypto::identity::test_util::issue(&ca, &ca_key, &cluster, &node, |_| {});
     let roots = vec![ca.der().to_vec()];
     let identity = Arc::new(
         pending
@@ -82,7 +83,7 @@ fn shared_identity_publication_revalidates_trust_without_revoking_held_owners() 
             .is_err()
     );
 
-    let certificates = racer_identity::Certificates::new(cluster, worker.clone());
+    let certificates = racer_crypto::identity::Certificates::new(cluster, worker.clone());
     let message = b"shared publication";
     let signature = held.sign(message).unwrap();
     assert_eq!(
@@ -93,7 +94,7 @@ fn shared_identity_publication_revalidates_trust_without_revoking_held_owners() 
         &node,
     );
     let original_roots = worker.peer_trust_roots().unwrap();
-    let (replacement, _) = racer_identity::test_util::ca();
+    let (replacement, _) = racer_crypto::identity::test_util::ca();
     bundle.peer_trust_roots = vec![replacement.der().to_vec()];
     assert!(install_decoded(&installer, &bundle).is_err());
     assert!(Arc::ptr_eq(
@@ -208,7 +209,7 @@ fn real_decode_installer_rotation_retained_lease_and_rejection_are_atomic() {
     bundle.cache_keys[0].key.id = KeyId([0; 16]);
     assert_eq!(
         keys.install(bundle),
-        Err(racer_identity::Error::InvalidConfiguration)
+        Err(racer_crypto::identity::Error::InvalidConfiguration)
     );
     assert_eq!(
         racer_dataplane::model::key_id_from_generation(0, 1),

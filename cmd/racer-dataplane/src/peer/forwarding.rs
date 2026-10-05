@@ -63,7 +63,7 @@ use racer_control_wire::CacheId;
 #[cfg(test)]
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
-use racer_identity::VerifiedPeer;
+use racer_crypto::identity::VerifiedPeer;
 use std::rc::Rc;
 use std::sync::Arc;
 

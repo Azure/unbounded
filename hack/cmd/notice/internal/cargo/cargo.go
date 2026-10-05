@@ -38,7 +38,6 @@ var crateInputs = []crateInput{
 	{"cmd/racer-dataplane/flow/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/topology/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/control-wire/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
-	{"cmd/racer-dataplane/identity/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/uds-endpoint/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/wire-codec/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 }

@@ -14,7 +14,7 @@
 //! CRC checks, telemetry, and completion ownership. PKCS8 persistence export is
 //! explicit and zeroizing. Errors contain no input data. Certificate caches are
 //! worker-local and non-Send; verified peers cannot be constructed by callers.
-//! This crate has no dependency on the dataplane worker or service graph.
+//! This module has no dependency on the dataplane worker or service graph.
 //!
 //! # Validation and fixtures
 //!
@@ -23,21 +23,21 @@
 //! Run these gates from `cmd/racer-dataplane`:
 //!
 //! ```sh
-//! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-identity
-//! timeout --signal=TERM --kill-after=10s 300s cargo clippy --locked -p racer-identity --all-targets --no-deps -- -D warnings
+//! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-crypto
+//! timeout --signal=TERM --kill-after=10s 300s cargo clippy --locked -p racer-crypto --all-targets --all-features --no-deps -- -D warnings
 //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-dataplane --test identity_integration
 //! ```
 //!
 //! The opt-in `test-util` feature exposes Ed25519 CA and node-certificate fixtures
 //! with customizable parameters. `test_util::issue_pending` retains an existing
 //! key without consuming additional entropy. Production does not enable it.
+use crate::{SigningKey, VerifyingKey};
 #[cfg(test)]
 use racer_control_wire::CacheKeyPurpose;
 pub use racer_control_wire::valid_uuid as canonical_uuid;
 use racer_control_wire::{
     BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KeyId, NodeId, SCHEMA_VERSION,
 };
-use racer_crypto::{SigningKey, VerifyingKey};
 use rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivatePkcs8KeyDer},
@@ -56,11 +56,17 @@ use zeroize::Zeroizing;
 /// Payload-free component failures, explicitly mapped by the application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// The requested operation has invalid input.
     InvalidRequest,
+    /// The proposed key configuration or epoch transition is invalid.
     InvalidConfiguration,
+    /// Identity, trust, or authentication validation failed.
     Unauthorized,
+    /// A required resource or coherent publication is temporarily unavailable.
     Unavailable,
+    /// No admitted key matches the requested cache, ID, and purpose.
     MissingKey,
+    /// A page record or its cryptographic encoding is invalid.
     CorruptRecord,
 }
 
@@ -104,12 +110,12 @@ pub struct Keyring {
 
 /// An immutable secret owner, not a raw-key export capability.
 /// ```compile_fail
-/// fn raw(key: &racer_identity::KeyLease) {
-///     key.material(racer_identity::KeyPurpose::Page);
+/// fn raw(key: &racer_crypto::identity::KeyLease) {
+///     key.material(racer_crypto::identity::KeyPurpose::Page);
 /// }
 /// ```
 /// ```compile_fail
-/// fn diagnostic(key: racer_identity::KeyLease) { println!("{key:?}"); }
+/// fn diagnostic(key: racer_crypto::identity::KeyLease) { println!("{key:?}"); }
 /// ```
 pub struct KeyLease {
     reference: CacheKeyRef,
@@ -122,7 +128,7 @@ pub use racer_control_wire::CacheKeyPurpose as KeyPurpose;
 /// Worker-local verifier caching exact chains against the current trust roots.
 /// ```compile_fail
 /// fn send<T: Send>() {}
-/// send::<racer_identity::Certificates>();
+/// send::<racer_crypto::identity::Certificates>();
 /// ```
 pub struct Certificates {
     cluster: ClusterId,
@@ -134,7 +140,7 @@ pub struct Certificates {
 
 /// Only successful certificate validation can construct a verified peer.
 /// ```compile_fail
-/// let peer = racer_identity::VerifiedPeer { node: racer_control_wire::NodeId("forged".into()) };
+/// let peer = racer_crypto::identity::VerifiedPeer { node: racer_control_wire::NodeId("forged".into()) };
 /// ```
 pub struct VerifiedPeer {
     node: NodeId,
@@ -442,7 +448,7 @@ impl KeyLease {
         input: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
-        racer_crypto::seal(
+        crate::seal(
             self.bound_material(cache, self.id(), KeyPurpose::Page)?,
             nonce,
             aad,
@@ -463,7 +469,7 @@ impl KeyLease {
         input: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
-        racer_crypto::open(
+        crate::open(
             self.bound_material(cache, id, KeyPurpose::Page)?,
             nonce,
             aad,
@@ -481,7 +487,7 @@ impl KeyLease {
         input: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
-        racer_crypto::seal(
+        crate::seal(
             self.bound_material(cache, self.id(), KeyPurpose::OriginCredentials)?,
             nonce,
             aad,
@@ -502,7 +508,7 @@ impl KeyLease {
         input: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
-        racer_crypto::open(
+        crate::open(
             self.bound_material(cache, id, KeyPurpose::OriginCredentials)?,
             nonce,
             aad,
@@ -519,8 +525,8 @@ impl KeyLease {
         domain.extend_from_slice(&length.to_be_bytes());
         domain.extend_from_slice(cache.0.as_bytes());
         domain.extend_from_slice(&self.id().0);
-        let derived = Zeroizing::new(racer_crypto::hmac_sha256(material, &domain));
-        *out = racer_crypto::hmac_sha256(&derived, message);
+        let derived = Zeroizing::new(crate::hmac_sha256(material, &domain));
+        *out = crate::hmac_sha256(&derived, message);
         Ok(())
     }
     /// Authenticate a request MAC in constant time after checking its binding.
@@ -534,7 +540,7 @@ impl KeyLease {
         self.bound_material(cache, id, KeyPurpose::OriginCredentials)?;
         let mut expected = [0; 32];
         self.request_mac(cache, message, &mut expected)?;
-        if !racer_crypto::ct_eq(&expected, tag) {
+        if !crate::ct_eq(&expected, tag) {
             return Err(Error::Unauthorized);
         }
         Ok(())
@@ -1966,8 +1972,8 @@ mod purpose_operations {
         domain.extend_from_slice(&(cache.0.len() as u32).to_be_bytes());
         domain.extend_from_slice(cache.0.as_bytes());
         domain.extend_from_slice(&key.id().0);
-        let derived = Zeroizing::new(racer_crypto::hmac_sha256(&[8; 32], &domain));
-        assert_eq!(tag, racer_crypto::hmac_sha256(&derived, b"message"));
+        let derived = Zeroizing::new(crate::hmac_sha256(&[8; 32], &domain));
+        assert_eq!(tag, crate::hmac_sha256(&derived, b"message"));
         key.verify_request_mac(&cache, key.id(), b"message", &tag)
             .unwrap();
         assert_eq!(

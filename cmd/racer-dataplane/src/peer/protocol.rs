@@ -32,9 +32,9 @@ use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
-use racer_identity::Certificates;
-use racer_identity::Keyring;
-use racer_identity::VerifiedPeer;
+use racer_crypto::identity::Certificates;
+use racer_crypto::identity::Keyring;
+use racer_crypto::identity::VerifiedPeer;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeSet;
@@ -106,9 +106,10 @@ impl Signatures {
         );
         if head.unique("racer-kind")? == Some(b"request".as_slice()) {
             let cache = CacheId(field(&head, "racer-cache")?);
-            let key = self
-                .keys
-                .active(&cache, racer_identity::KeyPurpose::OriginCredentials)?;
+            let key = self.keys.active(
+                &cache,
+                racer_crypto::identity::KeyPurpose::OriginCredentials,
+            )?;
             push_binary(&mut head, "racer-mac-key", &key.id().0);
             let mut tag = [0; 32];
             key.request_mac(&cache, &mac_base(&head)?, &mut tag)?;
@@ -165,7 +166,7 @@ impl Signatures {
             let key = self.keys.lease(
                 Some(&cache),
                 KeyId(id),
-                racer_identity::KeyPurpose::OriginCredentials,
+                racer_crypto::identity::KeyPurpose::OriginCredentials,
             )?;
             key.verify_request_mac(
                 &cache,
