@@ -35,18 +35,18 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use uring_runtime::drivers::yield_now;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const SLOTS: uring_runtime::reactor::filesystem::checkpoint::Slots<HEADER_BYTES> =
+    uring_runtime::reactor::filesystem::checkpoint::Slots {
+        names: CHECKPOINT_NAMES,
+        minimum_bytes: HEADER_BYTES + 4 + DIGEST_BYTES,
+        maximum_bytes: MAX_CHECKPOINT_BYTES,
+    };
 
 pub struct Checkpointer {
     directory: PathBuf,
@@ -175,13 +175,9 @@ impl Checkpointer {
             let newest = candidates(&self.directory, MAX_CHECKPOINT_BYTES)?
                 .next()
                 .map(|(slot, image)| (slot, image.sequence));
-            let sequence = match &newest {
-                Some((_, sequence)) => sequence.checked_add(1).ok_or(Error::Unavailable)?,
-                None => 1,
-            };
             // Replace the slot opposite the newest valid image, including after a
             // torn newer publication. The surviving valid generation stays intact.
-            let slot = newest.map_or(0, |(slot, _)| 1 - slot);
+            let (slot, sequence) = SLOTS.next_publication(newest).ok_or(Error::Unavailable)?;
             let bytes = encode(&CheckpointImage {
                 version: CHECKPOINT_VERSION,
                 sequence,
@@ -237,45 +233,11 @@ impl Checkpointer {
             if bytes.len() > budget / 2 {
                 return Err(Error::Overloaded);
             }
-            use std::ffi::CString;
-            use std::os::unix::ffi::OsStrExt;
-            let dir = reactor
-                .file_open(
-                    None,
-                    CString::new(directory.as_os_str().as_bytes())
-                        .map_err(|_| Error::InvalidConfiguration)?,
-                    libc::O_RDONLY | libc::O_DIRECTORY,
-                    0,
-                    &scope,
-                )
-                .await?;
-            let temporary = CString::new(".checkpoint.periodic.stage").unwrap();
-            match reactor
-                .file_unlink(dir.clone(), temporary.clone(), &scope)
-                .await
-            {
-                Ok(()) | Err(Error::MissingKey) => (),
-                Err(error) => return Err(error),
-            }
-            let fd = reactor
-                .file_open(
-                    Some(dir.clone()),
-                    temporary.clone(),
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                    0,
-                    &scope,
-                )
-                .await?;
-            reactor
-                .file_replace_chunked(
-                    uring_runtime::reactor::filesystem::operations::Replacement {
-                        directory: dir,
-                        staged: fd,
-                        temporary,
-                        target: CString::new(CHECKPOINT_NAMES[slot]).unwrap(),
-                        durability:
-                            uring_runtime::reactor::filesystem::operations::Durability::Publish,
-                    },
+            SLOTS
+                .publish_async(
+                    &reactor,
+                    &directory,
+                    slot,
                     &bytes,
                     std::num::NonZeroUsize::new(16384).unwrap(),
                     &scope,
@@ -293,23 +255,7 @@ impl Drop for Checkpointer {
 }
 
 fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
-    // A stale partial file never prevents a later publication, including after PID
-    // reuse. Exactly one application coordinator serializes publications.
-    let candidates = (0..128).map(|_| {
-        #[cfg(test)]
-        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
-            return directory.join(format!(".checkpoint.{}.tmp", sim.next_sequence()));
-        }
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        directory.join(format!(".checkpoint.{}.{sequence}.tmp", std::process::id()))
-    });
-    uring_runtime::reactor::filesystem::operations::publish_new(
-        directory,
-        &directory.join(CHECKPOINT_NAMES[slot]),
-        bytes,
-        candidates,
-    )
-    .map_err(|_| Error::Io)
+    SLOTS.publish(directory, slot, bytes).map_err(|_| Error::Io)
 }
 
 /// Newest-valid checkpoint selection with empty-cache fallback and no payload scan.
@@ -402,138 +348,21 @@ impl Recovery {
 /// directory is fatal; individual checkpoint files are disposable hints. Slab
 /// opening/validation remains independently fatal during Store::open.
 pub(crate) fn candidates(directory: &Path, budget: usize) -> Result<Candidates> {
-    // Preserve missing-directory cold starts for the standalone store API.
-    match CandidateFile::open(directory, true) {
-        Ok(_) => (),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Candidates {
-                slots: vec![],
-                budget,
-            });
-        }
-        Err(e) => {
+    SLOTS
+        .candidates(
+            directory,
+            budget,
+            |header| sequence_hint(header).map_err(std::io::Error::other),
+            |bytes, budget| decode_with_budget(bytes, budget).map_err(std::io::Error::other),
+        )
+        .map_err(|e| {
             eprintln!("racer: checkpoint storage directory unavailable: {e}");
-            return Err(Error::Io);
-        }
-    }
-    let mut slots = Vec::with_capacity(CHECKPOINT_NAMES.len());
-    for (slot, name) in CHECKPOINT_NAMES.iter().enumerate() {
-        let result = (|| -> std::io::Result<_> {
-            let mut file = CandidateFile::open(&directory.join(name), false)?;
-            let length = file.length()?;
-            if length < 68 || length > MAX_CHECKPOINT_BYTES as u64 || length > budget as u64 {
-                return Err(std::io::Error::other(
-                    "checkpoint encoded size exceeds recovery budget or format limit",
-                ));
-            }
-            let mut header = [0; 32];
-            file.read_exact(&mut header)?;
-            let sequence = sequence_hint(&header)
-                .map_err(|_| std::io::Error::other("invalid checkpoint header"))?;
-            Ok((slot, sequence, file, length as usize, header))
-        })();
-        match result {
-            Ok(candidate) => slots.push(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(e) => eprintln!("racer: skipping checkpoint slot {slot}: {e}"),
-        }
-    }
-    slots.sort_by_key(|(_, sequence, ..)| *sequence);
-    Ok(Candidates { slots, budget })
+            Error::Io
+        })
 }
 
-pub(crate) struct Candidates {
-    slots: Vec<(usize, u64, CandidateFile, usize, [u8; 32])>,
-    budget: usize,
-}
-
-impl Iterator for Candidates {
-    type Item = (usize, CheckpointImage);
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some((slot, _, mut file, length, header)) = self.slots.pop() {
-            // Length is checked before reserving. read_exact never grows this
-            // buffer if the file grows; an extra stack byte detects that race.
-            let result = (|| -> Result<CheckpointImage> {
-                let mut bytes = Vec::new();
-                bytes
-                    .try_reserve_exact(length)
-                    .map_err(|_| Error::Overloaded)?;
-                bytes.resize(length, 0);
-                bytes[..32].copy_from_slice(&header);
-                file.read_exact(&mut bytes[32..]).map_err(|_| Error::Io)?;
-                if file.read(&mut [0]).map_err(|_| Error::Io)? != 0 {
-                    return Err(Error::CorruptRecord);
-                }
-                decode_with_budget(&bytes, self.budget)
-            })();
-            match result {
-                Ok(image) => return Some((slot, image)),
-                Err(e) => {
-                    eprintln!("racer: skipping checkpoint slot {slot} during read/decode: {e}")
-                }
-            }
-        }
-        None
-    }
-}
-
-enum CandidateFile {
-    Real(std::fs::File),
-    #[cfg(test)]
-    Sim(uring_runtime::reactor::simulation::Handle, u64),
-}
-impl CandidateFile {
-    fn open(path: &Path, directory: bool) -> std::io::Result<Self> {
-        let flags =
-            libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
-        #[cfg(test)]
-        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
-            let handle = sim
-                .open(None, path, libc::O_RDONLY | flags)?
-                .into_sim()
-                .expect("simulated file");
-            return Ok(Self::Sim(handle, 0));
-        }
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(flags)
-            .open(path)
-            .map(Self::Real)
-    }
-    fn length(&self) -> std::io::Result<u64> {
-        let (regular, length) = match self {
-            Self::Real(file) => {
-                let m = file.metadata()?;
-                (m.is_file(), m.len())
-            }
-            #[cfg(test)]
-            Self::Sim(handle, _) => {
-                let m = handle.stat()?;
-                (
-                    m.stx_mode as u32 & libc::S_IFMT == libc::S_IFREG,
-                    m.stx_size,
-                )
-            }
-        };
-        if !regular {
-            return Err(std::io::Error::other("checkpoint is not a regular file"));
-        }
-        Ok(length)
-    }
-}
-impl Read for CandidateFile {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Real(file) => file.read(bytes),
-            #[cfg(test)]
-            Self::Sim(handle, offset) => {
-                let n = handle.file_read(*offset, bytes)?;
-                *offset += n as u64;
-                Ok(n)
-            }
-        }
-    }
-}
+pub(crate) type Candidates =
+    uring_runtime::reactor::filesystem::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
 
 #[cfg(test)]
 pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, CheckpointImage)>> {

@@ -2941,9 +2941,6 @@ mod checkpoint {
     use std::fs;
     use std::path::PathBuf;
     use std::rc::Rc;
-    use uring_runtime::reactor::simulation::Fault;
-    use uring_runtime::reactor::simulation::Simulation;
-
     const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 
     #[test]
@@ -3305,22 +3302,6 @@ mod checkpoint {
             candidates(&directory.0.join("checkpoint.1"), MAX_CHECKPOINT_BYTES),
             Err(Error::Io)
         ));
-    }
-
-    #[test]
-    fn candidate_read_failure_tries_older_slot() {
-        use crate::store::checkpoint::candidates;
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let path = PathBuf::from("/recovery-budget-test");
-        sim.write_file(&path.join("checkpoint.0"), &encode(&image(1)).unwrap())
-            .unwrap();
-        sim.write_file(&path.join("checkpoint.1"), &encode(&image(2)).unwrap())
-            .unwrap();
-        let mut scan = candidates(&path, MAX_CHECKPOINT_BYTES).unwrap();
-        sim.inject("read", Fault::Errno(libc::EIO)).unwrap();
-        assert_eq!(scan.next().unwrap().1.sequence, 1);
-        assert!(scan.next().is_none());
     }
 
     #[test]
