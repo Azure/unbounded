@@ -52,7 +52,6 @@ use crate::peer::protocol::field;
 use crate::peer::protocol::node_field;
 use crate::peer::protocol::number;
 use crate::peer::protocol::push;
-use crate::peer::protocol::push_binary;
 use crate::peer::protocol::receiver;
 use crate::peer::protocol::signed_digest;
 use crate::topology::RouteBudget;
@@ -70,12 +69,7 @@ use std::sync::Arc;
 pub struct Forwarding {
     signatures: Rc<Signatures>,
 }
-pub struct ForwardedHead {
-    /// Shared ownership lets an outstanding attempt retain its exact original
-    /// head while the transport owns the envelope. Never replace it at a relay.
-    pub original: Arc<SignedHead>,
-    pub hops: Vec<SignedHead>,
-}
+pub use peer_wire::ForwardedHead;
 
 /// Opaque outstanding-request context, minted only by request signing or ingress
 /// verification. Retains the exact original head/signature, not just a request ID.
@@ -221,8 +215,8 @@ impl Forwarding {
         }
         Ok(RequestBinding {
             original: request.authentication.original.clone(),
-            path: route.visited,
             deadline: route.deadline,
+            path: route.0.visited,
         })
     }
     pub(crate) fn verify_opaque(
@@ -266,8 +260,8 @@ impl Forwarding {
         let original = Arc::new(self.signatures.sign(head)?);
         let binding = RequestBinding {
             original: original.clone(),
-            path: route.visited,
             deadline: route.deadline,
+            path: route.0.visited,
         };
         Ok((
             SignedRequest {
@@ -325,12 +319,13 @@ impl Forwarding {
         if receiver(&previous.head)? != *self.signatures.node() {
             return Err(Error::Unauthorized);
         }
-        let mut path = route.visited;
+        let deadline = route.deadline;
+        let mut path = route.0.visited;
         path.push(self.signatures.node().clone());
         let binding = RequestBinding {
             original: auth.original.clone(),
             path,
-            deadline: route.deadline,
+            deadline,
         };
         Ok(VerifiedRequest {
             signed: request,
@@ -607,15 +602,14 @@ impl Forwarding {
     }
 }
 #[derive(PartialEq, Eq)]
-struct RouteState {
-    membership: u64,
-    request: String,
-    attempt: String,
-    destination: NodeId,
-    visited: Vec<NodeId>,
-    links: u64,
-    attempts: u32,
-    deadline: u64,
+struct RouteState(peer_wire::forwarding::RouteState);
+
+impl std::ops::Deref for RouteState {
+    type Target = peer_wire::forwarding::RouteState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 impl RouteState {
     fn from_budget(budget: &RouteBudget) -> Result<Self> {
@@ -627,66 +621,16 @@ impl RouteState {
         Self::from_head(&head)
     }
     fn from_head(head: &MessageHead) -> Result<Self> {
-        let state = Self {
-            membership: number(head, "racer-route-membership")?,
-            request: field(head, "racer-route-request")?,
-            attempt: field(head, "racer-route-attempt")?,
-            destination: node_field(head, "racer-route-destination")?,
-            visited: protocol::decode_nodes(field(head, "racer-route-visited")?.as_bytes())?,
-            links: number(head, "racer-route-links")?,
-            attempts: number(head, "racer-route-attempts")?
-                .try_into()
-                .map_err(|_| Error::Unauthorized)?,
-            deadline: number(head, "racer-route-deadline")?,
-        };
-        if state.membership == 0
-            || protocol::decode_binary(state.request.as_bytes())?.len() != 16
-            || protocol::decode_binary(state.attempt.as_bytes())?.len() != 16
-        {
-            return Err(Error::Unauthorized);
-        }
-        if state.links == 0
-            || state.links > protocol::MAX_HOPS as u64
-            || state.visited.is_empty()
-            || state.visited.len() + state.links as usize > protocol::MAX_HOPS + 1
-        {
-            return Err(Error::HopBudgetExhausted);
-        }
-        Ok(state)
+        peer_wire::forwarding::RouteState::from_head(head)
+            .map(Self)
+            .map_err(Into::into)
     }
     fn transition(&self, next: &Self, signer: &NodeId) -> Result<()> {
-        let mut visited = self.visited.clone();
-        visited.push(signer.clone());
-        if self.links <= 1
-            || next.links != self.links - 1
-            || next.attempts > self.attempts
-            || next.deadline > self.deadline
-            || next.membership != self.membership
-            || next.request != self.request
-            || next.attempt != self.attempt
-            || next.destination != self.destination
-            || self.visited.contains(signer)
-            || signer == &self.destination
-            || next.visited != visited
-        {
-            return Err(Error::HopBudgetExhausted);
-        }
-        Ok(())
+        self.0.transition(&next.0, signer).map_err(Into::into)
     }
 }
 fn hop_head(kind: &str, original: &SignedHead, previous: &SignedHead) -> Result<MessageHead> {
-    let mut head = MessageHead {
-        start: StartLine::Request {
-            method: "POST".into(),
-            target: "/racer/peer/v1/hop".into(),
-        },
-        headers: Vec::new(),
-    };
-    push(&mut head, "racer-kind", kind);
-    push(&mut head, "content-length", 0);
-    push_binary(&mut head, "racer-original", &signed_digest(original)?);
-    push_binary(&mut head, "racer-previous", &signed_digest(previous)?);
-    Ok(head)
+    peer_wire::forwarding::hop_head(kind, original, previous).map_err(Into::into)
 }
 fn check_hop(
     hop: &SignedHead,
@@ -695,25 +639,7 @@ fn check_hop(
     previous: &SignedHead,
     route: &RouteState,
 ) -> Result<()> {
-    let mut expected = hop_head(kind, original, previous)?;
-    // The route parser has already validated monotonic state. Copy only its fixed
-    // schema to the comparison head; unexpected fields still fail agreement.
-    for name in [
-        "racer-route-membership",
-        "racer-route-request",
-        "racer-route-attempt",
-        "racer-route-destination",
-        "racer-route-visited",
-        "racer-route-links",
-        "racer-route-attempts",
-        "racer-route-deadline",
-    ] {
-        push(&mut expected, name, field(&hop.head, name)?);
-    }
-    if route.visited.contains(&receiver(&hop.head)?) {
-        return Err(Error::Unauthorized);
-    }
-    protocol::agrees(&hop.head, &expected, false)
+    peer_wire::forwarding::check_hop(hop, kind, original, previous, &route.0).map_err(Into::into)
 }
 fn response_hop_head(
     original: &SignedHead,
@@ -722,11 +648,8 @@ fn response_hop_head(
     path: &[NodeId],
     index: usize,
 ) -> Result<MessageHead> {
-    let mut head = hop_head("response-hop", original, previous)?;
-    push_binary(&mut head, "racer-request-binding", &signed_digest(request)?);
-    push(&mut head, "racer-response-path", protocol::nodes(path)?);
-    push(&mut head, "racer-reverse-index", index);
-    Ok(head)
+    peer_wire::forwarding::response_hop_head(original, previous, request, path, index)
+        .map_err(Into::into)
 }
 fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()> {
     let outcome = field(response, "racer-outcome")?;

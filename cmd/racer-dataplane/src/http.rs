@@ -101,13 +101,13 @@ pub struct State {
 impl http1::connection::State<Error> for State {
     fn admit(&mut self, head: MessageHead) -> Result<MessageHead> {
         match &mut self.session {
-            Some(session) => session.admit(head),
+            Some(session) => session.admit(head).map_err(Into::into),
             None => Ok(head),
         }
     }
     fn sign(&mut self, head: MessageHead) -> Result<MessageHead> {
         match &mut self.session {
-            Some(session) => session.sign(head),
+            Some(session) => session.sign(head).map_err(Into::into),
             None => Ok(head),
         }
     }
@@ -157,16 +157,31 @@ pub(crate) fn from_reserved(
 ) -> Result<ConnectionLease> {
     ConnectionLease::from_reserved(fd, reservation, State::default())
 }
+#[cfg(test)]
 pub(crate) fn install_session(
     connection: &mut ConnectionLease,
     session: crate::peer::protocol::Session,
 ) -> Result<()> {
-    if connection.state().session.is_some() || connection.closing() {
-        return Err(Error::Unauthorized);
+    peer_wire::install_session(connection, session)
+}
+impl peer_wire::Context for HttpContext {
+    fn session(state: &State) -> Option<&peer_wire::Session> {
+        state.session.as_ref()
     }
-    connection.state_mut().session = Some(session);
-    connection.begin_io();
-    Ok(())
+
+    fn session_mut(state: &mut State) -> &mut Option<peer_wire::Session> {
+        &mut state.session
+    }
+
+    fn handshake_scope(parent: &RequestScope) -> Result<RequestScope> {
+        parent.check()?;
+        let mut scope = parent.clone();
+        scope.deadline.0 = scope
+            .deadline
+            .0
+            .min(uring_runtime::environment::now() + Duration::from_secs(5));
+        Ok(scope)
+    }
 }
 pub fn new_io(
     reactor: Rc<Reactor>,

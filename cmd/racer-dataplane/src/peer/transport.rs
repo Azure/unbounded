@@ -60,51 +60,31 @@ pub(crate) struct Binding {
     pub deadline: u64,
     pub rail: RailId,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Phase {
-    Accept,
-    Offer,
-    Setup,
-    Ready,
-    Grant,
-    Complete,
-    Failed,
-    Fallback,
-    Done,
-    Finish,
-}
-impl Phase {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Accept => "accept",
-            Self::Offer => "offer",
-            Self::Setup => "setup",
-            Self::Ready => "ready",
-            Self::Grant => "grant",
-            Self::Complete => "complete",
-            Self::Failed => "failed",
-            Self::Fallback => "fallback",
-            Self::Done => "done",
-            Self::Finish => "finish",
-        }
-    }
-    fn response(self) -> bool {
-        matches!(
-            self,
-            Self::Offer | Self::Ready | Self::Complete | Self::Failed | Self::Finish
-        )
-    }
-    fn fields(self) -> &'static [&'static str] {
-        match self {
-            Self::Offer => &["racer-rdma-setup"],
-            Self::Setup | Self::Ready => &["racer-rdma-setup", "racer-rdma-setup-binding"],
-            Self::Grant => &["racer-rdma-descriptor"],
-            Self::Complete => &["racer-rdma-completion"],
-            _ => &[],
-        }
-    }
-}
+pub(crate) use peer_wire::control::Phase;
 impl Binding {
+    #[cfg(test)]
+    fn head(
+        &self,
+        phase: Phase,
+        previous: &[u8; 32],
+        length: usize,
+        extensions: Vec<Header>,
+    ) -> Result<MessageHead> {
+        self.wire()
+            .head(phase, previous, length, extensions)
+            .map_err(Into::into)
+    }
+
+    fn wire(&self) -> peer_wire::control::Binding {
+        peer_wire::control::Binding {
+            request: self.request,
+            response: self.response,
+            transfer: self.transfer.0,
+            membership: self.membership,
+            deadline: self.deadline,
+            rail: self.rail,
+        }
+    }
     pub fn request(
         auth: &ForwardedHead,
         membership: u64,
@@ -122,61 +102,6 @@ impl Binding {
             rail,
         })
     }
-    fn head(
-        &self,
-        phase: Phase,
-        previous: &[u8; 32],
-        length: usize,
-        extensions: Vec<Header>,
-    ) -> Result<MessageHead> {
-        if self.membership == 0
-            || self.transfer.0 == [0; 16]
-            || extensions.len() != phase.fields().len()
-            || extensions
-                .iter()
-                .zip(phase.fields())
-                .any(|(h, n)| h.name != *n)
-        {
-            return Err(Error::InvalidRequest);
-        }
-        for h in &extensions {
-            if h.value.len() > 256 {
-                return Err(Error::InvalidRequest);
-            }
-            p::decode_binary(&h.value)?;
-        }
-        if length > crate::model::PAGE_BYTES as usize + 16
-            || (length != 0 && phase != Phase::Finish)
-        {
-            return Err(Error::InvalidRequest);
-        }
-        let mut h = MessageHead {
-            start: if phase.response() {
-                StartLine::Response { status: 200 }
-            } else {
-                StartLine::Request {
-                    method: "POST".into(),
-                    target: "/racer/peer/v1/payload".into(),
-                }
-            },
-            headers: vec![],
-        };
-        p::push(&mut h, "content-length", length);
-        p::push(&mut h, "racer-kind", format!("payload-v1-{}", phase.name()));
-        for (n, b) in [
-            ("racer-payload-request", self.request.as_slice()),
-            ("racer-payload-response", self.response.as_slice()),
-            ("racer-payload-transfer", self.transfer.0.as_slice()),
-            ("racer-payload-previous", previous.as_slice()),
-        ] {
-            p::push_binary(&mut h, n, b);
-        }
-        p::push(&mut h, "racer-payload-membership", self.membership);
-        p::push(&mut h, "racer-payload-deadline", self.deadline);
-        p::push(&mut h, "racer-payload-rail", self.rail.0);
-        h.headers.extend(extensions);
-        Ok(h)
-    }
     pub fn sign(
         &self,
         signatures: &Signatures,
@@ -186,9 +111,9 @@ impl Binding {
         length: usize,
         extensions: Vec<Header>,
     ) -> Result<SignedHead> {
-        let mut h = self.head(phase, previous, length, extensions)?;
-        p::push(&mut h, "racer-receiver", &to.0);
-        signatures.sign(h)
+        self.wire()
+            .sign(signatures.wire(), to, phase, previous, length, extensions)
+            .map_err(Into::into)
     }
     /// Verify the peer's signed phase against this transfer and its prior digest.
     #[allow(clippy::too_many_arguments)] // Protocol evidence is checked together at this boundary.
@@ -203,67 +128,27 @@ impl Binding {
         scope: &RequestScope,
     ) -> Result<(VerifiedHead, Phase)> {
         scope.check()?;
-        if p::decode_deadline(self.deadline)?.0 <= uring_runtime::environment::now() {
-            return Err(Error::DeadlineExceeded);
-        }
-        let kind = p::field(&signed.head, "racer-kind")?;
-        let phase = *allowed
-            .iter()
-            .find(|phase| kind == format!("payload-v1-{}", phase.name()))
-            .ok_or(Error::Unauthorized)?;
-        let extensions = phase
-            .fields()
-            .iter()
-            .map(|name| {
-                Ok(Header::new(
-                    *name,
-                    signed.head.unique(name)?.ok_or(Error::Unauthorized)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        p::agrees(
-            &signed.head,
-            &self.head(phase, previous, length, extensions)?,
-            false,
-        )?;
-        if crate::peer::protocol::node_field(&signed.head, "racer-signer")? != *from {
-            return Err(Error::Unauthorized);
-        }
-        Ok((signatures.verify_proof(signed)?, phase))
+        let (verified, phase) =
+            self.wire()
+                .verify(signatures.wire(), from, signed, allowed, previous, length)?;
+        let (signed, peer) = verified.into_parts();
+        Ok((VerifiedHead { signed, peer }, phase))
     }
     pub fn parse_accept(signed: &SignedHead) -> Result<Self> {
-        fn a<const N: usize>(h: &MessageHead, n: &str) -> Result<[u8; N]> {
-            p::decode_binary(p::field(h, n)?.as_bytes())?
-                .try_into()
-                .map_err(|_| Error::InvalidRequest)
-        }
-        let h = &signed.head;
+        let binding = peer_wire::control::Binding::parse_accept(signed)?;
         Ok(Self {
-            request: a(h, "racer-payload-request")?,
-            response: a(h, "racer-payload-response")?,
-            transfer: TransferId(a(h, "racer-payload-transfer")?),
-            membership: p::number(h, "racer-payload-membership")?,
-            deadline: p::number(h, "racer-payload-deadline")?,
-            rail: RailId(
-                p::number(h, "racer-payload-rail")?
-                    .try_into()
-                    .map_err(|_| Error::InvalidRequest)?,
-            ),
+            request: binding.request,
+            response: binding.response,
+            transfer: TransferId(binding.transfer),
+            membership: binding.membership,
+            deadline: binding.deadline,
+            rail: binding.rail,
         })
     }
 }
 /// Bind all original/hop signatures using security's canonical digest, never bodies.
 fn envelope_digest(auth: &ForwardedHead) -> Result<[u8; 32]> {
-    use sha2::Digest;
-    use sha2::Sha256;
-    let mut hash = Sha256::new();
-    hash.update(b"racer-peer-v1/payload-envelope\0");
-    hash.update((auth.hops.len() as u64).to_be_bytes());
-    hash.update(signed_digest(&auth.original)?);
-    for h in &auth.hops {
-        hash.update(signed_digest(h)?);
-    }
-    Ok(hash.finalize().into())
+    peer_wire::control::envelope_digest(auth).map_err(Into::into)
 }
 fn attach(head: &mut MessageHead, signed: &SignedHead) -> Result<()> {
     head.headers.push(Header {
