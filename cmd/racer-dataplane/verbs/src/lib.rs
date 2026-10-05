@@ -1581,8 +1581,10 @@ impl NativeService {
         self.port.shared.io.wake();
     }
 
-    /// True if no activation is running and every slot's native objects are
-    /// freed. [`IoPort::reopen`] may still wait on I/O holders or leaks.
+    /// True if no activation is pending and service-owned teardown is complete.
+    /// Failed native frees may still leave quarantined, charged resources.
+    /// This is not permission to reopen: [`IoPort::reopen`] separately checks
+    /// whether I/O holders and quarantined resources have released their charges.
     pub fn drained(&self) -> bool {
         self.activation.is_none()
             && self.activation_result.is_none()
