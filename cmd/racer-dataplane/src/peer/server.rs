@@ -60,7 +60,7 @@ pub struct PeerServer {
     subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
     placement: crate::topology::Placement,
     opaque_relay: bool,
-    pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
+    pipes: Rc<flow_control::PipePool<AdmissionPolicy>>,
     accept: AcceptMode,
     io: Rc<crate::http::HttpIo>,
     forwarding: Rc<Forwarding>,
@@ -293,7 +293,7 @@ impl PeerServer {
         wire: Rc<super::protocol::SecurityCodec>,
         signatures: Rc<crate::peer::protocol::Signatures>,
         subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
-        pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
+        pipes: Rc<flow_control::PipePool<AdmissionPolicy>>,
         transfers: Rc<super::transport::Transfers>,
         settings: Settings,
     ) -> Self {

@@ -386,7 +386,7 @@ struct Rig {
     coordinator: Rc<Coordinator>,
     io: Rc<HttpIo>,
     responses: Rc<Responses>,
-    pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
+    pipes: Rc<flow_control::PipePool<AdmissionPolicy>>,
     writer_task: RefCell<Option<Operation<'static, ()>>>,
     adapter: Adapter,
     _scratch: Scratch,

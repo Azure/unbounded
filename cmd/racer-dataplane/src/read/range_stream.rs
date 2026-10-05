@@ -557,7 +557,7 @@ pub struct RangeStreams {
 /// send::<RangeStream>();
 /// ```
 pub struct RangeStream {
-    pipe_admission: Option<Operation<'static, flow_control::pipe::PipeLease<AdmissionPolicy>>>,
+    pipe_admission: Option<Operation<'static, flow_control::PipeLease<AdmissionPolicy>>>,
     prefetch_error: Option<Error>,
     selected_ready: Option<PageResult>,
     selection: Option<Operation<'static, (Result<PageResult>, AcquisitionBudget)>>,
@@ -862,7 +862,7 @@ impl RangeStream {
     async fn admit_pipe(
         &mut self,
         scope: &RequestScope,
-    ) -> Result<flow_control::pipe::PipeLease<AdmissionPolicy>> {
+    ) -> Result<flow_control::PipeLease<AdmissionPolicy>> {
         let admission = self.pipe_admission.get_or_insert_with(|| {
             let delivery = self.delivery.clone();
             let scope = scope.clone();
@@ -1010,7 +1010,7 @@ pub(super) mod tests {
 
     struct Fixture {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-        pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
+        pipes: Rc<flow_control::PipePool<AdmissionPolicy>>,
         streams: RangeStreams,
     }
 

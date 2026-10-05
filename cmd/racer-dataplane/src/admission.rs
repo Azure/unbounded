@@ -408,7 +408,7 @@ pub(crate) struct Accepted {
     pub kind: Kind,
 }
 struct IngressAdmission(SharedQuotas<AdmissionPolicy>);
-impl flow_control::handoff::Admission for IngressAdmission {
+impl flow_control::HandoffAdmission for IngressAdmission {
     type Reservation = ConnectionReservation;
     fn register(&self, waker: &Waker) {
         self.0.register(waker);
@@ -417,13 +417,11 @@ impl flow_control::handoff::Admission for IngressAdmission {
         reserve_ingress_charges(&self.0)
     }
 }
-pub(crate) struct Ingress(
-    Arc<flow_control::handoff::Handoff<WorkerId, IngressAdmission, Accepted>>,
-);
-pub(crate) struct Offer(flow_control::handoff::Offer<WorkerId, IngressAdmission, Accepted>);
+pub(crate) struct Ingress(Arc<flow_control::Handoff<WorkerId, IngressAdmission, (OwnedFd, Kind)>>);
+pub(crate) struct Offer(flow_control::Offer<WorkerId, IngressAdmission, (OwnedFd, Kind)>);
 impl Ingress {
     pub fn new(workers: &[WorkerId]) -> Self {
-        Self(Arc::new(flow_control::handoff::Handoff::new(workers)))
+        Self(Arc::new(flow_control::Handoff::new(workers)))
     }
     pub fn install(&self, worker: WorkerId, admission: &Quotas<AdmissionPolicy>) -> Result<()> {
         self.0
@@ -439,7 +437,21 @@ impl Ingress {
         waker: &Waker,
         budget: usize,
     ) -> Result<[Option<Accepted>; N]> {
-        self.0.pop_batch(&worker, waker, budget).map_err(Into::into)
+        self.0
+            .pop_batch(&worker, waker, budget)
+            .map(|items| {
+                items.map(|item| {
+                    item.map(|item| {
+                        let ((fd, kind), reservation) = item.into_parts();
+                        Accepted {
+                            fd,
+                            reservation,
+                            kind,
+                        }
+                    })
+                })
+            })
+            .map_err(Into::into)
     }
     pub fn close(&self, worker: WorkerId) {
         self.0.close(&worker);
@@ -447,13 +459,7 @@ impl Ingress {
 }
 impl Offer {
     pub fn deliver(self, fd: OwnedFd, kind: Kind) -> Result<()> {
-        self.0
-            .deliver(|reservation| Accepted {
-                fd,
-                reservation,
-                kind,
-            })
-            .map_err(Into::into)
+        self.0.deliver(|| (fd, kind)).map_err(Into::into)
     }
 }
 

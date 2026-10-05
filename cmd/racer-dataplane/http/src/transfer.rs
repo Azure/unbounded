@@ -29,10 +29,7 @@ pub mod delivery {
     //! arithmetic, telemetry, reservation release, and exchange finalization stay with
     //! the caller. This engine neither authorizes bytes nor finishes exchanges.
     use crate::connection::{ConnectionLease, Context, OwnedBuffer, Result};
-    use flow_control::{
-        Policy,
-        pipe::{PipeLease, splice_unsupported},
-    };
+    use flow_control::{PipeLease, Policy, splice_unsupported};
     use std::{io, task::Poll, time::Instant};
     use uring_runtime::reactor::{Descriptor, IoBuffer, SendBuffer};
 
@@ -765,10 +762,7 @@ pub mod relay {
     //! policy. The `test-util` feature adds deterministic fallback injection; production
     //! unsupported errors trigger fallback without that feature.
     use crate::connection::{ConnectionLease, Context, HttpIo, OwnedBuffer, Result};
-    use flow_control::{
-        Policy,
-        pipe::{MAX_PIPE_BYTES, PipeLease, splice_unsupported},
-    };
+    use flow_control::{MAX_PIPE_BYTES, PipeLease, Policy, splice_unsupported};
     use std::{io, ops::Range, rc::Rc};
     use uring_runtime::reactor::{Descriptor, IoBuffer};
 

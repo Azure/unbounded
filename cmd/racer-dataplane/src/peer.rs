@@ -129,14 +129,14 @@ const CAPACITY: usize = 256;
 const BACKOFF: Duration = Duration::from_millis(250);
 const RECOVERY: Duration = Duration::from_secs(1);
 pub(crate) struct AdaptivePeers {
-    inner: Arc<flow_control::adaptive::Adaptive<NodeId, AdmissionObserver>>,
+    inner: Arc<flow_control::Adaptive<NodeId, AdmissionObserver>>,
 }
-pub(crate) use flow_control::adaptive::Outcome;
-pub(crate) type Permit = flow_control::adaptive::Permit<NodeId, AdmissionObserver>;
+pub(crate) use flow_control::AdaptiveOutcome as Outcome;
+pub(crate) type Permit = flow_control::AdaptivePermit<NodeId, AdmissionObserver>;
 pub(crate) struct AdmissionObserver(Metrics);
-impl flow_control::adaptive::Observer for AdmissionObserver {
-    fn event(&self, event: flow_control::adaptive::Event) {
-        use flow_control::adaptive::Event as AdmissionEvent;
+impl flow_control::AdaptiveObserver for AdmissionObserver {
+    fn event(&self, event: flow_control::AdaptiveEvent) {
+        use flow_control::AdaptiveEvent as AdmissionEvent;
         self.0.record(
             match event {
                 AdmissionEvent::Rejected => Event::PeerAdmissionRejected,
@@ -164,8 +164,8 @@ impl AdaptivePeers {
     pub(crate) fn new(config: Config, metrics: Metrics) -> Result<Arc<Self>> {
         config.validate()?;
         Ok(Arc::new(Self {
-            inner: flow_control::adaptive::Adaptive::new(
-                flow_control::adaptive::Config {
+            inner: flow_control::Adaptive::new(
+                flow_control::AdaptiveConfig {
                     total: config.total,
                     per_key: config.per_peer,
                     capacity: CAPACITY,

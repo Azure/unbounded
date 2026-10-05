@@ -1560,12 +1560,12 @@ fn validate_body_length(response: &PeerResponse, length: usize) -> Result<()> {
 }
 /// Both connections and all relay resources follow the readiness completion fence.
 type Transit =
-    http1::relay::Relay<crate::http::HttpContext, flow_control::pipe::PipeLease<AdmissionPolicy>>;
+    http1::relay::Relay<crate::http::HttpContext, flow_control::PipeLease<AdmissionPolicy>>;
 pub(crate) async fn relay_body(
     io: &HttpIo,
     source: crate::http::ConnectionLease,
     destination: crate::http::ConnectionLease,
-    pipe: Option<flow_control::pipe::PipeLease<AdmissionPolicy>>,
+    pipe: Option<flow_control::PipeLease<AdmissionPolicy>>,
     scope: &RequestScope,
 ) -> Result<crate::http::ConnectionLease> {
     if source.receive_remaining() != destination.send_remaining()

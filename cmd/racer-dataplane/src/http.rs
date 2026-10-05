@@ -10,8 +10,8 @@ use crate::memory::VerifiedPage;
 use crate::model::PageSlice;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
-use flow_control::pipe::PipeLease;
-use flow_control::pipe::PipePool;
+use flow_control::PipeLease;
+use flow_control::PipePool;
 use http1::MessageHead;
 #[cfg(test)]
 use std::io;
@@ -92,7 +92,7 @@ pub struct State {
     #[cfg(test)]
     pub(crate) relay_fallback_at: Option<usize>,
     pub(crate) relay_peer: Option<Box<ConnectionLease>>,
-    pub(crate) relay_pipe: Option<flow_control::pipe::PipeLease<AdmissionPolicy>>,
+    pub(crate) relay_pipe: Option<flow_control::PipeLease<AdmissionPolicy>>,
     pub(crate) relay_context: Option<flow_control::Charge<AdmissionPolicy>>,
     pub(crate) relay_reservation: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
     pub(crate) session: Option<crate::peer::protocol::Session>,
@@ -2304,7 +2304,7 @@ pub(crate) mod tests {
     mod relay_tests {
         use super::*;
         use crate::peer::transport::relay_body;
-        use flow_control::pipe::MAX_PIPE_BYTES;
+        use flow_control::MAX_PIPE_BYTES;
         use std::net::TcpStream;
         fn pair() -> (TcpStream, TcpStream) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();

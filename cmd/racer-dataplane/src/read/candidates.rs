@@ -1523,12 +1523,12 @@ impl HedgeConfig {
 }
 pub(crate) struct Hedges {
     config: HedgeConfig,
-    capacity: Arc<flow_control::hedge::Hedges>,
+    capacity: Arc<flow_control::Hedges>,
     metrics: Metrics,
 }
 pub(crate) struct Permit {
     owner: Arc<Hedges>,
-    capacity: flow_control::hedge::Permit,
+    capacity: flow_control::HedgePermit,
 }
 impl Hedges {
     pub(crate) fn new(config: HedgeConfig, metrics: Metrics) -> Result<Arc<Self>> {
@@ -1536,7 +1536,7 @@ impl Hedges {
         Ok(Arc::new(Self {
             config,
             metrics,
-            capacity: flow_control::hedge::Hedges::new(config.slots, config.bytes),
+            capacity: flow_control::Hedges::new(config.slots, config.bytes),
         }))
     }
     pub(crate) fn enabled(&self) -> bool {

@@ -41,7 +41,7 @@
 //!
 //! [`delivery`] sends immutable backing through a staging pipe and owned sends;
 //! [`relay`] transfers opaque fixed-length bodies with bounded synchronous steps.
-//! Both adapt [`flow_control::pipe::PipeLease`] without selecting application
+//! Both adapt [`flow_control::PipeLease`] without selecting application
 //! authorization, telemetry, quotas, or scheduling policy. Callers retain exchange
 //! finalization and must keep complete transfer owners through completion fences.
 //!

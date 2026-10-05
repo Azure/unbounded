@@ -49,9 +49,9 @@ const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
 
 // Worker-local link circuits, distinct from process readiness and placement.
 pub struct LinkHealth {
-    inner: flow_control::circuit::Circuits<NodeId>,
+    inner: flow_control::Circuits<NodeId>,
 }
-pub type LinkProbe<'a> = flow_control::circuit::Probe<'a, NodeId>;
+pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
 #[allow(non_upper_case_globals, clippy::declare_interior_mutable_const)]
 pub const LinkHealth: LinkHealth = LinkHealth::new(MAX_DEGREE);
 #[derive(Clone, Copy, Debug)]
@@ -89,7 +89,7 @@ impl LinkHealth {
     }
     pub const fn new(capacity: usize) -> Self {
         Self {
-            inner: flow_control::circuit::Circuits::new(capacity, Duration::from_secs(1)),
+            inner: flow_control::Circuits::new(capacity, Duration::from_secs(1)),
         }
     }
     pub fn observe(&self, neighbor: &NodeId, outcome: LinkOutcome) -> Result<()> {

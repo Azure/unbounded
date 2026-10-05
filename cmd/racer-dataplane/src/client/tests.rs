@@ -1506,7 +1506,7 @@ fn subscription_retains_delivered_page_until_release_and_rejects_invalid_release
 fn body_fixture(
     queue: usize,
     fail_first: bool,
-) -> (Fixture, Rc<flow_control::pipe::PipePool<AdmissionPolicy>>) {
+) -> (Fixture, Rc<flow_control::PipePool<AdmissionPolicy>>) {
     body_fixture_with_large_page(queue, fail_first, false)
 }
 
@@ -1514,7 +1514,7 @@ fn body_fixture_with_large_page(
     queue: usize,
     fail_first: bool,
     large_page: bool,
-) -> (Fixture, Rc<flow_control::pipe::PipePool<AdmissionPolicy>>) {
+) -> (Fixture, Rc<flow_control::PipePool<AdmissionPolicy>>) {
     let mut limits = limits();
     limits.pipes = NonZeroUsize::new(1).unwrap();
     limits.queue_entries = NonZeroUsize::new(queue).unwrap();
@@ -1569,10 +1569,7 @@ fn assert_no_body_leases(fixture: &Fixture) {
     }
 }
 
-fn assert_only_idle_pipes(
-    fixture: &Fixture,
-    pipes: &flow_control::pipe::PipePool<AdmissionPolicy>,
-) {
+fn assert_only_idle_pipes(fixture: &Fixture, pipes: &flow_control::PipePool<AdmissionPolicy>) {
     fixture.listeners.admission.reclaim_buffers();
     use crate::admission::ResourceClass;
     assert_eq!(fixture.listeners.active_connections(), 0);
