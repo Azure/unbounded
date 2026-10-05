@@ -47,3 +47,5 @@ trait Store {
     }
 }
 ```
+
+Use the same empty line formatting for ALL constructs, including impl stanzas, etc.
