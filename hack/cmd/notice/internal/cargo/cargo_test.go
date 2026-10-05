@@ -4,6 +4,8 @@
 package cargo
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,11 +13,90 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/testutil"
 )
 
+func TestCollectorAbsentCargoFiles(t *testing.T) {
+	for _, placeholder := range []bool{false, true} {
+		name := "missing directory"
+		if placeholder {
+			name = "placeholder directory"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			if placeholder {
+				testutil.WriteTree(t, root, map[string]string{"cmd/racer-dataplane/README.md": "Placeholder"})
+			}
+
+			c := New(filepath.Join(t.TempDir(), "nonexistent-cache"))
+			if err := c.Precheck(root); err != nil {
+				t.Fatalf("Precheck: %v", err)
+			}
+
+			entries, err := c.Collect(root)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("Collect = %v, %v; want no entries and no error", entries, err)
+			}
+		})
+	}
+}
+
+func TestCollectorRejectsIncompleteCargoFiles(t *testing.T) {
+	for _, present := range []string{"Cargo.toml", "Cargo.lock"} {
+		t.Run(present, func(t *testing.T) {
+			root := t.TempDir()
+			testutil.WriteTree(t, root, map[string]string{filepath.Join(cratePath, present): ""})
+
+			c := New(t.TempDir())
+			if err := c.Precheck(root); err == nil || !strings.Contains(err.Error(), "missing") {
+				t.Fatalf("Precheck error = %v; want missing file error", err)
+			}
+
+			if _, err := c.Collect(root); err == nil || !strings.Contains(err.Error(), "missing") {
+				t.Fatalf("Collect error = %v; want missing file error", err)
+			}
+		})
+	}
+}
+
+func TestCollectorRejectsCargoFilesystemErrors(t *testing.T) {
+	for _, name := range []string{"Cargo.toml", "Cargo.lock"} {
+		for _, kind := range []string{"directory", "symlink loop", "dangling symlink"} {
+			t.Run(name+"/"+kind, func(t *testing.T) {
+				root := t.TempDir()
+				testutil.WriteTree(t, root, map[string]string{filepath.Join(cratePath, "README.md"): "Placeholder"})
+				path := filepath.Join(root, cratePath, name)
+
+				var err error
+				switch kind {
+				case "directory":
+					err = os.Mkdir(path, 0o755)
+				case "dangling symlink":
+					err = os.Symlink("missing", path)
+				default:
+					err = os.Symlink(name, path)
+				}
+
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				c := New(t.TempDir())
+				if err := c.Precheck(root); err == nil {
+					t.Fatal("expected Precheck filesystem error")
+				}
+
+				if _, err := c.Collect(root); err == nil {
+					t.Fatal("expected Collect filesystem error")
+				}
+			})
+		}
+	}
+}
+
 func TestCollectorCollectHermetic(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": `[dependencies]
+		"cmd/racer-dataplane/Cargo.toml": `[dependencies]
 foo = "1"
 
 [build-dependencies]
@@ -27,7 +108,7 @@ linux-only = "3"
 [dev-dependencies]
 test-only = "4"
 `,
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
@@ -46,7 +127,7 @@ name = "test-only"
 version = "4.0.0"
 
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "build-helper",
@@ -103,7 +184,7 @@ version = "0.8.6"
 name = "rand"
 version = "0.9.2"
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "rand 0.8.6",
@@ -134,8 +215,8 @@ func TestDirectDependenciesResolvesPackageAlias(t *testing.T) {
 func TestCollectorPrecheckReportsMissingCache(t *testing.T) {
 	root := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\n",
-		"cmd/unbounded-storage/Cargo.lock": "version = 4\n",
+		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\n",
+		"cmd/racer-dataplane/Cargo.lock": "version = 4\n",
 	})
 
 	err := New(t.TempDir()).Precheck(root)
@@ -148,15 +229,15 @@ func TestCollectorRejectsDuplicateRegistrySources(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "foo",
@@ -180,15 +261,15 @@ func TestCollectorCollectsMultipleLicenseFiles(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "foo",
@@ -218,15 +299,15 @@ func TestCollectorUsesDeclaredLicenseWithoutLicenseFile(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "foo",
