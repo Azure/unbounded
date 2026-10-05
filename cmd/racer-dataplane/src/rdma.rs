@@ -33,8 +33,6 @@ use rdma_verbs::NativeService;
 use rdma_verbs::PortInfo;
 use rdma_verbs::QueuePairHandle;
 use rdma_verbs::Region;
-use rdma_verbs::Ticket;
-use rdma_verbs::Window;
 use rdma_verbs::discovery::Binding;
 use sha2::Digest;
 use sha2::Sha256;
@@ -65,9 +63,13 @@ pub const SETUP_BINDING_HEADER: &str = "racer-rdma-setup-binding";
 /// terminal QP destruction fences remote writes before registered memory reuse.
 pub struct Sessions {
     devices: Rc<Devices>,
+
     per_neighbor: usize,
-    live: RefCell<Vec<(NodeId, Rc<QueuePairHandle>)>>,
+
+    live: rdma_verbs::QpSet<NodeId>,
+
     draining: Cell<bool>,
+
     #[cfg(test)]
     pub(crate) prepare_attempts: Cell<usize>,
 }
@@ -155,20 +157,20 @@ pub(crate) fn signed_value(head: &VerifiedHead, name: &str, bound: usize) -> Res
 impl Sessions {
     #[cfg(test)]
     pub(crate) fn track_test(&self, qp: Rc<QueuePairHandle>) {
-        self.live.borrow_mut().push((NodeId("test".into()), qp));
+        self.live.track(NodeId("test".into()), qp);
     }
     pub fn register_driver(&self, waker: &std::task::Waker) {
         self.devices.register_driver(waker);
     }
     #[cfg(test)]
     pub(crate) fn track_peer_test(&self, peer: NodeId, qp: Rc<QueuePairHandle>) {
-        self.live.borrow_mut().push((peer, qp));
+        self.live.track(peer, qp);
     }
     pub fn new(devices: Rc<Devices>, per_neighbor: usize) -> Self {
         Self {
             devices,
             per_neighbor,
-            live: RefCell::new(Vec::new()),
+            live: rdma_verbs::QpSet::default(),
             draining: Cell::new(false),
             #[cfg(test)]
             prepare_attempts: Cell::new(0),
@@ -212,16 +214,12 @@ impl Sessions {
         if !self.ready(rail) {
             return Poll::Ready(Err(Error::Unavailable));
         }
-        let mut live = self.live.borrow_mut();
-        live.retain(|(_, qp)| !qp.stopped());
-        if live.len()
-            >= self
-                .per_neighbor
-                .saturating_mul(crate::topology::MAX_DEGREE)
-            || live.iter().filter(|(node, _)| node == peer.node()).count() >= self.per_neighbor
-        {
-            return Poll::Ready(Err(Error::Overloaded));
-        }
+        self.live.admit(
+            peer.node(),
+            self.per_neighbor
+                .saturating_mul(crate::topology::MAX_DEGREE),
+            self.per_neighbor,
+        )?;
         let qp = std::task::ready!(QueuePairHandle::poll_new(
             self.devices.select(rail)?.handle,
             if receive.is_some() {
@@ -234,7 +232,7 @@ impl Sessions {
         // transfer subsequently replaces this with its original request deadline.
         qp.expire_at(uring_runtime::environment::now() + std::time::Duration::from_secs(30));
         let setup = SetupParameters::new(rail, qp.endpoint)?;
-        live.push((peer.node().clone(), qp.clone()));
+        self.live.track(peer.node().clone(), qp.clone());
         Poll::Ready(Ok(PreparedSession {
             qp,
             peer: peer.node().clone(),
@@ -243,36 +241,15 @@ impl Sessions {
         }))
     }
     pub fn progress(&self) -> Result<usize> {
-        let mut count = 0;
-        for (_, qp) in self.live.borrow().iter() {
-            match qp.progress() {
-                Ok(n) => count += n,
-                Err(_) => {
-                    qp.stop();
-                }
-            }
-        }
-        self.live.borrow_mut().retain(|(_, qp)| !qp.stopped());
         // Errors belong to the attempt ticket. The paired native service keeps
         // failed fences quarantined; neither a timeout nor CQ error is node-fatal.
-        Ok(count)
+        Ok(self.live.progress())
     }
     pub fn drain(&self) -> Operation<'_, ()> {
         Box::pin(async move {
             self.draining.set(true);
-            let qps: Vec<_> = self
-                .live
-                .borrow()
-                .iter()
-                .map(|(_, qp)| qp.clone())
-                .collect();
-            for qp in &qps {
-                qp.stop();
-            }
-            for qp in qps {
-                futures::future::poll_fn(|cx| qp.poll_stopped(cx)).await?;
-            }
-            self.live.borrow_mut().clear();
+            self.live.fence().await?;
+            self.live.reap();
             self.devices.close();
             Ok(())
         })
@@ -283,21 +260,8 @@ impl Sessions {
     /// paired native role. A timeout never turns cancellation into successful DMA
     /// release. Callers may keep driving unrelated HTTP while this awaits.
     pub fn fence_cut(&self) -> Operation<'static, ()> {
-        let qps: Vec<_> = self
-            .live
-            .borrow()
-            .iter()
-            .map(|(_, qp)| qp.clone())
-            .collect();
-        Box::pin(async move {
-            for qp in &qps {
-                qp.stop();
-            }
-            for qp in qps {
-                futures::future::poll_fn(|cx| qp.poll_stopped(cx)).await?;
-            }
-            Ok(())
-        })
+        let fence = self.live.fence();
+        Box::pin(async move { fence.await.map_err(Into::into) })
     }
 }
 impl PreparedSession {
@@ -421,11 +385,13 @@ pub const COMPLETION_HEADER: &str = "racer-rdma-completion";
 /// invalidation plus terminal QP destruction precedes any CPU access or reuse.
 pub struct Grant {
     transfer: TransferId,
+
     buffer: Option<RegisteredLease>,
-    qp: Rc<QueuePairHandle>,
-    window: Rc<Window>,
-    bound: Ticket,
+
+    receive: rdma_verbs::Receive,
+
     deadline: Deadline,
+
     binding: [u8; 32],
 }
 pub struct RemoteDescriptor {
@@ -515,28 +481,13 @@ impl Grant {
             }
             session.claim()?;
             session.qp.expire_at(deadline.0);
-            struct Abort<'a>(Option<&'a QueuePairHandle>);
-            impl Drop for Abort<'_> {
-                fn drop(&mut self) {
-                    if let Some(qp) = self.0 {
-                        qp.stop();
-                    }
-                }
-            }
-            let mut abort = Abort(Some(&session.qp));
-            let (window, bound) = poll_scoped(scope, |cx| {
-                session.qp.register_waiter(cx);
-                session.qp.poll_bind(buffer.region.clone())
-            })
-            .await?;
-            // The returned Grant takes over abort-on-drop ownership.
-            abort.0 = None;
+            let receive = rdma_verbs::Transfer::new(session.qp.clone())
+                .bind(buffer.region.clone(), scope)
+                .await?;
             Ok(Grant {
                 transfer,
                 buffer: Some(buffer),
-                qp: session.qp.clone(),
-                window,
-                bound,
+                receive,
                 deadline,
                 binding: session.binding(),
             })
@@ -549,16 +500,13 @@ impl Grant {
         if uring_runtime::environment::now() >= self.deadline.0 {
             return Err(Error::DeadlineExceeded);
         }
-        if !self.qp.ready() {
-            return Err(Error::Unavailable);
-        }
-        self.bound.result().ok_or(Error::Unavailable)??;
+        let (address, scoped_key) = self.receive.descriptor()?;
         let buffer = self.buffer.as_ref().ok_or(Error::InvalidRequest)?;
         Ok(RemoteDescriptor {
             transfer: self.transfer,
-            address: self.window.address(),
+            address,
             length: buffer.len() as u64,
-            scoped_key: self.window.key(),
+            scoped_key,
         })
     }
     pub fn header_value(&self) -> Result<Vec<u8>> {
@@ -572,17 +520,14 @@ impl Grant {
             poll_fn(move |cx| {
                 cancellation.register(cx.waker());
                 if let Err(error) = scope.check() {
-                    self.qp.stop();
+                    self.receive.abort();
                     return Poll::Ready(Err(error));
                 }
                 if uring_runtime::environment::now() >= self.deadline.0 {
-                    self.qp.stop();
+                    self.receive.abort();
                     return Poll::Ready(Err(Error::DeadlineExceeded));
                 }
-                if let Err(error) = self.qp.progress() {
-                    return Poll::Ready(Err(error.into()));
-                }
-                self.bound.poll(cx).map_err(Into::into)
+                self.receive.poll_bound(cx).map_err(Into::into)
             })
             .await
         })
@@ -605,50 +550,19 @@ impl Grant {
             if bytes != completion_bytes(self.binding, self.transfer) {
                 return Err(Error::Unauthorized);
             }
-            self.bound.result().ok_or(Error::Unavailable)??;
-            let mut invalidated = None;
+            self.receive.check_bound()?;
             let cancellation = scope.cancellation.subscribe()?;
-            poll_fn(|cx| {
-                cancellation.register(cx.waker());
-                if let Err(error) = scope.check() {
-                    return Poll::Ready(Err(error));
-                }
-                if uring_runtime::environment::now() >= self.deadline.0 {
-                    return Poll::Ready(Err(Error::DeadlineExceeded));
-                }
-                if let Err(error) = self.qp.progress() {
-                    return Poll::Ready(Err(error.into()));
-                }
-                if invalidated.is_none() {
-                    match self.qp.poll_invalidate(self.window.clone(), cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                        Poll::Ready(Ok(ticket)) => invalidated = Some(ticket),
-                    }
-                }
-                invalidated.as_ref().unwrap().poll(cx).map_err(Into::into)
-            })
-            .await?;
-            // Cancellation/expiry returns no buffer. Grant Drop requests stop;
-            // the native service retains DMA ownership until the real fence.
             poll_fn(|cx| {
                 cancellation.register(cx.waker());
                 scope.check()?;
                 if uring_runtime::environment::now() >= self.deadline.0 {
                     return Poll::Ready(Err(Error::DeadlineExceeded));
                 }
-                self.qp.poll_stopped(cx).map_err(Into::into)
+                self.receive.poll_finish(cx).map_err(Into::into)
             })
             .await?;
             self.buffer.take().ok_or(Error::InvalidRequest)
         })
-    }
-}
-impl Drop for Grant {
-    fn drop(&mut self) {
-        // Dropping a future/grant is an abort, never implicit completion. On a
-        // failed fence QP-owned window/region references preserve quarantine.
-        self.qp.stop();
     }
 }
 pub(crate) fn completion_bytes(binding: [u8; 32], transfer: TransferId) -> Vec<u8> {
@@ -671,12 +585,6 @@ impl SendCompletion {
             .into_bytes()
     }
 }
-struct AbortOnDrop(Rc<QueuePairHandle>);
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.stop();
-    }
-}
 /// Ciphertext-only movement. Failed attempts are fenced before HTTP fallback.
 impl Sessions {
     pub fn send_to<'a>(
@@ -696,35 +604,17 @@ impl Sessions {
             session.wait_ready(scope).await?;
             session.claim()?;
             session.qp.expire_at(scope.deadline.0);
-            let _abort = AbortOnDrop(session.qp.clone());
+            let transfer = rdma_verbs::Transfer::new(session.qp.clone());
             let mut buffer = RegisteredLease::acquire(session, page.bytes().len(), scope).await?;
             buffer.copy_from(page.bytes(), scope).await?;
-            let ticket = poll_scoped(scope, |cx| {
-                session.qp.register_waiter(cx);
-                session.qp.poll_write(
+            transfer
+                .write(
                     buffer.region.clone(),
                     descriptor.descriptor.address,
                     descriptor.descriptor.scoped_key,
+                    scope,
                 )
-            })
-            .await?;
-            let cancellation = scope.cancellation.subscribe()?;
-            poll_fn(|cx| {
-                cancellation.register(cx.waker());
-                if let Err(error) = scope.check() {
-                    return Poll::Ready(Err(error));
-                }
-                if let Err(error) = session.progress() {
-                    return Poll::Ready(Err(error));
-                }
-                ticket.poll(cx).map_err(Into::into)
-            })
-            .await?;
-            // Source buffer is safe after its write CQE. Stop this single-use QP
-            // before returning a control completion or admitting a fallback.
-            // Request termination abandons this wait, not the native owner's
-            // quarantine. Only a successful terminal fence permits completion.
-            poll_scoped(scope, |cx| session.qp.poll_stopped(cx)).await?;
+                .await?;
             Ok(SendCompletion {
                 binding: session.binding(),
                 transfer: descriptor.descriptor.transfer,

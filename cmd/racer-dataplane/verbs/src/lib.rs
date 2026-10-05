@@ -279,6 +279,195 @@ pub struct Window {
 #[derive(Clone)]
 pub struct Ticket(Rc<TicketState>);
 
+/// Worker-local QPs grouped by caller identity, with caller-supplied admission limits.
+/// Progress failures stop only the affected QP; its tickets retain the error.
+pub struct QpSet<K>(RefCell<Vec<(K, Rc<QueuePairHandle>)>>);
+
+impl<K: PartialEq> Default for QpSet<K> {
+    /// Start with no tracked QPs.
+    fn default() -> Self {
+        Self(RefCell::new(Vec::new()))
+    }
+}
+
+impl<K: PartialEq> QpSet<K> {
+    /// Retire fenced entries and check caller-selected total and per-key limits.
+    /// Admission and tracking must run on the same worker without yielding.
+    pub fn admit(&self, key: &K, total: usize, per_key: usize) -> Result<()> {
+        let mut live = self.0.borrow_mut();
+        live.retain(|(_, qp)| !qp.stopped());
+        if live.len() >= total || live.iter().filter(|(k, _)| k == key).count() >= per_key {
+            return Err(Error::Overloaded);
+        }
+        Ok(())
+    }
+
+    /// Retain a successfully prepared QP until its terminal fence.
+    pub fn track(&self, key: K, qp: Rc<QueuePairHandle>) {
+        self.0.borrow_mut().push((key, qp));
+    }
+
+    /// Drive tracked QPs without promoting one attempt's failure to set failure.
+    pub fn progress(&self) -> usize {
+        let mut count = 0;
+        for (_, qp) in self.0.borrow().iter() {
+            match qp.progress() {
+                Ok(n) => count += n,
+                Err(_) => qp.stop(),
+            }
+        }
+        self.0.borrow_mut().retain(|(_, qp)| !qp.stopped());
+        count
+    }
+
+    /// Capture the current QPs now; stop and fence only that cut when polled.
+    /// Later admissions are unaffected and dropped waits never release DMA owners.
+    pub fn fence(&self) -> Operation<'static, (), Error> {
+        let qps: Vec<_> = self.0.borrow().iter().map(|(_, qp)| qp.clone()).collect();
+        Box::pin(async move {
+            for qp in &qps {
+                qp.stop();
+            }
+            for qp in qps {
+                std::future::poll_fn(|cx| qp.poll_stopped(cx)).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove fenced entries after a completed drain without driving new work.
+    pub fn reap(&self) {
+        self.0.borrow_mut().retain(|(_, qp)| !qp.stopped());
+    }
+}
+
+/// One-shot transfer ownership. Dropping it requests stop, never implicit success.
+/// The caller owns authorization, buffer sizing, deadlines, and single-use claims.
+pub struct Transfer(Rc<QueuePairHandle>);
+
+impl Transfer {
+    /// Take abort-on-drop responsibility before allocating or submitting work.
+    pub fn new(qp: Rc<QueuePairHandle>) -> Self {
+        Self(qp)
+    }
+
+    /// Bind a receive window, retaining abort ownership across mailbox contention.
+    pub fn bind<'a, S: Scope>(
+        self,
+        region: Rc<Region>,
+        scope: &'a S,
+    ) -> Operation<'a, Receive, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let (window, bound) = poll_scoped(scope, |cx| {
+                self.0.register_waiter(cx);
+                self.0.poll_bind(region.clone())
+            })
+            .await?;
+            Ok(Receive {
+                transfer: self,
+                window,
+                bound,
+                invalidated: None,
+                invalidation_done: false,
+            })
+        })
+    }
+
+    /// Write once, await its CQE, then await the terminal fence before success.
+    /// Cancellation abandons the wait but native ownership remains quarantined.
+    pub fn write<'a, S: Scope>(
+        self,
+        region: Rc<Region>,
+        address: u64,
+        key: u32,
+        scope: &'a S,
+    ) -> Operation<'a, (), S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let ticket = poll_scoped(scope, |cx| {
+                self.0.register_waiter(cx);
+                self.0.poll_write(region.clone(), address, key)
+            })
+            .await?;
+            poll_scoped(scope, |cx| {
+                self.0.progress()?;
+                ticket.poll(cx)
+            })
+            .await?;
+            poll_scoped(scope, |cx| self.0.poll_stopped(cx)).await
+        })
+    }
+}
+
+impl Drop for Transfer {
+    /// Request a native stop even if submission or completion was abandoned.
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
+/// A receive window whose buffer cannot be returned before the terminal fence.
+/// Authentication of the remote completion belongs to the caller, before finish.
+pub struct Receive {
+    transfer: Transfer,
+
+    window: Rc<Window>,
+
+    bound: Ticket,
+
+    invalidated: Option<Ticket>,
+
+    invalidation_done: bool,
+}
+
+impl Receive {
+    /// Return the native address and key only after bind completes on a ready QP.
+    pub fn descriptor(&self) -> Result<(u64, u32)> {
+        if !self.transfer.0.ready() {
+            return Err(Error::Unavailable);
+        }
+        self.check_bound()?;
+        Ok((self.window.address(), self.window.key()))
+    }
+
+    /// Require successful bind completion before accepting a remote completion.
+    pub fn check_bound(&self) -> Result<()> {
+        self.bound.result().ok_or(Error::Unavailable)?
+    }
+
+    /// Drive bind completion. The caller registers cancellation and checks expiry.
+    pub fn poll_bound(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.transfer.0.progress()?;
+        self.bound.poll(cx)
+    }
+
+    /// Request stop on cancellation without claiming that the fence has completed.
+    pub fn abort(&self) {
+        self.transfer.0.stop();
+    }
+
+    /// Invalidate exactly once, await its CQE, then await the terminal QP fence.
+    /// The caller must validate the remote completion before polling this method.
+    pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if !self.invalidation_done {
+            self.transfer.0.progress()?;
+            if self.invalidated.is_none() {
+                self.invalidated = Some(ready!(
+                    self.transfer.0.poll_invalidate(self.window.clone(), cx)
+                )?);
+            }
+            ready!(self.invalidated.as_ref().unwrap().poll(cx))?;
+            self.invalidation_done = true;
+        }
+        self.transfer.0.poll_stopped(cx)
+    }
+}
+
 impl Endpoint {
     /// Size of the wire encoding.
     pub const ENCODED_LEN: usize = 32;

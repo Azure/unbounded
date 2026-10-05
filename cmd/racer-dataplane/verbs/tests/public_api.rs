@@ -686,6 +686,122 @@ mod scoped {
         (Arc::new(Charge(count.clone())), Observer(count))
     }
 
+    /// One-shot helpers wait for native fences and QP cuts exclude later owners.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn one_shot_transfer_and_captured_qp_cut_preserve_fences() {
+        use rdma_verbs::{QpSet, Transfer};
+        let (sim, io, mut native) = fixture(3);
+        configure(&io, vec![Arc::new(()), Arc::new(()), Arc::new(())]);
+        for _ in 0..4 {
+            native.poll_budgeted(3).unwrap();
+        }
+        io.activation().unwrap().unwrap();
+        let sender = ready(QueuePairHandle::poll_new(io.device(u32::MAX), None));
+        let receiver = ready(QueuePairHandle::poll_new(io.device(u32::MAX), None));
+        ready(sender.poll_connect(receiver.endpoint));
+        ready(receiver.poll_connect(sender.endpoint));
+        for _ in 0..4 {
+            native.poll_budgeted(3).unwrap();
+        }
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        ready(sender.poll_connected(&mut cx));
+        ready(receiver.poll_connected(&mut cx));
+        let scope = TestScope(None);
+        let target = ready(Region::poll_acquire(&receiver, 17));
+        let mut receive = futures::executor::block_on(
+            Transfer::new(receiver.clone()).bind(target.clone(), &scope),
+        )
+        .unwrap();
+        assert_eq!(receive.descriptor(), Err(Error::Unavailable));
+        for _ in 0..4 {
+            native.poll_budgeted(3).unwrap();
+        }
+        ready(receive.poll_bound(&mut cx));
+        let (address, key) = receive.descriptor().unwrap();
+        let source = ready(Region::poll_acquire(&sender, 17));
+        ready(source.poll_copy_from(&[0xa5; 17]));
+        let mut write = Transfer::new(sender.clone()).write(source, address, key, &scope);
+        assert!(write.as_mut().poll(&mut cx).is_pending());
+        for _ in 0..4 {
+            native.poll_budgeted(3).unwrap();
+        }
+        // Even a successful write CQE cannot complete until the native stop turn.
+        assert!(write.as_mut().poll(&mut cx).is_pending());
+        assert!(!sender.stopped());
+        native.poll_budgeted(3).unwrap();
+        assert_eq!(write.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        assert!(sender.stopped());
+        drop(write);
+        assert!(receive.poll_finish(&mut cx).is_pending());
+        for _ in 0..4 {
+            native.poll_budgeted(3).unwrap();
+        }
+        assert!(receive.poll_finish(&mut cx).is_pending());
+        assert_eq!(
+            target.poll_copy_to(&mut cx),
+            Poll::Ready(Err(Error::Unavailable))
+        );
+        native.poll_budgeted(3).unwrap();
+        ready(receive.poll_finish(&mut cx));
+        assert_eq!(
+            target.poll_copy_to(&mut cx),
+            Poll::Ready(Ok(vec![0xa5; 17]))
+        );
+        let set = QpSet::default();
+        set.track("old", receiver.clone());
+        let mut cut = set.fence();
+        let later = ready(QueuePairHandle::poll_new(io.device(u32::MAX), None));
+        set.track("new", later.clone());
+        assert_eq!(set.admit(&"new", 3, 1), Err(Error::Overloaded));
+        assert_eq!(set.admit(&"other", 1, 1), Err(Error::Overloaded));
+        assert_eq!(set.admit(&"other", 2, 1), Ok(()));
+        assert_eq!(cut.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+        native.poll_budgeted(3).unwrap();
+        assert!(!later.stopped());
+        set.progress();
+        drop((cut, set, later, receive, target, receiver, sender));
+        io.close();
+        native.poll_budgeted(3).unwrap();
+        assert!(native.drained());
+        assert_eq!(sim.live_resources(), 0);
+    }
+
+    /// Canceling a one-shot submission requests stop but cannot fabricate a fence.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn canceled_one_shot_bind_preserves_native_ownership() {
+        let clock = uring_runtime::environment::SimulationClock::new(17);
+        let _clock = clock.environment(0).enter();
+        let (sim, io, mut native) = fixture(1);
+        configure(&io, vec![Arc::new(())]);
+        for _ in 0..2 {
+            native.poll_budgeted(1).unwrap();
+        }
+        io.activation().unwrap().unwrap();
+        let qp = ready(QueuePairHandle::poll_new(io.device(u32::MAX), None));
+        let region = ready(Region::poll_acquire(&qp, 17));
+        let scope = TestScope(Some(Cancellation::new().unwrap()));
+        scope.0.as_ref().unwrap().cancel().unwrap();
+        assert!(matches!(
+            futures::executor::block_on(rdma_verbs::Transfer::new(qp.clone()).bind(region, &scope)),
+            Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+        ));
+        assert!(!qp.stopped());
+        sim.reject(simulation::Operation::Stop, Some(qp.endpoint.qpn), true);
+        native.poll_budgeted(1).unwrap();
+        assert!(!qp.stopped());
+        sim.reject(simulation::Operation::Stop, Some(qp.endpoint.qpn), false);
+        clock.advance(std::time::Duration::from_millis(10));
+        native.poll_budgeted(1).unwrap();
+        assert!(qp.stopped());
+        drop(qp);
+        io.close();
+        native.poll_budgeted(1).unwrap();
+        assert!(native.drained());
+        assert_eq!(sim.live_resources(), 0);
+    }
+
     /// Cancellation wakes the waiter and takes precedence over another operation poll.
     #[test]
     fn scoped_wait_wakes_and_checks_cancellation_before_operation() {
