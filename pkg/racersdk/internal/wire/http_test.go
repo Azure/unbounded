@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
-	"io"
 	"math"
 	"net/http"
 	"strconv"
@@ -116,66 +115,6 @@ func TestRequestWire(t *testing.T) {
 	assertKind(t, err, ErrorInvalidArgument)
 }
 
-func TestRawHeaders(t *testing.T) {
-	for _, field := range []string{"Host", "Content-Length", "Content-Type", "Content-Range", "ETag", "If-Match", "Range", "Racer-Expires-At", "Racer-Metadata", "Authorization"} {
-		for _, second := range []string{"same", "different"} {
-			head := []byte("HEAD / HTTP/1.1\r\n" + field + ": same\r\n" + strings.ToLower(field) + ": " + second + "\r\n\r\n")
-			assertKind(t, ValidateRawHead(head, false), ErrorInvalidArgument)
-			assertKind(t, ValidateRawHead(head, true), ErrorProtocol)
-		}
-	}
-
-	for _, value := range []string{"", "x", "  x", " x ", "\tx", " x\t", " a\r\nb", " a\x00b", " a\x7fb"} {
-		for _, field := range []string{"Authorization", "Racer-Metadata"} {
-			err := ValidateRawHead(rawRequest("HEAD", field+":"+value+"\r\n"), false)
-			if err == nil {
-				t.Fatalf("accepted malformed %s", field)
-			}
-		}
-	}
-
-	for _, line := range []string{" Folded: x", "X : x", "X\t: x", "X: a\nb", "X: a\rb", ": x"} {
-		if err := ValidateRawHead(rawRequest("HEAD", line+"\r\n"), false); err == nil {
-			t.Fatal("accepted malformed field")
-		}
-	}
-
-	for _, count := range []int{8192, 8193} {
-		err := ValidateRawHead(rawRequest("HEAD", "Authorization: "+strings.Repeat("a", count)+"\r\n"), false)
-		if count == 8192 {
-			if err != nil {
-				t.Fatal(err)
-			}
-		} else {
-			assertKind(t, err, ErrorHeaderLimit)
-		}
-	}
-
-	base := rawRequest("HEAD", "X: \r\n")
-	for _, size := range []int{MaxHeadBytes - 1, MaxHeadBytes, MaxHeadBytes + 1} {
-		head := rawRequest("HEAD", "X: "+strings.Repeat("x", size-len(base))+"\r\n")
-
-		got, err := ReadRawHead(bufio.NewReader(bytes.NewReader(head)), false)
-		if size <= MaxHeadBytes {
-			if err != nil || !bytes.Equal(got, head) {
-				t.Fatal("head boundary")
-			}
-		} else {
-			assertKind(t, err, ErrorHeaderLimit)
-		}
-	}
-
-	_, err := ReadRawHead(bufio.NewReader(strings.NewReader("HTTP/1.1")), true)
-	if !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatal("truncated head")
-	}
-
-	_, err = ReadRawHead(bufio.NewReader(strings.NewReader("")), false)
-	if err != io.EOF {
-		t.Fatal("idle EOF")
-	}
-}
-
 func TestOutgoingHeaderBudget(t *testing.T) {
 	// The largest possible outgoing descriptor must fit without aggregate-size
 	// validation in Get. Exercise net/http serialization, not only requestHead.
@@ -210,23 +149,6 @@ func TestOutgoingHeaderBudget(t *testing.T) {
 	got, err := ParseRequestHead(wire.Bytes(), false)
 	if err != nil || got != r {
 		t.Fatalf("outgoing request failed round trip: %v", err)
-	}
-}
-
-func TestStdlibNormalizationRequiresRawValidation(t *testing.T) {
-	head := rawRequest("HEAD", "Authorization:  secret \r\nContent-Length: 0\r\nContent-Length: 0\r\n")
-
-	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(head)))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if req.Header.Get("Authorization") != "secret" || len(req.Header.Values("Content-Length")) != 1 {
-		t.Fatal("stdlib normalization changed; revisit guard assumptions")
-	}
-
-	if err := ValidateRawHead(head, false); err == nil {
-		t.Fatal("guard trusted normalized headers")
 	}
 }
 
@@ -405,64 +327,6 @@ func TestOriginResponseSelection(t *testing.T) {
 	assertKind(t, err, ErrorInvalidArgument)
 }
 
-type finalErrorReader struct{ err error }
-
-func (r finalErrorReader) Read(p []byte) (int, error) { return copy(p, "abc"), r.err }
-
-func TestFrameReaderBoundaries(t *testing.T) {
-	body := "body\r\n\r\nnot a head"
-	firstHead := rawResponse(200, "Content-Length: "+strconv.Itoa(len(body))+"\r\n")
-	nextHead := rawResponse(503, "Content-Length: 0\r\n")
-
-	source := bufio.NewReader(strings.NewReader(string(firstHead) + body + string(nextHead)))
-	if _, err := ReadRawHead(source, true); err != nil {
-		t.Fatal(err)
-	}
-
-	frame := &FrameReader{Source: source, Remaining: int64(len(body))}
-
-	got, err := io.ReadAll(frame)
-	if err != nil || string(got) != body {
-		t.Fatal("body corrupted")
-	}
-
-	head, err := ReadRawHead(source, true)
-	if err != nil || !bytes.Equal(head, nextHead) {
-		t.Fatal("read-ahead lost or body scanned")
-	}
-
-	frame = &FrameReader{Source: strings.NewReader("abc"), Remaining: 4}
-
-	got, err = io.ReadAll(frame)
-	if string(got) != "abc" || !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatal("truncation lost")
-	}
-
-	cause := errors.New("late private failure")
-	frame = &FrameReader{Source: finalErrorReader{err: cause}, Remaining: 3}
-
-	n, err := frame.Read(make([]byte, 8))
-	if n != 3 || !errors.Is(err, cause) {
-		t.Fatal("final error lost")
-	}
-
-	frame = &FrameReader{Source: finalErrorReader{err: io.EOF}, Remaining: 3}
-
-	got, err = io.ReadAll(frame)
-	if err != nil || string(got) != "abc" {
-		t.Fatal("exact EOF")
-	}
-
-	frame = &FrameReader{Remaining: 0}
-	if n, err := frame.Read(nil); n != 0 || err != nil {
-		t.Fatal("empty read")
-	}
-
-	if n, err := frame.Read(make([]byte, 1)); n != 0 || err != io.EOF {
-		t.Fatal("zero frame")
-	}
-}
-
 func TestClientHeadIsV2WithoutChangingOrigin(t *testing.T) {
 	r := Request{Operation: OperationHead}
 
@@ -534,5 +398,263 @@ func TestConstructedRequestValidation(t *testing.T) {
 		if _, err := RequestHead(request); err == nil {
 			t.Fatal("serialized invalid private request")
 		}
+	}
+}
+
+func TestRangeResolution(t *testing.T) {
+	for _, tt := range []struct {
+		wire        string
+		size        uint64
+		first, last uint64
+		kind        ErrorKind
+	}{
+		{"bytes=0-0", 1, 0, 0, 0},
+		{"bytes=0-99", 2, 0, 1, 0},
+		{"bytes=1-1", 2, 1, 1, 0},
+		{"bytes=0-0", 0, 0, 0, ErrorUnsatisfiableRange},
+		{"bytes=2-2", 2, 0, 0, ErrorUnsatisfiableRange},
+		{"bytes=0-9223372036854775807", math.MaxInt64, 0, math.MaxInt64 - 1, 0},
+		{"bytes=9223372036854775807-9223372036854775807", math.MaxInt64, 0, 0, ErrorUnsatisfiableRange},
+		{"bytes=0-0", math.MaxInt64 + 1, 0, 0, ErrorInvalidArgument},
+	} {
+		r, err := ParseRange(tt.wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if RangeValue(r) != tt.wire {
+			t.Fatal("range normalized")
+		}
+
+		first, last, err := r.Resolve(tt.size)
+		if tt.kind != 0 {
+			assertKind(t, err, tt.kind)
+		} else if err != nil || first != tt.first || last != tt.last {
+			t.Fatalf("%s/%d: %d-%d %v", tt.wire, tt.size, first, last, err)
+		}
+	}
+
+	for _, s := range []string{"", "bytes=-", "bytes=1-", "bytes=-0", "bytes=-99", "bytes=1-0", "bytes=00-1", "bytes=0-01", "bytes=+1-", "bytes=0-1,2-3", "bytes=0- 1", "bytes=0-9223372036854775808", "Bytes=0-1"} {
+		_, err := ParseRange(s)
+		assertKind(t, err, ErrorInvalidArgument)
+	}
+
+	_, err := ClosedRange(0, math.MaxInt64+1)
+	assertKind(t, err, ErrorInvalidArgument)
+	_, err = ClosedRange(2, 1)
+	assertKind(t, err, ErrorInvalidArgument)
+}
+
+func TestWholePages(t *testing.T) {
+	_, _, err := (Range{}).ResolvePage(1)
+	assertKind(t, err, ErrorInvalidArgument)
+	_, _, err = BootstrapRange().ResolvePage(math.MaxInt64 + 1)
+	assertKind(t, err, ErrorInvalidArgument)
+
+	p := uint64(PageSize)
+	for _, size := range []uint64{1, PageSize - 1, PageSize, PageSize + 1, math.MaxInt64} {
+		start := (uint64(size) - 1) / uint64(PageSize) * uint64(PageSize)
+		for _, end := range []uint64{uint64(size) - 1, NominalPageEnd(start)} {
+			r, err := ClosedRange(start, end)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			first, last, err := r.ResolvePage(size)
+			if err != nil || uint64(first) != start || last != size-1 {
+				t.Fatalf("page %d: %d-%d %v", size, first, last, err)
+			}
+		}
+	}
+
+	for _, tt := range []struct {
+		first, last uint64
+		size        uint64
+		kind        ErrorKind
+	}{
+		{1, p - 1, PageSize, ErrorInvalidArgument}, {0, p, PageSize + 1, ErrorInvalidArgument}, {0, p - 2, PageSize, ErrorInvalidArgument}, {p, 2*p - 1, PageSize, ErrorUnsatisfiableRange}, {0, p - 1, 0, ErrorUnsatisfiableRange},
+	} {
+		r, err := ClosedRange(tt.first, tt.last)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, _, err = r.ResolvePage(tt.size)
+		assertKind(t, err, tt.kind)
+	}
+}
+
+func FuzzRange(f *testing.F) {
+	for _, s := range []string{"bytes=0-0", "bytes=-0", "bytes=16777216-", "bytes=0-9223372036854775807", "bytes=9223372036854775807-9223372036854775807"} {
+		f.Add(s, uint64(math.MaxInt64))
+	}
+
+	f.Fuzz(func(t *testing.T, s string, n uint64) {
+		r, err := ParseRange(s)
+		if err != nil {
+			return
+		}
+
+		if RangeValue(r) != s {
+			t.Fatal("range round trip")
+		}
+
+		first, last, err := r.Resolve(n)
+		if err == nil && (first > last || uint64(last) >= n || uint64(last-first)+1 > math.MaxInt64) {
+			t.Fatal("invalid resolved bounds")
+		}
+
+		first, last, err = r.ResolvePage(n)
+		if err == nil && (uint64(first)%uint64(PageSize) != 0 || first > last || uint64(last) >= n || uint64(last-first)+1 > uint64(PageSize)) {
+			t.Fatal("invalid whole-page bounds")
+		}
+	})
+}
+
+func TestSubscriptionHeadRoundTrip(t *testing.T) {
+	r := Request{Operation: OperationHead, Pin: `"v"`, AdapterMetadata: "opaque\xff", Authorization: "Bearer secret"}
+
+	for _, length := range []uint64{0, 7} {
+		for _, ordered := range []bool{false, true} {
+			o := SubscriptionOptions{Offset: 3, Length: length, PageCredits: 2, ByteCredits: 2 * PageSize, Ordered: ordered}
+
+			head, err := SubscriptionHead(r, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(head)))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			parsed, err := ParseSubscriptionRequest(req)
+			if err != nil || parsed.Request != r || parsed.First != 3 || !parsed.Ranged || parsed.Ordered != ordered || parsed.PageCredits != 2 || parsed.ByteCredits != 2*PageSize {
+				t.Fatal("request round trip", parsed, err)
+			}
+
+			end := uint64(math.MaxInt64)
+			if length != 0 {
+				end = 3 + length
+			}
+
+			if parsed.End != end {
+				t.Fatal("range end")
+			}
+
+			for _, field := range []string{"Racer-Page-Credits", "Racer-Byte-Credits", "Racer-Ordered"} {
+				bad := req.Clone(t.Context())
+				bad.Header.Set(field, "bad")
+
+				if _, err := ParseSubscriptionRequest(bad); err == nil {
+					t.Fatal("accepted malformed credit", field)
+				}
+
+				bad.Header.Add(field, "1")
+
+				if _, err := ParseSubscriptionRequest(bad); err == nil {
+					t.Fatal("accepted duplicate credit", field)
+				}
+			}
+		}
+	}
+
+	head, err := ClientHead(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(head)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parsed, err := ParseClientHead(req)
+	if err != nil || parsed != r {
+		t.Fatal("client HEAD round trip", err)
+	}
+}
+
+func TestSubscriptionResponseRoundTrip(t *testing.T) {
+	for _, size := range []uint64{0, 7, PageSize + 1} {
+		m := Metadata{Size: size, ETag: `"v"`, ExpiresAt: time.UnixMilli(1).UTC(), ContentType: "text/plain"}
+
+		h, err := SubscriptionHeaders(m, 0, size)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var b bytes.Buffer
+		if err := WriteSubscriptionHead(&b, 200, h); err != nil {
+			t.Fatal(err)
+		}
+
+		r, err := ParseSubscriptionResponse(b.Bytes(), SubscriptionOptions{})
+		if err != nil || r.Metadata != m || r.First != 0 || r.End != size || r.Pages != PageCount(0, size) {
+			t.Fatal("response round trip", r, err)
+		}
+
+		for _, pair := range [][2]string{{"Connection: close", "Connection: keep-alive"}, {"Racer-Range-End:", "Missing-Range-End:"}, {"ETag:", "Missing-ETag:"}, {"Etag:", "Missing-Etag:"}} {
+			bad := strings.Replace(b.String(), pair[0], pair[1], 1)
+			if bad != b.String() {
+				if _, err := ParseSubscriptionResponse([]byte(bad), SubscriptionOptions{}); err == nil {
+					t.Fatal("accepted malformed response", pair)
+				}
+			}
+		}
+	}
+
+	if _, err := SubscriptionHeaders(Metadata{}, 0, math.MaxInt64); err == nil {
+		t.Fatal("accepted overflowing frame length")
+	}
+}
+
+func TestETag(t *testing.T) {
+	for _, s := range []string{`""`, `"a,b"`, `"a\b"`, `"!#~"`, `"` + strings.Repeat("a", 8190) + `"`} {
+		if err := ValidateETag(s); err != nil {
+			t.Fatalf("valid tag: %v", err)
+		}
+	}
+
+	for _, s := range []string{"", `*`, `W/"v"`, `"a", "b"`, `"a"b"`, `"a b"`, "\"\x80\"", "\"\t\"", `"` + strings.Repeat("a", 8191) + `"`} {
+		assertKind(t, ValidateETag(s), ErrorInvalidArgument)
+	}
+}
+
+func TestOpaque(t *testing.T) {
+	for _, s := range []string{"", " leading", "trailing ", "a\tb", "a\rb", "a\nb", "a\x00b", "a\x7fb"} {
+		assertKind(t, ValidateOpaque(s), ErrorInvalidArgument)
+	}
+
+	for _, s := range []string{strings.Repeat("x", 8192), "opaque, credential\xff"} {
+		if err := ValidateOpaque(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	assertKind(t, ValidateOpaque(strings.Repeat("x", 8193)), ErrorHeaderLimit)
+}
+
+func TestMetadata(t *testing.T) {
+	tag := `""`
+	for _, expiry := range []time.Time{time.UnixMilli(0), time.UnixMilli(math.MaxInt64), time.UnixMilli(123).In(time.FixedZone("offset", 3600))} {
+		m := Metadata{Size: math.MaxInt64, ETag: tag, ExpiresAt: expiry}
+		if err := m.Validate(); err != nil {
+			t.Fatal(err)
+		}
+
+		h, err := MetadataHeaders(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		parsed, err := Decimal(h.Get("Racer-Expires-At"))
+		if err != nil || int64(parsed) != expiry.UnixMilli() {
+			t.Fatal("expiry changed")
+		}
+	}
+
+	for _, m := range []Metadata{{}, {ETag: tag}, {ETag: tag, ExpiresAt: time.UnixMilli(-1)}, {ETag: tag, ExpiresAt: time.Unix(0, 1)}, {ETag: tag, ExpiresAt: time.UnixMilli(math.MaxInt64).Add(time.Millisecond)}, {Size: math.MaxInt64 + 1, ETag: tag, ExpiresAt: time.UnixMilli(0)}} {
+		assertKind(t, m.Validate(), ErrorInvalidArgument)
 	}
 }

@@ -4,73 +4,603 @@
 package racersdk
 
 import (
-	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/Azure/unbounded/pkg/racersdk/internal/fakeracer"
 )
 
-// offsetStream makes wrong page offsets observable without allocating an object.
-type offsetStream struct{ offset int64 }
+func TestFakeClientPages(t *testing.T) {
+	for _, size := range []ByteLength{0, 1, PageSize, PageSize + 13, 3*PageSize + 13} {
+		t.Run(strconv.FormatUint(uint64(size), 10), func(t *testing.T) {
+			var (
+				calls atomic.Int32
+				seen  sync.Map
+			)
 
-func (r *offsetStream) Read(p []byte) (int, error) {
-	for i := range p {
-		p[i] = byte((r.offset + int64(i)) % 251)
+			request := Request{Key: Key{1, 2, 3}, Context: FetchContext{
+				metadata:      AdapterMetadata{value: "opaque, interior  spaces\\\xff"},
+				authorization: Authorization{value: "Scheme opaque,credential\x80"},
+			}}
+
+			client, cleanup, err := newFakeClient(t, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+				call := calls.Add(1)
+
+				if r.Key() != request.Key || r.Context() != request.Context {
+					t.Error("key or context changed")
+				}
+
+				m := originMeta(size)
+
+				page, ok := r.Range()
+				if !ok || validatePageShape(page) != nil {
+					t.Error("origin received a non-page range")
+				}
+
+				if call == 1 {
+					if _, pinned := r.Pin(); pinned || r.Operation() != OperationBootstrap {
+						t.Error("bootstrap changed")
+					}
+				} else {
+					m.ExpiresAt = time.UnixMilli(int64(call))
+
+					pin, ok := r.Pin()
+					if !ok || pin != m.ETag || r.Operation() != OperationPinned {
+						t.Error("continuation lost immutable pin")
+					}
+				}
+
+				if size == 0 {
+					return m, nil, nil
+				}
+
+				first, last, err := page.Resolve(size)
+				if err != nil {
+					return m, nil, err
+				}
+
+				if _, duplicate := seen.LoadOrStore(first, true); duplicate || uint64(first)%uint64(PageSize) != 0 {
+					t.Error("duplicate or unaligned page scheduling")
+				}
+
+				return m, io.NopCloser(io.LimitReader(&offsetStream{offset: int64(first)}, int64(last-first)+1)), nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(cleanup)
+
+			value, err := client.Get(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeBody(value)
+
+			if calls.Load() != 1 {
+				t.Fatal("Get eagerly fetched a continuation")
+			}
+
+			sink := &offsetSink{}
+
+			n, err := io.Copy(sink, value)
+			if err != nil || n != int64(size) || sink.offset != int64(size) {
+				t.Fatal("stream mismatch", n, err)
+			}
+
+			m := value.Metadata()
+			if calls.Load() != int32(max(1, (size+PageSize-1)/PageSize)) || m.Size != size || m.ETag != originMeta(size).ETag || m.ExpiresAt.UnixMilli() != 0 {
+				t.Fatal("page count or metadata snapshot changed")
+			}
+		})
 	}
-
-	r.offset += int64(len(p))
-
-	return len(p), nil
 }
 
-type offsetSink struct{ offset int64 }
+func TestFakeSubscriptionFrames(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		size    ByteLength
+		headers string
+		first   uint64
+		end     uint64
+	}{
+		{name: "empty"},
+		{name: "whole", size: 13, end: 13},
+		{name: "open", size: PageSize + 13, headers: "Range: bytes=16777211-\r\n", first: uint64(PageSize) - 5, end: uint64(PageSize) + 13},
+		{name: "closed", size: 2 * PageSize, headers: "Range: bytes=16777211-16777219\r\nRacer-Ordered: 0\r\n", first: uint64(PageSize) - 5, end: uint64(PageSize) + 4},
+		{name: "clamped", size: 13, headers: "Range: bytes=3-20\r\n", first: 3, end: 13},
+		{name: "pinned", size: 13, headers: "If-Match: " + originMeta(13).ETag.String() + "\r\nRacer-Ordered: 1\r\n", end: 13},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, test.size))
+			if err != nil {
+				t.Fatal(err)
+			}
 
-func (w *offsetSink) Write(p []byte) (int, error) {
-	for i, b := range p {
-		if b != byte((w.offset+int64(i))%251) {
-			return i, fmt.Errorf("wrong byte at offset %d", w.offset+int64(i))
+			t.Cleanup(cleanup)
+
+			_, res := fakeSubscriptionSocket(t, client, test.headers)
+			if res.StatusCode != 200 || !res.Close || res.Header.Get("ETag") != originMeta(test.size).ETag.String() || res.Header.Get("Racer-Expires-At") != "0" || res.Header.Get("Racer-Content-Type") != "test/example" {
+				t.Fatal("response", res.Status, res.Header)
+			}
+
+			for name, want := range map[string]uint64{"Racer-Object-Length": uint64(test.size), "Racer-Range-Start": test.first, "Racer-Range-End": test.end} {
+				if res.Header.Get(name) != strconv.FormatUint(want, 10) {
+					t.Fatal(name, res.Header.Get(name), want)
+				}
+			}
+
+			pages := uint64(0)
+
+			for offset := test.first; offset < test.end; {
+				end := min((offset/uint64(PageSize)+1)*uint64(PageSize), test.end)
+				fakeReadFrame(t, res.Body, 1, offset/uint64(PageSize), offset, uint32(end-offset))
+				offset = end
+				pages++
+			}
+
+			fakeReadFrame(t, res.Body, 2, pages, test.end-test.first, 0)
+
+			if res.ContentLength != int64(test.end-test.first+21*(pages+1)) {
+				t.Fatal("content length", res.ContentLength)
+			}
+
+			if _, err := res.Body.Read(make([]byte, 1)); err != io.EOF {
+				t.Fatal("missing EOF", err)
+			}
+		})
+	}
+}
+
+func TestFakeSubscriptionCredits(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		headers string
+		window  uint64
+	}{
+		{name: "defaults", window: 2},
+		{name: "pages", headers: "Racer-Page-Credits: 1\r\n", window: 1},
+		{name: "bytes", headers: "Racer-Page-Credits: 64\r\nRacer-Byte-Credits: 16777216\r\n", window: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, 3*PageSize))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(cleanup)
+
+			conn, res := fakeSubscriptionSocket(t, client, test.headers)
+			for page := range test.window {
+				fakeReadFrame(t, res.Body, 1, page, page*uint64(PageSize), uint32(PageSize))
+			}
+
+			if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+
+			var b [1]byte
+
+			_, err = res.Body.Read(b[:])
+
+			var timeout net.Error
+			if !errors.As(err, &timeout) || !timeout.Timeout() {
+				t.Fatal("stream advanced without credits", err)
+			}
+
+			if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+
+			for page := test.window; page < 3; page++ {
+				fakeRelease(t, conn, page-test.window, uint32(PageSize))
+				fakeReadFrame(t, res.Body, 1, page, page*uint64(PageSize), uint32(PageSize))
+			}
+
+			fakeReadFrame(t, res.Body, 2, 3, 3*uint64(PageSize), 0)
+		})
+	}
+}
+
+func TestFakeSubscriptionInvalidRelease(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		page   uint64
+		length uint32
+	}{
+		{name: "unknown", page: 4, length: uint32(PageSize)},
+		{name: "length", length: uint32(PageSize) - 1},
+		{name: "zero"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, 2*PageSize))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(cleanup)
+			conn, res := fakeSubscriptionSocket(t, client, "Racer-Page-Credits: 1\r\n")
+			fakeReadFrame(t, res.Body, 1, 0, 0, uint32(PageSize))
+			fakeRelease(t, conn, test.page, test.length)
+
+			if _, err := res.Body.Read(make([]byte, 1)); !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatal("invalid release did not close the subscription", err)
+			}
+		})
+	}
+}
+
+func TestFakeSubscriptionInvalidHeaders(t *testing.T) {
+	client, cleanup, err := newFakeClient(t, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+		t.Error("invalid subscription reached origin")
+		return Metadata{}, nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(cleanup)
+
+	for _, headers := range []string{
+		"Racer-Page-Credits: 0\r\n", "Racer-Page-Credits: 65\r\n",
+		"Racer-Byte-Credits: 16777215\r\n", "Racer-Byte-Credits: 1073741825\r\n",
+		"Racer-Ordered: 2\r\n", "Racer-Ordered: \r\n",
+		"Range: bytes=-5\r\n", "Range: bytes=2-1\r\n", "Range: bytes=0-1,3-4\r\n",
+		"Racer-Page-Credits: 1\r\nRacer-Page-Credits: 2\r\n", "If-Match: W/\"weak\"\r\n",
+	} {
+		t.Run(strings.TrimSpace(headers), func(t *testing.T) {
+			_, res := fakeSubscriptionSocket(t, client, headers)
+			if res.StatusCode != 400 {
+				t.Fatal(res.Status)
+			}
+		})
+	}
+}
+
+func TestFakeSubscriptionCancellation(t *testing.T) {
+	for _, action := range []string{"disconnect", "cleanup"} {
+		t.Run(action, func(t *testing.T) {
+			body := &blockedBody{done: make(chan struct{}), first: true}
+
+			client, cleanup, err := newFakeClient(t, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+				return originMeta(1), body, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(cleanup)
+
+			conn, res := fakeSubscriptionSocket(t, client, "")
+			if res.StatusCode != 200 {
+				t.Fatal(res.Status)
+			}
+
+			if action == "disconnect" {
+				closeBody(conn)
+			} else {
+				cleanup()
+			}
+
+			select {
+			case <-body.done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("subscription retained origin body")
+			}
+		})
+	}
+}
+
+func TestFakeSubscriptionErrors(t *testing.T) {
+	for _, kind := range []ErrorKind{ErrorUnauthorized, ErrorForbidden, ErrorNotFound, ErrorVersionUnavailable, ErrorUnavailable, ErrorInternal} {
+		t.Run(kind.String(), func(t *testing.T) {
+			client, cleanup, err := newFakeClient(t, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+				return Metadata{}, nil, NewOriginError(kind, nil)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(cleanup)
+
+			_, res := fakeSubscriptionSocket(t, client, "")
+			if statusError(res.StatusCode).kind != kind || res.ContentLength != 0 || !res.Close {
+				t.Fatal("origin error changed", res.Status, res.Header)
+			}
+		})
+	}
+
+	for _, size := range []ByteLength{0, 13} {
+		t.Run("unsatisfiable/"+strconv.FormatUint(uint64(size), 10), func(t *testing.T) {
+			client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, size))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(cleanup)
+
+			_, res := fakeSubscriptionSocket(t, client, "Range: bytes=13-\r\n")
+			if res.StatusCode != 416 || res.ContentLength != 0 || res.Header.Get("Content-Range") != "bytes */"+strconv.FormatUint(uint64(size), 10) {
+				t.Fatal(res.Status, res.Header)
+			}
+		})
+	}
+}
+
+func TestFakeSubscriptionDuplicateRelease(t *testing.T) {
+	client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, 3*PageSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(cleanup)
+	conn, res := fakeSubscriptionSocket(t, client, "Racer-Page-Credits: 1\r\n")
+	fakeReadFrame(t, res.Body, 1, 0, 0, uint32(PageSize))
+	fakeRelease(t, conn, 0, uint32(PageSize))
+	fakeReadFrame(t, res.Body, 1, 1, uint64(PageSize), uint32(PageSize))
+	fakeRelease(t, conn, 0, uint32(PageSize))
+
+	if _, err := res.Body.Read(make([]byte, 1)); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatal("duplicate release did not close the subscription", err)
+	}
+}
+
+func TestFakeSubscriptionPartialPageRelease(t *testing.T) {
+	client, cleanup, err := newFakeClient(t, fakeSubscriptionOrigin(t, PageSize+3))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(cleanup)
+	conn, res := fakeSubscriptionSocket(t, client, "Range: bytes=16777214-\r\nRacer-Page-Credits: 1\r\n")
+	fakeReadFrame(t, res.Body, 1, 0, uint64(PageSize)-2, 2)
+	fakeRelease(t, conn, 0, 2)
+	fakeReadFrame(t, res.Body, 1, 1, uint64(PageSize), 3)
+	fakeReadFrame(t, res.Body, 2, 2, 5, 0)
+}
+
+func TestFakeSubscriptionPendingCallbackCancellation(t *testing.T) {
+	entered, canceled := make(chan struct{}), make(chan struct{})
+
+	client, cleanup, err := newFakeClient(t, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
+		close(entered)
+		<-ctx.Done()
+		close(canceled)
+
+		return Metadata{}, nil, ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(cleanup)
+
+	conn, _, err := client.bulk.Get(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(conn)
+
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fmt.Fprintf(conn, "POST /v2/objects/%s HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n\r\n", (Key{}).String()); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("origin not called")
+	}
+
+	closeBody(conn)
+
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("disconnect did not cancel pending origin callback")
+	}
+}
+
+func TestStreamingHTTP2Success(t *testing.T) {
+	for _, size := range []int64{0, 1, 2*copyBufferSize + 17} {
+		t.Run(strconv.FormatInt(size, 10), func(t *testing.T) {
+			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				streamResponseHead(w, 0, size, size, `"v"`)
+				_, _ = io.CopyN(w, &offsetStream{}, size)
+			}))
+			c := testClient(t, path, 1)
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.ProtoMajor != 2 {
+					t.Error("HTTP/2 not negotiated")
+				}
+
+				v, err := c.GetStreaming(r.Context(), Request{})
+				if err != nil {
+					t.Error(err)
+					http.Error(w, "get failed", http.StatusBadGateway)
+
+					return
+				}
+				defer closeBody(v)
+
+				w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+
+				if n, err := v.WriteToHTTP(w); n != size || err != nil {
+					t.Error(n, err)
+				}
+			}))
+			server.EnableHTTP2 = true
+			server.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+
+			server.StartTLS()
+			defer server.Close()
+			// Exercise successive streams on the same HTTP/2 connection. Reading
+			// to EOF observes END_STREAM and catches resets after the final Write.
+			for range 5 {
+				r, err := server.Client().Get(server.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if r.ProtoMajor != 2 || r.StatusCode != http.StatusOK {
+					closeBody(r.Body)
+					t.Fatal(r.Proto, r.Status)
+				}
+
+				n, err := io.Copy(&offsetSink{}, r.Body)
+				closeBody(r.Body)
+
+				if n != size || err != nil {
+					t.Fatal(n, err)
+				}
+			}
+
+			if c.Stats().BytesRead != uint64(5*size) || c.Stats().ActiveBulk != 0 {
+				t.Fatal(c.Stats())
+			}
+		})
+	}
+}
+
+type transferResponse struct {
+	http.ResponseWriter
+	fast *atomic.Int64
+}
+
+func (w transferResponse) ReadFrom(r io.Reader) (int64, error) {
+	if lr, ok := r.(*io.LimitedReader); ok {
+		if _, ok := lr.R.(*net.UnixConn); ok {
+			w.fast.Add(lr.N)
 		}
 	}
 
-	w.offset += int64(len(p))
-
-	return len(p), nil
+	return w.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
 }
 
-func unixTransport(path string) *http.Transport {
-	return &http.Transport{
-		DisableCompression: true, MaxConnsPerHost: 16, MaxIdleConnsPerHost: 16,
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", path)
-		},
+func TestHTTPTransferKeepsConnectionsAndRanges(t *testing.T) {
+	testHTTPTransferKeepsConnectionsAndRanges(t, 0)
+}
+
+func TestHTTPTransferWindowKeepsConnectionsAndRanges(t *testing.T) {
+	testHTTPTransferKeepsConnectionsAndRanges(t, 2)
+}
+
+func testHTTPTransferKeepsConnectionsAndRanges(t *testing.T, window int) {
+	t.Helper()
+
+	const size = 2*int64(PageSize) + 173
+
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first, last := fixtureRange(t, r, size)
+
+		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
+		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
+	}))
+	c := testClient(t, path, 2)
+	c.config.PageWindow = window
+
+	var fast, connections atomic.Int64
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+		options := ReadOptions{}
+
+		if offset != 0 {
+			metadata := Metadata{Size: ByteLength(size), ETag: ETag{value: `"v"`}, ExpiresAt: time.Unix(2000000000, 0)}
+			options = ReadOptions{Offset: ByteOffset(offset), Pin: metadata.ETag, Metadata: &metadata}
+		}
+
+		v, err := c.Get(r.Context(), Request{}, options)
+		if err != nil {
+			t.Error(err)
+			http.Error(w, "get failed", http.StatusBadGateway)
+
+			return
+		}
+		defer closeBody(v)
+
+		w.Header().Set("Content-Length", strconv.FormatInt(size-offset, 10))
+
+		if offset != 0 {
+			w.WriteHeader(http.StatusPartialContent)
+		}
+
+		if n, err := v.WriteToHTTP(transferResponse{w, &fast}); err != nil || n != size-offset {
+			t.Errorf("transfer %d: %v", n, err)
+		}
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+
+	server.Start()
+	defer server.Close()
+
+	for _, offset := range []int64{0, int64(PageSize) + 7, 0} {
+		response, err := server.Client().Get(server.URL + "?offset=" + strconv.FormatInt(offset, 10))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		n, err := io.Copy(&offsetSink{offset: offset}, response.Body)
+		closeBody(response.Body)
+
+		if err != nil || n != size-offset {
+			t.Fatal(n, err)
+		}
+	}
+
+	if connections.Load() != 1 || fast.Load() != 0 {
+		t.Fatal("keep-alive/fast path", connections.Load(), fast.Load())
+	}
+
+	if c.Stats().ActiveBulk != 0 {
+		t.Fatal("retained admission")
 	}
 }
 
-// pageForwarder is a deliberately sequential fake dataplane: it splits a client
-// range into origin pages. It establishes SDK integration, not Rust compatibility.
-func pageForwarder(t *testing.T, path string, size int64) http.Handler {
-	t.Helper()
+func TestHTTPTransferFallbackAndTruncation(t *testing.T) {
+	for _, truncated := range []bool{false, true} {
+		t.Run(strconv.FormatBool(truncated), func(t *testing.T) {
+			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				streamResponseHead(w, 0, 8192, 8192, `"v"`)
 
-	transport := unixTransport(path)
-	t.Cleanup(transport.CloseIdleConnections)
+				length := int64(8192)
+				if truncated {
+					length--
+				}
 
-	return fakeracer.NewHandler(transport)
-}
+				_, _ = io.CopyN(w, &offsetStream{}, length)
+			}))
+			c := testClient(t, path, 1)
 
-// originClient exercises the real Unix origin through the subscription fake.
-func originClient(t *testing.T, path string, maxConnections int) *Client {
-	t.Helper()
-	return testClient(t, rawClientPeer(t, pageForwarder(t, path, 0)), maxConnections)
+			v, err := c.Get(context.Background(), Request{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeBody(v)
+
+			n, err := v.WriteToHTTP(httptest.NewRecorder())
+			if truncated != (err != nil) || !truncated && n != 8192 {
+				t.Fatal(n, err)
+			}
+		})
+	}
 }
 
 func TestIntegrationOriginRoundTrip(t *testing.T) {
@@ -207,56 +737,6 @@ func TestIntegrationCancelBlockedDial(t *testing.T) {
 	}
 }
 
-func TestIntegrationResponseHeadBoundary(t *testing.T) {
-	for _, size := range []int{maxHeadBytes, maxHeadBytes + 1} {
-		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			path := socketDir(t) + "/socket"
-
-			listener, err := net.Listen("unix", path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer closeBody(listener)
-
-			finished := make(chan struct{})
-
-			go func() {
-				defer close(finished)
-
-				conn, err := listener.Accept()
-				if err != nil {
-					return
-				}
-				defer closeBody(conn)
-
-				_, err = readRawHead(bufio.NewReader(conn), false)
-				if err != nil {
-					return
-				}
-
-				fields := "Content-Length: 21\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\nRacer-Object-Length: 0\r\nRacer-Range-Start: 0\r\nRacer-Range-End: 0\r\nConnection: close\r\nX: \r\n"
-				padding := strings.Repeat("x", size-len(rawResponse(200, fields)))
-				_, _ = conn.Write(rawResponse(200, strings.Replace(fields, "X: ", "X: "+padding, 1)))
-			}()
-
-			client := testClient(t, path, 1)
-
-			v, err := client.Get(context.Background(), Request{})
-			if size == maxHeadBytes {
-				if err != nil {
-					t.Fatal("exact limit rejected", err)
-				}
-
-				closeBody(v)
-			} else {
-				assertKind(t, err, ErrorProtocol)
-			}
-
-			<-finished
-		})
-	}
-}
-
 func TestIntegrationValueCloseBlockedBody(t *testing.T) {
 	for _, cancelContext := range []bool{false, true} {
 		t.Run(strconv.FormatBool(cancelContext), func(t *testing.T) {
@@ -338,39 +818,184 @@ func TestIntegrationAbortedConnectionNotReused(t *testing.T) {
 	}
 }
 
-func TestIntegrationExpiredBootstrapDoesNotCacheVersion(t *testing.T) {
-	var calls atomic.Int32
+func TestValueWriteToSplicesOrderedHTTPBodies(t *testing.T) {
+	const size = 2*int64(PageSize) + 173
 
-	path, cancel, done := startOrigin(t, OriginConfig{}, func(_ context.Context, request OriginRequest) (Metadata, io.ReadCloser, error) {
-		if _, pinned := request.Pin(); pinned || request.Operation() != OperationBootstrap {
-			t.Error("fresh Get reused an old pin")
-		}
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first, last := fixtureRange(t, r, size)
 
-		version := strconv.Itoa(int(calls.Add(1)))
-		metadata := originMeta(1)
-		metadata.ETag = ETag{value: `"` + version + `"`}
+		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
+		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
+	}))
+	c := testClient(t, path, 3)
 
-		return metadata, io.NopCloser(strings.NewReader(version)), nil
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	defer func() { cancel(); <-done }()
+	v, err := c.Get(ctx, Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
 
-	client := originClient(t, path, 1)
-	for _, want := range []string{"1", "2"} {
-		value, err := client.Get(context.Background(), Request{})
-		if err != nil {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(listener)
+
+	peer, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(peer)
+
+	connection, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(connection)
+
+	if err := peer.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := io.CopyN(&offsetSink{}, peer, size)
+		done <- err
+	}()
+
+	sink := &tcpTransferWriter{TCPConn: connection.(*net.TCPConn)}
+
+	n, err := v.WriteTo(sink)
+	if err != nil || n != size {
+		t.Fatal(n, err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	if sink.readFrom != 0 {
+		t.Fatal("buffered subscription bypassed page validation", sink.readFrom)
+	}
+
+	if len(c.slots) != 0 {
+		t.Fatal("body permits leaked")
+	}
+	// A later response still goes through Transport parsing and body lifecycle.
+	other, err := c.Get(ctx, Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closeBody(other)
+
+	streaming, err := c.GetStreaming(ctx, Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(streaming)
+
+	go func() {
+		_, err := io.CopyN(&offsetSink{}, peer, size)
+		done <- err
+	}()
+
+	if n, err := streaming.WriteToHTTP(sink); err != nil || n != size {
+		t.Fatal(n, err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	if sink.readFrom == 0 || c.Stats().ActiveBulk != 0 {
+		t.Fatal("streaming transfer did not dispatch ReaderFrom or release admission")
+	}
+}
+
+func TestValueWriteToSpliceCancellation(t *testing.T) {
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		streamResponse(w, 0, int64(PageSize), int64(PageSize), `"v"`)
+	}))
+	c := testClient(t, path, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	v, err := c.GetStreaming(ctx, Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(listener)
+
+	peer, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(peer)
+
+	connection, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(connection)
+
+	if err := connection.(*net.TCPConn).SetWriteBuffer(4096); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := peer.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &tcpTransferWriter{TCPConn: connection.(*net.TCPConn)}
+
+	done := make(chan error, 1)
+
+	go func() { _, err := v.WriteToHTTP(sink); done <- err }()
+	// Consume a prefix, then leave the destination blocked and cancel the Value.
+	if _, err := io.CopyN(io.Discard, peer, 64*1024); err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
 			t.Fatal(err)
 		}
-
-		data, err := io.ReadAll(value)
-		closeBody(value)
-
-		if err != nil || string(data) != want || value.Metadata().ETag.String() != `"`+want+`"` {
-			t.Fatal("fresh read failed to select a new immutable version", err)
-		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("splice did not cancel")
 	}
 
-	if calls.Load() != 2 {
-		t.Fatal("unexpected bootstrap count")
+	if len(c.slots) != 0 {
+		t.Fatal("canceled splice retained page")
 	}
+}
+
+// tcpTransferWriter exposes the real TCP ReaderFrom and deadline implementations
+// without HTTP buffering, so transfers exercise Unix-to-TCP dispatch directly.
+type tcpTransferWriter struct {
+	*net.TCPConn
+	readFrom int
+}
+
+func (w *tcpTransferWriter) Header() http.Header { return make(http.Header) }
+
+func (w *tcpTransferWriter) WriteHeader(int) {}
+
+func (w *tcpTransferWriter) ReadFrom(r io.Reader) (int64, error) {
+	w.readFrom++
+	return w.TCPConn.ReadFrom(r)
 }

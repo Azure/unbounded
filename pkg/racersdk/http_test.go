@@ -5,19 +5,266 @@ package racersdk
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// Model a destination with a shorter write budget than the source read budget.
+// Real HTTP/2 expires that budget by resetting the stream, even when no Write
+// is in progress. Clearing the deadline must reach the actual HTTP/2 writer.
+type streamingShortDeadline struct{ http.ResponseWriter }
+
+func (w streamingShortDeadline) SetWriteDeadline(d time.Time) error {
+	if !d.IsZero() && d.After(time.Now()) {
+		d = time.Now().Add(50 * time.Millisecond)
+	}
+
+	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(d)
+}
+
+func TestStreamingHTTP2UpstreamWaits(t *testing.T) {
+	for _, phase := range []string{"first", "body", "page", "Complete"} {
+		t.Run(phase, func(t *testing.T) {
+			const size = uint64(PageSize) + 3
+
+			pause := func(at string) {
+				if at == phase {
+					time.Sleep(200 * time.Millisecond)
+				}
+			}
+			c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
+				_, _ = io.WriteString(conn, subscriptionHead(size, 0, size))
+
+				pause("first")
+
+				_ = fakeSubscriptionFrame(conn, 1, 0, 0, uint32(PageSize))
+				_, _ = io.CopyN(conn, &offsetStream{}, copyBufferSize)
+
+				pause("body")
+
+				_, _ = io.CopyN(conn, &offsetStream{offset: copyBufferSize}, int64(PageSize)-copyBufferSize)
+				if !orderedRelease(t, reader, 0, uint32(PageSize)) {
+					return
+				}
+
+				pause("page")
+
+				_ = fakeSubscriptionFrame(conn, 1, 1, uint64(PageSize), 3)
+				_, _ = io.CopyN(conn, &offsetStream{offset: int64(PageSize)}, 3)
+
+				if !orderedRelease(t, reader, 1, 3) {
+					return
+				}
+
+				pause("Complete")
+
+				_ = fakeSubscriptionFrame(conn, 2, 2, size, 0)
+			})
+			c.config.BodyReadTimeout = 3 * time.Second
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				v, err := c.GetStreaming(r.Context(), Request{}, ReadOptions{PageCredits: 1})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer closeBody(v)
+
+				w.Header().Set("Content-Length", strconv.FormatUint(size, 10))
+
+				if err := http.NewResponseController(w).Flush(); err != nil {
+					t.Error(err)
+				}
+
+				if n, err := v.WriteToHTTP(streamingShortDeadline{w}); n != int64(size) || err != nil {
+					t.Errorf("stream: bytes=%d err=%v", n, err)
+					panic(http.ErrAbortHandler)
+				}
+			}))
+			server.EnableHTTP2 = true
+			server.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+
+			server.StartTLS()
+			defer server.Close()
+
+			server.Client().Timeout = 10 * time.Second
+
+			resp, err := server.Client().Get(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeBody(resp.Body)
+
+			n, err := io.Copy(&offsetSink{}, resp.Body)
+			if resp.ProtoMajor != 2 || n != int64(size) || err != nil {
+				t.Fatalf("proto=%s bytes=%d err=%v", resp.Proto, n, err)
+			}
+		})
+	}
+}
+
+type streamingDeadlineState struct {
+	http.ResponseWriter
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (w *streamingDeadlineState) SetWriteDeadline(d time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.deadline = d
+
+	return nil
+}
+
+func TestStreamingOperationClearPreservesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	dst := &streamingDeadlineState{ResponseWriter: httptest.NewRecorder()}
+	h := &streamingHTTP{value: &Value{admissionLease: &admissionLease{ctx: ctx}}, controller: http.NewResponseController(dst)}
+	interrupt := time.Now().Add(-time.Second)
+
+	cancel()
+
+	if err := dst.SetWriteDeadline(interrupt); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.clearWriteDeadline(); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+
+	if !dst.deadline.Equal(interrupt) {
+		t.Fatal("operation cleanup erased cancellation deadline")
+	}
+}
+
+type streamingHTTP2BlockedWriter struct {
+	http.ResponseWriter
+	active  atomic.Bool
+	written atomic.Int64
+}
+
+func (w *streamingHTTP2BlockedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *streamingHTTP2BlockedWriter) Write(p []byte) (int, error) {
+	w.active.Store(true)
+	defer w.active.Store(false)
+
+	n, err := w.ResponseWriter.Write(p)
+	w.written.Add(int64(n))
+
+	return n, err
+}
+
+func TestStreamingHTTP2BlockedDestinationCancellation(t *testing.T) {
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		streamResponse(w, 0, int64(PageSize), int64(PageSize), `"v"`)
+	}))
+	c := testClient(t, path, 1)
+	c.config.BodyReadTimeout = 10 * time.Second
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	destination := make(chan *streamingHTTP2BlockedWriter, 1)
+	done := make(chan error, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		v, err := c.GetStreaming(ctx, Request{})
+		if err != nil {
+			done <- err
+			return
+		}
+		defer closeBody(v)
+
+		w.Header().Set("Content-Length", strconv.FormatUint(uint64(PageSize), 10))
+
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			done <- err
+			return
+		}
+
+		dst := &streamingHTTP2BlockedWriter{ResponseWriter: w}
+		destination <- dst
+
+		_, err = v.WriteToHTTP(dst)
+		done <- err
+
+		if err != nil {
+			panic(http.ErrAbortHandler)
+		}
+	}))
+	server.EnableHTTP2 = true
+	server.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+
+	server.StartTLS()
+	defer server.Close()
+
+	server.Client().Timeout = 5 * time.Second
+
+	resp, err := server.Client().Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(resp.Body)
+
+	if resp.ProtoMajor != 2 {
+		t.Fatal("HTTP/2 not negotiated")
+	}
+
+	var dst *streamingHTTP2BlockedWriter
+	select {
+	case dst = <-destination:
+	case <-time.After(3 * time.Second):
+		t.Fatal("destination not started")
+	}
+	// Do not consume the body: exhaust the client's stream flow-control window.
+	// Require an actual Write to stay active with no progress before canceling.
+	deadline := time.Now().Add(3 * time.Second)
+	blocked := false
+
+	for time.Now().Before(deadline) {
+		before := dst.written.Load()
+
+		time.Sleep(100 * time.Millisecond)
+
+		if before > 0 && dst.active.Load() && dst.written.Load() == before {
+			blocked = true
+			break
+		}
+	}
+
+	if !blocked {
+		t.Fatal("destination never blocked in HTTP/2 Write")
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocked HTTP/2 destination did not cancel")
+	}
+
+	if c.Stats().ActiveBulk != 0 || len(c.copySlots) != 0 {
+		t.Fatal("canceled HTTP/2 transfer retained admission")
+	}
+}
 
 func TestStreamingFinalGateAndIncompletePages(t *testing.T) {
 	for _, mode := range []string{"success", "short payload", "missing complete", "bad complete"} {
@@ -218,6 +465,7 @@ type streamingResponse struct {
 }
 
 func (w streamingResponse) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (w streamingResponse) ReadFrom(r io.Reader) (int64, error) {
 	lr, ok := r.(*io.LimitedReader)
 	if !ok || lr.N <= 0 || lr.N > copyBufferSize {
@@ -309,39 +557,6 @@ func TestStreamingHTTPFastPathRangesAndFallback(t *testing.T) {
 	}
 }
 
-func TestStreamingReadAhead(t *testing.T) {
-	// Deliver headers, payload, and Complete in a single read-ahead buffer.
-	c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
-		var all bytes.Buffer
-		all.WriteString(subscriptionHead(3, 0, 3))
-		_ = fakeSubscriptionFrame(&all, 1, 0, 0, 3)
-		all.WriteString("abc")
-		_ = fakeSubscriptionFrame(&all, 2, 1, 3, 0)
-		_, _ = conn.Write(all.Bytes())
-
-		orderedRelease(t, reader, 0, 3)
-	})
-
-	v, err := c.GetStreaming(t.Context(), Request{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeBody(v)
-
-	if v.stream.conn.Reader.Buffered() != 45 {
-		t.Fatal("fixture did not read ahead")
-	}
-
-	dst := httptest.NewRecorder()
-	if n, err := v.WriteToHTTP(dst); n != 3 || err != nil || dst.Body.String() != "abc" {
-		t.Fatal(n, err, dst.Body.String())
-	}
-
-	if c.Stats().BytesRead != 3 {
-		t.Fatal(c.Stats())
-	}
-}
-
 type streamingWriter struct {
 	http.ResponseWriter
 	write func([]byte) (int, error)
@@ -412,80 +627,11 @@ func TestStreamingBlockedWriterCapacityAndCancellation(t *testing.T) {
 	}
 }
 
-func TestStreamingShortWritesAndBodyDeadline(t *testing.T) {
-	for _, mode := range []string{"short", "negative", "excess", "deadline"} {
-		t.Run(mode, func(t *testing.T) {
-			c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
-				_, _ = io.WriteString(conn, subscriptionHead(3, 0, 3))
-
-				_ = fakeSubscriptionFrame(conn, 1, 0, 0, 3)
-				if mode != "deadline" {
-					_, _ = io.WriteString(conn, "abc")
-				}
-
-				_, _ = io.Copy(io.Discard, reader)
-			})
-			c.config.BodyReadTimeout = 30 * time.Millisecond
-
-			v, err := c.GetStreaming(t.Context(), Request{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer closeBody(v)
-
-			n, err := v.WriteToHTTP(streamingWriter{httptest.NewRecorder(), func(p []byte) (int, error) {
-				switch mode {
-				case "negative":
-					return -1, nil
-				case "excess":
-					return len(p) + 1, nil
-				}
-
-				return 0, nil
-			}})
-			if n != 0 {
-				t.Fatal(n)
-			}
-
-			if mode == "deadline" {
-				assertKind(t, err, ErrorIO)
-
-				var timeout net.Error
-				if !errors.As(err, &timeout) || !timeout.Timeout() {
-					t.Fatal("missing socket timeout", err)
-				}
-			} else if !errors.Is(err, io.ErrShortWrite) {
-				t.Fatal(err)
-			}
-
-			if c.Stats().ActiveBulk != 0 {
-				t.Fatal("admission leaked")
-			}
-		})
-	}
-}
-
-func TestStreamingOptionsValidation(t *testing.T) {
-	c := testClient(t, "unused", 1)
-	for _, o := range []ReadOptions{{PageCredits: -1}, {PageCredits: 65}, {ByteCredits: PageSize - 1}, {ByteCredits: 64*PageSize + 1}} {
-		_, err := c.GetStreaming(t.Context(), Request{}, o)
-		assertKind(t, err, ErrorInvalidArgument)
-	}
-
-	_, err := c.GetStreaming(nil, Request{}) //nolint:staticcheck // Exercise invalid nil-context rejection.
-	assertKind(t, err, ErrorInvalidArgument)
-	_, err = c.GetStreaming(t.Context(), Request{}, ReadOptions{}, ReadOptions{})
-	assertKind(t, err, ErrorInvalidArgument)
-
-	if c.Stats().Dials != 0 {
-		t.Fatal("invalid options dialed")
-	}
-}
-
 type streamingTCPResponse struct{ *net.TCPConn }
 
 func (w streamingTCPResponse) Header() http.Header { return make(http.Header) }
-func (w streamingTCPResponse) WriteHeader(int)     {}
+
+func (w streamingTCPResponse) WriteHeader(int) {}
 
 func TestStreamingFastDestinationCancellation(t *testing.T) {
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -650,67 +796,6 @@ func TestStreamingTLSFallback(t *testing.T) {
 	}
 }
 
-func TestStreamingHTTP2Success(t *testing.T) {
-	for _, size := range []int64{0, 1, 2*copyBufferSize + 17} {
-		t.Run(strconv.FormatInt(size, 10), func(t *testing.T) {
-			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				streamResponseHead(w, 0, size, size, `"v"`)
-				_, _ = io.CopyN(w, &offsetStream{}, size)
-			}))
-			c := testClient(t, path, 1)
-			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.ProtoMajor != 2 {
-					t.Error("HTTP/2 not negotiated")
-				}
-
-				v, err := c.GetStreaming(r.Context(), Request{})
-				if err != nil {
-					t.Error(err)
-					http.Error(w, "get failed", http.StatusBadGateway)
-
-					return
-				}
-				defer closeBody(v)
-
-				w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-
-				if n, err := v.WriteToHTTP(w); n != size || err != nil {
-					t.Error(n, err)
-				}
-			}))
-			server.EnableHTTP2 = true
-			server.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
-
-			server.StartTLS()
-			defer server.Close()
-			// Exercise successive streams on the same HTTP/2 connection. Reading
-			// to EOF observes END_STREAM and catches resets after the final Write.
-			for range 5 {
-				r, err := server.Client().Get(server.URL)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				if r.ProtoMajor != 2 || r.StatusCode != http.StatusOK {
-					closeBody(r.Body)
-					t.Fatal(r.Proto, r.Status)
-				}
-
-				n, err := io.Copy(&offsetSink{}, r.Body)
-				closeBody(r.Body)
-
-				if n != size || err != nil {
-					t.Fatal(n, err)
-				}
-			}
-
-			if c.Stats().BytesRead != uint64(5*size) || c.Stats().ActiveBulk != 0 {
-				t.Fatal(c.Stats())
-			}
-		})
-	}
-}
-
 type streamingDeadlineRecorder struct {
 	http.ResponseWriter
 	expired atomic.Int64
@@ -743,5 +828,127 @@ func TestStreamingSuccessDoesNotExpireDestination(t *testing.T) {
 
 	if dst.expired.Load() != 0 {
 		t.Fatal("successful completion expired destination deadline")
+	}
+}
+
+func completeTestValue(t *testing.T, size uint64, completion string) *Value {
+	t.Helper()
+	c := rawSubscriptionClient(t, func(conn net.Conn, _ *bufio.Reader, _ []byte) {
+		_, _ = io.WriteString(conn, subscriptionHead(size, 0, size))
+		for first := uint64(0); first < size; {
+			n := min(uint64(PageSize), size-first)
+			_ = fakeSubscriptionFrame(conn, 1, first/uint64(PageSize), first, uint32(n))
+			_, _ = io.CopyN(conn, &offsetStream{offset: int64(first)}, int64(n))
+			first += n
+		}
+
+		if completion != "missing" {
+			pages := (size + uint64(PageSize) - 1) / uint64(PageSize)
+			if completion == "bad" {
+				pages++
+			}
+
+			_ = fakeSubscriptionFrame(conn, 2, pages, size, 0)
+		}
+	})
+
+	v, err := c.Get(t.Context(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { closeBody(v) })
+
+	return v
+}
+
+func TestWriteToHTTPCompleteBeforeEmptySuccessAndAbortAfterCommit(t *testing.T) {
+	for _, mode := range []string{"http", "tls", "nonhijackable"} {
+		for _, size := range []uint64{0, 4, uint64(PageSize) + 1} {
+			for _, completion := range []string{"good", "bad", "missing"} {
+				t.Run(mode+"/"+strconv.FormatUint(size, 10)+"/"+completion, func(t *testing.T) {
+					v := completeTestValue(t, size, completion)
+					handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						defer closeBody(v)
+
+						w.Header().Set("Content-Length", strconv.FormatUint(size, 10))
+
+						n, err := v.WriteToHTTP(w)
+						if err != nil {
+							if n > 0 {
+								panic(http.ErrAbortHandler)
+							}
+
+							w.Header().Del("Content-Length")
+							http.Error(w, "value unavailable", http.StatusBadGateway)
+						}
+					})
+
+					if mode == "nonhijackable" {
+						w := httptest.NewRecorder()
+
+						var caught any
+
+						func() {
+							defer func() { caught = recover() }()
+
+							handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+						}()
+
+						if completion == "good" {
+							if caught != nil || w.Code != 200 || uint64(w.Body.Len()) != size {
+								t.Fatal(w.Code, w.Body.Len(), caught)
+							}
+						} else if size > uint64(PageSize) {
+							if caught != http.ErrAbortHandler {
+								t.Fatal("committed response did not abort", caught)
+							}
+						} else if caught != nil || w.Code < 400 {
+							t.Fatal("failure before commit reported success", w.Code, caught)
+						}
+
+						return
+					}
+
+					server := httptest.NewUnstartedServer(handler)
+
+					server.Config.ErrorLog = log.New(io.Discard, "", 0)
+					if mode == "tls" {
+						server.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+						server.StartTLS()
+					} else {
+						server.Start()
+					}
+					defer server.Close()
+
+					response, err := server.Client().Get(server.URL)
+					if err != nil {
+						if completion == "good" || size == 0 {
+							t.Fatal(err)
+						}
+
+						return
+					}
+					defer closeBody(response.Body)
+
+					if mode == "tls" && response.TLS.Version != tls.VersionTLS13 {
+						t.Fatal("TLS 1.3 required")
+					}
+
+					count, readErr := io.Copy(io.Discard, response.Body)
+					if completion == "good" {
+						if response.StatusCode != 200 || count != int64(size) || readErr != nil {
+							t.Fatal(response.Status, count, readErr)
+						}
+					} else if size == 0 {
+						if response.StatusCode < 400 {
+							t.Fatal("empty response committed before Complete", response.Status)
+						}
+					} else if response.StatusCode < 400 && readErr == nil {
+						t.Fatal("incomplete response reported success", count)
+					}
+				})
+			}
+		}
 	}
 }

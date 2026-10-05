@@ -175,15 +175,15 @@ alone cannot exceed the byte cap, and actual memory admission may allow fewer.
 Compiled `RACER_RANGE_WINDOW_PAGES` defaults to **2** (`D/config.rs:252`). Gantry
 passes `racer_page_window` to SDK `PageWindow`; absent credits select two, with
 byte credits derived from page credits (`cmd/gantry/agent_racer.go:243-253`,
-`pkg/racersdk/subscription.go:92-104`). Gantry also accepts
+`pkg/racersdk/subscription.go:92-107`). Gantry also accepts
 `GANTRY_RACER_PAGE_WINDOW` and `--racer-page-window`; the guard rejects precedence
 that shadows the reviewed config (`internal/gantry/config/config.go:679,782`,
 `hack/scripts/racer-rollout/page_window.py:118-130`). The ordered dataplane window is the minimum
 of configured window and client page credits; SDK resident buffers are capped at
 two, further reduced by page/byte credits (`D/read/range_stream.rs:259-266`,
-`pkg/racersdk/ordered.go:27-30`). A window-1 contract is tested for resident storage
+`pkg/racersdk/value.go:159-162`). A window-1 contract is tested for resident storage
 and reuse, not a universal prohibition on window 2
-(`pkg/racersdk/ordered_test.go:159-204`).
+(`pkg/racersdk/value_test.go:318-363`).
 At 16 MiB per page, the two-buffer allowance is 32 MiB per active bulk stream,
 before other allocations; window 2 is not a free concurrency increase.
 

@@ -11,9 +11,168 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
+
+type transferDiscard struct{ *httptest.ResponseRecorder }
+
+func (transferDiscard) ReadFrom(r io.Reader) (int64, error) { return io.Copy(io.Discard, r) }
+
+func TestBodyReadTimeoutReleasesAdmission(t *testing.T) {
+	for _, fast := range []bool{false, true} {
+		name := "copy"
+		if fast {
+			name = "HTTP transfer"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			done := make(chan struct{})
+			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				streamResponseHead(w, 0, 8192, 8192, `"v"`)
+				w.(http.Flusher).Flush()
+				<-done
+			}))
+
+			defer close(done)
+
+			c := testClient(t, path, 1)
+			c.config.BodyReadTimeout = 30 * time.Millisecond
+
+			v, err := c.Get(context.Background(), Request{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeBody(v)
+
+			if fast {
+				_, err = v.WriteToHTTP(transferDiscard{httptest.NewRecorder()})
+			} else {
+				_, err = io.Copy(io.Discard, v)
+			}
+
+			if err == nil || c.Stats().ActiveBulk != 0 {
+				t.Fatal("stalled body retained admission", err, c.Stats())
+			}
+		})
+	}
+}
+
+func TestBodyReadTimeoutDoesNotBoundCallerThinkTime(t *testing.T) {
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		streamResponseHead(w, 0, 2, 2, `"v"`)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	c := testClient(t, path, 1)
+	c.config.BodyReadTimeout = 20 * time.Millisecond
+
+	v, err := c.Get(context.Background(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
+
+	buf := make([]byte, 1)
+	if _, err := v.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(40 * time.Millisecond)
+
+	if _, err := v.Read(buf); err != nil || string(buf) != "k" {
+		t.Fatal(string(buf), err)
+	}
+}
+
+func TestStreamingReadAhead(t *testing.T) {
+	// Deliver headers, payload, and Complete in a single read-ahead buffer.
+	c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
+		var all bytes.Buffer
+		all.WriteString(subscriptionHead(3, 0, 3))
+		_ = fakeSubscriptionFrame(&all, 1, 0, 0, 3)
+		all.WriteString("abc")
+		_ = fakeSubscriptionFrame(&all, 2, 1, 3, 0)
+		_, _ = conn.Write(all.Bytes())
+
+		orderedRelease(t, reader, 0, 3)
+	})
+
+	v, err := c.GetStreaming(t.Context(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
+
+	if v.stream.conn.Reader.Buffered() != 45 {
+		t.Fatal("fixture did not read ahead")
+	}
+
+	dst := httptest.NewRecorder()
+	if n, err := v.WriteToHTTP(dst); n != 3 || err != nil || dst.Body.String() != "abc" {
+		t.Fatal(n, err, dst.Body.String())
+	}
+
+	if c.Stats().BytesRead != 3 {
+		t.Fatal(c.Stats())
+	}
+}
+
+func TestStreamingShortWritesAndBodyDeadline(t *testing.T) {
+	for _, mode := range []string{"short", "negative", "excess", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
+				_, _ = io.WriteString(conn, subscriptionHead(3, 0, 3))
+
+				_ = fakeSubscriptionFrame(conn, 1, 0, 0, 3)
+				if mode != "deadline" {
+					_, _ = io.WriteString(conn, "abc")
+				}
+
+				_, _ = io.Copy(io.Discard, reader)
+			})
+			c.config.BodyReadTimeout = 30 * time.Millisecond
+
+			v, err := c.GetStreaming(t.Context(), Request{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeBody(v)
+
+			n, err := v.WriteToHTTP(streamingWriter{httptest.NewRecorder(), func(p []byte) (int, error) {
+				switch mode {
+				case "negative":
+					return -1, nil
+				case "excess":
+					return len(p) + 1, nil
+				}
+
+				return 0, nil
+			}})
+			if n != 0 {
+				t.Fatal(n)
+			}
+
+			if mode == "deadline" {
+				assertKind(t, err, ErrorIO)
+
+				var timeout net.Error
+				if !errors.As(err, &timeout) || !timeout.Timeout() {
+					t.Fatal("missing socket timeout", err)
+				}
+			} else if !errors.Is(err, io.ErrShortWrite) {
+				t.Fatal(err)
+			}
+
+			if c.Stats().ActiveBulk != 0 {
+				t.Fatal("admission leaked")
+			}
+		})
+	}
+}
 
 func orderedWait(t *testing.T, done <-chan struct{}) {
 	t.Helper()
@@ -521,5 +680,286 @@ func TestGetTerminalReadWaitsForReceiverCleanup(t *testing.T) {
 
 	if c.Stats().ActiveBulk != 0 || len(v.stream.buffers) != 0 {
 		t.Fatal("terminal read returned before cleanup")
+	}
+}
+
+type writeFunc func([]byte) (int, error)
+
+func (f writeFunc) Write(p []byte) (int, error) { return f(p) }
+
+type copyDestination struct {
+	bytes.Buffer
+	readFrom bool
+	maxWrite int
+	sizes    []int
+}
+
+func (w *copyDestination) ReadFrom(io.Reader) (int64, error) {
+	w.readFrom = true
+	return 0, errors.New("unexpected ReaderFrom")
+}
+
+func (w *copyDestination) Write(p []byte) (int, error) {
+	w.maxWrite = max(w.maxWrite, len(p))
+	w.sizes = append(w.sizes, len(p))
+
+	return w.Buffer.Write(p)
+}
+
+// Exercise copying through the supported subscription transport, including page
+// verification, ordered delivery, and admission cleanup.
+func copyTestValue(t *testing.T, source io.ReadCloser, length int64) *Value {
+	t.Helper()
+	t.Cleanup(func() { closeBody(source) })
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		streamResponseHead(w, 0, length, length, `"v"`)
+		_, _ = io.Copy(w, source)
+	}))
+	c := testClient(t, path, 1)
+
+	v, err := c.Get(t.Context(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { closeBody(v) })
+
+	return v
+}
+
+func TestWriteToUsesBoundedBufferWithoutReaderFrom(t *testing.T) {
+	data := strings.Repeat("xyz", copyBufferSize+13)
+	v := copyTestValue(t, io.NopCloser(strings.NewReader(data)), int64(len(data)))
+	w := &copyDestination{}
+
+	n, err := io.Copy(w, v)
+	if err != nil || n != int64(len(data)) || w.String() != data || w.readFrom || w.maxWrite != copyBufferSize {
+		t.Fatal("copy chunking or ReaderFrom dispatch", n, err, w.readFrom, w.maxWrite)
+	}
+
+	if n, err := v.WriteTo(w); n != 0 || err != nil {
+		t.Fatal("repeated EOF", n, err)
+	}
+
+	if len(v.client.copySlots) != 0 || len(v.client.copyBuffers) != 1 {
+		t.Fatal("copy buffer not returned")
+	}
+}
+
+func TestWriteToDeliveryBatches(t *testing.T) {
+	// Use a literal target, independent of the implementation's scratch size.
+	const batch = 256 * 1024
+
+	for _, tt := range []struct {
+		name  string
+		size  int
+		sizes []int
+	}{
+		{"short", batch - 1, []int{batch - 1}},
+		{"exact", batch, []int{batch}},
+		{"tail", 2*batch + 17, []int{batch, batch, 17}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := bytes.Repeat([]byte("xyz"), (tt.size+2)/3)[:tt.size]
+			v := copyTestValue(t, io.NopCloser(bytes.NewReader(data)), int64(len(data)))
+			w := &copyDestination{}
+
+			n, err := io.Copy(w, v)
+			if err != nil || n != int64(len(data)) || !bytes.Equal(w.Bytes(), data) || w.readFrom || !slices.Equal(w.sizes, tt.sizes) {
+				t.Fatalf("copy bytes=%d err=%v ReaderFrom=%v batches=%v want=%v", n, err, w.readFrom, w.sizes, tt.sizes)
+			}
+		})
+	}
+}
+
+func TestWriteToWriterFailures(t *testing.T) {
+	sentinel := errors.New("writer failed")
+	for _, tt := range []struct {
+		name    string
+		n       int
+		err     error
+		wantN   int64
+		wantErr error
+	}{
+		{"zero", 0, nil, 0, io.ErrShortWrite},
+		{"short", 2, nil, 2, io.ErrShortWrite},
+		{"error", 0, sentinel, 0, sentinel},
+		{"partial error", 2, sentinel, 2, sentinel},
+		{"full error", 4, sentinel, 4, sentinel},
+		{"negative", -1, nil, 0, io.ErrShortWrite},
+		{"excess", 5, nil, 0, io.ErrShortWrite},
+		{"negative error", -1, sentinel, 0, sentinel},
+		{"excess error", 5, sentinel, 0, sentinel},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			v := copyTestValue(t, io.NopCloser(strings.NewReader("data")), 4)
+			calls := 0
+
+			n, err := v.WriteTo(writeFunc(func(p []byte) (int, error) {
+				calls++
+
+				if string(p) != "data" {
+					t.Fatal("unexpected writer data")
+				}
+
+				return tt.n, tt.err
+			}))
+			if n != tt.wantN || !errors.Is(err, tt.wantErr) || calls != 1 {
+				t.Fatal(n, err, calls)
+			}
+
+			if len(v.client.copySlots) != 0 {
+				t.Fatal("writer failure retained copy buffer")
+			}
+
+			closeBody(v)
+
+			if len(v.client.slots) != 0 {
+				t.Fatal("writer failure retained admission after Close")
+			}
+		})
+	}
+}
+
+func TestWriteToPartialReadErrorsAndNoProgress(t *testing.T) {
+	// Incomplete pages and a missing Complete frame never expose unverified
+	// bytes. Source errors cross the wire as truncation, not Go error identities.
+	for _, payload := range []string{"dat", "data"} {
+		c := rawSubscriptionClient(t, func(conn net.Conn, _ *bufio.Reader, _ []byte) {
+			_, _ = io.WriteString(conn, subscriptionHead(4, 0, 4))
+			_ = fakeSubscriptionFrame(conn, 1, 0, 0, 4)
+			_, _ = io.WriteString(conn, payload)
+		})
+
+		v, err := c.Get(t.Context(), Request{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var dst bytes.Buffer
+
+		n, err := v.WriteTo(&dst)
+		if n != 0 || dst.Len() != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatal(n, err, dst.String())
+		}
+
+		if _, err := v.Read(nil); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatal("source error not terminal", err)
+		}
+	}
+
+	// No progress on a subscription is bounded by its context, rather than a
+	// synthetic reader repeatedly returning (0, nil).
+	c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
+		_, _ = io.WriteString(conn, subscriptionHead(1, 0, 1))
+		_, _ = reader.ReadByte()
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	v, err := c.Get(ctx, Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+
+	if n, err := v.WriteTo(io.Discard); n != 0 || !errors.Is(err, context.Canceled) {
+		t.Fatal(n, err)
+	}
+}
+
+func TestWriteToCancellationFromWriter(t *testing.T) {
+	for _, action := range []string{"context", "value", "client"} {
+		t.Run(action, func(t *testing.T) {
+			v := copyTestValue(t, io.NopCloser(io.LimitReader(repeatedByte('x'), 2*copyBufferSize)), 2*copyBufferSize)
+
+			n, err := v.WriteTo(writeFunc(func(p []byte) (int, error) {
+				switch action {
+				case "context":
+					v.cancel()
+				case "value":
+					closeBody(v)
+				case "client":
+					closeBody(v.client)
+				}
+
+				return len(p), nil
+			}))
+			if n != copyBufferSize {
+				t.Fatal("read after cancellation", n)
+			}
+
+			if action == "context" {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			} else {
+				assertKind(t, err, ErrorClosed)
+			}
+		})
+	}
+}
+
+func TestWriteToScratchBoundWithCanceledBlockedWriter(t *testing.T) {
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { streamResponse(w, 0, 1, 1, `"v"`) }))
+	c := testClient(t, path, 1)
+
+	v, err := c.Get(context.Background(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := v.WriteTo(writeFunc(func(p []byte) (int, error) { close(entered); <-release; return len(p), nil }))
+		done <- err
+	}()
+
+	<-entered
+	closeBody(v)
+
+	if len(c.slots) != 0 || len(c.copySlots) != 1 {
+		t.Fatal("cancellation did not separate value and scratch lifetimes")
+	}
+
+	next, err := c.Get(context.Background(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(next)
+
+	if n, err := next.WriteTo(io.Discard); n != 0 {
+		t.Fatal(n, err)
+	} else {
+		assertKind(t, err, ErrorUnavailable)
+	}
+	// Ordinary Read remains usable without SDK copy scratch.
+	if data, err := io.ReadAll(next); err != nil || string(data) != "x" {
+		t.Fatal(string(data), err)
+	}
+
+	closeBody(c)
+
+	if len(c.copyBuffers) != 0 {
+		t.Fatal("closed client retained idle scratch")
+	}
+	// Unblock without closing twice in deferred cleanup.
+	release <- struct{}{}
+
+	select {
+	case err := <-done:
+		assertKind(t, err, ErrorClosed)
+	case <-time.After(time.Second):
+		t.Fatal("copy did not return after writer unblocked")
+	}
+
+	if len(c.copySlots) != 0 || len(c.copyBuffers) != 0 {
+		t.Fatal("copy returned scratch to closed client")
 	}
 }
