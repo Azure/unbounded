@@ -104,7 +104,10 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
   Development dependencies are excluded; normal, target, build, and optional
   direct dependencies are included. Local path dependencies must be declared
-  workspace members; their registry dependencies are collected separately and
+  workspace members, including paths in development and target-specific
+  development dependencies. These development edges are checked only for
+  membership; registry development dependencies remain excluded. Members'
+  normal registry dependencies are collected separately and
   deduplicated. Conflicting direct versions fail collection. Member manifests
   must declare package names. Member-local lockfiles are ignored.
   The supported workspace layout uses explicit relative member directories,
