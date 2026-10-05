@@ -616,6 +616,9 @@ impl<P: Policy> Quotas<P> {
                 return Err(Error::Overloaded);
             }
         }
+        // Application cloning may panic. Finish it before committing admission
+        // so every counter increment is paired with a fully constructed owner.
+        let key = key.cloned();
         self.totals
             .counter(class)
             .reserve(amount, limit)
@@ -629,7 +632,7 @@ impl<P: Policy> Quotas<P> {
         Ok(Charge {
             class,
             amount,
-            key: key.cloned(),
+            key,
             totals: self.totals.clone(),
             local,
             buffers: Arc::downgrade(&self.buffers),
