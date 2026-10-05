@@ -55,19 +55,19 @@ func (c *Collector) Precheck(root string) error {
 		return err
 	}
 
-	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
+	lockPath := filepath.Join(root, cratePath, "Cargo.lock")
 
-	manifest, err := os.ReadFile(manifestPath)
+	lock, err := os.ReadFile(lockPath)
 	if err != nil {
-		return fmt.Errorf("reading %s: %w", manifestPath, err)
+		return fmt.Errorf("reading %s: %w", lockPath, err)
 	}
 
-	direct, err := directDependencies(string(manifest))
+	versions, err := localRegistryVersions(filepath.Join(root, cratePath), string(lock))
 	if err != nil {
-		return fmt.Errorf("parsing %s: %w", manifestPath, err)
+		return err
 	}
 
-	if len(direct) == 0 {
+	if len(versions) == 0 {
 		return nil
 	}
 
