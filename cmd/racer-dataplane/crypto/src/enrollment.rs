@@ -164,9 +164,7 @@ impl PersistedIdentity {
 
     /// Keep serialized private material in zeroizing storage until submission.
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
-        Ok(Zeroizing::new(
-            serde_json::to_vec(self).map_err(|_| Error::Io)?,
-        ))
+        encode_private(self, wire::MAX_ENROLLMENT_BYTES * 3)
     }
 }
 
@@ -378,7 +376,7 @@ where
                 Err(e) => return Err(e),
             }
             let pending = self.generate()?;
-            let encoded = Zeroizing::new(serde_json::to_vec(&pending).map_err(|_| Error::Io)?);
+            let encoded = encode_private(&pending, wire::MAX_ENROLLMENT_BYTES)?;
             secure::atomic_write(r, &dir, "pending.json", &encoded, &scope).await?;
             self.request(&pending, nics, shares).map_err(Into::into)
         })
@@ -566,6 +564,39 @@ impl LocalSigningIdentity {
     }
 }
 
+/// Fixed-capacity output that cannot reallocate after receiving secret bytes.
+struct PrivateOutput {
+    bytes: Zeroizing<Vec<u8>>,
+
+    limit: usize,
+}
+
+impl std::io::Write for PrivateOutput {
+    /// Reject an oversized write before copying any bytes or growing the allocation.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit - self.bytes.len() {
+            return Err(std::io::ErrorKind::FileTooLarge.into());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    /// Serialization writes directly to memory, so there is nothing to flush.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize directly into wiping storage sized before any secrets are copied.
+fn encode_private(value: &impl Serialize, limit: usize) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let mut output = PrivateOutput {
+        bytes: Zeroizing::new(Vec::with_capacity(limit)),
+        limit,
+    };
+    serde_json::to_writer(&mut output, value).map_err(|_| Error::Io)?;
+    Ok(output.bytes)
+}
+
 /// Parse a projected bearer credential without retaining leading/trailing whitespace.
 fn token(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
     let token = Zeroizing::new(
@@ -681,6 +712,76 @@ mod tests {
             ));
             assert_eq!(PRIVATE_KEY_DROPS.with(Cell::get), 1);
         }
+    }
+
+    /// Fixed storage bounds both record families, including late serializer errors.
+    #[test]
+    fn private_serialization_is_bounded_non_reallocating_and_round_trips() {
+        use std::io::Write;
+        let pending =
+            r#"{"cluster":"cluster","enrollment":"id","private_key":"secret","csr":"csr"}"#;
+        let record = decode_pending(pending.as_bytes()).unwrap();
+        let encoded = encode_private(&record, pending.len()).unwrap();
+        assert_eq!(&*encoded, pending.as_bytes());
+        assert_eq!(
+            decode_pending(&encoded).unwrap().private_key.0.as_str(),
+            "secret"
+        );
+        assert!(matches!(
+            encode_private(&record, pending.len() - 1),
+            Err(Error::Io)
+        ));
+        let persisted = PersistedIdentity {
+            pending: record,
+            response: "response".into(),
+        };
+        let encoded = persisted.encode().unwrap();
+        let decoded = PersistedIdentity::decode(&encoded).unwrap();
+        assert_eq!(decoded.pending.private_key.0.as_str(), "secret");
+        assert_eq!(decoded.response, "response");
+        let oversized = PersistedIdentity {
+            pending: decode_pending(pending.as_bytes()).unwrap(),
+            response: "x".repeat(wire::MAX_ENROLLMENT_BYTES * 3),
+        };
+        assert!(matches!(oversized.encode(), Err(Error::Io)));
+        let mut oversized_pending = decode_pending(pending.as_bytes()).unwrap();
+        oversized_pending.csr = "x".repeat(wire::MAX_ENROLLMENT_BYTES);
+        assert!(matches!(
+            encode_private(&oversized_pending, wire::MAX_ENROLLMENT_BYTES),
+            Err(Error::Io)
+        ));
+
+        let mut output = PrivateOutput {
+            bytes: Zeroizing::new(Vec::with_capacity(6)),
+            limit: 6,
+        };
+        let pointer = output.bytes.as_ptr();
+        let capacity = output.bytes.capacity();
+        for part in [b"sec".as_slice(), b"ret"] {
+            output.write_all(part).unwrap();
+            assert_eq!(output.bytes.as_ptr(), pointer);
+            assert_eq!(output.bytes.capacity(), capacity);
+        }
+        assert_eq!(
+            output.write(b"! ").unwrap_err().kind(),
+            std::io::ErrorKind::FileTooLarge
+        );
+        assert_eq!(&*output.bytes, b"secret");
+        assert_eq!(output.bytes.as_ptr(), pointer);
+        assert_eq!(output.bytes.capacity(), capacity);
+
+        /// Fail after the serializer has already emitted a secret-bearing field.
+        struct FailsLate;
+        impl Serialize for FailsLate {
+            /// Exercise cleanup after a non-capacity serialization failure.
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStruct;
+                let mut record = serializer.serialize_struct("record", 2)?;
+                record.serialize_field("private_key", "secret")?;
+                Err(serde::ser::Error::custom("late failure"))
+            }
+        }
+        assert!(matches!(encode_private(&FailsLate, 128), Err(Error::Io)));
     }
 
     /// Flat cause and publication phase keep test adapter errors lossless.
