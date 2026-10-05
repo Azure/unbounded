@@ -277,6 +277,8 @@ func take(slots chan struct{}) bool {
 func release(slots chan struct{}) { <-slots }
 
 func (s *Server) Ready(r *http.Request) error {
+	s.initializeAdmission()
+
 	if s.Lifecycle == nil {
 		return wire.Unavailable
 	}
@@ -286,8 +288,15 @@ func (s *Server) Ready(r *http.Request) error {
 		return wire.Unavailable
 	}
 
-	if _, err := reloader.getCertificate(nil); err != nil {
+	certificate, err := reloader.getCertificate(nil)
+	if err != nil {
 		return err
+	}
+
+	// A valid chain for a different service cannot serve controller clients.
+	// The reloader has already parsed and validated this immutable leaf.
+	if certificate.Leaf == nil || certificate.Leaf.VerifyHostname(s.config.ReplicationServerName) != nil {
+		return wire.Unavailable
 	}
 
 	if _, err := s.Trust.pool(); err != nil {

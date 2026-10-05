@@ -174,6 +174,9 @@ failure and have a 30-second deadline. Excess connections or handshakes are
 closed before HTTP without a queued waiter or overload response. Completed TLS
 connections do not retain handshake slots. Request authentication and poll
 admission remain independent; shutdown forcibly closes all admitted sockets.
+Readiness also requires the cached serving certificate's DNS SANs to match the
+configured replication server name. A valid certificate for another service is
+not ready; reloading a correctly named certificate restores this readiness gate.
 
 The operator owns identity/wiring: cluster UUID, URL, images, service accounts, trust,
 replication identity, and durable resource names. These are not tuning keys. Node identity

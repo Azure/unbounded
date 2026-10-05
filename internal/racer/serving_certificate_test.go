@@ -39,7 +39,7 @@ func servingTestCertificate(t *testing.T, serial int64, before, after time.Time,
 		t.Fatal(err)
 	}
 
-	template := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: fmt.Sprint(serial)}, NotBefore: before, NotAfter: after, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, IsCA: ca, BasicConstraintsValid: true}
+	template := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: fmt.Sprint(serial)}, NotBefore: before, NotAfter: after, DNSNames: []string{"racer-controller.racer.svc"}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, IsCA: ca, BasicConstraintsValid: true}
 	if ca {
 		template.KeyUsage |= x509.KeyUsageCertSign
 	}
