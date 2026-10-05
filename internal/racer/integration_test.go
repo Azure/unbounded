@@ -845,6 +845,10 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 
 	endpoint := "https://" + listener.Addr().String() + wire.SnapshotPath
 	// The first request includes a real TLS handshake. Neither path may read API state.
+	if err := measured.authority.Observe(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
 	requests.Store(0)
 	received.Store(0)
 
@@ -870,6 +874,12 @@ func integrationAuthorizationLoad(t *testing.T, rc *rest.Config, c client.Client
 			var nodes corev1.NodeList
 			return a.Topology.List(t.Context(), &nodes) == nil && len(nodes.Items) == count
 		})
+
+		// This standalone owner has no observer loop. Setup may outlast snapshot
+		// freshness, so refresh outside the measured request window.
+		if err := measured.authority.Observe(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 
 		requests.Store(0)
 		nodeLists.Store(0)

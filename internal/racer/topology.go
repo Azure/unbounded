@@ -69,23 +69,14 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	return r.annotate(ctx, update)
 }
 
-// TopologyHints are detached recovery annotations returned after gate release.
-// Mutating them cannot advance the publisher's accepted history.
-type TopologyHints = authority.TopologyHints
-
-type topologyUpdate = TopologyHints
-
 // publish protects authoritative reads, CAS, and local installation. Annotation
 // writes are recovery hints, not authority, and must not block trust observation.
-func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error) {
+func (r *TopologyReconciler) publish(ctx context.Context) (authority.TopologyHints, error) {
 	return r.authority.PublishTopology(ctx, r.observeTopology)
 }
 
 // TopologyObservation contains discovery inputs, not accepted history or proofs.
 type TopologyObservation = authority.TopologyObservation
-
-// PublishTopology invokes discovery under its private gate. History advances only
-// after durable CAS and local installation; returned annotation hints are detached.
 
 func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObservation, error) {
 	cfg := r.runtimeConfig()
@@ -100,7 +91,7 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObser
 		return TopologyObservation{}, err
 	}
 
-	catalog, err := BuildCatalog(caches.Items)
+	catalog, err := membership.BuildCatalog(caches.Items)
 	if err != nil {
 		return TopologyObservation{}, err
 	}
@@ -131,7 +122,7 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObser
 	}}, nil
 }
 
-func (r *TopologyReconciler) annotate(ctx context.Context, update topologyUpdate) error {
+func (r *TopologyReconciler) annotate(ctx context.Context, update authority.TopologyHints) error {
 	for i := range update.Nodes.Items {
 		node := &update.Nodes.Items[i]
 
@@ -222,11 +213,6 @@ func (ids DataplaneWorkloadIdentities) observed() membership.WorkloadIdentities 
 	return observed
 }
 
-// Owns checks only ownership against the observed live workload identities.
-func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
-	return ids.observed().Owns(pod)
-}
-
 // Custom standalone installations retain their single configured workload.
 // Operator installations use both fixed names, never a label-derived allowlist.
 func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cfg Config) (DataplaneWorkloadIdentities, error) {
@@ -256,35 +242,3 @@ const (
 	enrolledRDMANICsAnnotation = membership.EnrolledRDMANICsAnnotation
 	admittedMemberAnnotation   = membership.AdmittedMemberAnnotation
 )
-
-// AcceptedMembers is backed by per-Node UID-bound last-admitted annotations.
-type AcceptedMembers = membership.History
-
-type MemberAttributes = membership.MemberAttributes
-
-type Diagnostic = membership.Diagnostic
-
-// ParseAnnotations distinguishes absent defaults from malformed proposed updates.
-func ParseAnnotations(node *corev1.Node) (MemberAttributes, error) {
-	return membership.ParseAnnotations(node)
-}
-
-// selectEndpoint retains the parent test bridge during membership migration.
-func selectEndpoint(pods []corev1.Pod, ownership DataplaneWorkloadIdentities, nodeName string, port uint16) (string, error) {
-	return membership.SelectEndpoint(pods, ownership.observed(), nodeName, port)
-}
-
-// reconcileMembers retains the parent test bridge during membership migration.
-func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, ownership DataplaneWorkloadIdentities, accepted AcceptedMembers, port uint16) (AcceptedMembers, []Diagnostic, error) {
-	result, err := membership.Reconcile(membership.Input{
-		Nodes: nodes, PodsByNode: podsByNode, Ownership: ownership.observed(), PeerPort: port,
-	}, accepted)
-
-	return result.Members, result.Diagnostics, err
-}
-
-// BuildCatalog derives identities from UIDs and paths from names, sorted by UID.
-// An invalid catalog never partially replaces the currently served publication.
-func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error) {
-	return membership.BuildCatalog(caches)
-}

@@ -14,7 +14,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/membership"
 	"github.com/Azure/unbounded/internal/racer/wire"
 	"github.com/Azure/unbounded/internal/racer/workload"
@@ -200,7 +199,3 @@ const (
 	enrolledRDMANICsAnnotation = membership.EnrolledRDMANICsAnnotation
 	admittedMemberAnnotation   = membership.AdmittedMemberAnnotation
 )
-
-func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error) {
-	return membership.BuildCatalog(caches)
-}
