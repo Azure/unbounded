@@ -63,20 +63,11 @@ func (c *OCICache) SetDigestForArchitecture(imageRef, architecture, digest strin
 	c.digests[imageRefCacheKey(imageRef, architecture)] = digest
 }
 
-func (c *OCICache) DigestFor(imageRef string) string {
-	return c.DigestForArchitecture(imageRef, v1alpha3.DefaultPXEArchitecture)
-}
-
 func (c *OCICache) DigestForArchitecture(imageRef, architecture string) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	return c.digests[imageRefCacheKey(imageRef, architecture)]
-}
-
-// ImageDir returns the base directory for a cached image by digest.
-func (c *OCICache) ImageDir(digest string) string {
-	return c.ImageDirForArchitecture(digest, v1alpha3.DefaultPXEArchitecture)
 }
 
 // ImageDirForArchitecture returns the base directory for a cached image by
@@ -97,21 +88,10 @@ func (c *OCICache) DiskDirForArchitecture(digest, architecture string) string {
 	return filepath.Join(c.ImageDirForArchitecture(digest, architecture), "disk")
 }
 
-// IsCached returns true if the image digest is already unpacked locally.
-func (c *OCICache) IsCached(digest string) bool {
-	return c.IsCachedForArchitecture(digest, v1alpha3.DefaultPXEArchitecture)
-}
-
 // IsCachedForArchitecture returns true if the image digest is already unpacked locally.
 func (c *OCICache) IsCachedForArchitecture(digest, architecture string) bool {
 	_, err := os.Stat(c.DiskDirForArchitecture(digest, architecture))
 	return err == nil
-}
-
-// Metadata returns the parsed metadata.yaml for a cached image,
-// reading it from disk and caching in memory on first access.
-func (c *OCICache) Metadata(digest string) (*ImageMetadata, error) {
-	return c.MetadataForArchitecture(digest, v1alpha3.DefaultPXEArchitecture)
 }
 
 // MetadataForArchitecture returns the parsed metadata.yaml for a cached image.
@@ -224,21 +204,6 @@ func (c *OCICache) ResolvePathForArchitecture(imageRef, architecture, reqPath st
 	}
 
 	return "", false, fmt.Errorf("file not found in image %q: %s", imageRef, reqPath)
-}
-
-// InvalidateRef removes the digest mapping for an image reference,
-// so it will be re-pulled on next reconcile.
-func (c *OCICache) InvalidateRef(imageRef string) {
-	c.InvalidateRefForArchitecture(imageRef, v1alpha3.DefaultPXEArchitecture)
-}
-
-// InvalidateRefForArchitecture removes the digest mapping for an image
-// reference and target architecture, so it will be re-pulled on next reconcile.
-func (c *OCICache) InvalidateRefForArchitecture(imageRef, architecture string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	delete(c.digests, imageRefCacheKey(imageRef, architecture))
 }
 
 func imageRefCacheKey(imageRef, architecture string) imageRefKey {
