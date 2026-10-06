@@ -124,28 +124,15 @@ impl OriginClient {
         scope: &RequestScope,
     ) -> Result<MetadataReply> {
         scope.check()?;
-        let (admission, buffers) = (&self.admission, &self.buffers);
-        reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
-        if !admission.owns(&reservation) || reservation.key() != Some(&context.object.cache) {
-            return Err(Error::InvalidConfiguration);
-        }
+        self.validate_reservation(&reservation, context)?;
         let mut head = request(context, "GET")?;
-        head.headers.push(header("Range", b"bytes=0-16777215"));
+        head.headers.push(Header::new("Range", b"bytes=0-16777215"));
         let connection = self
             .pool
             .checkout_wait(endpoint, scope)
             .await
             .map_err(response_error)?;
-        let sent = self
-            .io
-            .send_head(connection, head, scope)
-            .await
-            .map_err(response_error)?;
-        let mut response = self
-            .io
-            .receive_head_limited(sent.connection, scope, 32 * 1024)
-            .await
-            .map_err(response_error)?;
+        let mut response = self.exchange_head(connection, head, scope).await?;
         let (metadata, length) = validate_bootstrap(&response.value, &context.object)?;
         if length == 0 {
             scope.check()?;
@@ -158,7 +145,7 @@ impl OriginClient {
                 page_zero: None,
             });
         }
-        let buffer = buffers.plaintext(reservation, length as usize)?;
+        let buffer = self.buffers.plaintext(reservation, length as usize)?;
         let mut body = self.read_page(response.connection, buffer, scope).await?;
         let page = PageId {
             version: metadata.version.clone(),
@@ -201,7 +188,7 @@ impl OriginClient {
         scope.check()?;
         let mut head = request(context, "HEAD")?;
         if let MetadataSelector::Pinned(etag) = &selector {
-            head.headers.push(header("If-Match", etag.as_bytes()));
+            head.headers.push(Header::new("If-Match", etag.as_bytes()));
         }
         // HEAD has no plaintext reservation and uses metadata connection admission.
         // Where the endpoint cap permits, GETs leave a slot available for HEAD.
@@ -210,16 +197,7 @@ impl OriginClient {
             .checkout_metadata(endpoint, scope)
             .await
             .map_err(response_error)?;
-        let sent = self
-            .io
-            .send_head(connection, head, scope)
-            .await
-            .map_err(response_error)?;
-        let mut response = self
-            .io
-            .receive_head_limited(sent.connection, scope, 32 * 1024)
-            .await
-            .map_err(response_error)?;
+        let mut response = self.exchange_head(connection, head, scope).await?;
         // A pinned 404 is a broken origin contract, not permission to refresh.
         validate_response(
             &response.value,
@@ -264,32 +242,21 @@ impl OriginClient {
             .filter(|last| *last <= i64::MAX as u64)
             .ok_or(Error::InvalidRange)?;
         let mut head = request(context, "GET")?;
+        head.headers.push(Header::new(
+            "Range",
+            format!("bytes={first}-{last}").as_bytes(),
+        ));
         head.headers
-            .push(header("Range", format!("bytes={first}-{last}").as_bytes()));
-        head.headers
-            .push(header("If-Match", page.version.etag.as_bytes()));
-        let (admission, buffers) = (&self.admission, &self.buffers);
-        reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
-        if !admission.owns(&reservation) || reservation.key() != Some(&context.object.cache) {
-            return Err(Error::InvalidConfiguration);
-        }
+            .push(Header::new("If-Match", page.version.etag.as_bytes()));
+        self.validate_reservation(&reservation, context)?;
         let connection = self
             .pool
             .checkout_wait(endpoint, scope)
             .await
             .map_err(response_error)?;
-        let sent = self
-            .io
-            .send_head(connection, head, scope)
-            .await
-            .map_err(response_error)?;
-        let response = self
-            .io
-            .receive_head_limited(sent.connection, scope, 32 * 1024)
-            .await
-            .map_err(response_error)?;
+        let response = self.exchange_head(connection, head, scope).await?;
         let (_, length) = validate_page_head(&response.value, page)?;
-        let buffer = buffers.plaintext(reservation, length as usize)?;
+        let buffer = self.buffers.plaintext(reservation, length as usize)?;
         let mut body = self.read_page(response.connection, buffer, scope).await?;
         let metadata = validate_page(&response.value, page, body.bytes)?;
         scope.check()?;
@@ -300,6 +267,37 @@ impl OriginClient {
             metadata,
             plaintext: body.buffer,
         })
+    }
+
+    /// Check the supplied full-page plaintext charge without taking ownership.
+    fn validate_reservation(
+        &self,
+        reservation: &flow_control::Charge<AdmissionPolicy>,
+        context: &OriginContext,
+    ) -> Result<()> {
+        reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
+        if !self.admission.owns(reservation) || reservation.key() != Some(&context.object.cache) {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(())
+    }
+
+    /// Exchange bounded heads after the caller selects metadata or body admission.
+    async fn exchange_head(
+        &self,
+        connection: ConnectionLease,
+        head: MessageHead,
+        scope: &RequestScope,
+    ) -> Result<http1::connection::HeadCompletion<crate::http::HttpContext, MessageHead>> {
+        let sent = self
+            .io
+            .send_head(connection, head, scope)
+            .await
+            .map_err(response_error)?;
+        self.io
+            .receive_head_limited(sent.connection, scope, 32 * 1024)
+            .await
+            .map_err(response_error)
     }
 
     async fn read_page(
@@ -392,10 +390,6 @@ impl Origin for OriginClient {
                 .await
         })
     }
-}
-
-fn header(name: &str, value: &[u8]) -> Header {
-    Header::new(name, value)
 }
 
 fn response_error(error: Error) -> Error {

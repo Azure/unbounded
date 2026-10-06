@@ -285,7 +285,8 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!("origin-root-{}", std::process::id()));
-    std::fs::create_dir(&path).unwrap();
+    // A shared CARGO_TARGET_DIR need not create this worktree's local target directory.
+    std::fs::create_dir_all(&path).unwrap();
     let _cleanup = Directory(path.clone());
     std::fs::create_dir_all(path.join("cache-a/origin")).unwrap();
     let directory = std::fs::File::open(&path).unwrap();
@@ -1187,6 +1188,30 @@ fn reserved_page_rejects_foreign_or_mismatched_admission_before_io() {
         assert!(matches!(result, Err(Error::InvalidConfiguration)));
         assert_eq!(owner.used(ResourceClass::Plaintext), 0);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+}
+
+/// Transport framing failures become gateway errors without hiding admission or cancellation.
+#[test]
+fn exchange_errors_preserve_resource_and_request_failures() {
+    for error in [
+        Error::InvalidRequest,
+        Error::HeaderTooLarge,
+        Error::CorruptRecord,
+        Error::Io,
+        Error::Os(libc::ECONNRESET),
+    ] {
+        assert_eq!(response_error(error), Error::BadGateway);
+    }
+    for error in [
+        Error::Overloaded,
+        Error::Cancelled,
+        Error::DeadlineExceeded,
+        Error::OriginRejected,
+        Error::OriginForbidden,
+        Error::VersionUnavailable,
+    ] {
+        assert_eq!(response_error(error), error);
     }
 }
 
