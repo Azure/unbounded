@@ -945,9 +945,11 @@ mod tests {
         );
         assert_eq!(&buffer.bytes().unwrap()[..31], &[42; 31]);
         assert!(buffer.bytes().unwrap()[31..].iter().all(|b| *b == 0));
+        // Filesystems may accept unaligned O_DIRECT I/O via buffered fallback.
+        // The allocator must reject it before submission regardless of the kernel.
         assert_eq!(
-            unsafe { libc::pwrite(fd, buffer.bytes().unwrap().as_ptr().cast(), 31, 1) },
-            -1
+            alignment.check(Extent::new(1, 31).unwrap(), &buffer),
+            Err(Error::InvalidConfiguration)
         );
         drop(buffer);
         assert_eq!(slabs.idle_bytes(), extent.length());
