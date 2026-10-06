@@ -42,7 +42,7 @@ func (p *PageLease) Release() error {
 	}
 
 	p.once.Do(func() {
-		p.err = p.stream.release(p.number, p.length)
+		p.err = p.stream.release(p.number, p.length, false)
 		p.Data = nil
 		p.stream.putBuffer(p.buffer)
 		p.buffer = nil
@@ -319,8 +319,10 @@ func (s *PageStream) next() (*PageLease, error) {
 	defer func() {
 		if !validPayload {
 			s.mu.Lock()
-			delete(s.outstanding, number)
-			s.bytesHeld -= uint64(length)
+			if _, held := s.outstanding[number]; held {
+				delete(s.outstanding, number)
+				s.bytesHeld -= uint64(length)
+			}
 			s.mu.Unlock()
 			s.putBuffer(buffer)
 		}
@@ -333,7 +335,23 @@ func (s *PageStream) next() (*PageLease, error) {
 	s.delivered++
 
 	if s.delivered == s.pages {
-		if err := s.readComplete("subscription frame"); err != nil {
+		released := make(chan error, 1)
+
+		go func() { released <- s.release(number, length, true) }()
+
+		err := s.readComplete("subscription frame")
+		closeBody(s.conn)
+		<-released
+
+		if err != nil {
+			return nil, err
+		}
+
+		if err := s.owner.ctx.Err(); err != nil {
+			return nil, ioFailure("subscription", err)
+		}
+
+		if err := s.owner.err(); err != nil {
 			return nil, err
 		}
 	}
@@ -479,11 +497,16 @@ func (s *PageStream) readBytes(p []byte, payload bool) error {
 	return nil
 }
 
-func (s *PageStream) release(number uint64, length uint32) error {
+func (s *PageStream) release(number uint64, length uint32, terminalRead bool) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	s.mu.Lock()
+	if _, held := s.outstanding[number]; !held {
+		s.mu.Unlock()
+		return nil
+	}
+
 	complete := s.complete
 	delete(s.outstanding, number)
 	s.bytesHeld -= uint64(length)
@@ -517,7 +540,7 @@ func (s *PageStream) release(number uint64, length uint32) error {
 		// was held. The read side, not a racing release write, decides whether
 		// the subscription completed or was truncated.
 		if err != nil && !staleConnectionError(err) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
-			if s.buffers != nil {
+			if terminalRead || s.buffers != nil {
 				return ioFailure("subscription release", err)
 			}
 
@@ -985,7 +1008,7 @@ func (h *streamingHTTP) transfer() (int64, error) {
 		s.delivered++
 		// Return even the final credit before waiting for Complete. A one-credit
 		// peer is allowed to wait for this release before emitting Complete.
-		if err := s.release(number, length); err != nil {
+		if err := s.release(number, length, false); err != nil {
 			return written, err
 		}
 	}

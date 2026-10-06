@@ -16,10 +16,424 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type finalCreditBlockedConn struct {
+	net.Conn
+	started     chan struct{}
+	closed      chan struct{}
+	writeResult chan error
+	once        sync.Once
+}
+
+func (c *finalCreditBlockedConn) Write(p []byte) (int, error) {
+	if len(p) == 12 {
+		close(c.started)
+
+		n, err := c.Conn.Write(p)
+		c.writeResult <- err
+
+		return n, err
+	}
+
+	return c.Conn.Write(p)
+}
+
+func (c *finalCreditBlockedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { close(c.closed) })
+
+	return err
+}
+
+func TestBufferedCompleteBeforeFinalCredit(t *testing.T) {
+	for _, api := range []string{"Get", "OpenPages"} {
+		for _, mode := range []string{"success", "malformed", "missing", "canceled"} {
+			t.Run(api+"/"+mode, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				started, closed, peerDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				writeResult := make(chan error, 1)
+				c := rawSubscriptionClient(t, func(conn net.Conn, _ *bufio.Reader, _ []byte) {
+					defer close(peerDone)
+
+					_, _ = io.WriteString(conn, subscriptionHead(3, 0, 3))
+					_ = fakeSubscriptionFrame(conn, 1, 0, 0, 3)
+					_, _ = io.WriteString(conn, "abc")
+
+					select {
+					case <-started:
+					case <-closed:
+						return
+					}
+
+					switch mode {
+					case "canceled":
+						cancel()
+					case "missing":
+						return
+					default:
+						length := uint64(3)
+						if mode == "malformed" {
+							length++
+						}
+
+						_ = fakeSubscriptionFrame(conn, 2, 1, length, 0)
+					}
+
+					<-closed
+				})
+				poolConfig := c.bulk.config
+				dial := poolConfig.Dial
+				poolConfig.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+					conn, err := dial(ctx, network, address)
+					if err != nil {
+						return nil, err
+					}
+
+					return &finalCreditBlockedConn{Conn: conn, started: started, closed: closed, writeResult: writeResult}, nil
+				}
+				c.configurePools(poolConfig)
+
+				var (
+					data []byte
+					err  error
+				)
+
+				if api == "Get" {
+					v, openErr := c.Get(ctx, Request{}, ReadOptions{PageCredits: 1})
+					if openErr != nil {
+						t.Fatal(openErr)
+					}
+					defer closeBody(v)
+
+					data, err = io.ReadAll(v)
+					orderedClean(t, v)
+				} else {
+					s, openErr := c.OpenPages(ctx, Request{}, ReadOptions{PageCredits: 1})
+					if openErr != nil {
+						t.Fatal(openErr)
+					}
+					defer closeBody(s)
+
+					var page *PageLease
+
+					page, err = s.Next()
+					if page != nil {
+						data = append(data, page.Data...)
+						if releaseErr := page.Release(); releaseErr != nil {
+							t.Fatal(releaseErr)
+						}
+
+						if _, nextErr := s.Next(); nextErr != io.EOF {
+							t.Fatal(nextErr)
+						}
+					}
+
+					if s.bytesHeld != 0 || len(s.outstanding) != 0 {
+						t.Fatal("retained final accounting")
+					}
+				}
+
+				orderedWait(t, peerDone)
+
+				if writeErr := <-writeResult; !errors.Is(writeErr, io.ErrClosedPipe) && !errors.Is(writeErr, net.ErrClosed) {
+					t.Fatal("final credit write was not interrupted by closure", writeErr)
+				}
+
+				if mode == "success" {
+					if err != nil || string(data) != "abc" {
+						t.Fatal("Complete overridden by blocked final credit", string(data), err)
+					}
+				} else {
+					if len(data) != 0 {
+						t.Fatal("invalid final bytes exposed", string(data))
+					}
+
+					switch mode {
+					case "malformed":
+						assertKind(t, err, ErrorProtocol)
+					case "missing":
+						if !errors.Is(err, io.ErrUnexpectedEOF) {
+							t.Fatal(err)
+						}
+					case "canceled":
+						if !errors.Is(err, context.Canceled) {
+							t.Fatal(err)
+						}
+					}
+				}
+
+				if c.Stats().ActiveBulk != 0 {
+					t.Fatal("retained admission", c.Stats())
+				}
+			})
+		}
+	}
+}
+
+func TestBufferedFinalCreditGate(t *testing.T) {
+	for _, api := range []string{"Get", "OpenPages"} {
+		for _, mode := range []string{"success", "malformed", "missing"} {
+			t.Run(api+"/"+mode, func(t *testing.T) {
+				released := make(chan struct{})
+
+				resume := make(chan struct{})
+				defer close(resume)
+
+				peerDone := make(chan struct{})
+				c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, head []byte) {
+					defer close(peerDone)
+
+					if headHeaders(head).Get("Racer-Page-Credits") != "1" {
+						t.Error("not a one-credit subscription")
+					}
+
+					_, _ = io.WriteString(conn, subscriptionHead(3, 0, 3))
+					_ = fakeSubscriptionFrame(conn, 1, 0, 0, 3)
+					_, _ = io.WriteString(conn, "abc")
+
+					var credit [12]byte
+					if _, err := io.ReadFull(reader, credit[:]); err != nil {
+						return
+					}
+
+					if binary.BigEndian.Uint64(credit[:8]) != 0 || binary.BigEndian.Uint32(credit[8:]) != 3 {
+						t.Error("incorrect final credit", credit)
+						return
+					}
+
+					close(released)
+					<-resume
+
+					if mode == "missing" {
+						return
+					}
+
+					length := uint64(3)
+					if mode == "malformed" {
+						length++
+					}
+
+					_ = fakeSubscriptionFrame(conn, 2, 1, length, 0)
+
+					if n, _ := io.Copy(io.Discard, reader); n != 0 {
+						t.Error("duplicate final credit", n)
+					}
+				})
+
+				type result struct {
+					data []byte
+					page *PageLease
+					err  error
+				}
+
+				done := make(chan result, 1)
+
+				var (
+					s   *PageStream
+					v   *Value
+					err error
+				)
+
+				if api == "Get" {
+					v, err = c.Get(t.Context(), Request{}, ReadOptions{PageCredits: 1})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer closeBody(v)
+
+					s = v.stream
+
+					go func() {
+						data := make([]byte, 3)
+
+						n, err := v.Read(data)
+						done <- result{data: data[:n], err: err}
+					}()
+				} else {
+					s, err = c.OpenPages(t.Context(), Request{}, ReadOptions{PageCredits: 1})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer closeBody(s)
+
+					go func() { page, err := s.Next(); done <- result{page: page, err: err} }()
+				}
+
+				select {
+				case <-released:
+				case got := <-done:
+					t.Fatal("receive ended before final credit", got.err)
+				case <-time.After(2 * time.Second):
+					t.Fatal("peer did not receive final credit before Complete")
+				}
+
+				select {
+				case got := <-done:
+					t.Fatal("final bytes exposed before Complete", got)
+				default:
+				}
+
+				resume <- struct{}{}
+
+				got := <-done
+				if mode == "success" {
+					if got.page != nil {
+						got.data = append([]byte(nil), got.page.Data...)
+						if err := got.page.Release(); err != nil {
+							t.Fatal(err)
+						}
+
+						if err := got.page.Release(); err != nil || got.page.Data != nil {
+							t.Fatal("final release is not idempotent", err)
+						}
+
+						if _, err := s.Next(); err != io.EOF {
+							t.Fatal(err)
+						}
+					}
+
+					if got.err != nil || string(got.data) != "abc" {
+						t.Fatal(string(got.data), got.err)
+					}
+
+					if v != nil {
+						if n, err := v.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+							t.Fatal(n, err)
+						}
+					}
+				} else {
+					if got.page != nil || len(got.data) != 0 {
+						t.Fatal("invalid final page exposed", got)
+					}
+
+					if mode == "malformed" {
+						assertKind(t, got.err, ErrorProtocol)
+					} else if !errors.Is(got.err, io.ErrUnexpectedEOF) {
+						t.Fatal(got.err)
+					}
+				}
+
+				if v != nil {
+					orderedClean(t, v)
+				} else {
+					closeBody(s)
+				}
+
+				orderedWait(t, peerDone)
+				s.mu.Lock()
+				defer s.mu.Unlock()
+
+				if s.bytesHeld != 0 || len(s.outstanding) != 0 || c.Stats().ActiveBulk != 0 {
+					t.Fatal("final page retained accounting or admission", s.bytesHeld, s.outstanding, c.Stats())
+				}
+			})
+		}
+	}
+}
+
+func TestPageStreamFinalCreditPreservesOutstandingLease(t *testing.T) {
+	for _, mode := range []string{"success", "malformed", "missing"} {
+		t.Run(mode, func(t *testing.T) {
+			const (
+				first = uint64(PageSize) - 2
+				end   = uint64(PageSize) + 3
+			)
+
+			peerDone := make(chan struct{})
+			c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
+				defer close(peerDone)
+
+				_, _ = io.WriteString(conn, subscriptionHead(end, first, end))
+				_ = fakeSubscriptionFrame(conn, 1, 0, first, 2)
+				_, _ = io.WriteString(conn, "ab")
+				_ = fakeSubscriptionFrame(conn, 1, 1, uint64(PageSize), 3)
+				_, _ = io.WriteString(conn, "xyz")
+
+				if !orderedRelease(t, reader, 1, 3) {
+					return
+				}
+
+				if mode == "missing" {
+					return
+				}
+
+				length := uint64(5)
+				if mode == "malformed" {
+					length++
+				}
+
+				_ = fakeSubscriptionFrame(conn, 2, 2, length, 0)
+
+				if n, _ := io.Copy(io.Discard, reader); n != 0 {
+					t.Error("unexpected credit after terminal frame", n)
+				}
+			})
+
+			s, err := c.OpenPages(t.Context(), Request{}, ReadOptions{Offset: ByteOffset(first), PageCredits: 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeBody(s)
+
+			p, err := s.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			last, err := s.Next()
+			if mode == "success" {
+				if err != nil || last == nil || string(last.Data) != "xyz" {
+					t.Fatal(last, err)
+				}
+
+				if err := last.Release(); err != nil {
+					t.Fatal(err)
+				}
+
+				if err := last.Release(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if last != nil {
+					t.Fatal("invalid final lease exposed")
+				}
+
+				if mode == "malformed" {
+					assertKind(t, err, ErrorProtocol)
+				} else if !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatal(err)
+				}
+			}
+
+			s.mu.Lock()
+			held, count, length := s.bytesHeld, len(s.outstanding), s.outstanding[0]
+			s.mu.Unlock()
+
+			if held != 2 || count != 1 || length != 2 || string(p.Data) != "ab" {
+				t.Fatal("final credit changed outstanding lease", held, count, length, string(p.Data))
+			}
+
+			releaseErr := p.Release()
+			if releaseErr != err {
+				t.Fatal("unexpected outstanding release error", releaseErr, err)
+			}
+
+			if s.bytesHeld != 0 || len(s.outstanding) != 0 || p.Data != nil {
+				t.Fatal("outstanding release retained accounting")
+			}
+
+			closeBody(s)
+			orderedWait(t, peerDone)
+		})
+	}
+}
 
 func TestClientContinuationAbsoluteDeadline(t *testing.T) {
 	const (
@@ -1364,7 +1778,9 @@ func TestGetReadAheadCleanup(t *testing.T) {
 
 					var frame [12]byte
 					if _, err := io.ReadFull(reader, frame[:]); err == nil {
-						t.Error("cleanup prematurely returned held credit")
+						if state != "complete queued" || binary.BigEndian.Uint64(frame[:8]) != 1 || binary.BigEndian.Uint32(frame[8:]) != 3 {
+							t.Error("cleanup prematurely returned held credit")
+						}
 					}
 				})
 

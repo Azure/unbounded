@@ -816,6 +816,11 @@ func TestReadOptionsInvalidSnapshotDoesNotFetch(t *testing.T) {
 }
 
 func TestClientStats(t *testing.T) {
+	complete := make(chan struct{})
+
+	allowComplete := sync.OnceFunc(func() { close(complete) })
+	defer allowComplete()
+
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "HEAD" {
 			w.Header().Set("Content-Length", "3")
@@ -826,6 +831,11 @@ func TestClientStats(t *testing.T) {
 		}
 
 		streamResponse(w, 0, 3, 3, `"v"`)
+
+		select {
+		case <-complete:
+		case <-r.Context().Done():
+		}
 	}))
 
 	c, err := newClient(ClientConfig{Volume: VolumeName{value: "test"}, MaxConnections: 1, MaxQueuedRequests: 1, QueueTimeout: 100 * time.Millisecond}, path)
@@ -862,6 +872,14 @@ func TestClientStats(t *testing.T) {
 	s := c.Stats()
 	if s.QueueDepth != 1 || s.QueueWaits != 1 || s.QueueRejections != 1 || s.ActiveBulk != 1 || s.ActiveMetadata != 0 || s.Connections != 2 || s.IdleConnections != 1 || s.Dials != 2 {
 		t.Fatal(s)
+	}
+
+	allowComplete()
+	orderedWait(t, v.ordered.done)
+
+	s = c.Stats()
+	if s.Connections != 1 || s.IdleConnections != 1 || s.ActiveBulk != 1 || s.QueueDepth != 1 {
+		t.Fatal("wire completion did not separate socket and admission lifetimes", s)
 	}
 
 	cancel()
@@ -1439,6 +1457,10 @@ func TestClientReservedPoolFiniteAdmissionAndCancellation(t *testing.T) {
 
 func TestIndependentQueuesAndSmallObjectAdmission(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
+	complete := make(chan struct{})
+
+	allowComplete := sync.OnceFunc(func() { close(complete) })
+	defer allowComplete()
 
 	var heads atomic.Int32
 
@@ -1462,6 +1484,11 @@ func TestIndependentQueuesAndSmallObjectAdmission(t *testing.T) {
 		}
 
 		streamResponse(w, 0, 1, 1, `"v"`)
+
+		select {
+		case <-complete:
+		case <-r.Context().Done():
+		}
 	}))
 
 	c, err := newClient(ClientConfig{Volume: VolumeName{value: "test"}, MaxConnections: 1, MaxQueuedRequests: 1, MetadataConnections: 1, MetadataQueuedRequests: 1, SmallObjectConnections: 1, SmallObjectQueuedRequests: 1}, path)
@@ -1532,6 +1559,15 @@ func TestIndependentQueuesAndSmallObjectAdmission(t *testing.T) {
 		if err := <-headDone; err != nil {
 			t.Fatal("reserved metadata queue rejected HEAD", err)
 		}
+	}
+
+	allowComplete()
+	orderedWait(t, v.ordered.done)
+	orderedWait(t, small.ordered.done)
+
+	s = c.Stats()
+	if s.Connections != 1 || s.IdleConnections != 1 || s.ActiveBulk != 1 || s.ActiveSmallObjects != 1 || s.BulkQueueDepth != 1 || s.SmallObjectQueueDepth != 1 {
+		t.Fatal("wire completion released admission or retained sockets", s)
 	}
 
 	cancel()
