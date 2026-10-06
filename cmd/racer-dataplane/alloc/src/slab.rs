@@ -520,7 +520,7 @@ impl<C: Charge> Submission<C> {
 struct WriteState {
     count: Cell<usize>,
 
-    waiters: RefCell<Vec<Rc<RefCell<Waker>>>>,
+    waiters: RefCell<Vec<Rc<RefCell<Rc<Waker>>>>>,
 }
 
 impl WriteState {
@@ -536,7 +536,7 @@ impl WriteState {
 struct FenceWaiter {
     state: Rc<WriteState>,
 
-    registration: Option<Rc<RefCell<Waker>>>,
+    registration: Option<Rc<RefCell<Rc<Waker>>>>,
 }
 
 impl Future for FenceWaiter {
@@ -548,7 +548,7 @@ impl Future for FenceWaiter {
             self.unregister();
             return Poll::Ready(Ok(()));
         }
-        let waker = cx.waker().clone();
+        let waker = Rc::new(cx.waker().clone());
         if self.state.count.get() == 0 {
             self.unregister();
             return Poll::Ready(Ok(()));
@@ -603,8 +603,9 @@ impl Drop for WriteFence {
         if remaining == 0 {
             let waiters = std::mem::take(&mut *self.0.waiters.borrow_mut());
             for waiter in waiters {
+                // Snapshot ownership without invoking the raw waker's clone callback.
                 let waker = waiter.borrow().clone();
-                waker.wake();
+                waker.wake_by_ref();
             }
         }
     }
@@ -1024,6 +1025,167 @@ mod tests {
         );
     }
 
+    /// Select the callback that runs a one-shot reentrant test action.
+    #[derive(Clone, Copy, PartialEq)]
+    enum FenceCallback {
+        Clone,
+        Drop,
+        /// Reenter on completion's first clone or wake, with either implementation.
+        Notify,
+    }
+
+    /// One action and the waker callback that should run it.
+    type FenceAction = (FenceCallback, Box<dyn FnOnce()>);
+
+    thread_local! {
+        static FENCE_CALLBACK: RefCell<Option<FenceAction>> =
+            RefCell::new(None);
+        static FENCE_WAKES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Run caller code after releasing the callback registry's borrow.
+    fn run_fence_callback(event: FenceCallback) {
+        let callback = FENCE_CALLBACK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|(on, _)| {
+                *on == event || (*on == FenceCallback::Notify && event == FenceCallback::Clone)
+            }) {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        if let Some((_, callback)) = callback {
+            callback();
+        }
+    }
+
+    /// A stateless waker accesses only the calling thread's test registry.
+    fn fence_callback_waker() -> Waker {
+        use std::task::{RawWaker, RawWakerVTable};
+
+        /// Cloning owns no data but may run the thread's registered action.
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            run_fence_callback(FenceCallback::Clone);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+
+        /// Both wake forms count a notification and may run the test action.
+        unsafe fn wake(_: *const ()) {
+            FENCE_WAKES.with(|count| count.set(count.get() + 1));
+            run_fence_callback(FenceCallback::Notify);
+        }
+
+        /// Dropping owns no data but may run the thread's registered action.
+        unsafe fn drop_raw(_: *const ()) {
+            run_fence_callback(FenceCallback::Drop);
+        }
+
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop_raw);
+
+        // SAFETY: there is no raw data or shared ownership. Every callback accesses
+        // only its calling thread's registry, even if the Waker moves across threads.
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    /// Completion during clone or replacement drop is observed before returning.
+    #[test]
+    fn fence_poll_handles_reentrant_clone_and_drop() {
+        for event in [FenceCallback::Clone, FenceCallback::Drop] {
+            for new_write in [false, true] {
+                let state = Rc::new(WriteState::default());
+                let write = state.acquire().unwrap();
+                let mut waiter = FenceWaiter {
+                    state: state.clone(),
+                    registration: None,
+                };
+                let waker = fence_callback_waker();
+                let mut cx = Context::from_waker(&waker);
+                if event == FenceCallback::Drop {
+                    assert!(Pin::new(&mut waiter).poll(&mut cx).is_pending());
+                }
+                let next = Rc::new(RefCell::new(None));
+                let saved_next = next.clone();
+                let saved_state = state.clone();
+                FENCE_CALLBACK.with(|slot| {
+                    *slot.borrow_mut() = Some((
+                        event,
+                        Box::new(move || {
+                            drop(write);
+                            if new_write {
+                                *saved_next.borrow_mut() = Some(saved_state.acquire().unwrap());
+                            }
+                        }),
+                    ));
+                });
+                let result = Pin::new(&mut waiter).poll(&mut cx);
+                FENCE_CALLBACK.with(|slot| assert!(slot.borrow().is_none()));
+                if new_write {
+                    assert!(result.is_pending());
+                    assert_eq!(state.count.get(), 1);
+                    assert_eq!(state.waiters.borrow().len(), 1);
+                    let before = FENCE_WAKES.get();
+                    drop(next.borrow_mut().take());
+                    assert_eq!(FENCE_WAKES.get(), before + 1);
+                    assert_eq!(Pin::new(&mut waiter).poll(&mut cx), Poll::Ready(Ok(())));
+                } else {
+                    assert_eq!(result, Poll::Ready(Ok(())));
+                }
+                assert_eq!(state.count.get(), 0);
+                assert!(state.waiters.borrow().is_empty());
+                assert!(waiter.registration.is_none());
+            }
+        }
+    }
+
+    /// Completion callbacks can accept a write and repoll a drained registration.
+    #[test]
+    fn fence_completion_allows_reentrant_registration() {
+        let state = Rc::new(WriteState::default());
+        let write = state.acquire().unwrap();
+        let waiter = Rc::new(RefCell::new(FenceWaiter {
+            state: state.clone(),
+            registration: None,
+        }));
+        let waker = fence_callback_waker();
+        assert!(
+            Pin::new(&mut *waiter.borrow_mut())
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let next = Rc::new(RefCell::new(None));
+        let saved_next = next.clone();
+        let saved_state = state.clone();
+        let saved_waiter = waiter.clone();
+        FENCE_CALLBACK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                FenceCallback::Notify,
+                Box::new(move || {
+                    *saved_next.borrow_mut() = Some(saved_state.acquire().unwrap());
+                    let waker = fence_callback_waker();
+                    assert!(
+                        Pin::new(&mut *saved_waiter.borrow_mut())
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                }),
+            ));
+        });
+        drop(write);
+        FENCE_CALLBACK.with(|slot| assert!(slot.borrow().is_none()));
+        assert_eq!(state.waiters.borrow().len(), 1);
+        assert_eq!(state.count.get(), 1);
+        let before = FENCE_WAKES.get();
+        drop(next.borrow_mut().take());
+        assert_eq!(FENCE_WAKES.get(), before + 1);
+        assert_eq!(
+            Pin::new(&mut *waiter.borrow_mut()).poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Ok(()))
+        );
+        assert!(state.waiters.borrow().is_empty());
+        assert!(waiter.borrow().registration.is_none());
+    }
+
     /// Waiters sleep, replace wakers, unregister on cancellation, and register again.
     #[test]
     fn fence_waiters_sleep_update_wakers_and_unregister_on_cancellation() {
@@ -1068,6 +1230,7 @@ mod tests {
         assert_eq!(slab.writes.waiters.borrow().len(), 3);
         drop(abandoned);
         assert_eq!(slab.writes.waiters.borrow().len(), 2);
+        assert_eq!(Arc::strong_count(&cancelled), 1);
         drop(first_write);
         for count in [&old, &current, &other, &cancelled] {
             assert_eq!(count.0.load(Ordering::Relaxed), 0);
