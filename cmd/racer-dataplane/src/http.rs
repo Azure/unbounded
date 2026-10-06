@@ -2107,6 +2107,7 @@ pub(crate) mod tests {
         use crate::peer::transport::relay_body;
         use flow_control::MAX_PIPE_BYTES;
         use std::net::TcpStream;
+        use std::os::fd::AsRawFd;
         fn pair() -> (TcpStream, TcpStream) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -2295,6 +2296,27 @@ pub(crate) mod tests {
                     ));
                     let mut reader = Some(reader);
                     if end == "disconnect" {
+                        // A graceful TCP close first appears as a FIN, which the
+                        // half-close-safe relay must allow while sending. Force
+                        // a reset to model an unambiguous abandoned requester.
+                        let linger = libc::linger {
+                            l_onoff: 1,
+                            l_linger: 0,
+                        };
+                        // SAFETY: the live socket and initialized linger value
+                        // remain valid for the duration of setsockopt.
+                        assert_eq!(
+                            unsafe {
+                                libc::setsockopt(
+                                    reader.as_ref().unwrap().as_raw_fd(),
+                                    libc::SOL_SOCKET,
+                                    libc::SO_LINGER,
+                                    (&linger as *const libc::linger).cast(),
+                                    std::mem::size_of_val(&linger) as libc::socklen_t,
+                                )
+                            },
+                            0
+                        );
                         reader.take();
                     }
                     if end == "cancel" {
@@ -2309,7 +2331,8 @@ pub(crate) mod tests {
                         };
                         assert!(
                             matches!(result, Err(error) if error == expected),
-                            "{writing}/{end}"
+                            "{writing}/{end}: {:?}",
+                            result.as_ref().err()
                         );
                     }
                     drop(work);

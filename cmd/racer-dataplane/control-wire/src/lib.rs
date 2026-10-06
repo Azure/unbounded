@@ -246,7 +246,7 @@ impl Drop for CacheEncryptionKey {
 }
 
 #[cfg(test)]
-mod transfer_tests {
+mod shared_metadata_tests {
     #[test]
     fn shared_member_metadata_contract_keeps_identity_policy_separate() {
         for endpoint in ["0.0.0.0:80", "[ff02::1]:80", "192.0.2.1:65535"] {
