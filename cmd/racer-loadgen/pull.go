@@ -68,8 +68,8 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 		opts.Backend = "gantry"
 	}
 
-	if opts.Backend != "gantry" && opts.Backend != "uds" {
-		return nil, errors.New("backend must be gantry or uds")
+	if opts.Backend != "gantry" && opts.Backend != "uds" && opts.Backend != "s3" {
+		return nil, errors.New("backend must be gantry, uds, or s3")
 	}
 
 	if opts.BlobConcurrency == 0 {

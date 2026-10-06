@@ -1,12 +1,118 @@
 # racer-loadgen
 
-Generate deterministic blobs and repeatedly consume them through either Gantry's
-registry API or Racer's client Unix domain socket (UDS). Both backends use the
+Generate deterministic blobs and repeatedly consume them through Gantry's
+registry API, Racer's client Unix domain socket (UDS), or racer-object's S3 HTTP
+endpoint. All backends use the
 same catalog selection, worker admission, pacing, deadlines, integrity checking,
 diagnostics, and metrics. Payloads are generated on demand, not retained in a
 load-generator content cache.
 
 ## Workloads and backends
+
+### S3 HTTP benchmark and synthetic origin
+
+S3 mode performs an unsigned, path-style **HTTP GET for every operation**, not
+an SDK shortcut. Use a racer-object sidecar as the endpoint to measure the object
+adapter, or point the same client directly at the origin for a baseline.
+
+Origin-only process (no Garage provisioning or uploads required):
+
+```sh
+racer-loadgen --backend=s3 --s3-origin --listen=:8080 --concurrency=0 \
+  --bucket=benchmark --object-count=128 --object-bytes=67108864 \
+  --seed=benchmark-v1 --startup-timeout=4m --metrics-listen=:9090
+```
+
+Client process in a pod with a racer-object sidecar:
+
+```sh
+racer-loadgen --backend=s3 --endpoint=http://127.0.0.1:8080 \
+  --bucket=benchmark --object-count=128 --object-bytes=67108864 \
+  --seed=benchmark-v1 --concurrency=8 --profile=shuffle \
+  --pull-timeout=2m --startup-timeout=4m --metrics-listen=:9090
+```
+
+S3 mode defaults to bucket `benchmark`, 128 objects of 64 MiB, and endpoint
+`http://127.0.0.1:8080`. Objects have keys `object-000000` through
+`object-000127` for this example. Count is bounded to 1-512; size must be positive.
+Bytes use the existing deterministic raw-blob generator, without OCI metadata or
+tar framing. Each process hashes its whole catalog at startup using bounded
+scratch space, not an in-memory object cache. The example hashes 8 GiB on each
+pod before readiness; allow CPU and a sufficient startup probe budget.
+Very small payloads may collide; duplicate-content catalogs are rejected.
+
+Keep **seed, count, size, and bucket identical** on origin and client pods.
+Integrity verification compares downloaded SHA-256 and size against the local
+deterministic catalog, independently of the upstream's ETag format.
+`--verify=false` disables hashing during reads, but still checks body size and
+does not skip startup catalog hashing. An external S3 store can be used only if
+these exact keys and payloads are populated separately and unsigned reads are
+allowed; loadgen neither uploads objects nor signs requests.
+
+Recommended DaemonSet split:
+
+1. Replace the old load workload with origin-only loadgen containers using
+   `--s3-origin --concurrency=0`. Run a `racer-object origin` container on every
+   eligible Racer origin node, with `--cache=racer-object --namespace=benchmark-v1
+   --bucket=benchmark --region=us-east-1 --path-style=true
+   --endpoint=http://127.0.0.1:8080` when colocated with the synthetic server.
+   Mount the cache's origin socket directory only into racer-object origin.
+   The AWS client still needs credentials: for this unauthenticated fixture,
+   supply non-secret placeholder AWS credential environment values and set
+   `AWS_EC2_METADATA_DISABLED=true`. Do not use real cloud credentials.
+2. Run another loadgen DaemonSet with a `racer-object sidecar` container:
+   `sidecar --cache=racer-object --namespace=benchmark-v1 --bucket=benchmark
+   --listen=127.0.0.1:8080`. Mount the cache's client socket directory only into
+   the sidecar. The loadgen container needs no socket mounts or credentials.
+   Without `--s3-origin`, S3 loadgen starts only its metrics/probe listener,
+   leaving port 8080 free for the sidecar. Do not expose the sidecar with a Service
+   or host networking.
+3. For a direct-origin comparison, use the same client flags but change
+   `--endpoint` to the origin Service URL (for example,
+   `http://racer-s3-origin:8080`). Run comparisons separately with identical
+   concurrency, catalog, profile, verification, and resource limits. Label the
+   jobs `direct` and `racer-object` in deployment metadata, not object labels.
+   A Service-routed baseline and a node-local origin can have different network
+   paths; report that topology rather than attributing all differences to caching.
+
+The synthetic origin implements object HEAD/GET, one closed/open/suffix byte
+range, strong quoted ETags, If-Match/If-None-Match (including wildcard conditions),
+and S3 XML errors. Racer-object's pinned HEAD and ranged GET requests are tested
+with the real AWS HTTP client. ETags are quoted `sha256:<hex>`, not MD5.
+This is an **unauthenticated, read-only test fixture**, not a general S3 server:
+no listing, writes, versioning, date conditions, If-Range, or multipart reads.
+Keep it on a trusted benchmark network; it accepts signed requests without
+validating signatures. `x-id=GetObject` and `x-id=HeadObject` are supported SDK
+query plumbing; version reads fail rather than silently returning current data.
+
+Existing `--profile=shuffle|zipf`, `--zipf-exponent`, `--concurrency-file`, node
+caps, `--interval`, `--retry-delay`, `--duration`, and `--diagnose-integrity` work
+unchanged. One operation is one full object GET; per-blob concurrency is fixed to
+one. S3 mode rejects OCI sizing/transport flags instead of silently ignoring them;
+use `--endpoint`, not `--target`, and configure the upstream namespace on
+racer-object, not loadgen.
+
+Metrics retain their existing names and the `kind="blob"` label. Successful
+operations appear in `racer_loadgen_pulls_total{result="success"}`; verified goodput
+is `rate(racer_loadgen_verified_bytes_total[1m])`, in bytes/s, and failures are
+classified in `racer_loadgen_pull_failures_total`. Use request/pull duration
+histograms for latency and `racer_loadgen_origin_bytes_total` on origin pods for
+generated body bytes. No per-key metric labels are added. `/readyz` indicates
+catalog readiness, not sidecar/dataplane health, and performs no warmup GET.
+The process can exit normally after `--duration` even if reads failed: evaluate
+the success, failure, and byte counters, not just its exit code. A finite run
+stops the metrics listener at completion, so scrape during the run.
+
+Verification consumes CPU, and synthetic origins spend CPU regenerating data;
+neither result represents persistent-storage performance. Restarting with the
+same seed does not make the cache cold. Unlike the digest-keyed UDS mode, S3 names
+stay stable across seed changes: use a new racer-object namespace for an isolated
+cold run to avoid metadata-TTL staleness. The local adapter integration test uses
+a noncaching SDK test daemon and does not establish real cache-hit behavior,
+cluster compatibility, or throughput. Size the sidecar and dataplane separately;
+the loadgen's streaming buffer does not account for their page storage.
+
+### Gantry and direct SDK modes
 
 For independent raw blobs through Gantry:
 

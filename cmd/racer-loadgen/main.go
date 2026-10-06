@@ -28,6 +28,7 @@ import (
 )
 
 type options struct {
+	s3             s3Options
 	image          imageOptions
 	pull           pullOptions
 	listen         string
@@ -45,7 +46,12 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
 	f.SetOutput(output)
-	f.StringVar(&opts.pull.Backend, "backend", "gantry", "Acquisition and origin transport: gantry (OCI HTTP) or uds (direct Racer SDK)")
+	f.StringVar(&opts.pull.Backend, "backend", "gantry", "Acquisition transport: gantry (OCI HTTP), uds (direct Racer SDK), or s3 (HTTP object GET)")
+	f.StringVar(&opts.s3.Endpoint, "endpoint", "", "S3 HTTP endpoint: racer-object sidecar or direct synthetic origin (default http://127.0.0.1:8080)")
+	f.StringVar(&opts.s3.Bucket, "bucket", "", "Synthetic S3 bucket (default benchmark; requires backend=s3)")
+	f.IntVar(&opts.s3.Count, "object-count", 0, "Synthetic S3 object count, 1-512 (default 128)")
+	f.Int64Var(&opts.s3.Bytes, "object-bytes", 0, "Exact bytes per S3 object (default 67108864)")
+	f.BoolVar(&opts.s3.Origin, "s3-origin", false, "Serve synthetic S3 on listen; requires backend=s3, use concurrency=0 for origin only")
 	f.StringVar(&opts.pull.Cache, "cache", "", "Racer cache name; required for uds, using /run/racer/<cache>/{client,origin}/socket")
 	f.StringVar(&opts.listen, "listen", ":8080", "Synthetic registry listen address")
 	f.StringVar(&opts.metricsListen, "metrics-listen", ":9090", "Metrics and health listen address")
@@ -88,8 +94,12 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	f.Visit(func(flag *flag.Flag) { seen[flag.Name] = true })
 
-	if opts.pull.Backend != "gantry" && opts.pull.Backend != "uds" {
-		return opts, errors.New("backend must be gantry or uds")
+	if opts.pull.Backend != "gantry" && opts.pull.Backend != "uds" && opts.pull.Backend != "s3" {
+		return opts, errors.New("backend must be gantry, uds, or s3")
+	}
+
+	if err := configureS3Options(&opts, seen); err != nil {
+		return opts, err
 	}
 
 	if opts.pull.Backend == "uds" {
@@ -195,13 +205,17 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 			return
 		}
 
-		catalog.handler().ServeHTTP(w, r)
+		if opts.pull.Backend == "s3" {
+			catalog.s3Handler(opts.s3.Bucket).ServeHTTP(w, r)
+		} else {
+			catalog.handler().ServeHTTP(w, r)
+		}
 	}))
 
 	servers := []*http.Server{
 		{Addr: opts.metricsListen, Handler: ops, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute},
 	}
-	if p.opts.Backend == "gantry" {
+	if p.opts.Backend == "gantry" || opts.s3.Origin {
 		servers = append(servers, &http.Server{Addr: opts.listen, Handler: origin, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute})
 	}
 
@@ -257,7 +271,9 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	defer stopStartup()
 
 	var catalog *blobCatalog
-	if opts.catalogBlobs > 0 {
+	if opts.pull.Backend == "s3" {
+		catalog, err = newBlobCatalog(startupCtx, "benchmark/s3", opts.image.Seed, opts.s3.Count, opts.s3.Bytes)
+	} else if opts.catalogBlobs > 0 {
 		catalog, err = newBlobCatalog(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes)
 	} else {
 		catalog, err = newCatalog(startupCtx, opts.image, opts.catalogImages)
@@ -276,6 +292,10 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 		p.images = catalog.images
 
 		p.batches = catalog.batches
+		if p.opts.Backend == "s3" {
+			p.configureS3(catalog, opts.s3.Bucket)
+		}
+
 		if p.opts.Backend == "uds" {
 			p.logUDSMemory()
 
