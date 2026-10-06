@@ -146,8 +146,8 @@ on site configuration, and maintain SiteNodeSlice and GatewayPool status.`,
 
 	// Leader election flags
 	flags.BoolVar(&cfg.LeaderElection.Enabled, "leader-elect", true, "Enable leader election for controller manager")
-	flags.DurationVar(&cfg.LeaderElection.LeaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait to force acquire leadership")
-	flags.DurationVar(&cfg.LeaderElection.RenewDeadline, "leader-elect-renew-deadline", 5*time.Second, "Duration that the acting leader will retry refreshing leadership before giving up")
+	flags.DurationVar(&cfg.LeaderElection.LeaseDuration, "leader-elect-lease-duration", 30*time.Second, "Duration that non-leader candidates will wait to force acquire leadership")
+	flags.DurationVar(&cfg.LeaderElection.RenewDeadline, "leader-elect-renew-deadline", 15*time.Second, "Duration that the acting leader will retry refreshing leadership before giving up")
 	flags.DurationVar(&cfg.LeaderElection.RetryPeriod, "leader-elect-retry-period", 10*time.Second, "Duration the LeaderElector clients should wait between tries of actions")
 	flags.StringVar(&cfg.LeaderElection.ResourceNamespace, "leader-elect-resource-namespace", unbounded.SystemNamespace(), "Namespace for leader election lease")
 	flags.StringVar(&cfg.LeaderElection.ResourceName, "leader-elect-resource-name", "unbounded-net-controller", "Name of leader election lease")
@@ -353,11 +353,11 @@ General Flags:
 
 Leader Election Flags:
       --leader-elect                             Enable leader election for controller manager (default true)
-      --leader-elect-lease-duration duration     Duration that non-leader candidates will wait to force acquire leadership (default 15s)
-      --leader-elect-renew-deadline duration     Duration that the acting leader will retry refreshing leadership before giving up (default 10s)
+      --leader-elect-lease-duration duration     Duration that non-leader candidates will wait to force acquire leadership (default 30s)
+      --leader-elect-renew-deadline duration     Duration that the acting leader will retry refreshing leadership before giving up (default 15s)
       --leader-elect-resource-name string        Name of leader election lease (default "unbounded-net-controller")
       --leader-elect-resource-namespace string   Namespace for leader election lease (default "unbounded-system")
-      --leader-elect-retry-period duration       Duration the LeaderElector clients should wait between tries of actions (default 2s)
+      --leader-elect-retry-period duration       Duration the LeaderElector clients should wait between tries of actions (default 10s)
 
 Utility Flags:
   -h, --help                                     help for {{.Name}}
@@ -534,6 +534,14 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		klog.Warning("Dry-run mode is not supported for site-based pod CIDR assignment; running normally")
 	}
 
+	// With leader election enabled, pod CIDR allocation is fenced to the period
+	// in which this process has confirmed it holds the lease, so a deposed
+	// leader that has not yet noticed cannot allocate CIDRs.
+	var podCIDRFence *leaseFence
+	if cfg.LeaderElection.Enabled {
+		podCIDRFence = newLeaseFence(cfg.LeaderElection.RenewDeadline)
+	}
+
 	// runFunc creates and runs the controller - called only when becoming leader
 	// This ensures the allocator and informer are created fresh with current state
 	//
@@ -568,7 +576,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		// Create and start site controller (shares the node informer factory)
 		//
 		// This is fatal rather than logged because the site controller is not
-		// optional: it backs the mutating webhook's CIDR allocator, and the
+		// optional: it backs the mutating webhook's site resolver, and the
 		// Service endpoint this pod publishes is only published once the site
 		// controller reports ready. Continuing without it produces a leader
 		// that holds the lease, passes its probes, and never publishes an
@@ -581,8 +589,11 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 			klog.Fatalf("Failed to create site controller: %v", err)
 		}
 
-		// Wire the site controller as CIDR allocator for the mutating webhook
-		webhookServer.SetCIDRAllocator(siteCtrl)
+		if podCIDRFence != nil {
+			siteCtrl.SetLeaseFence(podCIDRFence)
+		}
+
+		webhookServer.SetNodeSiteResolver(siteCtrl)
 
 		// Set informers in health state for efficient lookups in status endpoints
 		healthState.setInformers(siteCtrl.GetNodeLister(), podLister, siteCtrl.GetSiteInformer(), gatewayPoolInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
@@ -751,7 +762,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		}
 
 		klog.Info("Leader election enabled, waiting for leadership...")
-		runLeaderElection(ctx, cfg, clientset, healthState, runFunc)
+		runLeaderElection(ctx, cfg, clientset, healthState, podCIDRFence, runFunc)
 	} else {
 		klog.Info("Leader election disabled")
 		runAsLeader(ctx, healthState, runFunc)

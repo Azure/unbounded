@@ -3,7 +3,105 @@
 
 package allocator
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
+
+func TestMatchesAllocation(t *testing.T) {
+	pools4, _ := ParseCIDRs([]string{"10.0.0.0/16"})
+	pools6, _ := ParseCIDRs([]string{"fd00::/48"})
+
+	alloc, err := NewAllocator(pools4, pools6, 24, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		cidrs []string
+		want  bool
+	}{
+		{"dual-stack", []string{"10.0.0.0/24", "fd00::/64"}, true},
+		{"reversed-families", []string{"fd00::/64", "10.0.0.0/24"}, true},
+		{"missing-ipv6", []string{"10.0.0.0/24"}, false},
+		{"missing-ipv4", []string{"fd00::/64"}, false},
+		{"duplicate-family", []string{"10.0.0.0/24", "10.0.1.0/24", "fd00::/64"}, false},
+		{"wrong-v4-mask", []string{"10.0.0.0/25", "fd00::/64"}, false},
+		{"wrong-v6-mask", []string{"10.0.0.0/24", "fd00::/65"}, false},
+		{"outside-pool", []string{"10.1.0.0/24", "fd00::/64"}, false},
+		{"extends-outside-pool", []string{"10.0.0.0/8", "fd00::/64"}, false},
+		{"noncanonical", []string{"10.0.0.1/24", "fd00::/64"}, false},
+		{"invalid", []string{"invalid", "fd00::/64"}, false},
+		{"empty", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := alloc.MatchesAllocation(tc.cidrs); got != tc.want {
+				t.Fatalf("MatchesAllocation(%v) = %v, want %v", tc.cidrs, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAllocateAvoidsDifferentSizedReservations(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		pool     string
+		reserved string
+		mask     int
+		want     string
+	}{
+		{"larger-ipv4", "10.0.0.0/16", "10.0.0.0/23", 24, "10.0.2.0/24"},
+		{"smaller-ipv4", "10.0.0.0/16", "10.0.0.128/25", 24, "10.0.1.0/24"},
+		{"larger-ipv6", "fd00::/48", "fd00::/63", 64, "fd00:0:0:2::/64"},
+		{"smaller-ipv6", "fd00::/48", "fd00::/65", 64, "fd00:0:0:1::/64"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pools, err := ParseCIDRs([]string{tc.pool})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var (
+				alloc    *Allocator
+				allocate func() (string, error)
+			)
+
+			if pools[0].IP.To4() != nil {
+				alloc, err = NewAllocator(pools, nil, tc.mask, 0)
+				allocate = alloc.AllocateIPv4
+			} else {
+				alloc, err = NewAllocator(nil, pools, 0, tc.mask)
+				allocate = alloc.AllocateIPv6
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			alloc.MarkAllocated(tc.reserved)
+
+			got, err := allocate()
+			if err != nil || got != tc.want {
+				t.Fatalf("allocation = %q, %v; want %q", got, err, tc.want)
+			}
+
+			alloc.Release(tc.reserved)
+
+			got, err = allocate()
+			if err != nil || got != pools[0].IP.String()+"/"+fmt.Sprint(tc.mask) {
+				t.Fatalf("allocation after release = %q, %v", got, err)
+			}
+
+			alloc.MarkAllocated(tc.reserved)
+			alloc.Reset()
+
+			if len(alloc.overlappingReservations) != 0 {
+				t.Fatal("reset retained overlap reservations")
+			}
+		})
+	}
+}
 
 // TestNewAllocator tests new allocator.
 func TestNewAllocator(t *testing.T) {

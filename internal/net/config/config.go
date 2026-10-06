@@ -101,9 +101,9 @@ type LeaderElectionConfig struct {
 func DefaultLeaderElectionConfig() LeaderElectionConfig {
 	return LeaderElectionConfig{
 		Enabled:           true,
-		LeaseDuration:     15 * time.Second,
-		RenewDeadline:     10 * time.Second,
-		RetryPeriod:       2 * time.Second,
+		LeaseDuration:     30 * time.Second,
+		RenewDeadline:     15 * time.Second,
+		RetryPeriod:       10 * time.Second,
 		ResourceNamespace: unbounded.SystemNamespace(),
 		ResourceName:      "unbounded-net-controller",
 	}

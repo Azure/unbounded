@@ -334,23 +334,14 @@ func spawnPortForward(_ context.Context, g *globalFlags, spec portForwardSpec) (
 		return nil, fmt.Errorf("port-forward stdout pipe: %w", err)
 	}
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("port-forward stderr pipe: %w", err)
-	}
+	// Let os/exec own the stderr copier so Wait joins it before diagnostics
+	// read the buffer. A separately launched io.Copy would race with String.
+	errBuf := newRingBuffer(portForwardStderrCapacity)
+	cmd.Stderr = errBuf
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("port-forward start: %w", err)
 	}
-
-	// Drain stderr into a bounded buffer so the subprocess never
-	// blocks on a full pipe and our diagnostic memory footprint is
-	// capped regardless of session length.
-	errBuf := newRingBuffer(portForwardStderrCapacity)
-
-	go func() {
-		_, _ = io.Copy(errBuf, stderr) //nolint:errcheck // drain best-effort
-	}()
 
 	ready := make(chan error, 1)
 

@@ -36,7 +36,10 @@ func runAsLeader(ctx context.Context, health *healthState, runFunc controllerRun
 	runFunc(ctx, func() { health.setControllerReady(ctx) })
 }
 
-func runLeaderElection(ctx context.Context, cfg *config.Config, clientset kubernetes.Interface, health *healthState, runFunc controllerRunFunc) {
+// runLeaderElection campaigns for the lease and runs the controller while it is
+// held. Every lease write is reported to fence, which must have been created
+// with cfg.LeaderElection.RenewDeadline as its window.
+func runLeaderElection(ctx context.Context, cfg *config.Config, clientset kubernetes.Interface, health *healthState, fence *leaseFence, runFunc controllerRunFunc) {
 	// Get identity for leader election - prefer POD_NAME env var (required for hostNetwork),
 	// fall back to hostname for local development
 	identity := os.Getenv("POD_NAME")
@@ -67,7 +70,7 @@ func runLeaderElection(ctx context.Context, cfg *config.Config, clientset kubern
 
 	// Start leader election
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
-		Lock:            lock,
+		Lock:            fence.wrap(lock),
 		ReleaseOnCancel: true,
 		LeaseDuration:   cfg.LeaderElection.LeaseDuration,
 		RenewDeadline:   cfg.LeaderElection.RenewDeadline,
