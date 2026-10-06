@@ -476,7 +476,7 @@ impl<C: Context> HttpIo<C> {
     ) -> Operation<'a, C, HeadCompletion<C, Result<C, MessageHead>>> {
         Box::pin(async move {
             scope.check()?;
-            if connection.rx_remaining.is_some_and(|n| n != 0) {
+            if connection.rx_remaining.is_some() {
                 return Err(Error::Malformed.into());
             }
             connection.begin_io();
@@ -598,7 +598,7 @@ impl<C: Context> HttpIo<C> {
     ) -> Operation<'a, C, HeadCompletion<C, ()>> {
         Box::pin(async move {
             scope.check()?;
-            if connection.tx_remaining.is_some_and(|n| n != 0) {
+            if connection.tx_remaining.is_some() {
                 return Err(Error::Malformed.into());
             }
             connection.begin_io();
@@ -1104,7 +1104,7 @@ impl<C: Context> Drop for ConnectionLease<C> {
             None
         };
         let mut candidate = candidate;
-        {
+        let wake = {
             let mut state = state.borrow_mut();
             let closed = state.closed;
             if let Some(entry) = state.entries.get_mut(&target.endpoint) {
@@ -1119,9 +1119,12 @@ impl<C: Context> Drop for ConnectionLease<C> {
                     state.entries.remove(&target.endpoint);
                 }
             }
-            state.wake_endpoint(&target.endpoint);
-        }
+            state.endpoint_waker(&target.endpoint)
+        };
         drop(candidate);
+        if let Some(wake) = wake {
+            wake.wake();
+        }
     }
 }
 
@@ -1284,12 +1287,17 @@ impl<C: Context> HttpPool<C> {
             return;
         }
         state.next_waiter_poll = now + Duration::from_millis(1);
+        let mut wakes = Vec::new();
         for _ in 0..budget.min(state.waiting.len()) {
             state.poll_cursor %= state.waiting.len();
             if let Some(waker) = state.waiting[state.poll_cursor].waker.borrow().as_ref() {
-                waker.wake_by_ref();
+                wakes.push(waker.clone());
             }
             state.poll_cursor += 1;
+        }
+        drop(state);
+        for wake in wakes {
+            wake.wake();
         }
     }
 
@@ -1503,14 +1511,17 @@ impl<C: Context> HttpPool<C> {
 
     /// Reject new work, wake queued checkouts, and release idle connections.
     pub fn close(&self) {
-        {
+        let wakes: Vec<_> = {
             let mut state = self.state.borrow_mut();
             state.closed = true;
-            for entry in &state.waiting {
-                if let Some(waker) = entry.waker.borrow().as_ref() {
-                    waker.wake_by_ref();
-                }
-            }
+            state
+                .waiting
+                .iter()
+                .filter_map(|entry| entry.waker.borrow().clone())
+                .collect()
+        };
+        for wake in wakes {
+            wake.wake();
         }
         self.clear_idle();
     }
@@ -1634,18 +1645,21 @@ impl<C: Context> Drop for Waiting<C> {
         if state.waiting.is_empty() {
             state.waiting = VecDeque::new();
         }
-        state.wake_endpoint(&self.entry.endpoint);
+        let wake = state.endpoint_waker(&self.entry.endpoint);
+        drop(state);
+        if let Some(wake) = wake {
+            wake.wake();
+        }
     }
 }
 
 impl<C: Context> PoolState<C> {
-    /// Notify the first queued waiter for an endpoint without moving its owner.
-    fn wake_endpoint(&self, endpoint: &C::Endpoint) {
-        if let Some(entry) = self.waiting.iter().find(|e| &e.endpoint == endpoint)
-            && let Some(waker) = entry.waker.borrow().as_ref()
-        {
-            waker.wake_by_ref();
-        }
+    /// Clone the first endpoint waiter's waker for notification outside pool borrows.
+    fn endpoint_waker(&self, endpoint: &C::Endpoint) -> Option<Waker> {
+        self.waiting
+            .iter()
+            .find(|e| &e.endpoint == endpoint)
+            .and_then(|entry| entry.waker.borrow().clone())
     }
 }
 
@@ -1827,6 +1841,12 @@ fn framing(
         StartLine::Request { .. } => length.unwrap_or(0),
         StartLine::Response { status: 100..=199 } => return Err(Error::Malformed),
         StartLine::Response { status: 204 } => {
+            if length.is_some() {
+                return Err(Error::Malformed);
+            }
+            0
+        }
+        StartLine::Response { status: 205 } => {
             if length.is_some_and(|n| n != 0) {
                 return Err(Error::Malformed);
             }
@@ -2288,6 +2308,145 @@ mod tests {
         assert_eq!(framing(&head(200, 8), false, 8), Ok(8));
     }
 
+    /// No-content statuses reject prohibited lengths on both receive and send.
+    #[test]
+    fn no_content_responses_enforce_status_specific_lengths() {
+        use std::io::Read;
+
+        for status in [204, 205] {
+            for length in [None, Some(0), Some(1), Some(u64::MAX)] {
+                for request_is_head in [false, true] {
+                    let valid = length.is_none() || (status == 205 && length == Some(0));
+                    for sending in [false, true] {
+                        let hooks = hooks();
+                        let reactor = reactor();
+                        let io = HttpIo::<Hooks>::new(
+                            reactor.clone(),
+                            Codec::new(128),
+                            hooks.clone(),
+                            8,
+                            8,
+                        );
+                        let (mut connection, mut peer) = lease(&hooks, Policy::default());
+                        connection.request_is_head = request_is_head;
+                        let mut response = head(status, length.unwrap_or(0));
+                        if length.is_none() {
+                            response.headers.clear();
+                        }
+                        assert_eq!(
+                            framing(&response, request_is_head, 8),
+                            if valid { Ok(0) } else { Err(Error::Malformed) }
+                        );
+                        let result = if sending {
+                            drive(&reactor, io.send_head(connection, response, &TestScope))
+                                .map(|done| done.connection)
+                        } else {
+                            let wire = Codec::<()>::new(128).encode_head(&response).unwrap();
+                            let buffer = OwnedBuffer::copy_from(hooks.as_ref(), &wire).unwrap();
+                            connection
+                                .restore_read_ahead(buffer, 0..wire.len())
+                                .unwrap();
+                            drive(&reactor, io.receive_head(connection, &TestScope))
+                                .map(|done| done.connection)
+                        };
+                        if valid {
+                            let connection = result.unwrap();
+                            assert_eq!(
+                                if sending {
+                                    connection.send_remaining()
+                                } else {
+                                    connection.receive_remaining()
+                                },
+                                Some(0)
+                            );
+                        } else {
+                            assert!(matches!(result, Err(Failure::Http(Error::Malformed))));
+                            assert_eq!(reactor.in_flight(), 0);
+                            let mut wire = Vec::new();
+                            peer.read_to_end(&mut wire).unwrap();
+                            assert!(wire.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Completed bodies do not authorize another head until the exchange is reset.
+    #[test]
+    fn subsequent_heads_require_exchange_reset() {
+        use std::io::Read;
+
+        for mode in 0..3 {
+            for reset in 0..3 {
+                let hooks = hooks();
+                let reactor = reactor();
+                let io =
+                    HttpIo::<Hooks>::new(reactor.clone(), Codec::new(128), hooks.clone(), 8, 8);
+                let calls = Rc::new(Cell::new(0));
+                let (mut connection, mut peer) = lease(
+                    &hooks,
+                    Policy {
+                        hook_calls: Some(calls.clone()),
+                        ..Policy::default()
+                    },
+                );
+                connection.set_framing(Some(0), Some(0), false);
+                match reset {
+                    1 => connection.next_round().unwrap(),
+                    2 => connection.finish_exchange().unwrap(),
+                    _ => (),
+                }
+                let wire = b"GET /next HTTP/1.1\r\nHost: example\r\n\r\n";
+                if mode != 2 {
+                    let buffer = OwnedBuffer::copy_from(hooks.as_ref(), wire).unwrap();
+                    connection
+                        .restore_read_ahead(buffer, 0..wire.len())
+                        .unwrap();
+                    if reset == 0 {
+                        assert_eq!(
+                            connection.finish_exchange(),
+                            Err(Failure::Http(Error::Malformed))
+                        );
+                    }
+                }
+                let result = match mode {
+                    0 => drive(&reactor, io.receive_head(connection, &TestScope))
+                        .map(|done| done.connection),
+                    1 => drive(
+                        &reactor,
+                        io.receive_request_head_limited(connection, &TestScope, 128),
+                    )
+                    .map(|done| {
+                        assert!(done.value.is_ok());
+                        done.connection
+                    }),
+                    _ => drive(&reactor, io.send_head(connection, head(200, 0), &TestScope))
+                        .map(|done| done.connection),
+                };
+                if reset == 0 {
+                    assert!(matches!(result, Err(Failure::Http(Error::Malformed))));
+                    assert_eq!(calls.get(), 0);
+                    assert_eq!(reactor.in_flight(), 0);
+                    let mut sent = Vec::new();
+                    peer.read_to_end(&mut sent).unwrap();
+                    assert!(sent.is_empty());
+                } else {
+                    let connection = result.unwrap();
+                    assert_eq!(calls.get(), 1);
+                    assert_eq!(
+                        if mode == 2 {
+                            connection.send_remaining()
+                        } else {
+                            connection.receive_remaining()
+                        },
+                        Some(0)
+                    );
+                }
+            }
+        }
+    }
+
     /// Cached storage is cleared, charged, and unavailable after caller shutdown.
     #[test]
     fn buffer_charge_zeroization_and_stop_use_caller_hooks() {
@@ -2402,6 +2561,93 @@ mod tests {
             pool.prepare_connection(&Key),
             Err(Failure::Runtime(uring_runtime::Error::Unavailable))
         ));
+    }
+
+    thread_local! {
+        /// Run a local checkout poll from a thread-safe test waker.
+        static ON_WAKE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Dispatch a notification to the current thread's reentrancy probe.
+    struct ReentrantWake;
+
+    impl std::task::Wake for ReentrantWake {
+        /// Take the callback before invoking it so nested notifications are safe.
+        fn wake(self: std::sync::Arc<Self>) {
+            let callback = ON_WAKE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    }
+
+    /// Maintenance, shutdown, lease return, and waiter removal allow checkout reentry.
+    #[test]
+    fn pool_wakeups_allow_reentrant_checkout_polling() {
+        for mode in 0..4 {
+            let hooks = hooks();
+            let pool = Rc::new(HttpPool::<Hooks>::new(
+                reactor(),
+                hooks.clone(),
+                PoolConfig::default(),
+            ));
+            let (mut connection, _) = pool.prepare_connection(&Key).unwrap();
+            let (fd, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            fd.set_nonblocking(true).unwrap();
+            connection.fd = Rc::new(fd.into());
+            connection.set_framing(Some(0), Some(0), false);
+            connection.finish_exchange().unwrap();
+            let mut connection = Some(connection);
+            let mut first = (mode == 3).then(|| pool.checkout_wait(&Key, &TestScope));
+            if let Some(first) = first.as_mut() {
+                assert!(
+                    first
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            }
+            let waiter_pool = pool.clone();
+            let mut waiting =
+                Box::pin(async move { waiter_pool.checkout_wait(&Key, &TestScope).await });
+            let waker = Waker::from(std::sync::Arc::new(ReentrantWake));
+            assert!(
+                waiting
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let calls = Rc::new(Cell::new(0));
+            let observed = calls.clone();
+            ON_WAKE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    observed.set(observed.get() + 1);
+                    let result = waiting
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(Waker::noop()));
+                    match mode {
+                        1 => assert!(matches!(
+                            result,
+                            Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Unavailable)))
+                        )),
+                        2 => assert!(matches!(result, Poll::Ready(Ok(_)))),
+                        _ => assert!(result.is_pending()),
+                    }
+                }));
+            });
+            match mode {
+                0 => {
+                    pool.poll_waiters(0);
+                    assert_eq!(calls.get(), 0);
+                    pool.poll_waiters(1);
+                }
+                1 => pool.close(),
+                2 => drop(connection.take()),
+                _ => drop(first.take()),
+            }
+            assert_eq!(calls.get(), 1);
+            assert!(pool.state.borrow().waiting.is_empty());
+        }
     }
 
     /// Drive a future and reactor with a bounded deadline.
