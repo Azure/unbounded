@@ -66,9 +66,8 @@ pub struct Authorization {
 impl Authorization {
     /// Validate HTTP field syntax/size without interpreting the credential scheme.
     pub fn from_header(bytes: &[u8]) -> Result<Self> {
-        validate_opaque(bytes)?;
         Ok(Self {
-            bytes: Zeroizing::new(bytes.to_vec()),
+            bytes: opaque_bytes(bytes)?,
         })
     }
     /// Expose only for encryption or local adapter writes, never diagnostics.
@@ -81,17 +80,18 @@ pub struct OpaqueMetadata {
     bytes: Zeroizing<Vec<u8>>,
 }
 impl OpaqueMetadata {
+    /// Preserve a validated field in independently owned zeroizing storage.
     pub fn from_header(bytes: &[u8]) -> Result<Self> {
-        validate_opaque(bytes)?;
         Ok(Self {
-            bytes: Zeroizing::new(bytes.to_vec()),
+            bytes: opaque_bytes(bytes)?,
         })
     }
     pub fn as_header(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 }
-fn validate_opaque(bytes: &[u8]) -> Result<()> {
+/// Reject invalid field bytes before allocating sensitive storage.
+fn opaque_bytes(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if bytes.is_empty()
         || bytes.len() > MAX_FIELD_BYTES
         || bytes.first() == Some(&b' ')
@@ -100,7 +100,7 @@ fn validate_opaque(bytes: &[u8]) -> Result<()> {
     {
         return Err(Error::InvalidRequest);
     }
-    Ok(())
+    Ok(Zeroizing::new(bytes.to_vec()))
 }
 impl fmt::Debug for Authorization {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -399,7 +399,7 @@ impl PageCryptoEngine {
     /// All fallible work borrows input. Ownership transfers only after the final
     /// cancellation check, so failures retain the exact input and quota owners.
     pub fn process(job: CryptoJob) -> CryptoCompletion {
-        let measurement_start = job.permit.execution_start();
+        let measurement_start = uring_runtime::environment::now();
         let CryptoJob {
             mut permit,
             input,
@@ -417,9 +417,7 @@ impl PageCryptoEngine {
             Err(error) => CryptoOutcome::Failed { input, error },
             Ok((envelope, bytes)) => Self::complete(input, envelope, bytes),
         };
-        if let Some(start) = measurement_start {
-            permit.executed(start);
-        }
+        permit.executed(measurement_start);
         CryptoCompletion {
             permit,
             outcome,
@@ -605,7 +603,7 @@ impl PageCryptoEngine {
         let _environment = self.environment.enter();
         self.executor
             .poll(&mut self.runtime.port.queue, cx, budget, |mut job| {
-                job.permit.measurement.queue_ns = job.permit.measurement.submitted.map(elapsed_ns);
+                job.permit.dequeued();
                 Self::process(job)
             })
             .map_err(Into::into)
@@ -1000,18 +998,28 @@ pub enum CryptoOutput {
 /// ```
 pub struct CryptoPermit {
     pub(crate) send_sample: Option<crate::telemetry::Work>,
+
     measurement: Measurement,
+
     pub(crate) aead_failure: Option<crate::telemetry::AeadFailure>,
+
     reservation: offload::Permit<CryptoId>,
 }
+/// Per-job timing and integrity observations, published only at I/O completion.
 #[derive(Default)]
 struct Measurement {
     checksum_only: bool,
+
     decrypt: bool,
+
     bytes: u64,
+
     submitted: Option<std::time::Instant>,
+
     queue_ns: Option<u64>,
+
     execution_ns: Option<u64>,
+
     rejection: Option<IntegrityRejection>,
 }
 /// Exact failed integrity check, not a diagnosis of where bytes became invalid.
@@ -1027,12 +1035,35 @@ fn elapsed_ns(start: std::time::Instant) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 impl CryptoPermit {
-    pub(crate) fn execution_start(&self) -> Option<std::time::Instant> {
-        Some(uring_runtime::environment::now())
+    /// Retain queue admission with fresh measurements and optional send sampling.
+    fn new(
+        reservation: offload::Permit<CryptoId>,
+        send_sample: Option<crate::telemetry::Work>,
+    ) -> Self {
+        Self {
+            send_sample,
+            measurement: Measurement::default(),
+            aead_failure: None,
+            reservation,
+        }
     }
+
+    /// Start queue timing at each publication attempt, including a retry.
+    fn submitted(&mut self) {
+        self.measurement.submitted = Some(uring_runtime::environment::now());
+    }
+
+    /// Stop queue timing when the worker takes ownership, before execution.
+    fn dequeued(&mut self) {
+        self.measurement.queue_ns = self.measurement.submitted.map(elapsed_ns);
+    }
+
+    /// Record elapsed execution even for failed or canceled accepted jobs.
     pub(crate) fn executed(&mut self, start: std::time::Instant) {
         self.measurement.execution_ns = Some(elapsed_ns(start));
     }
+
+    /// Retain the exact integrity check that rejected this job.
     pub(crate) fn rejected(&mut self, rejection: IntegrityRejection) {
         self.measurement.rejection = Some(rejection);
     }
@@ -1201,12 +1232,7 @@ impl IoCryptoPort {
     pub fn poll_reserve(&self, cx: &mut Context<'_>, id: CryptoId) -> Poll<Result<CryptoPermit>> {
         self.queue.poll_reserve(cx, id).map(|result| {
             result
-                .map(|reservation| CryptoPermit {
-                    send_sample: None,
-                    aead_failure: None,
-                    reservation,
-                    measurement: Measurement::default(),
-                })
+                .map(|reservation| CryptoPermit::new(reservation, None))
                 .map_err(Into::into)
         })
     }
@@ -1219,7 +1245,7 @@ impl IoCryptoPort {
         // Capture at publication attempt, not reservation. Retry overwrites it.
         self.queue
             .try_submit(job, |job| {
-                job.permit.measurement.submitted = Some(uring_runtime::environment::now());
+                job.permit.submitted();
             })
             .map_err(Into::into)
     }
@@ -1243,7 +1269,7 @@ impl CryptoPort {
         let result = self.queue.poll_job(cx).map_err(Into::into);
         match result {
             Poll::Ready(Ok(Some(mut job))) => {
-                job.permit.measurement.queue_ns = job.permit.measurement.submitted.map(elapsed_ns);
+                job.permit.dequeued();
                 Poll::Ready(Ok(Some(job)))
             }
             other => other,
@@ -1319,16 +1345,10 @@ impl CryptoClient {
                         if let Some(sample) = &sample {
                             sample.identify(reservation.id());
                         }
-                        CryptoPermit {
-                            reservation,
-                            send_sample: sample,
-                            aead_failure: None,
-                            measurement: Measurement::default(),
-                        }
-                        .job(input, key, scope.clone())
+                        CryptoPermit::new(reservation, sample).job(input, key, scope.clone())
                     },
                     |job| {
-                        job.permit.measurement.submitted = Some(uring_runtime::environment::now());
+                        job.permit.submitted();
                     },
                 )
                 .await?;
@@ -1386,6 +1406,66 @@ mod tests {
     use racer_control_wire::CacheId;
     use racer_control_wire::KeyId;
     use uring_runtime::group::Service;
+
+    /// Publication retries reset only queue timing, not execution or ownership.
+    #[test]
+    fn permit_bookkeeping_preserves_missing_submission_and_retry_timing() {
+        use std::time::Duration;
+        use uring_runtime::environment::{SimulationClock, now};
+
+        let clock = SimulationClock::new(817);
+        let _environment = clock.environment(0).enter();
+        let (port, _worker) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let id = CryptoId {
+            worker: WorkerId(0),
+            generation: 1,
+            sequence: 0,
+        };
+        let Poll::Ready(Ok(mut permit)) = port.poll_reserve(&mut cx, id) else {
+            panic!("initial permit must be available");
+        };
+        assert!(permit.send_sample.is_none());
+        assert!(permit.aead_failure.is_none());
+        assert_eq!(permit.measurement.execution_ns, None);
+        permit.dequeued();
+        assert_eq!(permit.measurement.queue_ns, None);
+        permit.submitted();
+        clock.advance(Duration::from_nanos(11));
+        permit.submitted();
+        clock.advance(Duration::from_nanos(7));
+        permit.dequeued();
+        assert_eq!(permit.measurement.queue_ns, Some(7));
+        let start = now();
+        clock.advance(Duration::from_nanos(5));
+        permit.executed(start);
+        permit.rejected(IntegrityRejection::Aead);
+        assert_eq!(permit.measurement.execution_ns, Some(5));
+        assert!(matches!(
+            permit.measurement.rejection,
+            Some(IntegrityRejection::Aead)
+        ));
+        assert_eq!(permit.reservation.id(), id);
+        assert_eq!(port.queue.outstanding(), 1);
+        drop(permit);
+        assert_eq!(port.queue.outstanding(), 0);
+    }
+
+    /// Identical sensitive fields remain distinct owners without changing bytes.
+    #[test]
+    fn opaque_field_construction_copies_without_sharing_sensitive_storage() {
+        let mut source = b"private\xff".to_vec();
+        let authorization = Authorization::from_header(&source).unwrap();
+        let metadata = OpaqueMetadata::from_header(&source).unwrap();
+        assert_ne!(authorization.bytes.as_ptr(), source.as_ptr());
+        assert_ne!(metadata.bytes.as_ptr(), authorization.bytes.as_ptr());
+        source.fill(0);
+        assert_eq!(authorization.expose_for_origin(), b"private\xff");
+        assert_eq!(metadata.as_header(), b"private\xff");
+        drop(authorization);
+        assert_eq!(metadata.as_header(), b"private\xff");
+    }
+
     #[test]
     fn opaque_context_round_trips_non_utf8_without_normalization() {
         let bytes = b"opaque,  credential\\\"\xff";
