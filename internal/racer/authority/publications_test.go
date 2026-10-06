@@ -739,6 +739,136 @@ func TestTopologyReconcileAcceptsNewerDurableVersion(t *testing.T) {
 	}
 }
 
+func TestTopologyRejectsCredentialReplay(t *testing.T) {
+	for _, replay := range []string{"rollback", "conflicting generation"} {
+		for _, invalidated := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/invalidated=%t", replay, invalidated), func(t *testing.T) {
+				r, _ := testKeyring(t)
+				runKeys(t, r)
+				original, oldBundle, _, _ := keyState(t, r)
+
+				volume := catalogVolume("added", testOtherUID)
+				if err := r.Create(t.Context(), &volume); err != nil {
+					t.Fatal(err)
+				}
+
+				runKeys(t, r)
+				a := Assemble(r.Config, r.Client, r.APIReader)
+				runKeys(t, a.Keyring)
+				image := reconcileTopology(t, a.Topology, t.Context())
+
+				decoded, err := wire.DecodePublication(strings.NewReader(image.encoded))
+				if err != nil || len(decoded.Caches) != 2 {
+					t.Fatalf("fixture did not admit both caches: %v", err)
+				}
+
+				before, record, err := readVersion(t.Context(), r.APIReader, r.Config)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				trust := a.Server.Trust
+				highWater, digest := trust.highWater, trust.digest
+
+				guard, cancel, err := a.authority.TrustContext(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer cancel()
+
+				secret, current, _, _ := keyState(t, r)
+				secret.Data = original.DeepCopy().Data
+
+				if replay == "conflicting generation" {
+					oldBundle.Generation = current.Generation
+
+					secret.Data["bundle.json"], err = wire.EncodeBundle(oldBundle)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				if err := r.Update(t.Context(), secret); err != nil {
+					t.Fatal(err)
+				}
+
+				if invalidated {
+					if err := a.authority.Observe(t.Context()); !errors.Is(err, wire.Conflict) {
+						t.Fatalf("observer did not reject replay: %v", err)
+					}
+				}
+
+				writes := 0
+
+				a.Topology.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+					writes++
+					return c.Update(ctx, obj, opts...)
+				}})
+				for range 2 {
+					_, err := a.Topology.Reconcile(t.Context(), ctrl.Request{})
+					if !errors.Is(err, wire.Conflict) || writes != 0 {
+						t.Errorf("credential replay reached publication: err=%v writes=%d", err, writes)
+					}
+				}
+
+				after, gotRecord, err := readVersion(t.Context(), r.APIReader, r.Config)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if before.ResourceVersion != after.ResourceVersion || gotRecord != record || a.Topology.Publications.current != image {
+					t.Error("replayed bundle changed committed catalog or counters")
+				}
+
+				if trustReady(trust) || trust.highWater != highWater || trust.digest != digest || !errors.Is(guard.Err(), context.Canceled) || !a.Topology.Publications.suspended {
+					t.Error("replay did not revoke serving authority and retain replay protection")
+				}
+			})
+		}
+	}
+}
+
+func TestTopologyAcceptsNewerCredentialGeneration(t *testing.T) {
+	for _, invalidated := range []bool{false, true} {
+		t.Run(fmt.Sprint(invalidated), func(t *testing.T) {
+			r, _ := testKeyring(t)
+			runKeys(t, r)
+			a := Assemble(r.Config, r.Client, r.APIReader)
+			runKeys(t, a.Keyring)
+			reconcileTopology(t, a.Topology, t.Context())
+			trust := a.Server.Trust
+			highWater, digest, confirmed := trust.highWater, trust.digest, trust.confirmed
+
+			volume := catalogVolume("added", testOtherUID)
+			if err := r.Create(t.Context(), &volume); err != nil {
+				t.Fatal(err)
+			}
+
+			runKeys(t, r)
+
+			if r.Trust.highWater <= highWater {
+				t.Fatal("fixture did not advance durable credentials")
+			}
+
+			if invalidated {
+				trust.invalidate()
+			}
+
+			accepted, roots := trust.bundle, trust.roots
+			image := reconcileTopology(t, a.Topology, t.Context())
+
+			decoded, err := wire.DecodePublication(strings.NewReader(image.encoded))
+			if err != nil || len(decoded.Caches) != 2 {
+				t.Fatalf("newer credentials did not admit new cache: %v", err)
+			}
+
+			if trust.highWater != highWater || trust.digest != digest || trust.confirmed != confirmed || trust.bundle != accepted || trust.roots != roots || trustReady(trust) == invalidated {
+				t.Fatal("topology installed or refreshed trust")
+			}
+		})
+	}
+}
+
 func TestPrepareCanonicalEquivalence(t *testing.T) {
 	numa := uint32(3)
 	members := AcceptedMembers{

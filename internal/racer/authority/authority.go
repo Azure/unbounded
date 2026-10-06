@@ -605,6 +605,13 @@ func (a *Authority) PublishTopology(ctx context.Context, observe func(context.Co
 			return TopologyHints{}, err
 		}
 
+		if r.Trust != nil {
+			if err := r.Trust.checkReplay(credentials.bundle); err != nil {
+				r.suspendInvalidAuthority(err)
+				return TopologyHints{}, err
+			}
+		}
+
 		keyed := keyedCaches(credentials.bundle)
 
 		accepted := make([]wire.CacheDefinition, 0, len(catalog))
