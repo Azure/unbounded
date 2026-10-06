@@ -1144,13 +1144,13 @@ func (h *streamingHTTP) transferFromSocket(raw *net.UnixConn, destination io.Rea
 		}
 	}
 
-	if err == io.EOF || err == nil && limited.N != 0 {
-		err = ioFailure("subscription payload", io.ErrUnexpectedEOF)
+	if err == nil && limited.N != 0 {
+		err = io.ErrUnexpectedEOF
 	}
 
 	if err == nil && n != batch {
 		err = io.ErrShortWrite
 	}
 
-	return n, err
+	return n, ioFailure("subscription payload", truncation(err))
 }
