@@ -1232,9 +1232,9 @@ mod tests {
         );
     }
 
-    /// Equal queries share cache entries; different domains do not.
+    /// Equal queries and weight-only snapshots share entries; different domains do not.
     #[test]
-    fn canonical_cache_identity_includes_domain_and_weights() {
+    fn canonical_cache_identity_includes_domain_but_not_weights() {
         /// Same records under a different domain.
         struct Other(TestMember);
 
@@ -1284,7 +1284,6 @@ mod tests {
         let mut changed = members.members().to_vec();
         changed[0].1 = NonZeroU32::new(1).unwrap();
         block_on(paths.route(&Membership::new(changed).unwrap(), a)).unwrap();
-        // Historical name retained: weights affect selection, not cache identity.
         assert_eq!(paths.cache.borrow().entries.len(), 2);
     }
 

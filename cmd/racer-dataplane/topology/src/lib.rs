@@ -118,7 +118,7 @@
 //! Every node in a cluster must agree on placement and routing. Both depend
 //! on [`Member::DOMAIN`], member IDs, weights, and this crate's hash formats.
 //!
-//! - Changing a domain moves every key and route.
+//! - Changing a domain changes the hashes; placement and routes may move.
 //! - Hash formats are versioned (`/slot/v1`, `/hrw/v1`,
 //!   `/placement-identity/v1`, `/next-hop/v5`, and ring `v1`). Changing one
 //!   needs a planned cluster-wide rollout. Nothing here detects a mismatch.
@@ -149,7 +149,7 @@ pub trait Member {
     /// A name that keeps this application's hashes apart from others.
     ///
     /// Must not contain a NUL byte (`\0`). Any other string, even an empty one,
-    /// is fine. Changing it moves every key and route.
+    /// is fine. Changing it changes the hashes; placement and routes may move.
     const DOMAIN: &'static str;
 
     /// Unique ID for this member. Should not change over the member's life.
@@ -194,7 +194,7 @@ impl std::fmt::Display for Error {
             Self::InvalidDomain => "member domain must not contain NUL",
             Self::InvalidMember => "member identity exceeds the hash length limit",
             Self::InvalidQuery => "invalid topology query",
-            Self::Overloaded => "topology cache overloaded",
+            Self::Overloaded => "topology placement or route search overloaded",
             Self::Unreachable => "destination unreachable",
             Self::SamplingExhausted => "weighted selection retry budget exhausted",
         })
