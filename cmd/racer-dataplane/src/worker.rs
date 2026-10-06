@@ -2769,6 +2769,13 @@ mod tests {
                     RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
                         .unwrap();
                 group.start(factory.clone(), &scope).unwrap();
+                // Startup completion can precede the first serving-loop turn.
+                // Observe driver registration before requesting drain rather
+                // than racing that transition from another thread.
+                while factory.drivers.load(Ordering::SeqCst) == 0 {
+                    assert!(Instant::now() < scope.deadline.0, "driver startup watchdog");
+                    thread::yield_now();
+                }
                 let started = Instant::now();
                 let result = group.drain(&scope);
                 let elapsed = started.elapsed();
