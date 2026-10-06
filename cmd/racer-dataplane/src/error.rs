@@ -7,15 +7,43 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Worker-local future: deliberately not `Send`, and never drives a hidden executor.
 pub type Operation<'a, T> = uring_runtime::Operation<'a, T, Error>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
+/// Declare root failures once, keeping publication phases out of their own causes.
+macro_rules! boundary_errors {
+    ($( $(#[$attribute:meta])* $variant:ident $(($binding:ident: $payload:ty))? ),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum Error {
+            $( $(#[$attribute])* $variant $(($payload))?, )*
+            /// Rename completion did not certify publication. Reconcile first.
+            RenameUncertain(PublicationCause),
+            /// Publication occurred, but directory durability was not certified.
+            PublishedNotDurable(PublicationCause),
+        }
+
+        /// Allocation-free root failure, preserving the outer publication phase.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum PublicationCause {
+            $( $(#[$attribute])* $variant $(($payload))?, )*
+        }
+
+        impl From<Error> for PublicationCause {
+            fn from(error: Error) -> Self {
+                match error {
+                    $( Error::$variant $(($binding))? => Self::$variant $(($binding))?, )*
+                    Error::RenameUncertain(cause) | Error::PublishedNotDurable(cause) => cause,
+                }
+            }
+        }
+    };
+}
+
+boundary_errors! {
     InvalidConfiguration,
     InvalidRequest,
     MethodNotAllowed,
     HeaderTooLarge,
     InvalidRange,
     UnsatisfiableRange,
-    UnsatisfiableRangeWithLength(u64),
+    UnsatisfiableRangeWithLength(length: u64),
     NotFound,
     Forbidden,
     BadGateway,
@@ -40,86 +68,7 @@ pub enum Error {
     MissingKey,
     DirectIoUnsupported,
     Io,
-    Os(i32),
-    /// Rename completion did not certify whether publication occurred. Reconcile first.
-    RenameUncertain(PublicationCause),
-    /// Publication occurred, but directory durability was not certified.
-    PublishedNotDurable(PublicationCause),
-}
-
-/// Root failure of a filesystem publication. Kept separate from `Error` so phase
-/// information stays allocation-free and Copy for lifecycle failure reporters.
-/// Wrapping a publication failure again retains its root cause and outer phase.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PublicationCause {
-    InvalidConfiguration,
-    InvalidRequest,
-    MethodNotAllowed,
-    HeaderTooLarge,
-    InvalidRange,
-    UnsatisfiableRange,
-    UnsatisfiableRangeWithLength(u64),
-    NotFound,
-    Forbidden,
-    BadGateway,
-    Internal,
-    VersionUnavailable,
-    Unavailable,
-    Overloaded,
-    DeadlineExceeded,
-    Cancelled,
-    StaleFlight,
-    Unauthorized,
-    NodeIdentityChanged,
-    OriginRejected,
-    OriginForbidden,
-    Replay,
-    IncompatibleMembership,
-    HopBudgetExhausted,
-    CorruptRecord,
-    MissingKey,
-    DirectIoUnsupported,
-    Io,
-    Os(i32),
-}
-
-impl From<Error> for PublicationCause {
-    fn from(error: Error) -> Self {
-        match error {
-            Error::InvalidConfiguration => Self::InvalidConfiguration,
-            Error::InvalidRequest => Self::InvalidRequest,
-            Error::MethodNotAllowed => Self::MethodNotAllowed,
-            Error::HeaderTooLarge => Self::HeaderTooLarge,
-            Error::InvalidRange => Self::InvalidRange,
-            Error::UnsatisfiableRange => Self::UnsatisfiableRange,
-            Error::UnsatisfiableRangeWithLength(length) => {
-                Self::UnsatisfiableRangeWithLength(length)
-            }
-            Error::NotFound => Self::NotFound,
-            Error::Forbidden => Self::Forbidden,
-            Error::BadGateway => Self::BadGateway,
-            Error::Internal => Self::Internal,
-            Error::VersionUnavailable => Self::VersionUnavailable,
-            Error::Unavailable => Self::Unavailable,
-            Error::Overloaded => Self::Overloaded,
-            Error::DeadlineExceeded => Self::DeadlineExceeded,
-            Error::Cancelled => Self::Cancelled,
-            Error::StaleFlight => Self::StaleFlight,
-            Error::Unauthorized => Self::Unauthorized,
-            Error::NodeIdentityChanged => Self::NodeIdentityChanged,
-            Error::OriginRejected => Self::OriginRejected,
-            Error::OriginForbidden => Self::OriginForbidden,
-            Error::Replay => Self::Replay,
-            Error::IncompatibleMembership => Self::IncompatibleMembership,
-            Error::HopBudgetExhausted => Self::HopBudgetExhausted,
-            Error::CorruptRecord => Self::CorruptRecord,
-            Error::MissingKey => Self::MissingKey,
-            Error::DirectIoUnsupported => Self::DirectIoUnsupported,
-            Error::Io => Self::Io,
-            Error::Os(errno) => Self::Os(errno),
-            Error::RenameUncertain(cause) | Error::PublishedNotDurable(cause) => cause,
-        }
-    }
+    Os(errno: i32),
 }
 
 impl fmt::Display for Error {
@@ -298,6 +247,48 @@ impl From<uring_runtime::reactor::filesystem::operations::ReplacementError<Error
 
 #[cfg(test)]
 mod tests {
+    /// Generic HTTP syntax errors retain the application's response classifications.
+    #[test]
+    fn http_errors_keep_racer_boundary_meanings() {
+        assert_eq!(
+            super::Error::from(http1::Error::Malformed),
+            super::Error::InvalidRequest
+        );
+        assert_eq!(
+            super::Error::from(http1::Error::HeadTooLarge),
+            super::Error::HeaderTooLarge
+        );
+    }
+    /// Declaration sharing must retain Debug-based display and flatten either phase.
+    #[test]
+    fn publication_causes_and_display_preserve_payloads() {
+        use super::{Error, PublicationCause};
+        for (error, cause, text) in [
+            (Error::Cancelled, PublicationCause::Cancelled, "Cancelled"),
+            (Error::Os(-1), PublicationCause::Os(-1), "Os(-1)"),
+            (
+                Error::UnsatisfiableRangeWithLength(u64::MAX),
+                PublicationCause::UnsatisfiableRangeWithLength(u64::MAX),
+                "UnsatisfiableRangeWithLength(18446744073709551615)",
+            ),
+        ] {
+            assert_eq!(error.to_string(), text);
+            assert_eq!(PublicationCause::from(error), cause);
+            assert_eq!(PublicationCause::from(Error::RenameUncertain(cause)), cause);
+            assert_eq!(
+                PublicationCause::from(Error::PublishedNotDurable(cause)),
+                cause
+            );
+            assert_eq!(
+                Error::RenameUncertain(cause).to_string(),
+                format!("RenameUncertain({text})")
+            );
+            assert_eq!(
+                Error::PublishedNotDurable(cause).to_string(),
+                format!("PublishedNotDurable({text})")
+            );
+        }
+    }
     use super::Error;
     use super::Operation;
 
