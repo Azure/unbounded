@@ -41,8 +41,6 @@ use std::time::SystemTime;
 
 const MAX_WAITERS: usize = 64;
 const MAX_REFRESH_ATTEMPTS: usize = 8;
-const DEFAULT_ATTEMPTS: u32 = 32;
-const DEFAULT_LINKS: u8 = 96;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RefreshKey {
@@ -230,8 +228,7 @@ impl MetadataService {
         scope: &'a RequestScope,
     ) -> Operation<'a, ObjectMetadata> {
         Box::pin(async move {
-            let mut budget =
-                AcquisitionBudget::new(scope.deadline.0, DEFAULT_ATTEMPTS, DEFAULT_LINKS);
+            let mut budget = super::default_budget(scope);
             self.resolve_with_budget(selector, membership, context, scope, &mut budget)
                 .await
         })

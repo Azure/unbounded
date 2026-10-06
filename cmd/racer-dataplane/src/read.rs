@@ -123,25 +123,31 @@ impl Coordinator {
             let membership = snapshot.membership.clone();
             let directory = self.streams.directory();
             let ClientRequest { kind, origin } = request;
+            let selector = match &kind {
+                ReadKind::Subscription { pin, .. } => pin
+                    .clone()
+                    .map_or(MetadataSelector::Fresh, MetadataSelector::Pinned),
+                ReadKind::Head => MetadataSelector::Fresh,
+                ReadKind::HeadPinned { etag } => MetadataSelector::Pinned(etag.clone()),
+            };
+            let metadata = directory
+                .resolve_with_budget(
+                    selector.clone(),
+                    membership.clone(),
+                    &origin,
+                    scope,
+                    &mut budget,
+                )
+                .await?;
+            validate_metadata(&metadata, &origin.object, &selector)?;
             match kind {
                 ReadKind::Subscription {
-                    pin,
                     range,
                     page_credits,
                     byte_credits,
                     ordered,
+                    ..
                 } => {
-                    let selector = pin.map_or(MetadataSelector::Fresh, MetadataSelector::Pinned);
-                    let metadata = directory
-                        .resolve_with_budget(
-                            selector.clone(),
-                            membership.clone(),
-                            &origin,
-                            scope,
-                            &mut budget,
-                        )
-                        .await?;
-                    validate_metadata(&metadata, &origin.object, &selector)?;
                     if metadata.length == 0 && range.is_none() {
                         return Ok(ReadResponse {
                             metadata,
@@ -165,27 +171,11 @@ impl Coordinator {
                         body: Some(body),
                     })
                 }
-                ReadKind::Head | ReadKind::HeadPinned { .. } => {
-                    let selector = match kind {
-                        ReadKind::HeadPinned { etag } => MetadataSelector::Pinned(etag),
-                        _ => MetadataSelector::Fresh,
-                    };
-                    let metadata = directory
-                        .resolve_with_budget(
-                            selector.clone(),
-                            membership,
-                            &origin,
-                            scope,
-                            &mut budget,
-                        )
-                        .await?;
-                    validate_metadata(&metadata, &origin.object, &selector)?;
-                    Ok(ReadResponse {
-                        metadata,
-                        range: None,
-                        body: None,
-                    })
-                }
+                ReadKind::Head | ReadKind::HeadPinned { .. } => Ok(ReadResponse {
+                    metadata,
+                    range: None,
+                    body: None,
+                }),
             }
         })
     }
@@ -362,6 +352,23 @@ impl LocalPageService for Coordinator {
         })
     }
 }
+/// Combine exact immutable descriptors without replacing a valid value on failure.
+fn merge_metadata(
+    found: &mut Option<crate::model::VersionMetadata>,
+    descriptor: crate::model::VersionMetadata,
+    version: &crate::model::ObjectVersion,
+) -> Result<()> {
+    if &descriptor.version != version
+        || found
+            .as_ref()
+            .is_some_and(|old| !old.compatible(&descriptor))
+    {
+        return Err(Error::CorruptRecord);
+    }
+    *found = Some(descriptor);
+    Ok(())
+}
+
 fn validate_metadata(
     metadata: &ObjectMetadata,
     object: &ObjectId,

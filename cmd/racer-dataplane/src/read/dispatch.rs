@@ -571,12 +571,7 @@ impl WorkerDirectory {
                 };
                 match value {
                     Value::Retained(Some(value)) => {
-                        if value.version != *version
-                            || found.as_ref().is_some_and(|old| !old.compatible(&value))
-                        {
-                            return Err(Error::CorruptRecord);
-                        }
-                        found = Some(value);
+                        super::merge_metadata(&mut found, value, version)?;
                     }
                     Value::Retained(None) => {}
                     _ => return Err(Error::StaleFlight),

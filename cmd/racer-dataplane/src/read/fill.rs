@@ -15,6 +15,7 @@ use super::flight::FlightLeader;
 use super::flight::Flights;
 use super::flight::JoinedCopy;
 use super::flight::JoinedFlight;
+use super::merge_metadata;
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
 use crate::error::Error;
@@ -29,7 +30,6 @@ use crate::memory::UnverifiedPage;
 use crate::model::ObjectMetadata;
 use crate::model::PAGE_BYTES;
 use crate::model::PageId;
-use crate::model::VersionMetadata;
 use crate::origin::Origin;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
@@ -1831,21 +1831,6 @@ pub(super) fn validate_copy(copy: &crate::memory::CiphertextCopy, page: &PageId)
         .validate_page(copy.ciphertext.envelope())
         .map_err(Into::into)
 }
-fn merge_metadata(
-    found: &mut Option<VersionMetadata>,
-    descriptor: VersionMetadata,
-    version: &crate::model::ObjectVersion,
-) -> Result<()> {
-    if &descriptor.version != version
-        || found
-            .as_ref()
-            .is_some_and(|old| !old.compatible(&descriptor))
-    {
-        return Err(Error::CorruptRecord);
-    }
-    *found = Some(descriptor);
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1853,6 +1838,7 @@ mod tests {
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
     use crate::model::StrongEtag;
+    use crate::model::VersionMetadata;
     use racer_control_wire::CacheId;
     #[test]
     fn decrypt_source_counters_preserve_results_and_ignore_non_corruption() {
