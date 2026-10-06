@@ -692,9 +692,9 @@ notices:
       - Copyright (c) The Rust Project Developers
     license:
       - name: Apache License, Version 2.0
-        link: https://docs.rs/crate/libc/0.2.189/source/LICENSE-APACHE
+        link: https://docs.rs/crate/libc/0.2.190/source/LICENSE-APACHE
       - name: MIT License
-        link: https://docs.rs/crate/libc/0.2.189/source/LICENSE-MIT
+        link: https://docs.rs/crate/libc/0.2.190/source/LICENSE-MIT
   - dependency: modernc.org/sqlite
     ecosystem: go
     copyright:
