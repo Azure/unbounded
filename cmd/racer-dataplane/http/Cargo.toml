@@ -16,3 +16,7 @@ uring-runtime = { path = "../runtime" }
 httparse = "1"
 zeroize = "1"
 libc = "0.2"
+
+[[test]]
+name = "pool"
+required-features = ["test-util"]
