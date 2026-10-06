@@ -257,10 +257,10 @@ identical in either case. Follow the [deployment README](../deploy/racer-loadgen
 for prerequisites, rendering, C0 checks, and a controlled ramp. Reapplying the
 base resets the control ConfigMap to C0; do not treat reapplication as resume.
 
-At report handoff, **C0 pause was requested; final verification belongs to the
-parent operator**. This report does not certify the live fleet is drained.
-The parent owns integration, artifact preservation, and temporary overlay/worktree
-cleanup. No cluster mutations were performed while writing this report.
+Final sampling at **15:29:29Z** verified all **128 consumers at C0**, with zero
+in-flight reads and zero byte deltas. All 128 consumer pods and 1,500 origin pods
+were Ready. Only `ClusterCache/racer-object` remained. The deployment is retained
+with load paused and sidecar profiling disabled.
 
 For an explicitly authorized later resume in the intended cluster context:
 
@@ -284,12 +284,13 @@ Operational evidence was read from the original workspace's
 `tmp/racer-s3-benchmark-checkpoint.md` (phase results and image actions),
 `tmp/racer-s3-prometheus-128.md` (fixed-time queries, coverage, and limitations),
 and `tmp/racer-s3-startup-diagnosis.md` (terminal/admission evidence). Raw sampler
-artifacts are in the benchmark worktree's `tmp/s3-*/summary.json`, including
+artifacts were collected in the benchmark worktree's `tmp/s3-*/summary.json`, including
 `s3-direct-c1-active`, `s3-direct-c8`, `s3-sidecar-c1`, `s3-sidecar-c8`,
 `s3-sidecar-c32`, `s3-sidecar-prefix-c8`, `s3-sidecar-fixed-c8`,
 `s3-sidecar-fixed-c32`, `s3-sidecar-fixed-16nodes-c8`, and
 `s3-sidecar-fixed-128nodes-c8`. Profiles are
 `tmp/s3-sidecar-c8-cpu.pprof` and `tmp/s3-sidecar-fixed-c8-cpu.pprof`.
-These temporary artifacts are not committed by this documentation chunk; the
-parent must preserve them before cleanup. The core results and caveats above
-are retained here so the report does not depend on temporary files to be read.
+These temporary artifacts are preserved in the original workspace at
+`tmp/racer-s3-benchmark-artifacts.tar.gz` before worktree cleanup, not committed.
+The core results and caveats above are retained here so the report does not
+depend on temporary files to be read.
