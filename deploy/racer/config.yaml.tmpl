@@ -1,0 +1,41 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: racer-config
+  namespace: {{ .Namespace | default "unbounded-system" }}
+data:
+  # Supply one permanent UUID before deployment. Empty fails configuration validation.
+  RACER_CLUSTER_ID: {{ .ClusterID | default "" | quote }}
+  # Workload wiring is consumed by the operator's members.Config, not the controller.
+  RACER_DATAPLANE_IMAGE: {{ .DataplaneImage | default "ghcr.io/azure/racer-dataplane:latest" | quote }}
+  RACER_CONTROL_URL: {{ .ControlURL | default (printf "https://racer-controller.%s.svc:8443" (.Namespace | default "unbounded-system")) | quote }}
+  RACER_CONTROL_ADDRESS: ":8443"
+  RACER_METRICS_ADDRESS: ":8080"
+  RACER_PROBE_ADDRESS: ":8081"
+  RACER_PEER_PORT: "8082"
+  # Racer-only operator opt-in. Keep peer publication and listener wiring in this
+  # ConfigMap; a port transition requires quiescing traffic (see the runbook).
+  RACER_HOST_NETWORK: "false"
+  # Optional RACER_DIAGNOSTICS_PORT: "19090". If absent, preserve 9090 (9091
+  # when the peer port is 9090). Explicit ports must be distinct and >= 1024.
+  RACER_TLS_CERTIFICATE_FILE: "/etc/racer/tls/tls.crt"
+  RACER_TLS_PRIVATE_KEY_FILE: "/etc/racer/tls/tls.key"
+  RACER_CONTROLLER_SERVICE_ACCOUNT: "racer-controller"
+  RACER_REPLICATION_TOKEN_FILE: "/var/run/secrets/racer-controller/token"
+  # The mounted ca.crt is Secret key ca-bundle.crt, not the single signing root.
+  # It contains the current CA plus retained roots (up to 14 days after rotation,
+  # bounded by certificate expiry). Cross-signed serving chains support the
+  # reverse projection order: an old follower verifying a newly rotated leader.
+  RACER_REPLICATION_TRUST_FILE: "/etc/racer/tls/ca.crt"
+  RACER_REPLICATION_SERVER_NAME: {{ printf "racer-controller.%s.svc" (.Namespace | default "unbounded-system") | quote }}
+  RACER_REPLICATION_PORT: "8443"
+  RACER_SNAPSHOT_MAX_AGE: "30s"
+  # Bootstrap trust is also workload-only wiring.
+  RACER_BOOTSTRAP_TRUST_CONFIGMAP: {{ .BootstrapTrustConfigMap | default "racer-bootstrap-trust" | quote }}
+  RACER_DATAPLANE_SERVICE_ACCOUNT: "racer-dataplane"
+  RACER_DAEMONSET_NAME: "racer-dataplane"
+  RACER_CREDENTIALS_SECRET_NAME: {{ .CredentialsSecretName | default "racer-credentials" | quote }}
+  RACER_VERSION_CONFIGMAP_NAME: {{ .VersionConfigMapName | default "racer-version" | quote }}
+  RACER_INSTALLATION_CONFIGMAP_NAME: {{ .InstallationConfigMapName | default "racer-installation" | quote }}
