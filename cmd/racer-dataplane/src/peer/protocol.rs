@@ -693,27 +693,6 @@ fn page_fields(
     Ok(())
 }
 
-/// Canonical page metadata without materializing an opaque transit body.
-pub(crate) fn opaque_page_head(
-    m: &ObjectMetadata,
-    e: &crate::model::PageEnvelope,
-    bootstrap: bool,
-    binding: &[u8; 32],
-    path: &[NodeId],
-) -> Result<MessageHead> {
-    opaque_page_response(
-        m,
-        e,
-        if bootstrap {
-            PageOutcome::Bootstrap
-        } else {
-            PageOutcome::Page
-        },
-        binding,
-        path,
-    )
-}
-
 /// Page-bearing outcomes with distinct canonical header shapes.
 #[derive(Clone, Copy)]
 enum PageOutcome {
@@ -1362,7 +1341,9 @@ pub(crate) mod tests {
             (PeerResponse::Overloaded, 200, "overloaded"),
         ] {
             let head = response_head(&response, &[0; 32], &[]).unwrap();
-            assert_eq!(head.start, StartLine::Response { status });
+            assert!(
+                matches!(head.start, StartLine::Response { status: actual } if actual == status)
+            );
             assert_eq!(head.headers.len(), 5);
             assert_eq!(head.headers[3].value, outcome.as_bytes());
             assert_eq!(head.headers[4].value, b"0");
@@ -1370,15 +1351,19 @@ pub(crate) mod tests {
         let mut invalid = envelope.clone();
         invalid.page.number = PageNumber(1);
         assert!(matches!(
-            opaque_page_head(&metadata, &invalid, true, &[0; 32], &[]),
+            opaque_page_response(&metadata, &invalid, PageOutcome::Bootstrap, &[0; 32], &[]),
             Err(Error::InvalidRequest)
         ));
         invalid = envelope.clone();
         invalid.ciphertext_length = 18;
-        assert!(opaque_page_head(&metadata, &invalid, false, &[0; 32], &[]).is_err());
+        assert!(
+            opaque_page_response(&metadata, &invalid, PageOutcome::Page, &[0; 32], &[]).is_err()
+        );
         invalid = envelope;
         invalid.page.version.etag = StrongEtag::test_value("other");
-        assert!(opaque_page_head(&metadata, &invalid, false, &[0; 32], &[]).is_err());
+        assert!(
+            opaque_page_response(&metadata, &invalid, PageOutcome::Page, &[0; 32], &[]).is_err()
+        );
         let mut page = page;
         Arc::get_mut(&mut page.inner).unwrap().storage.bytes.pop();
         assert!(matches!(
