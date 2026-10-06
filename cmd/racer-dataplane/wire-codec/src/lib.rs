@@ -669,8 +669,9 @@ pub mod rest {
             let mut idle = self.idle.borrow_mut();
             let connection = idle.take()?;
             if let Authentication::Authenticated(auth) = &connection.authentication
-                && identity.is_some()
+                && let Some(identity) = identity
                 && auth.epoch == epoch
+                && auth.expires == identity.expires
                 && auth.owner.upgrade().is_some()
                 && connection.within_max_age()
                 && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
@@ -2083,6 +2084,44 @@ pub mod rest {
             assert!(transport.idle.borrow().is_none());
             assert_eq!(get().status, 204);
             transport.close_idle();
+            server.join().unwrap();
+        }
+
+        /// A pooled connection cannot outlive the current caller's identity deadline.
+        #[test]
+        fn pooled_connections_require_matching_identity_expiration() {
+            let d = testing::Directory::new();
+            let (ca, key) = testing::ca();
+            let identity = TestIdentity::new(&ca, &key);
+            let (endpoint, server) = scripted_server(
+                &d,
+                &ca,
+                &key,
+                vec![vec![("/snapshot".to_owned(), 200, b"{}".to_vec())]],
+            );
+            let transport = Transport::new(endpoint);
+            transport.attach_io(Rc::new(FixtureIo));
+            let scope = testing::scope();
+            let connection =
+                futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
+            futures::executor::block_on(connection.request(
+                testing::request(Method::Get, "/snapshot", None, 1024),
+                &scope,
+            ))
+            .unwrap();
+            let (epoch, expires) = {
+                let mut idle = transport.idle.borrow_mut();
+                let auth = authenticated(idle.as_mut().unwrap());
+                (auth.epoch, auth.expires)
+            };
+            let mut shorter_identity = identity.borrowed();
+            shorter_identity.expires = expires - Duration::from_secs(1);
+            assert!(
+                transport
+                    .checkout(Some(shorter_identity), epoch, &scope)
+                    .is_none()
+            );
+            assert!(transport.idle.borrow().is_none());
             server.join().unwrap();
         }
 
