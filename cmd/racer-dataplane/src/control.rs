@@ -84,7 +84,7 @@ fn enter(flag: &Cell<bool>) -> Result<Busy<'_>> {
 }
 
 /// Identify failures that may recover on a later scoped attempt.
-fn transient(e: Error) -> bool {
+pub(crate) fn transient(e: Error) -> bool {
     matches!(
         e,
         Error::Io | Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded

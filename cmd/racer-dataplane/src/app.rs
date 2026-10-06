@@ -25,6 +25,7 @@ use crate::control::Snapshot;
 use crate::control::publication::PublicationTarget;
 use crate::control::rails::RailJournal;
 use crate::control::session::Session;
+use crate::control::transient;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -302,6 +303,54 @@ fn scope(timeout: Duration) -> Result<RequestScope> {
     )
 }
 
+/// Retry enrollment under the original startup scope and the session's backoff.
+async fn start_control(
+    control: &Session,
+    reactor: Rc<Reactor>,
+    startup: &RequestScope,
+) -> Result<racer_crypto::enrollment::LocalSigningIdentity> {
+    loop {
+        match control.start(startup).await {
+            Ok(identity) => return Ok(identity),
+            Err(error) if transient(error) => {
+                startup.check()?;
+                ReactorControlIo::new(reactor.clone())
+                    .sleep(
+                        control
+                            .next_attempt()
+                            .unwrap_or_else(uring_runtime::environment::now),
+                        startup,
+                    )
+                    .await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// A serving listener must stay pending; shutdown permits scoped termination.
+fn listener_completion(
+    result: Result<()>,
+    stopping: bool,
+    worker: WorkerId,
+    stage: &str,
+) -> Result<()> {
+    if !stopping {
+        if let Err(error) = &result {
+            eprintln!(
+                "racer-dataplane: worker={} stage={stage} error={error:?}",
+                worker.0
+            );
+        }
+        result?;
+        return Err(Error::Unavailable);
+    }
+    match result {
+        Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Divide aggregate resource dimensions, preserving per-operation protocol caps.
 /// Replay is a single node-wide table, so every handle uses the same node cap.
 #[cfg(test)]
@@ -337,26 +386,7 @@ fn bootstrap(
         node.inventory.clone(),
     );
     let mut operation = Box::pin(async {
-        let identity = loop {
-            match control.start(startup).await {
-                Ok(identity) => break identity,
-                Err(
-                    Error::Io | Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded,
-                ) => {
-                    startup.check()?;
-                    let io = ReactorControlIo::new(reactor.clone());
-                    ReactorControlIo::sleep(
-                        &io,
-                        control
-                            .next_attempt()
-                            .unwrap_or_else(uring_runtime::environment::now),
-                        startup,
-                    )
-                    .await?;
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let identity = start_control(&control, reactor.clone(), startup).await?;
         let keys = Rc::new(Keyring::new(
             config.cluster.clone(),
             identity.node().clone(),
@@ -1444,24 +1474,7 @@ impl WorkerApplication {
     /// Advance listeners, read flights, and native transfers while observing failures.
     fn poll_listeners(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         if let Some(result) = poll_task(&mut self.diagnostic_task, cx) {
-            if let Err(error) = &result
-                && !self.stopping
-            {
-                eprintln!(
-                    "racer-dataplane: worker={} stage=diagnostic-service error={error:?}",
-                    self.worker.0
-                );
-            }
-            if !self.stopping {
-                result?;
-                return Err(Error::Unavailable);
-            }
-            if !matches!(
-                result,
-                Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded)
-            ) {
-                result?;
-            }
+            listener_completion(result, self.stopping, self.worker, "diagnostic-service")?;
         }
         if let Some(endpoint) = &mut self.endpoint {
             endpoint.poll(cx, budget).inspect_err(|error| {
@@ -1484,24 +1497,7 @@ impl WorkerApplication {
             rdma.progress()?;
         }
         if let Some(result) = poll_task(&mut self.peer_task, cx) {
-            if let Err(error) = &result
-                && !self.stopping
-            {
-                eprintln!(
-                    "racer-dataplane: worker={} stage=peer-listener error={error:?}",
-                    self.worker.0
-                );
-            }
-            if !self.stopping {
-                result?;
-                return Err(Error::Unavailable);
-            }
-            if !matches!(
-                result,
-                Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded)
-            ) {
-                result?;
-            }
+            listener_completion(result, self.stopping, self.worker, "peer-listener")?;
         }
         Ok(())
     }
@@ -1546,10 +1542,7 @@ impl WorkerApplication {
         // retries: the owner must reconcile namespace state before another mutation.
         self.poll_keyring(cx)?;
         if let Some(result) = poll_task(&mut self.control_task, cx)
-            && !matches!(
-                result,
-                Err(Error::Io | Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded)
-            )
+            && !result.is_err_and(transient)
         {
             result?;
         }
@@ -1567,10 +1560,7 @@ impl WorkerApplication {
     /// Keep one scoped keyring turn active and preserve nontransient failures.
     fn poll_keyring(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if let Some(result) = poll_task(&mut self.keyring_task, cx)
-            && !matches!(
-                result,
-                Err(Error::Io | Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded)
-            )
+            && !result.is_err_and(transient)
         {
             result?;
         }
@@ -1983,13 +1973,8 @@ impl WorkerApplication {
             }
             if let Some(result) = poll_task(&mut self.cache_prepare_task, cx) {
                 match result {
-                    Ok(())
-                    | Err(
-                        Error::Io
-                        | Error::Overloaded
-                        | Error::Unavailable
-                        | Error::DeadlineExceeded,
-                    ) => (),
+                    Ok(()) => (),
+                    Err(error) if transient(error) => (),
                     Err(error) => return Err(error),
                 }
             }
@@ -2225,29 +2210,7 @@ impl WorkerApplication {
     /// Drive enrollment and local installation until the first publication is accepted.
     async fn accept_initial_publication(&mut self, startup: &RequestScope) -> Result<()> {
         if let Some(control) = self.control.clone() {
-            let identity = loop {
-                match control.start(startup).await {
-                    Ok(identity) => break identity,
-                    Err(
-                        Error::Io
-                        | Error::Unavailable
-                        | Error::Overloaded
-                        | Error::DeadlineExceeded,
-                    ) => {
-                        startup.check()?;
-                        let io = ReactorControlIo::new(self.runtime.reactor.clone());
-                        ReactorControlIo::sleep(
-                            &io,
-                            control
-                                .next_attempt()
-                                .unwrap_or_else(uring_runtime::environment::now),
-                            startup,
-                        )
-                        .await?;
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
+            let identity = start_control(&control, self.runtime.reactor.clone(), startup).await?;
             if identity.node() != self.keys.node() {
                 return Err(Error::NodeIdentityChanged);
             }
@@ -2276,12 +2239,7 @@ impl WorkerApplication {
                 .await;
                 match result {
                     Ok(_) => (),
-                    Err(
-                        Error::Io
-                        | Error::Unavailable
-                        | Error::Overloaded
-                        | Error::DeadlineExceeded,
-                    ) => {
+                    Err(error) if transient(error) => {
                         let io = ReactorControlIo::new(self.runtime.reactor.clone());
                         ReactorControlIo::sleep(
                             &io,
@@ -2485,3 +2443,47 @@ fn size_workers(node: &Limits, plan: &mut AffinityPlan, rdma: bool) -> Result<Li
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod lifecycle_policy_tests {
+    //! Listener completion and control retry classification remain independent.
+
+    use super::*;
+
+    /// Only cancellation and deadline expiry become successful shutdown outcomes.
+    #[test]
+    fn listener_completion_preserves_serving_and_shutdown_errors() {
+        for result in [
+            Ok(()),
+            Err(Error::Cancelled),
+            Err(Error::DeadlineExceeded),
+            Err(Error::Io),
+            Err(Error::Unavailable),
+            Err(Error::Overloaded),
+            Err(Error::Unauthorized),
+            Err(Error::Os(libc::EIO)),
+        ] {
+            assert_eq!(
+                listener_completion(result, false, WorkerId(0), "test"),
+                result.and(Err(Error::Unavailable)),
+            );
+            let expected = match result {
+                Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded) => Ok(()),
+                other => other,
+            };
+            assert_eq!(
+                listener_completion(result, true, WorkerId(0), "test"),
+                expected
+            );
+        }
+    }
+
+    /// A pending listener is retained without invoking completion policy.
+    #[test]
+    fn pending_listener_is_not_a_completion() {
+        let mut task: Option<Operation<'static, ()>> = Some(Box::pin(std::future::pending()));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(poll_task(&mut task, &mut cx).is_none());
+        assert!(task.is_some());
+    }
+}
