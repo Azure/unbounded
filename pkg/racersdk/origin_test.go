@@ -1113,8 +1113,44 @@ func originAssertFileContent(t *testing.T, path, want string) {
 	require.Equal(t, want, string(data), "file changed: %s", path)
 }
 
+func TestOwnedSocketTestDirCleanCheckout(t *testing.T) {
+	base, err := os.MkdirTemp("../..", "o-")
+	require.NoError(t, err)
+
+	base, err = filepath.Abs(base)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(base)) })
+
+	working := filepath.Join(base, "pkg", "racersdk")
+	require.NoError(t, os.MkdirAll(working, 0o700))
+	t.Chdir(working)
+
+	parent := filepath.Join(base, "tmp")
+	_, err = os.Stat(parent)
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	for _, name := range []string{"missing parent", "existing parent"} {
+		t.Run(name, func(t *testing.T) {
+			dir := ownedSocketTestDir(t)
+			require.Equal(t, parent, filepath.Dir(dir))
+
+			listener, err := net.Listen("unix", filepath.Join(dir, "socket"))
+			require.NoError(t, err)
+			t.Cleanup(func() { closeBody(listener) })
+		})
+	}
+
+	entries, err := os.ReadDir(parent)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
 func ownedSocketTestDir(t *testing.T) string {
 	t.Helper()
+
+	if err := os.MkdirAll("../../tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
 
 	dir, err := os.MkdirTemp("../../tmp", "sdk-")
 	if err != nil {
