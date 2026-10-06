@@ -306,15 +306,17 @@ pub mod mailbox {
             let queued_scope = Arc::new(scope.clone());
             let mut state = lock(&self.state);
             if state.admission != Admission::Open {
+                drop(state);
                 return Err(Error::Unavailable.into());
             }
             if self.outstanding() >= self.capacity {
+                drop(state);
                 return Err(Error::Overloaded.into());
             }
-            state
-                .queue
-                .try_reserve(1)
-                .map_err(|_| S::Error::from(Error::Overloaded))?;
+            if state.queue.try_reserve(1).is_err() {
+                drop(state);
+                return Err(Error::Overloaded.into());
+            }
             self.credits.outstanding.fetch_add(1, Ordering::AcqRel);
             let permit = Arc::new(Permit {
                 credits: self.credits.clone(),
