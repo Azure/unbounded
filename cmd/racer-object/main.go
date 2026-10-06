@@ -52,6 +52,7 @@ type options struct {
 	metadataTTL    time.Duration
 	requestTimeout time.Duration
 	listen         string
+	debugListen    string
 }
 
 func main() {
@@ -98,6 +99,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	cache := fs.String("cache", "racer-object", "Racer cache name")
 	fs.StringVar(&o.namespace, "namespace", "", "Required stable upstream identity; use the same value in origin and sidecar")
 	fs.Var(&o.buckets, "bucket", "Allowed bucket (repeatable; omitted allows all buckets)")
+	fs.StringVar(&o.debugListen, "debug-listen", "", "Optional pprof address (e.g. 127.0.0.1:6060); disabled when empty. Trusted diagnostic access only: nonloopback addresses such as :6060 expose unauthenticated profiles")
 
 	showVersion := fs.Bool("version", false, "Print version")
 	if o.mode == "origin" {
@@ -237,11 +239,13 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return nil
 	}
 
-	if o.mode == "origin" {
-		return runOrigin(ctx, o)
-	}
+	return runWithDebug(ctx, o.debugListen, func(ctx context.Context) error {
+		if o.mode == "origin" {
+			return runOrigin(ctx, o)
+		}
 
-	return runSidecar(ctx, o)
+		return runSidecar(ctx, o)
+	})
 }
 
 func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
