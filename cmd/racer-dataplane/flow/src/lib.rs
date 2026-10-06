@@ -348,12 +348,13 @@ impl<P: Policy> Charge<P> {
             return Err(Error::InvalidInput);
         }
         if let Some(pool) = self.buffers.upgrade() {
-            let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(index) = pool
-                .iter()
-                .position(|(bytes, _)| bytes.capacity() == length)
-            {
-                let (bytes, old) = pool.swap_remove(index);
+            let recycled = {
+                let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+                pool.iter()
+                    .position(|(bytes, _)| bytes.capacity() == length)
+                    .map(|index| pool.swap_remove(index))
+            };
+            if let Some((bytes, old)) = recycled {
                 drop(old);
                 debug_assert_eq!(bytes.len(), length);
                 return Ok(bytes);
@@ -380,8 +381,10 @@ impl<P: Policy> Charge<P> {
         let Some(pool) = self.buffers.upgrade() else {
             return;
         };
-        let Ok(mut pool) = pool.try_lock() else {
-            return;
+        let mut pool = match pool.try_lock() {
+            Ok(pool) => pool,
+            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         };
         if self.stopped.load(Ordering::Acquire) || pool.len() >= 2 {
             return;
@@ -548,10 +551,11 @@ impl<P: Policy> Quotas<P> {
 
     /// Release every idle recycler allocation and its charge.
     pub fn reclaim_buffers(&self) {
-        self.buffers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let reclaimed = {
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *buffers)
+        };
+        drop(reclaimed);
     }
 
     /// Divide the aggregate ceiling, honoring the clipped per-key floor.
@@ -580,16 +584,21 @@ impl<P: Policy> Quotas<P> {
 
     /// Reclaim only when key records, fairness, or this class can benefit.
     fn reclaim_buffers_for(&self, key: Option<&P::Key>, class: P::Class) {
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        // Keyed admission can exhaust records or fair shares too. Unkeyed
-        // admission only reclaims when this class has an idle charge.
-        if key.is_some()
-            || buffers
-                .iter()
-                .any(|(_, charge)| charge.class.index() == class.index())
-        {
-            buffers.clear();
-        }
+        let reclaimed = {
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            // Keyed admission can exhaust records or fair shares too. Unkeyed
+            // admission only reclaims when this class has an idle charge.
+            if key.is_some()
+                || buffers
+                    .iter()
+                    .any(|(_, charge)| charge.class.index() == class.index())
+            {
+                std::mem::take(&mut *buffers)
+            } else {
+                Vec::new()
+            }
+        };
+        drop(reclaimed);
     }
 
     /// Perform one admission attempt and report its rejection before retrying.
@@ -1071,6 +1080,32 @@ mod quota_tests {
         }
     }
 
+    /// Checks recycler lock availability during a synchronous charge wake.
+    struct PoolWake {
+        buffers: Arc<Mutex<Vec<(Vec<u8>, Charge<TestPolicy>)>>>,
+
+        unlocked: Arc<AtomicBool>,
+    }
+
+    impl std::task::Wake for PoolWake {
+        /// Record whether callback reentry can acquire the recycler mutex.
+        fn wake(self: Arc<Self>) {
+            self.unlocked
+                .store(self.buffers.try_lock().is_ok(), Ordering::SeqCst);
+        }
+    }
+
+    /// Register a callback that probes the recycler mutex when the next charge drops.
+    fn watch_buffer_unlock(quotas: &Quotas<TestPolicy>) -> Arc<AtomicBool> {
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(PoolWake {
+            buffers: quotas.buffers.clone(),
+            unlocked: unlocked.clone(),
+        });
+        quotas.shared().register(&std::task::Waker::from(wake));
+        unlocked
+    }
+
     /// Wiping initializes every allocated byte without moving or resizing backing.
     #[test]
     fn secure_payload_wipe_initializes_spare_capacity_and_preserves_geometry() {
@@ -1240,6 +1275,62 @@ mod quota_tests {
             0,
             "usage handles must not retain recycled buffers"
         );
+    }
+
+    /// Recycled and reclaimed charges wake only after the recycler mutex is released.
+    #[test]
+    fn recycler_charge_wakes_after_unlock_on_take_and_reclaim() {
+        let size = 1 << 20;
+        let quotas = Quotas::new(TestPolicy::new(3 * size, 4));
+        let mut charge = quotas.reserve(None, Resource::Other, size).unwrap();
+        charge.recycle(vec![0xa7; size]);
+
+        let mut owner = quotas.reserve(None, Resource::Other, size).unwrap();
+        let unlocked = watch_buffer_unlock(&quotas);
+        let bytes = owner.buffer(size).unwrap();
+        assert!(unlocked.load(Ordering::SeqCst));
+        owner.recycle(bytes);
+
+        let unlocked = watch_buffer_unlock(&quotas);
+        quotas.reclaim_buffers();
+        assert!(unlocked.load(Ordering::SeqCst));
+        assert_eq!(quotas.retained_buffer_bytes(), 0);
+    }
+
+    /// Keyed pressure reclamation drops retained charges outside the pool lock.
+    #[test]
+    fn pressure_reclamation_drops_charges_after_unlock() {
+        let size = 1 << 20;
+        let quotas = Quotas::new(TestPolicy::new(size, 4));
+        let mut charge = quotas.reserve(None, Resource::Other, size).unwrap();
+        charge.recycle(vec![0xa7; size]);
+
+        let unlocked = watch_buffer_unlock(&quotas);
+        let key = "reclaim".to_owned();
+        assert!(quotas.reserve(Some(&key), Resource::Other, 1).is_ok());
+        assert!(unlocked.load(Ordering::SeqCst));
+        assert_eq!(quotas.retained_buffer_bytes(), 0);
+    }
+
+    /// A poisoned recycler remains usable after a prior operation panicked.
+    #[test]
+    fn recycler_recovers_poisoned_mutex() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let size = 1 << 20;
+        let quotas = Quotas::new(TestPolicy::new(2 * size, 4));
+        let buffers = quotas.buffers.clone();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _buffers = buffers.lock().unwrap();
+                panic!("poison recycler mutex");
+            }))
+            .is_err()
+        );
+
+        let mut charge = quotas.reserve(None, Resource::Other, size).unwrap();
+        charge.recycle(vec![0xa7; size]);
+        assert_eq!(quotas.retained_buffer_bytes(), size);
     }
 
     /// Key-table pressure reports original facts before successful reclamation.
