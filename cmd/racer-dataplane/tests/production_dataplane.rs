@@ -158,6 +158,8 @@ impl Scratch {
     }
     fn under(root: &std::path::Path) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
+        // Shared Cargo artifacts need not create this worktree's scratch parent.
+        fs::create_dir_all(root).unwrap();
         let path = root.join(format!(
             "production-{}-{}",
             std::process::id(),
@@ -179,6 +181,28 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+/// Missing scratch parents are created without reusing another live fixture.
+#[test]
+fn scratch_creates_missing_parent_and_cleans_up_unique_children() {
+    let outer = Scratch::new();
+    let parent = outer.path.join("missing/target");
+    assert!(!parent.exists());
+
+    let first = Scratch::under(&parent);
+    let second = Scratch::under(&parent);
+    assert_ne!(first.path, second.path);
+    assert!(first.path.is_dir());
+    assert!(second.path.is_dir());
+
+    let first_path = first.path.clone();
+    drop(first);
+    assert!(!first_path.exists());
+    assert!(second.path.is_dir());
+
+    drop(second);
+    assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
 }
 
 #[derive(Clone, Debug)]

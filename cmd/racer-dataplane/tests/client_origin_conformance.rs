@@ -857,6 +857,8 @@ mod sdk {
         let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join(format!("conformance-sdk-{}", std::process::id()));
+        // Keep fixture output local even when Cargo uses a shared target directory.
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
         fs::create_dir(&output).unwrap();
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
