@@ -285,16 +285,41 @@ impl StoreReader {
 
 struct Dirty {
     _resident: catalog::Resident,
+
     _payload: crate::retention::Payload,
+
     _metric: ::telemetry::Lease,
+
     ticket: u64,
+
     page: CiphertextCopy,
+
     _reservation: Rc<flow_control::Charge<AdmissionPolicy>>,
+
     staging: Option<flow_control::Charge<AdmissionPolicy>>,
 }
+
+impl Dirty {
+    /// Bytes released by dropping this queued write's staging charge.
+    fn staging_bytes(&self) -> usize {
+        self.staging
+            .as_ref()
+            .map_or(0, flow_control::Charge::amount)
+    }
+}
+
 /// Foreground queue selection and positional removal inspect only this prefix.
 /// VecDeque::remove shifts the shorter side, so a prefix victim also bounds moves.
 const QUEUE_RECLAIM_CANDIDATES: usize = 64;
+
+/// Locate queued work without inspecting the unselected suffix.
+fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
+    queue
+        .iter()
+        .take(QUEUE_RECLAIM_CANDIDATES)
+        .position(|queued| queued == page)
+}
+
 /// Bounded dirty copies persist asynchronously, with publication after full I/O.
 pub struct StoreWriter {
     metrics: crate::telemetry::Metrics,
@@ -585,11 +610,7 @@ impl StoreWriter {
     pub(crate) fn discard_idle_copy(&self, page: &crate::memory::PageResult) -> usize {
         let id = page.plaintext.page();
         let mut queue = self.queue.borrow_mut();
-        let Some(position) = queue
-            .iter()
-            .take(QUEUE_RECLAIM_CANDIDATES)
-            .position(|queued| queued == id)
-        else {
+        let Some(position) = queued_position(&queue, id) else {
             return 0;
         };
         let mut pending = self.pending.borrow_mut();
@@ -600,10 +621,7 @@ impl StoreWriter {
             queue.remove(position);
             let dirty = pending.remove(id).expect("located queued copy");
             self.note_discard(1);
-            return dirty
-                .staging
-                .as_ref()
-                .map_or(0, flow_control::Charge::amount);
+            return dirty.staging_bytes();
         }
         0
     }
@@ -617,7 +635,7 @@ impl StoreWriter {
         staging_bytes: usize,
     ) -> usize {
         let retention = self.retention();
-        if (dirty_bytes == 0 && staging_bytes == 0) || !retention.owned_only(incoming).eligible() {
+        if (dirty_bytes == 0 && staging_bytes == 0) || !retention.is_owned(incoming) {
             return 0;
         }
         let mut queue = self.queue.borrow_mut();
@@ -627,7 +645,7 @@ impl StoreWriter {
             .take(QUEUE_RECLAIM_CANDIDATES)
             .filter(|id| {
                 cache.is_none_or(|cache| cache == &id.version.object.cache)
-                    && !retention.owned_only(id).eligible()
+                    && !retention.is_owned(id)
             })
             .cloned()
             .collect();
@@ -638,19 +656,10 @@ impl StoreWriter {
             }
             if let Some(dirty) = pending.remove(&id) {
                 dirty_released = dirty_released.saturating_add(dirty._reservation.amount());
-                staging_released = staging_released.saturating_add(
-                    dirty
-                        .staging
-                        .as_ref()
-                        .map_or(0, flow_control::Charge::amount),
-                );
+                staging_released = staging_released.saturating_add(dirty.staging_bytes());
                 removed += 1;
             }
-            if let Some(position) = queue
-                .iter()
-                .take(QUEUE_RECLAIM_CANDIDATES)
-                .position(|page| page == &id)
-            {
+            if let Some(position) = queued_position(&queue, &id) {
                 queue.remove(position);
             }
         }
@@ -681,12 +690,7 @@ impl StoreWriter {
                 break;
             }
             if let Some(dirty) = pending.remove(&id) {
-                released = released.saturating_add(
-                    dirty
-                        .staging
-                        .as_ref()
-                        .map_or(0, flow_control::Charge::amount),
-                );
+                released = released.saturating_add(dirty.staging_bytes());
                 if std::sync::Arc::strong_count(&dirty.page.ciphertext.inner) == 1 {
                     released =
                         released.saturating_add(dirty.page.ciphertext.inner.reservation.amount());
@@ -695,11 +699,7 @@ impl StoreWriter {
             }
             // Every candidate came from this prefix and removals only move it
             // closer to the front. Never scan the unselected queue suffix.
-            if let Some(position) = queue
-                .iter()
-                .take(QUEUE_RECLAIM_CANDIDATES)
-                .position(|page| page == &id)
-            {
+            if let Some(position) = queued_position(&queue, &id) {
                 queue.remove(position);
             }
         }

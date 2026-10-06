@@ -251,7 +251,7 @@ impl Retention {
     pub fn snapshot(&self) -> Snapshot {
         let mut state = self.state.borrow_mut();
         let (set_bits, bits) = state.history.occupancy(uring_runtime::environment::now());
-        let mut snapshot = Snapshot {
+        Snapshot {
             observations: self.counters.observations.load(Ordering::Relaxed),
             qualified: self.counters.qualified.load(Ordering::Relaxed),
             persistence_attempts: self.counters.attempts.load(Ordering::Relaxed),
@@ -259,12 +259,10 @@ impl Retention {
             pending_payload_bytes: self.pending_payload_bytes.get(),
             indexed_payload_bytes: self.indexed_payload_bytes.get(),
             disk: self.disk.get(),
-            ..Snapshot::default()
-        };
-        snapshot.filter_set_bits = set_bits;
-        snapshot.filter_bits = bits;
-        snapshot.heat_entries = state.heat.len();
-        snapshot
+            filter_set_bits: set_bits,
+            filter_bits: bits,
+            heat_entries: state.heat.len(),
+        }
     }
 }
 
