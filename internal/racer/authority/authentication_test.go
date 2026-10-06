@@ -319,6 +319,116 @@ func TestIssuerFullEncodedRequestBound(t *testing.T) {
 	}
 }
 
+func TestIssuerRejectsCredentialReplay(t *testing.T) {
+	for _, replay := range []string{"rollback", "conflicting generation"} {
+		t.Run(replay, func(t *testing.T) {
+			r, now := testKeyring(t)
+			runKeys(t, r)
+			original, oldBundle, initial, _ := keyState(t, r)
+			*now = initial.NextRotation
+
+			runKeys(t, r)
+			_, _, staged, _ := keyState(t, r)
+			*now = staged.ActivateAt
+
+			runKeys(t, r)
+			_, _, active, _ := keyState(t, r)
+			*now = active.Retiring[initial.ActiveIssuer]
+
+			runKeys(t, r)
+
+			secret, current, _, _ := keyState(t, r)
+			if containsRoot(current, initial.ActiveIssuer) {
+				t.Fatal("fixture retained retired issuer")
+			}
+
+			highWater, digest := r.Trust.highWater, r.Trust.digest
+
+			guard, cancel, err := r.Trust.writeContext(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cancel()
+
+			secret.Data = original.DeepCopy().Data
+
+			if replay == "conflicting generation" {
+				oldBundle.Generation = current.Generation
+
+				secret.Data["bundle.json"], err = wire.EncodeBundle(oldBundle)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := r.Update(t.Context(), secret); err != nil {
+				t.Fatal(err)
+			}
+
+			identity, request, _ := issuanceRequest(t, r)
+			for range 2 {
+				encoded, err := testIssuer(r).Issue(t.Context(), identity, request)
+				if !errors.Is(err, wire.Conflict) || len(encoded) != 0 {
+					t.Fatalf("replayed signing credentials issued a response: err=%v bytes=%d", err, len(encoded))
+				}
+
+				if trustReady(r.Trust) || r.Trust.highWater != highWater || r.Trust.digest != digest || !errors.Is(guard.Err(), context.Canceled) {
+					t.Fatal("replay retained trust or lost replay protection")
+				}
+			}
+		})
+	}
+}
+
+func TestIssuerAcceptsNewerDurableGeneration(t *testing.T) {
+	for _, invalidated := range []bool{false, true} {
+		t.Run(map[bool]string{false: "accepted trust", true: "invalidated trust"}[invalidated], func(t *testing.T) {
+			r, now := testKeyring(t)
+			runKeys(t, r)
+			lagged := Assemble(r.Config, r.Client, r.APIReader).Keyring
+			lagged.Now = r.Now
+			runKeys(t, lagged)
+			accepted, roots := lagged.Trust.bundle, lagged.Trust.roots
+			highWater, digest, confirmed := lagged.Trust.highWater, lagged.Trust.digest, lagged.Trust.confirmed
+			_, _, initial, _ := keyState(t, r)
+			*now = initial.NextRotation
+
+			runKeys(t, r)
+			_, _, staged, _ := keyState(t, r)
+			*now = staged.ActivateAt
+
+			runKeys(t, r)
+
+			_, current, active, material := keyState(t, r)
+			if current.Generation <= highWater || active.ActiveIssuer == initial.ActiveIssuer {
+				t.Fatal("fixture did not advance durable issuer")
+			}
+
+			if invalidated {
+				lagged.Trust.invalidate()
+
+				accepted, roots = nil, nil
+			}
+
+			identity, request, _ := issuanceRequest(t, lagged)
+
+			encoded, err := testIssuer(lagged).Issue(t.Context(), identity, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			response := decodeIssuedResponse(t, encoded)
+			if !bytes.Equal(response.CertificateChain[1], material.Keys[active.ActiveIssuer].Certificate) {
+				t.Fatal("lagged issuer did not use newer durable credentials")
+			}
+
+			if lagged.Trust.bundle != accepted || lagged.Trust.roots != roots || lagged.Trust.highWater != highWater || lagged.Trust.digest != digest || lagged.Trust.confirmed != confirmed || trustReady(lagged.Trust) == invalidated {
+				t.Fatal("issuance installed or renewed serving trust")
+			}
+		})
+	}
+}
+
 func TestIssuerConcurrentIssuanceAndReconciliation(t *testing.T) {
 	r, _ := testKeyring(t)
 	issuer := testIssuer(r)

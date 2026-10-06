@@ -217,6 +217,10 @@ func (i *issuer) loadSigning(ctx context.Context, now time.Time) (signingState, 
 	}
 
 	state, err := loadSigning(ctx, i.APIReader, i.runtimeConfig(), now)
+	if err == nil && i.Trust != nil {
+		err = i.Trust.checkReplay(state.bundle)
+	}
+
 	if shouldInvalidateTrust(err) {
 		i.Trust.invalidate()
 	}
