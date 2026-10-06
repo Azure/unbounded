@@ -1,5 +1,16 @@
 # Racer next library boundaries
 
+## Concurrent extraction reconciliation (2026-10-06)
+
+The current ownership and measured results are recorded in
+[the reconciled scope audit](racer-extraction-scope-audit.md). The extraction now
+coexists with the newer controlplane and durable enrollment owners; older
+publication/enrollment proposals below must not restore superseded adapters or
+weaken shared identity validation. Generic mechanisms and their associated test
+moves are complete, while domain policy and application integration tests remain
+intentional application ownership. Net workspace Rust source grew, as quantified
+in the audit; application directory shrinkage alone is not a complexity claim.
+
 Current source references include the generic controlplane and durable enrollment
 extractions; deferred library extractions below remain separate decisions. These navigation updates do
 not claim that historical validation or performance measurements were rerun.
