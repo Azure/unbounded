@@ -227,7 +227,7 @@ impl TestIdentity {
     }
 
     /// Borrow the certificate and key without copying sensitive bytes.
-    fn borrowed(&self) -> Identity<'_> {
+    pub(crate) fn borrowed(&self) -> Identity<'_> {
         Identity {
             certificate_chain: &self.chain,
             private_key: &self.key,
