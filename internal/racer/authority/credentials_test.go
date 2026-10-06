@@ -262,6 +262,7 @@ func TestCredentialsStalePreparationReplacementIsAtomic(t *testing.T) {
 				}
 			}
 
+			bundle.Generation++
 			writeSigningCredentials(t, r, bundle, state, material)
 			before, _, _, _ := keyState(t, r)
 
@@ -405,6 +406,120 @@ func TestKeyringReplayProtectionSurvivesInvalidation(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestCredentialReplayRejectedBeforeMutation(t *testing.T) {
+	for _, replay := range []string{"rollback", "conflicting generation"} {
+		for _, invalidate := range []bool{false, true} {
+			for _, transition := range []string{"admission", "rotation"} {
+				t.Run(fmt.Sprintf("%s/invalidated=%t/%s", replay, invalidate, transition), func(t *testing.T) {
+					r, now := testKeyring(t)
+					runKeys(t, r)
+					secret, bundle, state, _ := keyState(t, r)
+					bundle.Generation = 2
+
+					var err error
+
+					secret.Data["bundle.json"], err = wire.EncodeBundle(bundle)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if err := r.Update(t.Context(), secret); err != nil {
+						t.Fatal(err)
+					}
+
+					runKeys(t, r)
+					highWater, digest := r.Trust.highWater, r.Trust.digest
+
+					secret, bundle, _, _ = keyState(t, r)
+					if replay == "rollback" {
+						bundle.Generation--
+					} else {
+						key := bundle.CacheKeys[0]
+
+						bundle.CacheKeys[0], err = wire.NewCacheKey(key.Key, key.State, [32]byte{1})
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+
+					secret.Data["bundle.json"], err = wire.EncodeBundle(bundle)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if err := r.Update(t.Context(), secret); err != nil {
+						t.Fatal(err)
+					}
+
+					if invalidate {
+						if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !errors.Is(err, wire.Conflict) {
+							t.Fatalf("idle replay not rejected: %v", err)
+						}
+					}
+
+					if transition == "rotation" {
+						*now = state.NextRotation
+					} else {
+						volume := catalogVolume("added", testOtherUID)
+						if err := r.Create(t.Context(), &volume); err != nil {
+							t.Fatal(err)
+						}
+					}
+
+					before := secret.DeepCopy()
+					writes := 0
+					r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+						writes++
+						return c.Update(ctx, obj, opts...)
+					}})
+
+					_, err = r.Reconcile(t.Context(), ctrl.Request{})
+					if !errors.Is(err, wire.Conflict) || writes != 0 {
+						t.Fatalf("replay must fail before mutation: err=%v writes=%d", err, writes)
+					}
+
+					after, _, _, _ := keyState(t, r)
+					if !reflect.DeepEqual(before.Data, after.Data) || before.ResourceVersion != after.ResourceVersion {
+						t.Fatal("replay changed durable credentials")
+					}
+
+					if trustReady(r.Trust) || r.Trust.highWater != highWater || r.Trust.digest != digest {
+						t.Fatal("replay restored trust or changed replay protection")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCredentialReconcileAcceptsNewerDurableGeneration(t *testing.T) {
+	r, _ := testKeyring(t)
+	runKeys(t, r)
+	lagged := Assemble(r.Config, r.Client, r.APIReader).Keyring
+	runKeys(t, lagged)
+
+	volume := catalogVolume("added", testOtherUID)
+	if err := r.Create(t.Context(), &volume); err != nil {
+		t.Fatal(err)
+	}
+
+	runKeys(t, r)
+
+	if lagged.Trust.highWater != 1 || r.Trust.highWater != 2 {
+		t.Fatal("fixture did not leave a lagged replica")
+	}
+
+	if err := r.Delete(t.Context(), &volume); err != nil {
+		t.Fatal(err)
+	}
+
+	runKeys(t, lagged)
+
+	if lagged.Trust.highWater != 3 || !trustReady(lagged.Trust) {
+		t.Fatal("lagged replica could not reconcile newer durable state")
 	}
 }
 

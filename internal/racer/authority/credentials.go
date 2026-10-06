@@ -139,6 +139,12 @@ func (r *credentials) reconcileKeys(ctx context.Context) (ctrl.Result, error) {
 		return ctrl.Result{}, err
 	}
 
+	if r.Trust != nil {
+		if err := r.Trust.checkReplay(credentials.bundle); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	catalog, err = admitCatalog(ctx, cfg, catalog, credentials.bundle)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -771,6 +777,24 @@ type acceptedKeyring struct {
 
 func (*acceptedKeyring) String() string   { return "<redacted keyring>" }
 func (*acceptedKeyring) GoString() string { return "<redacted keyring>" }
+
+func (t *trustStore) checkReplay(bundle wire.KeyringBundle) error {
+	encoded, err := wire.EncodeBundle(bundle)
+	if err != nil {
+		return err
+	}
+
+	digest := sha256.Sum256(encoded)
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if bundle.Generation < t.highWater || bundle.Generation == t.highWater && digest != t.digest {
+		return wire.Conflict
+	}
+
+	return nil
+}
 
 func (t *trustStore) install(ctx context.Context, roots *x509.CertPool, bundle wire.KeyringBundle) error {
 	encoded, err := wire.EncodeBundle(bundle)
