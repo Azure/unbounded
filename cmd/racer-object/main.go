@@ -25,7 +25,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go/logging"
-	"golang.org/x/net/netutil"
 	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/internal/racerobject"
@@ -414,7 +413,7 @@ func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handl
 
 	finished := make(chan error, 1)
 
-	go func() { finished <- server.Serve(netutil.LimitListener(listener, 128)) }()
+	go func() { finished <- server.Serve(limitSidecarListener(listener, 128)) }()
 
 	select {
 	case err := <-finished:
