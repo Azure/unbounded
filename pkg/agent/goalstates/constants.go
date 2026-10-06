@@ -88,12 +88,6 @@ func AppliedConfigPath(machineName string) string {
 	return fmt.Sprintf("%s/%s-applied-config.json", AgentConfigDir, machineName)
 }
 
-// ContainerImageArchivePath returns the path inside the nspawn machine where a
-// preloaded container image archive is staged before importing into containerd.
-func ContainerImageArchivePath(index int) string {
-	return fmt.Sprintf("%s/image-%d.tar", ContainerImageArchiveDir, index)
-}
-
 func KubeProxyImage(kubernetesVersion string) string {
 	kubernetesVersion = strings.TrimSpace(kubernetesVersion)
 	if kubernetesVersion == "" {
@@ -182,7 +176,6 @@ const (
 	KubeletConfigurationPath       = "/var/lib/kubelet/config.yaml"
 	KubeletKubeconfigPath          = "/var/lib/kubelet/kubeconfig"
 	KubeletBootstrapKubeconfigPath = "/var/lib/kubelet/bootstrap-kubeconfig"
-	KubeletPKIDir                  = "/etc/kubernetes/pki"
 	KubeletAPIServerCACertPath     = "/etc/kubernetes/pki/apiserver-client-ca.crt"
 	KubeletServiceDropInDir        = "/etc/systemd/system/kubelet.service.d"
 	KubeletStaticPodManifestsDir   = "/etc/kubernetes/manifests"

@@ -110,11 +110,6 @@ func checkIsPrivilegedUser(log *slog.Logger, deps hostCheckDeps) preflight.Check
 	}}
 }
 
-// CheckHostPackages verifies all required host packages are already installed.
-func CheckHostPackages(log *slog.Logger) preflight.Checker {
-	return checkHostPackages(log, false, defaultHostCheckDeps())
-}
-
 func checkHostPackages(log *slog.Logger, failMissing bool, deps hostCheckDeps) preflight.Checker {
 	return simpleHostChecker{name: checkHostPackagesName, check: func(ctx context.Context) []preflight.Result {
 		pm, err := deps.detectPackageManager(deps.lookupPath)

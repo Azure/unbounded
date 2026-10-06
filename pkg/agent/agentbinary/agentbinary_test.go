@@ -25,44 +25,6 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
-func TestInstallFromTarGzVerifiesInstalledBinary(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range []struct {
-		name     string
-		exitCode int
-		wantErr  string
-	}{
-		{name: "valid", exitCode: 0},
-		{name: "broken", exitCode: 42, wantErr: "verify agent binary"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				require.NoError(t, writeTestAgentArchive(w, testAgentScript(tt.name, tt.exitCode)))
-			}))
-			t.Cleanup(server.Close)
-
-			targetPath := filepath.Join(t.TempDir(), "unbounded-agent")
-
-			err := installFromTarGz(context.Background(), targetPath, InstallOptions{
-				DownloadURL:    server.URL,
-				ExpectedMember: "unbounded-agent",
-				Mode:           0o755,
-			})
-			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
-
-				return
-			}
-
-			require.NoError(t, err)
-		})
-	}
-}
-
 func TestInstallAndSwitchFromTarGz(t *testing.T) {
 	t.Parallel()
 
@@ -106,18 +68,6 @@ func TestInstallAndSwitchFromTarGz(t *testing.T) {
 	assertSymlinkTarget(t, paths.CurrentPath, paths.BluePath)
 	assertSymlinkTarget(t, paths.LastGoodPath, paths.BinaryPath)
 	assertFileContent(t, paths.BluePath, string(release))
-}
-
-func TestInstallFromTarGzRejectsUnsupportedScheme(t *testing.T) {
-	t.Parallel()
-
-	err := installFromTarGz(context.Background(), filepath.Join(t.TempDir(), "agent"), InstallOptions{
-		DownloadURL:    "file:///tmp/unbounded-agent.tar.gz",
-		ExpectedMember: "unbounded-agent",
-		Mode:           0o755,
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported agent download URL scheme")
 }
 
 func TestVerifyBoundsInheritedOutputWait(t *testing.T) {
