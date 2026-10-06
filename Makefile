@@ -9,6 +9,7 @@ RACER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 RACER_CLUSTER_ID ?=
 RACER_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controller:$(VERSION_TAG)
 RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
+RACER_OBJECT_IMAGE ?= $(CONTAINER_REGISTRY)/racer-object:$(VERSION_TAG)
 # Rust dataplane packaging is independent of the Go controller scaffold.
 RACER_CARGO ?= cargo
 RACER_DATAPLANE_BIN ?= bin/racer-dataplane
@@ -253,7 +254,7 @@ REACT_DEV ?= false
 
 ##@ General
 
-all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry racer-object ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -379,6 +380,10 @@ help: ## Show this help
 	@echo ""
 	@echo "Racer:"
 	@echo "  racer-controller-build           Build the Go controller"
+	@echo "  racer-object                     Test and build the S3 read adapter"
+	@echo "  racer-object-build               Build the S3 read adapter without tests"
+	@echo "  racer-object-test                Test the S3 read adapter and deployment examples"
+	@echo "  image-racer-object-local         Build the S3 read adapter image locally"
 	@echo "  racer-test | racer-generate | racer-manifests  Test/generate/render Racer artifacts"
 	@echo "  racer-dataplane-build             Build the locked Rust release binary into bin/"
 	@echo "  racer-dataplane-test              Run Rust unit and helper integration tests (RACER_TEST_ARGS)"
@@ -589,6 +594,24 @@ racer-controller: racer-server-test racer-controller-build ## Test and build the
 racer-controller-build: ## Build the Racer controller without lint/test
 	@mkdir -p bin
 	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controller ./cmd/racer-controller
+
+.PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
+racer-object: racer-object-test racer-object-build ## Test and build the S3 read adapter
+
+racer-object-build: ## Build the S3 read adapter without lint/test
+	@mkdir -p bin
+	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-object ./cmd/racer-object
+
+racer-object-test: ## Test the S3 read adapter and deployment examples
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m ./cmd/racer-object/... ./internal/racerobject/... ./deploy/racer-object/...
+
+image-racer-object-local: ## Build the S3 read adapter image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION="$(VERSION)" --build-arg GIT_COMMIT="$(GIT_COMMIT)" \
+		--build-arg BUILD_TIME="$(BUILD_TIME)" \
+		-t racer-object:$(VERSION_TAG) -t $(RACER_OBJECT_IMAGE) \
+		-f ./images/racer-object/Dockerfile .
+	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
 
 .PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-dst racer-dataplane-dst-10m racer-dataplane-contention racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
 racer-dataplane-test: ## Run Rust unit and helper integration tests with all features (RACER_TEST_ARGS)
