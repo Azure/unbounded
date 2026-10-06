@@ -5,13 +5,82 @@ package racersdk
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+func TestStreamingBufferedCompleteWithoutFinalCredit(t *testing.T) {
+	started, closed, peerDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	writeResult := make(chan error, 1)
+	c := rawSubscriptionClient(t, func(conn net.Conn, _ *bufio.Reader, _ []byte) {
+		defer close(peerDone)
+
+		var all bytes.Buffer
+		all.WriteString(subscriptionHead(3, 0, 3))
+		_ = fakeSubscriptionFrame(&all, 1, 0, 0, 3)
+		all.WriteString("abc")
+		_ = fakeSubscriptionFrame(&all, 2, 1, 3, 0)
+		_, _ = conn.Write(all.Bytes())
+
+		<-closed
+	})
+	c.config.BodyReadTimeout = time.Minute
+	poolConfig := c.bulk.config
+	dial := poolConfig.Dial
+	poolConfig.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dial(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+
+		return &finalCreditBlockedConn{Conn: conn, started: started, closed: closed, writeResult: writeResult}, nil
+	}
+	c.configurePools(poolConfig)
+
+	v, err := c.GetStreaming(t.Context(), Request{}, ReadOptions{PageCredits: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
+
+	if v.stream.conn.Reader.Buffered() != 45 {
+		t.Fatal("fixture did not read ahead")
+	}
+
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+
+	var n int64
+
+	go func() {
+		defer close(done)
+
+		n, err = v.WriteToHTTP(w)
+	}()
+
+	defer func() {
+		closeBody(v)
+		orderedWait(t, done)
+		orderedWait(t, peerDone)
+	}()
+
+	orderedWait(t, done)
+	orderedWait(t, peerDone)
+
+	if err != nil || n != 3 || w.Body.String() != "abc" {
+		t.Fatal("buffered Complete waited for final credit", n, w.Body.String(), err)
+	}
+
+	if c.Stats().BytesRead != 3 || c.Stats().ActiveBulk != 0 || len(c.copySlots) != 0 || v.stream.bytesHeld != 0 || len(v.stream.outstanding) != 0 {
+		t.Fatal("retained admission or final credit accounting", c.Stats())
+	}
+}
 
 func TestStreamingFinalCreditOrderings(t *testing.T) {
 	for _, ordering := range []string{"complete first", "credit first"} {

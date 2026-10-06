@@ -1442,7 +1442,10 @@ func TestBodyReadTimeoutDoesNotBoundCallerThinkTime(t *testing.T) {
 
 func TestStreamingReadAhead(t *testing.T) {
 	// Deliver headers, payload, and Complete in a single read-ahead buffer.
+	peerDone := make(chan struct{})
 	c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
+		defer close(peerDone)
+
 		var all bytes.Buffer
 		all.WriteString(subscriptionHead(3, 0, 3))
 		_ = fakeSubscriptionFrame(&all, 1, 0, 0, 3)
@@ -1450,14 +1453,29 @@ func TestStreamingReadAhead(t *testing.T) {
 		_ = fakeSubscriptionFrame(&all, 2, 1, 3, 0)
 		_, _ = conn.Write(all.Bytes())
 
-		orderedRelease(t, reader, 0, 3)
+		// Complete ends the subscription without requiring final credit. If
+		// credit wins the race with closure, it must still be exact.
+		var credit [12]byte
+
+		n, err := io.ReadFull(reader, credit[:])
+		if n == 0 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe)) {
+			return
+		}
+
+		if err != nil || binary.BigEndian.Uint64(credit[:8]) != 0 || binary.BigEndian.Uint32(credit[8:]) != 3 {
+			t.Error("incorrect final credit", credit, err)
+		}
 	})
 
 	v, err := c.GetStreaming(t.Context(), Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer closeBody(v)
+
+	defer func() {
+		closeBody(v)
+		orderedWait(t, peerDone)
+	}()
 
 	if v.stream.conn.Reader.Buffered() != 45 {
 		t.Fatal("fixture did not read ahead")
@@ -1471,6 +1489,8 @@ func TestStreamingReadAhead(t *testing.T) {
 	if c.Stats().BytesRead != 3 {
 		t.Fatal(c.Stats())
 	}
+
+	orderedWait(t, peerDone)
 }
 
 func TestStreamingShortWritesAndBodyDeadline(t *testing.T) {
