@@ -5,6 +5,7 @@ package racersdk
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -312,6 +313,219 @@ func TestOriginOperationsAndReuse(t *testing.T) {
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatal("socket retained")
 	}
+}
+
+func TestOriginInterruptedPipelinedHead(t *testing.T) {
+	for _, split := range []int{1, 20, 110, 114} {
+		t.Run(strconv.Itoa(split), func(t *testing.T) {
+			testOriginInterruptedPipelinedHead(t, split, "Authorization: secret\r\n", http.StatusOK)
+		})
+	}
+
+	t.Run("malformed", func(t *testing.T) {
+		testOriginInterruptedPipelinedHead(t, 110, "Authorization: secret \r\n", http.StatusBadRequest)
+	})
+	t.Run("oversized", func(t *testing.T) {
+		testOriginInterruptedPipelinedHead(t, maxHeadBytes-1, "X: "+strings.Repeat("x", maxHeadBytes)+"\r\n", http.StatusRequestHeaderFieldsTooLarge)
+	})
+}
+
+func testOriginInterruptedPipelinedHead(t *testing.T, split int, fields string, status int) {
+	t.Helper()
+
+	entered, release := make(chan struct{}), make(chan struct{})
+
+	var calls atomic.Int32
+
+	path, cancel, done := startOrigin(t, OriginConfig{}, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return Metadata{}, nil, ctx.Err()
+			}
+		}
+
+		return originMeta(0), nil, nil
+	})
+
+	defer func() { cancel(); <-done }()
+
+	conn := originDial(t, path)
+	_, err := conn.Write(rawRequest("HEAD", ""))
+	require.NoError(t, err)
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first callback did not start")
+	}
+
+	second := rawRequest("HEAD", fields)
+	require.Less(t, split, len(second))
+	_, err = conn.Write(second[:split])
+	require.NoError(t, err)
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	reader := bufio.NewReader(conn)
+	response, err := http.ReadResponse(reader, &http.Request{Method: "HEAD"})
+	require.NoError(t, err)
+	closeBody(response.Body)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	time.Sleep(20 * time.Millisecond)
+
+	_, err = conn.Write(second[split:])
+	require.NoError(t, err)
+	response, err = http.ReadResponse(reader, &http.Request{Method: "HEAD"})
+	require.NoError(t, err)
+	closeBody(response.Body)
+	require.Equal(t, status, response.StatusCode)
+
+	if status == http.StatusOK {
+		require.EqualValues(t, 2, calls.Load())
+	} else {
+		require.Zero(t, response.ContentLength)
+		require.True(t, response.Close)
+		require.EqualValues(t, 1, calls.Load())
+	}
+}
+
+func TestOriginPipelinedHeadTimeout(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+
+	var calls atomic.Int32
+
+	path, cancel, done := startOrigin(t, OriginConfig{ReadHeaderTimeout: 100 * time.Millisecond}, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
+		calls.Add(1)
+		close(entered)
+
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return Metadata{}, nil, ctx.Err()
+		}
+
+		return originMeta(0), nil, nil
+	})
+
+	defer func() { cancel(); <-done }()
+
+	conn := originDial(t, path)
+	_, err := conn.Write(rawRequest("HEAD", ""))
+	require.NoError(t, err)
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first callback did not start")
+	}
+
+	_, err = io.WriteString(conn, "HEAD ")
+	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	reader := bufio.NewReader(conn)
+	for _, status := range []int{http.StatusOK, http.StatusBadRequest} {
+		response, err := http.ReadResponse(reader, &http.Request{Method: "HEAD"})
+		require.NoError(t, err)
+		closeBody(response.Body)
+		require.Equal(t, status, response.StatusCode)
+
+		if status == http.StatusBadRequest {
+			require.Zero(t, response.ContentLength)
+			require.True(t, response.Close)
+		}
+	}
+
+	require.EqualValues(t, 1, calls.Load())
+}
+
+func TestOriginHeadRepeatedInterruptions(t *testing.T) {
+	server, client := net.Pipe()
+	defer closeBody(server)
+	defer closeBody(client)
+
+	require.NoError(t, client.SetDeadline(time.Now().Add(3*time.Second)))
+
+	c := &originConn{Conn: server, config: OriginConfig{ReadHeaderTimeout: time.Second}}
+	wire := rawRequest("HEAD", "Authorization: secret\r\n")
+
+	var deadline time.Time
+
+	for i, end := range []int{1, 20, len(wire) - 1} {
+		result := make(chan error, 1)
+		start := len(c.raw)
+
+		go func() {
+			var one [1]byte
+
+			n, err := c.Read(one[:])
+			if n != 0 {
+				err = fmt.Errorf("interrupted read returned %d bytes", n)
+			}
+
+			result <- err
+		}()
+
+		_, err := client.Write(wire[start:end])
+		require.NoError(t, err)
+		require.NoError(t, c.SetReadDeadline(time.Unix(1, 0)))
+
+		select {
+		case err := <-result:
+			var timeout net.Error
+			require.ErrorAs(t, err, &timeout)
+			require.True(t, timeout.Timeout())
+		case <-time.After(time.Second):
+			t.Fatal("read did not abort")
+		}
+
+		require.Equal(t, wire[:end], c.raw)
+		require.Empty(t, c.pending)
+		require.False(t, c.failed)
+
+		if i == 0 {
+			deadline = c.headerDeadline
+		} else {
+			require.Equal(t, deadline, c.headerDeadline)
+		}
+
+		require.NoError(t, c.SetReadDeadline(time.Time{}))
+	}
+
+	c.reader = bufio.NewReader(io.MultiReader(bytes.NewReader(wire[len(c.raw):]), server))
+	buffer := make([]byte, maxHeadBytes)
+	n, err := c.Read(buffer)
+	require.NoError(t, err)
+	require.Equal(t, wire, buffer[:n])
+	require.Len(t, c.pending, 1)
+	require.NoError(t, c.takeHead().err)
+	require.Empty(t, c.raw)
+}
+
+func TestOriginInterruptedHeadExpiredWithBufferedRemainder(t *testing.T) {
+	server, client := net.Pipe()
+	defer closeBody(server)
+	defer closeBody(client)
+
+	wire := rawRequest("HEAD", "")
+	c := &originConn{
+		Conn: server, first: true, config: OriginConfig{ReadHeaderTimeout: time.Second},
+		raw: wire[:1], reader: bufio.NewReader(bytes.NewReader(wire[1:])),
+		headerDeadline: time.Now().Add(-time.Millisecond),
+	}
+	buffer := make([]byte, maxHeadBytes)
+	_, err := c.Read(buffer)
+	require.NoError(t, err)
+	require.True(t, c.failed)
+	require.Len(t, c.pending, 1)
+	require.ErrorIs(t, c.takeHead().err, os.ErrDeadlineExceeded)
+	_, err = c.Read(buffer)
+	require.ErrorIs(t, err, io.EOF)
 }
 
 func TestOriginBodyContracts(t *testing.T) {

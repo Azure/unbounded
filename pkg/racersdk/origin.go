@@ -5,6 +5,7 @@ package racersdk
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -451,15 +452,18 @@ type originHead struct {
 
 type originConn struct {
 	net.Conn
-	config  OriginConfig
-	release func()
-	once    sync.Once
-	reader  *bufio.Reader
-	head    []byte
-	first   bool
-	mu      sync.Mutex
-	pending []originHead
-	failed  bool
+	config         OriginConfig
+	release        func()
+	once           sync.Once
+	reader         *bufio.Reader
+	head           []byte
+	first          bool
+	mu             sync.Mutex
+	pending        []originHead
+	failed         bool
+	raw            []byte
+	headerDeadline time.Time
+	interrupted    bool
 }
 
 // Close closes the socket and returns its admission slot exactly once.
@@ -468,6 +472,59 @@ func (c *originConn) Close() error {
 	c.once.Do(c.release)
 
 	return err
+}
+
+func (c *originConn) SetReadDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.interrupted = !deadline.IsZero() && deadline.Before(time.Now())
+
+	return c.Conn.SetReadDeadline(deadline)
+}
+
+func (c *originConn) setHeaderDeadline() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.interrupted {
+		return nil
+	}
+
+	return c.Conn.SetReadDeadline(c.headerDeadline)
+}
+
+func (c *originConn) readHead() ([]byte, error) {
+	for len(c.raw) < maxHeadBytes {
+		if !time.Now().Before(c.headerDeadline) {
+			return c.raw, os.ErrDeadlineExceeded
+		}
+
+		line, err := c.reader.ReadSlice('\n')
+		if len(line) > maxHeadBytes-len(c.raw) {
+			return c.raw, failure(ErrorHeaderLimit, "wire head", nil)
+		}
+
+		c.raw = append(c.raw, line...)
+
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+
+		if err != nil {
+			if err == io.EOF && len(c.raw) != 0 {
+				err = io.ErrUnexpectedEOF
+			}
+
+			return c.raw, err
+		}
+
+		if bytes.HasSuffix(c.raw, []byte("\r\n\r\n")) {
+			return c.raw, nil
+		}
+	}
+
+	return c.raw, failure(ErrorHeaderLimit, "wire head", nil)
 }
 
 // Read passes only validated canonical requests to net/http. Unknown fields are
@@ -492,23 +549,43 @@ func (c *originConn) Read(p []byte) (int, error) {
 		first := !c.first
 		if first {
 			c.first = true
-			if err := c.SetReadDeadline(time.Now().Add(c.config.ReadHeaderTimeout)); err != nil {
+
+			c.headerDeadline = time.Now().Add(c.config.ReadHeaderTimeout)
+			if err := c.setHeaderDeadline(); err != nil {
 				return 0, err
 			}
 		}
 
-		if _, err := c.reader.Peek(1); err != nil {
+		if len(c.raw) == 0 {
+			if _, err := c.reader.Peek(1); err != nil {
+				return 0, err
+			}
+
+			if !first {
+				c.headerDeadline = time.Now().Add(c.config.ReadHeaderTimeout)
+			}
+		}
+
+		if err := c.setHeaderDeadline(); err != nil {
 			return 0, err
 		}
 
-		if !first {
-			if err := c.SetReadDeadline(time.Now().Add(c.config.ReadHeaderTimeout)); err != nil {
-				return 0, err
+		raw, err := c.readHead()
+		at := time.Now()
+
+		if err != nil {
+			var timeout net.Error
+
+			c.mu.Lock()
+			interrupted := c.interrupted
+			c.mu.Unlock()
+
+			if errors.As(err, &timeout) && timeout.Timeout() && interrupted && at.Before(c.headerDeadline) {
+				return 0, timeout
 			}
 		}
 
-		raw, err := readHeadBytes(c.reader, false)
-		at := time.Now()
+		c.raw = nil
 
 		var request OriginRequest
 		if err == nil {
