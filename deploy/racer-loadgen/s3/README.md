@@ -1,5 +1,8 @@
 # Synthetic S3 benchmark
 
+For measured results, image pins, and known startup limitations, see the internal
+[October 6, 2026 benchmark report](../../../designs/racer-s3-benchmark-2026-10-06.md).
+
 This standalone Kustomize base replaces `DaemonSet/racer-loadgen` with two
 containers: an origin-only synthetic S3 server on 8080 (metrics on 9090), and
 `racer-object origin`. It preserves the existing immutable selector and
