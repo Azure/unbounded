@@ -673,16 +673,8 @@ fn profile_plan(io_shards: usize) -> racer_dataplane::worker::AffinityPlan {
 
 #[test]
 fn capped_profiles_count_io_shards_and_unique_crypto_threads() {
-    use racer_dataplane::config::Config;
     use racer_dataplane::worker::AffinityPlan;
-    let mut config = Config::from_lookup(|name| {
-        Ok(match name {
-            "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
-            "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
-            _ => None,
-        })
-    })
-    .unwrap();
+    let mut config = enrollment_io::default_config(CLUSTER);
     for (io, crypto, cap) in [(1, 1, 2), (2, 1, 3), (4, 2, 6)] {
         config.max_threads = profile_thread_cap(io);
         assert_eq!(config.max_threads, cap);

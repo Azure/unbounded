@@ -1,3 +1,5 @@
+// Shared production-default configuration, enrollment, and wire fixtures.
+
 use super::dataplane;
 use dataplane::admission::AdmissionPolicy;
 use dataplane::config::Limits;
@@ -8,6 +10,18 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
+
+/// Parse production defaults without ambient overrides or fixture-specific limits.
+pub fn default_config(cluster: &str) -> dataplane::config::Config {
+    dataplane::config::Config::from_lookup(|name| {
+        Ok(match name {
+            "RACER_CLUSTER_ID" => Some(cluster.into()),
+            "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
+            _ => None,
+        })
+    })
+    .unwrap()
+}
 
 pub fn reactor() -> Rc<Reactor> {
     let n = NonZeroUsize::new(1024 * 1024).unwrap();

@@ -1,9 +1,14 @@
 //! Observe the allocation at deallocation, before the system allocator can reuse it.
+/// Shared integration configuration and enrollment helpers.
+#[path = "support/enrollment.rs"]
+#[allow(dead_code)]
+mod fixture_io;
+
 use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
+use racer_dataplane as dataplane;
 use racer_dataplane::admission::AdmissionPolicy;
 use racer_dataplane::admission::ResourceClass;
-use racer_dataplane::config::Config;
 use racer_dataplane::memory::BufferPool;
 use racer_dataplane::model::CacheKey;
 use racer_dataplane::model::Nonce;
@@ -74,14 +79,7 @@ fn watch(pointer: *const u8) {
 
 #[test]
 fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
-    let config = Config::from_lookup(|name| {
-        Ok(match name {
-            "RACER_CLUSTER_ID" => Some("11111111-1111-4111-8111-111111111111".into()),
-            "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
-            _ => None,
-        })
-    })
-    .unwrap();
+    let config = fixture_io::default_config("11111111-1111-4111-8111-111111111111");
     let cache = CacheId("44444444-4444-4444-8444-444444444444".into());
     for ciphertext in [false, true] {
         for scenario in ["retained", "small", "full", "stopped", "destroyed"] {

@@ -1,11 +1,16 @@
 //! Cross-component ownership: real control decoding, application publication,
 //! immutable identity leases, and completion-retained page crypto work.
+/// Shared integration configuration and enrollment helpers.
+#[path = "support/enrollment.rs"]
+#[allow(dead_code)]
+mod fixture_io;
+
 use racer_control_wire as wire;
 use racer_control_wire::*;
 use racer_crypto::identity::BundleInstaller;
+use racer_dataplane as dataplane;
 use racer_dataplane::admission::AdmissionPolicy;
 use racer_dataplane::admission::ResourceClass;
-use racer_dataplane::config::Config;
 use racer_dataplane::error::Error;
 use racer_dataplane::memory::BufferPool;
 use racer_dataplane::model::CacheKey;
@@ -223,14 +228,7 @@ fn real_decode_installer_rotation_retained_lease_and_rejection_are_atomic() {
 fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease() {
     let (keys, installer, mut bundle) = fixture();
     let cache = CacheId(CACHE.into());
-    let config = Config::from_lookup(|name| {
-        Ok(match name {
-            "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
-            "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
-            _ => None,
-        })
-    })
-    .unwrap();
+    let config = fixture_io::default_config(CLUSTER);
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         config.limits,
     )));
