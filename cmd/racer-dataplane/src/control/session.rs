@@ -232,6 +232,16 @@ struct ObservedPublication {
     received: Rc<Cell<Option<(u64, u64)>>>,
 }
 
+/// Retain the newest receipt for diagnostics, including equal-sequence replacements.
+fn observe_receipt(received: &Cell<Option<(u64, u64)>>, document: &wire::Publication) {
+    if received
+        .get()
+        .is_none_or(|old| document.sequence.0 >= old.0)
+    {
+        received.set(Some((document.sequence.0, document.membership_version.0)));
+    }
+}
+
 impl Codec for ObservedPublication {
     type Document = wire::Publication;
 
@@ -253,14 +263,7 @@ impl Codec for ObservedPublication {
 
     fn digest(&self, document: &Self::Document) -> Result<String> {
         let digest = PublicationCodec.digest(document)?;
-        if self
-            .received
-            .get()
-            .is_none_or(|old| document.sequence.0 >= old.0)
-        {
-            self.received
-                .set(Some((document.sequence.0, document.membership_version.0)));
-        }
+        observe_receipt(&self.received, document);
         Ok(digest)
     }
 }
@@ -282,14 +285,7 @@ impl Target<ObservedPublication> for PublicationInstall {
         document: Arc<wire::Publication>,
     ) -> Result<Preparation<Self::Prepared, Error>> {
         self.auth.check()?;
-        if self
-            .received
-            .get()
-            .is_none_or(|old| document.sequence.0 >= old.0)
-        {
-            self.received
-                .set(Some((document.sequence.0, document.membership_version.0)));
-        }
+        observe_receipt(&self.received, &document);
         self.target.prepare(document)
     }
 
@@ -917,6 +913,27 @@ pub(super) mod tests {
         future::Future,
         task::{Context, Poll},
     };
+
+    /// Receipts never regress by sequence and remain independent of acceptance.
+    #[test]
+    fn receipt_observation_preserves_equal_sequence_and_reset_behavior() {
+        let received = Cell::new(None);
+        for (sequence, membership, expected) in [
+            (10, 1, (10, 1)),
+            (9, 2, (10, 1)),
+            (10, 3, (10, 3)),
+            (11, 4, (11, 4)),
+        ] {
+            let mut publication = document(sequence);
+            publication.membership_version.0 = membership;
+            observe_receipt(&received, &publication);
+            assert_eq!(received.get(), Some(expected));
+        }
+        received.set(None);
+        let publication = document(1);
+        observe_receipt(&received, &publication);
+        assert_eq!(received.get(), Some((1, publication.membership_version.0)));
+    }
 
     /// Scripted wire boundary; real Feed/Sync still owns all protocol progress.
     struct Script {

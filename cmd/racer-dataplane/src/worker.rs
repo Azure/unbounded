@@ -381,17 +381,12 @@ impl WorkerGroup {
         // Allocate every endpoint before spawning even the coordinator. Panics
         // in caller policy and fallible queue allocation have identical rollback.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let limits = factory.limits();
-            let mut ports = Vec::new();
-            for pair in &self.plan.pairs {
-                let (io, crypto) = allocate(pair.worker, self.generation, limits.queue_entries)?;
-                ports.push(Mutex::new((Some(io), Some(crypto))));
-            }
-            Ok(Resources {
-                limits,
-                workers: self.plan.pairs.iter().map(|p| p.worker).collect(),
-                ports,
-            })
+            Resources::with_allocator(
+                factory.limits(),
+                self.plan.pairs.iter().map(|pair| pair.worker).collect(),
+                self.generation,
+                &mut allocate,
+            )
         }))
         .unwrap_or(Err(Error::Io))
     }
@@ -536,13 +531,32 @@ fn runtime_plan(plan: &AffinityPlan) -> Plan {
         max_threads: plan.max_threads,
     }
 }
+/// One-shot paired endpoints retained until their owning services are constructed.
 pub struct Resources {
     limits: Limits,
+
     workers: Vec<WorkerId>,
+
     ports: Vec<Mutex<(Option<IoCryptoPort>, Option<CryptoPort>)>>,
 }
+
 impl Resources {
+    /// Allocate all paired endpoints before any service thread starts.
     pub fn new(limits: Limits, workers: Vec<WorkerId>, generation: u64) -> Result<Self> {
+        Self::with_allocator(limits, workers, generation, security::try_pair)
+    }
+
+    /// Share transactional endpoint construction with fault-injected startup tests.
+    fn with_allocator(
+        limits: Limits,
+        workers: Vec<WorkerId>,
+        generation: u64,
+        mut allocate: impl FnMut(
+            WorkerId,
+            u64,
+            std::num::NonZeroUsize,
+        ) -> Result<(IoCryptoPort, CryptoPort)>,
+    ) -> Result<Self> {
         let mut unique = HashSet::new();
         if workers.is_empty() || workers.iter().any(|worker| !unique.insert(*worker)) {
             return Err(Error::InvalidConfiguration);
@@ -552,7 +566,7 @@ impl Resources {
             .try_reserve_exact(workers.len())
             .map_err(|_| Error::Overloaded)?;
         for worker in &workers {
-            let (io, crypto) = security::try_pair(*worker, generation, limits.queue_entries)?;
+            let (io, crypto) = allocate(*worker, generation, limits.queue_entries)?;
             ports.push(Mutex::new((Some(io), Some(crypto))));
         }
         Ok(Self {
@@ -561,6 +575,7 @@ impl Resources {
             ports,
         })
     }
+
     pub fn abandon_lane(&self, lane: usize) -> Result<()> {
         if let Some(port) = self
             .ports
@@ -780,6 +795,74 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
 mod tests {
     use super::*;
     use racer_control_wire::CacheId;
+
+    /// Validate before allocation and stop at the first failed endpoint pair.
+    #[test]
+    fn endpoint_allocator_preserves_order_generation_and_failure_boundary() {
+        let limits = crate::test_support::cluster::config(false).limits;
+        for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
+            assert!(matches!(
+                Resources::with_allocator(limits.clone(), workers, 9, |_, _, _| {
+                    panic!("invalid worker set reached allocator")
+                }),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        for fail in [false, true] {
+            let mut calls = Vec::new();
+            let result = Resources::with_allocator(
+                limits.clone(),
+                vec![WorkerId(7), WorkerId(3), WorkerId(9)],
+                42,
+                |worker, generation, capacity| {
+                    calls.push(worker);
+                    assert_eq!(generation, 42);
+                    assert_eq!(capacity, limits.queue_entries);
+                    if fail && worker == WorkerId(3) {
+                        return Err(Error::Overloaded);
+                    }
+                    security::try_pair(worker, generation, capacity)
+                },
+            );
+            if fail {
+                assert!(matches!(result, Err(Error::Overloaded)));
+                assert_eq!(calls, vec![WorkerId(7), WorkerId(3)]);
+            } else {
+                let resources = result.unwrap();
+                assert_eq!(calls, resources.workers);
+                assert_eq!(calls, vec![WorkerId(7), WorkerId(3), WorkerId(9)]);
+                assert_eq!(resources.ports.len(), 3);
+            }
+        }
+    }
+
+    /// A later failure drops previously allocated I/O endpoints, closing their peers.
+    #[test]
+    fn endpoint_allocator_failure_releases_earlier_ports() {
+        let limits = crate::test_support::cluster::config(false).limits;
+        let mut retained_peer = None;
+        let result = Resources::with_allocator(
+            limits,
+            vec![WorkerId(0), WorkerId(1)],
+            42,
+            |worker, generation, capacity| {
+                if worker == WorkerId(1) {
+                    return Err(Error::Overloaded);
+                }
+                let (io, peer) = security::try_pair(worker, generation, capacity)?;
+                retained_peer = Some(peer);
+                // Keep the real peer as a drop observer; no service uses the substitute.
+                let (_, substitute) = security::try_pair(worker, generation, capacity)?;
+                Ok((io, substitute))
+            },
+        );
+        assert!(matches!(result, Err(Error::Overloaded)));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(
+            retained_peer.unwrap().poll_job(&mut cx),
+            Poll::Ready(Ok(None))
+        ));
+    }
 
     #[test]
     fn io_wait_forwards_and_observes_post_poll_policy() {
