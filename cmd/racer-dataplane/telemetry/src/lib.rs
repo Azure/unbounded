@@ -442,7 +442,6 @@ pub mod metrics {
         ($kind:ident, $all:ident, $count:ident; $(Self::$variant:ident => $name:literal,)*) => {
             #[doc = "Fixed metric identifiers in registry index order."]
             #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-            #[repr(usize)]
             pub enum $kind { $(#[doc = $name] $variant,)* }
 
             /// Number of metrics in this schema.
