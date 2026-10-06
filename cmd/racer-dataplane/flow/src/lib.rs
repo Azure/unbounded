@@ -1080,9 +1080,11 @@ mod quota_tests {
         }
     }
 
+    type TestBufferPool = Arc<Mutex<Vec<(Vec<u8>, Charge<TestPolicy>)>>>;
+
     /// Checks recycler lock availability during a synchronous charge wake.
     struct PoolWake {
-        buffers: Arc<Mutex<Vec<(Vec<u8>, Charge<TestPolicy>)>>>,
+        buffers: TestBufferPool,
 
         unlocked: Arc<AtomicBool>,
     }
