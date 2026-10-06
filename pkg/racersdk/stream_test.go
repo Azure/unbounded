@@ -844,7 +844,7 @@ func TestPageStreamCallerFailureReleasesOwnership(t *testing.T) {
 
 	failed := errors.New("destination failed")
 
-	_, err = (writeFunc(func([]byte) (int, error) { return 0, failed })).Write(p.Data)
+	_, err = writeFunc(func([]byte) (int, error) { return 0, failed }).Write(p.Data)
 	if !errors.Is(err, failed) {
 		t.Fatal(err)
 	}

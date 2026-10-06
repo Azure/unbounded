@@ -536,6 +536,7 @@ func fromWireError(err error) error {
 }
 
 func (r Range) wire() wire.Range { return wire.Range{Present: r.present, First: r.first, Last: r.last} }
+
 func fromWireRange(r wire.Range) Range {
 	return Range{present: r.Present, first: r.First, last: r.Last}
 }

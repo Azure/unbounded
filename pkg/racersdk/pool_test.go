@@ -1593,7 +1593,7 @@ func TestRustSubscriptionInterop(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		n, err := (writeFunc(func([]byte) (int, error) { return 0, sentinel })).Write(page.Data)
+		n, err := writeFunc(func([]byte) (int, error) { return 0, sentinel }).Write(page.Data)
 		if n != 0 || !errors.Is(err, sentinel) {
 			t.Fatal(n, err)
 		}
