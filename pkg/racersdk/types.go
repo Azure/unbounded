@@ -27,7 +27,7 @@ const (
 // Key identifies an object. Every value, including zero, is valid.
 type Key [32]byte
 
-// ParseKey parses a 64-character hexadecimal object key.
+// ParseKey parses a 64-character lowercase hexadecimal object key.
 func ParseKey(s string) (Key, error) {
 	key, err := wire.ParseKey(s)
 	return Key(key), fromWireError(err)

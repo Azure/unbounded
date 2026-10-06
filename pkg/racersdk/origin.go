@@ -680,7 +680,7 @@ func (b *onceBody) close() {
 	})
 }
 
-// Retain at most 2 MiB across origin servers. Active buffers remain owned by the
+// Retain at most 16 MiB across origin servers. Active buffers remain owned by the
 // admitted callback until copying returns, including noncooperative readers.
 var originCopyBuffers = make(chan *[copyBufferSize]byte, 64)
 

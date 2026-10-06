@@ -49,7 +49,9 @@ type ClientConfig struct {
 	QueueTimeout time.Duration
 	// DialTimeout bounds each Unix dial (default 5 seconds).
 	DialTimeout time.Duration
-	// ResponseHeaderTimeout starts after request headers are written (default 60 seconds).
+	// ResponseHeaderTimeout bounds request writes and response headers (default 60 seconds).
+	// Subscriptions share one deadline for both; Stat starts a fresh header deadline
+	// after writing its request.
 	ResponseHeaderTimeout time.Duration
 	// BodyReadTimeout bounds one body read or bounded socket-transfer chunk
 	// (default 60 seconds), not the total object lifetime or caller think time.
