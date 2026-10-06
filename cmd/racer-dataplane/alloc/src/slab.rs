@@ -554,7 +554,7 @@ impl Future for FenceWaiter {
             return Poll::Ready(Ok(()));
         }
         if let Some(registration) = self.registration.clone() {
-            let old = registration.borrow_mut().replace(waker);
+            let old = registration.replace(waker);
             drop(old);
             if self.state.count.get() == 0 {
                 self.unregister();
