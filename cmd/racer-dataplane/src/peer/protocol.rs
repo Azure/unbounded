@@ -540,13 +540,7 @@ pub fn response_head(
     request_digest: &[u8; 32],
     path: &[NodeId],
 ) -> Result<MessageHead> {
-    let mut head = MessageHead {
-        start: StartLine::Response { status: 200 },
-        headers: Vec::new(),
-    };
-    push(&mut head, "racer-kind", "response");
-    push_binary(&mut head, "racer-request-binding", request_digest);
-    push(&mut head, "racer-response-path", nodes(path)?);
+    let mut head = response_prefix(request_digest, path)?;
     let (outcome, length) = match response {
         PeerResponse::Selected {
             metadata: m,
@@ -573,26 +567,7 @@ pub fn response_head(
                 if m.length == 0 || page.envelope().page.number.0 != 0 {
                     return Err(Error::InvalidRequest);
                 }
-                let page_head = response_head(
-                    &PeerResponse::Page {
-                        metadata: m.clone(),
-                        ciphertext: page.clone(),
-                    },
-                    request_digest,
-                    path,
-                )?;
-                for header in page_head.headers {
-                    if !matches!(
-                        header.name.as_str(),
-                        "racer-kind"
-                            | "racer-request-binding"
-                            | "racer-response-path"
-                            | "racer-outcome"
-                            | "content-length"
-                    ) {
-                        head.headers.push(header);
-                    }
-                }
+                ciphertext_fields(&mut head, m, page)?;
                 push(&mut head, "racer-page-present", 1);
                 ("bootstrap", u64::from(page.envelope().ciphertext_length))
             }
@@ -609,12 +584,8 @@ pub fn response_head(
             metadata: m,
             ciphertext,
         } => {
-            let e = ciphertext.envelope();
-            if ciphertext.bytes().len() != e.ciphertext_length as usize {
-                return Err(Error::InvalidRequest);
-            }
-            page_fields(&mut head, m, e)?;
-            ("page", u64::from(e.ciphertext_length))
+            ciphertext_fields(&mut head, m, ciphertext)?;
+            ("page", u64::from(ciphertext.envelope().ciphertext_length))
         }
         PeerResponse::Metadata(m) => {
             metadata_fields(&mut head, m)?;
@@ -637,10 +608,41 @@ pub fn response_head(
             _ => 200,
         },
     };
-    push(&mut head, "racer-outcome", outcome);
-    push(&mut head, "content-length", length);
+    response_tail(&mut head, outcome, length);
     Ok(head)
 }
+
+/// Start a canonical response with its retained request binding and reverse path.
+fn response_prefix(binding: &[u8; 32], path: &[NodeId]) -> Result<MessageHead> {
+    let mut head = MessageHead {
+        start: StartLine::Response { status: 200 },
+        headers: Vec::new(),
+    };
+    push(&mut head, "racer-kind", "response");
+    push_binary(&mut head, "racer-request-binding", binding);
+    push(&mut head, "racer-response-path", nodes(path)?);
+    Ok(head)
+}
+
+/// Append the outcome and body framing in canonical order.
+fn response_tail(head: &mut MessageHead, outcome: &str, length: u64) {
+    push(head, "racer-outcome", outcome);
+    push(head, "content-length", length);
+}
+
+/// Validate materialized body length before encoding its page descriptor.
+fn ciphertext_fields(
+    head: &mut MessageHead,
+    metadata: &ObjectMetadata,
+    ciphertext: &CiphertextPage,
+) -> Result<()> {
+    let envelope = ciphertext.envelope();
+    if ciphertext.bytes().len() != envelope.ciphertext_length as usize {
+        return Err(Error::InvalidRequest);
+    }
+    page_fields(head, metadata, envelope)
+}
+
 pub(crate) fn grant_fields(
     head: &mut MessageHead,
     grant: &crate::peer::subscriptions::TransferGrant,
@@ -699,26 +701,56 @@ pub(crate) fn opaque_page_head(
     binding: &[u8; 32],
     path: &[NodeId],
 ) -> Result<MessageHead> {
+    opaque_page_response(
+        m,
+        e,
+        if bootstrap {
+            PageOutcome::Bootstrap
+        } else {
+            PageOutcome::Page
+        },
+        binding,
+        path,
+    )
+}
+
+/// Page-bearing outcomes with distinct canonical header shapes.
+#[derive(Clone, Copy)]
+enum PageOutcome {
+    Page,
+    Bootstrap,
+    Selected,
+}
+
+impl PageOutcome {
+    /// Return the signed wire spelling for this outcome.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Page => "page",
+            Self::Bootstrap => "bootstrap",
+            Self::Selected => "selected",
+        }
+    }
+}
+
+/// Encode page-bearing opaque outcomes without constructing a temporary body.
+fn opaque_page_response(
+    m: &ObjectMetadata,
+    e: &PageEnvelope,
+    outcome: PageOutcome,
+    binding: &[u8; 32],
+    path: &[NodeId],
+) -> Result<MessageHead> {
+    let bootstrap = matches!(outcome, PageOutcome::Bootstrap);
     if bootstrap && (m.length == 0 || e.page.number.0 != 0) {
         return Err(Error::InvalidRequest);
     }
-    let mut head = MessageHead {
-        start: StartLine::Response { status: 200 },
-        headers: Vec::new(),
-    };
-    push(&mut head, "racer-kind", "response");
-    push_binary(&mut head, "racer-request-binding", binding);
-    push(&mut head, "racer-response-path", nodes(path)?);
+    let mut head = response_prefix(binding, path)?;
     page_fields(&mut head, m, e)?;
     if bootstrap {
         push(&mut head, "racer-page-present", 1);
     }
-    push(
-        &mut head,
-        "racer-outcome",
-        if bootstrap { "bootstrap" } else { "page" },
-    );
-    push(&mut head, "content-length", e.ciphertext_length);
+    response_tail(&mut head, outcome.name(), u64::from(e.ciphertext_length));
     Ok(head)
 }
 /// Exact logical agreement, rejecting unknown application fields as well as
@@ -880,20 +912,18 @@ pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<
         if length != envelope.ciphertext_length as usize {
             return Err(Error::InvalidRequest);
         }
-        let mut canonical = opaque_page_head(
+        let mut canonical = opaque_page_response(
             &metadata,
             &envelope,
-            outcome == "bootstrap",
+            match outcome.as_str() {
+                "bootstrap" => PageOutcome::Bootstrap,
+                "selected" => PageOutcome::Selected,
+                _ => PageOutcome::Page,
+            },
             &binding,
             &path,
         )?;
         if outcome == "selected" {
-            canonical
-                .headers
-                .iter_mut()
-                .find(|h| h.name == "racer-outcome")
-                .unwrap()
-                .value = b"selected".to_vec();
             grant_fields(&mut canonical, &grant(head)?)?;
         }
         return Ok(canonical);
@@ -1134,6 +1164,235 @@ impl SecurityCodec {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Keep ordered wire fields independent of the production response builders.
+    #[test]
+    fn page_response_headers_preserve_exact_fields_and_order() {
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let metadata = ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId("00000000-0000-4000-8000-000000000001".into()),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            },
+            length: 3,
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
+        };
+        let envelope = PageEnvelope {
+            page: PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(0),
+            },
+            key_id: KeyId([0; 16]),
+            nonce: Nonce([0; 24]),
+            plaintext_length: 3,
+            ciphertext_length: 19,
+        };
+        let page = BufferPool::new(admission.clone())
+            .ciphertext(
+                admission
+                    .reserve(
+                        Some(&metadata.version.object.cache),
+                        ResourceClass::Ciphertext,
+                        19,
+                    )
+                    .unwrap(),
+                envelope.clone(),
+                vec![9; 19],
+            )
+            .unwrap();
+        let grant = super::super::subscriptions::TransferGrant {
+            subscription_id: [0; 16],
+            sequence: 2,
+            page: envelope.page.clone(),
+            membership: MembershipVersion(1),
+            receiver: NodeId("00000000-0000-4000-8000-000000000002".into()),
+            deadline: 7,
+            remaining_page_budget: 4,
+            remaining_byte_budget: 80,
+        };
+        let prefix = vec![
+            ("racer-kind", "response"),
+            (
+                "racer-request-binding",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            ),
+            ("racer-response-path", ""),
+            ("racer-cache", "00000000-0000-4000-8000-000000000001"),
+            (
+                "racer-key",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            ("racer-etag", "\"v1\""),
+            ("racer-length", "3"),
+            ("racer-expires", "0"),
+            ("racer-metadata-version", "2"),
+        ];
+        let page_fields = [
+            ("racer-page", "0"),
+            ("racer-page-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
+            ("racer-page-nonce", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ("racer-plaintext-length", "3"),
+            ("racer-ciphertext-length", "19"),
+            ("content-range", "bytes 0-2/3"),
+        ];
+        let grant_fields = [
+            ("racer-subscription", "AAAAAAAAAAAAAAAAAAAAAA=="),
+            ("racer-subscription-sequence", "2"),
+            ("racer-grant-membership", "1"),
+            (
+                "racer-grant-receiver",
+                "00000000-0000-4000-8000-000000000002",
+            ),
+            ("racer-grant-deadline", "7"),
+            ("racer-page-budget", "4"),
+            ("racer-byte-budget", "80"),
+        ];
+        for outcome in ["page", "bootstrap", "selected", "empty"] {
+            let mut expected = prefix.clone();
+            let response = match outcome {
+                "page" => PeerResponse::Page {
+                    metadata: metadata.clone(),
+                    ciphertext: page.clone(),
+                },
+                "bootstrap" => PeerResponse::Bootstrap {
+                    metadata: metadata.clone(),
+                    page_zero: Some(page.clone()),
+                },
+                "selected" => PeerResponse::Selected {
+                    metadata: metadata.clone(),
+                    ciphertext: page.clone(),
+                    grant: grant.clone(),
+                },
+                _ => {
+                    let mut empty = metadata.clone();
+                    empty.length = 0;
+                    expected[6].1 = "0";
+                    PeerResponse::Bootstrap {
+                        metadata: empty,
+                        page_zero: None,
+                    }
+                }
+            };
+            if outcome != "empty" {
+                expected.extend(page_fields);
+            }
+            if outcome == "selected" {
+                expected.extend(grant_fields);
+            }
+            if matches!(outcome, "bootstrap" | "empty") {
+                expected.push((
+                    "racer-page-present",
+                    if outcome == "empty" { "0" } else { "1" },
+                ));
+            }
+            expected.push((
+                "racer-outcome",
+                if outcome == "empty" {
+                    "bootstrap"
+                } else {
+                    outcome
+                },
+            ));
+            expected.push((
+                "content-length",
+                if outcome == "empty" { "0" } else { "19" },
+            ));
+            let head = response_head(&response, &[0; 32], &[]).unwrap();
+            assert!(matches!(head.start, StartLine::Response { status: 200 }));
+            let fields = |head: &MessageHead| {
+                head.headers
+                    .iter()
+                    .map(|h| (h.name.clone(), h.value.clone()))
+                    .collect::<Vec<_>>()
+            };
+            let owned = |fields: Vec<(&str, &str)>| {
+                fields
+                    .into_iter()
+                    .map(|(n, v)| (n.to_owned(), v.as_bytes().to_vec()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(fields(&head), owned(expected.clone()), "{outcome}");
+            let opaque =
+                opaque_response_head(&head, if outcome == "empty" { 0 } else { 19 }).unwrap();
+            if outcome == "selected" {
+                // Opaque canonicalization historically appends grants after framing.
+                expected.drain(
+                    prefix.len() + page_fields.len()
+                        ..prefix.len() + page_fields.len() + grant_fields.len(),
+                );
+                expected.extend(grant_fields);
+            }
+            assert_eq!(fields(&opaque), owned(expected), "opaque {outcome}");
+        }
+        let mut invalid = metadata.clone();
+        invalid.length = 0;
+        assert!(matches!(
+            response_head(
+                &PeerResponse::Bootstrap {
+                    metadata: invalid,
+                    page_zero: Some(page.clone())
+                },
+                &[0; 32],
+                &[]
+            ),
+            Err(Error::InvalidRequest)
+        ));
+        assert!(matches!(
+            response_head(
+                &PeerResponse::Bootstrap {
+                    metadata: metadata.clone(),
+                    page_zero: None
+                },
+                &[0; 32],
+                &[]
+            ),
+            Err(Error::InvalidRequest)
+        ));
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        for (response, status, outcome) in [
+            (PeerResponse::NotFound, 404, "not-found"),
+            (PeerResponse::OriginRejected, 401, "origin-rejected"),
+            (PeerResponse::OriginForbidden, 403, "origin-forbidden"),
+            (PeerResponse::Overloaded, 200, "overloaded"),
+        ] {
+            let head = response_head(&response, &[0; 32], &[]).unwrap();
+            assert_eq!(head.start, StartLine::Response { status });
+            assert_eq!(head.headers.len(), 5);
+            assert_eq!(head.headers[3].value, outcome.as_bytes());
+            assert_eq!(head.headers[4].value, b"0");
+        }
+        let mut invalid = envelope.clone();
+        invalid.page.number = PageNumber(1);
+        assert!(matches!(
+            opaque_page_head(&metadata, &invalid, true, &[0; 32], &[]),
+            Err(Error::InvalidRequest)
+        ));
+        invalid = envelope.clone();
+        invalid.ciphertext_length = 18;
+        assert!(opaque_page_head(&metadata, &invalid, false, &[0; 32], &[]).is_err());
+        invalid = envelope;
+        invalid.page.version.etag = StrongEtag::test_value("other");
+        assert!(opaque_page_head(&metadata, &invalid, false, &[0; 32], &[]).is_err());
+        let mut page = page;
+        Arc::get_mut(&mut page.inner).unwrap().storage.bytes.pop();
+        assert!(matches!(
+            response_head(
+                &PeerResponse::Bootstrap {
+                    metadata,
+                    page_zero: Some(page)
+                },
+                &[0; 32],
+                &[]
+            ),
+            Err(Error::InvalidRequest)
+        ));
+    }
 
     mod metadata_tests {
         use super::*;
