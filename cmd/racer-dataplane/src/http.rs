@@ -313,13 +313,42 @@ fn peer_connect_failure(errno: Option<i32>) -> bool {
 
 /// One current final send, never an admission to release its CQE-owned leases.
 #[derive(Default)]
-pub(crate) struct FinalSend(std::cell::Cell<Option<bool>>);
+pub(crate) struct FinalSend(std::cell::Cell<FinalSendState>);
+
+/// A provisional release is valid only during the current final send's CQE wait.
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+enum FinalSendState {
+    #[default]
+    Inactive,
+    Pending,
+    Released,
+}
+
 impl FinalSend {
+    /// Accept one exact release without returning any completion-owned resources.
     pub(crate) fn provisional_release(&self) -> Result<()> {
-        if self.0.get() != Some(false) {
+        if self.0.get() != FinalSendState::Pending {
             return Err(Error::InvalidRequest);
         }
-        self.0.set(Some(true));
+        self.0.set(FinalSendState::Released);
+        Ok(())
+    }
+
+    /// Only a send covering all remaining bytes can admit a provisional release.
+    fn before_send(&self, count: usize, remaining: usize) {
+        self.0.set(if count == remaining {
+            FinalSendState::Pending
+        } else {
+            FinalSendState::Inactive
+        });
+    }
+
+    /// Clear the send state before rejecting a provisionally released short send.
+    fn after_send(&self, count: usize, accepted: usize) -> Result<()> {
+        let released = self.0.replace(FinalSendState::Inactive) == FinalSendState::Released;
+        if released && accepted != count {
+            return Err(Error::InvalidRequest);
+        }
         Ok(())
     }
 }
@@ -428,15 +457,12 @@ impl http1::delivery::Observer<HttpContext> for DeliveryObserver<'_> {
     }
     fn before_send(&self, count: usize, remaining: usize) {
         if let Some(state) = self.final_send {
-            state.0.set((count == remaining).then_some(false));
+            state.before_send(count, remaining);
         }
     }
     fn after_send(&self, count: usize, accepted: usize) -> Result<()> {
         if let Some(state) = self.final_send {
-            let released = state.0.replace(None) == Some(true);
-            if released && accepted != count {
-                return Err(Error::InvalidRequest);
-            }
+            state.after_send(count, accepted)?;
         }
         Ok(())
     }
@@ -583,6 +609,50 @@ pub(crate) mod tests {
     use std::time::Duration;
     use std::time::Instant;
     use uring_runtime::reactor::IoBuffer;
+
+    /// Exercise final-send admission, duplicate rejection, short CQEs, and reset.
+    #[test]
+    fn final_send_release_state_preserves_completion_fence() {
+        for (count, remaining) in [(0, 0), (2, 2), (1, 2)] {
+            for release in [false, true] {
+                for accepted in 0..=count {
+                    let send = FinalSend::default();
+                    assert_eq!(send.provisional_release(), Err(Error::InvalidRequest));
+                    send.before_send(count, remaining);
+                    if release {
+                        assert_eq!(
+                            send.provisional_release(),
+                            if count == remaining {
+                                Ok(())
+                            } else {
+                                Err(Error::InvalidRequest)
+                            }
+                        );
+                        assert_eq!(send.provisional_release(), Err(Error::InvalidRequest));
+                    }
+                    assert_eq!(
+                        send.after_send(count, accepted),
+                        if release && count == remaining && accepted != count {
+                            Err(Error::InvalidRequest)
+                        } else {
+                            Ok(())
+                        }
+                    );
+                    assert_eq!(send.0.get(), FinalSendState::Inactive);
+                    assert_eq!(send.provisional_release(), Err(Error::InvalidRequest));
+                    send.before_send(1, 1);
+                    assert_eq!(send.provisional_release(), Ok(()));
+                    assert_eq!(send.after_send(1, 1), Ok(()));
+                }
+            }
+        }
+        let send = FinalSend::default();
+        send.before_send(2, 2);
+        send.provisional_release().unwrap();
+        send.before_send(1, 2);
+        assert_eq!(send.0.get(), FinalSendState::Inactive);
+        assert_eq!(send.after_send(1, 0), Ok(()));
+    }
 
     mod delivery {
         use crate::admission::AdmissionPolicy;
