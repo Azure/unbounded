@@ -694,8 +694,11 @@ func (ids DataplaneWorkloadIdentities) observed() members.WorkloadIdentities {
 
 	return observed
 }
+
 func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool { return ids.observed().Owns(pod) }
-func managedWorkloadNames(cfg Config) []string                    { return members.ManagedNames(cfg.DaemonSetName) }
+
+func managedWorkloadNames(cfg Config) []string { return members.ManagedNames(cfg.DaemonSetName) }
+
 func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cfg Config) (DataplaneWorkloadIdentities, error) {
 	ids := DataplaneWorkloadIdentities{namespace: cfg.Namespace}
 	for i, name := range managedWorkloadNames(cfg) {
