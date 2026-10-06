@@ -4,7 +4,6 @@
 package override
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -76,30 +75,6 @@ func ProblemsError(problems []Problem) error {
 	sort.Strings(rendered)
 
 	return fmt.Errorf("invalid override document:\n  %s", strings.Join(rendered, "\n  "))
-}
-
-// ProblemsErr joins the underlying errors without the document framing, for
-// callers that want to wrap them in their own message.
-func ProblemsErr(problems []Problem) error {
-	errs := make([]error, 0, len(problems))
-	for _, problem := range problems {
-		errs = append(errs, errors.New(problem.String()))
-	}
-
-	return errors.Join(errs...)
-}
-
-// AnyKeyLevel reports whether any problem covers a whole key, which is what
-// decides between withholding the workloads a set of entries names and
-// withholding every workload an override could reach.
-func AnyKeyLevel(problems []Problem) bool {
-	for _, problem := range problems {
-		if problem.KeyLevel() {
-			return true
-		}
-	}
-
-	return false
 }
 
 // keyProblem builds a problem covering a whole ConfigMap key.

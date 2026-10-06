@@ -136,11 +136,6 @@ func (r ExecutionResult) Skipped() []OperationResult {
 	return r.withStatus(OpSkipped)
 }
 
-// Dropped returns the operations removed from the plan before execution.
-func (r ExecutionResult) Dropped() []OperationResult {
-	return r.withStatus(OpDropped)
-}
-
 // DeferredResults returns the operations that were not written this pass
 // because the cluster moved under it.
 func (r ExecutionResult) DeferredResults() []OperationResult {

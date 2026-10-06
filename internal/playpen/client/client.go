@@ -201,11 +201,6 @@ func (c *Client) deallocate(ctx context.Context, idempotencyKey string) error {
 	return c.doJSON(req, http.StatusNoContent, nil)
 }
 
-// WireGuardPrivateKey returns the client's WireGuard private key for this playpen.
-func (p *Playpen) WireGuardPrivateKey() string {
-	return p.wireGuardPrivateKey
-}
-
 // TunnelConfig returns the local tunnel settings for this playpen.
 func (p *Playpen) TunnelConfig() TunnelConfig {
 	p.mu.Lock()
