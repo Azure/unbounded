@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
+	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -620,6 +621,121 @@ func TestPublicationInstalledStateNeverExceedsHighWater(t *testing.T) {
 				t.Fatal("rejected install mutated state")
 			}
 		})
+	}
+}
+
+func TestTopologyReplayRejectedBeforeMutation(t *testing.T) {
+	for _, replay := range []string{"rollback", "conflicting sequence"} {
+		for _, suspended := range []bool{false, true} {
+			for _, operation := range []string{"publish", "commit"} {
+				t.Run(fmt.Sprintf("%s/suspended=%t/%s", replay, suspended, operation), func(t *testing.T) {
+					r := initializedTopology(t)
+					first := reconcileTopology(t, r, t.Context())
+
+					cm, _, err := readVersion(t.Context(), r.APIReader, r.Config)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					record := first.record
+					record.Sequence = 10
+
+					cm.Data = versionData(record)
+					if err := r.Update(t.Context(), cm); err != nil {
+						t.Fatal(err)
+					}
+
+					reconcileTopology(t, r, t.Context())
+
+					if err := r.Get(t.Context(), client.ObjectKeyFromObject(cm), cm); err != nil {
+						t.Fatal(err)
+					}
+
+					replayed := record
+					if replay == "rollback" {
+						replayed.Sequence--
+					} else {
+						replayed.ContentHash = strings.Repeat("a", 64)
+					}
+
+					cm.Data = versionData(replayed)
+					if err := r.Update(t.Context(), cm); err != nil {
+						t.Fatal(err)
+					}
+
+					before := cm.DeepCopy()
+
+					if suspended {
+						if err := r.Publications.confirm(replayed); !errors.Is(err, wire.Conflict) {
+							t.Fatalf("replay was not rejected: %v", err)
+						}
+					}
+
+					proposed := AcceptedMembers{testNodeUID: {Node: testNodeUID, Shares: 4, PeerEndpoint: "192.0.2.1:8082"}}
+
+					candidate, err := r.Publications.Prepare(replayed, cm.ResourceVersion, proposed, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					writes := 0
+
+					r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+						writes++
+						return c.Update(ctx, obj, opts...)
+					}})
+					if operation == "commit" {
+						_, err = r.CommitVersion(t.Context(), candidate)
+					} else {
+						r.authority.publisher = r.engine()
+						_, err = r.authority.PublishTopology(t.Context(), func(context.Context) (TopologyObservation, error) {
+							node, pod := memberNode(), memberPod("pod", 1, "192.0.2.1")
+							return TopologyObservation{Input: members.Input{Nodes: []corev1.Node{node}, PodsByNode: map[string][]corev1.Pod{node.Name: {pod}}, PeerPort: 8082, Ownership: members.WorkloadIdentities{Namespace: r.Config.Namespace, Workloads: [2]members.WorkloadIdentity{{Name: r.Config.DaemonSetName, UID: testDaemonSetUID}}}}}, nil
+						})
+					}
+
+					if !errors.Is(err, wire.Conflict) || writes != 0 {
+						t.Fatalf("replay must fail before mutation: err=%v writes=%d", err, writes)
+					}
+
+					if err := r.APIReader.Get(t.Context(), client.ObjectKeyFromObject(cm), cm); err != nil {
+						t.Fatal(err)
+					}
+
+					if !reflect.DeepEqual(before.Data, cm.Data) || before.ResourceVersion != cm.ResourceVersion {
+						t.Fatal("replay changed durable counters")
+					}
+
+					if r.Publications.observed != record || !r.Publications.suspended {
+						t.Fatal("replay changed high-water state or retained serving authority")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestTopologyReconcileAcceptsNewerDurableVersion(t *testing.T) {
+	r := initializedTopology(t)
+	reconcileTopology(t, r, t.Context())
+	lagged := Assemble(r.Config, r.Client, r.APIReader).Topology
+	reconcileTopology(t, lagged, t.Context())
+
+	cm, record, err := readVersion(t.Context(), r.APIReader, r.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	record.Sequence += 2
+
+	cm.Data = versionData(record)
+	if err := r.Update(t.Context(), cm); err != nil {
+		t.Fatal(err)
+	}
+
+	current := reconcileTopology(t, lagged, t.Context())
+	if current.record != record || lagged.Publications.observed != record {
+		t.Fatal("lagged replica failed to accept newer durable counters")
 	}
 }
 

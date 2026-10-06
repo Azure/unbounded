@@ -582,6 +582,11 @@ func (a *Authority) PublishTopology(ctx context.Context, observe func(context.Co
 		return TopologyHints{}, err
 	}
 
+	if err := r.Publications.confirm(previous); err != nil {
+		r.suspendInvalidAuthority(err)
+		return TopologyHints{}, err
+	}
+
 	if observe == nil {
 		return TopologyHints{}, wire.InvalidRequest
 	}

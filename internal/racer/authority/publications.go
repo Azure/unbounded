@@ -248,6 +248,11 @@ func (r *publisher) CommitVersion(ctx context.Context, p *preparedPublication) (
 		return nil, err
 	}
 
+	if err := r.Publications.confirm(previous); err != nil {
+		r.suspendInvalidAuthority(err)
+		return nil, err
+	}
+
 	if cm.ResourceVersion != p.resourceVersion || previous != p.previous {
 		return nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, wire.Conflict)
 	}
