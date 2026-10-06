@@ -967,10 +967,7 @@ impl Transfers {
 /// Stable, quota-owned transport staging. Never contains plaintext page data.
 /// Construction normalizes capacity before pointer extraction; Vec backing then
 /// stays fixed while ownership moves through reactor completion closures.
-pub(crate) struct WireBuffer {
-    bytes: Vec<u8>,
-    _reservation: flow_control::Charge<AdmissionPolicy>,
-}
+pub(crate) struct WireBuffer(flow_control::ChargedBuffer<AdmissionPolicy>);
 impl WireBuffer {
     pub(crate) fn new(
         admission: &flow_control::Quotas<AdmissionPolicy>,
@@ -980,10 +977,10 @@ impl WireBuffer {
             return Err(Error::InvalidRequest);
         }
         let reservation = admission.reserve(None, ResourceClass::Ciphertext, length)?;
-        Ok(Self {
-            bytes: reservation.buffer(length)?.into_boxed_slice().into_vec(),
-            _reservation: reservation,
-        })
+        Ok(Self(flow_control::ChargedBuffer::unpooled(
+            reservation,
+            length,
+        )?))
     }
     pub(crate) fn reserved(
         reservation: flow_control::Charge<AdmissionPolicy>,
@@ -993,23 +990,24 @@ impl WireBuffer {
         if length > crate::model::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
         }
-        Ok(Self {
-            bytes: reservation.buffer(length)?.into_boxed_slice().into_vec(),
-            _reservation: reservation,
-        })
+        Ok(Self(flow_control::ChargedBuffer::unpooled(
+            reservation,
+            length,
+        )?))
     }
     pub(crate) fn into_parts(self) -> (Vec<u8>, flow_control::Charge<AdmissionPolicy>) {
-        (self.bytes, self._reservation)
+        let (bytes, reservation) = self.0.into_parts();
+        (bytes.into_vec(), reservation)
     }
 }
-// SAFETY: private fixed Vec retains its reservation and is not aliased.
+// SAFETY: ChargedBuffer owns stable, exclusive backing and its complete reservation.
 unsafe impl IoBuffer for WireBuffer {
     type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
-        Ok(&self.bytes)
+        Ok(self.0.bytes())
     }
     fn bytes_mut(&mut self) -> Result<&mut [u8]> {
-        Ok(&mut self.bytes)
+        Ok(self.0.bytes_mut())
     }
 }
 
@@ -2421,6 +2419,28 @@ mod tests {
             Err(Error::Unavailable)
         ));
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+    /// Pre-reserved staging retains surplus credit and permits an empty view.
+    #[test]
+    fn wire_reserved_surplus_empty_and_abandoned_backing_keep_accounting() {
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        for length in [0, 3, 1 << 20] {
+            let amount = 2 << 20;
+            let buffer = WireBuffer::reserved(
+                admission
+                    .reserve(None, ResourceClass::Ciphertext, amount)
+                    .unwrap(),
+                length,
+            )
+            .unwrap();
+            assert_eq!(buffer.bytes().unwrap().len(), length);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), amount);
+            drop(buffer);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+            assert_eq!(admission.retained_buffer_bytes(), 0);
+        }
     }
     #[test]
     #[ignore = "opt-in same-workload wire buffer checkout benchmark"]

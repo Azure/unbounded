@@ -227,6 +227,38 @@ mod buffer_tests {
             assert_eq!(quotas.used(Class), 0);
         }
     }
+
+    /// Unpooled staging keeps excess credit and never retains backing on abandonment.
+    #[test]
+    fn unpooled_backing_preserves_reservation_and_releases_on_drop() {
+        let quotas = Quotas::new(TestPolicy);
+        let length = 1 << 20;
+        for transfer in [false, true] {
+            let buffer =
+                ChargedBuffer::unpooled(quotas.reserve(None, Class, 2 * length).unwrap(), length)
+                    .unwrap();
+            assert_eq!(buffer.charge().amount(), 2 * length);
+            assert_eq!(quotas.used(Class), 2 * length);
+            if transfer {
+                let pointer = buffer.bytes().as_ptr();
+                let (bytes, charge) = buffer.into_parts();
+                assert_eq!(bytes.as_ptr(), pointer);
+                assert_eq!(charge.amount(), 2 * length);
+                drop((bytes, charge));
+            } else {
+                drop(buffer);
+            }
+            assert_eq!(quotas.used(Class), 0);
+            assert_eq!(quotas.retained_buffer_bytes(), 0);
+        }
+        assert!(ChargedBuffer::unpooled(quotas.reserve(None, Class, 8).unwrap(), 9).is_err());
+        assert_eq!(quotas.used(Class), 0);
+        let empty = ChargedBuffer::unpooled(quotas.reserve(None, Class, 8).unwrap(), 0).unwrap();
+        assert!(empty.bytes().is_empty());
+        assert_eq!(empty.charge().amount(), 8);
+        drop(empty);
+        assert_eq!(quotas.used(Class), 0);
+    }
 }
 
 /// Quota transfers, retained key lifetimes, and exact release notifications.

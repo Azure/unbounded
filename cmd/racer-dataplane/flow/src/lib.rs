@@ -838,21 +838,37 @@ pub struct ChargedBuffer<P: Policy> {
     bytes: Vec<u8>,
 
     charge: Option<Charge<P>>,
+
+    recycle: bool,
 }
 
 impl<P: Policy> ChargedBuffer<P> {
     /// Allocate admitted backing; the caller validates class, key, and provenance.
-    pub fn new(mut charge: Charge<P>, length: usize) -> Result<Self> {
+    pub fn new(charge: Charge<P>, length: usize) -> Result<Self> {
         if length == 0 {
             return Err(Error::InvalidInput);
         }
+        let mut buffer = Self::unpooled(charge, length)?;
+        buffer
+            .charge
+            .as_mut()
+            .expect("owned charge")
+            .shrink(length)?;
+        buffer.recycle = true;
+        Ok(buffer)
+    }
+
+    /// Preserve the complete reservation and release backing on drop. Transport
+    /// staging may borrow recycler storage without retaining it after abandonment.
+    /// An empty view is allowed while its nonzero reservation remains owned.
+    pub fn unpooled(charge: Charge<P>, length: usize) -> Result<Self> {
         let bytes = charge.buffer(length)?;
         // Do not box or resize again while I/O pointers are live.
         let bytes = bytes.into_boxed_slice().into_vec();
-        charge.shrink(bytes.len())?;
         Ok(Self {
             bytes,
             charge: Some(charge),
+            recycle: false,
         })
     }
 
@@ -881,9 +897,11 @@ impl<P: Policy> ChargedBuffer<P> {
 }
 
 impl<P: Policy> Drop for ChargedBuffer<P> {
-    /// Wipe and optionally retain backing before its admission is released.
+    /// Recycle ordinary backing; unpooled staging drops before releasing its charge.
     fn drop(&mut self) {
-        if let Some(charge) = &mut self.charge {
+        if self.recycle
+            && let Some(charge) = &mut self.charge
+        {
             charge.recycle(std::mem::take(&mut self.bytes));
         }
     }
