@@ -74,6 +74,10 @@ func (c *Client) closeIdleConnections() {
 func socketDir(t testing.TB) string {
 	t.Helper()
 
+	if err := os.MkdirAll("../../tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
 	dir, err := os.MkdirTemp("../../tmp", "sdk-")
 	if err != nil {
 		t.Fatal(err)
@@ -91,6 +95,67 @@ func socketDir(t testing.TB) string {
 	})
 
 	return path
+}
+
+func TestSocketDirCleanCheckout(t *testing.T) {
+	base, err := os.MkdirTemp("../..", "s-")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base, err = filepath.Abs(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.RemoveAll(base); err != nil {
+			t.Error(err)
+		}
+	})
+
+	working := filepath.Join(base, "pkg", "racersdk")
+	if err := os.MkdirAll(working, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(working)
+	t.Setenv("TMPDIR", filepath.Join(base, "unused"))
+
+	parent := filepath.Join(base, "tmp")
+	if _, err := os.Stat(parent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("scratch parent already exists: %v", err)
+	}
+
+	var dirs []string
+
+	t.Run("create and reuse parent", func(t *testing.T) {
+		for range 2 {
+			dir := socketDir(t)
+
+			dirs = append(dirs, dir)
+			if filepath.Dir(dir) != parent {
+				t.Fatalf("scratch directory outside checkout: %s", dir)
+			}
+
+			listener, err := net.Listen("unix", filepath.Join(dir, "socket"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() { closeBody(listener) })
+		}
+
+		if dirs[0] == dirs[1] {
+			t.Fatal("scratch directories are not unique")
+		}
+	})
+
+	for _, dir := range dirs {
+		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("scratch directory retained after cleanup: %s: %v", dir, err)
+		}
+	}
 }
 
 func testClient(t *testing.T, path string, maxConn int) *Client {
