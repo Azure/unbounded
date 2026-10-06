@@ -325,6 +325,109 @@ func TestFakeClientPendingCallbackCleanup(t *testing.T) {
 	}
 }
 
+func TestFakeClientMetadataUnderSaturation(t *testing.T) {
+	for _, phase := range []string{"callback", "body"} {
+		t.Run(phase, func(t *testing.T) {
+			const connections = 16
+
+			entered := make(chan *blockedBody, connections)
+
+			client, cleanup, err := NewClient(func(ctx context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				if r.Operation() == racersdk.OperationHead {
+					return originMeta(1), nil, nil
+				}
+
+				if phase == "callback" {
+					entered <- nil
+
+					<-ctx.Done()
+
+					return racersdk.Metadata{}, nil, ctx.Err()
+				}
+
+				body := &blockedBody{done: make(chan struct{}), first: true}
+				entered <- body
+
+				return originMeta(1), body, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			results := make(chan error, connections)
+
+			t.Cleanup(func() {
+				cleanup()
+
+				deadline := time.After(5 * time.Second)
+
+				for range connections {
+					select {
+					case err := <-results:
+						if err == nil {
+							t.Error("blocked GET completed without an error")
+						}
+					case <-deadline:
+						t.Error("cleanup retained blocked GETs")
+						return
+					}
+				}
+			})
+
+			for range connections {
+				go func() {
+					v, err := client.Get(context.Background(), racersdk.Request{})
+					if err == nil {
+						_, err = io.Copy(io.Discard, v)
+						closeBody(v)
+					}
+
+					results <- err
+				}()
+			}
+
+			var bodies []*blockedBody
+
+			deadline := time.After(5 * time.Second)
+
+			for range connections {
+				select {
+				case body := <-entered:
+					if body != nil {
+						bodies = append(bodies, body)
+					}
+				case <-deadline:
+					t.Fatal("GETs did not saturate the origin transport")
+				}
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+
+			metadata, err := client.Stat(ctx, racersdk.Request{})
+
+			want := originMeta(1)
+			if err != nil || metadata.Size != want.Size || metadata.ETag != want.ETag || !metadata.ExpiresAt.Equal(want.ExpiresAt) || metadata.ContentType != want.ContentType {
+				t.Fatalf("HEAD starved behind blocked GETs: metadata=%+v, error=%v", metadata, err)
+			}
+
+			cleanup()
+
+			for _, body := range bodies {
+				select {
+				case <-body.done:
+				case <-time.After(5 * time.Second):
+					t.Fatal("cleanup retained an origin body")
+				}
+
+				if body.closed.Load() != 1 {
+					t.Fatal("origin body close count", body.closed.Load())
+				}
+			}
+		})
+	}
+}
+
 func TestFakeClientImmutableContinuation(t *testing.T) {
 	for _, change := range []string{"pin", "size"} {
 		t.Run(change, func(t *testing.T) {

@@ -89,7 +89,11 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	transport := originTransport(ctx, config, originPath)
-	handler := &trackedHandler{next: fakeracer.NewHandler(transport)}
+	metadataTransport := originTransport(ctx, config, originPath)
+	metadataTransport.MaxConnsPerHost = config.MaxConcurrentHeadRequests
+	metadataTransport.MaxIdleConns = config.MaxConcurrentHeadRequests
+	metadataTransport.MaxIdleConnsPerHost = config.MaxConcurrentHeadRequests
+	handler := &trackedHandler{next: fakeracer.NewHandler(originTransports{bulk: transport, metadata: metadataTransport})}
 	server := &http.Server{
 		ReadHeaderTimeout: config.ReadHeaderTimeout, IdleTimeout: config.IdleTimeout,
 		MaxHeaderBytes: wire.MaxHeadBytes, ErrorLog: log.New(io.Discard, "", 0),
@@ -107,6 +111,7 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 		serving.Wait()
 		handler.active.Wait()
 		transport.CloseIdleConnections()
+		metadataTransport.CloseIdleConnections()
 		removeDir(dir)
 	})
 	// Every startup failure after this point uses the same shutdown sequence.
@@ -179,6 +184,19 @@ func socketDir() (string, error) {
 	ready = true
 
 	return resolved, nil
+}
+
+// HEAD must reach the origin's reserved capacity even when every GET is blocked.
+type originTransports struct {
+	bulk, metadata *http.Transport
+}
+
+func (t originTransports) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodHead {
+		return t.metadata.RoundTrip(r)
+	}
+
+	return t.bulk.RoundTrip(r)
 }
 
 func originTransport(ctx context.Context, config racersdk.OriginConfig, path string) *http.Transport {
