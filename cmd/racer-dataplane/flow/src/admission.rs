@@ -311,6 +311,7 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
 impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
     /// Release final ownership and renew backoff for an unsuccessful probe.
     fn drop(&mut self) {
+        let now = self.probe.then(|| (self.owner.now)());
         let Ok(mut state) = self.owner.state.lock() else {
             return;
         };
@@ -322,7 +323,7 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
         if self.probe {
             peer.probe = false;
             if peer.retry.is_some() {
-                let now = (self.owner.now)();
+                let now = now.expect("probe clock sampled before locking");
                 peer.retry = Some(now + self.owner.config.backoff);
                 peer.updated = now;
             }
@@ -1052,6 +1053,7 @@ mod hedge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
     /// Synchronous observer recording emitted events and gauges.
     #[derive(Default)]
@@ -1061,6 +1063,19 @@ mod tests {
         active: Mutex<usize>,
 
         limit: Mutex<usize>,
+    }
+
+    static CLOCK_OWNER: OnceLock<std::sync::Weak<Adaptive<u8, Counts>>> = OnceLock::new();
+
+    /// Verify clock callbacks run without the adaptive-state mutex held.
+    fn reentrant_clock() -> Instant {
+        if let Some(owner) = CLOCK_OWNER.get().and_then(std::sync::Weak::upgrade) {
+            let _state = owner
+                .state
+                .try_lock()
+                .expect("clock called while adaptive state is locked");
+        }
+        Instant::now()
     }
 
     impl Observer for Counts {
@@ -1216,5 +1231,18 @@ mod tests {
         permit.observe(Outcome::Verified);
         assert_eq!(*owner.observer.limit.lock().unwrap(), usize::MAX);
         assert_eq!(owner.state.lock().unwrap().peers[&()].limit, usize::MAX);
+    }
+
+    /// Probe release invokes the injected clock only after releasing adaptive state.
+    #[test]
+    fn probe_drop_calls_clock_outside_state_lock() {
+        let owner = Adaptive::new(config(), Counts::default(), reentrant_clock).unwrap();
+        CLOCK_OWNER.set(Arc::downgrade(&owner)).unwrap();
+        let failed = owner.acquire(&1).unwrap();
+        failed.observe(Outcome::PeerFailure);
+        drop(failed);
+        owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry = Some(Instant::now());
+        let probe = owner.acquire(&1).unwrap();
+        drop(probe);
     }
 }

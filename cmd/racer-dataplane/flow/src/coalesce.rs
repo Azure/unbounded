@@ -82,6 +82,9 @@ impl<K: Clone + Eq + Hash, V, S: BuildHasher + Default> Table<K, V, S> {
         key: K,
         capacity: usize,
     ) -> Result<Registration<K, V, S>, CapacityError> {
+        if self.limits.waiters_per_cohort == 0 {
+            return Err(CapacityError);
+        }
         if self.registrations.get() >= capacity.saturating_mul(self.limits.waiters_per_cohort) {
             return Err(CapacityError);
         }
@@ -1935,7 +1938,9 @@ mod tests {
     /// Zero bounds and identifier exhaustion reject work without leaking charges.
     #[test]
     fn zero_limits_and_id_exhaustion_never_wrap_or_leak_registrations() {
-        assert!(matches!(table(0, 1).join("key", 1), Err(CapacityError)));
+        let no_waiters = table(0, 1);
+        assert!(matches!(no_waiters.join("key", 1), Err(CapacityError)));
+        assert_eq!(no_waiters.active_count(), 0);
         let zero = table(1, 0);
         let waiter = zero.join("key", 1).unwrap();
         assert_eq!(
