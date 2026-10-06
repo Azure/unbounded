@@ -364,7 +364,6 @@ pub enum ProtocolFailure {
     Unavailable,
 }
 
-/// Payload-free control error response.
 impl ProtocolFailure {
     /// Standard HTTP status for the bounded control failure contract.
     pub const fn status(self) -> u16 {

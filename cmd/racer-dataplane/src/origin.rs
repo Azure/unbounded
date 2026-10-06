@@ -226,10 +226,10 @@ impl OriginClient {
             matches!(selector, MetadataSelector::Pinned(_)),
         )?;
         let metadata = validate_metadata(&response.value, &context.object)?;
-        if let MetadataSelector::Pinned(etag) = selector {
-            if metadata.version.etag != etag {
-                return Err(Error::BadGateway);
-            }
+        if let MetadataSelector::Pinned(etag) = selector
+            && metadata.version.etag != etag
+        {
+            return Err(Error::BadGateway);
         }
         scope.check()?;
         response
