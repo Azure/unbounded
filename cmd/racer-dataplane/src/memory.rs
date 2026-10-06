@@ -318,15 +318,19 @@ impl AcquiredPage {
             Self::Plaintext(page) => page.copy(),
         }
     }
+
+    /// Validate the requested identity without cloning retained payload owners.
     pub fn validate_for(&self, page: &PageId) -> Result<()> {
-        if let Self::Plaintext(result) = self {
-            return result.validate_for(page);
+        match self {
+            Self::Plaintext(result) => result.validate_for(page),
+            Self::Ciphertext(result) => {
+                let copy = &result.copy;
+                if &copy.ciphertext.envelope().page != page {
+                    return Err(Error::CorruptRecord);
+                }
+                copy.validate_metadata()
+            }
         }
-        let copy = self.copy();
-        if &copy.ciphertext.envelope().page != page {
-            return Err(Error::CorruptRecord);
-        }
-        copy.validate_metadata()
     }
 }
 impl From<PageResult> for AcquiredPage {
@@ -1482,6 +1486,46 @@ pub(crate) mod tests {
     mod page {
         use super::*;
         use crate::error::Error;
+
+        /// Both acquisition forms enforce identity and structure without retaining owners.
+        #[test]
+        fn acquired_validation_preserves_identity_metadata_and_ownership() {
+            let admission = super::admission(8);
+            for plaintext in [false, true] {
+                for malformed in [false, true] {
+                    let mut page = bundle(&admission, "v1");
+                    let id = page.plaintext.page().clone();
+                    if malformed {
+                        page.metadata.length += 1;
+                    }
+                    let acquired = if plaintext {
+                        AcquiredPage::Plaintext(page)
+                    } else {
+                        AcquiredPage::Ciphertext(UnverifiedPage {
+                            copy: page.copy(),
+                            disk_token: None,
+                        })
+                    };
+                    let owner = match &acquired {
+                        AcquiredPage::Plaintext(page) => &page.ciphertext.inner,
+                        AcquiredPage::Ciphertext(page) => &page.copy.ciphertext.inner,
+                    };
+                    let owners = Arc::strong_count(owner);
+                    let expected = if malformed {
+                        Err(Error::CorruptRecord)
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(acquired.validate_for(&id), expected);
+                    let mut wrong = id.clone();
+                    wrong.number.0 += 1;
+                    assert_eq!(acquired.validate_for(&wrong), Err(Error::CorruptRecord));
+                    assert_eq!(Arc::strong_count(owner), owners);
+                    assert_eq!(acquired.validate_for(&id), expected);
+                }
+            }
+        }
+
         #[test]
         fn shared_results_reject_truncated_or_padded_ciphertext() {
             let admission = crate::memory::tests::admission(8);
