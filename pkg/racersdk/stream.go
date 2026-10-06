@@ -975,8 +975,9 @@ func (h *streamingHTTP) transfer() (int64, error) {
 	s := h.value.stream
 
 	var (
-		written int64
-		final   [1]byte
+		written  int64
+		final    [1]byte
+		released chan error
 	)
 
 	for s.delivered < s.pages {
@@ -1006,14 +1007,24 @@ func (h *streamingHTTP) transfer() (int64, error) {
 		}
 
 		s.delivered++
-		// Return even the final credit before waiting for Complete. A one-credit
-		// peer is allowed to wait for this release before emitting Complete.
-		if err := s.release(number, length, false); err != nil {
+		// The peer may wait for final credit or send Complete without reading it.
+		// Read Complete concurrently so either ordering can make progress.
+		if last {
+			released = make(chan error, 1)
+
+			go func() { released <- s.release(number, length, true) }()
+		} else if err := s.release(number, length, false); err != nil {
 			return written, err
 		}
 	}
 
-	if err := s.readComplete("subscription complete"); err != nil {
+	err := s.readComplete("subscription complete")
+	if released != nil {
+		closeBody(s.conn)
+		<-released
+	}
+
+	if err != nil {
 		return written, err
 	}
 
