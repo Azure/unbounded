@@ -1007,6 +1007,22 @@ mod tests {
     /// Empty pipes reuse both descriptors while partial payloads are closed.
     #[test]
     fn empty_pipe_reuses_descriptors_and_partial_pipe_is_closed() {
+        const CHILD: &str = "FLOW_PIPE_DESCRIPTOR_CLOSE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Descriptor numbers are process-global. Other parallel tests may
+            // reuse a closed number before fcntl, so assert closure in isolation.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipe::tests::empty_pipe_reuses_descriptors_and_partial_pipe_is_closed",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated descriptor assertions failed");
+            return;
+        }
         let admission = admission(1);
         let pool = new_pool(admission.clone());
         let mut pipe = pool.acquire().unwrap();
