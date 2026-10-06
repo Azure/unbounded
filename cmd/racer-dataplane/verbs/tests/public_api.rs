@@ -191,6 +191,42 @@ fn caller_arc_clones_do_not_block_quarantine_drain_and_reopen() {
     assert_eq!(count.load(Ordering::Acquire), 0);
 }
 
+/// Failed device closes retain a charge even when activation never builds a slot.
+#[cfg(feature = "simulation")]
+#[test]
+fn failed_device_close_keeps_charge_and_blocks_reopen() {
+    for failure in [None, Some(simulation::Operation::Register)] {
+        let (sim, io, mut native) = fixture(2);
+        let count = Arc::new(AtomicUsize::new(2));
+        configure(
+            &io,
+            (0..2)
+                .map(|_| Arc::new(Charge(count.clone())) as Guard)
+                .collect(),
+        );
+        native.poll_budgeted(1).unwrap();
+        sim.fault(simulation::Operation::Close, simulation::Fault::Reject);
+        if let Some(operation) = failure {
+            sim.fault(operation, simulation::Fault::Reject);
+        }
+        native.poll_budgeted(2).unwrap();
+        let result = io.activation().unwrap();
+        assert_eq!(result.is_err(), failure.is_some());
+        io.close();
+        for _ in 0..3 {
+            native.poll_budgeted(2).unwrap();
+            assert!(native.drained());
+            assert_eq!(io.reopen(), Err(Error::Overloaded));
+            assert_eq!(count.load(Ordering::Acquire), 1);
+            assert_eq!(sim.live_resources(), 1, "only the failed device remains");
+        }
+        assert_eq!(sim.pending_faults(), 0);
+        drop(native);
+        drop(io);
+        assert_eq!(count.load(Ordering::Acquire), 1);
+    }
+}
+
 /// Selection executes during native progress and rejects invalid tag/index plans.
 #[cfg(feature = "simulation")]
 #[test]
@@ -400,6 +436,61 @@ fn public_ports_copy_only_after_terminal_fence() {
     assert!(native.drained());
     assert_eq!(sim.pending_faults(), 0);
     assert_eq!(sim.live_resources(), 0);
+}
+
+/// New leases cannot send old staging bytes or read unwritten bytes from an old MR.
+#[cfg(feature = "simulation")]
+#[test]
+fn recycled_leases_clear_uninitialized_sends_and_partial_receives() {
+    for length in [7, 32] {
+        let (sim, io, mut native) = fixture(2);
+        configure(&io, vec![Arc::new(()), Arc::new(())]);
+        native.poll_budgeted(2).unwrap();
+        native.poll_budgeted(1).unwrap();
+        io.activation().unwrap().unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for round in 0..2 {
+            let sender = ready(QueuePairHandle::poll_new(io.device(u32::MAX), None));
+            let receiver = ready(QueuePairHandle::poll_new(io.device(u32::MAX), None));
+            ready(sender.poll_connect(receiver.endpoint));
+            ready(receiver.poll_connect(sender.endpoint));
+            native.poll_budgeted(2).unwrap();
+            ready(sender.poll_connected(&mut cx));
+            ready(receiver.poll_connected(&mut cx));
+            let source = ready(Region::poll_acquire(
+                &sender,
+                if round == 0 { 32 } else { length },
+            ));
+            let target = ready(Region::poll_acquire(&receiver, 32));
+            let (window, bind) = ready(receiver.poll_bind(target.clone()));
+            native.poll_budgeted(2).unwrap();
+            native.poll_budgeted(2).unwrap();
+            ready(bind.poll(&mut cx));
+            if round == 0 {
+                ready(source.poll_copy_from(&[0xa5; 32]));
+            }
+            let write = ready(sender.poll_write(source.clone(), window.address(), window.key()));
+            native.poll_budgeted(2).unwrap();
+            native.poll_budgeted(2).unwrap();
+            ready(write.poll(&mut cx));
+            sender.stop();
+            receiver.stop();
+            native.poll_budgeted(2).unwrap();
+            ready(sender.poll_stopped(&mut cx));
+            ready(receiver.poll_stopped(&mut cx));
+            let expected = vec![if round == 0 { 0xa5 } else { 0 }; 32];
+            assert_eq!(ready(target.poll_copy_to(&mut cx)), expected);
+            // Keep the region lease after the QP and tickets have gone.
+            drop((sender, receiver, source, window, bind, write));
+            native.poll_budgeted(2).unwrap();
+            assert_eq!(ready(target.poll_copy_to(&mut cx)), expected);
+            drop(target);
+            native.poll_budgeted(2).unwrap();
+        }
+        io.close();
+        native.poll_budgeted(2).unwrap();
+        assert_eq!(sim.live_resources(), 0);
+    }
 }
 
 /// Failed QP and probe frees permanently retain the slot charge and forbid reuse.
@@ -779,6 +870,8 @@ mod scoped {
         failure: Option<Failure>,
 
         wake: Waker,
+
+        wait: std::time::Duration,
     }
 
     impl Service<TestScope> for Inner {
@@ -804,6 +897,11 @@ mod scoped {
             assert_eq!(budget, 7);
             self.calls.borrow_mut().push("poll");
             Ok(())
+        }
+
+        /// Return the current wait bound unchanged when it is shorter than the maximum.
+        fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
+            maximum.min(self.wait)
         }
 
         /// Verify native drainage permits reopening before the inner drain runs.
@@ -859,6 +957,7 @@ mod scoped {
                 io: Rc::new(io),
                 failure: None,
                 wake: wake.clone(),
+                wait: std::time::Duration::MAX,
             },
             port,
         );
@@ -886,6 +985,28 @@ mod scoped {
         );
     }
 
+    /// Zero, shorter, and maximum waits all reach the wrapper unchanged.
+    #[test]
+    fn wrapper_forwards_inner_wait_timeout() {
+        use std::time::Duration;
+
+        let maximum = Duration::from_millis(1);
+        for wait in [Duration::ZERO, Duration::from_micros(1), Duration::MAX] {
+            let (io, port) = pair(1).unwrap();
+            let service = WithNative::new(
+                Inner {
+                    calls: Rc::default(),
+                    io: Rc::new(io),
+                    failure: None,
+                    wake: Waker::noop().clone(),
+                    wait,
+                },
+                port,
+            );
+            assert_eq!(service.wait_timeout(maximum), wait.min(maximum));
+        }
+    }
+
     /// Inner hook failures do not prevent native admission from being closed.
     #[test]
     fn wrapper_forwards_hook_errors_and_closes_native_on_inner_close_failure() {
@@ -897,6 +1018,7 @@ mod scoped {
                 io: io.clone(),
                 failure: Some(Failure::Verbs(Error::Io)),
                 wake: Waker::noop().clone(),
+                wait: std::time::Duration::MAX,
             },
             port,
         );
@@ -1014,6 +1136,7 @@ mod scoped {
                     io: io.clone(),
                     failure: None,
                     wake: Waker::noop().clone(),
+                    wait: std::time::Duration::MAX,
                 },
                 port,
             );

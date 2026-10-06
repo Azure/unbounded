@@ -241,6 +241,9 @@ pub struct NativeService {
 
     resources: Vec<Option<Resource>>,
 
+    /// Selected devices keep their charges even if activation fails before slot creation.
+    device_quotas: Vec<Arc<GuardOwner>>,
+
     activation: Option<Activation>,
 
     /// Completed activation retained until its mailbox can be locked.
@@ -1179,6 +1182,7 @@ impl NativeService {
             environment: uring_runtime::environment::Environment::current(),
             port,
             resources,
+            device_quotas: Vec::new(),
             activation: None,
             activation_result: None,
             cursor: 0,
@@ -1202,7 +1206,7 @@ impl NativeService {
         if config.bytes == 0 || config.bytes > u32::MAX as usize {
             return Err(Error::InvalidRange);
         }
-        let discovered = if config.discover {
+        let mut discovered = if config.discover {
             ffi::discover()?
         } else {
             Vec::new()
@@ -1233,6 +1237,11 @@ impl NativeService {
         }
         if selected.len() > self.resources.len() {
             return Err(Error::Overloaded);
+        }
+        for (selection, guard) in selected.iter().zip(&config.guards) {
+            let quota = GuardOwner::new(guard.clone());
+            discovered[selection.index].quota = Some(quota.clone());
+            self.device_quotas.push(quota);
         }
         self.activation = Some(Activation {
             devices: discovered.into_iter().map(Rc::new).collect(),
@@ -1364,7 +1373,8 @@ impl NativeService {
                 .is_ok_and(|c| c.is_none())
             && self.resources.iter().all(Option::is_none)
         {
-            let mut drained = true;
+            self.device_quotas.retain(|q| q.quarantined());
+            let mut drained = self.device_quotas.is_empty();
             for slot in &self.port.shared.slots {
                 let Ok(mut mailbox) = slot.mailbox.try_lock() else {
                     drained = false;
@@ -1480,16 +1490,20 @@ impl NativeService {
             if !slot.released.load(Ordering::Acquire) {
                 return;
             }
-            let quota = mailbox.quota.as_ref().unwrap();
+            let quota = mailbox.quota.as_ref().unwrap().clone();
             if quota.quarantined() {
                 slot.state.store(RETIRED, Ordering::Release);
                 return;
             }
+            if resource.region.clear().is_err() {
+                return;
+            }
+            mailbox.bytes.fill(0);
             // Lease returned: build a fresh QP. Never reuse a QP. The region
             // stays registered for the life of the pool.
             match ffi::NativeQueuePair::new_charged(
                 resource.device.clone(),
-                quota.clone(),
+                quota,
                 slot.stopped.clone(),
             ) {
                 Ok(qp) => {
@@ -1689,6 +1703,11 @@ where
     ) -> std::result::Result<(), S::Error> {
         self.inner.poll_budgeted(cx, budget)?;
         self.native.poll_budgeted(budget).map_err(Into::into)
+    }
+
+    /// Pass through to the inner service.
+    fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
+        self.inner.wait_timeout(maximum)
     }
 
     /// Stop the inner service only. Native work keeps going.

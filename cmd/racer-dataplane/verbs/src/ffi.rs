@@ -229,6 +229,8 @@ pub(crate) struct NativeDevice {
 
     raw: NonNull<c_void>,
 
+    pub(crate) quota: Option<Arc<GuardOwner>>,
+
     pub(crate) name: String,
 
     /// Port info. `qpn` and `psn` are unset.
@@ -257,9 +259,13 @@ impl NativeDevice {
 }
 
 impl Drop for NativeDevice {
-    /// Close the device. On failure, keep the library loaded.
+    /// Close the device. On failure, keep the library and charged owner.
     fn drop(&mut self) {
         if unsafe { (self.api.close)(self.raw.as_ptr()) } != 0 {
+            if let Some(quota) = self.quota.take() {
+                quota.quarantine();
+                std::mem::forget(quota);
+            }
             std::mem::forget(self.api.clone());
         }
     }
@@ -302,6 +308,7 @@ pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
         devices.push(NativeDevice {
             api: api.clone(),
             raw,
+            quota: None,
             name,
             endpoint: Endpoint {
                 gid: port.gid,
@@ -409,6 +416,17 @@ impl NativeRegion {
                 (self.device.api.bytes)(self.raw.as_ptr()),
                 self.length(),
             );
+        }
+        Ok(())
+    }
+
+    /// Clear the full allocation, not just the active range. Not while busy.
+    pub(crate) fn clear(&self) -> Result<()> {
+        if self.busy.get() {
+            return Err(Error::Unavailable);
+        }
+        unsafe {
+            std::ptr::write_bytes((self.device.api.bytes)(self.raw.as_ptr()), 0, self.length);
         }
         Ok(())
     }
@@ -1118,6 +1136,7 @@ pub(crate) mod lifetime_tests {
         let device = Rc::new(NativeDevice {
             api,
             raw: NonNull::new(pointer()).unwrap(),
+            quota: None,
             name: "test-only".into(),
             endpoint: Endpoint {
                 gid: [1; 16],
