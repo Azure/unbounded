@@ -800,7 +800,7 @@ func listenOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), err
 		return nil, nil, ioFailure("socket exists", err)
 	}
 
-	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	l, err := bindOriginSocket(path, mode)
 	if err != nil {
 		return nil, nil, ioFailure("socket bind", err)
 	}
@@ -822,10 +822,6 @@ func listenOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), err
 				return
 			}
 		}
-	}
-	if err := os.Chmod(path, mode); err != nil {
-		cleanup()
-		return nil, nil, ioFailure("socket mode", err)
 	}
 
 	return l, cleanup, nil
@@ -1037,7 +1033,7 @@ func recoverOriginSocket(socket, witness string) error {
 
 func listenOriginAtWitness(path string, mode os.FileMode) (*net.UnixListener, func(), error) {
 	// The caller pinned and validated the directory; /proc/self/fd is intentional.
-	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	l, err := bindOriginSocket(path, mode)
 	if err != nil {
 		return nil, nil, ioFailure("socket bind", err)
 	}
@@ -1059,10 +1055,49 @@ func listenOriginAtWitness(path string, mode os.FileMode) (*net.UnixListener, fu
 			}
 		}
 	}
-	if err := os.Chmod(path, mode); err != nil {
-		cleanup()
-		return nil, nil, ioFailure("socket mode", err)
-	}
 
 	return l, cleanup, nil
+}
+
+func bindOriginSocket(path string, mode os.FileMode) (*net.UnixListener, error) {
+	// Bind behind a private directory so even a permissive umask cannot expose
+	// the socket before chmod. A hard link publishes without replacing a path.
+	stage, err := os.MkdirTemp(filepath.Dir(path), ".racer-origin-")
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if err := os.RemoveAll(stage); err != nil {
+			return
+		}
+	}()
+
+	dir, err := os.Open(stage)
+	if err != nil {
+		return nil, err
+	}
+	defer closeBody(dir)
+
+	// Use the directory FD to avoid consuming the public socket's path budget.
+	private := fmt.Sprintf("/proc/self/fd/%d/socket", dir.Fd())
+
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: private, Net: "unix"})
+	if err != nil {
+		return nil, err
+	}
+
+	l.SetUnlinkOnClose(false)
+
+	if err := os.Chmod(private, mode); err != nil {
+		closeBody(l)
+		return nil, err
+	}
+
+	if err := os.Link(private, path); err != nil {
+		closeBody(l)
+		return nil, err
+	}
+
+	return l, nil
 }
