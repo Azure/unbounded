@@ -641,7 +641,7 @@ impl World {
 }
 
 /// Normalizes fixture names without allowing parent traversal.
-fn normalize(path: &Path) -> io::Result<PathBuf> {
+pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
     let mut out = PathBuf::from("/");
     for component in path.components() {
         match component {

@@ -411,9 +411,6 @@ pub mod mailbox {
         /// Values are consumed once; polling again after a value returns `Pending`,
         /// not `Cancelled`. Discarded and producer-loss errors remain observable.
         pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Result<Completion<V, B>>> {
-            if let Some(cancellation) = &self.cancellation {
-                cancellation.register(cx.waker());
-            }
             self.reply.poll_completion(cx)
         }
     }
@@ -1108,6 +1105,27 @@ pub mod mailbox {
             drop(receipt);
             assert_eq!(dropped.load(Ordering::Relaxed), 2);
             assert_eq!(mailbox.outstanding(), 0);
+        }
+
+        #[test]
+        fn cancelled_completion_poll_waits_for_reply_not_cancellation() {
+            let (mailbox, scope) = setup();
+            let receipt = mailbox.submit(1, String::new(), &scope, None).unwrap();
+            let command = mailbox.pop().unwrap();
+            scope.0.cancel().unwrap();
+            let counter = Arc::new(WakeCounter::default());
+            let waker = Waker::from(counter.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(receipt.poll_completion(&mut cx).is_pending());
+            assert_eq!(counter.count(), 0);
+            assert!(receipt.poll_completion(&mut cx).is_pending());
+            assert_eq!(counter.count(), 0);
+            drop(command);
+            assert_eq!(counter.count(), 1);
+            assert!(matches!(
+                receipt.poll_completion(&mut cx),
+                Poll::Ready(Err(Error::Unavailable))
+            ));
         }
 
         /// Closing admission retains accepted ownership until queued producers are disposed.

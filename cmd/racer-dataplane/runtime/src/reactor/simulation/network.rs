@@ -48,7 +48,13 @@ impl Simulation {
     /// Creates a listener and, for Unix sockets, its volatile filesystem name.
     pub fn listen(&self, address: SocketAddress) -> io::Result<Descriptor> {
         validate_address(&address)?;
+        let address = normalize_address(&address)?;
         if self.0.borrow().listeners.contains_key(&address) {
+            return Err(errno(libc::EADDRINUSE));
+        }
+        if let SocketAddress::Unix(path) = &address
+            && self.0.borrow().paths.contains_key(path)
+        {
             return Err(errno(libc::EADDRINUSE));
         }
         let fd = self.insert(Resource::Listener {
@@ -58,11 +64,6 @@ impl Simulation {
         self.0.borrow_mut().listeners.insert(address.clone(), h.id);
         if let SocketAddress::Unix(path) = address {
             let mut w = self.0.borrow_mut();
-            if w.paths.contains_key(&path) {
-                drop(w);
-                drop(fd);
-                return Err(errno(libc::EADDRINUSE));
-            }
             let node = w.node(libc::S_IFSOCK as u16 | 0o660);
             w.paths.insert(path, node);
         }
@@ -267,6 +268,7 @@ impl Handle {
     /// Connects this socket and queues the server endpoint for acceptance.
     pub fn connect(&self, address: &SocketAddress) -> io::Result<()> {
         validate_address(address)?;
+        let address = normalize_address(address)?;
         let mut w = self.sim.0.borrow_mut();
         let local = match w.resources.get(&self.id) {
             Some(Resource::Socket {
@@ -275,7 +277,7 @@ impl Handle {
                 connected,
                 ..
             }) => {
-                if *domain != address_family(address) {
+                if *domain != address_family(&address) {
                     return Err(errno(libc::EAFNOSUPPORT));
                 }
                 if *connected {
@@ -285,19 +287,19 @@ impl Handle {
             }
             _ => return Err(errno(libc::ENOTSOCK)),
         };
-        if local.as_ref().is_some_and(|a| w.partitioned(a, address)) {
+        if local.as_ref().is_some_and(|a| w.partitioned(a, &address)) {
             w.record("blocked:connect", self.id, 0);
             return Err(errno(libc::EAGAIN));
         }
         let listener = *w
             .listeners
-            .get(address)
+            .get(&address)
             .ok_or_else(|| errno(libc::ECONNREFUSED))?;
         let peer = w.id();
         w.resources.insert(
             peer,
             Resource::Socket {
-                domain: address_family(address),
+                domain: address_family(&address),
                 read_shutdown: false,
                 write_shutdown: false,
                 peer: Some(self.id),
@@ -316,7 +318,7 @@ impl Handle {
         {
             *p = Some(peer);
             *connected = true;
-            *remote = Some(address.clone());
+            *remote = Some(address);
         }
         let Some(Resource::Listener { pending }) = w.resources.get_mut(&listener) else {
             return Err(errno(libc::ECONNREFUSED));
@@ -458,6 +460,26 @@ impl Handle {
                     0
                 } else {
                     libc::POLLIN
+                }
+            }
+            Some(Resource::Pipe {
+                bytes,
+                write,
+                capacity,
+            }) => {
+                let len = bytes.borrow().len();
+                if *write {
+                    if !w.pipe_endpoint_open(bytes, false) {
+                        libc::POLLERR
+                    } else if len < *capacity {
+                        libc::POLLOUT
+                    } else {
+                        0
+                    }
+                } else {
+                    let writers = w.pipe_endpoint_open(bytes, true);
+                    (if len > 0 || !writers { libc::POLLIN } else { 0 })
+                        | if writers { 0 } else { libc::POLLHUP }
                 }
             }
             Some(Resource::Socket {
@@ -628,6 +650,14 @@ fn validate_address(address: &SocketAddress) -> io::Result<()> {
         .map_err(|_| errno(libc::EINVAL))
 }
 
+/// Use the fixture filesystem's path representation for Unix address keys.
+fn normalize_address(address: &SocketAddress) -> io::Result<SocketAddress> {
+    match address {
+        SocketAddress::Unix(path) => disk::normalize(path).map(SocketAddress::Unix),
+        _ => Ok(address.clone()),
+    }
+}
+
 /// End-to-end stream, packet, and completion ownership tests.
 #[cfg(test)]
 pub(super) mod tests {
@@ -763,6 +793,84 @@ pub(super) mod tests {
         drop((server, listener));
         assert_eq!(sim.live_handles(), 0);
         assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
+    }
+
+    #[test]
+    fn relative_unix_listener_lookup_unlink_and_rebind() {
+        let sim = Simulation::new();
+        let relative = SocketAddress::Unix("sock".into());
+        let absolute = SocketAddress::Unix("/sock".into());
+        let listener = sim.listen(relative.clone()).unwrap();
+        assert_eq!(
+            sim.metadata(Path::new("sock")).unwrap(),
+            sim.metadata(Path::new("/sock")).unwrap()
+        );
+        assert_eq!(
+            sim.listen(absolute.clone()).unwrap_err().raw_os_error(),
+            Some(libc::EADDRINUSE)
+        );
+        let client = sim.connect(absolute.clone()).unwrap();
+        assert!(listener.as_sim().unwrap().accept().is_ok());
+        drop(client);
+        sim.unlink(Path::new("sock")).unwrap();
+        assert_eq!(
+            sim.connect(relative.clone()).unwrap_err().raw_os_error(),
+            Some(libc::ECONNREFUSED)
+        );
+        let rebound = sim.listen(relative.clone()).unwrap();
+        assert!(sim.connect(relative).is_ok());
+        drop((listener, rebound));
+        assert_eq!(
+            sim.listen(absolute).unwrap_err().raw_os_error(),
+            Some(libc::EADDRINUSE)
+        );
+    }
+
+    #[test]
+    fn reactor_pipe_readiness_tracks_bytes_capacity_and_closed_peers() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let r = reactor();
+        let scope = scope();
+        let (read, write) = sim.pipe(2);
+        let (read, write) = (Rc::new(read), Rc::new(write));
+        let check = |fd: &Rc<Descriptor>, interest, expected| {
+            assert_eq!(
+                drive(&r, r.readiness(fd.clone(), interest, &scope)).unwrap(),
+                expected
+            );
+        };
+        check(&write, libc::POLLOUT as u32, libc::POLLOUT as u32);
+        let mut empty = r.readiness(read.clone(), libc::POLLIN as u32, &scope);
+        assert!(poll(&mut empty).is_pending());
+        r.poll_budgeted(8).unwrap();
+        assert!(poll(&mut empty).is_pending());
+        write.as_sim().unwrap().pipe_write(b"ab").unwrap();
+        assert_eq!(drive(&r, empty).unwrap(), libc::POLLIN as u32);
+        check(&read, libc::POLLIN as u32, libc::POLLIN as u32);
+        let mut full = r.readiness(write.clone(), libc::POLLOUT as u32, &scope);
+        assert!(poll(&mut full).is_pending());
+        r.poll_budgeted(8).unwrap();
+        assert!(poll(&mut full).is_pending());
+        read.as_sim().unwrap().pipe_read(&mut [0; 1]).unwrap();
+        assert_eq!(drive(&r, full).unwrap(), libc::POLLOUT as u32);
+        drop(write);
+        check(
+            &read,
+            libc::POLLIN as u32,
+            libc::POLLIN as u32 | libc::POLLHUP as u32,
+        );
+        read.as_sim().unwrap().pipe_read(&mut [0; 1]).unwrap();
+        check(
+            &read,
+            libc::POLLIN as u32,
+            libc::POLLIN as u32 | libc::POLLHUP as u32,
+        );
+
+        let (read, write) = sim.pipe(1);
+        let (read, write) = (Rc::new(read), Rc::new(write));
+        drop(read);
+        check(&write, libc::POLLOUT as u32, libc::POLLERR as u32);
     }
 
     #[test]
