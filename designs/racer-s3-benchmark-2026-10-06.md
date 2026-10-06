@@ -185,6 +185,15 @@ the failures or raise quotas blindly to make this benchmark appear clean.
 
 ## Deployment identity and reproducibility
 
+Integration note: while these measurements ran, the original `racer-v2` branch
+advanced to the ClusterVolume API. Final integration preserves that concurrent
+work and adapts the new deployment base to `ClusterVolume`, `spec.type: Cache`,
+and `--volume`. The images and live cluster measured below still use the earlier
+ClusterCache API. The final integrated source is tested but was not rebuilt or
+deployed for these measurements. Do not apply the current base to the measured
+legacy cluster without its corresponding controller/dataplane API migration.
+The overlay below records historical image identity, not an API migration recipe.
+
 The old 1,500-pod `DaemonSet/racer-loadgen` was replaced with the synthetic origin
 plus `racer-object origin` adapter. `ClusterCache/gantry` was deleted after old
 clients were removed; the Gantry DaemonSet remains idle. The new cache is
