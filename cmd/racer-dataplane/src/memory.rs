@@ -1520,6 +1520,7 @@ pub(crate) mod tests {
                     let mut wrong = id.clone();
                     wrong.number.0 += 1;
                     assert_eq!(acquired.validate_for(&wrong), Err(Error::CorruptRecord));
+                    // This checks net retention, not temporary clones during validation.
                     assert_eq!(Arc::strong_count(owner), owners);
                     assert_eq!(acquired.validate_for(&id), expected);
                 }

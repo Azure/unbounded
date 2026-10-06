@@ -9,6 +9,7 @@ use racer_control_wire::KeyId;
 use racer_dataplane as dataplane;
 use racer_dataplane::admission::AdmissionPolicy;
 use racer_dataplane::admission::ResourceClass;
+use racer_dataplane::config::Config;
 use racer_dataplane::memory::BufferPool;
 use racer_dataplane::model::CacheKey;
 use racer_dataplane::model::Nonce;
