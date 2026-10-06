@@ -469,16 +469,12 @@ impl Handle {
             }) => {
                 let len = bytes.borrow().len();
                 if *write {
-                    if !w.pipe_endpoint_open(bytes, false) {
-                        libc::POLLERR
-                    } else if len < *capacity {
-                        libc::POLLOUT
-                    } else {
-                        0
-                    }
+                    let readers = w.pipe_endpoint_open(bytes, false);
+                    (if len < *capacity { libc::POLLOUT } else { 0 })
+                        | if readers { 0 } else { libc::POLLERR }
                 } else {
                     let writers = w.pipe_endpoint_open(bytes, true);
-                    (if len > 0 || !writers { libc::POLLIN } else { 0 })
+                    (if len > 0 { libc::POLLIN } else { 0 })
                         | if writers { 0 } else { libc::POLLHUP }
                 }
             }
@@ -861,16 +857,90 @@ pub(super) mod tests {
             libc::POLLIN as u32 | libc::POLLHUP as u32,
         );
         read.as_sim().unwrap().pipe_read(&mut [0; 1]).unwrap();
-        check(
-            &read,
-            libc::POLLIN as u32,
-            libc::POLLIN as u32 | libc::POLLHUP as u32,
-        );
+        check(&read, libc::POLLIN as u32, libc::POLLHUP as u32);
 
         let (read, write) = sim.pipe(1);
         let (read, write) = (Rc::new(read), Rc::new(write));
         drop(read);
-        check(&write, libc::POLLOUT as u32, libc::POLLERR as u32);
+        check(
+            &write,
+            libc::POLLOUT as u32,
+            (libc::POLLOUT | libc::POLLERR) as u32,
+        );
+    }
+
+    #[test]
+    fn pipe_read_readiness_separates_queued_bytes_from_writer_close() {
+        for len in 0..=2 {
+            let sim = Simulation::new();
+            let (read, write) = sim.pipe(2);
+            let read = read.into_sim().unwrap();
+            assert_eq!(
+                write.as_sim().unwrap().pipe_write(&b"ab"[..len]).unwrap(),
+                len
+            );
+            if len == 0 {
+                assert_eq!(
+                    read.ready(libc::POLLIN as u32).unwrap_err().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+            } else {
+                assert_eq!(
+                    read.ready(libc::POLLIN as u32).unwrap(),
+                    libc::POLLIN as i32
+                );
+            }
+            drop(write);
+            let data = if len == 0 { 0 } else { libc::POLLIN };
+            assert_eq!(
+                read.ready(libc::POLLIN as u32).unwrap(),
+                (data | libc::POLLHUP) as i32
+            );
+            assert_eq!(read.ready(0).unwrap(), libc::POLLHUP as i32);
+            let mut output = [0; 2];
+            assert_eq!(read.pipe_read(&mut output).unwrap(), len);
+            assert_eq!(&output[..len], &b"ab"[..len]);
+            assert_eq!(
+                read.ready(libc::POLLIN as u32).unwrap(),
+                libc::POLLHUP as i32
+            );
+            assert_eq!(read.pipe_read(&mut output).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn pipe_write_readiness_separates_capacity_from_reader_close() {
+        for len in 0..=2 {
+            let sim = Simulation::new();
+            let (read, write) = sim.pipe(2);
+            let write = write.into_sim().unwrap();
+            assert_eq!(write.pipe_write(&b"ab"[..len]).unwrap(), len);
+            if len == 2 {
+                assert_eq!(
+                    write
+                        .ready(libc::POLLOUT as u32)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+            } else {
+                assert_eq!(
+                    write.ready(libc::POLLOUT as u32).unwrap(),
+                    libc::POLLOUT as i32
+                );
+            }
+            drop(read);
+            let capacity = if len < 2 { libc::POLLOUT } else { 0 };
+            assert_eq!(
+                write.ready(libc::POLLOUT as u32).unwrap(),
+                (capacity | libc::POLLERR) as i32
+            );
+            assert_eq!(write.ready(0).unwrap(), libc::POLLERR as i32);
+            assert_eq!(
+                write.pipe_write(b"x").unwrap_err().raw_os_error(),
+                Some(libc::EPIPE)
+            );
+        }
     }
 
     #[test]
