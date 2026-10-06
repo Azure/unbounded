@@ -2199,7 +2199,7 @@ func TestServerScale(t *testing.T) {
 
 			start = time.Now()
 
-			if current := reconcileTopology(t, r, ctx); current != first {
+			if current := reconcileTopology(t, r, ctx); current.record != first.record || current.encoded != first.encoded {
 				t.Fatal("no-op reconcile replaced publication")
 			}
 
@@ -2210,6 +2210,23 @@ func TestServerScale(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestScaleNoopPublicationState(t *testing.T) {
+	f := newServingFixture(t)
+	first := capturePublication(t, f.a.authority)
+	current := reconcileTopology(t, f.a.Topology, f.ctx)
+	require.NotSame(t, first, current)
+	require.Equal(t, first.record, current.record)
+	require.Equal(t, first.encoded, current.encoded)
+
+	var node corev1.Node
+	require.NoError(t, f.a.Topology.Get(f.ctx, client.ObjectKey{Name: "worker"}, &node))
+	node.Labels = map[string]string{wire.ExclusionLabel: ""}
+	require.NoError(t, f.a.Topology.Update(f.ctx, &node))
+	changed := reconcileTopology(t, f.a.Topology, f.ctx)
+	require.NotEqual(t, first.record, changed.record)
+	require.NotEqual(t, first.encoded, changed.encoded)
 }
 
 func scaleCache(t *testing.T, r *TopologyReconciler, count int) cache.Cache {
