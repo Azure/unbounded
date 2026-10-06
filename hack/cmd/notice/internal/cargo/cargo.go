@@ -10,9 +10,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/pelletier/go-toml/v2"
 
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/license"
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
@@ -31,6 +34,7 @@ type Collector struct {
 
 type dependency struct {
 	packageName string
+	localPath   string
 }
 
 // New constructs a Collector. An empty cargoHome uses CARGO_HOME or Cargo's
@@ -54,19 +58,12 @@ func (c *Collector) Precheck(root string) error {
 		return err
 	}
 
-	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
-
-	manifest, err := os.ReadFile(manifestPath)
+	versions, err := workspaceVersions(root)
 	if err != nil {
-		return fmt.Errorf("reading %s: %w", manifestPath, err)
+		return err
 	}
 
-	direct, err := directDependencies(string(manifest))
-	if err != nil {
-		return fmt.Errorf("parsing %s: %w", manifestPath, err)
-	}
-
-	if len(direct) == 0 {
+	if len(versions) == 0 {
 		return nil
 	}
 
@@ -89,28 +86,9 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, err
 	}
 
-	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
-
-	manifest, err := os.ReadFile(manifestPath)
+	versions, err := workspaceVersions(root)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", manifestPath, err)
-	}
-
-	direct, err := directDependencies(string(manifest))
-	if err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", manifestPath, err)
-	}
-
-	lockPath := filepath.Join(root, cratePath, "Cargo.lock")
-
-	lock, err := os.ReadFile(lockPath)
-	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", lockPath, err)
-	}
-
-	versions, err := lockedDirectVersions(string(lock), direct)
-	if err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", lockPath, err)
+		return nil, err
 	}
 
 	entries := make([]notice.Entry, 0, len(versions))
@@ -217,7 +195,7 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 		}
 
 		licenseNames, classifyErr := license.Classify(licenseText)
-		if classifyErr != nil {
+		if classifyErr != nil && !licenseIndex(licensePath, licenseText, licensePaths) {
 			return notice.Entry{}, fmt.Errorf("classifying %s: %w", licensePath, classifyErr)
 		}
 
@@ -274,6 +252,51 @@ func declaredLicenses(expression, link string) []notice.License {
 	return licenses
 }
 
+// The rustls family uses this exact index instead of license terms. Only its
+// known subjects and body (apart from whitespace) are accepted. Every referenced
+// companion must exist and is still classified separately. An optional leading
+// attribution is retained by buildEntry, not discarded with the index.
+const rustlsLicenseIndex = `is distributed under the following three licenses:
+- Apache License version 2.0.
+- MIT license.
+- ISC license.
+These are included as LICENSE-APACHE, LICENSE-MIT and LICENSE-ISC
+respectively. You may use this software under the terms of any
+of these licenses, at your option.`
+
+var indexCopyright = regexp.MustCompile(`^Copyright (?:\(c\) |© )?[0-9]{4}(?:-[0-9]{4})? .+$`)
+
+func licenseIndex(path string, text []byte, paths []string) bool {
+	if filepath.Base(path) != "LICENSE" {
+		return false
+	}
+
+	body := strings.TrimSpace(string(text))
+	for {
+		line, rest, found := strings.Cut(body, "\n")
+		if !found || !indexCopyright.MatchString(strings.TrimSpace(line)) {
+			break
+		}
+
+		body = strings.TrimSpace(rest)
+	}
+
+	body = strings.Join(strings.Fields(body), " ")
+
+	known := strings.Join(strings.Fields(rustlsLicenseIndex), " ")
+	if body != "Rustls "+known && body != "rustls-pemfile "+known {
+		return false
+	}
+
+	for _, name := range []string{"LICENSE-APACHE", "LICENSE-MIT", "LICENSE-ISC"} {
+		if !slices.Contains(paths, filepath.Join(filepath.Dir(path), name)) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func crateLicenseFiles(dir string) ([]string, error) {
 	var paths []string
 
@@ -318,130 +341,144 @@ func (c *Collector) home() (string, error) {
 }
 
 func directDependencies(data string) (map[string]dependency, error) {
-	direct := map[string]dependency{}
-	section := ""
-
-	scanner := bufio.NewScanner(strings.NewReader(data))
-	for scanner.Scan() {
-		line := strings.TrimSpace(strings.SplitN(scanner.Text(), "#", 2)[0])
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			continue
-		}
-
-		if !dependencySection(section) || line == "" {
-			continue
-		}
-
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) == "" {
-			return nil, fmt.Errorf("invalid dependency line %q", line)
-		}
-
-		name := strings.Trim(strings.TrimSpace(key), `"'`)
-
-		packageName := name
-		if parsed := inlinePackageName(value); parsed != "" {
-			packageName = parsed
-		}
-
-		direct[name] = dependency{packageName: packageName}
+	var manifest map[string]any
+	if err := toml.Unmarshal([]byte(data), &manifest); err != nil {
+		return nil, err
 	}
 
-	if err := scanner.Err(); err != nil {
+	direct := map[string]dependency{}
+	if err := collectDependencyTables(manifest, direct); err != nil {
 		return nil, err
+	}
+
+	if targets, ok := manifest["target"].(map[string]any); ok {
+		for _, target := range targets {
+			tables, ok := target.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("invalid target dependency table")
+			}
+
+			if err := collectDependencyTables(tables, direct); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	return direct, nil
 }
 
-func inlinePackageName(value string) string {
-	for _, field := range strings.Split(strings.Trim(value, " {}"), ",") {
-		key, fieldValue, found := strings.Cut(field, "=")
-		if found && strings.TrimSpace(key) == "package" {
-			return quotedValue(strings.TrimSpace(fieldValue))
+func collectDependencyTables(tables map[string]any, direct map[string]dependency) error {
+	for _, section := range []string{"dependencies", "build-dependencies", "dev-dependencies"} {
+		value, exists := tables[section]
+		if !exists {
+			continue
+		}
+
+		deps, ok := value.(map[string]any)
+		if !ok {
+			return fmt.Errorf("invalid %s table", section)
+		}
+
+		for alias, value := range deps {
+			// Cargo can implicitly enroll path dependencies as workspace members,
+			// even through development edges. Retain those paths for validation,
+			// but never collect registry development dependencies for NOTICE.
+			if section == "dev-dependencies" {
+				spec, ok := value.(map[string]any)
+				if !ok {
+					continue
+				}
+
+				if _, inherited := spec["workspace"]; inherited {
+					return fmt.Errorf("dependency %s: workspace inheritance is not supported", alias)
+				}
+
+				if _, local := spec["path"]; !local {
+					continue
+				}
+			}
+
+			name := alias
+
+			switch value := value.(type) {
+			case string:
+			case map[string]any:
+				if _, inherited := value["workspace"]; inherited {
+					return fmt.Errorf("dependency %s: workspace inheritance is not supported", alias)
+				}
+
+				if _, git := value["git"]; git {
+					return fmt.Errorf("dependency %s: git sources are not supported", alias)
+				}
+
+				if path, local := value["path"]; local {
+					text, ok := path.(string)
+					if !ok || text == "" {
+						return fmt.Errorf("dependency %s: invalid path", alias)
+					}
+
+					direct["path:"+text] = dependency{localPath: text}
+
+					continue
+				}
+
+				if renamed, exists := value["package"]; exists {
+					var ok bool
+
+					name, ok = renamed.(string)
+					if !ok || name == "" {
+						return fmt.Errorf("dependency %s: invalid package", alias)
+					}
+				}
+			default:
+				return fmt.Errorf("dependency %s: invalid declaration", alias)
+			}
+			// Key by registry name so target-specific aliases cannot overwrite each other.
+			direct["registry:"+name] = dependency{packageName: name}
+			direct[alias] = dependency{packageName: name}
 		}
 	}
 
-	return ""
-}
-
-func dependencySection(section string) bool {
-	return section == "dependencies" || section == "build-dependencies" ||
-		(strings.HasPrefix(section, "target.") && (strings.HasSuffix(section, ".dependencies") || strings.HasSuffix(section, ".build-dependencies")))
+	return nil
 }
 
 func lockedDirectVersions(data string, direct map[string]dependency) (map[string]string, error) {
+	return lockedPackageVersions(data, crateName, direct)
+}
+
+func lockedPackageVersions(data, packageName string, direct map[string]dependency) (map[string]string, error) {
 	type pkg struct {
-		name, version string
-		dependencies  []string
+		Name         string
+		Version      string
+		Dependencies []string
 	}
 
-	var (
-		packages []pkg
-		current  *pkg
-	)
-
-	inDependencies := false
-
-	scanner := bufio.NewScanner(strings.NewReader(data))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "[[package]]" {
-			packages = append(packages, pkg{})
-			current = &packages[len(packages)-1]
-			inDependencies = false
-
-			continue
-		}
-
-		if current == nil {
-			continue
-		}
-
-		if inDependencies {
-			if line == "]" {
-				inDependencies = false
-				continue
-			}
-
-			if dep := quotedValue(strings.TrimSuffix(line, ",")); dep != "" {
-				current.dependencies = append(current.dependencies, dep)
-			}
-
-			continue
-		}
-
-		switch {
-		case strings.HasPrefix(line, "name ="):
-			current.name = quotedValue(strings.TrimSpace(strings.TrimPrefix(line, "name =")))
-		case strings.HasPrefix(line, "version ="):
-			current.version = quotedValue(strings.TrimSpace(strings.TrimPrefix(line, "version =")))
-		case line == "dependencies = [":
-			inDependencies = true
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
+	var lock struct{ Package []pkg }
+	if err := toml.Unmarshal([]byte(data), &lock); err != nil {
 		return nil, err
 	}
+
+	packages := lock.Package
 
 	var root *pkg
 
 	for i := range packages {
-		if packages[i].name == crateName {
+		if packages[i].Name == packageName {
+			if root != nil {
+				return nil, fmt.Errorf("ambiguous workspace package %s", packageName)
+			}
+
 			root = &packages[i]
-			break
 		}
 	}
 
 	if root == nil {
-		return nil, fmt.Errorf("%s package not found", crateName)
+		return nil, fmt.Errorf("%s package not found", packageName)
 	}
 
 	versions := map[string]string{}
 
-	for _, dependency := range root.dependencies {
+	for _, dependency := range root.Dependencies {
 		name, version := lockDependency(dependency)
 		if !containsPackage(direct, name) {
 			continue
@@ -449,12 +486,12 @@ func lockedDirectVersions(data string, direct map[string]dependency) (map[string
 
 		if version == "" {
 			for _, candidate := range packages {
-				if candidate.name == name {
+				if candidate.Name == name {
 					if version != "" {
 						return nil, fmt.Errorf("dependency %s has ambiguous locked versions", name)
 					}
 
-					version = candidate.version
+					version = candidate.Version
 				}
 			}
 		}
@@ -463,10 +500,31 @@ func lockedDirectVersions(data string, direct map[string]dependency) (map[string
 			return nil, fmt.Errorf("dependency %s has no locked version", name)
 		}
 
+		found := false
+
+		for _, candidate := range packages {
+			if candidate.Name == name && candidate.Version == version {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return nil, fmt.Errorf("dependency %s@%s has no lock entry", name, version)
+		}
+
+		if previous := versions[name]; previous != "" && previous != version {
+			return nil, fmt.Errorf("crate %s has conflicting direct versions %s and %s", name, previous, version)
+		}
+
 		versions[name] = version
 	}
 
 	for alias, dep := range direct {
+		if dep.localPath != "" {
+			continue
+		}
+
 		if versions[dep.packageName] == "" {
 			return nil, fmt.Errorf("direct dependency %s not found in root lock entry", alias)
 		}
@@ -477,7 +535,7 @@ func lockedDirectVersions(data string, direct map[string]dependency) (map[string
 
 func containsPackage(direct map[string]dependency, name string) bool {
 	for _, dep := range direct {
-		if dep.packageName == name {
+		if dep.localPath == "" && dep.packageName == name {
 			return true
 		}
 	}
