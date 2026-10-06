@@ -69,7 +69,11 @@ jobs:
           fi
 
           if [[ ! -f "$file" ]]; then
-            echo "::error::No Containerfile found at ${file}"
+            file="images/${name}/Dockerfile"
+          fi
+
+          if [[ ! -f "$file" ]]; then
+            echo "::error::No Containerfile or Dockerfile found in images/${name}"
             exit 1
           fi
 

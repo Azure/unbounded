@@ -20,6 +20,7 @@ GO_PACKAGE_DIRS=$(shell $(GOCMD) list -tags e2e -f '{{.Dir}}' $(GO_PACKAGE_PATTE
 
 CONTAINER_ENGINE ?= podman
 CONTAINER_REGISTRY ?= ghcr.io/azure
+RACER_OBJECT_IMAGE ?= $(CONTAINER_REGISTRY)/racer-object:$(VERSION_TAG)
 
 # Unified install namespace for all unbounded components. Each component's
 # *_NAMESPACE var derives from this by default, so overriding UNBOUNDED_NAMESPACE
@@ -234,7 +235,7 @@ REACT_DEV ?= false
 
 ##@ General
 
-all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry racer-object ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -292,6 +293,9 @@ help: ## Show this help
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
+	@echo "  racer-object                     Test and build the S3 read adapter"
+	@echo "  racer-object-build               Build the S3 read adapter without tests"
+	@echo "  racer-object-test                Test the S3 read adapter and deployment examples"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -320,6 +324,7 @@ help: ## Show this help
 	@echo "  machine-ops-controller-oci-push  Build machine-ops-controller image and push"
 	@echo "  metalman-oci-push                Build metalman image and push"
 	@echo "  image-orca-local                 Build orca image"
+	@echo "  image-racer-object-local         Build the S3 read adapter image locally"
 	@echo "  orca-oci-push                    Build orca image and push"
 	@echo ""
 	@echo "Net Frontend:"
@@ -524,12 +529,14 @@ ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
 test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
+	@mkdir -p tmp
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
 test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
+	@mkdir -p tmp
 	$(GOTEST) ./...
 
 endif
@@ -540,6 +547,24 @@ e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
+
+.PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
+racer-object: racer-object-test racer-object-build ## Test and build the S3 read adapter
+
+racer-object-build: ## Build the S3 read adapter without lint/test
+	@mkdir -p bin
+	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-object ./cmd/racer-object
+
+racer-object-test: ## Test the S3 read adapter and deployment examples
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m ./cmd/racer-object/... ./internal/racerobject/... ./deploy/racer-object/...
+
+image-racer-object-local: ## Build the S3 read adapter image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION="$(VERSION)" --build-arg GIT_COMMIT="$(GIT_COMMIT)" \
+		--build-arg BUILD_TIME="$(BUILD_TIME)" \
+		-t racer-object:$(VERSION_TAG) -t $(RACER_OBJECT_IMAGE) \
+		-f ./images/racer-object/Dockerfile .
+	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
 
 build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...
