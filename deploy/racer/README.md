@@ -7,9 +7,14 @@ the controller does not apply dataplane workloads.
 
 ## Prerequisites
 
-- A Kubernetes cluster supporting `admissionregistration.k8s.io/v1`
-  `ValidatingAdmissionPolicy` and its binding, and permission to install the
-  policy, CRDs, and RBAC.
+- Kubernetes 1.32+ with `ServiceAccountTokenPodNodeInfo` (stable and always
+  enabled from 1.32). Bootstrap and keyring bearer authentication require
+  `authentication.kubernetes.io/node-name` and `authentication.kubernetes.io/node-uid`
+  in TokenReview results for Pod-bound ServiceAccount tokens. Requests without
+  either extra are rejected. See Kubernetes
+  [Pod-bound token metadata](https://kubernetes.io/docs/reference/access-authn-authz/service-accounts-admin/#additional-metadata-in-pod-bound-tokens).
+- Support for `admissionregistration.k8s.io/v1` `ValidatingAdmissionPolicy` and
+  its binding, and permission to install the policy, CRDs, and RBAC.
 - An existing namespace, default `unbounded-system`, and a controller image
   available to its nodes. Use a fixed image tag or digest.
 - A permanent cluster UUID. Use a new UUID for each new installation.
