@@ -981,9 +981,45 @@ func TestRustKeyringInterop(t *testing.T) {
 		t.Skip("set RACER_RUST_INTEROP=1 to run the Rust client")
 	}
 
-	root, err := filepath.Abs("../..")
+	root, err := filepath.Abs("../../..")
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	manifest := filepath.Join(root, "cmd/racer-dataplane/Cargo.toml")
+	metadataCommand := exec.CommandContext(t.Context(), "timeout", "--signal=TERM", "--kill-after=10s", "230s", "cargo", "metadata", "--locked", "--no-deps", "--format-version=1", "--manifest-path", manifest)
+	metadataCommand.Cancel = func() error { return metadataCommand.Process.Signal(syscall.SIGTERM) }
+	metadataCommand.WaitDelay = 10 * time.Second
+	metadataCommand.Stderr = os.Stderr
+
+	encodedMetadata, err := metadataCommand.Output()
+	if err != nil {
+		t.Fatalf("Rust interoperability metadata: %v", err)
+	}
+
+	var metadata struct {
+		Packages []struct {
+			ManifestPath string `json:"manifest_path"`
+			Targets      []struct {
+				Name string   `json:"name"`
+				Kind []string `json:"kind"`
+			} `json:"targets"`
+		} `json:"packages"`
+	}
+	require.NoError(t, json.Unmarshal(encodedMetadata, &metadata))
+
+	available := false
+
+	for _, pkg := range metadata.Packages {
+		for _, target := range pkg.Targets {
+			if pkg.ManifestPath == manifest && target.Name == "keyring_interop" && slices.Contains(target.Kind, "test") {
+				available = true
+			}
+		}
+	}
+
+	if !available {
+		t.Skip("standalone controller extraction has no production Rust keyring_interop test target")
 	}
 
 	if err := os.MkdirAll(filepath.Join(root, "tmp"), 0o700); err != nil {
@@ -1029,7 +1065,7 @@ func TestRustKeyringInterop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 240*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "timeout", "--signal=TERM", "--kill-after=10s", "230s", "cargo", "test", "--locked", "--manifest-path", filepath.Join(root, "cmd/racer-dataplane/Cargo.toml"), "--test", "keyring_interop", "--", "--ignored", "--nocapture")
+	cmd := exec.CommandContext(ctx, "timeout", "--signal=TERM", "--kill-after=10s", "230s", "cargo", "test", "--locked", "--manifest-path", manifest, "--test", "keyring_interop", "--", "--ignored", "--nocapture")
 
 	cmd.Env = append(os.Environ(), "RACER_KEYRING_INTEROP_DIR="+directory)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
