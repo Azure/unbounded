@@ -6,6 +6,7 @@ package ociartifact
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"strings"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
@@ -50,7 +52,56 @@ func Open(ctx context.Context, source string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("fetch OCI blob %q: %w", title, err)
 	}
 
-	return body, nil
+	return newVerifyingReadCloser(body, desc, title), nil
+}
+
+// verifyingReadCloser streams a blob while hashing it, and fails the final Read
+// when the content does not match the descriptor.
+//
+// oras-go does not verify blob content on its own. Repository.Fetch only
+// compares the Docker-Content-Digest response header against the expected
+// digest, and skips even that when the registry omits the header, so the bytes
+// themselves are never checked. Content that is the right size but the wrong
+// bytes would otherwise be accepted.
+//
+// The mismatch is surfaced through Read rather than Close because callers
+// reliably check read errors and frequently ignore the error from Close.
+type verifyingReadCloser struct {
+	verifier *content.VerifyReader
+	closer   io.Closer
+	title    string
+	verified bool
+}
+
+func newVerifyingReadCloser(body io.ReadCloser, desc ocispec.Descriptor, title string) *verifyingReadCloser {
+	return &verifyingReadCloser{
+		verifier: content.NewVerifyReader(body, desc),
+		closer:   body,
+		title:    title,
+	}
+}
+
+func (v *verifyingReadCloser) Read(p []byte) (int, error) {
+	n, err := v.verifier.Read(p)
+	if !errors.Is(err, io.EOF) {
+		return n, err
+	}
+
+	// The stream is complete, so the digest can now be checked. Report a
+	// mismatch as a read failure so it cannot be mistaken for a clean EOF.
+	if !v.verified {
+		if verifyErr := v.verifier.Verify(); verifyErr != nil {
+			return n, fmt.Errorf("verify OCI blob %q: %w", v.title, verifyErr)
+		}
+
+		v.verified = true
+	}
+
+	return n, io.EOF
+}
+
+func (v *verifyingReadCloser) Close() error {
+	return v.closer.Close()
 }
 
 // FetchManifest resolves an OCI artifact source and returns its selected
