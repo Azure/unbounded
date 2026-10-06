@@ -548,16 +548,24 @@ impl Future for FenceWaiter {
             self.unregister();
             return Poll::Ready(Ok(()));
         }
-        if let Some(registration) = &self.registration {
-            registration.borrow_mut().clone_from(cx.waker());
-            // Final completion drained registrations; a new write can precede
-            // our next poll, in which case this waiter must register again.
+        let waker = cx.waker().clone();
+        if self.state.count.get() == 0 {
+            self.unregister();
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(registration) = self.registration.clone() {
+            let old = registration.borrow_mut().replace(waker);
+            drop(old);
+            if self.state.count.get() == 0 {
+                self.unregister();
+                return Poll::Ready(Ok(()));
+            }
             let mut waiters = self.state.waiters.borrow_mut();
-            if !waiters.iter().any(|w| Rc::ptr_eq(w, registration)) {
-                waiters.push(registration.clone());
+            if !waiters.iter().any(|w| Rc::ptr_eq(w, &registration)) {
+                waiters.push(registration);
             }
         } else {
-            let registration = Rc::new(RefCell::new(cx.waker().clone()));
+            let registration = Rc::new(RefCell::new(waker));
             self.state.waiters.borrow_mut().push(registration.clone());
             self.registration = Some(registration);
         }
