@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -97,9 +98,10 @@ func (o *Object) Read(p []byte) (int, error) {
 // from Racer's socket to w inside the kernel with splice(2), with no copy into
 // process memory. Other writers receive data through a reused 256 KiB buffer.
 //
-// When w is an [http.ResponseWriter], WriteTo applies a write deadline to each
-// write and interrupts a blocked write if the Get context ends. Set response
-// headers, including Content-Length, before calling WriteTo.
+// When w supports SetWriteDeadline, directly or through an HTTP response
+// controller, WriteTo bounds each write and interrupts it if the Get context
+// ends. It clears its deadlines before returning and never closes w. Set HTTP
+// response headers, including Content-Length, before calling WriteTo.
 func (o *Object) WriteTo(w io.Writer) (int64, error) {
 	if err := o.begin(); err != nil {
 		if err == io.EOF {
@@ -578,15 +580,14 @@ func truncation(err error) error {
 	}
 }
 
-// destination wraps a WriteTo writer. For an http.ResponseWriter it bounds
-// each write with a deadline and can interrupt a blocked write.
+// destination bounds writes and interrupts them when the writer supports deadlines.
 type destination struct {
-	ctx     context.Context
-	w       io.Writer
-	rf      io.ReaderFrom
-	rc      *http.ResponseController
-	timeout time.Duration
-	mu      sync.Mutex
+	ctx              context.Context
+	w                io.Writer
+	rf               io.ReaderFrom
+	setWriteDeadline func(time.Time) error
+	timeout          time.Duration
+	mu               sync.Mutex
 }
 
 func newDestination(ctx context.Context, w io.Writer, timeout time.Duration) *destination {
@@ -596,7 +597,9 @@ func newDestination(ctx context.Context, w io.Writer, timeout time.Duration) *de
 	}
 
 	if rw, ok := w.(http.ResponseWriter); ok {
-		d.rc = http.NewResponseController(rw)
+		d.setWriteDeadline = http.NewResponseController(rw).SetWriteDeadline
+	} else if dw, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		d.setWriteDeadline = dw.SetWriteDeadline
 	}
 
 	return d
@@ -604,7 +607,7 @@ func newDestination(ctx context.Context, w io.Writer, timeout time.Duration) *de
 
 // interruptOnCancel returns an idempotent stop-and-join function.
 func (d *destination) interruptOnCancel() func() {
-	if d.rc == nil {
+	if d.setWriteDeadline == nil {
 		return func() {}
 	}
 
@@ -615,18 +618,21 @@ func (d *destination) interruptOnCancel() func() {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 
-		_ = d.rc.SetWriteDeadline(time.Now()) //nolint:errcheck // Unsupported writers cannot be interrupted.
+		_ = d.setWriteDeadline(time.Now()) //nolint:errcheck // Unsupported writers cannot be interrupted.
 	})
 
 	return sync.OnceFunc(func() {
 		if !stop() {
 			<-done
 		}
+
+		// The write has ended. Join the interrupt before clearing its deadline.
+		_ = d.setWriteDeadline(time.Time{}) //nolint:errcheck // Best effort cleanup of caller-owned writers.
 	})
 }
 
 func (d *destination) deadline(t time.Time) error {
-	if d.rc == nil {
+	if d.setWriteDeadline == nil {
 		return nil
 	}
 
@@ -638,7 +644,7 @@ func (d *destination) deadline(t time.Time) error {
 		return err
 	}
 
-	if err := d.rc.SetWriteDeadline(t); err != nil && !errors.Is(err, http.ErrNotSupported) {
+	if err := d.setWriteDeadline(t); err != nil && !errors.Is(err, http.ErrNotSupported) && !errors.Is(err, os.ErrNoDeadline) {
 		return err
 	}
 
