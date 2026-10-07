@@ -2962,11 +2962,11 @@ mod tests {
         FillQueue,
     }
 
+    /// Thread-local callback used to change the pool during admission.
+    type AdmissionHook = std::thread::LocalKey<RefCell<Option<Box<dyn FnOnce()>>>>;
+
     /// Poll once to catch lost wakeups without relying on periodic maintenance.
-    fn check_waiter_admission_reentry(
-        hook: &'static std::thread::LocalKey<RefCell<Option<Box<dyn FnOnce()>>>>,
-        change: AdmissionChange,
-    ) {
+    fn check_waiter_admission_reentry(hook: &'static AdmissionHook, change: AdmissionChange) {
         for priority in [false, true] {
             let hooks = Rc::new(Hooks::<ReentryKey> {
                 used: Rc::default(),
