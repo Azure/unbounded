@@ -149,7 +149,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pinned Rust
-        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
 
       - name: Enable io_uring
         run: timeout --signal=TERM --kill-after=10s 300s sudo sysctl -w kernel.io_uring_disabled=0
@@ -179,6 +179,37 @@ jobs:
 
       - name: Test all features
         run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --all-features
+
+      - name: Strict runtime Clippy
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --all-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --no-default-features -- -D warnings
+
+      - name: Runtime production real I/O (no simulation)
+        env:
+          RUNTIME_REQUIRE_IO_URING: "1"
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --no-default-features
+
+  runtime-miri:
+    name: Runtime Miri (${{ matrix.group }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [channel, offload, scheduler, memory]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Miri
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install nightly-2025-11-21 --profile minimal --component miri,rust-src
+
+      - name: Prepare Miri sysroot
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +nightly-2025-11-21 miri setup
+
+      - name: Validate exact pure runtime test group
+        run: timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/runtime-miri.py ${{ matrix.group }}
 
   # ---------- Orca Integration Tests ----------
   # Spins up Garage and Azurite via testcontainers-go and runs the
