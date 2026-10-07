@@ -1062,8 +1062,12 @@ impl IoPort {
         }
         self.shared.generation.store(generation, Ordering::Release);
         self.shared.configured.store(false, Ordering::Release);
-        self.shared.drained.store(false, Ordering::Release);
+        // Open before clearing the acknowledgment. Native progress that acquires
+        // the cleared drained flag must also see this pool as open.
         self.shared.closed.store(false, Ordering::Release);
+        #[cfg(test)]
+        tests::poll_during_reopen();
+        self.shared.drained.store(false, Ordering::Release);
         self.shared.engine.wake();
         Ok(())
     }
@@ -1361,6 +1365,7 @@ impl NativeService {
         }
         // Drained once closed and all native objects are gone. Then clear
         // the mailboxes so reopen starts fresh.
+        // Read drained first: acquiring reopen's reset also publishes closed=false.
         if !self.port.shared.drained.load(Ordering::Acquire)
             && self.port.shared.closed.load(Ordering::Acquire)
             && self.activation.is_none()
@@ -2037,6 +2042,96 @@ mod tests {
     use super::*;
 
     use std::task::Context;
+
+    thread_local! {
+        static REOPEN_STEP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Let the native thread poll between reopen's two publication stores.
+    pub(super) fn poll_during_reopen() {
+        REOPEN_STEP.with(|step| {
+            if let Some(step) = step.borrow_mut().take() {
+                step();
+            }
+        });
+    }
+
+    /// An old drain acknowledgment cannot authorize resetting a new live lease.
+    #[test]
+    fn reopen_interleaved_native_poll_requires_a_fresh_drain() {
+        let (io, port) = pair(1).unwrap();
+        let io = Rc::new(io);
+        type Step = Box<dyn FnOnce(&mut NativeService) + Send>;
+        let (step_tx, step_rx) = std::sync::mpsc::channel::<Step>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let sim = simulation::Simulation::new()
+                .with_devices(vec![simulation::Device::new("sim0", [1; 16])])
+                .unwrap();
+            let _environment = sim.enter();
+            let mut native = NativeService::new(port);
+            while let Ok(step) = step_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                step(&mut native);
+                done_tx.send(()).unwrap();
+            }
+            assert!(native.drained());
+            assert_eq!(sim.live_resources(), 0);
+        });
+        let step = Rc::new(move |f: Step| {
+            step_tx.send(f).unwrap();
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        });
+        io.close();
+        step(Box::new(|native| native.poll_budgeted(1).unwrap()));
+        assert!(io.shared.drained.load(Ordering::Acquire));
+        let interleave = step.clone();
+        REOPEN_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                interleave(Box::new(|native| native.poll_budgeted(1).unwrap()));
+            }));
+        });
+        io.reopen().unwrap();
+        assert!(!io.closed());
+        assert!(!io.shared.drained.load(Ordering::Acquire));
+        // Also poll after the reset, when the native side must see the pool open.
+        step(Box::new(|native| native.poll_budgeted(1).unwrap()));
+        assert!(!io.shared.drained.load(Ordering::Acquire));
+
+        let (guard, charged) = test_guard::guard();
+        futures::executor::block_on(io.configure(Configuration {
+            discover: true,
+            bytes: 32,
+            guards: vec![guard],
+            selector: Box::new(|_| Ok(vec![(0, 0)])),
+        }))
+        .unwrap();
+        step(Box::new(|native| {
+            native.poll_budgeted(1).unwrap();
+            native.poll_budgeted(1).unwrap();
+            assert!(native.resources[0].is_some());
+        }));
+        io.activation().unwrap().unwrap();
+        let qp = claim(&io);
+        step(Box::new(|native| native.close()));
+        assert_eq!(io.reopen(), Err(Error::Overloaded));
+        assert_eq!(io.shared.generation.load(Ordering::Acquire), 2);
+        assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), OWNED);
+        assert!(!qp.stopped());
+        assert_eq!(charged.get(), 1);
+
+        step(Box::new(|native| native.poll_budgeted(1).unwrap()));
+        assert!(qp.stopped());
+        assert_eq!(io.reopen(), Err(Error::Overloaded));
+        drop(qp);
+        step(Box::new(|native| native.poll_budgeted(1).unwrap()));
+        assert_eq!(charged.get(), 0);
+        io.reopen().unwrap();
+        assert_eq!(io.shared.generation.load(Ordering::Acquire), 3);
+        drop(step);
+        thread.join().unwrap();
+    }
 
     /// Install a private ABI fixture while keeping its independent quota observer.
     pub(super) fn provision_test(
