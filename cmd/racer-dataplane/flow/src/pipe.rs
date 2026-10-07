@@ -1166,9 +1166,15 @@ mod tests {
         drop(pipe);
         assert!(pool.idle.borrow().is_empty());
         assert_eq!(admission.used(ResourceClass::Pipe), 0);
-        // SAFETY: only query the closed descriptor numbers, without reusing them.
-        assert_eq!(unsafe { libc::fcntl(read, libc::F_GETFD) }, -1);
-        assert_eq!(unsafe { libc::fcntl(write, libc::F_GETFD) }, -1);
+        // Dropped resources close their owned descriptors. Do not probe the old
+        // numbers: parallel tests may already have reused them for other files.
+        let mut replacement = pool.acquire().unwrap();
+        assert_eq!(admission.used(ResourceClass::Pipe), 1);
+        assert_eq!(replacement.buffered(), 0);
+        assert_eq!(
+            replacement.try_read(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     /// A lease outliving its pool continues to hold capacity until drop.
