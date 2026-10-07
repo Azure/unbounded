@@ -35,37 +35,42 @@ Non-goals:
 
 Live allocation and I/O authority is worker-local. `Segments` and `Slab` use
 `Rc`-owned state and are neither `Send` nor `Sync`
-(`alloc/src/segments.rs:160-179`, `alloc/src/slab.rs:57-72`). Buffers, leases,
-freeze guards, and the reclamation clock have the same restriction
-(`alloc/src/lib.rs:545-550`, `alloc/src/segments.rs:62-76`,
-`alloc/src/segments.rs:144`, `alloc/src/segments.rs:617-626`).
+(see `Segments` in `alloc/src/segments.rs` and `Slab` in `alloc/src/slab.rs`).
+Buffers, leases, freeze guards, and the reclamation clock have the same restriction
+(see `AlignedBuffer` in `alloc/src/lib.rs` and `SegmentLease`, `FreezeGuard`, and
+`SegmentClock` in `alloc/src/segments.rs`).
 Value types such as `Alignment` and `SegmentId`, and startup inputs such as
-`DevicePlacement`, are `Send + Sync` (`alloc/src/lib.rs:313-319`,
-`alloc/src/segments.rs:13-15`, `alloc/src/slab.rs:34-43`). Each worker owns its
+`DevicePlacement`, are `Send + Sync` (see their declarations in `alloc/src/lib.rs`,
+`alloc/src/segments.rs`, and `alloc/src/slab.rs`, respectively). Each worker owns its
 storage ranges, segment table, and buffer pool; live allocation and I/O authority
 cannot move to another worker.
 
 ## Buffers
 
 `AlignedBuffer` is a heap allocation from `alloc_zeroed` with the alignment that
-the file needs (`alloc/src/lib.rs:415-442`). Lengths are padded to the least common
-multiple of the offset and length units, so the next record also starts aligned.
-A single buffer is at most 1 GiB.
+the file needs (see `Alignment::allocate` in `alloc/src/lib.rs`). Lengths are
+padded to the least common multiple of the offset and length units, so the next
+record also starts aligned.
+A single buffer is at most 1 GiB (see `Alignment::extent` and
+`Alignment::MAX_TRANSFER_LENGTH` in `alloc/src/lib.rs`).
 
 Each buffer holds a caller-supplied `Charge`, so the caller can account for
 memory against its own budget. The slab keeps at most one idle buffer.
 After checking charge coverage, allocation reuses it only for an exact length
 match; otherwise it frees the idle buffer and allocates new storage
-(`alloc/src/slab.rs:566-580`). On drop, a buffer fills the idle slot only if the
-pool still exists and the slot is empty and can be mutably borrowed; otherwise
-its storage is freed (`alloc/src/lib.rs:630-650`, `alloc/src/lib.rs:522-529`).
+(see `Slab::allocate` in `alloc/src/slab.rs`). On drop, a buffer fills the idle slot
+only if the pool still exists and the slot is empty and can be mutably borrowed; otherwise
+its storage is freed (see the `Drop` implementations for `AlignedBuffer` and
+`Allocation` in `alloc/src/lib.rs`).
 The retained size depends on return order, not necessarily the last size used.
 This is not a general size-class pool.
 
 Each buffer tracks whether it is still all zeros. Any mutable access, including
 handing it to the kernel for a read, marks it dirty. On drop, a dirty buffer is
 wiped in full, including padding, with `explicit_bzero` (or `zeroize` where that
-is not available) before it is pooled or freed (`alloc/src/lib.rs:483-520`).
+is not available) before it is pooled or freed (see `Allocation::as_mut_slice`,
+`Allocation::wipe`, and the `IoBuffer` implementation for `AlignedBuffer` in
+`alloc/src/lib.rs`).
 Clean buffers skip the wipe. This keeps old page data from leaking into the
 next request without paying for a wipe on every allocation.
 
@@ -103,11 +108,11 @@ any segment that was open before the restart.
 
 ## Reclaim
 
-`SegmentClock` is a bounded clock (second-chance) sweep over sealed segments
-(`alloc/src/segments.rs:785-842`). The caller calls `mark_read` when it serves
-a read from a segment. The sweep clears that mark once before it picks the
-segment. Each call has limits on
-the number of segments it visits and the number of index entries it removes.
+`SegmentClock::reclaim` in `alloc/src/segments.rs` is a bounded clock
+(second-chance) sweep over sealed segments. The caller calls `mark_read` when it
+serves a read from a segment. The sweep clears that mark once before it picks the
+segment. Each call has limits on the number of segments it visits and the number
+of index entries it removes.
 For a nonzero reserve, `reclaim` and `reclaim_scored` succeed only when the reserve
 (capped at the slot count) is met and no evictions remain. They intentionally
 return `Busy` while evictions remain, even if enough slots are already free.
@@ -128,14 +133,15 @@ The key rule is: remove the index entries first, then wait for in-flight I/O,
 then reuse. `reclaim_scored` visits at most `min(slot count, max_visits, 64)`
 slots, including skipped slots. It ranks eligible candidates in that sample by a
 caller-provided score instead of recent reads. The limit is on visited slots,
-not eligible candidates. `reclaim_index` drops index entries one at a time until a caller check
-(for example, an index size limit) passes. It does not free segments and does not
-ask `can_evict`.
+not eligible candidates. `reclaim_index` drops index entries one at a time until a
+caller check (for example, an index size limit) passes. It does not free segments
+and does not ask `can_evict`.
 
 ## Storage and I/O
 
 `Slab::new` describes one cache file. Opening is blocking and is meant to run at
-startup (`alloc/src/slab.rs:368-409`). For this file-backed mode, it:
+startup (see `Slab::open_configured` and `Slab::open_file` in `alloc/src/slab.rs`).
+For this file-backed mode, it:
 
 - Walks the path without following symlinks or `..`.
 - Requires a regular file owned by the current user, mode 0600, one hard link.
@@ -143,6 +149,9 @@ startup (`alloc/src/slab.rs:368-409`). For this file-backed mode, it:
 - Reads the required alignment from `statx(STATX_DIOALIGN)`.
 - Sizes an empty file sparsely to capacity. A file with the wrong size is
   rejected, not truncated.
+
+See `Slab::open_file`, `Slab::validate_layout`, `open_private_file`,
+`validate_file`, and `probe_fd` in `alloc/src/slab.rs` for these checks.
 
 `Slab::from_devices` instead owns caller-opened file or block-device placements,
 one per logical segment, without creating, sizing, or locking them. Files must
@@ -156,13 +165,14 @@ and sizes unchanged while in use (see `Slab::from_devices` in `alloc/src/slab.rs
 
 For device placements, `open_configured` duplicates the owned files into
 worker-local descriptors and releases the original placement references
-(`alloc/src/slab.rs:295-325`). In both modes, it then binds the slab to one
-segment table. I/O is refused until binding succeeds, and a slab cannot be
-rebound to a different table (`alloc/src/slab.rs:241-276`,
-`alloc/src/slab.rs:447-449`).
+(see `Slab::open_file` in `alloc/src/slab.rs`). In both modes, it then binds the
+slab to one segment table. I/O is refused until binding succeeds, and a slab cannot be
+rebound to a different table (see `Slab::bind` and `Slab::submission` in
+`alloc/src/slab.rs`).
 
 `read` and `write` check the extent, alignment, and lease, then pass the buffer
-and lease to the reactor (`alloc/src/slab.rs:461-515`). The reactor holds both
+and lease to the reactor (see `Slab::submission`, `Submission::read`, and
+`Submission::write` in `alloc/src/slab.rs`). The reactor holds both
 until the kernel reports completion, even if the caller drops the future or
 cancels. So the memory and the segment both stay reserved until the kernel is
 done with them. Short reads and writes are returned as errors.
