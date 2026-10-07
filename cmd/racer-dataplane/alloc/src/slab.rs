@@ -1004,19 +1004,82 @@ mod tests {
     }
 
     /// Skip only explicit unsupported-filesystem results unless real I/O is required.
-    fn real_alignment(result: Result<Alignment>) -> Option<Alignment> {
+    fn real_alignment<T>(result: Result<T>) -> Option<T> {
+        real_io_result(
+            result,
+            std::env::var("PAGE_ALLOC_REQUIRE_REAL_IO").as_deref() == Ok("1"),
+        )
+    }
+
+    /// Apply the capability policy without changing the process environment in tests.
+    fn real_io_result<T>(result: Result<T>, required: bool) -> Option<T> {
         match result {
-            Ok(alignment) => Some(alignment),
+            Ok(value) => Some(value),
             Err(Error::Unsupported) => {
-                assert_ne!(
-                    std::env::var("PAGE_ALLOC_REQUIRE_REAL_IO").as_deref(),
-                    Ok("1"),
+                assert!(
+                    !required,
                     "PAGE_ALLOC_REQUIRE_REAL_IO=1 forbids capability skips: filesystem does not support direct I/O geometry"
                 );
                 eprintln!("SKIP real slab test: filesystem does not support direct I/O geometry");
                 None
             }
             Err(error) => panic!("unexpected real slab startup failure: {error}"),
+        }
+    }
+
+    /// Successful setup is preserved in both optional and required modes.
+    #[test]
+    fn real_io_success_is_preserved() {
+        for required in [false, true] {
+            assert_eq!(real_io_result(Ok(42), required), Some(42));
+        }
+    }
+
+    /// Unsupported direct opens skip only when the real-I/O gate is optional.
+    #[test]
+    fn real_io_unsupported_open_obeys_required_policy() {
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+            let error = direct_error("open", std::io::Error::from_raw_os_error(errno));
+            assert_eq!(real_io_result::<()>(Err(error), false), None);
+            let panic =
+                std::panic::catch_unwind(|| real_io_result::<()>(Err(error), true)).unwrap_err();
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap();
+            assert!(message.contains("PAGE_ALLOC_REQUIRE_REAL_IO=1 forbids capability skips"));
+        }
+    }
+
+    /// Other open failures, including errors without errno, must never skip.
+    #[test]
+    fn real_io_unexpected_open_errors_fail_in_both_modes() {
+        for errno in [
+            Some(libc::EACCES),
+            Some(libc::EIO),
+            Some(libc::EEXIST),
+            None,
+        ] {
+            let error = direct_error(
+                "open",
+                errno
+                    .map(std::io::Error::from_raw_os_error)
+                    .unwrap_or_else(|| std::io::Error::other("synthetic")),
+            );
+            assert_eq!(
+                error,
+                Error::SystemIo {
+                    operation: "open",
+                    errno
+                }
+            );
+            for required in [false, true] {
+                assert!(
+                    std::panic::catch_unwind(|| real_io_result::<()>(Err(error), required))
+                        .is_err()
+                );
+            }
         }
     }
 
@@ -1096,7 +1159,7 @@ mod tests {
     }
 
     /// Open direct files without using the slab's private-file startup path.
-    fn device_file(path: &Path) -> Arc<File> {
+    fn device_file(path: &Path) -> Option<Arc<File>> {
         use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -1104,9 +1167,10 @@ mod tests {
             .create_new(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)
-            .unwrap();
+            .map_err(|error| direct_error("open", error));
+        let file = real_alignment(file)?;
         file.set_len(16384).unwrap();
-        Arc::new(file)
+        Some(Arc::new(file))
     }
 
     /// Device layouts reject aliases, misalignment, overflow, and invalid file flags.
@@ -1114,7 +1178,9 @@ mod tests {
     fn device_layout_validation_is_read_only() {
         use std::os::unix::fs::OpenOptionsExt;
         let directory = Directory::new();
-        let file = device_file(&directory.0.join("device"));
+        let Some(file) = device_file(&directory.0.join("device")) else {
+            return;
+        };
         let Some(a) = real_alignment(probe(&file)) else {
             return;
         };
@@ -1239,7 +1305,9 @@ mod tests {
     #[test]
     fn device_submission_checks_logical_and_physical_extents() {
         let directory = Directory::new();
-        let file = device_file(&directory.0.join("device"));
+        let Some(file) = device_file(&directory.0.join("device")) else {
+            return;
+        };
         let Some(a) = real_alignment(probe(&file)) else {
             return;
         };
@@ -1333,7 +1401,9 @@ mod tests {
             }
         }
         let directory = Directory::new();
-        let file = device_file(&directory.0.join("device"));
+        let Some(file) = device_file(&directory.0.join("device")) else {
+            return;
+        };
         let Some(a) = real_alignment(probe(&file)) else {
             return;
         };
