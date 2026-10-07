@@ -189,6 +189,8 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
 
     /// Admit work or one exclusive recovery probe without waiting.
     pub fn acquire(self: &Arc<Self>, key: &K) -> Result<Arc<Permit<K, O>>> {
+        let indexed = key.clone();
+        let owned = key.clone();
         let now = (self.now)();
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.active >= state.limit {
@@ -198,22 +200,19 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         if !state.peers.contains_key(key) && state.peers.len() == self.config.capacity {
             let retired = state
                 .peers
-                .iter()
-                .find(|(_, p)| {
+                .extract_if(.., |_, p| {
                     p.active == 0
                         && !p.probe
                         && p.retry.is_none_or(|retry| now >= retry)
                         && now.saturating_duration_since(p.updated) >= self.config.retire_after
                 })
-                .map(|(k, _)| k.clone());
-            if let Some(retired) = retired {
-                state.peers.remove(&retired);
-            } else {
+                .next();
+            if retired.is_none() {
                 self.observer.event(Event::Rejected);
                 return Err(Error::Overloaded);
             }
         }
-        let peer = state.peers.entry(key.clone()).or_insert(Peer {
+        let peer = state.peers.entry(indexed).or_insert(Peer {
             active: 0,
             limit: self.config.per_key,
             generation: 0,
@@ -241,7 +240,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         }
         Ok(Arc::new(Permit {
             owner: self.clone(),
-            key: key.clone(),
+            key: owned,
             generation,
             probe,
         }))
@@ -1104,6 +1103,87 @@ mod tests {
             backoff: Duration::from_millis(250),
             recovery: Duration::from_secs(1),
             retire_after: Duration::from_secs(60),
+        }
+    }
+
+    /// Clone panics leave the mutex usable and all admission capacity recoverable.
+    #[test]
+    fn adaptive_clone_panic_preserves_capacity_and_mutex() {
+        use std::{
+            panic::{AssertUnwindSafe, catch_unwind},
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        static CLONES: AtomicUsize = AtomicUsize::new(0);
+        static PANIC_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static PANIC_KEY: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+        /// Key with selectable clone failures, including during retirement.
+        #[derive(Eq, Ord, PartialEq, PartialOrd)]
+        struct Key(usize);
+
+        impl Clone for Key {
+            fn clone(&self) -> Self {
+                let clone = CLONES.fetch_add(1, Ordering::SeqCst) + 1;
+                assert_ne!(clone, PANIC_AT.load(Ordering::SeqCst), "key clone failed");
+                assert_ne!(
+                    self.0,
+                    PANIC_KEY.load(Ordering::SeqCst),
+                    "retired key cloned"
+                );
+                Self(self.0)
+            }
+        }
+
+        for existing in [false, true] {
+            for panic_at in [1, 2] {
+                let owner = Adaptive::new(
+                    Config {
+                        total: 2,
+                        per_key: 2,
+                        capacity: 1,
+                        retire_after: Duration::ZERO,
+                        ..config()
+                    },
+                    Counts::default(),
+                    Instant::now,
+                )
+                .unwrap();
+                let held = existing.then(|| owner.acquire(&Key(1)).unwrap());
+                CLONES.store(0, Ordering::SeqCst);
+                PANIC_AT.store(panic_at, Ordering::SeqCst);
+                let result = catch_unwind(AssertUnwindSafe(|| owner.acquire(&Key(1))));
+                PANIC_AT.store(usize::MAX, Ordering::SeqCst);
+                assert!(result.is_err());
+                assert_eq!(CLONES.load(Ordering::SeqCst), panic_at);
+                {
+                    let state = owner.state.lock().expect("clone panic poisoned state");
+                    assert_eq!(state.active, usize::from(existing));
+                    assert_eq!(state.peers.len(), usize::from(existing));
+                    if existing {
+                        assert_eq!(state.peers[&Key(1)].active, 1);
+                    }
+                }
+                drop(held);
+                let one = owner.acquire(&Key(1)).unwrap();
+                let two = owner.acquire(&Key(1)).unwrap();
+                assert!(matches!(owner.acquire(&Key(1)), Err(Error::Overloaded)));
+                drop((one, two));
+                assert_eq!(owner.state.lock().unwrap().active, 0);
+                assert_eq!(*owner.observer.active.lock().unwrap(), 0);
+
+                PANIC_KEY.store(1, Ordering::SeqCst);
+                let replacement = owner.acquire(&Key(2)).expect("retirement must not clone");
+                PANIC_KEY.store(usize::MAX, Ordering::SeqCst);
+                {
+                    let state = owner.state.lock().unwrap();
+                    assert_eq!(state.peers.len(), 1);
+                    assert!(!state.peers.contains_key(&Key(1)));
+                    assert_eq!(state.peers[&Key(2)].active, 1);
+                }
+                drop(replacement);
+                assert_eq!(owner.state.lock().unwrap().active, 0);
+            }
         }
     }
 
