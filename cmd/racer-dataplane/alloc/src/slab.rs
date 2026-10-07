@@ -91,16 +91,41 @@ impl<C: Charge> Slab<C> {
     }
 
     /// Describe device ranges in logical segment order, without creating, sizing,
-    /// or locking files. The caller must verify device capacity and supply alignment
-    /// that meets every device's requirements. Regular direct files are also accepted.
-    /// Overlapping ranges on the same device or file are rejected within this slab;
-    /// the caller must keep ranges in different slabs disjoint.
+    /// or locking files. Bounds use BLKGETSIZE64 for block devices and file length
+    /// for regular direct files. The caller must supply suitable alignment and keep
+    /// exclusive ownership, file flags, and capacity unchanged while in use.
+    /// Overlap checks only compare the same inode or device identity in this slab.
+    /// Whole-disk, partition, and device-mapper aliases are not detected. The caller
+    /// must guarantee disjoint physical storage across aliases and different slabs.
     /// Files stay owned until `open_configured` creates worker-local descriptors.
     pub fn from_devices(
         placements: Vec<DevicePlacement>,
         segment_bytes: u64,
         max_record_bytes: usize,
         alignment: Alignment,
+    ) -> Result<Self> {
+        Self::from_devices_with_capacity(
+            placements,
+            segment_bytes,
+            max_record_bytes,
+            alignment,
+            |file, metadata| {
+                if metadata.mode() & libc::S_IFMT == libc::S_IFBLK {
+                    block_device_capacity(file.as_raw_fd())
+                } else {
+                    Ok(metadata.len())
+                }
+            },
+        )
+    }
+
+    /// Keep capacity probing injectable for tests without block-device access.
+    fn from_devices_with_capacity(
+        placements: Vec<DevicePlacement>,
+        segment_bytes: u64,
+        max_record_bytes: usize,
+        alignment: Alignment,
+        mut capacity: impl FnMut(&File, &std::fs::Metadata) -> Result<u64>,
     ) -> Result<Self> {
         let capacity_bytes = (placements.len() as u64)
             .checked_mul(segment_bytes)
@@ -125,7 +150,7 @@ impl<C: Charge> Slab<C> {
                 return Err(Error::InvalidConfiguration);
             }
             let key = Arc::as_ptr(&placement.file);
-            let metadata = match files.entry(key) {
+            let (metadata, capacity_bytes) = match files.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     // SAFETY: F_GETFL only inspects the live caller-owned descriptor.
@@ -149,15 +174,16 @@ impl<C: Charge> Slab<C> {
                     ) {
                         return Err(Error::InvalidConfiguration);
                     }
-                    entry.insert(metadata)
+                    let capacity_bytes = capacity(&placement.file, &metadata)?;
+                    entry.insert((metadata, capacity_bytes))
                 }
             };
+            if end > *capacity_bytes {
+                return Err(Error::InvalidConfiguration);
+            }
             let identity = if metadata.mode() & libc::S_IFMT == libc::S_IFBLK {
                 (libc::S_IFBLK, metadata.rdev(), 0)
             } else {
-                if end > metadata.len() {
-                    return Err(Error::InvalidConfiguration);
-                }
                 (libc::S_IFREG, metadata.dev(), metadata.ino())
             };
             ranges.push((identity, placement.offset, end));
@@ -271,6 +297,15 @@ impl<C: Charge> Slab<C> {
 
     /// Blocking startup helper. Do not invoke on a latency-sensitive worker.
     pub fn open_configured(&self, segments: &Segments) -> Result<Alignment> {
+        // Automatic tables need one slot per physical segment; partial tables do not.
+        if !segments.is_configured()
+            && self
+                .capacity_bytes
+                .checked_div(self.segment_bytes)
+                .is_none_or(|count| count > crate::MAX_SEGMENTS)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
         let alignment = self.open_file()?;
         self.bind(segments)?;
         Ok(alignment)
@@ -523,6 +558,10 @@ impl<C: Charge> Slab<C> {
 
     /// Read exactly one checked extent, retaining its buffer and lease until completion.
     /// Dropping the waiting future does not release kernel-owned resources.
+    /// Neither a lease nor a successful read proves initialization in this
+    /// generation. Append only reserves space; recycled bytes may come from an
+    /// earlier generation or a different cache. Before exposing a valid record,
+    /// the caller must check its integrity, authentication, and cache identity.
     pub fn read<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,
@@ -543,6 +582,10 @@ impl<C: Charge> Slab<C> {
 
     /// Write exactly one checked extent with completion-owned accounting and lease.
     /// Failed writes do not roll back the space reserved by append.
+    /// Any lease permits writes within its captured prefix, including a lease from
+    /// [`Segments::lease`]; it does not grant exclusive record ownership. The trusted
+    /// caller must write only reserved extents it owns, never overwrite published or
+    /// readable records, and publish a mapping only after the write succeeds.
     pub fn write<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,
@@ -803,6 +846,22 @@ impl Drop for WriteFence {
     }
 }
 
+/// Read the block device's byte capacity without changing its contents.
+fn block_device_capacity(fd: i32) -> Result<u64> {
+    let mut capacity = 0u64;
+    // Linux fs.h encodes BLKGETSIZE64 with size_t, but the output is always u64.
+    let request = libc::_IOR::<libc::size_t>(0x12, 114);
+    // SAFETY: BLKGETSIZE64 writes one u64 to this live output pointer. Invalid
+    // descriptors are rejected by the kernel without accessing device storage.
+    if unsafe { libc::ioctl(fd, request, &mut capacity) } != 0 {
+        return Err(system_error(
+            "ioctl-blkgetsize64",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(capacity)
+}
+
 /// Preserve synchronous operating-system diagnostic context.
 fn system_error(operation: &'static str, error: std::io::Error) -> Error {
     Error::SystemIo {
@@ -1004,19 +1063,82 @@ mod tests {
     }
 
     /// Skip only explicit unsupported-filesystem results unless real I/O is required.
-    fn real_alignment(result: Result<Alignment>) -> Option<Alignment> {
+    fn real_alignment<T>(result: Result<T>) -> Option<T> {
+        real_io_result(
+            result,
+            std::env::var("PAGE_ALLOC_REQUIRE_REAL_IO").as_deref() == Ok("1"),
+        )
+    }
+
+    /// Apply the capability policy without changing the process environment in tests.
+    fn real_io_result<T>(result: Result<T>, required: bool) -> Option<T> {
         match result {
-            Ok(alignment) => Some(alignment),
+            Ok(value) => Some(value),
             Err(Error::Unsupported) => {
-                assert_ne!(
-                    std::env::var("PAGE_ALLOC_REQUIRE_REAL_IO").as_deref(),
-                    Ok("1"),
+                assert!(
+                    !required,
                     "PAGE_ALLOC_REQUIRE_REAL_IO=1 forbids capability skips: filesystem does not support direct I/O geometry"
                 );
                 eprintln!("SKIP real slab test: filesystem does not support direct I/O geometry");
                 None
             }
             Err(error) => panic!("unexpected real slab startup failure: {error}"),
+        }
+    }
+
+    /// Successful setup is preserved in both optional and required modes.
+    #[test]
+    fn real_io_success_is_preserved() {
+        for required in [false, true] {
+            assert_eq!(real_io_result(Ok(42), required), Some(42));
+        }
+    }
+
+    /// Unsupported direct opens skip only when the real-I/O gate is optional.
+    #[test]
+    fn real_io_unsupported_open_obeys_required_policy() {
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+            let error = direct_error("open", std::io::Error::from_raw_os_error(errno));
+            assert_eq!(real_io_result::<()>(Err(error), false), None);
+            let panic =
+                std::panic::catch_unwind(|| real_io_result::<()>(Err(error), true)).unwrap_err();
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap();
+            assert!(message.contains("PAGE_ALLOC_REQUIRE_REAL_IO=1 forbids capability skips"));
+        }
+    }
+
+    /// Other open failures, including errors without errno, must never skip.
+    #[test]
+    fn real_io_unexpected_open_errors_fail_in_both_modes() {
+        for errno in [
+            Some(libc::EACCES),
+            Some(libc::EIO),
+            Some(libc::EEXIST),
+            None,
+        ] {
+            let error = direct_error(
+                "open",
+                errno
+                    .map(std::io::Error::from_raw_os_error)
+                    .unwrap_or_else(|| std::io::Error::other("synthetic")),
+            );
+            assert_eq!(
+                error,
+                Error::SystemIo {
+                    operation: "open",
+                    errno
+                }
+            );
+            for required in [false, true] {
+                assert!(
+                    std::panic::catch_unwind(|| real_io_result::<()>(Err(error), required))
+                        .is_err()
+                );
+            }
         }
     }
 
@@ -1096,7 +1218,7 @@ mod tests {
     }
 
     /// Open direct files without using the slab's private-file startup path.
-    fn device_file(path: &Path) -> Arc<File> {
+    fn device_file(path: &Path) -> Option<Arc<File>> {
         use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -1104,142 +1226,273 @@ mod tests {
             .create_new(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)
-            .unwrap();
+            .map_err(|error| direct_error("open", error));
+        let file = real_alignment(file)?;
         file.set_len(16384).unwrap();
-        Arc::new(file)
+        Some(Arc::new(file))
     }
 
-    /// Device layouts reject aliases, misalignment, overflow, and invalid file flags.
+    /// Queried capacities bound every placement, including cached-file placements.
     #[test]
-    fn device_layout_validation_is_read_only() {
-        use std::os::unix::fs::OpenOptionsExt;
+    fn device_capacity_bounds_are_checked_before_startup() {
         let directory = Directory::new();
-        let file = device_file(&directory.0.join("device"));
-        let Some(a) = real_alignment(probe(&file)) else {
+        let Some(file) = device_file(&directory.0.join("capacity")) else {
             return;
         };
-        let build = |offsets: &[u64], segment, record| {
-            Slab::<()>::from_devices(
+        let a = Alignment::new(512, 512, 512).unwrap();
+        for (capacity, offsets, valid) in [
+            (0, vec![0], false),
+            (4095, vec![0], false),
+            (4096, vec![0], true),
+            (8191, vec![4096], false),
+            (8192, vec![4096], true),
+            (8192, vec![8192], false),
+            (8192, vec![0, 4096], true),
+            (8191, vec![0, 4096], false),
+            (u64::MAX, vec![0, 4096], true),
+        ] {
+            let mut queries = 0;
+            let result = Slab::<()>::from_devices_with_capacity(
                 offsets
-                    .iter()
-                    .map(|&offset| DevicePlacement {
+                    .into_iter()
+                    .map(|offset| DevicePlacement {
                         file: file.clone(),
                         offset,
                     })
                     .collect(),
-                segment,
-                record,
-                a,
-            )
-        };
-        for (offsets, segment, record) in [
-            (vec![], 4096, 512),
-            (vec![0], 0, 512),
-            (vec![0], 4096, 0),
-            (vec![0], 4097, 512),
-            (vec![0], 4096, 4097),
-            (vec![0, 4096], u64::MAX, 512),
-            (vec![0], i64::MAX as u64 + 1, 512),
-            (vec![1], 4096, 512),
-            (vec![16384], 4096, 512),
-            (vec![u64::MAX], 4096, 512),
-            (vec![i64::MAX as u64 - 4095], 4096, 512),
-            (vec![0, 0], 4096, 512),
-            (vec![0, 2048], 4096, 512),
-        ] {
-            assert!(matches!(
-                build(&offsets, segment, record),
-                Err(Error::InvalidConfiguration)
-            ));
-        }
-        let duplicate = Arc::new(file.try_clone().unwrap());
-        assert!(matches!(
-            Slab::<()>::from_devices(
-                vec![
-                    DevicePlacement {
-                        file: file.clone(),
-                        offset: 0
-                    },
-                    DevicePlacement {
-                        file: duplicate,
-                        offset: 2048
-                    },
-                ],
                 4096,
                 512,
-                a
-            ),
-            Err(Error::InvalidConfiguration)
-        ));
-        for flags in [0, libc::O_DIRECT | libc::O_APPEND] {
-            let invalid = std::fs::OpenOptions::new()
+                a,
+                |_, _| {
+                    queries += 1;
+                    Ok(capacity)
+                },
+            );
+            if valid {
+                assert!(result.is_ok(), "capacity {capacity}: {:?}", result.err());
+            } else {
+                assert!(matches!(result, Err(Error::InvalidConfiguration)));
+            }
+            assert_eq!(queries, 1);
+            assert_eq!(file.metadata().unwrap().len(), 16384);
+        }
+    }
+
+    /// Failed capacity queries preserve syscall context rather than allowing a slab.
+    #[test]
+    fn device_capacity_errors_keep_errno() {
+        assert_eq!(
+            block_device_capacity(-1),
+            Err(Error::SystemIo {
+                operation: "ioctl-blkgetsize64",
+                errno: Some(libc::EBADF),
+            })
+        );
+        let directory = Directory::new();
+        let Some(file) = device_file(&directory.0.join("capacity-error")) else {
+            return;
+        };
+        assert_eq!(
+            block_device_capacity(file.as_raw_fd()),
+            Err(Error::SystemIo {
+                operation: "ioctl-blkgetsize64",
+                errno: Some(libc::ENOTTY),
+            })
+        );
+        for errno in [libc::EIO, libc::EACCES, libc::ENOTTY] {
+            let error = system_error(
+                "ioctl-blkgetsize64",
+                std::io::Error::from_raw_os_error(errno),
+            );
+            let result = Slab::<()>::from_devices_with_capacity(
+                vec![DevicePlacement {
+                    file: file.clone(),
+                    offset: 0,
+                }],
+                4096,
+                512,
+                Alignment::new(512, 512, 512).unwrap(),
+                |_, _| Err(error),
+            );
+            assert!(matches!(result, Err(actual) if actual == error));
+        }
+    }
+
+    /// Device layouts reject same-identity overlaps, misalignment, overflow, and invalid flags.
+    #[test]
+    fn device_layout_validation_is_read_only() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = Directory::new();
+        let Some(file) = device_file(&directory.0.join("device")) else {
+            return;
+        };
+        let Some(host_alignment) = real_alignment(probe(&file)) else {
+            return;
+        };
+        for a in [
+            host_alignment,
+            Alignment::new(4096, 4096, 4096).unwrap(),
+            Alignment::new(8192, 8192, 8192).unwrap(),
+            Alignment::new(4096, 768, 512).unwrap(),
+        ] {
+            let unit = a.extent(0, 1).unwrap().length();
+            let segment_bytes = 2 * unit as u64;
+            let file_bytes = 4 * segment_bytes;
+            file.set_len(file_bytes).unwrap();
+            let build = |offsets: &[u64], segment, record| {
+                Slab::<()>::from_devices(
+                    offsets
+                        .iter()
+                        .map(|&offset| DevicePlacement {
+                            file: file.clone(),
+                            offset,
+                        })
+                        .collect(),
+                    segment,
+                    record,
+                    a,
+                )
+            };
+            for (offsets, segment, record) in [
+                (vec![], segment_bytes, unit),
+                (vec![0], 0, unit),
+                (vec![0], segment_bytes, 0),
+                (vec![0], segment_bytes + 1, unit),
+                (vec![0], segment_bytes, segment_bytes as usize + 1),
+                (vec![0, segment_bytes], u64::MAX, unit),
+                (vec![0], i64::MAX as u64 + 1, unit),
+                (vec![1], segment_bytes, unit),
+                (vec![file_bytes], segment_bytes, unit),
+                (vec![u64::MAX], segment_bytes, unit),
+                (
+                    vec![i64::MAX as u64 - segment_bytes + 1],
+                    segment_bytes,
+                    unit,
+                ),
+            ] {
+                assert!(matches!(
+                    build(&offsets, segment, record),
+                    Err(Error::InvalidConfiguration)
+                ));
+            }
+            let duplicate = Arc::new(file.try_clone().unwrap());
+            assert!(!Arc::ptr_eq(&file, &duplicate));
+            for second in [file.clone(), duplicate] {
+                let placement = |offset| DevicePlacement {
+                    file: second.clone(),
+                    offset,
+                };
+                for offset in [0, unit as u64, segment_bytes] {
+                    assert!(
+                        Slab::<()>::from_devices(vec![placement(offset)], segment_bytes, unit, a)
+                            .is_ok()
+                    );
+                }
+                assert!(
+                    Slab::<()>::from_devices(
+                        vec![
+                            DevicePlacement {
+                                file: file.clone(),
+                                offset: 0
+                            },
+                            placement(segment_bytes)
+                        ],
+                        segment_bytes,
+                        unit,
+                        a
+                    )
+                    .is_ok()
+                );
+                for offset in [0, unit as u64] {
+                    assert!(matches!(
+                        Slab::<()>::from_devices(
+                            vec![
+                                DevicePlacement {
+                                    file: file.clone(),
+                                    offset: 0
+                                },
+                                placement(offset),
+                            ],
+                            segment_bytes,
+                            unit,
+                            a
+                        ),
+                        Err(Error::InvalidConfiguration)
+                    ));
+                }
+            }
+            for flags in [0, libc::O_DIRECT | libc::O_APPEND] {
+                let invalid = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(flags)
+                    .open(directory.0.join("device"))
+                    .unwrap();
+                assert!(matches!(
+                    Slab::<()>::from_devices(
+                        vec![DevicePlacement {
+                            file: Arc::new(invalid),
+                            offset: 0,
+                        }],
+                        segment_bytes,
+                        unit,
+                        a
+                    ),
+                    Err(Error::InvalidConfiguration)
+                ));
+            }
+            let readonly = std::fs::OpenOptions::new()
                 .read(true)
-                .write(true)
-                .custom_flags(flags)
+                .custom_flags(libc::O_DIRECT)
                 .open(directory.0.join("device"))
                 .unwrap();
             assert!(matches!(
                 Slab::<()>::from_devices(
                     vec![DevicePlacement {
-                        file: Arc::new(invalid),
+                        file: Arc::new(readonly),
                         offset: 0,
                     }],
-                    4096,
-                    512,
+                    segment_bytes,
+                    unit,
                     a
                 ),
                 Err(Error::InvalidConfiguration)
             ));
+            let slab = build(&[2 * segment_bytes, segment_bytes], segment_bytes, unit).unwrap();
+            assert_eq!(slab.capacity_bytes(), 2 * segment_bytes);
+            assert_eq!(
+                slab.open_configured(&Segments::new(2 * segment_bytes)),
+                Err(Error::InvalidConfiguration)
+            );
+            let segments = Segments::new(segment_bytes);
+            assert_eq!(slab.open_configured(&segments), Ok(a));
+            assert_eq!(slab.open_configured(&segments), Ok(a));
+            assert_eq!(file.metadata().unwrap().len(), file_bytes);
+            let independent = File::open(directory.0.join("device")).unwrap();
+            // SAFETY: this live independent descriptor tests that startup took no flock.
+            assert_eq!(
+                unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let opened = slab.opened.borrow();
+            let OpenBacking::Devices(placements) = &opened.as_ref().unwrap().backing else {
+                unreachable!()
+            };
+            assert!(Rc::ptr_eq(&placements[0].file, &placements[1].file));
+            let Backing::Devices { placements, .. } = &slab.backing else {
+                unreachable!()
+            };
+            assert!(placements.borrow().is_empty());
         }
-        let readonly = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(directory.0.join("device"))
-            .unwrap();
-        assert!(matches!(
-            Slab::<()>::from_devices(
-                vec![DevicePlacement {
-                    file: Arc::new(readonly),
-                    offset: 0,
-                }],
-                4096,
-                512,
-                a
-            ),
-            Err(Error::InvalidConfiguration)
-        ));
-        let slab = build(&[8192, 4096], 4096, 512).unwrap();
-        assert_eq!(slab.capacity_bytes(), 8192);
-        assert_eq!(
-            slab.open_configured(&Segments::new(8192)),
-            Err(Error::InvalidConfiguration)
-        );
-        let segments = Segments::new(4096);
-        assert_eq!(slab.open_configured(&segments), Ok(a));
-        assert_eq!(slab.open_configured(&segments), Ok(a));
-        assert_eq!(file.metadata().unwrap().len(), 16384);
-        let independent = File::open(directory.0.join("device")).unwrap();
-        // SAFETY: this live independent descriptor tests that startup took no flock.
-        assert_eq!(
-            unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        let opened = slab.opened.borrow();
-        let OpenBacking::Devices(placements) = &opened.as_ref().unwrap().backing else {
-            unreachable!()
-        };
-        assert!(Rc::ptr_eq(&placements[0].file, &placements[1].file));
-        let Backing::Devices { placements, .. } = &slab.backing else {
-            unreachable!()
-        };
-        assert!(placements.borrow().is_empty());
     }
 
     /// Translation preserves logical authority and rechecks physical bounds and alignment.
     #[test]
     fn device_submission_checks_logical_and_physical_extents() {
         let directory = Directory::new();
-        let file = device_file(&directory.0.join("device"));
+        let Some(file) = device_file(&directory.0.join("device")) else {
+            return;
+        };
         let Some(a) = real_alignment(probe(&file)) else {
             return;
         };
@@ -1333,7 +1586,9 @@ mod tests {
             }
         }
         let directory = Directory::new();
-        let file = device_file(&directory.0.join("device"));
+        let Some(file) = device_file(&directory.0.join("device")) else {
+            return;
+        };
         let Some(a) = real_alignment(probe(&file)) else {
             return;
         };
@@ -1457,6 +1712,132 @@ mod tests {
         assert_eq!(slabs.reclaim_idle(), extent.length());
         assert_eq!(slabs.idle_bytes(), 0);
         assert_eq!(conflicting.open_now(), Err(Error::Unavailable));
+    }
+
+    /// An oversized automatic table must fail before creating or sizing its backing.
+    #[test]
+    fn open_configured_rejects_oversized_table_without_file_side_effects() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = Directory::new();
+        let existing = directory.0.join("existing");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&existing)
+            .unwrap();
+        let paths = [
+            directory.0.join("new"),
+            directory.0.join("missing/data"),
+            existing.clone(),
+        ];
+        for path in &paths {
+            let segments = Segments::new(4096);
+            let slab = Slab::<()>::new(path.clone(), 4096 * (crate::MAX_SEGMENTS + 1), 4096, 512);
+            assert_eq!(
+                slab.open_configured(&segments),
+                Err(Error::InvalidConfiguration)
+            );
+            assert!(!segments.is_configured());
+            assert_eq!(segments.count(), 0);
+            assert_eq!(file.metadata().unwrap().len(), 0);
+            if path != &existing {
+                assert!(!path.exists());
+            }
+            assert!(!directory.0.join("missing").exists());
+            assert_eq!(slab.geometry(), Err(Error::Unavailable));
+        }
+
+        let Some(alignment) = real_alignment(probe(&file)) else {
+            return;
+        };
+        let segment_bytes = alignment.extent(0, 512).unwrap().length() as u64;
+        let capacity = segment_bytes.checked_mul(crate::MAX_SEGMENTS + 1).unwrap();
+        let retry_capacity = segment_bytes.checked_mul(2).unwrap();
+        for path in &paths {
+            let segments = Segments::new(segment_bytes);
+            let slab = Slab::<()>::new(path.clone(), capacity, segment_bytes, 512);
+            assert_eq!(
+                slab.open_configured(&segments),
+                Err(Error::InvalidConfiguration)
+            );
+            assert!(!segments.is_configured());
+            assert_eq!(slab.geometry(), Err(Error::Unavailable));
+            let retry = Slab::<()>::new(path.clone(), retry_capacity, segment_bytes, 512);
+            if real_alignment(retry.open_configured(&segments)).is_none() {
+                return;
+            }
+            assert_eq!(segments.count(), 2);
+            assert_eq!(std::fs::metadata(path).unwrap().len(), retry_capacity);
+            drop(retry);
+            std::fs::remove_file(path).unwrap();
+            if path.parent() != Some(directory.0.as_path()) {
+                std::fs::remove_dir(path.parent().unwrap()).unwrap();
+            }
+        }
+    }
+
+    /// Invalid arithmetic inputs fail without creating a directory or a file.
+    #[test]
+    fn open_configured_rejects_invalid_geometry_before_open() {
+        let directory = Directory::new();
+        for (capacity, segment, record) in [
+            (0, 0, 512),
+            (4096, 0, 512),
+            (0, 4096, 512),
+            (4097, 4096, 512),
+            (4096, 8192, 512),
+            (4096, 4096, 0),
+            (u64::MAX, 1, 512),
+            (u64::MAX, u64::MAX, 512),
+        ] {
+            let path = directory.0.join("missing/data");
+            let slab = Slab::<()>::new(path.clone(), capacity, segment, record);
+            let segments = Segments::new(segment);
+            assert_eq!(
+                slab.open_configured(&segments),
+                Err(Error::InvalidConfiguration)
+            );
+            assert!(!segments.is_configured());
+            assert_eq!(slab.geometry(), Err(Error::Unavailable));
+            assert!(!path.exists());
+            assert!(!path.parent().unwrap().exists());
+        }
+    }
+
+    /// The slot limit does not cap physical backing for an already configured table.
+    #[test]
+    fn open_configured_accepts_partial_table_above_physical_segment_limit() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = Directory::new();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.0.join("probe"))
+            .unwrap();
+        let Some(alignment) = real_alignment(probe(&file)) else {
+            return;
+        };
+        let segment_bytes = alignment.extent(0, 512).unwrap().length() as u64;
+        let capacity = segment_bytes.checked_mul(crate::MAX_SEGMENTS + 1).unwrap();
+        let segments = Segments::new(segment_bytes);
+        segments.configure(capacity, 2, alignment).unwrap();
+        let path = directory.0.join("partial");
+        let slab = Slab::<()>::new(path.clone(), capacity, segment_bytes, 512);
+        let Some(opened_alignment) = real_alignment(slab.open_configured(&segments)) else {
+            return;
+        };
+        assert_eq!(opened_alignment, alignment);
+        assert_eq!(segments.count(), 2);
+        assert_eq!(segments.capacity_bytes(), capacity);
+        assert_eq!(
+            slab.geometry().unwrap().segment_count(),
+            crate::MAX_SEGMENTS + 1
+        );
+        assert_eq!(std::fs::metadata(path).unwrap().len(), capacity);
     }
 
     /// Invalid startup dimensions never truncate a preexisting nonempty file.
@@ -1762,7 +2143,7 @@ mod tests {
         let old = Arc::new(WakeCount::default());
         let current = Arc::new(WakeCount::default());
         let other = Arc::new(WakeCount::default());
-        let cancelled = Arc::new(WakeCount::default());
+        let canceled = Arc::new(WakeCount::default());
         let poll = |op: &mut Operation<'_, (), Error>, wakes: &Arc<WakeCount>| {
             op.as_mut()
                 .poll(&mut Context::from_waker(&Waker::from(wakes.clone())))
@@ -1773,18 +2154,18 @@ mod tests {
         assert!(poll(&mut one, &old).is_pending());
         assert!(poll(&mut one, &current).is_pending());
         assert!(poll(&mut two, &other).is_pending());
-        assert!(poll(&mut abandoned, &cancelled).is_pending());
+        assert!(poll(&mut abandoned, &canceled).is_pending());
         assert_eq!(slab.writes.waiters.borrow().len(), 3);
         drop(abandoned);
         assert_eq!(slab.writes.waiters.borrow().len(), 2);
-        assert_eq!(Arc::strong_count(&cancelled), 1);
+        assert_eq!(Arc::strong_count(&canceled), 1);
         drop(first_write);
-        for count in [&old, &current, &other, &cancelled] {
+        for count in [&old, &current, &other, &canceled] {
             assert_eq!(count.0.load(Ordering::Relaxed), 0);
         }
         drop(last_write);
         assert_eq!(old.0.load(Ordering::Relaxed), 0);
-        assert_eq!(cancelled.0.load(Ordering::Relaxed), 0);
+        assert_eq!(canceled.0.load(Ordering::Relaxed), 0);
         assert_eq!(current.0.load(Ordering::Relaxed), 1);
         assert_eq!(other.0.load(Ordering::Relaxed), 1);
         assert!(slab.writes.waiters.borrow().is_empty());

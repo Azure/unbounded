@@ -30,12 +30,16 @@
 //! and unlink; neither traversal nor flock stops noncooperating writers.
 //!
 //! [`Slab::from_devices`] instead accepts one [`DevicePlacement`] per logical
-//! segment. The caller opens devices with O_EXCL and O_DIRECT, checks capacity,
-//! and supplies common alignment. Placements can share an `Arc<File>` to use one
+//! segment. The caller opens devices with O_EXCL and O_DIRECT and supplies common
+//! alignment. Bounds use BLKGETSIZE64 for block devices and length for regular
+//! files. Placements can share an `Arc<File>` to use one
 //! runtime descriptor per device. Startup never creates, resizes, or locks these
 //! files. Logical extents still use segment-table offsets; submissions translate
-//! them to the placement's physical range after checking lease bounds. Keep ranges
-//! disjoint across workers, and do not change file flags or sizes while in use.
+//! them to the placement's physical range after checking lease bounds. Overlap
+//! checks only compare the same inode or device identity within one slab. They
+//! cannot detect whole-disk, partition, or device-mapper aliases. The caller must
+//! guarantee disjoint physical storage across aliases and slabs, keep exclusive
+//! ownership, and not change file flags or sizes while in use.
 //!
 //! In file mode, empty files are sparsely extended to capacity; nonempty size mismatches are
 //! rejected without truncation. Capacity is a logical bound, not reserved disk
@@ -68,11 +72,18 @@
 //!
 //! For writes, round the logical size, append the padded length, allocate matching
 //! storage, copy bytes into the zeroed buffer, and submit [`Slab::write`]. Publish
-//! the caller's mapping only after handling completion. Append reserves space and
+//! the caller's mapping only after the write succeeds. Append reserves space and
 //! does not roll it back on failed writes. For reads, validate the stored slot,
 //! generation, and extent, acquire a lease, allocate storage, and submit a read.
 //! A lease authorizes the segment's used prefix at acquisition, not just the last
 //! appended record; it cannot authorize bytes appended afterward.
+//! Any lease, including one from [`Segments::lease`], permits writes in that prefix.
+//! Leases do not grant exclusive record ownership. The trusted caller must write
+//! only reserved extents it owns and never overwrite published or readable records.
+//! A lease does not prove initialization in its generation: append reserves space
+//! without writing it. Recycled bytes may come from an earlier generation or a
+//! different cache. Before exposing them as a valid record, the caller must check
+//! record integrity, authentication, and cache identity, even after a successful read.
 //!
 //! Submission checks table identity, alignment, length, segment boundaries, and
 //! captured used bytes. Reads and writes reject short completions. Accepted I/O
@@ -116,11 +127,18 @@
 //!
 //! [`SegmentClock`] shares a cursor and second-chance set across bounded sweeps.
 //! Index reclamation forgets mappings without touching bytes or generations.
-//! Physical reclamation only visits Sealed/Evicting slots and recycles empty slots
-//! after leases drain. Each sweep visits at most two rotations, further capped by
-//! the caller. Insufficient progress returns Busy, not a spin loop. A zero reserve
-//! is a no-op; a zero entry budget can recycle empty slots but cannot begin
-//! populated eviction. There is no compaction. [`SegmentEntries`] implementations
+//! Physical reclamation selects only Sealed/Evicting slots and recycles empty slots
+//! after leases drain. Index and unscored sweeps visit at most two rotations,
+//! further capped by the caller. Scored reclamation visits at most
+//! min(slot count, max_visits, 64) slots, including skipped slots, then ranks
+//! eligible candidates. For a nonzero reserve, [`SegmentClock::reclaim`] and
+//! [`SegmentClock::reclaim_scored`] succeed only when the reserve (capped at the
+//! slot count) is met and no evictions remain. Busy is intentional even with enough
+//! free slots while pending evictions drain. Use [`Segments::free_count`] to check
+//! capacity, and retry bounded reclamation later to finish draining rather than
+//! spinning. A zero reserve is a no-op, not a drain request; a zero entry budget
+//! can recycle empty slots but cannot begin populated eviction. There is no
+//! compaction. [`SegmentEntries`] implementations
 //! must compare current mappings before removal and report within budget; an
 //! error cannot undo callback side effects. Freeze does not block index sweeps.
 //!
