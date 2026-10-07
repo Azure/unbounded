@@ -147,6 +147,9 @@ struct Peer {
     probe: bool,
 
     updated: Instant,
+
+    /// Start of the current idle interval, independent of recovery throttling.
+    idle_since: Option<Instant>,
 }
 
 /// An admitted operation; the final shared owner releases capacity.
@@ -225,7 +228,9 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
                     p.active == 0
                         && !p.probe
                         && p.retry.is_none_or(|retry| retry.elapsed(now))
-                        && now.saturating_duration_since(p.updated) >= self.config.retire_after
+                        && p.idle_since.is_some_and(|since| {
+                            now.saturating_duration_since(since) >= self.config.retire_after
+                        })
                 })
                 .next();
             if retired.is_none() {
@@ -240,6 +245,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             retry: None,
             probe: false,
             updated: now,
+            idle_since: None,
         });
         if peer.probe || peer.retry.is_some_and(|at| !at.elapsed(now)) {
             self.observer.event(Event::CircuitRejected);
@@ -252,6 +258,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         let probe = peer.retry.is_some();
         peer.probe = probe;
         peer.active += 1;
+        peer.idle_since = None;
         let generation = peer.generation;
         state.active += 1;
         self.observer.active(state.active);
@@ -332,7 +339,7 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
 impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
     /// Release final ownership and renew backoff for an unsuccessful probe.
     fn drop(&mut self) {
-        let now = self.probe.then(|| (self.owner.now)());
+        let now = (self.owner.now)();
         let Ok(mut state) = self.owner.state.lock() else {
             return;
         };
@@ -341,10 +348,12 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
             .get_mut(&self.key)
             .expect("live permit retains key");
         peer.active -= 1;
+        if peer.active == 0 {
+            peer.idle_since = Some(now);
+        }
         if self.probe {
             peer.probe = false;
             if peer.retry.is_some() {
-                let now = now.expect("probe clock sampled before locking");
                 peer.retry = Some(Deadline::after(now, self.owner.config.backoff));
                 peer.updated = now;
             }
@@ -1675,6 +1684,157 @@ mod tests {
         assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
     }
 
+    /// Idle age and recovery use independent clocks without wall-clock sleeps.
+    mod idle_retirement {
+        use super::*;
+        use std::cell::Cell;
+
+        thread_local! {
+            static CLOCK: Cell<Instant> = Cell::new(Instant::now());
+        }
+
+        fn now() -> Instant {
+            CLOCK.get()
+        }
+
+        fn advance(duration: Duration) {
+            CLOCK.set(now() + duration);
+        }
+
+        #[test]
+        fn waits_from_last_owner_and_restarts_after_reuse() {
+            for outcome in [Outcome::Neutral, Outcome::Verified] {
+                let config = Config {
+                    capacity: 1,
+                    recovery: Duration::MAX,
+                    ..config()
+                };
+                let owner = Adaptive::new(config, Counts::default(), now).unwrap();
+                let first = owner.acquire(&1).unwrap();
+                let last = owner.acquire(&1).unwrap();
+                let fence = last.clone();
+                advance(config.retire_after);
+                first.observe(outcome);
+                drop(first);
+                advance(config.retire_after);
+                drop(last);
+                assert_eq!(owner.state.lock().unwrap().peers[&1].active, 1);
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                drop(fence);
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+
+                advance(config.retire_after - Duration::from_nanos(1));
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                let reused = owner.acquire(&1).unwrap();
+                advance(config.retire_after);
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                drop(reused);
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                advance(config.retire_after - Duration::from_nanos(1));
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                advance(Duration::from_nanos(1));
+                let replacement = owner.acquire(&2).unwrap();
+                assert!(!owner.state.lock().unwrap().peers.contains_key(&1));
+                drop(replacement);
+                assert_eq!(*owner.observer.active.lock().unwrap(), 0);
+            }
+        }
+
+        #[test]
+        fn probe_release_requires_idle_age_and_expired_backoff() {
+            for outcome in [Outcome::Neutral, Outcome::Verified, Outcome::PeerFailure] {
+                let config = Config {
+                    capacity: 1,
+                    backoff: Duration::from_secs(3),
+                    retire_after: Duration::from_secs(2),
+                    ..config()
+                };
+                let owner = Adaptive::new(config, Counts::default(), now).unwrap();
+                let failed = owner.acquire(&1).unwrap();
+                failed.observe(Outcome::PeerFailure);
+                drop(failed);
+                advance(config.backoff);
+                let probe = owner.acquire(&1).unwrap();
+                probe.observe(outcome);
+                advance(config.backoff + config.retire_after);
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                drop(probe);
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                advance(config.retire_after - Duration::from_nanos(1));
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                advance(Duration::from_nanos(1));
+                if outcome != Outcome::Verified {
+                    assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                    assert!(matches!(owner.acquire(&1), Err(Error::Unavailable)));
+                    advance(config.backoff - config.retire_after);
+                }
+                assert!(owner.acquire(&2).is_ok());
+            }
+        }
+
+        #[test]
+        fn acquisition_and_drop_preserve_recovery_throttle() {
+            let config = Config {
+                backoff: Duration::ZERO,
+                recovery: Duration::from_secs(10),
+                ..config()
+            };
+            let owner = Adaptive::new(config, Counts::default(), now).unwrap();
+            let failed = owner.acquire(&1).unwrap();
+            failed.observe(Outcome::PeerFailure);
+            drop(failed);
+            let updated = now();
+            advance(config.recovery / 2);
+            let probe = owner.acquire(&1).unwrap();
+            probe.observe(Outcome::Verified);
+            drop(probe);
+            assert_eq!(owner.state.lock().unwrap().peers[&1].updated, updated);
+            assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 2);
+            advance(config.recovery / 2);
+            let work = owner.acquire(&1).unwrap();
+            work.observe(Outcome::Verified);
+            drop(work);
+            assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 3);
+            let updated = now();
+            advance(config.recovery - Duration::from_nanos(1));
+            let early = owner.acquire(&1).unwrap();
+            early.observe(Outcome::Verified);
+            drop(early);
+            assert_eq!(owner.state.lock().unwrap().peers[&1].updated, updated);
+            assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 3);
+            advance(Duration::from_nanos(1));
+            let ready = owner.acquire(&1).unwrap();
+            ready.observe(Outcome::Verified);
+            assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 4);
+        }
+
+        #[test]
+        fn zero_and_maximum_idle_age_preserve_live_ownership() {
+            for retire_after in [Duration::ZERO, Duration::MAX] {
+                let owner = Adaptive::new(
+                    Config {
+                        capacity: 1,
+                        retire_after,
+                        ..config()
+                    },
+                    Counts::default(),
+                    now,
+                )
+                .unwrap();
+                let work = owner.acquire(&1).unwrap();
+                advance(Duration::from_secs(120));
+                assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                drop(work);
+                if retire_after.is_zero() {
+                    assert!(owner.acquire(&2).is_ok());
+                } else {
+                    assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+                    assert!(owner.acquire(&1).is_ok());
+                }
+            }
+        }
+    }
+
     /// Only sufficiently old, idle, eligible peer records may be retired.
     #[test]
     fn capacity_preserves_live_work_and_stale_backoff_then_retires_idle() {
@@ -1691,7 +1851,7 @@ mod tests {
             .peers
             .get_mut(&1)
             .unwrap()
-            .updated = Instant::now() - Duration::from_secs(61);
+            .idle_since = Some(Instant::now() - Duration::from_secs(61));
         assert!(matches!(owner.acquire(&3), Err(Error::Overloaded)));
         assert!(owner.state.lock().unwrap().peers.contains_key(&1));
         owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry =
@@ -1708,7 +1868,7 @@ mod tests {
             .peers
             .get_mut(&2)
             .unwrap()
-            .updated = Instant::now() - Duration::from_secs(61);
+            .idle_since = Some(Instant::now() - Duration::from_secs(61));
         assert!(owner.acquire(&3).is_ok());
         assert_eq!(owner.state.lock().unwrap().peers.len(), 2);
     }
