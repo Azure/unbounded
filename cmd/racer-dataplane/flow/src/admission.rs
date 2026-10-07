@@ -217,13 +217,15 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         let indexed = key.clone();
         let owned = key.clone();
         let now = (self.now)();
+        // Drop retired keys after the guard on every exit, since Drop may reenter.
+        let retired;
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.active >= state.limit {
             self.observer.event(Event::Rejected);
             return Err(Error::Overloaded);
         }
         if !state.peers.contains_key(key) && state.peers.len() == self.config.capacity {
-            let retired = state
+            retired = state
                 .peers
                 .extract_if(.., |_, p| {
                     p.active == 0
@@ -2077,6 +2079,99 @@ mod tests {
                 assert_eq!(owner.state.lock().unwrap().active, 0);
             }
         }
+    }
+
+    /// Retired keys can reenter after publication; rejected attempts keep accounting.
+    #[test]
+    fn adaptive_retired_key_drop_can_reenter_after_unlock() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        static OWNER: OnceLock<std::sync::Weak<Adaptive<Key, Counts>>> = OnceLock::new();
+        static WATCH: AtomicBool = AtomicBool::new(false);
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        static BLOCKED: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+        struct Key(u8);
+
+        impl Drop for Key {
+            fn drop(&mut self) {
+                if self.0 != 1 || !WATCH.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Some(owner) = OWNER.get().and_then(std::sync::Weak::upgrade) else {
+                    return;
+                };
+                DROPS.fetch_add(1, Ordering::SeqCst);
+                let Ok(state) = owner.state.try_lock() else {
+                    BLOCKED.fetch_add(1, Ordering::SeqCst);
+                    return;
+                };
+                assert_eq!(state.active, 2);
+                assert_eq!(state.peers.len(), 2);
+                assert!(state.peers.keys().all(|key| key.0 != 1));
+                assert_eq!(state.peers[&Key(3)].active, 1);
+                drop(state);
+                assert!(owner.available(&Key(3)));
+            }
+        }
+
+        let owner = Adaptive::new(
+            Config {
+                total: 2,
+                per_key: 1,
+                backoff: Duration::MAX,
+                ..config()
+            },
+            Counts::default(),
+            Instant::now,
+        )
+        .unwrap();
+        assert!(OWNER.set(Arc::downgrade(&owner)).is_ok());
+        let one = owner.acquire(&Key(1)).unwrap();
+        let two = owner.acquire(&Key(2)).unwrap();
+        assert!(matches!(owner.acquire(&Key(3)), Err(Error::Overloaded)));
+        assert_eq!(owner.state.lock().unwrap().active, 2);
+        drop(one);
+        WATCH.store(true, Ordering::SeqCst);
+
+        assert!(matches!(owner.acquire(&Key(2)), Err(Error::Overloaded)));
+        two.observe(Outcome::PeerFailure);
+        assert!(matches!(owner.acquire(&Key(2)), Err(Error::Unavailable)));
+        assert!(matches!(owner.acquire(&Key(3)), Err(Error::Overloaded)));
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        {
+            let mut state = owner.state.lock().unwrap();
+            assert_eq!(state.active, 1);
+            assert_eq!(state.peers.len(), 2);
+            let idle = state.peers.values_mut().next().unwrap();
+            assert_eq!(idle.active, 0);
+            idle.idle_since = Some(Instant::now() - config().retire_after);
+        }
+        assert_eq!(*owner.observer.active.lock().unwrap(), 1);
+
+        let replacement = owner.acquire(&Key(3)).unwrap();
+        WATCH.store(false, Ordering::SeqCst);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+        assert_eq!(BLOCKED.load(Ordering::SeqCst), 0);
+        assert_eq!(*owner.observer.active.lock().unwrap(), 2);
+        assert_eq!(
+            *owner.observer.events.lock().unwrap(),
+            [
+                Event::Accepted,
+                Event::Accepted,
+                Event::Rejected,
+                Event::Rejected,
+                Event::LinkFailure,
+                Event::CircuitRejected,
+                Event::Rejected,
+                Event::Accepted,
+            ]
+        );
+        drop((two, replacement));
+        assert_eq!(owner.state.lock().unwrap().active, 0);
+        assert_eq!(*owner.observer.active.lock().unwrap(), 0);
+        assert!(owner.acquire(&Key(3)).is_ok());
     }
 
     /// Stale success cannot undo failure and shared fences retain active work.
