@@ -196,11 +196,23 @@ impl<K: Eq + Hash, V, S: BuildHasher> Registration<K, V, S> {
 impl<K: Eq + Hash, V: Clone, S: BuildHasher> Registration<K, V, S> {
     /// Register the latest wake target and elect at most once per attempt.
     pub fn event(&self, waker: &Waker) -> Poll<Event<V>> {
+        let waker = waker.clone();
+        let retired = {
+            let mut state = self.owner.cohort.borrow_mut();
+            if state.result.is_some() {
+                Some(waker)
+            } else {
+                state.waiters.insert(self.owner.id, Some(waker)).flatten()
+            }
+        };
+        drop(retired);
+
+        // Clone and drop callbacks can retry, elect, or finish. Decide from the
+        // current state only after those callbacks have released their borrows.
         let mut state = self.owner.cohort.borrow_mut();
         if let Some(result) = &state.result {
             return Poll::Ready(Event::Complete(result.clone()));
         }
-        state.waiters.insert(self.owner.id, Some(waker.clone()));
         if state.leader.is_none() {
             if state.attempts >= self.owner.table.limits.attempts_per_cohort {
                 drop(state);
@@ -232,16 +244,16 @@ impl<K: Eq + Hash, V, S: BuildHasher> RegistrationOwner<K, V, S> {
 impl<K: Eq + Hash, V, S: BuildHasher> Drop for RegistrationOwner<K, V, S> {
     /// Detach once, release the charge, then wake followers outside all borrows.
     fn drop(&mut self) {
-        let (empty, wakers) = {
+        let (empty, retired, wakers) = {
             let mut state = self.cohort.borrow_mut();
-            state.waiters.remove(&self.id);
+            let retired = state.waiters.remove(&self.id);
             let wakers = if state.leader == Some(self.id) {
                 state.leader = None;
                 state.take_wakers()
             } else {
                 Vec::new()
             };
-            (state.waiters.is_empty(), wakers)
+            (state.waiters.is_empty(), retired, wakers)
         };
         self.table
             .registrations
@@ -249,6 +261,7 @@ impl<K: Eq + Hash, V, S: BuildHasher> Drop for RegistrationOwner<K, V, S> {
         if empty {
             self.remove_active();
         }
+        drop(retired);
         wake_all(wakers);
     }
 }

@@ -843,12 +843,198 @@ mod coalesce_tests {
     use std::future::Future;
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
     use std::time::Instant;
 
     thread_local! {
         /// Callback invoked only by synchronous wakes on the current test worker.
         static ON_WAKE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+
+        /// One-shot hooks for raw waker ownership callbacks on this test worker.
+        static ON_COHORT_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+
+        static ON_COHORT_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Stateless raw waker; callbacks use only the calling thread's test hooks.
+    fn cohort_raw_waker() -> RawWaker {
+        /// Run the clone hook without retaining its registry borrow.
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            let callback = ON_COHORT_CLONE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+            cohort_raw_waker()
+        }
+
+        /// Run the drop hook without retaining its registry borrow.
+        unsafe fn drop(_: *const ()) {
+            let callback = ON_COHORT_DROP.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+
+        /// Notifications need no action for these ownership callback tests.
+        unsafe fn wake(_: *const ()) {}
+
+        RawWaker::new(
+            std::ptr::null(),
+            &RawWakerVTable::new(clone, wake, wake, drop),
+        )
+    }
+
+    /// Create a thread-safe stateless waker with worker-local test hooks.
+    fn cohort_waker() -> Waker {
+        // SAFETY: The vtable never dereferences data or shares thread-local hooks.
+        unsafe { Waker::from_raw(cohort_raw_waker()) }
+    }
+
+    /// Clone and replacement callbacks may poll, retry, or finish the same cohort.
+    fn check_cohort_waker_event_reentry(on_clone: bool) {
+        for action in 0..3 {
+            let table = table(2);
+            let leader = table.join(1, 1).unwrap();
+            let follower = table.join(1, 1).unwrap();
+            assert_eq!(leader.event(Waker::noop()), Poll::Ready(Event::Lead));
+            let waker = cohort_waker();
+            if !on_clone {
+                assert!(follower.event(&waker).is_pending());
+            }
+            let called = Rc::new(Cell::new(false));
+            let callback: Box<dyn FnOnce()> = Box::new({
+                let leader = leader.clone();
+                let follower = follower.clone();
+                let called = called.clone();
+                move || {
+                    match action {
+                        0 => assert!(follower.event(Waker::noop()).is_pending()),
+                        1 => leader.retry(),
+                        _ => leader.finish(7),
+                    }
+                    called.set(true);
+                }
+            });
+            if on_clone {
+                ON_COHORT_CLONE.with(|slot| *slot.borrow_mut() = Some(callback));
+            } else {
+                ON_COHORT_DROP.with(|slot| *slot.borrow_mut() = Some(callback));
+            }
+            let event = follower.event(if on_clone { &waker } else { Waker::noop() });
+            assert!(called.get());
+            assert_eq!(
+                event,
+                match action {
+                    0 => Poll::Pending,
+                    1 => Poll::Ready(Event::Lead),
+                    _ => Poll::Ready(Event::Complete(7)),
+                }
+            );
+            assert_eq!(table.registration_count(), 2);
+            assert_eq!(table.active_count(), usize::from(action != 2));
+            drop((leader, follower, waker));
+            assert_eq!(table.registration_count(), 0);
+            assert_eq!(table.active_count(), 0);
+        }
+    }
+
+    /// Cloning the incoming waker runs before borrowing or deciding the event.
+    #[test]
+    fn cohort_waker_clone_reentry() {
+        check_cohort_waker_event_reentry(true);
+    }
+
+    /// Retiring the old waker runs before deciding the event from current state.
+    #[test]
+    fn cohort_waker_replacement_drop_reentry() {
+        check_cohort_waker_event_reentry(false);
+    }
+
+    /// Detach updates charges and leadership before destroying the removed waker.
+    #[test]
+    fn cohort_waker_detach_drop_reentry() {
+        for drop_leader in [false, true] {
+            for action in 0..3 {
+                let table = table(2);
+                let leader = table.join(1, 1).unwrap();
+                let follower = table.join(1, 1).unwrap();
+                let waker = cohort_waker();
+                assert_eq!(leader.event(&waker), Poll::Ready(Event::Lead));
+                assert!(follower.event(&waker).is_pending());
+                let (removed, remaining) = if drop_leader {
+                    (leader, follower)
+                } else {
+                    (follower, leader)
+                };
+                let called = Rc::new(Cell::new(false));
+                ON_COHORT_DROP.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new({
+                        let table = table.clone();
+                        let remaining = remaining.clone();
+                        let called = called.clone();
+                        move || {
+                            match action {
+                                0 => assert_eq!(
+                                    remaining.event(Waker::noop()),
+                                    if drop_leader {
+                                        Poll::Ready(Event::Lead)
+                                    } else {
+                                        Poll::Pending
+                                    }
+                                ),
+                                1 => remaining.retry(),
+                                _ => remaining.finish(7),
+                            }
+                            assert_eq!(table.registration_count(), 1);
+                            called.set(true);
+                        }
+                    }));
+                });
+                drop(removed);
+                assert!(called.get());
+                if action == 1 {
+                    assert_eq!(remaining.event(Waker::noop()), Poll::Ready(Event::Lead));
+                } else if action == 2 {
+                    assert_eq!(
+                        remaining.event(Waker::noop()),
+                        Poll::Ready(Event::Complete(7))
+                    );
+                }
+                drop((remaining, waker));
+                assert_eq!(table.registration_count(), 0);
+                assert_eq!(table.active_count(), 0);
+            }
+        }
+    }
+
+    /// Last-owner waker destruction sees released capacity and can admit a new cohort.
+    #[test]
+    fn cohort_waker_last_detach_admits_replacement() {
+        let table = table(1);
+        let registration = table.join(1, 1).unwrap();
+        let waker = cohort_waker();
+        assert_eq!(registration.event(&waker), Poll::Ready(Event::Lead));
+        let replacement = Rc::new(RefCell::new(None));
+        ON_COHORT_DROP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new({
+                let table = table.clone();
+                let replacement = replacement.clone();
+                move || {
+                    assert_eq!(table.registration_count(), 0);
+                    assert_eq!(table.active_count(), 0);
+                    let next = table.join(1, 1).unwrap();
+                    assert_eq!(next.event(Waker::noop()), Poll::Ready(Event::Lead));
+                    replacement.replace(Some(next));
+                }
+            }));
+        });
+        drop(registration);
+        assert!(replacement.borrow().is_some());
+        assert_eq!(table.registration_count(), 1);
+        assert_eq!(table.active_count(), 1);
+        drop((replacement, waker));
+        assert_eq!(table.registration_count(), 0);
+        assert_eq!(table.active_count(), 0);
     }
 
     /// Safe thread-local callback dispatch; no non-Send data enters the Waker itself.
