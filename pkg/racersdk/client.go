@@ -81,8 +81,9 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	mu   sync.Mutex
-	idle []*clientConn
+	mu     sync.Mutex
+	idle   []*clientConn
+	active map[context.Context]context.CancelCauseFunc
 }
 
 type lane struct {
@@ -150,9 +151,16 @@ func validateVolume(s string) error {
 // Close closes idle connections and fails in-progress and future calls with
 // an error wrapping [net.ErrClosed]. It is safe to call more than once.
 func (c *Client) Close() error {
+	c.mu.Lock()
 	c.cancel(errClosed)
 
-	c.mu.Lock()
+	// Cancel request contexts before returning, so peer shutdown cannot
+	// report a transport error while client cancellation is still pending.
+	for _, cancel := range c.active {
+		cancel(errClosed)
+	}
+
+	c.active = nil
 	idle := c.idle
 	c.idle = nil
 	c.mu.Unlock()
@@ -438,10 +446,24 @@ func (c *Client) admit(ctx context.Context, l *lane, op string) (func(), error) 
 // is closed.
 func (c *Client) bind(parent context.Context) (context.Context, func()) {
 	ctx, cancel := context.WithCancelCause(parent)
-	stop := context.AfterFunc(c.ctx, func() { cancel(errClosed) })
+
+	c.mu.Lock()
+	if c.ctx.Err() != nil {
+		cancel(errClosed)
+	} else {
+		if c.active == nil {
+			c.active = make(map[context.Context]context.CancelCauseFunc)
+		}
+
+		c.active[ctx] = cancel
+	}
+	c.mu.Unlock()
 
 	return ctx, func() {
-		stop()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		delete(c.active, ctx)
 		cancel(nil)
 	}
 }
