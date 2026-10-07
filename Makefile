@@ -583,7 +583,7 @@ racer-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets a
 racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
 	@mkdir -p tmp/racer-envtest
-	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/racer ./internal/racer/authority -run '^TestEnvtest(Server|Authority)$$' -count=1 -v -timeout=5m
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/racer ./internal/racer/authority ./deploy/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
