@@ -1063,6 +1063,7 @@ mod hedge {
             let mut state = self.owner.state.lock().expect("hedge alarm lock");
             let alarm = state.alarms.get_mut(&self.id).expect("live hedge alarm");
             if now >= alarm.due {
+                alarm.wake = None;
                 Poll::Ready(())
             } else {
                 alarm.wake = Some(cx.waker().clone());
@@ -1130,6 +1131,36 @@ mod hedge {
             let max = Hedges::new(2, usize::MAX);
             let _all = max.acquire(usize::MAX, now).unwrap();
             assert!(matches!(max.acquire(1, now), Err(Error::Overloaded)));
+        }
+
+        /// Direct completion clears the waiter but retains speculative capacity.
+        #[test]
+        fn hedge_ready_delay_clears_registration_without_releasing_capacity() {
+            for elapsed in [Duration::ZERO, Duration::from_secs(1)] {
+                let now = Instant::now();
+                let due = now + Duration::from_secs(1);
+                let owner = Hedges::new(1, 1);
+                let permit = owner.acquire(1, due).unwrap();
+                let waiter = Arc::new(Counter::default());
+                assert!(
+                    permit
+                        .delay(now, &mut Context::from_waker(&Waker::from(waiter.clone())))
+                        .is_pending()
+                );
+                assert!(
+                    permit
+                        .delay(due + elapsed, &mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                );
+                assert_eq!(Arc::strong_count(&waiter), 1);
+                owner.poll(due + elapsed);
+                owner.poll(due + elapsed);
+                assert_eq!(waiter.0.load(Ordering::SeqCst), 0);
+                assert_eq!(Arc::strong_count(&waiter), 1);
+                assert!(matches!(owner.acquire(1, due), Err(Error::Overloaded)));
+                drop(permit);
+                assert!(owner.acquire(1, due).is_ok());
+            }
         }
 
         /// Only the latest registered waker fires and drop cancels notification.
