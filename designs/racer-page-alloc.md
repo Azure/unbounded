@@ -133,11 +133,12 @@ startup (`alloc/src/slab.rs:368-409`). For this file-backed mode, it:
 `Slab::from_devices` instead owns caller-opened file or block-device placements,
 one per logical segment, without creating, sizing, or locking them. Files must
 be read/write with `O_DIRECT` and without `O_APPEND`. The constructor checks
-geometry, offset alignment, regular-file bounds, and overlapping ranges within
-the slab (`alloc/src/slab.rs:99-176`). The caller must open real devices
-exclusively, verify device capacity, supply alignment that meets every device's
-requirements, and keep ranges in different slabs disjoint
-(`alloc/src/slab.rs:34-42`, `alloc/src/slab.rs:93-98`).
+geometry, offset alignment, regular-file length, and block-device capacity from
+`BLKGETSIZE64`. Overlap checks only compare the same inode or device identity
+within the slab; they cannot detect whole-disk, partition, or device-mapper
+aliases. The caller must guarantee disjoint physical storage across aliases and
+slabs, keep exclusive ownership, supply suitable alignment, and keep file flags
+and sizes unchanged while in use (see `Slab::from_devices` in `alloc/src/slab.rs`).
 
 For device placements, `open_configured` duplicates the owned files into
 worker-local descriptors and releases the original placement references
