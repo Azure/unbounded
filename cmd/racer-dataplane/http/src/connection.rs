@@ -1161,7 +1161,7 @@ impl<C: Context> Drop for ConnectionLease<C> {
         let wake = {
             let mut state = state.borrow_mut();
             let closed = state.closed;
-            if let Some(entry) = state.entries.get_mut(&target.endpoint) {
+            if let Some(entry) = state.entries.get_mut(target.endpoint.as_ref()) {
                 entry.active = entry.active.saturating_sub(1);
                 if !closed
                     && entry.generation == target.generation
@@ -1170,7 +1170,7 @@ impl<C: Context> Drop for ConnectionLease<C> {
                     entry.idle.push(idle);
                 }
                 if entry.active == 0 && entry.idle.is_empty() {
-                    state.entries.remove(&target.endpoint);
+                    state.entries.remove(target.endpoint.as_ref());
                 }
             }
             state.endpoint_waker(&target.endpoint)
@@ -1388,6 +1388,11 @@ impl<C: Context> HttpPool<C> {
         if self.context.stopped() {
             return Err(uring_runtime::Error::Unavailable.into());
         }
+        // Caller-defined cloning may reenter before admission, never during a borrow.
+        let key = Rc::new(endpoint.clone());
+        if self.context.stopped() {
+            return Err(uring_runtime::Error::Unavailable.into());
+        }
         // All evicted policy and resource owners are dropped after releasing the borrow.
         let mut garbage = Vec::new();
         let prepared: Result<C, _> = (|| {
@@ -1418,7 +1423,7 @@ impl<C: Context> HttpPool<C> {
                     .ok_or(uring_runtime::Error::Unavailable)?;
                 let generation = state.next_generation;
                 state.entries.insert(
-                    endpoint.clone(),
+                    key.clone(),
                     Entry {
                         generation,
                         ..Entry::default()
@@ -1441,7 +1446,7 @@ impl<C: Context> HttpPool<C> {
         let (idle, generation) = prepared?;
         let target = ReturnToPool {
             state: Rc::downgrade(&self.state),
-            endpoint: endpoint.clone(),
+            endpoint: key,
             generation,
         };
         let mut slot = ConnectingSlot(Some(target));
@@ -1544,7 +1549,12 @@ impl<C: Context> HttpPool<C> {
                 let next = state
                     .expiry_cursor
                     .as_ref()
-                    .and_then(|cursor| state.entries.range((Excluded(cursor), Unbounded)).next())
+                    .and_then(|cursor| {
+                        state
+                            .entries
+                            .range::<C::Endpoint, _>((Excluded(cursor.as_ref()), Unbounded))
+                            .next()
+                    })
                     .or_else(|| state.entries.iter().next())
                     .map(|(k, _)| k.clone());
                 let Some(key) = next else {
@@ -1606,13 +1616,20 @@ impl<C: Context> HttpPool<C> {
     /// Snapshot waiter counts and per-endpoint active and idle counts for tests.
     #[cfg(feature = "test-util")]
     pub fn snapshot(&self) -> PoolSnapshot<C::Endpoint> {
-        let s = self.state.borrow();
-        PoolSnapshot {
-            waiting: s.waiting.len(),
-            entries: s
+        let (waiting, entries) = {
+            let s = self.state.borrow();
+            let entries: Vec<_> = s
                 .entries
                 .iter()
                 .map(|(k, e)| (k.clone(), (e.active, e.idle.len())))
+                .collect();
+            (s.waiting.len(), entries)
+        };
+        PoolSnapshot {
+            waiting,
+            entries: entries
+                .into_iter()
+                .map(|(k, counts)| (k.as_ref().clone(), counts))
                 .collect(),
         }
     }
@@ -1672,9 +1689,9 @@ impl<C: Context> Entry<C> {
 
 /// Shared endpoint table, maintenance cursors, and bounded waiting queue.
 struct PoolState<C: Context> {
-    entries: BTreeMap<C::Endpoint, Entry<C>>,
+    entries: BTreeMap<Rc<C::Endpoint>, Entry<C>>,
 
-    expiry_cursor: Option<C::Endpoint>,
+    expiry_cursor: Option<Rc<C::Endpoint>>,
 
     next_expiry: Instant,
 
@@ -1737,7 +1754,7 @@ impl<C: Context> PoolState<C> {
 struct ReturnToPool<C: Context> {
     state: Weak<RefCell<PoolState<C>>>,
 
-    endpoint: C::Endpoint,
+    endpoint: Rc<C::Endpoint>,
 
     generation: u64,
 }
@@ -1768,10 +1785,10 @@ impl<C: Context> Drop for ConnectingSlot<C> {
             && let Some(state) = target.state.upgrade()
         {
             let mut state = state.borrow_mut();
-            if let Some(entry) = state.entries.get_mut(&target.endpoint) {
+            if let Some(entry) = state.entries.get_mut(target.endpoint.as_ref()) {
                 entry.active = entry.active.saturating_sub(1);
                 if entry.active == 0 && entry.idle.is_empty() {
-                    state.entries.remove(&target.endpoint);
+                    state.entries.remove(target.endpoint.as_ref());
                 }
             }
         }
@@ -3054,6 +3071,184 @@ mod tests {
         ] {
             check_waiter_admission_reentry(&ON_WAITER_CLONE, change);
         }
+    }
+
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct PoolCloneKey(usize);
+
+    impl Clone for PoolCloneKey {
+        fn clone(&self) -> Self {
+            if self.0 == 0 {
+                let _ = ReentryKey.clone();
+            }
+            Self(self.0)
+        }
+    }
+
+    impl Endpoint<Failure> for PoolCloneKey {
+        fn address(&self) -> std::result::Result<SocketAddress, Failure> {
+            Key.address()
+        }
+    }
+
+    fn clone_pool() -> Rc<HttpPool<Hooks<PoolCloneKey>>> {
+        Rc::new(HttpPool::new(
+            reactor(),
+            Rc::new(Hooks {
+                used: Rc::default(),
+                slots: Rc::default(),
+                stopped: Cell::new(false),
+                reject_charge: Cell::new(false),
+                endpoint: std::marker::PhantomData,
+            }),
+            PoolConfig {
+                max_endpoints: 1,
+                ..PoolConfig::default()
+            },
+        ))
+    }
+
+    fn clone_pool_idle(pool: &HttpPool<Hooks<PoolCloneKey>>) {
+        let (mut connection, _) = pool.prepare_connection(&PoolCloneKey(0)).unwrap();
+        connection.set_framing(Some(0), Some(0), false);
+        connection.finish_exchange().unwrap();
+        drop(connection);
+        assert_eq!(pool.context.slots.get(), 1);
+    }
+
+    fn clone_pool_drop_probe(pool: &Rc<HttpPool<Hooks<PoolCloneKey>>>) -> Rc<Cell<bool>> {
+        let dropped = Rc::new(Cell::new(false));
+        let observed = dropped.clone();
+        let weak = Rc::downgrade(pool);
+        pool.state
+            .borrow_mut()
+            .entries
+            .get_mut(&PoolCloneKey(0))
+            .unwrap()
+            .idle[0]
+            .reservation
+            .2 = Some(Box::new(move || {
+            let pool = weak.upgrade().unwrap();
+            assert!(
+                !pool
+                    .state
+                    .borrow_mut()
+                    .entries
+                    .contains_key(&PoolCloneKey(0))
+            );
+            observed.set(true);
+        }));
+        dropped
+    }
+
+    #[test]
+    fn pool_endpoint_clone_insertion_rechecks_reentrant_changes() {
+        for change in 0..3 {
+            let pool = clone_pool();
+            let nested = Rc::new(RefCell::new(None));
+            let called = Rc::new(Cell::new(false));
+            ON_WAITER_CLONE.with(|slot| {
+                let pool = pool.clone();
+                let nested = nested.clone();
+                let called = called.clone();
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    called.set(true);
+                    match change {
+                        0 => pool.close(),
+                        1 => pool.context.stopped.set(true),
+                        _ => {
+                            *nested.borrow_mut() =
+                                Some(pool.prepare_connection(&PoolCloneKey(0)).unwrap().0);
+                        }
+                    }
+                }));
+            });
+            let result = pool.prepare_connection(&PoolCloneKey(0));
+            assert!(called.get());
+            let expected = if change == 2 {
+                uring_runtime::Error::Overloaded
+            } else {
+                uring_runtime::Error::Unavailable
+            };
+            assert!(matches!(result, Err(Failure::Runtime(e)) if e == expected));
+            assert_eq!(pool.context.slots.get(), usize::from(change == 2));
+            if change == 2 {
+                assert_eq!(pool.state.borrow().entries[&PoolCloneKey(0)].active, 1);
+            }
+            nested.borrow_mut().take();
+            assert!(pool.state.borrow().entries.is_empty());
+            assert_eq!(pool.context.slots.get(), 0);
+            assert_eq!(pool.context.used.get(), 0);
+        }
+    }
+
+    #[test]
+    fn pool_endpoint_clone_eviction_avoids_caller_clone() {
+        let pool = clone_pool();
+        clone_pool_idle(&pool);
+        let dropped = clone_pool_drop_probe(&pool);
+        ON_WAITER_CLONE.with(|slot| {
+            let pool = pool.clone();
+            *slot.borrow_mut() = Some(Box::new(move || pool.close()));
+        });
+        let (connection, _) = pool.prepare_connection(&PoolCloneKey(1)).unwrap();
+        assert!(dropped.get());
+        assert!(ON_WAITER_CLONE.with(|slot| slot.borrow_mut().take().is_some()));
+        assert!(!pool.state.borrow().closed);
+        assert!(!pool.state.borrow().entries.contains_key(&PoolCloneKey(0)));
+        assert_eq!(pool.context.slots.get(), 1);
+        drop(connection);
+        assert!(pool.state.borrow().entries.is_empty());
+        assert_eq!(pool.context.slots.get(), 0);
+    }
+
+    #[test]
+    fn pool_endpoint_clone_expiry_avoids_caller_clone() {
+        let pool = clone_pool();
+        clone_pool_idle(&pool);
+        let dropped = clone_pool_drop_probe(&pool);
+        pool.state
+            .borrow_mut()
+            .entries
+            .get_mut(&PoolCloneKey(0))
+            .unwrap()
+            .idle[0]
+            .since = uring_runtime::environment::now() - pool.config.idle_timeout;
+        ON_WAITER_CLONE.with(|slot| {
+            let pool = pool.clone();
+            *slot.borrow_mut() = Some(Box::new(move || pool.close()));
+        });
+        pool.poll_waiters(0);
+        assert_eq!(pool.context.slots.get(), 1);
+        pool.poll_waiters(1);
+        assert!(dropped.get());
+        assert!(ON_WAITER_CLONE.with(|slot| slot.borrow_mut().take().is_some()));
+        assert!(!pool.state.borrow().closed);
+        assert!(pool.state.borrow().entries.is_empty());
+        assert_eq!(pool.context.slots.get(), 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn pool_endpoint_clone_snapshot_allows_reentrant_close() {
+        let pool = clone_pool();
+        clone_pool_idle(&pool);
+        let called = Rc::new(Cell::new(false));
+        ON_WAITER_CLONE.with(|slot| {
+            let pool = pool.clone();
+            let called = called.clone();
+            *slot.borrow_mut() = Some(Box::new(move || {
+                called.set(true);
+                pool.close();
+            }));
+        });
+        let snapshot = pool.snapshot();
+        assert!(called.get());
+        assert_eq!(snapshot.waiting, 0);
+        assert_eq!(snapshot.entries[&PoolCloneKey(0)], (0, 1));
+        assert!(pool.state.borrow().closed);
+        assert_eq!(pool.context.slots.get(), 0);
+        assert_eq!(pool.snapshot().entries[&PoolCloneKey(0)], (0, 0));
     }
 
     /// Maintenance, shutdown, lease return, and waiter removal allow checkout reentry.
