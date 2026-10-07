@@ -509,8 +509,8 @@ impl<P: Policy> Quotas<P> {
         class: P::Class,
         amount: usize,
     ) -> Option<(Option<P::Key>, usize)> {
-        let keys = self.keys.borrow();
-        let local = keys.get(key).and_then(Weak::upgrade);
+        // Keep the counters alive, but release the lookup borrow before callbacks.
+        let local = self.keys.borrow().get(key).and_then(Weak::upgrade);
         let fair = self.fair_limit(
             class,
             self.active_keys.load(Ordering::Acquire) + usize::from(local.is_none()),
@@ -1307,6 +1307,187 @@ mod quota_tests {
                     assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
                 }
             }
+        }
+    }
+
+    /// Reclamation callbacks may admit keyed work without borrowing the lookup table.
+    mod reclamation_callbacks {
+        use super::*;
+
+        /// Application callback selected for one synchronous admission.
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum Callback {
+            Limit,
+
+            Floor,
+
+            Clone,
+        }
+
+        /// A one-shot callback, optionally delayed past the first limit sample.
+        struct Hook {
+            callback: Callback,
+
+            skip: usize,
+
+            action: Box<dyn FnOnce()>,
+        }
+
+        thread_local! {
+            static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
+
+        /// Take the selected callback before running it so nested calls are inert.
+        fn invoke(callback: Callback) {
+            let hook = HOOK.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let hook = slot.as_mut()?;
+                if hook.callback != callback {
+                    return None;
+                }
+                if hook.skip != 0 {
+                    hook.skip -= 1;
+                    return None;
+                }
+                slot.take()
+            });
+            if let Some(hook) = hook {
+                (hook.action)();
+            }
+        }
+
+        /// A transferable identity with a worker-local clone callback.
+        #[derive(Debug, Eq, PartialEq, Hash)]
+        struct Key(u8);
+
+        impl Clone for Key {
+            /// Exercise application code when reclamation returns a keyed deficit.
+            fn clone(&self) -> Self {
+                invoke(Callback::Clone);
+                Self(self.0)
+            }
+        }
+
+        /// Fixed limits with one-shot application callbacks.
+        struct ReentrantPolicy;
+
+        impl Policy for ReentrantPolicy {
+            type Class = Resource;
+
+            type Key = Key;
+
+            /// Permit both the initial charges and the nested admission.
+            fn limit(&self, _: Resource) -> usize {
+                invoke(Callback::Limit);
+                100
+            }
+
+            /// Exercise callback reentry during fair-share calculation.
+            fn floor(&self, _: Resource) -> usize {
+                invoke(Callback::Floor);
+                1
+            }
+
+            /// Leave room for nested creation as well as live-key reuse.
+            fn max_keys(&self) -> usize {
+                3
+            }
+
+            /// No waiter is needed for this synchronous regression.
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            /// The fixture does not allocate page backing.
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            /// Every nested admission must succeed without a retry.
+            fn rejected(&self, _: Rejection<Resource>) {
+                panic!("unexpected rejection");
+            }
+        }
+
+        /// Check deficit results and accounting after new-key and live-key reentry.
+        fn check(callback: Callback, skip: usize) {
+            for nested_key in [0, 2] {
+                for (keyed, unkeyed, amount, expected) in [
+                    (40, 0, 11, Some((Some(Key(0)), 1))),
+                    (0, 90, 11, Some((None, 1))),
+                    (0, 0, 11, None),
+                    (0, 0, 51, None),
+                ] {
+                    let local_deficit = keyed != 0;
+                    if (callback == Callback::Clone && !local_deficit)
+                        || (skip != 0 && (local_deficit || amount > 50))
+                    {
+                        continue;
+                    }
+                    let quotas = Rc::new(Quotas::new(ReentrantPolicy));
+                    let first = quotas.reserve(Some(&Key(0)), Resource::Other, 1).unwrap();
+                    let second = quotas.reserve(Some(&Key(1)), Resource::Other, 1).unwrap();
+                    let payload = (keyed + unkeyed != 0).then(|| {
+                        quotas
+                            .reserve(
+                                (keyed != 0).then_some(&Key(0)),
+                                Resource::Payload,
+                                keyed + unkeyed,
+                            )
+                            .unwrap()
+                    });
+                    let nested = quotas.clone();
+                    HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Hook {
+                            callback,
+                            skip,
+                            action: Box::new(move || {
+                                let charge = nested
+                                    .reserve(Some(&Key(nested_key)), Resource::Progress, 1)
+                                    .unwrap();
+                                assert_eq!(nested.used(Resource::Progress), 1);
+                                drop(charge);
+                                assert_eq!(nested.used(Resource::Progress), 0);
+                            }),
+                        });
+                    });
+                    assert_eq!(
+                        quotas.reclamation(&Key(0), Resource::Payload, amount),
+                        expected
+                    );
+                    assert!(HOOK.with(|slot| slot.borrow().is_none()));
+                    assert_eq!(quotas.used(Resource::Payload), keyed + unkeyed);
+                    assert_eq!(quotas.active_keys.load(Ordering::Acquire), 2);
+                    drop((payload, first, second));
+                    assert_eq!(quotas.used(Resource::Payload), 0);
+                    assert_eq!(quotas.used(Resource::Other), 0);
+                    assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+                }
+            }
+        }
+
+        /// The first aggregate sample runs without a key-table borrow.
+        #[test]
+        fn fair_limit_allows_keyed_reentry() {
+            check(Callback::Limit, 0);
+        }
+
+        /// The later aggregate headroom sample also permits keyed reentry.
+        #[test]
+        fn aggregate_limit_allows_keyed_reentry() {
+            check(Callback::Limit, 1);
+        }
+
+        /// The per-key floor callback may admit work synchronously.
+        #[test]
+        fn floor_allows_keyed_reentry() {
+            check(Callback::Floor, 0);
+        }
+
+        /// Cloning the returned identity may admit work synchronously.
+        #[test]
+        fn key_clone_allows_keyed_reentry() {
+            check(Callback::Clone, 0);
         }
     }
 
