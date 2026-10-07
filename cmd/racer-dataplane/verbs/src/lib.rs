@@ -241,7 +241,7 @@ pub struct NativeService {
 
     resources: Vec<Option<Resource>>,
 
-    /// Selected devices keep their charges even if activation fails before slot creation.
+    /// Discovered devices keep their charges even if selection or activation fails.
     device_quotas: Vec<Arc<GuardOwner>>,
 
     activation: Option<Activation>,
@@ -1210,8 +1210,15 @@ impl NativeService {
         if config.bytes == 0 || config.bytes > u32::MAX as usize {
             return Err(Error::InvalidRange);
         }
-        let mut discovered = if config.discover {
-            ffi::discover()?
+        let discovered = if config.discover {
+            let mut guards = config.guards.iter().cycle();
+            ffi::discover_with_quota(|| {
+                // Discovery may open more ports than slots. Share their guards,
+                // but track every owner before cleanup can fail.
+                let quota = GuardOwner::new(guards.next().unwrap().clone());
+                self.device_quotas.push(quota.clone());
+                Some(quota)
+            })?
         } else {
             Vec::new()
         };
@@ -1241,11 +1248,6 @@ impl NativeService {
         }
         if selected.len() > self.resources.len() {
             return Err(Error::Overloaded);
-        }
-        for (selection, guard) in selected.iter().zip(&config.guards) {
-            let quota = GuardOwner::new(guard.clone());
-            discovered[selection.index].quota = Some(quota.clone());
-            self.device_quotas.push(quota);
         }
         self.activation = Some(Activation {
             devices: discovered.into_iter().map(Rc::new).collect(),

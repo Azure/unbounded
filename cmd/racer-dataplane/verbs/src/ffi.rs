@@ -274,6 +274,13 @@ impl Drop for NativeDevice {
 /// List ports and open a device for each. Fails on more than 64 ports.
 /// Skips ports whose device will not open.
 pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
+    discover_with_quota(|| None)
+}
+
+/// Attach a tracked owner to each opened device before any discovery cleanup.
+pub(crate) fn discover_with_quota(
+    mut quota: impl FnMut() -> Option<Arc<GuardOwner>>,
+) -> Result<Vec<NativeDevice>> {
     #[cfg(any(test, feature = "simulation"))]
     let api = match simulation::current() {
         Some(_) => simulation::api(),
@@ -308,7 +315,7 @@ pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
         devices.push(NativeDevice {
             api: api.clone(),
             raw,
-            quota: None,
+            quota: quota(),
             name,
             endpoint: Endpoint {
                 gid: port.gid,
