@@ -620,6 +620,15 @@ notices:
         link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE
+  - dependency: httparse
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2015-2025 Sean McArthur
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/httparse/1.10.1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/httparse/1.10.1/source/LICENSE-MIT
   - dependency: io-uring
     ecosystem: cargo
     copyright:
