@@ -272,8 +272,9 @@ func (c *Client) exchangeHead(ctx context.Context, conn *clientConn, head []byte
 // and reported the object's metadata. Read the contents with [Object.Read] or
 // [Object.WriteTo] and always call [Object.Close].
 //
-// Pass at most one [ReadOptions]. ctx bounds the whole transfer, not just the
-// call to Get.
+// Pass at most one [ReadOptions]. ctx applies to the whole transfer, not just the
+// call to Get. However, [Object.WriteTo] cannot interrupt a blocked destination
+// write unless the writer supports write deadlines.
 func (c *Client) Get(ctx context.Context, request Request, options ...ReadOptions) (*Object, error) {
 	const op = "get"
 
