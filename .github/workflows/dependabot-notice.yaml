@@ -1,0 +1,80 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Update Dependabot NOTICE
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dependabot-notice-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  update:
+    if: >-
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Dependabot branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefer-offline --no-audit
+        working-directory: frontend
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Rust toolchain
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Fetch Rust dependencies
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked
+
+      - name: Generate NOTICE
+        run: timeout --signal=TERM --kill-after=10s 300s make notice
+
+      - name: Commit and push NOTICE
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- NOTICE; then
+            echo "NOTICE is already current."
+            exit 0
+          fi
+
+          remote_head="$(git ls-remote origin "refs/heads/${HEAD_REF}" | cut -f1)"
+          if [[ "$remote_head" != "$EXPECTED_HEAD" ]]; then
+            echo "::error::Dependabot branch advanced from ${EXPECTED_HEAD} to ${remote_head}; refusing to push stale NOTICE output"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- NOTICE
+          git commit -m "Update NOTICE"
+          git push origin "HEAD:refs/heads/${HEAD_REF}"

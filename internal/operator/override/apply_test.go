@@ -12,7 +12,7 @@ import (
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-// multiSitePlan builds a plan with one storage DaemonSet per Site plus a
+// multiSitePlan builds a plan with one metalman Deployment per Site plus a
 // cluster-singleton net DaemonSet, so Site selection can be exercised.
 func multiSitePlan(sites ...string) *component.Plan {
 	plan := component.NewPlan()
@@ -21,7 +21,7 @@ func multiSitePlan(sites ...string) *component.Plan {
 		plan.Add(component.Operation{
 			Kind:        component.OpApply,
 			Object:      testWorkload(site),
-			Component:   "storage",
+			Component:   "metalman",
 			Site:        site,
 			Overridable: true,
 		})
@@ -29,6 +29,7 @@ func multiSitePlan(sites ...string) *component.Plan {
 
 	netNode := testWorkload("cluster")
 	netNode.SetName("unbounded-net-node")
+	netNode.SetKind("DaemonSet")
 
 	plan.Add(component.Operation{
 		Kind:        component.OpApply,
@@ -41,10 +42,10 @@ func multiSitePlan(sites ...string) *component.Plan {
 	rbac := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "rbac.authorization.k8s.io/v1",
 		"kind":       "ClusterRole",
-		"metadata":   map[string]any{"name": "storage"},
+		"metadata":   map[string]any{"name": "metalman"},
 	}}
 
-	plan.Add(component.Operation{Kind: component.OpApply, Object: rbac, Component: "storage"})
+	plan.Add(component.Operation{Kind: component.OpApply, Object: rbac, Component: "metalman"})
 
 	return plan
 }
@@ -52,8 +53,8 @@ func multiSitePlan(sites ...string) *component.Plan {
 func TestResolveSelectsSites(t *testing.T) {
 	plan := multiSitePlan("rack-a", "rack-b", "rack-c")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     sites: [rack-a, rack-c]
     extraArgs:
       run: ["--selected"]
@@ -76,8 +77,8 @@ func TestResolveSelectsSites(t *testing.T) {
 func TestResolveOmittedSitesMatchesEverySite(t *testing.T) {
 	plan := multiSitePlan("rack-a", "rack-b")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     extraArgs:
       run: ["--all"]
 `))
@@ -96,7 +97,7 @@ func TestResolveIgnoresNonOverridableOperations(t *testing.T) {
 
 	entries := []SourcedEntry{{
 		Source: Source{Key: "a.yaml", Index: 0},
-		Entry:  Entry{Component: "storage", Kind: "ClusterRole", ExtraArgs: map[string][]string{"x": {"--y"}}},
+		Entry:  Entry{Component: "metalman", Kind: "ClusterRole", ExtraArgs: map[string][]string{"x": {"--y"}}},
 	}}
 
 	resolution := Resolve(plan, entries, []string{"rack-a"})
@@ -111,8 +112,8 @@ func TestResolveIgnoresNonOverridableOperations(t *testing.T) {
 func TestResolveReportsUnmatchedSitesWithoutFailing(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     sites: [rack-a, not-yet-created]
     extraArgs:
       run: ["--x"]
@@ -136,8 +137,8 @@ func TestResolveReportsUnmatchedSitesWithoutFailing(t *testing.T) {
 func TestApplyRejectsMisspelledContainer(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -164,8 +165,8 @@ func TestApplyRejectsMisspelledContainer(t *testing.T) {
 func TestApplyAcceptsDeclaredSidecar(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     addContainers: [log-shipper]
     patch:
       spec:
@@ -191,8 +192,8 @@ func TestApplyAcceptsDeclaredSidecar(t *testing.T) {
 func TestApplyRejectsAddingAnExistingContainer(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     addContainers: [run]
     patch:
       spec:
@@ -219,8 +220,8 @@ func TestApplyRejectsAddingAnExistingContainer(t *testing.T) {
 func TestApplyRejectsMountPathCollision(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -229,7 +230,7 @@ func TestApplyRejectsMountPathCollision(t *testing.T) {
               - name: run
                 volumeMounts:
                   - name: attacker-volume
-                    mountPath: /etc/storage
+                    mountPath: /etc/metalman
 `))
 
 	report := Apply(plan, entries, []string{"rack-a"})
@@ -247,8 +248,8 @@ func TestApplyRejectsMountPathCollision(t *testing.T) {
 func TestApplyAcceptsNewMountPath(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -275,8 +276,8 @@ func TestApplyComposesDisjointContributors(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
 	entries, err := parseAll(map[string]string{
-		"resources.yaml": doc(`  - component: storage
-    kind: DaemonSet
+		"resources.yaml": doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -287,8 +288,8 @@ func TestApplyComposesDisjointContributors(t *testing.T) {
                   limits:
                     memory: 512Mi
 `),
-		"scheduling.yaml": doc(`  - component: storage
-    kind: DaemonSet
+		"scheduling.yaml": doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -327,8 +328,8 @@ func TestApplyComposesDisjointContributors(t *testing.T) {
 func TestApplyIdenticalValuesDoNotConflict(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	sameLimit := doc(`  - component: storage
-    kind: DaemonSet
+	sameLimit := doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -358,8 +359,8 @@ func TestApplyRejectsTrueConflict(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
 	limit := func(memory string) string {
-		return doc(`  - component: storage
-    kind: DaemonSet
+		return doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -396,8 +397,8 @@ func TestApplyConflictIsScopedToOneObject(t *testing.T) {
 	plan := multiSitePlan("rack-a", "rack-b", "rack-c")
 
 	entries, err := parseAll(map[string]string{
-		"a.yaml": doc(`  - component: storage
-    kind: DaemonSet
+		"a.yaml": doc(`  - component: metalman
+    kind: Deployment
     sites: [rack-a, rack-b]
     extraArgs:
       run: ["--from-a"]
@@ -409,8 +410,8 @@ func TestApplyConflictIsScopedToOneObject(t *testing.T) {
               - name: run
                 image: image-a
 `),
-		"b.yaml": doc(`  - component: storage
-    kind: DaemonSet
+		"b.yaml": doc(`  - component: metalman
+    kind: Deployment
     sites: [rack-b, rack-c]
     extraArgs:
       run: ["--from-b"]
@@ -466,8 +467,8 @@ func TestApplyDropsRatherThanRevertsOnFailure(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 	before := len(plan.Operations)
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -487,7 +488,7 @@ func TestApplyDropsRatherThanRevertsOnFailure(t *testing.T) {
 	}
 
 	for _, op := range plan.Operations {
-		if op.Overridable && op.Component == "storage" {
+		if op.Overridable && op.Component == "metalman" {
 			t.Fatal("the failed workload must be dropped, not applied un-overridden")
 		}
 	}
@@ -498,8 +499,8 @@ func TestApplyDropsRatherThanRevertsOnFailure(t *testing.T) {
 func TestApplyStampsAnnotations(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     extraArgs:
       run: ["--x"]
 `))
@@ -529,15 +530,15 @@ func TestApplyStampsAnnotations(t *testing.T) {
 func TestApplyReportsImageDrift(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
           spec:
             containers:
               - name: run
-                image: registry.example.com/storage:pinned
+                image: registry.example.com/metalman:pinned
 `))
 
 	report := Apply(plan, entries, []string{"rack-a"})
@@ -545,7 +546,7 @@ func TestApplyReportsImageDrift(t *testing.T) {
 		t.Fatalf("Apply: %v", report.Err())
 	}
 
-	if report.Workloads[0].VersionDrift != "run=registry.example.com/storage:pinned" {
+	if report.Workloads[0].VersionDrift != "run=registry.example.com/metalman:pinned" {
 		t.Fatalf("drift = %q", report.Workloads[0].VersionDrift)
 	}
 
@@ -561,8 +562,8 @@ func TestApplyReportsImageDrift(t *testing.T) {
 func TestApplyHashesAreComparablePerWorkload(t *testing.T) {
 	plan := multiSitePlan("rack-a", "rack-b")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     extraArgs:
       run: ["--all"]
 `))
@@ -589,7 +590,7 @@ func TestApplyHashesAreComparablePerWorkload(t *testing.T) {
 	}
 
 	for _, op := range plan.Operations {
-		if !op.Overridable || op.Component != "storage" {
+		if !op.Overridable || op.Component != "metalman" {
 			continue
 		}
 
@@ -605,8 +606,8 @@ func TestApplyHashChangesWithContent(t *testing.T) {
 	hashFor := func(arg string) string {
 		plan := multiSitePlan("rack-a")
 
-		entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+		entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     extraArgs:
       run: ["`+arg+`"]
 `))
@@ -629,8 +630,8 @@ func TestApplyHashChangesWithContent(t *testing.T) {
 // describe it identically.
 func TestApplyAddContainerConflicts(t *testing.T) {
 	sidecar := func(image string) string {
-		return doc(`  - component: storage
-    kind: DaemonSet
+		return doc(`  - component: metalman
+    kind: Deployment
     addContainers: [log-shipper]
     patch:
       spec:
@@ -678,8 +679,8 @@ func TestApplyAddContainerConflicts(t *testing.T) {
 func TestApplyInitContainers(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     addInitContainers: [setup]
     patch:
       spec:
@@ -706,8 +707,8 @@ func TestApplyInitContainers(t *testing.T) {
 func TestApplyRejectsMisspelledInitContainer(t *testing.T) {
 	plan := multiSitePlan("rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -741,10 +742,10 @@ func TestApplyPreservesPodAntiAffinity(t *testing.T) {
 	}
 	_ = unstructured.SetNestedMap(workload.Object, affinity, "spec", "template", "spec", "affinity")
 
-	plan := planWith(workload, "storage", "rack-a")
+	plan := planWith(workload, "metalman", "rack-a")
 
-	entries := entriesFrom(t, doc(`  - component: storage
-    kind: DaemonSet
+	entries := entriesFrom(t, doc(`  - component: metalman
+    kind: Deployment
     patch:
       spec:
         template:
@@ -787,8 +788,8 @@ func TestApplyRejectsTwoContributorsAppendingToOneContainer(t *testing.T) {
 	args := func(value string) string {
 		return `apiVersion: ` + APIVersion + `
 overrides:
-  - component: storage
-    kind: DaemonSet
+  - component: metalman
+    kind: Deployment
     extraArgs:
       run: ["--log-level=` + value + `"]
 `
@@ -835,8 +836,8 @@ overrides:
 
 		sidecar := `apiVersion: ` + APIVersion + `
 overrides:
-  - component: storage
-    kind: DaemonSet
+  - component: metalman
+    kind: Deployment
     addContainers: [log-shipper]
     extraArgs:
       log-shipper: ["--verbose"]
@@ -874,8 +875,8 @@ func TestInertEntriesIgnoreOutOfScopeSites(t *testing.T) {
 	entry := func(site string) string {
 		return `apiVersion: ` + APIVersion + `
 overrides:
-  - component: storage
-    kind: DaemonSet
+  - component: metalman
+    kind: Deployment
     sites: [` + site + `]
     extraArgs:
       run: ["--x"]

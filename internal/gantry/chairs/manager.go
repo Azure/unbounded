@@ -25,7 +25,7 @@ type ManagerOptions struct {
 	Candidates          func() []Holder
 	Connect             func(context.Context, []string) int
 	BootstrapHealthy    func() bool
-	SeedTarget          func(context.Context) (int, error)
+	HolderTarget        func(context.Context) (int, error)
 	Now                 func() time.Time
 	Logger              *slog.Logger
 	LeaseDuration       time.Duration
@@ -38,7 +38,7 @@ type ManagerOptions struct {
 	ClaimInitialDivisor uint64
 	APITimeout          time.Duration
 	ClusterSizeEstimate int
-	SeedCount           int
+	ChairCount          int
 }
 
 type reservation struct {
@@ -59,17 +59,12 @@ type Manager struct {
 	selectionReady    bool
 	electionEpoch     int64
 	bootstrapReady    bool
-	seedTarget        int
+	holderTarget      int
 	observationRounds uint64
 	duplicateChairs   []ID
 }
 
 const claimStageRounds uint64 = 8
-
-// abandonedLeaseMultiple is how many lease durations a chair must go without a
-// renewal before another node may take it over. A live holder renews three
-// times per lease duration, so this is well clear of a transient API stall.
-const abandonedLeaseMultiple = 5
 
 func NewManager(opts ManagerOptions) *Manager {
 	if opts.Store == nil {
@@ -80,12 +75,12 @@ func NewManager(opts ManagerOptions) *Manager {
 		panic("chairs.NewManager: Self is required")
 	}
 
-	if opts.SeedCount <= 0 {
-		opts.SeedCount = DefaultSeedCount
+	if opts.ChairCount <= 0 {
+		opts.ChairCount = DefaultCount
 	}
 
 	if opts.Cache == nil {
-		opts.Cache = NewCache(opts.Store, opts.SeedCount)
+		opts.Cache = NewCache(opts.Store, opts.ChairCount)
 	}
 
 	if opts.Now == nil {
@@ -97,11 +92,11 @@ func NewManager(opts ManagerOptions) *Manager {
 	}
 
 	if opts.LeaseDuration <= 0 {
-		opts.LeaseDuration = time.Minute
+		opts.LeaseDuration = 5 * time.Minute
 	}
 
 	if opts.RenewPeriod <= 0 {
-		opts.RenewPeriod = 20 * time.Second
+		opts.RenewPeriod = time.Minute
 	}
 
 	if opts.RotationPeriod <= 0 {
@@ -133,8 +128,8 @@ func NewManager(opts ManagerOptions) *Manager {
 	}
 
 	observationRounds := uint64(1)
-	if opts.ClusterSizeEstimate > 500 {
-		observationRounds = uint64((opts.ClusterSizeEstimate + 499) / 500)
+	if opts.ClusterSizeEstimate > 1 {
+		observationRounds = uint64(opts.ClusterSizeEstimate)
 	}
 
 	opts.Logger = opts.Logger.With(slog.String("subsystem", "chairs"))
@@ -173,7 +168,7 @@ func (m *Manager) Ready() bool {
 		return false
 	}
 
-	return snapshot.SelectableCount() > 0
+	return snapshot.SelectableCountWithin(m.opts.ChairCount) > 0
 }
 
 func (m *Manager) Run(ctx context.Context) {
@@ -219,14 +214,15 @@ func (m *Manager) ValidateChair(_ context.Context, assignment ifaces.ChairAssign
 	epoch := m.CurrentEpoch()
 
 	return m.held != nil &&
-		uint32(m.held.ID) == assignment.ChairID &&
+		!m.held.Expired(m.opts.Now()) &&
+		uint64(m.held.ID) == assignment.ChairID &&
 		m.held.Generation == assignment.Generation &&
 		m.held.AssignmentEpoch == assignment.AssignmentEpoch &&
 		(assignment.AssignmentEpoch == epoch || assignment.AssignmentEpoch == epoch-1)
 }
 
 func (m *Manager) AcceptChair(ctx context.Context, proposer ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
-	if assignment.ChairID >= Count || assignment.AssignmentEpoch != m.CurrentEpoch()+1 {
+	if assignment.ChairID >= uint64(m.opts.ChairCount) || assignment.AssignmentEpoch != m.CurrentEpoch()+1 {
 		return ifaces.PeerEndpoint{}, false
 	}
 
@@ -331,7 +327,7 @@ func (m *Manager) recover(ctx context.Context) error {
 		sort.Slice(successors, func(left, right int) bool { return successors[left].ID < successors[right].ID })
 		m.mu.Lock()
 		m.reserved = &reservation{assignment: ifaces.ChairAssignment{
-			ChairID:         uint32(successors[0].ID),
+			ChairID:         uint64(successors[0].ID),
 			Generation:      successors[0].Generation + 1,
 			AssignmentEpoch: successors[0].AssignmentEpoch + 1,
 		}}
@@ -385,14 +381,14 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 	// non-holder whose initial dials all failed still needs the snapshot below,
 	// because observe is what retries Connect; returning here on knownFull
 	// alone would leave it disconnected until the next epoch.
-	if m.opts.SeedTarget == nil && legacySkipClaim && bootstrapReady {
+	if m.opts.HolderTarget == nil && legacySkipClaim && bootstrapReady {
 		m.mu.Unlock()
 		return
 	}
 
 	// Holders refresh capacity from maintain. Reserved successors cannot claim
 	// another chair while waiting for rotation.
-	if m.opts.SeedTarget != nil && (held || reserved) && bootstrapReady {
+	if m.opts.HolderTarget != nil && (held || reserved) && bootstrapReady {
 		m.mu.Unlock()
 		return
 	}
@@ -419,12 +415,12 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 	}
 
 	// Nonparticipants refresh on a stable slot in a cluster-sized window. At
-	// the shipped 100,000-node estimate this targets about 500 follow-up Lease
-	// lists per second, while eligibility itself continues widening every stage.
+	// the shipped 100,000-node estimate this targets about one follow-up Lease
+	// list per second, while eligibility itself continues widening every stage.
 	observerSlot := stableHash(string(m.opts.Self.PeerID), strconv.FormatInt(epoch, 10), "observe") % m.observationRounds
 	observerTurn := round%m.observationRounds == observerSlot
 
-	refreshingSatisfiedTarget := m.opts.SeedTarget != nil && selectionReady && bootstrapReady
+	refreshingSatisfiedTarget := m.opts.HolderTarget != nil && selectionReady && bootstrapReady
 	if (refreshingSatisfiedTarget || !eligible) && !observerTurn {
 		return
 	}
@@ -445,24 +441,26 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		return
 	}
 
-	refreshSeedTarget := refreshingSatisfiedTarget && snapshot.SelectableCount() < m.opts.SeedCount
+	now := m.opts.Now()
+	refreshHolderTarget := refreshingSatisfiedTarget && snapshot.ActiveCountWithin(m.opts.ChairCount, now) < m.opts.ChairCount
 
-	seedTarget, err := m.resolveSeedTarget(ctx, snapshot, refreshSeedTarget)
+	holderTarget, err := m.resolveHolderTarget(ctx, snapshot, refreshHolderTarget)
 	if err != nil {
-		m.opts.Logger.Warn("chair seed target unavailable", slog.Any("err", err))
+		m.opts.Logger.Warn("chair holder target unavailable", slog.Any("err", err))
 
 		return
 	}
 
-	if snapshot.SelectableCount() >= seedTarget {
+	expired := m.expiredChairs(snapshot, holderTarget, now)
+	if snapshot.ActiveCountWithin(holderTarget, now) >= holderTarget && len(expired) == 0 {
 		return
 	}
 
-	if reserved || !eligible {
+	if reserved || (!eligible && len(expired) == 0) {
 		return
 	}
 
-	empty := make([]ID, 0, seedTarget)
+	empty := make([]ID, 0, holderTarget)
 
 	occupied := make(map[ID]struct{}, len(snapshot.Chairs))
 
@@ -472,22 +470,18 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 		}
 	}
 
-	for index := range seedTarget {
+	for index := range holderTarget {
 		id := ID(index)
 		if _, ok := occupied[id]; !ok {
 			empty = append(empty, id)
 		}
 	}
 
-	// Only take over an abandoned chair once no genuinely free one is left, so
-	// a briefly slow but live holder is not displaced.
 	unresponsive := false
 
-	if len(empty) == 0 {
-		if reclaimable := m.reclaimableChairs(snapshot, seedTarget); len(reclaimable) > 0 {
-			empty = reclaimable
-			unresponsive = true
-		}
+	if !eligible || len(empty) == 0 {
+		empty = expired
+		unresponsive = len(expired) > 0
 	}
 
 	if len(empty) == 0 {
@@ -583,7 +577,7 @@ func (m *Manager) maintain(ctx context.Context) {
 	}
 	m.mu.Unlock()
 
-	if cached.Epoch != epoch || cached.SelectableCount() < m.opts.SeedCount || !bootstrapReady {
+	if cached.Epoch != epoch || cached.ActiveCountWithin(m.opts.ChairCount, m.opts.Now()) < m.opts.ChairCount || !bootstrapReady {
 		apiCtx, cancel := m.apiContext(ctx)
 		snapshot, snapshotErr := m.opts.Store.Snapshot(apiCtx, m.CurrentEpoch())
 
@@ -595,14 +589,14 @@ func (m *Manager) maintain(ctx context.Context) {
 		}
 	}
 
-	seedTarget, targetErr := m.resolveSeedTarget(ctx, cached, true)
+	holderTarget, targetErr := m.resolveHolderTarget(ctx, cached, true)
 	if targetErr != nil {
-		m.opts.Logger.Warn("chair seed target refresh failed", slog.Any("err", targetErr))
+		m.opts.Logger.Warn("chair holder target refresh failed", slog.Any("err", targetErr))
 
 		return
 	}
 
-	if int(held.ID) >= seedTarget {
+	if int(held.ID) >= holderTarget {
 		apiCtx, cancel := m.apiContext(ctx)
 		vacateErr := m.opts.Store.Vacate(apiCtx, held.ID, m.opts.Self.PeerID)
 
@@ -621,25 +615,25 @@ func (m *Manager) maintain(ctx context.Context) {
 	m.prepareRotation(ctx, updated)
 }
 
-func (m *Manager) resolveSeedTarget(ctx context.Context, snapshot Snapshot, refresh bool) (int, error) {
-	if m.opts.SeedTarget == nil {
-		return m.opts.SeedCount, nil
+func (m *Manager) resolveHolderTarget(ctx context.Context, snapshot Snapshot, refresh bool) (int, error) {
+	if m.opts.HolderTarget == nil {
+		return m.opts.ChairCount, nil
 	}
 
 	m.mu.Lock()
-	seedTarget := m.seedTarget
+	holderTarget := m.holderTarget
 	m.mu.Unlock()
 
-	if !refresh && seedTarget > 0 {
-		return seedTarget, nil
+	if !refresh && holderTarget > 0 {
+		return holderTarget, nil
 	}
 
-	if !refresh && snapshot.SelectableCount() >= m.opts.SeedCount {
-		return m.opts.SeedCount, nil
+	if !refresh && snapshot.ActiveCountWithin(m.opts.ChairCount, m.opts.Now()) >= m.opts.ChairCount {
+		return m.opts.ChairCount, nil
 	}
 
 	apiCtx, cancel := m.apiContext(ctx)
-	target, err := m.opts.SeedTarget(apiCtx)
+	target, err := m.opts.HolderTarget(apiCtx)
 
 	cancel()
 
@@ -651,13 +645,14 @@ func (m *Manager) resolveSeedTarget(ctx context.Context, snapshot Snapshot, refr
 		target = 1
 	}
 
-	if target > m.opts.SeedCount {
-		target = m.opts.SeedCount
+	if target > m.opts.ChairCount {
+		target = m.opts.ChairCount
 	}
 
 	m.mu.Lock()
-	m.seedTarget = target
-	m.selectionReady = snapshot.SelectableCount() >= target
+	m.holderTarget = target
+	m.selectionReady = snapshot.ActiveCountWithin(target, m.opts.Now()) >= target
+	m.opts.Cache.SetHolderCount(target)
 	m.mu.Unlock()
 
 	return target, nil
@@ -743,7 +738,7 @@ func (m *Manager) prepareRotation(ctx context.Context, held Chair) {
 	})
 
 	assignment := ifaces.ChairAssignment{
-		ChairID:         uint32(held.ID),
+		ChairID:         uint64(held.ID),
 		Generation:      held.Generation + 1,
 		AssignmentEpoch: nextEpoch,
 	}
@@ -790,18 +785,43 @@ func (m *Manager) adoptReservation(ctx context.Context) {
 		return
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if chair.Holder.PeerID == m.opts.Self.PeerID &&
 		chair.Generation == reserved.assignment.Generation &&
 		chair.AssignmentEpoch == reserved.assignment.AssignmentEpoch {
-		chairCopy := chair
-		m.held = &chairCopy
-		m.reserved = nil
+		m.setHeld(chair)
 
 		return
 	}
+
+	// The old holder may have failed before performing the scheduled rotation.
+	// After the assignment epoch begins, the successor may replace it once the
+	// Lease expires.
+	if chair.NextHolder.PeerID == m.opts.Self.PeerID &&
+		chair.Generation+1 == reserved.assignment.Generation &&
+		chair.Expired(m.opts.Now()) {
+		apiCtx, cancel = m.apiContext(ctx)
+		claimed, claimErr := m.opts.Store.Claim(
+			apiCtx,
+			chair.ID,
+			m.opts.Self,
+			m.CurrentEpoch(),
+			m.opts.LeaseDuration,
+			true,
+			m.opts.Now(),
+		)
+
+		cancel()
+
+		if claimErr == nil {
+			m.setHeld(claimed)
+			m.opts.Cache.UpdateChair(claimed)
+		}
+
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	// Keep waiting while the Lease still records this node as the accepted
 	// successor. Holder and successor heartbeats are independent, so the
@@ -837,15 +857,16 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 	// claimable" rather than "every chair records a holder". Chairs abandoned by
 	// departed nodes stay occupied forever and are exactly what a replacement
 	// node needs to take over.
-	m.knownFull = snapshot.OccupiedCount() == Count && len(m.reclaimableChairs(snapshot, Count)) == 0
+	m.knownFull = snapshot.OccupiedCountWithin(m.opts.ChairCount) == m.opts.ChairCount &&
+		len(m.expiredChairs(snapshot, m.opts.ChairCount, m.opts.Now())) == 0
 	m.initialized = true
 
-	seedTarget := m.seedTarget
-	if seedTarget == 0 {
-		seedTarget = m.opts.SeedCount
+	holderTarget := m.holderTarget
+	if holderTarget == 0 {
+		holderTarget = m.opts.ChairCount
 	}
 
-	m.selectionReady = snapshot.SelectableCount() >= seedTarget
+	m.selectionReady = snapshot.ActiveCountWithin(holderTarget, m.opts.Now()) >= holderTarget
 
 	bootstrapHealthy := m.opts.BootstrapHealthy == nil || m.opts.BootstrapHealthy()
 	if (m.opts.Connect == nil || connected > 0) && bootstrapHealthy {
@@ -854,22 +875,12 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 	m.mu.Unlock()
 }
 
-// reclaimableChairs returns chairs whose holder stopped renewing long enough
-// ago to be treated as gone. Occupancy alone is not evidence of a live holder:
-// a node pool replaced wholesale leaves every Lease recording an absent one, so
-// without this no chair is ever free again and the deployment cannot recover.
-func (m *Manager) reclaimableChairs(snapshot Snapshot, seedTarget int) []ID {
-	if m.opts.LeaseDuration <= 0 {
-		return nil
-	}
-
-	now := m.opts.Now()
-	abandonedAfter := m.opts.LeaseDuration * abandonedLeaseMultiple
-
+// expiredChairs returns occupied target slots whose Lease has expired.
+func (m *Manager) expiredChairs(snapshot Snapshot, holderTarget int, now time.Time) []ID {
 	out := make([]ID, 0, len(snapshot.Chairs))
 
 	for _, chair := range snapshot.Chairs {
-		if int(chair.ID) >= seedTarget {
+		if int(chair.ID) >= holderTarget {
 			continue
 		}
 
@@ -877,7 +888,7 @@ func (m *Manager) reclaimableChairs(snapshot Snapshot, seedTarget int) []ID {
 			continue
 		}
 
-		if chair.LeaseDuration > 0 && now.After(chair.RenewTime.Add(abandonedAfter)) {
+		if chair.Expired(now) {
 			out = append(out, chair.ID)
 		}
 	}

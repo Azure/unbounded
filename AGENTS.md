@@ -11,7 +11,6 @@ unbounded-kube is organized into several directories:
 - `api/` - where API definitions for custom resources are located.
   - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
   - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
-  - `unbounded-storage/` - shared protobuf schema (config.proto) for the unbounded-storage daemon config, the source of truth for both the daemon's Rust (prost) bindings and the supervisor's Go bindings.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
@@ -21,11 +20,9 @@ unbounded-kube is organized into several directories:
   - `kubectl-unbounded` - sources for the `kubectl unbounded` plugin (includes `net` subcommand).
   - `machina` - sources for the machina controller.
   - `metalman` - sources for the metalman controller.
-  - `racer` - standalone Rust crate for the RACER peer-to-peer distributed block device. Read `cmd/racer/README.md` and `cmd/racer/ARCHITECTURE.md` before making changes; its Cargo-based build and testing conventions differ from the Go components.
   - `unbounded-net-controller` - sources for the unbounded-net network controller.
   - `unbounded-net-node` - sources for the unbounded-net node agent.
   - `unbounded-net-routeplan-debug` - debugging tool for route plans.
-  - `unbounded-storage` - sources for the Rust unbounded-storage daemon. It has its own conventions for layout, build, and testing (in particular a deterministic simulation testing harness under `cmd/unbounded-storage/tests/`). Agents working on anything under `cmd/unbounded-storage/` must read `cmd/unbounded-storage/AGENTS.md` first; the Go-oriented rules in this file largely do not apply there.
   - `unping` - health check probe utility.
   - `unroute` - eBPF route inspection utility.
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
@@ -57,11 +54,10 @@ unbounded-kube is organized into several directories:
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
 - To build `gantry` use `make gantry` which runs tests and builds the binary.
 - To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
-- To test `racer`, install `liburing-dev` and `protobuf-compiler`, then run `cargo test --locked --all-targets` and `cargo test --locked --all-targets --features sim` from `cmd/racer/`.
 - Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).
-- `make vulncheck` runs `govulncheck` and fails only on vulnerabilities that are both reachable from our code and have a published fix, since those are the ones a module bump resolves. Reachable ones with no fix available are reported and allowed through; acting on those means dropping or replacing the dependency, which is a judgment call rather than a build failure.
+- `make vulncheck` runs `govulncheck` and fails only on vulnerabilities that are both reachable from our code and have a final-release fix, since those are the ones a production module bump resolves. Reachable ones with no final fix are reported and allowed through; prerelease and Go pseudo-version fixes are also reported but do not block.
 - `make fmt` formats Go source (gofumpt + wsl_v5 blank-line rules); `make lint` runs golangci-lint; `make test` runs all tests.
 - `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
 - Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
@@ -76,7 +72,7 @@ unbounded-kube is organized into several directories:
   not `behaviour`, `initialise`, `labelled`, `catalogue`, `defence`, `judgement`. This applies to comments, doc
   strings, identifiers, user-facing strings, and Markdown, in every language in the repo.
   `make lint` catches the common cases in Go via `misspell`, but its dictionary is not exhaustive: it misses
-  `judgement` and `acknowledgement`, and it does not look at Rust, shell, TLA+, or Markdown at all. Treat it as
+  `judgement` and `acknowledgement`, and it does not look at shell or Markdown at all. Treat it as
   a backstop, not the rule.
   `make fmt` runs `golangci-lint --fix`, so `misspell` rewrites Go sources in place. When a British spelling is
   deliberate, it needs an exclusion in `.golangci.yaml` or the next `make fmt` will silently undo it.

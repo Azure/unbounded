@@ -17,13 +17,12 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/chairs"
 )
 
-// abandonedChairObjects returns a full set of Leases whose holders stopped
-// renewing long ago and whose assignments predate the current epoch, which is
-// what a wholesale node-pool replacement leaves behind.
+// abandonedChairObjects returns a full set of occupied, selectable Leases whose
+// holders stopped renewing.
 func abandonedChairObjects(namespace string, renewedAt time.Time, epoch int64) []runtime.Object {
-	objects := make([]runtime.Object, 0, chairs.Count)
+	objects := make([]runtime.Object, 0, chairs.DefaultCount)
 
-	for index := range chairs.Count {
+	for index := range chairs.DefaultCount {
 		micro := metav1.NewMicroTime(renewedAt)
 		holder := fmt.Sprintf("departed-node-%02d", index)
 		seconds := int32(60)
@@ -34,7 +33,9 @@ func abandonedChairObjects(namespace string, renewedAt time.Time, epoch int64) [
 				Namespace: namespace,
 				Labels:    map[string]string{chairs.LabelChair: "true"},
 				Annotations: map[string]string{
-					chairs.AnnotationEpoch: fmt.Sprint(epoch),
+					chairs.AnnotationEpoch:        fmt.Sprint(epoch),
+					chairs.AnnotationP2PAddrs:     fmt.Sprintf(`["/ip4/10.0.0.%d/tcp/4001"]`, index+1),
+					chairs.AnnotationTransferAddr: fmt.Sprintf("10.0.0.%d:5001", index+1),
 				},
 			},
 			Spec: coordinationv1.LeaseSpec{
@@ -56,8 +57,8 @@ func TestManagerReclaimsAbandonedChairs(t *testing.T) {
 	const ns = "gantry-system"
 
 	now := time.Unix(1_000_000, 0)
-	// Renewed far enough in the past to be abandoned rather than merely late.
-	objects := abandonedChairObjects(ns, now.Add(-time.Hour), 0)
+	epoch := chairs.CurrentEpoch(now, time.Hour)
+	objects := abandonedChairObjects(ns, now.Add(-time.Hour), epoch)
 
 	client := fake.NewClientset(objects...)
 	store := chairs.NewStore(client.CoordinationV1().Leases(ns))
@@ -112,8 +113,8 @@ func TestManagerDoesNotStealLiveChairs(t *testing.T) {
 	const ns = "gantry-system"
 
 	now := time.Unix(1_000_000, 0)
-	// Renewed moments ago: late at worst, certainly not abandoned.
-	objects := abandonedChairObjects(ns, now.Add(-time.Second), 0)
+	epoch := chairs.CurrentEpoch(now, time.Hour)
+	objects := abandonedChairObjects(ns, now.Add(-time.Second), epoch)
 
 	client := fake.NewClientset(objects...)
 	store := chairs.NewStore(client.CoordinationV1().Leases(ns))

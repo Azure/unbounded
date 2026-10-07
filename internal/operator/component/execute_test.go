@@ -497,9 +497,8 @@ func TestExecuteRejectsMismatchedSharedOperations(t *testing.T) {
 // commit C's golden tests depend on: a component's operations execute in the
 // order it planned them, so deliberate sequencing survives.
 //
-// gantry removes its legacy node config before applying anything, and storage
-// writes its ConfigMap before the DaemonSet that carries its hash. Sorting by
-// kind or name inside a component would silently reorder both.
+// gantry removes its legacy node config before applying anything. Sorting by
+// kind or name inside a component would silently reorder those operations.
 func TestExecutePreservesWithinComponentOrder(t *testing.T) {
 	env, calls := recordingEnv(t)
 
@@ -653,7 +652,7 @@ func TestExecuteDeleteToleratesMissingObject(t *testing.T) {
 	env, _ := recordingEnv(t)
 
 	plan := NewPlan()
-	plan.Add(Operation{Kind: OpDelete, Object: daemonSetObject("never-existed"), Component: "storage", Site: "edge"})
+	plan.Add(Operation{Kind: OpDelete, Object: daemonSetObject("never-existed"), Component: "example", Site: "edge"})
 
 	result, err := env.Execute(t.Context(), plan)
 	if err != nil {
@@ -835,10 +834,8 @@ func TestConflictDefersRatherThanFails(t *testing.T) {
 //
 // createIfAbsent reports errStale when it loses a create race, because
 // everything the pass computed from "this object does not exist" is now wrong.
-// The dependents were applied anyway: storage stamps the hash of the ConfigMap
-// payload it read onto the DaemonSet that mounts it, so the DaemonSet rolled to
-// a hash matching nothing and rolled again once a later pass read the real
-// payload. Two rollouts of a host-networked DaemonSet for one lost race.
+// Applying dependent workloads anyway can stamp a ConfigMap hash matching
+// nothing, causing another rollout once a later pass reads the real payload.
 func TestStaleCreateDefersItsDependents(t *testing.T) {
 	existing := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: DefaultNamespace},
@@ -854,9 +851,9 @@ func TestStaleCreateDefersItsDependents(t *testing.T) {
 
 	plan := NewPlan()
 	plan.Add(
-		Operation{Kind: OpCreateIfAbsent, Object: config, Component: "storage", Site: "edge"},
+		Operation{Kind: OpCreateIfAbsent, Object: config, Component: "example", Site: "edge"},
 		Operation{
-			Kind: OpApply, Object: workload, Component: "storage", Site: "edge",
+			Kind: OpApply, Object: workload, Component: "example", Site: "edge",
 			DependsOn: []ObjectRef{RefOf(config)},
 		},
 	)

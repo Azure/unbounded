@@ -1,8 +1,8 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod`, `frontend/package.json`, and `cmd/unbounded-storage/Cargo.toml` plus
-the pinned libfabric and OpenSSL source versions in `Makefile`.
+`go.mod`, `frontend/package.json`, and `cmd/racer-dataplane/Cargo.toml` plus
+the pinned libfabric and OpenSSL source versions in `Makefile`, when present.
 
 ## Usage
 
@@ -48,6 +48,17 @@ hack/cmd/notice/
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
 
+### Retained Racer scaffolding
+
+Cargo and native collectors remain registered for the replacement Racer
+implementation. Cargo collection is inactive when neither `Cargo.toml` nor
+`Cargo.lock` exists under `cmd/racer-dataplane`; no Cargo registry cache is
+required for a workspace without direct registry dependencies. The collector reads
+the root package and its explicitly declared workspace members using the root
+lockfile; no future members or load generator are required.
+Native collection is inactive when neither native version pin is declared in
+`Makefile`. Incomplete inputs remain errors rather than silently omitting notices.
+
 ## Adding a new ecosystem
 
 To add a new ecosystem (e.g. PyPI, Cargo):
@@ -88,10 +99,22 @@ To add a new ecosystem (e.g. PyPI, Cargo):
 - Do not commit fake `node_modules/`, module-cache, or `site-packages/` trees.
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
 - Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
-  reads license files from the local Cargo registry source cache. Populate it
-  with `cargo fetch --manifest-path cmd/unbounded-storage/Cargo.toml --locked`.
+  reads license files from the local Cargo registry source cache for direct
+  dependencies. When the Racer crate has dependencies, populate it with
+  `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
   Development dependencies are excluded; normal, target, build, and optional
-  direct dependencies are included.
+  direct dependencies are included. Local path dependencies must be declared
+  workspace members, including paths in development and target-specific
+  development dependencies. These development edges are checked only for
+  membership; registry development dependencies remain excluded. Members'
+  normal registry dependencies are collected separately and
+  deduplicated. Conflicting direct versions fail collection. Member manifests
+  must declare package names. Member-local lockfiles are ignored.
+  The supported workspace layout uses explicit relative member directories,
+  including `.` for the root. Globs, exclusions, workspace-inherited dependencies,
+  and git dependencies are rejected rather than silently omitted. TOML syntax,
+  including multiline member arrays, literal strings, and dependency subtables,
+  is parsed by the existing pinned Go TOML library.
 - Native collection is fully local. Its metadata and canonical license links
   are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
   `OPENSSL_VERSION` in `Makefile`.

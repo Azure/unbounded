@@ -63,7 +63,6 @@ type siteInitHandler struct {
 
 	enableMachina  bool
 	enableMetalman bool
-	enableStorage  bool
 
 	// kubeCli is the kubernetes client interface.
 	kubeCli kubernetes.Interface
@@ -334,9 +333,6 @@ func (h *siteInitHandler) remoteSiteConfig() unboundedSiteConfig {
 		ManageCniPlugin:      h.manageCniPlugin,
 		EnableMetalman:       h.enableMetalman,
 		EnableTokenRefresher: true,
-		// Storage (RDMA) targets the worker nodes of the site being
-		// initialized, so --enable-storage applies to the remote Site.
-		EnableStorage: h.enableStorage,
 		Manifests: []string{
 			"site.yaml",
 			"sitegatewaypoolassignment.yaml",
@@ -401,7 +397,6 @@ type unboundedSiteConfig struct {
 	Manifests            []string
 	EnableMachina        bool
 	EnableMetalman       bool
-	EnableStorage        bool
 	EnableTokenRefresher bool
 	// ManageCniPlugin controls whether unbounded-net manages the CNI plugin.
 	// When false, the template emits manageCniPlugin: false so that an
@@ -491,7 +486,6 @@ func siteInitCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&handler.manageCniPlugin, "manage-cni-plugin", true, "Whether unbounded-net manages the CNI plugin; set to false when the cluster already has a CNI (e.g. Cilium, Calico)")
 	cmd.Flags().BoolVar(&handler.enableMachina, "enable-machina", true, "Enable machina for the Site")
 	cmd.Flags().BoolVar(&handler.enableMetalman, "enable-metalman", false, "Enable metalman for the Site")
-	cmd.Flags().BoolVar(&handler.enableStorage, "enable-storage", false, "Enable unbounded-storage for the Site")
 
 	if err := cmd.MarkFlagRequired("name"); err != nil {
 		panic(err)

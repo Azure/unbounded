@@ -6,6 +6,7 @@ package chairs
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -82,8 +83,8 @@ func TestManagersClaimOnlyProportionalTargetSlots(t *testing.T) {
 			ClaimJitter:         time.Nanosecond,
 			ClaimInitialDivisor: 1,
 			RotationPeriod:      time.Hour,
-			SeedCount:           50,
-			SeedTarget:          func(context.Context) (int, error) { return 2, nil },
+			ChairCount:          50,
+			HolderTarget:        func(context.Context) (int, error) { return 2, nil },
 		})
 
 		if err := manager.Initialize(context.Background()); err != nil {
@@ -123,8 +124,8 @@ func TestManagerVacatesChairAboveReducedTarget(t *testing.T) {
 		Self:           self,
 		Now:            func() time.Time { return time.Unix(1, 0) },
 		RotationPeriod: time.Hour,
-		SeedCount:      50,
-		SeedTarget:     func(context.Context) (int, error) { return 2, nil },
+		ChairCount:     50,
+		HolderTarget:   func(context.Context) (int, error) { return 2, nil },
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -165,8 +166,8 @@ func TestManagerClaimsAfterProportionalTargetIncreases(t *testing.T) {
 		ClaimInitialDivisor: 1,
 		RotationPeriod:      time.Hour,
 		ClusterSizeEstimate: 1,
-		SeedCount:           50,
-		SeedTarget:          func(context.Context) (int, error) { return target, nil },
+		ChairCount:          50,
+		HolderTarget:        func(context.Context) (int, error) { return target, nil },
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -196,8 +197,65 @@ func TestManagerScalesObservationCadence(t *testing.T) {
 		ClusterSizeEstimate: 100_000,
 	})
 
-	if manager.observationRounds != 200 {
-		t.Fatalf("observation rounds = %d, want 200", manager.observationRounds)
+	if manager.observationRounds != 100_000 {
+		t.Fatalf("observation rounds = %d, want 100000", manager.observationRounds)
+	}
+}
+
+func TestSampledObserverCanReclaimExpiredChair(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	epoch := CurrentEpoch(now, time.Hour)
+	holder := "departed"
+	duration := int32(300)
+	renewTime := metav1.NewMicroTime(now.Add(-5 * time.Minute))
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ID(0).Name(),
+			Namespace: "gantry-system",
+			Labels:    map[string]string{LabelChair: "true"},
+			Annotations: map[string]string{
+				AnnotationEpoch:        strconv.FormatInt(epoch, 10),
+				AnnotationP2PAddrs:     `["/ip4/10.0.0.1/tcp/4001"]`,
+				AnnotationTransferAddr: "10.0.0.1:5001",
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holder,
+			LeaseDurationSeconds: &duration,
+			RenewTime:            &renewTime,
+		},
+	}
+	client := fake.NewClientset(lease)
+	store := NewStore(client.CoordinationV1().Leases("gantry-system"))
+	peerID := ifaces.NodeID("observer")
+
+	for suffix := 0; claimEligible(peerID, epoch, 0, 2048); suffix++ {
+		peerID = ifaces.NodeID(fmt.Sprintf("observer-%d", suffix))
+	}
+
+	self := Holder{PeerID: peerID, P2PAddrs: []string{"/ip4/10.0.0.2/tcp/4001"}, TransferAddr: "10.0.0.2:5001"}
+
+	manager := NewManager(ManagerOptions{
+		Store:               store,
+		Self:                self,
+		Now:                 func() time.Time { return now },
+		ClaimJitter:         time.Nanosecond,
+		ClaimInitialDivisor: 2048,
+		ClusterSizeEstimate: 1,
+		ChairCount:          1,
+		HolderTarget:        func(context.Context) (int, error) { return 1, nil },
+		LeaseDuration:       5 * time.Minute,
+		RotationPeriod:      time.Hour,
+	})
+	if err := manager.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	manager.attemptClaim(context.Background())
+
+	claimed, ok := manager.Held()
+	if !ok || claimed.Holder.PeerID != self.PeerID {
+		t.Fatalf("sampled observer did not reclaim expired chair: %+v, %t", claimed, ok)
 	}
 }
 
@@ -348,7 +406,7 @@ func TestManagerPlansAndCompletesRotation(t *testing.T) {
 func TestSuccessorWaitsForHolderRotation(t *testing.T) {
 	clock := time.Unix(0, int64(55*time.Minute))
 	holderID := "holder"
-	durationSeconds := int32(60)
+	durationSeconds := int32(600)
 	generation := int32(3)
 	renewTime := metav1.NewMicroTime(clock)
 	lease := &coordinationv1.Lease{
@@ -371,11 +429,11 @@ func TestSuccessorWaitsForHolderRotation(t *testing.T) {
 	holder := NewManager(ManagerOptions{
 		Store: store, Self: Holder{PeerID: "holder"}, Rotation: &rotationStub{endpoint: next},
 		Candidates: func() []Holder { return []Holder{next} }, Now: func() time.Time { return clock },
-		LeaseDuration: time.Minute, RotationPeriod: time.Hour, RotationLead: 10 * time.Minute,
+		LeaseDuration: 10 * time.Minute, RotationPeriod: time.Hour, RotationLead: 10 * time.Minute,
 	})
 	successor := NewManager(ManagerOptions{
 		Store: store, Self: next, Now: func() time.Time { return clock },
-		LeaseDuration: time.Minute, RotationPeriod: time.Hour,
+		LeaseDuration: 10 * time.Minute, RotationPeriod: time.Hour,
 	})
 
 	if err := holder.Initialize(context.Background()); err != nil {
@@ -403,6 +461,76 @@ func TestSuccessorWaitsForHolderRotation(t *testing.T) {
 	adopted, ok := successor.Held()
 	if !ok || adopted.Holder.PeerID != "next" {
 		t.Fatalf("successor did not adopt delayed rotation: %+v, %t", adopted, ok)
+	}
+}
+
+func TestSuccessorClaimsExpiredHolderAtRotation(t *testing.T) {
+	clock := time.Unix(0, int64(55*time.Minute))
+	holderID := "holder"
+	durationSeconds := int32(60)
+	generation := int32(3)
+	renewTime := metav1.NewMicroTime(clock)
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ID(5).Name(),
+			Namespace: "gantry-system",
+			Labels:    map[string]string{LabelChair: "true"},
+			Annotations: map[string]string{
+				AnnotationEpoch:        "0",
+				AnnotationNextPeerID:   "next",
+				AnnotationNextP2PAddrs: `["/ip4/10.0.0.2/tcp/4001/p2p/next"]`,
+				AnnotationNextTransfer: "10.0.0.2:5001",
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holderID,
+			LeaseDurationSeconds: &durationSeconds,
+			LeaseTransitions:     &generation,
+			RenewTime:            &renewTime,
+		},
+	}
+	client := fake.NewClientset(lease)
+	store := NewStore(client.CoordinationV1().Leases("gantry-system"))
+
+	successor := NewManager(ManagerOptions{
+		Store: store,
+		Self: Holder{
+			PeerID:       "next",
+			P2PAddrs:     []string{"/ip4/10.0.0.2/tcp/4001/p2p/next"},
+			TransferAddr: "10.0.0.2:5001",
+		},
+		Now:            func() time.Time { return clock },
+		LeaseDuration:  time.Minute,
+		RotationPeriod: time.Hour,
+	})
+	if err := successor.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	clock = clock.Add(2 * time.Minute)
+
+	successor.maintain(context.Background())
+
+	if _, ok := successor.Held(); ok {
+		t.Fatal("successor claimed expired chair before its assignment epoch")
+	}
+
+	clock = time.Unix(0, int64(time.Hour))
+
+	successor.maintain(context.Background())
+
+	held, ok := successor.Held()
+	if !ok || held.Holder.PeerID != "next" || held.Generation != 4 || held.AssignmentEpoch != 1 {
+		t.Fatalf("successor did not claim expired chair: %+v, %t", held, ok)
+	}
+
+	claimed, err := store.Get(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("Get claimed chair: %v", err)
+	}
+
+	if claimed.NextHolder.PeerID != "" {
+		t.Fatalf("claimed chair still has successor: %+v", claimed.NextHolder)
 	}
 }
 
@@ -454,9 +582,9 @@ func TestHolderRefreshesSnapshotUntilBootstrapConnects(t *testing.T) {
 
 func TestManagerRetriesBootstrapAfterHealthDrops(t *testing.T) {
 	clock := time.Unix(0, 0)
-	objects := make([]runtime.Object, 0, Count)
+	objects := make([]runtime.Object, 0, DefaultCount)
 
-	for index := range Count {
+	for index := range DefaultCount {
 		holderID := fmt.Sprintf("holder-%d", index)
 		objects = append(objects, &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
@@ -484,7 +612,7 @@ func TestManagerRetriesBootstrapAfterHealthDrops(t *testing.T) {
 		BootstrapHealthy:    func() bool { return bootstrapHealthy },
 		RotationPeriod:      time.Hour,
 		ClusterSizeEstimate: 1,
-		SeedCount:           1,
+		ChairCount:          1,
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)

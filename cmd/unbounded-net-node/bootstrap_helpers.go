@@ -273,6 +273,7 @@ func doWriteCNIConfig(cfg *config, podCIDRs []string) error {
 	confPath := filepath.Join(cfg.CNIConfDir, cfg.CNIConfFile)
 
 	tmpPath := confPath + ".tmp"
+
 	defer func() {
 		if err := cfg.removeFile(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			klog.Warningf("Failed to remove temporary CNI configuration %s: %v", tmpPath, err)

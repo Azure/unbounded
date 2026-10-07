@@ -86,16 +86,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fedora, AlmaLinux, and CentOS Stream cover RPM hosts with Azure
-          # Linux nspawn. Azure Linux 3 does not currently publish a QEMU-ready
-          # VHD that this e2e can boot directly as the host VM.
+          # Fedora and AlmaLinux cover RPM hosts with Azure Linux nspawn.
+          # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
+          # e2e can boot directly as the host VM.
           hosts='[
             {"host-base-os":"ubuntu2404","nspawn-base-os":"ubuntu2404","timeout":60},
             {"host-base-os":"fedora","nspawn-base-os":"azlinux3","timeout":60},
             {"host-base-os":"almalinux9","nspawn-base-os":"azlinux3","timeout":60},
             {"host-base-os":"almalinux10","nspawn-base-os":"azlinux3","timeout":60},
-            {"host-base-os":"centosstream9","nspawn-base-os":"azlinux3","timeout":60},
-            {"host-base-os":"centosstream10","nspawn-base-os":"azlinux3","timeout":60},
             {"host-base-os":"ubuntu2604","nspawn-base-os":"ubuntu2604","timeout":60}
           ]'
 

@@ -118,7 +118,8 @@ func TestRendersFixedChairLeaseSet(t *testing.T) {
 		var object struct {
 			Kind     string `yaml:"kind"`
 			Metadata struct {
-				Name string `yaml:"name"`
+				Name        string            `yaml:"name"`
+				Annotations map[string]string `yaml:"annotations"`
 			} `yaml:"metadata"`
 		}
 		if err := decoder.Decode(&object); err != nil {
@@ -137,6 +138,10 @@ func TestRendersFixedChairLeaseSet(t *testing.T) {
 			t.Fatalf("rendered chair kind = %q, want Lease", object.Kind)
 		}
 
+		if object.Metadata.Annotations["helm.sh/resource-policy"] != "keep" {
+			t.Fatalf("chair Lease %s is not retained across count reductions", object.Metadata.Name)
+		}
+
 		seen[object.Metadata.Name] = true
 	}
 
@@ -149,6 +154,65 @@ func TestRendersFixedChairLeaseSet(t *testing.T) {
 		if !seen[name] {
 			t.Fatalf("missing chair Lease %s", name)
 		}
+	}
+}
+
+func TestRendersConfiguredChairAndSeedCounts(t *testing.T) {
+	t.Parallel()
+
+	outputDir := renderChart(t, false,
+		"--set", "gantry.chairCount=128",
+		"--set", "gantry.chairSeedCount=100",
+	)
+
+	rawConfig, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered config: %v", err)
+	}
+
+	if !bytes.Contains(rawConfig, []byte("chair_count: 128")) {
+		t.Fatal("rendered config does not contain chair_count: 128")
+	}
+
+	if !bytes.Contains(rawConfig, []byte("chair_seed_count: 100")) {
+		t.Fatal("rendered config does not contain chair_seed_count: 100")
+	}
+
+	if !bytes.Contains(rawConfig, []byte(`chair_lease_duration: "5m"`)) {
+		t.Fatal("rendered config does not contain five-minute chair Lease duration")
+	}
+
+	if !bytes.Contains(rawConfig, []byte(`chair_renew_period: "1m"`)) {
+		t.Fatal("rendered config does not contain one-minute chair renewal period")
+	}
+
+	rawLeases, err := os.ReadFile(filepath.Join(outputDir, "rendezvous-leases.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered chairs: %v", err)
+	}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(rawLeases))
+	count := 0
+
+	for {
+		var object struct {
+			Kind string `yaml:"kind"`
+		}
+		if err := decoder.Decode(&object); err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			t.Fatalf("decode chair manifest: %v", err)
+		}
+
+		if object.Kind == "Lease" {
+			count++
+		}
+	}
+
+	if count != 128 {
+		t.Fatalf("chair Lease count = %d, want 128", count)
 	}
 }
 
@@ -467,7 +531,7 @@ func renderStandaloneTemplates(t *testing.T) string {
 	return renderChart(t, false)
 }
 
-func renderChart(t *testing.T, operatorProfile bool) string {
+func renderChart(t *testing.T, operatorProfile bool, extraArgs ...string) string {
 	t.Helper()
 
 	deployDir := filepath.Dir(sourceFile(t))
@@ -498,6 +562,8 @@ func renderChart(t *testing.T, operatorProfile bool) string {
 			"--skip-schema-validation",
 		)
 	}
+
+	args = append(args, extraArgs...)
 
 	cmd := exec.Command(helm, args...)
 

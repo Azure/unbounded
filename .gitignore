@@ -1,6 +1,5 @@
 # Build artifacts
 bin/
-!cmd/unbounded-storage/src/bin/
 /gantry
 /gantry-benchmark
 /dist/

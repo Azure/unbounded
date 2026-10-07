@@ -16,13 +16,15 @@ import (
 )
 
 const (
-	Count            = 64
-	DefaultSeedCount = 50
-	SeedCount        = 8
-	NamePrefix       = "gantry-chair-"
+	DefaultCount = 64
+	// Count is retained as the historical default for source compatibility.
+	// Runtime chair sizing uses Config.ChairCount.
+	Count      = DefaultCount
+	SeedCount  = 8
+	NamePrefix = "gantry-chair-"
 )
 
-type ID uint8
+type ID int
 
 func (id ID) Name() string {
 	return fmt.Sprintf("%s%02d", NamePrefix, id)
@@ -36,7 +38,7 @@ func ParseName(name string) (ID, error) {
 	raw := strings.TrimPrefix(name, NamePrefix)
 
 	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 || n >= Count {
+	if err != nil || n < 0 {
 		return 0, fmt.Errorf("invalid chair name %q", name)
 	}
 
@@ -71,6 +73,10 @@ func (c Chair) Expired(now time.Time) bool {
 	return c.Occupied() && c.LeaseDuration > 0 && !now.Before(c.RenewTime.Add(c.LeaseDuration))
 }
 
+func (c Chair) Active(now time.Time) bool {
+	return c.Selectable() && !c.Expired(now)
+}
+
 type Snapshot struct {
 	Epoch     int64
 	Chairs    []Chair
@@ -79,9 +85,17 @@ type Snapshot struct {
 }
 
 func (s Snapshot) OccupiedCount() int {
+	return s.OccupiedCountWithin(0)
+}
+
+func (s Snapshot) OccupiedCountWithin(chairCount int) int {
 	count := 0
 
 	for _, chair := range s.Chairs {
+		if chairCount > 0 && int(chair.ID) >= chairCount {
+			continue
+		}
+
 		if chair.Occupied() {
 			count++
 		}
@@ -108,10 +122,34 @@ func (s Snapshot) AvailableCount() int {
 // rotated. Older snapshots returned during an API outage carry their original
 // Snapshot.Epoch and remain usable as dial hints.
 func (s Snapshot) SelectableCount() int {
+	return s.SelectableCountWithin(0)
+}
+
+func (s Snapshot) SelectableCountWithin(chairCount int) int {
 	count := 0
 
 	for _, chair := range s.Chairs {
+		if chairCount > 0 && int(chair.ID) >= chairCount {
+			continue
+		}
+
 		if chair.Selectable() && (chair.AssignmentEpoch == s.Epoch || chair.AssignmentEpoch == s.Epoch-1) {
+			count++
+		}
+	}
+
+	return count
+}
+
+func (s Snapshot) ActiveCountWithin(chairCount int, now time.Time) int {
+	count := 0
+
+	for _, chair := range s.Chairs {
+		if chairCount > 0 && int(chair.ID) >= chairCount {
+			continue
+		}
+
+		if chair.Active(now) && (chair.AssignmentEpoch == s.Epoch || chair.AssignmentEpoch == s.Epoch-1) {
 			count++
 		}
 	}
@@ -129,33 +167,29 @@ func (s Snapshot) HolderChair(peerID ifaces.NodeID) (Chair, bool) {
 	return Chair{}, false
 }
 
-func Rank(snapshot Snapshot, d digest.Digest) []Chair {
+func Rank(snapshot Snapshot, d digest.Digest, chairCount int) []Chair {
 	byName := make(map[string]Chair, len(snapshot.Chairs))
-	candidates := make([]ifaces.Node, 0, Count)
-
-	for index := range Count {
-		id := ID(index)
-		name := id.Name()
-		candidates = append(candidates, ifaces.Node{ID: ifaces.NodeID(name)})
-	}
+	candidates := make([]ifaces.Node, 0, min(len(snapshot.Chairs), chairCount))
 
 	for _, chair := range snapshot.Chairs {
+		if chair.ID < 0 || int(chair.ID) >= chairCount || !chair.Selectable() {
+			continue
+		}
+
 		if chair.AssignmentEpoch != snapshot.Epoch && chair.AssignmentEpoch != snapshot.Epoch-1 {
 			continue
 		}
 
-		byName[chair.ID.Name()] = chair
+		name := chair.ID.Name()
+		byName[name] = chair
+		candidates = append(candidates, ifaces.Node{ID: ifaces.NodeID(name)})
 	}
 
-	scored := hrw.TopK(candidates, d, Count)
-	ranked := make([]Chair, 0, snapshot.OccupiedCount())
+	scored := hrw.TopK(candidates, d, len(candidates))
+	ranked := make([]Chair, 0, len(candidates))
 
 	for _, candidate := range scored {
-		chair, ok := byName[string(candidate.Node.ID)]
-		if !ok || !chair.Selectable() {
-			continue
-		}
-
+		chair := byName[string(candidate.Node.ID)]
 		ranked = append(ranked, chair)
 	}
 

@@ -33,7 +33,6 @@ import (
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
-	"github.com/Azure/unbounded/internal/operator/components/storage"
 	"github.com/Azure/unbounded/internal/operator/components/tokenrefresher"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
@@ -50,7 +49,7 @@ type Config = component.Config
 
 // SiteReconciler reconciles the registered components for every Site. It drives
 // a component.Registry: cluster components (net, machina) run on every pass, and
-// per-Site components (metalman, storage) run when a Site is present. Adding a
+// per-Site components (metalman) run when a Site is present. Adding a
 // component is a matter of implementing component.ClusterComponent or
 // component.SiteComponent and adding it to the registry; this loop, the status
 // conditions, ordering, and the Site-less pass are all registry-driven.
@@ -89,7 +88,7 @@ type SiteReconciler struct {
 }
 
 // DefaultRegistry returns the built-in component registry: the cluster
-// singletons followed by the metalman and storage per-Site components. The slice
+// singletons followed by the metalman per-Site component. The slice
 // order is the stable Site status condition order (cluster first, then site).
 func DefaultRegistry() *component.Registry {
 	return &component.Registry{
@@ -101,7 +100,6 @@ func DefaultRegistry() *component.Registry {
 		},
 		Site: []component.SiteComponent{
 			metalman.New(),
-			storage.New(),
 		},
 	}
 }
@@ -559,7 +557,7 @@ func planComponents(
 // singleton request uses, reconciles every Site.
 //
 // That fan-out is why it exists. The overrides ConfigMap watch enqueues only
-// the singleton request, so without it metalman and storage would never see an
+// the singleton request, so without it metalman would never see an
 // override change. Doing the fan-out here rather than in the watch handler is
 // what makes it retryable: a handler that listed Sites at event-delivery time
 // would consume the event and lose the fan-out permanently if that List failed.

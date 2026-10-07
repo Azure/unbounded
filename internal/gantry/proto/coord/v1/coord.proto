@@ -116,7 +116,7 @@ message PleasePullRequest {
 }
 
 message ChairAssignment {
-  uint32 chair_id         = 1;
+  uint64 chair_id         = 1;
   int64 generation       = 2;
   int64 assignment_epoch = 3;
 }

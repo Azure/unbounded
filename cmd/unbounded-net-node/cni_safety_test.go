@@ -666,6 +666,7 @@ func TestGuardedWriteCNIConfigCancellationAndConcurrentReadiness(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
+
 	go func() {
 		done <- guardedWriteCNIConfig(ctx, cfg, []string{"10.244.1.0/24"}, health)
 	}()
@@ -673,6 +674,7 @@ func TestGuardedWriteCNIConfigCancellationAndConcurrentReadiness(t *testing.T) {
 	var readers sync.WaitGroup
 	for range 8 {
 		readers.Add(1)
+
 		go func() {
 			defer readers.Done()
 

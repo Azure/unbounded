@@ -89,18 +89,10 @@ The graphroot must be `/opt/gantry-benchmark/containers`.
 
 ## 2. Start The Full Lifecycle
 
-Before provisioning the operator VM or starting the lifecycle on AKS, apply
-the benchmark containerd configuration and require it to be Ready on every
-target node. This enables debug unpack logs, sets the no-progress timeout to
-15 minutes, and raises transfer-service layer downloads to six. The DaemonSet
-performs one detached containerd restart per configuration hash.
-
-```bash
-kubectl create namespace gantry-system --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f hack/gantry-benchmark/manifests/containerd.yaml
-kubectl -n gantry-system rollout status \
-   daemonset/gantry-benchmark-containerd-config --timeout=45m
-```
+The benchmark deployment sets containerd's `image_pull_progress_timeout` to 30
+minutes and transfer-service `max_concurrent_downloads` to six. It changes no
+other daemon tuning. Gantry's Helm chart separately owns only registry routing
+under `/etc/containerd/certs.d`.
 
 ```bash
 export OPERATOR_VM_NAME="${OPERATOR_VM_NAME:-gantry-benchmark-operator}"

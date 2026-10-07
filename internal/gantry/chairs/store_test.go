@@ -78,6 +78,25 @@ func TestStoreClaimCreatesMissingChair(t *testing.T) {
 	}
 }
 
+func TestStoreSupportsChairIDsAboveUint8(t *testing.T) {
+	client := fake.NewClientset()
+	store := chairs.NewStore(client.CoordinationV1().Leases("gantry-system"))
+	holder := chairs.Holder{
+		PeerID:       "peer-300",
+		P2PAddrs:     []string{"/ip4/10.0.0.1/tcp/4001"},
+		TransferAddr: "10.0.0.1:5001",
+	}
+
+	claimed, err := store.Claim(context.Background(), 300, holder, 1, time.Minute, false, time.Now())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	if claimed.ID != 300 || claimed.Holder.PeerID != holder.PeerID {
+		t.Fatalf("claimed chair = %+v", claimed)
+	}
+}
+
 type countingReader struct {
 	mu       sync.Mutex
 	calls    int
@@ -234,6 +253,27 @@ func TestCacheUsesOldSnapshotWhenAPIUnavailable(t *testing.T) {
 	}
 }
 
+func TestCacheUsesScaledHolderTargetWhenAPIUnavailable(t *testing.T) {
+	reader := &countingReader{snapshot: occupiedSnapshotWithCount(32, 32)}
+	cache := chairs.NewCache(reader, chairs.DefaultCount)
+	cache.SetHolderCount(32)
+
+	if _, err := cache.Snapshot(context.Background(), 32); err != nil {
+		t.Fatalf("prime Snapshot: %v", err)
+	}
+
+	reader.err = errors.New("apiserver unavailable")
+
+	snapshot, err := cache.Snapshot(context.Background(), 33)
+	if err != nil {
+		t.Fatalf("stale Snapshot: %v", err)
+	}
+
+	if !snapshot.Stale || snapshot.Epoch != 32 {
+		t.Fatalf("snapshot = %+v, want stale epoch 32", snapshot)
+	}
+}
+
 func TestCacheCollapsesConcurrentFailedRefresh(t *testing.T) {
 	reader := &countingReader{snapshot: occupiedSnapshot(2)}
 
@@ -301,8 +341,12 @@ func TestCacheCollapsesConcurrentFailedRefresh(t *testing.T) {
 }
 
 func occupiedSnapshot(epoch int64) chairs.Snapshot {
+	return occupiedSnapshotWithCount(epoch, chairs.SeedCount)
+}
+
+func occupiedSnapshotWithCount(epoch int64, count int) chairs.Snapshot {
 	snapshot := chairs.Snapshot{Epoch: epoch}
-	for index := range chairs.SeedCount {
+	for index := range count {
 		snapshot.Chairs = append(snapshot.Chairs, chairs.Chair{
 			ID:              chairs.ID(index),
 			AssignmentEpoch: epoch,

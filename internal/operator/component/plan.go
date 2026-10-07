@@ -250,8 +250,7 @@ func (p *Plan) Summary() string {
 //
 // Within-component order is preserved rather than sorted because components
 // plan deliberately: gantry removes its legacy node config before applying
-// anything, and storage writes its ConfigMap before the DaemonSet that hashes
-// it. Sorting by kind or name would silently reorder that intent. Components
+// anything. Sorting by kind or name would silently reorder that intent. Components
 // plan deterministically, walking sorted manifest file lists, so preserving
 // their order is still stable across passes.
 //

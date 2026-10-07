@@ -12,31 +12,29 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-func TestProportionalChairSeedTarget(t *testing.T) {
+func TestBoundedChairHolderTarget(t *testing.T) {
 	tests := []struct {
-		name       string
-		capacity   int
-		percentage int
-		maximum    int
-		want       int
+		name     string
+		capacity int
+		maximum  int
+		want     int
 	}{
-		{name: "two nodes", capacity: 2, percentage: 10, maximum: 50, want: 1},
-		{name: "three nodes", capacity: 3, percentage: 10, maximum: 50, want: 1},
-		{name: "twenty nodes", capacity: 20, percentage: 10, maximum: 50, want: 2},
-		{name: "round up", capacity: 21, percentage: 10, maximum: 50, want: 3},
-		{name: "maximum", capacity: 1000, percentage: 10, maximum: 50, want: 50},
+		{name: "small cluster", capacity: 2, maximum: 64, want: 2},
+		{name: "below maximum", capacity: 32, maximum: 64, want: 32},
+		{name: "at maximum", capacity: 64, maximum: 64, want: 64},
+		{name: "above maximum", capacity: 1000, maximum: 64, want: 64},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := proportionalChairSeedTarget(test.capacity, test.percentage, test.maximum); got != test.want {
+			if got := boundedChairHolderTarget(test.capacity, test.maximum); got != test.want {
 				t.Fatalf("target = %d; want %d", got, test.want)
 			}
 		})
 	}
 }
 
-func TestDaemonSetChairCapacitySeedTarget(t *testing.T) {
+func TestDaemonSetChairCapacityHolderTarget(t *testing.T) {
 	client := fake.NewSimpleClientset(&appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{Name: "gantry", Namespace: "gantry-system"},
 		Status:     appsv1.DaemonSetStatus{DesiredNumberScheduled: 21},
@@ -44,17 +42,16 @@ func TestDaemonSetChairCapacitySeedTarget(t *testing.T) {
 	source := daemonSetChairCapacity{
 		daemonSets: client.AppsV1().DaemonSets("gantry-system"),
 		name:       "gantry",
-		percentage: 10,
-		maximum:    50,
+		maximum:    64,
 	}
 
-	target, err := source.SeedTarget(context.Background())
+	target, err := source.HolderTarget(context.Background())
 	if err != nil {
-		t.Fatalf("SeedTarget: %v", err)
+		t.Fatalf("HolderTarget: %v", err)
 	}
 
-	if target != 3 {
-		t.Fatalf("target = %d; want 3", target)
+	if target != 21 {
+		t.Fatalf("target = %d; want 21", target)
 	}
 }
 
@@ -65,12 +62,11 @@ func TestDaemonSetChairCapacityRejectsZeroDesiredCapacity(t *testing.T) {
 	source := daemonSetChairCapacity{
 		daemonSets: client.AppsV1().DaemonSets("gantry-system"),
 		name:       "gantry",
-		percentage: 10,
-		maximum:    50,
+		maximum:    64,
 	}
 
-	if _, err := source.SeedTarget(context.Background()); err == nil {
-		t.Fatal("SeedTarget succeeded with zero desired capacity")
+	if _, err := source.HolderTarget(context.Background()); err == nil {
+		t.Fatal("HolderTarget succeeded with zero desired capacity")
 	}
 }
 

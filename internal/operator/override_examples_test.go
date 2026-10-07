@@ -24,7 +24,6 @@ import (
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	netmanifests "github.com/Azure/unbounded/deploy/net"
 	tokenrefreshermanifests "github.com/Azure/unbounded/deploy/token-refresher"
-	storagemanifests "github.com/Azure/unbounded/deploy/unbounded-storage-supervisor"
 	"github.com/Azure/unbounded/internal/metalman/commands"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
@@ -42,7 +41,6 @@ var componentManifests = map[string]fs.FS{
 	"net":             netmanifests.Manifests,
 	"machina":         machinamanifests.Manifests,
 	"gantry":          gantrymanifests.Manifests,
-	"storage":         storagemanifests.Manifests,
 	"token-refresher": tokenrefreshermanifests.Manifests,
 }
 
@@ -130,9 +128,7 @@ func metalmanContainerNames(t *testing.T) map[string]bool {
 // repository ships and checks that the containers they name actually exist.
 //
 // This test earns its place. The design document warns that container names are
-// release-specific, and then violated that rule in its own examples for two
-// revisions: the storage example named a container "supervisor" when the
-// containers are "install" and "run", and the machina example named
+// release-specific, and then violated that rule: the machina example named
 // "controller" when it is "machina-controller". A document that cannot keep its
 // own examples resolvable is evidence that users will not either.
 //
@@ -200,7 +196,7 @@ func assertExampleContainersExist(t *testing.T, entry override.SourcedEntry) {
 // actually parses, for the components this package can reach.
 //
 // Only metalman qualifies today: its command is built in internal/, so this
-// package may import it. machina, net, gantry and storage all define their
+// package may import it. machina, net, and gantry all define their
 // flags in cmd/ packages, which internal/ must not import (see AGENTS.md), so
 // an extraArgs example naming one of those cannot be checked here.
 var componentFlagSets = map[string]func() *cobra.Command{
@@ -616,7 +612,7 @@ func TestDocumentedComponentKindsMatchTheTable(t *testing.T) {
 		t.Fatalf("read %s: %v", doc, err)
 	}
 
-	for _, component := range []string{"net", "machina", "gantry", "metalman", "storage", "token-refresher"} {
+	for _, component := range []string{"net", "machina", "gantry", "metalman", "token-refresher"} {
 		kinds := override.ComponentKinds(component)
 		if len(kinds) == 0 {
 			t.Fatalf("override.ComponentKinds(%q) is empty; the test is looking at the wrong names", component)

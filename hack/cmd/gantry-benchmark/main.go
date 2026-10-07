@@ -74,6 +74,12 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return benchmark.prebuildGantryImages(ctx, count)
 	case "disable":
 		return benchmark.disable(ctx)
+	case "recover-direct-config":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: gantry-benchmark recover-direct-config <expected-current-sha256>")
+		}
+
+		return benchmark.recoverDirectConfig(ctx, args[1])
 	case "enable":
 		return benchmark.enable(ctx)
 	case "prepare":
@@ -143,6 +149,8 @@ Subcommands:
 	prebuild-gantry <count>
 	           build and push reusable Gantry images without enabling a benchmark
 	disable    restore the cluster and remove benchmark instrumentation
+	recover-direct-config <expected-current-sha256>
+	           acknowledge direct-mode Gantry config drift, then complete disable
 	enable     install benchmark instrumentation after safety checks
 	prepare    build and push both digest-pinned images before ACR goes private
 	prepare-adopt <baseline-image> <gantry-image> <payload-sha256>

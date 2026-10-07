@@ -609,7 +609,7 @@ func (x *PleasePullRequest) GetChairAssignment() *ChairAssignment {
 
 type ChairAssignment struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
-	ChairId         uint32                 `protobuf:"varint,1,opt,name=chair_id,json=chairId,proto3" json:"chair_id,omitempty"`
+	ChairId         uint64                 `protobuf:"varint,1,opt,name=chair_id,json=chairId,proto3" json:"chair_id,omitempty"`
 	Generation      int64                  `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"`
 	AssignmentEpoch int64                  `protobuf:"varint,3,opt,name=assignment_epoch,json=assignmentEpoch,proto3" json:"assignment_epoch,omitempty"`
 	unknownFields   protoimpl.UnknownFields
@@ -646,7 +646,7 @@ func (*ChairAssignment) Descriptor() ([]byte, []int) {
 	return file_coord_proto_rawDescGZIP(), []int{4}
 }
 
-func (x *ChairAssignment) GetChairId() uint32 {
+func (x *ChairAssignment) GetChairId() uint64 {
 	if x != nil {
 		return x.ChairId
 	}
@@ -940,7 +940,7 @@ const file_coord_proto_rawDesc = "" +
 	"\rKIND_MANIFEST\x10\x02\x12\x0f\n" +
 	"\vKIND_CONFIG\x10\x03\"w\n" +
 	"\x0fChairAssignment\x12\x19\n" +
-	"\bchair_id\x18\x01 \x01(\rR\achairId\x12\x1e\n" +
+	"\bchair_id\x18\x01 \x01(\x04R\achairId\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\x03R\n" +
 	"generation\x12)\n" +

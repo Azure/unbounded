@@ -52,13 +52,11 @@ func fixedField(fixed string) string {
 	return `,"fixed_version":"` + fixed + `"`
 }
 
-// TestGateBlocksOnlyOnFixableReachableVulnerabilities is the policy.
+// TestGateBlocksOnlyOnReachableVulnerabilitiesWithFinalFixes is the policy.
 //
-// The failing case cannot be observed against the repository's own scan: every
-// vulnerability that currently reaches our code is unfixable upstream, so
-// without a fixture the blocking path would ship untested and a regression
-// would look exactly like a clean run.
-func TestGateBlocksOnlyOnFixableReachableVulnerabilities(t *testing.T) {
+// Fixtures keep the verdict independent of whichever advisories happen to be
+// in the live vulnerability database when the tests run.
+func TestGateBlocksOnlyOnReachableVulnerabilitiesWithFinalFixes(t *testing.T) {
 	cases := []struct {
 		name        string
 		input       string
@@ -74,7 +72,18 @@ func TestGateBlocksOnlyOnFixableReachableVulnerabilities(t *testing.T) {
 				symbolFinding("GO-2026-6170", "github.com/lib/pq", "v1.12.3", "", "Open"),
 			),
 			wantBlocked: false,
-			wantMention: []string{"GO-2026-6170", "no fix available", "not blocking"},
+			wantMention: []string{"GO-2026-6170", "without a final-release fix", "not blocking"},
+		},
+		{
+			name: "reachable with only a prerelease fix is reported and allowed",
+			input: stream(
+				configMsg,
+				osvMsg("GO-2026-6443", "Something fixed only in development"),
+				moduleFinding("GO-2026-6443", "example.com/dev", "v1.84.0", "v1.85.0-dev.0.20260825072537-93e31b48545e"),
+				symbolFinding("GO-2026-6443", "example.com/dev", "v1.84.0", "v1.85.0-dev.0.20260825072537-93e31b48545e", "Vulnerable"),
+			),
+			wantBlocked: false,
+			wantMention: []string{"GO-2026-6443", "prerelease fix: v1.85.0-dev.0.20260825072537-93e31b48545e", "not blocking"},
 		},
 		{
 			name: "reachable with a fix blocks",
@@ -98,16 +107,16 @@ func TestGateBlocksOnlyOnFixableReachableVulnerabilities(t *testing.T) {
 				moduleFinding("GO-2026-8888", "example.com/unused", "v0.1.0", "v0.2.0"),
 			),
 			wantBlocked: false,
-			wantMention: []string{"no reachable vulnerability has an available fix"},
+			wantMention: []string{"no reachable vulnerability has a final-release fix"},
 		},
 		{
-			// One OSV can span modules. If any reachable finding names a fix,
-			// there is something to bump, so the whole entry blocks.
-			name: "mixed findings for one OSV block on the fixable one",
+			// One OSV can span modules. A final fix must replace a prerelease
+			// encountered first so the actionable finding still blocks.
+			name: "mixed findings for one OSV prefer the final fix",
 			input: stream(
 				configMsg,
-				osvMsg("GO-2026-7777", "Two modules, one fixed"),
-				symbolFinding("GO-2026-7777", "example.com/nofix", "v1.0.0", "", "A"),
+				osvMsg("GO-2026-7777", "Two modules, two kinds of fix"),
+				symbolFinding("GO-2026-7777", "example.com/prerelease", "v1.0.0", "v1.1.0-rc.1", "A"),
 				symbolFinding("GO-2026-7777", "example.com/fixed", "v1.0.0", "v1.1.0", "B"),
 			),
 			wantBlocked: true,
@@ -117,7 +126,7 @@ func TestGateBlocksOnlyOnFixableReachableVulnerabilities(t *testing.T) {
 			name:        "a clean scan passes",
 			input:       stream(configMsg),
 			wantBlocked: false,
-			wantMention: []string{"no reachable vulnerability has an available fix"},
+			wantMention: []string{"no reachable vulnerability has a final-release fix"},
 		},
 	}
 
@@ -140,6 +149,31 @@ func TestGateBlocksOnlyOnFixableReachableVulnerabilities(t *testing.T) {
 				if !strings.Contains(out.String(), want) {
 					t.Fatalf("output does not mention %q:\n%s", want, out.String())
 				}
+			}
+		})
+	}
+}
+
+func TestBlockingFix(t *testing.T) {
+	cases := []struct {
+		name    string
+		version string
+		want    bool
+	}{
+		{name: "empty", version: "", want: false},
+		{name: "final", version: "v1.2.3", want: true},
+		{name: "final with build metadata", version: "v1.2.3+build.1", want: true},
+		{name: "development", version: "v1.3.0-dev.0.20260825072537-93e31b48545e", want: false},
+		{name: "release candidate", version: "v1.3.0-rc.1", want: false},
+		{name: "beta", version: "v1.3.0-beta.1", want: false},
+		{name: "Go pseudo-version", version: "v0.0.0-20260719225207-c76316d4aa82", want: false},
+		{name: "malformed fails closed", version: "not-semver", want: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := blockingFix(tc.version); got != tc.want {
+				t.Fatalf("blockingFix(%q) = %v, want %v", tc.version, got, tc.want)
 			}
 		})
 	}
@@ -184,7 +218,7 @@ func TestGateRejectsMalformedOutput(t *testing.T) {
 
 // TestAnnotationsAreEmittedOnlyUnderActions pins the reporting side channel.
 //
-// A passing job's log is not read, so the unfixable set is surfaced as a
+// A passing job's log is not read, so the nonblocking set is surfaced as a
 // workflow annotation instead. Emitting the same syntax locally would be noise.
 func TestAnnotationsAreEmittedOnlyUnderActions(t *testing.T) {
 	vulns, err := parse(strings.NewReader(stream(

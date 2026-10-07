@@ -44,7 +44,7 @@ class TestHostImageSelection(unittest.TestCase):
         path on hosts that were working.
         """
         for base_os in ("ubuntu2404", "ubuntu2604", "fedora", "almalinux9",
-                        "almalinux10", "centosstream9", "centosstream10"):
+                        "almalinux10"):
             with self.subTest(base_os=base_os):
                 with patch.object(e2e, "HOST_BASE_OS", base_os):
                     image = e2e.host_image()
