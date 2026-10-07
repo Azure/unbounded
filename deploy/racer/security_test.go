@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -67,19 +68,42 @@ func TestRenderedRuntimeSecurity(t *testing.T) {
 
 			decode("rbac.yaml", &sa, &dataplane, &clusterRole, &clusterBinding, &role)
 
+			granted := map[string][]string{}
+
 			for _, rule := range append(role.Rules, clusterRole.Rules...) {
+				require.NotContains(t, rule.APIGroups, "*")
+				require.NotContains(t, rule.Resources, "*")
+				require.NotContains(t, rule.Verbs, "*")
+
 				for _, resource := range rule.Resources {
 					for _, verb := range rule.Verbs {
 						if resource == "secrets" && verb != "create" {
 							require.Equal(t, []string{credentials}, rule.ResourceNames)
 						}
 
-						if resource == "configmaps" && (verb == "update" || verb == "patch") {
+						if resource == "configmaps" && verb != "create" {
 							require.Equal(t, []string{installation, version}, rule.ResourceNames)
+						}
+
+						if resource == "leases" && verb != "create" {
+							require.Equal(t, []string{"racer-controller"}, rule.ResourceNames)
+						}
+
+						if resource == "configmaps" || resource == "leases" {
+							if verb == "create" {
+								require.Empty(t, rule.ResourceNames, "create cannot be name-restricted")
+							}
+
+							if !slices.Contains(granted[resource], verb) {
+								granted[resource] = append(granted[resource], verb)
+							}
 						}
 					}
 				}
 			}
+
+			require.ElementsMatch(t, []string{"get", "list", "watch", "create", "update", "patch"}, granted["configmaps"])
+			require.ElementsMatch(t, []string{"get", "create", "update"}, granted["leases"])
 
 			var policy admissionv1.ValidatingAdmissionPolicy
 			decode("create-restriction.yaml", &policy)

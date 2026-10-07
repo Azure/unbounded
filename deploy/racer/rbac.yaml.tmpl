@@ -50,9 +50,6 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "serviceaccounts"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "watch"]
   # Create cannot be restricted by resourceNames. The fail-closed admission
   # policy must be installed before enabling this RoleBinding or any workload.
   - apiGroups: [""]
@@ -66,13 +63,19 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: [{{ .InstallationConfigMapName | default "racer-installation" | quote }}, {{ .VersionConfigMapName | default "racer-version" | quote }}]
-    verbs: ["update", "patch"]
+    # Each cache uses its own matching metadata.name field selector.
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["apps"]
     resources: ["daemonsets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    # RBAC cannot restrict create by name; LeaseLock needs no list/watch.
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["racer-controller"]
+    verbs: ["get", "update"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
