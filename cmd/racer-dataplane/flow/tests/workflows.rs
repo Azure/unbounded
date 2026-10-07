@@ -1358,8 +1358,10 @@ mod coalesce_tests {
                 notified.set(true);
             }
         });
+        drop(flight::update(&table, |table, _| {
+            table.register_drain(waker)
+        }));
         flight::update(&table, |table, wakes| {
-            table.register_drain(&waker);
             let operations = &mut table.get_mut(&1).unwrap().0;
             operations.complete(id).unwrap();
             assert_eq!(operations.complete(id), Err(Stale));

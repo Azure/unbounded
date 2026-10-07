@@ -676,9 +676,11 @@ pub mod flight {
             self.stopping
         }
 
-        /// Retain the latest drain task's wake target.
-        pub fn register_drain(&mut self, waker: &Waker) {
-            state::store_waker(&mut self.drain_waker, waker);
+        /// Retain the latest drain task's wake target and return the previous one.
+        /// Clone before borrowing the owner; drop the returned waker after releasing
+        /// that borrow. With `update`, return it from the transaction closure.
+        pub fn register_drain(&mut self, waker: Waker) -> Option<Waker> {
+            self.drain_waker.replace(waker)
         }
 
         /// Enqueue a pending drain notification at most once.
