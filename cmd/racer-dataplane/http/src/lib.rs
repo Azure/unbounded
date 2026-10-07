@@ -7,6 +7,8 @@
 //! Content-Length or Host fields, and leaves body limits to [`connection`].
 //! Response codes from 100 to 599 are valid at the codec boundary; the connection
 //! exchange layer rejects informational responses, upgrades, and CONNECT requests.
+//! Requests require one Host with URI host and optional port syntax. Empty Host
+//! values remain valid for targets without authority; callers enforce routing.
 //!
 //! Header names retain their spelling and order, and ordinary repeated fields
 //! remain separate. Decoding removes at most one separator space after the colon;
@@ -315,9 +317,93 @@ impl<O: Opaque> Codec<O> {
         }
         head.content_length()?;
         head.closes_connection()?;
-        head.unique("host")?;
+        let host = head.unique("host")?;
+        if matches!(head.start, StartLine::Request { .. }) {
+            validate_host(host.ok_or(Error::Malformed)?)?;
+        }
         Ok(())
     }
+}
+
+/// Check RFC 9110 Host syntax without changing stored bytes or routing policy.
+/// Empty hosts and empty ports are valid URI grammar (RFC 3986 section 3.2).
+fn validate_host(value: &[u8]) -> Result<()> {
+    let value = trim_ows(value);
+    let port = if let Some(literal) = value.strip_prefix(b"[") {
+        let end = literal
+            .iter()
+            .position(|b| *b == b']')
+            .ok_or(Error::Malformed)?;
+        let address = &literal[..end];
+        let ipv6 = std::str::from_utf8(address)
+            .ok()
+            .and_then(|s| s.parse::<std::net::Ipv6Addr>().ok())
+            .is_some();
+        let future = address
+            .strip_prefix(b"v")
+            .or_else(|| address.strip_prefix(b"V"))
+            .and_then(|rest| {
+                rest.iter()
+                    .position(|b| *b == b'.')
+                    .map(|i| (&rest[..i], &rest[i + 1..]))
+            })
+            .is_some_and(|(version, name)| {
+                !version.is_empty()
+                    && version.iter().all(u8::is_ascii_hexdigit)
+                    && !name.is_empty()
+                    && name.iter().all(|b| is_host_char(*b) || *b == b':')
+            });
+        if !ipv6 && !future {
+            return Err(Error::Malformed);
+        }
+        &literal[end + 1..]
+    } else {
+        let end = value.iter().position(|b| *b == b':').unwrap_or(value.len());
+        let mut name = &value[..end];
+        while let Some((&byte, rest)) = name.split_first() {
+            name = if byte == b'%' {
+                if rest.len() < 2 || !rest[..2].iter().all(u8::is_ascii_hexdigit) {
+                    return Err(Error::Malformed);
+                }
+                &rest[2..]
+            } else if is_host_char(byte) {
+                rest
+            } else {
+                return Err(Error::Malformed);
+            };
+        }
+        &value[end..]
+    };
+    if !port.is_empty()
+        && !port
+            .strip_prefix(b":")
+            .is_some_and(|p| p.iter().all(u8::is_ascii_digit))
+    {
+        return Err(Error::Malformed);
+    }
+    Ok(())
+}
+
+/// URI unreserved and sub-delimiter bytes allowed in a registered name.
+fn is_host_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+        )
 }
 
 impl MessageHead {
@@ -707,6 +793,93 @@ mod tests {
     /// A codec using the test opaque policy.
     type TestCodec = Codec<Fields>;
 
+    /// Host presence and URI grammar apply to both wire and owned request heads.
+    #[test]
+    fn request_host_grammar_preserves_empty_authority() {
+        let codec = TestCodec::new(1024);
+        for (value, valid) in [
+            ("", true),
+            (" \t ", true),
+            ("example.test", true),
+            (" example.test:443\t", true),
+            ("127.0.0.1:", true),
+            ("[::1]:80", true),
+            ("[2001:db8::1]", true),
+            ("[vF.a:b]", true),
+            ("[VF.a:b]:", true),
+            ("a!$&'()*+,;=._~-", true),
+            ("example:999999999999999999999999", true),
+            ("a%20b", true),
+            (":80", true),
+            ("user@example", false),
+            ("example/path", false),
+            ("example?query", false),
+            ("example#fragment", false),
+            ("a b", false),
+            ("a\tb", false),
+            ("example:abc", false),
+            ("::1", false),
+            ("[no-ip]", false),
+            ("[::1", false),
+            ("[::1]suffix", false),
+            ("[v.a]", false),
+            ("[v1.]", false),
+            ("[v1.a%20b]", false),
+            ("[::1]:80:90", false),
+            ("[fe80::1%25eth0]", false),
+            ("example\\path", false),
+            ("a%2", false),
+            ("a%zz", false),
+            ("café", false),
+        ] {
+            let head = MessageHead {
+                start: StartLine::Request {
+                    method: "GET".into(),
+                    target: "/".into(),
+                },
+                headers: vec![Header::new("hOsT", value)],
+            };
+            let wire = format!("GET / HTTP/1.1\r\nhOsT: {value}\r\n\r\n");
+            assert_eq!(codec.encode_head(&head).is_ok(), valid, "{value:?}");
+            let decoded = codec.decode_head(wire.as_bytes());
+            assert_eq!(decoded.is_ok(), valid, "{value:?}");
+            if valid {
+                assert_eq!(
+                    decoded.unwrap().unwrap().0.unique("host").unwrap(),
+                    Some(value.as_bytes())
+                );
+            }
+        }
+        for headers in [
+            vec![],
+            vec![Header::new("Host", "a"), Header::new("host", "b")],
+        ] {
+            let head = MessageHead {
+                start: StartLine::Request {
+                    method: "GET".into(),
+                    target: "/".into(),
+                },
+                headers,
+            };
+            assert_eq!(codec.encode_head(&head), Err(Error::Malformed));
+        }
+        for wire in [
+            "GET / HTTP/1.1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a\r\nhost: b\r\n\r\n",
+        ] {
+            assert!(matches!(
+                codec.decode_head(wire.as_bytes()),
+                Err(Error::Malformed)
+            ));
+        }
+        let response = MessageHead {
+            start: StartLine::Response { status: 200 },
+            headers: vec![],
+        };
+        let wire = codec.encode_head(&response).unwrap();
+        assert!(codec.decode_head(&wire).unwrap().is_some());
+    }
+
     /// Construction copies bytes, while encoding still rejects invalid field syntax.
     #[test]
     fn header_constructor_copies_exact_bytes_and_codec_still_validates() {
@@ -730,7 +903,7 @@ mod tests {
     fn maximum_wire_heads_and_maximum_field_count_have_checked_decoded_bounds() {
         for limit in [MAX_HEAD_BYTES, 18 * 64 * 1024] {
             let codec = TestCodec::new(limit);
-            let mut bytes = b"GET / HTTP/1.1\r\nX: ".to_vec();
+            let mut bytes = b"GET / HTTP/1.1\r\nHost: ".to_vec();
             bytes.resize(limit - 4, b'a');
             bytes.extend_from_slice(b"\r\n\r\n");
             let (head, used) = codec.decode_head(&bytes).unwrap().unwrap();
@@ -738,12 +911,12 @@ mod tests {
             assert_eq!(codec.encode_head(&head).unwrap(), bytes);
             let allocation = codec.decoded_allocation(&bytes).unwrap();
             assert!(allocation >= head.headers[0].value.len() + std::mem::size_of::<Header>());
-            let mut fields = b"GET / HTTP/1.1\r\n".to_vec();
+            let mut fields = b"GET / HTTP/1.1\r\nHost:\r\n".to_vec();
             while fields.len() + 6 <= limit {
                 fields.extend_from_slice(b"X:\r\n");
             }
             fields.extend_from_slice(b"\r\n");
-            let count = (fields.len() - 18) / 4;
+            let count = 1 + (fields.len() - 25) / 4;
             let allocation = codec.decoded_allocation(&fields).unwrap();
             assert!(allocation >= count * std::mem::size_of::<Header>());
             assert_eq!(
@@ -761,7 +934,7 @@ mod tests {
     #[test]
     fn fragmented_head_preserves_opaque_values_and_duplicates() {
         let codec = TestCodec::new(1024);
-        let bytes = b"GET /a HTTP/1.1\r\nX-Opaque:  \xff\t \r\nx-opaque: second\r\nContent-Length: 3\r\n\r\nabc";
+        let bytes = b"GET /a HTTP/1.1\r\nX-Opaque:  \xff\t \r\nx-opaque: second\r\nContent-Length: 3\r\nHost: example\r\n\r\nabc";
         let end = bytes.len() - 3;
         for length in 0..end {
             assert!(codec.decode_head(&bytes[..length]).unwrap().is_none());
@@ -779,15 +952,15 @@ mod tests {
     fn rejects_smuggling_and_malformed_syntax() {
         let codec = TestCodec::new(1024);
         for bytes in [
-            &b"GET / HTTP/1.1\n\n"[..],
-            &b"GET / HTTP/1.0\r\n\r\n"[..],
-            &b"GET / HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n"[..],
-            &b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
-            &b"GET / HTTP/1.1\r\nContent-Length: +1\r\n\r\n"[..],
-            &b"GET / HTTP/1.1\r\nContent-Length: 18446744073709551616\r\n\r\n"[..],
-            &b"GET / HTTP/1.1\r\nX: first\r\n second\r\n\r\n"[..],
-            &b"GET / HTTP/1.1\r\nConnection: content-length\r\n\r\n"[..],
-            &b"GET / HTTP/1.1\r\nBad : x\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\nHost: example\n\n"[..],
+            &b"GET / HTTP/1.0\r\nHost: example\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: example\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: example\r\nContent-Length: +1\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: example\r\nContent-Length: 18446744073709551616\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: example\r\nX: first\r\n second\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: example\r\nConnection: content-length\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: example\r\nBad : x\r\n\r\n"[..],
         ] {
             assert!(codec.decode_head(bytes).is_err(), "accepted malformed head");
         }
@@ -824,12 +997,12 @@ mod tests {
                 &b" x "[..],
                 &b" x\t"[..],
             ] {
-                let mut bytes = format!("GET / HTTP/1.1\r\n{field}:").into_bytes();
+                let mut bytes = format!("GET / HTTP/1.1\r\nHost: example\r\n{field}:").into_bytes();
                 bytes.extend_from_slice(suffix);
                 bytes.extend_from_slice(b"\r\n\r\n");
                 assert!(codec.decode_head(&bytes).is_err());
             }
-            let mut bytes = format!("GET / HTTP/1.1\r\n{field}: ").into_bytes();
+            let mut bytes = format!("GET / HTTP/1.1\r\nHost: example\r\n{field}: ").into_bytes();
             bytes.extend_from_slice(b"\xffopaque\x80\r\n\r\n");
             let (head, _) = codec.decode_head(&bytes).unwrap().unwrap();
             assert_eq!(head.unique(field).unwrap().unwrap(), b"\xffopaque\x80");
@@ -844,7 +1017,7 @@ mod tests {
     /// Opaque policy applies case-insensitively only when a name is configured.
     #[test]
     fn empty_and_custom_opaque_lists_are_case_insensitive() {
-        let bytes = b"GET / HTTP/1.1\r\nAuThOrIzAtIoN:  padded \r\n\r\n";
+        let bytes = b"GET / HTTP/1.1\r\nAuThOrIzAtIoN:  padded \r\nHost: example\r\n\r\n";
         let plain = Codec::<()>::new(1024);
         let head = plain.decode_head(bytes).unwrap().unwrap().0;
         assert_eq!(plain.encode_head(&head).unwrap(), bytes);
@@ -992,7 +1165,7 @@ mod tests {
     /// Admission charging shares layout bounds without taking over syntax validation.
     #[test]
     fn checked_layout_excludes_read_ahead_and_preserves_admission_error_order() {
-        let wire = b"GET / HTTP/1.1\r\nX: a\r\nY:\r\n\r\nbody\r\n\r\n";
+        let wire = b"GET / HTTP/1.1\r\nX: a\r\nHost:\r\n\r\nbody\r\n\r\n";
         let end = wire.len() - b"body\r\n\r\n".len();
         let codec = Codec::<()>::new(end);
         let expected = 2 * std::mem::size_of::<Header>() + end + std::mem::size_of::<MessageHead>();
@@ -1012,7 +1185,7 @@ mod tests {
             Codec::<()>::new(1).decoded_allocation(b"not a head"),
             Err(Error::Malformed)
         );
-        let malformed = b"GET / HTTP/1.1\nX: a\r\n\r\n";
+        let malformed = b"GET / HTTP/1.1\nHost:\r\nX: a\r\n\r\n";
         assert!(codec.decoded_allocation(malformed).is_ok());
         assert!(matches!(
             codec.decode_head(malformed),
@@ -1038,7 +1211,7 @@ mod tests {
             Codec::<()>::new(0).decode_head(b""),
             Err(Error::HeadTooLarge)
         ));
-        let complete = b"GET / HTTP/1.1\nX: a\r\n\r\n";
+        let complete = b"GET / HTTP/1.1\nHost:\r\nX: a\r\n\r\n";
         assert!(matches!(
             Codec::<()>::new(complete.len()).decode_head(complete),
             Err(Error::Malformed)
@@ -1081,7 +1254,7 @@ mod tests {
         ] {
             let mut wire = b"GET / HTTP/1.1\r\nX:".to_vec();
             wire.extend_from_slice(suffix);
-            wire.extend_from_slice(b"\r\n\r\n");
+            wire.extend_from_slice(b"\r\nHost: example\r\n\r\n");
             let (head, _) = codec.decode_head(&wire).unwrap().unwrap();
             assert_eq!(head.headers[0].value, expected);
         }

@@ -148,13 +148,15 @@ fn head(start: StartLine, length: usize) -> MessageHead {
 
 /// Construct a request for the shared fixture resource.
 fn request(method: &str, length: usize) -> MessageHead {
-    head(
+    let mut request = head(
         StartLine::Request {
             method: method.into(),
             target: "/items".into(),
         },
         length,
-    )
+    );
+    request.headers.push(Header::new("Host", "example"));
+    request
 }
 
 /// Exercise sequential upload and fetch exchanges and server-directed closure.

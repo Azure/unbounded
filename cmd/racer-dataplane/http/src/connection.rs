@@ -1988,6 +1988,10 @@ mod tests {
                     head.start = StartLine::Request {
                         method: "CONNECT".into(),
                         target: "example.com:443".into(),
+                    };
+                    if head.unique("host").unwrap().is_none() {
+                        head.headers
+                            .push(crate::Header::new("Host", b"example.com:443"));
                     }
                 }
                 Some(Rewrite::Kind) => head.start = StartLine::Response { status: 200 },
@@ -2779,6 +2783,10 @@ mod tests {
                 headers: length
                     .map(|n| crate::Header::new("Content-Length", n.to_string().as_bytes()))
                     .into_iter()
+                    .chain(std::iter::once(crate::Header::new(
+                        "Host",
+                        b"example.com:443",
+                    )))
                     .collect(),
             };
             let codec = Codec::<()>::new(256);
@@ -2924,7 +2932,7 @@ mod tests {
                         method: method.into(),
                         target: target.into(),
                     },
-                    headers: vec![],
+                    headers: vec![crate::Header::new("Host", b"example")],
                 };
                 let result = drive(&reactor, io.send_head(connection, request, &TestScope));
                 if accepted {
@@ -2937,7 +2945,7 @@ mod tests {
                 let mut wire = Vec::new();
                 peer.read_to_end(&mut wire).unwrap();
                 if accepted {
-                    assert_eq!(wire, b"HEAD / HTTP/1.1\r\n\r\n");
+                    assert_eq!(wire, b"HEAD / HTTP/1.1\r\nHost: example\r\n\r\n");
                 } else {
                     assert!(wire.is_empty());
                 }
@@ -2984,7 +2992,10 @@ mod tests {
                     method: "GET".into(),
                     target: "/".into(),
                 },
-                headers: vec![crate::Header::new("Content-Length", b"0")],
+                headers: vec![
+                    crate::Header::new("Content-Length", b"0"),
+                    crate::Header::new("Host", b"example"),
+                ],
             };
             let result = drive(&reactor, io.exchange_head(connection, request, &TestScope));
             if accepted {
@@ -3047,7 +3058,7 @@ mod tests {
             connection.request_is_head = true;
             let wire: &[u8] = if matches!(rewrite, Rewrite::Head | Rewrite::Connect | Rewrite::Kind)
             {
-                b"GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+                b"GET / HTTP/1.1\r\nContent-Length: 0\r\nHost: example\r\n\r\n"
             } else {
                 b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"
             };
