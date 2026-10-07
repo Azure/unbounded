@@ -31,6 +31,9 @@ func TestRenderedRuntimeSecurity(t *testing.T) {
 				data = map[string]string{"CredentialsSecretName": credentials, "InstallationConfigMapName": installation, "VersionConfigMapName": version}
 			}
 
+			data["InitializationState"] = "fresh"
+			data["ClusterID"] = "11111111-1111-1111-1111-111111111111"
+
 			out := t.TempDir()
 			require.NoError(t, render.Render(".", out, data))
 

@@ -28,11 +28,49 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
+
+func TestStartupGuards(t *testing.T) {
+	f := newServingFixture(t)
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Server)
+		want   error
+	}{
+		{"invalid limits", func(s *Server) { s.config.Limits.MaxPolls = 0 }, wire.InvalidRequest},
+		{"missing address", func(s *Server) { s.config.ControlAddress = "" }, wire.InvalidRequest},
+		{"missing lifecycle", func(s *Server) { s.Lifecycle = nil }, wire.Unavailable},
+		{"missing authority", func(s *Server) { s.authority = nil }, wire.Unavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(f.a.Server.config, f.a.Server.writer, f.a.authority, f.a.Lifecycle, f.a.Replication)
+			tc.mutate(s)
+			require.ErrorIs(t, s.Start(canceled), tc.want)
+		})
+	}
+
+	s := New(f.a.Server.config, nil, nil, nil, nil)
+	require.False(t, s.NeedLeaderElection())
+	_, err := s.TLSConfig(canceled)
+	require.ErrorIs(t, err, wire.Unavailable)
+
+	s = New(Config{}, nil, f.a.authority, nil, nil)
+	_, err = s.TLSConfig(canceled)
+	require.ErrorIs(t, err, wire.InvalidRequest)
+
+	lifecycle := NewLifecycle(f.a.authority)
+	lifecycle.SetCacheSync(func(ctx context.Context) bool { return ctx.Err() == nil })
+	require.NoError(t, lifecycle.Start(canceled))
+	require.PanicsWithValue(t, http.ErrAbortHandler, func() { flushResponse(canceled, httptest.NewRecorder()) })
+}
 
 func servingTestCertificate(t *testing.T, serial int64, before, after time.Time, parent *tls.Certificate, ca bool) tls.Certificate {
 	t.Helper()
@@ -140,6 +178,44 @@ func TestServingCertificateValidation(t *testing.T) {
 
 func certificatePointer(c tls.Certificate) *tls.Certificate { return &c }
 
+func TestServingCertificateChainOnlyRotation(t *testing.T) {
+	now := time.Now()
+	old := servingTestCertificate(t, 1, now.Add(-time.Hour), now.Add(time.Hour), nil, true)
+	current := servingTestCertificate(t, 2, now.Add(-time.Hour), now.Add(time.Hour), nil, true)
+	leaf := servingTestCertificate(t, 3, now.Add(-time.Minute), now.Add(time.Hour), &current, false)
+	bridge, err := x509.CreateCertificate(rand.Reader, current.Leaf, old.Leaf, current.Leaf.PublicKey, old.PrivateKey)
+	require.NoError(t, err)
+
+	compatible := leaf
+	compatible.Certificate = [][]byte{leaf.Certificate[0], bridge, old.Certificate[0]}
+	dir := t.TempDir()
+	writeServingTestPair(t, dir, compatible)
+	r, err := newServingCertificateReloader(filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key"))
+	require.NoError(t, err)
+	testCachedHandshake(t, r, now, old.Leaf, true, 3)
+
+	initial := r.current.Load()
+
+	writeServingTestPair(t, dir, leaf)
+	require.NoError(t, r.reload())
+	require.NotSame(t, initial, r.current.Load())
+	selected, err := r.getCertificate(nil)
+	require.NoError(t, err)
+	require.Equal(t, compatible.Certificate[0], selected.Certificate[0], "leaf must remain unchanged")
+	require.Equal(t, leaf.Certificate, selected.Certificate, "chain-only update was ignored")
+	testCachedHandshake(t, r, now, current.Leaf, true, 2)
+	testCachedHandshake(t, r, now, old.Leaf, false, 0)
+
+	bad := compatible
+	bad.Certificate = [][]byte{leaf.Certificate[0], old.Certificate[0]}
+	last := r.current.Load()
+
+	writeServingTestPair(t, dir, bad)
+	require.Error(t, r.reload(), "same-leaf invalid chain bypassed validation")
+	require.Same(t, last, r.current.Load())
+	testCachedHandshake(t, r, now, current.Leaf, true, 2)
+}
+
 func TestServerReadinessTracksCachedServingCertificate(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newServingFixture(t)
@@ -245,9 +321,7 @@ func TestServingCertificateProjectionAndRecovery(t *testing.T) {
 	second := servingTestCertificate(t, 2, now.Add(-time.Hour), now.Add(time.Hour), nil, false)
 	for name, certificate := range map[string]tls.Certificate{"one": first, "two": second} {
 		path := filepath.Join(dir, name)
-		if err := os.Mkdir(path, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.Mkdir(path, 0o700))
 
 		writeServingTestPair(t, path, certificate)
 	}
@@ -255,20 +329,13 @@ func TestServingCertificateProjectionAndRecovery(t *testing.T) {
 	project := func(generation string) {
 		t.Helper()
 
-		if err := os.Symlink(generation, filepath.Join(dir, "..next")); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := os.Rename(filepath.Join(dir, "..next"), filepath.Join(dir, "..data")); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.Symlink(generation, filepath.Join(dir, "..next")))
+		require.NoError(t, os.Rename(filepath.Join(dir, "..next"), filepath.Join(dir, "..data")))
 	}
 	project("one")
 
 	for _, name := range []string{"tls.crt", "tls.key"} {
-		if err := os.Symlink(filepath.Join("..data", name), filepath.Join(dir, name)); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.Symlink(filepath.Join("..data", name), filepath.Join(dir, name)))
 	}
 
 	r, err := newServingCertificateReloader(filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key"))
@@ -299,49 +366,34 @@ func TestServingCertificateProjectionAndRecovery(t *testing.T) {
 	second.Certificate = first.Certificate
 	writeServingTestPair(t, filepath.Join(dir, "two"), second)
 
-	if err := os.Remove(filepath.Join(dir, "tls.key")); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Remove(filepath.Join(dir, "tls.key")))
 
-	if err := os.Symlink("one/tls.key", filepath.Join(dir, "tls.key")); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Symlink("one/tls.key", filepath.Join(dir, "tls.key")))
 
 	project("two")
 
-	if err := r.reload(); err == nil || r.current.Load() != initial {
-		t.Fatal("mixed generation accepted")
-	}
+	require.Error(t, r.reload(), "mixed generation accepted")
+	require.Same(t, initial, r.current.Load())
 
-	if err := os.Remove(filepath.Join(dir, "tls.key")); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Remove(filepath.Join(dir, "tls.key")))
 
-	if err := os.Symlink("..data/tls.key", filepath.Join(dir, "tls.key")); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Symlink("..data/tls.key", filepath.Join(dir, "tls.key")))
 
 	if err := r.reload(); err != nil {
 		t.Fatal(err)
 	}
 
-	if r.current.Load() == initial {
-		t.Fatal("projection did not recover")
-	}
+	require.NotSame(t, initial, r.current.Load(), "projection did not recover")
 
 	last := r.current.Load()
 
-	if err := os.WriteFile(filepath.Join(dir, "two/tls.crt"), []byte("malformed"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "two/tls.crt"), []byte("malformed"), 0o600))
 
 	if err := r.reload(); err == nil || r.current.Load() != last {
 		t.Fatal("malformed update replaced certificate")
 	}
 
-	if err := os.Remove(filepath.Join(dir, "two/tls.key")); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Remove(filepath.Join(dir, "two/tls.key")))
 
 	if err := r.reload(); err == nil || r.current.Load() != last {
 		t.Fatal("missing update replaced certificate")
@@ -452,9 +504,12 @@ func TestServingCertificateExpirationAndCancellation(t *testing.T) {
 func TestServingTLSConfigInitialFailure(t *testing.T) {
 	f := newServingFixture(t)
 	dir := t.TempDir()
-	f.a.Server.Config.TLSCertificateFile = filepath.Join(dir, "tls.crt")
 
-	f.a.Server.Config.TLSPrivateKeyFile = filepath.Join(dir, "tls.key")
+	f.configureServer(func(c *Config) {
+		c.TLSCertificateFile = filepath.Join(dir, "tls.crt")
+		c.TLSPrivateKeyFile = filepath.Join(dir, "tls.key")
+	})
+
 	if _, err := f.a.Server.TLSConfig(f.ctx); err == nil {
 		t.Fatal("missing initial pair accepted")
 	}
@@ -481,8 +536,12 @@ func TestServingTLSConfigInitialFailure(t *testing.T) {
 func TestServingTLSLiveReloadPreservesConnectionsAndPolls(t *testing.T) {
 	f := newServingFixture(t)
 	dir := t.TempDir()
-	f.a.Server.Config.TLSCertificateFile = filepath.Join(dir, "tls.crt")
-	f.a.Server.Config.TLSPrivateKeyFile = filepath.Join(dir, "tls.key")
+
+	f.configureServer(func(c *Config) {
+		c.TLSCertificateFile = filepath.Join(dir, "tls.crt")
+		c.TLSPrivateKeyFile = filepath.Join(dir, "tls.key")
+	})
+
 	now := time.Now()
 	root := servingTestCertificate(t, 10, now.Add(-time.Hour), now.Add(time.Hour), nil, true)
 	first := servingTestCertificate(t, 11, now.Add(-time.Minute), now.Add(time.Hour), &root, false)
@@ -491,9 +550,7 @@ func TestServingTLSLiveReloadPreservesConnectionsAndPolls(t *testing.T) {
 	newRoot := servingTestCertificate(t, 20, now.Add(-time.Hour), now.Add(time.Hour), nil, true)
 
 	crossDER, err := x509.CreateCertificate(rand.Reader, newRoot.Leaf, root.Leaf, newRoot.Leaf.PublicKey, root.PrivateKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	second := servingTestCertificate(t, 12, now.Add(-time.Minute), now.Add(time.Hour), &newRoot, false)
 	second.Certificate = [][]byte{second.Certificate[0], crossDER, root.Certificate[0]}
@@ -502,9 +559,7 @@ func TestServingTLSLiveReloadPreservesConnectionsAndPolls(t *testing.T) {
 	writeServingTestPair(t, dir, first)
 
 	config, err := f.a.Server.TLSConfig(f.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	s := httptest.NewUnstartedServer(f.a.Server.Handler())
 	s.Config.ConnContext = connectionContext
@@ -520,9 +575,7 @@ func TestServingTLSLiveReloadPreservesConnectionsAndPolls(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if response.TLS.PeerCertificates[0].SerialNumber.Int64() != 11 {
-		t.Fatal("wrong initial certificate")
-	}
+	require.Equal(t, int64(11), response.TLS.PeerCertificates[0].SerialNumber.Int64(), "wrong initial certificate")
 
 	type result struct {
 		response *http.Response
@@ -538,24 +591,7 @@ func TestServingTLSLiveReloadPreservesConnectionsAndPolls(t *testing.T) {
 
 	awaitServerPolls(t, f.a.Server, 1)
 	writeServingTestPair(t, dir, second)
-	fresh := f.client(t, nil)
-	fresh.Transport.(*http.Transport).DisableKeepAlives = true
-	deadline := time.Now().Add(5 * time.Second)
-
-	for {
-		freshResponse, freshErr := fresh.Get(s.URL + wire.SnapshotPath)
-		responseBody(t, freshResponse, freshErr, http.StatusUnauthorized)
-
-		if freshResponse.TLS.PeerCertificates[0].SerialNumber.Int64() == 12 {
-			break
-		}
-
-		if time.Now().After(deadline) {
-			t.Fatal("new handshakes did not see replacement")
-		}
-
-		time.Sleep(10 * time.Millisecond)
-	}
+	awaitServingSerial(t, f, s.URL, 12)
 
 	select {
 	case result := <-done:
@@ -583,9 +619,7 @@ func TestServingTLSLiveReloadPreservesConnectionsAndPolls(t *testing.T) {
 	case result := <-done:
 		responseBody(t, result.response, result.err, http.StatusOK)
 
-		if result.response.TLS.PeerCertificates[0].SerialNumber.Int64() != 11 {
-			t.Fatal("long poll reconnected")
-		}
+		require.Equal(t, int64(11), result.response.TLS.PeerCertificates[0].SerialNumber.Int64(), "long poll reconnected")
 	case <-time.After(5 * time.Second):
 		t.Fatal("long poll did not complete")
 	}
@@ -601,8 +635,29 @@ func TestServingTLSLiveReloadPreservesConnectionsAndPolls(t *testing.T) {
 	response, err = peer.Do(req)
 	responseBody(t, response, err, http.StatusOK)
 
-	if !reused || response.TLS.PeerCertificates[0].SerialNumber.Int64() != 11 {
-		t.Fatal("persistent connection replaced")
+	require.True(t, reused, "persistent connection replaced")
+	require.Equal(t, int64(11), response.TLS.PeerCertificates[0].SerialNumber.Int64())
+}
+
+func awaitServingSerial(t *testing.T, f *servingFixture, endpoint string, serial int64) {
+	t.Helper()
+	fresh := f.client(t, nil)
+	fresh.Transport.(*http.Transport).DisableKeepAlives = true
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		response, err := fresh.Get(endpoint + wire.SnapshotPath)
+		responseBody(t, response, err, http.StatusUnauthorized)
+
+		if response.TLS.PeerCertificates[0].SerialNumber.Int64() == serial {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("new handshakes did not see replacement")
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -693,68 +748,24 @@ func TestServingTLSCompatibilitySuffixExpiration(t *testing.T) {
 	bridgeTemplate.NotAfter = old.Leaf.NotAfter
 
 	bridgeDER, err := x509.CreateCertificate(rand.Reader, &bridgeTemplate, old.Leaf, current.Leaf.PublicKey, old.PrivateKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	leaf.Certificate = [][]byte{leaf.Certificate[0], bridgeDER, old.Certificate[0]}
 	dir := t.TempDir()
 	writeServingTestPair(t, dir, leaf)
 
 	r := &servingCertificateReloader{certificateFile: filepath.Join(dir, "tls.crt"), keyFile: filepath.Join(dir, "tls.key")}
-	if err := r.reloadAt(now); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, r.reloadAt(now))
 
 	initial := r.current.Load()
 	// Remove source files: selection after the frozen expiration boundary must
 	// work using only immutable cached, prevalidated chain prefixes.
-	if err := os.Remove(r.certificateFile); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.Remove(r.keyFile); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Remove(r.certificateFile))
+	require.NoError(t, os.Remove(r.keyFile))
 
 	handshake := func(at time.Time, root *x509.Certificate, want bool, length int) {
 		t.Helper()
-
-		roots := x509.NewCertPool()
-		roots.AddCert(root)
-
-		serverSide, clientSide := net.Pipe()
-		defer serverSide.Close()
-		defer clientSide.Close()
-
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		defer cancel()
-
-		done := make(chan error, 1)
-
-		go func() {
-			defer serverSide.Close()
-
-			server := tls.Server(serverSide, &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return r.getCertificateAt(at) }})
-			done <- server.HandshakeContext(ctx)
-		}()
-
-		peer := tls.Client(clientSide, &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots, ServerName: "127.0.0.1", Time: func() time.Time { return at }})
-
-		err := peer.HandshakeContext(ctx)
-		if (err == nil) != want {
-			t.Fatalf("handshake at %s: %v, want success=%v", at, err, want)
-		}
-
-		if want && len(peer.ConnectionState().PeerCertificates) != length {
-			t.Fatalf("chain length=%d, want %d", len(peer.ConnectionState().PeerCertificates), length)
-		}
-
-		clientSide.Close()
-
-		if err := <-done; want && err != nil {
-			t.Fatal(err)
-		}
+		testCachedHandshake(t, r, at, root, want, length)
 	}
 	handshake(now, old.Leaf, true, 3)
 	handshake(now, current.Leaf, true, 3)
@@ -763,35 +774,27 @@ func TestServingTLSCompatibilitySuffixExpiration(t *testing.T) {
 	handshake(after, old.Leaf, false, 0)
 	handshake(leaf.Leaf.NotAfter, current.Leaf, false, 0)
 
-	if r.current.Load() != initial {
-		t.Fatal("handshake changed published certificate")
-	}
+	require.Same(t, initial, r.current.Load(), "handshake changed published certificate")
 	// The operator normally sends leaf + bridges, omitting the old root.
 	// Exercise that wire layout as well as the explicit-root layout above.
 	withoutRoot := leaf
 	withoutRoot.Certificate = leaf.Certificate[:2:2]
 	writeServingTestPair(t, dir, withoutRoot)
 
-	if err := r.reloadAt(now); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, r.reloadAt(now))
 
 	handshake(now, old.Leaf, true, 2)
 	handshake(after, current.Leaf, true, 1)
 	handshake(after, old.Leaf, false, 0)
 
-	if err := r.reloadAt(after); err != nil {
-		t.Fatal("expired bridge prevented initial load", err)
-	}
+	require.NoError(t, r.reloadAt(after), "expired bridge prevented initial load")
 	// Initial/repeated loading of an unpruned Secret must also accept the
 	// current path, including a leaf issued after the old bridge expired.
 	newLeaf := servingTestCertificate(t, 103, after.Add(time.Hour), after.Add(7*24*time.Hour), &current, false)
 	newLeaf.Certificate = [][]byte{newLeaf.Certificate[0], bridgeDER, old.Certificate[0]}
 	writeServingTestPair(t, dir, newLeaf)
 
-	if err := r.reloadAt(after.Add(2 * time.Hour)); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, r.reloadAt(after.Add(2*time.Hour)))
 
 	handshake(after.Add(2*time.Hour), current.Leaf, true, 1)
 	last := r.current.Load()
@@ -812,9 +815,7 @@ func TestServingTLSCompatibilitySuffixExpiration(t *testing.T) {
 				rootTemplate.MaxPathLen, rootTemplate.MaxPathLenZero = 0, true
 
 				der, err := x509.CreateCertificate(rand.Reader, &rootTemplate, &rootTemplate, old.Leaf.PublicKey, old.PrivateKey)
-				if err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, err)
 
 				bad.Certificate[2] = der
 			case "malformed suffix":
@@ -825,9 +826,7 @@ func TestServingTLSCompatibilitySuffixExpiration(t *testing.T) {
 
 			if scenario == "future bridge" || scenario == "wrong EKU" {
 				der, err := x509.CreateCertificate(rand.Reader, &template, old.Leaf, current.Leaf.PublicKey, old.PrivateKey)
-				if err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, err)
 
 				bad.Certificate[1] = der
 			}
@@ -839,10 +838,47 @@ func TestServingTLSCompatibilitySuffixExpiration(t *testing.T) {
 				at = leaf.Leaf.NotAfter
 			}
 
-			if err := r.reloadAt(at); err == nil || r.current.Load() != last {
-				t.Fatal("invalid replacement accepted or last good lost")
-			}
+			require.Error(t, r.reloadAt(at), "invalid replacement accepted")
+			require.Same(t, last, r.current.Load(), "last good lost")
 		})
+	}
+}
+
+func testCachedHandshake(t *testing.T, r *servingCertificateReloader, at time.Time, root *x509.Certificate, want bool, length int) {
+	t.Helper()
+
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+	defer clientSide.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		defer serverSide.Close()
+
+		server := tls.Server(serverSide, &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return r.getCertificateAt(at) }})
+		done <- server.HandshakeContext(ctx)
+	}()
+
+	peer := tls.Client(clientSide, &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots, ServerName: "127.0.0.1", Time: func() time.Time { return at }})
+	err := peer.HandshakeContext(ctx)
+	require.Equal(t, want, err == nil, "handshake at %s: %v", at, err)
+
+	if want {
+		require.Len(t, peer.ConnectionState().PeerCertificates, length)
+	}
+
+	clientSide.Close()
+
+	err = <-done
+	if want {
+		require.NoError(t, err)
 	}
 }
 
@@ -871,7 +907,7 @@ func TestTransportTemporaryAcceptRecoversTLS(t *testing.T) {
 
 		return raw.Accept()
 	}}
-	l := newTransportListener(f.ctx, listener, f.a.Server.tlsConfig(f.ctx, f.serverCertificate), Limits{MaxConnections: 1, MaxConcurrentHandshakes: 1, WriteTimeout: time.Second})
+	l := newTransportListener(f.ctx, listener, f.a.Server.tlsConfig(f.ctx, f.serverCertificate), Limits{MaxConnections: 1, MaxConcurrentHandshakes: 1, HandshakeTimeout: time.Second, WriteTimeout: 30 * time.Second})
 
 	t.Cleanup(func() {
 		if err := l.Close(); err != nil {
@@ -980,16 +1016,12 @@ func TestTransportTemporaryAcceptCancellation(t *testing.T) {
 				time.Sleep(1500 * time.Millisecond)
 				synctest.Wait()
 
-				if calls != 9 {
-					t.Fatalf("accept calls=%d want=9", calls)
-				}
+				require.Equal(t, 9, calls, "accept calls")
 
 				start := time.Now()
 
 				if closeListener {
-					if err := l.Close(); err != nil {
-						t.Fatal(err)
-					}
+					require.NoError(t, l.Close())
 				} else {
 					cancel()
 				}
@@ -1002,13 +1034,13 @@ func TestTransportTemporaryAcceptCancellation(t *testing.T) {
 					t.Fatal("cancellation left accept pump sleeping")
 				}
 
-				if conn, err := l.Accept(); conn != nil || !errors.Is(err, net.ErrClosed) {
-					t.Fatalf("canceled accept=%v, %v", conn, err)
-				}
-
-				if time.Since(start) != 0 || calls != 9 || len(l.connections) != 0 || len(l.handshakes) != 0 {
-					t.Fatal("cancellation delayed or leaked accept work")
-				}
+				conn, err := l.Accept()
+				require.Nil(t, conn)
+				require.ErrorIs(t, err, net.ErrClosed)
+				require.Zero(t, time.Since(start))
+				require.Equal(t, 9, calls)
+				require.Empty(t, l.connections)
+				require.Empty(t, l.handshakes)
 			})
 		})
 	}
@@ -1022,7 +1054,7 @@ func testTransport(t *testing.T, f *servingFixture, connections, handshakes int,
 		t.Fatal(err)
 	}
 
-	l := newTransportListener(f.ctx, listener, f.a.Server.tlsConfig(f.ctx, f.serverCertificate), Limits{MaxConnections: connections, MaxConcurrentHandshakes: handshakes, WriteTimeout: deadline})
+	l := newTransportListener(f.ctx, listener, f.a.Server.tlsConfig(f.ctx, f.serverCertificate), Limits{MaxConnections: connections, MaxConcurrentHandshakes: handshakes, HandshakeTimeout: deadline, WriteTimeout: 30 * time.Second})
 
 	t.Cleanup(func() {
 		if err := l.Close(); err != nil {
@@ -1126,6 +1158,67 @@ func TestTransportHandshakeDeadlineAndFailure(t *testing.T) {
 	awaitTransport(t, l, 0, 0)
 }
 
+func TestTransportPartialFlightTimeoutAndRecovery(t *testing.T) {
+	f := newServingFixture(t)
+	l := testTransport(t, f, 1, 1, 200*time.Millisecond)
+	entered, resume := make(chan struct{}), make(chan struct{})
+
+	unblock := sync.OnceFunc(func() { close(resume) })
+	defer unblock()
+
+	client := tls.Client(dialTransport(t, l), &tls.Config{
+		RootCAs: f.roots, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			close(entered)
+			<-resume
+
+			return &f.certificate, nil
+		},
+	})
+	done := make(chan error, 1)
+
+	go func() { done <- client.HandshakeContext(f.ctx) }()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("client did not receive the server flight")
+	}
+
+	awaitTransport(t, l, 1, 1)
+	expectTransportClosed(t, dialTransport(t, l))
+	// No final client flight arrives. Both budgets must recover without waiting
+	// for the independent 30-second response write budget.
+	awaitTransport(t, l, 0, 0)
+	unblock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("partial client handshake leaked")
+	}
+
+	fresh := tls.Client(dialTransport(t, l), &tls.Config{RootCAs: f.roots, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13})
+	require.NoError(t, fresh.HandshakeContext(f.ctx), "admission did not recover")
+
+	conn, err := l.Accept()
+	require.NoError(t, err)
+	awaitTransport(t, l, 1, 0)
+
+	var closes sync.WaitGroup
+	for range 8 {
+		closes.Go(func() { closeTransport(conn) })
+	}
+
+	closes.Go(func() {
+		if err := l.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	closes.Wait()
+	awaitTransport(t, l, 0, 0)
+}
+
 func TestTransportHandshakeBudgetThroughClientCertificate(t *testing.T) {
 	f := newServingFixture(t)
 	l := testTransport(t, f, 2, 1, time.Minute)
@@ -1202,10 +1295,12 @@ func TestTransportCompletedTLSRetainsOnlyConnectionSlot(t *testing.T) {
 
 func TestTransportProductionLongPollAndIdleAdmission(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Server.Config.Limits.MaxConnections = 2
-	f.a.Server.Config.Limits.MaxConcurrentHandshakes = 1
-	f.a.Server.Config.Limits.WriteTimeout = 100 * time.Millisecond
-	f.a.Server.initializeAdmission()
+	f.configureServer(func(c *Config) {
+		c.Limits.MaxConnections = 2
+		c.Limits.MaxConcurrentHandshakes = 1
+		c.Limits.HandshakeTimeout = 100 * time.Millisecond
+		c.Limits.WriteTimeout = time.Second
+	})
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1252,6 +1347,12 @@ func TestTransportProductionLongPollAndIdleAdmission(t *testing.T) {
 	// A long poll outlives the handshake deadline and does not monopolize it.
 	time.Sleep(150 * time.Millisecond)
 
+	select {
+	case err := <-requestDone:
+		t.Fatalf("handshake timeout interrupted an established poll: %v", err)
+	default:
+	}
+
 	other := f.client(t, &f.certificate)
 	response, err := other.Get("https://" + listener.Addr().String() + "/invalid")
 	responseBody(t, response, err, http.StatusBadRequest)
@@ -1290,6 +1391,19 @@ func TestTransportLimitsValidation(t *testing.T) {
 			}
 		}
 	}
+
+	for _, value := range []time.Duration{0, -time.Nanosecond, time.Nanosecond, 5 * time.Second} {
+		cfg := testConfig(t).ServerConfig
+
+		cfg.Limits.HandshakeTimeout = value
+		if value <= 0 {
+			require.ErrorIs(t, cfg.Validate(), wire.InvalidRequest)
+		} else {
+			require.NoError(t, cfg.Validate())
+			cfg.Limits.WriteTimeout = 0
+			require.ErrorIs(t, cfg.Validate(), wire.InvalidRequest, "handshake timeout must not replace write validation")
+		}
+	}
 }
 
 var _ net.Listener = (*transportListener)(nil)
@@ -1302,7 +1416,7 @@ func TestServingReadinessRequiresConfiguredHostname(t *testing.T) {
 			leaf := *certificate.Leaf
 			leaf.DNSNames = names
 			// A matching CommonName alone must not bypass SAN validation.
-			leaf.Subject.CommonName = f.a.Server.Config.ReplicationServerName
+			leaf.Subject.CommonName = f.a.Server.config.ReplicationServerName
 
 			der, err := x509.CreateCertificate(rand.Reader, &leaf, &leaf, leaf.PublicKey, certificate.PrivateKey)
 			if err != nil {
@@ -1341,7 +1455,6 @@ func TestServingReadinessRequiresConfiguredHostname(t *testing.T) {
 
 func TestLeaderCancellationClosesActiveTLSPoll(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Server.initializeAdmission()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1405,17 +1518,13 @@ func TestTLSPollExpirationAndRequestCancellation(t *testing.T) {
 			c := f.client(t, &cert)
 
 			publication, err := f.a.authority.Current()
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 
 			ctx, cancel := context.WithCancel(f.ctx)
 			defer cancel()
 
 			r, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/snapshot?after=%d", endpoint, publication.Sequence()), nil)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 
 			done := make(chan struct{})
 
@@ -1455,7 +1564,7 @@ func TestTLSPollExpirationAndRequestCancellation(t *testing.T) {
 
 func TestBootstrapReadDeadlineAndChunkedBound(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Server.Config.Limits.WriteTimeout = 100 * time.Millisecond
+	f.configureServer(func(c *Config) { c.Limits.WriteTimeout = 100 * time.Millisecond })
 	endpoint := f.start(t)
 	c := f.client(t, nil)
 	// A body of unknown length must still be bounded by the wire decoder.
@@ -1499,7 +1608,7 @@ func TestBootstrapReadDeadlineAndChunkedBound(t *testing.T) {
 
 func TestTLSSlowSnapshotWriteDeadline(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Server.Config.Limits.WriteTimeout = 200 * time.Millisecond
+	f.configureServer(func(c *Config) { c.Limits.WriteTimeout = 200 * time.Millisecond })
 	// Exercise socket backpressure without constructing a large topology. The
 	// immutable publication remains valid JSON with bounded trailing whitespace.
 	largeFixturePublication(t, f)

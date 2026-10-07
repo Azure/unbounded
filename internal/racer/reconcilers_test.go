@@ -8,10 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"reflect"
 	"slices"
 	"strconv"
@@ -47,61 +45,62 @@ import (
 func TestTerminalPodsCannotReplaceEndpoints(t *testing.T) {
 	ownership := memberOwnership(t, testDaemonSetUID)
 	for _, phase := range []corev1.PodPhase{corev1.PodPending, corev1.PodRunning, corev1.PodUnknown, corev1.PodFailed, corev1.PodSucceeded} {
-		t.Run(string(phase), func(t *testing.T) {
-			old := memberPod("old", 1, "192.0.2.1")
-			newest := memberPod("new", 2, "192.0.2.2")
-			newest.Status.Phase = phase
-			terminal := phase == corev1.PodFailed || phase == corev1.PodSucceeded
+		t.Run(string(phase), func(t *testing.T) { terminalPodEndpoint(t, ownership, phase) })
+	}
+}
 
-			want := "192.0.2.2:8082"
-			if terminal {
-				want = "192.0.2.1:8082"
-			}
+func terminalPodEndpoint(t *testing.T, ownership members.WorkloadIdentities, phase corev1.PodPhase) {
+	t.Helper()
 
-			endpoint, err := selectEndpoint([]corev1.Pod{old, newest}, ownership, old.Spec.NodeName, 8082)
-			if err != nil || endpoint != want {
-				t.Fatalf("selected %q, %v; want %q", endpoint, err, want)
-			}
+	old := memberPod("old", 1, "192.0.2.1")
+	newest := memberPod("new", 2, "192.0.2.2")
+	newest.Status.Phase = phase
+	terminal := phase == corev1.PodFailed || phase == corev1.PodSucceeded
 
-			endpoint, err = selectEndpoint([]corev1.Pod{newest}, ownership, old.Spec.NodeName, 8082)
-			if terminal {
-				if endpoint != "" || !errors.Is(err, wire.Unavailable) {
-					t.Fatalf("terminal-only endpoint: %q, %v", endpoint, err)
-				}
+	want := "192.0.2.2:8082"
+	if terminal {
+		want = "192.0.2.1:8082"
+	}
 
-				node := memberNode()
-				groups := map[string][]corev1.Pod{node.Name: {newest}}
+	endpoint, err := selectEndpoint([]corev1.Pod{old, newest}, ownership, old.Spec.NodeName, 8082)
+	require.NoError(t, err)
+	require.Equal(t, want, endpoint)
 
-				candidate, _, err := reconcileMembers([]corev1.Node{node}, groups, ownership, nil, 8082)
-				if err != nil || len(candidate) != 0 {
-					t.Fatalf("terminal-only Pod admitted a new node: %v, %v", candidate, err)
-				}
+	endpoint, err = selectEndpoint([]corev1.Pod{newest}, ownership, old.Spec.NodeName, 8082)
+	if terminal {
+		require.Empty(t, endpoint)
+		require.ErrorIs(t, err, wire.Unavailable)
 
-				previous := wire.Member{Node: testNodeUID, Shares: wire.DefaultShares, PeerEndpoint: want}
+		node := memberNode()
+		groups := map[string][]corev1.Pod{node.Name: {newest}}
 
-				candidate, _, err = reconcileMembers([]corev1.Node{node}, groups, ownership, AcceptedMembers{testNodeUID: previous}, 8082)
-				if err != nil || candidate[testNodeUID].PeerEndpoint != previous.PeerEndpoint {
-					t.Fatalf("terminal-only gap lost admitted endpoint: %v, %v", candidate, err)
-				}
-			} else if err != nil || endpoint != want {
-				t.Fatalf("unready live endpoint: %q, %v", endpoint, err)
-			}
+		candidate, _, err := reconcileMembers([]corev1.Node{node}, groups, ownership, nil, 8082)
+		require.NoError(t, err)
+		require.Empty(t, candidate, "terminal-only Pod admitted a new node")
 
-			pred := managedPodChanges(Config{Namespace: "racer", DaemonSetName: DataplaneDaemonSetName})
-			before := newest.DeepCopy()
+		previous := wire.Member{Node: testNodeUID, Shares: wire.DefaultShares, PeerEndpoint: want}
 
-			before.Status.Phase = corev1.PodRunning
-			if pred.Update(event.UpdateEvent{ObjectOld: before, ObjectNew: &newest}) != (phase != corev1.PodRunning) {
-				t.Fatal("Pod phase transition predicate mismatch")
-			}
+		candidate, _, err = reconcileMembers([]corev1.Node{node}, groups, ownership, AcceptedMembers{testNodeUID: previous}, 8082)
+		require.NoError(t, err)
+		require.Equal(t, previous.PeerEndpoint, candidate[testNodeUID].PeerEndpoint)
+	} else {
+		require.NoError(t, err)
+		require.Equal(t, want, endpoint)
+	}
 
-			before = newest.DeepCopy()
+	pred := managedPodChanges(Config{Namespace: "racer", DaemonSetName: DataplaneDaemonSetName})
+	before := newest.DeepCopy()
 
-			newest.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
-			if pred.Update(event.UpdateEvent{ObjectOld: before, ObjectNew: &newest}) {
-				t.Fatal("readiness-only change triggered topology")
-			}
-		})
+	before.Status.Phase = corev1.PodRunning
+	if pred.Update(event.UpdateEvent{ObjectOld: before, ObjectNew: &newest}) != (phase != corev1.PodRunning) {
+		t.Fatal("Pod phase transition predicate mismatch")
+	}
+
+	before = newest.DeepCopy()
+
+	newest.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if pred.Update(event.UpdateEvent{ObjectOld: before, ObjectNew: &newest}) {
+		t.Fatal("readiness-only change triggered topology")
 	}
 }
 
@@ -115,75 +114,80 @@ func TestReconcilerDependencyCancellationRetries(t *testing.T) {
 			for _, dependencyErr := range []error{context.DeadlineExceeded, context.Canceled} {
 				for _, cancelParent := range []bool{false, true} {
 					t.Run(fmt.Sprintf("%s/%s/%v/parent=%v", controller, stage, dependencyErr, cancelParent), func(t *testing.T) {
-						topology := initializedTopology(t)
-						app := assembleFixture(topology.Config, topology.Client, topology.APIReader)
-
-						var target reconcile.Reconciler = app.Topology
-						if controller == "keyring" {
-							runKeys(t, app.Keyring)
-							_, _, state, _ := keyState(t, app.Keyring)
-							fixtureDependencies[app.authority].now = func() time.Time { return state.NextRotation }
-							target = app.Keyring
-						}
-
-						ctx, cancel := context.WithCancel(t.Context())
-						defer cancel()
-
-						injected, reads := false, 0
-						fail := func() error {
-							injected = true
-
-							if cancelParent {
-								cancel()
-							}
-
-							return fmt.Errorf("dependency: %w", dependencyErr)
-						}
-						base := topology.Client.(client.WithWatch)
-						wrapped := interceptor.NewClient(base, interceptor.Funcs{
-							Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-								if _, ok := obj.(*corev1.ConfigMap); ok && key.Name == topology.Config.VersionConfigMapName {
-									reads++
-									if stage == "read" || stage == "completion read" && reads == 2 {
-										return fail()
-									}
-								}
-
-								return c.Get(ctx, key, obj, opts...)
-							},
-							Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-								if stage == "write" {
-									return fail()
-								}
-
-								return c.Update(ctx, obj, opts...)
-							},
-						})
-						app.Topology.Client, app.Topology.APIReader = wrapped, wrapped
-						fixtureDependencies[app.authority].Client, fixtureDependencies[app.authority].reader = wrapped, wrapped
-
-						_, err := target.Reconcile(ctx, ctrl.Request{})
-
-						want := dependencyErr
-						if cancelParent {
-							want = context.Canceled
-						}
-
-						if !injected || !errors.Is(err, want) || errors.Is(err, reconcile.TerminalError(nil)) != cancelParent {
-							t.Fatalf("injected=%v, error=%v, parent canceled=%v", injected, err, cancelParent)
-						}
-
-						// A fresh reconcile succeeds without waiting for another watch event.
-						app.Topology.Client, app.Topology.APIReader = base, base
-						fixtureDependencies[app.authority].Client, fixtureDependencies[app.authority].reader = base, base
-
-						if _, err := target.Reconcile(t.Context(), ctrl.Request{}); err != nil {
-							t.Fatalf("retry failed: %v", err)
-						}
+						dependencyCancellation(t, controller, stage, dependencyErr, cancelParent)
 					})
 				}
 			}
 		}
+	}
+}
+
+func dependencyCancellation(t *testing.T, controller, stage string, dependencyErr error, cancelParent bool) {
+	t.Helper()
+	topology := initializedTopology(t)
+	app := assembleFixture(topology.config, topology.Client, topology.APIReader)
+
+	var target reconcile.Reconciler = app.Topology
+	if controller == "keyring" {
+		runKeys(t, app.Keyring)
+		_, _, state, _ := keyState(t, app.Keyring)
+		fixtureDependencies[app.authority].now = func() time.Time { return state.NextRotation }
+		target = app.Keyring
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	injected, reads := false, 0
+	fail := func() error {
+		injected = true
+
+		if cancelParent {
+			cancel()
+		}
+
+		return fmt.Errorf("dependency: %w", dependencyErr)
+	}
+	base := topology.Client.(client.WithWatch)
+	wrapped := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.ConfigMap); ok && key.Name == topology.config.VersionConfigMapName {
+				reads++
+				if stage == "read" || stage == "completion read" && reads == 2 {
+					return fail()
+				}
+			}
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if stage == "write" {
+				return fail()
+			}
+
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+	app.Topology.Client, app.Topology.APIReader = wrapped, wrapped
+	fixtureDependencies[app.authority].Client, fixtureDependencies[app.authority].reader = wrapped, wrapped
+
+	_, err := target.Reconcile(ctx, ctrl.Request{})
+
+	want := dependencyErr
+	if cancelParent {
+		want = context.Canceled
+	}
+
+	if !injected || !errors.Is(err, want) || errors.Is(err, reconcile.TerminalError(nil)) != cancelParent {
+		t.Fatalf("injected=%v, error=%v, parent canceled=%v", injected, err, cancelParent)
+	}
+
+	// A fresh reconcile succeeds without waiting for another watch event.
+	app.Topology.Client, app.Topology.APIReader = base, base
+	fixtureDependencies[app.authority].Client, fixtureDependencies[app.authority].reader = base, base
+
+	if _, err := target.Reconcile(t.Context(), ctrl.Request{}); err != nil {
+		t.Fatalf("retry failed: %v", err)
 	}
 }
 
@@ -204,7 +208,7 @@ func replicationSmokePublish(t *testing.T, ctx context.Context, r *TopologyRecon
 			nodes.Items = append(nodes.Items, corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: string(id), UID: types.UID(id), Annotations: map[string]string{admittedMemberAnnotation: string(encoded), wire.SharesAnnotation: strconv.FormatUint(uint64(member.Shares), 10)}}})
 		}
 
-		return TopologyObservation{Nodes: nodes, Input: members.Input{Nodes: nodes.Items, PeerPort: r.Config.PeerPort}}, nil
+		return TopologyObservation{Nodes: nodes, Input: members.Input{Nodes: nodes.Items, PeerPort: r.config.PeerPort}}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -260,7 +264,7 @@ func TestParseAnnotations(t *testing.T) {
 		{"defaults", nil, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
 		{"explicit empty NICs", map[string]string{wire.RDMANICsAnnotation: "[]", enrolledRDMANICsAnnotation: `[{"device":"a","port":1,"rail":0}]`}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
 		{"enrolled fallback", map[string]string{enrolledRDMANICsAnnotation: `[{"device":"a","port":1,"rail":0}]`}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{{Device: "a", Port: 1}}}, false},
-		{"legacy ignored", map[string]string{wire.RailsAnnotation: "malformed", wire.AlignmentAnnotation: "false"}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
+		{"legacy ignored", map[string]string{"racer.unbounded-cloud.io/rails": "malformed", "racer.unbounded-cloud.io/aligned-rails": "false"}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
 		{"bounds and sorting", map[string]string{
 			wire.SharesAnnotation:   "4294967295",
 			wire.RDMANICsAnnotation: `[{"rail":65535,"device":"β<&>","port":255,"numa_node":4294967295},{"rail":0,"device":"a","port":1,"numa_node":0}]`,
@@ -421,9 +425,10 @@ func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 	initial, diagnostics, err := reconcileMembers([]corev1.Node{node}, map[string][]corev1.Pod{node.Name: {pod}}, memberOwnership(t, testDaemonSetUID), nil, 7443)
 
 	want := wire.Member{Node: testNodeUID, Shares: 4, RDMANICs: []wire.RDMANIC{}, PeerEndpoint: "192.0.2.1:7443"}
-	if err != nil || len(diagnostics) != 0 || !reflect.DeepEqual(initial[testNodeUID], want) {
-		t.Fatalf("cold start: %#v, %v, %v", initial, diagnostics, err)
-	}
+
+	require.NoError(t, err)
+	require.Empty(t, diagnostics)
+	require.Equal(t, want, initial[testNodeUID])
 
 	for _, tc := range []struct {
 		name        string
@@ -443,23 +448,22 @@ func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 			node.Annotations = tc.annotations
 
 			got, diagnostics, err := reconcileMembers([]corev1.Node{*node}, map[string][]corev1.Pod{node.Name: tc.pods}, memberOwnership(t, testDaemonSetUID), initial, 7443)
-			if err != nil || len(diagnostics) != tc.diagnostics || got[testNodeUID].Shares != tc.shares || got[testNodeUID].PeerEndpoint != tc.endpoint {
-				t.Fatalf("warm reconcile: %#v, %v, %v", got, diagnostics, err)
-			}
+			require.NoError(t, err)
+			require.Len(t, diagnostics, tc.diagnostics)
+			require.Equal(t, tc.shares, got[testNodeUID].Shares)
+			require.Equal(t, tc.endpoint, got[testNodeUID].PeerEndpoint)
 
-			if initial[testNodeUID].Shares != 4 || initial[testNodeUID].PeerEndpoint != "192.0.2.1:7443" {
-				t.Fatal("mutated accepted input")
-			}
+			require.Equal(t, want, initial[testNodeUID], "mutated accepted input")
 
 			cold, diagnostics, err := reconcileMembers([]corev1.Node{*node}, map[string][]corev1.Pod{node.Name: tc.pods}, memberOwnership(t, testDaemonSetUID), nil, 7443)
-			if err != nil || len(cold) != 0 || len(diagnostics) != tc.diagnostics {
-				t.Fatalf("cold reconcile: %#v, %v, %v", cold, diagnostics, err)
-			}
+			require.NoError(t, err)
+			require.Empty(t, cold)
+			require.Len(t, diagnostics, tc.diagnostics)
 
 			for _, d := range diagnostics {
-				if d.Object != node.Name || d.Field == "" || d.Reason == "" {
-					t.Fatalf("unactionable diagnostic: %#v", d)
-				}
+				require.Equal(t, node.Name, d.Object)
+				require.NotEmpty(t, d.Field)
+				require.NotEmpty(t, d.Reason)
 			}
 		})
 	}
@@ -480,43 +484,40 @@ func TestReconcileMembersIdentityAndRemoval(t *testing.T) {
 		node.Labels = map[string]string{wire.ExclusionLabel: label}
 
 		got, diagnostics, err := reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), accepted, 7443)
-		if err != nil || len(got) != 0 || len(diagnostics) != 0 {
-			t.Fatalf("exclusion: %v, %v, %v", got, diagnostics, err)
-		}
+		require.NoError(t, err)
+		require.Empty(t, got)
+		require.Empty(t, diagnostics)
 
 		node.Labels = nil
 
 		got, _, err = reconcileMembers([]corev1.Node{node}, nil, memberOwnership(t, testDaemonSetUID), got, 7443)
-		if err != nil || len(got) != 0 {
-			t.Fatalf("exclusion history survived: %v, %v", got, err)
-		}
+		require.NoError(t, err)
+		require.Empty(t, got, "exclusion history survived")
 	}
 
 	got, _, err := reconcileMembers(nil, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
-	if err != nil || got == nil || len(got) != 0 {
-		t.Fatalf("deletion: %v, %v", got, err)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Empty(t, got)
 
 	node.UID = testOtherUID
 
 	got, _, err = reconcileMembers([]corev1.Node{node}, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
-	if err != nil || len(got) != 0 {
-		t.Fatalf("same-name recreation inherited history: %v, %v", got, err)
-	}
+	require.NoError(t, err)
+	require.Empty(t, got, "same-name recreation inherited history")
 
 	got, _, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), accepted, 7443)
-	if err != nil || len(got) != 1 || got[testOtherUID].Node != testOtherUID {
-		t.Fatalf("new UID not admitted: %v, %v", got, err)
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.EqualValues(t, testOtherUID, got[testOtherUID].Node)
 	// Node readiness and deletion timestamps do not change ownership while the
 	// Node remains in the Kubernetes input and is not explicitly excluded.
 	node.DeletionTimestamp = &metav1.Time{}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
 
 	got, _, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), got, 7443)
-	if err != nil || len(got) != 1 {
-		t.Fatalf("readiness removed ownership: %v, %v", got, err)
-	}
+	require.NoError(t, err)
+	require.Len(t, got, 1, "readiness removed ownership")
 }
 
 func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
@@ -623,13 +624,15 @@ func TestReconcileMembersGroupedPods(t *testing.T) {
 
 	for range 2 {
 		members, diagnostics, err := reconcileMembers(nodes, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
-		if err != nil || len(members) != 1 || members[testNodeUID].PeerEndpoint != "192.0.2.1:7443" {
-			t.Fatalf("grouped endpoint checks: %v, %v", members, err)
-		}
+		require.NoError(t, err)
+		require.Len(t, members, 1)
+		require.Equal(t, "192.0.2.1:7443", members[testNodeUID].PeerEndpoint)
 
-		if len(diagnostics) != 2 || diagnostics[0].Object != nodeB.Name || diagnostics[0].Field != "annotations" || diagnostics[1].Object != nodeB.Name || diagnostics[1].Field != "peer_endpoint" {
-			t.Fatalf("grouped diagnostics: %v", diagnostics)
-		}
+		require.Len(t, diagnostics, 2)
+		require.Equal(t, nodeB.Name, diagnostics[0].Object)
+		require.Equal(t, "annotations", diagnostics[0].Field)
+		require.Equal(t, nodeB.Name, diagnostics[1].Object)
+		require.Equal(t, "peer_endpoint", diagnostics[1].Field)
 
 		if firstDiagnostics != nil && !reflect.DeepEqual(diagnostics, firstDiagnostics) {
 			t.Fatalf("input order changed diagnostics: %v, %v", diagnostics, firstDiagnostics)
@@ -650,8 +653,11 @@ func TestReconcileMembersGroupedPods(t *testing.T) {
 	nodeA.Annotations = nodeB.Annotations
 	for _, nodes := range [][]corev1.Node{{nodeB, nodeA}, {nodeA, nodeB}} {
 		_, diagnostics, err := reconcileMembers(nodes, nil, memberOwnership(t, testDaemonSetUID), nil, 7443)
-		if err != nil || len(diagnostics) != 4 || diagnostics[0].Object != nodeA.Name || diagnostics[1].Object != nodeA.Name || diagnostics[2].Object != nodeB.Name || diagnostics[3].Object != nodeB.Name {
-			t.Fatalf("node diagnostic order: %v, %v", diagnostics, err)
+		require.NoError(t, err)
+		require.Len(t, diagnostics, 4)
+
+		for i, want := range []string{nodeA.Name, nodeA.Name, nodeB.Name, nodeB.Name} {
+			require.Equal(t, want, diagnostics[i].Object)
 		}
 	}
 }
@@ -668,9 +674,10 @@ func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 	podsBefore := map[string][]corev1.Pod{nodeA.Name: {*podA.DeepCopy()}, nodeB.Name: {*podB.DeepCopy()}}
 
 	members, diagnostics, err := reconcileMembers(nodes, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
-	if err != nil || len(diagnostics) != 0 || !reflect.DeepEqual(nodes, nodesBefore) || !reflect.DeepEqual(pods, podsBefore) {
-		t.Fatalf("candidate failed or mutated inputs: %v, %v", diagnostics, err)
-	}
+	require.NoError(t, err)
+	require.Empty(t, diagnostics)
+	require.Equal(t, nodesBefore, nodes)
+	require.Equal(t, podsBefore, pods)
 
 	candidate := wire.Publication{SchemaVersion: wire.SchemaVersion, Cluster: testNodeUID, Members: []wire.Member{members[testOtherUID], members[testNodeUID]}}
 
@@ -693,9 +700,9 @@ func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 	candidate.Members = []wire.Member{members[testNodeUID], members[testOtherUID]}
 
 	contentAgain, membershipAgain, err := wire.ContentHashes(candidate)
-	if err != nil || contentAgain != content || membershipAgain != membership {
-		t.Fatalf("order/dedup changed hashes: %v", err)
-	}
+	require.NoError(t, err)
+	require.Equal(t, content, contentAgain)
+	require.Equal(t, membership, membershipAgain)
 
 	candidate.Caches, err = BuildCatalog([]racerv1.ClusterVolume{catalogVolume("cache-a", testNodeUID)})
 	if err != nil {
@@ -740,9 +747,10 @@ func TestReconcileMembersLimit(t *testing.T) {
 
 func TestReconcileMembersMissingWorkloadAndRecovery(t *testing.T) {
 	empty, diagnostics, err := reconcileMembers(nil, nil, DataplaneWorkloadIdentities{}, nil, 7443)
-	if err != nil || empty == nil || len(empty) != 0 || len(diagnostics) != 0 {
-		t.Fatalf("empty initial reconcile: %#v, %v, %v", empty, diagnostics, err)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, empty)
+	require.Empty(t, empty)
+	require.Empty(t, diagnostics)
 
 	node := memberNode()
 	pods := map[string][]corev1.Pod{node.Name: {memberPod("a", 1, "192.0.2.1")}}
@@ -755,14 +763,14 @@ func TestReconcileMembersMissingWorkloadAndRecovery(t *testing.T) {
 	var got AcceptedMembers
 	for _, uid := range []types.UID{"", "replacement-daemonset"} {
 		got, diagnostics, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, uid), accepted, 7443)
-		if err != nil || !reflect.DeepEqual(got, accepted) || len(diagnostics) != 1 {
-			t.Fatalf("workload gap: %v, %v, %v", got, diagnostics, err)
-		}
+		require.NoError(t, err)
+		require.Equal(t, accepted, got)
+		require.Len(t, diagnostics, 1)
 
 		got, diagnostics, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, uid), nil, 7443)
-		if err != nil || len(got) != 0 || len(diagnostics) != 1 {
-			t.Fatalf("cold workload gap: %v, %v, %v", got, diagnostics, err)
-		}
+		require.NoError(t, err)
+		require.Empty(t, got)
+		require.Len(t, diagnostics, 1)
 	}
 
 	node.Annotations = map[string]string{wire.SharesAnnotation: "invalid-sensitive-input"}
@@ -782,80 +790,88 @@ func TestReconcileMembersMissingWorkloadAndRecovery(t *testing.T) {
 
 func TestTopologyIndexedPodGroups(t *testing.T) {
 	for _, stage := range []string{"success", "list error", "canceled list"} {
-		t.Run(stage, func(t *testing.T) {
-			nodeA, nodeB := memberNode(), memberNode()
-			nodeB.Name, nodeB.UID = "node-b", testOtherUID
-			podA, podB := memberPod("a", 1, "192.0.2.1"), memberPod("b", 1, "192.0.2.2")
-			podB.Spec.NodeName = nodeB.Name
-			r := initializedTopology(t, &nodeA, &nodeB, &podA, &podB, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
-				Name: "racer-dataplane", Namespace: "racer", UID: testDaemonSetUID,
-			}})
-			r.Config.PeerPort = 7443
+		t.Run(stage, func(t *testing.T) { topologyIndexedPodGroups(t, stage) })
+	}
+}
 
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
+func topologyIndexedPodGroups(t *testing.T, stage string) {
+	t.Helper()
 
-			boom := errors.New("pod list failed")
-			queries := map[string]int{}
-			writes := 0
-			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
-				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-					if _, ok := list.(*corev1.PodList); ok {
-						options := (&client.ListOptions{}).ApplyOptions(opts)
-						if options.Namespace != r.Config.Namespace || options.FieldSelector == nil {
-							t.Fatalf("Pod query lacks namespace or node index: %+v", options)
-						}
+	nodeA, nodeB := memberNode(), memberNode()
+	nodeB.Name, nodeB.UID = "node-b", testOtherUID
+	podA, podB := memberPod("a", 1, "192.0.2.1"), memberPod("b", 1, "192.0.2.2")
+	podB.Spec.NodeName = nodeB.Name
+	r := initializedTopology(t, &nodeA, &nodeB, &podA, &podB, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "racer-dataplane", Namespace: "racer", UID: testDaemonSetUID,
+	}})
+	r.config.PeerPort = 7443
 
-						name, exact := options.FieldSelector.RequiresExactMatch(podNodeIndex)
-						if !exact || (name != nodeA.Name && name != nodeB.Name) {
-							t.Fatalf("unexpected Pod node selector: %v", options.FieldSelector)
-						}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 
-						queries[name]++
-
-						if stage == "list error" {
-							return boom
-						}
-
-						if stage == "canceled list" {
-							defer cancel()
-						}
-					}
-
-					return c.List(ctx, list, opts...)
-				},
-				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-					writes++
-					return c.Update(ctx, obj, opts...)
-				},
-			})
-
-			result, err := r.Reconcile(ctx, ctrl.Request{})
-			if stage == "success" {
-				if err != nil || result.RequeueAfter != 0 || queries[nodeA.Name] != 1 || queries[nodeB.Name] != 1 || len(acceptedMembers(t, r)) != 2 || acceptedMembers(t, r)[testNodeUID].PeerEndpoint != "192.0.2.1:7443" || acceptedMembers(t, r)[testOtherUID].PeerEndpoint != "192.0.2.2:7443" {
-					t.Fatalf("indexed groups: queries=%v members=%v result=%v err=%v", queries, acceptedMembers(t, r), result, err)
+	boom := errors.New("pod list failed")
+	queries := map[string]int{}
+	writes := 0
+	r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				options := (&client.ListOptions{}).ApplyOptions(opts)
+				if options.Namespace != r.config.Namespace || options.FieldSelector == nil {
+					t.Fatalf("Pod query lacks namespace or node index: %+v", options)
 				}
 
-				return
-			}
+				name, exact := options.FieldSelector.RequiresExactMatch(podNodeIndex)
+				require.True(t, exact)
+				require.Contains(t, []string{nodeA.Name, nodeB.Name}, name)
 
-			wantErr := boom
-			if stage == "canceled list" {
-				wantErr = context.Canceled
+				queries[name]++
 
-				if !errors.Is(err, reconcile.TerminalError(nil)) {
-					t.Fatalf("canceled list is not terminal: %v", err)
+				if stage == "list error" {
+					return boom
+				}
+
+				if stage == "canceled list" {
+					defer cancel()
 				}
 			}
 
-			if !errors.Is(err, wantErr) || result.RequeueAfter != 0 || len(queries) != 1 || writes != 0 || len(acceptedMembers(t, r)) != 0 {
-				t.Fatalf("failed listing changed state or continued: queries=%v writes=%d members=%v result=%v err=%v", queries, writes, acceptedMembers(t, r), result, err)
-			}
+			return c.List(ctx, list, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			writes++
+			return c.Update(ctx, obj, opts...)
+		},
+	})
 
-			if _, err := r.authority.Current(); err == nil {
-				t.Fatal("installed publication after failed listing")
-			}
-		})
+	result, err := r.Reconcile(ctx, ctrl.Request{})
+	if stage == "success" {
+		require.NoError(t, err)
+		require.Zero(t, result.RequeueAfter)
+		require.Equal(t, 1, queries[nodeA.Name])
+		require.Equal(t, 1, queries[nodeB.Name])
+		accepted := acceptedMembers(t, r)
+		require.Len(t, accepted, 2)
+		require.Equal(t, "192.0.2.1:7443", accepted[testNodeUID].PeerEndpoint)
+		require.Equal(t, "192.0.2.2:7443", accepted[testOtherUID].PeerEndpoint)
+
+		return
+	}
+
+	wantErr := boom
+	if stage == "canceled list" {
+		wantErr = context.Canceled
+
+		if !errors.Is(err, reconcile.TerminalError(nil)) {
+			t.Fatalf("canceled list is not terminal: %v", err)
+		}
+	}
+
+	if !errors.Is(err, wantErr) || result.RequeueAfter != 0 || len(queries) != 1 || writes != 0 || len(acceptedMembers(t, r)) != 0 {
+		t.Fatalf("failed listing changed state or continued: queries=%v writes=%d members=%v result=%v err=%v", queries, writes, acceptedMembers(t, r), result, err)
+	}
+
+	if _, err := r.authority.Current(); err == nil {
+		t.Fatal("installed publication after failed listing")
 	}
 }
 
@@ -871,12 +887,10 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: workload, UID: testDaemonSetUID}}
 
 			r := initializedTopology(t, &node, &pod, ds)
-			if workload == "standalone-racer" {
-				r.Config.DaemonSetName = workload
-			}
+			r.config.DaemonSetName = workload
 
-			r.Config.PeerPort = 7443
-			a := Assemble(r.Config, r.Client, r.APIReader)
+			r.config.PeerPort = 7443
+			a := Assemble(r.config, r.Client, r.APIReader)
 			r = a.Topology
 			runKeys(t, a.Keyring)
 			first := reconcileTopology(t, r, t.Context())
@@ -903,7 +917,7 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 
 			node.Annotations[wire.SharesAnnotation] = "malformed"
 			require.NoError(t, r.Update(t.Context(), &node))
-			a = Assemble(r.Config, r.Client, r.APIReader)
+			a = Assemble(r.config, r.Client, r.APIReader)
 			r = a.Topology
 			restarted := reconcileTopology(t, r, t.Context())
 			require.Equal(t, withCache.encoded, restarted.encoded)
@@ -984,7 +998,7 @@ func TestTopologyCustomWorkloadOwnership(t *testing.T) {
 
 			r := initializedTopology(t, &node, &pod, ds)
 
-			r.Config.DaemonSetName = ds.Name
+			r.config.DaemonSetName = ds.Name
 			if scenario == "missing workload" || scenario == "deleting workload" {
 				require.NoError(t, r.Delete(t.Context(), ds))
 			}
@@ -1008,9 +1022,13 @@ func TestTopologyCustomWorkloadOwnership(t *testing.T) {
 // Test-local vocabulary keeps the original membership scenarios readable without
 // re-exporting the extracted packages through the production controller API.
 type (
-	AcceptedMembers  = members.History
-	MemberAttributes = members.MemberAttributes
-	Diagnostic       = members.Diagnostic
+	AcceptedMembers             = members.History
+	MemberAttributes            = members.MemberAttributes
+	Diagnostic                  = members.Diagnostic
+	DataplaneWorkloadIdentities = members.WorkloadIdentities
+	TopologyObservation         = authority.TopologyObservation
+	NodeIdentity                = authority.NodeIdentity
+	RotationPolicy              = authority.RotationPolicy
 )
 
 const (
@@ -1018,8 +1036,8 @@ const (
 	PodNetworkDaemonSetName = members.PodNetworkDaemonSetName
 )
 
-func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
-	return ids.observed().Owns(pod)
+func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cfg Config) (members.WorkloadIdentities, error) {
+	return members.ReadWorkloadIdentities(ctx, reader, cfg.Namespace, cfg.DaemonSetName)
 }
 
 func ParseAnnotations(node *corev1.Node) (MemberAttributes, error) {
@@ -1027,12 +1045,12 @@ func ParseAnnotations(node *corev1.Node) (MemberAttributes, error) {
 }
 
 func selectEndpoint(pods []corev1.Pod, ownership DataplaneWorkloadIdentities, nodeName string, port uint16) (string, error) {
-	return members.SelectEndpoint(pods, ownership.observed(), nodeName, port)
+	return members.SelectEndpoint(pods, ownership, nodeName, port)
 }
 
 func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, ownership DataplaneWorkloadIdentities, accepted AcceptedMembers, port uint16) (AcceptedMembers, []Diagnostic, error) {
 	result, err := members.Reconcile(members.Input{
-		Nodes: nodes, PodsByNode: podsByNode, Ownership: ownership.observed(), PeerPort: port,
+		Nodes: nodes, PodsByNode: podsByNode, Ownership: ownership, PeerPort: port,
 	}, accepted)
 
 	return result.Members, result.Diagnostics, err
@@ -1044,16 +1062,12 @@ func BuildCatalog(volumes []racerv1.ClusterVolume) ([]wire.CacheDefinition, erro
 
 func TestLegacyRDMADiagnosticsAndMalformedUnitRetention(t *testing.T) {
 	node := memberNode()
-	node.Annotations = map[string]string{wire.RailsAnnotation: "malformed", wire.AlignmentAnnotation: "false"}
+	node.Annotations = map[string]string{"racer.unbounded-cloud.io/rails": "malformed", "racer.unbounded-cloud.io/aligned-rails": "false"}
 	pods := map[string][]corev1.Pod{node.Name: {memberPod("a", 1, "192.0.2.1")}}
 	accepted, diagnostics, err := reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 	require.NoError(t, err)
-	require.Len(t, diagnostics, 2)
+	require.Empty(t, diagnostics)
 	require.Empty(t, accepted[testNodeUID].RDMANICs)
-
-	for _, diagnostic := range diagnostics {
-		require.Contains(t, diagnostic.Reason, "legacy annotation ignored")
-	}
 
 	node.Annotations = map[string]string{wire.SharesAnnotation: "8", enrolledRDMANICsAnnotation: `[{"device":"a","port":1,"rail":0}]`}
 	accepted, _, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), accepted, 7443)
@@ -1079,6 +1093,7 @@ func TestMixedControllerTopologyLiveOwnership(t *testing.T) {
 	pod.OwnerReferences[0].Name = PodNetworkDaemonSetName
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: PodNetworkDaemonSetName, UID: testDaemonSetUID}}
 	r := initializedTopology(t, &node, &pod, ds)
+	r.config.DaemonSetName = ds.Name
 	reconcileTopology(t, r, t.Context())
 	require.Len(t, acceptedMembers(t, r), 1)
 	before := acceptedMembers(t, r)[testNodeUID]
@@ -1098,7 +1113,7 @@ func TestMixedControllerTopologyLiveOwnership(t *testing.T) {
 	require.NoError(t, r.Delete(t.Context(), ds))
 	ds.UID, ds.ResourceVersion = "replacement", ""
 	require.NoError(t, r.Create(t.Context(), ds))
-	r = Assemble(r.Config, r.Client, r.APIReader).Topology
+	r = Assemble(r.config, r.Client, r.APIReader).Topology
 	reconcileTopology(t, r, t.Context())
 	require.Equal(t, before, acceptedMembers(t, r)[testNodeUID])
 }
@@ -1121,6 +1136,8 @@ func TestMixedControllerAuthorization(t *testing.T) {
 	pod := memberPod("pod", 1, "192.0.2.1")
 	pod.Spec.ServiceAccountName = "racer"
 	pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(ds, appsv1.SchemeGroupVersion.WithKind("DaemonSet"))}
+	require.ErrorIs(t, authorizePod(t.Context(), c, cfg, &pod, string(sa.UID)), wire.Forbidden)
+	cfg.DaemonSetName = ds.Name
 	require.NoError(t, authorizePod(t.Context(), c, cfg, &pod, string(sa.UID)))
 	require.ErrorIs(t, authorizePod(t.Context(), c, cfg, &pod, "old-sa"), wire.Forbidden)
 	require.ErrorIs(t, authorizePod(t.Context(), mixedFailReader{c}, cfg, &pod, string(sa.UID)), wire.Unavailable)
@@ -1169,26 +1186,26 @@ func TestMixedControllerMembership(t *testing.T) {
 	hostDS := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: DataplaneDaemonSetName, UID: testDaemonSetUID}}
 	podDS := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: PodNetworkDaemonSetName, UID: "podnet"}}
 	r := initializedTopology(t, &node, &host, hostDS, podDS)
-	r.Config.PeerPort = 7443
+	r.config.PeerPort = 7443
 	reconcileTopology(t, r, t.Context())
 	require.NoError(t, r.Create(t.Context(), &pod))
 	reconcileTopology(t, r, t.Context())
 	after := acceptedMembers(t, r)
 	require.Len(t, after, 1)
 	require.Equal(t, uint32(8), after[testNodeUID].Shares)
-	require.Equal(t, "192.0.2.2:7443", after[testNodeUID].PeerEndpoint)
+	require.Equal(t, "192.0.2.1:7443", after[testNodeUID].PeerEndpoint, "unconfigured workload cannot replace endpoint")
 
 	require.NoError(t, r.Delete(t.Context(), &host))
 	require.NoError(t, r.Delete(t.Context(), podDS))
 	podDS.UID, podDS.ResourceVersion = "recreated", ""
 	require.NoError(t, r.Create(t.Context(), podDS))
-	r = Assemble(r.Config, r.Client, r.APIReader).Topology
+	r = Assemble(r.config, r.Client, r.APIReader).Topology
 	reconcileTopology(t, r, t.Context())
 	require.Equal(t, after, acceptedMembers(t, r), "restart retains UID-bound last admitted endpoint")
 	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(&node), &node))
 	delete(node.Annotations, admittedMemberAnnotation)
 	require.NoError(t, r.Update(t.Context(), &node))
-	r = Assemble(r.Config, r.Client, r.APIReader).Topology
+	r = Assemble(r.config, r.Client, r.APIReader).Topology
 	reconcileTopology(t, r, t.Context())
 	require.Empty(t, acceptedMembers(t, r), "stale owner cannot admit a new member")
 
@@ -1202,379 +1219,396 @@ func TestMixedControllerMembership(t *testing.T) {
 func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 	for _, resource := range []string{"racer-installation", "racer-version", "issuer.json", "bundle.json"} {
 		for _, failure := range []string{"outage", "deleted", "malformed"} {
-			t.Run(resource+"/"+failure, func(t *testing.T) {
-				resourceName := resource
-				if resource == "issuer.json" || resource == "bundle.json" {
-					resourceName = "racer-credentials"
-				}
-
-				r, now := testKeyring(t)
-				runKeys(t, r)
-				_, _, initial, _ := keyState(t, r)
-				*now = initial.NextRotation
-
-				accepted, err := r.authority.TrustPool()
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				acceptedBundle, err := r.authority.Keyring()
-				if err != nil || acceptedBundle.Generation() != 1 {
-					t.Fatalf("initial delivery state: %v", err)
-				}
-
-				reads := 0
-				d := fixtureDependencies[r.authority]
-				d.reader = interceptor.NewClient(d.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if key.Name == resourceName {
-						reads++
-						if reads == 2 {
-							switch failure {
-							case "outage":
-								return errors.New("post-reconcile API outage")
-							case "deleted":
-								return apierrors.NewNotFound(corev1.Resource("secrets"), key.Name)
-							case "malformed":
-								if err := c.Get(ctx, key, obj, opts...); err != nil {
-									return err
-								}
-
-								switch value := obj.(type) {
-								case *corev1.Secret:
-									value.Data = nil
-								case *corev1.ConfigMap:
-									value.Data = nil
-								}
-
-								return nil
-							}
-						}
-					}
-
-					return c.Get(ctx, key, obj, opts...)
-				}})
-
-				if _, err := r.Reconcile(t.Context(), ctrl.Request{}); err == nil || reads != 2 {
-					t.Fatalf("post-reconcile failure bypassed: %v, reads=%d", err, reads)
-				}
-
-				current, err := r.authority.TrustPool()
-				if failure == "outage" {
-					if err != nil || !current.Equal(accepted) || r.authority.TrustReady() != nil {
-						t.Fatalf("read outage replaced accepted trust with candidate roots: %v", err)
-					}
-				} else if err == nil || r.authority.TrustReady() == nil {
-					t.Fatal("observed invalid authority retained or installed trust")
-				}
-
-				currentBundle, bundleErr := r.authority.Keyring()
-				if failure == "outage" {
-					if bundleErr != nil || currentBundle != acceptedBundle {
-						t.Fatalf("read outage exposed candidate delivery state: %v", bundleErr)
-					}
-				} else if bundleErr == nil {
-					t.Fatal("observed invalid authority retained delivery state")
-				}
-
-				d.reader = d.Client
-
-				_, staged, _, _ := keyState(t, r)
-				if staged.Generation != 2 || len(staged.PeerTrustRoots) != 2 {
-					t.Fatal("failure preceded successful rotation publication")
-				}
-
-				runKeys(t, r)
-
-				current, err = r.authority.TrustPool()
-				if err != nil || current.Equal(accepted) {
-					t.Fatalf("fresh successful reconciliation did not install staged trust: %v", err)
-				}
-
-				currentBundle, bundleErr = r.authority.Keyring()
-				if bundleErr != nil || currentBundle.Generation() != 2 {
-					t.Fatalf("committed delivery not installed with trust: %v", bundleErr)
-				}
-			})
+			t.Run(resource+"/"+failure, func(t *testing.T) { postReconcileCredentials(t, resource, failure) })
 		}
+	}
+}
+
+func postReconcileCredentials(t *testing.T, resource, failure string) {
+	t.Helper()
+
+	resourceName := resource
+	if resource == "issuer.json" || resource == "bundle.json" {
+		resourceName = "racer-credentials"
+	}
+
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, _, initial, _ := keyState(t, r)
+	*now = initial.NextRotation
+
+	accepted, err := r.authority.TrustPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	acceptedBundle, err := r.authority.Keyring()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, acceptedBundle.Generation())
+
+	reads := 0
+	d := fixtureDependencies[r.authority]
+	d.reader = interceptor.NewClient(d.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if key.Name == resourceName {
+			reads++
+			if reads == 2 {
+				return failedCredentialRead(ctx, c, key, obj, failure, opts...)
+			}
+		}
+
+		return c.Get(ctx, key, obj, opts...)
+	}})
+
+	_, err = r.Reconcile(t.Context(), ctrl.Request{})
+	require.Error(t, err)
+	require.Equal(t, 2, reads)
+
+	current, err := r.authority.TrustPool()
+	if failure == "outage" {
+		require.NoError(t, err)
+		require.True(t, current.Equal(accepted))
+		require.NoError(t, r.authority.TrustReady())
+	} else {
+		require.Error(t, err)
+		require.Error(t, r.authority.TrustReady())
+	}
+
+	currentBundle, bundleErr := r.authority.Keyring()
+	if failure == "outage" {
+		require.NoError(t, bundleErr)
+		require.True(t, acceptedBundle == currentBundle)
+	} else {
+		require.Error(t, bundleErr)
+	}
+
+	d.reader = d.Client
+
+	_, staged, _, _ := keyState(t, r)
+	require.EqualValues(t, 2, staged.Generation)
+	require.Len(t, staged.PeerTrustRoots, 2)
+
+	runKeys(t, r)
+
+	current, err = r.authority.TrustPool()
+	require.NoError(t, err)
+	require.False(t, current.Equal(accepted))
+
+	currentBundle, bundleErr = r.authority.Keyring()
+	require.NoError(t, bundleErr)
+	require.EqualValues(t, 2, currentBundle.Generation())
+}
+
+func failedCredentialRead(ctx context.Context, c client.Reader, key client.ObjectKey, obj client.Object, failure string, opts ...client.GetOption) error {
+	switch failure {
+	case "outage":
+		return errors.New("post-reconcile API outage")
+	case "deleted":
+		return apierrors.NewNotFound(corev1.Resource("secrets"), key.Name)
+	default:
+		if err := c.Get(ctx, key, obj, opts...); err != nil {
+			return err
+		}
+
+		switch value := obj.(type) {
+		case *corev1.Secret:
+			value.Data = nil
+		case *corev1.ConfigMap:
+			value.Data = nil
+		}
+
+		return nil
 	}
 }
 
 func TestKeyringCancellationOverridesPostReconcileReadFailure(t *testing.T) {
 	for _, failure := range []string{"outage", "conflict", "success"} {
-		t.Run(failure, func(t *testing.T) {
-			r, now := testKeyring(t)
-			runKeys(t, r)
-			_, _, initial, _ := keyState(t, r)
-			*now = initial.NextRotation
+		t.Run(failure, func(t *testing.T) { keyringCompletionCancellation(t, failure) })
+	}
+}
 
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
+func keyringCompletionCancellation(t *testing.T, failure string) {
+	t.Helper()
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, _, initial, _ := keyState(t, r)
+	*now = initial.NextRotation
 
-			reads := 0
-			d := fixtureDependencies[r.authority]
-			d.reader = interceptor.NewClient(d.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if key.Name == r.Config.CredentialsSecretName {
-					reads++
-					if reads == 2 {
-						defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 
-						switch failure {
-						case "outage":
-							return errors.New("post-reconcile API outage")
-						case "conflict":
-							return apierrors.NewConflict(corev1.Resource("secrets"), key.Name, wire.Conflict)
-						}
-					}
+	reads := 0
+	d := fixtureDependencies[r.authority]
+	d.reader = interceptor.NewClient(d.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if key.Name == r.config.CredentialsSecretName {
+			reads++
+			if reads == 2 {
+				defer cancel()
+
+				switch failure {
+				case "outage":
+					return errors.New("post-reconcile API outage")
+				case "conflict":
+					return apierrors.NewConflict(corev1.Resource("secrets"), key.Name, wire.Conflict)
 				}
-
-				return c.Get(ctx, key, obj, opts...)
-			}})
-
-			result, err := r.Reconcile(ctx, ctrl.Request{})
-			if reads != 2 || !errors.Is(err, context.Canceled) || !errors.Is(err, reconcile.TerminalError(nil)) || result != (ctrl.Result{}) {
-				t.Fatalf("post-reconcile cancellation: reads=%d result=%v err=%v", reads, result, err)
 			}
+		}
 
-			if err := r.authority.TrustReady(); err == nil {
-				t.Fatal("cancellation after admission retained trust or issuer readiness")
-			}
+		return c.Get(ctx, key, obj, opts...)
+	}})
 
-			if _, err := r.authority.Keyring(); err == nil {
-				t.Fatal("cancellation after admission retained delivery")
-			}
+	result, err := r.Reconcile(ctx, ctrl.Request{})
+	if reads != 2 || !errors.Is(err, context.Canceled) || !errors.Is(err, reconcile.TerminalError(nil)) || result != (ctrl.Result{}) {
+		t.Fatalf("post-reconcile cancellation: reads=%d result=%v err=%v", reads, result, err)
+	}
 
-			d.reader = d.Client
+	if err := r.authority.TrustReady(); err == nil {
+		t.Fatal("cancellation after admission retained trust or issuer readiness")
+	}
 
-			_, staged, _, _ := keyState(t, r)
-			if staged.Generation != 2 || len(staged.PeerTrustRoots) != 2 {
-				t.Fatal("cancellation preceded successful rotation publication")
-			}
-		})
+	if _, err := r.authority.Keyring(); err == nil {
+		t.Fatal("cancellation after admission retained delivery")
+	}
+
+	d.reader = d.Client
+
+	_, staged, _, _ := keyState(t, r)
+	if staged.Generation != 2 || len(staged.PeerTrustRoots) != 2 {
+		t.Fatal("cancellation preceded successful rotation publication")
 	}
 }
 
 func TestReconcilerAlreadyExistsHandling(t *testing.T) {
 	for _, operation := range []string{"keyring", "topology"} {
-		t.Run(operation, func(t *testing.T) {
-			r, now := testKeyring(t)
-			runKeys(t, r)
-			_, _, initial, _ := keyState(t, r)
-			*now = initial.NextRotation
+		t.Run(operation, func(t *testing.T) { reconcilerAlreadyExists(t, operation) })
+	}
+}
 
-			accepted, err := r.authority.TrustPool()
-			if err != nil {
-				t.Fatal(err)
-			}
+func reconcilerAlreadyExists(t *testing.T, operation string) {
+	t.Helper()
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, _, initial, _ := keyState(t, r)
+	*now = initial.NextRotation
 
-			writes := 0
-			d := fixtureDependencies[r.authority]
-			writer := interceptor.NewClient(d.Client.(client.WithWatch), interceptor.Funcs{Update: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
-				writes++
-				return apierrors.NewAlreadyExists(corev1.Resource("secrets"), obj.GetName())
-			}})
+	accepted, err := r.authority.TrustPool()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			var result ctrl.Result
+	writes := 0
+	d := fixtureDependencies[r.authority]
+	writer := interceptor.NewClient(d.Client.(client.WithWatch), interceptor.Funcs{Update: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
+		writes++
+		return apierrors.NewAlreadyExists(corev1.Resource("secrets"), obj.GetName())
+	}})
 
-			if operation == "keyring" {
-				d.Client = writer
+	var result ctrl.Result
 
-				result, err = r.Reconcile(t.Context(), ctrl.Request{})
-				if err != nil || result.RequeueAfter != retryConflictDelay {
-					t.Fatalf("keyring AlreadyExists not requeued: %v %v", result, err)
-				}
+	if operation == "keyring" {
+		d.Client = writer
 
-				if err := r.authority.TrustReady(); err == nil {
-					t.Fatal("keyring write failure retained trust or issuer readiness")
-				}
-			} else {
-				topology := Assemble(r.Config, writer, d.reader).Topology
+		result, err = r.Reconcile(t.Context(), ctrl.Request{})
+		if !apierrors.IsAlreadyExists(err) || result != (ctrl.Result{}) {
+			t.Fatalf("keyring AlreadyExists not requeued: %v %v", result, err)
+		}
 
-				result, err = topology.Reconcile(t.Context(), ctrl.Request{})
-				if !apierrors.IsAlreadyExists(err) || result != (ctrl.Result{}) {
-					t.Fatalf("topology AlreadyExists treated as Conflict: %v %v", result, err)
-				}
+		if err := r.authority.TrustReady(); err == nil {
+			t.Fatal("keyring write failure retained trust or issuer readiness")
+		}
+	} else {
+		topology := Assemble(r.config, writer, d.reader).Topology
 
-				if current, err := r.authority.TrustPool(); err != nil || !current.Equal(accepted) {
-					t.Fatalf("topology publication write failure changed trust: %v", err)
-				}
-			}
+		result, err = topology.Reconcile(t.Context(), ctrl.Request{})
+		if !apierrors.IsAlreadyExists(err) || result != (ctrl.Result{}) {
+			t.Fatalf("topology AlreadyExists treated as Conflict: %v %v", result, err)
+		}
 
-			if writes != 1 {
-				t.Fatalf("expected one failed write, got %d", writes)
-			}
-		})
+		if current, err := r.authority.TrustPool(); err != nil || !current.Equal(accepted) {
+			t.Fatalf("topology publication write failure changed trust: %v", err)
+		}
+	}
+
+	if writes != 1 {
+		t.Fatalf("expected one failed write, got %d", writes)
 	}
 }
 
 func TestTopologyAnnotationDoesNotBlockObserver(t *testing.T) {
 	for _, outcome := range []string{"success", "failure", "cancellation"} {
 		t.Run(outcome, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				f := newServingFixture(t)
-				r := f.a.Topology
-
-				var node corev1.Node
-				require.NoError(t, r.Get(f.ctx, client.ObjectKey{Name: "worker"}, &node))
-				node.Annotations["racer.unbounded-cloud.io/shares"] = "7"
-				require.NoError(t, r.Update(f.ctx, &node))
-
-				entered, release := make(chan struct{}), make(chan struct{})
-				patchError := errors.New("patch failed")
-				r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
-					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-						close(entered)
-
-						select {
-						case <-ctx.Done():
-							return ctx.Err()
-						case <-release:
-						}
-
-						if outcome == "failure" {
-							return patchError
-						}
-
-						return c.Patch(ctx, obj, patch, opts...)
-					},
-				})
-
-				ctx, cancel := context.WithCancel(f.ctx)
-				defer cancel()
-
-				done := make(chan error, 1)
-
-				go func() { _, err := r.Reconcile(ctx, ctrl.Request{}); done <- err }()
-
-				<-entered
-				require.EqualValues(t, 7, acceptedMembers(t, r)[testNodeUID].Shares)
-				// Cross the original freshness deadline while the actual Node patch
-				// remains blocked. The real observer must renew both accepted states.
-				for range 3 {
-					time.Sleep(20 * time.Second)
-
-					observed := make(chan struct{})
-
-					go func() { f.a.Replication.observe(f.ctx); close(observed) }()
-
-					synctest.Wait()
-
-					select {
-					case <-observed:
-					default:
-						t.Fatal("observer blocked behind annotation patch")
-					}
-
-					require.NoError(t, f.a.Server.Ready(nil))
-				}
-
-				if outcome == "cancellation" {
-					cancel()
-				} else {
-					close(release)
-				}
-
-				err := <-done
-
-				switch outcome {
-				case "success":
-					require.NoError(t, err)
-				case "failure":
-					require.ErrorIs(t, err, patchError)
-				case "cancellation":
-					require.ErrorIs(t, err, context.Canceled)
-				}
-
-				gateCtx, stop := context.WithTimeout(f.ctx, time.Second)
-				defer stop()
-
-				require.NoError(t, f.a.authority.Observe(gateCtx))
-			})
+			synctest.Test(t, func(t *testing.T) { annotationDoesNotBlockObserver(t, outcome) })
 		})
 	}
 }
 
-func TestReplicaInstallationAndFreshness(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		leader := initializedTopology(t)
-		publication := reconcileTopology(t, leader, t.Context())
-		follower := Assemble(leader.Config, leader.Client, leader.APIReader)
+func annotationDoesNotBlockObserver(t *testing.T, outcome string) {
+	t.Helper()
+	f := newServingFixture(t)
+	r := f.a.Topology
 
-		process, cancel := context.WithCancel(t.Context())
-		defer cancel()
+	var node corev1.Node
+	require.NoError(t, r.Get(f.ctx, client.ObjectKey{Name: "worker"}, &node))
+	node.Annotations["racer.unbounded-cloud.io/shares"] = "7"
+	require.NoError(t, r.Update(f.ctx, &node))
 
-		follower.authority.BindProcess(process)
+	entered, release := make(chan struct{}), make(chan struct{})
+	patchError := errors.New("patch failed")
+	r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			close(entered)
 
-		image, err := wire.DecodePublication(strings.NewReader(publication.encoded))
-		if err != nil {
-			t.Fatal(err)
-		}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-release:
+			}
 
-		bad := image
+			if outcome == "failure" {
+				return patchError
+			}
 
-		bad.Sequence++
-		if err := follower.Replication.installReplica(t.Context(), process, bad); err == nil {
-			t.Fatal("unconfirmed counters installed")
-		}
-
-		if err := follower.Replication.installReplica(t.Context(), process, image); err != nil {
-			t.Fatal(err)
-		}
-
-		_, err = follower.authority.Current()
-		if err != nil || capturePublication(t, follower.authority).encoded != publication.encoded {
-			t.Fatal("replica did not install canonical image", err)
-		}
-
-		time.Sleep(20 * time.Second)
-
-		if err := follower.authority.AcceptReplica(t.Context(), process, image); err != nil {
-			t.Fatal(err)
-		}
-
-		time.Sleep(20 * time.Second)
-
-		if follower.authority.PublicationReady() != nil {
-			t.Fatal("unchanged authoritative confirmation did not renew freshness")
-		}
-
-		time.Sleep(11 * time.Second)
-
-		if follower.authority.PublicationReady() == nil {
-			t.Fatal("expired image still serves")
-		}
-
-		if err := follower.Replication.installReplica(t.Context(), process, image); err != nil {
-			t.Fatal(err)
-		}
-
-		if capturePublication(t, follower.authority).encoded != publication.encoded {
-			t.Fatal("interruption discarded validated image")
-		}
-
-		rollback := publication.record
-
-		rollback.ContentHash = strings.Repeat("0", 64)
-
-		cm, _, err := readVersion(t.Context(), leader.APIReader, leader.Config)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		cm.Data = versionData(rollback)
-		if err := leader.Update(t.Context(), cm); err != nil {
-			t.Fatal(err)
-		}
-
-		if follower.authority.AcceptReplica(t.Context(), process, image) == nil {
-			t.Fatal("same-counter corruption accepted")
-		}
-
-		cancel()
-
-		if follower.authority.PublicationReady() == nil {
-			t.Fatal("process cancellation ignored")
-		}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
 	})
+
+	ctx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() { _, err := r.Reconcile(ctx, ctrl.Request{}); done <- err }()
+
+	<-entered
+	require.EqualValues(t, 7, acceptedMembers(t, r)[testNodeUID].Shares)
+	// Cross the original freshness deadline while the actual Node patch
+	// remains blocked. The real observer must renew both accepted states.
+	for range 3 {
+		time.Sleep(20 * time.Second)
+
+		observed := make(chan struct{})
+
+		go func() { f.a.Replication.observe(f.ctx); close(observed) }()
+
+		synctest.Wait()
+
+		select {
+		case <-observed:
+		default:
+			t.Fatal("observer blocked behind annotation patch")
+		}
+
+		require.NoError(t, f.a.Server.Ready(nil))
+	}
+
+	if outcome == "cancellation" {
+		cancel()
+	} else {
+		close(release)
+	}
+
+	err := <-done
+
+	switch outcome {
+	case "success":
+		require.NoError(t, err)
+	case "failure":
+		require.NoError(t, err)
+		require.NotEmpty(t, r.hints)
+	case "cancellation":
+		require.ErrorIs(t, err, context.Canceled)
+	}
+
+	gateCtx, stop := context.WithTimeout(f.ctx, time.Second)
+	defer stop()
+
+	require.NoError(t, f.a.authority.Observe(gateCtx))
+}
+
+func TestReplicaInstallationAndFreshness(t *testing.T) {
+	synctest.Test(t, replicaInstallationAndFreshness)
+}
+
+func replicaInstallationAndFreshness(t *testing.T) {
+	t.Helper()
+	leader := initializedTopology(t)
+	publication := reconcileTopology(t, leader, t.Context())
+	follower := Assemble(leader.config, leader.Client, leader.APIReader)
+
+	process, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	follower.authority.BindProcess(process)
+
+	image, err := wire.DecodePublication(strings.NewReader(publication.encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bad := image
+
+	bad.Sequence++
+	if err := follower.authority.AcceptReplica(t.Context(), process, bad); err == nil {
+		t.Fatal("unconfirmed counters installed")
+	}
+
+	if err := follower.authority.AcceptReplica(t.Context(), process, image); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = follower.authority.Current()
+	if err != nil || capturePublication(t, follower.authority).encoded != publication.encoded {
+		t.Fatal("replica did not install canonical image", err)
+	}
+
+	time.Sleep(20 * time.Second)
+
+	if err := follower.authority.AcceptReplica(t.Context(), process, image); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(20 * time.Second)
+
+	if follower.authority.PublicationReady() != nil {
+		t.Fatal("unchanged authoritative confirmation did not renew freshness")
+	}
+
+	time.Sleep(11 * time.Second)
+
+	if follower.authority.PublicationReady() == nil {
+		t.Fatal("expired image still serves")
+	}
+
+	if err := follower.authority.AcceptReplica(t.Context(), process, image); err != nil {
+		t.Fatal(err)
+	}
+
+	if capturePublication(t, follower.authority).encoded != publication.encoded {
+		t.Fatal("interruption discarded validated image")
+	}
+
+	rollback := publication.record
+
+	rollback.ContentHash = strings.Repeat("0", 64)
+
+	cm, _, err := readVersion(t.Context(), leader.APIReader, leader.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cm.Data = versionData(rollback)
+	if err := leader.Update(t.Context(), cm); err != nil {
+		t.Fatal(err)
+	}
+
+	if follower.authority.AcceptReplica(t.Context(), process, image) == nil {
+		t.Fatal("same-counter corruption accepted")
+	}
+
+	cancel()
+
+	if follower.authority.PublicationReady() == nil {
+		t.Fatal("process cancellation ignored")
+	}
 }
 
 func TestReplicaServingSurvivesPublisherCancellation(t *testing.T) {
@@ -1589,7 +1623,7 @@ func TestReplicaServingSurvivesPublisherCancellation(t *testing.T) {
 		t.Fatal("publisher lifetime leaked into serving", err)
 	}
 
-	if _, _, err := publication.writeContext(t.Context()); err != nil {
+	if _, _, err := publication.admit(t.Context()); err != nil {
 		t.Fatal("image bound to publisher instead of process")
 	}
 }
@@ -1616,7 +1650,7 @@ func TestReplicaObservationsFailClosed(t *testing.T) {
 	r.APIReader = f.a.Topology.APIReader
 	fixtureDependencies[r.authority].reader = r.APIReader
 
-	cm, _, err := readVersion(f.ctx, r.APIReader, r.Config)
+	cm, _, err := readVersion(f.ctx, r.APIReader, r.config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1641,11 +1675,11 @@ func TestReplicaLeaderDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r.Config.ControllerServiceAccount = "racer-controller"
-	r.Config.ReplicationPort = 8443
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: "controller", UID: "controller-uid"}, Spec: corev1.PodSpec{ServiceAccountName: "racer-controller"}, Status: corev1.PodStatus{PodIP: "192.0.2.10"}}
+	r.config.ControllerServiceAccount = "racer-controller"
+	r.config.ReplicationPort = 8443
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: r.config.Namespace, Name: "controller", UID: "controller-uid"}, Spec: corev1.PodSpec{ServiceAccountName: "racer-controller"}, Status: corev1.PodStatus{PodIP: "192.0.2.10"}}
 
-	lease := &coordv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: "racer-controller"}, Spec: coordv1.LeaseSpec{HolderIdentity: ptr.To("controller/controller-uid"), RenewTime: ptr.To(metav1.NewMicroTime(time.Now())), LeaseDurationSeconds: ptr.To(int32(15))}}
+	lease := &coordv1.Lease{ObjectMeta: metav1.ObjectMeta{Namespace: r.config.Namespace, Name: "racer-controller"}, Spec: coordv1.LeaseSpec{HolderIdentity: ptr.To("controller/controller-uid"), RenewTime: ptr.To(metav1.NewMicroTime(time.Now())), LeaseDurationSeconds: ptr.To(int32(15))}}
 	for _, obj := range []client.Object{pod, lease} {
 		if err := r.Client.Create(f.ctx, obj); err != nil {
 			t.Fatal(err)
@@ -1669,139 +1703,137 @@ func TestReplicaLeaderDiscovery(t *testing.T) {
 func TestReplicaObservedHighWaterWithoutImage(t *testing.T) {
 	for _, initial := range []string{"installed10", "no image", "suspended"} {
 		for _, mutation := range []string{"rollback10", "conflicting11", "membership hash", "membership rollback", "membership jump"} {
-			t.Run(initial+"/"+mutation, func(t *testing.T) {
-				f := newServingFixture(t)
-				r := f.a.Replication
-				base := *capturePublication(t, f.a.authority)
-				base.record.Sequence, base.record.MembershipVersion = 10, 5
-
-				newer := base.record
-				newer.Sequence = 11
-				newer.ContentHash = strings.Repeat("a", 64)
-				setVersion := func(record VersionRecord) {
-					cm := &corev1.ConfigMap{}
-
-					err := r.APIReader.Get(f.ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.VersionConfigMapName}, cm)
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					cm.Data = versionData(record)
-					if err := r.Client.Update(f.ctx, cm); err != nil {
-						t.Fatal(err)
-					}
-				}
-				setVersion(base.record)
-
-				if initial == "no image" {
-					d := fixtureDependencies[f.a.authority]
-					a := authority.New(r.Config.authorityConfig(), authority.Dependencies{Reader: d, Writer: d})
-					f.a.authority = a
-					r.authority = a
-					f.a.Lifecycle = server.NewLifecycle(a)
-					f.a.Server = server.New(r.Config.serverConfig(), d, a, f.a.Lifecycle, r)
-					fixtureTLS(t, f.a.Server, f.ctx, f.serverCertificate)
-					f.a.Lifecycle.SetCacheSync(func(context.Context) bool { return true })
-
-					go func() { _ = f.a.Lifecycle.Start(f.ctx) }()
-
-					f.a.Lifecycle.SetServingReady(true)
-					f.a.Topology.authority = a
-					f.a.Keyring.authority = a
-					fixtureDependencies[a] = d
-				} else {
-					image, err := wire.DecodePublication(strings.NewReader(base.encoded))
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					image.Sequence = 10
-
-					image.MembershipVersion = 5
-					if err := r.installReplica(f.ctx, f.ctx, image); err != nil {
-						t.Fatal(err)
-					}
-
-					if initial == "suspended" {
-						restore := withdrawPublication(t, f.a.Topology)
-						restore()
-					}
-				}
-
-				setVersion(newer)
-				r.observe(f.ctx)
-
-				bad := newer
-
-				switch mutation {
-				case "rollback10":
-					bad = base.record
-				case "conflicting11":
-					bad.ContentHash = strings.Repeat("b", 64)
-				case "membership hash":
-					bad.Sequence++
-					bad.MembershipHash = strings.Repeat("b", 64)
-				case "membership rollback":
-					bad.Sequence++
-					bad.MembershipVersion--
-				case "membership jump":
-					bad.Sequence++
-					bad.MembershipVersion += 2
-				}
-
-				setVersion(bad)
-				r.observe(f.ctx)
-
-				if f.a.authority.PublicationReady() == nil || f.a.Server.Ready(nil) == nil {
-					t.Fatal("invalid authority failed to suspend or erased high-water")
-				}
-
-				if err := r.authority.TrustReady(); err == nil {
-					t.Fatal("invalid authority retained trust")
-				}
-
-				image, decodeErr := wire.DecodePublication(strings.NewReader(base.encoded))
-				if decodeErr != nil {
-					t.Fatal(decodeErr)
-				}
-
-				image.Sequence = 10
-
-				image.MembershipVersion = 5
-				if err := r.installReplica(f.ctx, f.ctx, image); err == nil {
-					t.Fatal("install bypassed observed high-water")
-				}
-
-				// Exercise the public serving boundary, not only store readiness:
-				// rejected authority must not expose even the previously valid image.
-				request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
-				request.TLS = f.requestState(t)
-				response := httptest.NewRecorder()
-				f.a.Server.Handler().ServeHTTP(response, request)
-
-				if response.Code != http.StatusServiceUnavailable {
-					t.Fatalf("invalid authority still served snapshot: %d", response.Code)
-				}
-
-				// Restoring the last valid authority permits a new reconcile/CAS,
-				// without forgetting the observed watermark or reusing revoked bytes.
-				setVersion(newer)
-				runKeys(t, f.a.Keyring)
-
-				recovered := reconcileTopology(t, f.a.Topology, f.ctx)
-				if recovered.record.Sequence != newer.Sequence+1 || recovered.record.MembershipVersion != newer.MembershipVersion {
-					t.Fatal("recovery reset counters or changed unchanged membership")
-				}
-
-				response = httptest.NewRecorder()
-				f.a.Server.Handler().ServeHTTP(response, request.Clone(f.ctx))
-
-				if response.Code != http.StatusOK || response.Body.String() != recovered.encoded {
-					t.Fatalf("reconciled authority not served: %d", response.Code)
-				}
-			})
+			t.Run(initial+"/"+mutation, func(t *testing.T) { observedHighWater(t, initial, mutation) })
 		}
 	}
+}
+
+func observedHighWater(t *testing.T, initial, mutation string) {
+	t.Helper()
+	f := newServingFixture(t)
+	r := f.a.Replication
+	base := *capturePublication(t, f.a.authority)
+	base.record.Sequence, base.record.MembershipVersion = 10, 5
+
+	newer := base.record
+	newer.Sequence = 11
+	newer.ContentHash = strings.Repeat("a", 64)
+	setVersion := func(record VersionRecord) {
+		cm := &corev1.ConfigMap{}
+
+		err := r.APIReader.Get(f.ctx, client.ObjectKey{Namespace: r.config.Namespace, Name: r.config.VersionConfigMapName}, cm)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		cm.Data = versionData(record)
+		if err := r.Client.Update(f.ctx, cm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setVersion(base.record)
+
+	if initial == "no image" {
+		d := fixtureDependencies[f.a.authority]
+		a := authority.New(r.config.authorityConfig(), authority.Dependencies{Reader: d, Writer: d})
+		f.a.authority = a
+		r.authority = a
+		f.a.Lifecycle = server.NewLifecycle(a)
+		f.a.Server = server.New(r.config.serverConfig(), d, a, f.a.Lifecycle, r)
+		fixtureTLS(t, f.a, f.ctx, f.serverCertificate)
+		f.a.Lifecycle.SetCacheSync(func(context.Context) bool { return true })
+
+		go func() { _ = f.a.Lifecycle.Start(f.ctx) }()
+
+		f.a.Lifecycle.SetServingReady(true)
+		f.a.Topology.authority = a
+		f.a.Keyring.authority = a
+		fixtureDependencies[a] = d
+	} else {
+		image, err := wire.DecodePublication(strings.NewReader(base.encoded))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		image.Sequence, image.MembershipVersion = 10, 5
+		if err := r.authority.AcceptReplica(f.ctx, f.ctx, image); err != nil {
+			t.Fatal(err)
+		}
+
+		if initial == "suspended" {
+			restore := withdrawPublication(t, f.a.Topology)
+			restore()
+		}
+	}
+
+	setVersion(newer)
+	r.observe(f.ctx)
+
+	setVersion(invalidHighWater(base.record, newer, mutation))
+	r.observe(f.ctx)
+
+	require.Error(t, f.a.authority.PublicationReady())
+	require.Error(t, f.a.Server.Ready(nil))
+
+	require.Error(t, r.authority.TrustReady(), "invalid authority retained trust")
+
+	image, decodeErr := wire.DecodePublication(strings.NewReader(base.encoded))
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+
+	image.Sequence, image.MembershipVersion = 10, 5
+	if err := r.authority.AcceptReplica(f.ctx, f.ctx, image); err == nil {
+		t.Fatal("install bypassed observed high-water")
+	}
+
+	// Exercise the public serving boundary, not only store readiness:
+	// rejected authority must not expose even the previously valid image.
+	request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
+	request.TLS = f.requestState(t)
+	response := httptest.NewRecorder()
+	f.a.Server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("invalid authority still served snapshot: %d", response.Code)
+	}
+
+	// Restoring the last valid authority permits a new reconcile/CAS,
+	// without forgetting the observed watermark or reusing revoked bytes.
+	setVersion(newer)
+	runKeys(t, f.a.Keyring)
+
+	recovered := reconcileTopology(t, f.a.Topology, f.ctx)
+	require.Equal(t, newer.Sequence+1, recovered.record.Sequence)
+	require.Equal(t, newer.MembershipVersion, recovered.record.MembershipVersion)
+
+	response = httptest.NewRecorder()
+	f.a.Server.Handler().ServeHTTP(response, request.Clone(f.ctx))
+
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Equal(t, recovered.encoded, response.Body.String())
+}
+
+func invalidHighWater(base, newer VersionRecord, mutation string) VersionRecord {
+	bad := newer
+
+	switch mutation {
+	case "rollback10":
+		bad = base
+	case "conflicting11":
+		bad.ContentHash = strings.Repeat("b", 64)
+	case "membership hash":
+		bad.Sequence++
+		bad.MembershipHash = strings.Repeat("b", 64)
+	case "membership rollback":
+		bad.Sequence++
+		bad.MembershipVersion--
+	case "membership jump":
+		bad.Sequence++
+		bad.MembershipVersion += 2
+	}
+
+	return bad
 }
 
 type firstChunkWriter struct {
@@ -1824,38 +1856,41 @@ func TestPublicationWriteAuthorityRevocation(t *testing.T) {
 		t.Run(change, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				r := initializedTopology(t)
-				image := reconcileTopology(t, r, t.Context())
+				membership := AcceptedMembers{}
+
+				for i := range 500 {
+					id := wire.NodeID(fmt.Sprintf("22222222-2222-4222-8222-%012d", i))
+					membership[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: "192.0.2.1:8082", RDMANICs: []wire.RDMANIC{}}
+				}
+
+				image := replicationSmokePublish(t, t.Context(), r, membership)
 				copy := *image
-				copy.encoded = strings.Repeat("x", 64*1024)
+				require.Greater(t, len(copy.encoded), 32*1024)
+
 				w := &firstChunkWriter{entered: make(chan struct{}), unblock: make(chan struct{})}
 				done := make(chan error, 1)
 
-				writeCtx, stopWrite, err := copy.writeContext(t.Context())
+				guard, stopWrite, err := copy.admit(t.Context())
 				if err != nil {
 					t.Fatal(err)
 				}
 				defer stopWrite()
 
-				go func() { _, err := copy.ForBase("").writeTo(writeCtx, w); done <- err }()
+				go func() { _, err := copy.handle.ForBase(0, "").WriteTo(t.Context(), guard, w); done <- err }()
 
 				<-w.entered
 
 				switch change {
 				case "superseded":
-					next := *image
-					next.record.Sequence++
-
-					next.record.ContentHash = strings.Repeat("a", 64)
-
 					advanceFixturePublication(t, r)
 				case "suspend recover":
 					restore := withdrawPublication(t, r)
 					restore()
-					reconcileTopology(t, r, t.Context())
+					replicationSmokePublish(t, t.Context(), r, membership)
 				case "confirmation after write admission":
 					time.Sleep(20 * time.Second)
 
-					reconcileTopology(t, r, t.Context())
+					replicationSmokePublish(t, t.Context(), r, membership)
 
 					time.Sleep(11 * time.Second)
 				}
@@ -1866,7 +1901,13 @@ func TestPublicationWriteAuthorityRevocation(t *testing.T) {
 
 				close(w.unblock)
 
-				if err := <-done; err == nil || w.calls != 1 {
+				err = <-done
+				if change == "superseded" {
+					require.NoError(t, err, "ordinary advancement revoked admitted response")
+					require.Equal(t, (len(copy.encoded)+32*1024-1)/(32*1024), w.calls)
+					_, _, err = copy.admit(t.Context())
+					require.ErrorIs(t, err, wire.Unavailable)
+				} else if err == nil || w.calls != 1 {
 					t.Fatalf("revoked response continued: calls=%d err=%v", w.calls, err)
 				}
 			})
@@ -1953,7 +1994,7 @@ func TestTopologySiteChangesPersistAcrossRestart(t *testing.T) {
 		node.Annotations[wire.RDMANICsAnnotation] = "malformed"
 		require.NoError(t, r.Update(t.Context(), &node))
 		// Drop all in-memory history before processing the changed boundary.
-		r = Assemble(r.Config, r.Client, r.APIReader).Topology
+		r = Assemble(r.config, r.Client, r.APIReader).Topology
 		committed := reconcileTopology(t, r, t.Context())
 		next, err := wire.DecodePublication(strings.NewReader(committed.encoded))
 		require.NoError(t, err)
@@ -1979,86 +2020,9 @@ func TestTopologySiteChangesPersistAcrossRestart(t *testing.T) {
 		require.NoError(t, json.Unmarshal([]byte(node.Annotations[admittedMemberAnnotation]), &saved))
 		require.Equal(t, next.Members[0], saved)
 
-		r = Assemble(r.Config, r.Client, r.APIReader).Topology
+		r = Assemble(r.config, r.Client, r.APIReader).Topology
 		require.Equal(t, committed.encoded, reconcileTopology(t, r, t.Context()).encoded)
 
 		base = next
-	}
-}
-
-func workloadConfig(t *testing.T) members.Config {
-	t.Helper()
-
-	return members.Config{
-		Cluster: "11111111-1111-1111-1111-111111111111", Namespace: "racer",
-		ControlURL: "https://racer-controller.racer.svc:8443", DataplaneImage: "racer:test",
-		BootstrapTrustConfigMap: "racer-bootstrap-trust", PeerPort: 8082,
-		DataplaneServiceAccount: "racer-dataplane", DaemonSetName: "racer-dataplane",
-	}
-}
-
-func TestWorkloadPeerMembership(t *testing.T) {
-	for _, port := range []uint16{8082, 7443, 9090, 9091, 65535} {
-		t.Run(strconv.Itoa(int(port)), func(t *testing.T) {
-			cfg := workloadConfig(t)
-			cfg.PeerPort = port
-
-			ds, err := members.DesiredDaemonSet(cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			assertWorkloadPeerMembership(t, ds, port)
-		})
-	}
-}
-
-// Exercise the builder's ordered downward-API expansion and membership contract together.
-func assertWorkloadPeerMembership(t *testing.T, ds *appsv1.DaemonSet, peerPort uint16) {
-	t.Helper()
-
-	for _, ips := range [][]string{{"192.0.2.1"}, {"2001:db8::1"}, {"192.0.2.1", "2001:db8::1"}, {"2001:db8::1", "192.0.2.1"}} {
-		pod := memberPod("peer", 1, ips[0])
-		for _, ip := range ips {
-			pod.Status.PodIPs = append(pod.Status.PodIPs, corev1.PodIP{IP: ip})
-		}
-
-		podIP, listen := "", ""
-
-		for _, env := range ds.Spec.Template.Spec.Containers[0].Env {
-			switch env.Name {
-			case "RACER_POD_IP":
-				if podIP != "" || env.Value != "" || !reflect.DeepEqual(env.ValueFrom, &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.podIP"}}) {
-					t.Fatal("peer bind address must come from status.podIP")
-				}
-
-				podIP = pod.Status.PodIP
-			case "RACER_PEER_LISTEN":
-				if podIP == "" || listen != "" || env.ValueFrom != nil || env.Value != "[$(RACER_POD_IP)]:"+strconv.Itoa(int(peerPort)) {
-					t.Fatal("peer listener must expand the preceding Pod IP and configured peer port")
-				}
-
-				listen = strings.ReplaceAll(env.Value, "$(RACER_POD_IP)", podIP)
-			}
-		}
-
-		host, port, err := net.SplitHostPort(listen)
-		if err != nil {
-			t.Fatalf("expanded peer listener %q: %v", listen, err)
-		}
-
-		ip, err := netip.ParseAddr(host)
-		if err != nil || ip.IsUnspecified() || port != strconv.Itoa(int(peerPort)) {
-			t.Fatalf("peer listener must bind the exact Pod IP and peer port: %q", listen)
-		}
-
-		candidate, diagnostics, err := reconcileMembers([]corev1.Node{memberNode()}, map[string][]corev1.Pod{pod.Spec.NodeName: {pod}}, memberOwnership(t, testDaemonSetUID), nil, peerPort)
-		if err != nil || len(diagnostics) != 0 || len(candidate) != 1 {
-			t.Fatalf("unready Pod with IPs %v must be published: %v, %v", ips, diagnostics, err)
-		}
-
-		if endpoint := candidate[testNodeUID].PeerEndpoint; endpoint != netip.AddrPortFrom(ip, peerPort).String() {
-			t.Fatalf("membership endpoint %q disagrees with listener %q for Pod IPs %v", endpoint, listen, ips)
-		}
 	}
 }

@@ -6,9 +6,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -17,18 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,19 +33,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
-	"github.com/Azure/unbounded/internal/racer/authority"
 	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
@@ -63,18 +48,7 @@ func TestHTTPSBootstrapSnapshotAndStrictRoutes(t *testing.T) {
 	endpoint := f.start(t)
 	anonymous := f.client(t, nil)
 
-	body, err := wire.EncodeBootstrapRequest(f.request)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	req, err := http.NewRequestWithContext(f.ctx, "POST", endpoint+wire.BootstrapPath, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+f.token)
-	req.Header.Set("Content-Type", "application/json")
+	req := bootstrapTestRequest(t, f.ctx, endpoint, f.token, f.request)
 	response, err := anonymous.Do(req)
 	encoded := responseBody(t, response, err, 200)
 
@@ -138,18 +112,7 @@ func TestAuthenticatedSharesProposalAndExplicitNodePrecedence(t *testing.T) {
 	endpoint := f.start(t)
 	f.request.Shares = 9
 
-	body, err := wire.EncodeBootstrapRequest(f.request)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	req, err := http.NewRequestWithContext(f.ctx, "POST", endpoint+wire.BootstrapPath, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+f.token)
-	req.Header.Set("Content-Type", "application/json")
+	req := bootstrapTestRequest(t, f.ctx, endpoint, f.token, f.request)
 	response, err := f.client(t, nil).Do(req)
 	responseBody(t, response, err, 200)
 
@@ -268,18 +231,7 @@ func TestHTTPSCertificateRejectionAndRecovery(t *testing.T) {
 		})
 	}
 	// Expired identities can recover by omitting the certificate entirely.
-	encoded, err := wire.EncodeBootstrapRequest(f.request)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	req, err := http.NewRequestWithContext(f.ctx, "POST", endpoint+wire.BootstrapPath, bytes.NewReader(encoded))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+f.token)
+	req := bootstrapTestRequest(t, f.ctx, endpoint, f.token, f.request)
 	response, err := f.client(t, nil).Do(req)
 
 	enrollment, err := wire.DecodeBootstrapResponse(bytes.NewReader(responseBody(t, response, err, http.StatusOK)))
@@ -318,9 +270,7 @@ func TestPooledTLSIgnoresWorkloadChangesButRejectsExpiry(t *testing.T) {
 			switch scenario {
 			case "excluded", "recreated node":
 				node := &corev1.Node{}
-				if err := f.a.Topology.Get(f.ctx, client.ObjectKey{Name: "worker"}, node); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, f.a.Topology.Get(f.ctx, client.ObjectKey{Name: "worker"}, node))
 
 				if scenario == "excluded" {
 					node.Labels = map[string]string{wire.ExclusionLabel: ""}
@@ -328,23 +278,14 @@ func TestPooledTLSIgnoresWorkloadChangesButRejectsExpiry(t *testing.T) {
 					node.UID = "replacement"
 				}
 
-				if err := f.a.Topology.Update(f.ctx, node); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, f.a.Topology.Update(f.ctx, node))
 			case "pod gone":
 				pod := &corev1.Pod{}
-				if err := f.a.Topology.Get(f.ctx, client.ObjectKey{Namespace: "racer", Name: "worker-pod"}, pod); err != nil {
-					t.Fatal(err)
-				}
-
-				if err := f.a.Topology.Delete(f.ctx, pod); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, f.a.Topology.Get(f.ctx, client.ObjectKey{Namespace: "racer", Name: "worker-pod"}, pod))
+				require.NoError(t, f.a.Topology.Delete(f.ctx, pod))
 			case "expired":
 				leaf, err := x509.ParseCertificate(cert.Certificate[0])
-				if err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, err)
 
 				time.Sleep(time.Until(leaf.NotAfter) + 10*time.Millisecond)
 			}
@@ -353,9 +294,7 @@ func TestPooledTLSIgnoresWorkloadChangesButRejectsExpiry(t *testing.T) {
 			ctx := httptrace.WithClientTrace(f.ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused }})
 
 			req, err := http.NewRequestWithContext(ctx, "GET", endpoint+wire.SnapshotPath, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 
 			response, err = c.Do(req)
 
@@ -368,9 +307,7 @@ func TestPooledTLSIgnoresWorkloadChangesButRejectsExpiry(t *testing.T) {
 
 			responseBody(t, response, err, want)
 
-			if !reused {
-				t.Fatal("test failed to reuse TLS connection")
-			}
+			require.True(t, reused, "test failed to reuse TLS connection")
 		})
 	}
 }
@@ -561,7 +498,7 @@ func TestKeyringRequestValidation(t *testing.T) {
 		{"slash", func(r *http.Request) { r.URL.Path += "/" }, 400},
 		{"escaped path", func(r *http.Request) { r.URL.RawPath = "/v1/%6beyring" }, 400},
 		{"header limit", func(r *http.Request) {
-			r.Header.Set("X-Large", strings.Repeat("x", f.a.Server.Config.Limits.HeaderBytes))
+			r.Header.Set("X-Large", strings.Repeat("x", f.a.Server.config.Limits.HeaderBytes))
 		}, 413},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -699,109 +636,119 @@ func TestKeyringPollWakeAndTermination(t *testing.T) {
 	for _, bearer := range []bool{false, true} {
 		for _, scenario := range []string{"timeout", "rotation", "invalidation", "leader canceled", "request canceled", "expired", "bearer revoked", "retired trust"} {
 			t.Run(fmt.Sprintf("bearer=%t/%s", bearer, scenario), func(t *testing.T) {
-				synctest.Test(t, func(t *testing.T) {
-					f := newServingFixture(t)
-					// Isolate poll termination from the default 30-second freshness gate.
-					configureFixtureAge(t, f, time.Minute)
-
-					if scenario == "expired" {
-						if bearer {
-							_, status, _ := authFixture(t)
-							f.token = "header." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"exp":%d}`, time.Now().Add(time.Second).Unix())) + ".signature"
-							installReview(t, f.a, status, f.token)
-						} else {
-							f.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.NotAfter = time.Now().Add(time.Second) })
-						}
-					}
-
-					ctx, cancel := context.WithCancel(f.ctx)
-					defer cancel()
-
-					r := keyringRequest(t, f, bearer, "?after=1").WithContext(ctx)
-					handler := f.a.Server.Handler()
-					w := httptest.NewRecorder()
-					done := make(chan struct{})
-
-					go func() { defer close(done); handler.ServeHTTP(w, r) }()
-
-					synctest.Wait()
-
-					polls := f.a.Server.keyringPolls.count()
-
-					if polls != 1 || len(f.a.Server.writes) != 0 || len(f.a.Server.bootstrapSlots) != 0 {
-						t.Fatal("poll not parked independently of auth/write admission")
-					}
-
-					want := 503
-
-					switch scenario {
-					case "timeout":
-						want = 204
-						// Repeated unchanged reconciliations must not extend the wait.
-						time.Sleep(20 * time.Second)
-						runKeys(t, f.a.Keyring)
-						time.Sleep(10 * time.Second)
-					case "expired":
-						want = 401
-
-						time.Sleep(time.Second)
-					case "rotation":
-						want = 200
-						_, _, rotation, _ := keyState(t, f.a.Keyring)
-						fixtureDependencies[f.a.authority].now = func() time.Time { return rotation.NextRotation }
-						runKeys(t, f.a.Keyring)
-					case "invalidation":
-						invalidateFixtureTrust(t, f)
-					case "leader canceled":
-						f.cancel()
-					case "request canceled":
-						cancel()
-					case "bearer revoked":
-						want = 204
-						if bearer {
-							want = 403
-						}
-
-						pod := &corev1.Pod{}
-						if err := f.a.Topology.Get(f.ctx, client.ObjectKey{Namespace: "racer", Name: "worker-pod"}, pod); err != nil {
-							t.Fatal(err)
-						}
-
-						if err := f.a.Topology.Delete(f.ctx, pod); err != nil {
-							t.Fatal(err)
-						}
-
-						time.Sleep(wire.PollWait)
-					case "retired trust":
-						want = 401
-						if bearer {
-							want = 200
-						}
-
-						replaceFixtureCredentials(t, f)
-					}
-
-					select {
-					case <-done:
-					case <-time.After(time.Second):
-						t.Fatal("poll did not wake")
-					}
-
-					body := requireKeyringResponse(t, w, want)
-					if want == 200 {
-						bundle, err := wire.DecodeBundle(bytes.NewReader(body))
-						if err != nil || bundle.Generation != 2 {
-							t.Fatalf("updated bundle: %v", err)
-						}
-					}
-
-					if f.a.Server.keyringPolls.count() != 0 {
-						t.Fatal("admission leaked")
-					}
-				})
+				synctest.Test(t, func(t *testing.T) { testKeyringPollTermination(t, bearer, scenario) })
 			})
 		}
 	}
+}
+
+func testKeyringPollTermination(t *testing.T, bearer bool, scenario string) {
+	t.Helper()
+	f := newServingFixture(t)
+	// Isolate poll termination from the default 30-second freshness gate.
+	configureFixtureAge(t, f, time.Minute)
+
+	if scenario == "expired" {
+		f.expireIdentitySoon(t, bearer)
+	}
+
+	ctx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+
+	r := keyringRequest(t, f, bearer, "?after=1").WithContext(ctx)
+	handler := f.a.Server.Handler()
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+
+	go func() { defer close(done); handler.ServeHTTP(w, r) }()
+
+	synctest.Wait()
+
+	polls := f.a.Server.keyringPolls.count()
+
+	require.Equal(t, 1, polls)
+	require.Empty(t, f.a.Server.writes)
+	require.Empty(t, f.a.Server.bootstrapSlots)
+
+	want := terminateKeyringPoll(t, f, cancel, bearer, scenario)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("poll did not wake")
+	}
+
+	body := requireKeyringResponse(t, w, want)
+	if want == 200 {
+		bundle, err := wire.DecodeBundle(bytes.NewReader(body))
+		require.NoError(t, err)
+		require.Equal(t, wire.Generation(2), bundle.Generation)
+	}
+
+	require.Zero(t, f.a.Server.keyringPolls.count(), "admission leaked")
+}
+
+func terminateKeyringPoll(t *testing.T, f *servingFixture, cancel context.CancelFunc, bearer bool, scenario string) int {
+	t.Helper()
+
+	want := 503
+
+	switch scenario {
+	case "timeout":
+		want = 204
+		// Repeated unchanged reconciliations must not extend the wait.
+		time.Sleep(20 * time.Second)
+		runKeys(t, f.a.Keyring)
+		time.Sleep(10 * time.Second)
+	case "expired":
+		want = 401
+
+		time.Sleep(time.Second)
+	case "rotation":
+		want = 200
+		_, _, rotation, _ := keyState(t, f.a.Keyring)
+		fixtureDependencies[f.a.authority].now = func() time.Time { return rotation.NextRotation }
+		runKeys(t, f.a.Keyring)
+	case "invalidation":
+		invalidateFixtureTrust(t, f)
+	case "leader canceled":
+		f.cancel()
+	case "request canceled":
+		cancel()
+	case "bearer revoked":
+		want = 204
+		if bearer {
+			want = 403
+		}
+
+		pod := &corev1.Pod{}
+		require.NoError(t, f.a.Topology.Get(f.ctx, client.ObjectKey{Namespace: "racer", Name: "worker-pod"}, pod))
+		require.NoError(t, f.a.Topology.Delete(f.ctx, pod))
+
+		time.Sleep(wire.PollWait)
+	case "retired trust":
+		want = 401
+		if bearer {
+			want = 200
+		}
+
+		replaceFixtureCredentials(t, f)
+	}
+
+	return want
+}
+
+func (f *servingFixture) expireIdentitySoon(t *testing.T, bearer bool) {
+	t.Helper()
+
+	if !bearer {
+		f.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.NotAfter = time.Now().Add(time.Second) })
+		return
+	}
+
+	_, status, _ := authFixture(t)
+	f.token = "header." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"exp":%d}`, time.Now().Add(time.Second).Unix())) + ".signature"
+	installReview(t, f.a, status, f.token)
 }
 
 func TestKeyringAdmissionHeldThroughResponse(t *testing.T) {
@@ -810,7 +757,7 @@ func TestKeyringAdmissionHeldThroughResponse(t *testing.T) {
 			t.Run(fmt.Sprintf("flush=%t/status=%d", flush, status), func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					f := newServingFixture(t)
-					f.a.Server.Config.Limits.MaxPolls = 1
+					f.configureServer(func(c *Config) { c.Limits.MaxPolls = 1 })
 					// Keep authority fresh through the 204 wait and blocked response.
 					configureFixtureAge(t, f, time.Minute)
 					handler := f.a.Server.Handler()
@@ -849,18 +796,14 @@ func TestKeyringAdmissionHeldThroughResponse(t *testing.T) {
 						requireKeyringResponse(t, second, 429)
 					}
 					// Independent snapshot admission is available while delivery blocks.
-					if !f.a.Server.admitPoll(wire.NodeID(testNodeUID)) {
-						t.Fatal("keyring consumed snapshot admission")
-					}
+					require.True(t, f.a.Server.polls.acquire(wire.NodeID(testNodeUID)), "keyring consumed snapshot admission")
 
-					f.a.Server.releasePoll(wire.NodeID(testNodeUID))
+					f.a.Server.polls.release(wire.NodeID(testNodeUID))
 					unblock()
 					<-done
 					requireKeyringResponse(t, w.ResponseRecorder, status)
 
-					if f.a.Server.keyringPolls.count() != 0 || len(f.a.Server.writes) != 0 {
-						t.Fatal("admission leaked")
-					}
+					requireNoAdmission(t, f.a.Server)
 				})
 			})
 		}
@@ -870,9 +813,11 @@ func TestKeyringAdmissionHeldThroughResponse(t *testing.T) {
 func TestKeyringBearerAdmissionAndDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newServingFixture(t)
+		f.configureServer(func(c *Config) {
+			c.Limits.MaxConcurrentBootstrap = 1
+			c.Limits.WriteTimeout = time.Second
+		})
 		s := f.a.Server
-		s.Config.Limits.MaxConcurrentBootstrap = 1
-		s.Config.Limits.WriteTimeout = time.Second
 		fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
 			<-ctx.Done()
 			return ctx.Err()
@@ -910,7 +855,7 @@ func TestKeyringBearerAdmissionAndDeadline(t *testing.T) {
 func TestKeyringPerNodeAdmissionIndependentOfSnapshots(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newServingFixture(t)
-		f.a.Server.Config.Limits.MaxPolls = 2
+		f.configureServer(func(c *Config) { c.Limits.MaxPolls = 2 })
 		handler := f.a.Server.Handler()
 
 		ctx, cancel := context.WithCancel(f.ctx)
@@ -947,9 +892,7 @@ func TestKeyringPerNodeAdmissionIndependentOfSnapshots(t *testing.T) {
 func TestKeyringBearerExpiresDuringReauthentication(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newServingFixture(t)
-		_, status, _ := authFixture(t)
-		f.token = "header." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"exp":%d}`, time.Now().Add(time.Second).Unix())) + ".signature"
-		installReview(t, f.a, status, f.token)
+		f.expireIdentitySoon(t, true)
 
 		reads := 0
 		fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -981,91 +924,28 @@ func TestRustKeyringInterop(t *testing.T) {
 		t.Skip("set RACER_RUST_INTEROP=1 to run the Rust client")
 	}
 
-	root, err := filepath.Abs("../../..")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	manifest := filepath.Join(root, "cmd/racer-dataplane/Cargo.toml")
-	metadataCommand := exec.CommandContext(t.Context(), "timeout", "--signal=TERM", "--kill-after=10s", "230s", "cargo", "metadata", "--locked", "--no-deps", "--format-version=1", "--manifest-path", manifest)
-	metadataCommand.Cancel = func() error { return metadataCommand.Process.Signal(syscall.SIGTERM) }
-	metadataCommand.WaitDelay = 10 * time.Second
-	metadataCommand.Stderr = os.Stderr
-
-	encodedMetadata, err := metadataCommand.Output()
-	if err != nil {
-		t.Fatalf("Rust interoperability metadata: %v", err)
-	}
-
-	var metadata struct {
-		Packages []struct {
-			ManifestPath string `json:"manifest_path"`
-			Targets      []struct {
-				Name string   `json:"name"`
-				Kind []string `json:"kind"`
-			} `json:"targets"`
-		} `json:"packages"`
-	}
-	require.NoError(t, json.Unmarshal(encodedMetadata, &metadata))
-
-	available := false
-
-	for _, pkg := range metadata.Packages {
-		for _, target := range pkg.Targets {
-			if pkg.ManifestPath == manifest && target.Name == "keyring_interop" && slices.Contains(target.Kind, "test") {
-				available = true
-			}
-		}
-	}
-
-	if !available {
-		t.Skip("standalone controller extraction has no production Rust keyring_interop test target")
-	}
-
-	if err := os.MkdirAll(filepath.Join(root, "tmp"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-
+	root, err := filepath.Abs("../..")
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "tmp"), 0o700))
 	directory, err := os.MkdirTemp(filepath.Join(root, "tmp"), "keyring-interop-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	f := newServingFixture(t)
 
 	volume := catalogVolume("interop", testOtherUID)
-	if err := f.a.Topology.Create(f.ctx, &volume); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, f.a.Topology.Create(f.ctx, &volume))
 
 	runKeys(t, f.a.Keyring)
 	reconcileTopology(t, f.a.Topology, f.ctx)
 	endpoint := f.start(t)
 
-	trust := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: f.serverCertificate.Certificate[0]})
-	if err := os.WriteFile(filepath.Join(directory, "trust.pem"), trust, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	config, err := json.Marshal(map[string]string{
-		"endpoint": endpoint,
-		"cluster":  string(f.a.Topology.Config.Cluster),
-		"node":     testNodeUID,
-		"token":    f.token,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(directory, "config.json"), config, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeInteropConfig(t, f, directory, endpoint)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 240*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "timeout", "--signal=TERM", "--kill-after=10s", "230s", "cargo", "test", "--locked", "--manifest-path", manifest, "--test", "keyring_interop", "--", "--ignored", "--nocapture")
+	cmd := exec.CommandContext(ctx, "timeout", "--signal=TERM", "--kill-after=10s", "230s", "cargo", "test", "--locked", "--manifest-path", filepath.Join(root, "cmd/racer-dataplane/Cargo.toml"), "--test", "keyring_interop", "--", "--ignored", "--nocapture")
 
 	cmd.Env = append(os.Environ(), "RACER_KEYRING_INTEROP_DIR="+directory)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
@@ -1104,13 +984,8 @@ func TestRustKeyringInterop(t *testing.T) {
 		case err := <-done:
 			reaped = true
 
-			if err != nil {
-				t.Fatalf("Rust interoperability client: %v", err)
-			}
-
-			if !rotated {
-				t.Fatal("Rust client did not reach the rotation poll")
-			}
+			require.NoError(t, err, "Rust interoperability client")
+			require.True(t, rotated, "Rust client did not reach the rotation poll")
 
 			return
 		case <-refresh.C:
@@ -1136,6 +1011,20 @@ func TestRustKeyringInterop(t *testing.T) {
 			}
 		}
 	}
+}
+
+func writeInteropConfig(t *testing.T, f *servingFixture, directory, endpoint string) {
+	t.Helper()
+
+	trust := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: f.serverCertificate.Certificate[0]})
+	require.NoError(t, os.WriteFile(filepath.Join(directory, "trust.pem"), trust, 0o600))
+
+	config, err := json.Marshal(map[string]string{
+		"endpoint": endpoint, "cluster": string(f.a.Topology.Config.Cluster),
+		"node": testNodeUID, "token": f.token,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(directory, "config.json"), config, 0o600))
 }
 
 func TestAuthenticatedRDMANICProposalAndEmptyRemoval(t *testing.T) {
@@ -1240,565 +1129,6 @@ func TestEnrollmentRDMANICLiveNodeRecheck(t *testing.T) {
 			require.NotContains(t, node.Annotations, enrolledRDMANICsAnnotation)
 		})
 	}
-}
-
-// These are real HTTPS protocol clients, not Rust processes or in-memory Wait
-// calls. Kubernetes authority is fake. Never interpret this as API capacity.
-func TestReplicatedServingSmoke(t *testing.T) { replicatedServingSmoke(t, 12) }
-
-func TestReplicatedServingCapacity(t *testing.T) {
-	value := os.Getenv("RACER_REPLICATION_CLIENTS")
-	if value == "" {
-		t.Skip("set RACER_REPLICATION_CLIENTS to an exact count in [1,10000]")
-	}
-
-	count, err := strconv.Atoi(value)
-	if err != nil || count < 1 || count > 10_000 {
-		t.Fatal("RACER_REPLICATION_CLIENTS must be in [1,10000]; 100k requires distributed validation, not this loopback harness")
-	}
-
-	replicatedServingSmoke(t, count)
-}
-
-type replicationSmokeListener struct {
-	net.Listener
-	accepted atomic.Int64
-	live     atomic.Int64
-}
-
-type replicationSmokeConn struct {
-	net.Conn
-	once  sync.Once
-	owner *replicationSmokeListener
-}
-
-func (l *replicationSmokeListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-
-	l.accepted.Add(1)
-	l.live.Add(1)
-
-	return &replicationSmokeConn{Conn: c, owner: l}, nil
-}
-
-func (c *replicationSmokeConn) Close() error {
-	c.once.Do(func() { c.owner.live.Add(-1) })
-	return c.Conn.Close()
-}
-
-type replicationSmokeReplica struct {
-	a        *Application
-	ctx      context.Context
-	cancel   context.CancelFunc
-	endpoint string
-	listener *replicationSmokeListener
-	done     chan error
-}
-
-type replicationSmokePeer struct {
-	client  *http.Client
-	replica int
-}
-
-type replicationSmokeResult struct {
-	index   int
-	bytes   int64
-	digest  [32]byte
-	elapsed time.Duration
-	err     error
-}
-
-func replicatedServingSmoke(t *testing.T, count int) {
-	t.Helper()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 240*time.Second)
-	defer cancel()
-
-	f := newServingFixture(t)
-	accepted := make(AcceptedMembers, count)
-	peers := make([]replicationSmokePeer, count)
-	handshakes := make(chan struct{}, 24)
-	setup := time.Now()
-	_, _, rotation, material := keyState(t, f.a.Keyring)
-
-	ca, signingKey, err := parseSigning(material.Keys[rotation.ActiveIssuer])
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for i := range peers {
-		id := wire.NodeID(fmt.Sprintf("22222222-2222-4222-8222-%012d", i))
-		accepted[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: fmt.Sprintf("10.%d.%d.%d:8082", i>>16, (i>>8)&255, i&255), RDMANICs: []wire.RDMANIC{}}
-
-		pub, key, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		template := &x509.Certificate{SerialNumber: big.NewInt(int64(i + 1)), NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: []*url.URL{{Scheme: "spiffe", Host: string(f.request.Cluster), Path: "/node/" + string(id)}}}
-
-		der, err := x509.CreateCertificate(rand.Reader, template, ca, pub, signingKey)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: f.roots, Certificates: []tls.Certificate{{Certificate: [][]byte{der, ca.Raw}, PrivateKey: key}}}, MaxConnsPerHost: 1, MaxIdleConns: 1, MaxIdleConnsPerHost: 1, IdleConnTimeout: time.Minute, TLSHandshakeTimeout: 10 * time.Second}
-		transport.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-			select {
-			case handshakes <- struct{}{}:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-
-			defer func() { <-handshakes }()
-
-			bounded, stop := context.WithTimeout(ctx, 10*time.Second)
-			defer stop()
-
-			return (&tls.Dialer{Config: transport.TLSClientConfig}).DialContext(bounded, network, address)
-		}
-		t.Cleanup(transport.CloseIdleConnections)
-		peers[i] = replicationSmokePeer{client: &http.Client{Transport: transport, Timeout: 45 * time.Second}, replica: i % 3}
-	}
-
-	base := replicationSmokePublish(t, ctx, f.a.Topology, accepted)
-
-	var replicas []*replicationSmokeReplica
-
-	for range 3 {
-		a := assembleFixture(f.a.Topology.Config, f.a.Topology.Client, f.a.Topology.APIReader)
-		process, stop := context.WithCancel(ctx)
-		a.authority.BindProcess(process)
-		replicationSmokeLifecycle(a.Lifecycle, process)
-		a.Replication.observe(process)
-
-		listener, err := (&net.ListenConfig{}).Listen(process, "tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		r := &replicationSmokeReplica{a: a, ctx: process, cancel: stop, endpoint: "https://" + listener.Addr().String(), listener: &replicationSmokeListener{Listener: listener}, done: make(chan error, 1)}
-		replicas = append(replicas, r)
-
-		config := a.Server.tlsConfig(process, f.serverCertificate)
-
-		go func() {
-			r.done <- a.Server.serve(process, r.listener, config)
-		}()
-
-		t.Cleanup(func() {
-			stop()
-
-			select {
-			case err := <-r.done:
-				if err != nil {
-					t.Error(err)
-				}
-			case <-time.After(12 * time.Second):
-				t.Error("replica shutdown exceeded bound")
-			}
-		})
-	}
-
-	// Test-local leader selection and TokenReview, but the production TLS route,
-	// controller Pod/SA checks, bounded decoder and durable install are exercised.
-	leader := replicas[0]
-	leader.a.Replication.leader = leader.ctx
-
-	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: f.a.Topology.Config.Namespace, Name: f.a.Topology.Config.ControllerServiceAccount, UID: "smoke-controller-sa"}}
-	if err := f.a.Topology.Create(ctx, sa); err != nil {
-		t.Fatal(err)
-	}
-
-	tokens := map[string]*corev1.Pod{}
-
-	for i := 1; i < len(replicas); i++ {
-		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: sa.Namespace, Name: fmt.Sprintf("controller-%d", i), UID: types.UID(fmt.Sprintf("controller-uid-%d", i))}, Spec: corev1.PodSpec{ServiceAccountName: sa.Name}}
-		if err := f.a.Topology.Create(ctx, pod); err != nil {
-			t.Fatal(err)
-		}
-
-		tokens[f.token+strconv.Itoa(i)] = pod
-	}
-
-	var reviews atomic.Int64
-
-	leader.a.Replication.Client = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
-		review, ok := obj.(*authv1.TokenReview)
-		if !ok {
-			return fmt.Errorf("unexpected API create %T", obj)
-		}
-
-		reviews.Add(1)
-
-		pod := tokens[review.Spec.Token]
-		if pod == nil || !slices.Equal(review.Spec.Audiences, []string{ReplicationAudience}) {
-			return nil
-		}
-
-		review.Status = authv1.TokenReviewStatus{Authenticated: true, Audiences: []string{ReplicationAudience}, User: authv1.UserInfo{Username: "system:serviceaccount:" + sa.Namespace + ":" + sa.Name, UID: string(sa.UID), Extra: map[string]authv1.ExtraValue{"authentication.kubernetes.io/pod-name": {pod.Name}, "authentication.kubernetes.io/pod-uid": {string(pod.UID)}}}}
-
-		return nil
-	}})
-	fixtureDependencies[leader.a.authority].Client = leader.a.Replication.Client
-
-	// Initial publisher installation uses the same canonical/durable validation.
-	image, err := wire.DecodePublication(strings.NewReader(base.encoded))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := leader.a.Replication.installReplica(ctx, leader.ctx, image); err != nil {
-		t.Fatal(err)
-	}
-
-	internal := f.client(t, nil)
-	internal.Timeout = 30 * time.Second
-	replicate := func(publication *CommittedPublication) {
-		t.Helper()
-
-		start := time.Now()
-
-		for i, r := range replicas {
-			if i == 0 || r.ctx.Err() != nil {
-				continue
-			}
-
-			request, err := http.NewRequestWithContext(ctx, http.MethodGet, leader.endpoint+ReplicationPath, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			request.Header.Set("Authorization", "Bearer "+f.token+strconv.Itoa(i))
-
-			response, err := internal.Do(request)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			image, decodeErr := wire.DecodePublication(response.Body)
-
-			closeErr := response.Body.Close()
-			if response.StatusCode != http.StatusOK || decodeErr != nil || closeErr != nil {
-				t.Fatalf("replication status=%d decode=%v close=%v", response.StatusCode, decodeErr, closeErr)
-			}
-
-			if err := r.a.Replication.installReplica(ctx, r.ctx, image); err != nil {
-				t.Fatal(err)
-			}
-
-			_, err = r.a.authority.Current()
-			if err != nil || capturePublication(t, r.a.authority).encoded != publication.encoded {
-				t.Fatal("replica diverged", err)
-			}
-		}
-
-		t.Logf("replication sequence=%d elapsed=%s mock_token_reviews=%d", publication.record.Sequence, time.Since(start), reviews.Load())
-	}
-	replicate(base)
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, leader.endpoint+wire.SnapshotPath, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	response, err := internal.Do(request)
-	responseBody(t, response, err, http.StatusUnauthorized)
-
-	request, err = http.NewRequestWithContext(ctx, http.MethodGet, leader.endpoint+ReplicationPath, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	response, err = internal.Do(request)
-	responseBody(t, response, err, http.StatusUnauthorized)
-
-	// Keep production freshness bounds; periodic authority observations are fake
-	// Kubernetes reads, never fake dataplane polls or extended freshness windows.
-	observed := make(chan struct{})
-
-	go func() {
-		defer close(observed)
-
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				for _, r := range replicas {
-					if r.ctx.Err() == nil {
-						r.a.Replication.observe(r.ctx)
-					}
-				}
-			}
-		}
-	}()
-
-	defer func() { cancel(); <-observed }()
-
-	t.Logf("clients=%d replicas=3 GOMAXPROCS=%d setup=%s full_bytes=%d max_writes=%d max_auth=%d", count, runtime.GOMAXPROCS(0), time.Since(setup), len(base.encoded), leader.a.Server.Config.Limits.MaxConcurrentWrites, leader.a.Server.Config.Limits.MaxConcurrentBootstrap)
-	replicationSmokeStats(t, "baseline", replicas)
-
-	var (
-		overloaded, reconnected atomic.Int64
-		workers                 sync.WaitGroup
-	)
-
-	defer func() { cancel(); workers.Wait() }()
-
-	run := func(after wire.Sequence, cold bool) <-chan replicationSmokeResult {
-		results := make(chan replicationSmokeResult, count)
-		slots := make(chan struct{}, 24)
-
-		for i := range peers {
-			workers.Go(func() {
-				if cold {
-					select {
-					case slots <- struct{}{}:
-					case <-ctx.Done():
-						results <- replicationSmokeResult{index: i, err: ctx.Err()}
-						return
-					}
-
-					defer func() { <-slots }()
-				}
-
-				start := time.Now()
-				result := replicationSmokeResult{index: i}
-
-				defer func() { result.elapsed = time.Since(start); results <- result }()
-
-				for attempt := range 6 {
-					peer := &peers[i]
-					r := replicas[peer.replica]
-
-					path := r.endpoint + wire.SnapshotPath
-					if after != 0 {
-						path += fmt.Sprintf("?after=%d", after)
-					}
-
-					request, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
-					if err != nil {
-						result.err = err
-						return
-					}
-
-					response, err := peer.client.Do(request)
-					if err != nil {
-						if r.ctx.Err() != nil && ctx.Err() == nil {
-							peer.replica = i % 2
-
-							reconnected.Add(1)
-
-							continue
-						}
-
-						result.err = err
-
-						return
-					}
-
-					hash := sha256.New()
-					result.bytes, err = io.Copy(hash, io.LimitReader(response.Body, wire.MaxPublicationBytes+1))
-
-					closeErr := response.Body.Close()
-					if r.ctx.Err() != nil && ctx.Err() == nil && (err != nil || response.StatusCode == http.StatusServiceUnavailable) {
-						peer.replica = i % 2
-
-						reconnected.Add(1)
-
-						continue
-					}
-
-					if err != nil || closeErr != nil {
-						result.err = fmt.Errorf("body read=%v close=%v", err, closeErr)
-						return
-					}
-
-					if response.StatusCode == http.StatusTooManyRequests {
-						overloaded.Add(1)
-
-						if !replicationSleep(ctx, time.Second+time.Duration((i*31+attempt*97)%900)*time.Millisecond) {
-							break
-						}
-
-						continue
-					}
-
-					if response.StatusCode != http.StatusOK || response.TLS == nil || response.TLS.Version != tls.VersionTLS13 {
-						result.err = fmt.Errorf("HTTP status %d or missing TLS 1.3", response.StatusCode)
-						return
-					}
-
-					copy(result.digest[:], hash.Sum(nil))
-
-					return
-				}
-
-				result.err = fmt.Errorf("six-attempt request budget exhausted")
-			})
-		}
-
-		return results
-	}
-
-	collect := func(phase string, started time.Time, results <-chan replicationSmokeResult, want *CommittedPublication) {
-		t.Helper()
-
-		digest := sha256.Sum256([]byte(want.encoded))
-		latencies := make([]time.Duration, 0, count)
-
-		var total int64
-
-		for range peers {
-			select {
-			case result := <-results:
-				if result.err != nil || result.digest != digest || result.bytes != int64(len(want.encoded)) {
-					t.Fatalf("%s client=%d bytes=%d err=%v digest_match=%v", phase, result.index, result.bytes, result.err, result.digest == digest)
-				}
-
-				total += result.bytes
-				latencies = append(latencies, result.elapsed)
-			case <-ctx.Done():
-				t.Fatal(ctx.Err())
-			}
-		}
-
-		slices.Sort(latencies)
-		t.Logf("phase=%s clients=%d all_delivered=%s request_p50=%s request_p99=%s bytes=%d cumulative_429=%d reconnects=%d", phase, count, time.Since(started), latencies[len(latencies)/2], latencies[(len(latencies)-1)*99/100], total, overloaded.Load(), reconnected.Load())
-		replicationSmokeStats(t, phase, replicas)
-	}
-	start := time.Now()
-	collect("cold", start, run(0, true), base)
-
-	for phase := range 2 {
-		start = time.Now()
-		results := run(base.record.Sequence, false)
-		replicationSmokePark(t, ctx, replicas, count, results)
-		replicationSmokeStats(t, "parked", replicas)
-
-		if phase == 1 {
-			replicas[2].cancel()
-			replicationSmokePark(t, ctx, replicas[:2], count, results)
-			t.Logf("failure_repark=%s", time.Since(start))
-			replicationSmokeStats(t, "failure-parked", replicas)
-		}
-
-		for id, member := range accepted {
-			member.Shares++
-			accepted[id] = member
-		}
-
-		start = time.Now()
-		base = replicationSmokePublish(t, ctx, f.a.Topology, accepted)
-
-		image, err := wire.DecodePublication(strings.NewReader(base.encoded))
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if err := leader.a.Replication.installReplica(ctx, leader.ctx, image); err != nil {
-			t.Fatal(err)
-		}
-
-		replicate(base)
-		collect([]string{"update", "replica-failure-update"}[phase], start, results, base)
-	}
-
-	if reconnected.Load() != int64(count/3) {
-		t.Fatalf("reconnected=%d want=%d", reconnected.Load(), count/3)
-	}
-}
-
-func replicationSmokeLifecycle(l *Lifecycle, ctx context.Context) {
-	l.process, l.synced = ctx, true
-}
-
-func replicationSmokePublish(t *testing.T, ctx context.Context, r *TopologyReconciler, accepted AcceptedMembers) *CommittedPublication {
-	t.Helper()
-
-	_, err := r.authority.PublishTopology(ctx, func(context.Context) (TopologyObservation, error) {
-		nodes := corev1.NodeList{}
-
-		for id, member := range accepted {
-			encoded, err := json.Marshal(member)
-			if err != nil {
-				return TopologyObservation{}, err
-			}
-
-			nodes.Items = append(nodes.Items, corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: string(id), UID: types.UID(id), Annotations: map[string]string{admittedMemberAnnotation: string(encoded), wire.SharesAnnotation: strconv.FormatUint(uint64(member.Shares), 10)}}})
-		}
-
-		return TopologyObservation{Nodes: nodes, Input: members.Input{Nodes: nodes.Items, PeerPort: r.Config.PeerPort}}, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return capturePublication(t, r.authority)
-}
-
-func replicationSmokePark(t *testing.T, ctx context.Context, replicas []*replicationSmokeReplica, count int, results <-chan replicationSmokeResult) {
-	t.Helper()
-
-	deadline, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-
-	for {
-		select {
-		case result := <-results:
-			t.Fatalf("client %d completed before publication: %v", result.index, result.err)
-		default:
-		}
-
-		total := 0
-
-		for _, r := range replicas {
-			total += r.a.Server.polls.count()
-		}
-
-		if total == count {
-			return
-		}
-
-		if !replicationSleep(deadline, 10*time.Millisecond) {
-			t.Fatalf("parked %d/%d real HTTPS requests before deadline", total, count)
-		}
-	}
-}
-
-func replicationSmokeStats(t *testing.T, phase string, replicas []*replicationSmokeReplica) {
-	t.Helper()
-
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
-
-	var polls, live, accepted []int64
-
-	for _, r := range replicas {
-		polls = append(polls, int64(r.a.Server.polls.count()))
-		live = append(live, r.listener.live.Load())
-		accepted = append(accepted, r.listener.accepted.Load())
-	}
-
-	status, _ := os.ReadFile("/proc/self/status")
-
-	var resource []string
-
-	for _, line := range strings.Split(string(status), "\n") {
-		if strings.HasPrefix(line, "VmRSS:") || strings.HasPrefix(line, "VmHWM:") || strings.HasPrefix(line, "Threads:") {
-			resource = append(resource, strings.TrimSpace(line))
-		}
-	}
-
-	fds, _ := os.ReadDir("/proc/self/fd")
-	t.Logf("resources phase=%s polls=%v live_tcp=%v accepted_tcp=%v heap=%d stack=%d total_alloc=%d goroutines=%d fd=%d process=%v", phase, polls, live, accepted, mem.HeapAlloc, mem.StackInuse, mem.TotalAlloc, runtime.NumGoroutine(), len(fds), resource)
 }
 
 func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
@@ -1916,90 +1246,60 @@ func TestTrustAuthorityImmediateCompletion(t *testing.T) {
 
 			for _, change := range []string{"invalidate", "recover", "rotate"} {
 				t.Run(route+"/"+stage+"/"+change, func(t *testing.T) {
-					synctest.Test(t, func(t *testing.T) {
-						f := newServingFixture(t)
-						s := f.a.Server
-
-						request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
-
-						switch route {
-						case "bootstrap":
-							encoded, err := wire.EncodeBootstrapRequest(f.request)
-							if err != nil {
-								t.Fatal(err)
-							}
-
-							request = httptest.NewRequest(http.MethodPost, wire.BootstrapPath, bytes.NewReader(encoded))
-							request.Header.Set("Content-Type", "application/json")
-							request.Header.Set("Authorization", "Bearer "+f.token)
-						case "keyring":
-							request = httptest.NewRequest(http.MethodGet, wire.KeyringPath, nil)
-						case "keyring empty":
-							request = httptest.NewRequest(http.MethodGet, wire.KeyringPath+"?after=1", nil)
-							// Keep both stores fresh throughout the no-change poll.
-							configureFixtureAge(t, f, 2*wire.PollWait)
-						}
-
-						request.TLS = f.requestState(t)
-						called := false
-						changeAuthority := func() {
-							called = true
-
-							if change != "rotate" {
-								withdrawServerTrust(t, s)
-							}
-
-							if change != "invalidate" {
-								if change == "recover" {
-									restoreServerTrust(t, s)
-								} else {
-									rotateFixtureTrust(t, f)
-								}
-							}
-							// Deliberately do not yield or wait for cancellation callbacks.
-						}
-
-						w := &completionResponse{ResponseRecorder: httptest.NewRecorder()}
-						if stage == "write" {
-							w.onWrite = changeAuthority
-						} else {
-							w.onFlush = changeAuthority
-						}
-
-						var aborted any
-
-						func() {
-							defer func() { aborted = recover() }()
-
-							s.Handler().ServeHTTP(w, request)
-						}()
-
-						if !called {
-							t.Fatal("completion hook not reached", w.Code)
-						}
-
-						if change == "rotate" {
-							if aborted != nil {
-								t.Fatalf("ordinary rotation aborted admitted response: %v", aborted)
-							}
-						} else if aborted != http.ErrAbortHandler {
-							t.Fatalf("revoked response completed: %v", aborted)
-						}
-
-						if len(s.writes) != 0 || len(s.bootstrapSlots) != 0 || s.keyringPolls.count() != 0 || s.polls.count() != 0 {
-							t.Fatal("completion leaked admission")
-						}
-					})
+					synctest.Test(t, func(t *testing.T) { testTrustCompletion(t, route, stage, change) })
 				})
 			}
 		}
 	}
 }
 
+func testTrustCompletion(t *testing.T, route, stage, change string) {
+	t.Helper()
+	f := newServingFixture(t)
+	s := f.a.Server
+
+	request := f.publicRequest(t, route)
+	called := false
+	changeAuthority := func() {
+		called = true
+
+		if change != "rotate" {
+			withdrawServerTrust(t, s)
+		}
+
+		if change == "recover" {
+			restoreServerTrust(t, s)
+		}
+
+		if change == "rotate" {
+			rotateFixtureTrust(t, f)
+		}
+		// Deliberately do not yield or wait for cancellation callbacks.
+	}
+
+	w := &completionResponse{ResponseRecorder: httptest.NewRecorder()}
+	if stage == "write" {
+		w.onWrite = changeAuthority
+	} else {
+		w.onFlush = changeAuthority
+	}
+
+	aborted := serveRecover(s.Handler(), w, request)
+	require.True(t, called, "completion hook not reached: %d", w.Code)
+
+	if change == "rotate" {
+		require.Nil(t, aborted, "ordinary rotation aborted admitted response")
+	} else {
+		require.Equal(t, http.ErrAbortHandler, aborted, "revoked response completed")
+	}
+
+	requireNoAdmission(t, s)
+}
+
 func TestTrustAuthoritySynchronousRevocation(t *testing.T) {
 	f := newServingFixture(t)
 
-	ctx, cancel, err := f.a.authority.TrustContext(t.Context())
+	guard, cancel, err := f.a.authority.AdmitTrust(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2007,7 +1307,7 @@ func TestTrustAuthoritySynchronousRevocation(t *testing.T) {
 
 	withdrawServerTrust(t, f.a.Server)
 
-	if ctx.Err() != context.Canceled {
+	if guard.Check(t.Context()) != context.Canceled {
 		t.Fatal("revocation depends on callback scheduling")
 	}
 }
@@ -2025,23 +1325,7 @@ func TestPublicBlockedWriteTrustAuthority(t *testing.T) {
 					defer server.Close()
 					defer peer.Close()
 
-					request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
-					if route == "keyring" {
-						request = httptest.NewRequest(http.MethodGet, wire.KeyringPath, nil)
-					}
-
-					if route == "bootstrap" {
-						encoded, err := wire.EncodeBootstrapRequest(f.request)
-						if err != nil {
-							t.Fatal(err)
-						}
-
-						request = httptest.NewRequest(http.MethodPost, wire.BootstrapPath, bytes.NewReader(encoded))
-						request.Header.Set("Content-Type", "application/json")
-						request.Header.Set("Authorization", "Bearer "+f.token)
-					}
-
-					request.TLS = f.requestState(t)
+					request := f.publicRequest(t, route)
 					request = request.WithContext(connectionContext(f.ctx, server))
 					w := &pipeResponse{ResponseRecorder: httptest.NewRecorder(), conn: server}
 					done := make(chan any, 1)
@@ -2050,9 +1334,7 @@ func TestPublicBlockedWriteTrustAuthority(t *testing.T) {
 
 					synctest.Wait()
 
-					if len(s.writes) != 1 {
-						t.Fatal("response not blocked in write")
-					}
+					require.Len(t, s.writes, 1, "response not blocked in write")
 
 					start := time.Now()
 
@@ -2069,40 +1351,28 @@ func TestPublicBlockedWriteTrustAuthority(t *testing.T) {
 					case "reconfirm":
 						time.Sleep(3 * time.Second)
 
-						if _, err := f.a.authority.ReconcileCredentials(t.Context()); err != nil {
-							t.Fatal(err)
-						}
+						_, err := f.a.authority.ReconcileCredentials(t.Context())
+						require.NoError(t, err)
 
 						reconcileTopology(t, f.a.Topology, f.ctx)
 
 						time.Sleep(2 * time.Second)
 					}
 
-					if aborted := <-done; aborted != http.ErrAbortHandler {
-						t.Fatalf("blocked response did not abort: %v", aborted)
-					}
+					require.Equal(t, http.ErrAbortHandler, <-done, "blocked response did not abort")
 
 					want := time.Duration(0)
 					if change == "expire" || change == "reconfirm" {
 						want = 5 * time.Second
 					}
 
-					if elapsed := time.Since(start); elapsed != want {
-						t.Fatalf("trust cancellation took %s, want %s", elapsed, want)
-					}
-
-					if f.a.authority.PublicationReady() != nil {
-						t.Fatal("test must retain fresh publication independently of trust")
-					}
-
-					if len(s.writes) != 0 || len(s.bootstrapSlots) != 0 {
-						t.Fatal("write or bootstrap admission leaked")
-					}
+					require.Equal(t, want, time.Since(start), "trust cancellation delay")
+					require.NoError(t, f.a.authority.PublicationReady(), "test must retain fresh publication independently of trust")
+					require.Empty(t, s.writes)
+					require.Empty(t, s.bootstrapSlots)
 
 					if change == "invalidate recover" || change == "reconfirm" {
-						if err := f.a.authority.TrustReady(); err != nil {
-							t.Fatal("new requests should have usable trust", err)
-						}
+						require.NoError(t, f.a.authority.TrustReady(), "new requests should have usable trust")
 					}
 				})
 			})
@@ -2115,12 +1385,13 @@ func TestTrustRotationKeepsAdmittedResponseBounded(t *testing.T) {
 		f := newServingFixture(t)
 		configureFixtureAge(t, f, 5*time.Second)
 
-		ctx, cancel, err := f.a.authority.TrustContext(t.Context())
+		guard, cancel, err := f.a.authority.AdmitTrust(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer cancel()
 
+		ctx := guard.Context()
 		deadline, _ := ctx.Deadline()
 
 		time.Sleep(3 * time.Second)
@@ -2148,310 +1419,6 @@ func TestTrustRotationKeepsAdmittedResponseBounded(t *testing.T) {
 	})
 }
 
-type cachedScaleClient struct {
-	client.Client
-	reader client.Reader
-}
-
-func (c cachedScaleClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	return c.reader.Get(ctx, key, obj, opts...)
-}
-
-func (c cachedScaleClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	return c.reader.List(ctx, list, opts...)
-}
-
-// The informer uses a synthetic list/watch HTTP source, but the cache, field
-// index, deep copies, reconciler, canonical hashes, encoding and waiting are real.
-// Only durable version CAS uses a fake client. This is deliberately not an HTTPS
-// authentication or API-server capacity benchmark.
-func TestServerScale(t *testing.T) {
-	if os.Getenv("RACER_SCALE") != "1" {
-		t.Skip("set RACER_SCALE=1 for 100,000-member reconciliation and waiter measurements")
-	}
-
-	for _, count := range []int{1_000, 10_000, 100_000} {
-		t.Run(fmt.Sprint(count), func(t *testing.T) {
-			r := initializedTopology(t)
-
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-
-			reader := scaleCache(t, r, count)
-			r.Client = cachedScaleClient{Client: r.Client, reader: reader}
-
-			runtime.GC()
-
-			var before, after runtime.MemStats
-			runtime.ReadMemStats(&before)
-
-			start := time.Now()
-			first := reconcileTopology(t, r, ctx)
-			cold := time.Since(start)
-
-			runtime.ReadMemStats(&after)
-
-			if len(acceptedMembers(t, r)) != count {
-				t.Fatalf("accepted %d of %d", len(acceptedMembers(t, r)), count)
-			}
-
-			t.Logf("members=%d cold_reconcile=%s allocated_bytes=%d publication_bytes=%d", count, cold, after.TotalAlloc-before.TotalAlloc, len(first.encoded))
-
-			start = time.Now()
-
-			if current := reconcileTopology(t, r, ctx); current.record != first.record || current.encoded != first.encoded {
-				t.Fatal("no-op reconcile replaced publication")
-			}
-
-			t.Logf("members=%d unchanged_reconcile=%s", count, time.Since(start))
-
-			if count == 100_000 {
-				scaleFanout(t, r, ctx, count)
-			}
-		})
-	}
-}
-
-func TestScaleNoopPublicationState(t *testing.T) {
-	f := newServingFixture(t)
-	first := capturePublication(t, f.a.authority)
-	current := reconcileTopology(t, f.a.Topology, f.ctx)
-	require.NotSame(t, first, current)
-	require.Equal(t, first.record, current.record)
-	require.Equal(t, first.encoded, current.encoded)
-
-	var node corev1.Node
-	require.NoError(t, f.a.Topology.Get(f.ctx, client.ObjectKey{Name: "worker"}, &node))
-	node.Labels = map[string]string{wire.ExclusionLabel: ""}
-	require.NoError(t, f.a.Topology.Update(f.ctx, &node))
-	changed := reconcileTopology(t, f.a.Topology, f.ctx)
-	require.NotEqual(t, first.record, changed.record)
-	require.NotEqual(t, first.encoded, changed.encoded)
-}
-
-func scaleCache(t *testing.T, r *TopologyReconciler, count int) cache.Cache {
-	t.Helper()
-
-	nodes := &corev1.NodeList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "NodeList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}}
-	pods := &corev1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}}
-
-	for i := range count {
-		uid := types.UID(fmt.Sprintf("%08x-0000-4000-8000-000000000000", i))
-		node := memberNode()
-		node.Name, node.UID, node.ResourceVersion = fmt.Sprintf("node-%d", i), uid, "1"
-		node.Annotations = map[string]string{wire.RDMANICsAnnotation: `[{"rail":0,"device":"mlx5_0","port":1,"numa_node":0},{"rail":1,"device":"mlx5_1","port":1,"numa_node":1}]`}
-		pod := memberPod(uid, 1, fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&255, i&255))
-		pod.Spec.NodeName, pod.ResourceVersion = node.Name, "1"
-		pod.OwnerReferences[0].Name = r.Config.DaemonSetName
-
-		nodes.Items, pods.Items = append(nodes.Items, node), append(pods.Items, pod)
-	}
-
-	ds := &appsv1.DaemonSetList{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSetList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}, Items: []appsv1.DaemonSet{{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.DaemonSetName, UID: testDaemonSetUID, ResourceVersion: "1"}}}}
-
-	volumes := &racerv1.ClusterVolumeList{TypeMeta: metav1.TypeMeta{APIVersion: racerv1.GroupVersion.String(), Kind: "ClusterVolumeList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}}
-	for i := range 16 {
-		volumes.Items = append(volumes.Items, catalogVolume(fmt.Sprintf("cache-%d", i), types.UID(fmt.Sprintf("%08x-1111-4000-8000-000000000000", i))))
-		if err := r.Create(t.Context(), &volumes.Items[i]); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	runKeys(t, Assemble(r.Config, r.Client, r.APIReader).Keyring)
-
-	lists := map[string]any{
-		"/api/v1/nodes": nodes,
-		"/api/v1/namespaces/" + r.Config.Namespace + "/pods":             pods,
-		"/apis/apps/v1/namespaces/" + r.Config.Namespace + "/daemonsets": ds,
-		"/apis/" + racerv1.GroupVersion.String() + "/clustervolumes":     volumes,
-	}
-	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		if req.URL.Query().Get("sendInitialEvents") == "true" {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Failure", Reason: metav1.StatusReasonBadRequest, Code: 400, Message: "synthetic source supports ordinary list/watch"})
-
-			return
-		}
-
-		if req.URL.Query().Get("watch") == "true" {
-			w.WriteHeader(http.StatusOK)
-			http.NewResponseController(w).Flush()
-			<-req.Context().Done()
-
-			return
-		}
-
-		list, ok := lists[req.URL.Path]
-		if !ok {
-			http.NotFound(w, req)
-			return
-		}
-
-		json.NewEncoder(w).Encode(list)
-	}))
-	t.Cleanup(source.Close)
-
-	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{corev1.SchemeGroupVersion, appsv1.SchemeGroupVersion, racerv1.GroupVersion})
-	mapper.Add(corev1.SchemeGroupVersion.WithKind("Node"), meta.RESTScopeRoot)
-	mapper.Add(corev1.SchemeGroupVersion.WithKind("Pod"), meta.RESTScopeNamespace)
-	mapper.Add(corev1.SchemeGroupVersion.WithKind("PodList"), meta.RESTScopeNamespace)
-	mapper.Add(corev1.SchemeGroupVersion.WithKind("Secret"), meta.RESTScopeNamespace)
-	mapper.Add(corev1.SchemeGroupVersion.WithKind("ConfigMap"), meta.RESTScopeNamespace)
-	mapper.Add(appsv1.SchemeGroupVersion.WithKind("DaemonSet"), meta.RESTScopeNamespace)
-	mapper.Add(racerv1.GroupVersion.WithKind("ClusterVolume"), meta.RESTScopeRoot)
-
-	options := cache.Options{ByObject: map[client.Object]cache.ByObject{
-		&corev1.Pod{}:       {Namespaces: map[string]cache.Config{r.Config.Namespace: {}}},
-		&corev1.Secret{}:    {Namespaces: map[string]cache.Config{r.Config.Namespace: {}}, Field: fields.OneTermEqualSelector("metadata.name", r.Config.CredentialsSecretName)},
-		&corev1.ConfigMap{}: {Namespaces: map[string]cache.Config{r.Config.Namespace: {}}},
-		&appsv1.DaemonSet{}: {Namespaces: map[string]cache.Config{r.Config.Namespace: {}}},
-	}}
-	options.Scheme, options.Mapper = r.Scheme(), mapper
-
-	reader, err := cache.New(&rest.Config{Host: source.URL, QPS: 1000, Burst: 1000}, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := reader.IndexField(t.Context(), &corev1.Pod{}, podNodeIndex, podNodeKeys); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, obj := range []client.Object{&corev1.Node{}, &appsv1.DaemonSet{}, &racerv1.ClusterVolume{}} {
-		if _, err := reader.GetInformer(t.Context(), obj); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-
-	done := make(chan error, 1)
-
-	go func() { done <- reader.Start(ctx) }()
-
-	t.Cleanup(func() {
-		cancel()
-
-		if err := <-done; err != nil {
-			t.Error(err)
-		}
-	})
-
-	syncCtx, stopSync := context.WithTimeout(ctx, time.Minute)
-	defer stopSync()
-
-	if !reader.WaitForCacheSync(syncCtx) {
-		t.Fatal("scale informer did not synchronize")
-	}
-
-	return reader
-}
-
-func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count int) {
-	t.Helper()
-
-	current, err := r.authority.Current()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Keep both realistic full-size encodings alive. Prepare before admission so
-	// fanout measures Install plus delivery, independent of canonical encoding.
-	members := make(AcceptedMembers, count)
-
-	for id, member := range acceptedMembers(t, r) {
-		member.Shares++
-		members[id] = member
-	}
-
-	sequence := current.Sequence()
-	server := &Server{Config: r.Config.ServerConfig}
-	server.initializeAdmission()
-
-	waiting, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	results := make(chan *authority.PublicationHandle, count)
-	failures := make(chan error, count)
-
-	var wg sync.WaitGroup
-
-	runtime.GC()
-	runtime.GC() // Clear temporary encoding sync.Pools before the waiter baseline.
-
-	var before, parked runtime.MemStats
-	runtime.ReadMemStats(&before)
-
-	start := time.Now()
-
-	for id := range members {
-		wg.Go(func() {
-			if !server.admitPoll(id) {
-				results <- nil
-
-				failures <- wire.Overloaded
-
-				return
-			}
-			defer server.releasePoll(id)
-
-			p, err := waitFixturePublication(waiting, r.authority, sequence)
-			results <- p
-
-			failures <- err
-		})
-	}
-
-	defer wg.Wait()
-	defer cancel()
-
-	eventually(t, "100000 admitted waiters", func() bool {
-		return server.polls.count() == count
-	})
-
-	admit := time.Since(start)
-
-	runtime.GC()
-	runtime.ReadMemStats(&parked)
-
-	if server.admitPoll(testOtherUID) {
-		t.Fatal("global bound failed")
-	}
-
-	for id := range members {
-		if server.admitPoll(id) {
-			t.Fatal("duplicate bound failed")
-		}
-
-		break
-	}
-
-	start = time.Now()
-
-	next := replicationSmokePublish(t, ctx, r, members)
-
-	install := time.Since(start)
-
-	wg.Wait()
-
-	fanout := time.Since(start)
-
-	for range count {
-		if err := <-failures; err != nil {
-			t.Fatal(err)
-		}
-
-		if got := <-results; got == nil || got.Sequence() != next.record.Sequence {
-			t.Fatal("waiter missed or copied full publication")
-		}
-	}
-
-	awaitServerPolls(t, server, 0)
-	t.Logf("waiters=%d GOMAXPROCS=%d admission=%s install=%s all_delivered=%s heap_delta=%d stack_delta=%d next_bytes=%d", count, runtime.GOMAXPROCS(0), admit, install, fanout, int64(parked.HeapAlloc)-int64(before.HeapAlloc), int64(parked.StackInuse)-int64(before.StackInuse), len(next.encoded))
-}
-
 func eventually(t *testing.T, description string, ready func() bool) {
 	t.Helper()
 
@@ -2474,18 +1441,14 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 
 	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: "racer-controller", UID: "controller-sa"}}
 	for _, obj := range []client.Object{pod, sa} {
-		if err := r.Client.Create(f.ctx, obj); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, r.Client.Create(f.ctx, obj))
 	}
 
 	username := "system:serviceaccount:" + r.Config.Namespace + ":racer-controller"
 	audience := ReplicationAudience
 	r.Client = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
 		review := obj.(*authv1.TokenReview)
-		if len(review.Spec.Audiences) != 1 || review.Spec.Audiences[0] != ReplicationAudience {
-			t.Fatal("wrong review audience")
-		}
+		require.Equal(t, []string{ReplicationAudience}, review.Spec.Audiences, "wrong review audience")
 
 		review.Status = authv1.TokenReviewStatus{Authenticated: true, Audiences: []string{audience}, User: authv1.UserInfo{Username: username, UID: string(sa.UID), Extra: map[string]authv1.ExtraValue{"authentication.kubernetes.io/pod-name": {pod.Name}, "authentication.kubernetes.io/pod-uid": {string(pod.UID)}}}}
 
@@ -2496,74 +1459,7 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 	for _, unchanged := range []bool{false, true} {
 		for _, fail := range []bool{false, true} {
 			t.Run(fmt.Sprintf("blocked flush unchanged=%v failure=%v", unchanged, fail), func(t *testing.T) {
-				request := httptest.NewRequest(http.MethodGet, ReplicationPath, nil)
-				request.TLS = f.requestState(t)
-				request.Header.Set("Authorization", "Bearer "+f.token)
-
-				want := http.StatusOK
-
-				if unchanged {
-					p, err := r.authority.Current()
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					request.URL.RawQuery = fmt.Sprintf("after=%d", p.Sequence())
-					want = http.StatusNoContent
-				}
-
-				w := &blockingResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), unblock: make(chan struct{}), blockFlush: true, fail: fail}
-
-				unblock := sync.OnceFunc(func() { close(w.unblock) })
-				defer unblock()
-
-				done := make(chan any, 1)
-
-				go func() { defer func() { done <- recover() }(); f.a.Server.Handler().ServeHTTP(w, request) }()
-
-				select {
-				case <-w.entered:
-				case <-time.After(8 * time.Second):
-					t.Fatal("explicit flush not reached")
-				}
-
-				if len(f.a.Server.writes) != 1 {
-					t.Fatal("write admission released before flush")
-				}
-
-				held := f.a.Server.replicationPolls.count() == 1
-
-				if !held {
-					t.Fatal("poll admission released before flush")
-				}
-
-				duplicate := httptest.NewRecorder()
-				f.a.Server.Handler().ServeHTTP(duplicate, request.Clone(f.ctx))
-
-				if duplicate.Code != http.StatusTooManyRequests {
-					t.Fatalf("duplicate during flush: %d", duplicate.Code)
-				}
-
-				unblock()
-
-				var wantAbort any
-				if fail {
-					wantAbort = http.ErrAbortHandler
-				}
-
-				if aborted := <-done; aborted != wantAbort || w.Code != want {
-					t.Fatalf("flush result %v status %d", aborted, w.Code)
-				}
-
-				if len(f.a.Server.writes) != 0 {
-					t.Fatal("write admission leaked after flush")
-				}
-
-				held = f.a.Server.replicationPolls.count() != 0
-
-				if held {
-					t.Fatal("poll admission leaked after flush")
-				}
+				testReplicationFlush(t, f, unchanged, fail)
 			})
 		}
 	}
@@ -2574,11 +1470,7 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 	}{{"controller", 200}, {"duplicate poll", 429}, {"dataplane", 403}, {"wrong audience", 401}} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.name == "duplicate poll" {
-				f.a.Server.initializeAdmission()
-
-				if !f.a.Server.replicationPolls.acquire(string(pod.UID)) {
-					t.Fatal("could not reserve replication poll")
-				}
+				require.True(t, f.a.Server.replicationPolls.acquire(string(pod.UID)), "could not reserve replication poll")
 				defer f.a.Server.replicationPolls.release(string(pod.UID))
 			}
 
@@ -2597,9 +1489,7 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 			response := httptest.NewRecorder()
 			f.a.Server.Handler().ServeHTTP(response, request)
 
-			if response.Code != tc.code {
-				t.Fatal(response.Code, response.Body.String())
-			}
+			require.Equal(t, tc.code, response.Code, response.Body.String())
 		})
 	}
 	// TLS must be reachable before public readiness, including before trust is
@@ -2662,35 +1552,54 @@ func (w *pipeResponse) SetWriteDeadline(deadline time.Time) error {
 
 func TestRevokedDeltaCannotBorrowNewAuthority(t *testing.T) {
 	r := initializedTopology(t)
-	p := reconcileTopology(t, r, t.Context())
-	copy := *p
-	copy.delta = "delta"
-	copy.deltaBase = "base"
-	delta := copy.ForBase("base")
+	membership := AcceptedMembers{}
 
-	writeCtx, cancel, err := copy.writeContext(t.Context())
+	for i := range 100 {
+		id := wire.NodeID(fmt.Sprintf("22222222-2222-4222-8222-%012d", i))
+		membership[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: "192.0.2.1:8082", RDMANICs: []wire.RDMANIC{}}
+	}
+
+	base := replicationSmokePublish(t, t.Context(), r, membership)
+	id := wire.NodeID("22222222-2222-4222-8222-000000000000")
+	member := membership[id]
+	member.Shares++
+	membership[id] = member
+	p := replicationSmokePublish(t, t.Context(), r, membership)
+	delta := p.handle.ForBase(base.record.Sequence, base.record.ContentHash)
+
+	guard, cancel, err := p.admit(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cancel()
 
+	var encoded bytes.Buffer
+
+	_, err = delta.WriteTo(t.Context(), guard, &encoded)
+	require.NoError(t, err)
+	require.Less(t, encoded.Len(), len(p.encoded), "test must exercise the real delta response")
+	baseImage, err := wire.DecodePublication(strings.NewReader(base.encoded))
+	require.NoError(t, err)
+	_, err = wire.ApplyDelta(baseImage, &encoded)
+	require.NoError(t, err)
+
 	restore := withdrawPublication(t, r)
 	restore()
 	reconcileTopology(t, r, t.Context())
 
-	<-writeCtx.Done()
+	<-guard.Context().Done()
 
-	if _, err := delta.writeTo(writeCtx, io.Discard); !errors.Is(err, context.Canceled) {
+	if _, err := delta.WriteTo(t.Context(), guard, io.Discard); !errors.Is(err, context.Canceled) {
 		t.Fatalf("revoked delta: %v", err)
 	}
 
-	if _, _, err := copy.writeContext(t.Context()); !errors.Is(err, wire.Unavailable) {
+	if _, _, err := p.admit(t.Context()); !errors.Is(err, wire.Unavailable) {
 		t.Fatalf("old image borrowed new authority: %v", err)
 	}
 }
 
 func TestSnapshotAuthorityHeldThroughFlush(t *testing.T) {
-	for _, action := range []string{"suspend", "freshness"} {
+	for _, action := range []string{"suspend", "freshness", "advance"} {
 		t.Run(action, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newServingFixture(t)
@@ -2706,38 +1615,87 @@ func TestSnapshotAuthorityHeldThroughFlush(t *testing.T) {
 				<-w.entered
 
 				_, err := f.a.authority.Current()
-				if err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, err)
 
-				if action == "suspend" {
+				switch action {
+				case "advance":
+					replicationSmokePublish(t, f.ctx, f.a.Topology, AcceptedMembers{testNodeUID: {Node: testNodeUID, Shares: 9, PeerEndpoint: "192.0.2.1:8082", RDMANICs: []wire.RDMANIC{}}})
+				case "suspend":
 					restore := withdrawPublication(t, f.a.Topology)
 					restore()
 					reconcileTopology(t, f.a.Topology, f.ctx)
-				} else {
+				default:
 					time.Sleep(3 * time.Second)
 
-					if err := f.a.authority.Observe(f.ctx); err != nil {
-						t.Fatal(err)
-					}
+					require.NoError(t, f.a.authority.Observe(f.ctx))
 
 					time.Sleep(2 * time.Second)
 				}
 
-				if len(f.a.Server.writes) != 1 || f.a.Server.polls.count() != 1 {
-					t.Fatal("flush released admission")
-				}
+				require.Len(t, f.a.Server.writes, 1)
+				require.Equal(t, 1, f.a.Server.polls.count())
 
 				close(w.unblock)
 
-				if aborted := <-done; aborted != http.ErrAbortHandler {
-					t.Fatalf("revoked flush completed: %v", aborted)
+				if action == "advance" {
+					require.Nil(t, <-done, "ordinary advancement aborted admitted flush")
+				} else {
+					require.Equal(t, http.ErrAbortHandler, <-done, "revoked flush completed")
 				}
 
-				if len(f.a.Server.writes) != 0 || f.a.Server.polls.count() != 0 {
-					t.Fatal("aborted flush leaked admission")
-				}
+				require.Empty(t, f.a.Server.writes)
+				require.Zero(t, f.a.Server.polls.count())
 			})
+		})
+	}
+}
+
+func TestSnapshotDeltaRequiresSequenceAndHash(t *testing.T) {
+	f := newServingFixture(t)
+	membership := AcceptedMembers{}
+
+	for i := range 100 {
+		id := wire.NodeID(fmt.Sprintf("22222222-2222-4222-8222-%012d", i))
+		membership[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: "192.0.2.1:8082", RDMANICs: []wire.RDMANIC{}}
+	}
+
+	base := replicationSmokePublish(t, f.ctx, f.a.Topology, membership)
+	id := wire.NodeID("22222222-2222-4222-8222-000000000000")
+	member := membership[id]
+	member.Shares++
+	membership[id] = member
+	next := replicationSmokePublish(t, f.ctx, f.a.Topology, membership)
+	baseImage, err := wire.DecodePublication(strings.NewReader(base.encoded))
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name, query, hash string
+		delta             bool
+	}{
+		{"exact", fmt.Sprintf("?after=%d", base.record.Sequence), base.record.ContentHash, true},
+		{"older sequence same hash", fmt.Sprintf("?after=%d", base.record.Sequence-1), base.record.ContentHash, false},
+		{"no sequence same hash", "", base.record.ContentHash, false},
+		{"wrong hash", fmt.Sprintf("?after=%d", base.record.Sequence), strings.Repeat("a", 64), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, wire.SnapshotPath+tc.query, nil)
+			r.TLS = f.requestState(t)
+			r.Header.Set(wire.DeltaHeader, tc.hash)
+
+			w := httptest.NewRecorder()
+			f.a.Server.Handler().ServeHTTP(w, r)
+			require.Equal(t, http.StatusOK, w.Code)
+
+			if tc.delta {
+				applied, err := wire.ApplyDelta(baseImage, bytes.NewReader(w.Body.Bytes()))
+				require.NoError(t, err)
+				require.Equal(t, next.record.Sequence, applied.Sequence)
+				require.Less(t, w.Body.Len(), len(next.encoded))
+			} else {
+				require.Equal(t, next.encoded, w.Body.String())
+			}
+
+			requireNoAdmission(t, f.a.Server)
 		})
 	}
 }
@@ -2820,86 +1778,41 @@ func TestBootstrapAuthoritativeBindings(t *testing.T) {
 			defer cancel()
 
 			pod := &corev1.Pod{}
-			if err := a.Topology.Get(ctx, client.ObjectKey{Namespace: "racer", Name: "worker-pod"}, pod); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, a.Topology.Get(ctx, client.ObjectKey{Namespace: "racer", Name: "worker-pod"}, pod))
+
+			mutateBootstrapReview(scenario, &status)
+			mutateBootstrapPod(scenario, pod)
 
 			switch scenario {
-			case "audience":
-				status.Audiences = []string{"api"}
-			case "not authenticated":
-				status.Authenticated = false
-			case "review error":
-				status.Error = "private upstream details"
-			case "username":
-				status.User.Username = "system:serviceaccount:other:racer-dataplane"
-			case "sa uid":
-				status.User.UID = "old-sa"
-			case "pod uid":
-				status.User.Extra["authentication.kubernetes.io/pod-uid"] = authv1.ExtraValue{"old-pod"}
-			case "missing bound pod":
-				delete(status.User.Extra, "authentication.kubernetes.io/pod-name")
-			case "ambiguous bound pod":
-				status.User.Extra["authentication.kubernetes.io/pod-name"] = authv1.ExtraValue{"worker-pod", "other"}
-			case "node extra":
-				status.User.Extra["authentication.kubernetes.io/node-name"] = authv1.ExtraValue{"other"}
-			case "node extra uid":
-				status.User.Extra["authentication.kubernetes.io/node-uid"] = authv1.ExtraValue{"old"}
-			case "recreated pod":
-				pod.UID = "replacement"
 			case "recreated sa", "recreated ds":
 				var obj client.Object = &corev1.ServiceAccount{}
 				if scenario == "recreated ds" {
 					obj = &appsv1.DaemonSet{}
 				}
 
-				if err := a.Topology.Get(ctx, client.ObjectKey{Namespace: "racer", Name: "racer-dataplane"}, obj); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, a.Topology.Get(ctx, client.ObjectKey{Namespace: "racer", Name: "racer-dataplane"}, obj))
 
 				obj.SetUID("replacement")
 
-				if err := a.Topology.Update(ctx, obj); err != nil {
-					t.Fatal(err)
-				}
-			case "owner name":
-				pod.OwnerReferences[0].Name = "other"
-			case "owner kind":
-				pod.OwnerReferences[0].Kind = "ReplicaSet"
-			case "owner not controller":
-				pod.OwnerReferences[0].Controller = nil
-			case "pod sa":
-				pod.Spec.ServiceAccountName = "other"
-			case "unscheduled":
-				pod.Spec.NodeName = ""
+				require.NoError(t, a.Topology.Update(ctx, obj))
 			case "terminal pod":
 				pod.Status.Phase = corev1.PodFailed
-				if err := a.Topology.Client.Status().Update(ctx, pod); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, a.Topology.Client.Status().Update(ctx, pod))
 			case "excluded node", "deleted node":
 				node := &corev1.Node{}
-				if err := a.Topology.Get(ctx, client.ObjectKey{Name: "worker"}, node); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, a.Topology.Get(ctx, client.ObjectKey{Name: "worker"}, node))
 
 				if scenario == "deleted node" {
-					if err := a.Topology.Delete(ctx, node); err != nil {
-						t.Fatal(err)
-					}
+					require.NoError(t, a.Topology.Delete(ctx, node))
 				} else {
 					node.Labels = map[string]string{wire.ExclusionLabel: ""}
-					if err := a.Topology.Update(ctx, node); err != nil {
-						t.Fatal(err)
-					}
+					require.NoError(t, a.Topology.Update(ctx, node))
 				}
 			case "expired token":
 				token = "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1}`)) + ".signature"
 			}
 
-			if err := a.Topology.Update(ctx, pod); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, a.Topology.Update(ctx, pod))
 
 			installReview(t, a, status, token)
 
@@ -2913,15 +1826,8 @@ func TestBootstrapAuthoritativeBindings(t *testing.T) {
 				cancel()
 			}
 
-			body, err := wire.EncodeBootstrapRequest(enrollment)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			req := httptest.NewRequestWithContext(ctx, http.MethodPost, wire.BootstrapPath, bytes.NewReader(body))
+			req := bootstrapTestRequest(t, ctx, "", token, enrollment)
 			req.TLS = &tls.ConnectionState{HandshakeComplete: true}
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Authorization", "Bearer "+token)
 
 			if scenario == "duplicate bearer" {
 				req.Header.Add("Authorization", "Bearer "+token)
@@ -2930,44 +1836,90 @@ func TestBootstrapAuthoritativeBindings(t *testing.T) {
 			w := httptest.NewRecorder()
 			a.Server.Handler().ServeHTTP(w, req)
 
-			if scenario == "success" {
-				issued := decodeIssuedResponse(t, responseBody(t, w.Result(), nil, http.StatusOK))
-
-				leaf, err := x509.ParseCertificate(issued.CertificateChain[0])
-				if err != nil || issued.Node != wire.NodeID(testNodeUID) || issued.Cluster != a.Topology.Config.Cluster || !leaf.NotAfter.After(time.Now()) {
-					t.Fatalf("issued identity: %+v %v", issued, err)
-				}
-			} else {
-				want := http.StatusForbidden
-
-				switch scenario {
-				case "audience", "not authenticated", "review error", "missing bound pod", "ambiguous bound pod", "expired token", "duplicate bearer":
-					want = http.StatusUnauthorized
-				case "api failure", "canceled":
-					want = http.StatusServiceUnavailable
-				}
-
-				responseBody(t, w.Result(), nil, want)
-
-				var node corev1.Node
-				if scenario != "deleted node" {
-					if err := a.Topology.Get(t.Context(), client.ObjectKey{Name: "worker"}, &node); err != nil {
-						t.Fatal(err)
-					}
-
-					if node.Annotations[enrolledSharesAnnotation] != "" || node.Annotations[enrolledRDMANICsAnnotation] != "" {
-						t.Fatal("rejected enrollment persisted hardware proposal")
-					}
-				}
-			}
+			requireBootstrapBindingResult(t, a, scenario, w)
 		})
+	}
+}
+
+func requireBootstrapBindingResult(t *testing.T, a *Application, scenario string, w *httptest.ResponseRecorder) {
+	t.Helper()
+
+	if scenario == "success" {
+		issued := decodeIssuedResponse(t, responseBody(t, w.Result(), nil, http.StatusOK))
+		leaf, err := x509.ParseCertificate(issued.CertificateChain[0])
+		require.NoError(t, err)
+		require.Equal(t, wire.NodeID(testNodeUID), issued.Node)
+		require.Equal(t, a.Topology.Config.Cluster, issued.Cluster)
+		require.True(t, leaf.NotAfter.After(time.Now()))
+
+		return
+	}
+
+	want := http.StatusForbidden
+
+	switch scenario {
+	case "audience", "not authenticated", "review error", "missing bound pod", "ambiguous bound pod", "expired token", "duplicate bearer":
+		want = http.StatusUnauthorized
+	case "api failure", "canceled":
+		want = http.StatusServiceUnavailable
+	}
+
+	responseBody(t, w.Result(), nil, want)
+
+	if scenario != "deleted node" {
+		var node corev1.Node
+		require.NoError(t, a.Topology.Get(t.Context(), client.ObjectKey{Name: "worker"}, &node))
+		require.Empty(t, node.Annotations[enrolledSharesAnnotation], "rejected enrollment persisted shares")
+		require.Empty(t, node.Annotations[enrolledRDMANICsAnnotation], "rejected enrollment persisted NICs")
+	}
+}
+
+func mutateBootstrapReview(scenario string, status *authv1.TokenReviewStatus) {
+	switch scenario {
+	case "audience":
+		status.Audiences = []string{"api"}
+	case "not authenticated":
+		status.Authenticated = false
+	case "review error":
+		status.Error = "private upstream details"
+	case "username":
+		status.User.Username = "system:serviceaccount:other:racer-dataplane"
+	case "sa uid":
+		status.User.UID = "old-sa"
+	case "pod uid":
+		status.User.Extra["authentication.kubernetes.io/pod-uid"] = authv1.ExtraValue{"old-pod"}
+	case "missing bound pod":
+		delete(status.User.Extra, "authentication.kubernetes.io/pod-name")
+	case "ambiguous bound pod":
+		status.User.Extra["authentication.kubernetes.io/pod-name"] = authv1.ExtraValue{"worker-pod", "other"}
+	case "node extra":
+		status.User.Extra["authentication.kubernetes.io/node-name"] = authv1.ExtraValue{"other"}
+	case "node extra uid":
+		status.User.Extra["authentication.kubernetes.io/node-uid"] = authv1.ExtraValue{"old"}
+	}
+}
+
+func mutateBootstrapPod(scenario string, pod *corev1.Pod) {
+	switch scenario {
+	case "recreated pod":
+		pod.UID = "replacement"
+	case "owner name":
+		pod.OwnerReferences[0].Name = "other"
+	case "owner kind":
+		pod.OwnerReferences[0].Kind = "ReplicaSet"
+	case "owner not controller":
+		pod.OwnerReferences[0].Controller = nil
+	case "pod sa":
+		pod.Spec.ServiceAccountName = "other"
+	case "unscheduled":
+		pod.Spec.NodeName = ""
 	}
 }
 
 func TestEnrollmentSaturationPreservesLocalAuthentication(t *testing.T) {
 	f := newServingFixture(t)
+	f.configureServer(func(c *Config) { c.Limits.MaxConcurrentBootstrap = 1 })
 	s := f.a.Server
-	s.Config.Limits.MaxConcurrentBootstrap = 1
 	entered := make(chan struct{})
 	fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{
 		Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
@@ -3054,8 +2006,8 @@ func TestBootstrapIssuanceBeforeWriteAdmission(t *testing.T) {
 	for _, scenario := range []string{"success", "write saturation", "readiness lost", "canceled"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newServingFixture(t)
+			f.configureServer(func(c *Config) { c.Limits.MaxConcurrentWrites = 1 })
 			s := f.a.Server
-			s.Config.Limits.MaxConcurrentWrites = 1
 			handler := s.Handler()
 
 			ctx, cancel := context.WithCancel(f.ctx)
@@ -3090,29 +2042,24 @@ func TestBootstrapIssuanceBeforeWriteAdmission(t *testing.T) {
 				return c.Get(ctx, key, obj, opts...)
 			}})
 
-			body, err := wire.EncodeBootstrapRequest(f.request)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			r := httptest.NewRequestWithContext(ctx, "POST", wire.BootstrapPath, bytes.NewReader(body))
+			r := bootstrapTestRequest(t, ctx, "", f.token, f.request)
 			r.TLS = &tls.ConnectionState{HandshakeComplete: true}
-			r.Header.Set("Authorization", "Bearer "+f.token)
-			r.Header.Set("Content-Type", "application/json")
 
 			w := httptest.NewRecorder()
 			handler.ServeHTTP(w, r)
 
 			encoded := responseBody(t, w.Result(), nil, wantStatus)
-			if reads == 0 || len(s.bootstrapSlots) != 0 || len(s.authSlots) != 0 || len(s.writes) != wantWrites {
-				t.Fatal("issuance skipped or admission leaked")
-			}
+			require.NotZero(t, reads, "issuance skipped")
+			require.Empty(t, s.bootstrapSlots)
+			require.Empty(t, s.authSlots)
+			require.Len(t, s.writes, wantWrites)
 
 			if scenario == "success" {
 				response := decodeIssuedResponse(t, encoded)
-				if response.Enrollment != f.request.Enrollment || response.Node != wire.NodeID(testNodeUID) || !w.Flushed || w.Header().Get("Cache-Control") != "no-store" {
-					t.Fatal("issued response was not served completely")
-				}
+				require.Equal(t, f.request.Enrollment, response.Enrollment)
+				require.Equal(t, wire.NodeID(testNodeUID), response.Node)
+				require.True(t, w.Flushed)
+				require.Equal(t, "no-store", w.Header().Get("Cache-Control"))
 			}
 		})
 	}

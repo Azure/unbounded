@@ -12,6 +12,7 @@ data:
   RACER_DATAPLANE_IMAGE: {{ .DataplaneImage | default "ghcr.io/azure/racer-dataplane:latest" | quote }}
   RACER_CONTROL_URL: {{ .ControlURL | default (printf "https://racer-controller.%s.svc:8443" (.Namespace | default "unbounded-system")) | quote }}
   RACER_CONTROL_ADDRESS: ":8443"
+  RACER_HANDSHAKE_TIMEOUT: {{ .HandshakeTimeout | default "5s" | quote }}
   RACER_METRICS_ADDRESS: ":8080"
   RACER_PROBE_ADDRESS: ":8081"
   RACER_PEER_PORT: "8082"

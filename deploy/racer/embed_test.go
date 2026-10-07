@@ -23,6 +23,7 @@ import (
 var manifestNames = []string{
 	"bootstrap-trust.yaml",
 	"config.yaml",
+	"controller-pdb.yaml",
 	"controller.yaml",
 	"crd/racer.unbounded-cloud.io_clustervolumes.yaml",
 	"create-restriction.yaml",

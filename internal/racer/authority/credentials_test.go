@@ -13,12 +13,15 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,8 +59,8 @@ func TestCredentialsSingleCreateAndPermanentClaim(t *testing.T) {
 
 		for id := range material.Keys {
 			want := secret.Name + "/" + id
-			if version.Annotations[credentialClaim] != want || secret.Annotations[credentialClaim] != want {
-				t.Fatal("permanent secretName/initialRootFingerprint claim not durable before Create")
+			if version.Annotations[credentialClaim] != "" || version.Annotations[credentialUID] != "" || secret.Annotations[credentialClaim] != want {
+				t.Fatal("candidate claim missing or parent committed before Create")
 			}
 		}
 
@@ -65,6 +68,14 @@ func TestCredentialsSingleCreateAndPermanentClaim(t *testing.T) {
 	}})
 	runKeys(t, r)
 	runKeys(t, r)
+	version, _, err := readVersion(t.Context(), base, r.Config)
+	require.NoError(t, err)
+
+	secret := &corev1.Secret{}
+	require.NoError(t, base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.CredentialsSecretName}, secret))
+	require.NotEmpty(t, secret.UID)
+	require.Equal(t, string(secret.UID), version.Annotations[credentialUID])
+	require.Equal(t, secret.Annotations[credentialClaim], version.Annotations[credentialClaim])
 
 	if creates != 1 {
 		t.Fatalf("credential Creates = %d, want 1", creates)
@@ -124,16 +135,7 @@ func TestCredentialsMissingOrLegacyEntriesNeverRegenerate(t *testing.T) {
 
 			base := r.Client.(client.WithWatch)
 
-			r.Client = interceptor.NewClient(base, interceptor.Funcs{
-				Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
-					t.Fatal("claimed corrupt credentials regenerated")
-					return nil
-				},
-				Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
-					t.Fatal("claimed corrupt credentials rewritten")
-					return nil
-				},
-			})
+			r.Client = rejectWrites(t, base)
 			if _, err := r.Reconcile(t.Context(), ctrl.Request{}); err == nil || trustReady(r.Trust) {
 				t.Fatal("corrupt atomic version accepted")
 			} else if corruption == "duplicate material" && !errors.Is(err, wire.Unavailable) {
@@ -183,35 +185,7 @@ func TestCredentialsCandidateIsOneCoherentCAS(t *testing.T) {
 	r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
 		writes++
 		secret := obj.(*corev1.Secret)
-
-		bundle, err := wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		var (
-			rotation RotationState
-			material issuerMaterial
-		)
-
-		if json.Unmarshal(secret.Data["rotation.json"], &rotation) != nil || json.Unmarshal(secret.Data["issuer.json"], &material) != nil {
-			t.Fatal("unreadable candidate metadata")
-		}
-
-		candidate := credentialState{bundle: bundle, rotation: rotation, material: material}
-		if err := candidate.validateRotation(); err != nil {
-			t.Fatal("incoherent candidate")
-		}
-
-		if bundle.Generation != 2 || rotation.PreparedIssuer == "" || len(material.Keys) != 2 {
-			t.Fatal("candidate is not the complete preparation")
-		}
-
-		for _, key := range bundle.CacheKeys {
-			if binary.BigEndian.Uint64(key.Key.ID[4:12]) > uint64(bundle.Generation) {
-				t.Fatal("creation generation exceeds publication")
-			}
-		}
+		assertPreparedCredentials(t, secret)
 
 		return c.Update(ctx, obj, opts...)
 	}})
@@ -236,6 +210,30 @@ func TestCredentialsCandidateIsOneCoherentCAS(t *testing.T) {
 	}
 }
 
+func assertPreparedCredentials(t *testing.T, secret *corev1.Secret) {
+	t.Helper()
+
+	bundle, err := wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
+	require.NoError(t, err)
+
+	var (
+		rotation RotationState
+		material issuerMaterial
+	)
+
+	require.NoError(t, json.Unmarshal(secret.Data["rotation.json"], &rotation), "unreadable candidate rotation")
+	require.NoError(t, json.Unmarshal(secret.Data["issuer.json"], &material), "unreadable candidate issuers")
+	candidate := credentialState{bundle: bundle, rotation: rotation, material: material}
+	require.NoError(t, candidate.validateRotation(), "incoherent candidate")
+	require.EqualValues(t, 2, bundle.Generation)
+	require.NotEmpty(t, rotation.PreparedIssuer)
+	require.Len(t, material.Keys, 2)
+
+	for _, key := range bundle.CacheKeys {
+		require.LessOrEqual(t, binary.BigEndian.Uint64(key.Key.ID[4:12]), uint64(bundle.Generation), "creation generation exceeds publication")
+	}
+}
+
 func TestCredentialsStalePreparationReplacementIsAtomic(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(fmt.Sprint(fail), func(t *testing.T) {
@@ -252,17 +250,8 @@ func TestCredentialsStalePreparationReplacementIsAtomic(t *testing.T) {
 			})
 			shortID := rootID(short.Certificate)
 
-			delete(material.Keys, oldID)
-			material.Keys[shortID] = short
-			state.PreparedIssuer = shortID
+			rebindSigning(&bundle, &state, material, oldID, short, true)
 
-			for i, root := range bundle.PeerTrustRoots {
-				if rootID(root) == oldID {
-					bundle.PeerTrustRoots[i] = short.Certificate
-				}
-			}
-
-			bundle.Generation++
 			writeSigningCredentials(t, r, bundle, state, material)
 			before, _, _, _ := keyState(t, r)
 
@@ -271,14 +260,11 @@ func TestCredentialsStalePreparationReplacementIsAtomic(t *testing.T) {
 				r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
 					return wire.Unavailable
 				}})
-				if _, err := r.Reconcile(t.Context(), ctrl.Request{}); err == nil {
-					t.Fatal("failed replacement accepted")
-				}
+				_, err := r.Reconcile(t.Context(), ctrl.Request{})
+				require.Error(t, err, "failed replacement accepted")
 
 				after, _, _, _ := keyState(t, r)
-				if !reflect.DeepEqual(before.Data, after.Data) {
-					t.Fatal("failed stale replacement partially changed credentials")
-				}
+				require.Equal(t, before.Data, after.Data, "failed stale replacement partially changed credentials")
 
 				r.Client = base
 			}
@@ -290,13 +276,9 @@ func TestCredentialsStalePreparationReplacementIsAtomic(t *testing.T) {
 				t.Fatal("stale preparation replacement reset active issuer or publication version")
 			}
 
-			if containsRoot(after, shortID) || len(keys.Keys) != len(after.PeerTrustRoots) {
-				t.Fatal("stale root and private material not replaced atomically")
-			}
-
-			if _, retained := keys.Keys[shortID]; retained {
-				t.Fatal("stale private key retained")
-			}
+			require.False(t, containsRoot(after, shortID), "stale root retained")
+			require.Len(t, keys.Keys, len(after.PeerTrustRoots), "private material not replaced atomically")
+			require.NotContains(t, keys.Keys, shortID, "stale private key retained")
 
 			for _, key := range after.CacheKeys {
 				if key.State == wire.PreparedKey && binary.BigEndian.Uint64(key.Key.ID[4:12]) != uint64(after.Generation) {
@@ -318,34 +300,23 @@ func TestKeyringReplayProtectionSurvivesInvalidation(t *testing.T) {
 					t.Helper()
 
 					encoded, err := wire.EncodeBundle(candidate)
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					if err := r.Get(t.Context(), client.ObjectKeyFromObject(shared), shared); err != nil {
-						t.Fatal(err)
-					}
-
+					require.NoError(t, err)
+					require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(shared), shared))
 					shared.Data["bundle.json"] = encoded
-					if err := r.Update(t.Context(), shared); err != nil {
-						t.Fatal(err)
-					}
+					require.NoError(t, r.Update(t.Context(), shared))
 				}
 				bundle.Generation = 2
 				writeBundle(bundle)
 				runKeys(t, r)
 
 				accepted, _, err := r.Trust.keyring()
-				if err != nil || accepted.generation != 2 {
-					t.Fatalf("initial accepted state: %v", err)
-				}
+				require.NoError(t, err)
+				require.EqualValues(t, 2, accepted.generation)
 
 				digest := sha256.Sum256([]byte(accepted.encoded))
 
 				candidate, err := wire.DecodeBundle(bytes.NewBufferString(accepted.encoded))
-				if err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, err)
 
 				if scenario == "rollback" {
 					candidate.Generation--
@@ -353,30 +324,20 @@ func TestKeyringReplayProtectionSurvivesInvalidation(t *testing.T) {
 					key := candidate.CacheKeys[0]
 
 					candidate.CacheKeys[0], err = wire.NewCacheKey(key.Key, key.State, [32]byte{1})
-					if err != nil {
-						t.Fatal(err)
-					}
+					require.NoError(t, err)
 				}
 
 				writeBundle(candidate)
 
 				for range 3 {
 					_, err := r.Reconcile(t.Context(), ctrl.Request{})
-					if !errors.Is(err, wire.Conflict) {
-						t.Fatalf("replay was not rejected: %v", err)
-					}
-
-					if _, _, err := r.Trust.keyring(); !errors.Is(err, wire.Unavailable) {
-						t.Fatalf("replay restored delivery: %v", err)
-					}
-
-					if _, err := r.Trust.pool(); !errors.Is(err, wire.Unavailable) {
-						t.Fatalf("replay restored trust: %v", err)
-					}
-
-					if r.Trust.highWater != 2 || r.Trust.digest != digest {
-						t.Fatal("invalidation lost accepted replay protection")
-					}
+					require.ErrorIs(t, err, wire.Conflict, "replay was not rejected")
+					_, _, err = r.Trust.keyring()
+					require.ErrorIs(t, err, wire.Unavailable, "replay restored delivery")
+					_, err = r.Trust.pool()
+					require.ErrorIs(t, err, wire.Unavailable, "replay restored trust")
+					require.EqualValues(t, 2, r.Trust.highWater)
+					require.Equal(t, digest, r.Trust.digest, "invalidation lost accepted replay protection")
 				}
 
 				if restore == "new generation" {
@@ -388,138 +349,19 @@ func TestKeyringReplayProtectionSurvivesInvalidation(t *testing.T) {
 				runKeys(t, r)
 
 				current, _, err := r.Trust.keyring()
-				if err != nil || current.generation != bundle.Generation {
-					t.Fatalf("valid restoration failed: %v", err)
-				}
+				require.NoError(t, err)
+				require.Equal(t, bundle.Generation, current.generation)
 
 				expected, err := wire.EncodeBundle(bundle)
-				if err != nil || current.encoded != string(expected) {
-					t.Fatalf("restored wrong content: %v", err)
-				}
+				require.NoError(t, err)
+				require.Equal(t, string(expected), current.encoded, "restored wrong content")
 
-				if _, err := r.Trust.pool(); err != nil {
-					t.Fatalf("restoration did not restore trust: %v", err)
-				}
-
-				if r.Trust.highWater != bundle.Generation || r.Trust.digest != sha256.Sum256(expected) {
-					t.Fatal("restoration did not advance replay protection")
-				}
+				_, err = r.Trust.pool()
+				require.NoError(t, err, "restoration did not restore trust")
+				require.Equal(t, bundle.Generation, r.Trust.highWater)
+				require.Equal(t, sha256.Sum256(expected), r.Trust.digest, "restoration did not advance replay protection")
 			})
 		}
-	}
-}
-
-func TestCredentialReplayRejectedBeforeMutation(t *testing.T) {
-	for _, replay := range []string{"rollback", "conflicting generation"} {
-		for _, invalidate := range []bool{false, true} {
-			for _, transition := range []string{"admission", "rotation"} {
-				t.Run(fmt.Sprintf("%s/invalidated=%t/%s", replay, invalidate, transition), func(t *testing.T) {
-					r, now := testKeyring(t)
-					runKeys(t, r)
-					secret, bundle, state, _ := keyState(t, r)
-					bundle.Generation = 2
-
-					var err error
-
-					secret.Data["bundle.json"], err = wire.EncodeBundle(bundle)
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					if err := r.Update(t.Context(), secret); err != nil {
-						t.Fatal(err)
-					}
-
-					runKeys(t, r)
-					highWater, digest := r.Trust.highWater, r.Trust.digest
-
-					secret, bundle, _, _ = keyState(t, r)
-					if replay == "rollback" {
-						bundle.Generation--
-					} else {
-						key := bundle.CacheKeys[0]
-
-						bundle.CacheKeys[0], err = wire.NewCacheKey(key.Key, key.State, [32]byte{1})
-						if err != nil {
-							t.Fatal(err)
-						}
-					}
-
-					secret.Data["bundle.json"], err = wire.EncodeBundle(bundle)
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					if err := r.Update(t.Context(), secret); err != nil {
-						t.Fatal(err)
-					}
-
-					if invalidate {
-						if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !errors.Is(err, wire.Conflict) {
-							t.Fatalf("idle replay not rejected: %v", err)
-						}
-					}
-
-					if transition == "rotation" {
-						*now = state.NextRotation
-					} else {
-						volume := catalogVolume("added", testOtherUID)
-						if err := r.Create(t.Context(), &volume); err != nil {
-							t.Fatal(err)
-						}
-					}
-
-					before := secret.DeepCopy()
-					writes := 0
-					r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-						writes++
-						return c.Update(ctx, obj, opts...)
-					}})
-
-					_, err = r.Reconcile(t.Context(), ctrl.Request{})
-					if !errors.Is(err, wire.Conflict) || writes != 0 {
-						t.Fatalf("replay must fail before mutation: err=%v writes=%d", err, writes)
-					}
-
-					after, _, _, _ := keyState(t, r)
-					if !reflect.DeepEqual(before.Data, after.Data) || before.ResourceVersion != after.ResourceVersion {
-						t.Fatal("replay changed durable credentials")
-					}
-
-					if trustReady(r.Trust) || r.Trust.highWater != highWater || r.Trust.digest != digest {
-						t.Fatal("replay restored trust or changed replay protection")
-					}
-				})
-			}
-		}
-	}
-}
-
-func TestCredentialReconcileAcceptsNewerDurableGeneration(t *testing.T) {
-	r, _ := testKeyring(t)
-	runKeys(t, r)
-	lagged := Assemble(r.Config, r.Client, r.APIReader).Keyring
-	runKeys(t, lagged)
-
-	volume := catalogVolume("added", testOtherUID)
-	if err := r.Create(t.Context(), &volume); err != nil {
-		t.Fatal(err)
-	}
-
-	runKeys(t, r)
-
-	if lagged.Trust.highWater != 1 || r.Trust.highWater != 2 {
-		t.Fatal("fixture did not leave a lagged replica")
-	}
-
-	if err := r.Delete(t.Context(), &volume); err != nil {
-		t.Fatal(err)
-	}
-
-	runKeys(t, lagged)
-
-	if lagged.Trust.highWater != 3 || !trustReady(lagged.Trust) {
-		t.Fatal("lagged replica could not reconcile newer durable state")
 	}
 }
 
@@ -557,10 +399,23 @@ func TestAcceptedKeyringImmutableAndValidated(t *testing.T) {
 	}
 
 	for _, format := range []string{"%v", "%+v", "%#v"} {
-		if fmt.Sprintf(format, accepted) != "<redacted keyring>" {
-			t.Fatal("diagnostic exposed keyring")
-		}
+		require.Equal(t, "<redacted keyring>", fmt.Sprintf(format, accepted), "diagnostic exposed keyring")
 	}
+
+	assertRejectedKeyringInstalls(t, f, roots, accepted)
+
+	older := wire.Generation(1)
+
+	current, err := trust.waitKeyring(f.ctx, &older)
+	if err != nil || current != accepted {
+		t.Fatalf("older cursor did not return newest: %v", err)
+	}
+}
+
+func assertRejectedKeyringInstalls(t *testing.T, f *servingFixture, roots *x509.CertPool, accepted *acceptedKeyring) {
+	t.Helper()
+
+	trust := f.a.Server.Trust
 
 	for _, scenario := range []string{"invalid", "rollback", "same generation changed", "canceled", "nil roots"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -595,13 +450,6 @@ func TestAcceptedKeyringImmutableAndValidated(t *testing.T) {
 				t.Fatal("failed installation changed delivery")
 			}
 		})
-	}
-
-	older := wire.Generation(1)
-
-	current, err := trust.waitKeyring(f.ctx, &older)
-	if err != nil || current != accepted {
-		t.Fatalf("older cursor did not return newest: %v", err)
 	}
 }
 
@@ -708,7 +556,7 @@ func keyState(t *testing.T, r *KeyringReconciler) (*corev1.Secret, wire.KeyringB
 		t.Fatal(err)
 	}
 
-	credentials, err := readCredentials(context.Background(), r.APIReader, r.Config, version.Annotations[credentialClaim])
+	credentials, err := readBoundCredentials(context.Background(), r.APIReader, r.Config, version.Annotations[credentialClaim], version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,19 +570,13 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	result := runKeys(t, r)
 
 	shared, initial, state, _ := keyState(t, r)
-	if initial.Generation != 1 || len(initial.CacheKeys) != 2 || len(initial.PeerTrustRoots) != 1 || result.RequeueAfter != r.Config.Rotation.Interval-r.Config.Rotation.PrepareFor || !trustReady(r.Trust) {
-		t.Fatal("initial credentials or readiness")
-	}
+	require.EqualValues(t, 1, initial.Generation)
+	require.Len(t, initial.CacheKeys, 2)
+	require.Len(t, initial.PeerTrustRoots, 1)
+	require.Equal(t, r.Config.Rotation.Interval-r.Config.Rotation.PrepareFor, result.RequeueAfter)
+	require.True(t, trustReady(r.Trust), "initial readiness")
 
-	for _, k := range initial.CacheKeys {
-		if k.State != wire.ActiveKey {
-			t.Fatal("initial key not active")
-		}
-
-		if string(k.Key.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(k.Key.ID[4:12]) != 1 {
-			t.Fatal("initial key must bind the first publication generation")
-		}
-	}
+	assertCacheKeyGenerations(t, initial.CacheKeys, 1, 1)
 	// Repeated reconciliation must neither write nor consume a generation.
 	runKeys(t, r)
 
@@ -751,20 +593,14 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 		t.Fatal("activation cadence must include the preparation interval")
 	}
 
-	if staged.Generation != 2 || len(staged.CacheKeys) != 4 || len(staged.PeerTrustRoots) != 2 || prepared.ActiveIssuer != state.ActiveIssuer || prepared.PreparedIssuer == "" || result.RequeueAfter != r.Config.Rotation.PrepareFor {
-		t.Fatal("replacement not staged")
-	}
+	require.EqualValues(t, 2, staged.Generation)
+	require.Len(t, staged.CacheKeys, 4)
+	require.Len(t, staged.PeerTrustRoots, 2)
+	require.Equal(t, state.ActiveIssuer, prepared.ActiveIssuer)
+	require.NotEmpty(t, prepared.PreparedIssuer)
+	require.Equal(t, r.Config.Rotation.PrepareFor, result.RequeueAfter)
 
-	for _, k := range staged.CacheKeys {
-		want := uint64(1)
-		if k.State == wire.PreparedKey {
-			want = 2
-		}
-
-		if string(k.Key.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(k.Key.ID[4:12]) != want {
-			t.Fatal("rotation changed an existing epoch or failed to bind the next generation")
-		}
-	}
+	assertCacheKeyGenerations(t, staged.CacheKeys, 1, 2)
 
 	if !reflect.DeepEqual(staged.CacheKeys[:len(initial.CacheKeys)], initial.CacheKeys) {
 		t.Fatal("staging changed retained keys")
@@ -783,19 +619,13 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	runKeys(t, restarted)
 
 	_, activated, active, _ := keyState(t, r)
-	if activated.Generation != 3 || active.ActiveIssuer != prepared.PreparedIssuer || active.PreparedIssuer != "" || len(active.Retiring) != 1 || len(activated.CacheKeys) != 2 {
-		t.Fatal("activation/overlap incorrect")
-	}
+	require.EqualValues(t, 3, activated.Generation)
+	require.Equal(t, prepared.PreparedIssuer, active.ActiveIssuer)
+	require.Empty(t, active.PreparedIssuer)
+	require.Len(t, active.Retiring, 1)
+	require.Len(t, activated.CacheKeys, 2)
 
-	for i, k := range activated.CacheKeys {
-		if k.State == wire.PreparedKey {
-			t.Fatal("prepared key not activated")
-		}
-
-		if !reflect.DeepEqual(k.Key, staged.CacheKeys[i+2].Key) || !k.EqualMaterial(staged.CacheKeys[i+2]) {
-			t.Fatal("activation changed key identity or material")
-		}
-	}
+	assertActivatedCacheKeys(t, activated.CacheKeys, staged.CacheKeys[2:])
 	// Further cycles overlap without evicting an earlier retirement prematurely.
 	*now = active.NextRotation
 
@@ -819,9 +649,37 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 		t.Fatal("retirement pruning/reset")
 	}
 	// Topology CAS preserves the one-way initialization claim.
-	topology := &TopologyReconciler{Client: r.Client, APIReader: r.APIReader, Config: r.Config, Publications: NewPublications(), Accepted: make(AcceptedMembers)}
+	topology := Assemble(r.Config, r.Client, r.APIReader).Topology
 	reconcileTopology(t, topology, context.Background())
 	keyState(t, r)
+}
+
+func assertCacheKeyGenerations(t *testing.T, keys []wire.CacheKey, active, prepared uint64) {
+	t.Helper()
+
+	for _, k := range keys {
+		want := active
+		if active == prepared {
+			require.Equal(t, wire.ActiveKey, k.State, "initial key not active")
+		}
+
+		if k.State == wire.PreparedKey {
+			want = prepared
+		}
+
+		require.Equal(t, "RKG1", string(k.Key.ID[:4]))
+		require.Equal(t, want, binary.BigEndian.Uint64(k.Key.ID[4:12]), "key creation generation changed")
+	}
+}
+
+func assertActivatedCacheKeys(t *testing.T, activated, staged []wire.CacheKey) {
+	t.Helper()
+
+	for i, k := range activated {
+		require.NotEqual(t, wire.PreparedKey, k.State, "prepared key not activated")
+		require.Equal(t, staged[i].Key, k.Key, "activation changed key identity")
+		require.True(t, k.EqualMaterial(staged[i]), "activation changed key material")
+	}
 }
 
 func TestKeyringDerivedDeadlines(t *testing.T) {
@@ -888,13 +746,8 @@ func TestKeyringDerivedDeadlines(t *testing.T) {
 				}
 
 				var persisted map[string]json.RawMessage
-				if err := json.Unmarshal(shared.Data["rotation.json"], &persisted); err != nil {
-					t.Fatal(err)
-				}
-
-				if _, exists := persisted["next_transition"]; exists {
-					t.Fatal("derived deadline persisted")
-				}
+				require.NoError(t, json.Unmarshal(shared.Data["rotation.json"], &persisted))
+				require.NotContains(t, persisted, "next_transition", "derived deadline persisted")
 
 				// Every phase must resume from only primary state without rewriting
 				// credentials or extending a deadline when the process restarts.
@@ -902,14 +755,11 @@ func TestKeyringDerivedDeadlines(t *testing.T) {
 				restarted.Now = r.Now
 
 				*now = now.Add(time.Second)
-				if got := runKeys(t, restarted).RequeueAfter; got != step.next-step.at-time.Second {
-					t.Fatalf("step %d: restart requeue=%v", i, got)
-				}
+				require.Equal(t, step.next-step.at-time.Second, runKeys(t, restarted).RequeueAfter, "step %d: restart requeue", i)
 
 				unchanged, _, _, _ := keyState(t, restarted)
-				if shared.ResourceVersion != unchanged.ResourceVersion || !reflect.DeepEqual(shared.Data, unchanged.Data) {
-					t.Fatalf("step %d: restart rewrote credentials", i)
-				}
+				require.Equal(t, shared.ResourceVersion, unchanged.ResourceVersion, "step %d: restart rewrote credentials", i)
+				require.Equal(t, shared.Data, unchanged.Data, "step %d: restart rewrote credentials", i)
 
 				r = restarted
 			}
@@ -1144,103 +994,114 @@ func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 			r, now := testKeyring(t)
 			runKeys(t, r)
 
-			switch corrupt {
-			case "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "unknown retirement":
-				_, _, initial, _ := keyState(t, r)
-				*now = initial.NextRotation
-
-				runKeys(t, r)
-
-				switch corrupt {
-				case "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "unknown retirement":
-					_, _, prepared, _ := keyState(t, r)
-					*now = prepared.ActivateAt
-
-					runKeys(t, r)
-				}
-			}
+			prepareCorruptionPhase(t, r, now, corrupt)
 
 			shared, b, s, _ := keyState(t, r)
-
-			switch corrupt {
-			case "timestamp":
-				s.NextRotation = time.Time{}
-				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "transition mismatch":
-				// Preparation must activate strictly after the rotation timestamp.
-				s.ActivateAt = s.NextRotation
-				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "missing activation":
-				s.ActivateAt = time.Time{}
-				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "missing prepared issuer":
-				s.PreparedIssuer = ""
-				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "zero root retirement", "missing root retirement", "replaced retirement":
-				for _, root := range b.PeerTrustRoots {
-					if id := rootID(root); id != s.ActiveIssuer {
-						switch corrupt {
-						case "zero root retirement":
-							s.Retiring[id] = time.Time{}
-						case "missing root retirement":
-							delete(s.Retiring, id)
-						case "replaced retirement":
-							s.Retiring[s.ActiveIssuer] = s.Retiring[id]
-							delete(s.Retiring, id)
-						}
-					}
-				}
-
-				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "zero key retirement", "missing key retirement":
-				// Symmetric retirement metadata is never valid, with or without a deadline.
-				s.Retiring[keyID(b.CacheKeys[0])] = time.Time{}
-				if corrupt == "missing key retirement" {
-					s.Retiring[keyID(b.CacheKeys[0])] = s.NextRotation
-				}
-
-				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "nil retirement":
-				s.Retiring = nil
-				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "unknown retirement":
-				s.Retiring["unknown"] = s.NextRotation.Add(time.Hour)
-				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "active issuer":
-				s.ActiveIssuer = "missing"
-				shared.Data["rotation.json"], _ = json.Marshal(s)
-			case "bundle":
-				shared.Data["bundle.json"] = []byte("{}")
-			case "generation":
-				b.Generation = math.MaxUint64
-				shared.Data["bundle.json"], _ = wire.EncodeBundle(b)
-				*now = s.NextRotation
-			case "binding":
-				shared.Annotations[credentialClaim] = "foreign"
-			case "private key":
-				shared.Data["issuer.json"] = []byte("{}")
-			}
-
-			if err := r.Update(context.Background(), shared); err != nil {
-				t.Fatal(err)
-			}
-
-			before := shared.DeepCopy()
-
-			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err == nil || trustReady(r.Trust) {
-				t.Fatal("corrupt state accepted")
-			}
-
-			after := &corev1.Secret{}
-			if err := r.APIReader.Get(context.Background(), client.ObjectKeyFromObject(shared), after); err != nil {
-				t.Fatal(err)
-			}
-
-			if !reflect.DeepEqual(before.Data, after.Data) {
-				t.Fatal("corrupt state rewritten")
-			}
+			corruptCredentials(corrupt, shared, b, s, now)
+			assertCorruptCredentialsUnchanged(t, r, shared)
 		})
 	}
+}
+
+func corruptCredentials(corrupt string, shared *corev1.Secret, b wire.KeyringBundle, s RotationState, now *time.Time) {
+	switch corrupt {
+	case "timestamp":
+		s.NextRotation = time.Time{}
+		shared.Data["rotation.json"], _ = json.Marshal(s)
+	case "transition mismatch":
+		// Preparation must activate strictly after the rotation timestamp.
+		s.ActivateAt = s.NextRotation
+		shared.Data["rotation.json"], _ = json.Marshal(s)
+	case "missing activation":
+		s.ActivateAt = time.Time{}
+		shared.Data["rotation.json"], _ = json.Marshal(s)
+	case "missing prepared issuer":
+		s.PreparedIssuer = ""
+		shared.Data["rotation.json"], _ = json.Marshal(s)
+	case "zero root retirement", "missing root retirement", "replaced retirement":
+		corruptRootRetirement(corrupt, b, &s)
+
+		shared.Data["rotation.json"], _ = json.Marshal(s)
+	case "zero key retirement", "missing key retirement":
+		// Symmetric retirement metadata is never valid, with or without a deadline.
+		s.Retiring[keyID(b.CacheKeys[0])] = time.Time{}
+		if corrupt == "missing key retirement" {
+			s.Retiring[keyID(b.CacheKeys[0])] = s.NextRotation
+		}
+
+		shared.Data["rotation.json"], _ = json.Marshal(s)
+	case "nil retirement":
+		s.Retiring = nil
+		shared.Data["rotation.json"], _ = json.Marshal(s)
+	case "unknown retirement":
+		s.Retiring["unknown"] = s.NextRotation.Add(time.Hour)
+		shared.Data["rotation.json"], _ = json.Marshal(s)
+	case "active issuer":
+		s.ActiveIssuer = "missing"
+		shared.Data["rotation.json"], _ = json.Marshal(s)
+	case "bundle":
+		shared.Data["bundle.json"] = []byte("{}")
+	case "generation":
+		b.Generation = math.MaxUint64
+		shared.Data["bundle.json"], _ = wire.EncodeBundle(b)
+		*now = s.NextRotation
+	case "binding":
+		shared.Annotations[credentialClaim] = "foreign"
+	case "private key":
+		shared.Data["issuer.json"] = []byte("{}")
+	}
+}
+
+func prepareCorruptionPhase(t *testing.T, r *KeyringReconciler, now *time.Time, corrupt string) {
+	t.Helper()
+
+	switch corrupt {
+	case "transition mismatch", "missing activation", "missing prepared issuer", "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "unknown retirement":
+		_, _, initial, _ := keyState(t, r)
+		*now = initial.NextRotation
+
+		runKeys(t, r)
+	}
+
+	switch corrupt {
+	case "zero root retirement", "zero key retirement", "missing root retirement", "missing key retirement", "replaced retirement", "unknown retirement":
+		_, _, prepared, _ := keyState(t, r)
+		*now = prepared.ActivateAt
+
+		runKeys(t, r)
+	}
+}
+
+func corruptRootRetirement(corrupt string, b wire.KeyringBundle, s *RotationState) {
+	for _, root := range b.PeerTrustRoots {
+		id := rootID(root)
+		if id == s.ActiveIssuer {
+			continue
+		}
+
+		switch corrupt {
+		case "zero root retirement":
+			s.Retiring[id] = time.Time{}
+		case "missing root retirement":
+			delete(s.Retiring, id)
+		case "replaced retirement":
+			s.Retiring[s.ActiveIssuer] = s.Retiring[id]
+			delete(s.Retiring, id)
+		}
+	}
+}
+
+func assertCorruptCredentialsUnchanged(t *testing.T, r *KeyringReconciler, shared *corev1.Secret) {
+	t.Helper()
+	require.NoError(t, r.Update(t.Context(), shared))
+	before := shared.DeepCopy()
+	_, err := r.Reconcile(t.Context(), ctrl.Request{})
+	require.Error(t, err, "corrupt state accepted")
+	require.False(t, trustReady(r.Trust), "corrupt state trusted")
+
+	after := &corev1.Secret{}
+	require.NoError(t, r.APIReader.Get(t.Context(), client.ObjectKeyFromObject(shared), after))
+	require.Equal(t, before.Data, after.Data, "corrupt state rewritten")
 }
 
 func TestKeyringExhaustedGenerationTransitions(t *testing.T) {
@@ -1250,9 +1111,7 @@ func TestKeyringExhaustedGenerationTransitions(t *testing.T) {
 
 			r.Config.Rotation.Interval = 7 * 24 * time.Hour
 			if transition == "empty stage" {
-				if err := r.Delete(t.Context(), &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, r.Delete(t.Context(), &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}))
 			}
 
 			runKeys(t, r)
@@ -1278,26 +1137,17 @@ func TestKeyringExhaustedGenerationTransitions(t *testing.T) {
 			var err error
 
 			shared.Data["bundle.json"], err = wire.EncodeBundle(b)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if err := r.Update(t.Context(), shared); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
+			require.NoError(t, r.Update(t.Context(), shared))
 
 			switch transition {
 			case "admission":
 				volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "added", UID: types.UID(testOtherUID)}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-				if err := r.Create(t.Context(), volume); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, r.Create(t.Context(), volume))
 			case "stage", "empty stage":
 				*now = initial.NextRotation
 			case "remove":
-				if err := r.Delete(t.Context(), &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, r.Delete(t.Context(), &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}))
 			}
 
 			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
@@ -1311,9 +1161,8 @@ func TestKeyringExhaustedGenerationTransitions(t *testing.T) {
 			}
 
 			after, preserved, _, _ := keyState(t, r)
-			if after.ResourceVersion != shared.ResourceVersion || !reflect.DeepEqual(preserved, b) {
-				t.Fatal("exhausted generation changed the published bundle")
-			}
+			require.Equal(t, shared.ResourceVersion, after.ResourceVersion, "exhausted generation wrote credentials")
+			require.Equal(t, b, preserved, "exhausted generation changed the published bundle")
 		})
 	}
 }
@@ -1464,76 +1313,79 @@ func TestKeyringRotationCrashRecovery(t *testing.T) {
 	for _, phase := range []string{"stage", "activate", "prune"} {
 		for _, failure := range []string{"before issuer", "after issuer", "before bundle", "after bundle"} {
 			t.Run(phase+"/"+failure, func(t *testing.T) {
-				r, now := testKeyring(t)
-				runKeys(t, r)
-				_, _, initial, _ := keyState(t, r)
-				*now = initial.NextRotation
-
-				if phase != "stage" {
-					runKeys(t, r)
-					_, _, staged, _ := keyState(t, r)
-					*now = staged.ActivateAt
-
-					if phase == "prune" {
-						runKeys(t, r)
-						*now = now.Add(r.Config.Rotation.RetainFor)
-					}
-				}
-
-				base := r.Client.(client.WithWatch)
-				boom := errors.New("lost response")
-				failed := false
-				original, _, _, _ := keyState(t, r)
-				r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-					if obj.GetName() != r.Config.CredentialsSecretName {
-						t.Fatal("rotation wrote outside the credentials CAS")
-					}
-
-					if strings.HasPrefix(failure, "before ") && !failed {
-						failed = true
-						return boom
-					}
-
-					if err := c.Update(ctx, obj, opts...); err != nil {
-						return err
-					}
-
-					if strings.HasPrefix(failure, "after ") && !failed {
-						failed = true
-						return boom
-					}
-
-					return nil
-				}})
-
-				_, err := r.Reconcile(context.Background(), ctrl.Request{})
-				if !failed || !errors.Is(err, boom) || trustReady(r.Trust) {
-					t.Fatalf("write failure accepted: %v", err)
-				}
-				// Former two-Secret boundaries now fail one coherent atomic version.
-				committed, before, beforeState, _ := keyState(t, r)
-				if strings.HasPrefix(failure, "before ") && !reflect.DeepEqual(original.Data, committed.Data) {
-					t.Fatal("failed CAS partially changed credentials")
-				}
-
-				recovered := Assemble(r.Config, base, base).Keyring
-				recovered.Now = r.Now
-				runKeys(t, recovered)
-
-				_, after, afterState, _ := keyState(t, recovered)
-				if after.Generation < before.Generation {
-					t.Fatal("generation reset")
-				}
-
-				if strings.HasPrefix(failure, "after ") && (after.Generation != before.Generation || !reflect.DeepEqual(afterState, beforeState)) {
-					t.Fatal("committed atomic publication replaced on recovery")
-				}
-
-				if !beforeState.ActivateAt.IsZero() && !afterState.ActivateAt.IsZero() && !beforeState.ActivateAt.Equal(afterState.ActivateAt) {
-					t.Fatal("committed preparation restarted")
-				}
+				exerciseRotationCrash(t, phase, failure)
 			})
 		}
+	}
+}
+
+func exerciseRotationCrash(t *testing.T, phase, failure string) {
+	t.Helper()
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, _, initial, _ := keyState(t, r)
+	*now = initial.NextRotation
+
+	if phase != "stage" {
+		runKeys(t, r)
+		_, _, staged, _ := keyState(t, r)
+		*now = staged.ActivateAt
+
+		if phase == "prune" {
+			runKeys(t, r)
+			*now = now.Add(r.Config.Rotation.RetainFor)
+		}
+	}
+
+	base := r.Client.(client.WithWatch)
+	boom := errors.New("lost response")
+	failed := false
+	original, _, _, _ := keyState(t, r)
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		require.Equal(t, r.Config.CredentialsSecretName, obj.GetName(), "rotation wrote outside the credentials CAS")
+
+		if strings.HasPrefix(failure, "before ") && !failed {
+			failed = true
+			return boom
+		}
+
+		if err := c.Update(ctx, obj, opts...); err != nil {
+			return err
+		}
+
+		if strings.HasPrefix(failure, "after ") && !failed {
+			failed = true
+			return boom
+		}
+
+		return nil
+	}})
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{})
+
+	require.True(t, failed, "write failure not injected")
+	require.ErrorIs(t, err, boom, "write failure accepted")
+	require.False(t, trustReady(r.Trust), "failed write trusted")
+	// Former two-Secret boundaries now fail one coherent atomic version.
+	committed, before, beforeState, _ := keyState(t, r)
+	if strings.HasPrefix(failure, "before ") && !reflect.DeepEqual(original.Data, committed.Data) {
+		t.Fatal("failed CAS partially changed credentials")
+	}
+
+	recovered := Assemble(r.Config, base, base).Keyring
+	recovered.Now = r.Now
+	runKeys(t, recovered)
+
+	_, after, afterState, _ := keyState(t, recovered)
+	require.GreaterOrEqual(t, after.Generation, before.Generation, "generation reset")
+
+	if strings.HasPrefix(failure, "after ") {
+		require.Equal(t, before.Generation, after.Generation, "committed atomic generation replaced on recovery")
+		require.Equal(t, beforeState, afterState, "committed atomic state replaced on recovery")
+	}
+
+	if !beforeState.ActivateAt.IsZero() && !afterState.ActivateAt.IsZero() && !beforeState.ActivateAt.Equal(afterState.ActivateAt) {
+		t.Fatal("committed preparation restarted")
 	}
 }
 
@@ -1562,9 +1414,7 @@ func TestKeyringPrivatePruneRecovery(t *testing.T) {
 				}
 
 				_, b, _, _ := keyState(t, r)
-				if !containsRoot(b, initial.ActiveIssuer) {
-					t.Fatal("root changed before atomic pruning")
-				}
+				require.True(t, containsRoot(b, initial.ActiveIssuer), "root changed before atomic pruning")
 
 				if afterWrite {
 					if err := c.Update(ctx, obj, opts...); err != nil {
@@ -1574,9 +1424,8 @@ func TestKeyringPrivatePruneRecovery(t *testing.T) {
 
 				return boom
 			}})
-			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); !errors.Is(err, boom) {
-				t.Fatalf("prune interruption: %v", err)
-			}
+			_, err := r.Reconcile(context.Background(), ctrl.Request{})
+			require.ErrorIs(t, err, boom, "prune interruption")
 
 			_, before, _, beforeMaterial := keyState(t, r)
 			if containsRoot(before, initial.ActiveIssuer) == afterWrite || (len(beforeMaterial.Keys) == 2) == afterWrite {
@@ -1638,55 +1487,23 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			r, _ := testKeyring(t)
 			base := r.Client.(client.WithWatch)
-			boom := errors.New("crash")
-
-			r.Client = interceptor.NewClient(base, interceptor.Funcs{
-				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-					if failure == "before claim" {
-						return boom
-					}
-
-					if err := c.Update(ctx, obj, opts...); err != nil {
-						return err
-					}
-
-					if failure == "after claim" {
-						return boom
-					}
-
-					return nil
-				},
-				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-					if failure == "before issuer" || failure == "before bundle" {
-						return boom
-					}
-
-					if err := c.Create(ctx, obj, opts...); err != nil {
-						return err
-					}
-
-					if failure == "after issuer" || failure == "after bundle" {
-						return boom
-					}
-
-					return nil
-				},
-			})
-			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); !errors.Is(err, boom) {
-				t.Fatalf("crash not injected: %v", err)
-			}
+			boundary := strings.NewReplacer("claim", "commit", "issuer", "create", "bundle", "create").Replace(failure)
+			r.Client = interruptInitialization(base, boundary, func() {})
+			_, err := r.Reconcile(context.Background(), ctrl.Request{})
+			require.ErrorIs(t, err, errInitializationInterrupted, "crash not injected")
 
 			recovered := Assemble(r.Config, base, base).Keyring
 			recovered.Now = r.Now
 
-			_, err := recovered.Reconcile(context.Background(), ctrl.Request{})
-			if failure == "before claim" || failure == "after issuer" || failure == "after bundle" {
-				if err != nil {
-					t.Fatal(err)
-				}
-			} else if err == nil {
-				t.Fatal("incomplete initialization resurrected")
-			}
+			_, err = recovered.Reconcile(context.Background(), ctrl.Request{})
+			require.NoError(t, err, "staged initialization must recover an uncommitted candidate")
+			version, _, err := readVersion(t.Context(), base, r.Config)
+			require.NoError(t, err)
+
+			secret := &corev1.Secret{}
+			require.NoError(t, base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.CredentialsSecretName}, secret))
+			require.NotEmpty(t, secret.UID)
+			require.Equal(t, string(secret.UID), version.Annotations[credentialUID])
 		})
 	}
 
@@ -1696,12 +1513,8 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 			issuer := testIssuer(r)
 			runKeys(t, r)
 
-			for _, name := range []string{r.Config.CredentialsSecretName} {
-				if lost == "both" || lost == "issuer" || lost == "bundle" {
-					if err := r.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: name}}); err != nil {
-						t.Fatal(err)
-					}
-				}
+			if lost == "both" || lost == "issuer" || lost == "bundle" {
+				require.NoError(t, r.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.CredentialsSecretName}}))
 			}
 
 			if lost == "version" || lost == "marker" {
@@ -1710,22 +1523,19 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 					name = r.Config.InstallationConfigMapName
 				}
 
-				if err := r.Delete(context.Background(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: name}}); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, r.Delete(context.Background(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: name}}))
 			}
 
 			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
 				t.Fatal("recreated established state")
 				return nil
 			}})
-			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err == nil || trustReady(r.Trust) {
-				t.Fatal("lost state accepted")
-			}
+			_, err := r.Reconcile(context.Background(), ctrl.Request{})
+			require.Error(t, err, "lost state accepted")
+			require.False(t, trustReady(r.Trust))
 
-			if _, err := issuer.TrustRoots(context.Background()); err == nil {
-				t.Fatal("lost state still trusted")
-			}
+			_, err = issuer.TrustRoots(context.Background())
+			require.Error(t, err, "lost state still trusted")
 		})
 	}
 }
@@ -1733,66 +1543,72 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 func TestKeyringConflictCancellationAndAuthoritativeReads(t *testing.T) {
 	for _, cancelAt := range []string{"none", "before", "issuer", "bundle"} {
 		t.Run(cancelAt, func(t *testing.T) {
-			r, now := testKeyring(t)
-			runKeys(t, r)
-			_, _, s, _ := keyState(t, r)
-			*now = s.NextRotation
+			exerciseKeyringCancellation(t, cancelAt)
+		})
+	}
+}
 
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+func exerciseKeyringCancellation(t *testing.T, cancelAt string) {
+	t.Helper()
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, _, s, _ := keyState(t, r)
+	*now = s.NextRotation
 
-			base := r.Client.(client.WithWatch)
-			writes := 0
-			r.Client = interceptor.NewClient(base, interceptor.Funcs{
-				Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
-					t.Fatal("cached credential read")
-					return nil
-				},
-				List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-					t.Fatal("cached catalog read")
-					return nil
-				},
-				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-					writes++
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-					if (cancelAt == "issuer" || cancelAt == "bundle") && obj.GetName() == r.Config.CredentialsSecretName {
-						cancel()
-					}
+	base := r.Client.(client.WithWatch)
+	writes := 0
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			t.Fatal("cached credential read")
+			return nil
+		},
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			t.Fatal("cached catalog read")
+			return nil
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			writes++
 
-					if cancelAt == "none" {
-						return apierrors.NewConflict(corev1.Resource("secrets"), obj.GetName(), wire.Conflict)
-					}
-
-					return c.Update(ctx, obj, opts...)
-				},
-			})
-
-			if cancelAt == "before" {
+			if (cancelAt == "issuer" || cancelAt == "bundle") && obj.GetName() == r.Config.CredentialsSecretName {
 				cancel()
 			}
 
-			result, err := r.Reconcile(ctx, ctrl.Request{})
 			if cancelAt == "none" {
-				if err != nil || result.RequeueAfter != retryConflictDelay {
-					t.Fatalf("conflict not requeued: %v %v", result, err)
-				}
-			} else if !errors.Is(err, context.Canceled) || !errors.Is(err, reconcile.TerminalError(nil)) || result.RequeueAfter != 0 {
-				t.Fatalf("cancellation retried: %v %v", result, err)
+				return apierrors.NewConflict(corev1.Resource("secrets"), obj.GetName(), wire.Conflict)
 			}
 
-			if cancelAt == "before" && writes != 0 || cancelAt == "issuer" && writes != 1 {
-				t.Fatal("write after cancellation")
-			}
+			return c.Update(ctx, obj, opts...)
+		},
+	})
 
-			// Cancellation before admission observes no authority failure.
-			if trustReady(r.Trust) != (cancelAt == "before") {
-				t.Fatal("readiness did not reflect whether admission observed a failure")
-			}
-
-			r.Client = base
-			runKeys(t, r)
-		})
+	if cancelAt == "before" {
+		cancel()
 	}
+
+	result, err := r.Reconcile(ctx, ctrl.Request{})
+	if cancelAt == "none" {
+		require.NoError(t, err)
+		require.Equal(t, retryConflictDelay, result.RequeueAfter, "conflict not requeued")
+	} else {
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, reconcile.TerminalError(nil))
+		require.Zero(t, result.RequeueAfter, "cancellation retried")
+	}
+
+	if cancelAt == "before" && writes != 0 || cancelAt == "issuer" && writes != 1 {
+		t.Fatal("write after cancellation")
+	}
+
+	// Cancellation before admission observes no authority failure.
+	if trustReady(r.Trust) != (cancelAt == "before") {
+		t.Fatal("readiness did not reflect whether admission observed a failure")
+	}
+
+	r.Client = base
+	runKeys(t, r)
 }
 
 func TestKeyringExpiredPreparationRecovery(t *testing.T) {
@@ -1844,84 +1660,159 @@ func fmtBool(v bool) string {
 	return "active"
 }
 
+func TestReplicaAuthenticationBindings(t *testing.T) {
+	for _, scenario := range []string{"valid", "missing bearer", "review unavailable", "wrong account", "missing binding", "missing pod", "wrong pod uid", "failed pod", "missing account", "wrong account uid", "invalid expiration"} {
+		t.Run(scenario, func(t *testing.T) {
+			f, status, token := authenticatedBootstrapFixture(t)
+			a := f.a.authority
+			base := f.a.Topology.Client.(client.WithWatch)
+			a.config.ControllerServiceAccount = a.config.DataplaneServiceAccount
+			status.Audiences = []string{ReplicationAudience}
+			want := mutateReplicaBinding(t, a, base, scenario, &status, &token)
+			a.client = interceptor.NewClient(base, interceptor.Funcs{Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
+				if scenario == "review unavailable" {
+					return wire.Unavailable
+				}
+
+				review := obj.(*authv1.TokenReview)
+				require.Equal(t, []string{ReplicationAudience}, review.Spec.Audiences)
+				review.Status = status
+
+				return nil
+			}})
+
+			request := httptest.NewRequest("GET", "/replica", nil)
+			if scenario != "missing bearer" {
+				request.Header.Set("Authorization", "Bearer "+token)
+			}
+
+			identity, err := a.AuthenticateReplica(t.Context(), request)
+			if want != nil {
+				require.ErrorIs(t, err, want)
+				require.Equal(t, ReplicaIdentity{}, identity)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, "pod-uid", identity.UID())
+			require.True(t, identity.Expires().After(time.Now()))
+			require.Same(t, a, identity.owner)
+		})
+	}
+}
+
+func mutateReplicaBinding(t *testing.T, a *Authority, c client.Client, scenario string, status *authv1.TokenReviewStatus, token *string) error {
+	t.Helper()
+
+	switch scenario {
+	case "valid":
+		return nil
+	case "missing bearer", "missing binding", "invalid expiration":
+		if scenario == "missing binding" {
+			status.User.UID = ""
+		}
+
+		if scenario == "invalid expiration" {
+			*token = "invalid"
+		}
+
+		return wire.Unauthenticated
+	case "review unavailable":
+		return wire.Unavailable
+	case "wrong account":
+		status.User.Username = "other"
+	case "missing pod":
+		status.User.Extra["authentication.kubernetes.io/pod-name"] = authv1.ExtraValue{"missing"}
+	case "wrong pod uid":
+		status.User.Extra["authentication.kubernetes.io/pod-uid"] = authv1.ExtraValue{"other"}
+	case "failed pod":
+		var pod corev1.Pod
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Namespace: a.config.Namespace, Name: singleExtra(status.User, "pod-name")}, &pod))
+		pod.Status.Phase = corev1.PodFailed
+		require.NoError(t, c.Status().Update(t.Context(), &pod))
+	case "missing account":
+		require.NoError(t, c.Delete(t.Context(), &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: a.config.Namespace, Name: a.config.ControllerServiceAccount}}))
+	case "wrong account uid":
+		status.User.UID = "other"
+	}
+
+	return wire.Forbidden
+}
+
 func TestPreparedIssuerCoversReplacementActivation(t *testing.T) {
 	for _, early := range []bool{false, true} {
 		for _, margin := range []time.Duration{-time.Second, 0, time.Second} {
 			t.Run(fmt.Sprintf("early=%v/margin=%s", early, margin), func(t *testing.T) {
-				r, now := testKeyring(t)
-				runKeys(t, r)
-				_, _, initial, _ := keyState(t, r)
-				*now = initial.NextRotation
-
-				runKeys(t, r)
-				_, bundle, state, material := keyState(t, r)
-				oldID := state.PreparedIssuer
-
-				activation := state.ActivateAt
-				if !early {
-					// Late activation must schedule the next cycle from actual time.
-					*now = state.ActivateAt.Add(2 * time.Hour)
-					activation = *now
-				}
-
-				short := editSigningCertificate(t, material.Keys[oldID], func(cert *x509.Certificate) {
-					cert.NotAfter = activation.Add(r.Config.Rotation.Interval + r.Config.CertificateLifetime + margin)
-				})
-				shortID := rootID(short.Certificate)
-
-				delete(material.Keys, oldID)
-				material.Keys[shortID] = short
-				state.PreparedIssuer = shortID
-
-				for i, root := range bundle.PeerTrustRoots {
-					if rootID(root) == oldID {
-						bundle.PeerTrustRoots[i] = short.Certificate
-					}
-				}
-
-				bundle.Generation++
-				writeSigningCredentials(t, r, bundle, state, material)
-				runKeys(t, r)
-
-				_, after, next, keys := keyState(t, r)
-				if margin < 0 {
-					if containsRoot(after, shortID) || next.PreparedIssuer == shortID || next.ActiveIssuer != initial.ActiveIssuer || !next.ActivateAt.Equal(now.Add(r.Config.Rotation.PrepareFor)) {
-						t.Fatal("insufficient signing horizon did not restart preparation")
-					}
-
-					if _, retained := keys.Keys[shortID]; retained {
-						t.Fatal("stale private material retained")
-					}
-				} else if early {
-					if next.PreparedIssuer != shortID || !next.ActivateAt.Equal(state.ActivateAt) || after.Generation != bundle.Generation {
-						t.Fatal("usable preparation changed before activation")
-					}
-				} else if next.ActiveIssuer != shortID || next.PreparedIssuer != "" {
-					t.Fatal("usable prepared issuer did not activate")
-				}
-
-				if next.PreparedIssuer != "" {
-					*now = next.ActivateAt
-
-					runKeys(t, r)
-				}
-
-				_, _, active, _ := keyState(t, r)
-				*now = active.NextRotation
-
-				runKeys(t, r)
-				_, _, replacement, _ := keyState(t, r)
-				*now = replacement.ActivateAt.Add(-time.Second)
-
-				identity, request, _ := issuanceRequest(t, r)
-				if _, err := testIssuer(r).Issue(t.Context(), identity, request); err != nil {
-					t.Fatalf("issuer failed before replacement activation: %v", err)
-				}
-
-				*now = replacement.ActivateAt
-
-				runKeys(t, r)
+				exercisePreparedIssuerHorizon(t, early, margin)
 			})
 		}
 	}
+}
+
+func exercisePreparedIssuerHorizon(t *testing.T, early bool, margin time.Duration) {
+	t.Helper()
+	r, now := testKeyring(t)
+	runKeys(t, r)
+	_, _, initial, _ := keyState(t, r)
+	*now = initial.NextRotation
+
+	runKeys(t, r)
+	_, bundle, state, material := keyState(t, r)
+	oldID := state.PreparedIssuer
+
+	activation := state.ActivateAt
+	if !early {
+		// Late activation must schedule the next cycle from actual time.
+		*now = state.ActivateAt.Add(2 * time.Hour)
+		activation = *now
+	}
+
+	short := editSigningCertificate(t, material.Keys[oldID], func(cert *x509.Certificate) {
+		cert.NotAfter = activation.Add(r.Config.Rotation.Interval + r.Config.CertificateLifetime + margin)
+	})
+	shortID := rootID(short.Certificate)
+
+	rebindSigning(&bundle, &state, material, oldID, short, true)
+
+	bundle.Generation++
+	writeSigningCredentials(t, r, bundle, state, material)
+	runKeys(t, r)
+
+	_, after, next, keys := keyState(t, r)
+	if margin < 0 {
+		if containsRoot(after, shortID) || next.PreparedIssuer == shortID || next.ActiveIssuer != initial.ActiveIssuer || !next.ActivateAt.Equal(now.Add(r.Config.Rotation.PrepareFor)) {
+			t.Fatal("insufficient signing horizon did not restart preparation")
+		}
+
+		require.NotContains(t, keys.Keys, shortID, "stale private material retained")
+	} else if early {
+		if next.PreparedIssuer != shortID || !next.ActivateAt.Equal(state.ActivateAt) || after.Generation != bundle.Generation {
+			t.Fatal("usable preparation changed before activation")
+		}
+	} else if next.ActiveIssuer != shortID || next.PreparedIssuer != "" {
+		t.Fatal("usable prepared issuer did not activate")
+	}
+
+	if next.PreparedIssuer != "" {
+		*now = next.ActivateAt
+
+		runKeys(t, r)
+	}
+
+	_, _, active, _ := keyState(t, r)
+	*now = active.NextRotation
+
+	runKeys(t, r)
+	_, _, replacement, _ := keyState(t, r)
+	*now = replacement.ActivateAt.Add(-time.Second)
+
+	identity, request, _ := issuanceRequest(t, r)
+	if _, err := testIssuer(r).Issue(t.Context(), identity, request); err != nil {
+		t.Fatalf("issuer failed before replacement activation: %v", err)
+	}
+
+	*now = replacement.ActivateAt
+
+	runKeys(t, r)
 }

@@ -18,6 +18,7 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -34,16 +36,12 @@ import (
 )
 
 type credentials struct {
-	settings frozenConfig
 	client.Writer
-	APIReader   client.Reader
-	Config      Config
-	Trust       *trustStore
-	Now         func() time.Time
-	CatalogGate *catalogGate
+	APIReader client.Reader
+	Config    Config
+	Trust     *trustStore
+	Now       func() time.Time
 }
-
-func (r *credentials) runtimeConfig() Config { return r.settings.get(&r.Config) }
 
 // Reconcile creates/rotates issuer and cache keys through ordinary Secret CAS,
 // stages trust before using a new issuer, and returns RequeueAfter for deadlines.
@@ -53,12 +51,10 @@ func (r *credentials) runtimeConfig() Config { return r.settings.get(&r.Config) 
 // before releasing admission. Scheduling and conflict retries belong to root.
 func (a *Authority) ReconcileCredentials(ctx context.Context) (time.Duration, error) {
 	r := a.credentials
-	if a.gate != nil {
-		if err := a.gate.Acquire(ctx); err != nil {
-			return 0, err
-		}
-		defer a.gate.Release()
+	if err := a.gate.Acquire(ctx); err != nil {
+		return 0, err
 	}
+	defer a.gate.Release()
 
 	result, err := r.reconcileKeys(ctx)
 
@@ -69,8 +65,8 @@ func (a *Authority) ReconcileCredentials(ctx context.Context) (time.Duration, er
 	if err == nil {
 		var state signingState
 
-		state, err = loadSigning(ctx, r.APIReader, r.runtimeConfig(), r.now())
-		if err == nil && r.Trust != nil {
+		state, err = loadSigning(ctx, r.APIReader, r.Config, r.now())
+		if err == nil {
 			err = r.Trust.install(ctx, state.roots, state.bundle)
 		}
 	}
@@ -100,7 +96,7 @@ func credentialSecret(cfg Config, name, claim string) *corev1.Secret {
 }
 
 func (r *credentials) reconcileKeys(ctx context.Context) (ctrl.Result, error) {
-	cfg := r.runtimeConfig()
+	cfg := r.Config
 
 	if err := ctx.Err(); err != nil {
 		return ctrl.Result{}, err
@@ -139,11 +135,11 @@ func (r *credentials) reconcileKeys(ctx context.Context) (ctrl.Result, error) {
 		return ctrl.Result{}, err
 	}
 
-	if r.Trust != nil {
-		if err := r.Trust.checkReplay(credentials.bundle); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
+	return r.rotateKeys(ctx, cfg, credentials, catalog)
+}
+
+func (r *credentials) rotateKeys(ctx context.Context, cfg Config, credentials credentialState, catalog []wire.CacheDefinition) (ctrl.Result, error) {
+	var err error
 
 	catalog, err = admitCatalog(ctx, cfg, catalog, credentials.bundle)
 	if err != nil {
@@ -274,7 +270,7 @@ func (c *credentialState) encodeRotation(encoded []byte) (bool, error) {
 }
 
 func (r *credentials) initializeKeys(ctx context.Context, version *corev1.ConfigMap, catalog []wire.CacheDefinition) (ctrl.Result, error) {
-	cfg := r.runtimeConfig()
+	cfg := r.Config
 
 	existing := &corev1.Secret{}
 
@@ -284,11 +280,7 @@ func (r *credentials) initializeKeys(ctx context.Context, version *corev1.Config
 			return ctrl.Result{}, err
 		}
 
-		if version.Annotations[initializationProtocol] == stagedInitialization {
-			return r.commitStagedCredentials(ctx, version, existing)
-		}
-
-		return ctrl.Result{}, wire.Unavailable
+		return r.commitStagedCredentials(ctx, version, existing)
 	}
 
 	now := r.now()
@@ -345,33 +337,20 @@ func (r *credentials) initializeKeys(ctx context.Context, version *corev1.Config
 		return ctrl.Result{}, err
 	}
 
-	if version.Annotations[initializationProtocol] == stagedInitialization {
-		// Unlike the legacy path, the claim is committed only after the complete
-		// Secret exists. Until then readers cannot use this candidate.
-		secret.Annotations[installationUIDAnnotation] = version.Annotations[installationUIDAnnotation]
+	return r.createInitialCredentials(ctx, version, secret)
+}
 
-		secret.Annotations[initializationProtocol] = stagedInitialization
-		if err := r.Create(ctx, secret); err != nil {
-			return ctrl.Result{}, err
-		}
+func (r *credentials) createInitialCredentials(ctx context.Context, version *corev1.ConfigMap, secret *corev1.Secret) (ctrl.Result, error) {
+	// Commit the claim only after the complete Secret exists. Until then readers
+	// cannot use this candidate. Recovery must bind this exact Kubernetes UID.
+	secret.Annotations[installationUIDAnnotation] = version.Annotations[installationUIDAnnotation]
 
-		return r.commitStagedCredentials(ctx, version, secret)
-	}
-
-	version.Annotations[credentialClaim] = claim
-	if err := r.Update(ctx, version); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if err := ctx.Err(); err != nil {
-		return ctrl.Result{}, err
-	}
-
+	secret.Annotations[initializationProtocol] = stagedInitialization
 	if err := r.Create(ctx, secret); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: max(time.Second, cfg.Rotation.Interval-cfg.Rotation.PrepareFor)}, nil
+	return r.commitStagedCredentials(ctx, version, secret)
 }
 
 type RotationPolicy struct {
@@ -462,7 +441,62 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s rotationState, 
 	}
 
 	original, originalState := b, s
+	b, s = cloneRotation(b, s)
 
+	wanted, err := rotationCatalog(catalog)
+	if err != nil {
+		return b, s, nil, err
+	}
+
+	pruneRotation(&b, &s, wanted, now)
+
+	if err := addMissingCacheKeys(&b, catalog, creationGeneration); err != nil {
+		return b, s, nil, err
+	}
+
+	if !s.ActivateAt.IsZero() && !now.Before(s.ActivateAt) {
+		activateRotation(&b, &s, policy, now)
+	} else if s.ActivateAt.IsZero() && !now.Before(s.NextRotation) {
+		if err := prepareCacheKeys(&b, &s, policy, now, creationGeneration); err != nil {
+			return b, s, nil, err
+		}
+	}
+	// Generation counts changed publications, not rotation cycles.
+	if len(original.CacheKeys) == 0 {
+		original.CacheKeys = []wire.CacheKey{}
+	}
+
+	if originalState.Retiring == nil {
+		originalState.Retiring = map[string]time.Time{}
+	}
+
+	if !reflect.DeepEqual(original, b) || !reflect.DeepEqual(originalState, s) {
+		if creationGeneration == 0 {
+			return b, s, nil, wire.Unavailable
+		}
+
+		b.Generation = creationGeneration
+	}
+
+	encoded, err := wire.EncodeBundle(b)
+
+	return b, s, encoded, err
+}
+
+func rotationCatalog(catalog []wire.CacheDefinition) (map[wire.CacheID]bool, error) {
+	wanted := make(map[wire.CacheID]bool, len(catalog))
+	for _, cache := range catalog {
+		if !wire.ValidUUID(string(cache.ID)) || wanted[cache.ID] {
+			return nil, wire.InvalidRequest
+		}
+
+		wanted[cache.ID] = true
+	}
+
+	return wanted, nil
+}
+
+func cloneRotation(b wire.KeyringBundle, s rotationState) (wire.KeyringBundle, rotationState) {
 	rootsCopy := make([][]byte, len(b.PeerTrustRoots))
 	for i, root := range b.PeerTrustRoots {
 		rootsCopy[i] = bytes.Clone(root)
@@ -485,15 +519,10 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s rotationState, 
 
 	s.Retiring = retiring
 
-	wanted := map[wire.CacheID]bool{}
-	for _, cache := range catalog {
-		if !wire.ValidUUID(string(cache.ID)) || wanted[cache.ID] {
-			return b, s, nil, wire.InvalidRequest
-		}
+	return b, s
+}
 
-		wanted[cache.ID] = true
-	}
-
+func pruneRotation(b *wire.KeyringBundle, s *rotationState, wanted map[wire.CacheID]bool, now time.Time) {
 	keys := b.CacheKeys[:0]
 	for _, k := range b.CacheKeys {
 		if !wanted[k.Key.Cache] {
@@ -517,7 +546,9 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s rotationState, 
 	}
 
 	b.PeerTrustRoots = roots
+}
 
+func addMissingCacheKeys(b *wire.KeyringBundle, catalog []wire.CacheDefinition, generation wire.Generation) error {
 	present := map[string]bool{}
 	for _, key := range b.CacheKeys {
 		present[keyScope(key)] = true
@@ -526,9 +557,9 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s rotationState, 
 	for _, cache := range catalog {
 		for _, purpose := range []wire.KeyPurpose{wire.PageKey, wire.OriginCredentialsKey} {
 			if !present[string(cache.ID)+"/"+string(purpose)] {
-				k, err := newCacheKey(cache.ID, purpose, wire.ActiveKey, creationGeneration)
+				k, err := newCacheKey(cache.ID, purpose, wire.ActiveKey, generation)
 				if err != nil {
-					return b, s, nil, err
+					return err
 				}
 
 				b.CacheKeys = append(b.CacheKeys, k)
@@ -536,80 +567,64 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s rotationState, 
 		}
 	}
 
-	if !s.ActivateAt.IsZero() && !now.Before(s.ActivateAt) {
-		prepared := map[string]bool{}
+	return nil
+}
 
-		for _, key := range b.CacheKeys {
-			if key.State == wire.PreparedKey {
-				prepared[keyScope(key)] = true
-			}
+func activateRotation(b *wire.KeyringBundle, s *rotationState, policy RotationPolicy, now time.Time) {
+	prepared := map[string]bool{}
+
+	for _, key := range b.CacheKeys {
+		if key.State == wire.PreparedKey {
+			prepared[keyScope(key)] = true
 		}
-
-		keys := b.CacheKeys[:0]
-		for _, k := range b.CacheKeys {
-			// A cache added during preparation can have only its initial active key.
-			if k.State == wire.ActiveKey && prepared[keyScope(k)] {
-				continue
-			}
-
-			if k.State == wire.PreparedKey {
-				k.State = wire.ActiveKey
-			}
-
-			keys = append(keys, k)
-		}
-
-		b.CacheKeys = keys
-
-		s.Retiring[s.ActiveIssuer] = now.Add(policy.RetainFor)
-		s.ActiveIssuer, s.PreparedIssuer = s.PreparedIssuer, ""
-		s.ActivateAt = time.Time{}
-		s.NextRotation = now.Add(policy.Interval - policy.PrepareFor)
-	} else if s.ActivateAt.IsZero() && !now.Before(s.NextRotation) {
-		if s.PreparedIssuer == "" {
-			return b, s, nil, wire.Unavailable
-		}
-
-		var prepared []wire.CacheKey
-
-		for _, k := range b.CacheKeys {
-			if k.State != wire.ActiveKey {
-				continue
-			}
-
-			next, err := newCacheKey(k.Key.Cache, k.Key.Purpose, wire.PreparedKey, creationGeneration)
-			if err != nil {
-				return b, s, nil, err
-			}
-
-			prepared = append(prepared, next)
-		}
-
-		b.CacheKeys = append(b.CacheKeys, prepared...)
-		s.ActivateAt = now.Add(policy.PrepareFor)
 	}
 
-	// Generation is the final publication version, not a rotation ordinal.
-	// Normalize empty collections for the comparison without consuming a version.
-	if len(original.CacheKeys) == 0 {
-		original.CacheKeys = []wire.CacheKey{}
-	}
-
-	if originalState.Retiring == nil {
-		originalState.Retiring = map[string]time.Time{}
-	}
-
-	if !reflect.DeepEqual(original, b) || !reflect.DeepEqual(originalState, s) {
-		if creationGeneration == 0 {
-			return b, s, nil, wire.Unavailable
+	keys := b.CacheKeys[:0]
+	for _, k := range b.CacheKeys {
+		// A cache added during preparation can have only its initial active key.
+		if k.State == wire.ActiveKey && prepared[keyScope(k)] {
+			continue
 		}
 
-		b.Generation = creationGeneration
+		if k.State == wire.PreparedKey {
+			k.State = wire.ActiveKey
+		}
+
+		keys = append(keys, k)
 	}
 
-	encoded, err := wire.EncodeBundle(b)
+	b.CacheKeys = keys
 
-	return b, s, encoded, err
+	s.Retiring[s.ActiveIssuer] = now.Add(policy.RetainFor)
+	s.ActiveIssuer, s.PreparedIssuer = s.PreparedIssuer, ""
+	s.ActivateAt = time.Time{}
+	s.NextRotation = now.Add(policy.Interval - policy.PrepareFor)
+}
+
+func prepareCacheKeys(b *wire.KeyringBundle, s *rotationState, policy RotationPolicy, now time.Time, generation wire.Generation) error {
+	if s.PreparedIssuer == "" {
+		return wire.Unavailable
+	}
+
+	var prepared []wire.CacheKey
+
+	for _, k := range b.CacheKeys {
+		if k.State != wire.ActiveKey {
+			continue
+		}
+
+		next, err := newCacheKey(k.Key.Cache, k.Key.Purpose, wire.PreparedKey, generation)
+		if err != nil {
+			return err
+		}
+
+		prepared = append(prepared, next)
+	}
+
+	b.CacheKeys = append(b.CacheKeys, prepared...)
+	s.ActivateAt = now.Add(policy.PrepareFor)
+
+	return nil
 }
 
 func containsRoot(b wire.KeyringBundle, id string) bool {
@@ -766,6 +781,7 @@ type trustStore struct {
 	digest    [sha256.Size]byte
 	authority context.Context
 	revoke    context.CancelFunc
+	process   context.Context
 }
 
 // acceptedKeyring owns an immutable, bounded wire encoding, never issuer material.
@@ -777,24 +793,6 @@ type acceptedKeyring struct {
 
 func (*acceptedKeyring) String() string   { return "<redacted keyring>" }
 func (*acceptedKeyring) GoString() string { return "<redacted keyring>" }
-
-func (t *trustStore) checkReplay(bundle wire.KeyringBundle) error {
-	encoded, err := wire.EncodeBundle(bundle)
-	if err != nil {
-		return err
-	}
-
-	digest := sha256.Sum256(encoded)
-
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if bundle.Generation < t.highWater || bundle.Generation == t.highWater && digest != t.digest {
-		return wire.Conflict
-	}
-
-	return nil
-}
 
 func (t *trustStore) install(ctx context.Context, roots *x509.CertPool, bundle wire.KeyringBundle) error {
 	encoded, err := wire.EncodeBundle(bundle)
@@ -846,41 +844,33 @@ func (t *trustStore) notifyLocked() {
 	t.changed = make(chan struct{})
 }
 
-// writeContext captures trust before response authentication/issuance. Explicit
-// invalidation permanently revokes that generation, even across recovery. Normal
-// validated rotation allows admitted responses to finish, but neither rotation nor
-// reconfirmation extends their captured freshness deadline.
-func (t *trustStore) writeContext(parent context.Context) (context.Context, context.CancelFunc, error) {
-	if t == nil {
+// Caller holds mu so admission and accepted bundle are captured atomically.
+// Invalidation revokes admission across recovery. Rotation and reconfirmation
+// preserve it without extending its captured freshness deadline.
+func (t *trustStore) admitLocked(parent context.Context) (*Admission, context.CancelFunc, error) {
+	if t.process != nil && t.process.Err() != nil {
 		return nil, nil, wire.Unavailable
 	}
 
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	return t.writeContextLocked(parent)
-}
-
-// Caller holds mu so the guard and accepted bundle can be captured atomically.
-func (t *trustStore) writeContextLocked(parent context.Context) (context.Context, context.CancelFunc, error) {
 	if t.roots == nil || t.authority == nil || t.authority.Err() != nil || t.maxAge > 0 && time.Since(t.confirmed) >= t.maxAge {
 		return nil, nil, wire.Unavailable
 	}
 
-	var (
-		ctx    context.Context
-		cancel context.CancelFunc
-	)
-
+	expiry := time.Unix(1<<62, 0)
 	if t.maxAge > 0 {
-		ctx, cancel = context.WithDeadline(parent, t.confirmed.Add(t.maxAge))
-	} else {
-		ctx, cancel = context.WithCancel(parent)
+		expiry = t.confirmed.Add(t.maxAge)
 	}
 
-	stop := context.AfterFunc(t.authority, cancel)
+	guard, cancel := newAdmission(parent, t.authority, expiry)
+	guard.trust, guard.bundle = true, t.bundle
 
-	return authorityWriteContext{Context: ctx, authority: t.authority, parent: parent}, func() { stop(); cancel() }, nil
+	guard.process = t.process
+	if t.process != nil {
+		stop := context.AfterFunc(t.process, cancel)
+		return guard, func() { stop(); cancel() }, nil
+	}
+
+	return guard, cancel, nil
 }
 
 func (t *trustStore) invalidate() {
@@ -1009,22 +999,8 @@ type credentialState struct {
 	signing map[string]parsedSigning
 }
 
-func readCredentials(ctx context.Context, reader client.Reader, cfg Config, claim string) (credentialState, error) {
-	version, _, err := readVersion(ctx, reader, cfg)
-	if err != nil {
-		return credentialState{}, err
-	}
-
-	return readBoundCredentials(ctx, reader, cfg, claim, version)
-}
-
 func readBoundCredentials(ctx context.Context, reader client.Reader, cfg Config, claim string, version *corev1.ConfigMap) (credentialState, error) {
-	var (
-		secret   corev1.Secret
-		b        wire.KeyringBundle
-		s        rotationState
-		material issuerMaterial
-	)
+	var secret corev1.Secret
 
 	if err := ctx.Err(); err != nil {
 		return credentialState{}, err
@@ -1038,22 +1014,29 @@ func readBoundCredentials(ctx context.Context, reader client.Reader, cfg Config,
 		return credentialState{}, wire.Unavailable
 	}
 
-	if version.Annotations[credentialClaim] != claim || (version.Annotations[initializationProtocol] == stagedInitialization && (secret.UID == "" || version.Annotations[credentialUID] != string(secret.UID))) {
+	if version.Annotations[credentialClaim] != claim || secret.UID == "" || version.Annotations[credentialUID] != string(secret.UID) || secret.Annotations[initializationProtocol] != stagedInitialization || secret.Annotations[installationUIDAnnotation] != version.Annotations[installationUIDAnnotation] {
 		return credentialState{}, wire.Unavailable
 	}
 
-	var err error
+	return decodeCredentials(cfg, &secret)
+}
 
-	b, err = wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
+func decodeCredentials(cfg Config, secret *corev1.Secret) (credentialState, error) {
+	b, err := wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
 	if err != nil {
 		return credentialState{}, wire.Unavailable
 	}
+
+	var (
+		s        rotationState
+		material issuerMaterial
+	)
 
 	if b.Cluster != cfg.Cluster || decodeCredentialMetadata(secret.Data["rotation.json"], &s) != nil || decodeCredentialMetadata(secret.Data["issuer.json"], &material) != nil {
 		return credentialState{}, wire.Unavailable
 	}
 
-	credentials := credentialState{secret: &secret, bundle: b, rotation: s, material: material, generation: b.Generation}
+	credentials := credentialState{secret: secret, bundle: b, rotation: s, material: material, generation: b.Generation}
 	if err := credentials.validateRotation(); err != nil {
 		return credentialState{}, err
 	}
@@ -1096,13 +1079,22 @@ func (c *credentialState) validateRotation() error {
 		c.signing[id] = parsedSigning{certificate: cert, key: key}
 	}
 
-	required := map[string]struct{}{}
-
 	if !s.ActivateAt.IsZero() {
 		if !containsRoot(b, s.PreparedIssuer) || s.PreparedIssuer == s.ActiveIssuer || !s.ActivateAt.After(s.NextRotation) {
 			return wire.Unavailable
 		}
 	}
+
+	if err := c.validateRetiringRoots(); err != nil {
+		return err
+	}
+
+	return validatePreparedKeys(b.CacheKeys, s.ActivateAt)
+}
+
+func (c *credentialState) validateRetiringRoots() error {
+	b, s := c.bundle, c.rotation
+	required := map[string]struct{}{}
 
 	for _, root := range b.PeerTrustRoots {
 		id := rootID(root)
@@ -1117,19 +1109,6 @@ func (c *credentialState) validateRotation() error {
 		}
 	}
 
-	prepared := map[string]bool{}
-
-	for _, key := range b.CacheKeys {
-		if key.State == wire.PreparedKey {
-			scope := string(key.Key.Cache) + "/" + string(key.Key.Purpose)
-			if s.ActivateAt.IsZero() || prepared[scope] {
-				return wire.Unavailable
-			}
-
-			prepared[scope] = true
-		}
-	}
-
 	if len(required) != len(s.Retiring) {
 		return wire.Unavailable
 	}
@@ -1138,6 +1117,25 @@ func (c *credentialState) validateRotation() error {
 		if at, ok := s.Retiring[id]; !ok || at.IsZero() {
 			return wire.Unavailable
 		}
+	}
+
+	return nil
+}
+
+func validatePreparedKeys(keys []wire.CacheKey, activateAt time.Time) error {
+	prepared := map[string]bool{}
+
+	for _, key := range keys {
+		if key.State != wire.PreparedKey {
+			continue
+		}
+
+		scope := keyScope(key)
+		if activateAt.IsZero() || prepared[scope] {
+			return wire.Unavailable
+		}
+
+		prepared[scope] = true
 	}
 
 	return nil
@@ -1179,4 +1177,254 @@ func (g *catalogGate) Acquire(ctx context.Context) error {
 // Release ends a successfully acquired critical section.
 func (g *catalogGate) Release() {
 	g.token <- struct{}{}
+}
+
+const installationUIDAnnotation = "racer.unbounded-cloud.io/installation-uid"
+
+func readInstallation(ctx context.Context, reader client.Reader, cfg Config, fresh bool) (*corev1.ConfigMap, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	cm := &corev1.ConfigMap{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName}, cm); err != nil {
+		return nil, authorityReadFailure(err)
+	}
+
+	return cm, validateMarker(cm, cfg, fresh)
+}
+
+func validateMarker(cm *corev1.ConfigMap, cfg Config, fresh bool) error {
+	state := "consumed"
+	if fresh {
+		state = "fresh"
+	}
+
+	immutable := cm.Immutable != nil && *cm.Immutable
+	if cm.UID == "" || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil || cm.Data[markerInitializationProtocol] != stagedInitialization || cm.Data["cluster"] != string(cfg.Cluster) || cm.Data["version_configmap"] != cfg.VersionConfigMapName || cm.Data["state"] != state || immutable == fresh {
+		return fmt.Errorf("installation marker invalid: %w", wire.Unavailable)
+	}
+
+	return nil
+}
+
+// ensureInstalled recovers only staged-v1 installations with UID-bound authority.
+func ensureInstalled(ctx context.Context, writer client.Writer, reader client.Reader, cfg Config) error {
+	if !wire.ValidUUID(string(cfg.Cluster)) {
+		return wire.InvalidRequest
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	marker := &corev1.ConfigMap{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName}, marker); err != nil {
+		return err
+	}
+
+	return ensureStagedInstallation(ctx, writer, reader, cfg, marker)
+}
+
+func versionData(v versionRecord) map[string]string {
+	return map[string]string{"cluster": string(v.Cluster), "sequence": strconv.FormatUint(uint64(v.Sequence), 10), "membership_version": strconv.FormatUint(uint64(v.MembershipVersion), 10), "content_hash": v.ContentHash, "membership_hash": v.MembershipHash}
+}
+
+func validHash(s string) bool {
+	b, err := hex.DecodeString(s)
+	return err == nil && len(b) == 32 && hex.EncodeToString(b) == s
+}
+
+func (v versionRecord) valid() bool {
+	return wire.ValidUUID(string(v.Cluster)) && v.Sequence > 0 && v.MembershipVersion > 0 && uint64(v.MembershipVersion) <= uint64(v.Sequence) && validHash(v.ContentHash) && validHash(v.MembershipHash)
+}
+
+func parseVersion(cm *corev1.ConfigMap, cluster wire.ClusterID, markerUID types.UID) (versionRecord, error) {
+	sequence, e1 := strconv.ParseUint(cm.Data["sequence"], 10, 64)
+	membership, e2 := strconv.ParseUint(cm.Data["membership_version"], 10, 64)
+
+	v := versionRecord{Cluster: wire.ClusterID(cm.Data["cluster"]), Sequence: wire.Sequence(sequence), MembershipVersion: wire.MembershipVersion(membership), ContentHash: cm.Data["content_hash"], MembershipHash: cm.Data["membership_hash"]}
+	if e1 != nil || e2 != nil || !v.valid() || v.Cluster != cluster || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil || cm.Annotations[installationUIDAnnotation] != string(markerUID) || strconv.FormatUint(sequence, 10) != cm.Data["sequence"] || strconv.FormatUint(membership, 10) != cm.Data["membership_version"] {
+		return versionRecord{}, fmt.Errorf("durable version state invalid; explicit new-cluster rebootstrap required: %w", wire.Unavailable)
+	}
+
+	return v, nil
+}
+
+func readVersion(ctx context.Context, reader client.Reader, cfg Config) (*corev1.ConfigMap, versionRecord, error) {
+	marker, err := readInstallation(ctx, reader, cfg, false)
+	if err != nil {
+		return nil, versionRecord{}, err
+	}
+
+	cm := &corev1.ConfigMap{}
+
+	if err := ctx.Err(); err != nil {
+		return nil, versionRecord{}, err
+	}
+
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.VersionConfigMapName}, cm); err != nil {
+		return nil, versionRecord{}, authorityReadFailure(err)
+	}
+
+	v, err := parseVersion(cm, cfg.Cluster, marker.UID)
+	if marker.Data[versionUID] == "" || marker.Data[versionUID] != string(cm.UID) || cm.Annotations[initializationProtocol] != stagedInitialization {
+		err = wire.Unavailable
+	}
+
+	return cm, v, err
+}
+
+const (
+	initializationProtocol       = "racer.unbounded-cloud.io/initialization"
+	markerInitializationProtocol = "initialization_protocol"
+	stagedInitialization         = "staged-v1"
+	versionUID                   = "version_uid"
+	credentialUID                = "racer.unbounded-cloud.io/credentials-uid"
+)
+
+// A candidate is not authority: the
+// permanent parent CAS binds its Kubernetes UID before any reader can use it.
+// Retrying Create cannot restore deleted authority because the UID changes.
+func ensureStagedInstallation(ctx context.Context, writer client.Writer, reader client.Reader, cfg Config, marker *corev1.ConfigMap) error {
+	for {
+		err := stageInstallation(ctx, writer, reader, cfg, marker)
+		if !apierrors.IsConflict(err) && !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		marker = &corev1.ConfigMap{}
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName}, marker); err != nil {
+			return err
+		}
+	}
+}
+
+func stageInstallation(ctx context.Context, writer client.Writer, reader client.Reader, cfg Config, marker *corev1.ConfigMap) error {
+	if marker.Data[markerInitializationProtocol] != stagedInitialization {
+		return wire.Unavailable
+	}
+
+	if marker.Data["state"] == "consumed" {
+		_, _, err := readVersion(ctx, reader, cfg)
+		return err
+	}
+
+	if err := validateMarker(marker, cfg, true); err != nil {
+		return err
+	}
+
+	if marker.Data[versionUID] != "" {
+		return wire.Unavailable
+	}
+
+	content, membership, err := wire.ContentHashes(wire.Publication{SchemaVersion: wire.SchemaVersion, Cluster: cfg.Cluster})
+	if err != nil {
+		return err
+	}
+
+	data := versionData(versionRecord{Cluster: cfg.Cluster, Sequence: 1, MembershipVersion: 1, ContentHash: content, MembershipHash: membership})
+	key := client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.VersionConfigMapName}
+
+	candidate := &corev1.ConfigMap{}
+	if err := reader.Get(ctx, key, candidate); apierrors.IsNotFound(err) {
+		candidate = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Annotations: map[string]string{installationUIDAnnotation: string(marker.UID), initializationProtocol: stagedInitialization}}, Data: data}
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if err := writer.Create(ctx, candidate); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	// A concurrent winner may already have committed and advanced the candidate.
+	if _, _, err := readVersion(ctx, reader, cfg); err == nil {
+		return nil
+	}
+
+	if !validStagedVersion(candidate, marker.UID, data) {
+		return wire.Unavailable
+	}
+
+	marker.Data[versionUID] = string(candidate.UID)
+	marker.Data["state"] = "consumed"
+	immutable := true
+	marker.Immutable = &immutable
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if err := writer.Update(ctx, marker); err != nil {
+		return err
+	}
+
+	_, _, err = readVersion(ctx, reader, cfg)
+
+	return err
+}
+
+func validStagedVersion(candidate *corev1.ConfigMap, markerUID types.UID, data map[string]string) bool {
+	return candidate.UID != "" && candidate.ResourceVersion != "" && candidate.DeletionTimestamp == nil &&
+		(candidate.Immutable == nil || !*candidate.Immutable) && candidate.Annotations[installationUIDAnnotation] == string(markerUID) &&
+		candidate.Annotations[initializationProtocol] == stagedInitialization && candidate.Annotations[credentialClaim] == "" && reflect.DeepEqual(candidate.Data, data)
+}
+
+// Commit only a complete generation-one candidate from this installation. The
+// material stays exclusively in the ordinary credentials Secret. No pending
+// private-key copy, second Secret, or new RBAC permission is necessary.
+func (r *credentials) commitStagedCredentials(ctx context.Context, version *corev1.ConfigMap, secret *corev1.Secret) (ctrl.Result, error) {
+	cfg := r.Config
+
+	claim := secret.Annotations[credentialClaim]
+	if !validStagedCredentials(cfg, version, secret) {
+		return ctrl.Result{}, wire.Unavailable
+	}
+
+	bundle, err := wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
+	if err != nil {
+		return ctrl.Result{}, wire.Unavailable
+	}
+
+	candidate := credentialState{bundle: bundle}
+	if bundle.Cluster != cfg.Cluster || bundle.Generation != 1 || decodeCredentialMetadata(secret.Data["rotation.json"], &candidate.rotation) != nil || decodeCredentialMetadata(secret.Data["issuer.json"], &candidate.material) != nil {
+		return ctrl.Result{}, wire.Unavailable
+	}
+
+	if err := candidate.validateRotation(); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if claim != cfg.CredentialsSecretName+"/"+candidate.rotation.ActiveIssuer || candidate.rotation.PreparedIssuer != "" {
+		return ctrl.Result{}, wire.Unavailable
+	}
+
+	version.Annotations[credentialClaim] = claim
+	version.Annotations[credentialUID] = string(secret.UID)
+
+	if err := ctx.Err(); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Update(ctx, version); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: max(time.Second, candidate.rotation.nextTransition().Sub(r.now()))}, nil
+}
+
+func validStagedCredentials(cfg Config, version *corev1.ConfigMap, secret *corev1.Secret) bool {
+	return version.Annotations[credentialClaim] == "" && version.Annotations[credentialUID] == "" &&
+		secret.UID != "" && secret.ResourceVersion != "" && secret.DeletionTimestamp == nil && (secret.Immutable == nil || !*secret.Immutable) &&
+		secret.Annotations[initializationProtocol] == stagedInitialization && secret.Annotations[installationUIDAnnotation] == version.Annotations[installationUIDAnnotation] &&
+		validCredentialClaim(cfg, secret.Annotations[credentialClaim])
 }

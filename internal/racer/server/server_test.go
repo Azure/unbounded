@@ -14,7 +14,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +22,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -35,7 +33,6 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -49,84 +46,6 @@ import (
 	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
-
-type fixtureConfig struct {
-	authority.Config
-	ServerConfig Config
-	PeerPort     uint16
-}
-
-func (c fixtureConfig) authorityConfig() authority.Config { return c.Config }
-
-type Application struct {
-	authority   *authority.Authority
-	Topology    *TopologyReconciler
-	Keyring     *KeyringReconciler
-	Server      *Server
-	Lifecycle   *Lifecycle
-	Replication *fixtureLeader
-}
-
-type TopologyReconciler struct {
-	client.Client
-	APIReader client.Reader
-	Config    fixtureConfig
-	authority *authority.Authority
-}
-
-func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	_, err := r.authority.PublishTopology(ctx, r.observeTopology)
-	return ctrl.Result{}, err
-}
-
-type KeyringReconciler struct {
-	Config    fixtureConfig
-	authority *authority.Authority
-}
-
-func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	delay, err := r.authority.ReconcileCredentials(ctx)
-	return ctrl.Result{RequeueAfter: delay}, err
-}
-
-type fixtureLeader struct {
-	Config    fixtureConfig
-	Client    client.Client
-	APIReader client.Reader
-	authority *authority.Authority
-	mu        sync.Mutex
-	leader    context.Context
-}
-
-func (r *fixtureLeader) LeaderContext() (context.Context, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return r.leader, r.leader != nil && r.leader.Err() == nil
-}
-
-func (r *fixtureLeader) PollInterval() time.Duration {
-	return min(5*time.Second, r.Config.SnapshotMaxAge/3)
-}
-
-func (r *fixtureLeader) AuthenticateReplica(ctx context.Context, req *http.Request) (string, time.Time, error) {
-	i, e := r.authority.AuthenticateReplica(ctx, req)
-	return i.UID(), i.Expires(), e
-}
-
-func (r *fixtureLeader) observe(ctx context.Context) { _ = r.authority.Observe(ctx) }
-
-func (r *fixtureLeader) installReplica(ctx, process context.Context, p wire.Publication) error {
-	return r.authority.AcceptReplica(ctx, process, p)
-}
-
-func Assemble(cfg fixtureConfig, c client.Client, reader client.Reader) *Application {
-	a := authority.New(cfg.authorityConfig(), authority.Dependencies{Writer: c, Reader: reader})
-	l := NewLifecycle(a)
-	r := &fixtureLeader{Config: cfg, Client: c, APIReader: reader, authority: a}
-
-	return &Application{authority: a, Topology: &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, authority: a}, Keyring: &KeyringReconciler{Config: cfg, authority: a}, Server: New(cfg.ServerConfig, c, a, l, r), Lifecycle: l, Replication: r}
-}
 
 var fixtureConfigs = map[*authority.Authority]fixtureConfig{}
 
@@ -143,93 +62,6 @@ const (
 	admittedMemberAnnotation   = members.AdmittedMemberAnnotation
 	ReplicationAudience        = authority.ReplicationAudience
 )
-
-func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObservation, error) {
-	cfg := r.Config
-
-	var nodes corev1.NodeList
-	if err := r.List(ctx, &nodes); err != nil {
-		return TopologyObservation{}, err
-	}
-
-	var volumes racerv1.ClusterVolumeList
-	if err := r.APIReader.List(ctx, &volumes); err != nil {
-		return TopologyObservation{}, err
-	}
-
-	catalog, err := members.BuildCatalog(volumes.Items)
-	if err != nil {
-		return TopologyObservation{}, err
-	}
-
-	ownership, err := readManagedWorkloadIdentities(ctx, r.APIReader, cfg)
-	if err != nil {
-		return TopologyObservation{}, err
-	}
-	// Indexed namespace-scoped queries avoid scanning unrelated Pods for each
-	// Node. Ownership is still verified against the current DaemonSet UID.
-	podsByNode := make(map[string][]corev1.Pod, len(nodes.Items))
-
-	for _, node := range nodes.Items {
-		if err := ctx.Err(); err != nil {
-			return TopologyObservation{}, err
-		}
-
-		var list corev1.PodList
-		if err := r.List(ctx, &list, client.InNamespace(cfg.Namespace), client.MatchingFields{podNodeIndex: node.Name}); err != nil {
-			return TopologyObservation{}, err
-		}
-
-		podsByNode[node.Name] = list.Items
-	}
-
-	return TopologyObservation{Nodes: nodes, Catalog: catalog, Input: members.Input{
-		Nodes: nodes.Items, PodsByNode: podsByNode, Ownership: ownership.observed(), PeerPort: cfg.PeerPort,
-	}}, nil
-}
-
-type DataplaneWorkloadIdentities struct {
-	namespace string
-	workloads [2]workloadIdentity
-}
-
-type workloadIdentity struct {
-	name string
-	uid  types.UID
-}
-
-func (ids DataplaneWorkloadIdentities) observed() members.WorkloadIdentities {
-	observed := members.WorkloadIdentities{Namespace: ids.namespace}
-	for i, workload := range ids.workloads {
-		observed.Workloads[i] = members.WorkloadIdentity{Name: workload.name, UID: workload.uid}
-	}
-
-	return observed
-}
-
-// Custom standalone installations retain their single configured workload.
-// Operator installations use both fixed names, never a label-derived allowlist.
-func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cfg fixtureConfig) (DataplaneWorkloadIdentities, error) {
-	ids := DataplaneWorkloadIdentities{namespace: cfg.Namespace}
-	for i, name := range managedWorkloadNames(cfg) {
-		ids.workloads[i].name = name
-
-		var ds appsv1.DaemonSet
-		if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: name}, &ds); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-
-			return DataplaneWorkloadIdentities{}, err
-		}
-
-		if ds.DeletionTimestamp == nil {
-			ids.workloads[i].uid = ds.UID
-		}
-	}
-
-	return ids, nil
-}
 
 func podNodeKeys(obj client.Object) []string {
 	pod, ok := obj.(*corev1.Pod)
@@ -252,15 +84,9 @@ func replicationSleep(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func managedWorkloadNames(cfg fixtureConfig) []string {
-	return members.ManagedNames(cfg.DaemonSetName)
-}
-
 func catalogVolume(name string, uid types.UID) racerv1.ClusterVolume {
 	return racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
 }
-
-// CanonicalSocketPaths keeps these tests on the production wire validation boundary.
 
 func TestIdentityAdmission(t *testing.T) {
 	a := newIdentityAdmission[string](1)
@@ -277,18 +103,18 @@ func TestIdentityAdmission(t *testing.T) {
 }
 
 func TestAdmissionLimitsFrozen(t *testing.T) {
-	s := &Server{Config: testConfig(t).ServerConfig}
-	s.Config.Limits.MaxPolls = 1
-	s.Config.Limits.MaxConcurrentBootstrap = 1
-	s.initializeAdmission()
-	s.Config.Limits.MaxPolls = 2
-	s.Config.Limits.MaxConcurrentBootstrap = 2
-	s.Config.Limits.HeaderBytes = 1
-	s.initializeAdmission()
+	cfg := testConfig(t).ServerConfig
+	cfg.Limits.MaxPolls = 1
+	cfg.Limits.MaxConcurrentBootstrap = 1
+	s := New(cfg, nil, nil, nil, nil)
+	cfg.Limits.MaxPolls = 2
+	cfg.Limits.MaxConcurrentBootstrap = 2
+	cfg.Limits.HeaderBytes = 1
+
 	require.Equal(t, 1, s.polls.limit)
 	require.Equal(t, 1, s.keyringPolls.limit)
 	require.Equal(t, cap(s.bootstrapSlots), s.replicationPolls.limit)
-	require.NotEqual(t, s.Config.Limits.HeaderBytes, s.config.Limits.HeaderBytes)
+	require.NotEqual(t, cfg.Limits.HeaderBytes, s.config.Limits.HeaderBytes)
 }
 
 const (
@@ -464,19 +290,59 @@ func (w *blockingResponse) Unwrap() http.ResponseWriter { return w.ResponseRecor
 
 func awaitServerPolls(t *testing.T, s *Server, count int) {
 	t.Helper()
+	require.Eventually(t, func() bool { return s.polls.count() == count }, 5*time.Second, time.Millisecond, "poll admission did not reach %d", count)
+}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		n := s.polls.count()
+func bootstrapTestRequest(t *testing.T, ctx context.Context, endpoint, token string, request wire.BootstrapRequest) *http.Request {
+	t.Helper()
 
-		if n == count {
-			return
-		}
+	body, err := wire.EncodeBootstrapRequest(request)
+	require.NoError(t, err)
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+wire.BootstrapPath, bytes.NewReader(body))
+	require.NoError(t, err)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+token)
 
-		time.Sleep(time.Millisecond)
+	return r
+}
+
+func (f *servingFixture) publicRequest(t *testing.T, route string) *http.Request {
+	t.Helper()
+
+	r := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
+	if route == "keyring" {
+		r.URL.Path = wire.KeyringPath
 	}
 
-	t.Fatalf("poll admission did not reach %d", count)
+	if route == "bootstrap" {
+		r = bootstrapTestRequest(t, f.ctx, "", f.token, f.request)
+	}
+
+	if route == "keyring empty" {
+		r = httptest.NewRequest(http.MethodGet, wire.KeyringPath+"?after=1", nil)
+
+		configureFixtureAge(t, f, 2*wire.PollWait)
+	}
+
+	r.TLS = f.requestState(t)
+
+	return r
+}
+
+func requireNoAdmission(t *testing.T, s *Server) {
+	t.Helper()
+	require.Empty(t, s.writes, "write admission leaked")
+	require.Empty(t, s.bootstrapSlots, "bootstrap admission leaked")
+	require.Zero(t, s.keyringPolls.count(), "keyring admission leaked")
+	require.Zero(t, s.polls.count(), "snapshot admission leaked")
+}
+
+func serveRecover(handler http.Handler, w http.ResponseWriter, r *http.Request) (aborted any) {
+	defer func() { aborted = recover() }()
+
+	handler.ServeHTTP(w, r)
+
+	return nil
 }
 
 func (f *servingFixture) requestState(t *testing.T) *tls.ConnectionState {
@@ -512,9 +378,9 @@ func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newServingFixture(t)
-				f.a.Server.Config.Limits.MaxPolls = 1
+				f.configureServer(func(c *Config) { c.Limits.MaxPolls = 1 })
 				configureFixtureAge(t, f, 2*wire.PollWait)
-				f.a.Server.Config.Limits.MaxConcurrentWrites = 1
+				f.configureServer(func(c *Config) { c.Limits.MaxConcurrentWrites = 1 })
 				other := *f
 				other.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID })
 				otherState := other.requestState(t)
@@ -522,19 +388,7 @@ func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
 				r := httptest.NewRequest("GET", wire.SnapshotPath, nil)
 
 				r.TLS = f.requestState(t)
-				if tc.status != http.StatusOK {
-					current, err := f.a.authority.Current()
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					cursor := current.Sequence()
-					if tc.status == http.StatusServiceUnavailable {
-						cursor++
-					}
-
-					r.URL.RawQuery = fmt.Sprintf("after=%d", cursor)
-				}
+				r.URL.RawQuery = snapshotQueryForStatus(t, f, tc.status)
 
 				w := &blockingResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), unblock: make(chan struct{}), blockFlush: tc.flush, fail: tc.fail}
 
@@ -568,41 +422,52 @@ func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
 					wantWrites = 0
 				}
 
-				if got := len(f.a.Server.writes); got != wantWrites {
-					t.Fatalf("write slots during response: %d, want %d", got, wantWrites)
-				}
+				require.Len(t, f.a.Server.writes, wantWrites, "write slots during response")
 
 				unblock()
 
 				aborted := <-done
-				if tc.fail && aborted != http.ErrAbortHandler || !tc.fail && aborted != nil {
-					t.Fatalf("response abort: %v", aborted)
+				if tc.fail {
+					require.Equal(t, http.ErrAbortHandler, aborted)
+				} else {
+					require.Nil(t, aborted)
+					require.Equal(t, tc.status, w.Code)
 				}
 
-				if !tc.fail && w.Code != tc.status {
-					t.Fatalf("response status: %d, want %d", w.Code, tc.status)
-				}
-
-				if len(f.a.Server.writes) != 0 {
-					t.Fatal("write slot leaked")
-				}
+				require.Empty(t, f.a.Server.writes, "write slot leaked")
 
 				third := httptest.NewRecorder()
 				handler.ServeHTTP(third, r.Clone(f.ctx))
 
-				if third.Code != 200 {
-					t.Fatalf("admission leaked: %d", third.Code)
-				}
+				require.Equal(t, http.StatusOK, third.Code, "admission leaked")
 			})
 		})
 	}
+}
+
+func snapshotQueryForStatus(t *testing.T, f *servingFixture, status int) string {
+	t.Helper()
+
+	if status == http.StatusOK {
+		return ""
+	}
+
+	current, err := f.a.authority.Current()
+	require.NoError(t, err)
+
+	cursor := current.Sequence()
+	if status == http.StatusServiceUnavailable {
+		cursor++
+	}
+
+	return fmt.Sprintf("after=%d", cursor)
 }
 
 func TestHTTPPollAdmissionAndCancellation(t *testing.T) {
 	for _, limit := range []int{1, 2} {
 		t.Run(fmt.Sprint(limit), func(t *testing.T) {
 			f := newServingFixture(t)
-			f.a.Server.Config.Limits.MaxPolls = limit
+			f.configureServer(func(c *Config) { c.Limits.MaxPolls = limit })
 			other := *f
 			other.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID })
 			handler := f.a.Server.Handler()
@@ -665,7 +530,7 @@ func TestHTTPPollAdmissionAndCancellation(t *testing.T) {
 
 func TestTLSAdmissionSaturationSendsInternalError(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Server.Config.Limits.MaxConcurrentBootstrap = 1
+	f.configureServer(func(c *Config) { c.Limits.MaxConcurrentBootstrap = 1 })
 
 	endpoint := f.start(t)
 	if !take(f.a.Server.authSlots) {
@@ -693,8 +558,11 @@ func TestTLSAdmissionSaturationSendsInternalError(t *testing.T) {
 
 func TestAdmissionAndAPIDeadlines(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Server.Config.Limits.MaxConcurrentBootstrap = 1
-	f.a.Server.Config.Limits.WriteTimeout = 100 * time.Millisecond
+	f.configureServer(func(c *Config) {
+		c.Limits.MaxConcurrentBootstrap = 1
+		c.Limits.WriteTimeout = 100 * time.Millisecond
+	})
+
 	entered := make(chan struct{}, 1)
 	fixtureDependencies[f.a.authority].reader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
 		entered <- struct{}{}
@@ -751,7 +619,7 @@ func testConfig(t *testing.T) fixtureConfig {
 		},
 		PeerPort: 8082, ServerConfig: Config{
 			ControlAddress: ":8443", TLSCertificateFile: "/etc/racer/tls/tls.crt", TLSPrivateKeyFile: "/etc/racer/tls/tls.key", ReplicationServerName: "racer-controller.racer.svc",
-			Limits: Limits{MaxConnections: 2*wire.MaxMembers + 128, MaxConcurrentHandshakes: 32, MaxPolls: wire.MaxMembers, MaxConcurrentWrites: 128, MaxConcurrentBootstrap: 32, HeaderBytes: 16 * 1024, WriteTimeout: 30 * time.Second, ShutdownTimeout: 10 * time.Second},
+			Limits: Limits{MaxConnections: 2*wire.MaxMembers + 128, MaxConcurrentHandshakes: 32, MaxPolls: wire.MaxMembers, MaxConcurrentWrites: 128, MaxConcurrentBootstrap: 32, HeaderBytes: 16 * 1024, HandshakeTimeout: 5 * time.Second, WriteTimeout: 30 * time.Second, ShutdownTimeout: 10 * time.Second},
 		},
 	}
 }
@@ -767,8 +635,15 @@ func testTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
 		}
 	}
 
-	objects = append(objects, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName, UID: "installation-uid"}, Data: map[string]string{"cluster": string(cfg.Cluster), "version_configmap": cfg.VersionConfigMapName, "state": "fresh"}})
+	objects = append(objects, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName, UID: "installation-uid"}, Data: map[string]string{"cluster": string(cfg.Cluster), "version_configmap": cfg.VersionConfigMapName, "state": "fresh", "initialization_protocol": "staged-v1"}})
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithIndex(&corev1.Pod{}, podNodeIndex, podNodeKeys).Build()
+	c = interceptor.NewClient(c, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+		if obj.GetUID() == "" {
+			obj.SetUID(types.UID(fmt.Sprintf("fake-%s-%d", obj.GetName(), time.Now().UnixNano())))
+		}
+
+		return c.Create(ctx, obj, opts...)
+	}})
 
 	return Assemble(cfg, c, c).Topology
 }
@@ -790,8 +665,6 @@ type (
 	CommittedPublication struct {
 		handle     *authority.PublicationHandle
 		encoded    string
-		delta      string
-		deltaBase  string
 		record     VersionRecord
 		leadership context.Context
 	}
@@ -820,13 +693,14 @@ func captureHandle(t *testing.T, h *authority.PublicationHandle) *CommittedPubli
 
 	var b bytes.Buffer
 
-	ctx, cancel, err := h.WriteContext(t.Context())
+	guard, cancel, err := h.Admit(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cancel()
 
-	if _, err := h.ForBase("").WriteTo(ctx, &b); err != nil {
+	ctx := guard.Context()
+	if _, err := h.ForBase(0, "").WriteTo(ctx, guard, &b); err != nil {
 		t.Fatal(err)
 	}
 
@@ -843,8 +717,8 @@ func captureHandle(t *testing.T, h *authority.PublicationHandle) *CommittedPubli
 	return &CommittedPublication{handle: h, encoded: b.String(), record: VersionRecord{Cluster: p.Cluster, Sequence: p.Sequence, MembershipVersion: p.MembershipVersion, ContentHash: content, MembershipHash: members}, leadership: ctx}
 }
 
-func (p *CommittedPublication) writeContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
-	return p.handle.WriteContext(ctx)
+func (p *CommittedPublication) admit(ctx context.Context) (*authority.Admission, context.CancelFunc, error) {
+	return p.handle.Admit(ctx)
 }
 
 func reconcileTopology(t *testing.T, r *TopologyReconciler, ctx context.Context) *CommittedPublication {
@@ -1032,7 +906,7 @@ func invalidateFixtureTrust(t *testing.T, f *servingFixture) {
 }
 
 func readVersion(ctx context.Context, reader client.Reader, cfg fixtureConfig) (*corev1.ConfigMap, VersionRecord, error) {
-	if err := authority.ValidateInstallation(ctx, reader, cfg.Namespace, string(cfg.Cluster)); err != nil {
+	if err := authority.New(cfg.authorityConfig(), authority.Dependencies{Reader: reader}).Recover(ctx, nil); err != nil {
 		return nil, VersionRecord{}, err
 	}
 
@@ -1193,33 +1067,6 @@ func withdrawPublication(t *testing.T, r *TopologyReconciler) func() {
 	}
 }
 
-type capturedResponse struct{ encoded string }
-
-func (p *CommittedPublication) ForBase(hash string) capturedResponse {
-	if hash != "" && hash == p.deltaBase {
-		return capturedResponse{p.delta}
-	}
-
-	return capturedResponse{p.encoded}
-}
-
-func (p capturedResponse) writeTo(ctx context.Context, w io.Writer) (int64, error) {
-	var total int64
-
-	for rest := p.encoded; rest != ""; {
-		n, err := requestWriter{ctx: ctx, writer: w}.Write([]byte(rest[:min(len(rest), 32768)]))
-
-		total += int64(n)
-		if err != nil {
-			return total, err
-		}
-
-		rest = rest[n:]
-	}
-
-	return total, ctx.Err()
-}
-
 func parseSigning(m signingMaterial) (*x509.Certificate, ed25519.PrivateKey, error) {
 	cert, err := x509.ParseCertificate(m.Certificate)
 	if err != nil {
@@ -1321,8 +1168,7 @@ func TestServeTeardownErrorsAndLateAccept(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		s := &Server{Lifecycle: NewLifecycle(nil)}
-		s.Config.Limits.ShutdownTimeout = time.Second
+		s := New(Config{Limits: Limits{ShutdownTimeout: time.Second}}, nil, nil, NewLifecycle(nil), nil)
 
 		accepted, peer := net.Pipe()
 		defer peer.Close()
@@ -1384,8 +1230,7 @@ func TestServeTeardownCompletionBound(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		s := &Server{Lifecycle: NewLifecycle(nil)}
-		s.Config.Limits.ShutdownTimeout = time.Second
+		s := New(Config{Limits: Limits{ShutdownTimeout: time.Second}}, nil, nil, NewLifecycle(nil), nil)
 		unblock := make(chan struct{})
 
 		release := sync.OnceFunc(func() { close(unblock) })
@@ -1408,7 +1253,7 @@ func TestServeTeardownCompletionBound(t *testing.T) {
 			t.Fatalf("blocked teardown: %v", err)
 		}
 
-		if elapsed := time.Since(start); elapsed != s.Config.Limits.ShutdownTimeout {
+		if elapsed := time.Since(start); elapsed != s.config.Limits.ShutdownTimeout {
 			t.Fatalf("completion wait = %s", elapsed)
 		}
 
@@ -1425,14 +1270,14 @@ func TestServeTeardownClosesSlowTLSWrite(t *testing.T) {
 	for _, cause := range []string{"cancellation", "accept failure"} {
 		t.Run(cause, func(t *testing.T) {
 			f := newServingFixture(t)
-			f.a.Server.Config.Limits.WriteTimeout = time.Minute
-			f.a.Server.Config.Limits.ShutdownTimeout = time.Second
+			f.configureServer(func(c *Config) {
+				c.Limits.WriteTimeout = time.Minute
+				c.Limits.ShutdownTimeout = time.Second
+			})
 			largeFixturePublication(t, f)
 
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 
 			t.Cleanup(func() { _ = listener.Close() })
 
@@ -1445,25 +1290,13 @@ func TestServeTeardownClosesSlowTLSWrite(t *testing.T) {
 			go func() { done <- f.a.Server.serve(f.ctx, listener, config) }()
 
 			conn, err := tls.Dial("tcp", listener.Addr().String(), &tls.Config{RootCAs: f.roots, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{f.certificate}})
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
+
 			defer conn.Close()
 
-			if _, err := io.WriteString(conn, "GET /v1/snapshot HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
-				t.Fatal(err)
-			}
-
-			deadline := time.After(5 * time.Second)
-
-			for len(f.a.Server.writes) == 0 {
-				select {
-				case <-deadline:
-					t.Fatal("write not admitted")
-				default:
-					time.Sleep(time.Millisecond)
-				}
-			}
+			_, err = io.WriteString(conn, "GET /v1/snapshot HTTP/1.1\r\nHost: localhost\r\n\r\n")
+			require.NoError(t, err)
+			require.Eventually(t, func() bool { return len(f.a.Server.writes) != 0 }, 5*time.Second, time.Millisecond, "write not admitted")
 			// Keep the peer open without reading. Teardown must release the
 			// socket and admission before the much longer write deadline.
 			if cause == "cancellation" {
@@ -1483,9 +1316,8 @@ func TestServeTeardownClosesSlowTLSWrite(t *testing.T) {
 
 			awaitServerPolls(t, f.a.Server, 0)
 
-			if len(f.a.Server.writes) != 0 || f.a.Server.Ready(nil) == nil {
-				t.Fatal("teardown retained admission or readiness")
-			}
+			require.Empty(t, f.a.Server.writes, "teardown retained admission")
+			require.Error(t, f.a.Server.Ready(nil), "teardown retained readiness")
 		})
 	}
 }
@@ -1502,14 +1334,16 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 			d := fixtureDependencies[f.a.authority]
 
 			s.authority = authority.New(cfg.authorityConfig(), authority.Dependencies{Writer: d, Reader: d})
-			if err := s.authority.Observe(f.ctx); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, s.authority.Observe(f.ctx))
 
 			f.a.Replication.Config = cfg
 
 			want := cfg
-			wantServer := s.Config
+			input := s.config
+			s = New(input, s.writer, s.authority, s.Lifecycle, s.Leader)
+			s.installTestServingCertificate(f.serverCertificate)
+
+			wantServer := input
 
 			var handler http.Handler
 			if boundary == "handler" {
@@ -1522,7 +1356,7 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 			cfg.DataplaneServiceAccount = "wrong-account"
 			cfg.Cluster = ""
 			cfg.CertificateLifetime = time.Second
-			s.Config.Limits.HeaderBytes = 1
+			input.Limits.HeaderBytes = 1
 
 			cfg.ControllerServiceAccount = "wrong-controller"
 
@@ -1530,25 +1364,13 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 				handler = s.Handler()
 			}
 
-			if s.config != wantServer {
-				t.Fatal("server did not freeze transport before exposure")
-			}
-
-			encoded, err := wire.EncodeBootstrapRequest(f.request)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			request := httptest.NewRequest(http.MethodPost, wire.BootstrapPath, bytes.NewReader(encoded))
-			request.Header.Set("Content-Type", "application/json")
-			request.Header.Set("Authorization", "Bearer "+f.token)
+			require.Equal(t, wantServer, s.config, "server did not freeze transport before exposure")
+			request := bootstrapTestRequest(t, f.ctx, "", f.token, f.request)
 			request.TLS = &tls.ConnectionState{HandshakeComplete: true}
 			w := httptest.NewRecorder()
 			handler.ServeHTTP(w, request)
 
-			if w.Code != http.StatusOK {
-				t.Fatal("first request used post-exposure config", w.Code)
-			}
+			require.Equal(t, http.StatusOK, w.Code, "first request used post-exposure config")
 
 			response := decodeIssuedResponse(t, w.Body.Bytes())
 
@@ -1557,9 +1379,8 @@ func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if response.Cluster != want.Cluster || leaf.NotAfter.Sub(leaf.NotBefore) != want.CertificateLifetime+time.Minute {
-				t.Fatal("first issuance ignored frozen identity/lifetime")
-			}
+			require.Equal(t, want.Cluster, response.Cluster)
+			require.Equal(t, want.CertificateLifetime+time.Minute, leaf.NotAfter.Sub(leaf.NotBefore))
 		})
 	}
 }
@@ -1585,9 +1406,11 @@ func TestLifecycleProcessContext(t *testing.T) {
 				deadline, ok := child.Deadline()
 
 				parentDeadline, _ := parent.Deadline()
-				if child.Err() != nil || child.Value(key) != source || !ok || deadline != parentDeadline {
-					t.Fatal("child did not retain parent values, deadline, and live context")
-				}
+
+				require.NoError(t, child.Err())
+				require.Equal(t, source, child.Value(key))
+				require.True(t, ok)
+				require.Equal(t, parentDeadline, deadline)
 
 				switch source {
 				case "parent":
@@ -1964,7 +1787,7 @@ func newServingFixture(t *testing.T) *servingFixture {
 
 	response := decodeIssuedResponse(t, encoded)
 
-	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), DNSNames: []string{a.Server.Config.ReplicationServerName}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), DNSNames: []string{a.Server.config.ReplicationServerName}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 
 	der, err := x509.CreateCertificate(rand.Reader, template, template, pub, key)
 	if err != nil {
@@ -1981,6 +1804,15 @@ func newServingFixture(t *testing.T) *servingFixture {
 	a.Server.installTestServingCertificate(tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key})
 
 	return &servingFixture{a: a, token: token, key: key, request: request, certificate: tls.Certificate{Certificate: response.CertificateChain, PrivateKey: key}, serverCertificate: tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, roots: roots, ctx: ctx, cancel: cancel}
+}
+
+// configureServer replaces the unstarted fixture server with constructor inputs.
+func (f *servingFixture) configureServer(change func(*Config)) {
+	s := f.a.Server
+	cfg := s.config
+	change(&cfg)
+	f.a.Server = New(cfg, s.writer, s.authority, s.Lifecycle, s.Leader)
+	f.a.Server.servingCertificate.Store(s.servingCertificate.Load())
 }
 
 func (f *servingFixture) client(t *testing.T, cert *tls.Certificate) *http.Client {
@@ -2045,22 +1877,13 @@ func responseBody(t *testing.T, response *http.Response, err error, status int) 
 func TestOperationalStartCancellationAndTLSFiles(t *testing.T) {
 	f := newServingFixture(t)
 	dir := t.TempDir()
-	f.a.Server.Config.ControlAddress = "127.0.0.1:0"
-	f.a.Server.Config.TLSCertificateFile = filepath.Join(dir, "tls.crt")
 
-	f.a.Server.Config.TLSPrivateKeyFile = filepath.Join(dir, "tls.key")
-	if err := os.WriteFile(f.a.Server.Config.TLSCertificateFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: f.serverCertificate.Certificate[0]}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	key, err := x509.MarshalPKCS8PrivateKey(f.key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(f.a.Server.Config.TLSPrivateKeyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	f.configureServer(func(c *Config) {
+		c.ControlAddress = "127.0.0.1:0"
+		c.TLSCertificateFile = filepath.Join(dir, "tls.crt")
+		c.TLSPrivateKeyFile = filepath.Join(dir, "tls.key")
+	})
+	writeServingTestPair(t, dir, f.serverCertificate)
 
 	f.a.Lifecycle.SetServingReady(false)
 
@@ -2099,9 +1922,11 @@ func TestOperationalStartCancellationAndTLSFiles(t *testing.T) {
 
 func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 	f := newServingFixture(t)
-	f.a.Server.Config.Limits.MaxPolls = 1
-	f.a.Server.Config.Limits.MaxConcurrentWrites = 1
-	f.a.Server.Config.Limits.MaxConcurrentBootstrap = 1
+	f.configureServer(func(c *Config) {
+		c.Limits.MaxPolls = 1
+		c.Limits.MaxConcurrentWrites = 1
+		c.Limits.MaxConcurrentBootstrap = 1
+	})
 	handler := f.a.Server.Handler()
 	r := httptest.NewRequest("GET", wire.SnapshotPath, nil)
 
@@ -2121,7 +1946,7 @@ func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 				request.Method = "POST"
 				request.URL.Path = wire.BootstrapPath
 			case "headers":
-				request.Header.Set("X-Large", strings.Repeat("a", f.a.Server.Config.Limits.HeaderBytes))
+				request.Header.Set("X-Large", strings.Repeat("a", f.a.Server.config.Limits.HeaderBytes))
 			}
 
 			w := httptest.NewRecorder()

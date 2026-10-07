@@ -9,12 +9,14 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/yaml"
@@ -62,6 +64,11 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 
 			var config, trust, dataplaneConfig corev1.ConfigMap
 			decode("config.yaml", &config)
+
+			if config.Data["RACER_HANDSHAKE_TIMEOUT"] != "5s" {
+				t.Fatal("TLS handshakes must have an explicit five-second default deadline")
+			}
+
 			decode("bootstrap-trust.yaml", &trust)
 			decode("dataplane-config.yaml", &dataplaneConfig)
 
@@ -133,6 +140,21 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal("RDMA mount must tolerate nodes without device directories")
 			}
 
+			devices := volumes["devices"].HostPath
+			if devices == nil || devices.Path != "/dev" || devices.Type == nil || *devices.Type != corev1.HostPathDirectory {
+				t.Fatal("block device discovery requires the existing host /dev directory")
+			}
+
+			container := ds.Spec.Template.Spec.Containers[0]
+			if !slices.ContainsFunc(container.VolumeMounts, func(mount corev1.VolumeMount) bool {
+				return reflect.DeepEqual(mount, corev1.VolumeMount{Name: "devices", MountPath: "/host/dev", ReadOnly: true})
+			}) ||
+				!slices.ContainsFunc(container.Env, func(env corev1.EnvVar) bool {
+					return env.Name == "RACER_DEVICE_DIRECTORY" && env.Value == "/host/dev" && env.ValueFrom == nil
+				}) {
+				t.Fatal("block device discovery mount and environment must agree")
+			}
+
 			for _, variable := range ds.Spec.Template.Spec.Containers[0].Env {
 				if variable.Name == "RACER_SECRET_DIRECTORY" {
 					t.Fatal("obsolete keyring directory must not be configured")
@@ -150,9 +172,11 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 			var (
 				deployment appsv1.Deployment
 				service    corev1.Service
+				disruption policyv1.PodDisruptionBudget
 			)
 
 			decode("controller.yaml", &deployment, &service)
+			decode("controller-pdb.yaml", &disruption)
 
 			budget := deployment.Spec.Strategy.RollingUpdate
 			if deployment.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType || budget == nil || budget.MaxUnavailable == nil || budget.MaxSurge == nil || budget.MaxUnavailable.IntValue() != 0 || budget.MaxSurge.IntValue() != 1 {
@@ -162,6 +186,26 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 			pod := deployment.Spec.Template.Spec
 			if deployment.Namespace != namespace || *deployment.Spec.Replicas != 3 || pod.Containers[0].Image != data["ControllerImage"] || pod.Containers[0].EnvFrom[0].ConfigMapRef.Name != config.Name {
 				t.Fatal("controller configuration mismatch")
+			}
+
+			if disruption.Namespace != namespace || disruption.Spec.MinAvailable == nil || disruption.Spec.MinAvailable.IntValue() != 2 || disruption.Spec.MaxUnavailable != nil || disruption.Spec.Selector == nil || !maps.Equal(disruption.Spec.Selector.MatchLabels, deployment.Spec.Template.Labels) || len(disruption.Spec.Selector.MatchExpressions) != 0 {
+				t.Fatal("voluntary disruption must preserve two of the three controller replicas")
+			}
+
+			if pod.Affinity == nil || pod.Affinity.PodAntiAffinity == nil {
+				t.Fatal("controller replicas should prefer separate nodes")
+			}
+
+			antiAffinity := pod.Affinity.PodAntiAffinity
+			if len(antiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) != 0 || len(antiAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 1 {
+				t.Fatal("controller spread must remain a preference on small clusters")
+			}
+
+			spread := antiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0]
+
+			term := spread.PodAffinityTerm
+			if spread.Weight != 100 || term.TopologyKey != "kubernetes.io/hostname" || term.LabelSelector == nil || !maps.Equal(term.LabelSelector.MatchLabels, deployment.Spec.Template.Labels) || len(term.LabelSelector.MatchExpressions) != 0 || len(term.Namespaces) != 0 || term.NamespaceSelector != nil {
+				t.Fatal("controller anti-affinity must prefer different hosts within its namespace")
 			}
 
 			if pod.Volumes[0].Secret.SecretName != data["ServingTLSSecret"] || pod.Containers[0].VolumeMounts[0].MountPath+"/tls.crt" != cfg.TLSCertificateFile {
@@ -325,5 +369,26 @@ func TestBootstrapTrustCanBeProvisionedExternally(t *testing.T) {
 	var object corev1.ConfigMap
 	if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(b), 4096).Decode(&object); (err != nil && err != io.EOF) || object.Name != "" || object.Kind != "" || object.Data != nil {
 		t.Fatalf("default render must not replace external trust: %v", err)
+	}
+}
+
+func TestRenderedHandshakeTimeoutOverride(t *testing.T) {
+	out := t.TempDir()
+	if err := render.Render(".", out, map[string]string{"HandshakeTimeout": "9s"}); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := os.ReadFile(filepath.Join(out, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var config corev1.ConfigMap
+	if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(b), 4096).Decode(&config); err != nil {
+		t.Fatal(err)
+	}
+
+	if config.Data["RACER_HANDSHAKE_TIMEOUT"] != "9s" {
+		t.Fatal("handshake timeout override must reach controller configuration")
 	}
 }

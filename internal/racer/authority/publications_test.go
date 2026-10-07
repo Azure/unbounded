@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,7 +30,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
-	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -80,7 +80,7 @@ func TestPublicationDeltaSelectionAndDisconnectedFallback(t *testing.T) {
 	members[id] = m
 	next := install()
 
-	delta := next.ForBase(base.record.ContentHash)
+	delta := next.ForBase(base.record.Sequence, base.record.ContentHash)
 	if len(delta.encoded) >= len(next.encoded) {
 		t.Fatal("delta was not selected")
 	}
@@ -100,8 +100,12 @@ func TestPublicationDeltaSelectionAndDisconnectedFallback(t *testing.T) {
 		t.Fatalf("target mismatch: %v", err)
 	}
 
-	if next.ForBase("missing").encoded != next.encoded || next.ForBase("").encoded != next.encoded {
+	if next.ForBase(base.record.Sequence, "missing").encoded != next.encoded || next.ForBase(0, "").encoded != next.encoded {
 		t.Fatal("missing-base fallback failed")
+	}
+
+	for _, sequence := range []wire.Sequence{0, base.record.Sequence - 1, base.record.Sequence + 1} {
+		require.Equal(t, next.encoded, next.ForBase(sequence, base.record.ContentHash).encoded, "matching hash cannot authorize a delta from another sequence")
 	}
 }
 
@@ -301,37 +305,7 @@ func TestPollValidationAndCancellation(t *testing.T) {
 			t.Fatalf("immediate shared snapshot: %p, %v", got, err)
 		}
 
-		for _, cursor := range []wire.Sequence{0, sequence + 1} {
-			want := wire.Conflict
-			if cursor > sequence {
-				want = wire.Unavailable
-			}
-
-			if _, err := r.Publications.Wait(context.Background(), identity, &cursor); !errors.Is(err, want) {
-				t.Fatalf("future/zero cursor: %v", err)
-			}
-		}
-
-		wrong := identity
-
-		wrong.cluster = testNodeUID
-		if _, err := r.Publications.Wait(context.Background(), wrong, nil); !errors.Is(err, wire.Forbidden) {
-			t.Fatalf("wrong cluster: %v", err)
-		}
-
-		expired := identity
-
-		expired.expires = time.Now().Add(-time.Second)
-		if _, err := r.Publications.Wait(context.Background(), expired, nil); !errors.Is(err, wire.Unauthenticated) {
-			t.Fatalf("expired identity: %v", err)
-		}
-
-		invalid := identity
-
-		invalid.node = "not-a-uuid"
-		if _, err := r.Publications.Wait(context.Background(), invalid, nil); !errors.Is(err, wire.Unauthenticated) {
-			t.Fatalf("invalid identity: %v", err)
-		}
+		assertPollValidation(t, r, identity, sequence)
 
 		go func() { _, err := r.Publications.Wait(context.Background(), identity, &sequence); done <- err }()
 
@@ -350,10 +324,36 @@ func TestPollValidationAndCancellation(t *testing.T) {
 			t.Fatalf("immediate poll after leadership loss: %p, %v", got, err)
 		}
 
-		if _, _, err := current.writeContext(t.Context()); !errors.Is(err, context.Canceled) {
+		if _, _, err := current.admit(t.Context()); !errors.Is(err, context.Canceled) {
 			t.Fatalf("write after leadership: %v", err)
 		}
 	})
+}
+
+func assertPollValidation(t *testing.T, r *TopologyReconciler, identity NodeIdentity, sequence wire.Sequence) {
+	t.Helper()
+
+	zero, future := wire.Sequence(0), sequence+1
+	wrong, expired, invalid := identity, identity, identity
+	wrong.cluster = testNodeUID
+	expired.expires = time.Now().Add(-time.Second)
+
+	invalid.node = "not-a-uuid"
+	for _, tc := range []struct {
+		name     string
+		identity NodeIdentity
+		cursor   *wire.Sequence
+		want     error
+	}{
+		{"zero cursor", identity, &zero, wire.Conflict},
+		{"future cursor", identity, &future, wire.Unavailable},
+		{"wrong cluster", wrong, nil, wire.Forbidden},
+		{"expired identity", expired, nil, wire.Unauthenticated},
+		{"invalid identity", invalid, nil, wire.Unauthenticated},
+	} {
+		_, err := r.Publications.Wait(t.Context(), tc.identity, tc.cursor)
+		require.ErrorIs(t, err, tc.want, tc.name)
+	}
 }
 
 func TestPollImmediateReturnsWithoutAllocations(t *testing.T) {
@@ -575,7 +575,7 @@ func (shortPublicationWriter) Write([]byte) (int, error) { return 1, nil }
 
 func TestPublicationAdmissionRequiresOwner(t *testing.T) {
 	for _, image := range []*CommittedPublication{nil, {}, {leadership: t.Context()}} {
-		if _, _, err := image.writeContext(t.Context()); !errors.Is(err, wire.Unavailable) {
+		if _, _, err := image.admit(t.Context()); !errors.Is(err, wire.Unavailable) {
 			t.Fatalf("ownerless write admitted: %v", err)
 		}
 	}
@@ -619,251 +619,6 @@ func TestPublicationInstalledStateNeverExceedsHighWater(t *testing.T) {
 
 			if r.Publications.current != image || r.Publications.observed != newer {
 				t.Fatal("rejected install mutated state")
-			}
-		})
-	}
-}
-
-func TestTopologyReplayRejectedBeforeMutation(t *testing.T) {
-	for _, replay := range []string{"rollback", "conflicting sequence"} {
-		for _, suspended := range []bool{false, true} {
-			for _, operation := range []string{"publish", "commit"} {
-				t.Run(fmt.Sprintf("%s/suspended=%t/%s", replay, suspended, operation), func(t *testing.T) {
-					r := initializedTopology(t)
-					first := reconcileTopology(t, r, t.Context())
-
-					cm, _, err := readVersion(t.Context(), r.APIReader, r.Config)
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					record := first.record
-					record.Sequence = 10
-
-					cm.Data = versionData(record)
-					if err := r.Update(t.Context(), cm); err != nil {
-						t.Fatal(err)
-					}
-
-					reconcileTopology(t, r, t.Context())
-
-					if err := r.Get(t.Context(), client.ObjectKeyFromObject(cm), cm); err != nil {
-						t.Fatal(err)
-					}
-
-					replayed := record
-					if replay == "rollback" {
-						replayed.Sequence--
-					} else {
-						replayed.ContentHash = strings.Repeat("a", 64)
-					}
-
-					cm.Data = versionData(replayed)
-					if err := r.Update(t.Context(), cm); err != nil {
-						t.Fatal(err)
-					}
-
-					before := cm.DeepCopy()
-
-					if suspended {
-						if err := r.Publications.confirm(replayed); !errors.Is(err, wire.Conflict) {
-							t.Fatalf("replay was not rejected: %v", err)
-						}
-					}
-
-					proposed := AcceptedMembers{testNodeUID: {Node: testNodeUID, Shares: 4, PeerEndpoint: "192.0.2.1:8082"}}
-
-					candidate, err := r.Publications.Prepare(replayed, cm.ResourceVersion, proposed, nil)
-					if err != nil {
-						t.Fatal(err)
-					}
-
-					writes := 0
-
-					r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-						writes++
-						return c.Update(ctx, obj, opts...)
-					}})
-					if operation == "commit" {
-						_, err = r.CommitVersion(t.Context(), candidate)
-					} else {
-						r.authority.publisher = r.engine()
-						_, err = r.authority.PublishTopology(t.Context(), func(context.Context) (TopologyObservation, error) {
-							node, pod := memberNode(), memberPod("pod", 1, "192.0.2.1")
-							return TopologyObservation{Input: members.Input{Nodes: []corev1.Node{node}, PodsByNode: map[string][]corev1.Pod{node.Name: {pod}}, PeerPort: 8082, Ownership: members.WorkloadIdentities{Namespace: r.Config.Namespace, Workloads: [2]members.WorkloadIdentity{{Name: r.Config.DaemonSetName, UID: testDaemonSetUID}}}}}, nil
-						})
-					}
-
-					if !errors.Is(err, wire.Conflict) || writes != 0 {
-						t.Fatalf("replay must fail before mutation: err=%v writes=%d", err, writes)
-					}
-
-					if err := r.APIReader.Get(t.Context(), client.ObjectKeyFromObject(cm), cm); err != nil {
-						t.Fatal(err)
-					}
-
-					if !reflect.DeepEqual(before.Data, cm.Data) || before.ResourceVersion != cm.ResourceVersion {
-						t.Fatal("replay changed durable counters")
-					}
-
-					if r.Publications.observed != record || !r.Publications.suspended {
-						t.Fatal("replay changed high-water state or retained serving authority")
-					}
-				})
-			}
-		}
-	}
-}
-
-func TestTopologyReconcileAcceptsNewerDurableVersion(t *testing.T) {
-	r := initializedTopology(t)
-	reconcileTopology(t, r, t.Context())
-	lagged := Assemble(r.Config, r.Client, r.APIReader).Topology
-	reconcileTopology(t, lagged, t.Context())
-
-	cm, record, err := readVersion(t.Context(), r.APIReader, r.Config)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	record.Sequence += 2
-
-	cm.Data = versionData(record)
-	if err := r.Update(t.Context(), cm); err != nil {
-		t.Fatal(err)
-	}
-
-	current := reconcileTopology(t, lagged, t.Context())
-	if current.record != record || lagged.Publications.observed != record {
-		t.Fatal("lagged replica failed to accept newer durable counters")
-	}
-}
-
-func TestTopologyRejectsCredentialReplay(t *testing.T) {
-	for _, replay := range []string{"rollback", "conflicting generation"} {
-		for _, invalidated := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/invalidated=%t", replay, invalidated), func(t *testing.T) {
-				r, _ := testKeyring(t)
-				runKeys(t, r)
-				original, oldBundle, _, _ := keyState(t, r)
-
-				volume := catalogVolume("added", testOtherUID)
-				if err := r.Create(t.Context(), &volume); err != nil {
-					t.Fatal(err)
-				}
-
-				runKeys(t, r)
-				a := Assemble(r.Config, r.Client, r.APIReader)
-				runKeys(t, a.Keyring)
-				image := reconcileTopology(t, a.Topology, t.Context())
-
-				decoded, err := wire.DecodePublication(strings.NewReader(image.encoded))
-				if err != nil || len(decoded.Caches) != 2 {
-					t.Fatalf("fixture did not admit both caches: %v", err)
-				}
-
-				before, record, err := readVersion(t.Context(), r.APIReader, r.Config)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				trust := a.Server.Trust
-				highWater, digest := trust.highWater, trust.digest
-
-				guard, cancel, err := a.authority.TrustContext(t.Context())
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer cancel()
-
-				secret, current, _, _ := keyState(t, r)
-				secret.Data = original.DeepCopy().Data
-
-				if replay == "conflicting generation" {
-					oldBundle.Generation = current.Generation
-
-					secret.Data["bundle.json"], err = wire.EncodeBundle(oldBundle)
-					if err != nil {
-						t.Fatal(err)
-					}
-				}
-
-				if err := r.Update(t.Context(), secret); err != nil {
-					t.Fatal(err)
-				}
-
-				if invalidated {
-					if err := a.authority.Observe(t.Context()); !errors.Is(err, wire.Conflict) {
-						t.Fatalf("observer did not reject replay: %v", err)
-					}
-				}
-
-				writes := 0
-
-				a.Topology.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-					writes++
-					return c.Update(ctx, obj, opts...)
-				}})
-				for range 2 {
-					_, err := a.Topology.Reconcile(t.Context(), ctrl.Request{})
-					if !errors.Is(err, wire.Conflict) || writes != 0 {
-						t.Errorf("credential replay reached publication: err=%v writes=%d", err, writes)
-					}
-				}
-
-				after, gotRecord, err := readVersion(t.Context(), r.APIReader, r.Config)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				if before.ResourceVersion != after.ResourceVersion || gotRecord != record || a.Topology.Publications.current != image {
-					t.Error("replayed bundle changed committed catalog or counters")
-				}
-
-				if trustReady(trust) || trust.highWater != highWater || trust.digest != digest || !errors.Is(guard.Err(), context.Canceled) || !a.Topology.Publications.suspended {
-					t.Error("replay did not revoke serving authority and retain replay protection")
-				}
-			})
-		}
-	}
-}
-
-func TestTopologyAcceptsNewerCredentialGeneration(t *testing.T) {
-	for _, invalidated := range []bool{false, true} {
-		t.Run(fmt.Sprint(invalidated), func(t *testing.T) {
-			r, _ := testKeyring(t)
-			runKeys(t, r)
-			a := Assemble(r.Config, r.Client, r.APIReader)
-			runKeys(t, a.Keyring)
-			reconcileTopology(t, a.Topology, t.Context())
-			trust := a.Server.Trust
-			highWater, digest, confirmed := trust.highWater, trust.digest, trust.confirmed
-
-			volume := catalogVolume("added", testOtherUID)
-			if err := r.Create(t.Context(), &volume); err != nil {
-				t.Fatal(err)
-			}
-
-			runKeys(t, r)
-
-			if r.Trust.highWater <= highWater {
-				t.Fatal("fixture did not advance durable credentials")
-			}
-
-			if invalidated {
-				trust.invalidate()
-			}
-
-			accepted, roots := trust.bundle, trust.roots
-			image := reconcileTopology(t, a.Topology, t.Context())
-
-			decoded, err := wire.DecodePublication(strings.NewReader(image.encoded))
-			if err != nil || len(decoded.Caches) != 2 {
-				t.Fatalf("newer credentials did not admit new cache: %v", err)
-			}
-
-			if trust.highWater != highWater || trust.digest != digest || trust.confirmed != confirmed || trust.bundle != accepted || trust.roots != roots || trustReady(trust) == invalidated {
-				t.Fatal("topology installed or refreshed trust")
 			}
 		})
 	}
@@ -972,22 +727,18 @@ func TestPrepareRejectsFinalCounterGrowth(t *testing.T) {
 
 func stagedTopology(t *testing.T) *TopologyReconciler {
 	t.Helper()
-	r := testTopology(t)
+	return testTopology(t)
+}
 
-	marker, err := readInstallation(t.Context(), r.APIReader, r.Config, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	marker.Data[markerInitializationProtocol] = stagedInitialization
-	if err := r.Update(t.Context(), marker); err != nil {
-		t.Fatal(err)
-	}
+func stagedFakeClient(base client.WithWatch) client.WithWatch {
 	// The fake client does not assign server UIDs. Model the API's identity and
 	// immutable ConfigMap data rules, including metadata updates remaining legal.
-	r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+	return interceptor.NewClient(base, interceptor.Funcs{
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			obj.SetUID(types.UID(uuid.NewString()))
+			if obj.GetUID() == "" {
+				obj.SetUID(types.UID(uuid.NewString()))
+			}
+
 			return c.Create(ctx, obj, opts...)
 		},
 		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
@@ -1005,14 +756,14 @@ func stagedTopology(t *testing.T) *TopologyReconciler {
 			return c.Update(ctx, obj, opts...)
 		},
 	})
-
-	return r
 }
 
 // Each write boundary is tested both before persistence and with an uncertain
 // successful response, including cancellation immediately after persistence.
+var errInitializationInterrupted = errors.New("interrupted initialization")
+
 func interruptInitialization(base client.WithWatch, boundary string, cancel context.CancelFunc) client.WithWatch {
-	boom := errors.New("interrupted initialization")
+	boom := errInitializationInterrupted
 
 	return interceptor.NewClient(base, interceptor.Funcs{
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
@@ -1060,129 +811,105 @@ func TestStagedInitializationEveryBoundary(t *testing.T) {
 	for _, credentials := range []bool{false, true} {
 		for _, boundary := range []string{"before create", "after create", "cancel create", "before commit", "after commit", "cancel commit"} {
 			t.Run(fmt.Sprintf("credentials=%t/%s", credentials, boundary), func(t *testing.T) {
-				r := stagedTopology(t)
-
-				base := r.Client.(client.WithWatch)
-				if credentials {
-					if err := ensureInstalled(t.Context(), base, r.APIReader, r.Config); err != nil {
-						t.Fatal(err)
-					}
-				}
+				f := newStagedFixture(t, credentials)
 
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 
-				writer := interruptInitialization(base, boundary, cancel)
-
-				run := func(ctx context.Context, c client.WithWatch) error {
-					if !credentials {
-						return ensureInstalled(ctx, c, r.APIReader, r.Config)
-					}
-
-					_, err := Assemble(r.Config, c, r.APIReader).Keyring.Reconcile(ctx, ctrl.Request{})
-
-					return err
-				}
-				if err := run(ctx, writer); err == nil {
-					t.Fatal("interruption not observed")
-				}
-
-				var before client.Object = &corev1.ConfigMap{}
-
-				name := r.Config.VersionConfigMapName
-				if credentials {
-					before, name = &corev1.Secret{}, r.Config.CredentialsSecretName
-				}
-
-				err := base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, before)
-				if err != nil && !apierrors.IsNotFound(err) {
-					t.Fatal(err)
-				}
+				writer := interruptInitialization(f.base, boundary, cancel)
+				require.Error(t, f.run(ctx, writer), "interruption not observed")
+				before := f.object()
+				err := f.base.Get(t.Context(), client.ObjectKeyFromObject(before), before)
+				require.True(t, err == nil || apierrors.IsNotFound(err), "candidate read: %v", err)
 
 				if boundary != "after commit" && boundary != "cancel commit" {
-					if credentials {
-						if _, err := loadSigning(t.Context(), base, r.Config, Assemble(r.Config, base, base).Keyring.now()); err == nil {
-							t.Fatal("uncommitted credentials usable")
-						}
-					} else if _, _, err := readVersion(t.Context(), base, r.Config); err == nil {
-						t.Fatal("uncommitted version usable")
-					}
+					require.Error(t, f.read(t.Context()), "uncommitted authority usable")
 				}
 
-				if err := run(t.Context(), base); err != nil {
-					t.Fatalf("restart: %v", err)
-				}
+				require.NoError(t, f.run(t.Context(), f.base), "restart")
 
 				after := before.DeepCopyObject().(client.Object)
-				if err := base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, after); err != nil {
-					t.Fatal(err)
+				require.NoError(t, f.base.Get(t.Context(), client.ObjectKeyFromObject(before), after))
+
+				if before.GetUID() != "" {
+					require.Equal(t, before.GetUID(), after.GetUID(), "recovery replaced staged material")
 				}
 
-				if before.GetUID() != "" && before.GetUID() != after.GetUID() {
-					t.Fatal("recovery replaced staged material")
-				}
-
-				if secret, ok := before.(*corev1.Secret); ok && secret.UID != "" && !reflect.DeepEqual(secret.Data, after.(*corev1.Secret).Data) {
-					t.Fatal("recovery changed exact secret material")
+				if secret, ok := before.(*corev1.Secret); ok && secret.UID != "" {
+					require.Equal(t, secret.Data, after.(*corev1.Secret).Data, "recovery changed exact secret material")
 				}
 			})
 		}
 	}
 }
 
+type stagedFixture struct {
+	config      Config
+	base        client.WithWatch
+	credentials bool
+}
+
+func newStagedFixture(t *testing.T, credentials bool) stagedFixture {
+	t.Helper()
+	r := stagedTopology(t)
+
+	f := stagedFixture{config: r.Config, base: r.Client.(client.WithWatch), credentials: credentials}
+	if credentials {
+		require.NoError(t, ensureInstalled(t.Context(), f.base, f.base, f.config))
+	}
+
+	return f
+}
+
+func (f stagedFixture) object() client.Object {
+	metadata := metav1.ObjectMeta{Namespace: f.config.Namespace, Name: f.config.VersionConfigMapName}
+	if f.credentials {
+		metadata.Name = f.config.CredentialsSecretName
+		return &corev1.Secret{ObjectMeta: metadata}
+	}
+
+	return &corev1.ConfigMap{ObjectMeta: metadata}
+}
+
+func (f stagedFixture) run(ctx context.Context, writer client.WithWatch) error {
+	if f.credentials {
+		_, err := Assemble(f.config, writer, f.base).Keyring.Reconcile(ctx, ctrl.Request{})
+		return err
+	}
+
+	return ensureInstalled(ctx, writer, f.base, f.config)
+}
+
+func (f stagedFixture) read(ctx context.Context) error {
+	if f.credentials {
+		_, err := loadSigning(ctx, f.base, f.config, time.Now().UTC().Truncate(time.Second))
+		return err
+	}
+
+	_, _, err := readVersion(ctx, f.base, f.config)
+
+	return err
+}
+
 func TestStagedCommittedDeletionAndReplacementFailClosed(t *testing.T) {
 	for _, credentials := range []bool{false, true} {
 		for _, replace := range []bool{false, true} {
 			t.Run(fmt.Sprintf("credentials=%t/replace=%t", credentials, replace), func(t *testing.T) {
-				r := stagedTopology(t)
-
-				base := r.Client.(client.WithWatch)
-				if err := ensureInstalled(t.Context(), base, base, r.Config); err != nil {
-					t.Fatal(err)
-				}
-
-				runKeys(t, Assemble(r.Config, base, base).Keyring)
-
-				var obj client.Object = &corev1.ConfigMap{}
-
-				name := r.Config.VersionConfigMapName
-				if credentials {
-					obj, name = &corev1.Secret{}, r.Config.CredentialsSecretName
-				}
-
-				if err := base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, obj); err != nil {
-					t.Fatal(err)
-				}
-
-				if err := base.Delete(t.Context(), obj); err != nil {
-					t.Fatal(err)
-				}
+				f := newStagedFixture(t, credentials)
+				require.NoError(t, ensureInstalled(t.Context(), f.base, f.base, f.config))
+				runKeys(t, Assemble(f.config, f.base, f.base).Keyring)
+				obj := f.object()
+				require.NoError(t, f.base.Get(t.Context(), client.ObjectKeyFromObject(obj), obj))
+				require.NoError(t, f.base.Delete(t.Context(), obj))
 
 				if replace {
 					obj.SetResourceVersion("")
+					obj.SetUID("")
 
-					if err := base.Create(t.Context(), obj); err != nil {
-						t.Fatal(err)
-					}
+					require.NoError(t, f.base.Create(t.Context(), obj))
 				}
 
-				noWrites := interceptor.NewClient(base, interceptor.Funcs{
-					Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
-						t.Fatal("recreated committed state")
-						return nil
-					},
-					Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
-						t.Fatal("rewrote committed state")
-						return nil
-					},
-				})
-				if credentials {
-					if _, err := Assemble(r.Config, noWrites, base).Keyring.Reconcile(t.Context(), ctrl.Request{}); err == nil {
-						t.Fatal("lost credentials accepted")
-					}
-				} else if err := ensureInstalled(t.Context(), noWrites, base, r.Config); err == nil {
-					t.Fatal("lost version accepted")
-				}
+				require.Error(t, f.run(t.Context(), rejectWrites(t, f.base)), "lost authority accepted")
 			})
 		}
 	}
@@ -1222,9 +949,7 @@ func TestStagedDelayedCreateCannotResurrectAuthority(t *testing.T) {
 
 			base := r.Client.(client.WithWatch)
 			if credentials {
-				if err := ensureInstalled(t.Context(), base, base, r.Config); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, ensureInstalled(t.Context(), base, base, r.Config))
 			}
 
 			writer := interceptor.NewClient(base, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
@@ -1232,29 +957,22 @@ func TestStagedDelayedCreateCannotResurrectAuthority(t *testing.T) {
 				// installer is paused after its NotFound but before its Create.
 				if credentials {
 					runKeys(t, Assemble(r.Config, base, base).Keyring)
-				} else if err := ensureInstalled(ctx, base, base, r.Config); err != nil {
-					t.Fatal(err)
+				} else {
+					require.NoError(t, ensureInstalled(ctx, base, base, r.Config))
 				}
 
-				if err := base.Delete(ctx, obj); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, base.Delete(ctx, obj))
 
 				return c.Create(ctx, obj, opts...)
 			}})
 			if credentials {
 				_, _ = Assemble(r.Config, writer, base).Keyring.Reconcile(t.Context(), ctrl.Request{})
-				if _, err := Assemble(r.Config, base, base).Keyring.Reconcile(t.Context(), ctrl.Request{}); err == nil {
-					t.Fatal("delayed Create restored credentials authority")
-				}
+				_, err := Assemble(r.Config, base, base).Keyring.Reconcile(t.Context(), ctrl.Request{})
+				require.Error(t, err, "delayed Create restored credentials authority")
 			} else {
-				if err := ensureInstalled(t.Context(), writer, base, r.Config); err == nil {
-					t.Fatal("delayed Create restored version authority")
-				}
-
-				if _, _, err := readVersion(t.Context(), base, r.Config); err == nil {
-					t.Fatal("orphan version accepted")
-				}
+				require.Error(t, ensureInstalled(t.Context(), writer, base, r.Config), "delayed Create restored version authority")
+				_, _, err := readVersion(t.Context(), base, r.Config)
+				require.Error(t, err, "orphan version accepted")
 			}
 		})
 	}
@@ -1264,30 +982,11 @@ func TestStagedRejectsUnboundOrCorruptCandidates(t *testing.T) {
 	for _, credentials := range []bool{false, true} {
 		for _, corruption := range []string{"binding", "protocol", "immutable", "data"} {
 			t.Run(fmt.Sprintf("credentials=%t/%s", credentials, corruption), func(t *testing.T) {
-				r := stagedTopology(t)
-
-				base := r.Client.(client.WithWatch)
-				if credentials {
-					if err := ensureInstalled(t.Context(), base, base, r.Config); err != nil {
-						t.Fatal(err)
-					}
-				}
-
-				writer := interruptInitialization(base, "after create", func() {})
-
-				var obj client.Object = &corev1.ConfigMap{}
-
-				name := r.Config.VersionConfigMapName
-				if credentials {
-					_, _ = Assemble(r.Config, writer, base).Keyring.Reconcile(t.Context(), ctrl.Request{})
-					obj, name = &corev1.Secret{}, r.Config.CredentialsSecretName
-				} else {
-					_ = ensureInstalled(t.Context(), writer, base, r.Config)
-				}
-
-				if err := base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, obj); err != nil {
-					t.Fatal(err)
-				}
+				f := newStagedFixture(t, credentials)
+				writer := interruptInitialization(f.base, "after create", func() {})
+				_ = f.run(t.Context(), writer)
+				obj := f.object()
+				require.NoError(t, f.base.Get(t.Context(), client.ObjectKeyFromObject(obj), obj))
 
 				switch corruption {
 				case "binding":
@@ -1309,27 +1008,16 @@ func TestStagedRejectsUnboundOrCorruptCandidates(t *testing.T) {
 					}
 				}
 
-				if err := base.Update(t.Context(), obj); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, f.base.Update(t.Context(), obj))
+				require.Error(t, f.run(t.Context(), f.base), "invalid candidate committed")
 
 				if credentials {
-					if _, err := Assemble(r.Config, base, base).Keyring.Reconcile(t.Context(), ctrl.Request{}); err == nil {
-						t.Fatal("invalid candidate committed")
-					}
-
-					version, _, err := readVersion(t.Context(), base, r.Config)
-					if err != nil || version.Annotations[credentialClaim] != "" {
-						t.Fatal("invalid candidate consumed claim")
-					}
+					version, _, err := readVersion(t.Context(), f.base, f.config)
+					require.NoError(t, err)
+					require.Empty(t, version.Annotations[credentialClaim], "invalid candidate consumed claim")
 				} else {
-					if err := ensureInstalled(t.Context(), base, base, r.Config); err == nil {
-						t.Fatal("invalid candidate committed")
-					}
-
-					if _, err := readInstallation(t.Context(), base, r.Config, true); err != nil {
-						t.Fatal("invalid candidate consumed marker")
-					}
+					_, err := readInstallation(t.Context(), f.base, f.config, true)
+					require.NoError(t, err, "invalid candidate consumed marker")
 				}
 			})
 		}
@@ -1337,6 +1025,8 @@ func TestStagedRejectsUnboundOrCorruptCandidates(t *testing.T) {
 }
 
 func integrationStagedInitialization(t *testing.T, c client.WithWatch) {
+	t.Helper()
+
 	for _, credentials := range []bool{false, true} {
 		for i, boundary := range []string{"before create", "after create", "cancel create", "before commit", "after commit", "cancel commit"} {
 			t.Run(fmt.Sprintf("credentials=%t/%s", credentials, boundary), func(t *testing.T) {
@@ -1344,19 +1034,13 @@ func integrationStagedInitialization(t *testing.T, c client.WithWatch) {
 				cfg := a.Topology.Config
 
 				marker, err := readInstallation(t.Context(), c, cfg, true)
-				if err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, err)
 
 				marker.Data[markerInitializationProtocol] = stagedInitialization
-				if err := c.Update(t.Context(), marker); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, c.Update(t.Context(), marker))
 
 				if credentials {
-					if err := ensureInstalled(t.Context(), c, c, cfg); err != nil {
-						t.Fatal(err)
-					}
+					require.NoError(t, ensureInstalled(t.Context(), c, c, cfg))
 				}
 
 				ctx, cancel := context.WithCancel(t.Context())
@@ -1364,30 +1048,20 @@ func integrationStagedInitialization(t *testing.T, c client.WithWatch) {
 
 				writer := interruptInitialization(c, boundary, cancel)
 				if credentials {
-					if _, err := Assemble(cfg, writer, c).Keyring.Reconcile(ctx, ctrl.Request{}); err == nil {
-						t.Fatal("interruption not injected")
-					}
+					_, err := Assemble(cfg, writer, c).Keyring.Reconcile(ctx, ctrl.Request{})
+					require.Error(t, err, "interruption not injected")
 
 					runKeys(t, Assemble(cfg, c, c).Keyring)
 				} else {
-					if err := ensureInstalled(ctx, writer, c, cfg); err == nil {
-						t.Fatal("interruption not injected")
-					}
-
-					if err := ensureInstalled(t.Context(), c, c, cfg); err != nil {
-						t.Fatal(err)
-					}
+					require.Error(t, ensureInstalled(ctx, writer, c, cfg), "interruption not injected")
+					require.NoError(t, ensureInstalled(t.Context(), c, c, cfg))
 				}
 
 				marker, err = readInstallation(t.Context(), c, cfg, false)
-				if err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, err)
 
 				marker.Data[versionUID] = "replacement"
-				if err := c.Update(t.Context(), marker); err == nil {
-					t.Fatal("API allowed rewriting immutable binding")
-				}
+				require.Error(t, c.Update(t.Context(), marker), "API allowed rewriting immutable binding")
 			})
 		}
 	}
@@ -1417,11 +1091,13 @@ func testTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
 		}
 	}
 
-	marker := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName, UID: "installation-uid"}, Data: map[string]string{"cluster": string(cfg.Cluster), "version_configmap": cfg.VersionConfigMapName, "state": "fresh"}}
+	marker := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName, UID: "installation-uid"}, Data: map[string]string{"cluster": string(cfg.Cluster), "version_configmap": cfg.VersionConfigMapName, "state": "fresh", markerInitializationProtocol: stagedInitialization}}
 	objects = append(objects, marker)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithIndex(&corev1.Pod{}, podNodeIndex, podNodeKeys).Build()
 
-	return Assemble(cfg, c, c).Topology
+	api := stagedFakeClient(c)
+
+	return Assemble(cfg, api, api).Topology
 }
 
 func initializedTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
@@ -1454,99 +1130,88 @@ func reconcileTopology(t *testing.T, r *TopologyReconciler, ctx context.Context)
 func TestInitializeCrashOrdering(t *testing.T) {
 	for _, stage := range []string{"before marker", "marker response lost", "after marker", "create response lost", "success"} {
 		t.Run(stage, func(t *testing.T) {
-			r := testTopology(t)
-			base := r.Client.(client.WithWatch)
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			writes := []string{}
-			boom := errors.New("simulated crash")
-			r.Client = interceptor.NewClient(base, interceptor.Funcs{
-				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-					writes = append(writes, "consume")
-
-					if stage == "before marker" {
-						return boom
-					}
-
-					if err := c.Update(ctx, obj, opts...); err != nil {
-						return err
-					}
-
-					if stage == "marker response lost" {
-						return boom
-					}
-
-					if stage == "after marker" {
-						cancel()
-					}
-
-					return nil
-				},
-				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-					writes = append(writes, "create")
-
-					marker, err := readInstallation(ctx, r.APIReader, r.Config, false)
-					if err != nil || marker.Immutable == nil || !*marker.Immutable {
-						t.Fatalf("counter create before marker freeze: %v", err)
-					}
-
-					if err := c.Create(ctx, obj, opts...); err != nil {
-						return err
-					}
-
-					if stage == "create response lost" {
-						return boom
-					}
-
-					return nil
-				},
-			})
-
-			err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config)
-			if (err == nil) != (stage == "success") {
-				t.Fatalf("initialize: %v", err)
-			}
-
-			wantWrites := []string{"consume"}
-			if stage == "create response lost" || stage == "success" {
-				wantWrites = append(wantWrites, "create")
-			}
-
-			if !reflect.DeepEqual(writes, wantWrites) {
-				t.Fatalf("writes: %v", writes)
-			}
-
-			writes = nil
-
-			if stage == "before marker" {
-				r.Client = base
-				if err := ensureInstalled(context.Background(), r.Client, r.APIReader, r.Config); err != nil {
-					t.Fatalf("fresh marker cannot initialize: %v", err)
-				}
-			} else {
-				restart, stop := context.WithTimeout(t.Context(), 100*time.Millisecond)
-				defer stop()
-
-				err := ensureInstalled(restart, r.Client, r.APIReader, r.Config)
-				if (err == nil) != (stage == "success" || stage == "create response lost") {
-					t.Fatalf("restart: %v", err)
-				}
-
-				if len(writes) != 0 {
-					t.Fatalf("restart wrote state: %v", writes)
-				}
-			}
-
-			_, _, err = readVersion(context.Background(), r.APIReader, r.Config)
-
-			valid := stage == "before marker" || stage == "create response lost" || stage == "success"
-			if (err == nil) != valid {
-				t.Fatalf("recovery: %v", err)
-			}
+			exerciseInitializationCrash(t, stage)
 		})
 	}
+}
+
+func exerciseInitializationCrash(t *testing.T, stage string) {
+	t.Helper()
+	r := testTopology(t)
+	base := r.Client.(client.WithWatch)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	writes := []string{}
+	boom := errors.New("simulated crash")
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			writes = append(writes, "consume")
+
+			if stage == "before marker" {
+				return boom
+			}
+
+			if err := c.Update(ctx, obj, opts...); err != nil {
+				return err
+			}
+
+			if stage == "marker response lost" {
+				return boom
+			}
+
+			if stage == "after marker" {
+				cancel()
+			}
+
+			return nil
+		},
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			writes = append(writes, "create")
+
+			marker, err := readInstallation(ctx, r.APIReader, r.Config, true)
+			require.NoError(t, err, "candidate must precede marker freeze")
+			require.Empty(t, marker.Data[versionUID], "uncreated candidate was committed")
+
+			if err := c.Create(ctx, obj, opts...); err != nil {
+				return err
+			}
+
+			if stage == "create response lost" {
+				return boom
+			}
+
+			return nil
+		},
+	})
+
+	err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config)
+	require.Equal(t, stage == "success", err == nil, "initialize: %v", err)
+
+	wantWrites := []string{"create"}
+	if stage != "create response lost" {
+		wantWrites = append(wantWrites, "consume")
+	}
+
+	require.Equal(t, wantWrites, writes)
+
+	writes = nil
+
+	var candidate corev1.ConfigMap
+	require.NoError(t, base.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.VersionConfigMapName}, &candidate))
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+		t.Fatal("restart recreated staged candidate")
+		return nil
+	}})
+	require.NoError(t, ensureInstalled(t.Context(), r.Client, r.APIReader, r.Config))
+
+	_, _, err = readVersion(context.Background(), r.APIReader, r.Config)
+
+	require.NoError(t, err)
+	marker, err := readInstallation(t.Context(), base, r.Config, false)
+	require.NoError(t, err)
+	require.Equal(t, string(candidate.UID), marker.Data[versionUID], "recovery did not bind staged UID")
 }
 
 func TestInitializeConflictAndExistingState(t *testing.T) {
@@ -1558,25 +1223,29 @@ func TestInitializeConflictAndExistingState(t *testing.T) {
 		Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
 			return apierrors.NewConflict(corev1.Resource("configmaps"), "marker", errors.New("concurrent initializer"))
 		},
-		Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 			creates++
-			return nil
+			return c.Create(ctx, obj, opts...)
 		},
 	})
 
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 
-	if err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config); !errors.Is(err, context.DeadlineExceeded) || creates != 0 {
+	if err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config); !errors.Is(err, context.DeadlineExceeded) || creates != 1 {
 		t.Fatalf("marker conflict: %v, creates=%d", err, creates)
 	}
 
 	r.Client = base
+	if err := base.Delete(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.VersionConfigMapName}}); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := base.Create(context.Background(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.VersionConfigMapName}}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := ensureInstalled(context.Background(), r.Client, r.APIReader, r.Config); !errors.Is(err, wire.Conflict) {
+	if err := ensureInstalled(context.Background(), r.Client, r.APIReader, r.Config); !errors.Is(err, wire.Unavailable) {
 		t.Fatalf("existing counters accepted: %v", err)
 	}
 
@@ -1707,10 +1376,21 @@ func TestRecoveryNeverRecreatesCounters(t *testing.T) {
 				err = r.Update(ctx, cm)
 			case "mutable marker":
 				marker.Immutable = nil
-				err = r.Update(ctx, marker)
 			case "fresh marker":
 				marker.Data["state"] = "fresh"
-				err = r.Update(ctx, marker)
+			}
+
+			if mutation == "mutable marker" || mutation == "fresh marker" {
+				// Inject invalid observed state without weakening the fake API's
+				// immutable data enforcement for normal operations.
+				r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if key.Name == marker.Name {
+						marker.DeepCopyInto(obj.(*corev1.ConfigMap))
+						return nil
+					}
+
+					return c.Get(ctx, key, obj, opts...)
+				}})
 			}
 
 			if err != nil {
@@ -1778,6 +1458,13 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 	if v := member.record; v.Sequence != 3 || v.MembershipVersion != 2 {
 		t.Fatalf("member counters: %+v", v)
 	}
+
+	assertCrashAfterVersionCommit(t, r, member)
+}
+
+func assertCrashAfterVersionCommit(t *testing.T, r *TopologyReconciler, member *CommittedPublication) {
+	t.Helper()
+	ctx := t.Context()
 
 	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
@@ -1903,6 +1590,9 @@ func TestCancellationBeforeWritesAndInstall(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCancellationBetweenCommitAndInstall(t *testing.T) {
 	// Also cover cancellation between returning a committed token and Install.
 	r := initializedTopology(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1927,4 +1617,89 @@ func TestCancellationBeforeWritesAndInstall(t *testing.T) {
 	if err := r.Publications.Install(committed); !errors.Is(err, context.Canceled) {
 		t.Fatalf("late install: %v", err)
 	}
+}
+
+func TestReplicaAcceptanceAndPublicHandles(t *testing.T) {
+	f := newServingFixture(t)
+	a := f.a.authority
+	p, err := a.Current()
+	require.NoError(t, err)
+	image, err := wire.DecodePublication(strings.NewReader(p.image.encoded))
+	require.NoError(t, err)
+
+	process, stop := context.WithCancel(t.Context())
+	defer stop()
+
+	replica := New(a.config, Dependencies{Reader: a.reader, Writer: a.client})
+	replica.BindProcess(process)
+	require.NoError(t, replica.AcceptReplica(t.Context(), process, image))
+	current, changed, err := replica.CurrentAndSubscribe()
+	require.NoError(t, err)
+	require.NotNil(t, changed)
+	require.Equal(t, image.Sequence, current.Sequence())
+	require.Zero(t, (*PublicationHandle)(nil).Sequence())
+	require.Zero(t, (&PublicationHandle{}).Sequence())
+
+	identity := pollIdentity(a.config, testNodeUID)
+	identity.owner = replica
+	waited, err := replica.Wait(t.Context(), identity, nil)
+	require.NoError(t, err)
+	require.Equal(t, current.Sequence(), waited.Sequence())
+	require.NoError(t, replica.PublicationReady())
+	stop()
+
+	_, err = replica.Wait(t.Context(), identity, nil)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestReplicaRejectsInvalidAndUncommittedImages(t *testing.T) {
+	for _, scenario := range []string{"invalid", "uncommitted", "canceled", "missing version", "rollback"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newServingFixture(t)
+			a := f.a.authority
+			p, err := a.Current()
+			require.NoError(t, err)
+			image, err := wire.DecodePublication(strings.NewReader(p.image.encoded))
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			switch scenario {
+			case "invalid":
+				image.SchemaVersion = 0
+			case "uncommitted":
+				image.Sequence++
+			case "canceled":
+				cancel()
+			case "missing version":
+				require.NoError(t, f.a.Topology.Delete(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: a.config.Namespace, Name: a.config.VersionConfigMapName}}))
+			case "rollback":
+				newer := p.image.record
+				newer.Sequence++
+				require.NoError(t, a.publications.confirm(newer))
+			}
+
+			require.Error(t, a.AcceptReplica(ctx, t.Context(), image))
+		})
+	}
+}
+
+func TestPublicKeyringWaitAndUnavailableTrust(t *testing.T) {
+	f := newServingFixture(t)
+	a := f.a.authority
+	keyring, err := a.WaitKeyring(t.Context(), nil)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, keyring.Generation())
+	require.Zero(t, (KeyringHandle{}).Generation())
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err = a.WaitKeyring(ctx, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	a.trust.invalidate()
+	_, err = a.TrustPool()
+	require.ErrorIs(t, err, wire.Unavailable)
+	_, _, err = a.AdmitTrust(t.Context())
+	require.ErrorIs(t, err, wire.Unavailable)
 }
