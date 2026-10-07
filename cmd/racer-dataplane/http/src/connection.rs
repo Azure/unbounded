@@ -1304,7 +1304,19 @@ impl<C: Context> HttpPool<C> {
                         priority,
                         waker: RefCell::new(None),
                     });
-                    self.state.borrow_mut().waiting.push_back(entry.clone());
+                    // Admission and key cloning can reenter the pool.
+                    if self.context.stopped() {
+                        return Poll::Ready(Err(uring_runtime::Error::Unavailable.into()));
+                    }
+                    let mut state = self.state.borrow_mut();
+                    if state.closed {
+                        return Poll::Ready(Err(uring_runtime::Error::Unavailable.into()));
+                    }
+                    if state.waiting.len() >= self.config.waiter_cap {
+                        return Poll::Ready(Err(uring_runtime::Error::Overloaded.into()));
+                    }
+                    state.waiting.push_back(entry.clone());
+                    drop(state);
                     waiting = Some(Waiting {
                         state: self.state.clone(),
                         entry,
@@ -2167,6 +2179,10 @@ mod tests {
                 return Err(uring_runtime::Error::Overloaded.into());
             }
             self.used.set(self.used.get() + n);
+            let callback = ON_WAITER_CHARGE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
             Ok(Charge(self.used.clone(), n, None))
         }
 
@@ -2804,6 +2820,12 @@ mod tests {
     thread_local! {
         /// Run a local checkout poll from a thread-safe test waker.
         static ON_WAKE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+
+        static ON_WAITER_ALLOCATION: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+
+        static ON_WAITER_CHARGE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+
+        static ON_WAITER_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     }
 
     /// Dispatch a notification to the current thread's reentrancy probe.
@@ -2884,6 +2906,153 @@ mod tests {
                 assert_eq!(hooks.used.get(), 0);
                 assert!(pool.state.borrow().waiting.is_empty());
             }
+        }
+    }
+
+    /// Endpoint whose admission hooks can change the pool before registration.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct ReentryKey;
+
+    impl Clone for ReentryKey {
+        fn clone(&self) -> Self {
+            let callback = ON_WAITER_CLONE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+            Self
+        }
+    }
+
+    impl Endpoint<Failure> for ReentryKey {
+        fn address(&self) -> std::result::Result<SocketAddress, Failure> {
+            Key.address()
+        }
+
+        fn allocation(&self) -> usize {
+            let callback = ON_WAITER_ALLOCATION.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+            std::mem::size_of_val(self)
+        }
+    }
+
+    /// Changes that invalidate an earlier waiter admission check.
+    #[derive(Clone, Copy)]
+    enum AdmissionChange {
+        Close,
+        Stop,
+        FillQueue,
+    }
+
+    /// Poll once to catch lost wakeups without relying on periodic maintenance.
+    fn check_waiter_admission_reentry(
+        hook: &'static std::thread::LocalKey<RefCell<Option<Box<dyn FnOnce()>>>>,
+        change: AdmissionChange,
+    ) {
+        for priority in [false, true] {
+            let hooks = Rc::new(Hooks::<ReentryKey> {
+                used: Rc::default(),
+                slots: Rc::default(),
+                stopped: Cell::new(false),
+                reject_charge: Cell::new(false),
+                endpoint: std::marker::PhantomData,
+            });
+            let pool = Rc::new(HttpPool::new(
+                reactor(),
+                hooks.clone(),
+                PoolConfig {
+                    max_endpoints: 0,
+                    waiter_cap: 1,
+                    ..PoolConfig::default()
+                },
+            ));
+            let nested = Rc::new(RefCell::new(None));
+            let nested_charge = Rc::new(Cell::new(0));
+            let called = Rc::new(Cell::new(false));
+            hook.with(|slot| {
+                let pool = pool.clone();
+                let hooks = hooks.clone();
+                let nested = nested.clone();
+                let nested_charge = nested_charge.clone();
+                let called = called.clone();
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    called.set(true);
+                    match change {
+                        AdmissionChange::Close => pool.close(),
+                        AdmissionChange::Stop => hooks.stopped.set(true),
+                        AdmissionChange::FillQueue => {
+                            let before = hooks.used.get();
+                            let mut waiting = Box::pin(async move {
+                                pool.checkout_wait_class(&ReentryKey, &TestScope, priority)
+                                    .await
+                            });
+                            assert!(
+                                waiting
+                                    .as_mut()
+                                    .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                                    .is_pending()
+                            );
+                            nested_charge.set(hooks.used.get() - before);
+                            *nested.borrow_mut() = Some(waiting);
+                        }
+                    }
+                }));
+            });
+            let mut waiting = pool.checkout_wait_class(&ReentryKey, &TestScope, priority);
+            let result = waiting
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(Waker::noop()));
+            assert!(called.get());
+            let expected = match change {
+                AdmissionChange::Close | AdmissionChange::Stop => uring_runtime::Error::Unavailable,
+                AdmissionChange::FillQueue => uring_runtime::Error::Overloaded,
+            };
+            assert!(matches!(result, Poll::Ready(Err(Failure::Runtime(e))) if e == expected));
+            assert_eq!(hooks.used.get(), nested_charge.get());
+            assert_eq!(
+                pool.state.borrow().waiting.len(),
+                usize::from(matches!(change, AdmissionChange::FillQueue))
+            );
+            assert!(pool.state.borrow().entries.is_empty());
+            assert_eq!(hooks.slots.get(), 0);
+            drop(waiting);
+            nested.borrow_mut().take();
+            assert_eq!(hooks.used.get(), 0);
+            assert!(pool.state.borrow().waiting.is_empty());
+        }
+    }
+
+    #[test]
+    fn waiter_admission_rechecks_after_allocation() {
+        for change in [
+            AdmissionChange::Close,
+            AdmissionChange::Stop,
+            AdmissionChange::FillQueue,
+        ] {
+            check_waiter_admission_reentry(&ON_WAITER_ALLOCATION, change);
+        }
+    }
+
+    #[test]
+    fn waiter_admission_rechecks_after_charge() {
+        for change in [
+            AdmissionChange::Close,
+            AdmissionChange::Stop,
+            AdmissionChange::FillQueue,
+        ] {
+            check_waiter_admission_reentry(&ON_WAITER_CHARGE, change);
+        }
+    }
+
+    #[test]
+    fn waiter_admission_rechecks_after_clone() {
+        for change in [
+            AdmissionChange::Close,
+            AdmissionChange::Stop,
+            AdmissionChange::FillQueue,
+        ] {
+            check_waiter_admission_reentry(&ON_WAITER_CLONE, change);
         }
     }
 
