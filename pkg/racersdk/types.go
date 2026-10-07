@@ -46,7 +46,9 @@ func (k Key) String() string { return hex.EncodeToString(k[:]) }
 // Request identifies an object and carries the opaque values that Racer
 // forwards unchanged to the [Origin] on a cache miss.
 //
-// Metadata and Authorization are limited to 8 KiB of visible ASCII and spaces.
+// Metadata and Authorization may be empty; otherwise, each is limited to 8 KiB
+// with no leading or trailing ASCII space (0x20), bytes below 0x20, or byte 0x7f.
+// Bytes above 0x7f are allowed; values need not be valid UTF-8.
 // Formatting a Request with the fmt package redacts both values.
 type Request struct {
 	Key Key
