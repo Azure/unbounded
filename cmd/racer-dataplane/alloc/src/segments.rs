@@ -473,6 +473,7 @@ impl Segments {
         for (i, s) in images.iter().enumerate() {
             if s.id.0 != i as u64
                 || s.generation.0 == 0
+                || s.generation.0 < slots[i].image.generation.0
                 || s.used_bytes > self.segment_bytes
                 || !s.used_bytes.is_multiple_of(alignment.offset())
                 || !s.used_bytes.is_multiple_of(alignment.length() as u64)
@@ -496,6 +497,7 @@ impl Segments {
 
     /// Validate the complete image before publishing it, sealing its open tail.
     /// Frozen tables and outstanding leases return Busy without changing state.
+    /// A generation below the current slot generation returns Corrupt.
     pub fn restore(&self, images: Vec<SegmentSnapshot>) -> Result<()> {
         let epoch = self.validate_restore_epoch(&images)?;
         let mut slots = self.slots.borrow_mut();
@@ -889,6 +891,62 @@ mod tests {
         assert_eq!(s.snapshot()[0].state, SegmentState::Sealed);
         snap[0].used_bytes = 513;
         assert!(s.restore(snap).is_err());
+    }
+
+    /// Reject rollback atomically while allowing equal or newer generations.
+    #[test]
+    fn restore_rejects_generation_rollback_without_reviving_stale_mappings() {
+        let s = segments(1024, 2);
+        drop(s.append(1024).unwrap());
+        let (lease, extent) = s.append(1024).unwrap();
+        let id = lease.id();
+        let generation = lease.generation();
+        drop(lease);
+        let old_sealed = s.snapshot();
+        s.begin_evict(id).unwrap();
+        s.recycle(id).unwrap();
+        let before = s.snapshot();
+        let epoch = s.restore_epoch();
+
+        for state in [
+            SegmentState::Free,
+            SegmentState::Open,
+            SegmentState::Sealed,
+            SegmentState::Evicting,
+        ] {
+            let mut images = old_sealed.clone();
+            images[0].generation = Generation(3);
+            images[1].state = state;
+            images[1].used_bytes = match state {
+                SegmentState::Free => 0,
+                SegmentState::Open => 512,
+                _ => 1024,
+            };
+            assert_eq!(s.validate_restore(&images), Err(Error::Corrupt));
+            assert_eq!(s.restore(images), Err(Error::Corrupt));
+            assert_eq!(s.snapshot(), before);
+            assert_eq!(s.restore_epoch(), epoch);
+            assert_eq!(*s.free.borrow(), BTreeSet::from([1]));
+            assert_eq!(s.open.get(), None);
+            assert_eq!(s.evicting.get(), 0);
+        }
+
+        let (lease, new_extent) = s.append(1024).unwrap();
+        assert_eq!(lease.id(), id);
+        assert_eq!(lease.generation(), Generation(2));
+        assert_eq!(new_extent, extent);
+        assert_eq!(s.validate(id, generation, &extent), Err(Error::Stale));
+        assert!(matches!(s.lease(id, generation), Err(Error::Stale)));
+        drop(lease);
+
+        let mut images = s.snapshot();
+        assert_eq!(s.validate_restore(&images), Ok(()));
+        s.restore(images.clone()).unwrap();
+        images[1].generation = Generation(3);
+        assert_eq!(s.validate_restore(&images), Ok(()));
+        s.restore(images).unwrap();
+        assert_eq!(s.snapshot()[1].generation, Generation(3));
+        assert_eq!(s.validate(id, generation, &extent), Err(Error::Stale));
     }
 
     /// Tail rotation and generation exhaustion never wrap into stale authority.
