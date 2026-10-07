@@ -979,6 +979,7 @@ mod tests {
         csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
         customize(&mut csr.params);
         EnrollmentResponse {
+            block_devices: None,
             schema_version: 1,
             cluster: request.cluster.clone(),
             node: NodeId(NODE.into()),
