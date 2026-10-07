@@ -719,23 +719,27 @@ pub mod flight {
     }
 
     impl<K: Clone + Eq + Hash, E, S: BuildHasher> Table<K, E, S> {
-        /// The adapter must have checked admission before inserting a new identity.
-        pub fn insert(&mut self, key: K, entry: E) {
-            let sweep_id = self.allocate_sweep_id();
-            if let Some(previous) = self
-                .entries
-                .insert(key.clone(), Indexed { sweep_id, entry })
-            {
-                self.sweep.remove(&previous.sweep_id);
+        /// Insert only into a vacant key after the adapter checks admission.
+        /// Occupied keys, even quiescent ones, return the rejected key and entry.
+        /// Remove quiescent entries explicitly before admitting replacements.
+        /// Return rejection from `update` and drop it outside the owner borrow.
+        #[must_use = "drop the rejected key and entry outside the owner borrow"]
+        pub fn insert(&mut self, key: K, entry: E) -> Result<(), (K, E)> {
+            if self.entries.contains_key(&key) {
+                return Err((key, entry));
             }
+            let sweep_id = self.allocate_sweep_id();
+            self.entries
+                .insert(key.clone(), Indexed { sweep_id, entry });
             self.sweep.insert(sweep_id, key);
+            Ok(())
         }
 
         /// Find a free internal sweep slot without consuming incarnation IDs.
         fn allocate_sweep_id(&mut self) -> u64 {
             // Unlike externally visible incarnation fences, these IDs can be reused
             // after removal. At most len + 1 probes find a free ID, even after wrap.
-            // This keeps insert infallible without coupling it to identity().
+            // Vacant insertion needs no incarnation allocation or fallible counter.
             for _ in 0..=self.sweep.len() {
                 self.next_sweep_id = self.next_sweep_id.wrapping_add(1);
                 if !self.sweep.contains_key(&self.next_sweep_id) {
@@ -1557,15 +1561,19 @@ pub mod flight {
         /// Admit an entry with one waiter and return its initial identity.
         fn insert(table: &mut TestTable, owner: &Rc<()>, key: u32) -> Identity {
             let identity = table.identity(owner.clone()).unwrap();
-            table.insert(
-                key,
-                TestEntry {
-                    identity: identity.clone(),
-                    waiters: 1,
-                    canceled: false,
-                    refreshed: 0,
-                    operations: Operations::default(),
-                },
+            assert!(
+                table
+                    .insert(
+                        key,
+                        TestEntry {
+                            identity: identity.clone(),
+                            waiters: 1,
+                            canceled: false,
+                            refreshed: 0,
+                            operations: Operations::default(),
+                        },
+                    )
+                    .is_ok()
             );
             identity
         }
@@ -1600,6 +1608,82 @@ pub mod flight {
             table.get_mut(&1).unwrap().operations.complete(1).unwrap();
             assert!(table.remove_quiescent(&1).is_some());
             assert_eq!(table.len(), 1);
+        }
+
+        /// Occupied entries retain live resources until explicit completion.
+        #[test]
+        fn occupied_live_entry_rejects_insertion() {
+            occupied_entry_rejects_insertion(false, false);
+        }
+
+        /// Taking resources does not let insertion bypass the completion tombstone.
+        #[test]
+        fn occupied_tombstone_rejects_insertion() {
+            occupied_entry_rejects_insertion(true, false);
+        }
+
+        /// Even quiescent entries must be explicitly removed before replacement.
+        #[test]
+        fn occupied_quiescent_entry_rejects_insertion() {
+            occupied_entry_rejects_insertion(true, true);
+        }
+
+        /// Rejection preserves identity, resource ownership, and sweep membership.
+        fn occupied_entry_rejects_insertion(take: bool, complete: bool) {
+            let owner = Rc::new(());
+            let mut table = TestTable::default();
+            let original = insert(&mut table, &owner, 1);
+            let live = Rc::new(Cell::new(1));
+            let entry = table.get_mut(&1).unwrap();
+            entry.waiters = 0;
+            entry.operations.insert(1, Resource(live.clone()));
+            if take {
+                drop(entry.operations.take(1).unwrap());
+            }
+            if complete {
+                entry.operations.complete(1).unwrap();
+            }
+            let sweep_id = table.entries[&1].sweep_id;
+            let next_sweep_id = table.next_sweep_id;
+            let rejected_live = Rc::new(Cell::new(1));
+            let mut operations = Operations::default();
+            operations.insert(2, Resource(rejected_live.clone()));
+            let replacement = table.identity(owner).unwrap();
+            let rejected = table.insert(
+                1,
+                TestEntry {
+                    identity: replacement,
+                    waiters: 1,
+                    canceled: false,
+                    refreshed: 0,
+                    operations,
+                },
+            );
+            assert!(rejected.is_err());
+            assert!(original.same_registration(&table.get(&1).unwrap().identity));
+            assert_eq!(live.get(), usize::from(!take));
+            assert_eq!(rejected_live.get(), 1);
+            assert_eq!(table.len(), 1);
+            assert_eq!(table.entries[&1].sweep_id, sweep_id);
+            assert_eq!(table.next_sweep_id, next_sweep_id);
+            assert_eq!(table.sweep.len(), 1);
+            assert_eq!(table.sweep[&sweep_id], 1);
+            drop(rejected);
+            assert_eq!(rejected_live.get(), 0);
+            let removed = table.sweep(1, &mut Vec::new());
+            assert_eq!(removed.len(), usize::from(complete));
+            if !complete {
+                let entry = table.get_mut(&1).unwrap();
+                assert_eq!(entry.refreshed, 1);
+                assert_eq!(entry.operations.len(), 1);
+                if !take {
+                    drop(entry.operations.take(1).unwrap());
+                }
+                entry.operations.complete(1).unwrap();
+                assert!(table.remove_quiescent(&1).is_some());
+            }
+            assert!(table.is_empty());
+            assert!(table.sweep.is_empty());
         }
 
         /// Request handle that detaches its waiter without completing operations.
@@ -1766,6 +1850,8 @@ pub mod flight {
             assert!(table.remove_quiescent(&1).is_none());
             insert(&mut table, &owner, 1);
             let original = table.entries[&1].sweep_id;
+            table.get_mut(&1).unwrap().waiters = 0;
+            assert!(table.remove_quiescent(&1).is_some());
             insert(&mut table, &owner, 1);
             let replacement = table.entries[&1].sweep_id;
             insert(&mut table, &owner, 2);
@@ -1814,6 +1900,8 @@ pub mod flight {
                 entry.identity.incarnation = u64::MAX;
                 entry.canceled = true;
             });
+            table.get_mut(&2).unwrap().waiters = 0;
+            assert!(table.remove_quiescent(&2).is_some());
             insert(&mut table, &owner, 2);
             assert_eq!(table.sweep.len(), 3);
             drop(table.sweep(3, &mut Vec::new()));
@@ -1832,15 +1920,19 @@ pub mod flight {
             let mut table = TestTable::default();
             let identity = table.identity(owner).unwrap();
             for key in 1..=3 {
-                table.insert(
-                    key,
-                    TestEntry {
-                        identity: identity.clone(),
-                        waiters: 1,
-                        canceled: false,
-                        refreshed: 0,
-                        operations: Operations::default(),
-                    },
+                assert!(
+                    table
+                        .insert(
+                            key,
+                            TestEntry {
+                                identity: identity.clone(),
+                                waiters: 1,
+                                canceled: false,
+                                refreshed: 0,
+                                operations: Operations::default(),
+                            },
+                        )
+                        .is_ok()
                 );
             }
             assert_eq!(table.sweep.len(), 3);
@@ -1880,15 +1972,19 @@ pub mod flight {
             assert!(table.values().all(|entry| entry.refreshed == 1));
             table.incarnation = Counter(u64::MAX);
             assert!(table.identity(owner).is_err());
-            table.insert(
-                4,
-                TestEntry {
-                    identity: first,
-                    waiters: 1,
-                    canceled: false,
-                    refreshed: 0,
-                    operations: Operations::default(),
-                },
+            assert!(
+                table
+                    .insert(
+                        4,
+                        TestEntry {
+                            identity: first,
+                            waiters: 1,
+                            canceled: false,
+                            refreshed: 0,
+                            operations: Operations::default(),
+                        },
+                    )
+                    .is_ok()
             );
             assert_eq!(
                 table.len(),

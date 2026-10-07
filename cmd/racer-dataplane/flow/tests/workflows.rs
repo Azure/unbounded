@@ -1323,6 +1323,60 @@ mod coalesce_tests {
         }
     }
 
+    /// Rejected entries leave the transaction before their destructors reenter it.
+    #[test]
+    fn occupied_insertion_keeps_destructors_outside_owner_borrow() {
+        for quiescent in [false, true] {
+            let table = Rc::new(RefCell::new(flight::Table::<u32, DroppableEntry>::default()));
+            let original_dropped = Rc::new(Cell::new(false));
+            let rejected_dropped = Rc::new(Cell::new(false));
+            let unlocked = Rc::new(Cell::new(false));
+            let entry = |dropped: Rc<Cell<bool>>| DroppableEntry {
+                _resource: ReentrantResource(Some(Box::new({
+                    let table = Rc::downgrade(&table);
+                    let unlocked = unlocked.clone();
+                    move || {
+                        let Some(table) = table.upgrade() else {
+                            return;
+                        };
+                        if let Ok(mut table) = table.try_borrow_mut() {
+                            assert!(table.next_waiter_id().is_ok());
+                            unlocked.set(true);
+                        }
+                        dropped.set(true);
+                    }
+                }))),
+                quiescent,
+            };
+            assert!(
+                flight::update(&table, |table, _| {
+                    table.insert(1, entry(original_dropped.clone()))
+                })
+                .is_ok()
+            );
+            let rejected = flight::update(&table, |table, _| {
+                table.insert(1, entry(rejected_dropped.clone()))
+            });
+            assert!(rejected.is_err());
+            assert!(!original_dropped.get(), "occupied entry must stay owned");
+            assert!(!rejected_dropped.get(), "rejection must return ownership");
+            drop(rejected);
+            assert!(rejected_dropped.get());
+            assert!(unlocked.get());
+            assert!(!original_dropped.get());
+            let removed = flight::update(&table, |table, _| {
+                assert_eq!(table.len(), 1);
+                table.get_mut(&1).unwrap().quiescent = true;
+                table.remove_quiescent(&1)
+            });
+            // The original destructor also reenters after explicit removal.
+            unlocked.set(false);
+            drop(removed);
+            assert!(original_dropped.get());
+            assert!(unlocked.get());
+        }
+    }
+
     /// Sweeping transfers entry destruction past the owner transaction.
     #[test]
     fn swept_entry_destructor_can_reenter_owner() {
@@ -1349,24 +1403,33 @@ mod coalesce_tests {
                     let removed = table.sweep(1, wakes);
                     assert!(removed.is_empty());
                     assert_eq!(table.next_waiter_id(), Ok(1));
-                    table.insert(
-                        1,
-                        DroppableEntry {
-                            _resource: ReentrantResource(Some(Box::new(|| {}))),
-                            quiescent: false,
-                        },
+                    assert!(
+                        table
+                            .insert(
+                                1,
+                                DroppableEntry {
+                                    _resource: ReentrantResource(Some(Box::new(|| {}))),
+                                    quiescent: false,
+                                },
+                            )
+                            .is_ok()
                     );
                     removed
                 }));
                 dropped.set(dropped.get() + 1);
             }
         })));
-        table.borrow_mut().insert(
-            1,
-            DroppableEntry {
-                _resource: resource,
-                quiescent: false,
-            },
+        assert!(
+            table
+                .borrow_mut()
+                .insert(
+                    1,
+                    DroppableEntry {
+                        _resource: resource,
+                        quiescent: false,
+                    },
+                )
+                .is_ok()
         );
         let removed = flight::update(&table, |table, wakes| {
             assert!(table.remove_quiescent(&2).is_none());
@@ -1418,7 +1481,7 @@ mod coalesce_tests {
             assert_eq!(table.next_waiter_id(), Ok(1));
             assert_eq!(table.next_waiter_id(), Ok(2));
             let id = table.next_operation_id().unwrap();
-            table.insert(1, OwnedEntry::default());
+            assert!(table.insert(1, OwnedEntry::default()).is_ok());
             table.get_mut(&1).unwrap().0.insert(id, resource);
             assert_eq!(table.get_mut(&1).unwrap().0.complete(id), Err(Stale));
             id
