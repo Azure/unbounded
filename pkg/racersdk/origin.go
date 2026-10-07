@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -121,6 +122,14 @@ func (c OriginConfig) limits() (originLimits, error) {
 	if c.MaxConcurrentRequests != 0 {
 		l.maxRequests = c.MaxConcurrentRequests
 	}
+
+	// Full content admission must leave room for metadata and an overload response.
+	reserve := l.maxHeadRequests + 1
+	if l.maxRequests > math.MaxInt-reserve {
+		return originLimits{}, invalid("origin config", errors.New("MaxConcurrentRequests too large"))
+	}
+
+	l.maxConnections = max(l.maxConnections, l.maxRequests+reserve)
 
 	return l, nil
 }
