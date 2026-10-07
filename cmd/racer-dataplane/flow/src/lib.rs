@@ -657,6 +657,7 @@ impl<P: Policy> Quotas<P> {
 
     /// Reuse a live key record or create one after bounded retirement cleanup.
     fn key_counters(&self, key: &P::Key) -> Result<Arc<Counters<P::Key>>> {
+        let limit = self.policy.max_keys();
         let mut keys = self.keys.borrow_mut();
         let mut retired = self.retired_keys.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..256 {
@@ -671,11 +672,10 @@ impl<P: Policy> Quotas<P> {
             }
         }
         drop(retired);
-        if !keys.contains_key(key) && keys.len() >= self.policy.max_keys() {
-            self.policy.rejected(Rejection::Keys {
-                used: keys.len(),
-                limit: self.policy.max_keys(),
-            });
+        if !keys.contains_key(key) && keys.len() >= limit {
+            let used = keys.len();
+            drop(keys);
+            self.policy.rejected(Rejection::Keys { used, limit });
             return Err(Error::Overloaded);
         }
         if let Some(counts) = keys.get(key).and_then(Weak::upgrade) {
@@ -1365,6 +1365,89 @@ mod quota_tests {
             [Rejection::Keys { used: 1, limit: 1 }]
         ));
         drop(charge);
+    }
+
+    /// Key-table rejection callbacks can inspect and admit work for a live key.
+    #[test]
+    fn key_record_rejection_allows_keyed_reentry() {
+        /// Keep a weak link to the authority and guard callback reentry.
+        struct ReentrantPolicy {
+            quotas: RefCell<std::rc::Weak<Quotas<Self>>>,
+            entered: std::cell::Cell<bool>,
+            rejected: RefCell<Vec<Rejection<Resource>>>,
+        }
+
+        impl Policy for ReentrantPolicy {
+            type Class = Resource;
+            type Key = String;
+
+            /// Leave room for nested admission under the existing key.
+            fn limit(&self, _: Resource) -> usize {
+                10
+            }
+
+            /// Force a rejection for each new key while the first is live.
+            fn max_keys(&self) -> usize {
+                1
+            }
+
+            /// This test does not register admission waiters.
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            /// This test does not allocate page backing.
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            /// Reenter once and keep all rejection facts for assertions.
+            fn rejected(&self, rejection: Rejection<Resource>) {
+                self.rejected.borrow_mut().push(rejection);
+                if self.entered.replace(true) {
+                    return;
+                }
+                let quotas = self.quotas.borrow().upgrade().unwrap();
+                let key = "live".to_owned();
+                assert_eq!(
+                    quotas.reclamation(&key, Resource::Payload, 10),
+                    Some((Some(key.clone()), 1))
+                );
+                let nested = quotas.reserve(Some(&key), Resource::Payload, 2).unwrap();
+                assert_eq!(quotas.used(Resource::Payload), 3);
+                drop(nested);
+                assert_eq!(quotas.used(Resource::Payload), 1);
+            }
+        }
+
+        let quotas = Rc::new(Quotas::new(ReentrantPolicy {
+            quotas: RefCell::default(),
+            entered: std::cell::Cell::new(false),
+            rejected: RefCell::default(),
+        }));
+        *quotas.policy.quotas.borrow_mut() = Rc::downgrade(&quotas);
+        let (live, other) = ("live".to_owned(), "other".to_owned());
+        let charge = quotas.reserve(Some(&live), Resource::Payload, 1).unwrap();
+        assert!(matches!(
+            quotas.reserve(Some(&other), Resource::Payload, 1),
+            Err(Error::Overloaded)
+        ));
+        assert!(quotas.policy.entered.get());
+        assert!(matches!(
+            &quotas.policy.rejected.borrow()[..],
+            [
+                Rejection::Keys { used: 1, limit: 1 },
+                Rejection::Keys { used: 1, limit: 1 }
+            ]
+        ));
+        assert_eq!(quotas.used(Resource::Payload), 1);
+        assert_eq!(quotas.active_keys.load(Ordering::Acquire), 1);
+        drop(charge);
+        let replacement = quotas.reserve(Some(&other), Resource::Payload, 1).unwrap();
+        assert!(!quotas.keys.borrow().contains_key(&live));
+        drop(replacement);
+        assert_eq!(quotas.used(Resource::Payload), 0);
+        assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
     }
 
     /// Charges and shared handles retain exact accounting across threads.
