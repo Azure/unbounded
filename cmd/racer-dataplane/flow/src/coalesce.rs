@@ -388,7 +388,9 @@ pub mod shared {
     impl<K: Ord, V: Clone> Completion<K, V> {
         /// Real completion closes admission before notifying any old readers.
         pub fn finish(self, value: V) {
-            self.table.entries.borrow_mut().remove(&self.key);
+            let removed = self.table.entries.borrow_mut().remove(&self.key);
+            // Final receiver destruction can reenter the table.
+            drop(removed);
             let _ = self.send.send(value);
         }
     }
@@ -398,6 +400,67 @@ pub mod shared {
     mod tests {
         use super::*;
         use futures::executor::block_on;
+
+        /// Final receiver destruction can reenter through its retained closed value.
+        #[test]
+        fn completion_drops_last_receiver_outside_table_borrow() {
+            use std::cell::Cell;
+            use std::sync::Arc;
+            use std::task::{Context, Wake, Waker};
+
+            thread_local! {
+                static ON_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+            }
+
+            struct ReentrantDrop;
+
+            impl Wake for ReentrantDrop {
+                fn wake(self: Arc<Self>) {
+                    panic!("closed result waker must only be dropped");
+                }
+            }
+
+            impl Drop for ReentrantDrop {
+                fn drop(&mut self) {
+                    let callback = ON_DROP.with(|slot| slot.borrow_mut().take());
+                    if let Some(callback) = callback {
+                        callback();
+                    }
+                }
+            }
+
+            let table = Rc::new(Table::default());
+            let dropped = Rc::new(Cell::new(false));
+            let closed = Some(Waker::from(Arc::new(ReentrantDrop)));
+            let (mut receive, completion) = table.start(1, closed);
+            assert!(
+                receive
+                    .poll_unpin(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(receive);
+            assert_eq!(table.len(), 1);
+
+            let nested = table.clone();
+            let observed = dropped.clone();
+            ON_DROP.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    assert!(nested.is_empty());
+                    assert!(nested.get(&1).is_none());
+                    let (replacement, completion) = nested.start(1, None);
+                    assert_eq!(nested.len(), 1);
+                    completion.finish(None);
+                    assert!(block_on(replacement).is_none());
+                    observed.set(true);
+                }));
+            });
+
+            assert!(!dropped.get());
+            completion.finish(None);
+            assert!(dropped.get());
+            assert!(table.is_empty());
+            assert!(ON_DROP.with(|slot| slot.borrow().is_none()));
+        }
 
         /// Results remain readable after completion admits a replacement.
         #[test]
