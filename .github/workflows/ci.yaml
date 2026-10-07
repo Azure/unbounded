@@ -226,7 +226,8 @@ jobs:
       - name: Install native adapter build dependencies
         if: matrix.native
         run: |
-          # Let apt reach fallback mirrors before the outer timeout.
+          # Ubuntu runner sources share this list; bypass the stalled Azure mirror.
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | timeout --signal=TERM --kill-after=10s 300s sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           apt_options=(-o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=2)
           timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" update
           timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" install -y --no-install-recommends build-essential pkg-config libibverbs-dev
