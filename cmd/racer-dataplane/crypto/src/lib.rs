@@ -428,6 +428,9 @@ pub mod identity {
         keys: Rc<Keyring>,
 
         cache: RefCell<VecDeque<CachedPeer>>,
+
+        #[cfg(test)]
+        before_key_return: RefCell<Option<Box<dyn FnOnce()>>>,
     }
 
     /// Only successful certificate validation can construct a verified peer.
@@ -629,12 +632,32 @@ pub mod identity {
                 cluster,
                 keys,
                 cache: RefCell::new(VecDeque::new()),
+                #[cfg(test)]
+                before_key_return: RefCell::new(None),
             }
         }
 
         /// Reuse exact-chain validation only while roots and time remain valid.
         fn key(&self, chain: &[Vec<u8>], expected: &NodeId) -> Result<VerifyingKey> {
             let roots = self.keys.peer_trust_roots()?;
+            let key = self.key_for_roots(chain, expected, roots.clone())?;
+            #[cfg(test)]
+            if let Some(before_return) = self.before_key_return.borrow_mut().take() {
+                before_return();
+            }
+            if !Arc::ptr_eq(&roots, &self.keys.peer_trust_roots()?) {
+                return Err(Error::Unavailable);
+            }
+            Ok(key)
+        }
+
+        /// Look up or validate a chain against one immutable trust snapshot.
+        fn key_for_roots(
+            &self,
+            chain: &[Vec<u8>],
+            expected: &NodeId,
+            roots: Arc<Vec<Vec<u8>>>,
+        ) -> Result<VerifyingKey> {
             let now = unix_time().as_secs();
             let mut cache = self.cache.borrow_mut();
             cache.retain(|entry| {
@@ -1608,6 +1631,61 @@ pub mod identity {
     mod certificate_tests {
         use super::tests::{CLUSTER, NODE, issued};
         use super::*;
+
+        /// Both success paths recheck trust, but key-only rotation keeps trust valid.
+        #[test]
+        fn peer_key_rechecks_roots_after_cached_and_fresh_validation() {
+            for cached in [false, true] {
+                for replace_roots in [false, true] {
+                    let (pending, chain, roots) = issued();
+                    let epochs = Arc::new(KeyEpochs::default());
+                    let cluster = ClusterId(CLUSTER.into());
+                    let node = NodeId(NODE.into());
+                    let keys = Rc::new(Keyring::new(cluster.clone(), node.clone(), epochs.clone()));
+                    let other = Keyring::new(cluster.clone(), node.clone(), epochs);
+                    let bundle = racer_control_wire::KeyringBundle {
+                        schema_version: SCHEMA_VERSION,
+                        cluster: cluster.clone(),
+                        generation: BundleGeneration(1),
+                        peer_trust_roots: roots.clone(),
+                        cache_keys: vec![],
+                    };
+                    keys.install(bundle.clone()).unwrap();
+                    let identity = pending
+                        .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+                        .unwrap();
+                    let signature = identity.sign(b"message").unwrap();
+                    let certs = Certificates::new(cluster, keys.clone());
+                    if cached {
+                        certs
+                            .verify_signed(&chain, &node, b"message", &signature)
+                            .unwrap();
+                        assert_eq!(certs.cache.borrow().len(), 1);
+                    } else {
+                        assert!(certs.cache.borrow().is_empty());
+                    }
+                    let mut next = bundle;
+                    next.generation = BundleGeneration(2);
+                    if replace_roots {
+                        next.peer_trust_roots = issued().2;
+                    }
+                    *certs.before_key_return.borrow_mut() = Some(Box::new(move || {
+                        other.install(next).unwrap();
+                    }));
+                    let result = certs
+                        .verify_signed(&chain, &node, b"message", &signature)
+                        .map(|peer| peer.node().clone());
+                    assert_eq!(keys.generation().unwrap(), Some(2));
+                    if replace_roots {
+                        assert_eq!(result, Err(Error::Unavailable), "cached={cached}");
+                        assert_eq!(certs.key(&chain, &node), Err(Error::Unauthorized));
+                    } else {
+                        assert_eq!(result, Ok(node.clone()), "cached={cached}");
+                        assert!(certs.key(&chain, &node).is_ok());
+                    }
+                }
+            }
+        }
 
         /// Cached chains still require current roots, time, exact bytes, and signatures.
         #[test]
