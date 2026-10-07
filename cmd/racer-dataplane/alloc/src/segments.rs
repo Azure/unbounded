@@ -772,7 +772,7 @@ impl SegmentClock {
                 Err(error) => return Err(error),
             }
         }
-        if self.segments.free_count() >= target {
+        if self.segments.free_count() >= target && self.segments.evicting.get() == 0 {
             Ok(())
         } else {
             Err(Error::Busy)
@@ -1648,6 +1648,104 @@ mod clock_tests {
         assert_eq!(segments.free_count(), 1);
         assert_eq!(segments.evicting.get(), 0);
         assert_eq!(*entries.counts.borrow(), [0, 1, 1]);
+    }
+
+    /// Lowering scored demand still waits for pending leases and bounded visits.
+    #[test]
+    fn scored_pending_victims_drain_after_reserve_is_met() {
+        for max_visits in [1, 8] {
+            let segments = segments(4);
+            let mut leases: Vec<_> = (0..3)
+                .map(|_| Some(segments.append(1024).unwrap().0))
+                .collect();
+            drop(segments.append(1024).unwrap());
+            let clock = SegmentClock::new(segments.clone());
+            let entries = Entries::new(vec![1; 4]);
+            assert_eq!(
+                clock.reclaim_scored(&entries, 3, 3, 3, |_| 0),
+                Err(Error::Busy)
+            );
+            assert_eq!(segments.evicting.get(), 3);
+            assert_eq!(*entries.counts.borrow(), [0, 0, 0, 1]);
+
+            assert_eq!(
+                clock.reclaim_scored(&entries, 1, 1, 1, |_| 0),
+                Err(Error::Busy)
+            );
+            drop(leases[0].take());
+            assert_eq!(
+                clock.reclaim_scored(&entries, 1, max_visits, 0, |_| 0),
+                Err(Error::Busy)
+            );
+            assert_eq!(segments.free_count(), 1);
+            assert_eq!(segments.evicting.get(), 2);
+            assert!(matches!(
+                segments.lease(SegmentId(1), Generation(1)),
+                Err(Error::Stale)
+            ));
+
+            drop(leases);
+            let before = segments.snapshot();
+            assert_eq!(clock.reclaim_scored(&entries, 0, 8, 8, |_| 0), Ok(()));
+            assert_eq!(
+                clock.reclaim_scored(&entries, 1, 0, 0, |_| 0),
+                Err(Error::Busy)
+            );
+            assert_eq!(segments.snapshot(), before);
+            for _ in 0..4 {
+                let _ = clock.reclaim_scored(&entries, 1, max_visits, 0, |_| 0);
+            }
+            assert_eq!(clock.reclaim_scored(&entries, 1, 0, 0, |_| 0), Ok(()));
+            assert_eq!(segments.free_count(), 3);
+            assert_eq!(segments.evicting.get(), 0);
+            assert_eq!(segments.state(SegmentId(3)), Ok(SegmentState::Sealed));
+            assert_eq!(*entries.counts.borrow(), [0, 0, 0, 1]);
+            assert_eq!(entries.calls.borrow().len(), 3);
+            for image in &segments.snapshot()[..3] {
+                assert_eq!(image.state, SegmentState::Free);
+                assert_eq!(image.generation, Generation(2));
+            }
+        }
+    }
+
+    /// Meeting a lower reserve does not hide unfinished index removal.
+    #[test]
+    fn scored_pending_mappings_drain_after_reserve_is_met() {
+        let segments = segments(3);
+        for _ in 0..3 {
+            drop(segments.append(1024).unwrap());
+        }
+        let clock = SegmentClock::new(segments.clone());
+        let entries = Entries::new(vec![0, 3, 1]);
+        assert_eq!(
+            clock.reclaim_scored(&entries, 2, 3, 1, |_| 0),
+            Err(Error::Busy)
+        );
+        assert_eq!(segments.free_count(), 1);
+        assert_eq!(segments.evicting.get(), 1);
+        assert_eq!(*entries.counts.borrow(), [0, 2, 1]);
+
+        let before = segments.snapshot();
+        assert_eq!(
+            clock.reclaim_scored(&entries, 1, 3, 0, |_| 0),
+            Err(Error::Busy)
+        );
+        assert_eq!(segments.snapshot(), before);
+        assert_eq!(*entries.counts.borrow(), [0, 2, 1]);
+        assert_eq!(entries.calls.borrow().len(), 1);
+        assert_eq!(
+            clock.reclaim_scored(&entries, 1, 3, 1, |_| 0),
+            Err(Error::Busy)
+        );
+        assert_eq!(*entries.counts.borrow(), [0, 1, 1]);
+        assert_eq!(segments.state(SegmentId(1)), Ok(SegmentState::Evicting));
+        assert_eq!(clock.reclaim_scored(&entries, 1, 3, 1, |_| 0), Ok(()));
+        assert_eq!(segments.free_count(), 2);
+        assert_eq!(segments.evicting.get(), 0);
+        assert_eq!(segments.snapshot()[1].generation, Generation(2));
+        assert_eq!(segments.state(SegmentId(2)), Ok(SegmentState::Sealed));
+        assert_eq!(*entries.counts.borrow(), [0, 0, 1]);
+        assert_eq!(*entries.calls.borrow(), [(SegmentId(1), 1); 3]);
     }
 
     /// Over-reporting callbacks return configuration errors without unsafe reuse.
