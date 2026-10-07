@@ -165,7 +165,7 @@ change, so the same workflow tests run in both modes.
 
 - Unit tests cover padding math, wipe and reuse rules, lease and generation
   checks, reclaim limits, the eviction veto, restore, and file security checks.
-- `alloc/tests/workflows.rs` covers restart, short I/O, dropped and cancelled
+- `alloc/tests/workflows.rs` covers restart, short I/O, dropped and canceled
   reads and writes, startup failures, and confirms that reuse does not erase
   disk bytes.
 - CI checks and tests the production and simulation builds as separate
