@@ -240,7 +240,7 @@ func (c *Client) exchangeHead(ctx context.Context, conn *clientConn, head []byte
 		return wire.Response{}, started, err
 	}
 
-	response, err := wire.ParseResponseHead(raw, r, nil)
+	response, err := wire.ParseClientHeadResponse(raw, r)
 	if err != nil {
 		return wire.Response{}, started, err
 	}

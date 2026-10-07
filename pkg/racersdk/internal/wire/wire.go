@@ -941,6 +941,19 @@ type Response struct {
 // size/tag across continuation; refreshed expiry is permitted. For HEAD, length
 // is zero although metadata.Size comes from Content-Length. No body is consumed.
 func ParseResponseHead(head []byte, request Request, snapshot *Metadata) (Response, error) {
+	return parseResponseHead(head, request, snapshot, "HEAD, GET")
+}
+
+// ParseClientHeadResponse validates the client-v2 HEAD response, not origin-v1.
+func ParseClientHeadResponse(head []byte, request Request) (Response, error) {
+	if request.Operation != OperationHead {
+		return Response{}, failure(ErrorProtocol, "response", nil)
+	}
+
+	return parseResponseHead(head, request, nil, "HEAD, POST")
+}
+
+func parseResponseHead(head []byte, request Request, snapshot *Metadata, allow string) (Response, error) {
 	var result Response
 	if err := ValidateRawHead(head, true); err != nil {
 		return result, err
@@ -980,7 +993,7 @@ func ParseResponseHead(head []byte, request Request, snapshot *Metadata) (Respon
 	result.Close = ConnectionClose(h)
 
 	if status != 200 && status != 206 {
-		return result, responseStatusError(h, status, length, request, snapshot)
+		return result, responseStatusError(h, status, length, request, snapshot, allow)
 	}
 
 	m, ok := responseMetadata(h)
@@ -1000,7 +1013,7 @@ func ParseResponseHead(head []byte, request Request, snapshot *Metadata) (Respon
 	return result, nil
 }
 
-func responseStatusError(h http.Header, status int, length uint64, request Request, snapshot *Metadata) error {
+func responseStatusError(h http.Header, status int, length uint64, request Request, snapshot *Metadata, allow string) error {
 	bad := failure(ErrorProtocol, "response", nil)
 
 	statusErr := StatusError(status)
@@ -1017,7 +1030,7 @@ func responseStatusError(h http.Header, status int, length uint64, request Reque
 		return bad
 	}
 
-	if status == 405 && h.Get("Allow") != "HEAD, GET" || request.Pin != "" && status == 404 {
+	if status == 405 && h.Get("Allow") != allow || request.Pin != "" && status == 404 {
 		return bad
 	}
 
