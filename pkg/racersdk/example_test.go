@@ -109,14 +109,20 @@ func ExampleClient_Stat() { //nolint:testableexamples // Requires a running Race
 
 // An origin serving a single in-memory object.
 func ExampleServeOrigin() { //nolint:testableexamples // Requires a provisioned Racer origin directory.
-	content := []byte("hello, racer")
+	origin := exampleMemoryOrigin([]byte("hello, racer"))
+	if err := racersdk.ServeOrigin(context.Background(), racersdk.OriginConfig{Volume: "cache"}, origin); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func exampleMemoryOrigin(content []byte) racersdk.Origin {
 	metadata := racersdk.Metadata{
 		Size:      int64(len(content)),
 		ETag:      `"v1"`,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 
-	origin := func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+	return func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		if r.Key != key {
 			return racersdk.Metadata{}, nil, racersdk.ErrNotFound
 		}
@@ -126,12 +132,12 @@ func ExampleServeOrigin() { //nolint:testableexamples // Requires a provisioned 
 		}
 
 		start := min(r.Offset, metadata.Size)
-		end := min(r.Offset+r.Length, metadata.Size)
 
-		return metadata, io.NopCloser(bytes.NewReader(content[start:end])), nil
-	}
+		length := min(r.Length, metadata.Size-start)
+		if length == 0 {
+			return metadata, nil, nil
+		}
 
-	if err := racersdk.ServeOrigin(context.Background(), racersdk.OriginConfig{Volume: "cache"}, origin); err != nil {
-		log.Fatal(err)
+		return metadata, io.NopCloser(bytes.NewReader(content[start : start+length])), nil
 	}
 }
