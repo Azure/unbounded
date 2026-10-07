@@ -52,6 +52,9 @@ pub struct SegmentSnapshot {
 
 /// Unique worker-local lease that prevents reuse until its completion owner drops.
 /// It authorizes the used prefix at acquisition, not just the latest append.
+/// Any lease permits both reads and writes in that prefix; it is not exclusive
+/// record ownership. The trusted caller must follow [`crate::Slab::write`]'s
+/// ownership and publication rules.
 ///
 /// Lease counts cannot be duplicated by cloning a completion capability:
 ///
