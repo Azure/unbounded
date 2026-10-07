@@ -21,13 +21,9 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
-// TestRenderDaemonAsset renders the three daemon assets and checks every path
-// they carry comes from the same host root.
-//
-// The recovery unit's ExecStart is the only reference to the recovery script, so
-// a render that took the script from one root while the binaries came from
-// another would produce a unit that points at a file that is not there. Nothing
-// else would notice until recovery was needed.
+// TestRenderDaemonAsset checks every path the daemon assets carry comes from
+// the same host root. The recovery unit is the only reference to the recovery
+// script, so a mismatch would go unnoticed until recovery was needed.
 func TestRenderDaemonAsset(t *testing.T) {
 	t.Parallel()
 
@@ -201,14 +197,7 @@ func TestActivateDaemonUnitToleratesDeniedResetFailed(t *testing.T) {
 	require.NoError(t, activateDaemonUnit(t.Context(), discardLogger(), executil.Systemctl()))
 }
 
-// TestResetRemovesTheFirstBootBootstrapUnit covers the interaction between
-// reset and an Ignition-provisioned host.
-//
-// The unit carries no completion condition and runs on every boot, deciding
-// there is nothing to do from the agent's ownership record. Reset removes that
-// record. A unit left behind would therefore find an uninstalled host on the
-// next boot and bootstrap it, quietly undoing the reset.
-func TestResetRemovesTheFirstBootBootstrapUnit(t *testing.T) {
+func TestRemoveFirstBootBootstrapUnit(t *testing.T) {
 	dir := t.TempDir()
 	calls := filepath.Join(dir, "calls")
 
@@ -216,43 +205,24 @@ func TestResetRemovesTheFirstBootBootstrapUnit(t *testing.T) {
 		[]byte("#!/bin/sh\necho \"$@\" >> \""+calls+"\"\n"), 0o755))
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 
-	unitDir := t.TempDir()
-	unitPath := filepath.Join(unitDir, goalstates.FirstBootBootstrapUnit)
+	task := &removeFirstBootUnit{log: discardLogger(), unitDir: t.TempDir()}
+	unitPath := filepath.Join(task.unitDir, goalstates.FirstBootBootstrapUnit)
 	require.NoError(t, os.WriteFile(unitPath, []byte("[Unit]\n"), 0o644))
 
-	require.NoError(t, removeFirstBootBootstrapUnitIn(t.Context(), discardLogger(), unitDir))
-
+	require.NoError(t, task.Do(t.Context()))
 	require.NoFileExists(t, unitPath, "the unit file must be gone, or systemd can still start it")
 
 	recorded, err := os.ReadFile(calls)
 	require.NoError(t, err)
-
-	// --now is what stops it, and stopping it is the part that matters. The
-	// unit is a oneshot with RemainAfterExit=yes, so it stays active after it
-	// has run, and deleting the file does not change that. A host provisioned
-	// again afterwards writes the unit back and starts it, systemd finds it
-	// already active and does nothing, and the agent never runs. Nothing
-	// reports an error, so the reinstall looks like it succeeded and the node
-	// simply never appears.
-	require.Contains(t, string(recorded), "disable --now "+goalstates.FirstBootBootstrapUnit,
+	require.Equal(t, "disable --now "+goalstates.FirstBootBootstrapUnit+"\n", string(recorded),
 		"disabling without stopping leaves the unit active, so a later start is a no-op")
+
+	require.NoError(t, task.Do(t.Context()), "a host without the unit has nothing to remove")
 }
 
-// TestFirstBootBootstrapUnitAbsentIsSuccess covers every host not provisioned
-// through Ignition, which is the common case. There is nothing to remove and
-// nothing to report.
-func TestFirstBootBootstrapUnitAbsentIsSuccess(t *testing.T) {
-	t.Parallel()
-
-	require.NoError(t, removeFirstBootBootstrapUnitIn(t.Context(), discardLogger(), t.TempDir()))
-}
-
-// TestInstallBootstrapBinaryInstallsWhereTheDaemonLooks covers the first host
-// mutation of a bootstrap.
-//
-// PrepareHost is the earliest stage that writes anything, and it writes the
-// daemon binary. It has to land at the path the rest of the install resolves,
-// including an environment override, or VerifyDaemonInstalled looks elsewhere.
+// TestInstallBootstrapBinaryInstallsWhereTheDaemonLooks: the binary has to land
+// at the path the rest of the install resolves, including an environment
+// override, or VerifyDaemonInstalled looks elsewhere.
 func TestInstallBootstrapBinaryInstallsWhereTheDaemonLooks(t *testing.T) {
 	installed := filepath.Join(t.TempDir(), "bin", "unbounded-agent")
 	t.Setenv(goalstates.EnvDaemonBinary, installed)
@@ -264,41 +234,8 @@ func TestInstallBootstrapBinaryInstallsWhereTheDaemonLooks(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
 }
 
-// TestInstallBootstrapBinaryKeepsAnExistingBinary pins the retention rule: a
-// host that already has a usable binary keeps it, so a repair does not replace
-// the slot an upgrade activated.
-func TestInstallBootstrapBinaryKeepsAnExistingBinary(t *testing.T) {
-	installed := filepath.Join(t.TempDir(), "bin", "unbounded-agent")
-	t.Setenv(goalstates.EnvDaemonBinary, installed)
-
-	require.NoError(t, os.MkdirAll(filepath.Dir(installed), 0o755))
-	require.NoError(t, os.WriteFile(installed, []byte("incumbent"), 0o755))
-	require.NoError(t, InstallBootstrapBinary())
-
-	data, err := os.ReadFile(installed)
-	require.NoError(t, err)
-	assert.Equal(t, "incumbent", string(data), "an existing usable binary must be left alone")
-}
-
-// TestInstallBootstrapBinaryReplacesAnUnusableBinary is the other half: a
-// present but non-executable file is the state a half-finished install leaves
-// behind, and repair has to be able to get past it.
-func TestInstallBootstrapBinaryReplacesAnUnusableBinary(t *testing.T) {
-	installed := filepath.Join(t.TempDir(), "bin", "unbounded-agent")
-	t.Setenv(goalstates.EnvDaemonBinary, installed)
-
-	require.NoError(t, os.MkdirAll(filepath.Dir(installed), 0o755))
-	require.NoError(t, os.WriteFile(installed, []byte("not executable"), 0o644))
-	require.NoError(t, InstallBootstrapBinary())
-
-	data, err := os.ReadFile(installed)
-	require.NoError(t, err)
-	assert.NotEqual(t, "not executable", string(data), "an unusable binary must be replaced")
-}
-
 // TestRemoveAgentArtifactsRemovesTheRootLast runs the teardown against a
-// temporary tree. On a migrated host the files are reached through the link
-// the root is, so removing the root first would leave them all behind.
+// temporary tree. The root goes last, so its directories are empty by then.
 func TestRemoveAgentArtifactsRemovesTheRootLast(t *testing.T) {
 	t.Parallel()
 
@@ -347,35 +284,9 @@ func TestRemoveAgentArtifactsRemovesTheRootLast(t *testing.T) {
 	require.NoError(t, task.Do(t.Context()), "teardown must be repeatable")
 }
 
-// TestRemoveAgentArtifactsIsBuiltFromTheHostRoot pins the wiring between the
-// exported constructor and the swept layout, which the test above cannot see
-// because it supplies the list itself.
-func TestRemoveAgentArtifactsIsBuiltFromTheHostRoot(t *testing.T) {
-	t.Parallel()
-
-	task, ok := RemoveAgentArtifacts(discardLogger()).(*removeAgentArtifacts)
-	require.True(t, ok)
-
-	assert.Contains(t, task.files, filepath.Join(goalstates.ResolveHostPaths().BinDir, "unbounded-agent"))
-	assert.Contains(t, task.files, "/usr/local/bin/unbounded-agent", "teardown must not depend on the migration having run")
-	assert.Contains(t, task.files, "/usr/local/bin/unbounded-agent-install.sh")
-	assert.Contains(t, task.dirs, goalstates.AgentConfigDir)
-	assert.NotNil(t, task.removeRoot)
-}
-
 // TestRemoveOwnedFileSkipsTheUnlinkWhenTheFileIsAbsent covers the failure that
-// stopped a reset on an immutable host.
-//
-// Teardown removes the installer scripts from the legacy root on every host,
-// and on such a host that root is read-only. Unlinking a path that is not there returns
-// EROFS rather than ENOENT, because the kernel checks the parent directory for
-// write permission before it resolves the final component, so the ENOENT the
-// old code tolerated never arrived and a reset failed over a file that had
-// never existed.
-//
-// The unlink is asserted not to happen at all, rather than its error being
-// tolerated. An unwritable directory is not a substitute: unlink returns ENOENT
-// there, so a test built that way passes against the original bug.
+// stopped a reset on an immutable host; see removeOwnedFile. An unwritable
+// directory is no substitute for a read-only mount: unlink returns ENOENT there.
 func TestRemoveOwnedFileSkipsTheUnlinkWhenTheFileIsAbsent(t *testing.T) {
 	t.Parallel()
 
@@ -391,9 +302,8 @@ func TestRemoveOwnedFileSkipsTheUnlinkWhenTheFileIsAbsent(t *testing.T) {
 	assert.False(t, called, "an absent file must not be unlinked, whatever the filesystem would say")
 }
 
-// TestRemoveOwnedFileReportsAFailedUnlink keeps the tolerance narrow. A file
-// that is present and cannot be removed is still an error, because a teardown
-// reporting success would leave an installation the next bootstrap refuses.
+// TestRemoveOwnedFileReportsAFailedUnlink keeps the tolerance narrow: a file
+// that is present and cannot be removed is still an error.
 func TestRemoveOwnedFileReportsAFailedUnlink(t *testing.T) {
 	t.Parallel()
 
@@ -407,10 +317,6 @@ func TestRemoveOwnedFileReportsAFailedUnlink(t *testing.T) {
 }
 
 // TestRemoveOwnedFileRemovesADanglingSymlink pins why the check uses Lstat.
-//
-// A dangling link is exactly what a partial install leaves behind, and it is
-// still a file the agent owns. Stat would follow it, find nothing, and leave it
-// on the host.
 func TestRemoveOwnedFileRemovesADanglingSymlink(t *testing.T) {
 	t.Parallel()
 

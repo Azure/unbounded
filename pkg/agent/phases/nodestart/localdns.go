@@ -129,11 +129,8 @@ func (s *setupLocalDNSNetwork) Do(ctx context.Context) error {
 
 // WriteLocalDNSNetworkFiles writes the LocalDNS network helper under the host
 // root, the unit that runs it, and the nspawn ordering drop-in, without
-// reloading systemd or running the unit. It does nothing when LocalDNS is
-// disabled.
-//
-// Moving a host to the host root uses it on its own: the unit has to name the
-// helper's new path, but the network it configures is already in place.
+// reloading systemd or running the unit, which is what moving a host to the
+// host root needs. It does nothing when LocalDNS is disabled.
 func WriteLocalDNSNetworkFiles(goalState *goalstates.NodeStart) error {
 	if !goalState.LocalDNS.Enabled {
 		return nil

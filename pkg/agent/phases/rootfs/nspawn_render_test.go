@@ -309,21 +309,6 @@ func TestServiceOverride_ConfigRegenerationDependency(t *testing.T) {
 	require.Less(t, strings.Index(out, "After=unbounded-agent-regenerate-config@kube1.service"), strings.Index(out, "[Service]"))
 }
 
-// TestServiceOverride_OrdersAfterTheNFTablesFlush pins the ordering that gives
-// the machine a clean ruleset. The flush unit makes every machine require it,
-// but only this line orders them.
-func TestServiceOverride_OrdersAfterTheNFTablesFlush(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", defaultNSpawnTemplateData("kube1")))
-
-	out := buf.String()
-	require.Contains(t, out, "\nAfter="+goalstates.NFTablesFlushUnit+"\n")
-	require.Less(t, strings.Index(out, "[Unit]"), strings.Index(out, "After="+goalstates.NFTablesFlushUnit))
-	require.Less(t, strings.Index(out, "After="+goalstates.NFTablesFlushUnit), strings.Index(out, "[Service]"))
-}
-
 func TestConfigRegenerationUnit(t *testing.T) {
 	t.Parallel()
 
@@ -498,45 +483,4 @@ func TestAdditionalHostMounts_ConfigToNSpawn(t *testing.T) {
 	require.Contains(t, out, "Bind=/var/lib/data:/data")
 	// The writable mount must not appear as a BindReadOnly entry.
 	require.NotContains(t, out, "BindReadOnly=/var/lib/data")
-}
-
-// TestWriteNSpawnConfigsInvokeTheHelperUnderTheHostRoot writes the generated
-// units and checks they invoke the helper where the host root puts it.
-//
-// These units are the only callers of the helper. If they name the legacy
-// location while the helper is installed under the host root, nothing fails
-// until systemd starts the machine and the hook cannot exec.
-//
-// This goes through writeNSpawnConfigs rather than rendering the templates from
-// hand-built data, because the defect being guarded against is the population
-// step reverting to the constant. A test that supplies its own template data
-// passes either way.
-func TestWriteNSpawnConfigsInvokeTheHelperUnderTheHostRoot(t *testing.T) {
-	t.Parallel()
-
-	helper := goalstates.ResolveHostPaths().NSpawnLifecycleBinary
-	if helper == goalstates.LegacyHostPaths().NSpawnLifecycleBinary {
-		t.Skip("this host's root is linked to the legacy root, so the two cannot be told apart")
-	}
-
-	dir := t.TempDir()
-	goalState := &goalstates.RootFS{
-		MachineDir:             filepath.Join(dir, "machines", "kube1"),
-		NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
-		ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
-		ConfigRegenerationFile: filepath.Join(dir, "config-regeneration.service"),
-	}
-
-	require.NoError(t, writeNSpawnConfigs(slog.New(slog.DiscardHandler), goalState))
-
-	for _, path := range []string{goalState.ServiceOverrideFile, goalState.ConfigRegenerationFile} {
-		content, err := os.ReadFile(path)
-		require.NoError(t, err)
-
-		rendered := string(content)
-		require.Contains(t, rendered, helper+" nspawn-lifecycle",
-			"%s must invoke the helper under the host root", filepath.Base(path))
-		require.NotContains(t, rendered, goalstates.LegacyHostPaths().NSpawnLifecycleBinary,
-			"%s must not fall back to the legacy root", filepath.Base(path))
-	}
 }

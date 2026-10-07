@@ -28,13 +28,8 @@ const (
 // These are paths on the host. Files inside the nspawn machine are always
 // resolved relative to the machine directory.
 type HostPaths struct {
-	// Root is the resolved host root.
-	Root string
-	// BinDir is <Root>/bin.
+	// BinDir is <root>/bin.
 	BinDir string
-	// LibexecDir is <Root>/libexec.
-	LibexecDir string
-
 	// NSpawnLifecycleBinary is the rollback-stable helper invoked by the
 	// generated nspawn hook units.
 	NSpawnLifecycleBinary string
@@ -56,23 +51,14 @@ func PlannedHostPaths() HostPaths {
 	return hostPathsUnder(hostroot.Planned(HostRootMarkers()...))
 }
 
-// LegacyHostPaths returns the layout under hostroot.LegacyPath, for the few
-// checks that have to find an installation that has not been migrated yet.
-func LegacyHostPaths() HostPaths {
-	return hostPathsUnder(hostroot.LegacyPath)
-}
-
 func hostPathsUnder(root string) HostPaths {
 	binDir := filepath.Join(root, "bin")
-	libexecDir := filepath.Join(root, "libexec")
 
 	return HostPaths{
-		Root:                  root,
 		BinDir:                binDir,
-		LibexecDir:            libexecDir,
 		NSpawnLifecycleBinary: filepath.Join(binDir, nspawnLifecycleName),
 		DaemonRecoveryScript:  filepath.Join(binDir, daemonRecoveryScriptName),
-		LocalDNSNetworkHelper: filepath.Join(libexecDir, localDNSNetworkHelperName),
+		LocalDNSNetworkHelper: filepath.Join(root, "libexec", localDNSNetworkHelperName),
 	}
 }
 
@@ -106,22 +92,23 @@ func LegacySeedFile() string {
 // to the host root. Moving a host installed by an older agent copies these
 // from the legacy root.
 func HostLayout() []string {
-	return []string{
+	return append(
+		HostRootMarkers(),
 		filepath.Join("bin", daemonBinaryName),
-		filepath.Join("bin", daemonBinaryBlueName),
-		filepath.Join("bin", daemonBinaryGreenName),
-		filepath.Join("bin", daemonBinaryCurrentName),
-		filepath.Join("bin", daemonBinaryLastGoodName),
 		filepath.Join("bin", nspawnLifecycleName),
 		filepath.Join("bin", daemonRecoveryScriptName),
 		filepath.Join("libexec", localDNSNetworkHelperName),
-	}
+	)
 }
 
-// LegacyLayoutFiles returns the agent's layout under hostroot.LegacyPath, for
-// removing it once a host has been moved to the host root.
-func LegacyLayoutFiles() []string {
-	return layoutFilesUnder(hostroot.LegacyPath)
+// LayoutUnder returns HostLayout under root.
+func LayoutUnder(root string) []string {
+	files := HostLayout()
+	for i, rel := range files {
+		files[i] = filepath.Join(root, rel)
+	}
+
+	return files
 }
 
 // Base names of the installer scripts. The cloud-init variant and netboot write
@@ -133,46 +120,21 @@ const (
 )
 
 // OwnedHostFiles returns every host file outside the config directory that
-// teardown removes: the agent's files under the host root and, when that is not
-// the legacy root, under the legacy root as well, and the installer scripts
-// under the legacy root.
+// teardown removes: the agent's files under the host root and under the legacy
+// root, and the installer scripts under the legacy root. On a linked host the
+// first set reaches the second through the link, and the second finds nothing.
 //
 // The legacy layout is swept on every host so teardown does not depend on the
 // host root having been migrated. Reset is what an operator runs when the
 // migration refuses, and it has to leave the host clean then too.
 //
-// The existing-deployment preflight deliberately checks only a subset: the
-// daemon units and the recovery script. The install script and Ignition both
-// put the agent binary in place before preflight runs, so a preflight that
-// checked this whole list would refuse every fresh host.
-//
 // Environment overrides are deliberately not applied. These are the paths the
 // agent installs to as a matter of layout, and teardown needs to find them on a
 // host whose environment no longer resembles the one that provisioned it.
 func OwnedHostFiles() []string {
-	return ownedHostFilesUnder(hostroot.Resolve(), hostroot.LegacyPath)
-}
-
-func ownedHostFilesUnder(root, legacy string) []string {
-	files := layoutFilesUnder(root)
-	if root != legacy {
-		files = append(files, layoutFilesUnder(legacy)...)
-	}
-
 	return append(
-		files,
-		filepath.Join(legacy, "bin", agentInstallScriptName),
-		filepath.Join(legacy, "bin", agentUninstallScriptName),
+		append(LayoutUnder(hostroot.Path), LayoutUnder(hostroot.LegacyPath)...),
+		filepath.Join(hostroot.LegacyPath, "bin", agentInstallScriptName),
+		filepath.Join(hostroot.LegacyPath, "bin", agentUninstallScriptName),
 	)
-}
-
-func layoutFilesUnder(root string) []string {
-	layout := HostLayout()
-
-	files := make([]string, 0, len(layout))
-	for _, rel := range layout {
-		files = append(files, filepath.Join(root, rel))
-	}
-
-	return files
 }

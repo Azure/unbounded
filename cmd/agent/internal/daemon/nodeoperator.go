@@ -96,8 +96,7 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 		// If the sidecar file is missing, log a warning so operators
 		// know the integrity check was skipped.
 		if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {
-			log.Warn(
-				"no checksum sidecar found, skipping integrity check",
+			log.Warn("no checksum sidecar found, skipping integrity check",
 				"config_path", path,
 				"checksum_path", checksumPath,
 			)
@@ -256,8 +255,7 @@ func (nspawnNodeOperator) RepaveNode(
 	oldMachine := active.Name
 	newMachine := goalstates.AlternateMachine(oldMachine)
 
-	log.Info(
-		"starting node repave",
+	log.Info("starting node repave",
 		"old_machine", oldMachine,
 		"new_machine", newMachine,
 		"old_version", active.Config.Cluster.Version,
@@ -275,8 +273,7 @@ func (nspawnNodeOperator) RepaveNode(
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}
 
-	err = phases.Serial(
-		log,
+	err = phases.Serial(log,
 		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
@@ -291,8 +288,7 @@ func (nspawnNodeOperator) RepaveNode(
 		return err
 	}
 
-	log.Info(
-		"node repave completed",
+	log.Info("node repave completed",
 		"active_machine", newMachine,
 		"version", newCfg.Cluster.Version,
 	)

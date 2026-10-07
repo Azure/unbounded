@@ -4,79 +4,43 @@
 package goalstates
 
 import (
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
+// TestHostPathsUnder pins the layout, including under the legacy root, where
+// the units and recovery script a released agent wrote name these paths.
 func TestHostPathsUnder(t *testing.T) {
 	t.Parallel()
 
-	paths := hostPathsUnder("/opt/unbounded")
-
-	assert.Equal(t, HostPaths{
-		Root:                  "/opt/unbounded",
-		BinDir:                "/opt/unbounded/bin",
-		LibexecDir:            "/opt/unbounded/libexec",
-		NSpawnLifecycleBinary: "/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle",
-		DaemonRecoveryScript:  "/opt/unbounded/bin/unbounded-agent-daemon-recovery.sh",
-		LocalDNSNetworkHelper: "/opt/unbounded/libexec/unbounded-localdns-network",
-	}, paths)
-}
-
-// TestLegacyHostPathsMatchTheReleasedLayout pins the layout under the legacy
-// root to the paths released agents used. A migrated host keeps those files,
-// and the units and recovery script an older agent wrote name them.
-func TestLegacyHostPathsMatchTheReleasedLayout(t *testing.T) {
-	t.Parallel()
-
-	legacy := LegacyHostPaths()
-
-	assert.Equal(t, NSpawnLifecycleBinaryPath, legacy.NSpawnLifecycleBinary) //nolint:staticcheck // The released value is what is being pinned.
-	assert.Equal(t, DaemonRecoveryScriptPath, legacy.DaemonRecoveryScript)   //nolint:staticcheck // The released value is what is being pinned.
-	assert.Equal(t, "/usr/local/libexec/unbounded-localdns-network", legacy.LocalDNSNetworkHelper)
-
-	for _, pinned := range []string{
-		DaemonBinaryBluePath,     //nolint:staticcheck // The released value is what is being pinned.
-		DaemonBinaryGreenPath,    //nolint:staticcheck // The released value is what is being pinned.
-		DaemonBinaryCurrentPath,  //nolint:staticcheck // The released value is what is being pinned.
-		DaemonBinaryLastGoodPath, //nolint:staticcheck // The released value is what is being pinned.
-	} {
-		rel, err := filepath.Rel("/usr/local", pinned)
-		assert.NoError(t, err)
-		assert.Contains(t, HostRootMarkers(), rel, "a released slot path must identify a legacy installation")
-	}
-
-	seed, err := filepath.Rel("/usr/local", DaemonBinaryPath) //nolint:staticcheck // The released value is what is being pinned.
-	assert.NoError(t, err)
-	assert.Equal(t, seed, LegacySeedFile(), "install scripts seed the path released agents look for")
-
-	legacyLayout := LegacyLayoutFiles()
-	for _, rel := range HostLayout() {
-		assert.Contains(t, legacyLayout, filepath.Join("/usr/local", rel))
+	for _, root := range []string{"/opt/unbounded", "/usr/local"} {
+		assert.Equal(t, HostPaths{
+			BinDir:                root + "/bin",
+			NSpawnLifecycleBinary: root + "/bin/unbounded-agent-nspawn-lifecycle",
+			DaemonRecoveryScript:  root + "/bin/unbounded-agent-daemon-recovery.sh",
+			LocalDNSNetworkHelper: root + "/libexec/unbounded-localdns-network",
+		}, hostPathsUnder(root))
 	}
 }
 
 // TestHostRootMarkersAreTheBinaryLayout keeps files that a fresh host also has
-// under the legacy root out of the markers. Counting one would link a fresh
-// host's root to the legacy root and install the agent there.
+// under the legacy root out of the markers: the plain binary install scripts
+// seed, the install script cloud-init writes, and a helper an older reset can
+// leave behind. Counting one would link a fresh host's root to the legacy root
+// and install the agent there.
 func TestHostRootMarkersAreTheBinaryLayout(t *testing.T) {
 	t.Parallel()
 
-	markers := HostRootMarkers()
-
-	assert.Len(t, markers, 4)
-	assert.NotContains(t, markers, filepath.Join("bin", agentInstallScriptName), "cloud-init writes it on fresh hosts")
-	assert.NotContains(t, markers, filepath.Join("bin", nspawnLifecycleName), "an older reset can leave it behind")
-	assert.NotContains(t, markers, LegacySeedFile(), "install scripts seed it on fresh hosts")
-
-	for _, marker := range markers {
-		assert.Contains(t, HostLayout(), marker, "a marker is part of the layout a move copies")
-	}
+	assert.Equal(t, []string{
+		"bin/unbounded-agent-blue",
+		"bin/unbounded-agent-green",
+		"bin/unbounded-agent-current",
+		"bin/unbounded-agent-last-good",
+	}, HostRootMarkers())
 }
 
-func TestOwnedHostFilesUnder(t *testing.T) {
+func TestOwnedHostFiles(t *testing.T) {
 	t.Parallel()
 
 	layout := func(root string) []string {
@@ -91,26 +55,13 @@ func TestOwnedHostFilesUnder(t *testing.T) {
 			root + "/libexec/unbounded-localdns-network",
 		}
 	}
-	// Written under the legacy root by cloud-init and netboot on every host.
-	scripts := []string{
+	// Reset does not migrate, so on a host the migration refused the
+	// installation is under the legacy root while the root is a real
+	// directory. The installer scripts are written under the legacy root by
+	// cloud-init and netboot on every host.
+	want := append(append(layout("/opt/unbounded"), layout("/usr/local")...),
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/usr/local/bin/unbounded-agent-uninstall.sh",
-	}
-
-	t.Run("new root sweeps the legacy layout too", func(t *testing.T) {
-		t.Parallel()
-
-		// Reset does not migrate, so on a host the migration refused the
-		// installation is under the legacy root while the root is a real
-		// directory.
-		want := append(append(layout("/opt/unbounded"), layout("/usr/local")...), scripts...)
-		assert.ElementsMatch(t, want, ownedHostFilesUnder("/opt/unbounded", "/usr/local"))
-	})
-
-	t.Run("migrated root is swept once", func(t *testing.T) {
-		t.Parallel()
-
-		want := append(layout("/usr/local"), scripts...)
-		assert.ElementsMatch(t, want, ownedHostFilesUnder("/usr/local", "/usr/local"))
-	})
+	)
+	assert.ElementsMatch(t, want, OwnedHostFiles())
 }

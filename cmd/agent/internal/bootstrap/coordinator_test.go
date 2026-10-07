@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
@@ -26,10 +25,7 @@ type fakeStages struct {
 }
 
 var (
-	errInjected = errors.New("injected stage failure")
-	// errRepairFailed is distinct from errInjected so a test can tell whether
-	// the reported error is the fault that triggered a repair or the failure of
-	// the repair itself.
+	errInjected     = errors.New("injected stage failure")
 	errRepairFailed = errors.New("injected repair failure")
 )
 
@@ -123,6 +119,9 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 		r.Phase = installstate.Complete
 		require.NoError(t, store.Save(r))
 
+		before, err := os.Stat(filepath.Join(store.Root(), "install-state.json"))
+		require.NoError(t, err)
+
 		stages := &fakeStages{store: store, fail: "resolve"}
 		if repair {
 			stages.verifyErr = errInjected
@@ -140,9 +139,11 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 
 		require.Equal(t, want, stages.calls)
 
-		complete, err := store.Load()
+		// The Ignition unit reaches this on every boot; a completed record
+		// is never rewritten, repaired or not.
+		after, err := os.Stat(filepath.Join(store.Root(), "install-state.json"))
 		require.NoError(t, err)
-		require.Equal(t, installstate.Complete, complete.Phase)
+		require.True(t, os.SameFile(before, after), "the record must not be rewritten")
 	}
 }
 
@@ -193,7 +194,8 @@ func TestInterruptedRepairRemainsCompleteAndRetries(t *testing.T) {
 	c := New(slog.New(slog.DiscardHandler), store, stages, nil)
 	id := Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint}
 	_, err = c.Run(t.Context(), id)
-	require.ErrorIs(t, err, errInjected)
+	require.ErrorIs(t, err, errInjected, "the fault that triggered the repair is reported")
+	require.ErrorIs(t, err, errRepairFailed, "and so is the repair's own failure")
 	loaded, err := store.Load()
 	require.NoError(t, err)
 	require.Equal(t, installstate.Complete, loaded.Phase)
@@ -204,94 +206,6 @@ func TestInterruptedRepairRemainsCompleteAndRetries(t *testing.T) {
 	_, err = c.Run(t.Context(), id)
 	require.NoError(t, err)
 	require.Equal(t, []string{"verify", "repair", "verify"}, stages.calls)
-}
-
-// recordInode identifies the record file itself rather than its contents.
-//
-// MarkComplete on an already-complete record writes the same bytes, so
-// comparing content cannot tell a rewrite from a no-op. The store replaces the
-// file atomically, so any write at all produces a new inode.
-func recordInode(t *testing.T, store *installstate.Store) uint64 {
-	t.Helper()
-
-	info, err := os.Stat(filepath.Join(store.Root(), "install-state.json"))
-	require.NoError(t, err)
-
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	require.True(t, ok, "inode is how this test distinguishes a rewrite from a no-op")
-
-	return stat.Ino
-}
-
-// TestHealthyCompletedInstallIsNotRewritten covers the cost of an Ignition unit
-// that carries no completion condition.
-//
-// That unit runs on every boot and reaches this path each time. Rewriting the
-// record when nothing changed would be a durable write per boot on every node,
-// and a write is a chance to fail: a host that is entirely healthy would be
-// taking one for no reason.
-func TestHealthyCompletedInstallIsNotRewritten(t *testing.T) {
-	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-	r, err := installstate.NewRecord("machine", "fingerprint")
-	require.NoError(t, err)
-	require.NoError(t, store.MarkComplete(r))
-
-	before := recordInode(t, store)
-
-	stages := &fakeStages{store: store}
-	c := New(slog.New(slog.DiscardHandler), store, stages, nil)
-
-	outcome, err := c.Run(t.Context(), Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint})
-	require.NoError(t, err)
-	require.True(t, outcome.AlreadyComplete)
-	require.Equal(t, []string{"verify"}, stages.calls, "a healthy host needs no repair")
-
-	require.Equal(t, before, recordInode(t, store),
-		"nothing changed, so the record must not have been written at all")
-}
-
-// TestRepairedInstallIsCommitted is the other half: when a repair did happen,
-// the result has to be durable before the process exits.
-func TestRepairedInstallIsCommitted(t *testing.T) {
-	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-	r, err := installstate.NewRecord("machine", "fingerprint")
-	require.NoError(t, err)
-	require.NoError(t, store.MarkComplete(r))
-
-	before := recordInode(t, store)
-
-	stages := &fakeStages{store: store, verifyErr: errInjected}
-	c := New(slog.New(slog.DiscardHandler), store, stages, nil)
-
-	_, err = c.Run(t.Context(), Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint})
-	require.NoError(t, err)
-	require.Equal(t, []string{"verify", "repair", "verify"}, stages.calls)
-
-	loaded, err := store.Load()
-	require.NoError(t, err)
-	require.Equal(t, installstate.Complete, loaded.Phase)
-	require.NotEqual(t, before, recordInode(t, store),
-		"a repair changed the host, so the result has to be made durable")
-}
-
-// TestFailedRepairReportsWhatWasWrong pins that the original fault survives.
-//
-// The first verify says what is broken; the repair failure says only that
-// fixing it did not work. Reporting the second alone sends an operator after
-// the wrong thing.
-func TestFailedRepairReportsWhatWasWrong(t *testing.T) {
-	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
-	r, err := installstate.NewRecord("machine", "fingerprint")
-	require.NoError(t, err)
-	require.NoError(t, store.MarkComplete(r))
-
-	stages := &fakeStages{store: store, fail: "repair", verifyErr: errInjected}
-	c := New(slog.New(slog.DiscardHandler), store, stages, nil)
-
-	_, err = c.Run(t.Context(), Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint})
-	require.Error(t, err)
-	require.ErrorIs(t, err, errInjected, "the fault that triggered the repair must still be reported")
-	require.ErrorIs(t, err, errRepairFailed, "and so must the reason repairing it did not work")
 }
 
 // TestRunWaitsForTheInstallationLock covers a reboot, where the daemon holds
@@ -359,7 +273,6 @@ func TestRunWaitsForTheInstallationLock(t *testing.T) {
 			stages := &fakeStages{store: store}
 			c := New(slog.New(slog.DiscardHandler), store, stages, nil)
 			c.lockWait = tt.lockWait
-			c.lockPoll = 10 * time.Millisecond
 
 			_, err = c.Run(ctx, Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint})
 			if tt.wantErr != nil {

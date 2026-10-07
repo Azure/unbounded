@@ -31,9 +31,7 @@
 # machine. eBPF CNIs need a usable bpffs at /sys/fs/bpf to create and share BPF
 # maps, but each nspawn machine should get its own pinned-object namespace.
 #
-# nftables-flush.service clears stale firewall rules, and has to finish before
-# the machine starts for the node to come up with a clean ruleset. Its
-# [Install] section makes every machine require it, which does not order them.
+# After=nftables-flush.service gives the node a clean ruleset to start with.
 
 [Unit]
 Requires=unbounded-agent-regenerate-config@kube1.service

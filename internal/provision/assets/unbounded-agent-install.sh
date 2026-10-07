@@ -88,15 +88,9 @@ chmod 0755 "${AGENT_BIN}"
 # Seed the daemon binary path used by agents up to v0.8.0. The agent version is
 # selected independently of this script - by AGENT_VERSION, by AGENT_URL, or by
 # the default of tracking the latest published release - so it may be one that
-# never writes its own binary and looks for it at /usr/local/bin.
-#
-# The seed is placed for every agent, because nothing here can tell them apart
-# without running the binary. A newer agent installs itself under
-# /opt/unbounded, does not count a lone binary here as an installation, and
-# removes it once the daemon is running.
-#
-# A read-only /usr/local/bin is not an error. Agents up to v0.8.0 do not
-# support such hosts, and newer agents do not need the seed.
+# never writes its own binary and looks for it here. Newer agents install under
+# /opt/unbounded and remove a lone seed, and a read-only /usr/local/bin only
+# means the host cannot run the older agents.
 #
 # The test follows symlinks on purpose. On a host this installation already owns
 # the path resolves through the compatibility symlink to a live blue-green slot,

@@ -36,15 +36,13 @@ type hostAgentUpgradeHandler struct {
 	writer       io.Writer
 	executable   func() (string, error)
 	resolvedPath func() (goalstates.AgentUpgradePaths, error)
-	// plannedPath resolves the paths for preflight, which does not migrate
-	// the host root. Unset, preflight uses resolvedPath.
+	// plannedPath is what preflight resolves instead, because it leaves the
+	// host root alone and migrate is never called.
 	plannedPath  func() (goalstates.AgentUpgradePaths, error)
 	newService   func(goalstates.AgentUpgradePaths) agentbinary.DaemonService
 	geteuid      func() int
 	installation *installstate.Store
-	// migrate links the host root on a legacy host before paths are resolved.
-	// Preflight leaves the host alone and does not call it.
-	migrate func(*slog.Logger) error
+	migrate      func(*slog.Logger) error
 }
 
 func newCmdHostAgentUpgrade(cmdCtx *CommandContext) *cobra.Command {
@@ -98,9 +96,7 @@ func (h *hostAgentUpgradeHandler) execute(ctx context.Context) error {
 	resolve := h.resolvedPath
 
 	if h.preflight {
-		if h.plannedPath != nil {
-			resolve = h.plannedPath
-		}
+		resolve = h.plannedPath
 	} else {
 		// Before the migration, which cannot succeed without root either and
 		// would report it less plainly.
@@ -108,10 +104,8 @@ func (h *hostAgentUpgradeHandler) execute(ctx context.Context) error {
 			return fmt.Errorf("host agent upgrade requires root privileges")
 		}
 
-		if h.migrate != nil {
-			if err := h.migrate(h.cmdCtx.Logger); err != nil {
-				return err
-			}
+		if err := h.migrate(h.cmdCtx.Logger); err != nil {
+			return err
 		}
 	}
 

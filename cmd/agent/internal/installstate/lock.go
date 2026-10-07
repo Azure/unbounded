@@ -4,9 +4,11 @@
 package installstate
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/gofrs/flock"
 )
@@ -41,4 +43,24 @@ func (l *Lock) Release() error {
 	}
 
 	return l.flock.Unlock()
+}
+
+// AcquireWithin calls acquire until it returns anything but ErrLockHeld, or
+// until wait has passed. It returns ErrLockHeld if the lock is still held then,
+// and ctx's error if ctx ends first.
+func AcquireWithin(ctx context.Context, wait time.Duration, acquire func() (*Lock, error)) (*Lock, error) {
+	deadline := time.Now().Add(wait)
+
+	for {
+		lock, err := acquire()
+		if !errors.Is(err, ErrLockHeld) || !time.Now().Before(deadline) {
+			return lock, err
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }

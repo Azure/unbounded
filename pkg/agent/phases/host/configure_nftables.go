@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	nftablesFlushUnit = goalstates.NFTablesFlushUnit
+	nftablesFlushUnit = "nftables-flush.service"
 	nftablesClearPath = goalstates.ConfigDir + "/nftables-clear.nft"
 )
 

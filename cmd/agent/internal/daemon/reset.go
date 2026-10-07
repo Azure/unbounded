@@ -95,13 +95,10 @@ func resetUnderLock(ctx context.Context, log *slog.Logger, store *installstate.S
 	return durableReset(ctx, store, inner, teardownSyncPaths(store.Root()), unix.Syncfs)
 }
 
-// teardownSyncPaths returns the directories whose filesystems have to be
-// persisted for a teardown to survive a crash part way through: those holding
-// the agent's files, including the directory the host root link is in on a
-// migrated host, and the legacy root, where the installer scripts are. They are
-// resolved now, while the host root still leads to the files. A path that does
-// not exist is not a problem, because durableReset walks up to the nearest
-// existing ancestor before opening anything.
+// teardownSyncPaths returns the directories whose filesystems a teardown has to
+// persist: those holding the agent's files under either root, and the one the
+// host root link is in. They are resolved now, while the host root still leads
+// to the files; durableReset opens the nearest existing ancestor of each.
 func teardownSyncPaths(storeRoot string) []string {
 	return []string{
 		"/etc",
@@ -189,9 +186,8 @@ func resetResources(log *slog.Logger) phases.Task {
 			reset.RemoveBPFFSMount(log, goalstates.NSpawnMachineKube2),
 		),
 		reset.CleanupNetwork(log),
-		// Before the artifacts, so a failure here stops the reset while the
-		// host is still recognizably installed. A unit that survived a reset
-		// would bootstrap the host again on the next boot.
+		// Before the artifacts, so a failure stops the reset while the host is
+		// still recognizably installed.
 		RemoveFirstBootBootstrapUnit(log),
 		RemoveAgentArtifacts(log),
 		reset.ReloadSystemd(log),

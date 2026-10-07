@@ -244,7 +244,7 @@ func (h hostRootHost) rewriteLocalDNS() error {
 }
 
 func (h hostRootHost) FinishMove() error {
-	for _, path := range goalstates.LegacyLayoutFiles() {
+	for _, path := range goalstates.LayoutUnder(hostroot.LegacyPath) {
 		if err := removeOwnedFile(path); err != nil {
 			return err
 		}
