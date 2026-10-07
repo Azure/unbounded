@@ -661,6 +661,7 @@ dependencies = [
  "poly1305",
  "racer-control-wire",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
