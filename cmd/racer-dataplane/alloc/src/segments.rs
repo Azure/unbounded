@@ -801,7 +801,7 @@ impl SegmentClock {
         let mut free = self.segments.free_count();
         let mut entries_left = max_entries;
         for _ in 0..count.saturating_mul(2).min(max_visits) {
-            if free >= target {
+            if free >= target && self.segments.evicting.get() == 0 {
                 return Ok(());
             }
             let id = self.next(count);
@@ -809,7 +809,10 @@ impl SegmentClock {
             if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
                 continue;
             }
-            if state == SegmentState::Sealed && !entries.can_evict(id) {
+            if state == SegmentState::Sealed
+                && (free.saturating_add(self.segments.evicting.get()) >= target
+                    || !entries.can_evict(id))
+            {
                 continue;
             }
             if self.recent.borrow_mut().remove(&id) {
@@ -835,7 +838,7 @@ impl SegmentClock {
                 Err(e) => return Err(e),
             }
         }
-        if free >= target {
+        if free >= target && self.segments.evicting.get() == 0 {
             Ok(())
         } else {
             Err(Error::Busy)
@@ -1374,6 +1377,79 @@ mod clock_tests {
             assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Free));
             assert_eq!(segments.free_count(), 1);
             assert_eq!(segments.snapshot()[0].generation, Generation(2));
+        }
+    }
+
+    /// Pending victims satisfy demand without evicting more leased segments.
+    #[test]
+    fn reclaim_pending_victims_count_toward_reserve() {
+        let segments = segments(3);
+        let mut leases: Vec<_> = (0..3)
+            .map(|_| Some(segments.append(1024).unwrap().0))
+            .collect();
+        let clock = SegmentClock::new(segments.clone());
+        let entries = Entries::new(vec![1; 3]);
+        for _ in 0..6 {
+            assert_eq!(clock.reclaim(&entries, 1, 1, 256), Err(Error::Busy));
+            assert_eq!(*entries.counts.borrow(), [0, 1, 1]);
+            assert_eq!(segments.evicting.get(), 1);
+            assert_eq!(segments.free_count(), 0);
+            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
+            assert!(segments.lease(SegmentId(1), Generation(1)).is_ok());
+            assert!(segments.lease(SegmentId(2), Generation(1)).is_ok());
+        }
+        drop(leases[0].take());
+        clock.reclaim(&entries, 1, 6, 0).unwrap();
+        assert_eq!(segments.free_count(), 1);
+        assert_eq!(segments.evicting.get(), 0);
+        assert_eq!(*entries.counts.borrow(), [0, 1, 1]);
+        assert_eq!(segments.snapshot()[0].generation, Generation(2));
+    }
+
+    /// Lowering the target still drains existing victims within each visit budget.
+    #[test]
+    fn reclaim_pending_victims_drain_after_reserve_is_met() {
+        for max_visits in [1, 8] {
+            let segments = segments(4);
+            let mut leases: Vec<_> = (0..3)
+                .map(|_| Some(segments.append(1024).unwrap().0))
+                .collect();
+            drop(segments.append(1024).unwrap());
+            let clock = SegmentClock::new(segments.clone());
+            let entries = Entries::new(vec![1; 4]);
+            assert_eq!(clock.reclaim(&entries, 3, 3, 3), Err(Error::Busy));
+            assert_eq!(segments.evicting.get(), 3);
+            assert_eq!(*entries.counts.borrow(), [0, 0, 0, 1]);
+
+            // Wrap the cursor without starting a fourth victim.
+            entries.evictable.set(false);
+            assert_eq!(clock.reclaim(&entries, 1, 1, 1), Err(Error::Busy));
+            drop(leases[0].take());
+            assert_eq!(clock.reclaim(&entries, 1, max_visits, 0), Err(Error::Busy));
+            assert_eq!(segments.free_count(), 1);
+            assert_eq!(segments.evicting.get(), 2);
+            assert!(matches!(
+                segments.lease(SegmentId(1), Generation(1)),
+                Err(Error::Stale)
+            ));
+
+            drop(leases);
+            let before = segments.snapshot();
+            assert_eq!(clock.reclaim(&entries, 0, 8, 8), Ok(()));
+            assert_eq!(clock.reclaim(&entries, 1, 0, 0), Err(Error::Busy));
+            assert_eq!(segments.snapshot(), before);
+            for _ in 0..4 {
+                let _ = clock.reclaim(&entries, 1, max_visits, 0);
+            }
+            assert_eq!(clock.reclaim(&entries, 1, 0, 0), Ok(()));
+            assert_eq!(segments.free_count(), 3);
+            assert_eq!(segments.evicting.get(), 0);
+            assert_eq!(segments.state(SegmentId(3)), Ok(SegmentState::Sealed));
+            assert_eq!(*entries.counts.borrow(), [0, 0, 0, 1]);
+            for image in &segments.snapshot()[..3] {
+                assert_eq!(image.state, SegmentState::Free);
+                assert_eq!(image.generation, Generation(2));
+            }
         }
     }
 
