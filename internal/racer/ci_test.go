@@ -28,11 +28,11 @@ func TestRacerEnvtestCIContract(t *testing.T) {
 	}
 
 	run := target("racer-envtest")
-	for _, pkg := range []string{"./internal/racer", "./internal/racer/authority", "./deploy/racer"} {
+	for _, pkg := range []string{"./internal/racer", "./internal/racer/authority"} {
 		require.Contains(t, strings.Fields(run), pkg)
 	}
 
-	// A prefix includes new deployment admission tests without an allowlist.
+	// A prefix includes new envtest cases without an allowlist.
 	require.Contains(t, run, "-run '^TestEnvtest'")
 	require.Contains(t, run, "$(GOTEST) -race")
 	require.Contains(t, run, "-count=1")

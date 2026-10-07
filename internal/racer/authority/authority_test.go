@@ -471,7 +471,7 @@ func TestEnvtestAuthority(t *testing.T) {
 		}
 	}
 
-	environment := &envtest.Environment{BinaryAssetsDirectory: assets, CRDDirectoryPaths: []string{"../../../deploy/racer/crd"}, ErrorIfCRDPathMissing: true}
+	environment := &envtest.Environment{BinaryAssetsDirectory: assets, CRDDirectoryPaths: []string{"../../../api/racer/v1alpha1/crd"}, ErrorIfCRDPathMissing: true}
 
 	rc, err := environment.Start()
 	if err != nil {
