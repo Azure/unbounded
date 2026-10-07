@@ -152,14 +152,20 @@ Rust.
 Because the link is dynamic, the compiler cannot check the ABI. Three checks
 stand in for it:
 
-- The adapter reports ABI version 2 and Rust refuses any other
-  (`native/verbs.c:50-51`, `src/ffi.rs:167-212`).
+- The adapter reports ABI version 3 and Rust refuses any other
+  (`native/verbs.c:51-52`, `src/ffi.rs:174-235`).
 - `_Static_assert`s in C (`native/verbs.c:37-44`) and a Rust test check the
   same struct sizes, offsets, and opcode values.
 - CI builds the adapter and loads every symbol.
 
 Without the `native` feature, loading returns `Unavailable`
 (`src/ffi.rs:160-165`), so the crate builds on hosts without libibverbs.
+
+Discovery returns `INT_MIN` if closing a temporary context fails. This is
+distinct from a negative errno or port count. It stops on the first failed
+close, frees the device list, and leaves at most one context leaked. Rust
+quarantines and retains the discovery admission owner and adapter reference.
+Reopen stays blocked even when no ports were returned.
 
 ## Simulation
 
@@ -180,3 +186,9 @@ The `racer-verbs` CI job runs four feature sets: none, `simulation`,
 with `images/racer-dataplane/build-native.sh`, and load it. Each set runs
 fmt, check, clippy, and tests. Hosted runners have no RDMA hardware, so CI
 does not test real DMA or fencing. Tests that need a device stay ignored.
+
+Native CI also builds `native/discovery_faults.c`, which includes the production
+C adapter with controlled libibverbs calls. `src/discovery_fault_tests.rs`
+checks both internal discovery closes, quarantine, library retention, and
+blocked reopen. The Rust simulator's `Close` fault only covers device handles
+returned after discovery, not these temporary contexts.

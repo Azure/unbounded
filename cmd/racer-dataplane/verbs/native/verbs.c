@@ -4,12 +4,13 @@
  * functions below. libibverbs structs and inline helpers stay on this side,
  * built against the installed headers.
  *
- * Bump rdma_verbs_abi() whenever a struct or signature here changes.
+ * Bump rdma_verbs_abi() whenever a struct, signature, or result contract changes.
  *
  * Unless noted, int results are 0 on success and pointer results are NULL
  * on failure. A failed free leaves the resource in place. */
 #include <infiniband/verbs.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -48,11 +49,16 @@ struct rdma_verbs_qp { struct ibv_qp *qp; struct ibv_cq *cq; };
 struct rdma_verbs_mr { struct ibv_mr *mr; void *bytes; size_t length; };
 
 /* ABI version. Rust refuses to load any other value. */
-uint32_t rdma_verbs_abi(void) { return 2; }
+uint32_t rdma_verbs_abi(void) { return 3; }
+
+/* Distinct from negative errno: cleanup leaked a resource. Rust must keep
+ * the admission owner and adapter loaded. Stop before another resource leaks. */
+#define RDMA_VERBS_CLEANUP_LEAK INT_MIN
 
 /* List active ports on devices that support type 2B memory windows.
  * Uses GID index 0. Fills up to `capacity` entries but returns the full count,
- * so a result above `capacity` means some were left out. */
+ * so a result above `capacity` means some were left out.
+ * Returns RDMA_VERBS_CLEANUP_LEAK if an internal context cannot close. */
 int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
     int count = 0, n = 0;
     struct ibv_device **list = ibv_get_device_list(&n);
@@ -62,7 +68,11 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
         if (!ctx) continue;
         struct ibv_device_attr attr;
         if (ibv_query_device(ctx, &attr) || !(attr.device_cap_flags & IBV_DEVICE_MEM_WINDOW_TYPE_2B)) {
-            ibv_close_device(ctx); continue;
+            if (ibv_close_device(ctx)) {
+                count = RDMA_VERBS_CLEANUP_LEAK;
+                break;
+            }
+            continue;
         }
         for (unsigned p = 1; p <= attr.phys_port_cnt; ++p) {
             struct ibv_port_attr port;
@@ -81,7 +91,10 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
             }
             ++count;
         }
-        ibv_close_device(ctx);
+        if (ibv_close_device(ctx)) {
+            count = RDMA_VERBS_CLEANUP_LEAK;
+            break;
+        }
     }
     ibv_free_device_list(list);
     return count;

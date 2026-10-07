@@ -18,6 +18,10 @@ use std::{
 #[path = "simulation.rs"]
 pub mod simulation;
 
+#[cfg(all(test, feature = "native", target_os = "linux"))]
+#[path = "discovery_fault_tests.rs"]
+mod discovery_fault_tests;
+
 /// One port from `discover`. Matches `struct rdma_verbs_port` in C.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -157,6 +161,9 @@ native_api! {
     poll: unsafe extern "C" fn(*mut c_void, *mut Completion, u32) -> c_int,
 }
 
+/// C's `RDMA_VERBS_CLEANUP_LEAK`, outside the negative errno range.
+const CLEANUP_LEAK: c_int = c_int::MIN;
+
 impl Api {
     #[cfg(not(all(feature = "native", target_os = "linux")))]
     /// No native backend in this build.
@@ -165,7 +172,7 @@ impl Api {
     }
 
     #[cfg(all(feature = "native", target_os = "linux"))]
-    /// Load `librdma_verbs.so.1` and check it speaks ABI version 2.
+    /// Load `librdma_verbs.so.1` and check it speaks ABI version 3.
     fn load() -> Result<Rc<Self>> {
         // Fixed library name, found via the normal loader path.
         unsafe {
@@ -202,7 +209,7 @@ impl Api {
             }
 
             let version = sym!("rdma_verbs_abi", unsafe extern "C" fn() -> u32);
-            if version() != 2 {
+            if version() != 3 {
                 return Err(Error::Unavailable);
             }
             let api = Self::symbols(library)?;
@@ -279,7 +286,7 @@ pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
 
 /// Attach a tracked owner to each opened device before any discovery cleanup.
 pub(crate) fn discover_with_quota(
-    mut quota: impl FnMut() -> Option<Arc<GuardOwner>>,
+    quota: impl FnMut() -> Option<Arc<GuardOwner>>,
 ) -> Result<Vec<NativeDevice>> {
     #[cfg(any(test, feature = "simulation"))]
     let api = match simulation::current() {
@@ -288,6 +295,15 @@ pub(crate) fn discover_with_quota(
     };
     #[cfg(not(any(test, feature = "simulation")))]
     let api = Api::load()?;
+    discover_with_api(api, quota)
+}
+
+/// Charge temporary discovery contexts before calling into the adapter.
+fn discover_with_api(
+    api: Rc<Api>,
+    mut quota: impl FnMut() -> Option<Arc<GuardOwner>>,
+) -> Result<Vec<NativeDevice>> {
+    let discovery_quota = quota();
     let mut ports = [Port {
         name: [0; 64],
         gid: [0; 16],
@@ -297,6 +313,14 @@ pub(crate) fn discover_with_quota(
         link_layer: 0,
     }; 64];
     let count = unsafe { (api.discover)(ports.as_mut_ptr(), ports.len() as u32) };
+    if count == CLEANUP_LEAK {
+        if let Some(quota) = discovery_quota {
+            quota.quarantine();
+            std::mem::forget(quota);
+        }
+        std::mem::forget(api);
+        return Err(Error::Unavailable);
+    }
     if count < 0 || count as usize > ports.len() {
         return Err(Error::Unavailable);
     }
@@ -902,7 +926,7 @@ mod tests {
     #[test]
     #[ignore = "requires built C adapter on loader path; no RDMA hardware required"]
     fn required_native_adapter_loads_abi_and_symbols() {
-        let api = Api::load().expect("built native adapter must load with ABI 2 and all symbols");
+        let api = Api::load().expect("built native adapter must load with ABI 3 and all symbols");
         assert!(api.library.is_some(), "must load C adapter, not simulation");
     }
 

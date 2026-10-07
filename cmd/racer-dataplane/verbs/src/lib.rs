@@ -2294,7 +2294,7 @@ mod tests {
 
     #[cfg(feature = "native")]
     #[test]
-    #[ignore = "requires built native ABI v2 adapter and zero usable type-2B ports"]
+    #[ignore = "requires built native ABI v3 adapter and zero usable type-2B ports"]
     /// A real no-device adapter activates on the native role and releases charges.
     fn native_no_device_activation_runs_on_paired_role_and_releases_quota() {
         assert!(ffi::discover().expect("real adapter must load").is_empty());
