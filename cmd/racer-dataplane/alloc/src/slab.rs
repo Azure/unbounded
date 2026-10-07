@@ -1318,124 +1318,164 @@ mod tests {
         let Some(file) = device_file(&directory.0.join("device")) else {
             return;
         };
-        let Some(a) = real_alignment(probe(&file)) else {
+        let Some(host_alignment) = real_alignment(probe(&file)) else {
             return;
         };
-        let build = |offsets: &[u64], segment, record| {
-            Slab::<()>::from_devices(
-                offsets
-                    .iter()
-                    .map(|&offset| DevicePlacement {
-                        file: file.clone(),
-                        offset,
-                    })
-                    .collect(),
-                segment,
-                record,
-                a,
-            )
-        };
-        for (offsets, segment, record) in [
-            (vec![], 4096, 512),
-            (vec![0], 0, 512),
-            (vec![0], 4096, 0),
-            (vec![0], 4097, 512),
-            (vec![0], 4096, 4097),
-            (vec![0, 4096], u64::MAX, 512),
-            (vec![0], i64::MAX as u64 + 1, 512),
-            (vec![1], 4096, 512),
-            (vec![16384], 4096, 512),
-            (vec![u64::MAX], 4096, 512),
-            (vec![i64::MAX as u64 - 4095], 4096, 512),
-            (vec![0, 0], 4096, 512),
-            (vec![0, 2048], 4096, 512),
+        for a in [
+            host_alignment,
+            Alignment::new(4096, 4096, 4096).unwrap(),
+            Alignment::new(8192, 8192, 8192).unwrap(),
+            Alignment::new(4096, 768, 512).unwrap(),
         ] {
-            assert!(matches!(
-                build(&offsets, segment, record),
-                Err(Error::InvalidConfiguration)
-            ));
-        }
-        let duplicate = Arc::new(file.try_clone().unwrap());
-        assert!(matches!(
-            Slab::<()>::from_devices(
-                vec![
-                    DevicePlacement {
-                        file: file.clone(),
-                        offset: 0
-                    },
-                    DevicePlacement {
-                        file: duplicate,
-                        offset: 2048
-                    },
-                ],
-                4096,
-                512,
-                a
-            ),
-            Err(Error::InvalidConfiguration)
-        ));
-        for flags in [0, libc::O_DIRECT | libc::O_APPEND] {
-            let invalid = std::fs::OpenOptions::new()
+            let unit = a.extent(0, 1).unwrap().length();
+            let segment_bytes = 2 * unit as u64;
+            let file_bytes = 4 * segment_bytes;
+            file.set_len(file_bytes).unwrap();
+            let build = |offsets: &[u64], segment, record| {
+                Slab::<()>::from_devices(
+                    offsets
+                        .iter()
+                        .map(|&offset| DevicePlacement {
+                            file: file.clone(),
+                            offset,
+                        })
+                        .collect(),
+                    segment,
+                    record,
+                    a,
+                )
+            };
+            for (offsets, segment, record) in [
+                (vec![], segment_bytes, unit),
+                (vec![0], 0, unit),
+                (vec![0], segment_bytes, 0),
+                (vec![0], segment_bytes + 1, unit),
+                (vec![0], segment_bytes, segment_bytes as usize + 1),
+                (vec![0, segment_bytes], u64::MAX, unit),
+                (vec![0], i64::MAX as u64 + 1, unit),
+                (vec![1], segment_bytes, unit),
+                (vec![file_bytes], segment_bytes, unit),
+                (vec![u64::MAX], segment_bytes, unit),
+                (
+                    vec![i64::MAX as u64 - segment_bytes + 1],
+                    segment_bytes,
+                    unit,
+                ),
+            ] {
+                assert!(matches!(
+                    build(&offsets, segment, record),
+                    Err(Error::InvalidConfiguration)
+                ));
+            }
+            let duplicate = Arc::new(file.try_clone().unwrap());
+            assert!(!Arc::ptr_eq(&file, &duplicate));
+            for second in [file.clone(), duplicate] {
+                let placement = |offset| DevicePlacement {
+                    file: second.clone(),
+                    offset,
+                };
+                for offset in [0, unit as u64, segment_bytes] {
+                    assert!(
+                        Slab::<()>::from_devices(vec![placement(offset)], segment_bytes, unit, a)
+                            .is_ok()
+                    );
+                }
+                assert!(
+                    Slab::<()>::from_devices(
+                        vec![
+                            DevicePlacement {
+                                file: file.clone(),
+                                offset: 0
+                            },
+                            placement(segment_bytes)
+                        ],
+                        segment_bytes,
+                        unit,
+                        a
+                    )
+                    .is_ok()
+                );
+                for offset in [0, unit as u64] {
+                    assert!(matches!(
+                        Slab::<()>::from_devices(
+                            vec![
+                                DevicePlacement {
+                                    file: file.clone(),
+                                    offset: 0
+                                },
+                                placement(offset),
+                            ],
+                            segment_bytes,
+                            unit,
+                            a
+                        ),
+                        Err(Error::InvalidConfiguration)
+                    ));
+                }
+            }
+            for flags in [0, libc::O_DIRECT | libc::O_APPEND] {
+                let invalid = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(flags)
+                    .open(directory.0.join("device"))
+                    .unwrap();
+                assert!(matches!(
+                    Slab::<()>::from_devices(
+                        vec![DevicePlacement {
+                            file: Arc::new(invalid),
+                            offset: 0,
+                        }],
+                        segment_bytes,
+                        unit,
+                        a
+                    ),
+                    Err(Error::InvalidConfiguration)
+                ));
+            }
+            let readonly = std::fs::OpenOptions::new()
                 .read(true)
-                .write(true)
-                .custom_flags(flags)
+                .custom_flags(libc::O_DIRECT)
                 .open(directory.0.join("device"))
                 .unwrap();
             assert!(matches!(
                 Slab::<()>::from_devices(
                     vec![DevicePlacement {
-                        file: Arc::new(invalid),
+                        file: Arc::new(readonly),
                         offset: 0,
                     }],
-                    4096,
-                    512,
+                    segment_bytes,
+                    unit,
                     a
                 ),
                 Err(Error::InvalidConfiguration)
             ));
+            let slab = build(&[2 * segment_bytes, segment_bytes], segment_bytes, unit).unwrap();
+            assert_eq!(slab.capacity_bytes(), 2 * segment_bytes);
+            assert_eq!(
+                slab.open_configured(&Segments::new(2 * segment_bytes)),
+                Err(Error::InvalidConfiguration)
+            );
+            let segments = Segments::new(segment_bytes);
+            assert_eq!(slab.open_configured(&segments), Ok(a));
+            assert_eq!(slab.open_configured(&segments), Ok(a));
+            assert_eq!(file.metadata().unwrap().len(), file_bytes);
+            let independent = File::open(directory.0.join("device")).unwrap();
+            // SAFETY: this live independent descriptor tests that startup took no flock.
+            assert_eq!(
+                unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let opened = slab.opened.borrow();
+            let OpenBacking::Devices(placements) = &opened.as_ref().unwrap().backing else {
+                unreachable!()
+            };
+            assert!(Rc::ptr_eq(&placements[0].file, &placements[1].file));
+            let Backing::Devices { placements, .. } = &slab.backing else {
+                unreachable!()
+            };
+            assert!(placements.borrow().is_empty());
         }
-        let readonly = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(directory.0.join("device"))
-            .unwrap();
-        assert!(matches!(
-            Slab::<()>::from_devices(
-                vec![DevicePlacement {
-                    file: Arc::new(readonly),
-                    offset: 0,
-                }],
-                4096,
-                512,
-                a
-            ),
-            Err(Error::InvalidConfiguration)
-        ));
-        let slab = build(&[8192, 4096], 4096, 512).unwrap();
-        assert_eq!(slab.capacity_bytes(), 8192);
-        assert_eq!(
-            slab.open_configured(&Segments::new(8192)),
-            Err(Error::InvalidConfiguration)
-        );
-        let segments = Segments::new(4096);
-        assert_eq!(slab.open_configured(&segments), Ok(a));
-        assert_eq!(slab.open_configured(&segments), Ok(a));
-        assert_eq!(file.metadata().unwrap().len(), 16384);
-        let independent = File::open(directory.0.join("device")).unwrap();
-        // SAFETY: this live independent descriptor tests that startup took no flock.
-        assert_eq!(
-            unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        let opened = slab.opened.borrow();
-        let OpenBacking::Devices(placements) = &opened.as_ref().unwrap().backing else {
-            unreachable!()
-        };
-        assert!(Rc::ptr_eq(&placements[0].file, &placements[1].file));
-        let Backing::Devices { placements, .. } = &slab.backing else {
-            unreachable!()
-        };
-        assert!(placements.borrow().is_empty());
     }
 
     /// Translation preserves logical authority and rechecks physical bounds and alignment.
