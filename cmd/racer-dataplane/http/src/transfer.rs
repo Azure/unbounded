@@ -947,6 +947,9 @@ pub mod relay {
                             .pipe
                             .drain(buffer.bytes_mut()?)
                             .map_err(|_| uring_runtime::Error::Io)?;
+                        if n == 0 {
+                            return Err(uring_runtime::Error::Io.into());
+                        }
                         self.pending = 0..n;
                         continue;
                     }
@@ -1143,6 +1146,8 @@ pub mod relay {
 
             drain_error: bool,
 
+            zero_drain: bool,
+
             _owner: Rc<()>,
         }
 
@@ -1155,6 +1160,7 @@ pub mod relay {
                     interrupted: false,
                     unsupported: false,
                     drain_error: false,
+                    zero_drain: false,
                     _owner: Rc::new(()),
                 }
             }
@@ -1170,6 +1176,9 @@ pub mod relay {
             fn drain(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
                 if self.drain_error {
                     return Err(io::ErrorKind::Interrupted.into());
+                }
+                if self.zero_drain {
+                    return Ok(0);
                 }
                 let n = bytes.len().min(self.bytes.len());
                 bytes[..n].copy_from_slice(&self.bytes[..n]);
@@ -1378,6 +1387,55 @@ pub mod relay {
                 f.io.reclaim_buffer();
                 assert_eq!(f.hooks.slots.get(), 0);
                 assert_eq!(f.hooks.bytes.get(), 0);
+            }
+        }
+
+        /// A zero drain fails without losing prior progress or retaining admission on drop.
+        #[test]
+        fn zero_pipe_drain_is_terminal_and_preserves_prior_progress() {
+            for prefix in [b"".as_slice(), b"abc".as_slice()] {
+                let f = Fixture::new();
+                let pipe = Pipe {
+                    zero_drain: true,
+                    ..Pipe::default()
+                };
+                let weak = Rc::downgrade(&pipe._owner);
+                let (mut relay, mut writer, mut reader) = f.relay(prefix.len() as u64 + 3, pipe);
+                if !prefix.is_empty() {
+                    writer.write_all(prefix).unwrap();
+                    assert!(matches!(
+                        relay.step(&f.io).unwrap(),
+                        Step::Readiness {
+                            interest: libc::POLLIN,
+                            ..
+                        }
+                    ));
+                }
+                assert_eq!(relay.source.receive_remaining(), Some(3));
+                assert_eq!(relay.destination.send_remaining(), Some(3));
+                relay.pipe.unsupported = true;
+                writer.write_all(b"def").unwrap();
+                assert!(matches!(
+                    relay.step(&f.io),
+                    Err(Failure::Runtime(uring_runtime::Error::Io))
+                ));
+                assert_eq!(relay.source.receive_remaining(), Some(0));
+                assert_eq!(relay.destination.send_remaining(), Some(3));
+                assert_eq!(relay.pipe.bytes, b"def");
+                assert!(relay.pending.is_empty());
+                assert!(!relay.source.is_reusable() && !relay.destination.is_reusable());
+                assert_eq!(f.io.reactor().in_flight(), 0);
+                assert_eq!(f.hooks.slots.get(), 2);
+                assert_eq!(f.hooks.bytes.get(), MAX_PIPE_BYTES);
+                assert!(weak.upgrade().is_some());
+                drop(relay);
+                f.io.reclaim_buffer();
+                assert_eq!(f.hooks.slots.get(), 0);
+                assert_eq!(f.hooks.bytes.get(), 0);
+                assert!(weak.upgrade().is_none());
+                let mut wire = Vec::new();
+                reader.read_to_end(&mut wire).unwrap();
+                assert_eq!(wire, prefix);
             }
         }
 
