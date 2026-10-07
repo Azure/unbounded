@@ -395,9 +395,9 @@ struct Handle {
     id: u32,
 }
 
-/// Turn a raw pointer back into a handle. The caller keeps it alive.
-unsafe fn handle<'a>(raw: *mut c_void) -> &'a Handle {
-    unsafe { &*raw.cast::<Handle>() }
+/// Return no handle for null. The caller keeps any non-null handle alive.
+unsafe fn handle<'a>(raw: *mut c_void) -> Option<&'a Handle> {
+    unsafe { raw.cast::<Handle>().as_ref() }
 }
 
 /// Add a resource and return a new handle to it.
@@ -412,7 +412,7 @@ fn allocate(sim: &Simulation, resource: Resource) -> *mut c_void {
 
 /// The NUMA node set on a device.
 pub(super) fn numa_node(raw: NonNull<c_void>) -> Option<usize> {
-    let h = unsafe { handle(raw.as_ptr()) };
+    let h = unsafe { handle(raw.as_ptr()) }?;
     match h.sim.world.borrow().resources.get(&h.id) {
         Some(Resource::Device(d)) => d.numa_node,
         _ => None,
@@ -421,7 +421,9 @@ pub(super) fn numa_node(raw: NonNull<c_void>) -> Option<usize> {
 
 /// A region's fake wire address.
 pub(super) fn address(raw: NonNull<c_void>) -> u64 {
-    let h = unsafe { handle(raw.as_ptr()) };
+    let Some(h) = (unsafe { handle(raw.as_ptr()) }) else {
+        return 0;
+    };
     match h.sim.world.borrow().resources.get(&h.id) {
         Some(Resource::Region { address, .. }) => *address,
         _ => 0,
@@ -729,7 +731,9 @@ unsafe extern "C" fn open(name: *const c_char) -> *mut c_void {
 
 /// Create a QP on the device's port. Writes its QPN.
 unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) -> *mut c_void {
-    let h = unsafe { handle(device) };
+    let Some(h) = (unsafe { handle(device) }) else {
+        return std::ptr::null_mut();
+    };
     let mut world = h.sim.world.borrow_mut();
     if world.rejected(Operation::Qp, h.id) {
         return std::ptr::null_mut();
@@ -750,7 +754,7 @@ unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) ->
         },
     );
     unsafe {
-        *qpn = handle(raw).id;
+        *qpn = handle(raw).unwrap().id;
     }
     h.sim
         .world
@@ -765,7 +769,9 @@ unsafe extern "C" fn connect(
     local: *const Endpoint,
     remote: *const Endpoint,
 ) -> c_int {
-    let h = unsafe { handle(raw) };
+    let Some(h) = (unsafe { handle(raw) }) else {
+        return -1;
+    };
     let (local, remote) = unsafe { (*local, *remote) };
     let mut world = h.sim.world.borrow_mut();
     world.call(Operation::Connect, h.id, |world| {
@@ -816,7 +822,9 @@ unsafe extern "C" fn connect(
 
 /// Stop a QP: drop its queued work and unbind its windows.
 unsafe extern "C" fn stop(raw: *mut c_void) -> c_int {
-    let h = unsafe { handle(raw) };
+    let Some(h) = (unsafe { handle(raw) }) else {
+        return -1;
+    };
     let mut world = h.sim.world.borrow_mut();
     world.call(Operation::Stop, h.id, |world| {
         let Some(Resource::Qp { stopped, work, .. }) = world.resources.get_mut(&h.id) else {
@@ -837,7 +845,9 @@ unsafe extern "C" fn stop(raw: *mut c_void) -> c_int {
 
 /// Free a resource. Fails if anything still uses it.
 unsafe fn free(raw: *mut c_void, operation: Operation) -> c_int {
-    let h = unsafe { handle(raw) };
+    let Some(h) = (unsafe { handle(raw) }) else {
+        return -1;
+    };
     let mut world = h.sim.world.borrow_mut();
     let result = world.call(operation, h.id, |world| {
         let referenced = world.resources.iter().any(|(id, resource)| {
@@ -907,7 +917,9 @@ unsafe extern "C" fn window_free(raw: *mut c_void) -> c_int {
 
 /// Create a zeroed region with a fake wire address.
 unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
-    let h = unsafe { handle(device) };
+    let Some(h) = (unsafe { handle(device) }) else {
+        return std::ptr::null_mut();
+    };
     let mut world = h.sim.world.borrow_mut();
     if length == 0 {
         world.record(Operation::Register, h.id, None, -1, false);
@@ -935,7 +947,9 @@ unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
 
 /// Pointer to a region's bytes. Valid until the region is freed.
 unsafe extern "C" fn bytes(raw: *mut c_void) -> *mut u8 {
-    let h = unsafe { handle(raw) };
+    let Some(h) = (unsafe { handle(raw) }) else {
+        return std::ptr::null_mut();
+    };
     match h.sim.world.borrow_mut().resources.get_mut(&h.id) {
         Some(Resource::Region { bytes, .. }) => bytes.as_mut_ptr(),
         _ => std::ptr::null_mut(),
@@ -944,7 +958,9 @@ unsafe extern "C" fn bytes(raw: *mut c_void) -> *mut u8 {
 
 /// Create an unbound window. Its id is its key.
 unsafe extern "C" fn window(device: *mut c_void, key: *mut u32) -> *mut c_void {
-    let h = unsafe { handle(device) };
+    let Some(h) = (unsafe { handle(device) }) else {
+        return std::ptr::null_mut();
+    };
     if h.sim.world.borrow_mut().rejected(Operation::Window, h.id) {
         return std::ptr::null_mut();
     }
@@ -956,7 +972,7 @@ unsafe extern "C" fn window(device: *mut c_void, key: *mut u32) -> *mut c_void {
         },
     );
     unsafe {
-        *key = handle(raw).id;
+        *key = handle(raw).unwrap().id;
     }
     h.sim
         .world
@@ -974,7 +990,10 @@ unsafe extern "C" fn bind(
     id: u64,
     length: u32,
 ) -> c_int {
-    let (q, w, r) = unsafe { (handle(qp), handle(window), handle(region)) };
+    let (Some(q), Some(w), Some(r)) = (unsafe { (handle(qp), handle(window), handle(region)) })
+    else {
+        return -1;
+    };
     if !Rc::ptr_eq(&q.sim.world, &w.sim.world)
         || !Rc::ptr_eq(&q.sim.world, &r.sim.world)
         || key != w.id
@@ -998,7 +1017,9 @@ unsafe extern "C" fn bind(
 
 /// Queue an invalidate. Checked when it completes.
 unsafe extern "C" fn invalidate(qp: *mut c_void, key: u32, id: u64) -> c_int {
-    let q = unsafe { handle(qp) };
+    let Some(q) = (unsafe { handle(qp) }) else {
+        return -1;
+    };
     q.sim
         .world
         .borrow_mut()
@@ -1014,7 +1035,9 @@ unsafe extern "C" fn write(
     id: u64,
     length: u32,
 ) -> c_int {
-    let (q, r) = unsafe { (handle(qp), handle(region)) };
+    let (Some(q), Some(r)) = (unsafe { (handle(qp), handle(region)) }) else {
+        return -1;
+    };
     if !Rc::ptr_eq(&q.sim.world, &r.sim.world) {
         q.sim
             .world
@@ -1036,7 +1059,9 @@ unsafe extern "C" fn write(
 
 /// Run up to 32 queued requests in order. Stops at a delay or a failure.
 unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) -> c_int {
-    let q = unsafe { handle(qp) };
+    let Some(q) = (unsafe { handle(qp) }) else {
+        return -1;
+    };
     let mut world = q.sim.world.borrow_mut();
     if world.rejected(Operation::Poll, q.id) {
         return -1;
@@ -1118,6 +1143,125 @@ mod tests {
         assert_eq!(trace, expected);
     }
 
+    /// Every handle consumer rejects null before reading or writing through it.
+    fn null_handle_calls_fail(raw: *mut c_void) {
+        assert!(raw.is_null());
+        let mut output = 123;
+        let endpoint = Endpoint {
+            gid: [1; 16],
+            qpn: 1,
+            psn: 0,
+            mtu: 3,
+            lid: 0,
+            port: 1,
+            link_layer: 2,
+        };
+        let mut completion = Completion {
+            id: 42,
+            status: 43,
+            opcode: 44,
+        };
+        unsafe {
+            assert!(handle(raw).is_none());
+            assert!(qp(raw, 1, 1, &mut output).is_null());
+            assert!(register(raw, 32).is_null());
+            assert!(window(raw, &mut output).is_null());
+            assert!(bytes(raw).is_null());
+            assert_eq!(connect(raw, &endpoint, &endpoint), -1);
+            assert_eq!(stop(raw), -1);
+            assert_eq!(bind(raw, raw, raw, 1, 2, 3), -1);
+            assert_eq!(invalidate(raw, 1, 2), -1);
+            assert_eq!(write(raw, raw, 1, 2, 3, 4), -1);
+            assert_eq!(poll(raw, &mut completion, 1), -1);
+            assert_eq!(close(raw), -1);
+            assert_eq!(qp_free(raw), -1);
+            assert_eq!(deregister(raw), -1);
+            assert_eq!(window_free(raw), -1);
+        }
+        assert_eq!(output, 123);
+        assert_eq!(
+            (completion.id, completion.status, completion.opcode),
+            (42, 43, 44)
+        );
+    }
+
+    #[test]
+    /// All eight allocation failure paths can be passed back without a null access.
+    fn allocation_failures_reject_null_handles_without_side_effects() {
+        assert!(current().is_none());
+        null_handle_calls_fail(unsafe { open(c"sim0".as_ptr()) });
+        let sim = Simulation::new()
+            .with_devices(vec![Device::new("sim0", [1; 16])])
+            .unwrap();
+        let _scope = sim.enter();
+        unsafe {
+            let device = open(c"sim0".as_ptr());
+            assert!(handle(device).is_some());
+            let mut output = 123;
+            let mut failures = vec![
+                open(c"missing".as_ptr()),
+                qp(device, 2, 1, &mut output),
+                register(device, 0),
+            ];
+            sim.fault(Operation::Open, Fault::Reject);
+            failures.push(open(c"sim0".as_ptr()));
+            sim.fault(Operation::Qp, Fault::Reject);
+            failures.push(qp(device, 1, 1, &mut output));
+            sim.fault(Operation::Register, Fault::Reject);
+            failures.push(register(device, 32));
+            sim.fault(Operation::Window, Fault::Reject);
+            failures.push(window(device, &mut output));
+            assert_eq!(output, 123);
+            assert_eq!(sim.pending_faults(), 0);
+            let trace = sim.trace();
+            sim.fault(Operation::Stop, Fault::Reject);
+            for raw in failures {
+                null_handle_calls_fail(raw);
+                assert_eq!(sim.live_resources(), 1);
+                assert_eq!(sim.trace(), trace);
+                assert_eq!(sim.pending_faults(), 1);
+            }
+            assert_eq!(close(device), 0);
+        }
+        assert_eq!(sim.live_resources(), 0);
+    }
+
+    #[test]
+    /// A null secondary handle cannot post work or consume a scripted fault.
+    fn posts_reject_each_null_handle_without_side_effects() {
+        let sim = Simulation::new();
+        {
+            let (sender, receiver, source, target) = connected(&sim);
+            let (window, binding) = receiver.bind(target.clone()).unwrap();
+            receiver.progress().unwrap();
+            assert_eq!(binding.result(), Some(Ok(())));
+            let q = sender.raw.as_ptr();
+            let w = window.raw.as_ptr();
+            let r = source.raw.as_ptr();
+            let null = std::ptr::null_mut();
+            let trace = sim.trace();
+            let live = sim.live_resources();
+            sim.fault(Operation::Bind, Fault::Reject);
+            sim.fault(Operation::Write, Fault::Reject);
+            unsafe {
+                for (q, w, r) in [(null, w, r), (q, null, r), (q, w, null)] {
+                    assert_eq!(bind(q, w, r, window.key, 100, 17), -1);
+                }
+                for (q, r) in [(null, r), (q, null)] {
+                    assert_eq!(write(q, r, target.address(), window.key, 101, 17), -1);
+                }
+            }
+            assert_eq!(sim.trace(), trace);
+            assert_eq!(sim.live_resources(), live);
+            assert_eq!(sim.pending_faults(), 2);
+            assert_eq!(sender.progress(), Ok(0));
+            receiver.stop().unwrap();
+            assert_eq!(source.copy_to().unwrap(), [0xa5; 17]);
+            assert_eq!(target.copy_to().unwrap(), [0; 17]);
+        }
+        assert_eq!(sim.live_resources(), 0);
+    }
+
     #[test]
     /// Validation and scripted failures each emit one event and allocate nothing.
     fn allocation_events_report_final_outcomes() {
@@ -1137,7 +1281,7 @@ mod tests {
             let device = open(c"sim0".as_ptr());
             assert!(!device.is_null());
             events(&sim, &[(Operation::Open, 0, None, 0, false)]);
-            let d = handle(device).id;
+            let d = handle(device).unwrap().id;
             let mut id = 0;
             assert!(qp(device, 2, 1, &mut id).is_null());
             assert_eq!(id, 0);
@@ -1197,7 +1341,7 @@ mod tests {
         let _scope = sim.enter();
         unsafe {
             let device = open(c"sim0".as_ptr());
-            let d = handle(device).id;
+            let d = handle(device).unwrap().id;
             let mut qpn = 0;
             let q = qp(device, 1, 1, &mut qpn);
             let local = Endpoint {
@@ -1212,7 +1356,7 @@ mod tests {
             let peer = qp(device, 1, 1, &mut qpn);
             let remote = Endpoint { qpn, ..local };
             let region = register(device, 32);
-            let r = handle(region).id;
+            let r = handle(region).unwrap().id;
             let mut key = 0;
             let w = window(device, &mut key);
             events(
@@ -1272,10 +1416,10 @@ mod tests {
                     (region, Operation::Deregister),
                     (w, Operation::WindowFree),
                 ] {
-                    let id = handle(raw).id;
+                    let id = handle(raw).unwrap().id;
                     assert_eq!(free(raw, operation), -1);
                     events(&sim, &[(operation, id, None, -1, false)]);
-                    assert_eq!(handle(raw).id, id);
+                    assert_eq!(handle(raw).unwrap().id, id);
                     assert!(sim.world.borrow().resources.contains_key(&id));
                     assert_eq!(sim.live_resources(), 5);
                 }
@@ -1294,7 +1438,7 @@ mod tests {
                 (peer, Operation::QpFree),
                 (device, Operation::Close),
             ] {
-                let id = handle(raw).id;
+                let id = handle(raw).unwrap().id;
                 let live = sim.live_resources();
                 sim.fault(operation, Fault::Reject);
                 assert_eq!(free(raw, operation), -1);
