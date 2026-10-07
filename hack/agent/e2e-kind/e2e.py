@@ -1840,7 +1840,7 @@ def yaml_list(items: list[str], indent: str) -> str:
 def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
     packages = yaml_list(image.packages, "  ")
     commands = [*(image.pre_marker_commands or []), "mkdir -p /etc/agent"]
-    if HOST_BASE_OS in ("almalinux10", "centosstream10"):
+    if HOST_BASE_OS == "almalinux10":
         commands.extend(['dnf install -y "kernel-modules-extra-$(uname -r)"',
                          "modprobe nft_compat", "modprobe xt_conntrack", "modprobe xt_comment"])
     preparation = "\n".join(["set -eu", *commands,
