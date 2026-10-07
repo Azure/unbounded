@@ -127,6 +127,10 @@ func exampleMemoryOrigin(content []byte) racersdk.Origin {
 			return racersdk.Metadata{}, nil, racersdk.ErrNotFound
 		}
 
+		if r.ETag != "" && r.ETag != metadata.ETag {
+			return racersdk.Metadata{}, nil, racersdk.ErrVersionMismatch
+		}
+
 		if r.Head {
 			return metadata, nil, nil
 		}

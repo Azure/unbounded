@@ -20,7 +20,9 @@ func TestExampleMemoryOriginRanges4210611540(t *testing.T) {
 		length  int64
 		head    bool
 		missing bool
+		etag    string
 		want    string
+		wantErr error
 	}{
 		{name: "ordinary page", content: "hello, racer", length: racersdk.PageSize, want: "hello, racer"},
 		{name: "short range", content: "hello, racer", length: 5, want: "hello"},
@@ -32,7 +34,16 @@ func TestExampleMemoryOriginRanges4210611540(t *testing.T) {
 		{name: "final protocol page", content: "hello, racer", offset: math.MaxInt64 - racersdk.PageSize + 1, length: racersdk.PageSize},
 		{name: "empty object final protocol page", offset: math.MaxInt64 - racersdk.PageSize + 1, length: racersdk.PageSize},
 		{name: "head", content: "hello, racer", head: true},
-		{name: "missing key", content: "hello, racer", length: racersdk.PageSize, missing: true},
+		{name: "missing key", content: "hello, racer", length: racersdk.PageSize, missing: true, wantErr: racersdk.ErrNotFound},
+		{name: "matching pin", content: "hello, racer", length: racersdk.PageSize, etag: `"v1"`, want: "hello, racer"},
+		{name: "matching pin head", content: "hello, racer", head: true, etag: `"v1"`},
+		{name: "matching pin empty range", content: "hello, racer", offset: 12, length: racersdk.PageSize, etag: `"v1"`},
+		{name: "matching pin empty object", length: racersdk.PageSize, etag: `"v1"`},
+		{name: "unavailable pin", content: "hello, racer", length: racersdk.PageSize, etag: `"v2"`, wantErr: racersdk.ErrVersionMismatch},
+		{name: "unavailable pin head", content: "hello, racer", head: true, etag: `"v2"`, wantErr: racersdk.ErrVersionMismatch},
+		{name: "unavailable pin empty range", content: "hello, racer", offset: 12, length: racersdk.PageSize, etag: `"v2"`, wantErr: racersdk.ErrVersionMismatch},
+		{name: "unavailable pin zero length", content: "hello, racer", etag: `"v2"`, wantErr: racersdk.ErrVersionMismatch},
+		{name: "unavailable pin empty object", length: racersdk.PageSize, etag: `"v2"`, wantErr: racersdk.ErrVersionMismatch},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := racersdk.OriginRequest{
@@ -40,6 +51,7 @@ func TestExampleMemoryOriginRanges4210611540(t *testing.T) {
 				Offset:  tc.offset,
 				Length:  tc.length,
 				Head:    tc.head,
+				ETag:    tc.etag,
 			}
 			if tc.missing {
 				request.Key = racersdk.Key{}
@@ -50,9 +62,9 @@ func TestExampleMemoryOriginRanges4210611540(t *testing.T) {
 				defer body.Close()
 			}
 
-			if tc.missing {
-				if !errors.Is(err, racersdk.ErrNotFound) || body != nil || metadata != (racersdk.Metadata{}) {
-					t.Fatalf("missing key: metadata=%+v body=%v err=%v", metadata, body, err)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) || body != nil || metadata != (racersdk.Metadata{}) {
+					t.Fatalf("metadata=%+v body=%v err=%v, want zero metadata, nil body, and %v", metadata, body, err, tc.wantErr)
 				}
 
 				return
