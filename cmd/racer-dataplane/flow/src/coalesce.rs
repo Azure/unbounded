@@ -88,6 +88,22 @@ impl<K: Clone + Eq + Hash, V, S: BuildHasher + Default> Table<K, V, S> {
         if self.registrations.get() >= capacity.saturating_mul(self.limits.waiters_per_cohort) {
             return Err(CapacityError);
         }
+        let index_key = {
+            let active = self.active.borrow();
+            if active.contains_key(&key) {
+                None
+            } else {
+                if active.len() >= capacity {
+                    return Err(CapacityError);
+                }
+                drop(active);
+                Some(key.clone())
+            }
+        };
+        // Key cloning can admit work. Recheck all bounds and cohort membership.
+        if self.registrations.get() >= capacity.saturating_mul(self.limits.waiters_per_cohort) {
+            return Err(CapacityError);
+        }
         let mut active = self.active.borrow_mut();
         let cohort = if let Some(cohort) = active.get(&key) {
             cohort.clone()
@@ -96,7 +112,10 @@ impl<K: Clone + Eq + Hash, V, S: BuildHasher + Default> Table<K, V, S> {
                 return Err(CapacityError);
             }
             let cohort = Rc::new(RefCell::new(Cohort::default()));
-            active.insert(key.clone(), cohort.clone());
+            active.insert(
+                index_key.expect("missing cohort key was cloned"),
+                cohort.clone(),
+            );
             cohort
         };
         let id = {
@@ -357,13 +376,12 @@ pub mod shared {
         /// Called after miss-only admission, without yielding between get and start.
         /// The caller must not start a replacement while an entry is present.
         pub fn start(self: &Rc<Self>, key: K, closed: V) -> (Receiver<V>, Completion<K, V>) {
+            let index_key = key.clone();
             let (send, receive) = oneshot::channel();
             let receive = async move { receive.await.unwrap_or(closed) }
                 .boxed_local()
                 .shared();
-            self.entries
-                .borrow_mut()
-                .insert(key.clone(), receive.clone());
+            self.entries.borrow_mut().insert(index_key, receive.clone());
             (
                 receive,
                 Completion {
@@ -2030,6 +2048,132 @@ mod tests {
             },
             Err("exhausted"),
         ))
+    }
+
+    thread_local! {
+        static ON_KEY_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// A key whose next clone can call back into its table.
+    #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    struct CloneKey(u32);
+
+    impl Clone for CloneKey {
+        /// Run the one-shot callback without retaining the callback slot borrow.
+        fn clone(&self) -> Self {
+            let callback = ON_KEY_CLONE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+            Self(self.0)
+        }
+    }
+
+    /// A clone callback can admit the same key before the outer join resumes.
+    #[test]
+    fn key_clone_reentry_joins_current_cohort() {
+        let table = Rc::new(Table::<_, u32>::new(
+            Limits {
+                waiters_per_cohort: 2,
+                attempts_per_cohort: 1,
+            },
+            0,
+        ));
+        let admitted = Rc::new(RefCell::new(None));
+        let nested = table.clone();
+        let retained = admitted.clone();
+        ON_KEY_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(nested.active_count(), 0);
+                *retained.borrow_mut() = Some(nested.join(CloneKey(1), 1).unwrap());
+            }));
+        });
+        let outer = table.join(CloneKey(1), 1).unwrap();
+        let inner = admitted.borrow_mut().take().unwrap();
+        assert_eq!(table.active_count(), 1);
+        assert_eq!(table.registration_count(), 2);
+        assert_eq!(inner.event(Waker::noop()), Poll::Ready(Event::Lead));
+        assert!(outer.event(Waker::noop()).is_pending());
+        inner.finish(7);
+        assert_eq!(outer.event(Waker::noop()), Poll::Ready(Event::Complete(7)));
+        assert_eq!(table.active_count(), 0);
+        drop((inner, outer));
+        assert_eq!(table.registration_count(), 0);
+    }
+
+    /// Clone callbacks may fill key, waiter, or completed-reader capacity.
+    #[test]
+    fn key_clone_reentry_rechecks_all_bounds() {
+        for (capacity, waiters, nested_key, complete) in
+            [(1, 2, 2, false), (2, 1, 1, false), (1, 2, 2, true)]
+        {
+            let table = Rc::new(Table::<_, u32>::new(
+                Limits {
+                    waiters_per_cohort: waiters,
+                    attempts_per_cohort: 1,
+                },
+                0,
+            ));
+            let admitted = Rc::new(RefCell::new(Vec::new()));
+            let nested = table.clone();
+            let retained = admitted.clone();
+            ON_KEY_CLONE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let count = if complete { capacity * waiters } else { 1 };
+                    for _ in 0..count {
+                        let registration = nested.join(CloneKey(nested_key), capacity).unwrap();
+                        if complete {
+                            registration.finish(7);
+                        }
+                        retained.borrow_mut().push(registration);
+                    }
+                }));
+            });
+            assert!(matches!(
+                table.join(CloneKey(1), capacity),
+                Err(CapacityError)
+            ));
+            assert_eq!(table.active_count(), usize::from(!complete));
+            assert_eq!(table.registration_count(), admitted.borrow().len());
+            admitted.borrow_mut().clear();
+            assert_eq!(table.active_count(), 0);
+            assert_eq!(table.registration_count(), 0);
+            let next = table.join(CloneKey(1), capacity).unwrap();
+            assert_eq!(table.registration_count(), 1);
+            drop(next);
+            assert_eq!(table.active_count(), 0);
+            assert_eq!(table.registration_count(), 0);
+        }
+    }
+
+    /// Shared key cloning can inspect the table and start unrelated work.
+    #[test]
+    fn key_clone_reentry_shared_start_preserves_both_completions() {
+        use futures::executor::block_on;
+
+        let table = Rc::new(shared::Table::default());
+        let admitted = Rc::new(RefCell::new(None));
+        let nested = table.clone();
+        let retained = admitted.clone();
+        ON_KEY_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert!(nested.is_empty());
+                assert!(nested.get(&CloneKey(1)).is_none());
+                *retained.borrow_mut() = Some(nested.start(CloneKey(2), 0));
+            }));
+        });
+        let (outer, completion) = table.start(CloneKey(1), 0);
+        let (inner, nested_completion) = admitted.borrow_mut().take().unwrap();
+        assert_eq!(table.len(), 2);
+        completion.finish(7);
+        assert_eq!(block_on(outer), 7);
+        assert_eq!(table.len(), 1);
+        assert!(table.get(&CloneKey(1)).is_none());
+        let follower = table.get(&CloneKey(2)).unwrap();
+        nested_completion.finish(8);
+        assert_eq!(block_on(inner), 8);
+        assert_eq!(block_on(follower), 8);
+        assert!(table.is_empty());
     }
 
     /// Completion reaches both parked and unpolled readers without deleting replacements.
