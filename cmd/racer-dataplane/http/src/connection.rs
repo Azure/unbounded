@@ -1225,6 +1225,9 @@ impl<C: Context> HttpPool<C> {
     ) -> Operation<'a, C, ConnectionLease<C>> {
         Box::pin(async move {
             scope.check()?;
+            if !self.class_available(endpoint, false) {
+                return Err(uring_runtime::Error::Overloaded.into());
+            }
             let (mut connection, address) = self.prepare_connection_inner(endpoint)?;
             connection.state_mut().attach(checkout);
             self.connect(connection, address, scope).await
@@ -3337,6 +3340,119 @@ mod tests {
         drop(connection);
         drop(checkout);
         assert_eq!(hooks.used.get(), 0);
+    }
+
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct HeadroomKey(usize);
+
+    impl Endpoint<Failure> for HeadroomKey {
+        fn address(&self) -> std::result::Result<SocketAddress, Failure> {
+            Key.address()
+        }
+
+        fn priority_headroom(&self) -> usize {
+            self.0
+        }
+    }
+
+    /// Ordinary checkout leaves reserved capacity for metadata, even with idle sockets.
+    #[test]
+    fn nonqueueing_checkout_preserves_priority_headroom() {
+        for explicit_state in [false, true] {
+            for (capacity, headroom, ordinary_limit) in [(2, 1, 1), (3, 1, 2), (2, 0, 2), (1, 1, 1)]
+            {
+                let hooks = Rc::new(Hooks::<HeadroomKey> {
+                    used: Rc::default(),
+                    slots: Rc::default(),
+                    stopped: Cell::new(false),
+                    reject_charge: Cell::new(false),
+                    endpoint: std::marker::PhantomData,
+                });
+                let reactor = reactor();
+                let pool = HttpPool::new(
+                    reactor.clone(),
+                    hooks.clone(),
+                    PoolConfig {
+                        per_endpoint: capacity,
+                        ..PoolConfig::default()
+                    },
+                );
+                let key = HeadroomKey(headroom);
+                let mut connections = Vec::new();
+                let mut peers = Vec::new();
+                for _ in 0..capacity {
+                    let (mut connection, _) = pool.prepare_connection(&key).unwrap();
+                    let (fd, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                    fd.set_nonblocking(true).unwrap();
+                    connection.fd = Rc::new(fd.into());
+                    connection.set_framing(Some(0), Some(0), false);
+                    connection.finish_exchange().unwrap();
+                    connections.push(connection);
+                    peers.push(peer);
+                }
+                connections.clear();
+                let mut cx = std::task::Context::from_waker(Waker::noop());
+                for active in 0..=ordinary_limit {
+                    let mut checkout = if explicit_state {
+                        pool.checkout_with_state(
+                            &key,
+                            Policy {
+                                session: 42,
+                                transient: Some(hooks.charge(7).unwrap()),
+                                ..Policy::default()
+                            },
+                            &TestScope,
+                        )
+                    } else {
+                        pool.checkout(&key, &TestScope)
+                    };
+                    let result = checkout.as_mut().poll(&mut cx);
+                    if active < ordinary_limit {
+                        let Poll::Ready(Ok(connection)) = result else {
+                            panic!("ordinary capacity must remain available");
+                        };
+                        assert_eq!(
+                            connection.state().session,
+                            if explicit_state { 42 } else { 0 }
+                        );
+                        connections.push(connection);
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Overloaded)))
+                        ));
+                    }
+                    drop(checkout);
+                    assert_eq!(
+                        hooks.used.get(),
+                        if explicit_state {
+                            connections.len() * 7
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(pool.state.borrow().entries[&key].active, connections.len());
+                    assert!(pool.state.borrow().waiting.is_empty());
+                    assert_eq!(hooks.slots.get(), capacity);
+                    assert_eq!(reactor.in_flight(), 0);
+                }
+                let mut metadata = pool.checkout_metadata(&key, &TestScope);
+                if ordinary_limit < capacity {
+                    let Poll::Ready(Ok(connection)) = metadata.as_mut().poll(&mut cx) else {
+                        panic!("metadata must be able to use reserved capacity");
+                    };
+                    connections.push(connection);
+                } else {
+                    assert!(metadata.as_mut().poll(&mut cx).is_pending());
+                }
+                drop(metadata);
+                connections.clear();
+                pool.close();
+                assert_eq!(hooks.used.get(), 0);
+                assert_eq!(hooks.slots.get(), 0);
+                assert!(pool.state.borrow().waiting.is_empty());
+            }
+        }
     }
 
     /// Both waiting APIs replace idle policy, whether capacity is ready or queued.
