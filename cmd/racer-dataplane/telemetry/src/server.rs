@@ -26,7 +26,7 @@ use std::{
 };
 use uring_runtime::{
     Budget, Error, Operation, Result, environment,
-    reactor::{IoBuffer, Reactor, SubmissionCapacity, descriptor::Descriptor},
+    reactor::{IoBuffer, Reactor, SUBMISSION_BYTES, SubmissionCapacity, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -43,7 +43,7 @@ pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Buffers plus bounded service/future bookkeeping, acquired before serving.
-pub const RESERVED_BYTES: usize = (MAX_CONNECTIONS + 1) * (MAX_RESPONSE_BYTES + 4096);
+pub const RESERVED_BYTES: usize = (MAX_CONNECTIONS + 1) * (MAX_RESPONSE_BYTES + SUBMISSION_BYTES);
 
 /// Prepaid submissions for one accept and one operation per connection.
 pub const CONTROL_SLOTS: usize = MAX_CONNECTIONS + 1;
@@ -487,6 +487,16 @@ fn respond(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    /// Reserve runtime bookkeeping for every prepaid slot in addition to buffers.
+    #[test]
+    fn reservation_covers_buffers_and_runtime_submission_bookkeeping() {
+        let buffer_bytes = (MAX_CONNECTIONS + 1) * MAX_RESPONSE_BYTES;
+        assert_eq!(
+            RESERVED_BYTES - buffer_bytes,
+            CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+        );
+    }
 
     /// Trusted routes with recorded transport observations.
     #[derive(Default)]
