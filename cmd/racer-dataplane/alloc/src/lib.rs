@@ -30,12 +30,16 @@
 //! and unlink; neither traversal nor flock stops noncooperating writers.
 //!
 //! [`Slab::from_devices`] instead accepts one [`DevicePlacement`] per logical
-//! segment. The caller opens devices with O_EXCL and O_DIRECT, checks capacity,
-//! and supplies common alignment. Placements can share an `Arc<File>` to use one
+//! segment. The caller opens devices with O_EXCL and O_DIRECT and supplies common
+//! alignment. Bounds use BLKGETSIZE64 for block devices and length for regular
+//! files. Placements can share an `Arc<File>` to use one
 //! runtime descriptor per device. Startup never creates, resizes, or locks these
 //! files. Logical extents still use segment-table offsets; submissions translate
-//! them to the placement's physical range after checking lease bounds. Keep ranges
-//! disjoint across workers, and do not change file flags or sizes while in use.
+//! them to the placement's physical range after checking lease bounds. Overlap
+//! checks only compare the same inode or device identity within one slab. They
+//! cannot detect whole-disk, partition, or device-mapper aliases. The caller must
+//! guarantee disjoint physical storage across aliases and slabs, keep exclusive
+//! ownership, and not change file flags or sizes while in use.
 //!
 //! In file mode, empty files are sparsely extended to capacity; nonempty size mismatches are
 //! rejected without truncation. Capacity is a logical bound, not reserved disk

@@ -91,16 +91,41 @@ impl<C: Charge> Slab<C> {
     }
 
     /// Describe device ranges in logical segment order, without creating, sizing,
-    /// or locking files. The caller must verify device capacity and supply alignment
-    /// that meets every device's requirements. Regular direct files are also accepted.
-    /// Overlapping ranges on the same device or file are rejected within this slab;
-    /// the caller must keep ranges in different slabs disjoint.
+    /// or locking files. Bounds use BLKGETSIZE64 for block devices and file length
+    /// for regular direct files. The caller must supply suitable alignment and keep
+    /// exclusive ownership, file flags, and capacity unchanged while in use.
+    /// Overlap checks only compare the same inode or device identity in this slab.
+    /// Whole-disk, partition, and device-mapper aliases are not detected. The caller
+    /// must guarantee disjoint physical storage across aliases and different slabs.
     /// Files stay owned until `open_configured` creates worker-local descriptors.
     pub fn from_devices(
         placements: Vec<DevicePlacement>,
         segment_bytes: u64,
         max_record_bytes: usize,
         alignment: Alignment,
+    ) -> Result<Self> {
+        Self::from_devices_with_capacity(
+            placements,
+            segment_bytes,
+            max_record_bytes,
+            alignment,
+            |file, metadata| {
+                if metadata.mode() & libc::S_IFMT == libc::S_IFBLK {
+                    block_device_capacity(file.as_raw_fd())
+                } else {
+                    Ok(metadata.len())
+                }
+            },
+        )
+    }
+
+    /// Keep capacity probing injectable for tests without block-device access.
+    fn from_devices_with_capacity(
+        placements: Vec<DevicePlacement>,
+        segment_bytes: u64,
+        max_record_bytes: usize,
+        alignment: Alignment,
+        mut capacity: impl FnMut(&File, &std::fs::Metadata) -> Result<u64>,
     ) -> Result<Self> {
         let capacity_bytes = (placements.len() as u64)
             .checked_mul(segment_bytes)
@@ -125,7 +150,7 @@ impl<C: Charge> Slab<C> {
                 return Err(Error::InvalidConfiguration);
             }
             let key = Arc::as_ptr(&placement.file);
-            let metadata = match files.entry(key) {
+            let (metadata, capacity_bytes) = match files.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     // SAFETY: F_GETFL only inspects the live caller-owned descriptor.
@@ -149,15 +174,16 @@ impl<C: Charge> Slab<C> {
                     ) {
                         return Err(Error::InvalidConfiguration);
                     }
-                    entry.insert(metadata)
+                    let capacity_bytes = capacity(&placement.file, &metadata)?;
+                    entry.insert((metadata, capacity_bytes))
                 }
             };
+            if end > *capacity_bytes {
+                return Err(Error::InvalidConfiguration);
+            }
             let identity = if metadata.mode() & libc::S_IFMT == libc::S_IFBLK {
                 (libc::S_IFBLK, metadata.rdev(), 0)
             } else {
-                if end > metadata.len() {
-                    return Err(Error::InvalidConfiguration);
-                }
                 (libc::S_IFREG, metadata.dev(), metadata.ino())
             };
             ranges.push((identity, placement.offset, end));
@@ -812,6 +838,22 @@ impl Drop for WriteFence {
     }
 }
 
+/// Read the block device's byte capacity without changing its contents.
+fn block_device_capacity(fd: i32) -> Result<u64> {
+    let mut capacity = 0u64;
+    // Linux fs.h encodes BLKGETSIZE64 with size_t, but the output is always u64.
+    let request = libc::_IOR::<libc::size_t>(0x12, 114);
+    // SAFETY: BLKGETSIZE64 writes one u64 to this live output pointer. Invalid
+    // descriptors are rejected by the kernel without accessing device storage.
+    if unsafe { libc::ioctl(fd, request, &mut capacity) } != 0 {
+        return Err(system_error(
+            "ioctl-blkgetsize64",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(capacity)
+}
+
 /// Preserve synchronous operating-system diagnostic context.
 fn system_error(operation: &'static str, error: std::io::Error) -> Error {
     Error::SystemIo {
@@ -1182,7 +1224,93 @@ mod tests {
         Some(Arc::new(file))
     }
 
-    /// Device layouts reject aliases, misalignment, overflow, and invalid file flags.
+    /// Queried capacities bound every placement, including cached-file placements.
+    #[test]
+    fn device_capacity_bounds_are_checked_before_startup() {
+        let directory = Directory::new();
+        let Some(file) = device_file(&directory.0.join("capacity")) else {
+            return;
+        };
+        let a = Alignment::new(512, 512, 512).unwrap();
+        for (capacity, offsets, valid) in [
+            (0, vec![0], false),
+            (4095, vec![0], false),
+            (4096, vec![0], true),
+            (8191, vec![4096], false),
+            (8192, vec![4096], true),
+            (8192, vec![8192], false),
+            (8192, vec![0, 4096], true),
+            (8191, vec![0, 4096], false),
+            (u64::MAX, vec![0, 4096], true),
+        ] {
+            let mut queries = 0;
+            let result = Slab::<()>::from_devices_with_capacity(
+                offsets
+                    .into_iter()
+                    .map(|offset| DevicePlacement {
+                        file: file.clone(),
+                        offset,
+                    })
+                    .collect(),
+                4096,
+                512,
+                a,
+                |_, _| {
+                    queries += 1;
+                    Ok(capacity)
+                },
+            );
+            if valid {
+                assert!(result.is_ok(), "capacity {capacity}: {:?}", result.err());
+            } else {
+                assert!(matches!(result, Err(Error::InvalidConfiguration)));
+            }
+            assert_eq!(queries, 1);
+            assert_eq!(file.metadata().unwrap().len(), 16384);
+        }
+    }
+
+    /// Failed capacity queries preserve syscall context rather than allowing a slab.
+    #[test]
+    fn device_capacity_errors_keep_errno() {
+        assert_eq!(
+            block_device_capacity(-1),
+            Err(Error::SystemIo {
+                operation: "ioctl-blkgetsize64",
+                errno: Some(libc::EBADF),
+            })
+        );
+        let directory = Directory::new();
+        let Some(file) = device_file(&directory.0.join("capacity-error")) else {
+            return;
+        };
+        assert_eq!(
+            block_device_capacity(file.as_raw_fd()),
+            Err(Error::SystemIo {
+                operation: "ioctl-blkgetsize64",
+                errno: Some(libc::ENOTTY),
+            })
+        );
+        for errno in [libc::EIO, libc::EACCES, libc::ENOTTY] {
+            let error = system_error(
+                "ioctl-blkgetsize64",
+                std::io::Error::from_raw_os_error(errno),
+            );
+            let result = Slab::<()>::from_devices_with_capacity(
+                vec![DevicePlacement {
+                    file: file.clone(),
+                    offset: 0,
+                }],
+                4096,
+                512,
+                Alignment::new(512, 512, 512).unwrap(),
+                |_, _| Err(error),
+            );
+            assert!(matches!(result, Err(actual) if actual == error));
+        }
+    }
+
+    /// Device layouts reject same-identity overlaps, misalignment, overflow, and invalid flags.
     #[test]
     fn device_layout_validation_is_read_only() {
         use std::os::unix::fs::OpenOptionsExt;
