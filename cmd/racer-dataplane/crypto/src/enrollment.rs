@@ -427,7 +427,8 @@ where
             .await
             {
                 Ok(bytes) => {
-                    if PersistedIdentity::decode(&bytes)?.response()?.cluster != response.cluster {
+                    let existing = PersistedIdentity::decode(&bytes)?.response()?;
+                    if existing.cluster != response.cluster || existing.node != response.node {
                         return Err(Error::Unauthorized.into());
                     }
                 }
@@ -1320,6 +1321,80 @@ mod tests {
         .unwrap();
         assert!(accepted.signing_identity(&roots).is_ok());
         assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
+    }
+
+    /// A valid renewal cannot move a durable identity to another node UID.
+    #[test]
+    fn renewal_requires_node_continuity_before_durable_publication() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        let (ca, key) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let first = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let prior = drive(
+            &files,
+            e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
+        )
+        .unwrap();
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        assert_ne!(request.enrollment, first.enrollment);
+        let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
+        let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
+        let other_node = "33333333-3333-4333-8333-333333333333";
+        let mut response = issue(&request, &ca, &key, |params| {
+            params.subject_alt_names = vec![rcgen::SanType::URI(
+                format!("spiffe://{CLUSTER}/node/{other_node}")
+                    .try_into()
+                    .unwrap(),
+            )];
+        });
+        response.node = NodeId(other_node.into());
+        assert!(e.accept_pending(&pending, &response).is_ok());
+        assert!(matches!(
+            drive(&files, e.accept_response(response, &scope)),
+            Err(error) if error == Error::Unauthorized.into()
+        ));
+        for crashed in [false, true] {
+            if crashed {
+                sim.disk().crash().unwrap();
+            }
+            assert_eq!(
+                sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                committed
+            );
+            assert_eq!(
+                sim.read_file(Path::new("/private/pending.json")).unwrap(),
+                pending
+            );
+            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+            assert_eq!(recovered.node(), prior.node());
+            assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
+            assert_eq!(recovered.private_key_der(), prior.private_key_der());
+        }
+        let renewed = drive(
+            &files,
+            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+        )
+        .unwrap();
+        assert_eq!(renewed.node(), prior.node());
+        assert_eq!(renewed.enrollment, request.enrollment);
+        assert_ne!(renewed.private_key_der(), prior.private_key_der());
+        sim.disk().crash().unwrap();
+        assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
+        let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+        assert_eq!(recovered.node(), renewed.node());
+        assert_eq!(recovered.enrollment, renewed.enrollment);
+        assert_eq!(recovered.certificate_chain(), renewed.certificate_chain());
+        assert_eq!(recovered.private_key_der(), renewed.private_key_der());
     }
 
     /// Every root is checked before configuration and again before persistence/load.
