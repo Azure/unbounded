@@ -100,6 +100,7 @@ pub mod delivery {
     /// after success. Every async send owns the complete (reader, connection) tuple.
     /// The caller must invalidate connection reuse with begin_io before handing it
     /// to the future, including abandonment before the first poll.
+    /// A nonempty initial staging pipe is rejected before any body progress.
     pub async fn send<C, O, H>(
         context: &C,
         reactor: &C::Reactor,
@@ -112,6 +113,9 @@ pub mod delivery {
         O: Owner<C>,
         H: Observer<C>,
     {
+        if owner.parts().1.buffered() != 0 {
+            return Err(crate::Error::Malformed.into());
+        }
         let mut stalled_at = uring_runtime::environment::now();
         let mut copying = false;
         let mut budget = 0;
@@ -512,6 +516,36 @@ pub mod delivery {
             }
         }
 
+        /// Reject stale pipe bytes before policy, socket writes, or body progress.
+        #[test]
+        fn nonempty_initial_pipe_is_rejected_before_delivery() {
+            for body in [b"fresh".as_slice(), b"".as_slice()] {
+                let reactor = Rc::new(Reactor::new(16, ()));
+                let (connection, mut peer, slot) = connection();
+                let observer = Observe::default();
+                let owner = Reader {
+                    bytes: Rc::new(body.to_vec()),
+                    sent: 0,
+                    pipe: Pipe {
+                        bytes: b"stale".to_vec(),
+                        ..Pipe::default()
+                    },
+                };
+                let result = drive(
+                    &reactor,
+                    send(&Caller, &reactor, owner, connection, &observer),
+                );
+                assert!(matches!(result, Err(Failure::Http(Error::Malformed))));
+                assert!(observer.times.borrow().is_empty());
+                assert!(observer.events.borrow().is_empty());
+                assert_eq!(reactor.in_flight(), 0);
+                assert!(slot.upgrade().is_none());
+                let mut wire = Vec::new();
+                peer.read_to_end(&mut wire).unwrap();
+                assert!(wire.is_empty());
+            }
+        }
+
         /// Fallback must reconstruct the unaccepted body rather than replay staging.
         #[test]
         fn partial_pipe_fallback_resumes_at_accepted_not_staged_cursor() {
@@ -844,8 +878,8 @@ pub mod relay {
     }
 
     impl<C: Context, P: RelayPipe> Relay<C, P> {
-        /// Require equal known body lengths. The caller admits an empty pipe and
-        /// validates any application envelope before constructing a nonempty relay.
+        /// Require equal known body lengths and an empty pipe. The caller validates
+        /// any application envelope before constructing a nonempty relay.
         pub fn new(
             source: ConnectionLease<C>,
             destination: ConnectionLease<C>,
@@ -853,6 +887,7 @@ pub mod relay {
         ) -> Result<C, Self> {
             if source.receive_remaining().is_none()
                 || source.receive_remaining() != destination.send_remaining()
+                || pipe.buffered() != 0
             {
                 return Err(crate::Error::Malformed.into());
             }
@@ -1343,6 +1378,29 @@ pub mod relay {
                 f.io.reclaim_buffer();
                 assert_eq!(f.hooks.slots.get(), 0);
                 assert_eq!(f.hooks.bytes.get(), 0);
+            }
+        }
+
+        /// Reject stale pipe bytes even when the matching body lengths are zero.
+        #[test]
+        fn nonempty_initial_pipe_is_rejected_before_relay() {
+            for length in [5, 0] {
+                let f = Fixture::new();
+                let (source, _writer) = f.connection(length, 0);
+                let (destination, mut reader) = f.connection(0, length);
+                let pipe = Pipe {
+                    bytes: b"stale".to_vec(),
+                    ..Pipe::default()
+                };
+                let calls = pipe.calls.clone();
+                let result = Relay::new(source, destination, pipe);
+                assert!(matches!(result, Err(Failure::Http(Error::Malformed))));
+                assert_eq!(calls.get(), 0);
+                assert_eq!(f.hooks.slots.get(), 0);
+                assert_eq!(f.hooks.bytes.get(), 0);
+                let mut wire = Vec::new();
+                reader.read_to_end(&mut wire).unwrap();
+                assert!(wire.is_empty());
             }
         }
 
