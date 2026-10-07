@@ -140,7 +140,8 @@ struct Peer {
 
     limit: usize,
 
-    generation: u64,
+    /// Exhaustion blocks peer evidence and admission until all permits drain.
+    generation: Option<u64>,
 
     retry: Option<Deadline>,
 
@@ -205,9 +206,9 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
     pub fn available(&self, key: &K) -> bool {
         let now = (self.now)();
         self.state.lock().is_ok_and(|s| {
-            s.peers
-                .get(key)
-                .is_none_or(|p| !p.probe && p.retry.is_none_or(|at| at.elapsed(now)))
+            s.peers.get(key).is_none_or(|p| {
+                p.generation.is_some() && !p.probe && p.retry.is_none_or(|at| at.elapsed(now))
+            })
         })
     }
 
@@ -241,13 +242,14 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         let peer = state.peers.entry(indexed).or_insert(Peer {
             active: 0,
             limit: self.config.per_key,
-            generation: 0,
+            generation: Some(0),
             retry: None,
             probe: false,
             updated: now,
             idle_since: None,
         });
-        if peer.probe || peer.retry.is_some_and(|at| !at.elapsed(now)) {
+        if peer.generation.is_none() || peer.probe || peer.retry.is_some_and(|at| !at.elapsed(now))
+        {
             self.observer.event(Event::CircuitRejected);
             return Err(Error::Unavailable);
         }
@@ -259,7 +261,9 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         peer.probe = probe;
         peer.active += 1;
         peer.idle_since = None;
-        let generation = peer.generation;
+        let generation = peer
+            .generation
+            .expect("admission rejects exhausted generations");
         state.active += 1;
         self.observer.active(state.active);
         self.observer.event(Event::Accepted);
@@ -311,13 +315,13 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
             Outcome::Neutral => return,
         };
         self.owner.observer.event(event);
-        if peer.generation != self.generation {
+        if peer.generation != Some(self.generation) {
             return;
         }
         match outcome {
             Outcome::PeerFailure => {
                 peer.limit = (peer.limit / 2).max(1);
-                peer.generation = peer.generation.saturating_add(1);
+                peer.generation = self.generation.checked_add(1);
                 peer.retry = Some(Deadline::after(now, config.backoff));
                 peer.updated = now;
             }
@@ -349,6 +353,8 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
             .expect("live permit retains key");
         peer.active -= 1;
         if peer.active == 0 {
+            // No live permit can carry a reused generation after this point.
+            peer.generation.get_or_insert(0);
             peer.idle_since = Some(now);
         }
         if self.probe {
@@ -1782,6 +1788,84 @@ mod tests {
         owner.state.lock().unwrap().updated = Instant::now() - config().recovery;
         work.observe(Outcome::Verified);
         assert_eq!(*owner.observer.limit.lock().unwrap(), 3);
+    }
+
+    /// Failed probes cannot clear retry, even at the last generation.
+    #[test]
+    fn generation_exhaustion_fences_failed_probe_success() {
+        for generation in [0, u64::MAX - 1, u64::MAX] {
+            let owner = Adaptive::new(config(), Counts::default(), Instant::now).unwrap();
+            drop(owner.acquire(&1).unwrap());
+            {
+                let mut state = owner.state.lock().unwrap();
+                let peer = state.peers.get_mut(&1).unwrap();
+                peer.generation = Some(generation);
+                peer.retry = Some(Deadline::At(Instant::now()));
+            }
+            let probe = owner.acquire(&1).unwrap();
+            let fence = probe.clone();
+            probe.observe(Outcome::PeerFailure);
+            probe.observe(Outcome::Verified);
+            assert!(owner.state.lock().unwrap().peers[&1].retry.is_some());
+            assert!(!owner.available(&1));
+            drop(probe);
+            assert_eq!(*owner.observer.active.lock().unwrap(), 1);
+            assert!(matches!(owner.acquire(&1), Err(Error::Unavailable)));
+            drop(fence);
+            assert_eq!(*owner.observer.active.lock().unwrap(), 0);
+            assert!(matches!(owner.acquire(&1), Err(Error::Unavailable)));
+            owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry =
+                Some(Deadline::At(Instant::now()));
+            let recovered = owner.acquire(&1).unwrap();
+            recovered.observe(Outcome::Verified);
+            assert!(!owner.available(&1));
+            drop(recovered);
+            assert!(owner.available(&1));
+        }
+    }
+
+    /// Exhaustion fences every old permit and resets only after final release.
+    #[test]
+    fn generation_exhaustion_waits_for_live_permits_before_reuse() {
+        let owner = Adaptive::new(
+            Config {
+                backoff: Duration::ZERO,
+                recovery: Duration::ZERO,
+                ..config()
+            },
+            Counts::default(),
+            Instant::now,
+        )
+        .unwrap();
+        let old = owner.acquire(&1).unwrap();
+        owner
+            .state
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&1)
+            .unwrap()
+            .generation = Some(u64::MAX);
+        let failed = owner.acquire(&1).unwrap();
+        let fence = failed.clone();
+        failed.observe(Outcome::PeerFailure);
+        failed.observe(Outcome::PeerFailure);
+        assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 2);
+        assert!(!owner.available(&1));
+        assert!(!owner.hedge_available(&1));
+        drop(failed);
+        drop(fence);
+        assert_eq!(*owner.observer.active.lock().unwrap(), 1);
+        assert!(matches!(owner.acquire(&1), Err(Error::Unavailable)));
+        assert!(owner.acquire(&2).is_ok());
+        drop(old);
+        assert_eq!(*owner.observer.active.lock().unwrap(), 0);
+        assert!(owner.available(&1));
+        let recovered = owner.acquire(&1).unwrap();
+        recovered.observe(Outcome::Verified);
+        drop(recovered);
+        assert!(owner.available(&1));
+        assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 3);
     }
 
     /// Success at the ceiling must not delay an eligible pressure reduction.
