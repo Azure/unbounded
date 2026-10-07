@@ -1695,9 +1695,15 @@ where
         self.native.register_driver(waker);
     }
 
-    /// Start the inner service. The native side starts via [`IoPort::activate`].
+    /// Drive native activation while the inner service starts.
     fn start<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        self.inner.start(scope)
+        let mut startup = self.inner.start(scope);
+        let native = &mut self.native;
+        Box::pin(std::future::poll_fn(move |cx| {
+            native.register_driver(cx.waker());
+            native.poll_budgeted(1)?;
+            startup.as_mut().poll(cx)
+        }))
     }
 
     /// Poll the inner service, then the native side, each with `budget`.
