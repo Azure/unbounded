@@ -1693,13 +1693,15 @@ pub mod rest {
             request.push(0);
             request.extend_from_slice(&kind.to_be_bytes());
             request.extend_from_slice(&[0, 1]);
+            let charge = io.lease()?;
             let (socket, fd) = Datagram::connect(server)?;
             loop {
                 scope.check()?;
                 match socket.send(&request) {
                     Ok(n) if n == request.len() => break,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        io.ready(fd.clone(), false, true, None, scope).await?
+                        io.ready(fd.clone(), false, true, charge.clone(), scope)
+                            .await?
                     }
                     _ => return Err(Error::Io.into()),
                 }
@@ -1710,7 +1712,8 @@ pub mod rest {
                 match socket.recv(&mut response) {
                     Ok(n) => return parse(&response[..n], &request, kind).map_err(Into::into),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        io.ready(fd.clone(), true, false, None, scope).await?
+                        io.ready(fd.clone(), true, false, charge.clone(), scope)
+                            .await?
                     }
                     _ => return Err(Error::Io.into()),
                 }
@@ -1795,6 +1798,151 @@ pub mod rest {
         #[cfg(test)]
         mod tests {
             use super::*;
+            use crate::{rest::Operation, testing};
+            use std::{
+                cell::{Cell, RefCell},
+                rc::Weak,
+                task::{Context, Poll},
+            };
+
+            /// Track admission and model readiness retained until cleanup.
+            #[derive(Default)]
+            struct DnsIo {
+                deny: bool,
+                attempts: Cell<usize>,
+                lease: RefCell<Weak<()>>,
+                retained: RefCell<Option<(Rc<Descriptor>, Rc<()>)>>,
+                ready: Cell<bool>,
+            }
+
+            impl Io for DnsIo {
+                type Error = testing::Error;
+                type Scope = testing::TestScope;
+                type Lease = ();
+                type FileBytes = Vec<u8>;
+
+                fn lease(&self) -> Result<Option<Rc<()>>, Self::Error> {
+                    self.attempts.set(self.attempts.get() + 1);
+                    if self.deny {
+                        return Err(Error::Overloaded.into());
+                    }
+                    let lease = Rc::new(());
+                    *self.lease.borrow_mut() = Rc::downgrade(&lease);
+                    Ok(Some(lease))
+                }
+
+                fn ready<'a>(
+                    &'a self,
+                    fd: Rc<Descriptor>,
+                    read: bool,
+                    write: bool,
+                    lease: Option<Rc<()>>,
+                    _: &'a Self::Scope,
+                ) -> Operation<'a, (), Self::Error> {
+                    assert!(read);
+                    assert!(!write);
+                    let lease = lease.expect("DNS readiness must inherit admission");
+                    assert_eq!(Rc::strong_count(&lease), 2, "query retains its lease");
+                    *self.retained.borrow_mut() = Some((fd, lease));
+                    Box::pin(std::future::poll_fn(move |_| {
+                        if self.ready.get() {
+                            self.retained.borrow_mut().take();
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        }
+                    }))
+                }
+
+                fn resolve<'a>(
+                    &'a self,
+                    _: &'a str,
+                    _: u16,
+                    _: &'a Self::Scope,
+                ) -> Operation<'a, Vec<SocketAddr>, Self::Error> {
+                    unreachable!("test calls the actual DNS query")
+                }
+
+                fn read_file<'a>(
+                    &'a self,
+                    _: &'a std::path::Path,
+                    _: usize,
+                    _: &'a Self::Scope,
+                ) -> Operation<'a, Vec<u8>, Self::Error> {
+                    unreachable!("query does not read resolver configuration")
+                }
+            }
+
+            /// Denied admission must stop the real query before network I/O.
+            #[test]
+            fn dns_query_denied_admission_sends_nothing() {
+                let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+                server.set_nonblocking(true).unwrap();
+                let io = DnsIo {
+                    deny: true,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    futures::executor::block_on(query(
+                        &io,
+                        server.local_addr().unwrap(),
+                        "example.test",
+                        1,
+                        &testing::scope(),
+                    )),
+                    Err(Error::Overloaded.into())
+                );
+                assert_eq!(io.attempts.get(), 1);
+                assert!(io.retained.borrow().is_none());
+                assert_eq!(
+                    server.recv_from(&mut [0; 512]).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+
+            /// Success releases admission; cancellation keeps it through readiness cleanup.
+            #[test]
+            fn dns_query_lease_lives_through_response_or_cancel_cleanup() {
+                for cancel in [false, true] {
+                    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    server.set_nonblocking(true).unwrap();
+                    let io = DnsIo::default();
+                    let scope = testing::scope();
+                    let mut query = Box::pin(query(
+                        &io,
+                        server.local_addr().unwrap(),
+                        "example.test",
+                        1,
+                        &scope,
+                    ));
+                    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                    assert!(query.as_mut().poll(&mut cx).is_pending());
+                    assert_eq!(io.attempts.get(), 1);
+                    assert_eq!(io.lease.borrow().strong_count(), 2);
+                    let mut request = [0; 512];
+                    let (n, peer) = server.recv_from(&mut request).unwrap();
+                    if cancel {
+                        drop(query);
+                        assert_eq!(io.lease.borrow().strong_count(), 1);
+                        io.retained.borrow_mut().take();
+                    } else {
+                        let mut response = request[..n].to_vec();
+                        response[2] = 0x81;
+                        response[3] = 0x80;
+                        response[7] = 1;
+                        response.extend_from_slice(&[
+                            0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 192, 0, 2, 1,
+                        ]);
+                        server.send_to(&response, peer).unwrap();
+                        io.ready.set(true);
+                        assert_eq!(
+                            query.as_mut().poll(&mut cx),
+                            Poll::Ready(Ok(vec!["192.0.2.1".parse::<IpAddr>().unwrap()]))
+                        );
+                    }
+                    assert!(io.lease.borrow().upgrade().is_none());
+                }
+            }
 
             /// Reject truncated packets, changed questions, and incomplete answers.
             #[test]
