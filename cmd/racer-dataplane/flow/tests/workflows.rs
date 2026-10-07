@@ -5,7 +5,7 @@ mod handoff_tests {
     use flow_control::{Error, Handoff, HandoffAdmission, Result};
     use std::{
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::Waker,
@@ -38,6 +38,148 @@ mod handoff_tests {
                 .map_err(|_| Error::Overloaded)?;
             Ok(Held(self.0.clone()))
         }
+    }
+
+    struct ScriptedAdmission {
+        key: usize,
+        result: Result<usize>,
+        registered: AtomicUsize,
+        calls: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl HandoffAdmission for ScriptedAdmission {
+        type Reservation = usize;
+
+        fn register(&self, _: &Waker) {
+            self.registered.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn reserve(&self) -> Result<usize> {
+            assert_eq!(self.registered.swap(0, Ordering::SeqCst), 1);
+            self.calls.lock().unwrap().push(self.key);
+            self.result
+        }
+    }
+
+    fn scripted_handoff(
+        results: &[Result<usize>],
+        calls: &Arc<Mutex<Vec<usize>>>,
+    ) -> Arc<Handoff<usize, ScriptedAdmission, ()>> {
+        let keys: Vec<_> = (0..results.len()).collect();
+        let handoff = Arc::new(Handoff::new(&keys));
+        for (key, result) in results.iter().copied().enumerate() {
+            handoff
+                .install(
+                    &key,
+                    ScriptedAdmission {
+                        key,
+                        result,
+                        registered: AtomicUsize::new(0),
+                        calls: calls.clone(),
+                    },
+                )
+                .unwrap();
+        }
+        handoff
+    }
+
+    #[test]
+    fn admission_failures_preserve_classification_and_capacity_retry() {
+        use Error::{Overloaded, Unavailable};
+        for (errors, expected) in [
+            (vec![Overloaded], Overloaded),
+            (vec![Unavailable], Unavailable),
+            (vec![Unavailable, Unavailable], Unavailable),
+            (vec![Overloaded, Overloaded], Overloaded),
+            (vec![Overloaded, Unavailable], Overloaded),
+            (vec![Unavailable, Overloaded], Overloaded),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let results: Vec<_> = errors.iter().copied().map(Err).collect();
+            let handoff = scripted_handoff(&results, &calls);
+            assert_eq!(handoff.reserve(Waker::noop()).err(), Some(expected));
+            assert_eq!(
+                *calls.lock().unwrap(),
+                (0..errors.len()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn fatal_admission_errors_stop_scanning_without_becoming_overload() {
+        for error in [Error::InvalidInput, Error::Io] {
+            for preceding in [None, Some(Error::Overloaded), Some(Error::Unavailable)] {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let mut results: Vec<_> = preceding.into_iter().map(Err).collect();
+                results.extend([Err(error), Ok(99)]);
+                let handoff = scripted_handoff(&results, &calls);
+                assert_eq!(handoff.reserve(Waker::noop()).err(), Some(error));
+                assert_eq!(
+                    *calls.lock().unwrap(),
+                    (0..results.len() - 1).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn successful_admission_skips_retryable_failures_and_keeps_round_robin() {
+        for failures in [
+            [Error::Overloaded, Error::Unavailable],
+            [Error::Unavailable, Error::Overloaded],
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let handoff = scripted_handoff(
+                &[Err(failures[0]), Err(failures[1]), Ok(12), Ok(13)],
+                &calls,
+            );
+            for target in [2, 3, 2] {
+                handoff
+                    .reserve(Waker::noop())
+                    .unwrap()
+                    .deliver(|| ())
+                    .unwrap();
+                let [item] = handoff.pop_batch::<1>(&target, Waker::noop(), 1).unwrap();
+                assert_eq!(item.unwrap().into_parts(), ((), target + 10));
+            }
+            assert_eq!(*calls.lock().unwrap(), [0, 1, 2, 3, 0, 1, 2]);
+        }
+    }
+
+    #[test]
+    fn closed_and_uninstalled_targets_do_not_change_admission_errors() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handoff = scripted_handoff(&[Err(Error::Io), Err(Error::Unavailable)], &calls);
+        handoff.close(&0);
+        assert_eq!(
+            handoff.reserve(Waker::noop()).err(),
+            Some(Error::Unavailable)
+        );
+        assert_eq!(*calls.lock().unwrap(), [1]);
+        handoff.close(&1);
+        assert_eq!(
+            handoff.reserve(Waker::noop()).err(),
+            Some(Error::Overloaded)
+        );
+        assert_eq!(*calls.lock().unwrap(), [1]);
+
+        let handoff = Arc::new(Handoff::<_, _, ()>::new(&[0, 1]));
+        handoff
+            .install(
+                &1,
+                ScriptedAdmission {
+                    key: 1,
+                    result: Err(Error::Unavailable),
+                    registered: AtomicUsize::new(0),
+                    calls: calls.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            handoff.reserve(Waker::noop()).err(),
+            Some(Error::Unavailable)
+        );
+        assert_eq!(*calls.lock().unwrap(), [1, 1]);
     }
 
     /// Offers, envelopes, and popped items retain the selected target's slot.

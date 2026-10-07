@@ -867,6 +867,7 @@ mod handoff {
         /// Scan open targets fairly and reserve before returning an offer.
         pub fn reserve(self: &Arc<Self>, waker: &Waker) -> Result<Offer<K, A, T>> {
             let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
+            let mut rejection = None;
             for offset in 0..state.targets.len() {
                 let index = (state.cursor + offset) % state.targets.len();
                 let (_, target) = &state.targets[index];
@@ -877,16 +878,23 @@ mod handoff {
                     continue;
                 };
                 admission.register(waker);
-                if let Ok(reservation) = admission.reserve() {
-                    state.cursor = (index + 1) % state.targets.len();
-                    return Ok(Offer {
-                        handoff: self.clone(),
-                        target: index,
-                        reservation,
-                    });
+                match admission.reserve() {
+                    Ok(reservation) => {
+                        state.cursor = (index + 1) % state.targets.len();
+                        return Ok(Offer {
+                            handoff: self.clone(),
+                            target: index,
+                            reservation,
+                        });
+                    }
+                    Err(Error::Overloaded) => rejection = Some(Error::Overloaded),
+                    Err(Error::Unavailable) => {
+                        rejection.get_or_insert(Error::Unavailable);
+                    }
+                    Err(error) => return Err(error),
                 }
             }
-            Err(Error::Overloaded)
+            Err(rejection.unwrap_or(Error::Overloaded))
         }
 
         /// Pop at most the caller's budget while retaining each item's admission.
