@@ -1225,10 +1225,7 @@ impl<C: Context> HttpPool<C> {
     ) -> Operation<'a, C, ConnectionLease<C>> {
         Box::pin(async move {
             scope.check()?;
-            if !self.class_available(endpoint, false) {
-                return Err(uring_runtime::Error::Overloaded.into());
-            }
-            let (mut connection, address) = self.prepare_connection_inner(endpoint)?;
+            let (mut connection, address) = self.prepare_connection_inner(endpoint, false)?;
             connection.state_mut().attach(checkout);
             self.connect(connection, address, scope).await
         })
@@ -1284,7 +1281,7 @@ impl<C: Context> HttpPool<C> {
                         .is_some_and(|w| Rc::ptr_eq(first, &w.entry))
                 });
                 if turn && self.class_available(endpoint, priority) {
-                    match self.prepare_connection_inner(endpoint) {
+                    match self.prepare_connection_inner(endpoint, priority) {
                         Err(e) if e == C::Error::from(uring_runtime::Error::Overloaded) => (),
                         result => return Poll::Ready(result),
                     }
@@ -1333,17 +1330,25 @@ impl<C: Context> HttpPool<C> {
         })
     }
 
-    /// Check ordinary headroom without changing the endpoint's total capacity.
-    fn class_available(&self, endpoint: &C::Endpoint, priority: bool) -> bool {
+    /// Return the active limit for ordinary or priority checkouts.
+    fn class_capacity(&self, endpoint: &C::Endpoint, priority: bool) -> usize {
         let cap = endpoint.capacity(&self.config);
-        if priority || cap <= 1 || endpoint.priority_headroom() == 0 {
-            return true;
+        if priority || cap <= 1 {
+            cap
+        } else {
+            cap.saturating_sub(endpoint.priority_headroom())
         }
+    }
+
+    /// Avoid preparing connections while the selected class is full.
+    fn class_available(&self, endpoint: &C::Endpoint, priority: bool) -> bool {
+        let cap = self.class_capacity(endpoint, priority);
         self.state
             .borrow()
             .entries
             .get(endpoint)
-            .is_none_or(|e| e.active < cap.saturating_sub(endpoint.priority_headroom()))
+            .map_or(0, |e| e.active)
+            < cap
     }
 
     /// Maintain at most `budget` endpoints and wake at most `budget` waiters.
@@ -1377,19 +1382,21 @@ impl<C: Context> HttpPool<C> {
         &self,
         endpoint: &C::Endpoint,
     ) -> Result<C, (ConnectionLease<C>, Option<SocketAddress>)> {
-        self.prepare_connection_inner(endpoint)
+        self.prepare_connection_inner(endpoint, true)
     }
 
     /// Reserve capacity and reuse healthy idle storage or create an admitted socket.
     fn prepare_connection_inner(
         &self,
         endpoint: &C::Endpoint,
+        priority: bool,
     ) -> Result<C, (ConnectionLease<C>, Option<SocketAddress>)> {
         if self.context.stopped() {
             return Err(uring_runtime::Error::Unavailable.into());
         }
         // Caller-defined cloning may reenter before admission, never during a borrow.
         let key = Rc::new(endpoint.clone());
+        let cap = self.class_capacity(endpoint, priority);
         if self.context.stopped() {
             return Err(uring_runtime::Error::Unavailable.into());
         }
@@ -1436,7 +1443,8 @@ impl<C: Context> HttpPool<C> {
                 .ok_or(uring_runtime::Error::Unavailable)?;
             let now = uring_runtime::environment::now();
             entry.expire_idle(now, self.config.idle_timeout, &mut garbage);
-            if entry.active >= endpoint.capacity(&self.config) {
+            // Check and reserve the class limit together, before admission callbacks.
+            if entry.active >= cap {
                 return Err(uring_runtime::Error::Overloaded.into());
             }
             entry.active += 1;
@@ -2206,6 +2214,10 @@ mod tests {
         /// Reserve one counted connection slot.
         fn outbound_slot(&self) -> Result<Self, Charge> {
             self.slots.set(self.slots.get() + 1);
+            let callback = ON_OUTBOUND_SLOT.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
             Ok(Charge(self.slots.clone(), 1, None))
         }
 
@@ -2843,6 +2855,8 @@ mod tests {
         static ON_WAITER_CHARGE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 
         static ON_WAITER_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+
+        static ON_OUTBOUND_SLOT: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     }
 
     /// Dispatch a notification to the current thread's reentrancy probe.
@@ -3706,8 +3720,15 @@ mod tests {
         assert_eq!(hooks.used.get(), 0);
     }
 
-    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
     struct HeadroomKey(usize);
+
+    impl Clone for HeadroomKey {
+        fn clone(&self) -> Self {
+            let _ = ReentryKey.clone();
+            Self(self.0)
+        }
+    }
 
     impl Endpoint<Failure> for HeadroomKey {
         fn address(&self) -> std::result::Result<SocketAddress, Failure> {
@@ -3816,6 +3837,141 @@ mod tests {
                 assert_eq!(hooks.slots.get(), 0);
                 assert!(pool.state.borrow().waiting.is_empty());
             }
+        }
+    }
+
+    fn headroom_pool() -> Rc<HttpPool<Hooks<HeadroomKey>>> {
+        Rc::new(HttpPool::new(
+            reactor(),
+            Rc::new(Hooks {
+                used: Rc::default(),
+                slots: Rc::default(),
+                stopped: Cell::new(false),
+                reject_charge: Cell::new(false),
+                endpoint: std::marker::PhantomData,
+            }),
+            PoolConfig {
+                per_endpoint: 2,
+                ..PoolConfig::default()
+            },
+        ))
+    }
+
+    fn check_pool_clone_headroom(waiting: bool) {
+        let pool = headroom_pool();
+        let mut connections = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let (mut connection, _) = pool.prepare_connection(&HeadroomKey(1)).unwrap();
+            let (fd, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            fd.set_nonblocking(true).unwrap();
+            connection.fd = Rc::new(fd.into());
+            connection.set_framing(Some(0), Some(0), false);
+            connection.finish_exchange().unwrap();
+            connections.push(connection);
+            peers.push(peer);
+        }
+        connections.clear();
+        let nested = Rc::new(RefCell::new(None));
+        ON_WAITER_CLONE.with(|slot| {
+            let pool = pool.clone();
+            let nested = nested.clone();
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let mut checkout = if waiting {
+                    pool.checkout_wait(&HeadroomKey(1), &TestScope)
+                } else {
+                    pool.checkout(&HeadroomKey(1), &TestScope)
+                };
+                let Poll::Ready(Ok(connection)) = checkout
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                else {
+                    panic!("nested checkout must take the ordinary slot");
+                };
+                *nested.borrow_mut() = Some(connection);
+            }));
+        });
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        let mut checkout = if waiting {
+            pool.checkout_wait(&HeadroomKey(1), &TestScope)
+        } else {
+            pool.checkout(&HeadroomKey(1), &TestScope)
+        };
+        let result = checkout.as_mut().poll(&mut cx);
+        assert!(nested.borrow().is_some());
+        if waiting {
+            assert!(result.is_pending());
+        } else {
+            assert!(matches!(
+                result,
+                Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Overloaded)))
+            ));
+        }
+        assert_eq!(pool.state.borrow().entries[&HeadroomKey(1)].active, 1);
+        let mut metadata = pool.checkout_metadata(&HeadroomKey(1), &TestScope);
+        let Poll::Ready(Ok(connection)) = metadata.as_mut().poll(&mut cx) else {
+            panic!("metadata must retain access to priority headroom");
+        };
+        assert_eq!(pool.state.borrow().entries[&HeadroomKey(1)].active, 2);
+        drop(metadata);
+        drop(checkout);
+        drop(connection);
+        nested.borrow_mut().take();
+        pool.close();
+        assert_eq!(pool.context.used.get(), 0);
+        assert_eq!(pool.context.slots.get(), 0);
+        assert!(pool.state.borrow().waiting.is_empty());
+        assert_eq!(pool.reactor.in_flight(), 0);
+    }
+
+    #[test]
+    fn pool_nonwaiting_clone_reentry_preserves_headroom() {
+        check_pool_clone_headroom(false);
+    }
+
+    #[test]
+    fn pool_waiting_clone_reentry_preserves_headroom() {
+        check_pool_clone_headroom(true);
+    }
+
+    #[test]
+    fn pool_slot_reentry_observes_reserved_ordinary_capacity() {
+        for waiting in [false, true] {
+            let pool = headroom_pool();
+            let called = Rc::new(Cell::new(false));
+            ON_OUTBOUND_SLOT.with(|slot| {
+                let pool = pool.clone();
+                let called = called.clone();
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    called.set(true);
+                    assert_eq!(pool.state.borrow().entries[&HeadroomKey(1)].active, 1);
+                    let mut nested = if waiting {
+                        pool.checkout_wait(&HeadroomKey(1), &TestScope)
+                    } else {
+                        pool.checkout(&HeadroomKey(1), &TestScope)
+                    };
+                    let result = nested
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(Waker::noop()));
+                    if waiting {
+                        assert!(result.is_pending());
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Overloaded)))
+                        ));
+                    }
+                }));
+            });
+            let (connection, _) = pool
+                .prepare_connection_inner(&HeadroomKey(1), false)
+                .unwrap();
+            assert!(called.get());
+            assert_eq!(pool.state.borrow().entries[&HeadroomKey(1)].active, 1);
+            drop(connection);
+            assert_eq!(pool.context.slots.get(), 0);
+            assert_eq!(pool.context.used.get(), 0);
+            assert!(pool.state.borrow().waiting.is_empty());
         }
     }
 
