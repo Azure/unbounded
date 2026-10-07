@@ -578,6 +578,10 @@ impl<C: Charge> Slab<C> {
 
     /// Write exactly one checked extent with completion-owned accounting and lease.
     /// Failed writes do not roll back the space reserved by append.
+    /// Any lease permits writes within its captured prefix, including a lease from
+    /// [`Segments::lease`]; it does not grant exclusive record ownership. The trusted
+    /// caller must write only reserved extents it owns, never overwrite published or
+    /// readable records, and publish a mapping only after the write succeeds.
     pub fn write<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,

@@ -72,11 +72,14 @@
 //!
 //! For writes, round the logical size, append the padded length, allocate matching
 //! storage, copy bytes into the zeroed buffer, and submit [`Slab::write`]. Publish
-//! the caller's mapping only after handling completion. Append reserves space and
+//! the caller's mapping only after the write succeeds. Append reserves space and
 //! does not roll it back on failed writes. For reads, validate the stored slot,
 //! generation, and extent, acquire a lease, allocate storage, and submit a read.
 //! A lease authorizes the segment's used prefix at acquisition, not just the last
 //! appended record; it cannot authorize bytes appended afterward.
+//! Any lease, including one from [`Segments::lease`], permits writes in that prefix.
+//! Leases do not grant exclusive record ownership. The trusted caller must write
+//! only reserved extents it owns and never overwrite published or readable records.
 //!
 //! Submission checks table identity, alignment, length, segment boundaries, and
 //! captured used bytes. Reads and writes reject short completions. Accepted I/O

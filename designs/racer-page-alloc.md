@@ -157,6 +157,12 @@ until the kernel reports completion, even if the caller drops the future or
 cancels. So the memory and the segment both stay reserved until the kernel is
 done with them. Short reads and writes are returned as errors.
 
+Any lease, including one from `Segments::lease`, allows reads and writes within
+its captured used prefix, not just the latest append. It does not grant exclusive
+record ownership. The trusted caller must write only reserved extents it owns,
+never overwrite published or readable records, and publish a mapping only after
+the write succeeds (see `Slab::write` in `alloc/src/slab.rs`).
+
 `fence_writes` waits until no write is in flight. It is a count, not a snapshot,
 and it does not flush to disk.
 
