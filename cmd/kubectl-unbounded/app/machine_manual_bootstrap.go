@@ -15,7 +15,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"text/template"
@@ -25,15 +24,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/utils/ptr"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
-	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
 //go:embed assets/node-bootstrap/script.sh
@@ -52,10 +48,8 @@ const (
 	// variantCloudInit produces a cloud-init user-data document.
 	variantCloudInit bootstrapVariant = "cloud-init"
 
-	// variantIgnition produces an Ignition config. It is the only mechanism
-	// image-based hosts such as Azure Container Linux consume: they ship no
-	// cloud-init at all, so a cloud-init payload passed as user data is never
-	// acted on and nothing reports an error.
+	// variantIgnition produces an Ignition config, for image-based hosts such
+	// as Azure Container Linux that ship no cloud-init.
 	variantIgnition bootstrapVariant = "ignition"
 )
 
@@ -115,20 +109,12 @@ type manualBootstrapHandler struct {
 
 	// agentURL is a fully qualified override for the unbounded-agent download
 	// URL. When set it takes precedence over agentVersion and agentBaseURL.
-	//
-	// The ignition variant requires it, and requires it to name the bare agent
-	// binary rather than the release tarball: Ignition fetches files, it does
-	// not extract archives.
+	// The ignition variant requires it to name the bare binary.
 	agentURL string
 
-	// agentSHA256 is the expected digest of the agent binary. Required by the
-	// ignition variant, which fetches the binary without a script that could
-	// verify it afterwards.
-	agentSHA256 string
-
-	// agentHash is agentSHA256 in Ignition's form, set by validate for the
+	// agentSHA256 is the expected digest of the agent binary, required by the
 	// ignition variant.
-	agentHash string
+	agentSHA256 string
 
 	// agentBaseURL overrides the base URL used to construct the download URL
 	// for the unbounded-agent. Useful for self-hosted release mirrors. Must
@@ -370,52 +356,9 @@ func parseAdditionalHostDevice(value string) (string, error) {
 	return value, nil
 }
 
-// validateIgnitionInput checks the rules that only apply to the Ignition
-// variant, and returns the agent digest in Ignition's form. It runs before any
-// cluster contact, so a mistake is reported without waiting on the cluster.
-//
-// Every input is required rather than defaulted, because this variant has no
-// shell to fall back on. Ignition declares state; it cannot resolve a version,
-// detect an architecture, or extract an archive at boot, so the artifact has to
-// be named exactly, and a host that finds out otherwise has no way to report it.
-func (h *manualBootstrapHandler) validateIgnitionInput() (string, error) {
-	source := strings.TrimSpace(h.agentURL)
-	if source == "" {
-		return "", fmt.Errorf("--agent-url is required with --variant %s, and must point at the bare agent binary rather than the release tarball, because Ignition cannot extract an archive", variantIgnition)
-	}
-
-	if !ignitionRemoteFetchable(source) {
-		return "", fmt.Errorf("--agent-url %q cannot be fetched by Ignition; use an http, https, tftp, s3, arn, or gs URL", source)
-	}
-
-	if isEmpty(h.agentSHA256) {
-		return "", fmt.Errorf("--agent-sha256 is required with --variant %s; the digest for each release binary is published in checksums.txt", variantIgnition)
-	}
-
-	hash, err := ignitionHashFromSHA256(strings.TrimSpace(h.agentSHA256))
-	if err != nil {
-		return "", fmt.Errorf("invalid --agent-sha256: %w", err)
-	}
-
-	return hash, nil
-}
-
 func (h *manualBootstrapHandler) validate() error {
 	if isEmpty(h.siteName) {
 		return errors.New("site name is required")
-	}
-
-	// Checked here, before any cluster contact, so a missing flag is reported
-	// immediately rather than after connecting and resolving a site. An
-	// unparseable variant is reported by parseBootstrapVariant later; this only
-	// adds rules for the one variant that has them.
-	if variant, err := parseBootstrapVariant(h.variant); err == nil && variant == variantIgnition {
-		hash, err := h.validateIgnitionInput()
-		if err != nil {
-			return err
-		}
-
-		h.agentHash = hash
 	}
 
 	// The machine name is optional. When omitted, the unbounded-agent resolves
@@ -437,8 +380,15 @@ func (h *manualBootstrapHandler) validate() error {
 		h.variant = string(variantScript)
 	}
 
-	if _, err := parseBootstrapVariant(h.variant); err != nil {
+	variant, err := parseBootstrapVariant(h.variant)
+	if err != nil {
 		return err
+	}
+
+	if variant == variantIgnition {
+		if err := h.validateIgnitionInput(); err != nil {
+			return err
+		}
 	}
 
 	if err := validateOfflineArtifactsSource(h.offlineArtifactsSource); err != nil {
@@ -551,7 +501,6 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	})
 
 	cfg.Kubelet.NodeIP = strings.TrimSpace(h.nodeIP)
-
 	if source := strings.TrimSpace(h.offlineArtifactsSource); source != "" {
 		cfg.OfflineArtifacts = &provision.AgentOfflineArtifacts{Source: source}
 	}
@@ -720,7 +669,7 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.UnboundedAgentCo
 func newMachineManualBootstrapCommand(handler *manualBootstrapHandler) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "manual-bootstrap [NAME]",
-		Short: "Generate a bootstrap script or cloud-init config for provisioning a machine",
+		Short: "Generate a bootstrap script, cloud-init config, or Ignition config for provisioning a machine",
 		Long: `Generate a self-contained bootstrap payload that provisions a bare-metal or VM
 host as an unbounded worker node. The payload embeds the agent JSON
 configuration inline and the install script for the target architecture.
@@ -736,6 +685,9 @@ Use --variant to choose the output format:
 
   script      (default) A bash script that can be piped directly to a host.
   cloud-init  A cloud-init user-data document for VM provisioning APIs.
+  ignition    An Ignition config for image-based hosts such as Azure Container
+              Linux. Requires --agent-url naming the bare binary, and
+              --agent-sha256.
 
 Examples:
 
@@ -874,160 +826,4 @@ func resolveBootstrapToken(ctx context.Context, logger *slog.Logger, kubeCli kub
 	}
 
 	return nil, fmt.Errorf("no bootstrap token found for site %q and no tokens available in the cluster (run 'kubectl unbounded site init' first)", siteName)
-}
-
-// Paths the Ignition variant writes on the target host. The config path is the
-// one `unbounded-agent start` reads from UNBOUNDED_AGENT_CONFIG_FILE.
-const (
-	ignitionAgentConfigPath = "/etc/unbounded/agent/config.json"
-	ignitionAgentBinaryName = "unbounded-agent"
-)
-
-// renderIgnition emits an Ignition config that provisions the host with no
-// shell and no operator present.
-//
-// Ignition is declarative and runs from the initramfs, so everything it writes
-// is in place before any service starts. That is what lets the agent config,
-// the agent binary and the bootstrap unit all be present on the first boot
-// rather than fetched by something running on the host.
-func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentConfig) (string, error) {
-	configJSON, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("marshaling agent config: %w", err)
-	}
-
-	config := ignitionConfig{
-		Ignition: ignitionVersion{Version: ignitionSpecVersion},
-		Storage: &ignitionStorage{
-			Directories: []ignitionDirectory{{
-				Path: ignitionAgentBinDir(),
-				Mode: ignitionModeDir,
-			}},
-			Files: []ignitionFile{
-				{
-					Path:      ignitionAgentConfigPath,
-					Mode:      ignitionModeConfig,
-					Overwrite: ptr.To(true),
-					Contents:  ignitionContents{Source: ignitionDataURL(string(configJSON) + "\n")},
-				},
-				h.ignitionAgentBinaryFile(cfg),
-			},
-		},
-		Systemd: &ignitionSystemd{Units: []ignitionUnit{{
-			Name:     goalstates.FirstBootBootstrapUnit,
-			Enabled:  ptr.To(true),
-			Contents: h.ignitionBootstrapUnitContents(cfg),
-		}}},
-	}
-
-	rendered, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("marshaling ignition config: %w", err)
-	}
-
-	return string(rendered) + "\n", nil
-}
-
-// ignitionAgentBinDir returns the directory the agent binary is placed in,
-// under the host root. It is not resolved: this runs on the workstation, and
-// the host is a new installation whose host root is a real directory.
-func ignitionAgentBinDir() string {
-	return path.Join(hostroot.Path, "bin")
-}
-
-// ignitionAgentBinaryFile fetches the agent binary straight to its final
-// location, verified against the digest validate parsed.
-func (h *manualBootstrapHandler) ignitionAgentBinaryFile(cfg *provision.UnboundedAgentConfig) ignitionFile {
-	return ignitionFile{
-		Path:      ignitionAgentBinDir() + "/" + ignitionAgentBinaryName,
-		Mode:      ignitionModeScript,
-		Overwrite: ptr.To(true),
-		Contents: ignitionContents{
-			Source:       strings.TrimSpace(h.agentURL),
-			Verification: &ignitionVerification{Hash: h.agentHash},
-		},
-	}
-}
-
-// ignitionBootstrapUnitContents renders the oneshot unit that bootstraps the
-// agent on first boot.
-//
-// The unit runs the agent directly rather than a shell script. Ignition has
-// already placed and verified the binary, so a script here would only
-// re-implement that imperatively.
-//
-// It carries no completion condition, and so runs on every boot. That is
-// deliberate. A condition needs a marker file, and a marker is a second record
-// of completion that can disagree with the ownership record the agent already
-// keeps; the agent's own admission answers the same question from the record,
-// which is written before the first host mutation and therefore cannot be
-// missing on a host that started installing. Both commands below return
-// immediately once that record says the installation is complete: preflight
-// reports an empty result and start verifies the daemon and repairs it if it
-// is not running, neither resolving artifacts nor touching the network. The
-// cost is two short-lived processes per boot, and the benefit is that a node
-// whose daemon was stopped or damaged comes back on reboot.
-func (h *manualBootstrapHandler) ignitionBootstrapUnitContents(cfg *provision.UnboundedAgentConfig) string {
-	binary := ignitionAgentBinDir() + "/" + ignitionAgentBinaryName
-
-	var b strings.Builder
-
-	b.WriteString("[Unit]\n")
-	b.WriteString("Description=Bootstrap the unbounded agent\n")
-	b.WriteString("Wants=network-online.target\n")
-	// The agent downloads the node rootfs and the Kubernetes, CRI and CNI
-	// binaries, so it needs the network even though Ignition already fetched
-	// the agent itself. Ordering after systemd-sysext keeps any extension
-	// merged before the agent runs.
-	//
-	// On later boots the daemon unit starts in the same transaction, and is
-	// only active once the nspawn machine is up. Without ordering after it,
-	// start finds it not yet running and repairs a healthy host. On first boot
-	// the daemon unit does not exist yet, so this orders nothing.
-	b.WriteString("After=network-online.target nss-lookup.target systemd-sysext.service " + goalstates.DaemonUnit + "\n")
-	// Assert rather than Condition. A failed condition is not an error: systemd
-	// marks the unit inactive and moves on, so a host whose binary Ignition
-	// never placed sits there looking healthy and never bootstraps. A failed
-	// assertion puts the unit in the failed state, where `systemctl status` and
-	// any watchdog can see it. Neither one starts the service, so this changes
-	// only whether the reason is visible.
-	b.WriteString("AssertPathExists=" + binary + "\n")
-	// Retry indefinitely rather than giving up after systemd's default start
-	// limit. Bootstrap has no later opportunity to run, so a burst of early
-	// failures must not permanently disable it.
-	b.WriteString("StartLimitIntervalSec=0\n\n")
-
-	b.WriteString("[Service]\n")
-	b.WriteString("Type=oneshot\n")
-	b.WriteString("RemainAfterExit=yes\n")
-	// network-online.target only means a link is configured, not that DNS
-	// resolves. On a first boot the agent can start before systemd-resolved is
-	// answering and fail with an unresolved host, so retry rather than ordering
-	// against something that does not carry that guarantee. Verified on systemd
-	// 255 that Type=oneshot honors Restart=.
-	b.WriteString("Restart=on-failure\n")
-	b.WriteString("RestartSec=10s\n")
-	// Back off towards a five minute ceiling instead of retrying every ten
-	// seconds forever. With no start limit to stop it, a host that cannot reach
-	// the network would otherwise spawn the agent several thousand times a day,
-	// and the journal that would explain why scrolls away.
-	//
-	// These need systemd 254. Older versions log an unknown key and carry on
-	// with the fixed RestartSec above, which is the behavior this replaces, so
-	// nothing is lost where they are not understood.
-	b.WriteString("RestartSteps=10\n")
-	b.WriteString("RestartMaxDelaySec=300\n")
-	// `unbounded-agent start` has no --config flag and reads this variable.
-	b.WriteString("Environment=UNBOUNDED_AGENT_CONFIG_FILE=" + ignitionAgentConfigPath + "\n")
-
-	// Preflight runs as ExecStartPre so a failure is reported against this unit
-	// before any host mutation, and shows up in its status rather than being
-	// buried in a script's output.
-	b.WriteString("ExecStartPre=" + binary + " preflight\n")
-	b.WriteString("ExecStart=" + binary + " start\n\n")
-
-	b.WriteString("[Install]\n")
-	b.WriteString("WantedBy=multi-user.target\n")
-
-	return b.String()
 }

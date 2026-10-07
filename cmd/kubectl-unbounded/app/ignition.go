@@ -4,24 +4,32 @@
 package app
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
+
+	"k8s.io/utils/ptr"
+
+	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
-// Ignition configuration types, covering only the subset this command emits.
-//
-// These are hand-written rather than taken from github.com/coreos/ignition to
-// avoid a dependency carrying the whole specification for the handful of fields
-// used here. The schema version is pinned and asserted by tests.
+// Ignition configuration types, covering only the subset this command emits,
+// rather than a dependency carrying the whole specification.
 const ignitionSpecVersion = "3.4.0"
 
-// File modes are serialized as decimal integers in an Ignition config.
+// Paths the Ignition variant writes on the target host. The host is a new
+// installation, so the host root is a real directory and needs no resolving.
+// `unbounded-agent start` reads the config path from UNBOUNDED_AGENT_CONFIG_FILE.
 const (
-	ignitionModeConfig = 0o600
-	ignitionModeScript = 0o755
-	ignitionModeDir    = 0o755
+	ignitionAgentConfigPath = "/etc/unbounded/agent/config.json"
+	ignitionAgentBinaryPath = hostroot.Path + "/bin/unbounded-agent"
 )
 
 type ignitionConfig struct {
@@ -35,16 +43,7 @@ type ignitionVersion struct {
 }
 
 type ignitionStorage struct {
-	Directories []ignitionDirectory `json:"directories,omitempty"`
-	Files       []ignitionFile      `json:"files,omitempty"`
-}
-
-// ignitionDirectory declares a directory Ignition creates before writing files
-// into it. Ignition creates parents implicitly, so this exists to pin the mode
-// of the agent's bin directory rather than to make the write succeed.
-type ignitionDirectory struct {
-	Path string `json:"path"`
-	Mode int    `json:"mode,omitempty"`
+	Files []ignitionFile `json:"files,omitempty"`
 }
 
 type ignitionFile struct {
@@ -74,55 +73,118 @@ type ignitionUnit struct {
 	Contents string `json:"contents,omitempty"`
 }
 
-// ignitionDataURL encodes content as a data URL, which is how Ignition carries
-// inline file contents.
-func ignitionDataURL(content string) string {
-	return "data:;base64," + base64.StdEncoding.EncodeToString([]byte(content))
+// validateIgnitionInput checks the rules that only apply to the Ignition
+// variant, before any cluster contact, and normalizes the agent URL and digest.
+//
+// Every input is required rather than defaulted. Ignition declares state; it
+// cannot resolve a version, detect an architecture, or extract an archive at
+// boot, so the artifact has to be named exactly, and a host that finds out
+// otherwise has no shell and no operator to report it to.
+func (h *manualBootstrapHandler) validateIgnitionInput() error {
+	h.agentURL = strings.TrimSpace(h.agentURL)
+	if h.agentURL == "" {
+		return fmt.Errorf("--agent-url is required with --variant %s, and must point at the bare agent binary rather than the release tarball, because Ignition cannot extract an archive", variantIgnition)
+	}
+
+	if u, err := url.Parse(h.agentURL); err != nil || !slices.Contains([]string{"http", "https", "tftp", "s3", "arn", "gs"}, u.Scheme) {
+		return fmt.Errorf("--agent-url %q cannot be fetched by Ignition; use an http, https, tftp, s3, arn, or gs URL", h.agentURL)
+	}
+
+	// A bare digest, or the line for the binary in checksums.txt.
+	fields := strings.Fields(h.agentSHA256)
+	if len(fields) == 0 {
+		return fmt.Errorf("--agent-sha256 is required with --variant %s; the digest for each release binary is published in checksums.txt", variantIgnition)
+	}
+
+	// Ignition itself checks only the length, so a bad digest would otherwise
+	// fail at first boot.
+	if digest, err := hex.DecodeString(fields[0]); err != nil || len(digest) != sha256.Size {
+		return fmt.Errorf("invalid --agent-sha256 %q: want 64 hex characters", fields[0])
+	}
+
+	h.agentSHA256 = strings.ToLower(fields[0])
+
+	return nil
 }
 
-// ignitionRemoteFetchable reports whether Ignition can fetch a source itself.
-//
-// Ignition can retrieve http, https, tftp, s3, arn and gs. It also understands
-// data, but that is inline content rather than a fetch, so it is not listed
-// below: a caller asking whether a source can be fetched remotely wants a no
-// for a value it already holds.
-//
-// Ignition does not understand oci, which the agent resolves through its own
-// artifact source. A source Ignition cannot fetch has to be left to the agent,
-// which means the file lands after dbus has already started.
-func ignitionRemoteFetchable(source string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(source))
+// renderIgnition emits an Ignition config that provisions the host with no
+// shell and no operator present. Ignition runs from the initramfs, so the agent
+// config, the verified agent binary and the bootstrap unit are all in place
+// before any service starts.
+func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentConfig) (string, error) {
+	configJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return false
+		return "", fmt.Errorf("marshaling agent config: %w", err)
 	}
 
-	switch parsed.Scheme {
-	case "http", "https", "tftp", "s3", "arn", "gs":
-		return true
-	default:
-		return false
+	config := ignitionConfig{
+		Ignition: ignitionVersion{Version: ignitionSpecVersion},
+		Storage: &ignitionStorage{Files: []ignitionFile{
+			{
+				Path:      ignitionAgentConfigPath,
+				Mode:      0o600, // It carries a bootstrap token.
+				Overwrite: ptr.To(true),
+				Contents:  ignitionContents{Source: "data:;base64," + base64.StdEncoding.EncodeToString(append(configJSON, '\n'))},
+			},
+			{
+				Path:      ignitionAgentBinaryPath,
+				Mode:      0o755,
+				Overwrite: ptr.To(true),
+				Contents: ignitionContents{
+					Source:       h.agentURL,
+					Verification: &ignitionVerification{Hash: "sha256-" + h.agentSHA256},
+				},
+			},
+		}},
+		Systemd: &ignitionSystemd{Units: []ignitionUnit{{
+			Name:     goalstates.FirstBootBootstrapUnit,
+			Enabled:  ptr.To(true),
+			Contents: fmt.Sprintf(ignitionBootstrapUnit, ignitionAgentBinaryPath, goalstates.DaemonUnit, ignitionAgentConfigPath),
+		}}},
 	}
+
+	rendered, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshaling ignition config: %w", err)
+	}
+
+	return string(rendered) + "\n", nil
 }
 
-// ignitionHashFromSHA256 converts a hex digest into the form Ignition expects.
-func ignitionHashFromSHA256(hex string) (string, error) {
-	trimmed := strings.TrimSpace(hex)
+// ignitionBootstrapUnit runs the agent from the binary Ignition placed: %[1]s
+// is the binary, %[2]s the daemon unit and %[3]s the agent config.
+//
+// It has no completion condition and runs on every boot, because the agent's
+// ownership record already says whether the installation is complete, and a
+// marker would be a second record that could disagree with it. On a complete
+// host preflight and start return at once, or start repairs a daemon that is
+// not running, so a stopped or damaged daemon comes back on reboot. Ordering
+// after the daemon unit keeps a reboot from repairing a daemon that is still
+// starting; on first boot it does not exist yet.
+//
+// AssertPathExists, unlike a Condition, fails visibly when Ignition never placed
+// the binary. Restart covers DNS that is not answering yet on first boot,
+// backing off to five minutes with no start limit, because bootstrap has no
+// later chance to run. RestartSteps needs systemd 254; older versions keep the
+// fixed RestartSec.
+const ignitionBootstrapUnit = `[Unit]
+Description=Bootstrap the unbounded agent
+Wants=network-online.target
+After=network-online.target nss-lookup.target systemd-sysext.service %[2]s
+AssertPathExists=%[1]s
+StartLimitIntervalSec=0
 
-	// Accept a plain digest or the first field of sha256sum output.
-	if fields := strings.Fields(trimmed); len(fields) > 0 {
-		trimmed = fields[0]
-	}
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10s
+RestartSteps=10
+RestartMaxDelaySec=300
+Environment=UNBOUNDED_AGENT_CONFIG_FILE=%[3]s
+ExecStartPre=%[1]s preflight
+ExecStart=%[1]s start
 
-	if len(trimmed) != 64 {
-		return "", fmt.Errorf("sha256 digest must be 64 hex characters, got %d", len(trimmed))
-	}
-
-	for _, r := range trimmed {
-		isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
-		if !isHex {
-			return "", fmt.Errorf("sha256 digest contains a non-hex character %q", r)
-		}
-	}
-
-	return "sha256-" + strings.ToLower(trimmed), nil
-}
+[Install]
+WantedBy=multi-user.target
+`
