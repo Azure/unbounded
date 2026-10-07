@@ -445,9 +445,9 @@ pub mod identity {
     pub(super) struct ValidatedChain {
         pub(super) key: VerifyingKey,
 
-        valid_from: u64,
+        pub(super) valid_from: u64,
 
-        expires: u64,
+        pub(super) expires: u64,
     }
 
     /// Private validation staging owns zeroizing transfers on every rejection exit.

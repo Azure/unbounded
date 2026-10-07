@@ -337,8 +337,8 @@ impl<H: Host> Enrollment<H> {
             enrollment: r.enrollment.clone(),
             private_material,
             certificate_chain: r.certificate_chain.clone(),
-            not_before,
-            not_after,
+            not_before: public.valid_from,
+            not_after: public.expires,
         })
     }
 }
@@ -551,18 +551,18 @@ impl LocalSigningIdentity {
         .map(Arc::new)
     }
 
-    /// Return the issued leaf's expiration for REST connection lifetime checks.
+    /// Return the chain and trust roots' earliest expiry for REST lifetime checks.
     pub fn expires_at(&self) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(self.not_after)
     }
 
-    /// Check both ends of the leaf's lifetime against the scoped wall clock.
+    /// Check the chain and trust roots' validity bounds against the scoped wall clock.
     pub fn valid_now(&self) -> bool {
         let now = uring_runtime::environment::wall_now();
         now >= UNIX_EPOCH + Duration::from_secs(self.not_before) && now < self.expires_at()
     }
 
-    /// Renew after two thirds of the issued lifetime, capped by wire policy.
+    /// Renew after two thirds of the trusted lifetime, capped by wire policy.
     pub fn renewal_due(&self) -> bool {
         let lifetime = Duration::from_secs(self.not_after - self.not_before);
         uring_runtime::environment::wall_now()
@@ -1651,6 +1651,60 @@ mod tests {
                 .sign(b"still usable")
                 .is_ok()
         );
+    }
+
+    /// Held accepted and recovered identities must stay within the root's lifetime.
+    #[test]
+    fn held_enrollment_identity_uses_root_validity_bounds() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let clock = uring_runtime::environment::SimulationClock::new(106);
+        let _time = clock.environment(0).enter();
+        let (files, e, scope) = fixture();
+        let now = uring_runtime::environment::wall_now();
+        let (_, key) = identity::test_util::ca();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.not_before = now.into();
+        params.not_after = (now + Duration::from_secs(60)).into();
+        let ca = params.self_signed(&key).unwrap();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let response = issue(&request, &ca, &key, |_| {});
+        let (_, leaf) =
+            x509_parser::parse_x509_certificate(&response.certificate_chain[0]).unwrap();
+        let leaf_start = UNIX_EPOCH
+            + Duration::from_secs(leaf.validity().not_before.timestamp().try_into().unwrap());
+        let leaf_end = UNIX_EPOCH
+            + Duration::from_secs(leaf.validity().not_after.timestamp().try_into().unwrap());
+        assert!(leaf_start < now);
+        assert!(leaf_end > now + Duration::from_secs(60));
+        let accepted = drive(&files, e.accept_response(response, &scope)).unwrap();
+        let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+        for identity in [&accepted, &recovered] {
+            assert_eq!(identity.expires_at(), now + Duration::from_secs(60));
+            clock.set_wall_time(now - Duration::from_secs(1));
+            assert!(!identity.valid_now());
+            clock.set_wall_time(now);
+            assert!(identity.valid_now());
+            assert!(!identity.renewal_due());
+            clock.set_wall_time(now + Duration::from_secs(39));
+            assert!(!identity.renewal_due());
+            clock.set_wall_time(now + Duration::from_secs(40));
+            assert!(identity.renewal_due());
+            clock.set_wall_time(now + Duration::from_secs(59));
+            assert!(identity.valid_now());
+            clock.set_wall_time(now + Duration::from_secs(60));
+            assert!(!identity.valid_now());
+            clock.set_wall_time(now + Duration::from_secs(61));
+            assert!(!identity.valid_now());
+            assert!(uring_runtime::environment::wall_now() < leaf_end);
+        }
+        assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
     }
 
     /// Abandoned writes are fenced before retry and publication phases stay exact.
