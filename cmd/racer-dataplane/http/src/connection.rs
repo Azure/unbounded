@@ -402,7 +402,8 @@ impl<C: Context> HttpIo<C> {
 
     /// Release the cached buffer and its charge.
     pub fn reclaim_buffer(&self) {
-        self.idle_buffer.borrow_mut().take();
+        let idle = self.idle_buffer.borrow_mut().take();
+        drop(idle);
     }
 
     /// Report the admission retained by the idle buffer cache.
@@ -1924,12 +1925,15 @@ mod tests {
     }
 
     /// Counted admission released when its owner drops.
-    struct Charge(Rc<Cell<usize>>, usize);
+    struct Charge(Rc<Cell<usize>>, usize, Option<Box<dyn FnOnce()>>);
 
     impl Drop for Charge {
         /// Return the reserved count to the test ledger.
         fn drop(&mut self) {
             self.0.set(self.0.get() - self.1);
+            if let Some(callback) = self.2.take() {
+                callback();
+            }
         }
     }
 
@@ -2105,13 +2109,13 @@ mod tests {
                 return Err(uring_runtime::Error::Overloaded.into());
             }
             self.used.set(self.used.get() + n);
-            Ok(Charge(self.used.clone(), n))
+            Ok(Charge(self.used.clone(), n, None))
         }
 
         /// Reserve one counted connection slot.
         fn outbound_slot(&self) -> Result<Self, Charge> {
             self.slots.set(self.slots.get() + 1);
-            Ok(Charge(self.slots.clone(), 1))
+            Ok(Charge(self.slots.clone(), 1, None))
         }
 
         /// Report the injected shutdown state.
@@ -2486,6 +2490,45 @@ mod tests {
         ));
         io.reclaim_buffer();
         assert_eq!(hooks.used.get(), 0);
+    }
+
+    #[test]
+    fn reclaim_buffer_allows_charge_drop_reentry() {
+        for length in [0, 32] {
+            for replace in [false, true] {
+                let hooks = hooks();
+                let io = HttpIo::<Hooks>::new(reactor(), Codec::new(128), hooks.clone(), 8, 16);
+                let capped = io.capped(64);
+                let calls = Rc::new(Cell::new(0));
+                let mut buffer = io.buffer(length).unwrap();
+                buffer.reservation.as_mut().unwrap().2 = Some(Box::new({
+                    let hooks = hooks.clone();
+                    let calls = calls.clone();
+                    move || {
+                        calls.set(calls.get() + 1);
+                        assert_eq!(hooks.used.get(), 0);
+                        capped.reclaim_buffer();
+                        if replace {
+                            drop(capped.buffer(16).unwrap());
+                        }
+                    }
+                }));
+                drop(buffer);
+                assert_eq!(calls.get(), 0);
+                assert_eq!(hooks.used.get(), length.max(1));
+
+                io.reclaim_buffer();
+                assert_eq!(calls.get(), 1);
+                assert_eq!(hooks.used.get(), if replace { 16 } else { 0 });
+                assert_eq!(io.idle_buffer.borrow().is_some(), replace);
+
+                io.reclaim_buffer();
+                io.reclaim_buffer();
+                assert_eq!(calls.get(), 1);
+                assert_eq!(hooks.used.get(), 0);
+                assert!(io.idle_buffer.borrow().is_none());
+            }
+        }
     }
 
     /// Underflow and removed excess bytes cannot make a connection reusable.
