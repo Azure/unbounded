@@ -284,7 +284,7 @@ impl<P: Policy> SharedQuotas<P> {
                 });
                 Error::Overloaded
             })?;
-        Ok(Charge {
+        let charge = Charge {
             class,
             amount,
             key: None,
@@ -292,7 +292,13 @@ impl<P: Policy> SharedQuotas<P> {
             local: None,
             buffers: Weak::new(),
             stopped: self.stopped.clone(),
-        })
+        };
+        // Stop may race the policy callback or counter reservation. Dropping the
+        // charge rolls back usage and applies the usual release wake policy.
+        if self.is_stopped() && !P::allows_stopped(class) {
+            return Err(Error::Unavailable);
+        }
+        Ok(charge)
     }
 }
 
@@ -1029,6 +1035,8 @@ mod quota_tests {
         max_keys: usize,
 
         rejected: Arc<Mutex<Vec<Rejection<Resource>>>>,
+
+        limit_gate: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
     }
 
     impl TestPolicy {
@@ -1038,6 +1046,7 @@ mod quota_tests {
                 limit,
                 max_keys,
                 rejected: Arc::default(),
+                limit_gate: None,
             }
         }
     }
@@ -1051,6 +1060,10 @@ mod quota_tests {
 
         /// All fixture classes use the same aggregate ceiling.
         fn limit(&self, _: Resource) -> usize {
+            if let Some(gate) = &self.limit_gate {
+                gate.0.wait();
+                gate.1.wait();
+            }
             self.limit
         }
 
@@ -1401,6 +1414,38 @@ mod quota_tests {
             shared.reserve(Resource::Payload, 1),
             Err(Error::Unavailable)
         ));
+    }
+
+    /// Stop during the limit callback rolls back only ordinary admission.
+    #[test]
+    fn shared_reservation_rechecks_stop_after_limit_callback() {
+        for class in [Resource::Payload, Resource::Other, Resource::Progress] {
+            let mut quotas = Quotas::new(TestPolicy::new(10, 1));
+            let existing = quotas.reserve(None, class, 3).unwrap();
+            let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+            quotas.policy.limit_gate = Some(gate.clone());
+            let shared = quotas.shared();
+            let reservation = std::thread::spawn(move || shared.reserve(class, 7));
+
+            gate.0.wait();
+            assert_eq!(quotas.used(class), 3);
+            quotas.stop();
+            gate.1.wait();
+
+            let result = reservation.join().unwrap();
+            if TestPolicy::allows_stopped(class) {
+                let charge = result.unwrap();
+                assert_eq!(charge.amount(), 7);
+                assert_eq!(quotas.used(class), 10);
+                drop(charge);
+            } else {
+                assert!(matches!(result, Err(Error::Unavailable)));
+            }
+            assert_eq!(quotas.used(class), 3);
+            assert!(quotas.policy.rejected.lock().unwrap().is_empty());
+            drop(existing);
+            assert_eq!(quotas.used(class), 0);
+        }
     }
 
     /// Cross-thread release and local stop notify the registered shared waiter.
