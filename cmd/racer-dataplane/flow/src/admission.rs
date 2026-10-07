@@ -265,6 +265,7 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
             return;
         }
         if outcome == Outcome::Verified
+            && state.limit < config.total
             && now.saturating_duration_since(state.updated) >= config.recovery
         {
             state.limit = state.limit.saturating_add(1).min(config.total);
@@ -1343,6 +1344,76 @@ mod tests {
         owner.state.lock().unwrap().updated = Instant::now() - config().recovery;
         work.observe(Outcome::Verified);
         assert_eq!(*owner.observer.limit.lock().unwrap(), 3);
+    }
+
+    /// Success at the ceiling must not delay an eligible pressure reduction.
+    #[test]
+    fn recovery_at_ceiling_preserves_pressure_eligibility() {
+        fn now() -> Instant {
+            static NOW: OnceLock<Instant> = OnceLock::new();
+            *NOW.get_or_init(Instant::now)
+        }
+
+        for recovery in [Duration::ZERO, config().recovery] {
+            let config = Config {
+                recovery,
+                ..config()
+            };
+            let owner = Adaptive::new(config, Counts::default(), now).unwrap();
+            let work = owner.acquire(&1).unwrap();
+            let updated = now() - config.backoff.max(config.recovery);
+            owner.state.lock().unwrap().updated = updated;
+
+            for _ in 0..2 {
+                work.observe(Outcome::Verified);
+                let state = owner.state.lock().unwrap();
+                assert_eq!(state.limit, config.total);
+                assert_eq!(state.updated, updated);
+            }
+            work.observe(Outcome::LocalPressure);
+            assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
+            assert_eq!(owner.state.lock().unwrap().updated, now());
+            assert_eq!(owner.state.lock().unwrap().peers[&1].limit, config.per_key);
+            assert!(owner.available(&1));
+            assert_eq!(
+                *owner.observer.events.lock().unwrap(),
+                [
+                    Event::Accepted,
+                    Event::Verified,
+                    Event::Verified,
+                    Event::LocalPressure,
+                ]
+            );
+        }
+    }
+
+    /// Restoring the final slot still starts backoff and rate-limits pressure.
+    #[test]
+    fn recovery_restoring_slot_advances_pressure_backoff() {
+        fn now() -> Instant {
+            static NOW: OnceLock<Instant> = OnceLock::new();
+            *NOW.get_or_init(Instant::now)
+        }
+
+        let config = config();
+        let owner = Adaptive::new(config, Counts::default(), now).unwrap();
+        let work = owner.acquire(&1).unwrap();
+        {
+            let mut state = owner.state.lock().unwrap();
+            state.limit = config.total - 1;
+            state.updated = now() - config.recovery;
+        }
+        work.observe(Outcome::Verified);
+        assert_eq!(*owner.observer.limit.lock().unwrap(), config.total);
+        assert_eq!(owner.state.lock().unwrap().updated, now());
+        work.observe(Outcome::LocalPressure);
+        assert_eq!(*owner.observer.limit.lock().unwrap(), config.total);
+
+        owner.state.lock().unwrap().updated = now() - config.backoff;
+        work.observe(Outcome::LocalPressure);
+        assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
+        work.observe(Outcome::LocalPressure);
+        assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
     }
 
     /// Only sufficiently old, idle, eligible peer records may be retired.
