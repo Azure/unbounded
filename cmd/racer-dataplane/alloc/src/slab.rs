@@ -1,4 +1,4 @@
-//! Locked sparse storage and completion-owned direct I/O.
+//! Sparse file or device storage and completion-owned direct I/O.
 //!
 //! Startup is blocking and belongs outside the latency-sensitive worker path.
 //! Capacity bounds logical addresses, not reserved physical space: writes can
@@ -12,6 +12,7 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     ffi::CString,
     fs::File,
     future::Future,
@@ -22,6 +23,7 @@ use std::{
     path::{Component, Path, PathBuf},
     pin::Pin,
     rc::Rc,
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 use uring_runtime::{
@@ -29,12 +31,32 @@ use uring_runtime::{
     reactor::{Reactor, descriptor::Descriptor},
 };
 
-/// One sparse direct-I/O cache file, not a durable storage transaction.
+/// One logical segment's range on a caller-opened device.
+/// Share one Arc per device within a worker to avoid per-segment descriptors.
+#[derive(Clone, Debug)]
+pub struct DevicePlacement {
+    /// Read/write O_DIRECT file, opened exclusively by the caller for real devices.
+    pub file: Arc<File>,
+
+    /// Physical start of this segment, in bytes.
+    pub offset: u64,
+}
+
+/// Startup resources, before worker-local descriptor creation.
+enum Backing {
+    File(PathBuf),
+    Devices {
+        placements: RefCell<Vec<DevicePlacement>>,
+        geometry: SegmentGeometry,
+    },
+}
+
+/// Direct-I/O cache storage, not a durable storage transaction.
 /// `open_configured` binds submissions to one segment table; read/write require
 /// a successful binding, not merely an open file.
 #[repr(align(64))]
 pub struct Slab<C: Charge> {
-    path: PathBuf,
+    backing: Backing,
 
     capacity_bytes: u64,
 
@@ -58,7 +80,7 @@ impl<C: Charge> Slab<C> {
         max_record_bytes: usize,
     ) -> Self {
         Self {
-            path,
+            backing: Backing::File(path),
             capacity_bytes,
             segment_bytes,
             max_record_bytes,
@@ -68,7 +90,93 @@ impl<C: Charge> Slab<C> {
         }
     }
 
-    /// Logical file capacity, not a reservation of physical disk blocks.
+    /// Describe device ranges in logical segment order, without creating, sizing,
+    /// or locking files. The caller must verify device capacity and supply alignment
+    /// that meets every device's requirements. Regular direct files are also accepted.
+    /// Overlapping ranges on the same device or file are rejected within this slab;
+    /// the caller must keep ranges in different slabs disjoint.
+    /// Files stay owned until `open_configured` creates worker-local descriptors.
+    pub fn from_devices(
+        placements: Vec<DevicePlacement>,
+        segment_bytes: u64,
+        max_record_bytes: usize,
+        alignment: Alignment,
+    ) -> Result<Self> {
+        let capacity_bytes = (placements.len() as u64)
+            .checked_mul(segment_bytes)
+            .filter(|&size| size != 0 && size <= i64::MAX as u64)
+            .ok_or(Error::InvalidConfiguration)?;
+        let mut slab = Self::new(
+            PathBuf::new(),
+            capacity_bytes,
+            segment_bytes,
+            max_record_bytes,
+        );
+        let geometry = slab.validate_layout(alignment, capacity_bytes)?;
+        let mut files = HashMap::new();
+        let mut ranges = Vec::with_capacity(placements.len());
+        for placement in &placements {
+            let end = placement
+                .offset
+                .checked_add(segment_bytes)
+                .filter(|&end| end <= i64::MAX as u64)
+                .ok_or(Error::InvalidConfiguration)?;
+            if !placement.offset.is_multiple_of(alignment.offset()) {
+                return Err(Error::InvalidConfiguration);
+            }
+            let key = Arc::as_ptr(&placement.file);
+            let metadata = match files.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    // SAFETY: F_GETFL only inspects the live caller-owned descriptor.
+                    let flags = unsafe { libc::fcntl(placement.file.as_raw_fd(), libc::F_GETFL) };
+                    if flags < 0 {
+                        return Err(system_error("fcntl-getfl", std::io::Error::last_os_error()));
+                    }
+                    if flags & libc::O_DIRECT == 0
+                        || flags & libc::O_ACCMODE != libc::O_RDWR
+                        || flags & libc::O_APPEND != 0
+                    {
+                        return Err(Error::InvalidConfiguration);
+                    }
+                    let metadata = placement
+                        .file
+                        .metadata()
+                        .map_err(|e| system_error("fstat", e))?;
+                    if !matches!(
+                        metadata.mode() & libc::S_IFMT,
+                        libc::S_IFREG | libc::S_IFBLK
+                    ) {
+                        return Err(Error::InvalidConfiguration);
+                    }
+                    entry.insert(metadata)
+                }
+            };
+            let identity = if metadata.mode() & libc::S_IFMT == libc::S_IFBLK {
+                (libc::S_IFBLK, metadata.rdev(), 0)
+            } else {
+                if end > metadata.len() {
+                    return Err(Error::InvalidConfiguration);
+                }
+                (libc::S_IFREG, metadata.dev(), metadata.ino())
+            };
+            ranges.push((identity, placement.offset, end));
+        }
+        ranges.sort_unstable();
+        if ranges
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0 && pair[0].2 > pair[1].1)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        slab.backing = Backing::Devices {
+            placements: RefCell::new(placements),
+            geometry,
+        };
+        Ok(slab)
+    }
+
+    /// Logical capacity, not a reservation of physical disk blocks.
     pub fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
     }
@@ -104,7 +212,7 @@ impl<C: Charge> Slab<C> {
         })
     }
 
-    /// Discovered direct-I/O requirements, or Unavailable before startup.
+    /// Discovered or caller-supplied direct-I/O requirements, or Unavailable before startup.
     pub fn alignment(&self) -> Result<Alignment> {
         self.opened
             .borrow()
@@ -130,7 +238,7 @@ impl<C: Charge> Slab<C> {
         self.bind(segments)
     }
 
-    /// Attach the table identity to this file only after all dimensions agree.
+    /// Attach the table identity to this backing only after all dimensions agree.
     fn bind(&self, segments: &Segments) -> Result<()> {
         let mut opened = self.opened.borrow_mut();
         let slab = opened.as_mut().ok_or(Error::Unavailable)?;
@@ -179,11 +287,44 @@ impl<C: Charge> Slab<C> {
         self.open_file()
     }
 
-    /// Open and validate the physical file without granting submission authority.
+    /// Prepare backing descriptors without granting submission authority.
     fn open_file(&self) -> Result<Alignment> {
         if let Ok(a) = self.alignment() {
             return Ok(a);
         }
+        let path = match &self.backing {
+            Backing::File(path) => path,
+            Backing::Devices {
+                placements,
+                geometry,
+            } => {
+                let mut files = HashMap::new();
+                let mut opened = Vec::with_capacity(placements.borrow().len());
+                for placement in placements.borrow().iter() {
+                    let file = match files.entry(Arc::as_ptr(&placement.file)) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let file = placement
+                                .file
+                                .try_clone()
+                                .map_err(|e| system_error("dup", e))?;
+                            entry.insert(Rc::new(Descriptor::from(file)))
+                        }
+                    };
+                    opened.push(OpenPlacement {
+                        file: file.clone(),
+                        offset: placement.offset,
+                    });
+                }
+                *self.opened.borrow_mut() = Some(OpenSlab {
+                    backing: OpenBacking::Devices(opened),
+                    geometry: *geometry,
+                    table: None,
+                });
+                *placements.borrow_mut() = Vec::new();
+                return Ok(geometry.alignment());
+            }
+        };
         if self.segment_bytes == 0
             || self.capacity_bytes == 0
             || self.max_record_bytes == 0
@@ -194,14 +335,14 @@ impl<C: Charge> Slab<C> {
         }
         #[cfg(feature = "simulation")]
         if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
-            if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 sim.create_dir_all(parent)
                     .map_err(|e| system_error("mkdir", e))?;
             }
             let file = sim
                 .open(
                     None,
-                    &self.path,
+                    path,
                     libc::O_CREAT
                         | libc::O_RDWR
                         | libc::O_DIRECT
@@ -224,7 +365,7 @@ impl<C: Charge> Slab<C> {
             self.publish(file, geometry);
             return Ok(a);
         }
-        let file = open_private_file(&self.path)?;
+        let file = open_private_file(path)?;
         let metadata = file.metadata().map_err(|e| system_error("fstat", e))?;
         // SAFETY: geteuid has no arguments or borrowed memory.
         validate_file(
@@ -272,7 +413,7 @@ impl<C: Charge> Slab<C> {
     /// Publish geometry with its owning file, initially without I/O authority.
     fn publish(&self, file: Descriptor, geometry: SegmentGeometry) {
         *self.opened.borrow_mut() = Some(OpenSlab {
-            file: Rc::new(file),
+            backing: OpenBacking::File(Rc::new(file)),
             geometry,
             table: None,
         });
@@ -302,7 +443,7 @@ impl<C: Charge> Slab<C> {
         extent: Extent,
         buffer: &AlignedBuffer<C>,
         lease: &SegmentLease,
-    ) -> Result<Rc<Descriptor>> {
+    ) -> Result<(Rc<Descriptor>, Extent)> {
         let opened = self.opened.borrow();
         let slab = opened.as_ref().ok_or(Error::Unavailable)?;
         let table = slab.table.as_ref().ok_or(Error::Unavailable)?;
@@ -336,7 +477,32 @@ impl<C: Charge> Slab<C> {
         {
             return Err(Error::Corrupt);
         }
-        Ok(slab.file.clone())
+        match &slab.backing {
+            OpenBacking::File(file) => Ok((file.clone(), extent)),
+            OpenBacking::Devices(placements) => {
+                let position = usize::try_from(lease.id().0).map_err(|_| Error::Corrupt)?;
+                let placement = placements.get(position).ok_or(Error::Corrupt)?;
+                let offset = placement
+                    .offset
+                    .checked_add(extent.offset() - start)
+                    .ok_or(Error::Corrupt)?;
+                let physical = Extent::new(offset, extent.length())?;
+                let end = offset
+                    .checked_add(extent.length() as u64)
+                    .ok_or(Error::Corrupt)?;
+                if end
+                    > placement
+                        .offset
+                        .checked_add(self.segment_bytes)
+                        .ok_or(Error::Corrupt)?
+                    || end > i64::MAX as u64
+                {
+                    return Err(Error::Corrupt);
+                }
+                slab.geometry.alignment().check(physical, buffer)?;
+                Ok((placement.file.clone(), physical))
+            }
+        }
     }
 
     /// Consume a checked request so its descriptor, buffer, and lease travel together.
@@ -346,7 +512,7 @@ impl<C: Charge> Slab<C> {
         buffer: AlignedBuffer<C>,
         lease: SegmentLease,
     ) -> Result<Submission<C>> {
-        let file = self.submission(extent, &buffer, &lease)?;
+        let (file, extent) = self.submission(extent, &buffer, &lease)?;
         Ok(Submission {
             file,
             extent,
@@ -414,36 +580,49 @@ impl<C: Charge> Slab<C> {
             .pooled(&self.idle_buffer))
     }
 
-    /// Replace the open file for fault-injection tests; geometry remains unchanged.
+    /// Replace file-mode backing for fault tests; device mode is rejected.
     #[cfg(feature = "simulation")]
     #[doc(hidden)]
     pub fn replace_file_for_test(&self, file: File) -> Result<()> {
         self.replace_descriptor_for_test(file.into())
     }
 
-    /// Also accepts a virtual descriptor from the simulation backend.
+    /// Accept a virtual descriptor for file-mode fault tests; geometry stays unchanged.
     #[cfg(feature = "simulation")]
     #[doc(hidden)]
     pub fn replace_descriptor_for_test(&self, file: Descriptor) -> Result<()> {
         if self.writes_in_flight() != 0 {
             return Err(Error::Busy);
         }
-        self.opened
-            .borrow_mut()
-            .as_mut()
-            .ok_or(Error::Unavailable)?
-            .file = Rc::new(file);
+        let mut opened = self.opened.borrow_mut();
+        let slab = opened.as_mut().ok_or(Error::Unavailable)?;
+        let OpenBacking::File(current) = &mut slab.backing else {
+            return Err(Error::InvalidConfiguration);
+        };
+        *current = Rc::new(file);
         Ok(())
     }
 }
 
-/// A file and its geometry own their binding; a closed slab cannot retain authority.
+/// Backing and geometry own their binding; a closed slab cannot retain authority.
 struct OpenSlab {
-    file: Rc<Descriptor>,
+    backing: OpenBacking,
 
     geometry: SegmentGeometry,
 
     table: Option<TableIdentity>,
+}
+
+/// Runtime owners shared by all submissions to a backing file.
+enum OpenBacking {
+    File(Rc<Descriptor>),
+    Devices(Vec<OpenPlacement>),
+}
+
+/// One logical segment's worker-local destination.
+struct OpenPlacement {
+    file: Rc<Descriptor>,
+    offset: u64,
 }
 
 /// A validated transfer owns every resource needed to keep kernel access safe.
@@ -903,6 +1082,311 @@ mod tests {
         assert!(pool.borrow().is_none());
     }
 
+    /// Open direct files without using the slab's private-file startup path.
+    fn device_file(path: &Path) -> Arc<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+            .unwrap();
+        file.set_len(16384).unwrap();
+        Arc::new(file)
+    }
+
+    /// Device layouts reject aliases, misalignment, overflow, and invalid file flags.
+    #[test]
+    fn device_layout_validation_is_read_only() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = Directory::new();
+        let file = device_file(&directory.0.join("device"));
+        let Some(a) = real_alignment(probe(&file)) else {
+            return;
+        };
+        let build = |offsets: &[u64], segment, record| {
+            Slab::<()>::from_devices(
+                offsets
+                    .iter()
+                    .map(|&offset| DevicePlacement {
+                        file: file.clone(),
+                        offset,
+                    })
+                    .collect(),
+                segment,
+                record,
+                a,
+            )
+        };
+        for (offsets, segment, record) in [
+            (vec![], 4096, 512),
+            (vec![0], 0, 512),
+            (vec![0], 4096, 0),
+            (vec![0], 4097, 512),
+            (vec![0], 4096, 4097),
+            (vec![0, 4096], u64::MAX, 512),
+            (vec![0], i64::MAX as u64 + 1, 512),
+            (vec![1], 4096, 512),
+            (vec![16384], 4096, 512),
+            (vec![u64::MAX], 4096, 512),
+            (vec![i64::MAX as u64 - 4095], 4096, 512),
+            (vec![0, 0], 4096, 512),
+            (vec![0, 2048], 4096, 512),
+        ] {
+            assert!(matches!(
+                build(&offsets, segment, record),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        let duplicate = Arc::new(file.try_clone().unwrap());
+        assert!(matches!(
+            Slab::<()>::from_devices(
+                vec![
+                    DevicePlacement {
+                        file: file.clone(),
+                        offset: 0
+                    },
+                    DevicePlacement {
+                        file: duplicate,
+                        offset: 2048
+                    },
+                ],
+                4096,
+                512,
+                a
+            ),
+            Err(Error::InvalidConfiguration)
+        ));
+        for flags in [0, libc::O_DIRECT | libc::O_APPEND] {
+            let invalid = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(flags)
+                .open(directory.0.join("device"))
+                .unwrap();
+            assert!(matches!(
+                Slab::<()>::from_devices(
+                    vec![DevicePlacement {
+                        file: Arc::new(invalid),
+                        offset: 0,
+                    }],
+                    4096,
+                    512,
+                    a
+                ),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        let readonly = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(directory.0.join("device"))
+            .unwrap();
+        assert!(matches!(
+            Slab::<()>::from_devices(
+                vec![DevicePlacement {
+                    file: Arc::new(readonly),
+                    offset: 0,
+                }],
+                4096,
+                512,
+                a
+            ),
+            Err(Error::InvalidConfiguration)
+        ));
+        let slab = build(&[8192, 4096], 4096, 512).unwrap();
+        assert_eq!(slab.capacity_bytes(), 8192);
+        assert_eq!(
+            slab.open_configured(&Segments::new(8192)),
+            Err(Error::InvalidConfiguration)
+        );
+        let segments = Segments::new(4096);
+        assert_eq!(slab.open_configured(&segments), Ok(a));
+        assert_eq!(slab.open_configured(&segments), Ok(a));
+        assert_eq!(file.metadata().unwrap().len(), 16384);
+        let independent = File::open(directory.0.join("device")).unwrap();
+        // SAFETY: this live independent descriptor tests that startup took no flock.
+        assert_eq!(
+            unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let opened = slab.opened.borrow();
+        let OpenBacking::Devices(placements) = &opened.as_ref().unwrap().backing else {
+            unreachable!()
+        };
+        assert!(Rc::ptr_eq(&placements[0].file, &placements[1].file));
+        let Backing::Devices { placements, .. } = &slab.backing else {
+            unreachable!()
+        };
+        assert!(placements.borrow().is_empty());
+    }
+
+    /// Translation preserves logical authority and rechecks physical bounds and alignment.
+    #[test]
+    fn device_submission_checks_logical_and_physical_extents() {
+        let directory = Directory::new();
+        let file = device_file(&directory.0.join("device"));
+        let Some(a) = real_alignment(probe(&file)) else {
+            return;
+        };
+        let slab = Slab::<()>::from_devices(
+            vec![
+                DevicePlacement {
+                    file: file.clone(),
+                    offset: 8192,
+                },
+                DevicePlacement { file, offset: 0 },
+            ],
+            4096,
+            4096,
+            a,
+        )
+        .unwrap();
+        let segments = Segments::new(4096);
+        let _ = slab.open_configured(&segments).unwrap();
+        drop(segments.append(4096).unwrap());
+        let (lease, extent) = segments.append(4096).unwrap();
+        let buffer = slab.allocate(4096, ()).unwrap();
+        let (_, physical) = slab.submission(extent, &buffer, &lease).unwrap();
+        assert_eq!(physical, Extent::new(0, 4096).unwrap());
+        assert!(matches!(
+            slab.submission(Extent::new(0, 4096).unwrap(), &buffer, &lease),
+            Err(Error::Corrupt)
+        ));
+        assert!(matches!(
+            slab.submission(Extent::new(8192, 4096).unwrap(), &buffer, &lease),
+            Err(Error::Corrupt)
+        ));
+        assert!(matches!(
+            slab.submission(Extent::new(6144, 4096).unwrap(), &buffer, &lease),
+            Err(Error::Corrupt)
+        ));
+        assert!(matches!(
+            slab.submission(Extent::new(4097, 4096).unwrap(), &buffer, &lease),
+            Err(Error::InvalidConfiguration)
+        ));
+        let other = Segments::from_geometry(slab.geometry().unwrap()).unwrap();
+        let (foreign, extent) = other.append(4096).unwrap();
+        assert!(matches!(
+            slab.submission(extent, &buffer, &foreign),
+            Err(Error::Stale)
+        ));
+        let extent = Extent::new(4096, 4096).unwrap();
+        for (offset, expected) in [
+            (1, Error::InvalidConfiguration),
+            (u64::MAX - 511, Error::Corrupt),
+            (i64::MAX as u64 - 511, Error::Corrupt),
+        ] {
+            let mut opened = slab.opened.borrow_mut();
+            let OpenBacking::Devices(placements) = &mut opened.as_mut().unwrap().backing else {
+                unreachable!()
+            };
+            placements[1].offset = offset;
+            drop(opened);
+            assert!(
+                matches!(slab.submission(extent, &buffer, &lease), Err(error) if error == expected)
+            );
+        }
+    }
+
+    /// Device submissions keep completion error handling and release their fences.
+    #[cfg(feature = "simulation")]
+    #[test]
+    fn device_io_faults_release_completion_resources() {
+        use uring_runtime::reactor::simulation::{Fault, Simulation};
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum TestError {
+            Alloc(Error),
+            Runtime(uring_runtime::Error),
+        }
+        impl From<Error> for TestError {
+            fn from(error: Error) -> Self {
+                Self::Alloc(error)
+            }
+        }
+        impl From<uring_runtime::Error> for TestError {
+            fn from(error: uring_runtime::Error) -> Self {
+                Self::Runtime(error)
+            }
+        }
+        #[derive(Clone)]
+        struct TestScope;
+        impl Scope for TestScope {
+            type Error = TestError;
+            fn check(&self) -> std::result::Result<(), TestError> {
+                Ok(())
+            }
+        }
+        let directory = Directory::new();
+        let file = device_file(&directory.0.join("device"));
+        let Some(a) = real_alignment(probe(&file)) else {
+            return;
+        };
+        let slab =
+            Slab::<()>::from_devices(vec![DevicePlacement { file, offset: 4096 }], 4096, 4096, a)
+                .unwrap();
+        let segments = Segments::new(4096);
+        let _ = slab.open_configured(&segments).unwrap();
+        let (lease, extent) = segments.append(4096).unwrap();
+        drop(lease);
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let descriptor = sim
+            .open(
+                None,
+                Path::new("/device-faults"),
+                libc::O_CREAT | libc::O_RDWR,
+            )
+            .unwrap();
+        descriptor.as_sim().unwrap().set_len(8192).unwrap();
+        let mut opened = slab.opened.borrow_mut();
+        let OpenBacking::Devices(placements) = &mut opened.as_mut().unwrap().backing else {
+            unreachable!()
+        };
+        placements[0].file = Rc::new(descriptor);
+        drop(opened);
+        let reactor = Reactor::<TestScope, ()>::new(16, ());
+        for write in [false, true] {
+            for (fault, expected) in [
+                (Fault::Short(512), TestError::Alloc(Error::Io)),
+                (
+                    Fault::Errno(libc::EIO),
+                    TestError::Runtime(uring_runtime::Error::Os(libc::EIO)),
+                ),
+            ] {
+                sim.inject(if write { "write" } else { "read" }, fault)
+                    .unwrap();
+                let lease = segments.lease(SegmentId(0), Generation(1)).unwrap();
+                let buffer = slab.allocate(4096, ()).unwrap();
+                let mut operation = if write {
+                    slab.write(&reactor, extent, buffer, lease, &TestScope)
+                } else {
+                    slab.read(&reactor, extent, buffer, lease, &TestScope)
+                };
+                let mut completed = false;
+                for _ in 0..100 {
+                    if let Poll::Ready(result) = operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                    {
+                        assert_eq!(result.unwrap_err(), expected);
+                        completed = true;
+                        break;
+                    }
+                    reactor.poll_budgeted(64).unwrap();
+                }
+                assert!(completed);
+                drop(operation);
+                assert_eq!(slab.writes_in_flight(), 0);
+                assert_eq!(reactor.in_flight(), 0);
+            }
+        }
+        segments.begin_evict(SegmentId(0)).unwrap();
+        segments.recycle(SegmentId(0)).unwrap();
+    }
+
     /// The live descriptor is direct, sparse, exclusively locked, and aligned.
     #[test]
     fn real_file_is_direct_aligned_and_sparse_without_reactor() {
@@ -919,7 +1403,10 @@ mod tests {
         assert_eq!(stat.len(), slabs.capacity_bytes());
         assert!(stat.blocks() * 512 < stat.len());
         let opened = slabs.opened.borrow();
-        let fd = opened.as_ref().unwrap().file.as_raw_fd();
+        let OpenBacking::File(file) = &opened.as_ref().unwrap().backing else {
+            unreachable!()
+        };
+        let fd = file.as_raw_fd();
         // SAFETY: descriptor and buffers remain live throughout these synchronous calls.
         assert_ne!(
             unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_DIRECT,
