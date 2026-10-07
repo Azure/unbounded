@@ -377,6 +377,8 @@ mod circuit {
         retry_at: Instant,
 
         probe_until: Option<Instant>,
+
+        pending_backoff: Option<Rc<()>>,
     }
 
     impl Circuit {
@@ -441,6 +443,8 @@ mod circuit {
         }
 
         /// Record a caller-classified failure using caller-selected retry jitter.
+        /// Backoff may reenter: the count is visible before the callback, and any
+        /// newer transition for this key takes precedence over its returned delay.
         pub fn failure(
             &self,
             key: &K,
@@ -455,10 +459,27 @@ mod circuit {
                 failures: 0,
                 retry_at: now,
                 probe_until: None,
+                pending_backoff: None,
             });
             state.failures = state.failures.saturating_add(1);
-            state.retry_at = now + backoff(key, state.failures);
-            state.probe_until = None;
+            let failures = state.failures;
+            let pending = Rc::new(());
+            state.pending_backoff = Some(Rc::clone(&pending));
+            drop(states);
+
+            let retry_at = now + backoff(key, failures);
+            let mut states = self.states.borrow_mut();
+            // Never reinsert a removed record or overwrite a newer transition.
+            if let Some(state) = states.get_mut(key)
+                && state
+                    .pending_backoff
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &pending))
+            {
+                state.retry_at = retry_at;
+                state.probe_until = None;
+                state.pending_backoff = None;
+            }
             Ok(())
         }
 
@@ -485,6 +506,7 @@ mod circuit {
                 return false;
             }
             state.probe_until = Some(now + self.probe_timeout);
+            state.pending_backoff = None;
             true
         }
 
@@ -508,6 +530,103 @@ mod circuit {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Backoff can inspect the circuit without borrowing conflicts.
+        #[test]
+        fn backoff_reentry_observes_failure_record() {
+            let now = Instant::now();
+            let health = Circuits::new(1, Duration::from_secs(1));
+            health
+                .failure(&7, now, |key, failures| {
+                    assert_eq!((*key, failures), (7, 1));
+                    assert_eq!(health.len(), 1);
+                    assert!(!health.is_empty());
+                    assert!(health.available(key, now));
+                    Duration::from_secs(2)
+                })
+                .unwrap();
+            assert!(!health.available(&7, now));
+            assert!(health.available(&7, now + Duration::from_secs(2)));
+        }
+
+        /// A nested success or retention change must not be undone by backoff.
+        #[test]
+        fn backoff_reentry_preserves_removal_and_capacity() {
+            let now = Instant::now();
+            for retain in [false, true] {
+                let health = Circuits::new(1, Duration::ZERO);
+                health
+                    .failure(&7, now, |_, _| {
+                        if retain {
+                            health.retain(&[]);
+                        } else {
+                            health.success(&7);
+                        }
+                        health.failure(&8, now, |_, _| Duration::ZERO).unwrap();
+                        Duration::from_secs(10)
+                    })
+                    .unwrap();
+                assert_eq!(health.len(), 1);
+                assert!(health.available(&7, now));
+                assert_eq!(
+                    health.failure(&9, now, |_, _| panic!("capacity is full")),
+                    Err(Error::Overloaded)
+                );
+                health.success(&8);
+                assert!(health.is_empty());
+            }
+        }
+
+        /// Newer failures win even when counts saturate or the key is replaced.
+        #[test]
+        fn backoff_reentry_preserves_newer_failure() {
+            let now = Instant::now();
+            for (initial, replace) in [(0, false), (u32::MAX, false), (0, true)] {
+                let health = Circuits::new(1, Duration::ZERO);
+                if initial != 0 {
+                    health.failure(&7, now, |_, _| Duration::ZERO).unwrap();
+                    health.states.borrow_mut().get_mut(&7).unwrap().failures = initial;
+                }
+                health
+                    .failure(&7, now, |_, count| {
+                        assert_eq!(count, initial.saturating_add(1));
+                        if replace {
+                            health.success(&7);
+                        }
+                        health
+                            .failure(&7, now, |_, nested_count| {
+                                assert_eq!(
+                                    nested_count,
+                                    if replace { 1 } else { count.saturating_add(1) }
+                                );
+                                Duration::from_secs(2)
+                            })
+                            .unwrap();
+                        Duration::from_secs(10)
+                    })
+                    .unwrap();
+                assert!(!health.available(&7, now));
+                assert!(health.available(&7, now + Duration::from_secs(2)));
+                assert_eq!(health.len(), 1);
+            }
+        }
+
+        /// A probe admitted by backoff keeps its timeout after the callback.
+        #[test]
+        fn backoff_reentry_preserves_probe_timeout() {
+            let now = Instant::now();
+            let timeout = Duration::from_secs(2);
+            let health = Circuits::new(1, timeout);
+            health.failure(&7, now, |_, _| Duration::ZERO).unwrap();
+            health
+                .failure(&7, now, |_, _| {
+                    drop(health.acquire(&7, now).unwrap());
+                    Duration::from_secs(10)
+                })
+                .unwrap();
+            assert!(!health.available(&7, now));
+            assert!(health.available(&7, now + timeout));
+        }
 
         /// Failed key cloning must not leave an exclusive probe without an owner.
         #[test]
