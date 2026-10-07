@@ -80,6 +80,10 @@
 //! Any lease, including one from [`Segments::lease`], permits writes in that prefix.
 //! Leases do not grant exclusive record ownership. The trusted caller must write
 //! only reserved extents it owns and never overwrite published or readable records.
+//! A lease does not prove initialization in its generation: append reserves space
+//! without writing it. Recycled bytes may come from an earlier generation or a
+//! different cache. Before exposing them as a valid record, the caller must check
+//! record integrity, authentication, and cache identity, even after a successful read.
 //!
 //! Submission checks table identity, alignment, length, segment boundaries, and
 //! captured used bytes. Reads and writes reject short completions. Accepted I/O
