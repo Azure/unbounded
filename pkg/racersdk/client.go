@@ -221,12 +221,13 @@ func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
 }
 
 func (c *Client) exchangeHead(ctx context.Context, conn *clientConn, head []byte, r wire.Request) (wire.Response, bool, error) {
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) }) //nolint:errcheck // Best effort interrupt.
-	defer stop()
-
 	if err := conn.SetDeadline(time.Now().Add(c.limits.headerTimeout)); err != nil {
 		return wire.Response{}, false, err
 	}
+
+	// Arm cancellation last so its deadline cannot be overwritten by setup.
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) }) //nolint:errcheck // Best effort interrupt.
+	defer stop()
 
 	if _, err := conn.Write(head); err != nil {
 		return wire.Response{}, false, err
