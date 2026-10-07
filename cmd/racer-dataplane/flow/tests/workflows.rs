@@ -1244,7 +1244,7 @@ mod coalesce_tests {
                 .poll(&mut Context::from_waker(&waker))
                 .is_pending()
         );
-        complete.finish(7);
+        complete.unwrap().finish(7);
         assert_eq!(block_on(receive), 7);
         let (receive, complete) = replacement.borrow_mut().take().unwrap();
         assert_eq!(table.len(), 1);
