@@ -91,6 +91,8 @@ pub struct LocalSigningIdentity {
 
     certificate_chain: Vec<Vec<u8>>,
 
+    block_devices: Option<String>,
+
     not_before: u64,
 
     not_after: u64,
@@ -337,6 +339,10 @@ impl<H: Host> Enrollment<H> {
             enrollment: r.enrollment.clone(),
             private_material,
             certificate_chain: r.certificate_chain.clone(),
+            block_devices: r
+                .block_devices
+                .clone()
+                .filter(|selector| !selector.is_empty()),
             not_before: public.valid_from,
             not_after: public.expires,
         })
@@ -515,6 +521,11 @@ where
 }
 
 impl LocalSigningIdentity {
+    /// Borrow the accepted block-device selector, with empty selectors treated as absent.
+    pub fn block_devices(&self) -> Option<&str> {
+        self.block_devices.as_deref()
+    }
+
     /// Return the authenticated node UID.
     pub fn node(&self) -> &NodeId {
         &self.node
@@ -1084,6 +1095,93 @@ mod tests {
         assert_ne!(fresh.enrollment, request.enrollment);
         drive(&files, e.load_identity(&scope)).unwrap().unwrap();
         assert!(sim.metadata(Path::new("/private/pending.json")).is_ok());
+    }
+
+    /// Live acceptance and a fresh owner recover the same optional selector.
+    #[test]
+    fn block_device_selector_survives_acceptance_and_recovery() {
+        for selector in [Some(r"^nvme-eui\.[0-9a-f]+$"), None, Some("")] {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let (files, e, scope) = fixture();
+            let (ca, key) = identity::test_util::ca();
+            let roots = vec![ca.der().to_vec()];
+            e.set_peer_trust_roots(roots.clone()).unwrap();
+            let request = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            let mut response = issue(&request, &ca, &key, |_| {});
+            response.block_devices = selector.map(str::to_owned);
+            let expected = selector.filter(|value| !value.is_empty());
+            let accepted = drive(&files, e.accept_response(response, &scope)).unwrap();
+            assert_eq!(accepted.block_devices(), expected);
+            drop(e);
+            drop(files);
+            sim.disk().crash().unwrap();
+            let (files, e, scope) = fixture();
+            e.set_peer_trust_roots(roots).unwrap();
+            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+            assert_eq!(recovered.block_devices(), expected);
+            assert_eq!(recovered.node(), accepted.node());
+            assert_eq!(recovered.certificate_chain(), accepted.certificate_chain());
+        }
+    }
+
+    /// Rejected renewals retain the selector; accepted renewals replace or clear it.
+    #[test]
+    fn block_device_selector_changes_only_after_accepted_renewal() {
+        for selector in [Some("new-device.*"), None, Some("")] {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let (files, e, scope) = fixture();
+            let (ca, key) = identity::test_util::ca();
+            e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+            let first = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            let mut response = issue(&first, &ca, &key, |_| {});
+            response.block_devices = Some("old-device.*".into());
+            let prior = drive(&files, e.accept_response(response, &scope)).unwrap();
+            let request = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
+            let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
+            let mut response = issue(&request, &ca, &key, |_| {});
+            response.block_devices = selector.map(str::to_owned);
+            let mut rejected = response.clone();
+            rejected.enrollment = first.enrollment;
+            assert!(matches!(
+                drive(&files, e.accept_response(rejected, &scope)),
+                Err(error) if error == Error::Unauthorized.into()
+            ));
+            sim.disk().crash().unwrap();
+            assert_eq!(
+                sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                committed
+            );
+            assert_eq!(
+                sim.read_file(Path::new("/private/pending.json")).unwrap(),
+                pending
+            );
+            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+            assert_eq!(recovered.block_devices(), Some("old-device.*"));
+            assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
+            let renewed = drive(&files, e.accept_response(response, &scope)).unwrap();
+            let expected = selector.filter(|value| !value.is_empty());
+            assert_eq!(renewed.block_devices(), expected);
+            assert_eq!(prior.block_devices(), Some("old-device.*"));
+            sim.disk().crash().unwrap();
+            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+            assert_eq!(recovered.block_devices(), expected);
+            assert_eq!(recovered.certificate_chain(), renewed.certificate_chain());
+        }
     }
 
     /// Late base64 failures preserve pending work and never publish or recover a key.
