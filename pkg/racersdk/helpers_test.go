@@ -239,9 +239,14 @@ func offsetOrigin(size int64) Origin {
 			return m, nil, nil
 		}
 
-		start, end := min(r.Offset, size), min(r.Offset+r.Length, size)
+		start := min(r.Offset, size)
 
-		return m, io.NopCloser(io.LimitReader(&offsetStream{offset: start}, end-start)), nil
+		length := min(r.Length, size-start)
+		if length == 0 {
+			return m, nil, nil
+		}
+
+		return m, io.NopCloser(io.LimitReader(&offsetStream{offset: start}, length)), nil
 	}
 }
 
