@@ -707,8 +707,10 @@ impl SegmentClock {
         Err(Error::Busy)
     }
 
-    /// Rank at most 64 eligible slots before entering eviction. Scores are soft
-    /// preferences, not pins. The callback must itself bound mapping inspection.
+    /// Visit at most min(slot count, max_visits, 64) slots, then rank eligible
+    /// candidates before entering eviction. Skipped slots count toward this limit.
+    /// Scores are soft preferences, not pins. The callback must itself bound
+    /// mapping inspection.
     /// Existing eviction work sorts first so partial removals always make progress.
     /// Unlike the legacy clock, logical heat is supplied by the caller, so recent
     /// disk completions do not override value ranking.

@@ -125,8 +125,10 @@ Evicting a segment happens in this order:
    mark the segment `Free`.
 
 The key rule is: remove the index entries first, then wait for in-flight I/O,
-then reuse. `reclaim_scored` is a variant that ranks a small sample by a
-caller-provided score instead of recent reads. `reclaim_index` drops index entries one at a time until a caller check
+then reuse. `reclaim_scored` visits at most `min(slot count, max_visits, 64)`
+slots, including skipped slots. It ranks eligible candidates in that sample by a
+caller-provided score instead of recent reads. The limit is on visited slots,
+not eligible candidates. `reclaim_index` drops index entries one at a time until a caller check
 (for example, an index size limit) passes. It does not free segments and does not
 ask `can_evict`.
 

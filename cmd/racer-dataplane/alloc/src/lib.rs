@@ -127,9 +127,11 @@
 //!
 //! [`SegmentClock`] shares a cursor and second-chance set across bounded sweeps.
 //! Index reclamation forgets mappings without touching bytes or generations.
-//! Physical reclamation only visits Sealed/Evicting slots and recycles empty slots
-//! after leases drain. Each sweep visits at most two rotations, further capped by
-//! the caller. For a nonzero reserve, [`SegmentClock::reclaim`] and
+//! Physical reclamation selects only Sealed/Evicting slots and recycles empty slots
+//! after leases drain. Index and unscored sweeps visit at most two rotations,
+//! further capped by the caller. Scored reclamation visits at most
+//! min(slot count, max_visits, 64) slots, including skipped slots, then ranks
+//! eligible candidates. For a nonzero reserve, [`SegmentClock::reclaim`] and
 //! [`SegmentClock::reclaim_scored`] succeed only when the reserve (capped at the
 //! slot count) is met and no evictions remain. Busy is intentional even with enough
 //! free slots while pending evictions drain. Use [`Segments::free_count`] to check
