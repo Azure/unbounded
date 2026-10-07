@@ -55,6 +55,10 @@ pub struct SegmentSnapshot {
 /// Any lease permits both reads and writes in that prefix; it is not exclusive
 /// record ownership. The trusted caller must follow [`crate::Slab::write`]'s
 /// ownership and publication rules.
+/// A lease does not prove that bytes were initialized in this generation. Append
+/// only reserves space; recycled bytes may belong to an earlier generation or a
+/// different cache. The caller must check record integrity, authentication, and
+/// cache identity before exposing bytes as a valid record.
 ///
 /// Lease counts cannot be duplicated by cloning a completion capability:
 ///
@@ -278,6 +282,7 @@ impl Segments {
     /// Reserve an aligned used range. Malformed requests and lease overflow leave
     /// state unchanged. A valid rollover without a free slot seals the open tail
     /// before returning Busy, allowing reclamation to make a retry possible.
+    /// Reservation does not write or initialize disk bytes; see [`SegmentLease`].
     pub fn append(&self, length: usize) -> Result<(SegmentLease, Extent)> {
         if self.frozen.get() {
             return Err(Error::Busy);
@@ -368,7 +373,9 @@ impl Segments {
         usize::try_from(id.0).map_err(|_| Error::Corrupt)
     }
 
-    /// Acquire the current used prefix only while the generation is readable.
+    /// Acquire the current used prefix only while the slot is Open or Sealed and
+    /// the generation matches. This checks allocation state, not whether bytes
+    /// were initialized in this generation or form valid records; see [`SegmentLease`].
     pub fn lease(&self, id: SegmentId, generation: Generation) -> Result<SegmentLease> {
         let slots = self.slots.borrow();
         let slot = slots.get(Self::position(id)?).ok_or(Error::Corrupt)?;

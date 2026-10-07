@@ -86,8 +86,16 @@ Free -> Open -> Sealed -> Evicting -> Free (generation + 1)
   generation, and how much of the segment was in use when it was taken. While
   any lease exists, the segment cannot go back to `Free`.
 - The caller stores `(segment, generation, extent)` in its own index. A lookup
-  with an old generation fails with `Stale`, so a reused segment can never be
-  read as if it still held the old page.
+  with an old generation fails with `Stale`. This rejects stale mappings, not
+  stale bytes read through a lease for the current generation.
+
+Append reserves space without writing or initializing disk bytes. Neither a
+`SegmentLease` nor a successful read proves that bytes were initialized in the
+current generation. Recycled storage may still hold bytes from an earlier
+generation or a different cache. Before exposing bytes as a valid record, the
+caller must check record integrity, authentication, and cache identity (see
+`SegmentLease` and `Segments::append` in `alloc/src/segments.rs`, and `Slab::read`
+in `alloc/src/slab.rs`).
 
 `freeze`, `snapshot`, and `restore` support restart. Restore checks the whole
 image before it changes anything, requires that no leases are live, and seals

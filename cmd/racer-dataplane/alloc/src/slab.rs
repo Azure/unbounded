@@ -558,6 +558,10 @@ impl<C: Charge> Slab<C> {
 
     /// Read exactly one checked extent, retaining its buffer and lease until completion.
     /// Dropping the waiting future does not release kernel-owned resources.
+    /// Neither a lease nor a successful read proves initialization in this
+    /// generation. Append only reserves space; recycled bytes may come from an
+    /// earlier generation or a different cache. Before exposing a valid record,
+    /// the caller must check its integrity, authentication, and cache identity.
     pub fn read<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,
