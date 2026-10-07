@@ -892,6 +892,115 @@ mod tests {
         }
     }
 
+    /// Report exchange expiry once, keep serving, and release all resources on drain.
+    #[test]
+    fn serve_classifies_exchange_deadline_without_stopping_listener() {
+        use std::task::{Context, Waker};
+        use uring_runtime::{
+            environment::SimulationClock,
+            reactor::{SocketAddress, simulation::Simulation},
+        };
+
+        let now = Instant::now();
+        let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
+        let _clock = clock.environment(0).enter();
+        let simulation = Simulation::new();
+        let _simulation = simulation.enter();
+        let reactor = Reactor::<TestScope, ()>::new(8, ());
+        let memory = Rc::new(Cell::new(0));
+        let control = Rc::new(Cell::new(0));
+        let connections = Rc::new(Cell::new(0));
+        let submissions = reactor
+            .reserve_submissions(CONTROL_SLOTS, Charge::new(&control))
+            .unwrap();
+        let owner = Server::new(submissions, Charge::new(&memory));
+        let handler = Tracked {
+            routes: Routes::default(),
+            connections: connections.clone(),
+            deny_next: Cell::new(false),
+        };
+        let scope = TestScope {
+            deadline: now + Duration::from_secs(10),
+            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+        };
+        let address = SocketAddress::Inet("127.0.0.1:18080".parse().unwrap());
+        let listener = simulation.listen(address.clone()).unwrap();
+        let slow = simulation.connect(address.clone()).unwrap();
+        let mut server = owner.serve(&reactor, listener, &handler, &scope);
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..4 {
+            assert!(server.as_mut().poll(&mut cx).is_pending());
+            reactor.poll_budgeted(32).unwrap();
+        }
+        assert_eq!(*handler.routes.0.borrow(), vec![Event::Accepted]);
+        assert_eq!(connections.get(), 1);
+
+        clock.advance(CONNECTION_TIMEOUT - Duration::from_nanos(1));
+        for _ in 0..4 {
+            reactor.poll_budgeted(32).unwrap();
+            assert!(server.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(*handler.routes.0.borrow(), vec![Event::Accepted]);
+        assert_eq!(connections.get(), 1);
+
+        clock.advance(Duration::from_nanos(1));
+        for _ in 0..32 {
+            reactor.poll_budgeted(32).unwrap();
+            assert!(server.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(uring_runtime::Scope::check(&scope), Ok(()));
+        assert!(owner.serving.get());
+        assert_eq!(
+            *handler.routes.0.borrow(),
+            vec![Event::Accepted, Event::Timeout]
+        );
+        assert_eq!(owner.resources.active.get(), 0);
+        assert_eq!(connections.get(), 0);
+        assert_eq!(slow.try_recv(&mut [0; 1]).unwrap(), 0);
+
+        let healthy = simulation.connect(address).unwrap();
+        let request = b"GET /live HTTP/1.1\r\nHost: local\r\n\r\n";
+        assert_eq!(healthy.try_send(request).unwrap(), request.len());
+        for _ in 0..32 {
+            reactor.poll_budgeted(32).unwrap();
+            assert!(server.as_mut().poll(&mut cx).is_pending());
+        }
+        let mut response = [0; 256];
+        let used = healthy.try_recv(&mut response).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&response[..used]).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 3\r\nConnection: close\r\nCache-Control: no-store\r\n\r\nok\n"
+        );
+        assert_eq!(healthy.try_recv(&mut response).unwrap(), 0);
+        assert_eq!(uring_runtime::Scope::check(&scope), Ok(()));
+        assert_eq!(connections.get(), 0);
+        assert_eq!(
+            *handler.routes.0.borrow(),
+            vec![Event::Accepted, Event::Timeout, Event::Accepted]
+        );
+
+        drop(server);
+        assert!(!owner.serving.get());
+        drop(owner);
+        let mut drain = reactor.drain();
+        let mut result = Poll::Pending;
+        for _ in 0..32 {
+            reactor.poll_budgeted(32).unwrap();
+            result = drain.as_mut().poll(&mut cx);
+            if result.is_ready() {
+                break;
+            }
+        }
+        assert_eq!(result, Poll::Ready(Ok(())));
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(memory.get(), 0);
+        assert_eq!(control.get(), 0);
+        assert_eq!(connections.get(), 0);
+        drop(drain);
+        drop((reactor, scope, slow, healthy));
+        assert_eq!(simulation.live_handles(), 0);
+    }
+
     /// Keep reservations through abandonment and reject a second concurrent listener.
     #[test]
     fn independent_server_dispatch_guard_and_abandoned_buffer_fence() {
