@@ -644,7 +644,7 @@ impl<P: Policy> Quotas<P> {
         if let Some(local) = &local {
             local.counter(class).add(amount);
         }
-        Ok(Charge {
+        let charge = Charge {
             class,
             amount,
             key,
@@ -652,7 +652,13 @@ impl<P: Policy> Quotas<P> {
             local,
             buffers: Arc::downgrade(&self.buffers),
             stopped: self.stopped.clone(),
-        })
+        };
+        // Policy and key callbacks may stop admission. Drop the completed owner
+        // to roll back both counters while preserving completion and drain work.
+        if self.is_stopped() && mode == AdmissionMode::Ordinary && !P::allows_stopped(class) {
+            return Err(Error::Unavailable);
+        }
+        Ok(charge)
     }
 
     /// Reuse a live key record or create one after bounded retirement cleanup.
@@ -1528,6 +1534,173 @@ mod quota_tests {
             assert!(quotas.policy.rejected.lock().unwrap().is_empty());
             drop(existing);
             assert_eq!(quotas.used(class), 0);
+        }
+    }
+
+    /// Local callbacks cannot admit ordinary work after stopping the authority.
+    #[test]
+    fn local_reservation_rechecks_stop_after_callbacks() {
+        use std::cell::Cell;
+
+        thread_local! {
+            static CLONE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        }
+
+        /// A transferable key whose next clone can stop the local authority.
+        #[derive(Eq, PartialEq, Hash)]
+        struct Key(u8);
+
+        impl Clone for Key {
+            /// Run the one-shot callback without holding its borrow.
+            fn clone(&self) -> Self {
+                let hook = CLONE_HOOK.with(|hook| hook.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook();
+                }
+                Self(self.0)
+            }
+        }
+
+        /// Select which application callback requests shutdown.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Hook {
+            Limit,
+
+            Floor,
+
+            Clone,
+        }
+
+        /// Stop through a weak authority link without retaining an ownership cycle.
+        struct StopPolicy {
+            quotas: RefCell<std::rc::Weak<Quotas<Self>>>,
+
+            hook: Cell<Option<Hook>>,
+
+            rejections: Cell<usize>,
+        }
+
+        impl StopPolicy {
+            /// Stop only at the selected policy callback.
+            fn stop_at(&self, hook: Hook) {
+                if self.hook.get() == Some(hook) {
+                    self.hook.set(None);
+                    self.quotas.borrow().upgrade().unwrap().stop();
+                }
+            }
+        }
+
+        impl Policy for StopPolicy {
+            type Class = Resource;
+
+            type Key = Key;
+
+            /// Leave enough capacity for both the existing and attempted charge.
+            fn limit(&self, _: Resource) -> usize {
+                self.stop_at(Hook::Limit);
+                10
+            }
+
+            /// Exercise shutdown during keyed fair-share calculation.
+            fn floor(&self, _: Resource) -> usize {
+                self.stop_at(Hook::Floor);
+                1
+            }
+
+            /// Permit one live identity and verify its eventual retirement.
+            fn max_keys(&self) -> usize {
+                1
+            }
+
+            /// Preserve the fixture's class-specific release wake policy.
+            fn wakes(class: Resource) -> bool {
+                TestPolicy::wakes(class)
+            }
+
+            /// Preserve the fixture's drain-progress exception.
+            fn allows_stopped(class: Resource) -> bool {
+                TestPolicy::allows_stopped(class)
+            }
+
+            /// No page backing is allocated by this test.
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            /// Stop rejection must not be reported as quota pressure.
+            fn rejected(&self, _: Rejection<Resource>) {
+                self.rejections.set(self.rejections.get() + 1);
+            }
+        }
+
+        for hook in [Hook::Limit, Hook::Floor, Hook::Clone] {
+            // Unkeyed, new key, and existing key exercise distinct ownership paths.
+            for (keyed, live_key) in [(false, false), (true, false), (true, true)] {
+                if !keyed && hook != Hook::Limit {
+                    continue;
+                }
+                for (class, completion) in [
+                    (Resource::Payload, false),
+                    (Resource::Other, false),
+                    (Resource::Progress, false),
+                    (Resource::Payload, true),
+                ] {
+                    if completion && hook == Hook::Floor {
+                        continue;
+                    }
+                    let quotas = Rc::new(Quotas::new(StopPolicy {
+                        quotas: RefCell::default(),
+                        hook: Cell::new(None),
+                        rejections: Cell::new(0),
+                    }));
+                    *quotas.policy.quotas.borrow_mut() = Rc::downgrade(&quotas);
+                    let key = Key(1);
+                    let existing = quotas.reserve(live_key.then_some(&key), class, 3).unwrap();
+                    if hook == Hook::Clone {
+                        let weak = Rc::downgrade(&quotas);
+                        CLONE_HOOK.with(|hook| {
+                            *hook.borrow_mut() =
+                                Some(Box::new(move || weak.upgrade().unwrap().stop()));
+                        });
+                    } else {
+                        quotas.policy.hook.set(Some(hook));
+                    }
+                    let result = if completion {
+                        quotas.reserve_completion(keyed.then_some(&key), class, 7)
+                    } else {
+                        quotas.reserve(keyed.then_some(&key), class, 7)
+                    };
+                    assert!(quotas.is_stopped(), "callback {hook:?} must run");
+                    if completion || StopPolicy::allows_stopped(class) {
+                        let charge = result.unwrap();
+                        assert_eq!(charge.amount(), 7);
+                        assert_eq!(quotas.used(class), 10);
+                        if let Some(local) = &charge.local {
+                            assert_eq!(local.counter(class).used(), if live_key { 10 } else { 7 });
+                        }
+                        drop(charge);
+                    } else {
+                        assert!(matches!(result, Err(Error::Unavailable)), "hook {hook:?}");
+                    }
+                    assert_eq!(quotas.used(class), 3);
+                    assert_eq!(
+                        quotas.active_keys.load(Ordering::Acquire),
+                        usize::from(live_key)
+                    );
+                    if let Some(local) = &existing.local {
+                        assert_eq!(local.counter(class).used(), 3);
+                    }
+                    assert_eq!(quotas.policy.rejections.get(), 0);
+                    drop(existing);
+                    assert_eq!(quotas.used(class), 0);
+                    assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+                    let replacement = quotas.reserve_completion(Some(&Key(2)), class, 10).unwrap();
+                    assert!(!quotas.keys.borrow().contains_key(&key));
+                    drop(replacement);
+                    assert_eq!(quotas.used(class), 0);
+                    assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+                }
+            }
         }
     }
 
