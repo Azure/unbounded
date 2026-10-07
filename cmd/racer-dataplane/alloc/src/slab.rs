@@ -1747,13 +1747,29 @@ mod tests {
             }
             assert!(!directory.0.join("missing").exists());
             assert_eq!(slab.geometry(), Err(Error::Unavailable));
+        }
 
-            let retry = Slab::<()>::new(path.clone(), 8192, 4096, 512);
+        let Some(alignment) = real_alignment(probe(&file)) else {
+            return;
+        };
+        let segment_bytes = alignment.extent(0, 512).unwrap().length() as u64;
+        let capacity = segment_bytes.checked_mul(crate::MAX_SEGMENTS + 1).unwrap();
+        let retry_capacity = segment_bytes.checked_mul(2).unwrap();
+        for path in &paths {
+            let segments = Segments::new(segment_bytes);
+            let slab = Slab::<()>::new(path.clone(), capacity, segment_bytes, 512);
+            assert_eq!(
+                slab.open_configured(&segments),
+                Err(Error::InvalidConfiguration)
+            );
+            assert!(!segments.is_configured());
+            assert_eq!(slab.geometry(), Err(Error::Unavailable));
+            let retry = Slab::<()>::new(path.clone(), retry_capacity, segment_bytes, 512);
             if real_alignment(retry.open_configured(&segments)).is_none() {
                 return;
             }
             assert_eq!(segments.count(), 2);
-            assert_eq!(std::fs::metadata(path).unwrap().len(), 8192);
+            assert_eq!(std::fs::metadata(path).unwrap().len(), retry_capacity);
             drop(retry);
             std::fs::remove_file(path).unwrap();
             if path.parent() != Some(directory.0.as_path()) {
@@ -1793,17 +1809,28 @@ mod tests {
     /// The slot limit does not cap physical backing for an already configured table.
     #[test]
     fn open_configured_accepts_partial_table_above_physical_segment_limit() {
+        use std::os::unix::fs::OpenOptionsExt;
+
         let directory = Directory::new();
-        let probe = Slab::<()>::new(directory.0.join("probe"), 4096, 4096, 512);
-        let Some(alignment) = real_alignment(probe.open_now()) else {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.0.join("probe"))
+            .unwrap();
+        let Some(alignment) = real_alignment(probe(&file)) else {
             return;
         };
-        let capacity = 4096 * (crate::MAX_SEGMENTS + 1);
-        let segments = Segments::new(4096);
+        let segment_bytes = alignment.extent(0, 512).unwrap().length() as u64;
+        let capacity = segment_bytes.checked_mul(crate::MAX_SEGMENTS + 1).unwrap();
+        let segments = Segments::new(segment_bytes);
         segments.configure(capacity, 2, alignment).unwrap();
         let path = directory.0.join("partial");
-        let slab = Slab::<()>::new(path.clone(), capacity, 4096, 512);
-        assert_eq!(slab.open_configured(&segments), Ok(alignment));
+        let slab = Slab::<()>::new(path.clone(), capacity, segment_bytes, 512);
+        let Some(opened_alignment) = real_alignment(slab.open_configured(&segments)) else {
+            return;
+        };
+        assert_eq!(opened_alignment, alignment);
         assert_eq!(segments.count(), 2);
         assert_eq!(segments.capacity_bytes(), capacity);
         assert_eq!(
