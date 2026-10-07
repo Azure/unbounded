@@ -96,7 +96,15 @@ func (m Metadata) wire() wire.Metadata {
 		size = math.MaxUint64
 	}
 
-	return wire.Metadata{Size: size, ETag: m.ETag, ExpiresAt: time.UnixMilli(m.ExpiresAt.UnixMilli()).UTC(), ContentType: m.ContentType}
+	expiresAt := m.ExpiresAt
+	sec := expiresAt.Unix()
+	ms := int64(expiresAt.Nanosecond() / int(time.Millisecond))
+	// Keep invalid timestamps for wire validation rather than wrapping UnixMilli.
+	if sec >= 0 && sec <= math.MaxInt64/1000 && (sec < math.MaxInt64/1000 || ms <= math.MaxInt64%1000) {
+		expiresAt = time.UnixMilli(expiresAt.UnixMilli()).UTC()
+	}
+
+	return wire.Metadata{Size: size, ETag: m.ETag, ExpiresAt: expiresAt, ContentType: m.ContentType}
 }
 
 func fromWireMetadata(m wire.Metadata) Metadata {
