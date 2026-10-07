@@ -432,6 +432,8 @@ impl<P: Policy> Drop for Charge<P> {
     /// Release exactly this charge's remaining amount and apply wake policy.
     fn drop(&mut self) {
         self.release_to(0);
+        // Retire the final key owner before a wake callback retries admission.
+        drop(self.local.take());
         if P::wakes(self.class) {
             self.totals.wake.wake();
         }
@@ -1454,6 +1456,97 @@ mod quota_tests {
         drop(replacement);
         assert_eq!(quotas.used(Resource::Payload), 0);
         assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+    }
+
+    /// A final keyed release frees its record before synchronous waiter reentry.
+    #[test]
+    fn keyed_release_retires_before_reentrant_wake() {
+        thread_local! {
+            static ON_WAKE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        }
+
+        struct ReentrantWake(AtomicUsize);
+
+        impl std::task::Wake for ReentrantWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                let callback = ON_WAKE.with(|slot| slot.borrow_mut().take());
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
+        }
+
+        let quotas = Rc::new(Quotas::new(TestPolicy::new(10, 1)));
+        let old = "old".to_owned();
+        let mut charge = quotas.reserve(Some(&old), Resource::Other, 10).unwrap();
+        let split = charge.split(4).unwrap();
+        let wake = Arc::new(ReentrantWake(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(wake.clone());
+
+        let nested = quotas.clone();
+        ON_WAKE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(nested.used(Resource::Other), 6);
+                assert_eq!(nested.active_keys.load(Ordering::Acquire), 1);
+                let local = nested.keys.borrow()["old"].upgrade().unwrap();
+                assert_eq!(local.counter(Resource::Other).used(), 6);
+                assert!(nested.retired_keys.lock().unwrap().is_empty());
+                assert!(matches!(
+                    nested.reserve(Some(&"new".to_owned()), Resource::Other, 10),
+                    Err(Error::Overloaded)
+                ));
+            }));
+        });
+        quotas.shared().register(&waker);
+        drop(split);
+        assert_eq!(wake.0.load(Ordering::Relaxed), 1);
+        assert_eq!(charge.amount(), 6);
+        assert_eq!(quotas.used(Resource::Other), 6);
+
+        quotas.policy.rejected.lock().unwrap().clear();
+        let nested = quotas.clone();
+        ON_WAKE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(nested.used(Resource::Other), 0);
+                let replacement = nested
+                    .reserve(Some(&"new".to_owned()), Resource::Other, 10)
+                    .expect("the final release must free the key slot before waking");
+                assert_eq!(nested.used(Resource::Other), 10);
+                assert_eq!(nested.active_keys.load(Ordering::Acquire), 1);
+                assert_eq!(
+                    replacement
+                        .local
+                        .as_ref()
+                        .unwrap()
+                        .counter(Resource::Other)
+                        .used(),
+                    10
+                );
+                assert!(!nested.keys.borrow().contains_key("old"));
+                assert_eq!(nested.keys.borrow().len(), 1);
+                assert!(nested.retired_keys.lock().unwrap().is_empty());
+                drop(replacement);
+                assert_eq!(nested.used(Resource::Other), 0);
+                assert_eq!(nested.active_keys.load(Ordering::Acquire), 0);
+                assert_eq!(
+                    nested
+                        .retired_keys
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    vec!["new"]
+                );
+            }));
+        });
+        quotas.shared().register(&waker);
+        drop(charge);
+        assert_eq!(wake.0.load(Ordering::Relaxed), 2);
+        assert_eq!(quotas.used(Resource::Other), 0);
+        assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+        assert!(quotas.policy.rejected.lock().unwrap().is_empty());
+        assert!(ON_WAKE.with(|slot| slot.borrow().is_none()));
     }
 
     /// Charges and shared handles retain exact accounting across threads.
