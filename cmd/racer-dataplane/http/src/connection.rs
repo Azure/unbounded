@@ -1260,7 +1260,7 @@ impl<C: Context> HttpPool<C> {
             scope.check()?;
             let mut waiting: Option<Waiting<C>> = None;
             let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
-            let (connection, address) = poll_fn(|cx| {
+            let (mut connection, address) = poll_fn(|cx| {
                 if let Some(c) = &cancellation {
                     c.register(cx.waker());
                 }
@@ -1313,6 +1313,7 @@ impl<C: Context> HttpPool<C> {
             })
             .await?;
             drop(waiting);
+            connection.state_mut().attach(C::State::default());
             self.connect(connection, address, scope).await
         })
     }
@@ -3336,6 +3337,91 @@ mod tests {
         drop(connection);
         drop(checkout);
         assert_eq!(hooks.used.get(), 0);
+    }
+
+    /// Both waiting APIs replace idle policy, whether capacity is ready or queued.
+    #[test]
+    fn waiting_checkout_attaches_default_state_on_idle_reuse() {
+        for priority in [false, true] {
+            for queued in [false, true] {
+                let hooks = hooks();
+                let reactor = reactor();
+                let pool =
+                    HttpPool::<Hooks>::new(reactor.clone(), hooks.clone(), PoolConfig::default());
+                let (mut connection, _) = pool.prepare_connection(&Key).unwrap();
+                let (fd, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                fd.set_nonblocking(true).unwrap();
+                connection.fd = Rc::new(fd.into());
+                let socket = Rc::downgrade(&connection.fd);
+                let attachment = Rc::new(Cell::new(0));
+                connection.state_mut().session = 42;
+                connection.state_mut().hook_calls = Some(attachment.clone());
+                connection.set_framing(Some(0), Some(0), false);
+                connection.finish_exchange().unwrap();
+                let mut checkout = if priority {
+                    pool.checkout_metadata(&Key, &TestScope)
+                } else {
+                    pool.checkout_wait(&Key, &TestScope)
+                };
+                let mut cx = std::task::Context::from_waker(Waker::noop());
+                if queued {
+                    assert!(checkout.as_mut().poll(&mut cx).is_pending());
+                    assert_eq!(pool.state.borrow().waiting.len(), 1);
+                    assert!(hooks.used.get() > 0);
+                    assert_eq!(connection.state().session, 42);
+                }
+                drop(connection);
+                assert_eq!(Rc::strong_count(&attachment), 2);
+                let Poll::Ready(Ok(connection)) = checkout.as_mut().poll(&mut cx) else {
+                    panic!("healthy idle checkout must complete immediately");
+                };
+                assert!(Rc::ptr_eq(&connection.fd, &socket.upgrade().unwrap()));
+                assert_eq!(connection.state().session, 0);
+                assert_eq!(connection.state().finished, 0);
+                assert!(connection.state().hook_calls.is_none());
+                assert_eq!(Rc::strong_count(&attachment), 1);
+                assert!(pool.state.borrow().waiting.is_empty());
+                assert_eq!(hooks.used.get(), 0);
+                assert_eq!(hooks.slots.get(), 1);
+                assert_eq!(reactor.in_flight(), 0);
+                drop(connection);
+                drop(checkout);
+                assert_eq!(hooks.slots.get(), 0);
+            }
+        }
+    }
+
+    /// Rejected waiters release registration without changing the active policy.
+    #[test]
+    fn waiting_checkout_shutdown_preserves_active_state() {
+        for priority in [false, true] {
+            let hooks = hooks();
+            let reactor = reactor();
+            let pool =
+                HttpPool::<Hooks>::new(reactor.clone(), hooks.clone(), PoolConfig::default());
+            let (mut connection, _) = pool.prepare_connection(&Key).unwrap();
+            connection.state_mut().session = 42;
+            let mut checkout = if priority {
+                pool.checkout_metadata(&Key, &TestScope)
+            } else {
+                pool.checkout_wait(&Key, &TestScope)
+            };
+            let mut cx = std::task::Context::from_waker(Waker::noop());
+            assert!(checkout.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(pool.state.borrow().waiting.len(), 1);
+            pool.close();
+            assert!(matches!(
+                checkout.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Unavailable)))
+            ));
+            assert_eq!(connection.state().session, 42);
+            assert!(pool.state.borrow().waiting.is_empty());
+            assert_eq!(hooks.used.get(), 0);
+            assert_eq!(reactor.in_flight(), 0);
+            drop(checkout);
+            drop(connection);
+            assert_eq!(hooks.slots.get(), 0);
+        }
     }
 
     /// Connect observation is admitted before submission and retained until drain.
