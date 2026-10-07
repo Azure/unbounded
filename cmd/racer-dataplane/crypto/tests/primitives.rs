@@ -497,9 +497,9 @@ fn pmull_hardware_path_executes_when_available() {
 
 /// Generate key or nonce bytes for tests that do not require published vectors.
 fn random_material<const N: usize>() -> [u8; N] {
-    let mut bytes = [0; N];
-    uring_runtime::environment::fill_random(&mut bytes).unwrap();
-    bytes
+    ring::rand::generate(&ring::rand::SystemRandom::new())
+        .unwrap()
+        .expose()
 }
 
 /// Decode an even-length hexadecimal test vector.
