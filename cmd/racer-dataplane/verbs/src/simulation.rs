@@ -130,6 +130,7 @@ pub struct Event {
     pub work_id: Option<u64>,
 
     /// 0 is success, negative is a rejected call, positive is a completion error.
+    /// Includes validation failures. Successful discovery and polls use 0, not counts.
     pub result: i64,
 
     pub completion: bool,
@@ -474,17 +475,28 @@ impl World {
         self.faults.remove(i).map(|(_, _, fault)| fault)
     }
 
-    /// Trace a call and report whether it is rejected.
+    /// Check a scripted rejection and trace only the failed call.
     fn rejected(&mut self, operation: Operation, resource: u32) -> bool {
         let rejected = self.fault(operation, resource) == Some(Fault::Reject);
-        self.record(
-            operation,
-            resource,
-            None,
-            if rejected { -1 } else { 0 },
-            false,
-        );
+        if rejected {
+            self.record(operation, resource, None, -1, false);
+        }
         rejected
+    }
+
+    /// Run a call unless rejected, then trace its final result.
+    fn call(
+        &mut self,
+        operation: Operation,
+        resource: u32,
+        run: impl FnOnce(&mut Self) -> c_int,
+    ) -> c_int {
+        if self.rejected(operation, resource) {
+            return -1;
+        }
+        let result = run(self);
+        self.record(operation, resource, None, i64::from(result), false);
+        result
     }
 
     /// The device a resource belongs to.
@@ -666,6 +678,9 @@ unsafe extern "C" fn discover(out: *mut Port, capacity: u32) -> c_int {
         return -1;
     }
     if sim.devices.len() > capacity as usize {
+        sim.world
+            .borrow_mut()
+            .record(Operation::Discover, 0, None, -1, false);
         return -1;
     }
     for (i, device) in sim.devices.iter().enumerate() {
@@ -684,6 +699,9 @@ unsafe extern "C" fn discover(out: *mut Port, capacity: u32) -> c_int {
             *out.add(i) = port;
         }
     }
+    sim.world
+        .borrow_mut()
+        .record(Operation::Discover, 0, None, 0, false);
     sim.devices.len() as c_int
 }
 
@@ -697,18 +715,27 @@ unsafe extern "C" fn open(name: *const c_char) -> *mut c_void {
     }
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     let Some(device) = sim.devices.iter().find(|d| d.name.as_bytes() == name) else {
+        sim.world
+            .borrow_mut()
+            .record(Operation::Open, 0, None, -1, false);
         return std::ptr::null_mut();
     };
-    allocate(&sim, Resource::Device(device.clone()))
+    let raw = allocate(&sim, Resource::Device(device.clone()));
+    sim.world
+        .borrow_mut()
+        .record(Operation::Open, 0, None, 0, false);
+    raw
 }
 
 /// Create a QP on the device's port. Writes its QPN.
 unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) -> *mut c_void {
     let h = unsafe { handle(device) };
     let mut world = h.sim.world.borrow_mut();
-    if world.rejected(Operation::Qp, h.id)
-        || !matches!(world.resources.get(&h.id), Some(Resource::Device(d)) if d.port == port)
-    {
+    if world.rejected(Operation::Qp, h.id) {
+        return std::ptr::null_mut();
+    }
+    if !matches!(world.resources.get(&h.id), Some(Resource::Device(d)) if d.port == port) {
+        world.record(Operation::Qp, h.id, None, -1, false);
         return std::ptr::null_mut();
     }
     drop(world);
@@ -725,6 +752,10 @@ unsafe extern "C" fn qp(device: *mut c_void, port: u8, _: u32, qpn: *mut u32) ->
     unsafe {
         *qpn = handle(raw).id;
     }
+    h.sim
+        .world
+        .borrow_mut()
+        .record(Operation::Qp, h.id, None, 0, false);
     raw
 }
 
@@ -737,109 +768,116 @@ unsafe extern "C" fn connect(
     let h = unsafe { handle(raw) };
     let (local, remote) = unsafe { (*local, *remote) };
     let mut world = h.sim.world.borrow_mut();
-    if world.rejected(Operation::Connect, h.id)
-        || local.qpn != h.id
-        || local.validate().is_err()
-        || remote.validate().is_err()
-    {
-        return -1;
-    }
-    let Some(device_id) = world.device(h.id) else {
-        return -1;
-    };
-    if !matches!(world.resources.get(&device_id), Some(Resource::Device(d)) if d.gid == local.gid && d.port == local.port)
-    {
-        return -1;
-    }
-    let Some(remote_device) = world.device(remote.qpn) else {
-        return -1;
-    };
-    if !matches!(
-        world.resources.get(&remote.qpn),
-        Some(Resource::Qp { stopped: false, .. })
-    ) {
-        return -1;
-    }
-    if !matches!(world.resources.get(&remote_device), Some(Resource::Device(d)) if d.gid == remote.gid && d.port == remote.port)
-    {
-        return -1;
-    }
-    let Some(Resource::Qp {
-        local: ours,
-        remote: theirs,
-        stopped: false,
-        ..
-    }) = world.resources.get_mut(&h.id)
-    else {
-        return -1;
-    };
-    if ours.is_some() {
-        return -1;
-    }
-    *ours = Some(local);
-    *theirs = Some(remote);
-    0
+    world.call(Operation::Connect, h.id, |world| {
+        if local.qpn != h.id || local.validate().is_err() || remote.validate().is_err() {
+            return -1;
+        }
+        let Some(device_id) = world.device(h.id) else {
+            return -1;
+        };
+        if !matches!(
+            world.resources.get(&device_id),
+            Some(Resource::Device(d)) if d.gid == local.gid && d.port == local.port
+        ) {
+            return -1;
+        }
+        let Some(remote_device) = world.device(remote.qpn) else {
+            return -1;
+        };
+        if !matches!(
+            world.resources.get(&remote.qpn),
+            Some(Resource::Qp { stopped: false, .. })
+        ) {
+            return -1;
+        }
+        if !matches!(
+            world.resources.get(&remote_device),
+            Some(Resource::Device(d)) if d.gid == remote.gid && d.port == remote.port
+        ) {
+            return -1;
+        }
+        let Some(Resource::Qp {
+            local: ours,
+            remote: theirs,
+            stopped: false,
+            ..
+        }) = world.resources.get_mut(&h.id)
+        else {
+            return -1;
+        };
+        if ours.is_some() {
+            return -1;
+        }
+        *ours = Some(local);
+        *theirs = Some(remote);
+        0
+    })
 }
 
 /// Stop a QP: drop its queued work and unbind its windows.
 unsafe extern "C" fn stop(raw: *mut c_void) -> c_int {
     let h = unsafe { handle(raw) };
     let mut world = h.sim.world.borrow_mut();
-    if world.rejected(Operation::Stop, h.id) {
-        return -1;
-    }
-    let Some(Resource::Qp { stopped, work, .. }) = world.resources.get_mut(&h.id) else {
-        return -1;
-    };
-    *stopped = true;
-    work.clear();
-    for resource in world.resources.values_mut() {
-        if let Resource::Window { grant, .. } = resource
-            && grant.is_some_and(|g| g.qp == h.id)
-        {
-            *grant = None;
+    world.call(Operation::Stop, h.id, |world| {
+        let Some(Resource::Qp { stopped, work, .. }) = world.resources.get_mut(&h.id) else {
+            return -1;
+        };
+        *stopped = true;
+        work.clear();
+        for resource in world.resources.values_mut() {
+            if let Resource::Window { grant, .. } = resource
+                && grant.is_some_and(|g| g.qp == h.id)
+            {
+                *grant = None;
+            }
         }
-    }
-    0
+        0
+    })
 }
 
 /// Free a resource. Fails if anything still uses it.
 unsafe fn free(raw: *mut c_void, operation: Operation) -> c_int {
     let h = unsafe { handle(raw) };
     let mut world = h.sim.world.borrow_mut();
-    if world.rejected(operation, h.id) {
-        return -1;
-    }
-    let referenced = world.resources.iter().any(|(id, resource)| {
-        if *id == h.id {
-            return false;
-        }
-        match resource {
-            Resource::Qp { device, work, .. } => {
-                *device == h.id
-                    || work.iter().any(|w| match w.action {
-                        Action::Bind { window, region, .. } => window == h.id || region == h.id,
-                        Action::Invalidate { key } => key == h.id,
-                        Action::Write { region, .. } => region == h.id,
-                    })
+    let result = world.call(operation, h.id, |world| {
+        let referenced = world.resources.iter().any(|(id, resource)| {
+            if *id == h.id {
+                return false;
             }
-            Resource::Region { device, .. } => *device == h.id,
-            Resource::Window { device, grant } => {
-                *device == h.id || grant.is_some_and(|g| g.region == h.id || g.qp == h.id)
+            match resource {
+                Resource::Qp { device, work, .. } => {
+                    *device == h.id
+                        || work.iter().any(|w| match w.action {
+                            Action::Bind { window, region, .. } => window == h.id || region == h.id,
+                            Action::Invalidate { key } => key == h.id,
+                            Action::Write { region, .. } => region == h.id,
+                        })
+                }
+                Resource::Region { device, .. } => *device == h.id,
+                Resource::Window { device, grant } => {
+                    *device == h.id || grant.is_some_and(|g| g.region == h.id || g.qp == h.id)
+                }
+                _ => false,
             }
-            _ => false,
+        });
+        if referenced
+            || matches!(
+                world.resources.get(&h.id),
+                Some(Resource::Window { grant: Some(_), .. })
+            )
+            || matches!(
+                world.resources.get(&h.id),
+                Some(Resource::Qp { work, .. }) if !work.is_empty()
+            )
+        {
+            return -1;
         }
+        world.resources.remove(&h.id);
+        0
     });
-    if referenced
-        || matches!(
-            world.resources.get(&h.id),
-            Some(Resource::Window { grant: Some(_), .. })
-        )
-        || matches!(world.resources.get(&h.id), Some(Resource::Qp { work, .. }) if !work.is_empty())
-    {
-        return -1;
+    if result != 0 {
+        return result;
     }
-    world.resources.remove(&h.id);
     drop(world);
     unsafe {
         drop(Box::from_raw(raw.cast::<Handle>()));
@@ -871,19 +909,28 @@ unsafe extern "C" fn window_free(raw: *mut c_void) -> c_int {
 unsafe extern "C" fn register(device: *mut c_void, length: u32) -> *mut c_void {
     let h = unsafe { handle(device) };
     let mut world = h.sim.world.borrow_mut();
-    if length == 0 || world.rejected(Operation::Register, h.id) {
+    if length == 0 {
+        world.record(Operation::Register, h.id, None, -1, false);
+        return std::ptr::null_mut();
+    }
+    if world.rejected(Operation::Register, h.id) {
         return std::ptr::null_mut();
     }
     let address = ((world.next as u64) + 1) << 32;
     drop(world);
-    allocate(
+    let raw = allocate(
         &h.sim,
         Resource::Region {
             device: h.id,
             bytes: vec![0; length as usize].into_boxed_slice(),
             address,
         },
-    )
+    );
+    h.sim
+        .world
+        .borrow_mut()
+        .record(Operation::Register, h.id, None, 0, false);
+    raw
 }
 
 /// Pointer to a region's bytes. Valid until the region is freed.
@@ -911,6 +958,10 @@ unsafe extern "C" fn window(device: *mut c_void, key: *mut u32) -> *mut c_void {
     unsafe {
         *key = handle(raw).id;
     }
+    h.sim
+        .world
+        .borrow_mut()
+        .record(Operation::Window, h.id, None, 0, false);
     raw
 }
 
@@ -928,6 +979,10 @@ unsafe extern "C" fn bind(
         || !Rc::ptr_eq(&q.sim.world, &r.sim.world)
         || key != w.id
     {
+        q.sim
+            .world
+            .borrow_mut()
+            .record(Operation::Bind, q.id, Some(id), -1, false);
         return -1;
     }
     q.sim.world.borrow_mut().post(
@@ -961,6 +1016,10 @@ unsafe extern "C" fn write(
 ) -> c_int {
     let (q, r) = unsafe { (handle(qp), handle(region)) };
     if !Rc::ptr_eq(&q.sim.world, &r.sim.world) {
+        q.sim
+            .world
+            .borrow_mut()
+            .record(Operation::Write, q.id, Some(id), -1, false);
         return -1;
     }
     q.sim.world.borrow_mut().post(
@@ -1025,6 +1084,7 @@ unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) 
             break;
         }
     }
+    world.record(Operation::Poll, q.id, None, 0, false);
     count as c_int
 }
 
@@ -1036,6 +1096,301 @@ mod tests {
     use crate::test_guard::ready;
 
     use std::task::{Context, Poll};
+
+    /// Check every event since the last assertion, including order and identity.
+    fn events(sim: &Simulation, expected: &[(Operation, u32, Option<u64>, i64, bool)]) {
+        let trace = sim.take_trace();
+        let first = sim.world.borrow().sequence - trace.len() as u64;
+        let expected: Vec<_> = expected
+            .iter()
+            .enumerate()
+            .map(
+                |(i, &(operation, resource, work_id, result, completion))| Event {
+                    sequence: first + i as u64,
+                    operation,
+                    resource: resource.into(),
+                    work_id,
+                    result,
+                    completion,
+                },
+            )
+            .collect();
+        assert_eq!(trace, expected);
+    }
+
+    #[test]
+    /// Validation and scripted failures each emit one event and allocate nothing.
+    fn allocation_events_report_final_outcomes() {
+        let sim = Simulation::new()
+            .with_devices(vec![Device::new("sim0", [1; 16])])
+            .unwrap();
+        let _scope = sim.enter();
+        unsafe {
+            assert_eq!(discover(std::ptr::null_mut(), 0), -1);
+            events(&sim, &[(Operation::Discover, 0, None, -1, false)]);
+            let mut ports = std::mem::MaybeUninit::<Port>::uninit();
+            assert_eq!(discover(ports.as_mut_ptr(), 1), 1);
+            events(&sim, &[(Operation::Discover, 0, None, 0, false)]);
+            assert!(open(c"missing".as_ptr()).is_null());
+            events(&sim, &[(Operation::Open, 0, None, -1, false)]);
+            assert_eq!(sim.live_resources(), 0);
+            let device = open(c"sim0".as_ptr());
+            assert!(!device.is_null());
+            events(&sim, &[(Operation::Open, 0, None, 0, false)]);
+            let d = handle(device).id;
+            let mut id = 0;
+            assert!(qp(device, 2, 1, &mut id).is_null());
+            assert_eq!(id, 0);
+            events(&sim, &[(Operation::Qp, d, None, -1, false)]);
+            assert!(register(device, 0).is_null());
+            events(&sim, &[(Operation::Register, d, None, -1, false)]);
+            assert_eq!(sim.live_resources(), 1);
+            for operation in [
+                Operation::Discover,
+                Operation::Open,
+                Operation::Qp,
+                Operation::Register,
+                Operation::Window,
+            ] {
+                sim.fault(operation, Fault::Reject);
+                let resource = match operation {
+                    Operation::Discover => {
+                        assert_eq!(discover(ports.as_mut_ptr(), 1), -1);
+                        0
+                    }
+                    Operation::Open => {
+                        assert!(open(c"sim0".as_ptr()).is_null());
+                        0
+                    }
+                    Operation::Qp => {
+                        assert!(qp(device, 1, 1, &mut id).is_null());
+                        d
+                    }
+                    Operation::Register => {
+                        assert!(register(device, 32).is_null());
+                        d
+                    }
+                    Operation::Window => {
+                        assert!(window(device, &mut id).is_null());
+                        d
+                    }
+                    _ => unreachable!(),
+                };
+                events(&sim, &[(operation, resource, None, -1, false)]);
+                assert_eq!(sim.live_resources(), 1);
+                assert_eq!(sim.pending_faults(), 0);
+            }
+            assert_eq!(stop(device), -1);
+            events(&sim, &[(Operation::Stop, d, None, -1, false)]);
+            assert_eq!(close(device), 0);
+            events(&sim, &[(Operation::Close, d, None, 0, false)]);
+        }
+        assert_eq!(sim.live_resources(), 0);
+    }
+
+    #[test]
+    /// Failed connects leave the QP reusable; failed frees retain every handle.
+    fn connect_and_free_events_preserve_ownership_on_validation_failure() {
+        let sim = Simulation::new()
+            .with_devices(vec![Device::new("sim0", [1; 16])])
+            .unwrap();
+        let _scope = sim.enter();
+        unsafe {
+            let device = open(c"sim0".as_ptr());
+            let d = handle(device).id;
+            let mut qpn = 0;
+            let q = qp(device, 1, 1, &mut qpn);
+            let local = Endpoint {
+                gid: [1; 16],
+                qpn,
+                psn: 0,
+                mtu: 3,
+                lid: 0,
+                port: 1,
+                link_layer: 2,
+            };
+            let peer = qp(device, 1, 1, &mut qpn);
+            let remote = Endpoint { qpn, ..local };
+            let region = register(device, 32);
+            let r = handle(region).id;
+            let mut key = 0;
+            let w = window(device, &mut key);
+            events(
+                &sim,
+                &[
+                    (Operation::Open, 0, None, 0, false),
+                    (Operation::Qp, d, None, 0, false),
+                    (Operation::Qp, d, None, 0, false),
+                    (Operation::Register, d, None, 0, false),
+                    (Operation::Window, d, None, 0, false),
+                ],
+            );
+            for bad in [
+                Endpoint {
+                    qpn: 0xffffff,
+                    ..remote
+                },
+                Endpoint {
+                    gid: [2; 16],
+                    ..remote
+                },
+                Endpoint { port: 0, ..remote },
+                Endpoint { qpn: r, ..remote },
+            ] {
+                assert_eq!(connect(q, &local, &bad), -1);
+                events(&sim, &[(Operation::Connect, local.qpn, None, -1, false)]);
+                assert!(!sim.world.borrow().ready(local.qpn));
+                assert_eq!(sim.live_resources(), 5);
+            }
+            sim.fault(Operation::Connect, Fault::Reject);
+            assert_eq!(connect(q, &local, &remote), -1);
+            events(&sim, &[(Operation::Connect, local.qpn, None, -1, false)]);
+            assert!(!sim.world.borrow().ready(local.qpn));
+            assert_eq!(connect(q, &local, &remote), 0);
+            events(&sim, &[(Operation::Connect, local.qpn, None, 0, false)]);
+            assert!(sim.world.borrow().ready(local.qpn));
+            assert_eq!(connect(q, &local, &remote), -1);
+            events(&sim, &[(Operation::Connect, local.qpn, None, -1, false)]);
+            assert_eq!(bind(q, w, region, key, 7, 17), 0);
+            events(&sim, &[(Operation::Bind, local.qpn, Some(7), 0, false)]);
+            for completed in [false, true] {
+                if completed {
+                    let mut completion = Completion::default();
+                    assert_eq!(poll(q, &mut completion, 1), 1);
+                    assert_eq!(completion.status, 0);
+                    events(
+                        &sim,
+                        &[
+                            (Operation::Bind, local.qpn, Some(7), 0, true),
+                            (Operation::Poll, local.qpn, None, 0, false),
+                        ],
+                    );
+                }
+                for (raw, operation) in [
+                    (device, Operation::Close),
+                    (q, Operation::QpFree),
+                    (region, Operation::Deregister),
+                    (w, Operation::WindowFree),
+                ] {
+                    let id = handle(raw).id;
+                    assert_eq!(free(raw, operation), -1);
+                    events(&sim, &[(operation, id, None, -1, false)]);
+                    assert_eq!(handle(raw).id, id);
+                    assert!(sim.world.borrow().resources.contains_key(&id));
+                    assert_eq!(sim.live_resources(), 5);
+                }
+            }
+            sim.fault(Operation::Stop, Fault::Reject);
+            assert_eq!(stop(q), -1);
+            events(&sim, &[(Operation::Stop, local.qpn, None, -1, false)]);
+            assert!(sim.world.borrow().ready(local.qpn));
+            assert_eq!(stop(q), 0);
+            events(&sim, &[(Operation::Stop, local.qpn, None, 0, false)]);
+            assert!(!sim.world.borrow().ready(local.qpn));
+            for (raw, operation) in [
+                (w, Operation::WindowFree),
+                (region, Operation::Deregister),
+                (q, Operation::QpFree),
+                (peer, Operation::QpFree),
+                (device, Operation::Close),
+            ] {
+                let id = handle(raw).id;
+                let live = sim.live_resources();
+                sim.fault(operation, Fault::Reject);
+                assert_eq!(free(raw, operation), -1);
+                events(&sim, &[(operation, id, None, -1, false)]);
+                assert_eq!(sim.live_resources(), live);
+                assert_eq!(free(raw, operation), 0);
+                events(&sim, &[(operation, id, None, 0, false)]);
+                assert_eq!(sim.live_resources(), live - 1);
+                assert!(!sim.world.borrow().resources.contains_key(&id));
+            }
+        }
+        assert_eq!(sim.live_resources(), 0);
+        assert_eq!(sim.pending_faults(), 0);
+    }
+
+    #[test]
+    /// Early post failures and completion failures have distinct, accurate events.
+    fn post_and_poll_events_include_validation_and_completion_failures() {
+        let sim = Simulation::new();
+        let foreign = Simulation::new();
+        {
+            let (sender, receiver, source, target) = connected(&sim);
+            let (_, _, foreign_region, _) = connected(&foreign);
+            let (w, binding) = receiver.bind(target.clone()).unwrap();
+            receiver.progress().unwrap();
+            assert_eq!(binding.result(), Some(Ok(())));
+            sim.take_trace();
+            foreign.take_trace();
+            let q = sender.raw.as_ptr();
+            let qpn = sender.endpoint.qpn;
+            unsafe {
+                for (region, key) in [
+                    (foreign_region.raw.as_ptr(), w.key),
+                    (source.raw.as_ptr(), w.key + 1),
+                ] {
+                    assert_eq!(bind(q, w.raw.as_ptr(), region, key, 41, 17), -1);
+                    events(&sim, &[(Operation::Bind, qpn, Some(41), -1, false)]);
+                }
+                assert_eq!(
+                    write(
+                        q,
+                        foreign_region.raw.as_ptr(),
+                        target.address(),
+                        w.key,
+                        42,
+                        17
+                    ),
+                    -1
+                );
+                events(&sim, &[(Operation::Write, qpn, Some(42), -1, false)]);
+                assert_eq!(
+                    write(q, source.raw.as_ptr(), target.address(), w.key, 43, 33),
+                    -1
+                );
+                events(&sim, &[(Operation::Write, qpn, Some(43), -1, false)]);
+                assert_eq!(poll(q, std::ptr::null_mut(), 0), 0);
+                events(&sim, &[(Operation::Poll, qpn, None, 0, false)]);
+                for (operation, id) in [(Operation::Write, 44), (Operation::Invalidate, 45)] {
+                    let result = if operation == Operation::Write {
+                        write(
+                            q,
+                            source.raw.as_ptr(),
+                            target.address(),
+                            w.key + 100,
+                            id,
+                            17,
+                        )
+                    } else {
+                        invalidate(q, w.key + 100, id)
+                    };
+                    assert_eq!(result, 0);
+                    events(&sim, &[(operation, qpn, Some(id), 0, false)]);
+                    sim.fault(Operation::Poll, Fault::Reject);
+                    let mut completion = Completion::default();
+                    assert_eq!(poll(q, &mut completion, 1), -1);
+                    events(&sim, &[(Operation::Poll, qpn, None, -1, false)]);
+                    assert_eq!(poll(q, &mut completion, 1), 1);
+                    assert_eq!(completion.id, id);
+                    assert_eq!(completion.status, 10);
+                    events(
+                        &sim,
+                        &[
+                            (operation, qpn, Some(id), 10, true),
+                            (Operation::Poll, qpn, None, 0, false),
+                        ],
+                    );
+                }
+            }
+            events(&foreign, &[]);
+            assert_eq!(source.copy_to().unwrap(), [0xa5; 17]);
+            receiver.stop().unwrap();
+            assert_eq!(target.copy_to().unwrap(), [0; 17]);
+        }
+        assert_eq!(sim.live_resources(), 0);
+        assert_eq!(foreign.live_resources(), 0);
+    }
 
     /// Build connected native peers with 17-byte transfers in 32-byte allocations.
     fn connected(
