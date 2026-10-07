@@ -53,8 +53,14 @@ multiple of the offset and length units, so the next record also starts aligned.
 A single buffer is at most 1 GiB.
 
 Each buffer holds a caller-supplied `Charge`, so the caller can account for
-memory against its own budget. The slab keeps at most one idle buffer of the
-last size used (`alloc/src/slab.rs:398-415`). It is not a general size-class pool.
+memory against its own budget. The slab keeps at most one idle buffer.
+After checking charge coverage, allocation reuses it only for an exact length
+match; otherwise it frees the idle buffer and allocates new storage
+(`alloc/src/slab.rs:566-580`). On drop, a buffer fills the idle slot only if the
+pool still exists and the slot is empty and can be mutably borrowed; otherwise
+its storage is freed (`alloc/src/lib.rs:630-650`, `alloc/src/lib.rs:522-529`).
+The retained size depends on return order, not necessarily the last size used.
+This is not a general size-class pool.
 
 Each buffer tracks whether it is still all zeros. Any mutable access, including
 handing it to the kernel for a read, marks it dirty. On drop, a dirty buffer is
