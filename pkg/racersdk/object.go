@@ -114,8 +114,12 @@ func (o *Object) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	n, err := o.writeTo(w)
-	if err == nil {
+	switch err {
+	case nil:
 		err = io.EOF
+	case io.EOF:
+		// Only a nil result means success; a writer's EOF is an I/O failure.
+		err = failure(wire.ErrorIO, "write", err)
 	}
 
 	if err = o.finish("write", err); err == io.EOF {
