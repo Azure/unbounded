@@ -33,11 +33,17 @@ Non-goals:
 
 ## Threading model
 
-All state is worker-local. Types use `Rc`, `Cell`, and `RefCell`, so none of them
-are `Send` or `Sync` (`alloc/src/segments.rs:153-179`, `alloc/src/slab.rs:35-50`).
-Each worker owns its storage ranges, segment table, and buffer pool. This removes lock
-contention and makes ownership easy to reason about. The cost is that one worker
-cannot hand its storage to another.
+Live allocation and I/O authority is worker-local. `Segments` and `Slab` use
+`Rc`-owned state and are neither `Send` nor `Sync`
+(`alloc/src/segments.rs:160-179`, `alloc/src/slab.rs:57-72`). Buffers, leases,
+freeze guards, and the reclamation clock have the same restriction
+(`alloc/src/lib.rs:545-550`, `alloc/src/segments.rs:62-76`,
+`alloc/src/segments.rs:144`, `alloc/src/segments.rs:617-626`).
+Value types such as `Alignment` and `SegmentId`, and startup inputs such as
+`DevicePlacement`, are `Send + Sync` (`alloc/src/lib.rs:313-319`,
+`alloc/src/segments.rs:13-15`, `alloc/src/slab.rs:34-43`). Each worker owns its
+storage ranges, segment table, and buffer pool; live allocation and I/O authority
+cannot move to another worker.
 
 ## Buffers
 
