@@ -28,6 +28,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1054,7 +1055,7 @@ func testTransport(t *testing.T, f *servingFixture, connections, handshakes int,
 		t.Fatal(err)
 	}
 
-	l := newTransportListener(f.ctx, listener, f.a.Server.tlsConfig(f.ctx, f.serverCertificate), Limits{MaxConnections: connections, MaxConcurrentHandshakes: handshakes, HandshakeTimeout: deadline, WriteTimeout: 30 * time.Second})
+	l := newTransportListenerWithMetrics(f.ctx, listener, f.a.Server.tlsConfig(f.ctx, f.serverCertificate), Limits{MaxConnections: connections, MaxConcurrentHandshakes: handshakes, HandshakeTimeout: deadline, WriteTimeout: 30 * time.Second}, newTransportMetrics(prometheus.NewPedanticRegistry()))
 
 	t.Cleanup(func() {
 		if err := l.Close(); err != nil {
@@ -1120,14 +1121,25 @@ func TestTransportSilentPeersBoundAndRelease(t *testing.T) {
 			l := testTransport(t, f, limits.connections, limits.handshakes, time.Minute)
 			first, second := dialTransport(t, l), dialTransport(t, l)
 			awaitTransport(t, l, 2, 2)
+			assertTransportMetrics(t, l, 2, 2, 0, 0, 0)
 			// Rejection never enters a per-peer waiter or handshake goroutine.
 			for range 16 {
 				expectTransportClosed(t, dialTransport(t, l))
 			}
 
 			awaitTransport(t, l, 2, 2)
+
+			var connectionRejected, handshakeRejected float64
+			if limits.name == "connections" {
+				connectionRejected = 16
+			} else {
+				handshakeRejected = 16
+			}
+
+			assertTransportMetrics(t, l, 2, 2, connectionRejected, handshakeRejected, 0)
 			closeTransport(first)
 			awaitTransport(t, l, 1, 1)
+			assertTransportMetrics(t, l, 1, 1, connectionRejected, handshakeRejected, 0)
 			dialTransport(t, l)
 			awaitTransport(t, l, 2, 2)
 
@@ -1137,6 +1149,7 @@ func TestTransportSilentPeersBoundAndRelease(t *testing.T) {
 
 			expectTransportClosed(t, second)
 			awaitTransport(t, l, 0, 0)
+			assertTransportMetrics(t, l, 0, 0, connectionRejected, handshakeRejected, 0)
 		})
 	}
 }
@@ -1146,8 +1159,10 @@ func TestTransportHandshakeDeadlineAndFailure(t *testing.T) {
 	l := testTransport(t, f, 1, 1, 100*time.Millisecond)
 	conn := dialTransport(t, l)
 	awaitTransport(t, l, 1, 1)
+	assertTransportMetrics(t, l, 1, 1, 0, 0, 0)
 	expectTransportClosed(t, conn)
 	awaitTransport(t, l, 0, 0)
+	assertTransportMetrics(t, l, 0, 0, 0, 0, 1)
 
 	conn = dialTransport(t, l)
 	if _, err := io.WriteString(conn, "not a TLS record"); err != nil {
@@ -1156,6 +1171,7 @@ func TestTransportHandshakeDeadlineAndFailure(t *testing.T) {
 
 	expectTransportClosed(t, conn)
 	awaitTransport(t, l, 0, 0)
+	assertTransportMetrics(t, l, 0, 0, 0, 0, 1)
 }
 
 func TestTransportPartialFlightTimeoutAndRecovery(t *testing.T) {
@@ -1186,10 +1202,12 @@ func TestTransportPartialFlightTimeoutAndRecovery(t *testing.T) {
 	}
 
 	awaitTransport(t, l, 1, 1)
+	assertTransportMetrics(t, l, 1, 1, 0, 0, 0)
 	expectTransportClosed(t, dialTransport(t, l))
 	// No final client flight arrives. Both budgets must recover without waiting
 	// for the independent 30-second response write budget.
 	awaitTransport(t, l, 0, 0)
+	assertTransportMetrics(t, l, 0, 0, 1, 0, 1)
 	unblock()
 
 	select {
@@ -1217,6 +1235,7 @@ func TestTransportPartialFlightTimeoutAndRecovery(t *testing.T) {
 	})
 	closes.Wait()
 	awaitTransport(t, l, 0, 0)
+	assertTransportMetrics(t, l, 0, 0, 1, 0, 1)
 }
 
 func TestTransportHandshakeBudgetThroughClientCertificate(t *testing.T) {
@@ -1248,13 +1267,16 @@ func TestTransportHandshakeBudgetThroughClientCertificate(t *testing.T) {
 	// ServerHello was already delivered: GetConfigForClient has returned, but
 	// the server must retain admission while waiting for the client's flight.
 	awaitTransport(t, l, 1, 1)
+	assertTransportMetrics(t, l, 1, 1, 0, 0, 0)
 	expectTransportClosed(t, dialTransport(t, l))
+	assertTransportMetrics(t, l, 1, 1, 0, 1, 0)
 
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	awaitTransport(t, l, 0, 0)
+	assertTransportMetrics(t, l, 0, 0, 0, 1, 0)
 	// The client callback is deliberately parked; resume it during cleanup.
 	t.Cleanup(func() {
 		select {
@@ -1275,6 +1297,7 @@ func TestTransportCompletedTLSRetainsOnlyConnectionSlot(t *testing.T) {
 	}
 
 	awaitTransport(t, l, 1, 0)
+	assertTransportMetrics(t, l, 1, 0, 0, 0, 0)
 
 	conn, err := l.Accept()
 	if err != nil {
@@ -1287,10 +1310,12 @@ func TestTransportCompletedTLSRetainsOnlyConnectionSlot(t *testing.T) {
 	}
 
 	expectTransportClosed(t, dialTransport(t, l))
+	assertTransportMetrics(t, l, 1, 0, 1, 0, 0)
 	// Both TLS Close and force-close may happen concurrently; release once.
 	closeTransport(conn)
 	closeTransport(conn)
 	awaitTransport(t, l, 0, 0)
+	assertTransportMetrics(t, l, 0, 0, 1, 0, 0)
 }
 
 func TestTransportProductionLongPollAndIdleAdmission(t *testing.T) {

@@ -1283,6 +1283,7 @@ type transportListener struct {
 	acceptErr   error
 	connections chan struct{}
 	handshakes  chan struct{}
+	metrics     *transportMetrics
 	mu          sync.Mutex
 	closed      bool
 	live        map[*transportConn]struct{}
@@ -1291,6 +1292,10 @@ type transportListener struct {
 }
 
 func newTransportListener(ctx context.Context, listener net.Listener, config *tls.Config, limits Limits) *transportListener {
+	return newTransportListenerWithMetrics(ctx, listener, config, limits, servingTransportMetrics)
+}
+
+func newTransportListenerWithMetrics(ctx context.Context, listener net.Listener, config *tls.Config, limits Limits, metrics *transportMetrics) *transportListener {
 	ctx, cancel := context.WithCancel(ctx)
 
 	l := &transportListener{
@@ -1299,6 +1304,7 @@ func newTransportListener(ctx context.Context, listener net.Listener, config *tl
 		connections: make(chan struct{}, max(0, limits.MaxConnections)),
 		handshakes:  make(chan struct{}, max(0, limits.MaxConcurrentHandshakes)),
 		live:        make(map[*transportConn]struct{}),
+		metrics:     metrics,
 	}
 	go l.run()
 
@@ -1339,9 +1345,16 @@ func (l *transportListener) run() {
 		retryDelay = 0
 
 		if !take(l.connections) {
+			if l.ctx.Err() == nil {
+				l.metrics.connectionRejected.Inc()
+			}
+
 			closeTransport(conn)
+
 			continue
 		}
+
+		l.metrics.connections.Inc()
 
 		c := &transportConn{Conn: conn, owner: l}
 		l.mu.Lock()
@@ -1352,10 +1365,22 @@ func (l *transportListener) run() {
 		}
 		l.mu.Unlock()
 
-		if closed || !take(l.handshakes) {
+		if closed {
 			closeTransport(c)
 			continue
 		}
+
+		if !take(l.handshakes) {
+			if l.ctx.Err() == nil {
+				l.metrics.handshakeRejected.Inc()
+			}
+
+			closeTransport(c)
+
+			continue
+		}
+
+		l.metrics.handshakes.Inc()
 
 		go l.handshake(c)
 	}
@@ -1393,6 +1418,13 @@ func (l *transportListener) handshake(raw *transportConn) {
 	}
 
 	cancel()
+
+	var timeout net.Error
+	if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout()) {
+		l.metrics.handshakeTimeouts.Inc()
+	}
+
+	l.metrics.handshakes.Dec()
 	release(l.handshakes)
 
 	if err != nil {
@@ -1458,6 +1490,7 @@ func (c *transportConn) Close() error {
 		c.owner.mu.Lock()
 		delete(c.owner.live, c)
 		c.owner.mu.Unlock()
+		c.owner.metrics.connections.Dec()
 		release(c.owner.connections)
 	})
 
