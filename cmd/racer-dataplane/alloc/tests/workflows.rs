@@ -1,6 +1,6 @@
 //! Public allocator workflows across restart, cancellation, accounting, and real I/O.
 
-use page_alloc::{Alignment, Error, Generation, SegmentId, Segments, Slab};
+use page_alloc::{Alignment, DevicePlacement, Error, Generation, SegmentId, Segments, Slab};
 #[cfg(feature = "simulation")]
 use page_alloc::{Charge, SegmentState};
 #[cfg(feature = "simulation")]
@@ -11,6 +11,7 @@ use std::{
     os::fd::FromRawFd,
     path::PathBuf,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 #[cfg(feature = "simulation")]
@@ -842,6 +843,129 @@ fn io_uring_roundtrip_and_completion_fence() {
     }
     let clock = page_alloc::SegmentClock::new(std::rc::Rc::new(segments));
     clock.reclaim(&EmptyEntries, 2, 4, 0).unwrap();
+}
+
+/// Device placements translate whole segments and interior extents across real files.
+#[test]
+fn device_placements_route_real_io_and_reject_short_reads() {
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+
+    if !kernel_available() {
+        return;
+    }
+    let directory = Directory::new();
+    let probe = Slab::<()>::new(directory.0.join("probe"), 16384, 4096, 4096);
+    let Some(alignment) = real_alignment(probe.open_configured(&Segments::new(4096))) else {
+        return;
+    };
+    let files: Vec<_> = ["one", "two"]
+        .into_iter()
+        .map(|name| {
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(directory.0.join(name))
+                .unwrap();
+            file.set_len(16384).unwrap();
+            Arc::new(file)
+        })
+        .collect();
+    let slab = Slab::<()>::from_devices(
+        vec![
+            DevicePlacement {
+                file: files[0].clone(),
+                offset: 8192,
+            },
+            DevicePlacement {
+                file: files[1].clone(),
+                offset: 4096,
+            },
+            DevicePlacement {
+                file: files[0].clone(),
+                offset: 0,
+            },
+        ],
+        4096,
+        4096,
+        alignment,
+    )
+    .unwrap();
+    assert_eq!(slab.capacity_bytes(), 12288);
+    assert_eq!(slab.alignment(), Err(Error::Unavailable));
+    let segments = Segments::new(4096);
+    assert_eq!(slab.open_configured(&segments), Ok(alignment));
+    let reactor = Reactor::<TestScope, ()>::new(16, ());
+    reactor.init().unwrap();
+    for id in 0..3 {
+        for half in 0..2 {
+            let (lease, extent) = segments.append(2048).unwrap();
+            assert_eq!(lease.id(), SegmentId(id));
+            assert_eq!(extent.offset(), id * 4096 + half * 2048);
+            let mut buffer = slab.allocate(2048, ()).unwrap();
+            buffer.as_mut_slice().fill((id * 2 + half + 1) as u8);
+            drop(
+                drive_real(
+                    &reactor,
+                    slab.write(&reactor, extent, buffer, lease, &TestScope),
+                )
+                .unwrap(),
+            );
+            let read = drive_real(
+                &reactor,
+                slab.read(
+                    &reactor,
+                    extent,
+                    slab.allocate(2048, ()).unwrap(),
+                    segments.lease(SegmentId(id), Generation(1)).unwrap(),
+                    &TestScope,
+                ),
+            )
+            .unwrap();
+            assert!(
+                read.as_slice()
+                    .iter()
+                    .all(|&byte| byte == (id * 2 + half + 1) as u8)
+            );
+        }
+    }
+    // Inspect physical addresses independently so symmetric read/write bugs cannot pass.
+    for (file, offset, value) in [
+        (0, 0, 5),
+        (0, 2048, 6),
+        (0, 4096, 0),
+        (0, 8192, 1),
+        (0, 10240, 2),
+        (0, 12288, 0),
+        (1, 0, 0),
+        (1, 4096, 3),
+        (1, 6144, 4),
+        (1, 8192, 0),
+    ] {
+        let mut buffer = alignment.allocate(2048, ()).unwrap();
+        assert_eq!(
+            files[file].read_at(buffer.as_mut_slice(), offset).unwrap(),
+            2048
+        );
+        assert!(buffer.as_slice().iter().all(|&byte| byte == value));
+        assert_eq!(files[file].metadata().unwrap().len(), 16384);
+    }
+    // External truncation violates the startup contract but must still fail closed.
+    files[1].set_len(4096).unwrap();
+    let read = slab.read(
+        &reactor,
+        page_alloc::Extent::new(4096, 4096).unwrap(),
+        slab.allocate(4096, ()).unwrap(),
+        segments.lease(SegmentId(1), Generation(1)).unwrap(),
+        &TestScope,
+    );
+    assert!(matches!(
+        drive_real(&reactor, read),
+        Err(TestError::Alloc(Error::Io))
+    ));
+    assert_eq!(reactor.in_flight(), 0);
+    assert_eq!(slab.writes_in_flight(), 0);
 }
 
 /// Failed binding retains the open file but never grants admission to the reactor.
