@@ -122,9 +122,14 @@
 //! Index reclamation forgets mappings without touching bytes or generations.
 //! Physical reclamation only visits Sealed/Evicting slots and recycles empty slots
 //! after leases drain. Each sweep visits at most two rotations, further capped by
-//! the caller. Insufficient progress returns Busy, not a spin loop. A zero reserve
-//! is a no-op; a zero entry budget can recycle empty slots but cannot begin
-//! populated eviction. There is no compaction. [`SegmentEntries`] implementations
+//! the caller. For a nonzero reserve, [`SegmentClock::reclaim`] and
+//! [`SegmentClock::reclaim_scored`] succeed only when the reserve (capped at the
+//! slot count) is met and no evictions remain. Busy is intentional even with enough
+//! free slots while pending evictions drain. Use [`Segments::free_count`] to check
+//! capacity, and retry bounded reclamation later to finish draining rather than
+//! spinning. A zero reserve is a no-op, not a drain request; a zero entry budget
+//! can recycle empty slots but cannot begin populated eviction. There is no
+//! compaction. [`SegmentEntries`] implementations
 //! must compare current mappings before removal and report within budget; an
 //! error cannot undo callback side effects. Freeze does not block index sweeps.
 //!
