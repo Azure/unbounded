@@ -1762,7 +1762,7 @@ mod tests {
         let old = Arc::new(WakeCount::default());
         let current = Arc::new(WakeCount::default());
         let other = Arc::new(WakeCount::default());
-        let cancelled = Arc::new(WakeCount::default());
+        let canceled = Arc::new(WakeCount::default());
         let poll = |op: &mut Operation<'_, (), Error>, wakes: &Arc<WakeCount>| {
             op.as_mut()
                 .poll(&mut Context::from_waker(&Waker::from(wakes.clone())))
@@ -1773,18 +1773,18 @@ mod tests {
         assert!(poll(&mut one, &old).is_pending());
         assert!(poll(&mut one, &current).is_pending());
         assert!(poll(&mut two, &other).is_pending());
-        assert!(poll(&mut abandoned, &cancelled).is_pending());
+        assert!(poll(&mut abandoned, &canceled).is_pending());
         assert_eq!(slab.writes.waiters.borrow().len(), 3);
         drop(abandoned);
         assert_eq!(slab.writes.waiters.borrow().len(), 2);
-        assert_eq!(Arc::strong_count(&cancelled), 1);
+        assert_eq!(Arc::strong_count(&canceled), 1);
         drop(first_write);
-        for count in [&old, &current, &other, &cancelled] {
+        for count in [&old, &current, &other, &canceled] {
             assert_eq!(count.0.load(Ordering::Relaxed), 0);
         }
         drop(last_write);
         assert_eq!(old.0.load(Ordering::Relaxed), 0);
-        assert_eq!(cancelled.0.load(Ordering::Relaxed), 0);
+        assert_eq!(canceled.0.load(Ordering::Relaxed), 0);
         assert_eq!(current.0.load(Ordering::Relaxed), 1);
         assert_eq!(other.0.load(Ordering::Relaxed), 1);
         assert!(slab.writes.waiters.borrow().is_empty());
