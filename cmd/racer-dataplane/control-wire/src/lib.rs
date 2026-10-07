@@ -1288,6 +1288,11 @@ mod codec {
         if content_hash(&next)? != d.content_hash {
             return Err(Error::Replay);
         }
+        if next.membership_version == base.membership_version
+            && canonical_content(&next)?.1 != canonical_content(base)?.1
+        {
+            return Err(Error::Replay);
+        }
         Ok(next)
     }
 
@@ -1528,6 +1533,108 @@ mod codec {
     #[cfg(test)]
     mod delta_tests {
         use super::*;
+
+        /// Build a hash-valid delta with all target members as upserts.
+        fn delta_to(base: &Publication, next: &Publication) -> Value {
+            let dto = dto(next).unwrap();
+            let removed: Vec<_> = base
+                .members
+                .iter()
+                .filter(|m| !next.members.iter().any(|n| n.node == m.node))
+                .map(|m| &m.node.0)
+                .collect();
+            serde_json::json!({
+                "delta_version":1,"cluster":base.cluster.0,"base_sequence":base.sequence.0.to_string(),
+                "base_hash":content_hash(base).unwrap(),"sequence":next.sequence.0.to_string(),
+                "membership_version":next.membership_version.0.to_string(),"content_hash":content_hash(next).unwrap(),
+                "upsert_members":dto.members,"remove_members":removed,"caches":dto.caches
+            })
+        }
+
+        /// Every member change needs a newer version even when both hashes match.
+        #[test]
+        fn membership_changes_require_newer_version() {
+            let mut base = decode_publication(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../internal/racer/wire/testdata/publication.json"
+            )))
+            .unwrap();
+            base.sequence.0 = 1;
+            base.membership_version.0 = 2;
+            let original = encode_publication(&base).unwrap();
+            for change in ["add", "remove", "shares", "endpoint", "rails", "site"] {
+                let mut next = base.clone();
+                next.sequence.0 += 1;
+                match change {
+                    "add" => {
+                        let mut added = next.members[0].clone();
+                        added.node = NodeId("77777777-7777-4777-8777-777777777777".into());
+                        next.members.push(added);
+                    }
+                    "remove" => {
+                        next.members.pop();
+                    }
+                    "shares" => next.members[0].shares = NonZeroU32::new(9).unwrap(),
+                    "endpoint" => next.members[0].peer_endpoint = "192.0.2.2:7443".into(),
+                    "rails" => next.members[1].rails.clear(),
+                    "site" => next.members[0].site = "site2".into(),
+                    _ => unreachable!(),
+                }
+                for version in [2, 1, 3] {
+                    next.membership_version.0 = version;
+                    let delta = serde_json::to_vec(&delta_to(&base, &next)).unwrap();
+                    let result = apply_delta(&base, &delta);
+                    if version <= base.membership_version.0 {
+                        assert_eq!(result.err(), Some(Error::Replay), "{change}: {version}");
+                    } else {
+                        assert_eq!(
+                            encode_publication(&result.unwrap()).unwrap(),
+                            encode_publication(&next).unwrap(),
+                            "{change}: {version}"
+                        );
+                    }
+                    assert_eq!(encode_publication(&base).unwrap(), original);
+                }
+            }
+        }
+
+        /// Equal versions allow cache-only changes, no-ops, and identical upserts.
+        #[test]
+        fn unchanged_membership_allows_equal_version() {
+            let mut base = decode_publication(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../internal/racer/wire/testdata/publication.json"
+            )))
+            .unwrap();
+            base.sequence.0 = 1;
+            base.membership_version.0 = 2;
+            for cache_change in [false, true] {
+                for upsert in [false, true] {
+                    let mut next = base.clone();
+                    next.sequence.0 += 1;
+                    if cache_change {
+                        next.caches.clear();
+                    }
+                    let mut delta = delta_to(&base, &next);
+                    if upsert {
+                        delta["upsert_members"].as_array_mut().unwrap().reverse();
+                    } else {
+                        delta["upsert_members"] = serde_json::json!([]);
+                    }
+                    let accepted =
+                        apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).unwrap();
+                    assert_eq!(
+                        encode_publication(&accepted).unwrap(),
+                        encode_publication(&next).unwrap()
+                    );
+                    delta["membership_version"] = "1".into();
+                    assert_eq!(
+                        apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).err(),
+                        Some(Error::Replay)
+                    );
+                }
+            }
+        }
 
         /// Site-only updates preserve exact content hashes and reject altered labels.
         #[test]
