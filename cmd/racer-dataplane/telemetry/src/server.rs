@@ -240,7 +240,10 @@ impl Server {
         parent: &'a S,
     ) -> Operation<'a, (), S::Error> {
         Box::pin(async move {
-            let scope = parent.with_deadline(environment::now() + CONNECTION_TIMEOUT);
+            let deadline = environment::now()
+                .checked_add(CONNECTION_TIMEOUT)
+                .ok_or(Error::InvalidInput)?;
+            let scope = parent.with_deadline(deadline);
             let route = loop {
                 let completed = reactor
                     .recv_reserved(
@@ -760,6 +763,122 @@ mod tests {
         /// Forward observations to the ordered event log.
         fn observe(&self, event: Event) {
             self.routes.observe(event);
+        }
+    }
+
+    /// Find a valid instant less than one second below the platform's upper limit.
+    fn near_instant_limit() -> Instant {
+        let mut instant = Instant::now();
+        for bit in (0..64).rev() {
+            if let Some(next) = instant.checked_add(Duration::from_secs(1u64 << bit)) {
+                instant = next;
+            }
+        }
+        assert!(instant.checked_add(Duration::from_secs(1)).is_none());
+        instant
+    }
+
+    /// Reject deadline overflow before submitting I/O and release connection ownership.
+    #[test]
+    fn exchange_deadline_overflow_returns_invalid_input_without_io() {
+        use std::task::{Context, Waker};
+        use uring_runtime::{environment::SimulationClock, reactor::simulation::Simulation};
+
+        let limit = near_instant_limit();
+        let now = limit - Duration::from_secs(1);
+        assert!(now.checked_add(CONNECTION_TIMEOUT).is_none());
+        let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
+        let _clock = clock.environment(0).enter();
+        let simulation = Simulation::new();
+        let _simulation = simulation.enter();
+        let reactor = Reactor::<TestScope, ()>::new(8, ());
+        let submissions = reactor.reserve_submissions(CONTROL_SLOTS, ()).unwrap();
+        let owner = Server::new(submissions, ());
+        let connections = Rc::new(Cell::new(0));
+        let handler = Tracked {
+            routes: Routes::default(),
+            connections: connections.clone(),
+            deny_next: Cell::new(false),
+        };
+        let scope = TestScope {
+            deadline: limit,
+            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+        };
+        assert_eq!(uring_runtime::Scope::check(&scope), Ok(()));
+        let (fd, peer) = simulation.socket_pair();
+        let buffer = owner.buffer(&handler).unwrap();
+        assert_eq!(connections.get(), 1);
+        let trace = simulation.trace();
+        let mut exchange = owner.exchange(&reactor, &handler, Rc::new(fd), buffer, &scope);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(
+            exchange.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::InvalidInput))
+        );
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(owner.resources.active.get(), 0);
+        assert_eq!(connections.get(), 0);
+        let after = simulation.trace();
+        assert_eq!(&after[..trace.len()], trace);
+        assert_eq!(after.len(), trace.len() + 1);
+        assert_eq!(after.last().unwrap().operation, "close");
+        assert_eq!(peer.try_recv(&mut [0; 1]).unwrap(), 0);
+    }
+
+    /// Keep the two-second limit and earlier parent deadline, even near Instant's limit.
+    #[test]
+    fn exchange_deadline_preserves_timeout_and_parent_limit() {
+        use std::task::{Context, Waker};
+        use uring_runtime::{environment::SimulationClock, reactor::simulation::Simulation};
+
+        for (now, parent_timeout, timeout) in [
+            (Instant::now(), Duration::from_secs(10), CONNECTION_TIMEOUT),
+            (
+                Instant::now(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            (
+                near_instant_limit() - CONNECTION_TIMEOUT,
+                CONNECTION_TIMEOUT,
+                CONNECTION_TIMEOUT,
+            ),
+        ] {
+            let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
+            let _clock = clock.environment(0).enter();
+            let simulation = Simulation::new();
+            let _simulation = simulation.enter();
+            let reactor = Reactor::<TestScope, ()>::new(8, ());
+            let submissions = reactor.reserve_submissions(CONTROL_SLOTS, ()).unwrap();
+            let owner = Server::new(submissions, ());
+            let handler = Routes::default();
+            let scope = TestScope {
+                deadline: now.checked_add(parent_timeout).unwrap(),
+                cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+            };
+            let (fd, _peer) = simulation.socket_pair();
+            let buffer = owner.buffer(&handler).unwrap();
+            let mut exchange = owner.exchange(&reactor, &handler, Rc::new(fd), buffer, &scope);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(exchange.as_mut().poll(&mut cx).is_pending());
+            clock.advance(timeout - Duration::from_nanos(1));
+            for _ in 0..4 {
+                reactor.poll_budgeted(32).unwrap();
+                assert!(exchange.as_mut().poll(&mut cx).is_pending());
+            }
+            assert_eq!(owner.resources.active.get(), 1);
+            clock.advance(Duration::from_nanos(1));
+            let mut result = Poll::Pending;
+            for _ in 0..32 {
+                reactor.poll_budgeted(32).unwrap();
+                result = exchange.as_mut().poll(&mut cx);
+                if result.is_ready() {
+                    break;
+                }
+            }
+            assert_eq!(result, Poll::Ready(Err(Error::DeadlineExceeded)));
+            assert_eq!(reactor.in_flight(), 0);
+            assert_eq!(owner.resources.active.get(), 0);
         }
     }
 
