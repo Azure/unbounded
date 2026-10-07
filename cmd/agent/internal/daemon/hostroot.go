@@ -17,9 +17,8 @@ import (
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/fsutil"
-	"github.com/Azure/unbounded/pkg/agent/agentbinary"
+	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 )
 
@@ -27,7 +26,7 @@ import (
 // by an agent released before the host root. Commands that change the host
 // call it before resolving any path; see hostroot.Migrate.
 func MigrateHostRoot(log *slog.Logger) error {
-	return hostroot.Migrate(log, goalstates.HostRootMarkers()...)
+	return hostroot.Migrate(log, hostroot.Markers()...)
 }
 
 // hostRootAgentsPath records the SHA-256 digest of every agent binary that has
@@ -198,7 +197,7 @@ func (h hostRootHost) Ready() (bool, string, error) {
 func (h hostRootHost) Move(ctx context.Context) error {
 	// The directories a fresh installation's PrepareHost creates, so a moved
 	// host is laid out the same way.
-	return hostroot.Move(ctx, h.log, goalstates.HostLayout(), "bin", "libexec")
+	return hostroot.Move(ctx, h.log, hostroot.Layout(), "bin", "libexec")
 }
 
 func (h hostRootHost) RewriteUnits(ctx context.Context) error {
@@ -244,7 +243,7 @@ func (h hostRootHost) rewriteLocalDNS() error {
 }
 
 func (h hostRootHost) FinishMove() error {
-	for _, path := range goalstates.LayoutUnder(hostroot.LegacyPath) {
+	for _, path := range hostroot.LayoutUnder(hostroot.LegacyPath) {
 		if err := removeOwnedFile(path); err != nil {
 			return err
 		}
@@ -263,7 +262,7 @@ func (h hostRootHost) FinishMove() error {
 }
 
 func (h hostRootHost) RemoveSeed() error {
-	return hostroot.RemoveSeed(h.log, goalstates.LegacySeedFile())
+	return hostroot.RemoveSeed(h.log)
 }
 
 func (h hostRootHost) Restart(ctx context.Context) error {
@@ -345,7 +344,7 @@ func loadAgentDigests(path string) (map[string]bool, error) {
 }
 
 func fileDigest(path string) (string, error) {
-	sum, err := agentbinary.FileSHA256(path)
+	sum, err := fsutil.FileSHA256(path)
 
 	return hex.EncodeToString(sum[:]), err
 }

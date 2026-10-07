@@ -6,6 +6,7 @@
 package fsutil
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -142,4 +143,24 @@ func SyncOpenFilesystems(files []*os.File, syncfs func(int) error) error {
 	}
 
 	return nil
+}
+
+// FileSHA256 returns the SHA-256 digest of the file at path.
+func FileSHA256(path string) ([sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+
+	file, err := os.Open(path)
+	if err != nil {
+		return digest, err
+	}
+	defer file.Close() //nolint:errcheck // read error is authoritative
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return digest, err
+	}
+
+	copy(digest[:], hasher.Sum(nil))
+
+	return digest, nil
 }

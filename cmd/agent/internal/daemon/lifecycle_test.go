@@ -18,6 +18,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/fsutil"
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
@@ -206,7 +207,7 @@ func TestRemoveFirstBootBootstrapUnit(t *testing.T) {
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 
 	task := &removeFirstBootUnit{log: discardLogger(), unitDir: t.TempDir()}
-	unitPath := filepath.Join(task.unitDir, goalstates.FirstBootBootstrapUnit)
+	unitPath := filepath.Join(task.unitDir, provision.FirstBootBootstrapUnit)
 	require.NoError(t, os.WriteFile(unitPath, []byte("[Unit]\n"), 0o644))
 
 	require.NoError(t, task.Do(t.Context()))
@@ -214,7 +215,7 @@ func TestRemoveFirstBootBootstrapUnit(t *testing.T) {
 
 	recorded, err := os.ReadFile(calls)
 	require.NoError(t, err)
-	require.Equal(t, "disable --now "+goalstates.FirstBootBootstrapUnit+"\n", string(recorded),
+	require.Equal(t, "disable --now "+provision.FirstBootBootstrapUnit+"\n", string(recorded),
 		"disabling without stopping leaves the unit active, so a later start is a no-op")
 
 	require.NoError(t, task.Do(t.Context()), "a host without the unit has nothing to remove")

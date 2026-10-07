@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Azure/unbounded/internal/hostroot"
 )
 
 const AgentUpgradeBinaryName = "unbounded-agent"
@@ -42,11 +44,11 @@ func PlannedAgentUpgradePaths() (AgentUpgradePaths, error) {
 
 func agentUpgradePathsIn(binDir string) (AgentUpgradePaths, error) {
 	paths := AgentUpgradePaths{
-		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, filepath.Join(binDir, daemonBinaryName)),
-		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, filepath.Join(binDir, daemonBinaryBlueName)),
-		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, filepath.Join(binDir, daemonBinaryGreenName)),
-		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, filepath.Join(binDir, daemonBinaryCurrentName)),
-		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, filepath.Join(binDir, daemonBinaryLastGoodName)),
+		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, filepath.Join(binDir, hostroot.BinaryName)),
+		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, filepath.Join(binDir, hostroot.BinaryBlueName)),
+		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, filepath.Join(binDir, hostroot.BinaryGreenName)),
+		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, filepath.Join(binDir, hostroot.BinaryCurrentName)),
+		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, filepath.Join(binDir, hostroot.BinaryLastGoodName)),
 		SignalPath:   resolveDaemonBinaryPath(EnvDaemonAgentUpgradeSignalPath, DaemonAgentUpgradeSignalPath),
 	}
 

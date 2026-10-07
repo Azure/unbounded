@@ -1246,7 +1246,7 @@ func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
 	require.Len(t, cfg.Systemd.Units, 1)
 
 	unit := cfg.Systemd.Units[0]
-	require.Equal(t, goalstates.FirstBootBootstrapUnit, unit.Name)
+	require.Equal(t, provision.FirstBootBootstrapUnit, unit.Name)
 	require.NotNil(t, unit.Enabled)
 	require.True(t, *unit.Enabled, "an unenabled unit never runs and nothing reports it")
 

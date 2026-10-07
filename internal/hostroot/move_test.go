@@ -14,18 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testLayout mirrors goalstates.HostLayout, which this package cannot import.
-var testLayout = []string{
-	"bin/unbounded-agent",
-	"bin/unbounded-agent-blue",
-	"bin/unbounded-agent-green",
-	"bin/unbounded-agent-current",
-	"bin/unbounded-agent-last-good",
-	"bin/unbounded-agent-nspawn-lifecycle",
-	"bin/unbounded-agent-daemon-recovery.sh",
-	"libexec/unbounded-localdns-network",
-}
-
 // legacyHost lays out what an agent up to v0.8.0 leaves under the legacy root
 // after an upgrade to green, with the root linked to it as a newer agent
 // leaves it. The links name the legacy root the way that agent wrote them.
@@ -52,7 +40,7 @@ func legacyHost(t *testing.T) layout {
 	// Not part of the layout; it stays where it is.
 	touch(t, filepath.Join(bin, "unbounded-agent-install.sh"))
 
-	require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers))
+	require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()))
 
 	return l
 }
@@ -130,7 +118,7 @@ func TestStage(t *testing.T) {
 	// Left by an earlier attempt, and not trusted.
 	touch(t, filepath.Join(staging, "bin/stale"))
 
-	require.NoError(t, stage(l.root, l.legacy, testLayout))
+	require.NoError(t, stage(l.root, l.legacy, Layout()))
 
 	final := filepath.Join(canonical(filepath.Dir(l.root)), filepath.Base(l.root))
 
@@ -193,7 +181,7 @@ func TestStageRebasesLinksThroughALinkedLegacyRoot(t *testing.T) {
 	require.NoError(t, os.Symlink(filepath.Join(l.legacy, "bin/unbounded-agent-green"), filepath.Join(real, "bin/unbounded-agent-current")))
 	require.NoError(t, os.Symlink(filepath.Join(canonical(real), "bin/unbounded-agent-blue"), filepath.Join(real, "bin/unbounded-agent-last-good")))
 
-	require.NoError(t, stage(l.root, l.legacy, testLayout))
+	require.NoError(t, stage(l.root, l.legacy, Layout()))
 
 	final := filepath.Join(canonical(filepath.Dir(l.root)), filepath.Base(l.root))
 
@@ -232,7 +220,7 @@ func TestMove(t *testing.T) {
 
 	relabeled := ""
 
-	require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, testLayout, []string{"bin", "libexec"},
+	require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, Layout(), []string{"bin", "libexec"},
 		func(_ context.Context, _ *slog.Logger, root string) { relabeled = root }))
 
 	got, err := state(l.root, l.legacy)
@@ -266,14 +254,14 @@ func TestMoveResumes(t *testing.T) {
 			// The window in which the root does not exist.
 			name: "after removing the link",
 			interrupt: func(t *testing.T, l layout) {
-				require.NoError(t, stage(l.root, l.legacy, testLayout))
+				require.NoError(t, stage(l.root, l.legacy, Layout()))
 				require.NoError(t, os.Remove(l.root))
 			},
 		},
 		{
 			name: "after the swap",
 			interrupt: func(t *testing.T, l layout) {
-				require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, testLayout, nil, noRelabel))
+				require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, Layout(), nil, noRelabel))
 			},
 		},
 	}
@@ -287,13 +275,13 @@ func TestMoveResumes(t *testing.T) {
 
 			// What a restarted daemon runs: Migrate, then the move from
 			// wherever the state says it is.
-			require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers))
+			require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()))
 
 			got, err := state(l.root, l.legacy)
 			require.NoError(t, err)
 
 			if got == StateLinked {
-				require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, testLayout, nil, noRelabel))
+				require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, Layout(), nil, noRelabel))
 
 				got, err = state(l.root, l.legacy)
 				require.NoError(t, err)
@@ -305,7 +293,7 @@ func TestMoveResumes(t *testing.T) {
 
 			// The daemon rewrites the units here, then removes the legacy
 			// layout and finishes.
-			for _, rel := range testLayout {
+			for _, rel := range Layout() {
 				require.NoError(t, removeIfExists(filepath.Join(l.legacy, rel)))
 			}
 
@@ -319,7 +307,7 @@ func TestMoveResumes(t *testing.T) {
 			assert.Equal(t, "helper", readLinked(t, filepath.Join(l.root, "bin/unbounded-agent-nspawn-lifecycle")))
 			assert.FileExists(t, filepath.Join(l.legacy, "bin/unbounded-agent-install.sh"), "files outside the layout stay")
 
-			require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers), "a moved host is a plain installation")
+			require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()), "a moved host is a plain installation")
 		})
 	}
 }
@@ -327,18 +315,16 @@ func TestMoveResumes(t *testing.T) {
 func TestRemoveSeed(t *testing.T) {
 	t.Parallel()
 
-	const seed = "bin/unbounded-agent"
-
 	tests := []struct {
 		name     string
 		setup    func(t *testing.T, l layout)
 		wantKept bool
 	}{
-		{name: "a seeded binary is removed", setup: func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, seed)) }},
+		{name: "a seeded binary is removed", setup: func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, SeedFile)) }},
 		{
 			name: "a link is not a seed",
 			setup: func(t *testing.T, l layout) {
-				require.NoError(t, os.Symlink("/bin/true", filepath.Join(l.legacy, seed)))
+				require.NoError(t, os.Symlink("/bin/true", filepath.Join(l.legacy, SeedFile)))
 			},
 			wantKept: true,
 		},
@@ -351,12 +337,12 @@ func TestRemoveSeed(t *testing.T) {
 			l := newLayout(t)
 			tt.setup(t, l)
 
-			require.NoError(t, removeSeed(discard(), l.legacy, seed))
+			require.NoError(t, removeSeed(discard(), l.legacy, SeedFile))
 
-			_, err := os.Lstat(filepath.Join(l.legacy, seed))
+			_, err := os.Lstat(filepath.Join(l.legacy, SeedFile))
 			assert.Equal(t, tt.wantKept, err == nil, "seed kept")
 		})
 	}
 
-	require.NoError(t, removeSeed(discard(), newLayout(t).legacy, seed), "no seed")
+	require.NoError(t, removeSeed(discard(), newLayout(t).legacy, SeedFile), "no seed")
 }

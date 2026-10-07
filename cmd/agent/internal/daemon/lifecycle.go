@@ -18,9 +18,10 @@ import (
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/fsutil"
+	"github.com/Azure/unbounded/internal/hostroot"
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -299,20 +300,20 @@ func RemoveFirstBootBootstrapUnit(log *slog.Logger) phases.Task {
 func (t *removeFirstBootUnit) Name() string { return "remove-first-boot-unit" }
 
 func (t *removeFirstBootUnit) Do(ctx context.Context) error {
-	unitPath := filepath.Join(t.unitDir, goalstates.FirstBootBootstrapUnit)
+	unitPath := filepath.Join(t.unitDir, provision.FirstBootBootstrapUnit)
 
 	// Absent on every host not provisioned through Ignition.
 	if _, err := os.Lstat(unitPath); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 
-	t.log.Info("removing first-boot bootstrap unit", "unit", goalstates.FirstBootBootstrapUnit)
+	t.log.Info("removing first-boot bootstrap unit", "unit", provision.FirstBootBootstrapUnit)
 
 	// --now, because the unit has RemainAfterExit=yes and stays active after it
 	// has run, file or no file. A host provisioned again would then find it
 	// already active, and the agent would never run.
-	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", "--now", goalstates.FirstBootBootstrapUnit); err != nil {
-		return fmt.Errorf("disable %s: %w", goalstates.FirstBootBootstrapUnit, err)
+	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", "--now", provision.FirstBootBootstrapUnit); err != nil {
+		return fmt.Errorf("disable %s: %w", provision.FirstBootBootstrapUnit, err)
 	}
 
 	return removeOwnedFile(unitPath)
@@ -337,7 +338,7 @@ type removeAgentArtifacts struct {
 func RemoveAgentArtifacts(log *slog.Logger) phases.Task {
 	return &removeAgentArtifacts{
 		log:        log,
-		files:      goalstates.OwnedHostFiles(),
+		files:      hostroot.OwnedFiles(),
 		dirs:       []string{goalstates.AgentConfigDir, "/tmp/unbounded-agent"},
 		removeRoot: func() error { return hostroot.Remove(log) },
 	}

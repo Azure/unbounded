@@ -4,6 +4,7 @@
 package fsutil_test
 
 import (
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"testing"
@@ -80,4 +81,18 @@ func TestSyncOpenFilesystemsDeduplicatesByDevice(t *testing.T) {
 func TestSyncFilesystemsReportsMissingPath(t *testing.T) {
 	t.Parallel()
 	require.Error(t, fsutil.SyncFilesystems(filepath.Join(t.TempDir(), "absent")))
+}
+
+func TestFileSHA256(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(path, []byte("content"), 0o600))
+
+	digest, err := fsutil.FileSHA256(path)
+	require.NoError(t, err)
+	require.Equal(t, sha256.Sum256([]byte("content")), digest)
+
+	_, err = fsutil.FileSHA256(filepath.Join(t.TempDir(), "absent"))
+	require.ErrorIs(t, err, os.ErrNotExist)
 }

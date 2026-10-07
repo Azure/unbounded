@@ -15,8 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var testMarkers = []string{"bin/unbounded-agent-blue", "bin/unbounded-agent-current"}
-
 type layout struct {
 	root, legacy string
 }
@@ -172,12 +170,12 @@ func TestMigrate(t *testing.T) {
 			l := newLayout(t)
 			tt.setup(t, l)
 
-			err := migrate(discard(), l.root, l.legacy, testMarkers)
+			err := migrate(discard(), l.root, l.legacy, Markers())
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 			} else {
 				require.NoError(t, err)
-				require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers), "migration must be idempotent")
+				require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()), "migration must be idempotent")
 			}
 
 			info, err := os.Lstat(l.root)
@@ -203,7 +201,7 @@ func TestPlanned(t *testing.T) {
 		t.Parallel()
 
 		l := newLayout(t)
-		assert.Equal(t, canonical(l.root), planned(l.root, l.legacy, testMarkers))
+		assert.Equal(t, canonical(l.root), planned(l.root, l.legacy, Markers()))
 		_, err := os.Lstat(l.root)
 		assert.ErrorIs(t, err, os.ErrNotExist, "planning must not change the host")
 	})
@@ -213,7 +211,7 @@ func TestPlanned(t *testing.T) {
 
 		l := newLayout(t)
 		touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
-		assert.Equal(t, canonical(l.legacy), planned(l.root, l.legacy, testMarkers))
+		assert.Equal(t, canonical(l.legacy), planned(l.root, l.legacy, Markers()))
 		_, err := os.Lstat(l.root)
 		assert.ErrorIs(t, err, os.ErrNotExist, "planning must not change the host")
 	})
@@ -223,8 +221,8 @@ func TestPlanned(t *testing.T) {
 
 		l := newLayout(t)
 		touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
-		require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers))
-		assert.Equal(t, canonical(l.legacy), planned(l.root, l.legacy, testMarkers))
+		require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()))
+		assert.Equal(t, canonical(l.legacy), planned(l.root, l.legacy, Markers()))
 	})
 }
 
@@ -255,7 +253,7 @@ func TestPrepareLeavesAMigratedHostAlone(t *testing.T) {
 
 	l := newLayout(t)
 	touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
-	require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers))
+	require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()))
 
 	relabeled := false
 

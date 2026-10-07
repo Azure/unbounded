@@ -26,11 +26,6 @@ const (
 	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
 	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
 
-	// FirstBootBootstrapUnit is the unit an Ignition config installs to
-	// bootstrap the agent on every boot. Shared with kubectl-unbounded, which
-	// writes it, so reset removes the same unit.
-	FirstBootBootstrapUnit = "unbounded-agent-bootstrap.service"
-
 	// The agent's host-side files under hostroot.LegacyPath, where agents
 	// released before hostroot.Path installed them.
 	//
