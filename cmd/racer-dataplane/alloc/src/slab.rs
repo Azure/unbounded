@@ -2370,32 +2370,40 @@ mod tests {
     /// Valid handoffs use the current size and never truncate mismatched files.
     #[test]
     fn lock_handoff_uses_refreshed_size() {
-        for size in [0, 8192, 7] {
+        for size_in_segments in [0, 2, 1] {
             let directory = Directory::new();
             let path = directory.0.join("data");
             let prior = open_private_file(&path).unwrap();
+            let Some(alignment) = real_alignment(probe(&prior)) else {
+                continue;
+            };
+            let segment_bytes = alignment.extent(0, 512).unwrap().length() as u64;
+            let capacity = segment_bytes.checked_mul(2).unwrap();
+            let size = segment_bytes * size_in_segments;
             // SAFETY: flock borrows a live descriptor owned by this test.
             assert_eq!(
                 unsafe { libc::flock(prior.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
             );
-            let slab = Slab::<()>::new(path.clone(), 8192, 4096, 512);
+            let slab = Slab::<()>::new(path.clone(), capacity, segment_bytes, 512);
             let result = slab.open_file_with_lock_handoff(|_| {
                 prior.set_len(size).unwrap();
                 drop(prior);
             });
-            if size == 7 {
+            if result == Err(Error::Unsupported) {
+                assert!(real_alignment(result).is_none());
+                continue;
+            }
+            if size_in_segments == 1 {
                 assert_eq!(result, Err(Error::InvalidConfiguration));
                 assert!(slab.opened.borrow().is_none());
                 assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
             } else {
-                let Some(alignment) = real_alignment(result) else {
-                    continue;
-                };
+                assert_eq!(result, Ok(alignment));
                 assert_eq!(slab.alignment(), Ok(alignment));
-                assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), capacity);
                 assert_eq!(
-                    Slab::<()>::new(path, 8192, 4096, 512).open_now(),
+                    Slab::<()>::new(path, capacity, segment_bytes, 512).open_now(),
                     Err(Error::Unavailable)
                 );
             }
