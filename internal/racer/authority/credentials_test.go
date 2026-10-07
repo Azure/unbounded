@@ -252,6 +252,7 @@ func TestCredentialsStalePreparationReplacementIsAtomic(t *testing.T) {
 
 			rebindSigning(&bundle, &state, material, oldID, short, true)
 
+			bundle.Generation++
 			writeSigningCredentials(t, r, bundle, state, material)
 			before, _, _, _ := keyState(t, r)
 

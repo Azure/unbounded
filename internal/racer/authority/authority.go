@@ -667,6 +667,10 @@ func (a *Authority) PublishTopology(ctx context.Context, observe func(context.Co
 		return TopologyHints{}, err
 	}
 
+	if err := r.Publications.confirm(previous); err != nil {
+		return TopologyHints{}, err
+	}
+
 	if observe == nil {
 		return TopologyHints{}, wire.InvalidRequest
 	}
@@ -720,6 +724,10 @@ func (r *publisher) keyedCatalog(ctx context.Context, version *corev1.ConfigMap,
 	}
 
 	credentials, err := readBoundCredentials(ctx, r.APIReader, r.Config, claim, version)
+	if err == nil {
+		err = r.Trust.validateReplay(credentials.bundle)
+	}
+
 	if err != nil {
 		r.suspendInvalidAuthority(err)
 		return nil, err
@@ -940,6 +948,10 @@ func (i *issuer) loadSigning(ctx context.Context, now time.Time) (signingState, 
 	defer i.CatalogGate.Release()
 
 	state, err := loadSigning(ctx, i.APIReader, i.Config, now)
+	if err == nil {
+		err = i.Trust.validateReplay(state.bundle)
+	}
+
 	// Issuance only reads authority. A request ending supplies no invalid evidence
 	// and cannot make a write ambiguous. Inspect the returned error, not ctx.Err:
 	// validation failures observed alongside cancellation must still revoke trust.
@@ -1604,6 +1616,10 @@ func (r *publisher) CommitVersion(ctx context.Context, p *preparedPublication) (
 	cm, previous, err := readVersion(ctx, r.APIReader, cfg)
 	if err != nil {
 		r.suspendInvalidAuthority(err)
+		return nil, err
+	}
+
+	if err := r.Publications.confirm(previous); err != nil {
 		return nil, err
 	}
 

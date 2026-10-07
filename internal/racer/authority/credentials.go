@@ -135,6 +135,10 @@ func (r *credentials) reconcileKeys(ctx context.Context) (ctrl.Result, error) {
 		return ctrl.Result{}, err
 	}
 
+	if err := r.Trust.validateReplay(credentials.bundle); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	return r.rotateKeys(ctx, cfg, credentials, catalog)
 }
 
@@ -794,6 +798,26 @@ type acceptedKeyring struct {
 func (*acceptedKeyring) String() string   { return "<redacted keyring>" }
 func (*acceptedKeyring) GoString() string { return "<redacted keyring>" }
 
+func (t *trustStore) validateReplay(bundle wire.KeyringBundle) error {
+	encoded, err := wire.EncodeBundle(bundle)
+	if err != nil {
+		return err
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.validateReplayLocked(bundle.Generation, sha256.Sum256(encoded))
+}
+
+func (t *trustStore) validateReplayLocked(generation wire.Generation, digest [sha256.Size]byte) error {
+	if generation < t.highWater || generation == t.highWater && digest != t.digest {
+		return wire.Conflict
+	}
+
+	return nil
+}
+
 func (t *trustStore) install(ctx context.Context, roots *x509.CertPool, bundle wire.KeyringBundle) error {
 	encoded, err := wire.EncodeBundle(bundle)
 	if err != nil {
@@ -814,8 +838,8 @@ func (t *trustStore) install(ctx context.Context, roots *x509.CertPool, bundle w
 		return wire.Unavailable
 	}
 
-	if accepted.generation < t.highWater || accepted.generation == t.highWater && digest != t.digest {
-		return wire.Conflict
+	if err := t.validateReplayLocked(accepted.generation, digest); err != nil {
+		return err
 	}
 
 	if t.bundle != nil && accepted.generation == t.highWater {
