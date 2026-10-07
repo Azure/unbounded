@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -175,18 +174,6 @@ func TestStage(t *testing.T) {
 	assert.Equal(t, "green", readLinked(t, filepath.Join(l.legacy, "bin/unbounded-agent-current")), "the legacy layout is untouched")
 }
 
-func TestStageSkipsMissingFiles(t *testing.T) {
-	t.Parallel()
-
-	l := legacyHost(t)
-	require.NoError(t, os.Remove(filepath.Join(l.legacy, "libexec/unbounded-localdns-network")))
-
-	require.NoError(t, stage(l.root, l.legacy, testLayout))
-
-	_, err := os.Lstat(filepath.Join(l.root+stagingSuffix, "libexec/unbounded-localdns-network"))
-	assert.ErrorIs(t, err, os.ErrNotExist)
-}
-
 // TestStageRebasesLinksThroughALinkedLegacyRoot covers a legacy root that is
 // itself a link, as /usr/local is on some images. Older agents wrote link
 // targets through it and newer ones through what it resolves to, and both
@@ -236,91 +223,45 @@ func TestRebase(t *testing.T) {
 	}
 }
 
-func TestSwap(t *testing.T) {
+func TestMove(t *testing.T) {
 	t.Parallel()
 
-	t.Run("replaces the link with the copy", func(t *testing.T) {
-		t.Parallel()
+	l := legacyHost(t)
+	// LocalDNS was never enabled, so there is nothing under libexec.
+	require.NoError(t, os.RemoveAll(filepath.Join(l.legacy, "libexec")))
 
-		l := legacyHost(t)
-		// LocalDNS was never enabled, so there is nothing under libexec.
-		require.NoError(t, os.RemoveAll(filepath.Join(l.legacy, "libexec")))
-		require.NoError(t, stage(l.root, l.legacy, testLayout))
+	relabeled := ""
 
-		relabeled := ""
+	require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, testLayout, []string{"bin", "libexec"},
+		func(_ context.Context, _ *slog.Logger, root string) { relabeled = root }))
 
-		require.NoError(t, swap(t.Context(), discard(), l.root, l.legacy, []string{"bin", "libexec"},
-			func(_ context.Context, _ *slog.Logger, root string) { relabeled = root }))
+	got, err := state(l.root, l.legacy)
+	require.NoError(t, err)
+	assert.Equal(t, StateMoving, got)
+	assert.Equal(t, l.root, relabeled, "copied files take their new parent's SELinux label until restored")
+	assert.DirExists(t, filepath.Join(l.root, "libexec"), "a moved host is laid out like a fresh one")
+	assert.NoFileExists(t, filepath.Join(l.root, "libexec/unbounded-localdns-network"), "a missing file is skipped")
 
-		got, err := state(l.root, l.legacy)
-		require.NoError(t, err)
-		assert.Equal(t, StateMoving, got)
-		assert.Equal(t, l.root, relabeled, "copied files take their new parent's SELinux label until restored")
-		assert.DirExists(t, filepath.Join(l.root, "libexec"), "a moved host is laid out like a fresh one")
+	_, err = os.Lstat(l.root + stagingSuffix)
+	assert.ErrorIs(t, err, os.ErrNotExist)
 
-		_, err = os.Lstat(l.root + stagingSuffix)
-		assert.ErrorIs(t, err, os.ErrNotExist)
-
-		current, err := filepath.EvalSymlinks(filepath.Join(l.root, "bin/unbounded-agent-current"))
-		require.NoError(t, err)
-		assert.Equal(t, filepath.Join(canonical(l.root), "bin/unbounded-agent-green"), current,
-			"the current link leads to the copy, and compares equal to a slot built from the resolved root")
-	})
-
-	t.Run("refuses an incomplete copy", func(t *testing.T) {
-		t.Parallel()
-
-		l := legacyHost(t)
-		require.NoError(t, stage(l.root, l.legacy, testLayout))
-		require.NoError(t, os.Remove(filepath.Join(l.root+stagingSuffix, movingMarker)))
-
-		require.ErrorContains(t, swap(t.Context(), discard(), l.root, l.legacy, nil, noRelabel), "not a complete copy")
-
-		got, err := state(l.root, l.legacy)
-		require.NoError(t, err)
-		assert.Equal(t, StateLinked, got, "the link stays")
-	})
-
-	t.Run("refuses a root that is already a directory", func(t *testing.T) {
-		t.Parallel()
-
-		l := newLayout(t)
-		require.NoError(t, os.MkdirAll(l.root, 0o755))
-		touch(t, filepath.Join(l.root+stagingSuffix, movingMarker))
-
-		require.ErrorContains(t, swap(t.Context(), discard(), l.root, l.legacy, nil, noRelabel), "not a link to")
-	})
+	current, err := filepath.EvalSymlinks(filepath.Join(l.root, "bin/unbounded-agent-current"))
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(canonical(l.root), "bin/unbounded-agent-green"), current,
+		"the current link leads to the copy, and compares equal to a slot built from the resolved root")
 }
 
-// TestMoveResumes interrupts the move after each step, runs what a restarted
-// daemon runs, and checks the move completes. Throughout, the files the old
-// units name, under the legacy root, stay in place until the move is finished,
-// so a host interrupted at any point keeps a daemon unit that can start.
+// TestMoveResumes interrupts the move, runs what a restarted daemon runs, and
+// checks the move completes. The files the old units name, under the legacy
+// root, stay in place until the move is finished, so a host interrupted at any
+// point keeps a daemon unit that can start.
 func TestMoveResumes(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name      string
 		interrupt func(t *testing.T, l layout)
-		// removing is set once the daemon has begun removing the legacy
-		// layout, which it does only after the units name the new one.
-		removing bool
 	}{
-		{name: "before anything", interrupt: func(*testing.T, layout) {}},
-		{
-			name: "after staging",
-			interrupt: func(t *testing.T, l layout) {
-				require.NoError(t, stage(l.root, l.legacy, testLayout))
-			},
-		},
-		{
-			name: "part way through staging",
-			interrupt: func(t *testing.T, l layout) {
-				require.NoError(t, stage(l.root, l.legacy, testLayout))
-				require.NoError(t, os.Remove(filepath.Join(l.root+stagingSuffix, movingMarker)))
-				require.NoError(t, os.Remove(filepath.Join(l.root+stagingSuffix, "bin/unbounded-agent-green")))
-			},
-		},
 		{
 			// The window in which the root does not exist.
 			name: "after removing the link",
@@ -332,18 +273,8 @@ func TestMoveResumes(t *testing.T) {
 		{
 			name: "after the swap",
 			interrupt: func(t *testing.T, l layout) {
-				require.NoError(t, stage(l.root, l.legacy, testLayout))
-				require.NoError(t, swap(t.Context(), discard(), l.root, l.legacy, nil, noRelabel))
+				require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, testLayout, nil, noRelabel))
 			},
-		},
-		{
-			name: "part way through removing the legacy layout",
-			interrupt: func(t *testing.T, l layout) {
-				require.NoError(t, stage(l.root, l.legacy, testLayout))
-				require.NoError(t, swap(t.Context(), discard(), l.root, l.legacy, nil, noRelabel))
-				require.NoError(t, os.Remove(filepath.Join(l.legacy, "bin/unbounded-agent-blue")))
-			},
-			removing: true,
 		},
 	}
 
@@ -362,30 +293,23 @@ func TestMoveResumes(t *testing.T) {
 			require.NoError(t, err)
 
 			if got == StateLinked {
-				require.NoError(t, discardStaging(l.root))
-				require.NoError(t, stage(l.root, l.legacy, testLayout))
-				require.NoError(t, swap(t.Context(), discard(), l.root, l.legacy, nil, noRelabel))
+				require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, testLayout, nil, noRelabel))
 
 				got, err = state(l.root, l.legacy)
 				require.NoError(t, err)
 			}
 
 			require.Equal(t, StateMoving, got)
-
-			if !tt.removing {
-				assert.Equal(t, "green", readLinked(t, filepath.Join(l.legacy, "bin/unbounded-agent-current")),
-					"the legacy layout is still in place for the units that name it")
-			}
+			assert.Equal(t, "green", readLinked(t, filepath.Join(l.legacy, "bin/unbounded-agent-current")),
+				"the legacy layout is still in place for the units that name it")
 
 			// The daemon rewrites the units here, then removes the legacy
 			// layout and finishes.
 			for _, rel := range testLayout {
-				if err := os.Remove(filepath.Join(l.legacy, rel)); err != nil {
-					require.ErrorIs(t, err, os.ErrNotExist)
-				}
+				require.NoError(t, removeIfExists(filepath.Join(l.legacy, rel)))
 			}
 
-			require.NoError(t, finishMove(l.root))
+			require.NoError(t, removeIfExists(filepath.Join(l.root, movingMarker)))
 
 			got, err = state(l.root, l.legacy)
 			require.NoError(t, err)
@@ -393,9 +317,6 @@ func TestMoveResumes(t *testing.T) {
 			assert.Equal(t, "green", readLinked(t, filepath.Join(l.root, "bin/unbounded-agent-current")))
 			assert.Equal(t, "blue", readLinked(t, filepath.Join(l.root, "bin/unbounded-agent-last-good")))
 			assert.Equal(t, "helper", readLinked(t, filepath.Join(l.root, "bin/unbounded-agent-nspawn-lifecycle")))
-
-			_, err = os.Lstat(l.root + stagingSuffix)
-			assert.ErrorIs(t, err, os.ErrNotExist)
 			assert.FileExists(t, filepath.Join(l.legacy, "bin/unbounded-agent-install.sh"), "files outside the layout stay")
 
 			require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers), "a moved host is a plain installation")
@@ -403,83 +324,22 @@ func TestMoveResumes(t *testing.T) {
 	}
 }
 
-func TestDiscardStaging(t *testing.T) {
-	t.Parallel()
-
-	l := legacyHost(t)
-	require.NoError(t, discardStaging(l.root), "nothing to discard")
-
-	require.NoError(t, stage(l.root, l.legacy, testLayout))
-	require.NoError(t, discardStaging(l.root))
-
-	_, err := os.Lstat(l.root + stagingSuffix)
-	assert.ErrorIs(t, err, os.ErrNotExist)
-
-	got, err := state(l.root, l.legacy)
-	require.NoError(t, err)
-	assert.Equal(t, StateLinked, got)
-}
-
 func TestRemoveSeed(t *testing.T) {
 	t.Parallel()
 
 	const seed = "bin/unbounded-agent"
-
-	installed := func(t *testing.T, l layout) {
-		require.NoError(t, os.MkdirAll(filepath.Join(l.root, "bin"), 0o755))
-	}
 
 	tests := []struct {
 		name     string
 		setup    func(t *testing.T, l layout)
 		wantKept bool
 	}{
-		{
-			name: "a seed beside a host installed under the root is removed",
-			setup: func(t *testing.T, l layout) {
-				installed(t, l)
-				touch(t, filepath.Join(l.legacy, seed))
-			},
-		},
+		{name: "a seeded binary is removed", setup: func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, seed)) }},
 		{
 			name: "a link is not a seed",
 			setup: func(t *testing.T, l layout) {
-				installed(t, l)
 				require.NoError(t, os.Symlink("/bin/true", filepath.Join(l.legacy, seed)))
 			},
-			wantKept: true,
-		},
-		{
-			name: "a legacy installation keeps its binary",
-			setup: func(t *testing.T, l layout) {
-				installed(t, l)
-				touch(t, filepath.Join(l.legacy, seed))
-				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
-			},
-			wantKept: true,
-		},
-		{
-			name: "a linked host keeps it",
-			setup: func(t *testing.T, l layout) {
-				touch(t, filepath.Join(l.legacy, seed))
-				require.NoError(t, os.MkdirAll(filepath.Dir(l.root), 0o755))
-				require.NoError(t, os.Symlink(l.legacy, l.root))
-			},
-			wantKept: true,
-		},
-		{
-			name: "an unfinished move keeps it",
-			setup: func(t *testing.T, l layout) {
-				touch(t, filepath.Join(l.root, movingMarker))
-				touch(t, filepath.Join(l.legacy, seed))
-			},
-			wantKept: true,
-		},
-		{
-			// Bootstrap has not run yet, and the agent that runs it may be
-			// the one the seed is for.
-			name:     "a host with no root keeps it",
-			setup:    func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, seed)) },
 			wantKept: true,
 		},
 	}
@@ -491,40 +351,12 @@ func TestRemoveSeed(t *testing.T) {
 			l := newLayout(t)
 			tt.setup(t, l)
 
-			require.NoError(t, removeSeed(discard(), l.root, l.legacy, seed, testMarkers))
+			require.NoError(t, removeSeed(discard(), l.legacy, seed))
 
 			_, err := os.Lstat(filepath.Join(l.legacy, seed))
 			assert.Equal(t, tt.wantKept, err == nil, "seed kept")
 		})
 	}
 
-	t.Run("no seed", func(t *testing.T) {
-		t.Parallel()
-
-		l := newLayout(t)
-		installed(t, l)
-		require.NoError(t, removeSeed(discard(), l.root, l.legacy, seed, testMarkers))
-	})
-}
-
-// TestStageIgnoresTheUmask is not parallel because the umask belongs to the
-// process. Parallel tests are paused while it runs.
-func TestStageIgnoresTheUmask(t *testing.T) {
-	l := legacyHost(t)
-
-	old := syscall.Umask(0o077)
-
-	t.Cleanup(func() { syscall.Umask(old) })
-
-	require.NoError(t, stage(l.root, l.legacy, testLayout))
-
-	for _, dir := range []string{l.root + stagingSuffix, filepath.Join(l.root+stagingSuffix, "bin")} {
-		info, err := os.Stat(dir)
-		require.NoError(t, err)
-		assert.Equal(t, os.FileMode(0o755), info.Mode().Perm(), dir)
-	}
-
-	info, err := os.Stat(filepath.Join(l.root+stagingSuffix, "bin/unbounded-agent-green"))
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+	require.NoError(t, removeSeed(discard(), newLayout(t).legacy, seed), "no seed")
 }

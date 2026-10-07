@@ -267,12 +267,12 @@ func readSymlinkState(path string) (bool, string, error) {
 }
 
 func filesDiffer(firstPath, secondPath string) (bool, error) {
-	first, err := fileSHA256(firstPath)
+	first, err := FileSHA256(firstPath)
 	if err != nil {
 		return false, err
 	}
 
-	second, err := fileSHA256(secondPath)
+	second, err := FileSHA256(secondPath)
 	if err != nil {
 		return false, err
 	}
@@ -280,7 +280,8 @@ func filesDiffer(firstPath, secondPath string) (bool, error) {
 	return first != second, nil
 }
 
-func fileSHA256(path string) ([sha256.Size]byte, error) {
+// FileSHA256 returns the SHA-256 digest of the file at path.
+func FileSHA256(path string) ([sha256.Size]byte, error) {
 	var digest [sha256.Size]byte
 
 	file, err := os.Open(path)

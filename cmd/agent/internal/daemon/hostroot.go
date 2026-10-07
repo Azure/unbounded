@@ -5,20 +5,19 @@ package daemon
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/fsutil"
+	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
@@ -39,32 +38,17 @@ func MigrateHostRoot(log *slog.Logger) error {
 // It is under the agent config directory, which reset removes.
 var hostRootAgentsPath = filepath.Join(goalstates.AgentConfigDir, "host-root-agents")
 
-// daemonBinaryOverrides are the environment variables that move a daemon
-// binary path away from the layout. A host that uses one is not moved: the
-// move copies the layout, and cannot know what the override names.
-var daemonBinaryOverrides = []string{
-	goalstates.EnvDaemonBinary,
-	goalstates.EnvDaemonBinaryBlue,
-	goalstates.EnvDaemonBinaryGreen,
-	goalstates.EnvDaemonBinaryCurrent,
-	goalstates.EnvDaemonBinaryLastGood,
-}
-
 // hostRootSteps is the host work reconcileHostRoot orders. The daemon uses
 // hostRootHost; tests substitute a fake to check the order and the resume.
 type hostRootSteps interface {
 	// State reports what the host root is.
 	State() (hostroot.State, error)
-	// DiscardStaging removes a copy an interrupted move made.
-	DiscardStaging() error
 	// RecordSelf records this daemon's binary as one that knows the host root.
 	RecordSelf() error
 	// Ready reports whether the host can be moved, and if not, why.
 	Ready() (bool, string, error)
-	// Stage copies the legacy layout beside the host root.
-	Stage() error
-	// Swap puts the copy in place of the link.
-	Swap(context.Context) error
+	// Move puts a copy of the legacy layout in place of the link.
+	Move(context.Context) error
 	// RewriteUnits points every unit and script at the files under the host
 	// root, and reloads systemd.
 	RewriteUnits(context.Context) error
@@ -112,10 +96,6 @@ func reconcileHostRoot(ctx context.Context, log *slog.Logger, steps hostRootStep
 		return nil
 	}
 
-	if err := steps.DiscardStaging(); err != nil {
-		return err
-	}
-
 	if err := steps.RecordSelf(); err != nil {
 		return err
 	}
@@ -133,11 +113,7 @@ func reconcileHostRoot(ctx context.Context, log *slog.Logger, steps hostRootStep
 
 	log.Info("moving the agent's files to the host root", "from", hostroot.LegacyPath, "to", hostroot.Path)
 
-	if err := steps.Stage(); err != nil {
-		return err
-	}
-
-	if err := steps.Swap(ctx); err != nil {
+	if err := steps.Move(ctx); err != nil {
 		return err
 	}
 
@@ -184,31 +160,20 @@ func reconcileHostRootUnderLock(ctx context.Context, log *slog.Logger, store *in
 
 // hostRootHost is the real host work of reconcileHostRoot.
 type hostRootHost struct {
-	log        *slog.Logger
-	active     *ActiveMachine
-	operator   nodeOperator
-	agents     string
-	executable func() (string, error)
-	lookupEnv  func(string) (string, bool)
+	log      *slog.Logger
+	active   *ActiveMachine
+	operator nodeOperator
+	agents   string
 }
 
 func newHostRootHost(log *slog.Logger, active *ActiveMachine, operator nodeOperator) hostRootHost {
-	return hostRootHost{
-		log:        log,
-		active:     active,
-		operator:   operator,
-		agents:     hostRootAgentsPath,
-		executable: os.Executable,
-		lookupEnv:  os.LookupEnv,
-	}
+	return hostRootHost{log: log, active: active, operator: operator, agents: hostRootAgentsPath}
 }
 
 func (h hostRootHost) State() (hostroot.State, error) { return hostroot.CurrentState() }
 
-func (h hostRootHost) DiscardStaging() error { return hostroot.DiscardStaging() }
-
 func (h hostRootHost) RecordSelf() error {
-	self, err := h.executable()
+	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve the daemon's executable: %w", err)
 	}
@@ -222,38 +187,21 @@ func (h hostRootHost) RecordSelf() error {
 }
 
 func (h hostRootHost) Ready() (bool, string, error) {
-	for _, name := range daemonBinaryOverrides {
-		if value, ok := h.lookupEnv(name); ok && strings.TrimSpace(value) != "" {
-			return false, name + " overrides a daemon binary path", nil
-		}
-	}
-
 	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
 		return false, "", err
 	}
 
-	return hostRootMoveReady(h.agents, paths.SignalPath, map[string]string{
-		"current":   paths.CurrentPath,
-		"last-good": paths.LastGoodPath,
-	})
+	return hostRootMoveReady(h.agents, paths.SignalPath, paths.CurrentPath, paths.LastGoodPath)
 }
 
-func (h hostRootHost) Stage() error { return hostroot.Stage(goalstates.HostLayout()) }
-
-func (h hostRootHost) Swap(ctx context.Context) error {
+func (h hostRootHost) Move(ctx context.Context) error {
 	// The directories a fresh installation's PrepareHost creates, so a moved
 	// host is laid out the same way.
-	return hostroot.Swap(ctx, h.log, "bin", "libexec")
+	return hostroot.Move(ctx, h.log, goalstates.HostLayout(), "bin", "libexec")
 }
 
 func (h hostRootHost) RewriteUnits(ctx context.Context) error {
-	// The nspawn lifecycle helper, the machine's service override and its
-	// config regeneration unit. It reloads systemd.
-	if err := h.operator.EnsureLifecycleMigration(ctx, h.log, h.active); err != nil {
-		return err
-	}
-
 	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
 		return err
@@ -268,8 +216,10 @@ func (h hostRootHost) RewriteUnits(ctx context.Context) error {
 		return err
 	}
 
-	if err := executil.RunCmd(ctx, h.log, executil.Systemctl(), "daemon-reload"); err != nil {
-		return fmt.Errorf("reload systemd after moving to the host root: %w", err)
+	// Last, because it reloads systemd: the nspawn lifecycle helper, the
+	// machine's service override and its config regeneration unit.
+	if err := h.operator.EnsureLifecycleMigration(ctx, h.log, h.active); err != nil {
+		return err
 	}
 
 	return fsutil.SyncFilesystems(goalstates.SystemdSystemDir, hostroot.Resolve())
@@ -313,7 +263,7 @@ func (h hostRootHost) FinishMove() error {
 }
 
 func (h hostRootHost) RemoveSeed() error {
-	return hostroot.RemoveSeed(h.log, goalstates.LegacySeedFile(), goalstates.HostRootMarkers()...)
+	return hostroot.RemoveSeed(h.log, goalstates.LegacySeedFile())
 }
 
 func (h hostRootHost) Restart(ctx context.Context) error {
@@ -321,10 +271,10 @@ func (h hostRootHost) Restart(ctx context.Context) error {
 }
 
 // hostRootMoveReady reports whether a linked host can be moved: no
-// AgentUpgrade is waiting to be reported, and every link in slots resolves to
-// a binary recorded in agentsPath. A binary that is not recorded has never run
-// the code that records it, so it predates the host root.
-func hostRootMoveReady(agentsPath, signalPath string, slots map[string]string) (bool, string, error) {
+// AgentUpgrade is waiting to be reported, and the current and last-good links
+// resolve to binaries recorded in agentsPath. A binary that is not recorded has
+// never run the code that records it, so it predates the host root.
+func hostRootMoveReady(agentsPath, signalPath, currentPath, lastGoodPath string) (bool, string, error) {
 	if _, err := os.Stat(signalPath); err == nil {
 		return false, "an AgentUpgrade has not been reported yet", nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -336,15 +286,10 @@ func hostRootMoveReady(agentsPath, signalPath string, slots map[string]string) (
 		return false, "", err
 	}
 
-	names := make([]string, 0, len(slots))
-	for name := range slots {
-		names = append(names, name)
-	}
+	for _, slot := range [][2]string{{"current", currentPath}, {"last-good", lastGoodPath}} {
+		name, link := slot[0], slot[1]
 
-	slices.Sort(names)
-
-	for _, name := range names {
-		target, err := filepath.EvalSymlinks(slots[name])
+		target, err := filepath.EvalSymlinks(link)
 		if err != nil {
 			return false, fmt.Sprintf("the %s binary does not resolve: %v", name, err), nil
 		}
@@ -375,18 +320,11 @@ func recordAgentDigest(path, digest string) error {
 
 	known[digest] = true
 
-	digests := make([]string, 0, len(known))
-	for d := range known {
-		digests = append(digests, d)
-	}
-
-	slices.Sort(digests)
-
-	return writeFile(path, []byte(strings.Join(digests, "\n")+"\n"), 0o600)
+	return writeFile(path, []byte(strings.Join(slices.Sorted(maps.Keys(known)), "\n")+"\n"), 0o600)
 }
 
 // loadAgentDigests reads the digests recorded at path. A missing file records
-// none, and anything that is not a digest is ignored.
+// none.
 func loadAgentDigests(path string) (map[string]bool, error) {
 	known := map[string]bool{}
 
@@ -400,26 +338,14 @@ func loadAgentDigests(path string) (map[string]bool, error) {
 	}
 
 	for _, field := range strings.Fields(string(data)) {
-		if decoded, err := hex.DecodeString(field); err == nil && len(decoded) == sha256.Size {
-			known[strings.ToLower(field)] = true
-		}
+		known[field] = true
 	}
 
 	return known, nil
 }
 
 func fileDigest(path string) (string, error) {
-	f, err := os.Open(path) //nolint:gosec // One of the agent's own binaries.
-	if err != nil {
-		return "", fmt.Errorf("open %s: %w", path, err)
-	}
+	sum, err := agentbinary.FileSHA256(path)
 
-	defer f.Close() //nolint:errcheck // Read-only handle.
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", fmt.Errorf("hash %s: %w", path, err)
-	}
-
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(sum[:]), err
 }

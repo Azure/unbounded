@@ -139,15 +139,6 @@ func TestMigrate(t *testing.T) {
 			wantDir: true,
 		},
 		{
-			name: "a migrated host stays migrated",
-			setup: func(t *testing.T, l layout) {
-				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
-				require.NoError(t, os.MkdirAll(filepath.Dir(l.root), 0o755))
-				require.NoError(t, os.Symlink(l.legacy, l.root))
-			},
-			wantLink: true,
-		},
-		{
 			// An older agent's reset removes the files but not the link.
 			name: "a link with no installation behind it is removed",
 			setup: func(t *testing.T, l layout) {
@@ -203,24 +194,6 @@ func TestMigrate(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestMigratedPathsMatchTheLegacyLayout is why the root is resolved: the
-// current link a legacy agent wrote resolves to the legacy root, and a path
-// built from the new root has to compare equal to it.
-func TestMigratedPathsMatchTheLegacyLayout(t *testing.T) {
-	t.Parallel()
-
-	l := newLayout(t)
-	blue := filepath.Join(l.legacy, "bin/unbounded-agent-blue")
-	touch(t, blue)
-	require.NoError(t, os.Symlink(blue, filepath.Join(l.legacy, "bin/unbounded-agent-current")))
-
-	require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers))
-
-	current, err := filepath.EvalSymlinks(filepath.Join(l.root, "bin/unbounded-agent-current"))
-	require.NoError(t, err)
-	assert.Equal(t, filepath.Join(canonical(l.root), "bin/unbounded-agent-blue"), current)
 }
 
 func TestPlanned(t *testing.T) {
@@ -375,23 +348,11 @@ func TestRemove(t *testing.T) {
 			_, err = os.Lstat(l.root + stagingSuffix)
 			assert.ErrorIs(t, err, os.ErrNotExist, "a staging copy never survives reset")
 
+			_, err = os.Lstat(filepath.Join(l.root, "bin"))
+			assert.ErrorIs(t, err, os.ErrNotExist, "an empty subdirectory never survives reset")
+
 			_, err = os.Stat(filepath.Join(l.legacy, "bin"))
 			assert.Equal(t, tt.wantLegacy, err == nil, "legacy root untouched")
 		})
 	}
-}
-
-func TestRemoveKeepsNonEmptySubdirectories(t *testing.T) {
-	t.Parallel()
-
-	l := newLayout(t)
-	require.NoError(t, os.MkdirAll(filepath.Join(l.root, "bin"), 0o755))
-	touch(t, filepath.Join(l.root, "lib/keep"))
-
-	require.NoError(t, remove(discard(), l.root, l.legacy))
-
-	_, err := os.Stat(filepath.Join(l.root, "bin"))
-	assert.ErrorIs(t, err, os.ErrNotExist, "an empty subdirectory is removed")
-	_, err = os.Stat(filepath.Join(l.root, "lib/keep"))
-	assert.NoError(t, err, "a file left in the root is kept")
 }

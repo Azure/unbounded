@@ -61,7 +61,6 @@ type fakeNodeOperator struct {
 
 	hostRootCalls  int
 	hostRootActive *ActiveMachine
-	hostRootErr    error
 }
 
 func (op *fakeNodeOperator) FindActiveMachine(*slog.Logger) (*ActiveMachine, error) {
@@ -133,7 +132,7 @@ func (op *fakeNodeOperator) ReconcileHostRoot(_ context.Context, _ *slog.Logger,
 	op.hostRootCalls++
 	op.hostRootActive = active
 
-	return op.hostRootErr
+	return nil
 }
 
 func fakeStatusClient(objs ...client.Object) client.Client {
