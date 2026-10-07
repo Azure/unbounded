@@ -332,7 +332,8 @@ impl<P: Policy> Charge<P> {
         if amount == 0 || amount >= self.amount {
             return Err(Error::InvalidInput);
         }
-        Ok(self.transfer(amount, self.buffers.clone()))
+        let key = self.key.clone();
+        Ok(self.transfer(amount, self.buffers.clone(), key))
     }
 
     /// Caller must retain at least the capacity of every live backing allocation.
@@ -387,6 +388,9 @@ impl<P: Policy> Charge<P> {
         let Some(pool) = self.buffers.upgrade() else {
             return;
         };
+        // Application cloning may reenter stop or fill the pool. Clone unlocked,
+        // then check retention again before transferring any admission.
+        let key = self.key.clone();
         let mut pool = match pool.try_lock() {
             Ok(pool) => pool,
             Err(std::sync::TryLockError::WouldBlock) => return,
@@ -397,14 +401,12 @@ impl<P: Policy> Charge<P> {
         }
         // SAFETY: wipe_payload initialized the entire capacity above.
         unsafe { bytes.set_len(bytes.capacity()) };
-        let charge = self.transfer(self.amount, Weak::new());
+        let charge = self.transfer(self.amount, Weak::new(), key);
         pool.push((bytes, charge));
     }
 
-    /// Move admission to a new owner without touching either usage counter.
-    fn transfer(&mut self, amount: usize, buffers: Weak<Buffers<P>>) -> Self {
-        // Clone the application key before mutating ownership: its Clone may panic.
-        let key = self.key.clone();
+    /// Move admission with a precloned key without touching either usage counter.
+    fn transfer(&mut self, amount: usize, buffers: Weak<Buffers<P>>, key: Option<P::Key>) -> Self {
         self.amount -= amount;
         Self {
             class: self.class,
@@ -1333,6 +1335,109 @@ mod quota_tests {
         assert!(quotas.reserve(Some(&key), Resource::Other, 1).is_ok());
         assert!(unlocked.load(Ordering::SeqCst));
         assert_eq!(quotas.retained_buffer_bytes(), 0);
+    }
+
+    /// Key cloning runs unlocked, and callback changes are checked before retention.
+    #[test]
+    fn recycler_key_clone_runs_before_retention_checks() {
+        thread_local! {
+            static CLONE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        }
+
+        #[derive(Eq, PartialEq, Hash)]
+        struct Key;
+
+        impl Clone for Key {
+            fn clone(&self) -> Self {
+                let hook = CLONE_HOOK.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook();
+                }
+                Self
+            }
+        }
+
+        struct ClonePolicy;
+
+        impl Policy for ClonePolicy {
+            type Class = Resource;
+            type Key = Key;
+
+            fn limit(&self, _: Resource) -> usize {
+                4 << 20
+            }
+
+            fn max_keys(&self) -> usize {
+                1
+            }
+
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            fn rejected(&self, _: Rejection<Resource>) {
+                panic!("unexpected rejection");
+            }
+        }
+
+        let size = 1 << 20;
+        for action in ["retain", "stop", "fill"] {
+            let quotas = Rc::new(Quotas::new(ClonePolicy));
+            let mut idle = quotas.reserve(None, Resource::Payload, size).unwrap();
+            idle.recycle(vec![0xa7; size]);
+            let mut donor = quotas
+                .reserve(Some(&Key), Resource::Payload, 2 * size)
+                .unwrap();
+            let nested = quotas.clone();
+            CLONE_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Fail before reentry can block on the same mutex.
+                    assert!(
+                        nested.buffers.try_lock().is_ok(),
+                        "key cloned under recycler lock"
+                    );
+                    match action {
+                        "stop" => nested.stop(),
+                        "fill" => {
+                            let mut extra = nested.reserve(None, Resource::Payload, size).unwrap();
+                            extra.recycle(vec![0xa7; size]);
+                        }
+                        _ => {}
+                    }
+                }));
+            });
+
+            donor.recycle(vec![0xa7; size]);
+            assert!(CLONE_HOOK.with(|slot| slot.borrow().is_none()));
+            assert_eq!(quotas.is_stopped(), action == "stop");
+            let retained = match action {
+                "retain" => 3 * size,
+                "fill" => 2 * size,
+                _ => 0,
+            };
+            let owned = if action == "retain" { 0 } else { 2 * size };
+            assert_eq!(donor.amount(), owned);
+            assert!(donor.key().is_some());
+            assert_eq!(
+                donor
+                    .local
+                    .as_ref()
+                    .unwrap()
+                    .counter(Resource::Payload)
+                    .used(),
+                2 * size
+            );
+            assert_eq!(quotas.retained_buffer_bytes(), retained);
+            assert_eq!(quotas.used(Resource::Payload), retained + owned);
+            drop(donor);
+            quotas.reclaim_buffers();
+            assert_eq!(quotas.used(Resource::Payload), 0);
+            assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+        }
     }
 
     /// A poisoned recycler remains usable after a prior operation panicked.
