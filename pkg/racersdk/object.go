@@ -102,6 +102,9 @@ func (o *Object) Read(p []byte) (int, error) {
 // controller, WriteTo bounds each write and interrupts it if the Get context
 // ends. It clears its deadlines before returning and never closes w. Set HTTP
 // response headers, including Content-Length, before calling WriteTo.
+// Without supported write deadlines, neither context cancellation nor
+// [Object.Close] can interrupt an already-blocked write to w; that write must
+// return on its own.
 func (o *Object) WriteTo(w io.Writer) (int64, error) {
 	if err := o.begin(); err != nil {
 		if err == io.EOF {
@@ -131,9 +134,13 @@ func (o *Object) WriteTo(w io.Writer) (int64, error) {
 	return n, err
 }
 
-// Close stops the read and releases its connection. It is safe to call more
-// than once and concurrently with Read or WriteTo, which then fail with an
-// error wrapping [net.ErrClosed]. Close always returns nil.
+// Close stops the read and closes its Racer connection. It is safe to call more
+// than once and concurrently with Read or WriteTo. Close does not wait for
+// those calls to return and always returns nil. An interrupted Read or WriteTo
+// returns an error wrapping [net.ErrClosed].
+//
+// If WriteTo is already blocked in a destination write without supported write
+// deadlines, that write must return on its own before WriteTo can return.
 func (o *Object) Close() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
