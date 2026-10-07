@@ -605,7 +605,8 @@ func singletonHeader(name string) bool {
 	}
 }
 
-// HeadHeaders applies standard HTTP whitespace normalization to a validated head.
+// HeadHeaders preserves numeric and range bytes after one optional separator space.
+// Other fields use standard HTTP whitespace normalization.
 // Call ValidateRawHead first so opaque context has already been checked byte for byte.
 func HeadHeaders(head []byte) http.Header {
 	h := make(http.Header)
@@ -613,7 +614,18 @@ func HeadHeaders(head []byte) http.Header {
 	lines := bytes.Split(head[:len(head)-4], []byte("\r\n"))
 	for _, line := range lines[1:] {
 		i := bytes.IndexByte(line, ':')
-		h.Add(string(line[:i]), strings.Trim(string(line[i+1:]), " \t"))
+		name, value := string(line[:i]), string(line[i+1:])
+
+		switch strings.ToLower(name) {
+		case "content-length", "content-range", "range", "racer-expires-at",
+			"racer-object-length", "racer-range-start", "racer-range-end",
+			"racer-page-credits", "racer-byte-credits", "racer-ordered":
+			value = strings.TrimPrefix(value, " ")
+		default:
+			value = strings.Trim(value, " \t")
+		}
+
+		h.Add(name, value)
 	}
 
 	return h
