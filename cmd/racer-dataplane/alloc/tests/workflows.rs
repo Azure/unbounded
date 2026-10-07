@@ -746,6 +746,57 @@ fn real_alignment(result: page_alloc::Result<Alignment>) -> Option<Alignment> {
     }
 }
 
+/// Discover alignment before choosing any slab dimensions.
+fn probe_alignment(directory: &Directory) -> Option<Alignment> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+    let result = (|| {
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_DIRECT)
+            .open(directory.0.join("alignment-probe"))
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS) => Error::Unsupported,
+                errno => Error::SystemIo {
+                    operation: "open",
+                    errno,
+                },
+            })?;
+        // SAFETY: stat is initialized and the file and empty path remain live.
+        let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                libc::STATX_DIOALIGN,
+                &mut stat,
+            )
+        } != 0
+        {
+            return Err(match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENOSYS | libc::EOPNOTSUPP) => Error::Unsupported,
+                errno => Error::SystemIo {
+                    operation: "statx",
+                    errno,
+                },
+            });
+        }
+        if stat.stx_mask & libc::STATX_DIOALIGN == 0 {
+            return Err(Error::Unsupported);
+        }
+        Alignment::new(
+            stat.stx_dio_mem_align as usize,
+            stat.stx_dio_offset_align as u64,
+            stat.stx_dio_offset_align as usize,
+        )
+    })();
+    real_alignment(result)
+}
+
 /// Probe baseline io_uring support without hiding unexpected runtime setup failures.
 fn kernel_available() -> bool {
     let mut params = [0u64; 15];
@@ -793,14 +844,21 @@ fn io_uring_roundtrip_and_completion_fence() {
         return;
     }
     let directory = Directory::new();
-    let slab = Slab::<()>::new(directory.0.join("uring.dat"), 8192, 4096, 512);
-    let segments = Segments::new(4096);
-    if real_alignment(slab.open_configured(&segments)).is_none() {
+    let Some(alignment) = probe_alignment(&directory) else {
         return;
-    }
+    };
+    let (_, segment_bytes) = device_placement_sizes(alignment);
+    let slab = Slab::<()>::new(
+        directory.0.join("uring.dat"),
+        2 * segment_bytes,
+        segment_bytes,
+        segment_bytes as usize,
+    );
+    let segments = Segments::new(segment_bytes);
+    assert_eq!(slab.open_configured(&segments), Ok(alignment));
     let reactor = Reactor::<TestScope, ()>::new(16, ());
     reactor.init().unwrap();
-    let (lease, extent) = segments.append(4096).unwrap();
+    let (lease, extent) = segments.append(segment_bytes as usize).unwrap();
     let mut buffer = slab.allocate(extent.length(), ()).unwrap();
     buffer.as_mut_slice().fill(73);
     drop(
@@ -861,6 +919,10 @@ fn device_placement_sizes_support_4096_and_arbitrary_units() {
         (4096, 4096, 4096),
         (4096, 512, 4096),
         (512, 4096, 4096),
+        (8192, 8192, 8192),
+        (8192, 512, 8192),
+        (512, 8192, 8192),
+        (65536, 65536, 65536),
         (768, 512, 3072),
         (3, 5, 2055),
     ] {
@@ -899,6 +961,14 @@ fn device_placement_sizes_support_4096_and_arbitrary_units() {
             }
         }
         assert_eq!(segments.free_count(), 0);
+        let whole_segments = Segments::from_geometry(geometry).unwrap();
+        let buffer = alignment.allocate(segment_bytes as usize, ()).unwrap();
+        for id in 0..3 {
+            let (lease, extent) = whole_segments.append(segment_bytes as usize).unwrap();
+            assert_eq!(lease.id(), SegmentId(id));
+            assert_eq!(extent.offset(), id * segment_bytes);
+            alignment.check(extent, &buffer).unwrap();
+        }
     }
 }
 
@@ -911,8 +981,7 @@ fn device_placements_route_real_io_and_reject_short_reads() {
         return;
     }
     let directory = Directory::new();
-    let probe = Slab::<()>::new(directory.0.join("probe"), 16384, 4096, 4096);
-    let Some(alignment) = real_alignment(probe.open_configured(&Segments::new(4096))) else {
+    let Some(alignment) = probe_alignment(&directory) else {
         return;
     };
     let (half_bytes, segment_bytes) = device_placement_sizes(alignment);
@@ -1034,44 +1103,43 @@ fn device_placements_route_real_io_and_reject_short_reads() {
 #[test]
 fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission() {
     let directory = Directory::new();
+    let Some(alignment) = probe_alignment(&directory) else {
+        return;
+    };
+    let (_, segment_bytes) = device_placement_sizes(alignment);
     #[cfg(feature = "simulation")]
     let failures = ["unbound", "wrong-geometry", "frozen-table"].as_slice();
     #[cfg(not(feature = "simulation"))]
     let failures = ["wrong-geometry", "frozen-table"].as_slice();
     for &failure in failures {
-        let slab = Slab::<()>::new(directory.0.join(failure), 8192, 4096, 512);
-        let correct = Segments::new(4096);
+        let slab = Slab::<()>::new(
+            directory.0.join(failure),
+            2 * segment_bytes,
+            segment_bytes,
+            segment_bytes as usize,
+        );
+        let correct = Segments::new(segment_bytes);
         match failure {
             #[cfg(feature = "simulation")]
             "unbound" => {
-                if real_alignment(slab.open_now()).is_none() {
-                    return;
-                }
+                assert_eq!(slab.open_now(), Ok(alignment));
             }
             "wrong-geometry" => {
-                let result = slab.open_configured(&Segments::new(8192));
-                if result == Err(Error::Unsupported) {
-                    let _ = real_alignment(result);
-                    return;
-                }
+                let result = slab.open_configured(&Segments::new(2 * segment_bytes));
                 assert_eq!(result, Err(Error::InvalidConfiguration));
             }
             "frozen-table" => {
                 let frozen = correct.freeze().unwrap();
                 let result = slab.open_configured(&correct);
-                if result == Err(Error::Unsupported) {
-                    let _ = real_alignment(result);
-                    return;
-                }
                 assert_eq!(result, Err(Error::Busy));
                 drop(frozen);
             }
             _ => unreachable!(),
         }
-        let alignment = slab.alignment().unwrap();
+        assert_eq!(slab.alignment(), Ok(alignment));
         let correct = Segments::from_geometry(slab.geometry().unwrap()).unwrap();
-        let (lease, extent) = correct.append(4096).unwrap();
-        let buffer = slab.allocate(4096, ()).unwrap();
+        let (lease, extent) = correct.append(segment_bytes as usize).unwrap();
+        let buffer = slab.allocate(extent.length(), ()).unwrap();
         let reactor = Reactor::<TestScope, ()>::new(16, ());
         let mut read = slab.read(&reactor, extent, buffer, lease, &TestScope);
         assert!(matches!(
@@ -1082,7 +1150,7 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
         let mut write = slab.write(
             &reactor,
             extent,
-            slab.allocate(4096, ()).unwrap(),
+            slab.allocate(extent.length(), ()).unwrap(),
             correct.lease(SegmentId(0), Generation(1)).unwrap(),
             &TestScope,
         );
