@@ -16,6 +16,26 @@ pub use circuit::{Circuits, Probe};
 pub use handoff::{Admission as HandoffAdmission, Admitted, Handoff, Offer};
 pub use hedge::{Hedges, Permit as HedgePermit};
 
+/// A retry or timeout beyond the clock's range never expires.
+#[derive(Clone, Copy)]
+enum Deadline {
+    At(Instant),
+
+    Never,
+}
+
+impl Deadline {
+    /// Keep an unrepresentable deadline distinct from an absent delay.
+    fn after(now: Instant, delay: Duration) -> Self {
+        now.checked_add(delay).map_or(Self::Never, Self::At)
+    }
+
+    /// Only finite deadlines can become eligible.
+    fn elapsed(self, now: Instant) -> bool {
+        matches!(self, Self::At(at) if now >= at)
+    }
+}
+
 /// Limits and time intervals for shared adaptive admission.
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -29,6 +49,7 @@ pub struct Config {
     pub capacity: usize,
 
     /// Peer retry delay and minimum interval between aggregate pressure reductions.
+    /// A retry beyond the clock's range keeps the peer circuit open indefinitely.
     pub backoff: Duration,
 
     /// Minimum interval between one-slot verified-success recoveries.
@@ -121,7 +142,7 @@ struct Peer {
 
     generation: u64,
 
-    retry: Option<Instant>,
+    retry: Option<Deadline>,
 
     probe: bool,
 
@@ -183,7 +204,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         self.state.lock().is_ok_and(|s| {
             s.peers
                 .get(key)
-                .is_none_or(|p| !p.probe && p.retry.is_none_or(|at| now >= at))
+                .is_none_or(|p| !p.probe && p.retry.is_none_or(|at| at.elapsed(now)))
         })
     }
 
@@ -203,7 +224,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
                 .extract_if(.., |_, p| {
                     p.active == 0
                         && !p.probe
-                        && p.retry.is_none_or(|retry| now >= retry)
+                        && p.retry.is_none_or(|retry| retry.elapsed(now))
                         && now.saturating_duration_since(p.updated) >= self.config.retire_after
                 })
                 .next();
@@ -220,7 +241,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
             probe: false,
             updated: now,
         });
-        if peer.probe || peer.retry.is_some_and(|at| now < at) {
+        if peer.probe || peer.retry.is_some_and(|at| !at.elapsed(now)) {
             self.observer.event(Event::CircuitRejected);
             return Err(Error::Unavailable);
         }
@@ -290,7 +311,7 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
             Outcome::PeerFailure => {
                 peer.limit = (peer.limit / 2).max(1);
                 peer.generation = peer.generation.saturating_add(1);
-                peer.retry = Some(now + config.backoff);
+                peer.retry = Some(Deadline::after(now, config.backoff));
                 peer.updated = now;
             }
             Outcome::Verified => {
@@ -324,7 +345,7 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
             peer.probe = false;
             if peer.retry.is_some() {
                 let now = now.expect("probe clock sampled before locking");
-                peer.retry = Some(now + self.owner.config.backoff);
+                peer.retry = Some(Deadline::after(now, self.owner.config.backoff));
                 peer.updated = now;
             }
         }
@@ -335,6 +356,7 @@ impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
 
 /// Bounded worker-local endpoint failure tracking, independent of adaptive limits.
 mod circuit {
+    use super::Deadline;
     use crate::{Error, Result};
     use std::{
         cell::RefCell,
@@ -375,9 +397,9 @@ mod circuit {
     struct Circuit {
         failures: u32,
 
-        retry_at: Instant,
+        retry_at: Deadline,
 
-        probe_until: Option<Instant>,
+        probe_until: Option<Deadline>,
 
         pending_backoff: Option<Rc<()>>,
     }
@@ -385,7 +407,7 @@ mod circuit {
     impl Circuit {
         /// Require both retry backoff and any abandoned probe timeout to expire.
         fn available(&self, now: Instant) -> bool {
-            now >= self.retry_at && self.probe_until.is_none_or(|until| now >= until)
+            self.retry_at.elapsed(now) && self.probe_until.is_none_or(|until| until.elapsed(now))
         }
     }
 
@@ -407,6 +429,7 @@ mod circuit {
 
     impl<K: Ord + Clone> Circuits<K> {
         /// Bound failure records and set eligibility delay for abandoned probes.
+        /// A timeout beyond the clock's range never expires.
         pub const fn new(capacity: usize, probe_timeout: Duration) -> Self {
             Self {
                 capacity,
@@ -446,6 +469,7 @@ mod circuit {
         /// Record a caller-classified failure using caller-selected retry jitter.
         /// Backoff may reenter: the count is visible before the callback, and any
         /// newer transition for this key takes precedence over its returned delay.
+        /// A retry beyond the clock's range never expires on its own.
         pub fn failure(
             &self,
             key: &K,
@@ -458,7 +482,7 @@ mod circuit {
             }
             let state = states.entry(key.clone()).or_insert(Circuit {
                 failures: 0,
-                retry_at: now,
+                retry_at: Deadline::At(now),
                 probe_until: None,
                 pending_backoff: None,
             });
@@ -468,7 +492,7 @@ mod circuit {
             state.pending_backoff = Some(Rc::clone(&pending));
             drop(states);
 
-            let retry_at = now + backoff(key, failures);
+            let retry_at = Deadline::after(now, backoff(key, failures));
             let mut states = self.states.borrow_mut();
             // Never reinsert a removed record or overwrite a newer transition.
             if let Some(state) = states.get_mut(key)
@@ -506,7 +530,7 @@ mod circuit {
             if !state.available(now) {
                 return false;
             }
-            state.probe_until = Some(now + self.probe_timeout);
+            state.probe_until = Some(Deadline::after(now, self.probe_timeout));
             state.pending_backoff = None;
             true
         }
@@ -531,6 +555,62 @@ mod circuit {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Oversized retry delays stay closed to probes until explicit success.
+        #[test]
+        fn duration_overflow_endpoint_backoff() {
+            let now = Instant::now();
+            assert!(now.checked_add(Duration::MAX).is_none());
+            for delay in [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(u64::from(u32::MAX)),
+                Duration::MAX,
+            ] {
+                let health = Circuits::new(1, Duration::ZERO);
+                health.failure(&7, now, |_, _| delay).unwrap();
+                assert_eq!(health.available(&7, now), delay.is_zero());
+                if let Some(due) = now.checked_add(delay) {
+                    assert!(health.acquire(&7, due).is_ok());
+                } else {
+                    let later = now + Duration::from_secs(60);
+                    assert!(!health.available(&7, later));
+                    assert!(matches!(health.acquire(&7, later), Err(Error::Unavailable)));
+                    assert_eq!(
+                        health.failure(&8, later, |_, _| Duration::ZERO),
+                        Err(Error::Overloaded)
+                    );
+                }
+                health.success(&7);
+                assert!(health.acquire(&7, now).is_ok());
+            }
+        }
+
+        /// Oversized abandoned-probe timeouts never expire or lose ownership.
+        #[test]
+        fn duration_overflow_endpoint_probe_timeout() {
+            let now = Instant::now();
+            for delay in [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(u64::from(u32::MAX)),
+                Duration::MAX,
+            ] {
+                let health = Circuits::new(1, delay);
+                health.failure(&7, now, |_, _| Duration::ZERO).unwrap();
+                let probe = health.acquire(&7, now).unwrap();
+                assert!(!health.available(&7, now));
+                drop(probe);
+                assert_eq!(health.available(&7, now), delay.is_zero());
+                if let Some(due) = now.checked_add(delay) {
+                    assert!(health.try_acquire(&7, due));
+                } else {
+                    assert!(!health.try_acquire(&7, now + Duration::from_secs(60)));
+                }
+                health.success(&7);
+                assert!(health.acquire(&7, now).is_ok());
+            }
+        }
 
         /// Backoff can inspect the circuit without borrowing conflicts.
         #[test]
@@ -1265,6 +1345,89 @@ mod tests {
         }
     }
 
+    /// Oversized peer backoff must not panic, poison state, or retire early.
+    #[test]
+    fn duration_overflow_adaptive_failure() {
+        let owner = Adaptive::new(
+            Config {
+                capacity: 1,
+                backoff: Duration::MAX,
+                retire_after: Duration::ZERO,
+                ..config()
+            },
+            Counts::default(),
+            Instant::now,
+        )
+        .unwrap();
+        let stale = owner.acquire(&1).unwrap();
+        let failed = owner.acquire(&1).unwrap();
+        failed.observe(Outcome::PeerFailure);
+        stale.observe(Outcome::Verified);
+        assert!(!owner.available(&1));
+        assert!(!owner.hedge_available(&1));
+        drop((stale, failed));
+        assert_eq!(owner.state.lock().unwrap().active, 0);
+        assert_eq!(*owner.observer.active.lock().unwrap(), 0);
+        assert!(matches!(owner.acquire(&1), Err(Error::Unavailable)));
+        assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+    }
+
+    /// Renewing a probe can overflow even when its previous retry was finite.
+    #[test]
+    fn duration_overflow_adaptive_probe_drop() {
+        let owner = Adaptive::new(
+            Config {
+                backoff: Duration::MAX,
+                ..config()
+            },
+            Counts::default(),
+            Instant::now,
+        )
+        .unwrap();
+        drop(owner.acquire(&1).unwrap());
+        owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry =
+            Some(Deadline::At(Instant::now()));
+        let probe = owner.acquire(&1).unwrap();
+        drop(probe);
+        assert_eq!(owner.state.lock().unwrap().active, 0);
+        assert_eq!(*owner.observer.active.lock().unwrap(), 0);
+        assert!(!owner.available(&1));
+        assert!(matches!(owner.acquire(&1), Err(Error::Unavailable)));
+        assert!(owner.acquire(&2).is_ok());
+    }
+
+    /// Elapsed-time limits accept huge durations without forming deadlines.
+    #[test]
+    fn duration_overflow_elapsed_limits_remain_valid() {
+        let owner = Adaptive::new(
+            Config {
+                capacity: 1,
+                backoff: Duration::ZERO,
+                recovery: Duration::MAX,
+                retire_after: Duration::MAX,
+                ..config()
+            },
+            Counts::default(),
+            Instant::now,
+        )
+        .unwrap();
+        let work = owner.acquire(&1).unwrap();
+        work.observe(Outcome::LocalPressure);
+        work.observe(Outcome::PeerFailure);
+        drop(work);
+        let probe = owner.acquire(&1).unwrap();
+        probe.observe(Outcome::Verified);
+        drop(probe);
+        assert!(owner.available(&1));
+        assert_eq!(owner.state.lock().unwrap().limit, config().total / 2);
+        assert_eq!(
+            owner.state.lock().unwrap().peers[&1].limit,
+            config().per_key / 2
+        );
+        assert!(matches!(owner.acquire(&2), Err(Error::Overloaded)));
+        assert!(owner.acquire(&1).is_ok());
+    }
+
     /// Clone panics leave the mutex usable and all admission capacity recoverable.
     #[test]
     fn adaptive_clone_panic_preserves_capacity_and_mutex() {
@@ -1360,7 +1523,8 @@ mod tests {
         drop((old, failed));
         assert_eq!(*owner.observer.active.lock().unwrap(), 1);
         drop(fence);
-        owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry = Some(Instant::now());
+        owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry =
+            Some(Deadline::At(Instant::now()));
         let probe = owner.acquire(&1).unwrap();
         assert!(matches!(owner.acquire(&1), Err(Error::Unavailable)));
         probe.observe(Outcome::Verified);
@@ -1466,7 +1630,8 @@ mod tests {
             .updated = Instant::now() - Duration::from_secs(61);
         assert!(matches!(owner.acquire(&3), Err(Error::Overloaded)));
         assert!(owner.state.lock().unwrap().peers.contains_key(&1));
-        owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry = Some(Instant::now());
+        owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry =
+            Some(Deadline::At(Instant::now()));
         let probe = owner.acquire(&1).unwrap();
         drop(probe);
         assert!(!owner.available(&1));
@@ -1550,7 +1715,8 @@ mod tests {
         let failed = owner.acquire(&1).unwrap();
         failed.observe(Outcome::PeerFailure);
         drop(failed);
-        owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry = Some(Instant::now());
+        owner.state.lock().unwrap().peers.get_mut(&1).unwrap().retry =
+            Some(Deadline::At(Instant::now()));
         let probe = owner.acquire(&1).unwrap();
         drop(probe);
     }
