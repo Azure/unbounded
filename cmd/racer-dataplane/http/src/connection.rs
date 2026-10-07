@@ -1236,12 +1236,12 @@ impl<C: Context> HttpPool<C> {
                     if self.state.borrow().waiting.len() >= self.config.waiter_cap {
                         return Poll::Ready(Err(uring_runtime::Error::Overloaded.into()));
                     }
-                    let reservation = self.context.charge(
-                        std::mem::size_of::<Waiting<C>>()
-                            + std::mem::size_of::<WaitingEntry<C>>()
-                            + endpoint.allocation()
-                            + 128,
-                    )?;
+                    let allocation = std::mem::size_of::<Waiting<C>>()
+                        .checked_add(std::mem::size_of::<WaitingEntry<C>>())
+                        .and_then(|size| size.checked_add(endpoint.allocation()))
+                        .and_then(|size| size.checked_add(128))
+                        .ok_or(uring_runtime::Error::Overloaded)?;
+                    let reservation = self.context.charge(allocation)?;
                     let entry = Rc::new(WaitingEntry {
                         endpoint: endpoint.clone(),
                         priority,
@@ -2048,7 +2048,7 @@ mod tests {
     }
 
     /// Caller hooks exposing retained bytes, connection slots, and rejection switches.
-    struct Hooks {
+    struct Hooks<E = Key> {
         used: Rc<Cell<usize>>,
 
         slots: Rc<Cell<usize>>,
@@ -2056,9 +2056,11 @@ mod tests {
         stopped: Cell<bool>,
 
         reject_charge: Cell<bool>,
+
+        endpoint: std::marker::PhantomData<E>,
     }
 
-    impl Context for Hooks {
+    impl<E: Endpoint<Failure>> Context for Hooks<E> {
         type Error = Failure;
 
         type Scope = TestScope;
@@ -2075,7 +2077,7 @@ mod tests {
 
         type State = Policy;
 
-        type Endpoint = Key;
+        type Endpoint = E;
 
         /// Reserve counted bytes unless shutdown or overload is injected.
         fn charge(&self, n: usize) -> Result<Self, Charge> {
@@ -2108,6 +2110,7 @@ mod tests {
             slots: Rc::default(),
             stopped: Cell::new(false),
             reject_charge: Cell::new(false),
+            endpoint: std::marker::PhantomData,
         })
     }
 
@@ -2577,6 +2580,74 @@ mod tests {
             let callback = ON_WAKE.with(|slot| slot.borrow_mut().take());
             if let Some(callback) = callback {
                 callback();
+            }
+        }
+    }
+
+    /// Endpoint with a caller-selected storage estimate.
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct SizedKey(usize);
+
+    impl Endpoint<Failure> for SizedKey {
+        fn address(&self) -> std::result::Result<SocketAddress, Failure> {
+            Key.address()
+        }
+
+        fn allocation(&self) -> usize {
+            self.0
+        }
+    }
+
+    /// Waiter sizes must not wrap or panic before admission in either class.
+    #[test]
+    fn waiter_allocation_rejects_overflow_before_admission() {
+        let overhead = std::mem::size_of::<Waiting<Hooks<SizedKey>>>()
+            + std::mem::size_of::<WaitingEntry<Hooks<SizedKey>>>()
+            + 128;
+        for priority in [false, true] {
+            for allocation in [
+                0,
+                32,
+                usize::MAX - overhead,
+                usize::MAX - overhead + 1,
+                usize::MAX,
+            ] {
+                let hooks = Rc::new(Hooks::<SizedKey> {
+                    used: Rc::default(),
+                    slots: Rc::default(),
+                    stopped: Cell::new(false),
+                    reject_charge: Cell::new(false),
+                    endpoint: std::marker::PhantomData,
+                });
+                let pool = HttpPool::new(
+                    reactor(),
+                    hooks.clone(),
+                    PoolConfig {
+                        per_endpoint: 0,
+                        ..PoolConfig::default()
+                    },
+                );
+                let key = SizedKey(allocation);
+                let mut waiting = pool.checkout_wait_class(&key, &TestScope, priority);
+                let result = waiting
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(Waker::noop()));
+                if let Some(total) = allocation.checked_add(overhead) {
+                    assert!(result.is_pending());
+                    assert_eq!(hooks.used.get(), total);
+                    assert_eq!(pool.state.borrow().waiting.len(), 1);
+                } else {
+                    assert!(matches!(
+                        result,
+                        Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Overloaded)))
+                    ));
+                    assert_eq!(hooks.used.get(), 0);
+                    assert!(pool.state.borrow().waiting.is_empty());
+                }
+                assert_eq!(hooks.slots.get(), 0);
+                drop(waiting);
+                assert_eq!(hooks.used.get(), 0);
+                assert!(pool.state.borrow().waiting.is_empty());
             }
         }
     }
