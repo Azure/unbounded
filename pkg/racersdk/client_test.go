@@ -31,21 +31,21 @@ type readerOnly struct{ io.Reader }
 func TestNewClientValidation(t *testing.T) {
 	for _, config := range []ClientConfig{
 		{},
-		{Volume: "Upper"},
-		{Volume: "-bad"},
-		{Volume: "bad-"},
-		{Volume: "a..b"},
-		{Volume: "under_score"},
-		{Volume: strings.Repeat("a", 64)},
-		{Volume: strings.Repeat("a.", 60) + "a"},
-		{Volume: "ok", MaxConnections: -1},
+		{Cache: "Upper"},
+		{Cache: "-bad"},
+		{Cache: "bad-"},
+		{Cache: "a..b"},
+		{Cache: "under_score"},
+		{Cache: strings.Repeat("a", 64)},
+		{Cache: strings.Repeat("a.", 60) + "a"},
+		{Cache: "ok", MaxConnections: -1},
 	} {
 		if _, err := NewClient(config); !errors.Is(err, ErrInvalidRequest) {
 			t.Errorf("NewClient(%+v) = %v; want ErrInvalidRequest", config, err)
 		}
 	}
 
-	c, err := NewClient(ClientConfig{Volume: "cache.example-1"})
+	c, err := NewClient(ClientConfig{Cache: "cache.example-1"})
 	if err != nil {
 		t.Fatal(err)
 	}

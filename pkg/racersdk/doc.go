@@ -4,17 +4,17 @@
 // Package racersdk reads objects through a node-local Racer cache and serves
 // cache misses from your own storage.
 //
-// Racer runs on each node and exposes every volume as two Unix sockets under
-// /run/racer/<volume>/. A [Client] reads objects through the client socket.
+// Racer runs on each node and exposes every cache as two Unix sockets under
+// /run/racer/<cache>/. A [Client] reads objects through the client socket.
 // An [Origin], registered with [ServeOrigin] on the origin socket, supplies
 // objects that no Racer in the cluster has cached yet. One process may do
 // either or both.
 //
 // # Reading
 //
-// Create one [Client] per volume and share it:
+// Create one [Client] per cache and share it:
 //
-//	client, err := racersdk.NewClient(racersdk.ClientConfig{Volume: "blobs"})
+//	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: "blobs"})
 //	if err != nil {
 //		return err
 //	}

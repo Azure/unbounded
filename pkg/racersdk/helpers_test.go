@@ -57,7 +57,7 @@ func socketDir(t testing.TB) string {
 func testClient(t testing.TB, path string, maxConnections int) *Client {
 	t.Helper()
 
-	c, err := newClient(ClientConfig{Volume: "test", MaxConnections: maxConnections}, path)
+	c, err := newClient(ClientConfig{Cache: "test", MaxConnections: maxConnections}, path)
 	if err != nil {
 		t.Fatal(err)
 	}

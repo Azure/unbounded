@@ -33,7 +33,7 @@ func TestOriginConfigAdmissionLimits(t *testing.T) {
 		{math.MaxInt - 5, math.MaxInt - 5, math.MaxInt},
 	} {
 		t.Run(strconv.Itoa(tt.configured), func(t *testing.T) {
-			limits, err := (OriginConfig{Volume: "test", MaxConcurrentRequests: tt.configured}).limits()
+			limits, err := (OriginConfig{Cache: "test", MaxConcurrentRequests: tt.configured}).limits()
 			require.NoError(t, err)
 			require.Equal(t, tt.requests, limits.maxRequests)
 			require.Equal(t, 4, limits.maxHeadRequests)
@@ -43,7 +43,7 @@ func TestOriginConfigAdmissionLimits(t *testing.T) {
 
 	for _, configured := range []int{-1, math.MaxInt - 4, math.MaxInt - 1, math.MaxInt} {
 		t.Run("invalid/"+strconv.Itoa(configured), func(t *testing.T) {
-			_, err := (OriginConfig{Volume: "test", MaxConcurrentRequests: configured}).limits()
+			_, err := (OriginConfig{Cache: "test", MaxConcurrentRequests: configured}).limits()
 			require.ErrorIs(t, err, ErrInvalidRequest)
 		})
 	}
@@ -52,7 +52,7 @@ func TestOriginConfigAdmissionLimits(t *testing.T) {
 func TestOriginConfiguredAdmissionReservesMetadata(t *testing.T) {
 	for _, configured := range []int{0, 1, 64, 128, 256} {
 		t.Run(strconv.Itoa(configured), func(t *testing.T) {
-			limits, err := (OriginConfig{Volume: "test", MaxConcurrentRequests: configured}).limits()
+			limits, err := (OriginConfig{Cache: "test", MaxConcurrentRequests: configured}).limits()
 			require.NoError(t, err)
 
 			headEntered := make(chan struct{}, limits.maxHeadRequests)

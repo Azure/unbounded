@@ -26,7 +26,7 @@ var _ [PageSize - wire.PageSize]struct{}
 
 var _ [wire.PageSize - PageSize]struct{}
 
-// Key names an immutable object in a Racer volume. It is usually a content
+// Key names an immutable object in a Racer cache. It is usually a content
 // digest, for example the SHA-256 of a blob.
 type Key [32]byte
 

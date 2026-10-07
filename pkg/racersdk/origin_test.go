@@ -53,7 +53,7 @@ func TestOwnedOriginCrashChild(t *testing.T) {
 		return
 	}
 
-	err := serveOrigin(context.Background(), OriginConfig{Volume: "gantry", RecoverStaleSocket: true},
+	err := serveOrigin(context.Background(), OriginConfig{Cache: "gantry", RecoverStaleSocket: true},
 		func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) { return originMeta(0), nil, nil }, path)
 	t.Fatal(err)
 }
@@ -161,7 +161,7 @@ func startOrigin(t testing.TB, tune func(*originLimits), origin Origin) (string,
 	t.Helper()
 	path := filepath.Join(socketDir(t), "socket")
 
-	limits, err := OriginConfig{Volume: "test"}.limits()
+	limits, err := OriginConfig{Cache: "test"}.limits()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -921,7 +921,7 @@ func TestOriginSelectedRangeErrors(t *testing.T) {
 }
 
 func TestOriginConfigAndCycles(t *testing.T) {
-	for _, config := range []OriginConfig{{}, {Volume: "Test"}, {Volume: "test", MaxConcurrentRequests: -1}} {
+	for _, config := range []OriginConfig{{}, {Cache: "Test"}, {Cache: "test", MaxConcurrentRequests: -1}} {
 		_, err := config.limits()
 		assertIs(t, err, ErrInvalidRequest)
 	}

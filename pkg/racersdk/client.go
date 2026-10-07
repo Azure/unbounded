@@ -25,11 +25,11 @@ func init() {
 	sdkhook.ServeOriginAt = serveOrigin
 }
 
-// ClientConfig configures a [Client]. Only Volume is required.
+// ClientConfig configures a [Client]. Only Cache is required.
 type ClientConfig struct {
-	// Volume names the Racer volume, a DNS subdomain such as "blobs". The
-	// client connects to /run/racer/<Volume>/client/socket.
-	Volume string
+	// Cache names the Racer cache, a DNS subdomain such as "blobs". The
+	// client connects to /run/racer/<Cache>/client/socket.
+	Cache string
 	// MaxConnections bounds concurrent [Client.Get] transfers without
 	// [ReadOptions.SmallObject]. Zero means 64. SmallObject transfers and
 	// [Client.Stat] calls each have a separate four-slot lane. Each lane has a
@@ -70,8 +70,8 @@ var defaultClientLimits = clientLimits{
 	maxConnAge:    5 * time.Minute,
 }
 
-// Client reads objects from a Racer volume over its local Unix socket. It is
-// safe for concurrent use; create one per volume and share it.
+// Client reads objects from a Racer cache over its local Unix socket. It is
+// safe for concurrent use; create one per cache and share it.
 type Client struct {
 	path   string
 	limits clientLimits
@@ -95,14 +95,14 @@ func newLane(slots, queue int) lane {
 	return lane{slots: make(chan struct{}, slots), queue: make(chan struct{}, queue)}
 }
 
-// NewClient returns a client for config.Volume. It does not connect until the
+// NewClient returns a client for config.Cache. It does not connect until the
 // first request, so Racer need not be running yet.
 func NewClient(config ClientConfig) (*Client, error) {
-	return newClient(config, "/run/racer/"+config.Volume+"/client/socket")
+	return newClient(config, "/run/racer/"+config.Cache+"/client/socket")
 }
 
 func newClient(config ClientConfig, path string) (*Client, error) {
-	if err := validateVolume(config.Volume); err != nil {
+	if err := validateCache(config.Cache); err != nil {
 		return nil, err
 	}
 
@@ -127,20 +127,20 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	}, nil
 }
 
-func validateVolume(s string) error {
+func validateCache(s string) error {
 	if len(s) == 0 || len(s) > 253 || len("/run/racer/"+s+"/origin/socket") > socketPathLimit {
-		return invalid("volume", errors.New("invalid volume name"))
+		return invalid("cache", errors.New("invalid cache name"))
 	}
 
 	for label := range strings.SplitSeq(s, ".") {
 		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return invalid("volume", errors.New("invalid volume name"))
+			return invalid("cache", errors.New("invalid cache name"))
 		}
 
 		for i := range len(label) {
 			c := label[i]
 			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
-				return invalid("volume", errors.New("invalid volume name"))
+				return invalid("cache", errors.New("invalid cache name"))
 			}
 		}
 	}

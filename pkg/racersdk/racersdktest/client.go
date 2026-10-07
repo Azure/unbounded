@@ -72,7 +72,7 @@ func start(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 		panic("racersdktest: invalid ServeOriginAt hook")
 	}
 
-	const volume = "sdk-fake"
+	const cache = "sdk-fake"
 
 	dir, err := socketDir()
 	if err != nil {
@@ -81,7 +81,7 @@ func start(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 
 	originPath, clientPath := filepath.Join(dir, "o"), filepath.Join(dir, "c")
 
-	client, err := newClient(racersdk.ClientConfig{Volume: volume}, clientPath)
+	client, err := newClient(racersdk.ClientConfig{Cache: cache}, clientPath)
 	if err != nil {
 		removeDir(dir)
 		return nil, nil, err
@@ -126,7 +126,7 @@ func start(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 	originDone := make(chan error, 1)
 
 	serving.Go(func() {
-		originDone <- serveOrigin(ctx, racersdk.OriginConfig{Volume: volume}, origin, originPath)
+		originDone <- serveOrigin(ctx, racersdk.OriginConfig{Cache: cache}, origin, originPath)
 	})
 
 	if err := waitOrigin(originPath, originDone); err != nil {

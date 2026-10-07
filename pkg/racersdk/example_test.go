@@ -19,15 +19,15 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-// These examples need a Racer volume, so they compile but do not run. Tests
+// These examples need a Racer cache, so they compile but do not run. Tests
 // can use racersdktest instead.
 
 var key, _ = racersdk.ParseKey("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae")
 
 // Read copies the object into your buffer, for when you need to look at the
 // bytes, here to hash them.
-func ExampleObject_Read() { //nolint:testableexamples // Requires a running Racer volume.
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Volume: "cache"})
+func ExampleObject_Read() { //nolint:testableexamples // Requires a running Racer cache.
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: "cache"})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -49,8 +49,8 @@ func ExampleObject_Read() { //nolint:testableexamples // Requires a running Race
 
 // WriteTo forwards the object without copying it through your process,
 // here to an HTTP response.
-func ExampleObject_WriteTo() { //nolint:testableexamples // Requires a running Racer volume.
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Volume: "cache"})
+func ExampleObject_WriteTo() { //nolint:testableexamples // Requires a running Racer cache.
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: "cache"})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -77,8 +77,8 @@ func ExampleObject_WriteTo() { //nolint:testableexamples // Requires a running R
 }
 
 // A later range of a version found earlier, pinned by its ETag.
-func ExampleClient_Stat() { //nolint:testableexamples // Requires a running Racer volume.
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Volume: "cache"})
+func ExampleClient_Stat() { //nolint:testableexamples // Requires a running Racer cache.
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: "cache"})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func ExampleClient_Stat() { //nolint:testableexamples // Requires a running Race
 // An origin serving a single in-memory object.
 func ExampleServeOrigin() { //nolint:testableexamples // Requires a provisioned Racer origin directory.
 	origin := exampleMemoryOrigin([]byte("hello, racer"))
-	if err := racersdk.ServeOrigin(context.Background(), racersdk.OriginConfig{Volume: "cache"}, origin); err != nil {
+	if err := racersdk.ServeOrigin(context.Background(), racersdk.OriginConfig{Cache: "cache"}, origin); err != nil {
 		log.Fatal(err)
 	}
 }

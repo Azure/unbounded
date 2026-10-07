@@ -47,7 +47,7 @@ func TestRealRuntimeConnectionAgeLoad(t *testing.T) {
 	}
 
 	newLoadClient := func(path string) *Client {
-		c, err := newClient(ClientConfig{Volume: "age", MaxConnections: 2}, path)
+		c, err := newClient(ClientConfig{Cache: "age", MaxConnections: 2}, path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -354,7 +354,7 @@ func TestRustSubscriptionInterop(t *testing.T) {
 
 	path := fmt.Sprintf("/proc/%d/fd/%d/interop/client/socket", os.Getpid(), anchor.Fd())
 
-	client, err := newClient(ClientConfig{Volume: "interop", MaxConnections: 1}, path)
+	client, err := newClient(ClientConfig{Cache: "interop", MaxConnections: 1}, path)
 	if err != nil {
 		t.Fatal(err)
 	}

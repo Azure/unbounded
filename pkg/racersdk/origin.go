@@ -69,12 +69,12 @@ func (r OriginRequest) Format(s fmt.State, _ rune) {
 	_, _ = fmt.Fprintf(s, "OriginRequest{%v, Head: %t, ETag: %q, Offset: %d, Length: %d}", r.Request, r.Head, r.ETag, r.Offset, r.Length) //nolint:errcheck // See above.
 }
 
-// OriginConfig configures [ServeOrigin]. Only Volume is required.
+// OriginConfig configures [ServeOrigin]. Only Cache is required.
 type OriginConfig struct {
-	// Volume names the Racer volume. The origin listens on
-	// /run/racer/<Volume>/origin/socket. The directory must already exist and
+	// Cache names the Racer cache. The origin listens on
+	// /run/racer/<Cache>/origin/socket. The directory must already exist and
 	// its ancestors must not be symlinks.
-	Volume string
+	Cache string
 	// MaxConcurrentRequests bounds concurrent content requests; Racer receives
 	// a retryable error beyond it. Zero means 64. Metadata requests have a
 	// small separate limit.
@@ -100,7 +100,7 @@ type originLimits struct {
 }
 
 func (c OriginConfig) limits() (originLimits, error) {
-	if err := validateVolume(c.Volume); err != nil {
+	if err := validateCache(c.Cache); err != nil {
 		return originLimits{}, err
 	}
 
@@ -140,7 +140,7 @@ func (c OriginConfig) limits() (originLimits, error) {
 // so the origin must run as the same user as the Racer dataplane, usually
 // root. On return it removes the socket it created.
 func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error {
-	return serveOrigin(ctx, config, origin, "/run/racer/"+config.Volume+"/origin/socket")
+	return serveOrigin(ctx, config, origin, "/run/racer/"+config.Cache+"/origin/socket")
 }
 
 type originConnKey struct{}
