@@ -6,7 +6,7 @@
 //! HTTP/1.1 requests and responses, rejects transfer coding and duplicate
 //! Content-Length or Host fields, and leaves body limits to [`connection`].
 //! Response codes from 100 to 599 are valid at the codec boundary; the connection
-//! exchange layer rejects informational responses and upgrades.
+//! exchange layer rejects informational responses, upgrades, and CONNECT requests.
 //!
 //! Header names retain their spelling and order, and ordinary repeated fields
 //! remain separate. Decoding removes at most one separator space after the colon;

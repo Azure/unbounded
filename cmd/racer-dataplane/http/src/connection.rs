@@ -1819,6 +1819,9 @@ impl WireFraming {
     /// Snapshot framing-sensitive fields before running an admission hook.
     fn new(head: &MessageHead) -> std::result::Result<Self, Error> {
         let (request_is_head, status) = match &head.start {
+            StartLine::Request { method, .. } if method == "CONNECT" => {
+                return Err(Error::Malformed);
+            }
             StartLine::Request { method, .. } => (Some(method == "HEAD"), None),
             StartLine::Response { status } => (None, Some(*status)),
         };
@@ -1838,7 +1841,8 @@ fn framing(
     limit: u64,
 ) -> std::result::Result<u64, Error> {
     let length = head.content_length()?;
-    let body = match head.start {
+    let body = match &head.start {
+        StartLine::Request { method, .. } if method == "CONNECT" => return Err(Error::Malformed),
         StartLine::Request { .. } => length.unwrap_or(0),
         StartLine::Response { status: 100..=199 } => return Err(Error::Malformed),
         StartLine::Response { status: 204 } => {
@@ -1954,6 +1958,8 @@ mod tests {
 
         Head,
 
+        Connect,
+
         Kind,
 
         Close,
@@ -1976,6 +1982,12 @@ mod tests {
                     head.start = StartLine::Request {
                         method: "HEAD".into(),
                         target: "/".into(),
+                    }
+                }
+                Some(Rewrite::Connect) => {
+                    head.start = StartLine::Request {
+                        method: "CONNECT".into(),
+                        target: "example.com:443".into(),
                     }
                 }
                 Some(Rewrite::Kind) => head.start = StartLine::Response { status: 200 },
@@ -2753,6 +2765,64 @@ mod tests {
         )
     }
 
+    /// CONNECT remains codec-valid but cannot enter a fixed-length exchange.
+    #[test]
+    fn connect_is_rejected_before_signing_or_admission() {
+        use std::io::{Read, Write};
+
+        for length in [None, Some(0), Some(1)] {
+            let request = MessageHead {
+                start: StartLine::Request {
+                    method: "CONNECT".into(),
+                    target: "example.com:443".into(),
+                },
+                headers: length
+                    .map(|n| crate::Header::new("Content-Length", n.to_string().as_bytes()))
+                    .into_iter()
+                    .collect(),
+            };
+            let codec = Codec::<()>::new(256);
+            let wire = codec.encode_head(&request).unwrap();
+            let (decoded, end) = codec.decode_head(&wire).unwrap().unwrap();
+            assert_eq!(end, wire.len());
+            assert!(
+                matches!(&decoded.start, StartLine::Request { method, .. } if method == "CONNECT")
+            );
+            assert_eq!(framing(&decoded, false, 8), Err(Error::Malformed));
+            let hooks = hooks();
+            let reactor = reactor();
+            let io = HttpIo::<Hooks>::new(reactor.clone(), codec, hooks.clone(), 8, 8);
+            let calls = Rc::new(Cell::new(0));
+            let (connection, mut peer) = lease(
+                &hooks,
+                Policy {
+                    hook_calls: Some(calls.clone()),
+                    ..Policy::default()
+                },
+            );
+            let result = drive(&reactor, io.send_head(connection, request, &TestScope));
+            assert!(matches!(result, Err(Failure::Http(Error::Malformed))));
+            let mut sent = Vec::new();
+            peer.read_to_end(&mut sent).unwrap();
+            assert!(sent.is_empty());
+            assert_eq!(calls.get(), 0);
+            let (connection, mut peer) = lease(
+                &hooks,
+                Policy {
+                    hook_calls: Some(calls.clone()),
+                    ..Policy::default()
+                },
+            );
+            peer.write_all(&wire).unwrap();
+            let result = drive(&reactor, io.receive_head(connection, &TestScope));
+            assert!(matches!(result, Err(Failure::Http(Error::Malformed))));
+            assert_eq!(calls.get(), 0);
+            io.reclaim_buffer();
+            assert_eq!(hooks.slots.get(), 0);
+            assert_eq!(hooks.used.get(), 0);
+        }
+    }
+
     /// Signing controls final framing but cannot bypass prevalidation or limits.
     #[test]
     fn sign_uses_final_framing_and_rejects_invalid_changes_before_send() {
@@ -2764,6 +2834,7 @@ mod tests {
             (Rewrite::Status(204), None),
             (Rewrite::Status(101), None),
             (Rewrite::Transfer, None),
+            (Rewrite::Connect, None),
         ] {
             let hooks = hooks();
             let reactor = reactor();
@@ -2886,6 +2957,7 @@ mod tests {
         for (rewrite, accepted) in [
             (Rewrite::Length(1), false),
             (Rewrite::Kind, false),
+            (Rewrite::Connect, false),
             (Rewrite::Status(304), false),
             (Rewrite::Length(0), true),
             (Rewrite::Ordinary, true),
@@ -2956,6 +3028,7 @@ mod tests {
             Rewrite::Length(3),
             Rewrite::Status(304),
             Rewrite::Head,
+            Rewrite::Connect,
             Rewrite::Kind,
             Rewrite::Close,
             Rewrite::Transfer,
@@ -2972,7 +3045,8 @@ mod tests {
                 },
             );
             connection.request_is_head = true;
-            let wire: &[u8] = if matches!(rewrite, Rewrite::Head | Rewrite::Kind) {
+            let wire: &[u8] = if matches!(rewrite, Rewrite::Head | Rewrite::Connect | Rewrite::Kind)
+            {
                 b"GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
             } else {
                 b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"
