@@ -6,9 +6,9 @@
 `cmd/racer-dataplane/alloc/`. It gives one worker thread three things:
 
 1. Memory buffers that are aligned for direct I/O and wiped before reuse.
-2. A table of fixed-size segments inside one sparse cache file, with leases
-   that stop a segment from being reused while I/O still points at it.
-3. Async read and write of that file through the `uring-runtime` reactor.
+2. A table of fixed-size segments in a sparse cache file or caller-opened files
+   or devices, with leases that stop reuse while I/O still points at a segment.
+3. Async read and write of that storage through the `uring-runtime` reactor.
 
 The crate stores bytes only. It does not know about page keys, record headers,
 encryption, checksums, or versions. The caller owns the page index and
@@ -35,7 +35,7 @@ Non-goals:
 
 All state is worker-local. Types use `Rc`, `Cell`, and `RefCell`, so none of them
 are `Send` or `Sync` (`alloc/src/segments.rs:153-179`, `alloc/src/slab.rs:35-50`).
-Each worker owns its own file, segment table, and buffer pool. This removes lock
+Each worker owns its storage ranges, segment table, and buffer pool. This removes lock
 contention and makes ownership easy to reason about. The cost is that one worker
 cannot hand its storage to another.
 
@@ -59,8 +59,9 @@ next request without paying for a wipe on every allocation.
 
 ## Segments
 
-The file is split into fixed-size segments. Segment `n` starts at
-`n * segment_bytes`. Each segment has a state and a generation number:
+Storage is split into fixed-size logical segments. Segment `n` starts at
+`n * segment_bytes`; device placements map it to a caller-supplied physical range.
+Each segment has a state and a generation number:
 
 ```
 Free -> Open -> Sealed -> Evicting -> Free (generation + 1)
@@ -105,10 +106,10 @@ caller-provided score instead of recent reads. `reclaim_index` drops index entri
 (for example, an index size limit) passes. It does not free segments and does not
 ask `can_evict`.
 
-## File and I/O
+## Storage and I/O
 
-`Slab` owns one cache file. Opening is blocking and is meant to run at startup
-(`alloc/src/slab.rs:183-279`). It:
+`Slab::new` describes one cache file. Opening is blocking and is meant to run at
+startup (`alloc/src/slab.rs:368-409`). For this file-backed mode, it:
 
 - Walks the path without following symlinks or `..`.
 - Requires a regular file owned by the current user, mode 0600, one hard link.
@@ -117,8 +118,21 @@ ask `can_evict`.
 - Sizes an empty file sparsely to capacity. A file with the wrong size is
   rejected, not truncated.
 
-The slab is then bound to one segment table. I/O is refused until binding
-succeeds, and a slab cannot be rebound to a different table.
+`Slab::from_devices` instead owns caller-opened file or block-device placements,
+one per logical segment, without creating, sizing, or locking them. Files must
+be read/write with `O_DIRECT` and without `O_APPEND`. The constructor checks
+geometry, offset alignment, regular-file bounds, and overlapping ranges within
+the slab (`alloc/src/slab.rs:99-176`). The caller must open real devices
+exclusively, verify device capacity, supply alignment that meets every device's
+requirements, and keep ranges in different slabs disjoint
+(`alloc/src/slab.rs:34-42`, `alloc/src/slab.rs:93-98`).
+
+For device placements, `open_configured` duplicates the owned files into
+worker-local descriptors and releases the original placement references
+(`alloc/src/slab.rs:295-325`). In both modes, it then binds the slab to one
+segment table. I/O is refused until binding succeeds, and a slab cannot be
+rebound to a different table (`alloc/src/slab.rs:241-276`,
+`alloc/src/slab.rs:447-449`).
 
 `read` and `write` check the extent, alignment, and lease, then pass the buffer
 and lease to the reactor (`alloc/src/slab.rs:461-515`). The reactor holds both
@@ -131,7 +145,7 @@ and it does not flush to disk.
 
 ## Simulation
 
-The `simulation` feature routes file open, lock, stat, and sizing to the
+For file-backed slabs, the `simulation` feature routes open, lock, stat, and sizing to the
 `uring-runtime` simulated filesystem. Buffers, leases, and segment rules do not
 change, so the same workflow tests run in both modes.
 
