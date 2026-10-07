@@ -43,10 +43,6 @@ type credentials struct {
 	Now       func() time.Time
 }
 
-// Reconcile creates/rotates issuer and cache keys through ordinary Secret CAS,
-// stages trust before using a new issuer, and returns RequeueAfter for deadlines.
-// Enforce projected size bounds including overlapping keys before committing.
-
 // ReconcileCredentials completes authoritative post-write signing validation
 // before releasing admission. Scheduling and conflict retries belong to root.
 func (a *Authority) ReconcileCredentials(ctx context.Context) (time.Duration, error) {

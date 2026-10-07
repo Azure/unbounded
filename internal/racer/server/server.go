@@ -475,24 +475,6 @@ func minTime(a, b time.Time) time.Time {
 	return b
 }
 
-type requestWriter struct {
-	ctx    context.Context
-	writer io.Writer
-}
-
-func (w requestWriter) Write(b []byte) (int, error) {
-	if err := w.ctx.Err(); err != nil {
-		return 0, err
-	}
-
-	n, err := w.writer.Write(b)
-	if err == nil {
-		err = w.ctx.Err()
-	}
-
-	return n, err
-}
-
 func writeFailure(w http.ResponseWriter, err error) {
 	code := wire.Unavailable
 
@@ -744,7 +726,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		panic(http.ErrAbortHandler)
 	}
 
-	if _, err := (requestWriter{ctx: trustCtx, writer: w}).Write(encoded); err != nil || trust.Check(trustCtx) != nil {
+	if _, err := w.Write(encoded); err != nil || trust.Check(trustCtx) != nil {
 		panic(http.ErrAbortHandler)
 	}
 

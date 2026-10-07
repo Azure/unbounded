@@ -472,24 +472,6 @@ func (c Config) Validate() error {
 	return nil
 }
 
-type requestWriter struct {
-	ctx    context.Context
-	writer io.Writer
-}
-
-func (w requestWriter) Write(b []byte) (int, error) {
-	if err := w.ctx.Err(); err != nil {
-		return 0, err
-	}
-
-	n, err := w.writer.Write(b)
-	if err == nil {
-		err = w.ctx.Err()
-	}
-
-	return n, err
-}
-
 const ReplicationAudience = "racer-controller-replication"
 
 func (a *Authority) Observe(ctx context.Context) error {
@@ -1461,7 +1443,11 @@ func (p publicationResponse) writeTo(ctx context.Context, w io.Writer) (int64, e
 		// ResponseWriter need not implement StringWriter. Limit conversion scratch
 		// to 32 KiB rather than allocating a full publication for every response.
 		chunk := remaining[:min(len(remaining), 32*1024)]
-		n, err := io.WriteString(requestWriter{ctx: ctx, writer: w}, chunk)
+
+		n, err := w.Write([]byte(chunk))
+		if err == nil {
+			err = ctx.Err()
+		}
 
 		written += int64(n)
 		if err != nil {
