@@ -1,23 +1,35 @@
-/* Exercise the production discovery loop with failing libibverbs calls. */
+/* Exercise production discovery and open with failing libibverbs calls. */
 #include <infiniband/verbs.h>
 #include <assert.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 
 static struct ibv_device devices[3];
 static struct ibv_context contexts[3];
+static struct ibv_pd pd;
 static struct ibv_device *device_list[] = { &devices[0], &devices[1], &devices[2], NULL };
 static unsigned mode, fail_close, opens, closes, lists_freed;
+static unsigned allocations, deallocations, wrappers;
 
 /* Modes: query failure, unsupported, active, inactive, list error, open error,
- * empty list, and capacity overflow. Close failure is a one-based call index. */
+ * empty list, capacity overflow, PD success, second PD failure, wrapper failure.
+ * Close failure is a one-based call index. */
 void rdma_test_reset(unsigned scenario, unsigned close_call) {
     mode = scenario; fail_close = close_call;
     opens = closes = lists_freed = 0;
+    allocations = deallocations = wrappers = 0;
 }
 
 unsigned rdma_test_count(unsigned which) {
-    return which == 0 ? opens : which == 1 ? closes : lists_freed;
+    switch (which) {
+    case 0: return opens;
+    case 1: return closes;
+    case 2: return lists_freed;
+    case 3: return allocations;
+    case 4: return deallocations;
+    default: return wrappers;
+    }
 }
 
 static struct ibv_device **test_get_device_list(int *n) {
@@ -69,10 +81,22 @@ static const char *test_get_device_name(struct ibv_device *device) {
     return "discovery-test";
 }
 
-/* Discovery never allocates a PD. A later open fails cleanly in this fixture. */
+/* Original discovery scenarios still fail PD allocation on later opens. */
 static struct ibv_pd *test_alloc_pd(struct ibv_context *ctx) {
     (void)ctx;
-    return NULL;
+    ++allocations;
+    return mode == 8 || (mode == 9 && allocations != 2) ? &pd : NULL;
+}
+
+static int test_dealloc_pd(struct ibv_pd *value) {
+    assert(value == &pd);
+    ++deallocations;
+    return 0;
+}
+
+static void *test_calloc(size_t count, size_t size) {
+    ++wrappers;
+    return mode == 10 ? NULL : calloc(count, size);
 }
 
 #define ibv_get_device_list test_get_device_list
@@ -85,4 +109,6 @@ static struct ibv_pd *test_alloc_pd(struct ibv_context *ctx) {
 #define ibv_query_gid test_query_gid
 #define ibv_get_device_name test_get_device_name
 #define ibv_alloc_pd test_alloc_pd
+#define ibv_dealloc_pd test_dealloc_pd
+#define calloc test_calloc
 #include "verbs.c"

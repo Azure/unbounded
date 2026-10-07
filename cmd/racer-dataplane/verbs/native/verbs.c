@@ -49,11 +49,12 @@ struct rdma_verbs_qp { struct ibv_qp *qp; struct ibv_cq *cq; };
 struct rdma_verbs_mr { struct ibv_mr *mr; void *bytes; size_t length; };
 
 /* ABI version. Rust refuses to load any other value. */
-uint32_t rdma_verbs_abi(void) { return 3; }
+uint32_t rdma_verbs_abi(void) { return 4; }
 
 /* Distinct from negative errno: cleanup leaked a resource. Rust must keep
  * the admission owner and adapter loaded. Stop before another resource leaks. */
 #define RDMA_VERBS_CLEANUP_LEAK INT_MIN
+#define RDMA_VERBS_OPEN_CLEANUP_LEAK ((void *)UINTPTR_MAX)
 
 /* List active ports on devices that support type 2B memory windows.
  * Uses GID index 0. Fills up to `capacity` entries but returns the full count,
@@ -100,9 +101,12 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
     return count;
 }
 
-/* Open a device by name and allocate its protection domain. */
+/* Open a device by name and allocate its protection domain. NULL means clean
+ * failure. RDMA_VERBS_OPEN_CLEANUP_LEAK means a context leaked; it is not a
+ * handle and must not be passed to close or any other adapter function. */
 void *rdma_verbs_open(const char *name) {
     int n = 0;
+    int leaked = 0;
     struct ibv_device **list = ibv_get_device_list(&n);
     if (!list) return NULL;
     struct rdma_verbs_device *d = calloc(1, sizeof(*d));
@@ -114,12 +118,12 @@ void *rdma_verbs_open(const char *name) {
         }
         if (d->ctx) d->pd = ibv_alloc_pd(d->ctx);
         if (!d->pd) {
-            if (d->ctx) ibv_close_device(d->ctx);
+            if (d->ctx && ibv_close_device(d->ctx)) leaked = 1;
             free(d); d = NULL;
         }
     }
     ibv_free_device_list(list);
-    return d;
+    return leaked ? RDMA_VERBS_OPEN_CLEANUP_LEAK : d;
 }
 /* Free the protection domain and close. On failure, the handle is kept. */
 int rdma_verbs_close(struct rdma_verbs_device *d) {

@@ -152,7 +152,7 @@ Rust.
 Because the link is dynamic, the compiler cannot check the ABI. Three checks
 stand in for it:
 
-- The adapter reports ABI version 3 and Rust refuses any other
+- The adapter reports ABI version 4 and Rust refuses any other
   (`native/verbs.c:51-52`, `src/ffi.rs:174-235`).
 - `_Static_assert`s in C (`native/verbs.c:37-44`) and a Rust test check the
   same struct sizes, offsets, and opcode values.
@@ -166,6 +166,11 @@ distinct from a negative errno or port count. It stops on the first failed
 close, frees the device list, and leaves at most one context leaked. Rust
 quarantines and retains the discovery admission owner and adapter reference.
 Reopen stays blocked even when no ports were returned.
+
+Open returns `NULL` for a clean failure and `(void *)UINTPTR_MAX` if PD
+allocation fails and the context cannot close. The latter is not a handle.
+Rust charges an owner before each open, retains it and the adapter on this
+result, and stops opening ports. Previously opened devices close normally.
 
 ## Simulation
 
@@ -189,6 +194,6 @@ does not test real DMA or fencing. Tests that need a device stay ignored.
 
 Native CI also builds `native/discovery_faults.c`, which includes the production
 C adapter with controlled libibverbs calls. `src/discovery_fault_tests.rs`
-checks both internal discovery closes, quarantine, library retention, and
-blocked reopen. The Rust simulator's `Close` fault only covers device handles
-returned after discovery, not these temporary contexts.
+checks both internal discovery closes, failed-open cleanup, quarantine,
+library retention, and blocked reopen. The Rust simulator's `Close` fault only
+covers device handles returned after discovery, not these temporary contexts.

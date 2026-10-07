@@ -164,6 +164,9 @@ native_api! {
 /// C's `RDMA_VERBS_CLEANUP_LEAK`, outside the negative errno range.
 const CLEANUP_LEAK: c_int = c_int::MIN;
 
+/// C's `RDMA_VERBS_OPEN_CLEANUP_LEAK`, never a usable device handle.
+const OPEN_CLEANUP_LEAK: *mut c_void = std::ptr::without_provenance_mut(usize::MAX);
+
 impl Api {
     #[cfg(not(all(feature = "native", target_os = "linux")))]
     /// No native backend in this build.
@@ -172,7 +175,7 @@ impl Api {
     }
 
     #[cfg(all(feature = "native", target_os = "linux"))]
-    /// Load `librdma_verbs.so.1` and check it speaks ABI version 3.
+    /// Load `librdma_verbs.so.1` and check it speaks ABI version 4.
     fn load() -> Result<Rc<Self>> {
         // Fixed library name, found via the normal loader path.
         unsafe {
@@ -209,7 +212,7 @@ impl Api {
             }
 
             let version = sym!("rdma_verbs_abi", unsafe extern "C" fn() -> u32);
-            if version() != 3 {
+            if version() != 4 {
                 return Err(Error::Unavailable);
             }
             let api = Self::symbols(library)?;
@@ -333,13 +336,23 @@ fn discover_with_api(
             .to_str()
             .map_err(|_| Error::Io)?
             .to_owned();
-        let Some(raw) = NonNull::new(unsafe { (api.open)(port.name.as_ptr()) }) else {
+        let open_quota = quota();
+        let raw = unsafe { (api.open)(port.name.as_ptr()) };
+        if raw == OPEN_CLEANUP_LEAK {
+            if let Some(quota) = open_quota {
+                quota.quarantine();
+                std::mem::forget(quota);
+            }
+            std::mem::forget(api);
+            return Err(Error::Unavailable);
+        }
+        let Some(raw) = NonNull::new(raw) else {
             continue;
         };
         devices.push(NativeDevice {
             api: api.clone(),
             raw,
-            quota: quota(),
+            quota: open_quota,
             name,
             endpoint: Endpoint {
                 gid: port.gid,
@@ -926,7 +939,7 @@ mod tests {
     #[test]
     #[ignore = "requires built C adapter on loader path; no RDMA hardware required"]
     fn required_native_adapter_loads_abi_and_symbols() {
-        let api = Api::load().expect("built native adapter must load with ABI 3 and all symbols");
+        let api = Api::load().expect("built native adapter must load with ABI 4 and all symbols");
         assert!(api.library.is_some(), "must load C adapter, not simulation");
     }
 
