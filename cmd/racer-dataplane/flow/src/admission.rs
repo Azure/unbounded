@@ -1512,15 +1512,18 @@ mod hedge {
     impl Permit {
         /// Register the latest waiter until due, without releasing capacity.
         pub fn delay(&self, now: Instant, cx: &mut Context<'_>) -> Poll<()> {
+            // Waker clone and drop callbacks may reenter the hedge registry.
+            let wake = cx.waker().clone();
             let mut state = self.owner.state.lock().expect("hedge alarm lock");
             let alarm = state.alarms.get_mut(&self.id).expect("live hedge alarm");
-            if now >= alarm.due {
-                alarm.wake = None;
-                Poll::Ready(())
+            let (result, previous) = if now >= alarm.due {
+                (Poll::Ready(()), alarm.wake.take())
             } else {
-                alarm.wake = Some(cx.waker().clone());
-                Poll::Pending
-            }
+                (Poll::Pending, alarm.wake.replace(wake))
+            };
+            drop(state);
+            drop(previous);
+            result
         }
     }
 
@@ -1540,8 +1543,9 @@ mod hedge {
     mod tests {
         use super::*;
         use std::{
+            mem::ManuallyDrop,
             sync::atomic::{AtomicUsize, Ordering},
-            task::Wake,
+            task::{RawWaker, RawWakerVTable, Wake},
             time::Duration,
         };
 
@@ -1553,6 +1557,140 @@ mod hedge {
             /// Record one notification.
             fn wake(self: Arc<Self>) {
                 self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct DelayCallbacks {
+            owner: Arc<Hedges>,
+            now: Instant,
+            clones: AtomicUsize,
+            drops: AtomicUsize,
+            locked_clones: AtomicUsize,
+            locked_drops: AtomicUsize,
+        }
+
+        impl DelayCallbacks {
+            fn new(owner: &Arc<Hedges>, now: Instant) -> Arc<Self> {
+                Arc::new(Self {
+                    owner: owner.clone(),
+                    now,
+                    clones: AtomicUsize::new(0),
+                    drops: AtomicUsize::new(0),
+                    locked_clones: AtomicUsize::new(0),
+                    locked_drops: AtomicUsize::new(0),
+                })
+            }
+
+            fn reenter(&self, calls: &AtomicUsize, locked: &AtomicUsize) {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // Record a deadlock risk without hanging or poisoning the mutex.
+                if self.owner.state.try_lock().is_err() {
+                    locked.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                self.owner.poll(self.now);
+            }
+
+            fn raw(this: Arc<Self>) -> RawWaker {
+                RawWaker::new(Arc::into_raw(this).cast(), &Self::VTABLE)
+            }
+
+            fn waker(this: &Arc<Self>) -> Waker {
+                // SAFETY: The vtable owns one Arc per raw waker and uses atomic state.
+                unsafe { Waker::from_raw(Self::raw(this.clone())) }
+            }
+
+            const VTABLE: RawWakerVTable =
+                RawWakerVTable::new(Self::clone_raw, Self::drop_raw, |_| {}, Self::drop_raw);
+
+            unsafe fn clone_raw(data: *const ()) -> RawWaker {
+                // SAFETY: Borrow the raw waker's Arc without consuming its reference.
+                let this = ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<Self>()) });
+                this.reenter(&this.clones, &this.locked_clones);
+                Self::raw(Arc::clone(&this))
+            }
+
+            unsafe fn drop_raw(data: *const ()) {
+                // SAFETY: Drop or consuming wake releases exactly one owned reference.
+                let this = unsafe { Arc::from_raw(data.cast::<Self>()) };
+                this.reenter(&this.drops, &this.locked_drops);
+            }
+        }
+
+        #[test]
+        fn hedge_delay_clones_waiter_outside_lock() {
+            let now = Instant::now();
+            let due = now + Duration::from_secs(1);
+            let owner = Hedges::new(1, 1);
+            let permit = owner.acquire(1, due).unwrap();
+            let callbacks = DelayCallbacks::new(&owner, now);
+            let waker = DelayCallbacks::waker(&callbacks);
+            assert!(
+                permit
+                    .delay(now, &mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            // Clear the registration so cleanup does not exercise Permit::drop.
+            assert!(
+                permit
+                    .delay(due, &mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+            );
+            assert_eq!(callbacks.clones.load(Ordering::SeqCst), 1);
+            assert_eq!(callbacks.locked_clones.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn hedge_delay_replaces_waiter_outside_lock() {
+            let now = Instant::now();
+            let due = now + Duration::from_secs(1);
+            let owner = Hedges::new(1, 1);
+            let permit = owner.acquire(1, due).unwrap();
+            let callbacks = DelayCallbacks::new(&owner, now);
+            let waker = DelayCallbacks::waker(&callbacks);
+            assert!(
+                permit
+                    .delay(now, &mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let latest = Arc::new(Counter::default());
+            assert!(
+                permit
+                    .delay(now, &mut Context::from_waker(&Waker::from(latest.clone())))
+                    .is_pending()
+            );
+            assert_eq!(callbacks.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(callbacks.locked_drops.load(Ordering::SeqCst), 0);
+            owner.poll(due);
+            owner.poll(due);
+            assert_eq!(latest.0.load(Ordering::SeqCst), 1);
+            assert!(matches!(owner.acquire(1, due), Err(Error::Overloaded)));
+        }
+
+        #[test]
+        fn hedge_delay_clears_waiter_outside_lock() {
+            for elapsed in [Duration::ZERO, Duration::from_secs(1)] {
+                let now = Instant::now();
+                let due = now + Duration::from_secs(1);
+                let owner = Hedges::new(1, 1);
+                let permit = owner.acquire(1, due).unwrap();
+                let callbacks = DelayCallbacks::new(&owner, now);
+                let waker = DelayCallbacks::waker(&callbacks);
+                assert!(
+                    permit
+                        .delay(now, &mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert!(
+                    permit
+                        .delay(due + elapsed, &mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                );
+                assert_eq!(callbacks.drops.load(Ordering::SeqCst), 1);
+                assert_eq!(callbacks.locked_drops.load(Ordering::SeqCst), 0);
+                owner.poll(due + elapsed);
+                assert_eq!(callbacks.drops.load(Ordering::SeqCst), 1);
+                assert!(matches!(owner.acquire(1, due), Err(Error::Overloaded)));
             }
         }
 
