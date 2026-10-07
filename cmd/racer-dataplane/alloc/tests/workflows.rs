@@ -845,6 +845,63 @@ fn io_uring_roundtrip_and_completion_fence() {
     clock.reclaim(&EmptyEntries, 2, 4, 0).unwrap();
 }
 
+/// Keep both halves aligned even when offset and length units differ.
+fn device_placement_sizes(alignment: Alignment) -> (usize, u64) {
+    let half_bytes = alignment.extent(0, 2048).unwrap().length();
+    let segment_bytes = 2 * half_bytes as u64;
+    (half_bytes, segment_bytes)
+}
+
+/// Placement test geometry must work without relying on the host's alignment.
+#[test]
+fn device_placement_sizes_support_4096_and_arbitrary_units() {
+    for (offset, length, expected_half) in [
+        (1, 1, 2048),
+        (512, 512, 2048),
+        (4096, 4096, 4096),
+        (4096, 512, 4096),
+        (512, 4096, 4096),
+        (768, 512, 3072),
+        (3, 5, 2055),
+    ] {
+        let alignment = Alignment::new(4096, offset, length).unwrap();
+        let (half_bytes, segment_bytes) = device_placement_sizes(alignment);
+        assert_eq!(half_bytes, expected_half);
+        assert_eq!(segment_bytes, 2 * expected_half as u64);
+        let geometry =
+            page_alloc::SegmentGeometry::new(3 * segment_bytes, segment_bytes, 3, alignment)
+                .unwrap();
+        let segments = Segments::from_geometry(geometry).unwrap();
+        let buffer = alignment.allocate(half_bytes, ()).unwrap();
+        if half_bytes != 2048 {
+            assert!(matches!(
+                segments.append(2048),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        for (id, physical_start) in [2 * segment_bytes, segment_bytes, 0]
+            .into_iter()
+            .enumerate()
+        {
+            for half in 0..2 {
+                let (lease, extent) = segments.append(half_bytes).unwrap();
+                assert_eq!(lease.id(), SegmentId(id as u64));
+                assert_eq!(extent.length(), half_bytes);
+                assert_eq!(
+                    extent.offset(),
+                    id as u64 * segment_bytes + half * half_bytes as u64
+                );
+                alignment.check(extent, &buffer).unwrap();
+                let physical =
+                    page_alloc::Extent::new(physical_start + half * half_bytes as u64, half_bytes)
+                        .unwrap();
+                alignment.check(physical, &buffer).unwrap();
+            }
+        }
+        assert_eq!(segments.free_count(), 0);
+    }
+}
+
 /// Device placements translate whole segments and interior extents across real files.
 #[test]
 fn device_placements_route_real_io_and_reject_short_reads() {
@@ -858,6 +915,8 @@ fn device_placements_route_real_io_and_reject_short_reads() {
     let Some(alignment) = real_alignment(probe.open_configured(&Segments::new(4096))) else {
         return;
     };
+    let (half_bytes, segment_bytes) = device_placement_sizes(alignment);
+    let file_bytes = 4 * segment_bytes;
     let files: Vec<_> = ["one", "two"]
         .into_iter()
         .map(|name| {
@@ -868,7 +927,7 @@ fn device_placements_route_real_io_and_reject_short_reads() {
                 .custom_flags(libc::O_DIRECT)
                 .open(directory.0.join(name))
                 .unwrap();
-            file.set_len(16384).unwrap();
+            file.set_len(file_bytes).unwrap();
             Arc::new(file)
         })
         .collect();
@@ -876,34 +935,37 @@ fn device_placements_route_real_io_and_reject_short_reads() {
         vec![
             DevicePlacement {
                 file: files[0].clone(),
-                offset: 8192,
+                offset: 2 * segment_bytes,
             },
             DevicePlacement {
                 file: files[1].clone(),
-                offset: 4096,
+                offset: segment_bytes,
             },
             DevicePlacement {
                 file: files[0].clone(),
                 offset: 0,
             },
         ],
-        4096,
-        4096,
+        segment_bytes,
+        segment_bytes as usize,
         alignment,
     )
     .unwrap();
-    assert_eq!(slab.capacity_bytes(), 12288);
+    assert_eq!(slab.capacity_bytes(), 3 * segment_bytes);
     assert_eq!(slab.alignment(), Err(Error::Unavailable));
-    let segments = Segments::new(4096);
+    let segments = Segments::new(segment_bytes);
     assert_eq!(slab.open_configured(&segments), Ok(alignment));
     let reactor = Reactor::<TestScope, ()>::new(16, ());
     reactor.init().unwrap();
     for id in 0..3 {
         for half in 0..2 {
-            let (lease, extent) = segments.append(2048).unwrap();
+            let (lease, extent) = segments.append(half_bytes).unwrap();
             assert_eq!(lease.id(), SegmentId(id));
-            assert_eq!(extent.offset(), id * 4096 + half * 2048);
-            let mut buffer = slab.allocate(2048, ()).unwrap();
+            assert_eq!(
+                extent.offset(),
+                id * segment_bytes + half * half_bytes as u64
+            );
+            let mut buffer = slab.allocate(half_bytes, ()).unwrap();
             buffer.as_mut_slice().fill((id * 2 + half + 1) as u8);
             drop(
                 drive_real(
@@ -917,7 +979,7 @@ fn device_placements_route_real_io_and_reject_short_reads() {
                 slab.read(
                     &reactor,
                     extent,
-                    slab.allocate(2048, ()).unwrap(),
+                    slab.allocate(half_bytes, ()).unwrap(),
                     segments.lease(SegmentId(id), Generation(1)).unwrap(),
                     &TestScope,
                 ),
@@ -933,30 +995,30 @@ fn device_placements_route_real_io_and_reject_short_reads() {
     // Inspect physical addresses independently so symmetric read/write bugs cannot pass.
     for (file, offset, value) in [
         (0, 0, 5),
-        (0, 2048, 6),
-        (0, 4096, 0),
-        (0, 8192, 1),
-        (0, 10240, 2),
-        (0, 12288, 0),
+        (0, half_bytes as u64, 6),
+        (0, segment_bytes, 0),
+        (0, 2 * segment_bytes, 1),
+        (0, 2 * segment_bytes + half_bytes as u64, 2),
+        (0, 3 * segment_bytes, 0),
         (1, 0, 0),
-        (1, 4096, 3),
-        (1, 6144, 4),
-        (1, 8192, 0),
+        (1, segment_bytes, 3),
+        (1, segment_bytes + half_bytes as u64, 4),
+        (1, 2 * segment_bytes, 0),
     ] {
-        let mut buffer = alignment.allocate(2048, ()).unwrap();
+        let mut buffer = alignment.allocate(half_bytes, ()).unwrap();
         assert_eq!(
             files[file].read_at(buffer.as_mut_slice(), offset).unwrap(),
-            2048
+            half_bytes
         );
         assert!(buffer.as_slice().iter().all(|&byte| byte == value));
-        assert_eq!(files[file].metadata().unwrap().len(), 16384);
+        assert_eq!(files[file].metadata().unwrap().len(), file_bytes);
     }
     // External truncation violates the startup contract but must still fail closed.
-    files[1].set_len(4096).unwrap();
+    files[1].set_len(segment_bytes).unwrap();
     let read = slab.read(
         &reactor,
-        page_alloc::Extent::new(4096, 4096).unwrap(),
-        slab.allocate(4096, ()).unwrap(),
+        page_alloc::Extent::new(segment_bytes, segment_bytes as usize).unwrap(),
+        slab.allocate(segment_bytes as usize, ()).unwrap(),
         segments.lease(SegmentId(1), Generation(1)).unwrap(),
         &TestScope,
     );
