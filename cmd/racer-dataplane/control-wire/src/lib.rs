@@ -148,6 +148,8 @@ pub struct EnrollmentRequest {
 /// Assigned node identity and certificate chain correlated to an enrollment.
 #[derive(Clone)]
 pub struct EnrollmentResponse {
+    pub block_devices: Option<String>,
+
     pub schema_version: u32,
 
     pub cluster: ClusterId,
@@ -846,6 +848,13 @@ mod codec {
         enrollment: String,
 
         certificate_chain: Vec<String>,
+
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "nonnull_gid"
+        )]
+        block_devices: Option<String>,
     }
 
     /// Decode enrollment correlation and certificate syntax without establishing trust.
@@ -856,6 +865,7 @@ mod codec {
         uuid(&r.enrollment)?;
         let chain = certificates(&r.certificate_chain)?;
         Ok(EnrollmentResponse {
+            block_devices: r.block_devices.filter(|s| !s.is_empty()),
             schema_version: r.schema_version,
             cluster: ClusterId(r.cluster),
             node: NodeId(r.node),
@@ -868,6 +878,7 @@ mod codec {
     pub fn encode_enrollment_response(r: &EnrollmentResponse) -> Result<Vec<u8>> {
         let b = encode(
             &Response {
+                block_devices: r.block_devices.clone().filter(|s| !s.is_empty()),
                 schema_version: r.schema_version,
                 cluster: r.cluster.0.clone(),
                 node: r.node.0.clone(),
@@ -1753,6 +1764,68 @@ mod codec {
             ] {
                 let b = fixture(name);
                 assert_eq!(round_trip(name, &b).unwrap(), b, "{name}");
+            }
+        }
+
+        #[test]
+        fn optional_block_device_selector_preserves_legacy_and_rejects_non_strings() {
+            let legacy = fixture("bootstrap-response.json");
+            let mut response = decode_enrollment_response(&legacy).unwrap();
+            assert!(response.block_devices.is_none());
+            for selector in ["nvme.*cache", "[", ""] {
+                response.block_devices = Some(selector.into());
+                let encoded = encode_enrollment_response(&response).unwrap();
+                let decoded = decode_enrollment_response(&encoded).unwrap();
+                assert_eq!(
+                    decoded.block_devices.as_deref(),
+                    (!selector.is_empty()).then_some(selector)
+                );
+                if selector.is_empty() {
+                    assert_eq!(encoded, legacy);
+                }
+            }
+            for value in [
+                Value::Null,
+                serde_json::json!(1),
+                serde_json::json!(true),
+                serde_json::json!([]),
+            ] {
+                let mut json: Value = serde_json::from_slice(&legacy).unwrap();
+                json["block_devices"] = value;
+                assert!(decode_enrollment_response(&serde_json::to_vec(&json).unwrap()).is_err());
+            }
+        }
+
+        #[test]
+        fn shared_block_device_selector_vectors() {
+            let legacy = String::from_utf8(fixture("bootstrap-response.json")).unwrap();
+            let vectors: Vec<Value> =
+                serde_json::from_slice(&fixture("bootstrap-block-devices.json")).unwrap();
+            for vector in vectors {
+                let bytes = format!(
+                    "{}{} }}",
+                    legacy.trim_end().strip_suffix('}').unwrap(),
+                    vector["fields"].as_str().unwrap()
+                );
+                let decoded = decode_enrollment_response(bytes.as_bytes());
+                if vector["code"] == "" {
+                    let decoded = decoded.unwrap();
+                    assert_eq!(
+                        decoded.block_devices.as_deref().unwrap_or(""),
+                        vector["pattern"].as_str().unwrap()
+                    );
+                    let encoded = encode_enrollment_response(&decoded).unwrap();
+                    assert_eq!(
+                        decode_enrollment_response(&encoded).unwrap().block_devices,
+                        decoded.block_devices
+                    );
+                } else {
+                    assert!(
+                        matches!(decoded, Err(Error::InvalidRequest)),
+                        "{}",
+                        vector["name"]
+                    );
+                }
             }
         }
 
