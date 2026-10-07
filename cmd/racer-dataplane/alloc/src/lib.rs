@@ -29,7 +29,15 @@
 //! direct I/O. Parent directories still must be trusted against hostile rename
 //! and unlink; neither traversal nor flock stops noncooperating writers.
 //!
-//! Empty files are sparsely extended to capacity; nonempty size mismatches are
+//! [`Slab::from_devices`] instead accepts one [`DevicePlacement`] per logical
+//! segment. The caller opens devices with O_EXCL and O_DIRECT, checks capacity,
+//! and supplies common alignment. Placements can share an `Arc<File>` to use one
+//! runtime descriptor per device. Startup never creates, resizes, or locks these
+//! files. Logical extents still use segment-table offsets; submissions translate
+//! them to the placement's physical range after checking lease bounds. Keep ranges
+//! disjoint across workers, and do not change file flags or sizes while in use.
+//!
+//! In file mode, empty files are sparsely extended to capacity; nonempty size mismatches are
 //! rejected without truncation. Capacity is a logical bound, not reserved disk
 //! space, so later writes can fail with ENOSPC. Recycling changes metadata only:
 //! it does not erase, truncate, or hole-punch disk bytes. Buffer zeroization is
@@ -138,7 +146,7 @@ pub use segments::{
     FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
     SegmentSnapshot, SegmentState, Segments,
 };
-pub use slab::Slab;
+pub use slab::{DevicePlacement, Slab};
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     cell::RefCell,
