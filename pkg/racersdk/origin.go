@@ -22,106 +22,145 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
-// Origin atomically selects metadata and opens the requested immutable version.
-// It is called once per operation, including HEAD, and may be called concurrently.
-// HEAD requires a nil body; GET returns exactly the resolved page bytes (an empty
-// bootstrap may use nil). Every nonnil body transfers to the SDK even on error.
-// The callback must honor ctx, and body.Close must promptly interrupt Read and be
-// safe concurrently with it. The SDK closes each body once, probes EOF, and aborts
-// late failures. Panics are recovered without logging their values. Origins must
-// support repeated read operations because HTTP clients can replay failed reads.
-type Origin func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error)
+// Origin loads objects for Racer on a cache miss. It is called concurrently,
+// once per request, and must honor ctx.
+//
+// For a metadata request (Head is set) return the current metadata and a nil
+// body. Otherwise return the metadata of the version you are serving and a
+// body that yields exactly the bytes in [Offset, min(Offset+Length, Size)).
+// When that range is empty, return a nil body. If ETag is set, serve only
+// that version and return [ErrVersionMismatch] if it is gone; returning
+// metadata with a different ETag has the same effect.
+//
+// Report failures by wrapping one of the package errors, for example
+// fmt.Errorf("%w: %w", racersdk.ErrNotFound, err). Any other error is
+// reported to Racer as an internal error.
+//
+// The SDK takes ownership of a non-nil body even when err is non-nil, and
+// closes it exactly once, possibly concurrently with Read to abort a transfer.
+// Panics are recovered.
+type Origin func(ctx context.Context, request OriginRequest) (Metadata, io.ReadCloser, error)
 
-// OriginConfig selects the canonical volume endpoint and bounds server resources.
-// Zero numeric fields select defaults; negative values are invalid. The endpoint
-// directory must already exist and its ancestors must not be symlinks or writable
-// by untrusted peers. The SDK does not create or change parent directories.
+// OriginRequest is a request from Racer to an [Origin]. The embedded Request
+// carries the key and the opaque values a client passed to [Client.Get] or
+// [Client.Stat].
+type OriginRequest struct {
+	Request
+	// Head asks for metadata only.
+	Head bool
+	// ETag, when set, is the only version that may be served.
+	ETag string
+	// Offset is the first byte to return. It is always a multiple of
+	// [PageSize].
+	Offset int64
+	// Length is the maximum number of bytes to return, at most [PageSize].
+	// The range may extend past the end of the object.
+	Length int64
+}
+
+// Format prints the request with Metadata and Authorization redacted.
+func (r OriginRequest) Format(s fmt.State, _ rune) {
+	// fmt.State cannot usefully report a write error back through Format.
+	_, _ = fmt.Fprintf(s, "OriginRequest{%v, Head: %t, ETag: %q, Offset: %d, Length: %d}", r.Request, r.Head, r.ETag, r.Offset, r.Length) //nolint:errcheck // See above.
+}
+
+// OriginConfig configures [ServeOrigin]. Only Volume is required.
 type OriginConfig struct {
-	// Volume selects the canonical origin endpoint.
-	Volume VolumeName
-	// MaxConnections includes idle accepted connections (default 128).
-	MaxConnections int
-	// MaxConcurrentRequests bounds GET callbacks and bodies, with empty 503 on overload (default 64).
+	// Volume names the Racer volume. The origin listens on
+	// /run/racer/<Volume>/origin/socket. The directory must already exist and
+	// its ancestors must not be symlinks.
+	Volume string
+	// MaxConcurrentRequests bounds concurrent content requests; Racer receives
+	// a retryable error beyond it. Zero means 64. Metadata requests have a
+	// small separate limit.
 	MaxConcurrentRequests int
-	// MaxConcurrentHeadRequests reserves HEAD callback lifetimes (default 4).
-	// Canceled callbacks that ignore context retain their slot until returning.
-	MaxConcurrentHeadRequests int
-	// ReadHeaderTimeout bounds each raw head (default 5 seconds).
-	ReadHeaderTimeout time.Duration
-	// RequestTimeout bounds callback, body, EOF probe, and final success write
-	// (default 60 seconds). Expiry before headers sends empty 503 with a fresh
-	// WriteTimeout allowance; it never extends a successful stream's deadline.
-	RequestTimeout time.Duration
-	// WriteTimeout bounds each blocked bounded write (default 30 seconds).
-	WriteTimeout time.Duration
-	// IdleTimeout bounds waiting for a subsequent request (default 30 seconds).
-	IdleTimeout time.Duration
-	// SocketMode contains only permission bits and defaults to 0600.
-	SocketMode os.FileMode
-	// RecoverStaleSocket opts into exclusive endpoint ownership using persistent
-	// lock and socket witness files. Only sockets created in this mode are recovered.
-	// The directory must be owned by this user and not group/world writable.
+	// RecoverStaleSocket lets ServeOrigin replace a socket left behind by an
+	// earlier ServeOrigin with this option that exited without cleanup, such
+	// as after a crash. The directory must be owned by this user and must
+	// not be writable by group or others. Without it, an existing socket
+	// path is an error.
 	RecoverStaleSocket bool
 }
 
-func (c OriginConfig) defaults() (OriginConfig, error) {
-	if _, err := ParseVolumeName(c.Volume.value); err != nil {
-		return c, err
-	}
-
-	if c.MaxConnections < 0 || c.MaxConcurrentRequests < 0 || c.MaxConcurrentHeadRequests < 0 ||
-		c.ReadHeaderTimeout < 0 || c.RequestTimeout < 0 || c.WriteTimeout < 0 || c.IdleTimeout < 0 ||
-		c.SocketMode & ^os.FileMode(0o777) != 0 {
-		return c, failure(ErrorInvalidArgument, "origin config", nil)
-	}
-
-	defaultIfZero(&c.MaxConnections, 128)
-	defaultIfZero(&c.MaxConcurrentRequests, 64)
-	defaultIfZero(&c.MaxConcurrentHeadRequests, 4)
-	defaultIfZero(&c.ReadHeaderTimeout, 5*time.Second)
-	defaultIfZero(&c.RequestTimeout, 60*time.Second)
-	defaultIfZero(&c.WriteTimeout, 30*time.Second)
-	defaultIfZero(&c.IdleTimeout, 30*time.Second)
-	defaultIfZero(&c.SocketMode, 0o600)
-
-	return c, nil
+type originLimits struct {
+	maxConnections    int
+	maxRequests       int
+	maxHeadRequests   int
+	readHeaderTimeout time.Duration
+	requestTimeout    time.Duration
+	writeTimeout      time.Duration
+	idleTimeout       time.Duration
+	socketMode        os.FileMode
+	recoverStale      bool
 }
 
-// ServeOrigin binds /run/racer/<volume>/origin/socket and serves until cancellation
-// or a listener failure. Existing paths (including stale sockets) are refused
-// unless RecoverStaleSocket explicitly enables recovery of an owned endpoint.
-// Cleanup removes only this invocation's socket inode, preserving replacements.
-// Cancellation closes connections and bodies and returns ctx.Err() without waiting
-// for noncooperative callbacks; a late-returned body is still closed. Callbacks
-// that ignore cancellation continue occupying their bounded admission slot.
+func (c OriginConfig) limits() (originLimits, error) {
+	if err := validateVolume(c.Volume); err != nil {
+		return originLimits{}, err
+	}
+
+	if c.MaxConcurrentRequests < 0 {
+		return originLimits{}, invalid("origin config", errors.New("negative MaxConcurrentRequests"))
+	}
+
+	l := originLimits{
+		maxConnections:    128,
+		maxRequests:       64,
+		maxHeadRequests:   4,
+		readHeaderTimeout: 5 * time.Second,
+		requestTimeout:    60 * time.Second,
+		writeTimeout:      30 * time.Second,
+		idleTimeout:       30 * time.Second,
+		socketMode:        0o600,
+		recoverStale:      c.RecoverStaleSocket,
+	}
+	if c.MaxConcurrentRequests != 0 {
+		l.maxRequests = c.MaxConcurrentRequests
+	}
+
+	return l, nil
+}
+
+// ServeOrigin serves origin to Racer until ctx is canceled, then closes all
+// connections and bodies and returns ctx.Err(). It does not wait for
+// callbacks that ignore cancellation. The socket is created with mode 0600,
+// so the origin must run as the same user as the Racer dataplane, usually
+// root. On return it removes the socket it created.
 func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error {
-	return serveOrigin(ctx, config, origin, "/run/racer/"+config.Volume.value+"/origin/socket")
+	return serveOrigin(ctx, config, origin, "/run/racer/"+config.Volume+"/origin/socket")
 }
 
 type originConnKey struct{}
 
 func serveOrigin(ctx context.Context, config OriginConfig, origin Origin, path string) error {
 	if ctx == nil || origin == nil {
-		return failure(ErrorInvalidArgument, "origin", nil)
+		return invalid("origin", errors.New("nil context or origin"))
 	}
 
-	config, err := config.defaults()
+	limits, err := config.limits()
 	if err != nil {
 		return err
 	}
 
+	return serveOriginLimits(ctx, limits, origin, path)
+}
+
+// serveOriginLimits serves with explicit limits so tests can shorten them.
+func serveOriginLimits(ctx context.Context, limits originLimits, origin Origin, path string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	listen := listenOrigin
-	if config.RecoverStaleSocket {
+	if limits.recoverStale {
 		listen = listenOwnedOrigin
 	}
 
-	l, cleanup, err := listen(path, config.SocketMode)
+	l, cleanup, err := listen(path, limits.socketMode)
 	if err != nil {
 		return err
 	}
@@ -130,31 +169,54 @@ func serveOrigin(ctx context.Context, config OriginConfig, origin Origin, path s
 	lifetime, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	listener := &originListener{Listener: l, ctx: lifetime, slots: make(chan struct{}, config.MaxConnections), config: config}
+	listener := &originListener{Listener: l, ctx: lifetime, slots: make(chan struct{}, limits.maxConnections), limits: limits}
 	server := &http.Server{
-		ReadHeaderTimeout: config.ReadHeaderTimeout, IdleTimeout: config.IdleTimeout,
-		WriteTimeout:   config.WriteTimeout,
-		MaxHeaderBytes: maxHeadBytes, ErrorLog: log.New(io.Discard, "", 0),
-		BaseContext: func(net.Listener) context.Context { return lifetime },
+		ReadHeaderTimeout: limits.readHeaderTimeout,
+		IdleTimeout:       limits.idleTimeout,
+		WriteTimeout:      limits.writeTimeout,
+		MaxHeaderBytes:    wire.MaxHeadBytes,
+		ErrorLog:          log.New(io.Discard, "", 0),
+		BaseContext:       func(net.Listener) context.Context { return lifetime },
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			return context.WithValue(ctx, originConnKey{}, c)
 		},
 	}
-	slots := make(chan struct{}, config.MaxConcurrentRequests)
-	headSlots := make(chan struct{}, config.MaxConcurrentHeadRequests)
-	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { serveOperation(w, r, config, origin, slots, headSlots) })
+	slots := make(chan struct{}, limits.maxRequests)
+	headSlots := make(chan struct{}, limits.maxHeadRequests)
+	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serveOperation(w, r, limits, origin, slots, headSlots)
+	})
 
-	stop := context.AfterFunc(lifetime, func() { closeBody(server) })
+	stop := context.AfterFunc(lifetime, func() { closeQuietly(server) })
 	defer stop()
 
 	err = server.Serve(listener)
-	closeBody(server)
+	closeQuietly(server)
 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
 	return ioFailure("origin serve", err)
+}
+
+func newOriginRequest(r wire.Request) OriginRequest {
+	o := OriginRequest{
+		Request: Request{Key: r.Key, Metadata: r.AdapterMetadata, Authorization: r.Authorization},
+		ETag:    r.Pin,
+	}
+
+	switch r.Operation {
+	case wire.OperationHead:
+		o.Head = true
+	case wire.OperationBootstrap:
+		o.Length = PageSize
+	case wire.OperationPinned:
+		o.Offset = int64(r.Range.First)
+		o.Length = int64(r.Range.Last - r.Range.First + 1)
+	}
+
+	return o
 }
 
 type originResult struct {
@@ -166,7 +228,7 @@ type originResult struct {
 func callOrigin(ctx context.Context, origin Origin, request OriginRequest) (result originResult) {
 	defer func() {
 		if recover() != nil {
-			result.err = NewOriginError(ErrorInternal, nil)
+			result.err = failure(wire.ErrorInternal, "origin", errors.New("panic"))
 		}
 	}()
 
@@ -175,17 +237,17 @@ func callOrigin(ctx context.Context, origin Origin, request OriginRequest) (resu
 	return result
 }
 
-func serveOperation(w http.ResponseWriter, r *http.Request, config OriginConfig, origin Origin, slots, headSlots chan struct{}) {
-	writeOriginError := func(w http.ResponseWriter, status int, metadata Metadata) {
+func serveOperation(w http.ResponseWriter, r *http.Request, limits originLimits, origin Origin, slots, headSlots chan struct{}) {
+	writeOriginError := func(w http.ResponseWriter, status int, size uint64) {
 		// Once a request expires, only the empty error response gets a fresh,
 		// bounded write opportunity. Success writes never extend its deadline.
-		if status == 503 {
-			if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(config.WriteTimeout)); err != nil {
+		if status == http.StatusServiceUnavailable {
+			if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(limits.writeTimeout)); err != nil {
 				return
 			}
 		}
 
-		writeOriginErrorResponse(w, status, metadata)
+		writeOriginErrorResponse(w, status, size)
 	}
 	committed := false
 
@@ -195,52 +257,54 @@ func serveOperation(w http.ResponseWriter, r *http.Request, config OriginConfig,
 				panic(http.ErrAbortHandler)
 			}
 
-			writeOriginError(w, 500, Metadata{})
+			writeOriginError(w, http.StatusInternalServerError, 0)
 		}
 	}()
 
 	conn, ok := r.Context().Value(originConnKey{}).(*originConn)
 	if !ok {
-		writeOriginError(w, 500, Metadata{})
+		writeOriginError(w, http.StatusInternalServerError, 0)
 		return
 	}
 
 	head := conn.takeHead()
 	if head.err != nil {
-		writeOriginError(w, originHeadStatus(head.err), Metadata{})
-
+		writeOriginError(w, originHeadStatus(head.err), 0)
 		return
 	}
 
-	ctx, cancel := context.WithDeadline(r.Context(), head.at.Add(config.RequestTimeout))
+	ctx, cancel := context.WithDeadline(r.Context(), head.at.Add(limits.requestTimeout))
 	defer cancel()
 
 	if ctx.Err() != nil {
-		writeOriginError(w, 503, Metadata{})
+		writeOriginError(w, http.StatusServiceUnavailable, 0)
 		return
 	}
 
 	controller := http.NewResponseController(w)
 
 	deadline, _ := ctx.Deadline()
-	if err := controller.SetWriteDeadline(minTime(deadline, time.Now().Add(config.WriteTimeout))); err != nil {
+	if err := controller.SetWriteDeadline(minTime(deadline, time.Now().Add(limits.writeTimeout))); err != nil {
 		panic(http.ErrAbortHandler)
 	}
 
-	if head.request.operation == OperationHead {
+	request := head.request
+	pinned := request.Pin != ""
+
+	if request.Operation == wire.OperationHead {
 		slots = headSlots
 	}
 
 	select {
 	case slots <- struct{}{}:
 	default:
-		writeOriginError(w, 503, Metadata{})
+		writeOriginError(w, http.StatusServiceUnavailable, 0)
 		return
 	}
 
-	result, received := awaitOrigin(ctx, origin, head.request, slots)
+	result, received := awaitOrigin(ctx, origin, newOriginRequest(request), slots)
 	if !received {
-		writeOriginError(w, 503, Metadata{})
+		writeOriginError(w, http.StatusServiceUnavailable, 0)
 		return
 	}
 
@@ -253,57 +317,71 @@ func serveOperation(w http.ResponseWriter, r *http.Request, config OriginConfig,
 	defer stop()
 
 	if ctx.Err() != nil {
-		writeOriginError(w, 503, Metadata{})
+		writeOriginError(w, http.StatusServiceUnavailable, 0)
 		return
 	}
+
+	metadata := result.metadata.wire()
 
 	if result.err != nil {
-		status := callbackStatus(result.err, head.request.pin.value != "")
-		if status == 416 && (result.metadata.Validate() != nil || head.request.pin.value != "" && head.request.pin != result.metadata.ETag) {
-			status = 502
+		status := callbackStatus(result.err, pinned)
+		if status == http.StatusRequestedRangeNotSatisfiable && (metadata.Validate() != nil || pinned && request.Pin != metadata.ETag) {
+			status = http.StatusBadGateway
 		}
 
-		writeOriginError(w, status, result.metadata)
+		writeOriginError(w, status, metadata.Size)
 
 		return
 	}
 
-	response, err := originResponse(head.request, result.metadata)
+	if pinned && metadata.Validate() == nil && metadata.ETag != request.Pin {
+		// The origin no longer has the pinned version.
+		writeOriginError(w, http.StatusPreconditionFailed, 0)
+		return
+	}
+
+	response, err := wire.OriginResponse(request, metadata)
 	if err != nil {
-		writeOriginError(w, callbackStatus(err, head.request.pin.value != ""), result.metadata)
+		writeOriginError(w, callbackStatus(err, pinned), metadata.Size)
 		return
 	}
 
-	if head.request.operation == OperationHead && result.body != nil || response.length != 0 && result.body == nil {
-		writeOriginError(w, 502, Metadata{})
+	if request.Operation == wire.OperationHead && result.body != nil {
+		// Metadata requests carry no body; discard one if returned.
+		body.close()
+		result.body = nil
+	}
+
+	if response.Length != 0 && result.body == nil {
+		writeOriginError(w, http.StatusBadGateway, 0)
 		return
 	}
 
-	if response.length == 0 && result.body != nil {
+	if response.Length == 0 && result.body != nil {
 		if err := probeEOF(result.body); err != nil {
-			status := 502
+			status := http.StatusBadGateway
 			if ctx.Err() != nil {
-				status = 503
+				status = http.StatusServiceUnavailable
 			}
 
-			writeOriginError(w, status, Metadata{})
+			writeOriginError(w, status, 0)
 
 			return
 		}
 	}
 
 	if ctx.Err() != nil {
-		writeOriginError(w, 503, Metadata{})
+		writeOriginError(w, http.StatusServiceUnavailable, 0)
 		return
 	}
 
-	status, err := prepareOriginHeaders(w, head.request, result.metadata, response)
+	status, err := prepareOriginHeaders(w, request, metadata, response)
 	if err != nil {
-		writeOriginError(w, 502, Metadata{})
+		writeOriginError(w, http.StatusBadGateway, 0)
 		return
 	}
 
-	if err := controller.SetWriteDeadline(minTime(deadline, time.Now().Add(config.WriteTimeout))); err != nil {
+	if err := controller.SetWriteDeadline(minTime(deadline, time.Now().Add(limits.writeTimeout))); err != nil {
 		panic(http.ErrAbortHandler)
 	}
 
@@ -315,28 +393,78 @@ func serveOperation(w http.ResponseWriter, r *http.Request, config OriginConfig,
 		panic(http.ErrAbortHandler)
 	}
 
-	if response.length != 0 {
-		if err := copyOrigin(ctx, controller, w, result.body, response.length, config.WriteTimeout); err != nil {
+	if response.Length != 0 {
+		if err := copyOrigin(ctx, controller, w, result.body, response.Length, limits.writeTimeout); err != nil {
 			panic(http.ErrAbortHandler)
 		}
 	}
 }
 
-func originHeadStatus(err error) int {
-	status := 400
+// callbackStatus maps an origin or SDK error to the HTTP status sent to
+// Racer. A missing pinned version is a version mismatch.
+func callbackStatus(err error, pinned bool) int {
+	var w *wire.Error
+	if errors.As(err, &w) {
+		err = &sdkError{kind: w.Kind, op: w.Operation, status: w.Status, err: w.Err}
+	}
 
-	var typed *Error
+	var typed *sdkError
 	if errors.As(err, &typed) {
-		if typed.Kind() == ErrorHeaderLimit {
-			status = 431
-		}
-
-		if typed.StatusCode() == 405 {
-			status = 405
+		switch typed.kind {
+		case wire.ErrorHeaderLimit:
+			return http.StatusRequestHeaderFieldsTooLarge
+		case wire.ErrorInternal:
+			return http.StatusInternalServerError
+		case wire.ErrorBadGateway, wire.ErrorProtocol:
+			return http.StatusBadGateway
+		case wire.ErrorCanceled, wire.ErrorDeadline, wire.ErrorClosed:
+			return http.StatusServiceUnavailable
 		}
 	}
 
-	return status
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return http.StatusServiceUnavailable
+	case errors.Is(err, ErrInvalidRequest):
+		return http.StatusBadRequest
+	case errors.Is(err, ErrUnauthorized):
+		return http.StatusUnauthorized
+	case errors.Is(err, ErrForbidden):
+		return http.StatusForbidden
+	case errors.Is(err, ErrNotFound):
+		if pinned {
+			return http.StatusPreconditionFailed
+		}
+
+		return http.StatusNotFound
+	case errors.Is(err, ErrVersionMismatch):
+		return http.StatusPreconditionFailed
+	case errors.Is(err, ErrRangeNotSatisfiable):
+		return http.StatusRequestedRangeNotSatisfiable
+	case errors.Is(err, ErrUnavailable):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func originHeadStatus(err error) int {
+	var w *wire.Error
+	if errors.As(err, &w) {
+		switch {
+		case w.Kind == wire.ErrorHeaderLimit:
+			return http.StatusRequestHeaderFieldsTooLarge
+		case w.Status == http.StatusMethodNotAllowed:
+			return http.StatusMethodNotAllowed
+		}
+	}
+
+	var typed *sdkError
+	if errors.As(err, &typed) && typed.kind == wire.ErrorHeaderLimit {
+		return http.StatusRequestHeaderFieldsTooLarge
+	}
+
+	return http.StatusBadRequest
 }
 
 // An unbuffered handoff gives exactly one owner of a late callback result.
@@ -363,8 +491,8 @@ func awaitOrigin(ctx context.Context, origin Origin, request OriginRequest, slot
 	}
 }
 
-func prepareOriginHeaders(w http.ResponseWriter, request OriginRequest, metadata Metadata, response wireResponse) (int, error) {
-	h, err := metadataHeaders(metadata)
+func prepareOriginHeaders(w http.ResponseWriter, request wire.Request, metadata wire.Metadata, response wire.Response) (int, error) {
+	h, err := wire.MetadataHeaders(metadata)
 	if err != nil {
 		return 0, err
 	}
@@ -373,8 +501,8 @@ func prepareOriginHeaders(w http.ResponseWriter, request OriginRequest, metadata
 		w.Header()[name] = values
 	}
 
-	length := response.length
-	if request.operation == OperationHead {
+	length := response.Length
+	if request.Operation == wire.OperationHead {
 		length = int64(metadata.Size)
 	} else {
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -382,17 +510,17 @@ func prepareOriginHeaders(w http.ResponseWriter, request OriginRequest, metadata
 
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 
-	status := 200
+	status := http.StatusOK
 
-	if response.length != 0 {
-		cr, err := contentRangeValue(response.first, response.last, metadata.Size)
+	if response.Length != 0 {
+		cr, err := wire.ContentRangeValue(response.First, response.Last, metadata.Size)
 		if err != nil {
-			panic(http.ErrAbortHandler)
+			return 0, err
 		}
 
 		w.Header().Set("Content-Range", cr)
 
-		status = 206
+		status = http.StatusPartialContent
 	}
 
 	return status, nil
@@ -406,19 +534,19 @@ func minTime(a, b time.Time) time.Time {
 	return b
 }
 
-func writeOriginErrorResponse(w http.ResponseWriter, status int, metadata Metadata) {
+func writeOriginErrorResponse(w http.ResponseWriter, status int, size uint64) {
 	for name := range w.Header() {
 		w.Header().Del(name)
 	}
 
 	w.Header().Set("Content-Length", "0")
 
-	if status == 405 {
+	if status == http.StatusMethodNotAllowed {
 		w.Header().Set("Allow", "HEAD, GET")
 	}
 
-	if status == 416 {
-		w.Header().Set("Content-Range", "bytes */"+strconv.FormatUint(uint64(metadata.Size), 10))
+	if status == http.StatusRequestedRangeNotSatisfiable {
+		w.Header().Set("Content-Range", "bytes */"+strconv.FormatUint(size, 10))
 	}
 
 	w.WriteHeader(status)
@@ -429,7 +557,7 @@ func probeEOF(body io.Reader) error {
 	for range 100 {
 		n, err := body.Read(one[:])
 		if n != 0 {
-			return failure(ErrorBadGateway, "origin excess body", nil)
+			return failure(wire.ErrorBadGateway, "origin", errors.New("body longer than range"))
 		}
 
 		if err == io.EOF {
@@ -445,14 +573,14 @@ func probeEOF(body io.Reader) error {
 }
 
 type originHead struct {
-	request OriginRequest
+	request wire.Request
 	err     error
 	at      time.Time
 }
 
 type originConn struct {
 	net.Conn
-	config         OriginConfig
+	limits         originLimits
 	release        func()
 	once           sync.Once
 	reader         *bufio.Reader
@@ -495,14 +623,14 @@ func (c *originConn) setHeaderDeadline() error {
 }
 
 func (c *originConn) readHead() ([]byte, error) {
-	for len(c.raw) < maxHeadBytes {
+	for len(c.raw) < wire.MaxHeadBytes {
 		if !time.Now().Before(c.headerDeadline) {
 			return c.raw, os.ErrDeadlineExceeded
 		}
 
 		line, err := c.reader.ReadSlice('\n')
-		if len(line) > maxHeadBytes-len(c.raw) {
-			return c.raw, failure(ErrorHeaderLimit, "wire head", nil)
+		if len(line) > wire.MaxHeadBytes-len(c.raw) {
+			return c.raw, failure(wire.ErrorHeaderLimit, "wire head", nil)
 		}
 
 		c.raw = append(c.raw, line...)
@@ -524,7 +652,7 @@ func (c *originConn) readHead() ([]byte, error) {
 		}
 	}
 
-	return c.raw, failure(ErrorHeaderLimit, "wire head", nil)
+	return c.raw, failure(wire.ErrorHeaderLimit, "wire head", nil)
 }
 
 // Read passes only validated canonical requests to net/http. Unknown fields are
@@ -550,7 +678,7 @@ func (c *originConn) Read(p []byte) (int, error) {
 		if first {
 			c.first = true
 
-			c.headerDeadline = time.Now().Add(c.config.ReadHeaderTimeout)
+			c.headerDeadline = time.Now().Add(c.limits.readHeaderTimeout)
 			if err := c.setHeaderDeadline(); err != nil {
 				return 0, err
 			}
@@ -562,7 +690,7 @@ func (c *originConn) Read(p []byte) (int, error) {
 			}
 
 			if !first {
-				c.headerDeadline = time.Now().Add(c.config.ReadHeaderTimeout)
+				c.headerDeadline = time.Now().Add(c.limits.readHeaderTimeout)
 			}
 		}
 
@@ -587,19 +715,19 @@ func (c *originConn) Read(p []byte) (int, error) {
 
 		c.raw = nil
 
-		var request OriginRequest
+		var request wire.Request
 		if err == nil {
-			request, err = parseRequestHead(raw, true)
+			request, err = wire.ParseRequestHead(raw, true)
 		}
 
 		entry := originHead{request: request, err: err, at: at}
 		if err == nil {
-			c.head, err = requestHead(request)
+			c.head, err = wire.RequestHead(request)
 			if err != nil {
 				return 0, err
 			}
 
-			if connectionClose(headHeaders(raw)) {
+			if wire.ConnectionClose(wire.HeadHeaders(raw)) {
 				c.head = append(c.head[:len(c.head)-2], []byte("Connection: close\r\n\r\n")...)
 			}
 		} else {
@@ -641,7 +769,7 @@ type originListener struct {
 	net.Listener
 	ctx    context.Context
 	slots  chan struct{}
-	config OriginConfig
+	limits originLimits
 }
 
 // Accept reserves capacity before accepting a connection.
@@ -658,7 +786,7 @@ func (l *originListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
-	return &originConn{Conn: c, config: l.config, release: func() { <-l.slots }}, nil
+	return &originConn{Conn: c, limits: l.limits, release: func() { <-l.slots }}, nil
 }
 
 type onceBody struct {
@@ -676,7 +804,7 @@ func (b *onceBody) close() {
 			}
 		}()
 
-		closeBody(b.body)
+		closeQuietly(b.body)
 	})
 }
 
@@ -719,7 +847,7 @@ func copyOrigin(ctx context.Context, controller *http.ResponseController, w io.W
 
 		n, err := body.Read(buf[:min(int64(len(buf)), remaining)])
 		if n < 0 || int64(n) > min(int64(len(buf)), remaining) {
-			return failure(ErrorBadGateway, "origin read count", nil)
+			return failure(wire.ErrorBadGateway, "origin read count", nil)
 		}
 
 		remaining -= int64(n)
@@ -773,7 +901,7 @@ func copyOrigin(ctx context.Context, controller *http.ResponseController, w io.W
 
 func listenOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(path) > socketPathLimit {
-		return nil, nil, failure(ErrorInvalidArgument, "socket path", nil)
+		return nil, nil, failure(wire.ErrorInvalidArgument, "socket path", nil)
 	}
 
 	parent := string(filepath.Separator)
@@ -788,7 +916,7 @@ func listenOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), err
 		}
 
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return nil, nil, failure(ErrorInvalidArgument, "socket directory", nil)
+			return nil, nil, failure(wire.ErrorInvalidArgument, "socket directory", nil)
 		}
 	}
 
@@ -809,12 +937,12 @@ func listenOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), err
 
 	info, err := os.Lstat(path)
 	if err != nil {
-		closeBody(l)
+		closeQuietly(l)
 		return nil, nil, ioFailure("socket identity", err)
 	}
 
 	cleanup := func() {
-		closeBody(l)
+		closeQuietly(l)
 
 		current, err := os.Lstat(path)
 		if err == nil && current.Mode()&os.ModeSocket != 0 && os.SameFile(info, current) && info.ModTime().Equal(current.ModTime()) {
@@ -831,7 +959,7 @@ func listenOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), err
 // A hard-linked socket witness pins identity across crashes and inode reuse.
 func listenOwnedOrigin(path string, mode os.FileMode) (*net.UnixListener, func(), error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(path) > socketPathLimit {
-		return nil, nil, failure(ErrorInvalidArgument, "socket path", nil)
+		return nil, nil, failure(wire.ErrorInvalidArgument, "socket path", nil)
 	}
 
 	dir, err := openOriginDirectory(filepath.Dir(path))
@@ -843,7 +971,7 @@ func listenOwnedOrigin(path string, mode os.FileMode) (*net.UnixListener, func()
 
 	defer func() {
 		if !keepDir {
-			closeBody(dir)
+			closeQuietly(dir)
 		}
 	}()
 
@@ -858,7 +986,7 @@ func listenOwnedOrigin(path string, mode os.FileMode) (*net.UnixListener, func()
 
 	defer func() {
 		if !keep {
-			closeBody(lock)
+			closeQuietly(lock)
 		}
 	}()
 
@@ -892,10 +1020,10 @@ func listenOwnedOrigin(path string, mode os.FileMode) (*net.UnixListener, func()
 
 	return l, func() {
 		once.Do(func() {
-			defer closeBody(lock)
-			defer closeBody(dir)
+			defer closeQuietly(lock)
+			defer closeQuietly(dir)
 
-			closeBody(l)
+			closeQuietly(l)
 
 			for _, name := range []string{filepath.Base(path), ".racer-origin.socket"} {
 				entry := base + name
@@ -920,7 +1048,7 @@ func lockOriginSocket(path string) (*os.File, error) {
 
 	defer func() {
 		if !keep {
-			closeBody(lock)
+			closeQuietly(lock)
 		}
 	}()
 
@@ -961,7 +1089,7 @@ func openOriginDirectory(path string) (*os.File, error) {
 
 	for _, part := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
 		fd, err := unix.Openat(int(dir.Fd()), part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		closeBody(dir)
+		closeQuietly(dir)
 
 		if err != nil {
 			return nil, err
@@ -972,13 +1100,13 @@ func openOriginDirectory(path string) (*os.File, error) {
 
 	info, err := dir.Stat()
 	if err != nil {
-		closeBody(dir)
+		closeQuietly(dir)
 		return nil, err
 	}
 
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0o022 != 0 {
-		closeBody(dir)
+		closeQuietly(dir)
 		return nil, os.ErrPermission
 	}
 
@@ -1014,7 +1142,7 @@ func recoverOriginSocket(socket, witness string) error {
 	// A listener without our lock (for example an inherited descriptor) is live.
 	conn, probeErr := net.DialTimeout("unix", witness, time.Second)
 	if probeErr == nil {
-		closeBody(conn)
+		closeQuietly(conn)
 		return os.ErrExist
 	}
 
@@ -1042,12 +1170,12 @@ func listenOriginAtWitness(path string, mode os.FileMode) (*net.UnixListener, fu
 
 	identity, err := os.Lstat(path)
 	if err != nil {
-		closeBody(l)
+		closeQuietly(l)
 		return nil, nil, ioFailure("witness identity", err)
 	}
 
 	cleanup := func() {
-		closeBody(l)
+		closeQuietly(l)
 
 		if current, err := os.Lstat(path); err == nil && os.SameFile(identity, current) {
 			if err := os.Remove(path); err != nil {
@@ -1077,7 +1205,7 @@ func bindOriginSocket(path string, mode os.FileMode) (*net.UnixListener, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer closeBody(dir)
+	defer closeQuietly(dir)
 
 	// Use the directory FD to avoid consuming the public socket's path budget.
 	private := fmt.Sprintf("/proc/self/fd/%d/socket", dir.Fd())
@@ -1090,12 +1218,12 @@ func bindOriginSocket(path string, mode os.FileMode) (*net.UnixListener, error) 
 	l.SetUnlinkOnClose(false)
 
 	if err := os.Chmod(private, mode); err != nil {
-		closeBody(l)
+		closeQuietly(l)
 		return nil, err
 	}
 
 	if err := os.Link(private, path); err != nil {
-		closeBody(l)
+		closeQuietly(l)
 		return nil, err
 	}
 

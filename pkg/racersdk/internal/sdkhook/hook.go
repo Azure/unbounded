@@ -13,8 +13,4 @@ var (
 	NewClientAt any
 	// ServeOriginAt has type func(context.Context, racersdk.OriginConfig, racersdk.Origin, string) error.
 	ServeOriginAt any
-	// OriginDefaults has type func(racersdk.OriginConfig) (racersdk.OriginConfig, error).
-	OriginDefaults any
-	// InvalidOrigin has type func() error; it preserves the former fake's local error.
-	InvalidOrigin func() error
 )

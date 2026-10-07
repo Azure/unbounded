@@ -1,647 +1,298 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racersdk streams immutable objects through Racer and serves origin
-// callbacks over bounded Unix-socket connections.
 package racersdk
 
 import (
-	"bufio"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"strings"
+	"math"
+	"net"
+	"strconv"
 	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
-const (
-	maxHeadBytes    = wire.MaxHeadBytes
-	socketPathLimit = 107
-)
+// PageSize is the unit in which Racer caches and transfers objects (16 MiB).
+// Objects no larger than PageSize may be read with [ReadOptions.SmallObject].
+const PageSize = 16 << 20
 
-// Key identifies an object. Every value, including zero, is valid.
+// The public constant must match the wire protocol.
+var _ [PageSize - wire.PageSize]struct{}
+
+var _ [wire.PageSize - PageSize]struct{}
+
+// Key names an immutable object in a Racer volume. It is usually a content
+// digest, for example the SHA-256 of a blob.
 type Key [32]byte
 
-// ParseKey parses a 64-character lowercase hexadecimal object key.
+// ParseKey parses 64 lowercase hexadecimal characters.
 func ParseKey(s string) (Key, error) {
 	key, err := wire.ParseKey(s)
-	return Key(key), fromWireError(err)
+	if err != nil {
+		return Key{}, invalid("key", err)
+	}
+
+	return key, nil
 }
 
-// String returns the lowercase hexadecimal key.
+// String returns the 64-character lowercase hexadecimal form of k.
 func (k Key) String() string { return hex.EncodeToString(k[:]) }
 
-// ByteLength and ByteOffset are unsigned at the API boundary, but wire values
-// must fit MaxInt64. Constructors and Metadata.Validate check that constraint.
-type (
-	ByteLength uint64
-	ByteOffset uint64
-)
-
-// VolumeName is a DNS subdomain that fits both canonical Linux Unix socket paths.
-// Its zero value is invalid.
-type VolumeName struct{ value string }
-
-// ParseVolumeName validates a volume name and its canonical socket path lengths.
-func ParseVolumeName(s string) (VolumeName, error) {
-	if len(s) == 0 || len(s) > 253 || len("/run/racer/"+s+"/origin/socket") > socketPathLimit {
-		return VolumeName{}, failure(ErrorInvalidArgument, "volume name", nil)
-	}
-
-	for _, label := range strings.Split(s, ".") {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return VolumeName{}, failure(ErrorInvalidArgument, "volume name", nil)
-		}
-
-		for i := range len(label) {
-			c := label[i]
-			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
-				return VolumeName{}, failure(ErrorInvalidArgument, "volume name", nil)
-			}
-		}
-	}
-
-	return VolumeName{value: s}, nil
-}
-
-// String returns the validated volume name.
-func (n VolumeName) String() string { return n.value }
-
-// ETag is one strong quoted entity tag. Zero means no pin and is invalid metadata.
-// Quotes are retained; commas and backslashes within them are literal bytes.
-type ETag struct{ value string }
-
-// ParseETag validates a strong quoted entity tag without normalizing its bytes.
-func ParseETag(s string) (ETag, error) {
-	if err := wire.ValidateETag(s); err != nil {
-		return ETag{}, fromWireError(err)
-	}
-
-	return ETag{value: s}, nil
-}
-
-// String returns the quoted entity tag, or empty for an absent pin.
-func (e ETag) String() string { return e.value }
-
-// AdapterMetadata is opaque upstream context. Zero means absent.
-type (
-	AdapterMetadata struct{ value string }
-	// Authorization is an opaque upstream credential. Zero means absent. It has no
-	// String or serialization method that exposes the credential.
-	Authorization struct{ value string }
-)
-
-func validateOpaque(s string) error {
-	return fromWireError(wire.ValidateOpaque(s))
-}
-
-// ParseAdapterMetadata validates an opaque origin metadata field.
-func ParseAdapterMetadata(s string) (AdapterMetadata, error) {
-	if err := validateOpaque(s); err != nil {
-		return AdapterMetadata{}, err
-	}
-
-	return AdapterMetadata{value: s}, nil
-}
-
-// ParseAuthorization validates an opaque origin credential field.
-func ParseAuthorization(s string) (Authorization, error) {
-	if err := validateOpaque(s); err != nil {
-		return Authorization{}, err
-	}
-
-	return Authorization{value: s}, nil
-}
-
-// ForOrigin explicitly exposes the metadata to an origin adapter.
-func (m AdapterMetadata) ForOrigin() string { return m.value }
-
-// ForOrigin explicitly exposes the credential to an origin adapter.
-func (a Authorization) ForOrigin() string { return a.value }
-
-// Format redacts metadata from diagnostic output.
-func (m AdapterMetadata) Format(s fmt.State, _ rune) {
-	writeDiagnostic(s, "AdapterMetadata([redacted])")
-}
-
-// Format redacts credentials from diagnostic output.
-func (a Authorization) Format(s fmt.State, _ rune) { writeDiagnostic(s, "Authorization([redacted])") }
-
-// FetchContext is an immutable pair of optional origin fields. Zero is absent.
-type FetchContext struct {
-	metadata      AdapterMetadata
-	authorization Authorization
-}
-
-// NewFetchContext validates and combines optional origin metadata and credentials.
-func NewFetchContext(m AdapterMetadata, a Authorization) (FetchContext, error) {
-	for _, value := range []string{m.value, a.value} {
-		if value != "" {
-			if err := validateOpaque(value); err != nil {
-				return FetchContext{}, err
-			}
-		}
-	}
-
-	return FetchContext{metadata: m, authorization: a}, nil
-}
-
-// Metadata returns the optional origin metadata.
-func (c FetchContext) Metadata() AdapterMetadata { return c.metadata }
-
-// Authorization returns the optional origin credential.
-func (c FetchContext) Authorization() Authorization { return c.authorization }
-
-// Format redacts origin fields from diagnostic output.
-func (c FetchContext) Format(s fmt.State, _ rune) { writeDiagnostic(s, "FetchContext([redacted])") }
-
-// Request identifies an object and its optional origin fetch context.
+// Request identifies an object and carries the opaque values that Racer
+// forwards unchanged to the [Origin] on a cache miss.
+//
+// Metadata and Authorization are limited to 8 KiB of visible ASCII and spaces.
+// Formatting a Request with the fmt package redacts both values.
 type Request struct {
-	// Key identifies the immutable object to resolve.
 	Key Key
-	// Context carries optional opaque origin fields.
-	Context FetchContext
+	// Metadata tells the origin how to locate the object, for example a bucket
+	// and path. Racer does not interpret it.
+	Metadata string
+	// Authorization is a credential for the origin. Racer does not interpret it.
+	Authorization string
 }
 
-// Format redacts request data from diagnostic output.
-func (r Request) Format(s fmt.State, _ rune) { writeDiagnostic(s, "Request([redacted])") }
-
-// ReadOptions selects a subscription byte range. Length zero reads through EOF.
-// Pin optionally selects an existing immutable version; without a snapshot,
-// zero selects fresh metadata in the same subscription request.
-// A range extending beyond the object is rejected rather than silently shortened.
-type ReadOptions struct {
-	// PageCredits and ByteCredits bound outstanding subscription leases. Zero
-	// selects the configured PageWindow (default two) and PageCredits*PageSize
-	// bytes. Ordered requests ascending pages; Get always enables it.
-	PageCredits int
-	// ByteCredits bounds bytes held by outstanding page leases.
-	ByteCredits ByteLength
-	// Ordered requests ascending page delivery.
-	Ordered bool
-	// SmallObject selects reserved admission for objects no larger than PageSize.
-	// Larger objects fail with ErrorInvalidArgument before a Value is exposed.
-	SmallObject bool
-	// Offset selects the first object byte, defaulting to zero.
-	Offset ByteOffset
-	// Length selects a byte count; zero selects through EOF.
-	Length ByteLength
-	// Pin optionally selects an immutable version.
-	Pin ETag
-	// Metadata is an optional trusted snapshot for this request's object, usually
-	// from Stat. It pins the subscription to its ETag. A nonzero Pin must match.
-	// The SDK validates and copies it; do not mutate it during the opening call.
-	Metadata *Metadata
+// Format prints the key and redacts Metadata and Authorization.
+func (r Request) Format(s fmt.State, _ rune) {
+	// fmt.State cannot usefully report a write error back through Format.
+	_, _ = io.WriteString(s, "Request{Key: "+r.Key.String()+", Metadata: [redacted], Authorization: [redacted]}") //nolint:errcheck // See above.
 }
 
-// Metadata describes the entire immutable version, even for a partial response.
-// ExpiresAt is an admission hint, not a deadline for an admitted stream.
+func (r Request) wire(op wire.Operation) (wire.Request, error) {
+	w := wire.Request{Key: r.Key, Operation: op, AdapterMetadata: r.Metadata, Authorization: r.Authorization}
+	for _, value := range []string{r.Metadata, r.Authorization} {
+		if value != "" {
+			if err := wire.ValidateOpaque(value); err != nil {
+				return w, invalid("request", err)
+			}
+		}
+	}
+
+	return w, nil
+}
+
+// Metadata describes one immutable version of an object.
 type Metadata struct {
-	// Size is the full immutable object's byte length.
-	Size ByteLength
-	// ETag identifies the immutable version.
-	ETag ETag
-	// ExpiresAt is an admission hint, not an active stream deadline.
-	ExpiresAt time.Time
-	// ContentType is optional original-object MIME metadata, carried separately
-	// from the wire body's application/octet-stream Content-Type.
+	// Size is the object length in bytes.
+	Size int64
+	// ETag is a strong HTTP entity tag such as "\"v1\"". Racer uses it to
+	// ensure every page of a read comes from the same version.
+	ETag string
+	// ContentType is optional.
 	ContentType string
+	// ExpiresAt is when Racer must stop serving this version from cache. It
+	// is required and kept at millisecond precision.
+	ExpiresAt time.Time
 }
 
-// Validate rejects invalid size, absent tags, pre-epoch or overflowing expiry,
-// and sub-millisecond precision without silently rounding opaque metadata.
-func (m Metadata) Validate() error {
-	return fromWireError(m.wire().Validate())
+func (m Metadata) wire() wire.Metadata {
+	size := uint64(m.Size)
+	if m.Size < 0 {
+		size = math.MaxUint64
+	}
+
+	return wire.Metadata{Size: size, ETag: m.ETag, ExpiresAt: time.UnixMilli(m.ExpiresAt.UnixMilli()).UTC(), ContentType: m.ContentType}
 }
 
-// Operation is an origin callback operation. Zero is invalid.
-type Operation uint8
+func fromWireMetadata(m wire.Metadata) Metadata {
+	return Metadata{Size: int64(m.Size), ETag: m.ETag, ExpiresAt: m.ExpiresAt, ContentType: m.ContentType}
+}
 
-const (
-	// OperationHead requests full-object metadata without a body.
-	OperationHead Operation = iota + 1
-	// OperationBootstrap selects a version and its first page.
-	OperationBootstrap
-	// OperationPinned requests a page of a previously selected version.
-	OperationPinned
+// ReadOptions selects part of an object or a specific version. The zero value
+// reads the whole current version.
+type ReadOptions struct {
+	// Offset is the first byte to read.
+	Offset int64
+	// Length is the number of bytes to read. Zero reads to the end of the
+	// object. A range that extends past the end fails with
+	// [ErrRangeNotSatisfiable].
+	Length int64
+	// ETag pins the read to one version, typically from [Client.Stat]. If the
+	// object has changed, Get fails with [ErrVersionMismatch].
+	ETag string
+	// SmallObject declares that the object is at most [PageSize] bytes. Small
+	// reads use a separate admission queue so they are not delayed behind
+	// large transfers. Get fails with [ErrInvalidRequest] if the object is
+	// larger.
+	SmallObject bool
+}
+
+// Errors returned by [Client] methods and [Object] reads, and recognized when
+// returned by an [Origin]. Test for them with [errors.Is].
+//
+// Other failures wrap the cause: [context.Canceled] or
+// [context.DeadlineExceeded] when a context ends, and [net.ErrClosed] after
+// [Client.Close] or [Object.Close]. Anything else is a protocol or origin
+// failure that callers usually report as a bad gateway.
+var (
+	// ErrInvalidRequest reports an invalid key, request value, option, or
+	// configuration.
+	ErrInvalidRequest = errors.New("racersdk: invalid request")
+	// ErrUnauthorized reports that the origin rejected or required credentials.
+	ErrUnauthorized = errors.New("racersdk: unauthorized")
+	// ErrForbidden reports that the origin denied access.
+	ErrForbidden = errors.New("racersdk: forbidden")
+	// ErrNotFound reports that the object does not exist.
+	ErrNotFound = errors.New("racersdk: not found")
+	// ErrVersionMismatch reports that the requested ETag is no longer
+	// available.
+	ErrVersionMismatch = errors.New("racersdk: version mismatch")
+	// ErrRangeNotSatisfiable reports a range outside the object.
+	ErrRangeNotSatisfiable = errors.New("racersdk: range not satisfiable")
+	// ErrUnavailable reports a temporary failure: Racer or the origin is
+	// overloaded or unreachable, or a transfer was cut short. Retrying may
+	// succeed.
+	ErrUnavailable = errors.New("racersdk: unavailable")
 )
 
-// OriginRequest is constructed only after validating the wire request. The zero
-// value is invalid. Range is still unresolved until callback metadata is known.
-type OriginRequest struct {
-	key       Key
-	context   FetchContext
-	operation Operation
-	pin       ETag
-	byteRange Range
+// sdkError carries a private classification that maps onto at most one
+// exported sentinel, plus a safe operation name and the underlying cause.
+type sdkError struct {
+	kind   wire.ErrorKind
+	op     string
+	status int
+	err    error
 }
 
-// Key returns the requested object key.
-func (r OriginRequest) Key() Key { return r.key }
+func (e *sdkError) Error() string {
+	msg := "racersdk: " + e.op + ": " + kindText(e.kind)
+	if e.status != 0 {
+		msg += " (HTTP " + strconv.Itoa(e.status) + ")"
+	}
 
-// Context returns the origin fetch context.
-func (r OriginRequest) Context() FetchContext { return r.context }
+	if e.err != nil {
+		msg += ": " + e.err.Error()
+	}
 
-// Operation returns the validated callback operation.
-func (r OriginRequest) Operation() Operation { return r.operation }
+	return msg
+}
 
-// Pin returns the selected version and whether it is present.
-func (r OriginRequest) Pin() (ETag, bool) { return r.pin, r.pin.value != "" }
+func (e *sdkError) Unwrap() error { return e.err }
 
-// Range returns the unresolved inclusive range and whether it is present.
-func (r OriginRequest) Range() (Range, bool) { return r.byteRange, r.byteRange.present }
+func (e *sdkError) Is(target error) bool {
+	return target != nil && sentinel(e.kind) == target
+}
 
-// Format redacts callback request data from diagnostic output.
-func (r OriginRequest) Format(s fmt.State, _ rune) { writeDiagnostic(s, "OriginRequest([redacted])") }
-
-// ErrorKind classifies failures without exposing request or callback data.
-// Its zero value is unspecified and is not an origin error kind.
-type ErrorKind uint8
-
-const (
-	// ErrorInvalidArgument indicates invalid caller input.
-	ErrorInvalidArgument ErrorKind = iota + 1
-	// ErrorClosed indicates a closed client or value.
-	ErrorClosed
-	// ErrorProtocol indicates malformed wire data.
-	ErrorProtocol
-	// ErrorUnauthorized indicates missing or invalid authentication.
-	ErrorUnauthorized
-	// ErrorForbidden indicates access was denied.
-	ErrorForbidden
-	// ErrorNotFound indicates an unknown object.
-	ErrorNotFound
-	// ErrorVersionUnavailable indicates the pinned version is unavailable.
-	ErrorVersionUnavailable
-	// ErrorUnsatisfiableRange indicates a range outside the selected object.
-	ErrorUnsatisfiableRange
-	// ErrorHeaderLimit indicates a head or field exceeded its limit.
-	ErrorHeaderLimit
-	// ErrorInternal indicates an internal failure.
-	ErrorInternal
-	// ErrorBadGateway indicates an invalid upstream response.
-	ErrorBadGateway
-	// ErrorUnavailable indicates temporary unavailability or exhausted capacity.
-	ErrorUnavailable
-	// ErrorCanceled indicates context cancellation.
-	ErrorCanceled
-	// ErrorDeadline indicates an expired context or admission deadline.
-	ErrorDeadline
-	// ErrorIO indicates a transport or body I/O failure.
-	ErrorIO
-)
-
-// String returns a safe, human-readable classification.
-func (k ErrorKind) String() string {
-	switch k {
-	case ErrorInvalidArgument:
-		return "invalid argument"
-	case ErrorClosed:
-		return "closed"
-	case ErrorProtocol:
-		return "protocol"
-	case ErrorUnauthorized:
-		return "unauthorized"
-	case ErrorForbidden:
-		return "forbidden"
-	case ErrorNotFound:
-		return "not found"
-	case ErrorVersionUnavailable:
-		return "version unavailable"
-	case ErrorUnsatisfiableRange:
-		return "unsatisfiable range"
-	case ErrorHeaderLimit:
-		return "header limit"
-	case ErrorInternal:
-		return "internal"
-	case ErrorBadGateway:
-		return "bad gateway"
-	case ErrorUnavailable:
-		return "unavailable"
-	case ErrorCanceled:
-		return "canceled"
-	case ErrorDeadline:
-		return "deadline"
-	case ErrorIO:
-		return "I/O"
+func sentinel(kind wire.ErrorKind) error {
+	switch kind {
+	case wire.ErrorInvalidArgument, wire.ErrorHeaderLimit:
+		return ErrInvalidRequest
+	case wire.ErrorUnauthorized:
+		return ErrUnauthorized
+	case wire.ErrorForbidden:
+		return ErrForbidden
+	case wire.ErrorNotFound:
+		return ErrNotFound
+	case wire.ErrorVersionUnavailable:
+		return ErrVersionMismatch
+	case wire.ErrorUnsatisfiableRange:
+		return ErrRangeNotSatisfiable
+	case wire.ErrorUnavailable, wire.ErrorIO:
+		return ErrUnavailable
 	default:
-		return "unspecified"
-	}
-}
-
-// Error carries a safe operation name, classification, and optional HTTP status.
-// Unwrap deliberately exposes the original cause for explicit inspection only.
-// The zero value is an unspecified failure. Fields are private to prevent unsafe
-// operation strings from entering diagnostics.
-type Error struct {
-	kind      ErrorKind
-	operation string
-	status    int
-	cause     error
-}
-
-// Kind returns the failure classification, or zero for a nil error.
-func (e *Error) Kind() ErrorKind {
-	if e == nil {
-		return 0
-	}
-
-	return e.kind
-}
-
-// Operation returns the safe operation name, or empty for a nil error.
-func (e *Error) Operation() string {
-	if e == nil {
-		return ""
-	}
-
-	return e.operation
-}
-
-// StatusCode returns the HTTP status, or zero when unavailable.
-func (e *Error) StatusCode() int {
-	if e == nil {
-		return 0
-	}
-
-	return e.status
-}
-
-// Unwrap exposes the original cause for explicit inspection.
-func (e *Error) Unwrap() error {
-	if e == nil {
 		return nil
 	}
-
-	return e.cause
 }
 
-// Error returns a diagnostic that does not expose request or callback data.
-func (e *Error) Error() string {
-	if e == nil {
-		return "racersdk: unspecified"
-	}
-
-	if e.status != 0 {
-		return fmt.Sprintf("racersdk %s: %s (HTTP %d)", e.operation, e.kind, e.status)
-	}
-
-	return "racersdk " + e.operation + ": " + e.kind.String()
-}
-
-// Format also redacts Go-syntax formatting (%#v), which otherwise reveals causes.
-func (e Error) Format(s fmt.State, _ rune) { writeDiagnostic(s, e.Error()) }
-
-func failure(kind ErrorKind, op string, cause error) *Error {
-	return &Error{kind: kind, operation: op, cause: cause}
-}
-
-func writeDiagnostic(w io.Writer, text string) {
-	// fmt.State cannot usefully report a writer error back through Format.
-	if _, err := io.WriteString(w, text); err != nil {
-		return
-	}
-}
-
-// NewOriginError wraps a callback failure. Supported kinds map to 400, 401, 403,
-// 404, 412, 416, 431, 500, 502, and 503 respectively: InvalidArgument,
-// Unauthorized, Forbidden, NotFound, VersionUnavailable, UnsatisfiableRange,
-// HeaderLimit, Internal, BadGateway, and Unavailable. Canceled and Deadline also
-// map to 503. Unsupported kinds become Internal. A 416 requires valid callback
-// Metadata; the serving layer must check it before constructing the response.
-func NewOriginError(kind ErrorKind, cause error) error {
-	if originStatus(kind) == 0 {
-		kind = ErrorInternal
-	}
-
-	return failure(kind, "origin", cause)
-}
-
-func originStatus(kind ErrorKind) int {
+func kindText(kind wire.ErrorKind) string {
 	switch kind {
-	case ErrorInvalidArgument:
-		return 400
-	case ErrorUnauthorized:
-		return 401
-	case ErrorForbidden:
-		return 403
-	case ErrorNotFound:
-		return 404
-	case ErrorVersionUnavailable:
-		return 412
-	case ErrorUnsatisfiableRange:
-		return 416
-	case ErrorHeaderLimit:
-		return 431
-	case ErrorInternal:
-		return 500
-	case ErrorBadGateway:
-		return 502
-	case ErrorUnavailable, ErrorCanceled, ErrorDeadline:
-		return 503
+	case wire.ErrorInvalidArgument:
+		return "invalid request"
+	case wire.ErrorClosed:
+		return "closed"
+	case wire.ErrorProtocol:
+		return "protocol violation"
+	case wire.ErrorUnauthorized:
+		return "unauthorized"
+	case wire.ErrorForbidden:
+		return "forbidden"
+	case wire.ErrorNotFound:
+		return "not found"
+	case wire.ErrorVersionUnavailable:
+		return "version mismatch"
+	case wire.ErrorUnsatisfiableRange:
+		return "range not satisfiable"
+	case wire.ErrorHeaderLimit:
+		return "header limit exceeded"
+	case wire.ErrorInternal:
+		return "internal error"
+	case wire.ErrorBadGateway:
+		return "bad gateway"
+	case wire.ErrorUnavailable:
+		return "unavailable"
+	case wire.ErrorCanceled:
+		return "canceled"
+	case wire.ErrorDeadline:
+		return "deadline exceeded"
 	default:
-		return 0
+		return "I/O failure"
 	}
 }
 
-// callbackStatus handles semantic errors only; the server owns body closure,
-// validation of 416 metadata, and the before/after-headers decision.
-func callbackStatus(err error, pinned bool) int {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return 503
-	}
-
-	var sdkErr *Error
-	if errors.As(err, &sdkErr) {
-		status := originStatus(sdkErr.Kind())
-		if status == 404 && pinned {
-			return 412
-		}
-
-		if status != 0 {
-			return status
-		}
-	}
-
-	return 500
+func failure(kind wire.ErrorKind, op string, err error) error {
+	return &sdkError{kind: kind, op: op, err: err}
 }
 
+func invalid(op string, err error) error {
+	return failure(wire.ErrorInvalidArgument, op, unwrapWire(err))
+}
+
+var errClosed = fmt.Errorf("closed: %w", net.ErrClosed)
+
+func closedError(op string) error {
+	return failure(wire.ErrorClosed, op, net.ErrClosed)
+}
+
+// ioFailure classifies a transport error, preserving SDK errors and context
+// errors. Nil and io.EOF pass through unchanged.
 func ioFailure(op string, err error) error {
 	if err == nil || err == io.EOF {
 		return err
 	}
 
-	kind := ErrorIO
-	if errors.Is(err, context.Canceled) {
-		kind = ErrorCanceled
+	var typed *sdkError
+	if errors.As(err, &typed) {
+		return err
 	}
 
-	if errors.Is(err, context.DeadlineExceeded) {
-		kind = ErrorDeadline
+	var w *wire.Error
+	if errors.As(err, &w) {
+		return &sdkError{kind: w.Kind, op: w.Operation, status: w.Status, err: w.Err}
+	}
+
+	kind := wire.ErrorIO
+
+	switch {
+	case errors.Is(err, context.Canceled):
+		kind = wire.ErrorCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		kind = wire.ErrorDeadline
 	}
 
 	return failure(kind, op, err)
 }
 
-// PageSize is the v1 whole-page origin transfer unit.
-const PageSize ByteLength = wire.PageSize
-
-// Range is an inclusive closed byte range. Its zero value is absent.
-// Origin callbacks receive whole-page ranges; client continuations are private.
-type Range struct {
-	present     bool
-	first, last uint64
-}
-
-// Bounds returns the inclusive, unresolved wire bounds and whether a range is
-// present. Origin adapters should use Resolve to validate against object size.
-func (r Range) Bounds() (first, last ByteOffset, present bool) {
-	return ByteOffset(r.first), ByteOffset(r.last), r.present
-}
-
-// ClosedRange validates and constructs an inclusive byte range.
-func ClosedRange(first, last ByteOffset) (Range, error) {
-	r, err := wire.ClosedRange(uint64(first), uint64(last))
-	return fromWireRange(r), fromWireError(err)
-}
-
-// Resolve validates a whole origin page and returns its inclusive bounds in the
-// selected immutable version. The final page is shortened at EOF. An absent range,
-// unaligned start, or partial nonfinal page is invalid; an empty object is unsatisfiable.
-func (r Range) Resolve(size ByteLength) (ByteOffset, ByteOffset, error) {
-	first, last, err := r.wire().ResolvePage(uint64(size))
-	return ByteOffset(first), ByteOffset(last), fromWireError(err)
-}
-
-// fromWireError is the sole translation from protocol classifications to public SDK errors.
-// Translate nested protocol causes too, preserving the public error chain.
-func fromWireError(err error) error {
-	var e *wire.Error
-	if !errors.As(err, &e) {
-		return err
+// unwrapWire drops a wire classification, keeping only its cause, so callers
+// can apply their own.
+func unwrapWire(err error) error {
+	var w *wire.Error
+	if errors.As(err, &w) {
+		return w.Err
 	}
 
-	kind := ErrorKind(e.Kind)
-	// Closed is reserved on the wire, not a protocol classification.
-	if kind < ErrorInvalidArgument || kind > ErrorIO || kind == ErrorClosed {
-		kind = ErrorInternal
+	return err
+}
+
+// contextError reports why ctx ended: client closure or the caller's context.
+func contextError(op string, ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), errClosed) {
+		return closedError(op)
 	}
 
-	return &Error{kind: kind, operation: e.Operation, status: e.Status, cause: fromWireError(e.Err)}
+	return ioFailure(op, ctx.Err())
 }
-
-func (r Range) wire() wire.Range { return wire.Range{Present: r.present, First: r.first, Last: r.last} }
-
-func fromWireRange(r wire.Range) Range {
-	return Range{present: r.Present, first: r.First, last: r.Last}
-}
-
-func (m Metadata) wire() wire.Metadata {
-	return wire.Metadata{Size: uint64(m.Size), ETag: m.ETag.value, ExpiresAt: m.ExpiresAt, ContentType: m.ContentType}
-}
-
-func fromWireMetadata(m wire.Metadata) Metadata {
-	return Metadata{Size: ByteLength(m.Size), ETag: ETag{value: m.ETag}, ExpiresAt: m.ExpiresAt, ContentType: m.ContentType}
-}
-
-func (r OriginRequest) wire() wire.Request {
-	return wire.Request{
-		Key: r.key, Operation: wire.Operation(r.operation), Pin: r.pin.value, Range: r.byteRange.wire(),
-		AdapterMetadata: r.context.metadata.value, Authorization: r.context.authorization.value,
-	}
-}
-
-func fromWireRequest(r wire.Request) OriginRequest {
-	return OriginRequest{
-		key: r.Key, operation: Operation(r.Operation), pin: ETag{value: r.Pin}, byteRange: fromWireRange(r.Range),
-		context: FetchContext{
-			metadata: AdapterMetadata{value: r.AdapterMetadata}, authorization: Authorization{value: r.Authorization},
-		},
-	}
-}
-
-type wireResponse struct {
-	metadata    Metadata
-	first, last ByteOffset
-	length      int64
-	close       bool
-}
-
-func fromWireResponse(r wire.Response) wireResponse {
-	return wireResponse{metadata: fromWireMetadata(r.Metadata), first: ByteOffset(r.First), last: ByteOffset(r.Last), length: r.Length, close: r.Close}
-}
-
-func (o ReadOptions) wire() wire.SubscriptionOptions {
-	r := wire.SubscriptionOptions{
-		Offset: uint64(o.Offset), Length: uint64(o.Length),
-		PageCredits: o.PageCredits, ByteCredits: uint64(o.ByteCredits),
-		Ordered: o.Ordered, SmallObject: o.SmallObject, Pin: o.Pin.value,
-	}
-	if o.Metadata != nil {
-		m := o.Metadata.wire()
-		r.Metadata = &m
-	}
-
-	return r
-}
-func validateRequest(r OriginRequest) error { return fromWireError(wire.ValidateRequest(r.wire())) }
-func requestHead(r OriginRequest) ([]byte, error) {
-	b, err := wire.RequestHead(r.wire())
-	return b, fromWireError(err)
-}
-
-func clientHead(r OriginRequest) ([]byte, error) {
-	b, err := wire.ClientHead(r.wire())
-	return b, fromWireError(err)
-}
-
-func parseRequestHead(b []byte, origin bool) (OriginRequest, error) {
-	r, err := wire.ParseRequestHead(b, origin)
-	return fromWireRequest(r), fromWireError(err)
-}
-
-func parseResponseHead(b []byte, r OriginRequest, snapshot *Metadata) (wireResponse, error) {
-	var m *wire.Metadata
-
-	if snapshot != nil {
-		copy := snapshot.wire()
-		m = &copy
-	}
-
-	response, err := wire.ParseResponseHead(b, r.wire(), m)
-
-	return fromWireResponse(response), fromWireError(err)
-}
-
-func originResponse(r OriginRequest, m Metadata) (wireResponse, error) {
-	response, err := wire.OriginResponse(r.wire(), m.wire())
-	return fromWireResponse(response), fromWireError(err)
-}
-
-func metadataHeaders(m Metadata) (http.Header, error) {
-	h, err := wire.MetadataHeaders(m.wire())
-	return h, fromWireError(err)
-}
-
-func contentRangeValue(first, last ByteOffset, size ByteLength) (string, error) {
-	s, err := wire.ContentRangeValue(uint64(first), uint64(last), uint64(size))
-	return s, fromWireError(err)
-}
-
-func readRawHead(r *bufio.Reader, response bool) ([]byte, error) {
-	b, err := wire.ReadRawHead(r, response)
-	return b, fromWireError(err)
-}
-
-func readHeadBytes(r *bufio.Reader, response bool) ([]byte, error) {
-	b, err := wire.ReadHeadBytes(r, response)
-	return b, fromWireError(err)
-}
-
-func headHeaders(b []byte) http.Header   { return wire.HeadHeaders(b) }
-func connectionClose(h http.Header) bool { return wire.ConnectionClose(h) }

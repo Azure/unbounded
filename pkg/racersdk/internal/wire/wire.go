@@ -33,8 +33,8 @@ const (
 	CompleteFrame      byte = 2
 )
 
-// ErrorKind classifies wire failures. Its values must match racersdk.ErrorKind
-// so the SDK can convert classifications without a translation table.
+// ErrorKind classifies wire failures. The SDK maps kinds to its public
+// sentinel errors.
 type ErrorKind uint8
 
 const (

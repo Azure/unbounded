@@ -47,7 +47,7 @@ func TestOriginSocketPublicationMode(t *testing.T) {
 
 			conn, err := net.DialTimeout("unix", path, time.Second)
 			require.NoError(t, err)
-			closeBody(conn)
+			closeQuietly(conn)
 
 			// Directory events retain ordering even if the entire bind completed
 			// before this read. A chmod on either public name exposes the window.
@@ -90,7 +90,7 @@ func TestOriginSocketPublicationDoesNotOverwrite(t *testing.T) {
 				listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 				require.NoError(t, err)
 
-				defer closeBody(listener)
+				defer closeQuietly(listener)
 			}
 
 			before, err := os.Lstat(path)
@@ -141,7 +141,7 @@ func TestOriginSocketPublicationConcurrent(t *testing.T) {
 	close(failures)
 
 	for listener := range listeners {
-		t.Cleanup(func() { closeBody(listener) })
+		t.Cleanup(func() { closeQuietly(listener) })
 	}
 
 	require.Len(t, failures, 7, "publication must have exactly one winner")
@@ -156,7 +156,7 @@ func TestOriginSocketPublicationConcurrent(t *testing.T) {
 
 	conn, err := net.DialTimeout("unix", path, time.Second)
 	require.NoError(t, err)
-	closeBody(conn)
+	closeQuietly(conn)
 }
 
 func TestOriginSocketPublicationPathLimit(t *testing.T) {
@@ -176,7 +176,7 @@ func TestOriginSocketPublicationPathLimit(t *testing.T) {
 
 		conn, err := net.DialTimeout("unix", path, time.Second)
 		require.NoError(t, err)
-		closeBody(conn)
+		closeQuietly(conn)
 		cleanup()
 
 		entries, err := os.ReadDir(dir)

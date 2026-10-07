@@ -1,12 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racersdktest provides a local, noncaching Racer test helper backed by
-// the real SDK client and origin server. It does not require a deployed Racer.
+// Package racersdktest runs an in-process fake Racer so tests can exercise a
+// real [racersdk.Client] and [racersdk.Origin] without a deployed Racer.
 package racersdktest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk"
@@ -23,40 +25,41 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
-// NewClient returns a real Client backed by a sequential, noncaching fake Racer
-// and the SDK's real origin validation/serving machinery. It is a test helper,
-// not a Racer implementation or evidence of real Racer compatibility. Client
-// and origin resource defaults apply. A nil origin is invalid.
-//
-// Private temporary Unix sockets exercise the production socket path without
-// /run provisioning or production endpoint overrides.
-// TMPDIR must permit socket paths of at most 107 bytes; longer paths fail clearly.
-//
-// The fake forwards request metadata and authorization unchanged. It supports
-// v2 HEAD and credit-controlled subscriptions, forwarding pinned continuations
-// as whole-page origin requests without object-sized buffering. Origin callback
-// errors before response headers retain their HTTP classification; later errors
-// abort the stream. Origin must obey racersdk.ServeOrigin's cancellation/body
-// ownership contract.
-//
-// Always call the returned concurrent-safe, idempotent cleanup function (for
-// example with t.Cleanup). It closes the Client, cancels origin work, stops both
-// servers, waits for serving and fake subscription goroutines, and removes the
-// temporary directory. Client.Close alone does not stop the servers. Cleanup
-// does not wait for callbacks that ignore cancellation; late bodies are closed.
-func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
-	if origin == nil {
-		return nil, nil, sdkhook.InvalidOrigin()
-	}
+// Limits of the SDK origin server that the fake Racer must respect.
+const (
+	originHeadRequests = 4
+	originHeaderWait   = 5 * time.Second
+	originRequestWait  = 60 * time.Second
+	originIdleTimeout  = 30 * time.Second
+)
 
-	volume, err := racersdk.ParseVolumeName("sdk-fake")
+// NewClient returns a [racersdk.Client] connected to origin through an
+// in-process fake Racer, for testing code that reads objects, implements an
+// [racersdk.Origin], or both.
+//
+// The fake does not cache: every Get and Stat calls origin, through the same
+// validation and serving code that [racersdk.ServeOrigin] uses. It is not
+// evidence of compatibility with a real Racer.
+//
+// Everything is stopped and removed when the test ends. NewClient calls
+// t.Fatal if it cannot start, for example if TMPDIR is so long that a Unix
+// socket path inside it would exceed 107 bytes.
+func NewClient(t testing.TB, origin racersdk.Origin) *racersdk.Client {
+	t.Helper()
+
+	client, cleanup, err := start(origin)
 	if err != nil {
-		return nil, nil, err
+		t.Fatalf("racersdktest: %v", err)
 	}
 
-	defaults, ok := sdkhook.OriginDefaults.(func(racersdk.OriginConfig) (racersdk.OriginConfig, error))
-	if !ok {
-		panic("racersdktest: invalid OriginDefaults hook")
+	t.Cleanup(cleanup)
+
+	return client
+}
+
+func start(origin racersdk.Origin) (*racersdk.Client, func(), error) {
+	if origin == nil {
+		return nil, nil, errors.New("nil origin")
 	}
 
 	newClient, ok := sdkhook.NewClientAt.(func(racersdk.ClientConfig, string) (*racersdk.Client, error))
@@ -69,10 +72,7 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 		panic("racersdktest: invalid ServeOriginAt hook")
 	}
 
-	config, err := defaults(racersdk.OriginConfig{Volume: volume})
-	if err != nil {
-		return nil, nil, err
-	}
+	const volume = "sdk-fake"
 
 	dir, err := socketDir()
 	if err != nil {
@@ -88,14 +88,14 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	transport := originTransport(ctx, config, originPath)
-	metadataTransport := originTransport(ctx, config, originPath)
-	metadataTransport.MaxConnsPerHost = config.MaxConcurrentHeadRequests
-	metadataTransport.MaxIdleConns = config.MaxConcurrentHeadRequests
-	metadataTransport.MaxIdleConnsPerHost = config.MaxConcurrentHeadRequests
+	transport := originTransport(ctx, originPath)
+	metadataTransport := originTransport(ctx, originPath)
+	metadataTransport.MaxConnsPerHost = originHeadRequests
+	metadataTransport.MaxIdleConns = originHeadRequests
+	metadataTransport.MaxIdleConnsPerHost = originHeadRequests
 	handler := &trackedHandler{next: fakeracer.NewHandler(originTransports{bulk: transport, metadata: metadataTransport})}
 	server := &http.Server{
-		ReadHeaderTimeout: config.ReadHeaderTimeout, IdleTimeout: config.IdleTimeout,
+		ReadHeaderTimeout: originHeaderWait, IdleTimeout: originIdleTimeout,
 		MaxHeaderBytes: wire.MaxHeadBytes, ErrorLog: log.New(io.Discard, "", 0),
 		BaseContext: func(net.Listener) context.Context { return ctx },
 		Handler:     handler,
@@ -126,7 +126,7 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 	originDone := make(chan error, 1)
 
 	serving.Go(func() {
-		originDone <- serveOrigin(ctx, config, origin, originPath)
+		originDone <- serveOrigin(ctx, racersdk.OriginConfig{Volume: volume}, origin, originPath)
 	})
 
 	if err := waitOrigin(originPath, originDone); err != nil {
@@ -135,7 +135,7 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 
 	listener, err := net.Listen("unix", clientPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("racersdktest: fake listen: %w", err)
+		return nil, nil, fmt.Errorf("fake listen: %w", err)
 	}
 
 	serving.Go(func() {
@@ -156,7 +156,7 @@ func NewClient(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 func socketDir() (string, error) {
 	dir, err := os.MkdirTemp("", "rs-")
 	if err != nil {
-		return "", fmt.Errorf("racersdktest: temporary directory: %w", err)
+		return "", fmt.Errorf("temporary directory: %w", err)
 	}
 
 	ready := false
@@ -169,16 +169,16 @@ func socketDir() (string, error) {
 
 	absolute, err := filepath.Abs(dir)
 	if err != nil {
-		return "", fmt.Errorf("racersdktest: absolute temporary directory: %w", err)
+		return "", fmt.Errorf("absolute temporary directory: %w", err)
 	}
 
 	resolved, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
-		return "", fmt.Errorf("racersdktest: resolve temporary directory: %w", err)
+		return "", fmt.Errorf("resolve temporary directory: %w", err)
 	}
 
 	if length := len(filepath.Join(resolved, "o")); length > 107 {
-		return "", fmt.Errorf("racersdktest: Unix socket path exceeds 107-byte limit (%d bytes); use a shorter TMPDIR", length)
+		return "", fmt.Errorf("unix socket path exceeds 107-byte limit (%d bytes); use a shorter TMPDIR", length)
 	}
 
 	ready = true
@@ -199,10 +199,10 @@ func (t originTransports) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.bulk.RoundTrip(r)
 }
 
-func originTransport(ctx context.Context, config racersdk.OriginConfig, path string) *http.Transport {
+func originTransport(ctx context.Context, path string) *http.Transport {
 	return &http.Transport{
 		DisableCompression: true, MaxConnsPerHost: 16, MaxIdleConns: 16, MaxIdleConnsPerHost: 16,
-		ResponseHeaderTimeout: config.RequestTimeout, IdleConnTimeout: config.IdleTimeout,
+		ResponseHeaderTimeout: originRequestWait, IdleConnTimeout: originIdleTimeout,
 		MaxResponseHeaderBytes: int64(wire.MaxHeadBytes),
 		DialContext: func(dialCtx context.Context, _, _ string) (net.Conn, error) {
 			dialCtx, stop := context.WithCancel(dialCtx)
@@ -211,7 +211,7 @@ func originTransport(ctx context.Context, config racersdk.OriginConfig, path str
 			unhook := context.AfterFunc(ctx, stop)
 			defer unhook()
 
-			return (&net.Dialer{Timeout: config.ReadHeaderTimeout}).DialContext(dialCtx, "unix", path)
+			return (&net.Dialer{Timeout: originHeaderWait}).DialContext(dialCtx, "unix", path)
 		},
 	}
 }
@@ -265,9 +265,9 @@ func waitOrigin(path string, done <-chan error) error {
 
 		select {
 		case err := <-done:
-			return fmt.Errorf("racersdktest: origin startup: %w", err)
+			return fmt.Errorf("origin startup: %w", err)
 		case <-ctx.Done():
-			return fmt.Errorf("racersdktest: origin startup: %w", ctx.Err())
+			return fmt.Errorf("origin startup: %w", ctx.Err())
 		case <-ticker.C:
 		}
 	}

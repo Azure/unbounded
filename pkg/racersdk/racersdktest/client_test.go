@@ -6,7 +6,9 @@ package racersdktest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,18 +23,49 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-func originMeta(size racersdk.ByteLength) racersdk.Metadata {
-	tag, _ := racersdk.ParseETag(`"v"`)
-	return racersdk.Metadata{Size: size, ETag: tag, ExpiresAt: time.UnixMilli(0)}
+func originMeta(size int64) racersdk.Metadata {
+	return racersdk.Metadata{Size: size, ETag: `"v"`, ExpiresAt: time.UnixMilli(0)}
 }
 
-func assertKind(t *testing.T, err error, kind racersdk.ErrorKind) {
+func assertIs(t *testing.T, err, target error) {
 	t.Helper()
 
-	var typed *racersdk.Error
-	if !errors.As(err, &typed) || typed.Kind() != kind {
-		t.Fatalf("error = %v; want kind %v", err, kind)
+	if !errors.Is(err, target) {
+		t.Fatalf("error = %v; want %v", err, target)
 	}
+}
+
+var sentinels = []error{
+	racersdk.ErrInvalidRequest, racersdk.ErrUnauthorized, racersdk.ErrForbidden, racersdk.ErrNotFound,
+	racersdk.ErrVersionMismatch, racersdk.ErrRangeNotSatisfiable, racersdk.ErrUnavailable,
+}
+
+// assertBadGateway checks for a failure that matches no package error.
+func assertBadGateway(t *testing.T, err error) {
+	t.Helper()
+
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	for _, sentinel := range sentinels {
+		if errors.Is(err, sentinel) {
+			t.Fatalf("error = %v; want no package error, got %v", err, sentinel)
+		}
+	}
+}
+
+func startClient(t *testing.T, origin racersdk.Origin) (*racersdk.Client, func()) {
+	t.Helper()
+
+	client, cleanup, err := start(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(cleanup)
+
+	return client, cleanup
 }
 
 type ownedReader struct {
@@ -94,108 +127,92 @@ func (b *fakeLateBody) Close() error           { close(b.closed); return nil }
 
 func TestFakeClientOriginValidation(t *testing.T) {
 	for _, test := range []struct {
-		name string
-		size racersdk.ByteLength
-		data string
-		kind racersdk.ErrorKind
+		name       string
+		size       int64
+		data       string
+		badGateway bool
 	}{
-		{name: "short", size: 3, data: "ab", kind: racersdk.ErrorIO},
-		{name: "long", size: 1, data: "ab", kind: racersdk.ErrorIO},
-		{name: "empty excess", data: "x", kind: racersdk.ErrorBadGateway},
-		{name: "invalid metadata", kind: racersdk.ErrorBadGateway},
+		{name: "short", size: 3, data: "ab"},
+		{name: "long", size: 1, data: "ab"},
+		{name: "empty excess", data: "x", badGateway: true},
+		{name: "invalid metadata", badGateway: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			body := &ownedReader{Reader: strings.NewReader(test.data)}
 
-			client, cleanup, err := NewClient(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client, _ := startClient(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 				m := originMeta(test.size)
 				if test.name == "invalid metadata" {
-					m.ETag = racersdk.ETag{}
+					m.ETag = ""
 				}
 
 				return m, body, nil
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
 
 			v, err := client.Get(context.Background(), racersdk.Request{})
 			if err == nil {
 				_, err = io.Copy(io.Discard, v)
-				closeBody(v)
+				v.Close()
 			}
 
-			assertKind(t, err, test.kind)
+			if test.badGateway {
+				assertBadGateway(t, err)
+			} else {
+				assertIs(t, err, racersdk.ErrUnavailable)
+				assertIs(t, err, io.ErrUnexpectedEOF)
+			}
+
 			waitClosed(t, body)
-
-			if body.closed.Load() != 1 {
-				t.Fatal("origin body not closed exactly once")
-			}
 		})
 	}
 }
 
 func TestFakeClientErrors(t *testing.T) {
-	client, cleanup, err := NewClient(nil)
-	assertKind(t, err, racersdk.ErrorInvalidArgument)
-
-	if client != nil || cleanup != nil {
-		t.Fatal("invalid construction returned resources")
+	client, cleanup, err := start(nil)
+	if err == nil || client != nil || cleanup != nil {
+		t.Fatal("nil origin returned resources", err)
 	}
 
-	if err.Error() != "racersdk fake origin: invalid argument" {
-		t.Fatal("nil origin error changed", err)
-	}
+	for _, want := range []error{racersdk.ErrUnauthorized, racersdk.ErrForbidden, racersdk.ErrNotFound, racersdk.ErrVersionMismatch, racersdk.ErrUnavailable, nil} {
+		name := "plain"
+		if want != nil {
+			name = want.Error()
+		}
 
-	for _, kind := range []racersdk.ErrorKind{racersdk.ErrorUnauthorized, racersdk.ErrorForbidden, racersdk.ErrorNotFound, racersdk.ErrorVersionUnavailable, racersdk.ErrorUnavailable, racersdk.ErrorInternal} {
-		t.Run(kind.String(), func(t *testing.T) {
+		t.Run(name, func(t *testing.T) {
 			body := &ownedReader{Reader: strings.NewReader("")}
 
-			client, cleanup, err := NewClient(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-				return racersdk.Metadata{}, body, racersdk.NewOriginError(kind, nil)
+			client, _ := startClient(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				if want == nil {
+					return racersdk.Metadata{}, body, errors.New("backend failed")
+				}
+
+				return racersdk.Metadata{}, body, fmt.Errorf("backend: %w", want)
 			})
-			if err != nil {
-				t.Fatal(err)
+
+			_, err := client.Get(context.Background(), racersdk.Request{})
+			if want == nil {
+				assertBadGateway(t, err)
+			} else {
+				assertIs(t, err, want)
 			}
 
-			t.Cleanup(cleanup)
-
-			_, err = client.Get(context.Background(), racersdk.Request{})
-			assertKind(t, err, kind)
 			waitClosed(t, body)
-
-			if body.closed.Load() != 1 {
-				t.Fatal("error body leaked")
-			}
 		})
 	}
 }
 
 func TestFakeClientContinuationErrors(t *testing.T) {
-	for _, failPage := range []int32{1, 2} {
+	for _, failPage := range []int64{1, 2} {
 		t.Run(strconv.Itoa(int(failPage)), func(t *testing.T) {
-			client, cleanup, err := NewClient(func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client, _ := startClient(t, func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 				// Fail the selected page, not whichever callback arrives first.
-				requested, _ := r.Range()
-
-				first, _, err := requested.Resolve(3 * racersdk.PageSize)
-				if err != nil {
-					return racersdk.Metadata{}, nil, err
+				if r.Offset/racersdk.PageSize == failPage {
+					return racersdk.Metadata{}, nil, racersdk.ErrNotFound
 				}
 
-				if uint64(first)/uint64(racersdk.PageSize) == uint64(failPage) {
-					return racersdk.Metadata{}, nil, racersdk.NewOriginError(racersdk.ErrorNotFound, nil)
-				}
-
-				return originMeta(3 * racersdk.PageSize), io.NopCloser(io.LimitReader(repeatedByte('x'), int64(racersdk.PageSize))), nil
+				return originMeta(3 * racersdk.PageSize), io.NopCloser(io.LimitReader(repeatedByte('x'), racersdk.PageSize)), nil
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
 
 			v, err := client.Get(context.Background(), racersdk.Request{})
 			if err != nil {
@@ -203,7 +220,7 @@ func TestFakeClientContinuationErrors(t *testing.T) {
 			}
 
 			n, err := io.Copy(io.Discard, v)
-			if n != int64(failPage)*int64(racersdk.PageSize) {
+			if n != failPage*racersdk.PageSize {
 				t.Fatal("incorrect partial byte count", n)
 			}
 
@@ -219,14 +236,9 @@ func TestFakeClientCancellationAndCleanup(t *testing.T) {
 		t.Run(action, func(t *testing.T) {
 			body := &blockedBody{done: make(chan struct{}), first: true}
 
-			client, cleanup, err := NewClient(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client, cleanup := startClient(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 				return originMeta(1), body, nil
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -244,9 +256,9 @@ func TestFakeClientCancellationAndCleanup(t *testing.T) {
 			case "context":
 				cancel()
 			case "value":
-				closeBody(v)
+				v.Close()
 			case "client":
-				closeBody(client)
+				client.Close()
 			case "cleanup":
 				var wg sync.WaitGroup
 				for range 4 {
@@ -259,11 +271,9 @@ func TestFakeClientCancellationAndCleanup(t *testing.T) {
 			select {
 			case err := <-result:
 				if action == "context" {
-					if !errors.Is(err, context.Canceled) {
-						t.Fatal(err)
-					}
+					assertIs(t, err, context.Canceled)
 				} else {
-					assertKind(t, err, racersdk.ErrorClosed)
+					assertIs(t, err, net.ErrClosed)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("read did not stop")
@@ -278,7 +288,7 @@ func TestFakeClientCancellationAndCleanup(t *testing.T) {
 			cleanup()
 
 			_, err = client.Get(context.Background(), racersdk.Request{})
-			assertKind(t, err, racersdk.ErrorClosed)
+			assertIs(t, err, net.ErrClosed)
 
 			if body.closed.Load() != 1 {
 				t.Fatal("body close count", body.closed.Load())
@@ -290,18 +300,13 @@ func TestFakeClientCancellationAndCleanup(t *testing.T) {
 func TestFakeClientPendingCallbackCleanup(t *testing.T) {
 	entered, release, closed := make(chan struct{}), make(chan struct{}), make(chan struct{})
 
-	client, cleanup, err := NewClient(func(ctx context.Context, _ racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+	client, cleanup := startClient(t, func(ctx context.Context, _ racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		close(entered)
 		<-ctx.Done()
 		<-release
 
 		return originMeta(0), &fakeLateBody{closed: closed}, nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(cleanup)
 
 	result := make(chan error, 1)
 
@@ -313,7 +318,7 @@ func TestFakeClientPendingCallbackCleanup(t *testing.T) {
 
 	select {
 	case err := <-result:
-		assertKind(t, err, racersdk.ErrorClosed)
+		assertIs(t, err, net.ErrClosed)
 	case <-time.After(5 * time.Second):
 		t.Fatal("pending Get retained")
 	}
@@ -332,8 +337,8 @@ func TestFakeClientMetadataUnderSaturation(t *testing.T) {
 
 			entered := make(chan *blockedBody, connections)
 
-			client, cleanup, err := NewClient(func(ctx context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-				if r.Operation() == racersdk.OperationHead {
+			client, cleanup := startClient(t, func(ctx context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				if r.Head {
 					return originMeta(1), nil, nil
 				}
 
@@ -350,9 +355,6 @@ func TestFakeClientMetadataUnderSaturation(t *testing.T) {
 
 				return originMeta(1), body, nil
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
 
 			results := make(chan error, connections)
 
@@ -379,7 +381,7 @@ func TestFakeClientMetadataUnderSaturation(t *testing.T) {
 					v, err := client.Get(context.Background(), racersdk.Request{})
 					if err == nil {
 						_, err = io.Copy(io.Discard, v)
-						closeBody(v)
+						v.Close()
 					}
 
 					results <- err
@@ -431,30 +433,18 @@ func TestFakeClientMetadataUnderSaturation(t *testing.T) {
 func TestFakeClientImmutableContinuation(t *testing.T) {
 	for _, change := range []string{"pin", "size"} {
 		t.Run(change, func(t *testing.T) {
-			client, cleanup, err := NewClient(func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client, _ := startClient(t, func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 				m := originMeta(3 * racersdk.PageSize)
-				page, _ := r.Range()
-
-				first, _, err := page.Resolve(m.Size)
-				if err != nil {
-					return racersdk.Metadata{}, nil, err
-				}
-
-				if first == racersdk.ByteOffset(2*racersdk.PageSize) {
+				if r.Offset == 2*racersdk.PageSize {
 					if change == "pin" {
-						m.ETag, _ = racersdk.ParseETag(`"different"`)
+						m.ETag = `"different"`
 					} else {
 						m.Size++
 					}
 				}
 
-				return m, io.NopCloser(io.LimitReader(repeatedByte('x'), int64(racersdk.PageSize))), nil
+				return m, io.NopCloser(io.LimitReader(repeatedByte('x'), racersdk.PageSize)), nil
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
 
 			v, err := client.Get(context.Background(), racersdk.Request{})
 			if err != nil {
@@ -462,7 +452,7 @@ func TestFakeClientImmutableContinuation(t *testing.T) {
 			}
 
 			n, err := io.Copy(io.Discard, v)
-			if n != 2*int64(racersdk.PageSize) {
+			if n != 2*racersdk.PageSize {
 				t.Fatal("changed immutable version was accepted", n, err)
 			}
 
@@ -476,22 +466,17 @@ func TestFakeClientImmutableContinuation(t *testing.T) {
 func TestFakeClientFreshGets(t *testing.T) {
 	var calls atomic.Int32
 
-	client, cleanup, err := NewClient(func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-		if r.Operation() != racersdk.OperationBootstrap {
+	client, _ := startClient(t, func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		if r.ETag != "" {
 			t.Error("fresh Get reused a pin")
 		}
 
 		version := strconv.Itoa(int(calls.Add(1)))
 		m := originMeta(1)
-		m.ETag, _ = racersdk.ParseETag(`"` + version + `"`)
+		m.ETag = `"` + version + `"`
 
 		return m, io.NopCloser(strings.NewReader(version)), nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(cleanup)
 
 	for _, want := range []string{"1", "2"} {
 		v, err := client.Get(context.Background(), racersdk.Request{})
@@ -500,9 +485,9 @@ func TestFakeClientFreshGets(t *testing.T) {
 		}
 
 		data, err := io.ReadAll(v)
-		closeBody(v)
+		v.Close()
 
-		if err != nil || string(data) != want || v.Metadata().ETag.String() != `"`+want+`"` {
+		if err != nil || string(data) != want || v.Metadata().ETag != `"`+want+`"` {
 			t.Fatal("fresh Get did not select a fresh version", err)
 		}
 	}
@@ -512,14 +497,9 @@ func TestTemporarySockets(t *testing.T) {
 	parent := t.TempDir()
 	t.Setenv("TMPDIR", parent)
 
-	client, cleanup, err := NewClient(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+	client, cleanup := startClient(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 		return originMeta(0), nil, nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(cleanup)
 
 	entries, err := os.ReadDir(parent)
 	if err != nil || len(entries) != 1 {
@@ -534,7 +514,7 @@ func TestTemporarySockets(t *testing.T) {
 		}
 	}
 
-	closeBody(client)
+	client.Close()
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatal("Client.Close stopped servers", err)
@@ -569,14 +549,9 @@ func TestTMPDIRCanonicalPaths(t *testing.T) {
 				t.Setenv("TMPDIR", filepath.Join(link, "tmp"))
 			}
 
-			client, cleanup, err := NewClient(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client, cleanup := startClient(t, func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 				return originMeta(5), io.NopCloser(strings.NewReader("hello")), nil
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(cleanup)
 
 			entries, err := os.ReadDir(parent)
 			if err != nil || len(entries) != 1 {
@@ -597,7 +572,7 @@ func TestTMPDIRCanonicalPaths(t *testing.T) {
 			}
 
 			data, err := io.ReadAll(v)
-			closeBody(v)
+			v.Close()
 
 			if err != nil || string(data) != "hello" {
 				t.Fatal("Get round trip", string(data), err)
@@ -624,7 +599,7 @@ func TestTemporarySocketFailures(t *testing.T) {
 
 			t.Setenv("TMPDIR", parent)
 
-			client, cleanup, err := NewClient(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			client, cleanup, err := start(func(context.Context, racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 				return originMeta(0), nil, nil
 			})
 			if err == nil || client != nil || cleanup != nil {

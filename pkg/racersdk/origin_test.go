@@ -53,12 +53,7 @@ func TestOwnedOriginCrashChild(t *testing.T) {
 		return
 	}
 
-	volume, err := ParseVolumeName("gantry")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = serveOrigin(context.Background(), OriginConfig{Volume: volume, RecoverStaleSocket: true},
+	err := serveOrigin(context.Background(), OriginConfig{Volume: "gantry", RecoverStaleSocket: true},
 		func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) { return originMeta(0), nil, nil }, path)
 	t.Fatal(err)
 }
@@ -89,7 +84,7 @@ func TestOwnedOriginSIGKILLRestart(t *testing.T) {
 		for {
 			conn, err := net.DialTimeout("unix", path, 50*time.Millisecond)
 			if err == nil {
-				closeBody(conn)
+				closeQuietly(conn)
 				break
 			}
 
@@ -105,7 +100,7 @@ func TestOwnedOriginSIGKILLRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		closeBody(value)
+		closeQuietly(value)
 
 		before, err := os.Lstat(path)
 		if err != nil {
@@ -161,14 +156,24 @@ func TestOwnedOriginSIGKILLRestart(t *testing.T) {
 	}
 }
 
-func startOrigin(t *testing.T, config OriginConfig, origin Origin) (string, context.CancelFunc, <-chan error) {
+// startOrigin serves origin with default limits, adjusted by tune when set.
+func startOrigin(t testing.TB, tune func(*originLimits), origin Origin) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
 	path := filepath.Join(socketDir(t), "socket")
-	config.Volume = VolumeName{value: "test"}
+
+	limits, err := OriginConfig{Volume: "test"}.limits()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if tune != nil {
+		tune(&limits)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 
-	go func() { done <- serveOrigin(ctx, config, origin, path) }()
+	go func() { done <- serveOriginLimits(ctx, limits, origin, path) }()
 
 	t.Cleanup(func() { cancel() })
 
@@ -203,7 +208,7 @@ func originDial(t *testing.T, path string) net.Conn {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { closeBody(conn) })
+	t.Cleanup(func() { closeQuietly(conn) })
 
 	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -225,13 +230,13 @@ func originExchange(t *testing.T, path, method, fields string) *http.Response {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { closeBody(response.Body) })
+	t.Cleanup(func() { closeQuietly(response.Body) })
 
 	return response
 }
 
-func originMeta(size ByteLength) Metadata {
-	return Metadata{Size: size, ETag: ETag{value: `"v"`}, ExpiresAt: time.UnixMilli(0)}
+func originMeta(size int64) Metadata {
+	return Metadata{Size: size, ETag: `"v"`, ExpiresAt: time.UnixMilli(0)}
 }
 
 type ownedReader struct {
@@ -257,14 +262,14 @@ func waitClosed(t *testing.T, b *ownedReader) {
 func TestOriginOperationsAndReuse(t *testing.T) {
 	var calls atomic.Int32
 
-	path, cancel, done := startOrigin(t, OriginConfig{}, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+	path, cancel, done := startOrigin(t, nil, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
 		calls.Add(1)
 
-		if r.Context().Authorization().ForOrigin() != "secret\xff" {
+		if r.Authorization != "secret\xff" {
 			t.Error("context changed")
 		}
 
-		if r.Operation() == OperationHead {
+		if r.Head {
 			return originMeta(PageSize + 1), nil, nil
 		}
 
@@ -285,7 +290,7 @@ func TestOriginOperationsAndReuse(t *testing.T) {
 		}
 
 		body, err := io.ReadAll(response.Body)
-		closeBody(response.Body)
+		closeQuietly(response.Body)
 
 		if err != nil {
 			t.Fatal(err)
@@ -337,7 +342,7 @@ func testOriginInterruptedPipelinedHead(t *testing.T, split int, fields string, 
 
 	var calls atomic.Int32
 
-	path, cancel, done := startOrigin(t, OriginConfig{}, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
+	path, cancel, done := startOrigin(t, nil, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
 		if calls.Add(1) == 1 {
 			close(entered)
 
@@ -373,7 +378,7 @@ func testOriginInterruptedPipelinedHead(t *testing.T, split int, fields string, 
 	reader := bufio.NewReader(conn)
 	response, err := http.ReadResponse(reader, &http.Request{Method: "HEAD"})
 	require.NoError(t, err)
-	closeBody(response.Body)
+	closeQuietly(response.Body)
 	require.Equal(t, http.StatusOK, response.StatusCode)
 	time.Sleep(20 * time.Millisecond)
 
@@ -381,7 +386,7 @@ func testOriginInterruptedPipelinedHead(t *testing.T, split int, fields string, 
 	require.NoError(t, err)
 	response, err = http.ReadResponse(reader, &http.Request{Method: "HEAD"})
 	require.NoError(t, err)
-	closeBody(response.Body)
+	closeQuietly(response.Body)
 	require.Equal(t, status, response.StatusCode)
 
 	if status == http.StatusOK {
@@ -398,7 +403,7 @@ func TestOriginPipelinedHeadTimeout(t *testing.T) {
 
 	var calls atomic.Int32
 
-	path, cancel, done := startOrigin(t, OriginConfig{ReadHeaderTimeout: 100 * time.Millisecond}, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
+	path, cancel, done := startOrigin(t, func(l *originLimits) { l.readHeaderTimeout = 100 * time.Millisecond }, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
 		calls.Add(1)
 		close(entered)
 
@@ -432,7 +437,7 @@ func TestOriginPipelinedHeadTimeout(t *testing.T) {
 	for _, status := range []int{http.StatusOK, http.StatusBadRequest} {
 		response, err := http.ReadResponse(reader, &http.Request{Method: "HEAD"})
 		require.NoError(t, err)
-		closeBody(response.Body)
+		closeQuietly(response.Body)
 		require.Equal(t, status, response.StatusCode)
 
 		if status == http.StatusBadRequest {
@@ -446,12 +451,12 @@ func TestOriginPipelinedHeadTimeout(t *testing.T) {
 
 func TestOriginHeadRepeatedInterruptions(t *testing.T) {
 	server, client := net.Pipe()
-	defer closeBody(server)
-	defer closeBody(client)
+	defer closeQuietly(server)
+	defer closeQuietly(client)
 
 	require.NoError(t, client.SetDeadline(time.Now().Add(3*time.Second)))
 
-	c := &originConn{Conn: server, config: OriginConfig{ReadHeaderTimeout: time.Second}}
+	c := &originConn{Conn: server, limits: originLimits{readHeaderTimeout: time.Second}}
 	wire := rawRequest("HEAD", "Authorization: secret\r\n")
 
 	var deadline time.Time
@@ -509,12 +514,12 @@ func TestOriginHeadRepeatedInterruptions(t *testing.T) {
 
 func TestOriginInterruptedHeadExpiredWithBufferedRemainder(t *testing.T) {
 	server, client := net.Pipe()
-	defer closeBody(server)
-	defer closeBody(client)
+	defer closeQuietly(server)
+	defer closeQuietly(client)
 
 	wire := rawRequest("HEAD", "")
 	c := &originConn{
-		Conn: server, first: true, config: OriginConfig{ReadHeaderTimeout: time.Second},
+		Conn: server, first: true, limits: originLimits{readHeaderTimeout: time.Second},
 		raw: wire[:1], reader: bufio.NewReader(bytes.NewReader(wire[1:])),
 		headerDeadline: time.Now().Add(-time.Millisecond),
 	}
@@ -542,7 +547,7 @@ func TestOriginBodyContracts(t *testing.T) {
 				fields += "If-Match: \"other\"\r\n"
 			}
 
-			path, cancel, done := startOrigin(t, OriginConfig{}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+			path, cancel, done := startOrigin(t, nil, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 				m := originMeta(3)
 
 				switch mode {
@@ -565,15 +570,15 @@ func TestOriginBodyContracts(t *testing.T) {
 					m.Size = 0
 					body.Reader = errorReader{}
 				case "callback-error":
-					return Metadata{}, body, NewOriginError(ErrorForbidden, errors.New("secret"))
+					return Metadata{}, body, fmt.Errorf("%w: %w", ErrForbidden, errors.New("secret"))
 				case "panic-callback":
 					panic("private credential")
 				case "metadata":
-					m.ETag = ETag{}
+					m.ETag = ""
 				case "416-invalid":
-					return Metadata{}, body, NewOriginError(ErrorUnsatisfiableRange, nil)
+					return Metadata{}, body, ErrRangeNotSatisfiable
 				case "416-valid":
-					return m, body, NewOriginError(ErrorUnsatisfiableRange, nil)
+					return m, body, ErrRangeNotSatisfiable
 				}
 
 				return m, body, nil
@@ -597,8 +602,12 @@ func TestOriginBodyContracts(t *testing.T) {
 				if !errors.Is(err, io.ErrUnexpectedEOF) || len(got) >= 3 {
 					t.Fatal("late failure not truncated", string(got), err)
 				}
+			case "head-body":
+				status = 200
 			case "callback-error":
 				status = 403
+			case "pin":
+				status = 412
 			case "panic-callback":
 				status = 500
 			case "416-valid":
@@ -638,7 +647,7 @@ func (errorReader) Read([]byte) (int, error) { return 0, errors.New("secret erro
 func TestOriginRawMaliciousRequests(t *testing.T) {
 	var calls atomic.Int32
 
-	path, cancel, done := startOrigin(t, OriginConfig{}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+	path, cancel, done := startOrigin(t, nil, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 		calls.Add(1)
 		return originMeta(0), nil, nil
 	})
@@ -695,7 +704,7 @@ func (b *blockedBody) Close() error { b.closed.Add(1); b.once.Do(func() { close(
 func TestOriginProbeCancellation(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
-		size    ByteLength
+		size    int64
 		timeout time.Duration
 		status  int
 		readErr error
@@ -705,7 +714,7 @@ func TestOriginProbeCancellation(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			body := &blockedBody{done: make(chan struct{}), first: tt.size == 0}
-			path, cancel, done := startOrigin(t, OriginConfig{RequestTimeout: tt.timeout}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+			path, cancel, done := startOrigin(t, func(l *originLimits) { l.requestTimeout = tt.timeout }, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 				return originMeta(tt.size), body, nil
 			})
 
@@ -730,7 +739,7 @@ func TestOriginProbeCancellation(t *testing.T) {
 func TestOriginLateCallbackAndSaturation(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	body := &ownedReader{Reader: strings.NewReader("")}
-	path, cancel, done := startOrigin(t, OriginConfig{MaxConcurrentHeadRequests: 1, RequestTimeout: 50 * time.Millisecond}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+	path, cancel, done := startOrigin(t, func(l *originLimits) { l.maxHeadRequests, l.requestTimeout = 1, 50*time.Millisecond }, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 		close(entered)
 		<-release
 
@@ -758,7 +767,7 @@ func TestOriginLateCallbackAndSaturation(t *testing.T) {
 		t.Fatal("deadline before headers", err)
 	}
 
-	closeBody(response.Body)
+	closeQuietly(response.Body)
 
 	response = originExchange(t, path, "HEAD", "")
 	if response.StatusCode != 503 {
@@ -781,7 +790,7 @@ func TestOriginDisconnectAndServerCancel(t *testing.T) {
 	for _, serverCancel := range []bool{false, true} {
 		t.Run(strconv.FormatBool(serverCancel), func(t *testing.T) {
 			entered, canceled := make(chan struct{}), make(chan struct{})
-			path, cancel, done := startOrigin(t, OriginConfig{}, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
+			path, cancel, done := startOrigin(t, nil, func(ctx context.Context, _ OriginRequest) (Metadata, io.ReadCloser, error) {
 				close(entered)
 				<-ctx.Done()
 				close(canceled)
@@ -799,7 +808,7 @@ func TestOriginDisconnectAndServerCancel(t *testing.T) {
 			if serverCancel {
 				cancel()
 			} else {
-				closeBody(conn)
+				closeQuietly(conn)
 			}
 
 			select {
@@ -810,7 +819,7 @@ func TestOriginDisconnectAndServerCancel(t *testing.T) {
 
 			cancel()
 			<-done
-			closeBody(conn)
+			closeQuietly(conn)
 		})
 	}
 }
@@ -818,7 +827,9 @@ func TestOriginDisconnectAndServerCancel(t *testing.T) {
 func TestOriginConnectionAndHeaderLimits(t *testing.T) {
 	var calls atomic.Int32
 
-	path, cancel, done := startOrigin(t, OriginConfig{MaxConnections: 1, ReadHeaderTimeout: 80 * time.Millisecond, IdleTimeout: 40 * time.Millisecond}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+	path, cancel, done := startOrigin(t, func(l *originLimits) {
+		l.maxConnections, l.readHeaderTimeout, l.idleTimeout = 1, 80*time.Millisecond, 40*time.Millisecond
+	}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 		calls.Add(1)
 		return originMeta(0), nil, nil
 	})
@@ -829,7 +840,7 @@ func TestOriginConnectionAndHeaderLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer closeBody(first)
+	defer closeQuietly(first)
 
 	if _, err := io.WriteString(first, "HEAD "); err != nil {
 		t.Fatal(err)
@@ -839,7 +850,7 @@ func TestOriginConnectionAndHeaderLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer closeBody(second)
+	defer closeQuietly(second)
 
 	if _, err := second.Write(rawRequest("HEAD", "")); err != nil {
 		t.Fatal(err)
@@ -860,7 +871,7 @@ func TestOriginConnectionAndHeaderLimits(t *testing.T) {
 		t.Fatal("slot not released after slow header", err)
 	}
 
-	closeBody(response.Body)
+	closeQuietly(response.Body)
 
 	var one [1]byte
 	if _, err := second.Read(one[:]); err != io.EOF {
@@ -871,25 +882,26 @@ func TestOriginConnectionAndHeaderLimits(t *testing.T) {
 func TestOriginSelectedRangeErrors(t *testing.T) {
 	for _, tt := range []struct {
 		fields string
-		size   ByteLength
-		kind   ErrorKind
+		size   int64
+		err    error
 		status int
 	}{
-		{"Range: bytes=0-0\r\nIf-Match: \"v\"\r\n", 3, 0, 400},
-		{"Range: bytes=16777216-33554431\r\nIf-Match: \"v\"\r\n", 3, 0, 416},
-		{"Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\n", 3, ErrorNotFound, 412},
-		{"Range: bytes=0-16777215\r\n", 0, ErrorNotFound, 404},
-		{"Range: bytes=0-16777215\r\n", 0, ErrorUnauthorized, 401},
+		{"Range: bytes=0-0\r\nIf-Match: \"v\"\r\n", 3, nil, 400},
+		{"Range: bytes=16777216-33554431\r\nIf-Match: \"v\"\r\n", 3, nil, 416},
+		{"Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\n", 3, ErrNotFound, 412},
+		{"Range: bytes=0-16777215\r\n", 0, ErrNotFound, 404},
+		{"Range: bytes=0-16777215\r\n", 0, ErrUnauthorized, 401},
+		{"Range: bytes=0-16777215\r\n", 0, ErrForbidden, 403},
+		{"Range: bytes=0-16777215\r\n", 0, ErrVersionMismatch, 412},
+		{"Range: bytes=0-16777215\r\n", 0, ErrInvalidRequest, 400},
+		{"Range: bytes=0-16777215\r\n", 0, ErrUnavailable, 503},
+		{"Range: bytes=0-16777215\r\n", 0, context.DeadlineExceeded, 503},
+		{"Range: bytes=0-16777215\r\n", 0, errors.New("backend"), 500},
 	} {
-		t.Run(strconv.Itoa(tt.status), func(t *testing.T) {
+		t.Run(strconv.Itoa(tt.status)+"/"+fmt.Sprint(tt.err), func(t *testing.T) {
 			body := &ownedReader{Reader: strings.NewReader("")}
-			path, cancel, done := startOrigin(t, OriginConfig{}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
-				var err error
-				if tt.kind != 0 {
-					err = NewOriginError(tt.kind, nil)
-				}
-
-				return originMeta(tt.size), body, err
+			path, cancel, done := startOrigin(t, nil, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+				return originMeta(tt.size), body, tt.err
 			})
 
 			response := originExchange(t, path, "GET", tt.fields)
@@ -909,13 +921,13 @@ func TestOriginSelectedRangeErrors(t *testing.T) {
 }
 
 func TestOriginConfigAndCycles(t *testing.T) {
-	for _, config := range []OriginConfig{{}, {Volume: VolumeName{value: "test"}, MaxConnections: -1}, {Volume: VolumeName{value: "test"}, MaxConcurrentRequests: -1}, {Volume: VolumeName{value: "test"}, SocketMode: os.ModeSymlink}, {Volume: VolumeName{value: "test"}, RequestTimeout: -1}} {
-		_, err := config.defaults()
-		assertKind(t, err, ErrorInvalidArgument)
+	for _, config := range []OriginConfig{{}, {Volume: "Test"}, {Volume: "test", MaxConcurrentRequests: -1}} {
+		_, err := config.limits()
+		assertIs(t, err, ErrInvalidRequest)
 	}
 
 	for range 15 {
-		path, cancel, done := startOrigin(t, OriginConfig{}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) { return originMeta(0), nil, nil })
+		path, cancel, done := startOrigin(t, nil, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) { return originMeta(0), nil, nil })
 
 		response := originExchange(t, path, "HEAD", "")
 		if response.StatusCode != 200 {
@@ -936,7 +948,7 @@ func TestOriginConfigAndCycles(t *testing.T) {
 
 func TestOriginSlowDestination(t *testing.T) {
 	body := &ownedReader{Reader: io.LimitReader(repeatedByte('x'), int64(PageSize))}
-	path, cancel, done := startOrigin(t, OriginConfig{WriteTimeout: 30 * time.Millisecond}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+	path, cancel, done := startOrigin(t, func(l *originLimits) { l.writeTimeout = 30 * time.Millisecond }, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
 		return originMeta(PageSize), body, nil
 	})
 
@@ -953,10 +965,10 @@ func TestOriginSlowDestination(t *testing.T) {
 func TestOriginExactRawLimitsAndTarget(t *testing.T) {
 	var calls atomic.Int32
 
-	path, cancel, done := startOrigin(t, OriginConfig{}, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+	path, cancel, done := startOrigin(t, nil, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
 		calls.Add(1)
 
-		if len(r.Context().Metadata().ForOrigin()) != 8192 {
+		if len(r.Metadata) != 8192 {
 			t.Error("opaque limit not preserved")
 		}
 
@@ -994,8 +1006,8 @@ func TestOriginExactRawLimitsAndTarget(t *testing.T) {
 			t.Fatal("target accepted", err)
 		}
 
-		closeBody(response.Body)
-		closeBody(conn)
+		closeQuietly(response.Body)
+		closeQuietly(conn)
 	}
 
 	if calls.Load() != 1 {
@@ -1011,7 +1023,7 @@ func (b *panicCloser) Close() error { b.closed.Add(1); panic("credential in Clos
 
 func TestOriginClosePanicContained(t *testing.T) {
 	body := &panicCloser{}
-	path, cancel, done := startOrigin(t, OriginConfig{}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) { return originMeta(0), body, nil })
+	path, cancel, done := startOrigin(t, nil, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) { return originMeta(0), body, nil })
 
 	response := originExchange(t, path, "GET", "Range: bytes=0-16777215\r\n")
 	if response.StatusCode != 200 {
@@ -1032,8 +1044,8 @@ func TestOriginClosePanicContained(t *testing.T) {
 }
 
 func TestOriginHeadReservedFromFullBodyAdmission(t *testing.T) {
-	path, cancel, done := startOrigin(t, OriginConfig{MaxConcurrentRequests: 2, MaxConcurrentHeadRequests: 1}, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
-		if r.Operation() == OperationHead {
+	path, cancel, done := startOrigin(t, func(l *originLimits) { l.maxRequests, l.maxHeadRequests = 2, 1 }, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+		if r.Head {
 			return originMeta(1), nil, nil
 		}
 
@@ -1048,7 +1060,7 @@ func TestOriginHeadReservedFromFullBodyAdmission(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer closeBody(v)
+		defer closeQuietly(v)
 	}
 
 	ctx, stop := context.WithTimeout(context.Background(), time.Second)
@@ -1064,10 +1076,9 @@ func TestOriginSocketBindingFailuresAndWitnessCleanup(t *testing.T) {
 	dir := ownedSocketTestDir(t)
 	t.Run("missing witness directory", func(t *testing.T) {
 		_, _, err := listenOriginAtWitness(filepath.Join(dir, "missing", "socket"), 0o600)
-		assertKind(t, err, ErrorIO)
 
-		var typed *Error
-		if !errors.As(err, &typed) || typed.Operation() != "socket bind" || !errors.Is(err, os.ErrNotExist) {
+		var typed *sdkError
+		if !errors.As(err, &typed) || typed.op != "socket bind" || !errors.Is(err, os.ErrNotExist) {
 			t.Fatal("changed bind error", err)
 		}
 	})
@@ -1101,7 +1112,7 @@ func TestOriginSocketBindingFailuresAndWitnessCleanup(t *testing.T) {
 		originAssertFileContent(t, path, "keep")
 	})
 	t.Run("public validation", func(t *testing.T) {
-		assertKind(t, ServeOrigin(context.Background(), OriginConfig{}, nil), ErrorInvalidArgument)
+		assertIs(t, ServeOrigin(context.Background(), OriginConfig{}, nil), ErrInvalidRequest)
 	})
 }
 
@@ -1136,7 +1147,7 @@ func TestOwnedSocketTestDirCleanCheckout(t *testing.T) {
 
 			listener, err := net.Listen("unix", filepath.Join(dir, "socket"))
 			require.NoError(t, err)
-			t.Cleanup(func() { closeBody(listener) })
+			t.Cleanup(func() { closeQuietly(listener) })
 		})
 	}
 
@@ -1223,7 +1234,7 @@ func TestOriginSocketLifecycle(t *testing.T) {
 		t.Fatal("replaced live socket")
 	}
 
-	closeBody(l)
+	closeQuietly(l)
 
 	if _, _, err := listenOrigin(path, 0o600); err == nil {
 		t.Fatal("replaced stale socket")
@@ -1243,7 +1254,7 @@ func TestOwnedOriginRecoversWitnessBeforePublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer closeBody(anchor)
+	defer closeQuietly(anchor)
 
 	witness := fmt.Sprintf("/proc/self/fd/%d/.racer-origin.socket", anchor.Fd())
 
@@ -1253,7 +1264,7 @@ func TestOwnedOriginRecoversWitnessBeforePublication(t *testing.T) {
 	}
 
 	listener.SetUnlinkOnClose(false)
-	closeBody(listener)
+	closeQuietly(listener)
 
 	_, cleanup, err := listenOwnedOrigin(path, 0o600)
 	if err != nil {
@@ -1283,7 +1294,7 @@ func TestOwnedOriginRejectsSymlinkAncestorAndStaleReplacement(t *testing.T) {
 	}
 	defer cleanup()
 
-	closeBody(l)
+	closeQuietly(l)
 
 	if err := os.Rename(path, filepath.Join(dir, "original")); err != nil {
 		t.Fatal(err)
@@ -1295,7 +1306,7 @@ func TestOwnedOriginRejectsSymlinkAncestorAndStaleReplacement(t *testing.T) {
 	}
 
 	foreign.SetUnlinkOnClose(false)
-	closeBody(foreign)
+	closeQuietly(foreign)
 
 	before, err := os.Lstat(path)
 	if err != nil {
@@ -1353,10 +1364,10 @@ func TestOwnedOriginUnsafePathsAndForeignEndpoints(t *testing.T) {
 				listener, err = net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 				if err == nil {
 					listener.SetUnlinkOnClose(false)
-					t.Cleanup(func() { closeBody(listener) })
+					t.Cleanup(func() { closeQuietly(listener) })
 
 					if kind == "foreign-stale" {
-						closeBody(listener)
+						closeQuietly(listener)
 					}
 				}
 			}

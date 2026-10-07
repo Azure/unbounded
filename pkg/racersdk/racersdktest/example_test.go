@@ -1,63 +1,58 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package racersdktest_test
+package racersdktest_test //nolint:testableexamples // NewClient needs a *testing.T, so the example shows a test.
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk"
 	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
 
+// helloOrigin serves one five-byte object. It shows the whole origin contract:
+// honor the ETag pin, return no body for Head, and return exactly the
+// requested bytes, clamped to the end of the object.
+func helloOrigin(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+	const data = "hello"
+
+	m := racersdk.Metadata{Size: int64(len(data)), ETag: `"v1"`, ExpiresAt: time.Now().Add(time.Hour)}
+	if r.ETag != "" && r.ETag != m.ETag {
+		return m, nil, racersdk.ErrVersionMismatch
+	}
+
+	if r.Head {
+		return m, nil, nil
+	}
+
+	start, end := min(r.Offset, m.Size), min(r.Offset+r.Length, m.Size)
+
+	return m, io.NopCloser(strings.NewReader(data[start:end])), nil
+}
+
+// testGet is an ordinary test. Name it TestGet in your own _test.go file.
+func testGet(t *testing.T) {
+	client := racersdktest.NewClient(t, helloOrigin)
+
+	object, err := client.Get(t.Context(), racersdk.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Close()
+
+	data, err := io.ReadAll(object)
+	if err != nil || string(data) != "hello" {
+		t.Fatalf("Get = %q, %v", data, err)
+	}
+}
+
 func ExampleNewClient() {
-	tag, _ := racersdk.ParseETag(`"v1"`)
-
-	client, cleanup, err := racersdktest.NewClient(func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-		m := racersdk.Metadata{Size: 5, ETag: tag, ExpiresAt: time.UnixMilli(0)}
-		if err := ctx.Err(); err != nil {
-			return m, nil, err
-		}
-
-		if pin, ok := request.Pin(); ok && pin != tag {
-			return m, nil, racersdk.NewOriginError(racersdk.ErrorVersionUnavailable, nil)
-		}
-
-		if request.Operation() == racersdk.OperationHead {
-			return m, nil, nil
-		}
-
-		page, _ := request.Range()
-
-		first, last, err := page.Resolve(m.Size)
-		if err != nil {
-			return m, nil, err
-		}
-
-		return m, io.NopCloser(strings.NewReader("hello"[first : last+1])), nil
-	})
-	if err != nil {
-		panic(err)
-	}
-	defer cleanup() // In a test, use t.Cleanup(cleanup).
-
-	value, err := client.Get(context.Background(), racersdk.Request{})
-	if err != nil {
-		panic(err)
-	}
-	defer value.Close()
-
-	// io.ReadAll is appropriate for this known five-byte fixture only.
-	data, err := io.ReadAll(value)
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Println(value.Metadata().Size, string(data))
-	// Output:
-	// 5 hello
+	// Run testGet from a test function:
+	//
+	//	func TestGet(t *testing.T) { testGet(t) }
+	_ = testGet
 }
