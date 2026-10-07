@@ -1530,11 +1530,12 @@ mod hedge {
     impl Drop for Permit {
         /// Remove the alarm and return its cost only at final ownership release.
         fn drop(&mut self) {
-            if let Ok(mut state) = self.owner.state.lock()
-                && let Some(alarm) = state.alarms.remove(&self.id)
-            {
+            let alarm = self.owner.state.lock().ok().and_then(|mut state| {
+                let alarm = state.alarms.remove(&self.id)?;
                 state.used -= alarm.cost;
-            }
+                Some(alarm)
+            });
+            drop(alarm);
         }
     }
 
@@ -1793,6 +1794,65 @@ mod hedge {
             drop(permit);
             owner.poll(due);
             assert_eq!(current.0.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn hedge_permit_drop_releases_waker_outside_lock() {
+            struct ReenterOnDrop {
+                owner: std::sync::Weak<Hedges>,
+                drops: Arc<AtomicUsize>,
+                wakes: Arc<AtomicUsize>,
+            }
+
+            impl Wake for ReenterOnDrop {
+                fn wake(self: Arc<Self>) {
+                    self.wakes.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            impl Drop for ReenterOnDrop {
+                fn drop(&mut self) {
+                    let owner = self.owner.upgrade().unwrap();
+                    let state = owner
+                        .state
+                        .try_lock()
+                        .expect("permit drop must unlock before dropping its waker");
+                    assert!(state.alarms.is_empty());
+                    assert_eq!(state.used, 0);
+                    drop(state);
+                    let now = Instant::now();
+                    owner.poll(now);
+                    let permit = owner.acquire(owner.capacity, now).unwrap();
+                    drop(permit);
+                    self.drops.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            for cost in [0, 7] {
+                let now = Instant::now();
+                let due = now + Duration::from_secs(1);
+                let owner = Hedges::new(1, 7);
+                let permit = owner.acquire(cost, due).unwrap();
+                let drops = Arc::new(AtomicUsize::new(0));
+                let wakes = Arc::new(AtomicUsize::new(0));
+                let waker = Waker::from(Arc::new(ReenterOnDrop {
+                    owner: Arc::downgrade(&owner),
+                    drops: drops.clone(),
+                    wakes: wakes.clone(),
+                }));
+                assert!(
+                    permit
+                        .delay(now, &mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                drop(waker);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                drop(permit);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                owner.poll(due);
+                assert_eq!(wakes.load(Ordering::SeqCst), 0);
+                assert!(owner.acquire(7, due).is_ok());
+            }
         }
     }
 }
