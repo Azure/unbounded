@@ -189,6 +189,8 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
 
     /// Admit work or one exclusive recovery probe without waiting.
     pub fn acquire(self: &Arc<Self>, key: &K) -> Result<Arc<Permit<K, O>>> {
+        let indexed = key.clone();
+        let owned = key.clone();
         let now = (self.now)();
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.active >= state.limit {
@@ -198,22 +200,19 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         if !state.peers.contains_key(key) && state.peers.len() == self.config.capacity {
             let retired = state
                 .peers
-                .iter()
-                .find(|(_, p)| {
+                .extract_if(.., |_, p| {
                     p.active == 0
                         && !p.probe
                         && p.retry.is_none_or(|retry| now >= retry)
                         && now.saturating_duration_since(p.updated) >= self.config.retire_after
                 })
-                .map(|(k, _)| k.clone());
-            if let Some(retired) = retired {
-                state.peers.remove(&retired);
-            } else {
+                .next();
+            if retired.is_none() {
                 self.observer.event(Event::Rejected);
                 return Err(Error::Overloaded);
             }
         }
-        let peer = state.peers.entry(key.clone()).or_insert(Peer {
+        let peer = state.peers.entry(indexed).or_insert(Peer {
             active: 0,
             limit: self.config.per_key,
             generation: 0,
@@ -241,7 +240,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         }
         Ok(Arc::new(Permit {
             owner: self.clone(),
-            key: key.clone(),
+            key: owned,
             generation,
             probe,
         }))
@@ -378,6 +377,8 @@ mod circuit {
         retry_at: Instant,
 
         probe_until: Option<Instant>,
+
+        pending_backoff: Option<Rc<()>>,
     }
 
     impl Circuit {
@@ -442,6 +443,8 @@ mod circuit {
         }
 
         /// Record a caller-classified failure using caller-selected retry jitter.
+        /// Backoff may reenter: the count is visible before the callback, and any
+        /// newer transition for this key takes precedence over its returned delay.
         pub fn failure(
             &self,
             key: &K,
@@ -456,10 +459,27 @@ mod circuit {
                 failures: 0,
                 retry_at: now,
                 probe_until: None,
+                pending_backoff: None,
             });
             state.failures = state.failures.saturating_add(1);
-            state.retry_at = now + backoff(key, state.failures);
-            state.probe_until = None;
+            let failures = state.failures;
+            let pending = Rc::new(());
+            state.pending_backoff = Some(Rc::clone(&pending));
+            drop(states);
+
+            let retry_at = now + backoff(key, failures);
+            let mut states = self.states.borrow_mut();
+            // Never reinsert a removed record or overwrite a newer transition.
+            if let Some(state) = states.get_mut(key)
+                && state
+                    .pending_backoff
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &pending))
+            {
+                state.retry_at = retry_at;
+                state.probe_until = None;
+                state.pending_backoff = None;
+            }
             Ok(())
         }
 
@@ -486,6 +506,7 @@ mod circuit {
                 return false;
             }
             state.probe_until = Some(now + self.probe_timeout);
+            state.pending_backoff = None;
             true
         }
 
@@ -509,6 +530,103 @@ mod circuit {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Backoff can inspect the circuit without borrowing conflicts.
+        #[test]
+        fn backoff_reentry_observes_failure_record() {
+            let now = Instant::now();
+            let health = Circuits::new(1, Duration::from_secs(1));
+            health
+                .failure(&7, now, |key, failures| {
+                    assert_eq!((*key, failures), (7, 1));
+                    assert_eq!(health.len(), 1);
+                    assert!(!health.is_empty());
+                    assert!(health.available(key, now));
+                    Duration::from_secs(2)
+                })
+                .unwrap();
+            assert!(!health.available(&7, now));
+            assert!(health.available(&7, now + Duration::from_secs(2)));
+        }
+
+        /// A nested success or retention change must not be undone by backoff.
+        #[test]
+        fn backoff_reentry_preserves_removal_and_capacity() {
+            let now = Instant::now();
+            for retain in [false, true] {
+                let health = Circuits::new(1, Duration::ZERO);
+                health
+                    .failure(&7, now, |_, _| {
+                        if retain {
+                            health.retain(&[]);
+                        } else {
+                            health.success(&7);
+                        }
+                        health.failure(&8, now, |_, _| Duration::ZERO).unwrap();
+                        Duration::from_secs(10)
+                    })
+                    .unwrap();
+                assert_eq!(health.len(), 1);
+                assert!(health.available(&7, now));
+                assert_eq!(
+                    health.failure(&9, now, |_, _| panic!("capacity is full")),
+                    Err(Error::Overloaded)
+                );
+                health.success(&8);
+                assert!(health.is_empty());
+            }
+        }
+
+        /// Newer failures win even when counts saturate or the key is replaced.
+        #[test]
+        fn backoff_reentry_preserves_newer_failure() {
+            let now = Instant::now();
+            for (initial, replace) in [(0, false), (u32::MAX, false), (0, true)] {
+                let health = Circuits::new(1, Duration::ZERO);
+                if initial != 0 {
+                    health.failure(&7, now, |_, _| Duration::ZERO).unwrap();
+                    health.states.borrow_mut().get_mut(&7).unwrap().failures = initial;
+                }
+                health
+                    .failure(&7, now, |_, count| {
+                        assert_eq!(count, initial.saturating_add(1));
+                        if replace {
+                            health.success(&7);
+                        }
+                        health
+                            .failure(&7, now, |_, nested_count| {
+                                assert_eq!(
+                                    nested_count,
+                                    if replace { 1 } else { count.saturating_add(1) }
+                                );
+                                Duration::from_secs(2)
+                            })
+                            .unwrap();
+                        Duration::from_secs(10)
+                    })
+                    .unwrap();
+                assert!(!health.available(&7, now));
+                assert!(health.available(&7, now + Duration::from_secs(2)));
+                assert_eq!(health.len(), 1);
+            }
+        }
+
+        /// A probe admitted by backoff keeps its timeout after the callback.
+        #[test]
+        fn backoff_reentry_preserves_probe_timeout() {
+            let now = Instant::now();
+            let timeout = Duration::from_secs(2);
+            let health = Circuits::new(1, timeout);
+            health.failure(&7, now, |_, _| Duration::ZERO).unwrap();
+            health
+                .failure(&7, now, |_, _| {
+                    drop(health.acquire(&7, now).unwrap());
+                    Duration::from_secs(10)
+                })
+                .unwrap();
+            assert!(!health.available(&7, now));
+            assert!(health.available(&7, now + timeout));
+        }
 
         /// Failed key cloning must not leave an exclusive probe without an owner.
         #[test]
@@ -1104,6 +1222,87 @@ mod tests {
             backoff: Duration::from_millis(250),
             recovery: Duration::from_secs(1),
             retire_after: Duration::from_secs(60),
+        }
+    }
+
+    /// Clone panics leave the mutex usable and all admission capacity recoverable.
+    #[test]
+    fn adaptive_clone_panic_preserves_capacity_and_mutex() {
+        use std::{
+            panic::{AssertUnwindSafe, catch_unwind},
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        static CLONES: AtomicUsize = AtomicUsize::new(0);
+        static PANIC_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static PANIC_KEY: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+        /// Key with selectable clone failures, including during retirement.
+        #[derive(Eq, Ord, PartialEq, PartialOrd)]
+        struct Key(usize);
+
+        impl Clone for Key {
+            fn clone(&self) -> Self {
+                let clone = CLONES.fetch_add(1, Ordering::SeqCst) + 1;
+                assert_ne!(clone, PANIC_AT.load(Ordering::SeqCst), "key clone failed");
+                assert_ne!(
+                    self.0,
+                    PANIC_KEY.load(Ordering::SeqCst),
+                    "retired key cloned"
+                );
+                Self(self.0)
+            }
+        }
+
+        for existing in [false, true] {
+            for panic_at in [1, 2] {
+                let owner = Adaptive::new(
+                    Config {
+                        total: 2,
+                        per_key: 2,
+                        capacity: 1,
+                        retire_after: Duration::ZERO,
+                        ..config()
+                    },
+                    Counts::default(),
+                    Instant::now,
+                )
+                .unwrap();
+                let held = existing.then(|| owner.acquire(&Key(1)).unwrap());
+                CLONES.store(0, Ordering::SeqCst);
+                PANIC_AT.store(panic_at, Ordering::SeqCst);
+                let result = catch_unwind(AssertUnwindSafe(|| owner.acquire(&Key(1))));
+                PANIC_AT.store(usize::MAX, Ordering::SeqCst);
+                assert!(result.is_err());
+                assert_eq!(CLONES.load(Ordering::SeqCst), panic_at);
+                {
+                    let state = owner.state.lock().expect("clone panic poisoned state");
+                    assert_eq!(state.active, usize::from(existing));
+                    assert_eq!(state.peers.len(), usize::from(existing));
+                    if existing {
+                        assert_eq!(state.peers[&Key(1)].active, 1);
+                    }
+                }
+                drop(held);
+                let one = owner.acquire(&Key(1)).unwrap();
+                let two = owner.acquire(&Key(1)).unwrap();
+                assert!(matches!(owner.acquire(&Key(1)), Err(Error::Overloaded)));
+                drop((one, two));
+                assert_eq!(owner.state.lock().unwrap().active, 0);
+                assert_eq!(*owner.observer.active.lock().unwrap(), 0);
+
+                PANIC_KEY.store(1, Ordering::SeqCst);
+                let replacement = owner.acquire(&Key(2)).expect("retirement must not clone");
+                PANIC_KEY.store(usize::MAX, Ordering::SeqCst);
+                {
+                    let state = owner.state.lock().unwrap();
+                    assert_eq!(state.peers.len(), 1);
+                    assert!(!state.peers.contains_key(&Key(1)));
+                    assert_eq!(state.peers[&Key(2)].active, 1);
+                }
+                drop(replacement);
+                assert_eq!(owner.state.lock().unwrap().active, 0);
+            }
         }
     }
 
