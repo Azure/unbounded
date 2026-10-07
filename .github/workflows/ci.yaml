@@ -226,8 +226,10 @@ jobs:
       - name: Install native adapter build dependencies
         if: matrix.native
         run: |
-          timeout --signal=TERM --kill-after=10s 300s sudo apt-get update
-          timeout --signal=TERM --kill-after=10s 300s sudo apt-get install -y --no-install-recommends build-essential pkg-config libibverbs-dev
+          # Let apt reach fallback mirrors before the outer timeout.
+          apt_options=(-o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=2)
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" update
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" install -y --no-install-recommends build-essential pkg-config libibverbs-dev
 
       # Rust loads the adapter dynamically, so Cargo cannot compile-check its C ABI.
       - name: Compile native C adapter (not hardware validation)
