@@ -1476,7 +1476,14 @@ func annotationDoesNotBlockObserver(t *testing.T, outcome string) {
 
 	done := make(chan error, 1)
 
-	go func() { _, err := r.Reconcile(ctx, ctrl.Request{}); done <- err }()
+	var queued reconcile.Request
+
+	r.enqueueHint = func(request reconcile.Request) { queued = request }
+	_, err := r.Reconcile(ctx, ctrl.Request{})
+	require.NoError(t, err)
+	require.Equal(t, "hints", queued.Namespace)
+
+	go func() { _, err := r.Reconcile(ctx, queued); done <- err }()
 
 	<-entered
 	require.EqualValues(t, 7, acceptedMembers(t, r)[testNodeUID].Shares)
@@ -1506,13 +1513,13 @@ func annotationDoesNotBlockObserver(t *testing.T, outcome string) {
 		close(release)
 	}
 
-	err := <-done
+	err = <-done
 
 	switch outcome {
 	case "success":
 		require.NoError(t, err)
 	case "failure":
-		require.NoError(t, err)
+		require.ErrorIs(t, err, patchError)
 		require.NotEmpty(t, r.hints)
 	case "cancellation":
 		require.ErrorIs(t, err, context.Canceled)

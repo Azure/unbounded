@@ -645,10 +645,15 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (authority.Top
 }
 
 func (r *TopologyReconciler) queueHints(ctx context.Context, update authority.TopologyHints) error {
-	r.hints = make(map[string]nodeHint, len(update.Nodes.Items))
+	hints := make(map[string]nodeHint)
+
 	for i := range update.Nodes.Items {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		node := &update.Nodes.Items[i]
-		hint := nodeHint{node: node.DeepCopy()}
+		hint := nodeHint{}
 
 		member, ok := update.Members[wire.NodeID(node.UID)]
 		if !ok {
@@ -668,13 +673,24 @@ func (r *TopologyReconciler) queueHints(ctx context.Context, update authority.To
 			hint.member = string(encoded)
 		}
 
-		r.hints[node.Name] = hint
-		if err := r.reconcileHint(ctx, node.Name); err != nil {
-			ctrl.LoggerFrom(ctx).V(1).Info("recovery hint retry", "node", node.Name, "error", err)
+		// The cache can avoid work, but never authorize a write. Queued hints
+		// still require a fresh read and UID/input checks in reconcileHint.
+		if node.Annotations[admittedMemberAnnotation] == hint.member {
+			continue
+		}
 
-			if r.enqueueHint != nil {
-				r.enqueueHint(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "hints", Name: node.Name}})
-			}
+		hint.node = node.DeepCopy()
+		hints[node.Name] = hint
+	}
+
+	previous := r.hints
+
+	r.hints = hints
+	for name := range hints {
+		// Pending keys already have a queue entry or a rate-limited retry.
+		// Replace their desired state without bypassing the retry delay.
+		if _, pending := previous[name]; !pending && r.enqueueHint != nil {
+			r.enqueueHint(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "hints", Name: name}})
 		}
 	}
 

@@ -1230,6 +1230,13 @@ func reconcileTopology(t *testing.T, r *TopologyReconciler, ctx context.Context)
 		t.Fatalf("reconcile: %v, %v", result, err)
 	}
 
+	for name := range r.hints {
+		result, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "hints", Name: name}})
+		if err != nil || result != (ctrl.Result{}) {
+			t.Fatalf("hint reconcile: %v, %v", result, err)
+		}
+	}
+
 	return capturePublication(t, r.authority)
 }
 
