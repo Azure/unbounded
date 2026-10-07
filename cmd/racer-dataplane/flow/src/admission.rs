@@ -914,24 +914,24 @@ mod handoff {
 
     impl<K: Eq + Clone, A: Admission, T> Handoff<K, A, T> {
         /// Create stable target slots; empty target lists simply reject offers.
+        /// Repeated keys share one slot, in first-occurrence order.
         pub fn new(keys: &[K]) -> Self {
-            Self(Mutex::new(State {
-                targets: keys
-                    .iter()
-                    .map(|key| {
-                        (
-                            key.clone(),
-                            Target {
-                                admission: None,
-                                queue: VecDeque::new(),
-                                waker: None,
-                                closed: false,
-                            },
-                        )
-                    })
-                    .collect(),
-                cursor: 0,
-            }))
+            let mut targets = Vec::new();
+            for key in keys {
+                if targets.iter().any(|(candidate, _)| candidate == key) {
+                    continue;
+                }
+                targets.push((
+                    key.clone(),
+                    Target {
+                        admission: None,
+                        queue: VecDeque::new(),
+                        waker: None,
+                        closed: false,
+                    },
+                ));
+            }
+            Self(Mutex::new(State { targets, cursor: 0 }))
         }
 
         /// Install admission once on a known target that has not closed.
@@ -1034,6 +1034,70 @@ mod handoff {
                 waker.wake();
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        struct Ready;
+
+        impl Admission for Ready {
+            type Reservation = ();
+
+            fn register(&self, _: &Waker) {}
+
+            fn reserve(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn handoff_constructor_keeps_first_unique_targets() {
+            let cases: &[(&[u8], &[u8])] = &[
+                (&[], &[]),
+                (&[1], &[1]),
+                (&[1, 1, 1], &[1]),
+                (&[3, 1, 3, 2, 1, 3], &[3, 1, 2]),
+            ];
+            for &(keys, expected) in cases {
+                let handoff = Arc::new(Handoff::<_, Ready, u8>::new(keys));
+                assert_eq!(
+                    handoff
+                        .0
+                        .lock()
+                        .unwrap()
+                        .targets
+                        .iter()
+                        .map(|(key, _)| *key)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                for key in expected {
+                    handoff.install(key, Ready).unwrap();
+                    assert_eq!(handoff.install(key, Ready), Err(Error::InvalidInput));
+                }
+                for _ in 0..2 {
+                    for key in expected {
+                        handoff
+                            .reserve(Waker::noop())
+                            .unwrap()
+                            .deliver(|| *key)
+                            .unwrap();
+                        let [item] = handoff.pop_batch::<1>(key, Waker::noop(), 1).unwrap();
+                        assert_eq!(item.unwrap().into_parts(), (*key, ()));
+                    }
+                }
+                for key in expected {
+                    handoff.close(key);
+                    assert_eq!(handoff.install(key, Ready), Err(Error::InvalidInput));
+                }
+                assert!(matches!(
+                    handoff.reserve(Waker::noop()),
+                    Err(Error::Overloaded)
+                ));
+            }
         }
     }
 }
