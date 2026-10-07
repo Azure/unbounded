@@ -748,13 +748,15 @@ pub mod flight {
 
     impl<K: Eq + Hash, E: Entry, S: BuildHasher> Table<K, E, S> {
         /// Used after explicit detach or completion as well as by background sweeps.
-        pub fn remove_quiescent(&mut self, key: &K) -> bool {
+        /// Return the entry for destruction after releasing the owner borrow.
+        #[must_use = "drop the removed entry outside the owner borrow"]
+        pub fn remove_quiescent(&mut self, key: &K) -> Option<E> {
             if !self.get(key).is_some_and(Entry::quiescent) {
-                return false;
+                return None;
             }
             let entry = self.entries.remove(key).expect("quiescent entry");
             self.sweep.remove(&entry.sweep_id);
-            true
+            Some(entry.entry)
         }
     }
 
@@ -775,7 +777,10 @@ pub mod flight {
 
     impl<K: Clone + Eq + Hash, E: Entry, S: BuildHasher> Table<K, E, S> {
         /// Refresh at most the budgeted entry count and remove quiescent entries.
-        pub fn sweep(&mut self, budget: usize, wakes: &mut Vec<Waker>) {
+        /// Return removed entries from `update` and drop them outside its borrow.
+        #[must_use = "drop the removed entries outside the owner borrow"]
+        pub fn sweep(&mut self, budget: usize, wakes: &mut Vec<Waker>) -> Vec<E> {
+            let mut removed = Vec::new();
             for _ in 0..budget.min(self.sweep.len()) {
                 let Some((_, key)) = self.cursor.next(&self.sweep) else {
                     break;
@@ -784,11 +789,14 @@ pub mod flight {
                 if let Some(entry) = self.get_mut(&key) {
                     entry.refresh(wakes);
                 }
-                self.remove_quiescent(&key);
+                if let Some(entry) = self.remove_quiescent(&key) {
+                    removed.push(entry);
+                }
             }
             if self.entries.is_empty() {
                 self.notify_drain(wakes);
             }
+            removed
         }
     }
 
@@ -1574,20 +1582,23 @@ pub mod flight {
             entry.operations.insert(1, Resource(live.clone()));
             entry.canceled = true;
             let mut wakes = Vec::new();
-            table.sweep(1, &mut wakes);
+            drop(table.sweep(1, &mut wakes));
             assert_eq!(table.get(&1).unwrap().waiters, 0);
             assert_eq!(table.get(&2).unwrap().waiters, 1);
             assert_eq!(live.get(), 1, "cancellation is not completion");
             let resources = table.get_mut(&1).unwrap().operations.take(1).unwrap();
-            assert!(!table.remove_quiescent(&1), "occupied during resource drop");
+            assert!(
+                table.remove_quiescent(&1).is_none(),
+                "occupied during resource drop"
+            );
             drop(resources);
             assert_eq!(live.get(), 0);
             assert!(
-                !table.remove_quiescent(&1),
+                table.remove_quiescent(&1).is_none(),
                 "completion must clear the tombstone"
             );
             table.get_mut(&1).unwrap().operations.complete(1).unwrap();
-            assert!(table.remove_quiescent(&1));
+            assert!(table.remove_quiescent(&1).is_some());
             assert_eq!(table.len(), 1);
         }
 
@@ -1601,9 +1612,10 @@ pub mod flight {
         impl Drop for Waiter {
             /// Detach this request and remove its entry only if truly quiescent.
             fn drop(&mut self) {
-                let mut table = self.table.borrow_mut();
-                table.get_mut(&self.key).unwrap().waiters -= 1;
-                table.remove_quiescent(&self.key);
+                drop(update(&self.table, |table, _| {
+                    table.get_mut(&self.key).unwrap().waiters -= 1;
+                    table.remove_quiescent(&self.key)
+                }));
             }
         }
 
@@ -1625,7 +1637,7 @@ pub mod flight {
                 key: 1,
             });
             drop(token);
-            table.borrow_mut().sweep(100, &mut Vec::new());
+            drop(update(&table, |table, wakes| table.sweep(100, wakes)));
             assert_eq!(table.borrow().len(), 1);
             assert_eq!(live.get(), 1);
             let resources = table
@@ -1643,7 +1655,7 @@ pub mod flight {
                 .operations
                 .complete(1)
                 .unwrap();
-            table.borrow_mut().sweep(1, &mut Vec::new());
+            drop(update(&table, |table, wakes| table.sweep(1, wakes)));
             assert!(table.borrow().is_empty());
             assert_eq!(live.get(), 0);
         }
@@ -1681,7 +1693,7 @@ pub mod flight {
             wrong_owner.owner = Rc::new(());
             assert_eq!(wrong_owner.validate(&old), Err(Stale));
             entry.waiters = 0;
-            assert!(table.remove_quiescent(&1));
+            assert!(table.remove_quiescent(&1).is_some());
             let new = insert(&mut table, &owner, 1);
             assert!(!old.same_registration(&new));
             assert_eq!(old.validate(&new), Err(Stale));
@@ -1696,14 +1708,14 @@ pub mod flight {
             for key in 1..=3 {
                 insert(&mut table, &owner, key);
             }
-            table.sweep(0, &mut Vec::new());
+            drop(table.sweep(0, &mut Vec::new()));
             assert!(table.values().all(|entry| entry.refreshed == 0));
             for key in 1..=3 {
-                table.sweep(1, &mut Vec::new());
+                drop(table.sweep(1, &mut Vec::new()));
                 assert_eq!(table.get(&key).unwrap().refreshed, 1);
             }
             table.get_mut(&2).unwrap().canceled = true;
-            table.sweep(99, &mut Vec::new());
+            drop(table.sweep(99, &mut Vec::new()));
             assert!(!table.contains_key(&2));
             assert_eq!(table.sweep.len(), 2);
             assert!(table.values().all(|entry| entry.refreshed == 2));
@@ -1712,11 +1724,11 @@ pub mod flight {
                 entry.canceled = true;
             });
             let mut wakes = Vec::new();
-            table.sweep(99, &mut wakes);
+            drop(table.sweep(99, &mut wakes));
             assert!(table.is_empty());
             assert!(table.sweep.is_empty());
             assert_eq!(wakes.len(), 1);
-            table.sweep(99, &mut wakes);
+            drop(table.sweep(99, &mut wakes));
             assert_eq!(wakes.len(), 1, "drain wake is taken once");
         }
 
@@ -1751,7 +1763,7 @@ pub mod flight {
             let mut table = TestTable::default();
             assert!(table.get(&1).is_none());
             assert!(table.get_mut(&1).is_none());
-            assert!(!table.remove_quiescent(&1));
+            assert!(table.remove_quiescent(&1).is_none());
             insert(&mut table, &owner, 1);
             let original = table.entries[&1].sweep_id;
             insert(&mut table, &owner, 1);
@@ -1761,13 +1773,13 @@ pub mod flight {
             assert_eq!(table.values().count(), 2);
             assert!(!table.sweep.contains_key(&original));
             assert!(table.sweep.contains_key(&replacement));
-            table.sweep(2, &mut Vec::new());
+            drop(table.sweep(2, &mut Vec::new()));
             assert!(table.values().all(|entry| entry.refreshed == 1));
             table.get_mut(&1).unwrap().waiters = 0;
-            assert!(table.remove_quiescent(&1));
+            assert!(table.remove_quiescent(&1).is_some());
             assert!(!table.contains_key(&1));
             assert_eq!(table.sweep.len(), table.len());
-            table.sweep(1, &mut Vec::new());
+            drop(table.sweep(1, &mut Vec::new()));
             assert_eq!(table.get(&2).unwrap().refreshed, 2);
         }
 
@@ -1780,12 +1792,12 @@ pub mod flight {
             let other = insert(&mut table, &owner, 2);
             table.get_mut(&1).unwrap().identity.incarnation = other.incarnation;
             table.get_mut(&1).unwrap().waiters = 0;
-            assert!(table.remove_quiescent(&1));
+            assert!(table.remove_quiescent(&1).is_some());
             assert_eq!(table.sweep.len(), 1);
-            table.sweep(1, &mut Vec::new());
+            drop(table.sweep(1, &mut Vec::new()));
             assert_eq!(table.get(&2).unwrap().refreshed, 1);
             table.get_mut(&2).unwrap().waiters = 0;
-            table.sweep(1, &mut Vec::new());
+            drop(table.sweep(1, &mut Vec::new()));
             assert!(table.is_empty());
             assert!(table.sweep.is_empty());
         }
@@ -1804,12 +1816,12 @@ pub mod flight {
             });
             insert(&mut table, &owner, 2);
             assert_eq!(table.sweep.len(), 3);
-            table.sweep(3, &mut Vec::new());
+            drop(table.sweep(3, &mut Vec::new()));
             assert_eq!(table.len(), 1);
             assert_eq!(table.sweep.len(), 1);
             assert_eq!(table.get(&2).unwrap().refreshed, 1);
             table.get_mut(&2).unwrap().waiters = 0;
-            assert!(table.remove_quiescent(&2));
+            assert!(table.remove_quiescent(&2).is_some());
             assert!(table.sweep.is_empty());
         }
 
@@ -1832,10 +1844,10 @@ pub mod flight {
                 );
             }
             assert_eq!(table.sweep.len(), 3);
-            table.sweep(0, &mut Vec::new());
+            drop(table.sweep(0, &mut Vec::new()));
             assert!(table.values().all(|entry| entry.refreshed == 0));
             for key in 1..=3 {
-                table.sweep(1, &mut Vec::new());
+                drop(table.sweep(1, &mut Vec::new()));
                 assert_eq!(table.get(&key).unwrap().refreshed, 1);
                 assert_eq!(
                     table.values().map(|entry| entry.refreshed).sum::<usize>(),
@@ -1843,8 +1855,8 @@ pub mod flight {
                 );
             }
             table.get_mut(&2).unwrap().waiters = 0;
-            assert!(table.remove_quiescent(&2));
-            table.sweep(99, &mut Vec::new());
+            assert!(table.remove_quiescent(&2).is_some());
+            drop(table.sweep(99, &mut Vec::new()));
             assert_eq!(table.sweep.len(), 2);
             assert!(table.values().all(|entry| entry.refreshed == 2));
         }
@@ -1864,7 +1876,7 @@ pub mod flight {
                 (first.incarnation, second.incarnation, third.incarnation),
                 (1, 2, 3)
             );
-            table.sweep(3, &mut Vec::new());
+            drop(table.sweep(3, &mut Vec::new()));
             assert!(table.values().all(|entry| entry.refreshed == 1));
             table.incarnation = Counter(u64::MAX);
             assert!(table.identity(owner).is_err());
@@ -1884,7 +1896,7 @@ pub mod flight {
                 "insert does not require an incarnation allocation"
             );
             table.stop(&mut Vec::new(), |entry, _| entry.canceled = true);
-            table.sweep(4, &mut Vec::new());
+            drop(table.sweep(4, &mut Vec::new()));
             assert!(table.is_empty());
             assert!(table.sweep.is_empty());
         }

@@ -1308,6 +1308,93 @@ mod coalesce_tests {
         }
     }
 
+    /// A removable entry can still own application data with a reentrant destructor.
+    struct DroppableEntry {
+        _resource: ReentrantResource,
+
+        quiescent: bool,
+    }
+
+    impl Entry for DroppableEntry {
+        fn refresh(&mut self, _: &mut Vec<Waker>) {}
+
+        fn quiescent(&self) -> bool {
+            self.quiescent
+        }
+    }
+
+    /// Sweeping transfers entry destruction past the owner transaction.
+    #[test]
+    fn swept_entry_destructor_can_reenter_owner() {
+        removed_entry_destructor_can_reenter_owner(true);
+    }
+
+    /// Explicit removal has the same destruction boundary as a sweep.
+    #[test]
+    fn detached_entry_destructor_can_reenter_owner() {
+        removed_entry_destructor_can_reenter_owner(false);
+    }
+
+    /// Check both removal paths, including ineligible entries and same-key replacement.
+    fn removed_entry_destructor_can_reenter_owner(sweep: bool) {
+        let table = Rc::new(RefCell::new(flight::Table::<u32, DroppableEntry>::default()));
+        let dropped = Rc::new(Cell::new(0));
+        let resource = ReentrantResource(Some(Box::new({
+            let table = Rc::downgrade(&table);
+            let dropped = dropped.clone();
+            move || {
+                let table = table.upgrade().unwrap();
+                drop(flight::update(&table, |table, wakes| {
+                    assert!(table.is_empty());
+                    let removed = table.sweep(1, wakes);
+                    assert!(removed.is_empty());
+                    assert_eq!(table.next_waiter_id(), Ok(1));
+                    table.insert(
+                        1,
+                        DroppableEntry {
+                            _resource: ReentrantResource(Some(Box::new(|| {}))),
+                            quiescent: false,
+                        },
+                    );
+                    removed
+                }));
+                dropped.set(dropped.get() + 1);
+            }
+        })));
+        table.borrow_mut().insert(
+            1,
+            DroppableEntry {
+                _resource: resource,
+                quiescent: false,
+            },
+        );
+        let removed = flight::update(&table, |table, wakes| {
+            assert!(table.remove_quiescent(&2).is_none());
+            assert!(table.remove_quiescent(&1).is_none());
+            assert!(table.sweep(1, wakes).is_empty());
+            table.get_mut(&1).unwrap().quiescent = true;
+            assert!(table.sweep(0, wakes).is_empty());
+            assert_eq!(table.len(), 1);
+            let removed = if sweep {
+                table.sweep(1, wakes)
+            } else {
+                table.remove_quiescent(&1).into_iter().collect()
+            };
+            assert_eq!(removed.len(), 1);
+            assert!(table.is_empty());
+            assert!(table.remove_quiescent(&1).is_none());
+            assert_eq!(dropped.get(), 0);
+            removed
+        });
+        assert_eq!(dropped.get(), 0);
+        drop(removed);
+        assert_eq!(dropped.get(), 1);
+        assert_eq!(table.borrow_mut().next_waiter_id(), Ok(2));
+        drop(flight::update(&table, |table, wakes| table.sweep(1, wakes)));
+        assert_eq!(table.borrow().len(), 1, "replacement remains indexed");
+        assert_eq!(dropped.get(), 1);
+    }
+
     /// Resource drop reentrancy cannot erase the tombstone, and drain wakes run unlocked.
     #[test]
     fn completion_tombstone_survives_reentrant_destructor_and_shutdown() {
@@ -1318,11 +1405,12 @@ mod coalesce_tests {
             let dropped = dropped.clone();
             move || {
                 let table = table.upgrade().unwrap();
-                flight::update(&table, |table, wakes| {
-                    table.sweep(1, wakes);
+                drop(flight::update(&table, |table, wakes| {
+                    let removed = table.sweep(1, wakes);
                     assert_eq!(table.len(), 1);
-                    assert!(!table.remove_quiescent(&1));
-                });
+                    assert!(table.remove_quiescent(&1).is_none());
+                    removed
+                }));
                 dropped.set(true);
             }
         })));
@@ -1361,12 +1449,12 @@ mod coalesce_tests {
         drop(flight::update(&table, |table, _| {
             table.register_drain(waker)
         }));
-        flight::update(&table, |table, wakes| {
+        drop(flight::update(&table, |table, wakes| {
             let operations = &mut table.get_mut(&1).unwrap().0;
             operations.complete(id).unwrap();
             assert_eq!(operations.complete(id), Err(Stale));
-            table.sweep(1, wakes);
-        });
+            table.sweep(1, wakes)
+        }));
         assert!(notified.get());
     }
 
