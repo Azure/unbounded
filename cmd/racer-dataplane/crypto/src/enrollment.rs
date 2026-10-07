@@ -16,7 +16,7 @@ use racer_control_wire::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     num::NonZeroU32,
     path::PathBuf,
     sync::Arc,
@@ -24,6 +24,7 @@ use std::{
 };
 use uring_runtime::{
     Operation, Scope,
+    drivers::Busy,
     reactor::filesystem::{
         operations::ReplacementError,
         secure::{self, Attempts, Host},
@@ -34,6 +35,9 @@ use zeroize::{Zeroize, Zeroizing};
 /// Enrollment validation failures, separate from caller-owned filesystem errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// Trust replacement overlaps identity acceptance or recovery. Retry when idle.
+    Busy,
+
     /// Identity correlation, certificate, token, or key pairing failed.
     Unauthorized,
 
@@ -66,6 +70,8 @@ pub struct Enrollment<H: Host> {
     identity_directory: PathBuf,
 
     roots: RefCell<Vec<Vec<u8>>>,
+
+    trust_busy: Cell<bool>,
 
     host: H,
 
@@ -181,6 +187,7 @@ impl<H: Host> Enrollment<H> {
             token_path,
             identity_directory,
             roots: RefCell::new(Vec::new()),
+            trust_busy: Cell::new(false),
             host,
             attempts: Attempts::default(),
         }
@@ -192,7 +199,9 @@ impl<H: Host> Enrollment<H> {
     }
 
     /// Validate all roots before atomically replacing the enrollment trust snapshot.
+    /// Return Busy while acceptance or recovery holds trust across filesystem awaits.
     pub fn set_peer_trust_roots(&self, roots: Vec<Vec<u8>>) -> Result<(), Error> {
+        let _guard = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
         identity::root_store(&roots).map_err(|_| Error::Unauthorized)?;
         *self.roots.borrow_mut() = roots;
         Ok(())
@@ -404,6 +413,7 @@ where
     ) -> Operation<'a, LocalSigningIdentity, <H::Scope as Scope>::Error> {
         Box::pin(async move {
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
+            let _trust = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
             let r = self.host.reactor();
             let dir = secure::directory(r, &self.identity_directory, false, true, &scope).await?;
             match secure::read_at(
@@ -448,6 +458,7 @@ where
     ) -> Operation<'a, Option<LocalSigningIdentity>, <H::Scope as Scope>::Error> {
         Box::pin(async move {
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
+            let _trust = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
             let r = self.host.reactor();
             let dir =
                 match secure::directory(r, &self.identity_directory, false, true, &scope).await {
@@ -1405,6 +1416,104 @@ mod tests {
                     .sign(b"still usable")
                     .is_ok()
             );
+        }
+    }
+
+    /// Trust cannot change after validation while publication or cleanup awaits I/O.
+    #[test]
+    fn trust_rotation_is_excluded_until_acceptance_or_recovery_releases() {
+        for recovering in [false, true] {
+            for finish in ["complete", "abandon", "cancel", "failure"] {
+                let sim = Simulation::new();
+                let _environment = sim.enter();
+                let (files, e, scope) = fixture();
+                let (ca, key) = identity::test_util::ca();
+                let good = vec![ca.der().to_vec()];
+                let (other, _) = identity::test_util::ca();
+                let rotated = vec![other.der().to_vec()];
+                e.set_peer_trust_roots(good.clone()).unwrap();
+                let request = drive(
+                    &files,
+                    e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+                )
+                .unwrap();
+                let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
+                let response = issue(&request, &ca, &key, |_| {});
+                if recovering {
+                    drive(&files, e.accept_response(response.clone(), &scope)).unwrap();
+                    sim.write_file(Path::new("/private/pending.json"), &pending)
+                        .unwrap();
+                    sim.chmod(Path::new("/private/pending.json"), 0o600)
+                        .unwrap();
+                }
+                sim.inject(
+                    if recovering { "unlink" } else { "rename" },
+                    Fault::HoldCompletion(20),
+                )
+                .unwrap();
+                let mut operation = Box::pin(async {
+                    if recovering {
+                        e.load_identity(&scope).await.map(Option::unwrap)
+                    } else {
+                        e.accept_response(response, &scope).await
+                    }
+                });
+                let mut paused = false;
+                for _ in 0..100 {
+                    assert!(
+                        operation
+                            .as_mut()
+                            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                            .is_pending()
+                    );
+                    files.reactor.poll_budgeted(64).unwrap();
+                    files.reactor.wait(Duration::from_millis(1)).unwrap();
+                    paused = if recovering {
+                        sim.metadata(Path::new("/private/pending.json")).is_err()
+                    } else {
+                        sim.metadata(Path::new("/private/identity.json")).is_ok()
+                    };
+                    if paused {
+                        break;
+                    }
+                }
+                assert!(paused, "recovering={recovering}, finish={finish}");
+                // Both paths have validated and submitted a filesystem mutation.
+                assert_eq!(e.set_peer_trust_roots(rotated.clone()), Err(Error::Busy));
+                assert_eq!(*e.roots.borrow(), good);
+                // Rejected setters cannot release another operation's guard.
+                assert_eq!(e.set_peer_trust_roots(good.clone()), Err(Error::Busy));
+                match finish {
+                    "abandon" => drop(operation),
+                    "cancel" => {
+                        scope.cancellation.cancel().unwrap();
+                        assert!(matches!(drive(&files, operation), Err(error)
+                            if error.cause == Cause::Runtime(uring_runtime::Error::Cancelled)));
+                    }
+                    "failure" => {
+                        sim.inject("fsync", Fault::Errno(5)).unwrap();
+                        assert!(matches!(drive(&files, operation), Err(error)
+                            if error.cause == Cause::Runtime(uring_runtime::Error::Os(5))));
+                    }
+                    _ => {
+                        let accepted = drive(&files, operation).unwrap();
+                        assert!(accepted.signing_identity(&good).is_ok());
+                    }
+                }
+                e.set_peer_trust_roots(rotated.clone()).unwrap();
+                assert_eq!(*e.roots.borrow(), rotated);
+                let scope = Request {
+                    id: 0,
+                    cancellation: Cancellation::new().unwrap(),
+                };
+                // Recovery fences abandoned I/O, then applies the new trust roots.
+                assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
+                assert_eq!(files.reactor.in_flight(), 0);
+                e.set_peer_trust_roots(good.clone()).unwrap();
+                let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+                assert!(recovered.signing_identity(&good).is_ok());
+                assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
+            }
         }
     }
 
