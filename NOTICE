@@ -389,6 +389,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/google/renameio/blob/v2.0.2/LICENSE
+  - dependency: github.com/google/uuid
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2009,2014 Google Inc. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/google/uuid/blob/v1.6.0/LICENSE
   - dependency: github.com/insomniacslk/dhcp
     ecosystem: go
     copyright:
