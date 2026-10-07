@@ -108,12 +108,12 @@ func (r *credentials) reconcileKeys(ctx context.Context) (ctrl.Result, error) {
 		return ctrl.Result{}, err
 	}
 
-	var volumes racerv1.ClusterVolumeList
-	if err := r.APIReader.List(ctx, &volumes); err != nil {
+	var caches racerv1.ClusterCacheList
+	if err := r.APIReader.List(ctx, &caches); err != nil {
 		return ctrl.Result{}, authorityReadFailure(err)
 	}
 
-	catalog, err := members.BuildCatalog(volumes.Items)
+	catalog, err := members.BuildCatalog(caches.Items)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

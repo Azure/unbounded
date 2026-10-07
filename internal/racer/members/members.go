@@ -300,30 +300,26 @@ func (result *Result) reconcileNode(node *corev1.Node, input Input, accepted His
 	}
 }
 
-// BuildCatalog selects Cache volumes, deriving identities from UIDs and paths from names, sorted by UID.
+// BuildCatalog derives cache identities from UIDs and paths from names, sorted by UID.
 // An invalid catalog never partially replaces the currently served publication.
-func BuildCatalog(volumes []racerv1.ClusterVolume) ([]wire.CacheDefinition, error) {
-	catalog := make([]wire.CacheDefinition, 0, len(volumes))
-	ids := make(map[wire.CacheID]bool, len(volumes))
+func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error) {
+	catalog := make([]wire.CacheDefinition, 0, len(caches))
+	ids := make(map[wire.CacheID]bool, len(caches))
 
-	names := make(map[string]bool, len(volumes))
-	for _, volume := range volumes {
-		if volume.Spec.Type != racerv1.ClusterVolumeTypeCache {
-			continue
-		}
-
-		id := wire.CacheID(volume.UID)
-		if !wire.ValidUUID(string(id)) || ids[id] || names[volume.Name] {
+	names := make(map[string]bool, len(caches))
+	for _, cache := range caches {
+		id := wire.CacheID(cache.UID)
+		if !wire.ValidUUID(string(id)) || ids[id] || names[cache.Name] {
 			return nil, fmt.Errorf("cache identity: %w", wire.InvalidRequest)
 		}
 
-		client, origin, err := wire.CanonicalSocketPaths(volume.Name)
+		client, origin, err := wire.CanonicalSocketPaths(cache.Name)
 		if err != nil {
 			return nil, fmt.Errorf("cache socket paths: %w", err)
 		}
 
-		ids[id], names[volume.Name] = true, true
-		catalog = append(catalog, wire.CacheDefinition{ID: id, Name: volume.Name, ClientSocket: client, OriginSocket: origin})
+		ids[id], names[cache.Name] = true, true
+		catalog = append(catalog, wire.CacheDefinition{ID: id, Name: cache.Name, ClientSocket: client, OriginSocket: origin})
 	}
 
 	slices.SortFunc(catalog, func(a, b wire.CacheDefinition) int { return cmp.Compare(a.ID, b.ID) })

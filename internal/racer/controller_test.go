@@ -383,9 +383,7 @@ func TestEnvtestServer(t *testing.T) {
 	}
 
 	t.Run("initialization-and-CAS", func(t *testing.T) { integrationInitialization(t, c) })
-	t.Run("volume-name-admission", func(t *testing.T) { integrationVolumeNameAdmission(t, c) })
-	t.Run("volume-type-admission", func(t *testing.T) { integrationVolumeTypeAdmission(t, c) })
-	t.Run("volume-type-immutability", func(t *testing.T) { integrationVolumeTypeImmutability(t, c) })
+	t.Run("cache-name-admission", func(t *testing.T) { integrationCacheNameAdmission(t, c) })
 	t.Run("rotation-crash-recovery", func(t *testing.T) { integrationRotation(t, c) })
 	t.Run("manager-election-HTTPS-failover", func(t *testing.T) { integrationManagers(t, rc, scheme, c) })
 }
@@ -597,13 +595,13 @@ func integrationRotation(t *testing.T, c client.Client) {
 	a = assembleFixture(cfg, c, c)
 	require.NoError(t, a.Recover(t.Context(), a.Topology.Client))
 
-	volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "rotation-cache"}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-	if err := c.Create(t.Context(), volume); err != nil {
+	cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "rotation-cache"}}
+	if err := c.Create(t.Context(), cache); err != nil {
 		t.Fatal(err)
 	}
 
 	t.Cleanup(func() {
-		if err := c.Delete(context.Background(), volume); err != nil {
+		if err := c.Delete(context.Background(), cache); err != nil {
 			t.Error(err)
 		}
 	})
@@ -1681,8 +1679,8 @@ func TestHTTPSSnapshotDoesNotReadKubernetes(t *testing.T) {
 	}
 }
 
-func catalogVolume(name string, uid types.UID) racerv1.ClusterVolume {
-	return racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
+func catalogCache(name string, uid types.UID) racerv1.ClusterCache {
+	return racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}}
 }
 
 // CanonicalSocketPaths keeps these tests on the production wire validation boundary.
@@ -1707,27 +1705,27 @@ func TestCanonicalSocketPaths(t *testing.T) {
 }
 
 func TestBuildCatalog(t *testing.T) {
-	volumes := []racerv1.ClusterVolume{catalogVolume("cache-b", testOtherUID), catalogVolume("cache-a", testNodeUID), catalogVolume("cache-c", testDaemonSetUID)}
+	caches := []racerv1.ClusterCache{catalogCache("cache-b", testOtherUID), catalogCache("cache-a", testNodeUID), catalogCache("cache-c", testDaemonSetUID)}
 
-	original := make([]racerv1.ClusterVolume, len(volumes))
-	for i := range volumes {
-		original[i] = *volumes[i].DeepCopy()
+	original := make([]racerv1.ClusterCache, len(caches))
+	for i := range caches {
+		original[i] = *caches[i].DeepCopy()
 	}
 
-	got, err := BuildCatalog(volumes)
+	got, err := BuildCatalog(caches)
 
 	want := []wire.CacheDefinition{
 		{ID: testNodeUID, Name: "cache-a", ClientSocket: "/run/racer/cache-a/client/socket", OriginSocket: "/run/racer/cache-a/origin/socket"},
 		{ID: testOtherUID, Name: "cache-b", ClientSocket: "/run/racer/cache-b/client/socket", OriginSocket: "/run/racer/cache-b/origin/socket"},
 		{ID: wire.CacheID(testDaemonSetUID), Name: "cache-c", ClientSocket: "/run/racer/cache-c/client/socket", OriginSocket: "/run/racer/cache-c/origin/socket"},
 	}
-	if err != nil || !reflect.DeepEqual(got, want) || !reflect.DeepEqual(volumes, original) {
-		t.Fatalf("catalog: %#v, %v; inputs: %#v", got, err, volumes)
+	if err != nil || !reflect.DeepEqual(got, want) || !reflect.DeepEqual(caches, original) {
+		t.Fatalf("catalog: %#v, %v; inputs: %#v", got, err, caches)
 	}
 
-	slices.Reverse(volumes)
+	slices.Reverse(caches)
 
-	again, err := BuildCatalog(volumes)
+	again, err := BuildCatalog(caches)
 	if err != nil || !reflect.DeepEqual(again, want) {
 		t.Fatalf("order changed catalog: %#v, %v", again, err)
 	}
@@ -1737,35 +1735,35 @@ func TestBuildCatalog(t *testing.T) {
 		t.Fatalf("empty catalog: %#v, %v", empty, err)
 	}
 	// A terminating object still exists; removal follows its absence from inputs.
-	volume := catalogVolume("cache-a", testNodeUID)
-	volume.DeletionTimestamp = &metav1.Time{}
+	cache := catalogCache("cache-a", testNodeUID)
+	cache.DeletionTimestamp = &metav1.Time{}
 
-	got, err = BuildCatalog([]racerv1.ClusterVolume{volume})
+	got, err = BuildCatalog([]racerv1.ClusterCache{cache})
 	if err != nil || len(got) != 1 {
 		t.Fatalf("terminating cache: %#v, %v", got, err)
 	}
 
-	volume.UID = testOtherUID
+	cache.UID = testOtherUID
 
-	recreated, err := BuildCatalog([]racerv1.ClusterVolume{volume})
+	recreated, err := BuildCatalog([]racerv1.ClusterCache{cache})
 	if err != nil || recreated[0].ID == got[0].ID || recreated[0].ClientSocket != got[0].ClientSocket {
 		t.Fatalf("recreation: %#v, %v", recreated, err)
 	}
 }
 
 func TestBuildCatalogRejectsWholeInvalidCandidate(t *testing.T) {
-	valid := catalogVolume("cache-a", testNodeUID)
-	for name, invalid := range map[string]racerv1.ClusterVolume{
-		"missing uid":    catalogVolume("cache-b", ""),
-		"invalid uid":    catalogVolume("cache-b", "invalid"),
-		"uppercase uid":  catalogVolume("cache-b", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"),
-		"duplicate uid":  catalogVolume("cache-b", testNodeUID),
-		"duplicate name": catalogVolume("cache-a", testOtherUID),
-		"unsafe name":    catalogVolume("../cache", testOtherUID),
-		"long path":      catalogVolume(strings.Repeat("a", 63)+"."+strings.Repeat("b", 19), testOtherUID),
+	valid := catalogCache("cache-a", testNodeUID)
+	for name, invalid := range map[string]racerv1.ClusterCache{
+		"missing uid":    catalogCache("cache-b", ""),
+		"invalid uid":    catalogCache("cache-b", "invalid"),
+		"uppercase uid":  catalogCache("cache-b", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"),
+		"duplicate uid":  catalogCache("cache-b", testNodeUID),
+		"duplicate name": catalogCache("cache-a", testOtherUID),
+		"unsafe name":    catalogCache("../cache", testOtherUID),
+		"long path":      catalogCache(strings.Repeat("a", 63)+"."+strings.Repeat("b", 19), testOtherUID),
 	} {
 		t.Run(name, func(t *testing.T) {
-			got, err := BuildCatalog([]racerv1.ClusterVolume{valid, invalid})
+			got, err := BuildCatalog([]racerv1.ClusterCache{valid, invalid})
 			if !errors.Is(err, wire.InvalidRequest) || got != nil {
 				t.Fatalf("partial catalog escaped: %#v, %v", got, err)
 			}
@@ -1775,53 +1773,53 @@ func TestBuildCatalogRejectsWholeInvalidCandidate(t *testing.T) {
 
 // Run against the generated CRD in TestEnvtestServer, including Kubernetes'
 // built-in metadata validation rather than a fake client or a CEL-only evaluator.
-func integrationVolumeNameAdmission(t *testing.T, c client.Client) {
+func integrationCacheNameAdmission(t *testing.T, c client.Client) {
 	t.Helper()
 
 	for _, tt := range []struct {
 		name        string
-		volumeName  string
+		cacheName   string
 		wantMessage string
 	}{
-		{name: "single-character", volumeName: "a"},
-		{name: "digits-and-hyphens", volumeName: "0.cache-1.2"},
-		{name: "63-character-label", volumeName: strings.Repeat("a", 63)},
-		{name: "63-character-hyphenated-label", volumeName: "0" + strings.Repeat("-", 61) + "9"},
-		{name: "63-character-middle-label", volumeName: "a." + strings.Repeat("b", 63) + ".c"},
-		{name: "64-total-multiple-labels", volumeName: strings.Repeat("a", 62) + ".b"},
-		{name: "82-total-first-label-boundary", volumeName: strings.Repeat("a", 63) + "." + strings.Repeat("b", 18)},
-		{name: "82-total-last-label-boundary", volumeName: strings.Repeat("a", 18) + "." + strings.Repeat("b", 63)},
-		{name: "82-total-many-labels", volumeName: strings.Repeat("a.", 40) + "bb"},
-		{name: "64-character-label", volumeName: strings.Repeat("a", 64), wantMessage: "each name label must be at most 63 characters"},
-		{name: "64-character-first-label", volumeName: strings.Repeat("a", 64) + ".b", wantMessage: "each name label must be at most 63 characters"},
-		{name: "64-character-middle-label", volumeName: "a." + strings.Repeat("b", 64) + ".c", wantMessage: "each name label must be at most 63 characters"},
-		{name: "64-character-last-label", volumeName: "a." + strings.Repeat("b", 64), wantMessage: "each name label must be at most 63 characters"},
-		{name: "82-character-single-label", volumeName: strings.Repeat("a", 82), wantMessage: "each name label must be at most 63 characters"},
-		{name: "83-total-valid-labels", volumeName: strings.Repeat("a", 63) + "." + strings.Repeat("b", 19), wantMessage: "name must fit the canonical Unix socket path"},
-		{name: "83-total-many-labels", volumeName: strings.Repeat("a.", 41) + "b", wantMessage: "name must fit the canonical Unix socket path"},
-		{name: "empty", volumeName: "", wantMessage: "metadata.name"},
-		{name: "uppercase", volumeName: "Cache", wantMessage: "metadata.name"},
-		{name: "underscore", volumeName: "cache_a", wantMessage: "metadata.name"},
-		{name: "non-ASCII", volumeName: "caché", wantMessage: "metadata.name"},
-		{name: "slash", volumeName: "cache/child", wantMessage: "metadata.name"},
-		{name: "leading-dot", volumeName: ".cache", wantMessage: "metadata.name"},
-		{name: "trailing-dot", volumeName: "cache.", wantMessage: "metadata.name"},
-		{name: "empty-label", volumeName: "cache..a", wantMessage: "metadata.name"},
-		{name: "leading-hyphen", volumeName: "-cache", wantMessage: "metadata.name"},
-		{name: "trailing-hyphen", volumeName: "cache-", wantMessage: "metadata.name"},
-		{name: "label-leading-hyphen", volumeName: "cache.-a", wantMessage: "metadata.name"},
-		{name: "label-trailing-hyphen", volumeName: "cache.a-", wantMessage: "metadata.name"},
+		{name: "single-character", cacheName: "a"},
+		{name: "digits-and-hyphens", cacheName: "0.cache-1.2"},
+		{name: "63-character-label", cacheName: strings.Repeat("a", 63)},
+		{name: "63-character-hyphenated-label", cacheName: "0" + strings.Repeat("-", 61) + "9"},
+		{name: "63-character-middle-label", cacheName: "a." + strings.Repeat("b", 63) + ".c"},
+		{name: "64-total-multiple-labels", cacheName: strings.Repeat("a", 62) + ".b"},
+		{name: "82-total-first-label-boundary", cacheName: strings.Repeat("a", 63) + "." + strings.Repeat("b", 18)},
+		{name: "82-total-last-label-boundary", cacheName: strings.Repeat("a", 18) + "." + strings.Repeat("b", 63)},
+		{name: "82-total-many-labels", cacheName: strings.Repeat("a.", 40) + "bb"},
+		{name: "64-character-label", cacheName: strings.Repeat("a", 64), wantMessage: "each name label must be at most 63 characters"},
+		{name: "64-character-first-label", cacheName: strings.Repeat("a", 64) + ".b", wantMessage: "each name label must be at most 63 characters"},
+		{name: "64-character-middle-label", cacheName: "a." + strings.Repeat("b", 64) + ".c", wantMessage: "each name label must be at most 63 characters"},
+		{name: "64-character-last-label", cacheName: "a." + strings.Repeat("b", 64), wantMessage: "each name label must be at most 63 characters"},
+		{name: "82-character-single-label", cacheName: strings.Repeat("a", 82), wantMessage: "each name label must be at most 63 characters"},
+		{name: "83-total-valid-labels", cacheName: strings.Repeat("a", 63) + "." + strings.Repeat("b", 19), wantMessage: "name must fit the canonical Unix socket path"},
+		{name: "83-total-many-labels", cacheName: strings.Repeat("a.", 41) + "b", wantMessage: "name must fit the canonical Unix socket path"},
+		{name: "empty", cacheName: "", wantMessage: "metadata.name"},
+		{name: "uppercase", cacheName: "Cache", wantMessage: "metadata.name"},
+		{name: "underscore", cacheName: "cache_a", wantMessage: "metadata.name"},
+		{name: "non-ASCII", cacheName: "caché", wantMessage: "metadata.name"},
+		{name: "slash", cacheName: "cache/child", wantMessage: "metadata.name"},
+		{name: "leading-dot", cacheName: ".cache", wantMessage: "metadata.name"},
+		{name: "trailing-dot", cacheName: "cache.", wantMessage: "metadata.name"},
+		{name: "empty-label", cacheName: "cache..a", wantMessage: "metadata.name"},
+		{name: "leading-hyphen", cacheName: "-cache", wantMessage: "metadata.name"},
+		{name: "trailing-hyphen", cacheName: "cache-", wantMessage: "metadata.name"},
+		{name: "label-leading-hyphen", cacheName: "cache.-a", wantMessage: "metadata.name"},
+		{name: "label-trailing-hyphen", cacheName: "cache.a-", wantMessage: "metadata.name"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: tt.volumeName}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
+			cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: tt.cacheName}}
 
-			err := c.Create(t.Context(), volume)
+			err := c.Create(t.Context(), cache)
 			if err == nil {
 				t.Cleanup(func() {
 					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer cancel()
 
-					if err := c.Delete(ctx, volume); err != nil {
+					if err := c.Delete(ctx, cache); err != nil {
 						t.Error(err)
 					}
 				})
@@ -1829,17 +1827,17 @@ func integrationVolumeNameAdmission(t *testing.T, c client.Client) {
 
 			if tt.wantMessage != "" {
 				if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), tt.wantMessage) {
-					t.Fatalf("create %q: want Invalid containing %q, got %v", tt.volumeName, tt.wantMessage, err)
+					t.Fatalf("create %q: want Invalid containing %q, got %v", tt.cacheName, tt.wantMessage, err)
 				}
 
 				return
 			}
 
 			if err != nil {
-				t.Fatalf("create %q: %v", tt.volumeName, err)
+				t.Fatalf("create %q: %v", tt.cacheName, err)
 			}
 
-			catalog, err := BuildCatalog([]racerv1.ClusterVolume{*volume})
+			catalog, err := BuildCatalog([]racerv1.ClusterCache{*cache})
 			if err != nil || len(catalog) != 1 {
 				t.Fatalf("admitted cache cannot enter wire catalog: %v, %v", catalog, err)
 			}

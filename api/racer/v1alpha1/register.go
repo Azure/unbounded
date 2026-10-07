@@ -14,7 +14,7 @@ const GroupName = "racer.unbounded-cloud.io"
 var (
 	GroupVersion  = schema.GroupVersion{Group: GroupName, Version: "v1alpha1"}
 	SchemeBuilder = runtime.NewSchemeBuilder(func(s *runtime.Scheme) error {
-		s.AddKnownTypes(GroupVersion, &ClusterVolume{}, &ClusterVolumeList{})
+		s.AddKnownTypes(GroupVersion, &ClusterCache{}, &ClusterCacheList{})
 		metav1.AddToGroupVersion(s, GroupVersion)
 
 		return nil

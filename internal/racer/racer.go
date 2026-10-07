@@ -482,16 +482,16 @@ func managedPodChanges(cfg Config) predicate.Predicate {
 	})
 }
 
-func volumeChanges() predicate.Predicate {
+func cacheChanges() predicate.Predicate {
 	return changes(func(client.Object) bool { return true }, func(a, b client.Object) bool {
-		x, xok := a.(*racerv1.ClusterVolume)
+		x, xok := a.(*racerv1.ClusterCache)
 
-		y, yok := b.(*racerv1.ClusterVolume)
+		y, yok := b.(*racerv1.ClusterCache)
 		if !xok || !yok {
 			return false
 		}
 
-		return x.UID == y.UID && x.Name == y.Name && x.Spec.Type == y.Spec.Type
+		return x.UID == y.UID && x.Name == y.Name
 	})
 }
 
@@ -608,12 +608,12 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (authority.Top
 		return authority.TopologyObservation{}, err
 	}
 
-	var volumes racerv1.ClusterVolumeList
-	if err := r.APIReader.List(ctx, &volumes); err != nil {
+	var caches racerv1.ClusterCacheList
+	if err := r.APIReader.List(ctx, &caches); err != nil {
 		return authority.TopologyObservation{}, err
 	}
 
-	catalog, err := members.BuildCatalog(volumes.Items)
+	catalog, err := members.BuildCatalog(caches.Items)
 	if err != nil {
 		return authority.TopologyObservation{}, err
 	}
@@ -772,7 +772,7 @@ func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(nodeChanges())).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(managedPodChanges(cfg))).
 		Watches(&appsv1.DaemonSet{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, cfg.DaemonSetName))).
-		Watches(&racerv1.ClusterVolume{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(volumeChanges())).
+		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, cfg.CredentialsSecretName))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(cfg))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
@@ -820,7 +820,7 @@ func (r *KeyringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Named("racer-credentials").
 		WatchesRawSource(installation).
 		WatchesRawSource(initialEnqueue()).
-		Watches(&racerv1.ClusterVolume{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(volumeChanges())).
+		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, cfg.CredentialsSecretName))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(cfg))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).Complete(r)

@@ -296,12 +296,12 @@ func (r *topologyFixture) observeTopology(ctx context.Context) (TopologyObservat
 		return TopologyObservation{}, err
 	}
 
-	var volumes racerv1.ClusterVolumeList
-	if err := r.APIReader.List(ctx, &volumes); err != nil {
+	var caches racerv1.ClusterCacheList
+	if err := r.APIReader.List(ctx, &caches); err != nil {
 		return TopologyObservation{}, err
 	}
 
-	catalog, err := BuildCatalog(volumes.Items)
+	catalog, err := BuildCatalog(caches.Items)
 	if err != nil {
 		return TopologyObservation{}, err
 	}
@@ -370,8 +370,8 @@ var AuthenticateCertificate = authenticateCertificate
 
 func (r *credentialsFixture) now() time.Time { return credentialTime(r.Now) }
 
-func catalogVolume(name string, uid types.UID) racerv1.ClusterVolume {
-	return racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
+func catalogCache(name string, uid types.UID) racerv1.ClusterCache {
+	return racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}}
 }
 
 const (
@@ -454,8 +454,8 @@ func rejectWrites(t *testing.T, base client.WithWatch) client.WithWatch {
 	})
 }
 
-func BuildCatalog(volumes []racerv1.ClusterVolume) ([]wire.CacheDefinition, error) {
-	return members.BuildCatalog(volumes)
+func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error) {
+	return members.BuildCatalog(caches)
 }
 
 func TestEnvtestAuthority(t *testing.T) {
@@ -771,13 +771,13 @@ func TestCatalogGateSerializesCallers(t *testing.T) {
 	}
 }
 
-func capacityVolumes(count int) []racerv1.ClusterVolume {
-	volumes := make([]racerv1.ClusterVolume, count)
-	for i := range volumes {
-		volumes[i] = catalogVolume(fmt.Sprintf("capacity-%d", i), types.UID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", i)))
+func capacityCaches(count int) []racerv1.ClusterCache {
+	caches := make([]racerv1.ClusterCache, count)
+	for i := range caches {
+		caches[i] = catalogCache(fmt.Sprintf("capacity-%d", i), types.UID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", i)))
 	}
 
-	return volumes
+	return caches
 }
 
 func TestCatalogCapacityBoundary(t *testing.T) {
@@ -796,10 +796,10 @@ func TestCatalogCapacityBoundary(t *testing.T) {
 	for _, count := range []int{capacity, capacity + 1} {
 		keys := []map[string]any{}
 
-		for _, volume := range capacityVolumes(count) {
+		for _, cache := range capacityCaches(count) {
 			for range 2 {
 				for _, purpose := range []wire.KeyPurpose{wire.PageKey, wire.OriginCredentialsKey} {
-					keys = append(keys, map[string]any{"cache": volume.UID, "id": make([]byte, 16), "purpose": purpose, "state": wire.PreparedKey, "material": make([]byte, 32)})
+					keys = append(keys, map[string]any{"cache": cache.UID, "id": make([]byte, 16), "purpose": purpose, "state": wire.PreparedKey, "material": make([]byte, 32)})
 				}
 			}
 		}
@@ -837,8 +837,8 @@ func TestCatalogAdmissionRotationCycles(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			for _, volume := range capacityVolumes(capacity - 1) {
-				if err := r.Create(t.Context(), &volume); err != nil {
+			for _, cache := range capacityCaches(capacity - 1) {
+				if err := r.Create(t.Context(), &cache); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -901,9 +901,9 @@ func TestCatalogAdmissionGrowthRemovalAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	volumes := capacityVolumes(capacity + 1)
-	for _, volume := range volumes {
-		require.NoError(t, r.Create(t.Context(), &volume))
+	caches := capacityCaches(capacity + 1)
+	for _, cache := range caches {
+		require.NoError(t, r.Create(t.Context(), &cache))
 	}
 
 	if got := reconcileTopology(t, a.Topology, t.Context()); got != first {
@@ -919,14 +919,14 @@ func TestCatalogAdmissionGrowthRemovalAndRestart(t *testing.T) {
 		t.Fatalf("growth disabled healthy service: %v", err)
 	}
 
-	if !strings.Contains(logs.String(), "rotation_capacity") || !strings.Contains(logs.String(), volumes[capacity].Name) {
+	if !strings.Contains(logs.String(), "rotation_capacity") || !strings.Contains(logs.String(), caches[capacity].Name) {
 		t.Fatal("capacity rejection was not observable")
 	}
 
 	_, admitted, _, _ := keyState(t, r)
 
 	ids := keyedCaches(admitted)
-	if !ids[wire.CacheID(testNodeUID)] || len(ids) != capacity || ids[wire.CacheID(volumes[capacity-1].UID)] {
+	if !ids[wire.CacheID(testNodeUID)] || len(ids) != capacity || ids[wire.CacheID(caches[capacity-1].UID)] {
 		t.Fatal("growth displaced established UID or ignored sorted free-slot order")
 	}
 
@@ -934,7 +934,7 @@ func TestCatalogAdmissionGrowthRemovalAndRestart(t *testing.T) {
 	// Removing a rejected candidate must neither change keys nor consume a
 	// publication sequence. A restart retains the admitted set from the Secret.
 	before := reconcileTopology(t, a.Topology, t.Context())
-	require.NoError(t, r.Delete(t.Context(), &volumes[capacity]))
+	require.NoError(t, r.Delete(t.Context(), &caches[capacity]))
 
 	r = Assemble(r.Config, r.Client, r.APIReader).Keyring
 	runKeys(t, r)
@@ -943,7 +943,7 @@ func TestCatalogAdmissionGrowthRemovalAndRestart(t *testing.T) {
 		t.Fatal("rejected deletion changed publication")
 	}
 
-	if err := r.Delete(t.Context(), &volumes[0]); err != nil {
+	if err := r.Delete(t.Context(), &caches[0]); err != nil {
 		t.Fatal(err)
 	}
 
@@ -952,7 +952,7 @@ func TestCatalogAdmissionGrowthRemovalAndRestart(t *testing.T) {
 	assertPublishedKeys(t, a.Topology, capacity)
 
 	_, replaced, _, _ := keyState(t, r)
-	if keyedCaches(replaced)[wire.CacheID(volumes[0].UID)] || !keyedCaches(replaced)[wire.CacheID(volumes[capacity-1].UID)] {
+	if keyedCaches(replaced)[wire.CacheID(caches[0].UID)] || !keyedCaches(replaced)[wire.CacheID(caches[capacity-1].UID)] {
 		t.Fatal("deletion did not admit next waiting UID")
 	}
 
@@ -1004,7 +1004,7 @@ func TestCatalogAdmissionDeterministicColdStart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	input := capacityVolumes(capacity + 2)
+	input := capacityCaches(capacity + 2)
 	slices.Reverse(input)
 
 	catalog, err := BuildCatalog(input)
@@ -1042,16 +1042,16 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	volumes := capacityVolumes(capacity)
-	for _, volume := range volumes {
-		if err := r.Create(t.Context(), &volume); err != nil {
+	caches := capacityCaches(capacity)
+	for _, cache := range caches {
+		if err := r.Create(t.Context(), &cache); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	volumes = append(volumes, catalogVolume("cache", testNodeUID))
+	caches = append(caches, catalogCache("cache", testNodeUID))
 
-	catalog, err := BuildCatalog(volumes)
+	catalog, err := BuildCatalog(caches)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1164,13 +1164,13 @@ func integrationCatalogCapacity(t *testing.T, c client.Client) {
 	}
 
 	for i := range capacity + 1 {
-		volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("capacity-real-%d", i)}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-		if err := c.Create(t.Context(), volume); err != nil {
+		cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("capacity-real-%d", i)}}
+		if err := c.Create(t.Context(), cache); err != nil {
 			t.Fatal(err)
 		}
 
 		t.Cleanup(func() {
-			if err := c.Delete(context.Background(), volume); err != nil {
+			if err := c.Delete(context.Background(), cache); err != nil {
 				t.Error(err)
 			}
 		})

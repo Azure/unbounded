@@ -183,7 +183,7 @@ func TestPublicationBoundsOverflowAndInstallProof(t *testing.T) {
 		t.Fatalf("foreign install: %v", err)
 	}
 
-	cache, err := BuildCatalog([]racerv1.ClusterVolume{catalogVolume("cache", testNodeUID)})
+	cache, err := BuildCatalog([]racerv1.ClusterCache{catalogCache("cache", testNodeUID)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,9 +359,9 @@ func TestPollImmediateReturnsWithoutAllocations(t *testing.T) {
 	r := initializedTopology(t)
 	ctx := context.Background()
 	previous := reconcileTopology(t, r, ctx).record.Sequence
-	volume := catalogVolume("cache", testNodeUID)
+	cache := catalogCache("cache", testNodeUID)
 
-	if err := r.Create(ctx, &volume); err != nil {
+	if err := r.Create(ctx, &cache); err != nil {
 		t.Fatal(err)
 	}
 
@@ -508,8 +508,8 @@ func TestPollFanoutSharesOnePublication(t *testing.T) {
 
 		synctest.Wait()
 
-		volume := catalogVolume("cache", testNodeUID)
-		if err := r.Create(ctx, &volume); err != nil {
+		cache := catalogCache("cache", testNodeUID)
+		if err := r.Create(ctx, &cache); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1449,8 +1449,8 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 		t.Fatal("unchanged install replaced shared allocation")
 	}
 
-	volume := catalogVolume("cache-a", testNodeUID)
-	if err := r.Create(ctx, &volume); err != nil {
+	cache := catalogCache("cache-a", testNodeUID)
+	if err := r.Create(ctx, &cache); err != nil {
 		t.Fatal(err)
 	}
 

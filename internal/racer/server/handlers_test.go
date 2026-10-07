@@ -933,8 +933,8 @@ func TestRustKeyringInterop(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	f := newServingFixture(t)
 
-	volume := catalogVolume("interop", testOtherUID)
-	require.NoError(t, f.a.Topology.Create(f.ctx, &volume))
+	cache := catalogCache("interop", testOtherUID)
+	require.NoError(t, f.a.Topology.Create(f.ctx, &cache))
 
 	runKeys(t, f.a.Keyring)
 	reconcileTopology(t, f.a.Topology, f.ctx)

@@ -542,8 +542,8 @@ func TestCredentialTime(t *testing.T) {
 func testKeyring(t *testing.T) (*credentialsFixture, *time.Time) {
 	t.Helper()
 
-	volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache", UID: types.UID(testNodeUID)}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-	topology := initializedTopology(t, volume)
+	cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache", UID: types.UID(testNodeUID)}}
+	topology := initializedTopology(t, cache)
 	a := Assemble(topology.Config, topology.Client, topology.APIReader)
 	now := time.Now().UTC().Truncate(time.Second)
 	a.Keyring.Now = func() time.Time { return now }
@@ -850,12 +850,12 @@ func TestKeyringCatalogAndBounds(t *testing.T) {
 		t.Fatal("planner mutated input")
 	}
 
-	volume := &racerv1.ClusterVolume{}
-	if err := r.APIReader.Get(context.Background(), client.ObjectKey{Name: "cache"}, volume); err != nil {
+	cache := &racerv1.ClusterCache{}
+	if err := r.APIReader.Get(context.Background(), client.ObjectKey{Name: "cache"}, cache); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := r.Delete(context.Background(), volume); err != nil {
+	if err := r.Delete(context.Background(), cache); err != nil {
 		t.Fatal(err)
 	}
 
@@ -866,10 +866,10 @@ func TestKeyringCatalogAndBounds(t *testing.T) {
 		t.Fatal("removed cache keys retained")
 	}
 
-	volume.ResourceVersion = ""
+	cache.ResourceVersion = ""
 
-	volume.UID = types.UID(testOtherUID)
-	if err := r.Create(context.Background(), volume); err != nil {
+	cache.UID = types.UID(testOtherUID)
+	if err := r.Create(context.Background(), cache); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1125,7 +1125,7 @@ func TestKeyringExhaustedGenerationTransitions(t *testing.T) {
 
 			r.Config.Rotation.Interval = 7 * 24 * time.Hour
 			if transition == "empty stage" {
-				require.NoError(t, r.Delete(t.Context(), &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}))
+				require.NoError(t, r.Delete(t.Context(), &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}))
 			}
 
 			runKeys(t, r)
@@ -1156,12 +1156,12 @@ func TestKeyringExhaustedGenerationTransitions(t *testing.T) {
 
 			switch transition {
 			case "admission":
-				volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "added", UID: types.UID(testOtherUID)}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-				require.NoError(t, r.Create(t.Context(), volume))
+				cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "added", UID: types.UID(testOtherUID)}}
+				require.NoError(t, r.Create(t.Context(), cache))
 			case "stage", "empty stage":
 				*now = initial.NextRotation
 			case "remove":
-				require.NoError(t, r.Delete(t.Context(), &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}))
+				require.NoError(t, r.Delete(t.Context(), &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}))
 			}
 
 			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
@@ -1198,8 +1198,8 @@ func TestKeyringAdmissionAtLastGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "added", UID: types.UID(testOtherUID)}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-	if err := r.Create(t.Context(), volume); err != nil {
+	cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "added", UID: types.UID(testOtherUID)}}
+	if err := r.Create(t.Context(), cache); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1225,8 +1225,8 @@ func TestKeyringOversizedOverlapDoesNotWrite(t *testing.T) {
 	_, initial, _, _ := keyState(t, r)
 
 	for n := range 800 {
-		volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("cache-%d", n), UID: types.UID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", n+1))}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-		if err := r.Create(context.Background(), volume); err != nil {
+		cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("cache-%d", n), UID: types.UID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", n+1))}}
+		if err := r.Create(context.Background(), cache); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1276,8 +1276,8 @@ func TestKeyringOversizedOverlapDoesNotWrite(t *testing.T) {
 func TestKeyringEmptyCatalogAndCacheAddedDuringPreparation(t *testing.T) {
 	r, now := testKeyring(t)
 
-	volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache"}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-	if err := r.Delete(context.Background(), volume); err != nil {
+	cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}}
+	if err := r.Delete(context.Background(), cache); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1293,8 +1293,8 @@ func TestKeyringEmptyCatalogAndCacheAddedDuringPreparation(t *testing.T) {
 	runKeys(t, r)
 	_, _, staged, _ := keyState(t, r)
 
-	volume.UID = types.UID(testNodeUID)
-	if err := r.Create(context.Background(), volume); err != nil {
+	cache.UID = types.UID(testNodeUID)
+	if err := r.Create(context.Background(), cache); err != nil {
 		t.Fatal(err)
 	}
 

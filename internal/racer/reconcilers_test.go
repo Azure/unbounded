@@ -704,7 +704,7 @@ func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 	require.Equal(t, content, contentAgain)
 	require.Equal(t, membership, membershipAgain)
 
-	candidate.Caches, err = BuildCatalog([]racerv1.ClusterVolume{catalogVolume("cache-a", testNodeUID)})
+	candidate.Caches, err = BuildCatalog([]racerv1.ClusterCache{catalogCache("cache-a", testNodeUID)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -898,8 +898,8 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			history := node.Annotations[admittedMemberAnnotation]
 			require.NotEmpty(t, history)
 
-			volume := catalogVolume("cache-a", testOtherUID)
-			require.NoError(t, r.Create(t.Context(), &volume))
+			cache := catalogCache("cache-a", testOtherUID)
+			require.NoError(t, r.Create(t.Context(), &cache))
 			require.Equal(t, first.encoded, reconcileTopology(t, r, t.Context()).encoded, "cache waits for committed keys")
 			runKeys(t, a.Keyring)
 			withCache := reconcileTopology(t, r, t.Context())
@@ -942,7 +942,7 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			node.Annotations[wire.SharesAnnotation] = "16"
 			require.NoError(t, r.Update(t.Context(), &node))
 
-			invalid := catalogVolume("cache-b", "not-a-uuid")
+			invalid := catalogCache("cache-b", "not-a-uuid")
 			require.NoError(t, r.Create(t.Context(), &invalid))
 			_, err = r.Reconcile(t.Context(), ctrl.Request{})
 			require.ErrorIs(t, err, wire.InvalidRequest)
@@ -953,7 +953,7 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			require.Equal(t, history, node.Annotations[admittedMemberAnnotation])
 
 			require.NoError(t, r.Delete(t.Context(), &invalid))
-			require.NoError(t, r.Delete(t.Context(), &volume))
+			require.NoError(t, r.Delete(t.Context(), &cache))
 
 			node.Labels = map[string]string{wire.ExclusionLabel: ""}
 			require.NoError(t, r.Update(t.Context(), &node))
@@ -1056,8 +1056,8 @@ func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, o
 	return result.Members, result.Diagnostics, err
 }
 
-func BuildCatalog(volumes []racerv1.ClusterVolume) ([]wire.CacheDefinition, error) {
-	return members.BuildCatalog(volumes)
+func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error) {
+	return members.BuildCatalog(caches)
 }
 
 func TestLegacyRDMADiagnosticsAndMalformedUnitRetention(t *testing.T) {

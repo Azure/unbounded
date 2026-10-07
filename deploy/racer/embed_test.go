@@ -29,23 +29,42 @@ var manifestNames = []string{
 
 // Retain the manifest contract for standalone rendering, not a custom embedded FS.
 func TestEmbeddedManifestContract(t *testing.T) {
-	crd, err := os.ReadFile("crd/racer.unbounded-cloud.io_clustervolumes.yaml")
+	crd, err := os.ReadFile("crd/racer.unbounded-cloud.io_clustercaches.yaml")
 	require.NoError(t, err)
 
 	var definition struct {
 		Spec struct {
 			Names struct {
 				Kind       string
+				ListKind   string
+				Plural     string
+				Singular   string
 				ShortNames []string
 			}
-			Scope string
+			Scope    string
+			Versions []struct {
+				AdditionalPrinterColumns []any
+				Schema                   struct {
+					OpenAPIV3Schema struct {
+						Properties map[string]any
+						Required   []string
+					}
+				}
+			}
 		}
 	}
 
 	require.NoError(t, yaml.Unmarshal(crd, &definition))
-	require.Equal(t, "ClusterVolume", definition.Spec.Names.Kind)
-	require.Equal(t, []string{"cvol"}, definition.Spec.Names.ShortNames)
+	require.Equal(t, "ClusterCache", definition.Spec.Names.Kind)
+	require.Equal(t, "ClusterCacheList", definition.Spec.Names.ListKind)
+	require.Equal(t, "clustercaches", definition.Spec.Names.Plural)
+	require.Equal(t, "clustercache", definition.Spec.Names.Singular)
+	require.Equal(t, []string{"ccache"}, definition.Spec.Names.ShortNames)
 	require.Equal(t, "Cluster", definition.Spec.Scope)
+	require.Len(t, definition.Spec.Versions, 1)
+	require.Empty(t, definition.Spec.Versions[0].AdditionalPrinterColumns)
+	require.NotContains(t, definition.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties, "spec")
+	require.NotContains(t, definition.Spec.Versions[0].Schema.OpenAPIV3Schema.Required, "spec")
 	out := t.TempDir()
 	require.NoError(t, render.Render(".", out, map[string]string{"ControllerImage": "registry/controller:test"}))
 	require.NoError(t, fstest.TestFS(os.DirFS(out), manifestNames...))

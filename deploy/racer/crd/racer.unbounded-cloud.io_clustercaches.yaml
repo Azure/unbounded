@@ -6,27 +6,23 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: clustervolumes.racer.unbounded-cloud.io
+  name: clustercaches.racer.unbounded-cloud.io
 spec:
   group: racer.unbounded-cloud.io
   names:
-    kind: ClusterVolume
-    listKind: ClusterVolumeList
-    plural: clustervolumes
+    kind: ClusterCache
+    listKind: ClusterCacheList
+    plural: clustercaches
     shortNames:
-    - cvol
-    singular: clustervolume
+    - ccache
+    singular: clustercache
   scope: Cluster
   versions:
-  - additionalPrinterColumns:
-    - jsonPath: .spec.type
-      name: Type
-      type: string
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: |-
-          ClusterVolume names a volume. Its Kubernetes UID is its wire identity.
+          ClusterCache names a cache. Its Kubernetes UID is its wire identity.
           Socket paths are derived from metadata.name. Client access is controlled by pod volume mounts.
           The name limit keeps /run/racer/<name>/origin/socket within Linux sockaddr_un.
           Each DNS label is limited to 63 characters to match the wire contract;
@@ -50,22 +46,6 @@ spec:
             type: string
           metadata:
             type: object
-          spec:
-            description: ClusterVolumeSpec selects the volume behavior.
-            properties:
-              type:
-                description: Type is immutable after creation.
-                enum:
-                - Cache
-                type: string
-                x-kubernetes-validations:
-                - message: type is immutable
-                  rule: self == oldSelf
-            required:
-            - type
-            type: object
-        required:
-        - spec
         type: object
         x-kubernetes-validations:
         - message: name must fit the canonical Unix socket path
@@ -74,4 +54,3 @@ spec:
           rule: self.metadata.name.matches('^[^.]{1,63}([.][^.]{1,63})*$')
     served: true
     storage: true
-    subresources: {}

@@ -84,8 +84,8 @@ func replicationSleep(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func catalogVolume(name string, uid types.UID) racerv1.ClusterVolume {
-	return racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
+func catalogCache(name string, uid types.UID) racerv1.ClusterCache {
+	return racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}}
 }
 
 func TestIdentityAdmission(t *testing.T) {

@@ -105,8 +105,8 @@ func TestSecurityCredentialReplayBeforeUse(t *testing.T) {
 			t.Run(scenario+"/"+operation, func(t *testing.T) {
 				f := newServingFixture(t)
 				a, r := f.a.authority, f.a.Keyring
-				volume := catalogVolume("cache", testNodeUID)
-				require.NoError(t, r.Create(t.Context(), &volume))
+				cache := catalogCache("cache", testNodeUID)
+				require.NoError(t, r.Create(t.Context(), &cache))
 				runKeys(t, r)
 				_, oldBundle, oldRotation, oldMaterial := keyState(t, r)
 				_, bundle, rotation, material := keyState(t, r)

@@ -834,43 +834,21 @@ func TestObservedOwnershipAndEndpoint(t *testing.T) {
 }
 
 func TestCatalogOrderingAndWholeCandidateValidation(t *testing.T) {
-	volumes := []racerv1.ClusterVolume{
-		{ObjectMeta: metav1.ObjectMeta{Name: "cache-b", UID: types.UID(otherID)}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "cache-a", UID: types.UID(nodeID)}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}},
+	caches := []racerv1.ClusterCache{
+		{ObjectMeta: metav1.ObjectMeta{Name: "cache-b", UID: types.UID(otherID)}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "cache-a", UID: types.UID(nodeID)}},
 	}
 
-	catalog, err := BuildCatalog(volumes)
-	if err != nil || len(catalog) != 2 || catalog[0].ID != nodeID || catalog[0].ClientSocket != "/run/racer/cache-a/client/socket" || volumes[0].Name != "cache-b" {
+	catalog, err := BuildCatalog(caches)
+	if err != nil || len(catalog) != 2 || catalog[0].ID != nodeID || catalog[0].ClientSocket != "/run/racer/cache-a/client/socket" || caches[0].Name != "cache-b" {
 		t.Fatalf("catalog order or input mutation: %+v, %v", catalog, err)
 	}
 
-	volumes[1].Name = "../invalid"
+	caches[1].Name = "../invalid"
 
-	catalog, err = BuildCatalog(volumes)
+	catalog, err = BuildCatalog(caches)
 	if !errors.Is(err, wire.InvalidRequest) || catalog != nil {
 		t.Fatalf("partial catalog escaped: %+v, %v", catalog, err)
-	}
-}
-
-func TestCatalogSkipsNonCacheVolumesBeforeValidation(t *testing.T) {
-	valid := racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache", UID: types.UID(nodeID)}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-
-	for _, volumeType := range []racerv1.ClusterVolumeType{"", "Future", "cache"} {
-		t.Run(string(volumeType), func(t *testing.T) {
-			invalid := racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "../invalid", UID: "invalid"}, Spec: racerv1.ClusterVolumeSpec{Type: volumeType}}
-			duplicate := valid
-			duplicate.Spec.Type = volumeType
-
-			catalog, err := BuildCatalog([]racerv1.ClusterVolume{invalid, duplicate, valid, duplicate})
-			if err != nil || len(catalog) != 1 || catalog[0].ID != nodeID {
-				t.Fatalf("non-Cache volume affected catalog: %+v, %v", catalog, err)
-			}
-
-			catalog, err = BuildCatalog([]racerv1.ClusterVolume{invalid, duplicate, {}})
-			if err != nil || catalog == nil || len(catalog) != 0 {
-				t.Fatalf("non-Cache-only catalog: %+v, %v", catalog, err)
-			}
-		})
 	}
 }
 
@@ -1076,12 +1054,12 @@ func TestReconcileMemberLimit(t *testing.T) {
 }
 
 func TestCatalogRejectsInvalidIdentities(t *testing.T) {
-	valid := racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache", UID: nodeID}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
+	valid := racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache", UID: nodeID}}
 	for _, identity := range []metav1.ObjectMeta{{Name: "other", UID: "invalid"}, {Name: "other", UID: nodeID}, {Name: "cache", UID: otherID}} {
 		invalid := valid
 		invalid.ObjectMeta = identity
 
-		got, err := BuildCatalog([]racerv1.ClusterVolume{valid, invalid})
+		got, err := BuildCatalog([]racerv1.ClusterCache{valid, invalid})
 		if !errors.Is(err, wire.InvalidRequest) || got != nil {
 			t.Fatalf("invalid catalog identity: %+v, %v", got, err)
 		}

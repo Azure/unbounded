@@ -1526,8 +1526,8 @@ func advanceFixturePublication(t *testing.T, r *TopologyReconciler) {
 func testKeyring(t *testing.T) (*KeyringReconciler, *time.Time) {
 	t.Helper()
 
-	volume := &racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: "cache", UID: testNodeUID}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
-	r := initializedTopology(t, volume)
+	cache := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache", UID: testNodeUID}}
+	r := initializedTopology(t, cache)
 	a := assembleFixture(r.config, r.Client, r.APIReader)
 	now := time.Now().UTC().Truncate(time.Second)
 	fixtureDependencies[a.authority].now = func() time.Time { return now }

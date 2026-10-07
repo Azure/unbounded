@@ -114,12 +114,12 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObser
 		return TopologyObservation{}, err
 	}
 
-	var volumes racerv1.ClusterVolumeList
-	if err := r.APIReader.List(ctx, &volumes); err != nil {
+	var caches racerv1.ClusterCacheList
+	if err := r.APIReader.List(ctx, &caches); err != nil {
 		return TopologyObservation{}, err
 	}
 
-	catalog, err := members.BuildCatalog(volumes.Items)
+	catalog, err := members.BuildCatalog(caches.Items)
 	if err != nil {
 		return TopologyObservation{}, err
 	}
@@ -300,10 +300,10 @@ func scaleLists(t *testing.T, r *TopologyReconciler, count int) map[string]any {
 
 	ds := &appsv1.DaemonSetList{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSetList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}, Items: []appsv1.DaemonSet{{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.DaemonSetName, UID: testDaemonSetUID, ResourceVersion: "1"}}}}
 
-	volumes := &racerv1.ClusterVolumeList{TypeMeta: metav1.TypeMeta{APIVersion: racerv1.GroupVersion.String(), Kind: "ClusterVolumeList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}}
+	caches := &racerv1.ClusterCacheList{TypeMeta: metav1.TypeMeta{APIVersion: racerv1.GroupVersion.String(), Kind: "ClusterCacheList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}}
 	for i := range 16 {
-		volumes.Items = append(volumes.Items, catalogVolume(fmt.Sprintf("cache-%d", i), types.UID(fmt.Sprintf("%08x-1111-4000-8000-000000000000", i))))
-		require.NoError(t, r.Create(t.Context(), &volumes.Items[i]))
+		caches.Items = append(caches.Items, catalogCache(fmt.Sprintf("cache-%d", i), types.UID(fmt.Sprintf("%08x-1111-4000-8000-000000000000", i))))
+		require.NoError(t, r.Create(t.Context(), &caches.Items[i]))
 	}
 
 	runKeys(t, Assemble(r.Config, r.Client, r.APIReader).Keyring)
@@ -312,7 +312,7 @@ func scaleLists(t *testing.T, r *TopologyReconciler, count int) map[string]any {
 		"/api/v1/nodes": nodes,
 		"/api/v1/namespaces/" + r.Config.Namespace + "/pods":             pods,
 		"/apis/apps/v1/namespaces/" + r.Config.Namespace + "/daemonsets": ds,
-		"/apis/" + racerv1.GroupVersion.String() + "/clustervolumes":     volumes,
+		"/apis/" + racerv1.GroupVersion.String() + "/clustercaches":      caches,
 	}
 }
 
@@ -357,7 +357,7 @@ func scaleCache(t *testing.T, r *TopologyReconciler, count int) cache.Cache {
 	mapper.Add(corev1.SchemeGroupVersion.WithKind("Secret"), meta.RESTScopeNamespace)
 	mapper.Add(corev1.SchemeGroupVersion.WithKind("ConfigMap"), meta.RESTScopeNamespace)
 	mapper.Add(appsv1.SchemeGroupVersion.WithKind("DaemonSet"), meta.RESTScopeNamespace)
-	mapper.Add(racerv1.GroupVersion.WithKind("ClusterVolume"), meta.RESTScopeRoot)
+	mapper.Add(racerv1.GroupVersion.WithKind("ClusterCache"), meta.RESTScopeRoot)
 
 	options := cache.Options{ByObject: map[client.Object]cache.ByObject{
 		&corev1.Pod{}:       {Namespaces: map[string]cache.Config{r.Config.Namespace: {}}},
@@ -370,7 +370,7 @@ func scaleCache(t *testing.T, r *TopologyReconciler, count int) cache.Cache {
 	require.NoError(t, err)
 	require.NoError(t, reader.IndexField(t.Context(), &corev1.Pod{}, podNodeIndex, podNodeKeys))
 
-	for _, obj := range []client.Object{&corev1.Node{}, &appsv1.DaemonSet{}, &racerv1.ClusterVolume{}} {
+	for _, obj := range []client.Object{&corev1.Node{}, &appsv1.DaemonSet{}, &racerv1.ClusterCache{}} {
 		_, err := reader.GetInformer(t.Context(), obj)
 		require.NoError(t, err)
 	}
