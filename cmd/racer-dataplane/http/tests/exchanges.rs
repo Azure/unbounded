@@ -196,7 +196,7 @@ fn upload_then_fetch_on_one_connection_and_honor_server_close() {
             io.receive_request_head_limited(server, &RequestScope, 128),
         )
         .unwrap();
-        let request = received.value.unwrap();
+        let request = received.value.value().as_ref().unwrap();
         assert!(
             matches!(request.start, StartLine::Request { method: ref m, ref target }
             if m == method && target == "/items")
@@ -238,7 +238,7 @@ fn upload_then_fetch_on_one_connection_and_honor_server_close() {
         .lease;
         let received = drive(&io, io.receive_head(client, &RequestScope)).unwrap();
         assert!(matches!(
-            received.value.start,
+            received.value.value().start,
             StartLine::Response { status: 200 }
         ));
         client = received.connection;
@@ -322,7 +322,7 @@ fn response_on_request_only_connection_can_be_rejected_but_never_reused() {
     )
     .unwrap();
     assert!(matches!(
-        rejected.value,
+        rejected.value.value(),
         Err(Failure::Http(Error::Malformed))
     ));
     assert!(rejected.connection.closing());
@@ -339,7 +339,7 @@ fn response_on_request_only_connection_can_be_rejected_but_never_reused() {
     .unwrap();
     let received = drive(&io, io.receive_head(sent.connection, &RequestScope)).unwrap();
     assert!(matches!(
-        received.value.start,
+        received.value.value().start,
         StartLine::Response { status: 400 }
     ));
     assert_eq!(

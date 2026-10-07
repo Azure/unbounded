@@ -197,15 +197,61 @@ pub struct ConnectionLease<C: Context> {
 }
 
 /// A head result and the connection and decoded-storage charge it retains.
+///
+/// The decoded allocation cannot be detached from its charge.
+///
+/// ```compile_fail
+/// use http1::{MessageHead, connection::{Context, HeadCompletion}};
+/// fn detach<C: Context>(done: HeadCompletion<C, MessageHead>) -> MessageHead {
+///     let head = done.value;
+///     drop(done._decoded);
+///     head
+/// }
+/// ```
 pub struct HeadCompletion<C: Context, T> {
     /// Connection ownership recovered after head processing.
     pub connection: ConnectionLease<C>,
 
     /// Decoded head or operation-specific head outcome.
-    pub value: T,
+    pub value: DecodedHead<C, T>,
+}
 
-    /// Admission retained while the decoded head remains owned by this completion.
-    pub _decoded: Option<C::Charge>,
+/// An owned head outcome that retains its decoded-storage charge until drop.
+///
+/// Only shared access is exposed. Caller-made copies need their own admission.
+/// The value is dropped before its charge.
+///
+/// ```compile_fail
+/// use http1::{MessageHead, connection::{Context, DecodedHead}};
+/// fn detach<C: Context>(head: DecodedHead<C, MessageHead>) -> MessageHead {
+///     head.value
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use http1::{MessageHead, connection::{Context, DecodedHead}};
+/// fn release<C: Context>(head: DecodedHead<C, MessageHead>) {
+///     drop(head._decoded);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use http1::{MessageHead, connection::{Context, DecodedHead}};
+/// fn take<C: Context>(head: &mut DecodedHead<C, MessageHead>) -> Vec<http1::Header> {
+///     std::mem::take(&mut head.value().headers)
+/// }
+/// ```
+pub struct DecodedHead<C: Context, T> {
+    value: T,
+
+    _decoded: Option<C::Charge>,
+}
+
+impl<C: Context, T> DecodedHead<C, T> {
+    /// Borrow the outcome without separating its storage from its charge.
+    pub fn value(&self) -> &T {
+        &self.value
+    }
 }
 
 /// Fixed admitted storage, zeroized before release or single-buffer reuse.
@@ -449,8 +495,10 @@ impl<C: Context> HttpIo<C> {
                 .await?;
             Ok(HeadCompletion {
                 connection: completed.connection,
-                value: completed.value?,
-                _decoded: completed._decoded,
+                value: DecodedHead {
+                    value: completed.value.value?,
+                    _decoded: completed.value._decoded,
+                },
             })
         })
     }
@@ -544,8 +592,10 @@ impl<C: Context> HttpIo<C> {
                     }
                     return Ok(HeadCompletion {
                         connection,
-                        value: Ok(head),
-                        _decoded: decoded_charge,
+                        value: DecodedHead {
+                            value: Ok(head),
+                            _decoded: decoded_charge,
+                        },
                     });
                 }
                 if used == buffer.bytes.len() {
@@ -641,8 +691,10 @@ impl<C: Context> HttpIo<C> {
             connection.tx_remaining = Some(length);
             Ok(HeadCompletion {
                 connection,
-                value: (),
-                _decoded: None,
+                value: DecodedHead {
+                    value: (),
+                    _decoded: None,
+                },
             })
         })
     }
@@ -885,7 +937,7 @@ impl<C: Context> HttpIo<C> {
                 .send_head_impl(connection, request, scope, true)
                 .await?;
             let received = self.receive_head(sent.connection, scope).await?;
-            if !matches!(received.value.start, StartLine::Response { .. }) {
+            if !matches!(received.value.value().start, StartLine::Response { .. }) {
                 return Err(Error::Malformed.into());
             }
             Ok(received)
@@ -1879,8 +1931,10 @@ fn rejected_head<C: Context>(
     connection.request_is_head = false;
     HeadCompletion {
         connection,
-        value: Err(error.into()),
-        _decoded: None,
+        value: DecodedHead {
+            value: Err(error.into()),
+            _decoded: None,
+        },
     }
 }
 
@@ -2442,7 +2496,7 @@ mod tests {
                         io.receive_request_head_limited(connection, &TestScope, 128),
                     )
                     .map(|done| {
-                        assert!(done.value.is_ok());
+                        assert!(done.value.value().is_ok());
                         done.connection
                     }),
                     _ => drive(&reactor, io.send_head(connection, head(200, 0), &TestScope))
@@ -2469,6 +2523,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Moving a received owner keeps admission after its connection and I/O are gone.
+    #[test]
+    fn decoded_head_keeps_charge_when_connection_moves() {
+        let wire = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+        for request_only in [false, true] {
+            let hooks = hooks();
+            let reactor = reactor();
+            let codec = Codec::<()>::new(128);
+            let expected = codec.decoded_allocation(wire).unwrap();
+            let io = HttpIo::<Hooks>::new(reactor.clone(), codec, hooks.clone(), 8, 8);
+            let (mut connection, _peer) = lease(&hooks, Policy::default());
+            let buffer = OwnedBuffer::copy_from(hooks.as_ref(), wire).unwrap();
+            connection
+                .restore_read_ahead(buffer, 0..wire.len())
+                .unwrap();
+            if request_only {
+                let done = drive(
+                    &reactor,
+                    io.receive_request_head_limited(connection, &TestScope, 128),
+                )
+                .unwrap();
+                let owner = done.value;
+                drop(done.connection);
+                drop(io);
+                assert_eq!(hooks.slots.get(), 0);
+                assert_eq!(hooks.used.get(), expected);
+                assert_eq!(
+                    owner.value().as_ref().unwrap().unique("host").unwrap(),
+                    Some(b"example".as_slice())
+                );
+                drop(owner);
+            } else {
+                let done = drive(&reactor, io.receive_head(connection, &TestScope)).unwrap();
+                let owner = done.value;
+                drop(done.connection);
+                drop(io);
+                assert_eq!(hooks.slots.get(), 0);
+                assert_eq!(hooks.used.get(), expected);
+                assert_eq!(
+                    owner.value().unique("host").unwrap(),
+                    Some(b"example".as_slice())
+                );
+                drop(owner);
+            }
+            assert_eq!(hooks.used.get(), 0);
+            assert_eq!(reactor.in_flight(), 0);
+        }
+    }
+
+    /// Decode and framing rejections release admission without retaining a head.
+    #[test]
+    fn rejected_heads_release_decoded_charge() {
+        for wire in [
+            b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 9\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n",
+        ] {
+            for request_only in [false, true] {
+                let hooks = hooks();
+                let reactor = reactor();
+                let io =
+                    HttpIo::<Hooks>::new(reactor.clone(), Codec::new(128), hooks.clone(), 8, 8);
+                let (mut connection, _peer) = lease(&hooks, Policy::default());
+                let buffer = OwnedBuffer::copy_from(hooks.as_ref(), wire).unwrap();
+                connection
+                    .restore_read_ahead(buffer, 0..wire.len())
+                    .unwrap();
+                if request_only {
+                    let done = drive(
+                        &reactor,
+                        io.receive_request_head_limited(connection, &TestScope, 128),
+                    )
+                    .unwrap();
+                    io.reclaim_buffer();
+                    assert!(matches!(
+                        done.value.value(),
+                        Err(Failure::Http(Error::Malformed))
+                    ));
+                    assert_eq!(hooks.used.get(), 0);
+                    drop(done);
+                } else {
+                    assert!(matches!(
+                        drive(&reactor, io.receive_head(connection, &TestScope)),
+                        Err(Failure::Http(Error::Malformed))
+                    ));
+                }
+                drop(io);
+                assert_eq!(hooks.used.get(), 0);
+                assert_eq!(hooks.slots.get(), 0);
+                assert_eq!(reactor.in_flight(), 0);
+            }
+        }
+    }
+
+    /// The charge outlives the value's destructor, not just its last borrow.
+    #[test]
+    fn decoded_head_drops_value_before_charge() {
+        let hooks = hooks();
+        let used = hooks.used.clone();
+        let dropped = Rc::new(Cell::new(false));
+        let observed = dropped.clone();
+        let owner = DecodedHead::<Hooks, _> {
+            value: Charge(
+                Rc::new(Cell::new(1)),
+                1,
+                Some(Box::new(move || {
+                    assert_eq!(used.get(), 7);
+                    observed.set(true);
+                })),
+            ),
+            _decoded: Some(hooks.charge(7).unwrap()),
+        };
+        drop(owner);
+        assert!(dropped.get());
+        assert_eq!(hooks.used.get(), 0);
     }
 
     /// Cached storage is cleared, charged, and unavailable after caller shutdown.
@@ -3044,7 +3215,7 @@ mod tests {
             if accepted {
                 let done = result.unwrap();
                 assert!(matches!(
-                    done.value.start,
+                    done.value.value().start,
                     StartLine::Response { status: 200 }
                 ));
                 assert_eq!(done.connection.send_remaining(), Some(0));
@@ -3110,7 +3281,7 @@ mod tests {
             if matches!(rewrite, Rewrite::Ordinary) {
                 let done = result.unwrap();
                 assert_eq!(
-                    done.value.unique("x-checked").unwrap(),
+                    done.value.value().unique("x-checked").unwrap(),
                     Some(b"yes".as_slice())
                 );
                 assert_eq!(done.connection.receive_remaining(), Some(0));
