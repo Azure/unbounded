@@ -30,9 +30,11 @@ type ClientConfig struct {
 	// Volume names the Racer volume, a DNS subdomain such as "blobs". The
 	// client connects to /run/racer/<Volume>/client/socket.
 	Volume string
-	// MaxConnections bounds concurrent [Client.Get] transfers. Further calls
-	// wait briefly in a bounded queue and then fail with [ErrUnavailable].
-	// Zero means 64.
+	// MaxConnections bounds concurrent [Client.Get] transfers without
+	// [ReadOptions.SmallObject]. Zero means 64. SmallObject transfers and
+	// [Client.Stat] calls each have a separate four-slot lane. Each lane has a
+	// bounded queue; calls fail with [ErrUnavailable] if it is full or the
+	// wait times out.
 	MaxConnections int
 }
 
