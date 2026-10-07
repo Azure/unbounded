@@ -156,7 +156,12 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 	dialer.Put(lateAddr, d, body)
 
 	dht := fakes.NewDHT()
-	coldStart := &stubColdStart{err: mirror.ErrColdStartExhausted}
+	coldStartEntered := make(chan struct{})
+	signalColdStart := sync.OnceFunc(func() { close(coldStartEntered) })
+	coldStart := &stubColdStart{
+		err:       mirror.ErrColdStartExhausted,
+		onResolve: func(digest.Digest) { signalColdStart() },
+	}
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
 		mirror.WithLiveStreamThrough(),
@@ -186,6 +191,13 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 
 	if got := dialer.Calls(lateAddr); got != 0 {
 		t.Fatalf("peer calls before advertise = %d, want 0", got)
+	}
+
+	// Headers flush before round 0; wait until its empty lookup reaches cold-start.
+	select {
+	case <-coldStartEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cold-start was not entered before provider advertisement")
 	}
 
 	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
