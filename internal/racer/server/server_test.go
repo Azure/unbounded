@@ -141,7 +141,7 @@ func memberPod(uid types.UID, created int64, ip string) corev1.Pod {
 	}
 }
 
-const DataplaneDaemonSetName = members.DataplaneDaemonSetName
+const DataplaneDaemonSetName = "racer-dataplane"
 
 func TestHTTPRoutesBeforeReadinessAndTLS(t *testing.T) {
 	f := newServingFixture(t)

@@ -7,8 +7,8 @@ replicas can serve validated state.
 
 This component includes the Racer API types, controller packages, deployment
 templates, and image definition. The dataplane, SDK, and operator integration are
-separate work. The workload builder in `internal/racer/members` is retained, but
-this controller does not create or reconcile dataplane workloads.
+separate work. This controller does not build, create, or reconcile dataplane
+workloads. External workload builders exist only as shared test fixtures.
 
 ## Build and test
 
@@ -45,3 +45,21 @@ Every replica validates durable installation state before starting the manager.
 Successful recovery alone does not grant serving readiness. See the
 [standalone deployment guide](../../deploy/racer/README.md) for prerequisites,
 installation order, and state that must be retained.
+
+## Controller boundaries
+
+`internal/racer` owns runtime configuration, reconciliation, and retry queues.
+`authority` owns private signing state, staged installation, credential rotation,
+and publication admission. `server` owns HTTPS transport and request limits;
+`wire` owns bounded codecs. `members` observes Kubernetes objects and derives
+membership without writing workloads or owning clients.
+
+Discovery and bearer authorization share one configured DaemonSet lookup. They
+require its live UID, not a label match or a remembered UID. Unready Pods remain
+eligible for membership; terminating workloads grant no ownership. Failed
+annotation writes are retried without requiring another topology publication.
+
+Responses require opaque, revocable admission guards. Delta responses require
+both the exact base sequence and content hash; other cursors receive a full
+publication. TLS handshakes default to a separate five-second timeout. Validated
+serving-certificate loading and authoritative signing reads remain in use.

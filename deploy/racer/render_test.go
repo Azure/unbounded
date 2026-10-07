@@ -23,7 +23,7 @@ import (
 
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 	"github.com/Azure/unbounded/internal/racer"
-	"github.com/Azure/unbounded/internal/racer/members"
+	"github.com/Azure/unbounded/internal/racer/testutil"
 )
 
 func TestRenderedDeploymentWorkloadContract(t *testing.T) {
@@ -41,10 +41,19 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			// External workload fixtures retain projection/security assertions but
+			// are not part of the standalone controller apply directory.
+			workloadOut := renderWorkloadFixtures(t, data)
+
 			decode := func(file string, objects ...any) {
 				t.Helper()
 
-				b, err := os.ReadFile(filepath.Join(out, file))
+				directory := out
+				if file == "bootstrap-trust.yaml" || file == "dataplane-config.yaml" {
+					directory = workloadOut
+				}
+
+				b, err := os.ReadFile(filepath.Join(directory, file))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -101,12 +110,23 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			workloadCfg, err := members.ConfigFromLookup(os.LookupEnv)
+			workloadCfg, err := testutil.ConfigFromLookup(func(key string) (string, bool) {
+				value, ok := map[string]string{
+					"RACER_DATAPLANE_IMAGE":           data["DataplaneImage"],
+					"RACER_CONTROL_URL":               "https://racer-controller." + namespace + ".svc:8443",
+					"RACER_BOOTSTRAP_TRUST_CONFIGMAP": data["BootstrapTrustConfigMap"],
+				}[key]
+				if ok {
+					return value, true
+				}
+
+				return os.LookupEnv(key)
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			ds, err := members.DesiredDaemonSet(workloadCfg)
+			ds, err := testutil.DesiredDaemonSet(workloadCfg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -361,15 +381,40 @@ func TestBootstrapTrustCanBeProvisionedExternally(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := os.ReadFile(filepath.Join(out, "bootstrap-trust.yaml"))
-	if err != nil {
+	for _, name := range []string{"bootstrap-trust.yaml", "dataplane-config.yaml"} {
+		if _, err := os.Stat(filepath.Join(out, name)); !os.IsNotExist(err) {
+			t.Fatalf("controller render must not provision external workload configuration %s: %v", name, err)
+		}
+	}
+
+	for _, object := range decodeRenderedObjects(t, out) {
+		if object.GetKind() == "ConfigMap" && object.GetName() == "racer-bootstrap-trust" {
+			t.Fatal("controller render must not replace external trust")
+		}
+	}
+}
+
+func renderWorkloadFixtures(t *testing.T, data map[string]string) string {
+	t.Helper()
+
+	sources, out := t.TempDir(), t.TempDir()
+
+	for _, name := range []string{"bootstrap-trust", "dataplane-config"} {
+		content, err := os.ReadFile(filepath.Join("testdata", "workload", name+".fixture"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.WriteFile(filepath.Join(sources, name+".yaml.tmpl"), content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := render.Render(sources, out, data); err != nil {
 		t.Fatal(err)
 	}
 
-	var object corev1.ConfigMap
-	if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(b), 4096).Decode(&object); (err != nil && err != io.EOF) || object.Name != "" || object.Kind != "" || object.Data != nil {
-		t.Fatalf("default render must not replace external trust: %v", err)
-	}
+	return out
 }
 
 func TestRenderedHandshakeTimeoutOverride(t *testing.T) {

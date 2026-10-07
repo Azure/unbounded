@@ -6,6 +6,7 @@ package racer_test
 import (
 	"bytes"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
@@ -21,7 +23,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
-	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 func TestInstallationRenderingRequiresExplicitFreshUUID(t *testing.T) {
@@ -84,24 +85,21 @@ func TestDefaultRenderHasNoInstallationApplyOperations(t *testing.T) {
 	data := map[string]string{"InitializationState": "fresh", "ClusterID": "11111111-1111-1111-1111-111111111111"}
 	require.NoError(t, render.Render(".", out, data))
 
-	env := &component.Env{Namespace: "unbounded-system"}
-	objects, err := env.DecodeManifestFiles(os.DirFS(out), []string{"installation.yaml"}, nil)
-	require.NoError(t, err)
+	objects := decodeRenderedObjects(t, out, "installation.yaml")
 	require.Len(t, objects, 1)
 
 	// Reuse the output directory so a previous fresh manifest cannot survive a
 	// normal render and accidentally enter an apply plan.
 	delete(data, "InitializationState")
 	require.NoError(t, render.Render(".", out, data))
-	objects, err = env.DecodeManifestFS(os.DirFS(out), nil)
-	require.NoError(t, err)
+	objects = decodeRenderedObjects(t, out)
 
-	for _, operation := range component.ApplyOperations(objects, "racer", "") {
-		if operation.Object.GetKind() == "ConfigMap" {
-			require.NotContains(t, []string{"racer-installation", "racer-version"}, operation.Object.GetName())
+	for _, object := range objects {
+		if object.GetKind() == "ConfigMap" {
+			require.NotContains(t, []string{"racer-installation", "racer-version"}, object.GetName())
 		}
 
-		require.NotEqual(t, "Secret", operation.Object.GetKind(), "rendering must not recreate private authority")
+		require.NotEqual(t, "Secret", object.GetKind(), "rendering must not recreate private authority")
 	}
 }
 
@@ -122,12 +120,10 @@ func TestEnvtestDefaultApplyPreservesFinalizedInstallation(t *testing.T) {
 
 	const namespace = "unbounded-system"
 	require.NoError(t, c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}))
-	env := &component.Env{Client: c, Scheme: scheme.Scheme, Namespace: namespace}
 	out := t.TempDir()
 	data := map[string]string{"InitializationState": "fresh", "ClusterID": "11111111-1111-1111-1111-111111111111"}
 	require.NoError(t, render.Render(".", out, data))
-	objects, err := env.DecodeManifestFiles(os.DirFS(out), []string{"installation.yaml"}, nil)
-	require.NoError(t, err)
+	objects := decodeRenderedObjects(t, out, "installation.yaml")
 	require.Len(t, objects, 1)
 	require.NoError(t, c.Create(ctx, objects[0]))
 
@@ -142,11 +138,10 @@ func TestEnvtestDefaultApplyPreservesFinalizedInstallation(t *testing.T) {
 
 	delete(data, "InitializationState")
 	require.NoError(t, render.Render(".", out, data))
-	objects, err = env.DecodeManifestFiles(os.DirFS(out), []string{"installation.yaml", "config.yaml", "controller.yaml", "controller-pdb.yaml"}, nil)
-	require.NoError(t, err)
+	objects = decodeRenderedObjects(t, out, "installation.yaml", "config.yaml", "controller.yaml", "controller-pdb.yaml")
 
 	for _, obj := range objects {
-		require.NoError(t, env.ApplyObject(ctx, obj))
+		require.NoError(t, c.Apply(ctx, client.ApplyConfigurationFromUnstructured(obj), client.FieldOwner("racer-controller-installation-test")))
 	}
 
 	require.NoError(t, c.Get(ctx, key, marker))
@@ -155,4 +150,54 @@ func TestEnvtestDefaultApplyPreservesFinalizedInstallation(t *testing.T) {
 	budget := &policyv1.PodDisruptionBudget{}
 	require.NoError(t, c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "racer-controller"}, budget))
 	require.Equal(t, 2, budget.Spec.MinAvailable.IntValue())
+}
+
+// Decode the actual standalone apply input without operator implementation.
+func decodeRenderedObjects(t *testing.T, directory string, names ...string) []*unstructured.Unstructured {
+	t.Helper()
+
+	if len(names) == 0 {
+		require.NoError(t, filepath.WalkDir(directory, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if !entry.IsDir() && filepath.Ext(path) == ".yaml" {
+				name, err := filepath.Rel(directory, path)
+				if err != nil {
+					return err
+				}
+
+				names = append(names, name)
+			}
+
+			return nil
+		}))
+	}
+
+	var objects []*unstructured.Unstructured
+
+	for _, name := range names {
+		content, err := os.ReadFile(filepath.Join(directory, name))
+		require.NoError(t, err)
+
+		decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(content), 4096)
+
+		for {
+			object := &unstructured.Unstructured{}
+
+			err := decoder.Decode(object)
+			if err == io.EOF {
+				break
+			}
+
+			require.NoError(t, err)
+
+			if len(object.Object) != 0 {
+				objects = append(objects, object)
+			}
+		}
+	}
+
+	return objects
 }

@@ -42,7 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
-	"github.com/Azure/unbounded/internal/racer/members"
+	"github.com/Azure/unbounded/internal/racer/testutil"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -90,10 +90,10 @@ func boundPodToken(t *testing.T, kube kubernetes.Interface, pod *corev1.Pod, ser
 	return token.Status.Token
 }
 
-func workloadConfig(t *testing.T) members.Config {
+func workloadConfig(t *testing.T) testutil.Config {
 	t.Helper()
 
-	return members.Config{
+	return testutil.Config{
 		Cluster: "11111111-1111-1111-1111-111111111111", Namespace: "racer",
 		ControlURL: "https://racer-controller.racer.svc:8443", DataplaneImage: "racer:test",
 		BootstrapTrustConfigMap: "racer-bootstrap-trust", PeerPort: 8082,
@@ -106,7 +106,7 @@ func TestWorkloadPeerMembership(t *testing.T) {
 		t.Run(strconv.Itoa(int(port)), func(t *testing.T) {
 			cfg := workloadConfig(t)
 			cfg.PeerPort = port
-			ds, err := members.DesiredDaemonSet(cfg)
+			ds, err := testutil.DesiredDaemonSet(cfg)
 			require.NoError(t, err)
 			assertWorkloadPeerMembership(t, ds, port)
 		})

@@ -1032,8 +1032,8 @@ type (
 )
 
 const (
-	DataplaneDaemonSetName  = members.DataplaneDaemonSetName
-	PodNetworkDaemonSetName = members.PodNetworkDaemonSetName
+	DataplaneDaemonSetName  = "racer-dataplane"
+	PodNetworkDaemonSetName = "racer-dataplane-podnet"
 )
 
 func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cfg Config) (members.WorkloadIdentities, error) {

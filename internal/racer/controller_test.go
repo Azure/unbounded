@@ -53,7 +53,7 @@ import (
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/authority"
-	"github.com/Azure/unbounded/internal/racer/members"
+	"github.com/Azure/unbounded/internal/racer/testutil"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -67,36 +67,36 @@ func TestMixedNetworkConfiguration(t *testing.T) {
 
 	for _, input := range []string{`[]`, `["node-b","node-a"]`} {
 		values["RACER_POD_NETWORK_NODES"] = input
-		_, err := members.ConfigFromLookup(lookup)
+		_, err := testutil.ConfigFromLookup(lookup)
 		require.NoError(t, err)
 	}
 
 	for _, input := range []string{"", "null", `{}`, `"node-a"`, `[1]`, `[null]`, `[""]`, `["Node-A"]`, `["node-a","node-a"]`, `["node-a"] trailing`} {
 		values["RACER_POD_NETWORK_NODES"] = input
-		_, err := members.ConfigFromLookup(lookup)
+		_, err := testutil.ConfigFromLookup(lookup)
 		require.ErrorIs(t, err, wire.InvalidRequest, input)
 	}
 
 	values["RACER_POD_NETWORK_NODES"] = `["node-a"]`
 	values["RACER_HOST_NETWORK"] = "false"
-	_, err := members.ConfigFromLookup(lookup)
+	_, err := testutil.ConfigFromLookup(lookup)
 	require.ErrorIs(t, err, wire.InvalidRequest)
 }
 
 func TestMixedNetworkBuilders(t *testing.T) {
 	cfg := workloadConfig(t)
-	legacy, err := members.DesiredDaemonSet(cfg)
+	legacy, err := testutil.DesiredDaemonSet(cfg)
 	require.NoError(t, err)
-	sets, err := members.DesiredDaemonSets(cfg)
+	sets, err := testutil.DesiredDaemonSets(cfg)
 	require.NoError(t, err)
 	require.Equal(t, []*appsv1.DaemonSet{legacy}, sets)
 
 	cfg.HostNetwork = true
 	cfg.PeerPort, cfg.DiagnosticsPort = 18082, 19090
 	cfg.PodNetworkNodes = []string{"node-b", "node-a"}
-	_, err = members.DesiredDaemonSet(cfg)
+	_, err = testutil.DesiredDaemonSet(cfg)
 	require.ErrorIs(t, err, wire.InvalidRequest, "legacy planner must fail closed")
-	sets, err = members.DesiredDaemonSets(cfg)
+	sets, err = testutil.DesiredDaemonSets(cfg)
 	require.NoError(t, err)
 	require.Len(t, sets, 2)
 	host, pod := sets[0], sets[1]
@@ -209,7 +209,7 @@ func TestFailClosedEntryPoints(t *testing.T) {
 	operations := map[string]func() error{
 		"topology": func() error { _, err := a.Topology.Reconcile(ctx, ctrl.Request{}); return err },
 		"keyring":  func() error { _, err := a.Keyring.Reconcile(ctx, ctrl.Request{}); return err },
-		"workload": func() error { _, err := members.DesiredDaemonSet(members.Config{}); return err },
+		"workload": func() error { _, err := testutil.DesiredDaemonSet(testutil.Config{}); return err },
 		"server":   func() error { return a.Server.Start(ctx) },
 		"run":      func() error { return Run(ctx, Config{}) },
 	}
@@ -885,7 +885,7 @@ func integrationWorkloadDrift(t *testing.T, c client.Client, cfg Config, apps [2
 		t.Fatalf("Racer manager created a workload: %v", err)
 	}
 
-	workload, err := members.DesiredDaemonSet(members.Config{
+	workload, err := testutil.DesiredDaemonSet(testutil.Config{
 		Cluster: cfg.Cluster, Namespace: cfg.Namespace,
 		ControlURL: "https://127.0.0.1:8443", DataplaneImage: "example.invalid/racer:test",
 		BootstrapTrustConfigMap: "racer-bootstrap-trust", PeerPort: cfg.PeerPort,

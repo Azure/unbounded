@@ -51,8 +51,8 @@ import (
 	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/authority"
-	"github.com/Azure/unbounded/internal/racer/members"
 	"github.com/Azure/unbounded/internal/racer/server"
+	"github.com/Azure/unbounded/internal/racer/testutil"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -470,7 +470,7 @@ func TestWorkloadNameLabelBounds(t *testing.T) {
 			cfg.DaemonSetName = name
 			valid := len(validation.IsDNS1123Subdomain(name)) == 0 && len(validation.IsValidLabelValue(name)) == 0
 
-			ds, err := members.DesiredDaemonSet(cfg)
+			ds, err := testutil.DesiredDaemonSet(cfg)
 			if !valid {
 				if !errors.Is(err, wire.InvalidRequest) || ds != nil {
 					t.Fatalf("invalid name accepted: %v", err)
@@ -490,7 +490,7 @@ func TestWorkloadNameLabelBounds(t *testing.T) {
 	cfg.BootstrapTrustConfigMap = strings.Repeat("a", 63) + ".trust"
 
 	cfg.DataplaneServiceAccount = strings.Repeat("a", 63) + ".account"
-	if _, err := members.DesiredDaemonSet(cfg); err != nil {
+	if _, err := testutil.DesiredDaemonSet(cfg); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -558,7 +558,7 @@ func TestMixedControllerEvents(t *testing.T) {
 	require.False(t, pred.Create(event.CreateEvent{Object: &p}))
 
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: PodNetworkDaemonSetName}}
-	require.False(t, namedChanges(cfg.Namespace, members.ManagedNames(cfg.DaemonSetName)...).Create(event.CreateEvent{Object: ds}))
+	require.False(t, namedChanges(cfg.Namespace, cfg.DaemonSetName).Create(event.CreateEvent{Object: ds}))
 }
 
 func TestLocalSnapshotsDuringAPIOutage(t *testing.T) {
@@ -900,7 +900,7 @@ func TestWorkloadDefaultsAgreeWithController(t *testing.T) {
 	}
 	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 
-	cfg, err := members.ConfigFromLookup(lookup)
+	cfg, err := testutil.ConfigFromLookup(lookup)
 	if err != nil {
 		t.Fatal(err)
 	}
