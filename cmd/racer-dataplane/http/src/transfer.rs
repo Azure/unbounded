@@ -920,10 +920,12 @@ pub mod relay {
             }
             let mut wait = Step::Yield;
             for _ in 0..32 {
-                let remaining = self
-                    .source
-                    .receive_remaining()
-                    .ok_or(crate::Error::Malformed)? as usize;
+                let remaining = usize::try_from(
+                    self.source
+                        .receive_remaining()
+                        .ok_or(crate::Error::Malformed)?,
+                )
+                .unwrap_or(usize::MAX);
                 if self.pending.is_empty() && self.pipe.buffered() == 0 && remaining == 0 {
                     break;
                 }
@@ -1140,6 +1142,8 @@ pub mod relay {
 
             calls: Rc<Cell<usize>>,
 
+            receive_count: usize,
+
             interrupted: bool,
 
             unsupported: bool,
@@ -1157,6 +1161,7 @@ pub mod relay {
                 Self {
                     bytes: Vec::new(),
                     calls: Rc::default(),
+                    receive_count: 0,
                     interrupted: false,
                     unsupported: false,
                     drain_error: false,
@@ -1189,6 +1194,7 @@ pub mod relay {
             /// Receive at most three bytes and count attempts, including interruptions.
             fn receive(&mut self, socket: &Descriptor, count: usize) -> io::Result<usize> {
                 self.calls.set(self.calls.get() + 1);
+                self.receive_count = count;
                 if self.interrupted {
                     return Err(io::ErrorKind::Interrupted.into());
                 }
@@ -1282,6 +1288,85 @@ pub mod relay {
                 assert!(!source.is_reusable() && !destination.is_reusable());
                 source.finish_exchange().unwrap();
                 destination.finish_exchange().unwrap();
+            }
+        }
+
+        /// Receive requests saturate at the host bound without mistaking large bodies for empty.
+        #[test]
+        fn framed_lengths_saturate_receive_counts_at_host_bound() {
+            for length in [
+                0,
+                1,
+                usize::MAX as u64,
+                1_u64 << 32,
+                (1_u64 << 32) + 1,
+                u64::MAX,
+            ] {
+                let f = Fixture::new();
+                let (mut relay, _writer, _reader) = f.relay(length, Pipe::default());
+                let step = relay.step(&f.io).unwrap();
+                if length == 0 {
+                    assert!(matches!(step, Step::Complete));
+                    assert_eq!(relay.pipe.calls.get(), 0);
+                } else {
+                    assert!(matches!(
+                        step,
+                        Step::Readiness {
+                            interest: libc::POLLIN,
+                            ..
+                        }
+                    ));
+                    assert_eq!(relay.pipe.calls.get(), 1);
+                    assert_eq!(
+                        relay.pipe.receive_count,
+                        length.min(usize::MAX as u64) as usize
+                    );
+                }
+                assert_eq!(relay.source.receive_remaining(), Some(length));
+                assert_eq!(relay.destination.send_remaining(), Some(length));
+            }
+        }
+
+        /// Large framing preserves exact prefix progress through every receive path.
+        #[test]
+        fn large_framed_bodies_preserve_progress_and_report_eof() {
+            for length in [1_u64 << 32, (1_u64 << 32) + 1, u64::MAX] {
+                for path in ["splice", "copy", "ahead"] {
+                    let f = Fixture::new();
+                    let (mut relay, mut writer, mut reader) = f.relay(length, Pipe::default());
+                    relay.force_fallback(path == "copy", None);
+                    if path == "ahead" {
+                        let ahead = OwnedBuffer::copy_from(f.hooks.as_ref(), b"abc").unwrap();
+                        relay.source.restore_read_ahead(ahead, 0..3).unwrap();
+                    } else {
+                        writer.write_all(b"abc").unwrap();
+                    }
+                    assert!(matches!(
+                        relay.step(&f.io).unwrap(),
+                        Step::Readiness {
+                            interest: libc::POLLIN,
+                            ..
+                        }
+                    ));
+                    assert_eq!(relay.source.receive_remaining(), Some(length - 3));
+                    assert_eq!(relay.destination.send_remaining(), Some(length - 3));
+                    assert!(relay.pending.is_empty());
+                    assert_eq!(relay.pipe.buffered(), 0);
+                    drop(writer);
+                    assert!(matches!(
+                        relay.step(&f.io),
+                        Err(Failure::Runtime(uring_runtime::Error::Io))
+                    ));
+                    assert_eq!(relay.source.receive_remaining(), Some(length - 3));
+                    assert_eq!(relay.destination.send_remaining(), Some(length - 3));
+                    drop(relay);
+                    f.io.reclaim_buffer();
+                    assert_eq!(f.hooks.slots.get(), 0);
+                    assert_eq!(f.hooks.bytes.get(), 0);
+                    let mut wire = Vec::new();
+                    reader.read_to_end(&mut wire).unwrap();
+                    assert_eq!(wire, b"abc");
+                }
             }
         }
 
