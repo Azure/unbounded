@@ -324,6 +324,11 @@ impl<C: Charge> Slab<C> {
 
     /// Prepare backing descriptors without granting submission authority.
     fn open_file(&self) -> Result<Alignment> {
+        self.open_file_with_lock_handoff(|_| {})
+    }
+
+    /// Open backing storage with a hook for testing a prior lock holder's changes.
+    fn open_file_with_lock_handoff(&self, before_lock: impl FnOnce(&File)) -> Result<Alignment> {
         if let Ok(a) = self.alignment() {
             return Ok(a);
         }
@@ -409,13 +414,21 @@ impl<C: Charge> Slab<C> {
             unsafe { libc::geteuid() },
             metadata.nlink(),
         )?;
+        before_lock(&file);
         // SAFETY: flock synchronously borrows this live descriptor.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(lock_error(std::io::Error::last_os_error()));
         }
-        // Refresh size under the lock: a previous lock holder may have resized
-        // the file between the first fstat and acquiring our lock.
-        let size = file.metadata().map_err(|e| system_error("fstat", e))?.len();
+        // Recheck metadata under the lock: a prior holder may have changed it.
+        let metadata = file.metadata().map_err(|e| system_error("fstat", e))?;
+        // SAFETY: geteuid has no arguments or borrowed memory.
+        validate_file(
+            metadata.mode(),
+            metadata.uid(),
+            unsafe { libc::geteuid() },
+            metadata.nlink(),
+        )?;
+        let size = metadata.len();
         // Delay O_DIRECT until after rejecting nonregular files (including FIFOs).
         // SAFETY: fcntl synchronously borrows this live descriptor.
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
@@ -2307,6 +2320,93 @@ mod tests {
                 validate_file(mode, owner, 17, links),
                 Err(Error::InvalidConfiguration)
             );
+        }
+    }
+
+    /// A prior lock holder cannot leave unsafe metadata for startup to accept.
+    #[test]
+    fn lock_handoff_revalidates_private_file_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for change in ["permissions", "special-bits", "hard-link", "unlink"] {
+            let directory = Directory::new();
+            let path = directory.0.join("data");
+            let prior = open_private_file(&path).unwrap();
+            let observer = File::open(&path).unwrap();
+            // SAFETY: flock borrows a live descriptor owned by this test.
+            assert_eq!(
+                unsafe { libc::flock(prior.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let slab = Slab::<()>::new(path.clone(), 8192, 4096, 512);
+            let mut called = false;
+            let result = slab.open_file_with_lock_handoff(|_| {
+                called = true;
+                match change {
+                    "permissions" => prior
+                        .set_permissions(std::fs::Permissions::from_mode(0o644))
+                        .unwrap(),
+                    "special-bits" => prior
+                        .set_permissions(std::fs::Permissions::from_mode(0o4600))
+                        .unwrap(),
+                    "hard-link" => std::fs::hard_link(&path, directory.0.join("alias")).unwrap(),
+                    "unlink" => std::fs::remove_file(&path).unwrap(),
+                    _ => unreachable!(),
+                }
+                drop(prior);
+            });
+            assert!(called);
+            assert_eq!(result, Err(Error::InvalidConfiguration), "{change}");
+            assert!(slab.opened.borrow().is_none());
+            assert_eq!(observer.metadata().unwrap().len(), 0);
+            // SAFETY: the independent live descriptor checks lock cleanup on failure.
+            assert_eq!(
+                unsafe { libc::flock(observer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+        }
+    }
+
+    /// Valid handoffs use the current size and never truncate mismatched files.
+    #[test]
+    fn lock_handoff_uses_refreshed_size() {
+        for size_in_segments in [0, 2, 1] {
+            let directory = Directory::new();
+            let path = directory.0.join("data");
+            let prior = open_private_file(&path).unwrap();
+            let Some(alignment) = real_alignment(probe(&prior)) else {
+                continue;
+            };
+            let segment_bytes = alignment.extent(0, 512).unwrap().length() as u64;
+            let capacity = segment_bytes.checked_mul(2).unwrap();
+            let size = segment_bytes * size_in_segments;
+            // SAFETY: flock borrows a live descriptor owned by this test.
+            assert_eq!(
+                unsafe { libc::flock(prior.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let slab = Slab::<()>::new(path.clone(), capacity, segment_bytes, 512);
+            let result = slab.open_file_with_lock_handoff(|_| {
+                prior.set_len(size).unwrap();
+                drop(prior);
+            });
+            if result == Err(Error::Unsupported) {
+                assert!(real_alignment(result).is_none());
+                continue;
+            }
+            if size_in_segments == 1 {
+                assert_eq!(result, Err(Error::InvalidConfiguration));
+                assert!(slab.opened.borrow().is_none());
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+            } else {
+                assert_eq!(result, Ok(alignment));
+                assert_eq!(slab.alignment(), Ok(alignment));
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), capacity);
+                assert_eq!(
+                    Slab::<()>::new(path, capacity, segment_bytes, 512).open_now(),
+                    Err(Error::Unavailable)
+                );
+            }
         }
     }
 
