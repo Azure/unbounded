@@ -18,6 +18,8 @@ kind: ClusterRole
 metadata:
   name: racer-controller
 rules:
+  # Install node-restriction.yaml and its binding before this ClusterRoleBinding.
+  # RBAC cannot limit patches to the enrollment and recovery annotations.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]

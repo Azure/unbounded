@@ -23,6 +23,7 @@ var manifestNames = []string{
 	"controller.yaml",
 	"create-restriction.yaml",
 	"installation.yaml",
+	"node-restriction.yaml",
 	"rbac.yaml",
 }
 

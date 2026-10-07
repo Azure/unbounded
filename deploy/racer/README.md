@@ -50,10 +50,11 @@ Rendering does not contact a cluster. Build and test commands are in the
 Review the output, then install in this order using your deployment tool:
 
 1. Install `crd/` and wait for the CRDs to be established.
-2. Install `create-restriction.yaml`, including its binding, and verify that the
-   policy is active with no type-check errors **before** applying RBAC or any
-   controller workload. RBAC cannot restrict Secret and ConfigMap creation by
-   name; this deny policy supplies that restriction.
+2. Install `create-restriction.yaml` and `node-restriction.yaml`, including both
+   bindings, and verify that the policies are active with no type-check errors
+   **before** applying RBAC or any controller workload. RBAC cannot restrict
+   Secret and ConfigMap creation by name or limit Node patches to specific fields.
+   These fail-closed deny policies supply those restrictions.
 3. Ensure the serving TLS Secret exists. Apply `config.yaml`. Only for a new UUID
    with no existing version state, create `installation.yaml` once. Do not apply
    it over an existing marker.
@@ -129,6 +130,19 @@ regeneration. There is no migration reader for former split Secrets.
 Secret read/update/patch permissions name only the credentials Secret. The Secret
 informer uses the required name field selector. Secret creation is namespace-wide
 in RBAC, so install the fail-closed admission policy before the RoleBinding.
+
+The Node policy scopes updates to `racer-controller` in the configured namespace.
+It permits adding, changing, or removing only these annotations:
+
+- `racer.unbounded-cloud.io/enrolled-shares`
+- `racer.unbounded-cloud.io/enrolled-rdma-nics`
+- `racer.unbounded-cloud.io/last-admitted-member`
+
+All other Node fields must stay unchanged, except API-server field ownership
+bookkeeping (`metadata.managedFields`). Node creation and deletion are not granted
+by RBAC. The policy does not restrict other accounts, including node agents.
+Install its binding before the ClusterRoleBinding and retain both policies while
+the controller has write access.
 
 `InstallationConfigMapName`, `VersionConfigMapName`, and `CredentialsSecretName`
 template inputs set runtime configuration, RBAC, and admission policy names.
