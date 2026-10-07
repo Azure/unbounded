@@ -147,12 +147,3 @@ change, so the same workflow tests run in both modes.
   production run sets `PAGE_ALLOC_REQUIRE_REAL_IO=1`, so a host without
   io_uring or direct I/O fails instead of skipping. Miri runs only on
   `uring-runtime`, not on this crate.
-
-## Open questions
-
-- Should eviction punch holes or overwrite freed segments for hosts that need
-  data removed from disk?
-- Is one idle buffer enough once real traffic mixes page sizes, or does the
-  pool need size classes?
-- Should the crate run under Miri, at least for the pure buffer and segment
-  tests?
