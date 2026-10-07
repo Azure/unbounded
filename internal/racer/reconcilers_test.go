@@ -1383,6 +1383,109 @@ func TestReconcilerAlreadyExistsHandling(t *testing.T) {
 	}
 }
 
+func TestProductionReconcilerConflictAndCancellation(t *testing.T) {
+	for _, operation := range []string{"topology", "keyring"} {
+		for _, stage := range []string{"before reconcile", "read", "conflict", "canceled conflict", "after commit"} {
+			t.Run(operation+"/"+stage, func(t *testing.T) {
+				productionConflictAndCancellation(t, operation, stage)
+			})
+		}
+	}
+}
+
+func productionConflictAndCancellation(t *testing.T, operation, stage string) {
+	t.Helper()
+	r := initializedTopology(t)
+	a := assembleFixture(r.config, r.Client, r.APIReader)
+	d := fixtureDependencies[a.authority]
+	base := d.Client.(client.WithWatch)
+
+	var target reconcile.Reconciler = a.Topology
+	if operation == "keyring" {
+		runKeys(t, a.Keyring)
+		_, _, state, _ := keyState(t, a.Keyring)
+		d.now = func() time.Time { return state.NextRotation }
+		target = a.Keyring
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	writes := 0
+	wrapped := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			err := c.Get(ctx, key, obj, opts...)
+
+			if stage == "read" {
+				cancel()
+			}
+
+			return err
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			writes++
+
+			if stage == "conflict" || stage == "canceled conflict" {
+				if stage == "canceled conflict" {
+					cancel()
+				}
+
+				return apierrors.NewConflict(corev1.Resource("configmaps"), obj.GetName(), wire.Conflict)
+			}
+
+			err := c.Update(ctx, obj, opts...)
+
+			cancel()
+
+			return err
+		},
+	})
+	d.Client, d.reader = wrapped, wrapped
+	a.Topology.Client, a.Topology.APIReader = wrapped, wrapped
+
+	if stage == "before reconcile" {
+		cancel()
+	}
+
+	result, err := target.Reconcile(ctx, ctrl.Request{})
+	require.Equal(t, ctrl.Result{}, result, "errors must not use a fixed retry delay")
+
+	if stage == "conflict" {
+		require.True(t, apierrors.IsConflict(err))
+		require.NotErrorIs(t, err, reconcile.TerminalError(nil), "queue must retry conflicts")
+	} else {
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, reconcile.TerminalError(nil), "canceled leader must not retry")
+	}
+
+	if stage == "before reconcile" || stage == "read" {
+		require.Zero(t, writes)
+	} else {
+		require.Equal(t, 1, writes)
+	}
+
+	if operation == "topology" {
+		require.ErrorIs(t, a.authority.PublicationReady(), wire.Unavailable)
+	} else if stage == "before reconcile" {
+		require.NoError(t, a.authority.TrustReady())
+	} else {
+		require.ErrorIs(t, a.authority.TrustReady(), wire.Unavailable)
+	}
+
+	d.Client, d.reader = base, base
+	a.Topology.Client, a.Topology.APIReader = base, base
+	result, err = target.Reconcile(t.Context(), ctrl.Request{})
+	require.NoError(t, err, "fresh controller attempt must recover")
+
+	if operation == "keyring" {
+		require.Positive(t, result.RequeueAfter, "successful rotation retains its deadline")
+		require.NoError(t, a.authority.TrustReady())
+	} else {
+		require.Equal(t, ctrl.Result{}, result)
+		require.NoError(t, a.authority.PublicationReady())
+	}
+}
+
 func reconcilerAlreadyExists(t *testing.T, operation string) {
 	t.Helper()
 	r, now := testKeyring(t)

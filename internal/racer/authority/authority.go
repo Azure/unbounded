@@ -911,14 +911,6 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 	return signingState{certificate: cert, key: key, roots: roots, bundle: credentials.bundle}, nil
 }
 
-func (i *issuer) now() time.Time {
-	if i.Now != nil {
-		return i.Now().UTC().Truncate(time.Second)
-	}
-
-	return time.Now().UTC().Truncate(time.Second)
-}
-
 // Issuance can also observe invalid durable authority. It may withdraw trust,
 // but only controller reconciliation can install or restore serving trust.
 func (i *issuer) loadSigning(ctx context.Context, now time.Time) (signingState, error) {
@@ -954,7 +946,7 @@ func (i *issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.
 		return nil, err
 	}
 
-	now := i.now()
+	now := credentialTime(i.Now)
 	if identity.cluster != cfg.Cluster || !wire.ValidUUID(string(identity.node)) || !identity.expires.After(now) {
 		return nil, wire.Forbidden
 	}

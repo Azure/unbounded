@@ -46,7 +46,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/members"
@@ -86,20 +85,23 @@ func TestAuthorityPublicationHistoryIsOperationOwned(t *testing.T) {
 	f := newServingFixture(t)
 	a, r := f.a.authority, f.a.Topology
 	before := cloneAccepted(a.accepted)
-	member := r.Accepted[testNodeUID]
-	member.Shares = 999
-	r.Accepted[testNodeUID] = member
-
-	require.Equal(t, before, a.accepted, "legacy view aliases authority history")
-
 	update, err := a.PublishTopology(t.Context(), r.observeTopology)
+	require.NoError(t, err)
+
+	member := update.Members[testNodeUID]
+	member.Shares = 999
+	update.Members[testNodeUID] = member
+
+	require.Equal(t, before, a.accepted, "returned hints alias authority history")
+
+	update, err = a.PublishTopology(t.Context(), r.observeTopology)
 	require.NoError(t, err)
 	delete(update.Members, testNodeUID)
 	require.Equal(t, before, a.accepted, "annotation hints alias authority history")
 
 	var node corev1.Node
 	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Name: "worker"}, &node))
-	node.Annotations[wire.SharesAnnotation] = "7"
+	node.Annotations = map[string]string{wire.SharesAnnotation: "7"}
 	require.NoError(t, r.Update(t.Context(), &node))
 	base := r.Client.(client.WithWatch)
 	r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
@@ -142,7 +144,7 @@ func TestAuthorityHandlesRetainRevocationSemantics(t *testing.T) {
 
 	var node corev1.Node
 	require.NoError(t, f.a.Topology.Get(t.Context(), client.ObjectKey{Name: "worker"}, &node))
-	node.Annotations[wire.SharesAnnotation] = "7"
+	node.Annotations = map[string]string{wire.SharesAnnotation: "7"}
 	require.NoError(t, f.a.Topology.Update(t.Context(), &node))
 	_, err = a.PublishTopology(t.Context(), f.a.Topology.observeTopology)
 	require.NoError(t, err)
@@ -231,18 +233,16 @@ func TestAuthorityConstructorCopiesConfigWithoutIO(t *testing.T) {
 	require.Empty(t, a.accepted)
 }
 
-// Test-local engines preserve whitebox crash-boundary scenarios. They are not
-// exported production bridges and cannot be imported by root integrations.
-type TopologyReconciler struct {
+// Fixtures inject faults into real Authority operations without controller policy.
+type topologyFixture struct {
 	client.Client
 	APIReader    client.Reader
 	Config       Config
 	Publications *Publications
 	Trust        *Trust
-	Accepted     AcceptedMembers
 	authority    *Authority
 }
-type KeyringReconciler struct {
+type credentialsFixture struct {
 	client.Client
 	APIReader client.Reader
 	Config    Config
@@ -251,8 +251,8 @@ type KeyringReconciler struct {
 	authority *Authority
 }
 type Application struct {
-	Topology  *TopologyReconciler
-	Keyring   *KeyringReconciler
+	Topology  *topologyFixture
+	Keyring   *credentialsFixture
 	Server    *fixtureServer
 	authority *Authority
 }
@@ -268,8 +268,8 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 
 	return &Application{
 		authority: a,
-		Topology:  &TopologyReconciler{Client: c, APIReader: reader, Config: cfg, Publications: a.publications, Trust: a.trust, Accepted: make(AcceptedMembers), authority: a},
-		Keyring:   &KeyringReconciler{Client: c, APIReader: reader, Config: cfg, Trust: a.trust, authority: a},
+		Topology:  &topologyFixture{Client: c, APIReader: reader, Config: cfg, Publications: a.publications, Trust: a.trust, authority: a},
+		Keyring:   &credentialsFixture{Client: c, APIReader: reader, Config: cfg, Trust: a.trust, authority: a},
 		Server:    &fixtureServer{Bootstrap: a.bootstrap, Trust: a.trust, Publications: a.publications, Config: cfg},
 	}
 }
@@ -277,40 +277,20 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 func (a *Application) Recover(ctx context.Context, writer client.Writer) error {
 	return a.authority.Recover(ctx, writer)
 }
-func (r *TopologyReconciler) runtimeConfig() Config { return r.Config.effective() }
-func (r *TopologyReconciler) engine() *publisher {
-	return &publisher{Writer: r.Client, APIReader: r.APIReader, Config: r.runtimeConfig(), Publications: r.Publications, Trust: r.Trust}
+
+func (r *topologyFixture) operations() *Authority {
+	r.authority.publisher.Writer = r.Client
+	r.authority.publisher.APIReader = r.APIReader
+	r.authority.publisher.Config = r.Config.effective()
+
+	return r.authority
 }
 
-func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPublication) (*CommittedPublication, error) {
-	return r.engine().CommitVersion(ctx, p)
+func (r *topologyFixture) CommitVersion(ctx context.Context, p *PreparedPublication) (*CommittedPublication, error) {
+	return r.operations().publisher.CommitVersion(ctx, p)
 }
 
-func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	if err := ctx.Err(); err != nil {
-		return ctrl.Result{}, reconcile.TerminalError(err)
-	}
-
-	r.authority.publisher = r.engine()
-
-	update, err := r.authority.PublishTopology(ctx, r.observeTopology)
-	if err == nil {
-		r.Accepted = cloneAccepted(update.Members)
-		err = r.annotate(ctx, update)
-	}
-
-	if ctx.Err() != nil {
-		return ctrl.Result{}, reconcile.TerminalError(ctx.Err())
-	}
-
-	if apierrors.IsConflict(err) {
-		return ctrl.Result{RequeueAfter: 10 * time.Millisecond}, nil
-	}
-
-	return ctrl.Result{}, err
-}
-
-func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObservation, error) {
+func (r *topologyFixture) observeTopology(ctx context.Context) (TopologyObservation, error) {
 	var nodes corev1.NodeList
 	if err := r.List(ctx, &nodes); err != nil {
 		return TopologyObservation{}, err
@@ -345,58 +325,14 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (TopologyObser
 	return TopologyObservation{Nodes: nodes, Catalog: catalog, Input: members.Input{Nodes: nodes.Items, PodsByNode: pods, Ownership: ids, PeerPort: 8082}}, nil
 }
 
-func (r *TopologyReconciler) annotate(ctx context.Context, update TopologyHints) error {
-	for i := range update.Nodes.Items {
-		node := &update.Nodes.Items[i]
-
-		member, ok := update.Members[wire.NodeID(node.UID)]
-		if !ok {
-			continue
-		}
-
-		encoded, err := json.Marshal(member)
-		if err != nil {
-			return err
-		}
-
-		if node.Annotations[admittedMemberAnnotation] == string(encoded) {
-			continue
-		}
-
-		before := node.DeepCopy()
-		if node.Annotations == nil {
-			node.Annotations = map[string]string{}
-		}
-
-		node.Annotations[admittedMemberAnnotation] = string(encoded)
-		if err := r.Patch(ctx, node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-func (r *KeyringReconciler) runtimeConfig() Config { return r.Config.effective() }
-func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
+func (r *credentialsFixture) operations() *Authority {
 	a := r.authority
-	a.credentials.Writer, a.credentials.APIReader, a.credentials.Config, a.credentials.Now = r.Client, r.APIReader, r.runtimeConfig(), r.Now
+	a.credentials.Writer, a.credentials.APIReader, a.credentials.Config, a.credentials.Now = r.Client, r.APIReader, r.Config.effective(), r.Now
 
-	delay, err := a.ReconcileCredentials(ctx)
-	if ctx.Err() != nil {
-		return ctrl.Result{}, reconcile.TerminalError(ctx.Err())
-	}
-
-	if apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err) {
-		return ctrl.Result{RequeueAfter: 10 * time.Millisecond}, nil
-	}
-
-	return ctrl.Result{RequeueAfter: delay}, err
+	return a
 }
 
-const (
-	podNodeIndex       = "spec.nodeName"
-	retryConflictDelay = 10 * time.Millisecond
-)
+const podNodeIndex = "spec.nodeName"
 
 func podNodeKeys(obj client.Object) []string {
 	pod, ok := obj.(*corev1.Pod)
@@ -430,18 +366,9 @@ type (
 
 func NewPublications() *publicationStore { return newPublications() }
 
-var (
-	AuthenticateCertificate = authenticateCertificate
-	PlanRotation            = planRotationOnly
-)
+var AuthenticateCertificate = authenticateCertificate
 
-func (r *KeyringReconciler) now() time.Time {
-	if r.Now != nil {
-		return r.Now().UTC().Truncate(time.Second)
-	}
-
-	return time.Now().UTC().Truncate(time.Second)
-}
+func (r *credentialsFixture) now() time.Time { return credentialTime(r.Now) }
 
 func catalogVolume(name string, uid types.UID) racerv1.ClusterVolume {
 	return racerv1.ClusterVolume{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}, Spec: racerv1.ClusterVolumeSpec{Type: racerv1.ClusterVolumeTypeCache}}
@@ -935,7 +862,7 @@ func TestCatalogAdmissionRotationCycles(t *testing.T) {
 	}
 }
 
-func exerciseCapacityRotations(t *testing.T, r *KeyringReconciler, now *time.Time, capacity int) int {
+func exerciseCapacityRotations(t *testing.T, r *credentialsFixture, now *time.Time, capacity int) int {
 	t.Helper()
 
 	maxRoots := 0
@@ -988,7 +915,7 @@ func TestCatalogAdmissionGrowthRemovalAndRestart(t *testing.T) {
 	logger := funcr.New(func(_, msg string) { logs.WriteString(msg) }, funcr.Options{})
 
 	ctx := ctrl.LoggerInto(t.Context(), logger)
-	if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil || !trustReady(r.Trust) {
+	if _, err := r.operations().ReconcileCredentials(ctx); err != nil || !trustReady(r.Trust) {
 		t.Fatalf("growth disabled healthy service: %v", err)
 	}
 
@@ -1032,7 +959,7 @@ func TestCatalogAdmissionGrowthRemovalAndRestart(t *testing.T) {
 	assertMissingCredentialsSuspendTopology(t, r, a.Topology)
 }
 
-func assertMissingCredentialsSuspendTopology(t *testing.T, r *KeyringReconciler, topology *TopologyReconciler) {
+func assertMissingCredentialsSuspendTopology(t *testing.T, r *credentialsFixture, topology *topologyFixture) {
 	t.Helper()
 	// Missing/corrupt durable credentials remain fail-closed in both controllers.
 	shared := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.CredentialsSecretName}}
@@ -1040,7 +967,7 @@ func assertMissingCredentialsSuspendTopology(t *testing.T, r *KeyringReconciler,
 		t.Fatal(err)
 	}
 
-	if _, err := topology.Reconcile(t.Context(), ctrl.Request{}); err == nil {
+	if _, err := topology.operations().PublishTopology(t.Context(), topology.observeTopology); err == nil {
 		t.Fatal("missing credentials accepted by topology")
 	}
 
@@ -1049,7 +976,7 @@ func assertMissingCredentialsSuspendTopology(t *testing.T, r *KeyringReconciler,
 	}
 }
 
-func assertPublishedKeys(t *testing.T, r *TopologyReconciler, count int) {
+func assertPublishedKeys(t *testing.T, r *topologyFixture, count int) {
 	t.Helper()
 	p := reconcileTopology(t, r, t.Context())
 
@@ -1095,7 +1022,7 @@ func TestCatalogCapacityRejectsBeforeInitializationClaim(t *testing.T) {
 	r, _ := testKeyring(t)
 
 	r.Config.Rotation.Interval, r.Config.Rotation.PrepareFor = time.Nanosecond, time.Nanosecond
-	if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !errors.Is(err, wire.TooLarge) {
+	if _, err := r.operations().ReconcileCredentials(t.Context()); !errors.Is(err, wire.TooLarge) {
 		t.Fatalf("impossible root reserve: %v", err)
 	}
 
@@ -1130,7 +1057,7 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 	}
 	// Model the older controller's active-only admission without removing the
 	// planner's independent final wire-size check.
-	b, state, err = PlanRotation(r.Config.Rotation, b, state, catalog, *now)
+	b, state, _, err = planRotation(r.Config.Rotation, b, state, catalog, *now, nextGeneration(b.Generation))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1147,7 +1074,7 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !errors.Is(err, wire.TooLarge) || trustReady(r.Trust) {
+	if _, err := r.operations().ReconcileCredentials(t.Context()); !errors.Is(err, wire.TooLarge) || trustReady(r.Trust) {
 		t.Fatalf("legacy overcommit silently accepted: %v", err)
 	}
 
@@ -1177,7 +1104,7 @@ func TestCatalogAdmissionSerializesPublicationAndPruning(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := a.Topology.Reconcile(t.Context(), ctrl.Request{})
+		_, err := a.Topology.operations().PublishTopology(t.Context(), a.Topology.observeTopology)
 		done <- err
 	}()
 
@@ -1258,14 +1185,14 @@ func integrationCatalogCapacity(t *testing.T, c client.Client) {
 	}
 }
 
-func testIssuer(r *KeyringReconciler) *Issuer {
+func testIssuer(r *credentialsFixture) *Issuer {
 	return &Issuer{APIReader: r.APIReader, Config: r.Config.effective(), Trust: r.Trust, CatalogGate: r.authority.gate, Now: r.Now}
 }
 
 // TrustRoots is a test adapter for authoritative signing observations. Production
 // serving uses local Trust; only issuance and reconciliation read durable roots.
 func (i *Issuer) TrustRoots(ctx context.Context) (*x509.CertPool, error) {
-	state, err := i.loadSigning(ctx, i.now())
+	state, err := i.loadSigning(ctx, credentialTime(i.Now))
 	if err != nil {
 		return nil, err
 	}
@@ -1273,7 +1200,7 @@ func (i *Issuer) TrustRoots(ctx context.Context) (*x509.CertPool, error) {
 	return state.roots, nil
 }
 
-func issuanceRequest(t *testing.T, r *KeyringReconciler) (NodeIdentity, wire.BootstrapRequest, ed25519.PublicKey) {
+func issuanceRequest(t *testing.T, r *credentialsFixture) (NodeIdentity, wire.BootstrapRequest, ed25519.PublicKey) {
 	t.Helper()
 
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
@@ -1501,7 +1428,7 @@ func TestIssuerConcurrentIssuanceAndReconciliation(t *testing.T) {
 	wg.Wait()
 }
 
-func writeSigningCredentials(t *testing.T, r *KeyringReconciler, b wire.KeyringBundle, s RotationState, m issuerMaterial) {
+func writeSigningCredentials(t *testing.T, r *credentialsFixture, b wire.KeyringBundle, s RotationState, m issuerMaterial) {
 	t.Helper()
 
 	bundle, err := wire.EncodeBundle(b)
@@ -1559,14 +1486,14 @@ func TestSigningRejectsCorruptPrivateEntries(t *testing.T) {
 				require.ErrorIs(t, err, wire.Unavailable)
 				_, err = r.Trust.pool()
 				require.Error(t, err, "observed corruption retained trust")
-				_, err = r.Reconcile(t.Context(), ctrl.Request{})
+				_, err = r.operations().ReconcileCredentials(t.Context())
 				require.ErrorIs(t, err, wire.Unavailable)
 			})
 		}
 	}
 }
 
-func signingRole(t *testing.T, r *KeyringReconciler, role string, b *wire.KeyringBundle, s *RotationState, m issuerMaterial) string {
+func signingRole(t *testing.T, r *credentialsFixture, role string, b *wire.KeyringBundle, s *RotationState, m issuerMaterial) string {
 	t.Helper()
 
 	if role == "active" {
@@ -1597,7 +1524,7 @@ func signingRole(t *testing.T, r *KeyringReconciler, role string, b *wire.Keyrin
 	return id
 }
 
-func corruptSigning(t *testing.T, r *KeyringReconciler, corruption string, bad signingMaterial) signingMaterial {
+func corruptSigning(t *testing.T, r *credentialsFixture, corruption string, bad signingMaterial) signingMaterial {
 	t.Helper()
 
 	switch corruption {

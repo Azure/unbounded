@@ -5,6 +5,7 @@ package authority
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,11 +24,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/wire"
@@ -330,7 +329,7 @@ func TestPollValidationAndCancellation(t *testing.T) {
 	})
 }
 
-func assertPollValidation(t *testing.T, r *TopologyReconciler, identity NodeIdentity, sequence wire.Sequence) {
+func assertPollValidation(t *testing.T, r *topologyFixture, identity NodeIdentity, sequence wire.Sequence) {
 	t.Helper()
 
 	zero, future := wire.Sequence(0), sequence+1
@@ -469,7 +468,7 @@ func TestDurableLossWithdrawsPublication(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := r.Reconcile(ctx, ctrl.Request{}); err == nil {
+		if _, err := r.operations().PublishTopology(ctx, r.observeTopology); err == nil {
 			t.Fatal("missing counter accepted")
 		}
 
@@ -725,7 +724,7 @@ func TestPrepareRejectsFinalCounterGrowth(t *testing.T) {
 	}
 }
 
-func stagedTopology(t *testing.T) *TopologyReconciler {
+func stagedTopology(t *testing.T) *topologyFixture {
 	t.Helper()
 	return testTopology(t)
 }
@@ -873,7 +872,7 @@ func (f stagedFixture) object() client.Object {
 
 func (f stagedFixture) run(ctx context.Context, writer client.WithWatch) error {
 	if f.credentials {
-		_, err := Assemble(f.config, writer, f.base).Keyring.Reconcile(ctx, ctrl.Request{})
+		_, err := Assemble(f.config, writer, f.base).authority.ReconcileCredentials(ctx)
 		return err
 	}
 
@@ -932,7 +931,12 @@ func TestStagedCompetingInstallers(t *testing.T) {
 
 	for range 8 {
 		wg.Go(func() {
-			if _, err := Assemble(r.Config, base, base).Keyring.Reconcile(t.Context(), ctrl.Request{}); err != nil {
+			delay, err := Assemble(r.Config, base, base).authority.ReconcileCredentials(t.Context())
+			if apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err) {
+				if delay != 0 {
+					t.Errorf("losing initializer supplied retry delay %v", delay)
+				}
+			} else if err != nil {
 				t.Error(err)
 			}
 		})
@@ -940,6 +944,11 @@ func TestStagedCompetingInstallers(t *testing.T) {
 
 	wg.Wait()
 	runKeys(t, Assemble(r.Config, base, base).Keyring)
+	version, _, err := readVersion(t.Context(), base, r.Config)
+	require.NoError(t, err)
+	shared, bundle, _, _ := keyState(t, Assemble(r.Config, base, base).Keyring)
+	require.Equal(t, string(shared.UID), version.Annotations[credentialUID])
+	require.EqualValues(t, 1, bundle.Generation, "competitors must converge on the same initial generation")
 }
 
 func TestStagedDelayedCreateCannotResurrectAuthority(t *testing.T) {
@@ -966,8 +975,8 @@ func TestStagedDelayedCreateCannotResurrectAuthority(t *testing.T) {
 				return c.Create(ctx, obj, opts...)
 			}})
 			if credentials {
-				_, _ = Assemble(r.Config, writer, base).Keyring.Reconcile(t.Context(), ctrl.Request{})
-				_, err := Assemble(r.Config, base, base).Keyring.Reconcile(t.Context(), ctrl.Request{})
+				_, _ = Assemble(r.Config, writer, base).authority.ReconcileCredentials(t.Context())
+				_, err := Assemble(r.Config, base, base).authority.ReconcileCredentials(t.Context())
 				require.Error(t, err, "delayed Create restored credentials authority")
 			} else {
 				require.Error(t, ensureInstalled(t.Context(), writer, base, r.Config), "delayed Create restored version authority")
@@ -1048,7 +1057,7 @@ func integrationStagedInitialization(t *testing.T, c client.WithWatch) {
 
 				writer := interruptInitialization(c, boundary, cancel)
 				if credentials {
-					_, err := Assemble(cfg, writer, c).Keyring.Reconcile(ctx, ctrl.Request{})
+					_, err := Assemble(cfg, writer, c).authority.ReconcileCredentials(ctx)
 					require.Error(t, err, "interruption not injected")
 
 					runKeys(t, Assemble(cfg, c, c).Keyring)
@@ -1080,7 +1089,7 @@ func testConfig(t *testing.T) Config {
 	return cfg
 }
 
-func testTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
+func testTopology(t *testing.T, objects ...client.Object) *topologyFixture {
 	t.Helper()
 	cfg := testConfig(t)
 
@@ -1100,7 +1109,7 @@ func testTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
 	return Assemble(cfg, api, api).Topology
 }
 
-func initializedTopology(t *testing.T, objects ...client.Object) *TopologyReconciler {
+func initializedTopology(t *testing.T, objects ...client.Object) *topologyFixture {
 	t.Helper()
 
 	r := testTopology(t, objects...)
@@ -1111,12 +1120,12 @@ func initializedTopology(t *testing.T, objects ...client.Object) *TopologyReconc
 	return r
 }
 
-func reconcileTopology(t *testing.T, r *TopologyReconciler, ctx context.Context) *CommittedPublication {
+func reconcileTopology(t *testing.T, r *topologyFixture, ctx context.Context) *CommittedPublication {
 	t.Helper()
 
-	result, err := r.Reconcile(ctx, ctrl.Request{})
-	if err != nil || result.RequeueAfter != 0 {
-		t.Fatalf("reconcile: %v, %v", result, err)
+	_, err := r.operations().PublishTopology(ctx, r.observeTopology)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
 	}
 
 	p, err := r.Publications.Current()
@@ -1301,7 +1310,7 @@ func TestTopologyNamespaceOwnershipAndMissingDaemonSet(t *testing.T) {
 	ctx := context.Background()
 
 	first := reconcileTopology(t, r, ctx)
-	if len(r.Accepted) != 0 {
+	if len(r.authority.accepted) != 0 {
 		t.Fatal("pod in unrelated namespace admitted")
 	}
 
@@ -1322,7 +1331,7 @@ func TestTopologyNamespaceOwnershipAndMissingDaemonSet(t *testing.T) {
 	}
 
 	member := reconcileTopology(t, r, ctx)
-	if len(r.Accepted) != 1 {
+	if len(r.authority.accepted) != 1 {
 		t.Fatal("managed endpoint not admitted")
 	}
 
@@ -1334,12 +1343,19 @@ func TestTopologyNamespaceOwnershipAndMissingDaemonSet(t *testing.T) {
 		t.Fatal("missing workload discarded warm endpoint")
 	}
 
+	// Supply the persisted hint as input; root tests cover writing and removing it.
+	encoded, err := json.Marshal(r.authority.accepted[testNodeUID])
+	require.NoError(t, err)
+	require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(&node), &node))
+	node.Annotations = map[string]string{admittedMemberAnnotation: string(encoded)}
+	require.NoError(t, r.Update(ctx, &node))
+
 	r = Assemble(r.Config, r.Client, r.APIReader).Topology
 	if restarted := reconcileTopology(t, r, ctx); restarted.record != member.record || restarted.encoded != member.encoded {
 		t.Fatal("cold restart changed admitted membership during workload gap")
 	}
 
-	if len(r.Accepted) != 1 {
+	if len(r.authority.accepted) != 1 {
 		t.Fatal("cold restart lost persisted admitted identity")
 	}
 }
@@ -1409,7 +1425,7 @@ func TestRecoveryNeverRecreatesCounters(t *testing.T) {
 					return nil
 				},
 			})
-			if _, err := r.Reconcile(ctx, ctrl.Request{}); err == nil || writes != 0 {
+			if _, err := r.operations().PublishTopology(ctx, r.observeTopology); err == nil || writes != 0 {
 				t.Fatalf("unsafe recovery: %v, writes=%d", err, writes)
 			}
 
@@ -1462,7 +1478,7 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 	assertCrashAfterVersionCommit(t, r, member)
 }
 
-func assertCrashAfterVersionCommit(t *testing.T, r *TopologyReconciler, member *CommittedPublication) {
+func assertCrashAfterVersionCommit(t *testing.T, r *topologyFixture, member *CommittedPublication) {
 	t.Helper()
 	ctx := t.Context()
 
@@ -1484,7 +1500,7 @@ func assertCrashAfterVersionCommit(t *testing.T, r *TopologyReconciler, member *
 		t.Fatal("commit installed prematurely")
 	}
 
-	if len(r.Accepted) != 1 {
+	if len(r.authority.accepted) != 1 {
 		t.Fatal("commit replaced history")
 	}
 
@@ -1522,17 +1538,17 @@ func TestCASConflictRetriesFreshInputsAndKeepsHistory(t *testing.T) {
 		return c.Update(ctx, obj, opts...)
 	}})
 
-	result, err := r.Reconcile(ctx, ctrl.Request{})
-	if err != nil || result.RequeueAfter <= 0 || updates != 1 {
-		t.Fatalf("conflict retry: %v, %v, writes=%d", result, err, updates)
+	_, err := r.operations().PublishTopology(ctx, r.observeTopology)
+	if !apierrors.IsConflict(err) || updates != 1 {
+		t.Fatalf("conflict: %v, writes=%d", err, updates)
 	}
 
-	if current, _ := r.Publications.Current(); current != initial || r.Accepted[testNodeUID].Shares != 4 {
+	if current, _ := r.Publications.Current(); current != initial || r.authority.accepted[testNodeUID].Shares != 4 {
 		t.Fatal("failed commit changed publication/history")
 	}
 
 	next := reconcileTopology(t, r, ctx)
-	if r.Accepted[testNodeUID].Shares != 9 || next.record.Sequence != initial.record.Sequence+1 {
+	if r.authority.accepted[testNodeUID].Shares != 9 || next.record.Sequence != initial.record.Sequence+1 {
 		t.Fatal("retry reused stale inputs")
 	}
 }
@@ -1576,9 +1592,11 @@ func TestCancellationBeforeWritesAndInstall(t *testing.T) {
 				}})
 			}
 
-			result, err := r.Reconcile(ctx, ctrl.Request{})
-			if !errors.Is(err, context.Canceled) || !errors.Is(err, reconcile.TerminalError(nil)) || result.RequeueAfter != 0 {
-				t.Fatalf("canceled reconcile retried: %+v, %v", result, err)
+			_, err := r.operations().PublishTopology(ctx, r.observeTopology)
+			if stage == "conflict" {
+				require.True(t, apierrors.IsConflict(err), "operation must preserve the write error")
+			} else {
+				require.ErrorIs(t, err, context.Canceled)
 			}
 
 			if (stage == "before reconcile" || stage == "read") && writes != 0 {

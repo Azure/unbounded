@@ -61,7 +61,7 @@ func (a *Authority) ReconcileCredentials(ctx context.Context) (time.Duration, er
 	if err == nil {
 		var state signingState
 
-		state, err = loadSigning(ctx, r.APIReader, r.Config, r.now())
+		state, err = loadSigning(ctx, r.APIReader, r.Config, credentialTime(r.Now))
 		if err == nil {
 			err = r.Trust.install(ctx, state.roots, state.bundle)
 		}
@@ -79,9 +79,10 @@ func (a *Authority) ReconcileCredentials(ctx context.Context) (time.Duration, er
 	return result.RequeueAfter, err
 }
 
-func (r *credentials) now() time.Time {
-	if r.Now != nil {
-		return r.Now().UTC().Truncate(time.Second)
+// Credential timestamps use the same precision as X.509 validity times.
+func credentialTime(now func() time.Time) time.Time {
+	if now != nil {
+		return now().UTC().Truncate(time.Second)
 	}
 
 	return time.Now().UTC().Truncate(time.Second)
@@ -146,7 +147,7 @@ func (r *credentials) rotateKeys(ctx context.Context, cfg Config, credentials cr
 		return ctrl.Result{}, err
 	}
 
-	now := r.now()
+	now := credentialTime(r.Now)
 	credentials.discardStalePreparation(cfg, now)
 
 	if err := credentials.prepareIssuer(cfg, now); err != nil {
@@ -283,7 +284,7 @@ func (r *credentials) initializeKeys(ctx context.Context, version *corev1.Config
 		return r.commitStagedCredentials(ctx, version, existing)
 	}
 
-	now := r.now()
+	now := credentialTime(r.Now)
 
 	cert, key, err := generateIssuer(now, cfg)
 	if err != nil {
@@ -414,15 +415,6 @@ func newCacheKey(cache wire.CacheID, purpose wire.KeyPurpose, state wire.KeyStat
 	return wire.NewCacheKey(wire.CacheKeyRef{Cache: cache, Purpose: purpose, ID: id}, state, material)
 }
 
-// PlanRotation owns its output and plans transitions using the supplied policy.
-// Deadlines are measured from actual transitions, never advanced through
-// missed intervals after downtime. Issuer staging is done by reconcileKeys before
-// this planner; publication persists all credentials atomically.
-func planRotationOnly(policy RotationPolicy, b wire.KeyringBundle, s rotationState, catalog []wire.CacheDefinition, now time.Time) (wire.KeyringBundle, rotationState, error) {
-	b, s, _, err := planRotation(policy, b, s, catalog, now, nextGeneration(b.Generation))
-	return b, s, err
-}
-
 func nextGeneration(g wire.Generation) wire.Generation {
 	if g == math.MaxUint64 {
 		return 0
@@ -431,6 +423,8 @@ func nextGeneration(g wire.Generation) wire.Generation {
 	return g + 1
 }
 
+// planRotation owns its output. Deadlines start at actual transitions, not missed
+// intervals. reconcileKeys stages issuers before planning and commits atomically.
 // creationGeneration is the publication that will first contain new keys. Zero
 // forbids key creation when generations are exhausted, while allowing idle plans.
 func planRotation(policy RotationPolicy, b wire.KeyringBundle, s rotationState, catalog []wire.CacheDefinition, now time.Time, creationGeneration wire.Generation) (wire.KeyringBundle, rotationState, []byte, error) {
@@ -1439,7 +1433,7 @@ func (r *credentials) commitStagedCredentials(ctx context.Context, version *core
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: max(time.Second, candidate.rotation.nextTransition().Sub(r.now()))}, nil
+	return ctrl.Result{RequeueAfter: max(time.Second, candidate.rotation.nextTransition().Sub(credentialTime(r.Now)))}, nil
 }
 
 func validStagedCredentials(cfg Config, version *corev1.ConfigMap, secret *corev1.Secret) bool {
