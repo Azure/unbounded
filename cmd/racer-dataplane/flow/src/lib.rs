@@ -525,7 +525,8 @@ impl<P: Policy> Quotas<P> {
         if local_deficit != 0 {
             return Some((Some(key.clone()), local_deficit));
         }
-        let deficit = self.used(class).saturating_sub(self.limit(class) - amount);
+        let headroom = self.limit(class).checked_sub(amount)?;
+        let deficit = self.used(class).saturating_sub(headroom);
         (deficit != 0).then_some((None, deficit))
     }
 
@@ -1037,7 +1038,7 @@ mod quota_tests {
         }
     }
 
-    /// Fixed limits and a shared rejection log for assertions.
+    /// Optional limit samples and a shared rejection log for assertions.
     #[derive(Clone)]
     struct TestPolicy {
         limit: usize,
@@ -1047,6 +1048,8 @@ mod quota_tests {
         rejected: Arc<Mutex<Vec<Rejection<Resource>>>>,
 
         limit_gate: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
+
+        limit_samples: Arc<Mutex<VecDeque<usize>>>,
     }
 
     impl TestPolicy {
@@ -1057,6 +1060,7 @@ mod quota_tests {
                 max_keys,
                 rejected: Arc::default(),
                 limit_gate: None,
+                limit_samples: Arc::default(),
             }
         }
     }
@@ -1074,7 +1078,11 @@ mod quota_tests {
                 gate.0.wait();
                 gate.1.wait();
             }
-            self.limit
+            self.limit_samples
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(self.limit)
         }
 
         /// Return the fixture's key-record bound.
@@ -1249,6 +1257,140 @@ mod quota_tests {
         ));
         drop((completion, first, second));
         assert_eq!(quotas.used(Resource::Payload), 0);
+    }
+
+    /// A lower second limit must not wrap or suggest an impossible byte remedy.
+    #[test]
+    fn dynamic_limits_reclamation_revalidates_aggregate_headroom() {
+        for shared_usage in [false, true] {
+            for existing_key in [false, true] {
+                for (first, second, amount, expected) in [
+                    (10, 0, 5, None),
+                    (10, 4, 5, None),
+                    (10, 5, 5, Some((None, 3))),
+                    (10, 7, 5, Some((None, 1))),
+                    (10, 8, 5, None),
+                    (10, 20, 5, None),
+                    (usize::MAX, usize::MAX, usize::MAX, Some((None, 3))),
+                    (4, 0, 5, None),
+                ] {
+                    let quotas = Quotas::new(TestPolicy::new(100, 1));
+                    let shared = quotas.shared();
+                    let key = "a".to_owned();
+                    let owner = existing_key
+                        .then(|| quotas.reserve(Some(&key), Resource::Other, 1).unwrap());
+                    let held = if shared_usage {
+                        shared.reserve(Resource::Payload, 3).unwrap()
+                    } else {
+                        quotas.reserve(None, Resource::Payload, 3).unwrap()
+                    };
+                    quotas
+                        .policy
+                        .limit_samples
+                        .lock()
+                        .unwrap()
+                        .extend([first, second]);
+                    assert_eq!(
+                        quotas.reclamation(&key, Resource::Payload, amount),
+                        expected
+                    );
+                    assert_eq!(held.amount(), 3);
+                    assert_eq!(quotas.used(Resource::Payload), 3);
+                    assert_eq!(shared.used(Resource::Payload), 3);
+                    assert_eq!(
+                        quotas.active_keys.load(Ordering::Acquire),
+                        usize::from(existing_key)
+                    );
+                    assert!(quotas.policy.rejected.lock().unwrap().is_empty());
+                    drop((held, owner));
+                    assert_eq!(shared.used(Resource::Payload), 0);
+                    assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+                }
+            }
+        }
+    }
+
+    /// Lower ceilings reject without losing old charges; higher ceilings admit exactly.
+    #[test]
+    fn dynamic_limits_admission_preserves_failure_accounting_and_success_edges() {
+        let quotas = Quotas::new(TestPolicy::new(4, 1));
+        let shared = quotas.shared();
+        let key = "a".to_owned();
+        quotas.policy.limit_samples.lock().unwrap().extend([10, 10]);
+        let held = quotas.reserve(Some(&key), Resource::Payload, 6).unwrap();
+        assert!(matches!(
+            shared.reserve(Resource::Payload, 1),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            quotas.reserve(None, Resource::Payload, 1),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            quotas.reserve(Some(&key), Resource::Payload, 1),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            quotas.reserve_completion(Some(&key), Resource::Payload, 1),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            shared.reserve(Resource::Payload, 0),
+            Err(Error::InvalidInput)
+        ));
+        assert!(matches!(
+            quotas.reserve(Some(&key), Resource::Payload, 0),
+            Err(Error::InvalidInput)
+        ));
+        assert_eq!(quotas.used(Resource::Payload), 6);
+        assert_eq!(shared.used(Resource::Payload), 6);
+        assert_eq!(
+            held.local
+                .as_ref()
+                .unwrap()
+                .counter(Resource::Payload)
+                .used(),
+            6
+        );
+        assert_eq!(quotas.active_keys.load(Ordering::Acquire), 1);
+        {
+            let rejected = quotas.policy.rejected.lock().unwrap();
+            assert_eq!(
+                rejected.len(),
+                7,
+                "local retries once; shared does not retry"
+            );
+            for (index, rejection) in rejected.iter().enumerate() {
+                let (key_used, key_limit) = if matches!(index, 3 | 4) {
+                    (Some(6), Some(4))
+                } else {
+                    (None, None)
+                };
+                assert!(matches!(rejection, Rejection::Resource {
+                    class: Resource::Payload, used: 6, limit: 4, requested: 1,
+                    key_used: actual_used, key_limit: actual_limit,
+                } if *actual_used == key_used && *actual_limit == key_limit));
+            }
+        }
+        quotas.policy.limit_samples.lock().unwrap().extend([10, 10]);
+        let refill = quotas.reserve(Some(&key), Resource::Payload, 4).unwrap();
+        assert_eq!(shared.used(Resource::Payload), 10);
+        assert_eq!(
+            held.local
+                .as_ref()
+                .unwrap()
+                .counter(Resource::Payload)
+                .used(),
+            10
+        );
+        drop((refill, held));
+        assert_eq!(shared.used(Resource::Payload), 0);
+        assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+        let exact = shared.reserve(Resource::Payload, 4).unwrap();
+        assert_eq!(quotas.used(Resource::Payload), 4);
+        drop(exact);
+        assert_eq!(quotas.used(Resource::Payload), 0);
+        assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 7);
     }
 
     /// Idle backing retains two live charges and reports pressure before retry.
