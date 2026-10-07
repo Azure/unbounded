@@ -287,6 +287,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "telemetry"
+version = "0.1.0"
+dependencies = [
+ "httparse",
+ "uring-runtime",
+ "zeroize",
+]
+
+[[package]]
 name = "topology"
 version = "0.1.0"
 dependencies = [
