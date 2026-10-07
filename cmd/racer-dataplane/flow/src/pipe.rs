@@ -49,12 +49,12 @@ impl Drop for Notify {
     }
 }
 
-/// Wake the FIFO head without holding a queue borrow through the callback.
+/// Consume the head's notification before calling it without queue or entry borrows.
 fn wake_front(waiters: &Waiters) {
     let wake = waiters
         .borrow()
         .front()
-        .and_then(|entry| entry.borrow().clone());
+        .and_then(|entry| entry.borrow_mut().take());
     if let Some(wake) = wake {
         wake.wake();
     }
@@ -221,7 +221,10 @@ impl<P: Policy> PipePool<P> {
             if self.quotas.is_stopped() {
                 return Poll::Ready(Err(Error::Unavailable.into()));
             }
-            *waiting.entry.borrow_mut() = Some(cx.waker().clone());
+            // Clone and drop may reenter; publish before retiring the old waker.
+            let wake = cx.waker().clone();
+            let old = waiting.entry.borrow_mut().replace(wake);
+            drop(old);
             if self
                 .waiting
                 .borrow()
@@ -735,6 +738,161 @@ mod tests {
         fn count(&self) -> usize {
             self.0.load(Ordering::Relaxed)
         }
+    }
+
+    /// Waker callbacks use thread-local hooks without sharing worker-local state.
+    mod waker_callbacks {
+        use super::*;
+        use std::task::{RawWaker, RawWakerVTable};
+
+        type Hook = Box<dyn FnOnce(&str)>;
+
+        thread_local! {
+            static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
+
+        /// Remove the hook before calling it so nested callbacks are harmless.
+        fn invoke(event: &str) {
+            let hook = HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook(event);
+            }
+        }
+
+        /// Install one callback on this test thread.
+        pub fn on_callback(hook: impl FnOnce(&str) + 'static) {
+            HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        }
+
+        /// No data pointer is owned; callbacks only access the calling thread.
+        fn raw() -> RawWaker {
+            RawWaker::new(
+                std::ptr::null(),
+                &RawWakerVTable::new(
+                    |_| {
+                        invoke("clone");
+                        raw()
+                    },
+                    |_| invoke("wake"),
+                    |_| invoke("wake_by_ref"),
+                    |_| invoke("drop"),
+                ),
+            )
+        }
+
+        /// Build a transferable waker with no shared mutable data.
+        pub fn waker() -> Waker {
+            // SAFETY: the vtable never dereferences data and owns no allocation.
+            // All mutable hooks are thread-local, including on other threads.
+            unsafe { Waker::from_raw(raw()) }
+        }
+    }
+
+    /// Consume the head before callbacks can borrow or notify the same queue.
+    #[test]
+    fn review_regression_pipe_waker_front_reentry() {
+        let entry = Rc::new(RefCell::new(Some(waker_callbacks::waker())));
+        let queue: Waiters = Rc::new(RefCell::new(VecDeque::from([entry.clone()])));
+        let callback_queue = queue.clone();
+        let callback_entry = entry.clone();
+        let called = Rc::new(std::cell::Cell::new(false));
+        let callback_called = called.clone();
+        waker_callbacks::on_callback(move |event| {
+            let queue = callback_queue.borrow_mut();
+            let entry = callback_entry.borrow_mut();
+            assert_eq!(event, "wake", "notification must not clone its target");
+            assert!(entry.is_none());
+            assert_eq!(queue.len(), 1);
+            drop(entry);
+            drop(queue);
+            wake_front(&callback_queue);
+            callback_called.set(true);
+        });
+        wake_front(&queue);
+        assert!(called.get());
+        assert!(entry.borrow().is_none());
+        assert_eq!(queue.borrow().len(), 1);
+        wake_front(&queue);
+    }
+
+    /// Dropping a replaced registration may synchronously notify the new target.
+    #[test]
+    fn review_regression_pipe_waker_replacement_reentry() {
+        let pool = new_pool(admission(1));
+        let held = pool.acquire().unwrap();
+        let mut wait = acquire_wait(&pool);
+        let old = waker_callbacks::waker();
+        assert!(
+            wait.as_mut()
+                .poll(&mut Context::from_waker(&old))
+                .is_pending()
+        );
+        let queue = pool.waiting.clone();
+        waker_callbacks::on_callback(move |event| {
+            assert_eq!(event, "drop");
+            wake_front(&queue);
+        });
+        let counter = Arc::new(WakeCounter::default());
+        let new = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&new);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(counter.count(), 1);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        drop(held);
+        assert_eq!(counter.count(), 2);
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        assert!(pool.waiting.borrow().is_empty());
+    }
+
+    /// Consumed notifications rearm on each poll and preserve FIFO progress.
+    #[test]
+    fn review_regression_pipe_waker_rearms_and_advances_fifo() {
+        let quotas = admission(1);
+        let pool = new_pool(quotas.clone());
+        let held = pool.acquire().unwrap();
+        let registrations = std::cell::Cell::new(0);
+        let mut first = Box::pin(pool.acquire_wait(
+            || Ok::<_, Error>(()),
+            || Ok(|_: &Waker| registrations.set(registrations.get() + 1)),
+        ));
+        let mut second = acquire_wait(&pool);
+        let count = Arc::new(WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        wake_front(&pool.waiting);
+        wake_front(&pool.waiting);
+        assert_eq!(count.count(), 1);
+        let queue = pool.waiting.clone();
+        waker_callbacks::on_callback(move |event| {
+            assert_eq!(event, "clone");
+            wake_front(&queue);
+        });
+        let reentrant = waker_callbacks::waker();
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&reentrant))
+                .is_pending()
+        );
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(registrations.get(), 3);
+        assert_eq!(count.count(), 1, "pending polls must not self-wake");
+        drop(held);
+        assert_eq!(count.count(), 2);
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        let Poll::Ready(Ok(first_lease)) = first.as_mut().poll(&mut cx) else {
+            panic!("head did not acquire returned pipe");
+        };
+        assert_eq!(registrations.get(), 4);
+        assert_eq!(count.count(), 3, "head completion must notify successor");
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        drop(first_lease);
+        assert_eq!(count.count(), 4);
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        assert!(pool.waiting.borrow().is_empty());
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
     }
 
     /// Distinguish application gate rejection from flow-control exhaustion.
