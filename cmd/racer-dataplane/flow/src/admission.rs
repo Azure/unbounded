@@ -988,6 +988,7 @@ mod handoff {
         }
 
         /// Pop at most the caller's budget while retaining each item's admission.
+        /// Closed targets reject pops without retaining the caller's waker.
         pub fn pop_batch<const N: usize>(
             &self,
             key: &K,
@@ -996,6 +997,9 @@ mod handoff {
         ) -> Result<Batch<T, A::Reservation, N>> {
             let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
             let target = state.target(key).ok_or(Error::InvalidInput)?;
+            if target.closed {
+                return Err(Error::Unavailable);
+            }
             if let Some(old) = &mut target.waker {
                 old.clone_from(waker);
             } else {
@@ -1010,17 +1014,25 @@ mod handoff {
             }))
         }
 
-        /// Close a target and drop queued ownership outside the shared lock.
+        /// Close permanently, then drop ownership and wake outside the shared lock.
         pub fn close(&self, key: &K) {
-            let queued = {
+            let (queued, admission, waker) = {
                 let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(target) = state.target(key) else {
                     return;
                 };
                 target.closed = true;
-                std::mem::take(&mut target.queue)
+                (
+                    std::mem::take(&mut target.queue),
+                    target.admission.take(),
+                    target.waker.take(),
+                )
             };
             drop(queued);
+            drop(admission);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
     }
 
@@ -1049,6 +1061,164 @@ mod handoff {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::{
+            sync::{
+                Weak,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::Wake,
+        };
+
+        type ClosingHandoff = Handoff<u8, CloseAdmission, CloseDrop>;
+
+        #[derive(Clone)]
+        struct CloseDrop {
+            handoff: Weak<ClosingHandoff>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl CloseDrop {
+            fn reenter(&self) {
+                if let Some(handoff) = self.handoff.upgrade() {
+                    let state = handoff
+                        .0
+                        .try_lock()
+                        .expect("close must unlock before callbacks");
+                    assert!(state.targets[0].1.closed);
+                    assert!(state.targets[0].1.queue.is_empty());
+                    assert!(state.targets[0].1.admission.is_none());
+                    assert!(state.targets[0].1.waker.is_none());
+                    drop(state);
+                    handoff.close(&1);
+                    assert!(matches!(
+                        handoff.pop_batch::<1>(&1, Waker::noop(), 1),
+                        Err(Error::Unavailable)
+                    ));
+                }
+            }
+        }
+
+        impl Drop for CloseDrop {
+            fn drop(&mut self) {
+                self.reenter();
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct CloseAdmission(CloseDrop);
+
+        impl Admission for CloseAdmission {
+            type Reservation = CloseDrop;
+
+            fn register(&self, _: &Waker) {}
+
+            fn reserve(&self) -> Result<CloseDrop> {
+                Ok(self.0.clone())
+            }
+        }
+
+        struct CloseWake {
+            on_drop: CloseDrop,
+            wakes: Arc<AtomicUsize>,
+        }
+
+        impl Wake for CloseWake {
+            fn wake(self: Arc<Self>) {
+                self.on_drop.reenter();
+                self.wakes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn close_releases_admission_and_queue_outside_lock() {
+            for queued in [0, 2] {
+                let handoff = Arc::new(ClosingHandoff::new(&[1]));
+                let drops = Arc::new(AtomicUsize::new(0));
+                handoff
+                    .install(
+                        &1,
+                        CloseAdmission(CloseDrop {
+                            handoff: Arc::downgrade(&handoff),
+                            drops: drops.clone(),
+                        }),
+                    )
+                    .unwrap();
+                for _ in 0..queued {
+                    handoff
+                        .reserve(Waker::noop())
+                        .unwrap()
+                        .deliver(|| CloseDrop {
+                            handoff: Arc::downgrade(&handoff),
+                            drops: drops.clone(),
+                        })
+                        .unwrap();
+                }
+                handoff.close(&1);
+                assert_eq!(drops.load(Ordering::SeqCst), 1 + 2 * queued);
+                handoff.close(&1);
+                handoff.close(&2);
+                assert_eq!(drops.load(Ordering::SeqCst), 1 + 2 * queued);
+                assert!(handoff.0.lock().unwrap().targets[0].1.admission.is_none());
+            }
+        }
+
+        #[test]
+        fn close_wakes_and_releases_waiter_outside_lock() {
+            let handoff = Arc::new(ClosingHandoff::new(&[1]));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let waker = Waker::from(Arc::new(CloseWake {
+                on_drop: CloseDrop {
+                    handoff: Arc::downgrade(&handoff),
+                    drops: drops.clone(),
+                },
+                wakes: wakes.clone(),
+            }));
+            assert!(handoff.pop_batch::<1>(&1, &waker, 1).unwrap()[0].is_none());
+            drop(waker);
+            handoff.close(&2);
+            assert_eq!(wakes.load(Ordering::SeqCst), 0);
+            handoff.close(&1);
+            assert_eq!(wakes.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            handoff.close(&1);
+            assert_eq!(wakes.load(Ordering::SeqCst), 1);
+            assert!(handoff.0.lock().unwrap().targets[0].1.waker.is_none());
+        }
+
+        #[test]
+        fn close_rejects_pop_without_retaining_new_waiter() {
+            let handoff = Handoff::<_, Ready, ()>::new(&[1, 2]);
+            handoff.install(&1, Ready).unwrap();
+            for key in [1, 2] {
+                handoff.close(&key);
+                for budget in [0, 1, usize::MAX] {
+                    assert!(matches!(
+                        handoff.pop_batch::<1>(&key, Waker::noop(), budget),
+                        Err(Error::Unavailable)
+                    ));
+                    assert!(matches!(
+                        handoff.pop_batch::<0>(&key, Waker::noop(), budget),
+                        Err(Error::Unavailable)
+                    ));
+                    assert!(
+                        handoff
+                            .0
+                            .lock()
+                            .unwrap()
+                            .target(&key)
+                            .unwrap()
+                            .waker
+                            .is_none()
+                    );
+                }
+                assert_eq!(handoff.install(&key, Ready), Err(Error::InvalidInput));
+            }
+            assert!(matches!(
+                handoff.pop_batch::<1>(&3, Waker::noop(), 1),
+                Err(Error::InvalidInput)
+            ));
+        }
 
         struct Ready;
 
