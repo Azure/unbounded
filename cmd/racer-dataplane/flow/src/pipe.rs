@@ -202,7 +202,10 @@ impl<P: Policy> PipePool<P> {
         let reservation = self
             .quotas
             .reserve(None, self.waiter_class, self.waiter_bytes())?;
-        let mut register = subscribe()?;
+        // Reservation policy can synchronously admit another waiter.
+        if self.waiting.borrow().len() >= self.waiter_limit {
+            return Err(Error::Overloaded.into());
+        }
         let entry = Rc::new(RefCell::new(None));
         self.waiting.borrow_mut().push_back(entry.clone());
         let waiting = Waiting {
@@ -210,6 +213,8 @@ impl<P: Policy> PipePool<P> {
             entry,
             _reservation: reservation,
         };
+        // Publish before reentry; Waiting rolls back subscription errors or panics.
+        let mut register = subscribe()?;
         poll_fn(|cx| {
             register(cx.waker());
             check()?;
@@ -641,6 +646,8 @@ mod tests {
         pipes: usize,
 
         context: usize,
+
+        on_context_limit: RefCell<Option<Box<dyn FnOnce()>>>,
     }
 
     impl Policy for TestPolicy {
@@ -650,6 +657,12 @@ mod tests {
 
         /// Give pipes their count ceiling and other classes a byte ceiling.
         fn limit(&self, class: ResourceClass) -> usize {
+            if matches!(class, ResourceClass::RequestContext) {
+                let callback = self.on_context_limit.borrow_mut().take();
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
             match class {
                 ResourceClass::Pipe => self.pipes,
                 _ => self.context,
@@ -680,6 +693,7 @@ mod tests {
         Rc::new(Quotas::new(TestPolicy {
             pipes,
             context: 32 * 1024 * 1024,
+            on_context_limit: RefCell::default(),
         }))
     }
 
@@ -759,6 +773,7 @@ mod tests {
         let subscribed = Cell::new(0);
         let subscribe = || {
             subscribed.set(subscribed.get() + 1);
+            assert_eq!(pool.waiting.borrow().len(), 1);
             Err::<fn(&Waker), _>(GateError::Rejected)
         };
         let mut cx = Context::from_waker(Waker::noop());
@@ -788,7 +803,11 @@ mod tests {
         assert_eq!(pool.idle_count(), 1);
 
         for (context, waiter_limit) in [(0, 8), (usize::MAX, 0)] {
-            let quotas = Rc::new(Quotas::new(TestPolicy { pipes: 1, context }));
+            let quotas = Rc::new(Quotas::new(TestPolicy {
+                pipes: 1,
+                context,
+                on_context_limit: RefCell::default(),
+            }));
             let pool = PipePool::new(
                 quotas.clone(),
                 ResourceClass::Pipe,
@@ -805,6 +824,125 @@ mod tests {
             assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
             assert!(pool.waiting.borrow().is_empty());
         }
+    }
+
+    /// Reservation callbacks cannot let an outer wait overfill a reentered queue.
+    #[test]
+    fn review_regression_waiter_limit_after_reserve_reentry() {
+        let quotas = admission(1);
+        let pool = Rc::new(PipePool::new(
+            quotas.clone(),
+            ResourceClass::Pipe,
+            ResourceClass::RequestContext,
+            1,
+        ));
+        let held = pool.acquire().unwrap();
+        let nested_pool = pool.clone();
+        let nested = Rc::new(RefCell::new(Box::pin(async move {
+            acquire_wait(&nested_pool).await
+        })));
+        let callback_wait = nested.clone();
+        *quotas.policy.on_context_limit.borrow_mut() = Some(Box::new(move || {
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                callback_wait
+                    .borrow_mut()
+                    .as_mut()
+                    .poll(&mut cx)
+                    .is_pending()
+            );
+        }));
+        let mut outer = Box::pin(pool.acquire_wait(
+            || Ok::<_, Error>(()),
+            || -> Result<fn(&Waker)> {
+                panic!("overloaded outer wait must not subscribe");
+            },
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            outer.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        assert_eq!(pool.waiting.borrow().len(), 1);
+        assert_eq!(
+            quotas.used(ResourceClass::RequestContext),
+            pool.waiter_bytes()
+        );
+        drop(held);
+        assert!(matches!(
+            nested.borrow_mut().as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        assert!(pool.waiting.borrow().is_empty());
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+    }
+
+    /// Subscription sees its own queue slot before it tries a nested acquisition.
+    #[test]
+    fn review_regression_waiter_limit_during_subscribe_reentry() {
+        let quotas = admission(1);
+        let pool = PipePool::new(
+            quotas.clone(),
+            ResourceClass::Pipe,
+            ResourceClass::RequestContext,
+            1,
+        );
+        let held = pool.acquire().unwrap();
+        let mut nested = acquire_wait(&pool);
+        let mut outer = Box::pin(pool.acquire_wait(
+            || Ok::<_, Error>(()),
+            || {
+                let mut cx = Context::from_waker(Waker::noop());
+                assert!(matches!(
+                    nested.as_mut().poll(&mut cx),
+                    Poll::Ready(Err(Error::Overloaded))
+                ));
+                assert_eq!(pool.waiting.borrow().len(), 1);
+                assert_eq!(
+                    quotas.used(ResourceClass::RequestContext),
+                    pool.waiter_bytes()
+                );
+                Ok(|_: &Waker| {})
+            },
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(outer.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(pool.waiting.borrow().len(), 1);
+        drop(held);
+        assert!(matches!(outer.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        assert!(pool.waiting.borrow().is_empty());
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+    }
+
+    /// Unwinding a subscription removes its published slot and releases its charge.
+    #[test]
+    fn review_regression_subscription_panic_rolls_back_waiting() {
+        let quotas = admission(1);
+        let pool = new_pool(quotas.clone());
+        let _held = pool.acquire().unwrap();
+        let published = std::cell::Cell::new(false);
+        let mut wait = Box::pin(pool.acquire_wait(
+            || Ok::<_, Error>(()),
+            || -> Result<fn(&Waker)> {
+                published.set(pool.waiting.borrow().len() == 1);
+                panic!("subscription failed");
+            },
+        ));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        }));
+        assert!(result.is_err());
+        assert!(published.get());
+        assert!(pool.waiting.borrow().is_empty());
+        assert_eq!(pool.waiting.borrow().capacity(), 0);
+        assert_eq!(quotas.used(ResourceClass::RequestContext), 0);
+        let mut replacement = acquire_wait(&pool);
+        assert!(
+            replacement
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
     }
 
     /// Gate failure, stop, and abandonment release registration and exact charges.
