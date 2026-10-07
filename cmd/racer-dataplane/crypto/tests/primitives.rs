@@ -52,7 +52,7 @@ fn identity_module_public_api_preserves_key_and_error_contracts() {
 /// Exchange records in reused slices while preserving surrounding and rejected output.
 #[test]
 fn exchange_records_with_reusable_caller_buffers() {
-    let key = [7; 32];
+    let key = random_material();
     let mut send = [0xa5; 128];
     let mut receive = [0x5a; 128];
 
@@ -62,7 +62,7 @@ fn exchange_records_with_reusable_caller_buffers() {
         .into_iter()
         .enumerate()
     {
-        let mut nonce = [0; 24];
+        let mut nonce = random_material();
         nonce[..8].copy_from_slice(&(sequence as u64).to_le_bytes());
         let context = b"example/records/v1";
         let sealed_end = 3 + plaintext.len() + TAG_LEN;
@@ -166,18 +166,20 @@ fn xchacha_draft_known_answer() {
 fn aead_empty_and_block_boundaries() {
     for length in [0, 1, 15, 16, 17, 63, 64, 65, 255, 256, 257, 4096] {
         for aad in [b"".as_slice(), b"associated data"] {
+            let key = random_material();
+            let nonce = random_material();
             let plaintext: Vec<u8> = (0..length).map(|i| i as u8).collect();
             let mut sealed = vec![0xa5; length + TAG_LEN];
-            seal(&[7; 32], &[2; 24], aad, &plaintext, &mut sealed).unwrap();
+            seal(&key, &nonce, aad, &plaintext, &mut sealed).unwrap();
             let retained = sealed.clone();
             let mut opened = vec![0xa5; length];
-            open(&[7; 32], &[2; 24], aad, &sealed, &mut opened).unwrap();
+            open(&key, &nonce, aad, &sealed, &mut opened).unwrap();
             assert_eq!(opened, plaintext);
             assert_eq!(sealed, retained);
             // Empty plaintext still requires a valid authentication tag.
             sealed[length] ^= 1;
             opened.fill(0xa5);
-            assert!(open(&[7; 32], &[2; 24], aad, &sealed, &mut opened).is_err());
+            assert!(open(&key, &nonce, aad, &sealed, &mut opened).is_err());
             assert_eq!(opened, vec![0xa5; length]);
         }
     }
@@ -187,8 +189,8 @@ fn aead_empty_and_block_boundaries() {
 #[test]
 fn aead_tampering_never_writes_output() {
     let plaintext = b"immutable input and output on authentication failure";
-    let key = [7; 32];
-    let nonce = [2; 24];
+    let key = random_material();
+    let nonce = random_material();
     let aad = b"associated data";
     let mut sealed = vec![0; plaintext.len() + TAG_LEN];
     seal(&key, &nonce, aad, plaintext, &mut sealed).unwrap();
@@ -215,8 +217,8 @@ fn aead_tampering_never_writes_output() {
 /// Reject incorrect buffer lengths with an opaque error and unchanged output.
 #[test]
 fn aead_malformed_lengths_never_panic_or_write_output() {
-    let key = [7; 32];
-    let nonce = [2; 24];
+    let key = random_material();
+    let nonce = random_material();
     let error = open(&key, &nonce, b"", b"", &mut []).unwrap_err();
     let error: &dyn std::error::Error = &error;
     assert_eq!(error.to_string(), "cryptographic operation failed");
@@ -493,6 +495,13 @@ fn pmull_hardware_path_executes_when_available() {
     panic!("PMULL hardware verification requires an AArch64 host");
 }
 
+/// Generate key or nonce bytes for tests that do not require published vectors.
+fn random_material<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    uring_runtime::environment::fill_random(&mut bytes).unwrap();
+    bytes
+}
+
 /// Decode an even-length hexadecimal test vector.
 fn hex(bytes: &str) -> Vec<u8> {
     assert_eq!(bytes.len() % 2, 0);
@@ -552,6 +561,7 @@ fn assert_equivalent(bytes: &[u8]) {
 
 /// Identity workflows exercise the same public boundary used by the dataplane.
 mod identity_workflows {
+    use super::random_material;
     use racer_control_wire::{
         BundleGeneration, CacheEncryptionKey, CacheId, CacheKeyRef, CacheKeyState, ClusterId,
         KeyId, KeyringBundle, NodeId, SCHEMA_VERSION,
@@ -803,11 +813,12 @@ mod identity_workflows {
         let cache = CacheId(CACHE.into());
         let page = keys.active(&cache, KeyPurpose::Page).unwrap();
         let credentials = keys.active(&cache, KeyPurpose::OriginCredentials).unwrap();
+        let page_nonce = random_material();
         let mut sealed = [0; 19];
-        page.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed)
+        page.seal_page(&cache, &page_nonce, b"aad", b"abc", &mut sealed)
             .unwrap();
         let mut out = [42; 3];
-        page.open_page(&cache, page.id(), &[1; 24], b"aad", &sealed, &mut out)
+        page.open_page(&cache, page.id(), &page_nonce, b"aad", &sealed, &mut out)
             .unwrap();
         assert_eq!(&out, b"abc");
         out.fill(42);
@@ -815,7 +826,7 @@ mod identity_workflows {
             page.open_page(
                 &cache,
                 credentials.id(),
-                &[1; 24],
+                &page_nonce,
                 b"aad",
                 &sealed,
                 &mut out
@@ -827,7 +838,7 @@ mod identity_workflows {
             page.open_page(
                 &CacheId("wrong".into()),
                 page.id(),
-                &[1; 24],
+                &page_nonce,
                 b"aad",
                 &sealed,
                 &mut out
@@ -836,29 +847,30 @@ mod identity_workflows {
         );
         assert_eq!(out, [42; 3]);
         assert_eq!(
-            page.open_page(&cache, page.id(), &[1; 24], b"bad", &sealed, &mut out),
+            page.open_page(&cache, page.id(), &page_nonce, b"bad", &sealed, &mut out),
             Err(Error::CorruptRecord)
         );
         assert_eq!(out, [42; 3]);
         let original = sealed;
         assert_eq!(
-            credentials.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
+            credentials.seal_page(&cache, &page_nonce, b"aad", b"abc", &mut sealed),
             Err(Error::MissingKey)
         );
         assert_eq!(sealed, original);
         assert_eq!(
-            page.seal_credentials(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
+            page.seal_credentials(&cache, &page_nonce, b"aad", b"abc", &mut sealed),
             Err(Error::MissingKey)
         );
         assert_eq!(sealed, original);
+        let credential_nonce = random_material();
         credentials
-            .seal_credentials(&cache, &[2; 24], b"aad", b"abc", &mut sealed)
+            .seal_credentials(&cache, &credential_nonce, b"aad", b"abc", &mut sealed)
             .unwrap();
         credentials
             .open_credentials(
                 &cache,
                 credentials.id(),
-                &[2; 24],
+                &credential_nonce,
                 b"aad",
                 &sealed,
                 &mut out,
@@ -869,7 +881,7 @@ mod identity_workflows {
             credentials.open_credentials(
                 &cache,
                 credentials.id(),
-                &[2; 24],
+                &credential_nonce,
                 b"bad",
                 &sealed,
                 &mut out
@@ -882,10 +894,18 @@ mod identity_workflows {
             keys.lease(Some(&cache), page.id(), KeyPurpose::Page)
                 .is_err()
         );
-        page.seal_page(&cache, &[3; 24], b"aad", b"abc", &mut sealed)
+        let retained_page_nonce = random_material();
+        page.seal_page(&cache, &retained_page_nonce, b"aad", b"abc", &mut sealed)
             .unwrap();
-        page.open_page(&cache, page.id(), &[3; 24], b"aad", &sealed, &mut out)
-            .unwrap();
+        page.open_page(
+            &cache,
+            page.id(),
+            &retained_page_nonce,
+            b"aad",
+            &sealed,
+            &mut out,
+        )
+        .unwrap();
         assert_eq!(&out, b"abc");
     }
 
