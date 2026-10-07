@@ -893,7 +893,8 @@ mod handoff {
 
         queue: VecDeque<Admitted<T, A::Reservation>>,
 
-        waker: Option<Waker>,
+        // Sharing the registration avoids raw waker callbacks under the lock.
+        waker: Option<Arc<Waker>>,
 
         closed: bool,
     }
@@ -1001,23 +1002,23 @@ mod handoff {
             waker: &Waker,
             budget: usize,
         ) -> Result<Batch<T, A::Reservation, N>> {
+            let waker = Arc::new(waker.clone());
             let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
             let target = state.target(key).ok_or(Error::InvalidInput)?;
             if target.closed {
                 return Err(Error::Unavailable);
             }
-            if let Some(old) = &mut target.waker {
-                old.clone_from(waker);
-            } else {
-                target.waker = Some(waker.clone());
-            }
-            Ok(std::array::from_fn(|index| {
+            let old = target.waker.replace(waker);
+            let batch = std::array::from_fn(|index| {
                 if index < budget {
                     target.queue.pop_front()
                 } else {
                     None
                 }
-            }))
+            });
+            drop(state);
+            drop(old);
+            Ok(batch)
         }
 
         /// Close permanently, then drop ownership and wake outside the shared lock.
@@ -1037,7 +1038,7 @@ mod handoff {
             drop(queued);
             drop(admission);
             if let Some(waker) = waker {
-                waker.wake();
+                waker.wake_by_ref();
             }
         }
     }
@@ -1058,7 +1059,7 @@ mod handoff {
             let waker = target.waker.clone();
             drop(state);
             if let Some(waker) = waker {
-                waker.wake();
+                waker.wake_by_ref();
             }
             Ok(())
         }
@@ -1072,8 +1073,130 @@ mod handoff {
                 Weak,
                 atomic::{AtomicUsize, Ordering},
             },
-            task::Wake,
+            task::{RawWaker, RawWakerVTable, Wake},
         };
+
+        struct TargetWake {
+            handoff: Weak<Handoff<u8, Ready, u8>>,
+            blocked: AtomicUsize,
+            clones: AtomicUsize,
+            drops: AtomicUsize,
+            wakes: AtomicUsize,
+        }
+
+        impl TargetWake {
+            fn reenter(&self) {
+                let Some(handoff) = self.handoff.upgrade() else {
+                    return;
+                };
+                if let Ok(state) = handoff.0.try_lock() {
+                    drop(state);
+                    handoff.close(&2);
+                } else {
+                    self.blocked.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            fn new(handoff: &Arc<Handoff<u8, Ready, u8>>) -> (Arc<Self>, Waker) {
+                let state = Arc::new(Self {
+                    handoff: Arc::downgrade(handoff),
+                    blocked: AtomicUsize::new(0),
+                    clones: AtomicUsize::new(0),
+                    drops: AtomicUsize::new(0),
+                    wakes: AtomicUsize::new(0),
+                });
+                // SAFETY: Each raw waker owns one Arc, managed by this vtable.
+                let waker = unsafe { Waker::from_raw(Self::raw(state.clone())) };
+                (state, waker)
+            }
+
+            fn raw(state: Arc<Self>) -> RawWaker {
+                RawWaker::new(Arc::into_raw(state).cast(), &Self::VTABLE)
+            }
+
+            const VTABLE: RawWakerVTable = RawWakerVTable::new(
+                |data| {
+                    // SAFETY: Borrow the live Arc without consuming the source waker.
+                    let state =
+                        std::mem::ManuallyDrop::new(unsafe { Arc::<Self>::from_raw(data.cast()) });
+                    state.reenter();
+                    state.clones.fetch_add(1, Ordering::SeqCst);
+                    Self::raw(Arc::clone(&state))
+                },
+                |data| {
+                    // SAFETY: Wake consumes this raw waker's Arc exactly once.
+                    let state = unsafe { Arc::<Self>::from_raw(data.cast()) };
+                    state.reenter();
+                    state.wakes.fetch_add(1, Ordering::SeqCst);
+                },
+                |data| {
+                    // SAFETY: Borrow without consuming the source waker's Arc.
+                    let state =
+                        std::mem::ManuallyDrop::new(unsafe { Arc::<Self>::from_raw(data.cast()) });
+                    state.reenter();
+                    state.wakes.fetch_add(1, Ordering::SeqCst);
+                },
+                |data| {
+                    // SAFETY: Drop consumes this raw waker's Arc exactly once.
+                    let state = unsafe { Arc::<Self>::from_raw(data.cast()) };
+                    state.reenter();
+                    state.drops.fetch_add(1, Ordering::SeqCst);
+                },
+            );
+        }
+
+        #[test]
+        fn target_waker_clone_can_reenter_pop() {
+            let handoff = Arc::new(Handoff::new(&[1]));
+            let (state, waker) = TargetWake::new(&handoff);
+            for _ in 0..2 {
+                assert!(handoff.pop_batch::<1>(&1, &waker, 0).unwrap()[0].is_none());
+            }
+            assert!(state.clones.load(Ordering::SeqCst) > 0);
+            assert_eq!(state.blocked.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn target_waker_drop_can_reenter_replacement_and_rejection() {
+            let handoff = Arc::new(Handoff::new(&[1]));
+            let (state, waker) = TargetWake::new(&handoff);
+            handoff.pop_batch::<0>(&1, &waker, 0).unwrap();
+            state.blocked.store(0, Ordering::SeqCst);
+            handoff.pop_batch::<0>(&1, Waker::noop(), 0).unwrap();
+            assert_eq!(state.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(state.blocked.load(Ordering::SeqCst), 0);
+            handoff.close(&1);
+            assert!(matches!(
+                handoff.pop_batch::<1>(&1, &waker, 1),
+                Err(Error::Unavailable)
+            ));
+            assert!(matches!(
+                handoff.pop_batch::<1>(&2, &waker, 1),
+                Err(Error::InvalidInput)
+            ));
+            assert_eq!(state.blocked.load(Ordering::SeqCst), 0);
+            assert!(handoff.0.lock().unwrap().targets[0].1.waker.is_none());
+        }
+
+        #[test]
+        fn target_waker_callbacks_can_reenter_repeated_delivery() {
+            let handoff = Arc::new(Handoff::new(&[1]));
+            handoff.install(&1, Ready).unwrap();
+            let (state, waker) = TargetWake::new(&handoff);
+            handoff.pop_batch::<0>(&1, &waker, 0).unwrap();
+            state.blocked.store(0, Ordering::SeqCst);
+            for item in [7, 8] {
+                handoff
+                    .reserve(Waker::noop())
+                    .unwrap()
+                    .deliver(|| item)
+                    .unwrap();
+            }
+            assert_eq!(state.wakes.load(Ordering::SeqCst), 2);
+            assert_eq!(state.blocked.load(Ordering::SeqCst), 0);
+            let items = handoff.pop_batch::<2>(&1, Waker::noop(), 2).unwrap();
+            assert_eq!(items.map(|item| item.unwrap().into_parts().0), [7, 8]);
+        }
 
         type ClosingHandoff = Handoff<u8, CloseAdmission, CloseDrop>;
 
