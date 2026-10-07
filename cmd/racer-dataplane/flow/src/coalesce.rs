@@ -603,6 +603,8 @@ pub mod flight {
     //! Entry hooks own result interpretation and policy. A sweep refreshes each
     //! selected entry once and removes it only when the hook reports quiescence.
     //! Callers collect wakes while borrowed and dispatch them after releasing locks.
+    //! Clone incoming wakers before borrowing. Return retired wakers from `update`
+    //! and drop them after it returns, including unused copies of the same target.
 
     use std::cell::RefCell;
     use std::collections::{BTreeMap, HashMap, hash_map::RandomState};
@@ -1364,10 +1366,16 @@ pub mod flight {
             }
         }
 
-        /// Replace a wake target only when it would notify a different task.
-        pub fn store_waker(slot: &mut Option<Waker>, waker: &Waker) {
-            if slot.as_ref().is_none_or(|old| !old.will_wake(waker)) {
-                *slot = Some(waker.clone());
+        /// Store an owned wake target without calling waker clone or drop callbacks.
+        /// Clone the input before borrowing the owner. Return the retired waker from
+        /// `update` and drop it after releasing the borrow. For the same target, keep
+        /// the stored waker and return the unused input instead.
+        #[must_use = "drop the retired waker outside the owner borrow"]
+        pub fn store_waker(slot: &mut Option<Waker>, waker: Waker) -> Option<Waker> {
+            if slot.as_ref().is_some_and(|old| old.will_wake(&waker)) {
+                Some(waker)
+            } else {
+                slot.replace(waker)
             }
         }
 
@@ -1562,9 +1570,13 @@ pub mod flight {
                         true,
                         true,
                     );
-                    let slot = &mut core.waiters.get_mut(&id).unwrap().waker;
-                    store_waker(slot, &Waker::from(old.clone()));
-                    store_waker(slot, &Waker::from(latest.clone()));
+                    let old = Waker::from(old.clone());
+                    let latest = Waker::from(latest.clone());
+                    let retired = {
+                        let slot = &mut core.waiters.get_mut(&id).unwrap().waker;
+                        (store_waker(slot, old), store_waker(slot, latest))
+                    };
+                    drop(retired);
                 }
                 let mut wakes = Vec::new();
                 core.refresh(true, 9, 8, || now, split, &mut wakes);
