@@ -177,9 +177,13 @@ impl<K: Eq + Hash, V, S: BuildHasher> Registration<K, V, S> {
 
     /// Broadcast a caller-owned value and close admission before waking readers.
     /// The operation owner must call this only after completion, not cancellation.
+    /// The first result is final; later calls leave it unchanged.
     pub fn finish(&self, result: V) {
         let wakers = {
             let mut state = self.owner.cohort.borrow_mut();
+            if state.result.is_some() {
+                return;
+            }
             state.result = Some(result);
             state.leader = None;
             state.take_wakers()
@@ -1867,6 +1871,72 @@ mod tests {
                 assert_eq!(table.active_count(), 1, "old cohort cannot remove new key");
             }
         }
+    }
+
+    /// The first result survives later finishes and remains separate from replacements.
+    #[test]
+    fn first_completion_wins_for_early_and_late_readers() {
+        for result in [Ok(42), Err("failed")] {
+            let table = table(5, 2);
+            let leader = table.join("key", 1).unwrap();
+            let early = table.join("key", 1).unwrap();
+            let late = table.join("key", 1).unwrap();
+            let survivor = leader.clone();
+            let count = Arc::new(Counter::default());
+            let waker = Waker::from(count.clone());
+            assert_eq!(leader.event(Waker::noop()), Poll::Ready(Event::Lead));
+            assert_eq!(early.event(&waker), Poll::Pending);
+            leader.finish(result);
+            drop(leader);
+            assert_eq!(count.0.load(Ordering::Relaxed), 1);
+            assert_eq!(early.event(&waker), Poll::Ready(Event::Complete(result)));
+            assert_eq!(table.active_count(), 0);
+
+            let next = table.join("key", 1).unwrap();
+            assert_eq!(next.event(Waker::noop()), Poll::Ready(Event::Lead));
+            survivor.finish(Ok(99));
+            early.finish(Err("late failure"));
+            assert_eq!(count.0.load(Ordering::Relaxed), 1);
+            assert_eq!(early.event(&waker), Poll::Ready(Event::Complete(result)));
+            assert_eq!(
+                late.event(Waker::noop()),
+                Poll::Ready(Event::Complete(result))
+            );
+            assert_eq!(
+                survivor.event(Waker::noop()),
+                Poll::Ready(Event::Complete(result))
+            );
+            assert_eq!(table.active_count(), 1);
+            let next_follower = table.join("key", 1).unwrap();
+            assert_eq!(next_follower.event(Waker::noop()), Poll::Pending);
+            next.finish(Ok(7));
+            assert_eq!(
+                next_follower.event(Waker::noop()),
+                Poll::Ready(Event::Complete(Ok(7)))
+            );
+            assert_eq!(
+                late.event(Waker::noop()),
+                Poll::Ready(Event::Complete(result))
+            );
+            drop((survivor, early, late, next, next_follower));
+            assert_eq!(table.registration_count(), 0);
+            assert_eq!(table.active_count(), 0);
+        }
+    }
+
+    /// Attempt exhaustion is also a terminal result, even for unpolled followers.
+    #[test]
+    fn first_completion_from_exhaustion_cannot_be_overwritten() {
+        let table = table(2, 0);
+        let first = table.join("key", 1).unwrap();
+        let late = table.join("key", 1).unwrap();
+        let exhausted = Poll::Ready(Event::Complete(Err("exhausted")));
+        assert_eq!(first.event(Waker::noop()), exhausted);
+        first.finish(Ok(1));
+        late.finish(Err("late failure"));
+        assert_eq!(first.event(Waker::noop()), exhausted);
+        assert_eq!(late.event(Waker::noop()), exhausted);
+        assert_eq!(table.active_count(), 0);
     }
 
     /// Detached execution retains one waiter until its final handle is dropped.
