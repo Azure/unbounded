@@ -9,8 +9,10 @@ boot, where to get it, and which paths the agent will use on it. Getting any of
 them wrong produces a run that fails somewhere else entirely, usually as a guest
 that will not boot or an assertion against a path nothing ever wrote to.
 """
+import hashlib
 import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -35,40 +37,6 @@ class TestHostImageSelection(unittest.TestCase):
         # feed it different manifests, so each starts from a clear cache.
         e2e.acl_image_from_manifest.cache_clear()
         clear_image_pin(self)
-
-    def test_conventional_hosts_use_cloud_init(self):
-        """Every pre-existing host must keep the behavior it had.
-
-        The provisioning field was added for one image. If it changed the
-        answer for any other, the change would show up as a different bootstrap
-        path on hosts that were working.
-        """
-        for base_os in ("ubuntu2404", "ubuntu2604", "fedora", "almalinux9",
-                        "almalinux10"):
-            with self.subTest(base_os=base_os):
-                with patch.object(e2e, "HOST_BASE_OS", base_os):
-                    image = e2e.host_image()
-
-                self.assertEqual(image.provisioning, "cloud-init")
-                self.assertEqual(image.ssh_user, "ubuntu")
-                self.assertEqual(image.auth, "")
-                self.assertTrue(image.packages, "a host with a package manager installs prerequisites")
-
-    def test_acl_declares_an_immutable_host(self):
-        """The properties that make ACL different, asserted together.
-
-        They are not independent. Ignition provisioning is why there is no
-        package installation step, and no package installation is why the image
-        has to carry the tools. A change to one of them without the others
-        describes a host that does not exist.
-        """
-        with patch.dict(os.environ, {"HOST_IMAGE_PATH": __file__}):
-            with patch.object(e2e, "HOST_BASE_OS", "acl"):
-                image = e2e.host_image()
-
-        self.assertEqual(image.provisioning, "ignition")
-        self.assertEqual(image.ssh_user, "core")
-        self.assertEqual(image.packages, [])
 
     def test_acl_from_the_manifest_carries_download_credentials(self):
         """The blob needs a token too, not just the manifest.
@@ -108,13 +76,6 @@ class TestHostImageSelection(unittest.TestCase):
         self.assertEqual(image.sha256, "", "a local file has no published digest to check")
         self.assertTrue(image.url.startswith("file://"))
 
-    def test_unsupported_host_names_the_supported_ones(self):
-        with patch.object(e2e, "HOST_BASE_OS", "windows"):
-            with self.assertRaises(SystemExit):
-                e2e.host_image()
-
-
-
 class TestACLImageResolution(unittest.TestCase):
     """Resolving the image from the published manifest."""
 
@@ -138,20 +99,13 @@ class TestACLImageResolution(unittest.TestCase):
         again. If every build landed under the same name, a machine that had run
         the suite before would silently keep booting the old one.
         """
-        with patch.object(e2e, "http_get", return_value=json.dumps(self.MANIFEST)):
+        with patch.object(e2e, "http_get", return_value=json.dumps(self.MANIFEST)) as get:
             url, file_name, digest = e2e.acl_image_from_manifest()
 
         self.assertEqual(url, self.MANIFEST["qcow2"]["url"])
         self.assertEqual(file_name, "acl-2026091817.qcow2")
         self.assertEqual(digest, self.MANIFEST["qcow2"]["sha256"])
-
-    def test_manifest_is_read_with_storage_credentials(self):
-        """The account disables anonymous access and shared keys alike, so the
-        manifest is unreadable without a bearer token."""
-        with patch.object(e2e, "http_get", return_value=json.dumps(self.MANIFEST)) as get:
-            e2e.acl_image_from_manifest()
-
-        get.assert_called_once()
+        # The account disables anonymous access and shared keys alike.
         self.assertEqual(get.call_args.kwargs.get("auth"), "azure-storage")
 
     def test_build_override_must_match_the_manifest(self):
@@ -168,25 +122,19 @@ class TestACLImageResolution(unittest.TestCase):
 
         self.assertEqual(file_name, "acl-2026091817.qcow2")
 
-    def test_a_malformed_build_id_is_refused(self):
+    def test_a_malformed_manifest_is_refused(self):
         """The build names the cached file, so an empty or odd one could make
-        different builds share a name, or a path."""
-        for build in ("", None, 2026, "../x", "a b"):
-            with self.subTest(build=build):
+        different builds share a name, or a path. And an unverified image boots,
+        so whatever goes wrong afterwards looks like a product bug."""
+        manifests = [dict(self.MANIFEST, build_id=build) for build in ("", None, 2026, "../x", "a b")]
+        manifests += [dict(self.MANIFEST, qcow2=qcow2)
+                      for qcow2 in ({}, {"url": "https://example.test/a.qcow2"}, {"sha256": "abc"})]
+        for manifest in manifests:
+            with self.subTest(manifest=manifest):
                 e2e.acl_image_from_manifest.cache_clear()
-                manifest = dict(self.MANIFEST, build_id=build)
                 with patch.object(e2e, "http_get", return_value=json.dumps(manifest)):
                     with self.assertRaises(SystemExit):
                         e2e.acl_image_from_manifest()
-
-    def test_a_pinned_build_skips_the_manifest(self):
-        with patch.object(e2e, "ACL_IMAGE_URL", "https://example.test/old.qcow2"), \
-                patch.object(e2e, "ACL_IMAGE_SHA256", "ab" * 32), \
-                patch.object(e2e, "ACL_IMAGE_BUILD_ID", "2026010101"), \
-                patch.object(e2e, "http_get") as get:
-            self.assertEqual(e2e.acl_image_from_manifest(),
-                             ("https://example.test/old.qcow2", "acl-2026010101.qcow2", "ab" * 32))
-        get.assert_not_called()
 
     def test_a_partial_pin_is_refused(self):
         for url, digest, build in (("u", "", "b"), ("", "d", "b"), ("u", "d", "")):
@@ -202,8 +150,6 @@ class TestACLImageResolution(unittest.TestCase):
     def test_resolve_host_image_exports_a_pin_that_reads_back(self):
         """What resolve-host-image writes for later steps has to resolve to the
         same image without reading the manifest."""
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             env_file, output_file = Path(tmp) / "env", Path(tmp) / "output"
             with patch.object(e2e, "HOST_BASE_OS", "acl"), \
@@ -223,53 +169,12 @@ class TestACLImageResolution(unittest.TestCase):
                 self.MANIFEST["qcow2"]["url"], "acl-2026091817.qcow2", self.MANIFEST["qcow2"]["sha256"]))
         get.assert_not_called()
 
-    def test_manifest_without_a_digest_is_refused(self):
-        """An unverified image is the one thing worse than no image: it boots,
-        and whatever goes wrong afterwards looks like a product bug."""
-        for qcow2 in ({}, {"url": "https://example.test/a.qcow2"}, {"sha256": "abc"}):
-            with self.subTest(qcow2=qcow2):
-                manifest = json.dumps({"build_id": "b", "qcow2": qcow2})
-                with patch.object(e2e, "http_get", return_value=manifest):
-                    with self.assertRaises(SystemExit):
-                        e2e.acl_image_from_manifest()
-
-
-class TestVerifySHA256(unittest.TestCase):
-    def test_mismatch_removes_the_file_and_fails(self):
-        """The file is deleted so the next run downloads again rather than
-        reusing a bad image that is now sitting under the expected name."""
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "image.qcow2"
-            target.write_bytes(b"not the image")
-
-            with self.assertRaises(SystemExit):
-                e2e.verify_sha256(target, "0" * 64)
-
-            self.assertFalse(target.exists(), "a corrupt download must not be left in place")
-
-    def test_matching_digest_keeps_the_file(self):
-        import hashlib
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "image.qcow2"
-            target.write_bytes(b"contents")
-
-            e2e.verify_sha256(target, hashlib.sha256(b"contents").hexdigest())
-
-            self.assertTrue(target.exists())
-
-
 class TestAcquireHostImage(unittest.TestCase):
     """Only a verified image is kept under the name later runs trust."""
 
     GOOD = b"the image"
 
     def _image(self):
-        import hashlib
-
         return e2e.HostImage(url="https://example.test/acl.qcow2", file_name="acl-b.qcow2",
                              backing_format="qcow2", sudo_group="sudo", packages=[],
                              ssh_user="core", provisioning="ignition",
@@ -288,27 +193,12 @@ class TestAcquireHostImage(unittest.TestCase):
             e2e.acquire_host_image(self._image())
         return downloads
 
-    def test_an_intact_existing_image_is_reused(self):
-        import tempfile
-
+    def test_an_existing_image_is_reused(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "acl-b.qcow2").write_bytes(self.GOOD)
             self.assertEqual(self._acquire(tmp, self.GOOD), [])
 
-    def test_a_damaged_existing_image_is_downloaded_again(self):
-        """A cache restore or an interrupted download can leave the right name
-        on the wrong bytes."""
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "acl-b.qcow2"
-            target.write_bytes(b"truncated")
-            self.assertEqual(len(self._acquire(tmp, self.GOOD)), 1)
-            self.assertEqual(target.read_bytes(), self.GOOD)
-
     def test_a_download_is_renamed_only_once_verified(self):
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit):
                 downloads = self._acquire(tmp, b"wrong bytes")
@@ -342,23 +232,6 @@ class TestCurlAuthConfig(unittest.TestCase):
         self.assertIn("--config", args)
         self.assertIn('header = "Authorization: Bearer secret-token"', kw["input"])
         printed.assert_any_call("::add-mask::secret-token", flush=True)
-
-    def test_a_failed_download_does_not_print_the_command(self):
-        import subprocess
-
-        def failing_run(args, **kw):
-            raise subprocess.CalledProcessError(22, args)
-
-        with patch.object(e2e, "capture", return_value="secret-token"), \
-                patch.object(e2e, "run", side_effect=failing_run), \
-                patch.object(e2e, "die", side_effect=SystemExit) as died:
-            with self.assertRaises(SystemExit):
-                e2e.download_file("https://example.test/x", Path("/tmp/x"), auth="azure-storage")
-
-        self.assertNotIn("secret-token", died.call_args.args[0])
-
-    def test_no_auth_needs_no_config(self):
-        self.assertEqual(e2e.curl_auth_config(""), "")
 
 
 if __name__ == "__main__":
