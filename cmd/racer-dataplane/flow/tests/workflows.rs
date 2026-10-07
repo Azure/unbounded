@@ -890,6 +890,114 @@ mod coalesce_tests {
         unsafe { Waker::from_raw(cohort_raw_waker()) }
     }
 
+    /// Register a flight wake target through the caller-owned borrow boundary.
+    fn register_flight_waker(owner: &RefCell<Option<Waker>>, waker: &Waker) {
+        let waker = waker.clone();
+        let retired = flight::update(owner, |slot, _| flight::state::store_waker(slot, waker));
+        drop(retired);
+    }
+
+    /// Empty, different, and equal slots transfer ownership without callbacks.
+    #[test]
+    fn flight_store_waker_returns_retired_without_callbacks() {
+        let owner = RefCell::new(None);
+        let waker = cohort_waker();
+        let cloned = Rc::new(Cell::new(false));
+        let dropped = Rc::new(Cell::new(false));
+        ON_COHORT_CLONE.with(|slot| {
+            let cloned = cloned.clone();
+            *slot.borrow_mut() = Some(Box::new(move || cloned.set(true)));
+        });
+        ON_COHORT_DROP.with(|slot| {
+            let dropped = dropped.clone();
+            *slot.borrow_mut() = Some(Box::new(move || dropped.set(true)));
+        });
+        let duplicate = cohort_waker();
+        let retired = flight::update(&owner, |slot, _| {
+            assert!(flight::state::store_waker(slot, waker).is_none());
+            let retired = flight::state::store_waker(slot, duplicate).unwrap();
+            assert!(slot.as_ref().unwrap().will_wake(&retired));
+            assert!(!cloned.get());
+            assert!(!dropped.get());
+            retired
+        });
+        drop(retired);
+        assert!(dropped.get());
+        let latest = Waker::from(Arc::new(Reenter));
+        let replacement = latest.clone();
+        let retired = flight::update(&owner, |slot, _| {
+            flight::state::store_waker(slot, replacement)
+        });
+        assert!(retired.as_ref().unwrap().will_wake(&cohort_waker()));
+        assert!(owner.borrow().as_ref().unwrap().will_wake(&latest));
+        assert!(!cloned.get());
+        ON_COHORT_CLONE.with(|slot| slot.borrow_mut().take());
+    }
+
+    /// Clone callbacks can change the slot before registration borrows its owner.
+    #[test]
+    fn flight_store_waker_clone_reentry() {
+        let owner = Rc::new(RefCell::new(None));
+        let called = Rc::new(Cell::new(false));
+        ON_COHORT_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new({
+                let owner = owner.clone();
+                let called = called.clone();
+                move || {
+                    register_flight_waker(&owner, Waker::noop());
+                    called.set(true);
+                }
+            }));
+        });
+        let waker = cohort_waker();
+        register_flight_waker(&owner, &waker);
+        assert!(called.get());
+        assert!(owner.borrow().as_ref().unwrap().will_wake(&waker));
+    }
+
+    /// Retired and redundant targets are dropped only after the owner is released.
+    fn check_flight_store_waker_drop_reentry(identical: bool) {
+        let owner = Rc::new(RefCell::new(None));
+        let waker = cohort_waker();
+        let latest = Waker::from(Arc::new(Reenter));
+        register_flight_waker(&owner, &waker);
+        let called = Rc::new(Cell::new(false));
+        ON_COHORT_DROP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new({
+                let owner = owner.clone();
+                let called = called.clone();
+                let latest = latest.clone();
+                move || {
+                    let expected = if identical {
+                        cohort_waker()
+                    } else {
+                        latest.clone()
+                    };
+                    flight::update(&owner, |slot, _| {
+                        assert!(slot.as_ref().unwrap().will_wake(&expected));
+                    });
+                    register_flight_waker(&owner, &latest);
+                    called.set(true);
+                }
+            }));
+        });
+        register_flight_waker(&owner, if identical { &waker } else { &latest });
+        assert!(called.get());
+        assert!(owner.borrow().as_ref().unwrap().will_wake(&latest));
+    }
+
+    /// Replacing a different target must return the old waker for deferred drop.
+    #[test]
+    fn flight_store_waker_replacement_drop_reentry() {
+        check_flight_store_waker_drop_reentry(false);
+    }
+
+    /// Keeping the same target must return the unused incoming waker for deferred drop.
+    #[test]
+    fn flight_store_waker_identical_drop_reentry() {
+        check_flight_store_waker_drop_reentry(true);
+    }
+
     /// Clone and replacement callbacks may poll, retry, or finish the same cohort.
     fn check_cohort_waker_event_reentry(on_clone: bool) {
         for action in 0..3 {
