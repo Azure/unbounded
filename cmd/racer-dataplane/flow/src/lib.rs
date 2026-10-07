@@ -75,7 +75,7 @@ impl std::fmt::Display for Error {
         f.write_str(match self {
             Self::InvalidInput => "invalid flow-control input",
             Self::Overloaded => "flow-control quota exhausted",
-            Self::Unavailable => "flow control stopped",
+            Self::Unavailable => "flow control unavailable",
             Self::Io => "flow-control I/O failed",
         })
     }
@@ -1017,6 +1017,12 @@ fn wipe_payload(bytes: &mut Vec<u8>) {
 #[cfg(test)]
 mod quota_tests {
     use super::*;
+
+    /// Unavailability does not imply that flow control has stopped.
+    #[test]
+    fn unavailable_display_is_state_neutral() {
+        assert_eq!(Error::Unavailable.to_string(), "flow control unavailable");
+    }
 
     /// Distinct payload, wake-enabled, and drain-progress fixture classes.
     #[derive(Clone, Copy, Debug)]
