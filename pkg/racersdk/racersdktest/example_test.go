@@ -29,9 +29,14 @@ func helloOrigin(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata
 		return m, nil, nil
 	}
 
-	start, end := min(r.Offset, m.Size), min(r.Offset+r.Length, m.Size)
+	start := min(r.Offset, m.Size)
 
-	return m, io.NopCloser(strings.NewReader(data[start:end])), nil
+	length := min(r.Length, m.Size-start)
+	if length == 0 {
+		return m, nil, nil
+	}
+
+	return m, io.NopCloser(strings.NewReader(data[start : start+length])), nil
 }
 
 // testGet is an ordinary test. Name it TestGet in your own _test.go file.
