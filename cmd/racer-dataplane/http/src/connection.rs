@@ -605,6 +605,7 @@ impl<C: Context> HttpIo<C> {
             // Preserve pre-hook validation precedence, then validate the actual
             // signed head and use its framing for the bytes that will be sent.
             framing(&head, connection.request_is_head, self.send_limit)?;
+            self.codec.validate(&head)?;
             let scratch = self.context.charge(self.codec.header_limit().max(1))?;
             let head = connection.state_mut().sign(head)?;
             let length = framing(&head, connection.request_is_head, self.send_limit)?;
@@ -2814,6 +2815,67 @@ mod tests {
             0,
             "prevalidation precedes charging and signing"
         );
+    }
+
+    /// Invalid caller syntax cannot trigger signing, even when the signer repairs it.
+    #[test]
+    fn send_head_rejects_syntax_before_charging_or_signing() {
+        use std::io::Read;
+
+        for (method, target, accepted) in [
+            ("", "/", false),
+            ("G ET", "/", false),
+            ("GET", "", false),
+            ("GET", "/bad target", false),
+            ("GET", "/", true),
+        ] {
+            for reject_charge in [false, true] {
+                if accepted && reject_charge {
+                    continue;
+                }
+                let hooks = hooks();
+                let reactor = reactor();
+                let io =
+                    HttpIo::<Hooks>::new(reactor.clone(), Codec::new(256), hooks.clone(), 8, 8);
+                let calls = Rc::new(Cell::new(0));
+                let (connection, mut peer) = lease(
+                    &hooks,
+                    Policy {
+                        rewrite: Some(Rewrite::Head),
+                        hook_calls: Some(calls.clone()),
+                        ..Policy::default()
+                    },
+                );
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                hooks.reject_charge.set(reject_charge);
+                let request = MessageHead {
+                    start: StartLine::Request {
+                        method: method.into(),
+                        target: target.into(),
+                    },
+                    headers: vec![],
+                };
+                let result = drive(&reactor, io.send_head(connection, request, &TestScope));
+                if accepted {
+                    drop(result.unwrap());
+                    assert_eq!(calls.get(), 1);
+                } else {
+                    assert!(matches!(result, Err(Failure::Http(Error::Malformed))));
+                    assert_eq!(calls.get(), 0);
+                }
+                let mut wire = Vec::new();
+                peer.read_to_end(&mut wire).unwrap();
+                if accepted {
+                    assert_eq!(wire, b"HEAD / HTTP/1.1\r\n\r\n");
+                } else {
+                    assert!(wire.is_empty());
+                }
+                assert_eq!(reactor.in_flight(), 0);
+                io.reclaim_buffer();
+                assert_eq!(hooks.slots.get(), 0);
+                assert_eq!(hooks.used.get(), 0);
+            }
+        }
     }
 
     /// Head-only exchanges validate the signed request before emitting any wire bytes.
