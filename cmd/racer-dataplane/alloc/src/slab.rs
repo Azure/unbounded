@@ -271,6 +271,15 @@ impl<C: Charge> Slab<C> {
 
     /// Blocking startup helper. Do not invoke on a latency-sensitive worker.
     pub fn open_configured(&self, segments: &Segments) -> Result<Alignment> {
+        // Automatic tables need one slot per physical segment; partial tables do not.
+        if !segments.is_configured()
+            && self
+                .capacity_bytes
+                .checked_div(self.segment_bytes)
+                .is_none_or(|count| count > crate::MAX_SEGMENTS)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
         let alignment = self.open_file()?;
         self.bind(segments)?;
         Ok(alignment)
@@ -1527,6 +1536,105 @@ mod tests {
         assert_eq!(slabs.reclaim_idle(), extent.length());
         assert_eq!(slabs.idle_bytes(), 0);
         assert_eq!(conflicting.open_now(), Err(Error::Unavailable));
+    }
+
+    /// An oversized automatic table must fail before creating or sizing its backing.
+    #[test]
+    fn open_configured_rejects_oversized_table_without_file_side_effects() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = Directory::new();
+        let existing = directory.0.join("existing");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&existing)
+            .unwrap();
+        let paths = [
+            directory.0.join("new"),
+            directory.0.join("missing/data"),
+            existing.clone(),
+        ];
+        for path in &paths {
+            let segments = Segments::new(4096);
+            let slab = Slab::<()>::new(path.clone(), 4096 * (crate::MAX_SEGMENTS + 1), 4096, 512);
+            assert_eq!(
+                slab.open_configured(&segments),
+                Err(Error::InvalidConfiguration)
+            );
+            assert!(!segments.is_configured());
+            assert_eq!(segments.count(), 0);
+            assert_eq!(file.metadata().unwrap().len(), 0);
+            if path != &existing {
+                assert!(!path.exists());
+            }
+            assert!(!directory.0.join("missing").exists());
+            assert_eq!(slab.geometry(), Err(Error::Unavailable));
+
+            let retry = Slab::<()>::new(path.clone(), 8192, 4096, 512);
+            if real_alignment(retry.open_configured(&segments)).is_none() {
+                return;
+            }
+            assert_eq!(segments.count(), 2);
+            assert_eq!(std::fs::metadata(path).unwrap().len(), 8192);
+            drop(retry);
+            std::fs::remove_file(path).unwrap();
+            if path.parent() != Some(directory.0.as_path()) {
+                std::fs::remove_dir(path.parent().unwrap()).unwrap();
+            }
+        }
+    }
+
+    /// Invalid arithmetic inputs fail without creating a directory or a file.
+    #[test]
+    fn open_configured_rejects_invalid_geometry_before_open() {
+        let directory = Directory::new();
+        for (capacity, segment, record) in [
+            (0, 0, 512),
+            (4096, 0, 512),
+            (0, 4096, 512),
+            (4097, 4096, 512),
+            (4096, 8192, 512),
+            (4096, 4096, 0),
+            (u64::MAX, 1, 512),
+            (u64::MAX, u64::MAX, 512),
+        ] {
+            let path = directory.0.join("missing/data");
+            let slab = Slab::<()>::new(path.clone(), capacity, segment, record);
+            let segments = Segments::new(segment);
+            assert_eq!(
+                slab.open_configured(&segments),
+                Err(Error::InvalidConfiguration)
+            );
+            assert!(!segments.is_configured());
+            assert_eq!(slab.geometry(), Err(Error::Unavailable));
+            assert!(!path.exists());
+            assert!(!path.parent().unwrap().exists());
+        }
+    }
+
+    /// The slot limit does not cap physical backing for an already configured table.
+    #[test]
+    fn open_configured_accepts_partial_table_above_physical_segment_limit() {
+        let directory = Directory::new();
+        let probe = Slab::<()>::new(directory.0.join("probe"), 4096, 4096, 512);
+        let Some(alignment) = real_alignment(probe.open_now()) else {
+            return;
+        };
+        let capacity = 4096 * (crate::MAX_SEGMENTS + 1);
+        let segments = Segments::new(4096);
+        segments.configure(capacity, 2, alignment).unwrap();
+        let path = directory.0.join("partial");
+        let slab = Slab::<()>::new(path.clone(), capacity, 4096, 512);
+        assert_eq!(slab.open_configured(&segments), Ok(alignment));
+        assert_eq!(segments.count(), 2);
+        assert_eq!(segments.capacity_bytes(), capacity);
+        assert_eq!(
+            slab.geometry().unwrap().segment_count(),
+            crate::MAX_SEGMENTS + 1
+        );
+        assert_eq!(std::fs::metadata(path).unwrap().len(), capacity);
     }
 
     /// Invalid startup dimensions never truncate a preexisting nonempty file.
