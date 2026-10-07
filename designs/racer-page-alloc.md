@@ -99,9 +99,13 @@ any segment that was open before the restart.
 (`alloc/src/segments.rs:785-842`). The caller calls `mark_read` when it serves
 a read from a segment. The sweep clears that mark once before it picks the
 segment. Each call has limits on
-the number of segments it visits and the number of index entries it removes. If it
-cannot free enough space within those limits, it returns `Busy` and the caller
-tries again later.
+the number of segments it visits and the number of index entries it removes.
+For a nonzero reserve, `reclaim` and `reclaim_scored` succeed only when the reserve
+(capped at the slot count) is met and no evictions remain. They intentionally
+return `Busy` while evictions remain, even if enough slots are already free.
+Callers should use `Segments::free_count` to check capacity and keep retrying
+bounded reclamation later to drain pending evictions. A zero reserve is a no-op,
+not a drain request.
 
 Evicting a segment happens in this order:
 

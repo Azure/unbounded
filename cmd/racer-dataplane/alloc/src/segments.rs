@@ -702,6 +702,11 @@ impl SegmentClock {
     /// Existing eviction work sorts first so partial removals always make progress.
     /// Unlike the legacy clock, logical heat is supplied by the caller, so recent
     /// disk completions do not override value ranking.
+    /// For a nonzero reserve, success requires both the reserve (capped at the slot
+    /// count) and no pending evictions. Busy is intentional even if the reserve is
+    /// met while evictions remain. Use [`Segments::free_count`] to check capacity;
+    /// keep retrying bounded reclamation with a nonzero reserve to drain evictions.
+    /// A zero reserve is a no-op, not a drain request.
     pub fn reclaim_scored(
         &self,
         entries: &impl SegmentEntries,
@@ -784,6 +789,10 @@ impl SegmentClock {
     /// Reclaim a reserve with bounded visits and mapping removals, without compaction.
     /// Busy leases keep segments Evicting until a later sweep. A zero reserve is a
     /// no-op; a zero mapping budget can recycle empty but not populated segments.
+    /// For a nonzero reserve, success requires both the reserve (capped at the slot
+    /// count) and no pending evictions. Busy is intentional even if the reserve is
+    /// met while evictions remain. Use [`Segments::free_count`] to check capacity;
+    /// keep retrying bounded reclamation with a nonzero reserve to drain evictions.
     pub fn reclaim(
         &self,
         entries: &impl SegmentEntries,
