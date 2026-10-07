@@ -723,32 +723,45 @@ impl Future for FenceWaiter {
 
     /// Refresh the task's registration without busy-waking the worker.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.state.count.get() == 0 {
-            self.unregister();
-            return Poll::Ready(Ok(()));
-        }
-        let waker = Rc::new(cx.waker().clone());
-        if self.state.count.get() == 0 {
-            self.unregister();
-            return Poll::Ready(Ok(()));
-        }
-        if let Some(registration) = self.registration.clone() {
-            let old = registration.replace(waker);
-            drop(old);
+        loop {
             if self.state.count.get() == 0 {
                 self.unregister();
-                return Poll::Ready(Ok(()));
+                if self.state.count.get() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
             }
-            let mut waiters = self.state.waiters.borrow_mut();
-            if !waiters.iter().any(|w| Rc::ptr_eq(w, &registration)) {
-                waiters.push(registration);
+            let waker = Rc::new(cx.waker().clone());
+            if self.state.count.get() == 0 {
+                drop(waker);
+                self.unregister();
+                if self.state.count.get() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
             }
-        } else {
-            let registration = Rc::new(RefCell::new(waker));
-            self.state.waiters.borrow_mut().push(registration.clone());
-            self.registration = Some(registration);
+            if let Some(registration) = self.registration.clone() {
+                let old = registration.replace(waker);
+                drop(old);
+                if self.state.count.get() == 0 {
+                    drop(registration);
+                    self.unregister();
+                    if self.state.count.get() == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    continue;
+                }
+                let mut waiters = self.state.waiters.borrow_mut();
+                if !waiters.iter().any(|w| Rc::ptr_eq(w, &registration)) {
+                    waiters.push(registration);
+                }
+            } else {
+                let registration = Rc::new(RefCell::new(waker));
+                self.state.waiters.borrow_mut().push(registration.clone());
+                self.registration = Some(registration);
+            }
+            return Poll::Pending;
         }
-        Poll::Pending
     }
 }
 
@@ -1622,6 +1635,53 @@ mod tests {
                 assert!(state.waiters.borrow().is_empty());
                 assert!(waiter.registration.is_none());
             }
+        }
+    }
+
+    /// Cleanup callbacks can accept a write at every zero-count exit.
+    #[test]
+    fn fence_poll_rechecks_unregister_callbacks() {
+        for completion in [None, Some(FenceCallback::Clone), Some(FenceCallback::Drop)] {
+            let slab = Slab::<()>::new(PathBuf::new(), 4096, 4096, 512);
+            let write = slab.writes.acquire().unwrap();
+            let mut waiter = slab.fence_writes();
+            let waker = fence_callback_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(waiter.as_mut().poll(&mut cx).is_pending());
+            let next = Rc::new(RefCell::new(None));
+            let saved_next = next.clone();
+            let state = slab.writes.clone();
+            let accept: Box<dyn FnOnce()> = Box::new(move || {
+                *saved_next.borrow_mut() = Some(state.acquire().unwrap());
+            });
+            if let Some(event) = completion {
+                FENCE_CALLBACK.with(|slot| {
+                    *slot.borrow_mut() = Some((
+                        event,
+                        Box::new(move || {
+                            drop(write);
+                            FENCE_CALLBACK.with(|slot| {
+                                *slot.borrow_mut() = Some((FenceCallback::Drop, accept));
+                            });
+                        }),
+                    ));
+                });
+            } else {
+                drop(write);
+                FENCE_CALLBACK.with(|slot| {
+                    *slot.borrow_mut() = Some((FenceCallback::Drop, accept));
+                });
+            }
+            assert!(waiter.as_mut().poll(&mut cx).is_pending());
+            FENCE_CALLBACK.with(|slot| assert!(slot.borrow().is_none()));
+            assert_eq!(slab.writes_in_flight(), 1);
+            assert_eq!(slab.writes.waiters.borrow().len(), 1);
+            let before = FENCE_WAKES.get();
+            drop(next.borrow_mut().take());
+            assert_eq!(FENCE_WAKES.get(), before + 1);
+            assert_eq!(waiter.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+            assert_eq!(slab.writes_in_flight(), 0);
+            assert!(slab.writes.waiters.borrow().is_empty());
         }
     }
 
