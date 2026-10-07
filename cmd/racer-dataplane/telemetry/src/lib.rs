@@ -445,7 +445,7 @@ pub mod metrics {
             pub enum $kind { $(#[doc = $name] $variant,)* }
 
             /// Number of metrics in this schema.
-            pub const $count: usize = [$($name,)*].len();
+            pub const $count: usize = <[&str]>::len(&[$($name,)*]);
 
             /// Every metric in registry index order.
             pub const $all: [$kind; $count] = [$($kind::$variant,)*];

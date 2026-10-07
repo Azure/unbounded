@@ -22,6 +22,52 @@ telemetry::metrics! { Gauge, GAUGES, GAUGE_COUNT;
     Self::Active => "active",
 }
 
+telemetry::metrics! { Empty, EMPTY, EMPTY_COUNT; }
+
+/// An empty schema exposes no identifiers and emits no samples for any writer.
+#[test]
+fn empty_metric_schema_has_zero_count_and_no_output() {
+    assert_eq!(EMPTY_COUNT, 0);
+    assert_eq!(EMPTY, []);
+    assert_eq!(Empty::ALL, &EMPTY);
+    assert_eq!(<Empty as telemetry::Metric>::ALL, &EMPTY);
+    for shards in [1, 3] {
+        let workers = Metrics::<Empty, Empty>::shards(shards);
+        assert_eq!(workers.len(), shards);
+        for worker in workers {
+            let mut output = String::new();
+            worker.write_prometheus(&mut output).unwrap();
+            assert!(output.is_empty());
+        }
+    }
+}
+
+/// Counters still aggregate and render when the gauge schema is empty.
+#[test]
+fn empty_gauge_schema_supports_counter_only_registry() {
+    let workers = Metrics::<Counter, Empty>::shards(2);
+    workers[0].add(Counter::Completed, 2);
+    workers[1].add(Counter::Completed, 3);
+    assert_eq!(workers[0].count(Counter::Completed), 5);
+    let mut output = String::new();
+    workers[0].write_prometheus(&mut output).unwrap();
+    assert_eq!(
+        output,
+        "# TYPE completed_total counter\ncompleted_total 5\n"
+    );
+}
+
+/// Gauges still share values and render when the counter schema is empty.
+#[test]
+fn empty_counter_schema_supports_gauge_only_registry() {
+    let workers = Metrics::<Empty, Gauge>::shards(2);
+    workers[0].set(Gauge::Active, 7);
+    assert_eq!(workers[1].gauge(Gauge::Active), 7);
+    let mut output = String::new();
+    workers[1].write_prometheus(&mut output).unwrap();
+    assert_eq!(output, "# TYPE active gauge\nactive 7\n");
+}
+
 /// Shared metrics used by both worker lifecycle and HTTP diagnostics tests.
 type Observations = Metrics<Counter, Gauge>;
 
