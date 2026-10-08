@@ -104,7 +104,13 @@ in `alloc/src/slab.rs`).
 
 `freeze`, `snapshot`, and `restore` support restart. Restore checks the whole
 image before it changes anything, requires that no leases are live, and seals
-any segment that was open before the restart.
+any segment that was open before the restart. It also checks generations: an
+image with any slot generation below the live table returns `Stale`. An image
+that marks a slot Free at the generation of an occupied live slot publishes it
+at the next generation. Otherwise the next append would reissue the same
+extents under a generation that old mappings still match. When that increment
+would wrap, restore returns `Unavailable`. Restoring into a freshly configured
+table keeps the image generations, so recovered mappings stay valid.
 
 ## Reclaim
 
@@ -196,9 +202,15 @@ change, so the same workflow tests run in both modes.
 
 - Unit tests cover padding math, wipe and reuse rules, lease and generation
   checks, reclaim limits, the eviction veto, restore, and file security checks.
-- `alloc/tests/workflows.rs` covers restart, short I/O, dropped and canceled
-  reads and writes, startup failures, and confirms that reuse does not erase
-  disk bytes.
+- `alloc/tests/dst.rs` is a deterministic simulation test suite. One generator
+  drives appends, simulated I/O with injected faults, leases, freezes,
+  snapshots, historical and edited restores, reclaim, and restart. After every
+  step it checks the allocator against an independent record model. The checks
+  cover aliasing, generation monotonicity, mapping fencing, atomic restore
+  failure, reclaim bounds, and charge accounting. Fixed regression traces, a
+  restore cross-product, and seeded sequences all run through the same runner.
+- `alloc/tests/workflows.rs` covers short I/O, dropped and canceled reads and
+  writes, startup failures, and confirms that reuse does not erase disk bytes.
 - CI checks and tests the production and simulation builds as separate
   commands, so feature unification cannot hide one from the other. The
   production run sets `PAGE_ALLOC_REQUIRE_REAL_IO=1`, so a host without

@@ -466,8 +466,14 @@ impl Segments {
         self.validate_restore_epoch(images).map(|_| ())
     }
 
-    /// Validate recovery invariants and reserve the next nonwrapping epoch value.
-    fn validate_restore_epoch(&self, images: &[SegmentSnapshot]) -> Result<u64> {
+    /// Validate recovery invariants and return the next nonwrapping epoch value
+    /// with the generation each slot publishes.
+    ///
+    /// Errors follow a fixed precedence so mixed images do not depend on slot
+    /// order: Busy for freezes or leases, Corrupt for any structural defect,
+    /// Stale for a generation rollback, then Unavailable for an exhausted
+    /// generation or epoch.
+    fn validate_restore_epoch(&self, images: &[SegmentSnapshot]) -> Result<(u64, Vec<Generation>)> {
         if self.frozen.get() {
             return Err(Error::Busy);
         }
@@ -483,7 +489,6 @@ impl Segments {
         for (i, s) in images.iter().enumerate() {
             if s.id.0 != i as u64
                 || s.generation.0 == 0
-                || s.generation.0 < slots[i].image.generation.0
                 || s.used_bytes > self.segment_bytes
                 || !s.used_bytes.is_multiple_of(alignment.offset())
                 || !s.used_bytes.is_multiple_of(alignment.length() as u64)
@@ -499,22 +504,40 @@ impl Segments {
                 open = true;
             }
         }
-        self.restore_epoch
+        if images
+            .iter()
+            .zip(slots.iter())
+            .any(|(s, slot)| s.generation.0 < slot.image.generation.0)
+        {
+            return Err(Error::Stale);
+        }
+        let generations = images
+            .iter()
+            .zip(slots.iter())
+            .map(|(s, slot)| restored_generation(&slot.image, s))
+            .collect::<Result<Vec<_>>>()?;
+        let epoch = self
+            .restore_epoch
             .get()
             .checked_add(1)
-            .ok_or(Error::Unavailable)
+            .ok_or(Error::Unavailable)?;
+        Ok((epoch, generations))
     }
 
     /// Validate the complete image before publishing it, sealing its open tail.
     /// Frozen tables and outstanding leases return Busy without changing state.
-    /// A generation below the current slot generation returns Corrupt.
+    /// Structural defects return Corrupt, and a generation below the current
+    /// slot generation returns Stale. A slot that the image frees while it is
+    /// currently in use at the same generation is published at the next
+    /// generation, so mappings into its old contents stay stale after reuse.
+    /// When that generation is exhausted, restore returns Unavailable.
     pub fn restore(&self, images: Vec<SegmentSnapshot>) -> Result<()> {
-        let epoch = self.validate_restore_epoch(&images)?;
+        let (epoch, generations) = self.validate_restore_epoch(&images)?;
         let mut slots = self.slots.borrow_mut();
         self.open.set(None);
         self.free.borrow_mut().clear();
         self.evicting.set(0);
-        for (slot, mut image) in slots.iter_mut().zip(images) {
+        for ((slot, mut image), generation) in slots.iter_mut().zip(images).zip(generations) {
             if image.state == SegmentState::Open {
                 image.state = SegmentState::Sealed;
             }
@@ -524,6 +547,7 @@ impl Segments {
             if image.state == SegmentState::Evicting {
                 self.evicting.set(self.evicting.get() + 1);
             }
+            image.generation = generation;
             slot.image = image;
         }
         self.restore_epoch.set(epoch);
@@ -590,6 +614,28 @@ impl Segments {
             .map(|s| s.image.state)
             .ok_or(Error::Corrupt)
     }
+}
+
+/// Return the generation a restored slot publishes.
+///
+/// Restoring a slot to Free at the generation it currently occupies would let
+/// the next append reissue the same extents under that generation, so old
+/// mappings would validate against new contents. Such slots advance to the next
+/// generation instead, exactly as ordinary recycling does. Every other image
+/// keeps its own generation.
+fn restored_generation(live: &SegmentSnapshot, image: &SegmentSnapshot) -> Result<Generation> {
+    if image.state == SegmentState::Free
+        && live.state != SegmentState::Free
+        && image.generation == live.generation
+    {
+        return image
+            .generation
+            .0
+            .checked_add(1)
+            .map(Generation)
+            .ok_or(Error::Unavailable);
+    }
+    Ok(image.generation)
 }
 
 /// Nominal, unforgeable identity shared by a table, bound file, and its leases.
@@ -886,107 +932,6 @@ mod tests {
         s
     }
 
-    /// Lease ownership prevents reuse and old-generation acquisition.
-    #[test]
-    fn no_reuse_before_lease_drop_and_no_aba() {
-        let s = segments(1024, 2);
-        let a = s.append(1024).unwrap();
-        s.begin_evict(a.0.id()).unwrap();
-        assert_eq!(s.recycle(a.0.id()), Err(Error::Busy));
-        drop(a);
-        s.recycle(SegmentId(0)).unwrap();
-        assert!(s.lease(SegmentId(0), Generation(1)).is_err());
-        assert_eq!(s.append(512).unwrap().0.generation(), Generation(2));
-        let frozen = s.freeze().unwrap();
-        assert!(s.append(512).is_err());
-        drop(frozen);
-    }
-
-    /// Recovery seals the append tail and rejects unaligned occupancy.
-    #[test]
-    fn restore_seals_open_and_rejects_invalid_geometry() {
-        let s = segments(1024, 1);
-        drop(s.append(512).unwrap());
-        let mut snap = s.snapshot();
-        s.restore(snap.clone()).unwrap();
-        assert_eq!(s.snapshot()[0].state, SegmentState::Sealed);
-        snap[0].used_bytes = 513;
-        assert!(s.restore(snap).is_err());
-    }
-
-    /// Reject rollback atomically while allowing equal or newer generations.
-    #[test]
-    fn restore_rejects_generation_rollback_without_reviving_stale_mappings() {
-        let s = segments(1024, 2);
-        drop(s.append(1024).unwrap());
-        let (lease, extent) = s.append(1024).unwrap();
-        let id = lease.id();
-        let generation = lease.generation();
-        drop(lease);
-        let old_sealed = s.snapshot();
-        s.begin_evict(id).unwrap();
-        s.recycle(id).unwrap();
-        let before = s.snapshot();
-        let epoch = s.restore_epoch();
-
-        for state in [
-            SegmentState::Free,
-            SegmentState::Open,
-            SegmentState::Sealed,
-            SegmentState::Evicting,
-        ] {
-            let mut images = old_sealed.clone();
-            images[0].generation = Generation(3);
-            images[1].state = state;
-            images[1].used_bytes = match state {
-                SegmentState::Free => 0,
-                SegmentState::Open => 512,
-                _ => 1024,
-            };
-            assert_eq!(s.validate_restore(&images), Err(Error::Corrupt));
-            assert_eq!(s.restore(images), Err(Error::Corrupt));
-            assert_eq!(s.snapshot(), before);
-            assert_eq!(s.restore_epoch(), epoch);
-            assert_eq!(*s.free.borrow(), BTreeSet::from([1]));
-            assert_eq!(s.open.get(), None);
-            assert_eq!(s.evicting.get(), 0);
-        }
-
-        let (lease, new_extent) = s.append(1024).unwrap();
-        assert_eq!(lease.id(), id);
-        assert_eq!(lease.generation(), Generation(2));
-        assert_eq!(new_extent, extent);
-        assert_eq!(s.validate(id, generation, &extent), Err(Error::Stale));
-        assert!(matches!(s.lease(id, generation), Err(Error::Stale)));
-        drop(lease);
-
-        let mut images = s.snapshot();
-        assert_eq!(s.validate_restore(&images), Ok(()));
-        s.restore(images.clone()).unwrap();
-        images[1].generation = Generation(3);
-        assert_eq!(s.validate_restore(&images), Ok(()));
-        s.restore(images).unwrap();
-        assert_eq!(s.snapshot()[1].generation, Generation(3));
-        assert_eq!(s.validate(id, generation, &extent), Err(Error::Stale));
-    }
-
-    /// Tail rotation and generation exhaustion never wrap into stale authority.
-    #[test]
-    fn generation_exhaustion_never_wraps_and_small_tails_are_sealed() {
-        let s = segments(1024, 2);
-        drop(s.append(512).unwrap());
-        let next = s.append(1024).unwrap();
-        assert_eq!(next.0.id(), SegmentId(1));
-        drop(next);
-        assert_eq!(s.state(SegmentId(0)).unwrap(), SegmentState::Sealed);
-        let mut snapshot = s.snapshot();
-        snapshot[0].generation = Generation(u64::MAX);
-        s.restore(snapshot).unwrap();
-        s.begin_evict(SegmentId(0)).unwrap();
-        assert_eq!(s.recycle(SegmentId(0)), Err(Error::Unavailable));
-        assert_eq!(s.snapshot()[0].generation, Generation(u64::MAX));
-    }
-
     /// Validation distinguishes stale identity, corrupt ranges, and busy ownership.
     #[test]
     fn validation_rejects_unwritten_ranges_generations_and_busy_restore() {
@@ -1225,55 +1170,31 @@ mod tests {
         }
     }
 
-    /// Recovery validates all states atomically and fails before epoch wraparound.
+    /// Restore-epoch exhaustion fails before publishing any slot or generation bump.
+    ///
+    /// The epoch is private, so the DST suite in `tests/dst.rs` cannot reach this boundary.
     #[test]
-    fn invalid_restore_states_are_atomic_and_valid_states_round_trip() {
-        let s = segments(1024, 3);
-        drop(s.append(1024).unwrap());
+    fn restore_epoch_exhaustion_is_atomic() {
+        let s = segments(1024, 2);
+        let free = s.snapshot();
         drop(s.append(512).unwrap());
         let before = s.snapshot();
-        let mut cases = Vec::new();
-        for state in [
-            SegmentState::Open,
-            SegmentState::Sealed,
-            SegmentState::Evicting,
-        ] {
-            let mut images = before.clone();
-            images[2].state = state;
-            cases.push(images);
-        }
-        let mut images = before.clone();
-        images[0].state = SegmentState::Open;
-        cases.push(images);
-        let mut images = before.clone();
-        images[0].state = SegmentState::Open;
-        images[0].used_bytes = 512;
-        cases.push(images);
-        for images in cases {
-            assert_eq!(s.restore(images), Err(Error::Corrupt));
-            assert_eq!(s.snapshot(), before);
-            assert_eq!(s.free_count(), 1);
-            assert_eq!(s.open.get(), Some(1));
-            assert_eq!(s.restore_epoch(), 0);
-        }
-        let mut images = before;
-        images[0].state = SegmentState::Evicting;
-        s.restore(images).unwrap();
-        assert_eq!(s.restore_epoch(), 1);
-        assert_eq!(s.state(SegmentId(0)), Ok(SegmentState::Evicting));
-        assert_eq!(s.state(SegmentId(1)), Ok(SegmentState::Sealed));
-        s.recycle(SegmentId(0)).unwrap();
-        assert_eq!(s.free_count(), 2);
-        let before = s.snapshot();
+        let open = s.open.get();
         s.restore_epoch.set(u64::MAX - 1);
         assert_eq!(s.validate_restore(&before), Ok(()));
         s.restore(before.clone()).unwrap();
         assert_eq!(s.restore_epoch(), u64::MAX);
+        assert_eq!(s.state(SegmentId(0)), Ok(SegmentState::Sealed));
+        let before = s.snapshot();
+        // Restoring the empty image would bump slot 0, but the epoch check must come first.
+        assert_eq!(s.validate_restore(&free), Err(Error::Unavailable));
+        assert_eq!(s.restore(free), Err(Error::Unavailable));
         assert_eq!(s.snapshot(), before);
-        s.restore_epoch.set(u64::MAX);
-        assert_eq!(s.validate_restore(&before), Err(Error::Unavailable));
-        assert_eq!(s.restore(before.clone()), Err(Error::Unavailable));
-        assert_eq!(s.snapshot(), before);
+        assert_eq!(s.restore_epoch(), u64::MAX);
+        assert_eq!(*s.free.borrow(), BTreeSet::from([1]));
+        assert_eq!(s.open.get(), None);
+        assert_ne!(open, None);
+        assert_eq!(s.evicting.get(), 0);
     }
 }
 
