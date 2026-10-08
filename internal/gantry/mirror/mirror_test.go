@@ -170,6 +170,32 @@ func TestMirrorLocalIndexDetectsContentTypeBeyondPrefix(t *testing.T) {
 	}
 }
 
+func TestMirrorLocalImageConfigUsesBlobContentType(t *testing.T) {
+	body := []byte(`{"architecture":"amd64","config":{"Env":["PATH=/usr/bin"]},"os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`)
+	d := digestOf(body)
+	fixture := newFixture(t, nil)
+	fixture.cache.Put(d, body)
+
+	req, err := http.NewRequest(http.MethodGet, fixture.server.URL+"/v2/repo/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("Content-Type"); got != "application/octet-stream" {
+		t.Fatalf("Content-Type = %q, want application/octet-stream", got)
+	}
+}
+
 type writerSpyCache struct {
 	writerCalls int32
 }

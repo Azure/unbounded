@@ -187,6 +187,10 @@ func TestDetectContentType(t *testing.T) {
 			want: "application/vnd.oci.image.manifest.v1+json",
 		},
 		{
+			name: "OCI image config is not a manifest",
+			body: `{"architecture":"amd64","config":{"Env":["PATH=/usr/bin"]},"os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`,
+		},
+		{
 			name: "opaque blob",
 			body: "not json",
 		},

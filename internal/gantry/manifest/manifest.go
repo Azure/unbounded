@@ -29,10 +29,9 @@ const (
 	dockerManifestMediaType     = "application/vnd.docker.distribution.manifest.v2+json"
 )
 
-// containerd rejects registry manifests larger than this during resolution.
-// Keep detection bounded to the same limit so a blob requested through a
-// /manifests/ URL cannot force an unbounded scan.
-const maxContentTypeDetectionBytes int64 = 4 * 1048 * 1048
+// Keep detection within the repository's 4 MiB manifest parsing bound so a
+// blob requested through a /manifests/ URL cannot force an unbounded scan.
+const maxContentTypeDetectionBytes int64 = 4 * 1024 * 1024
 
 // schema is the subset of the OCI / Docker schema-2 manifest layout
 // the prefetch path needs.
@@ -138,15 +137,17 @@ func knownContentType(mediaType string) string {
 }
 
 func contentTypeForShape(hasManifestFields, hasManifests, schemaVersionTwo bool) string {
+	if !schemaVersionTwo {
+		return ""
+	}
+
 	switch {
 	case hasManifestFields:
 		return ociImageManifestMediaType
 	case hasManifests:
 		return ociImageIndexMediaType
-	case schemaVersionTwo:
-		return ociImageManifestMediaType
 	default:
-		return ""
+		return ociImageManifestMediaType
 	}
 }
 
