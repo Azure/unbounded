@@ -29,7 +29,8 @@ var _ [wire.PageSize - PageSize]struct{}
 // Key names an object in a Racer cache. The object's content may change
 // over time; each version is identified by the ETag in its [Metadata] and
 // must never change. A key is often a content digest, such as the SHA-256
-// of a blob, in which case the object has only one version.
+// of a blob, in which case the bytes cannot change, but the origin may
+// report a new ETag for the same bytes.
 type Key [32]byte
 
 // ParseKey parses 64 lowercase hexadecimal characters.
