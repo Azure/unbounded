@@ -4,6 +4,7 @@
 package manifest_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -69,6 +70,19 @@ const ociImageIndex = `{
   ]
 }`
 
+const dockerManifestList = `{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+  "manifests": [
+    {
+      "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+      "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "size": 1357,
+      "platform": {"architecture": "amd64", "os": "linux"}
+    }
+  ]
+}`
+
 const manifestWithForeignLayer = `{
   "schemaVersion": 2,
   "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
@@ -111,6 +125,91 @@ func TestChildDigests_OCIManifest(t *testing.T) {
 		if got[i].String() != d.String() {
 			t.Fatalf("digest[%d]: got %s want %s", i, got[i], d)
 		}
+	}
+}
+
+func TestDetectContentType(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "OCI manifest",
+			body: ociImageManifest,
+			want: "application/vnd.oci.image.manifest.v1+json",
+		},
+		{
+			name: "Docker manifest",
+			body: dockerImageManifest,
+			want: "application/vnd.docker.distribution.manifest.v2+json",
+		},
+		{
+			name: "OCI index",
+			body: ociImageIndex,
+			want: "application/vnd.oci.image.index.v1+json",
+		},
+		{
+			name: "Docker manifest list",
+			body: dockerManifestList,
+			want: "application/vnd.docker.distribution.manifest.list.v2+json",
+		},
+		{
+			name: "Docker manifest media type after shape",
+			body: `{"schemaVersion":2,"config":{},"layers":[],"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}`,
+			want: "application/vnd.docker.distribution.manifest.v2+json",
+		},
+		{
+			name: "Docker manifest list media type after shape",
+			body: `{"schemaVersion":2,"manifests":[],"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json"}`,
+			want: "application/vnd.docker.distribution.manifest.list.v2+json",
+		},
+		{
+			name: "index without media type",
+			body: `{"schemaVersion":2,"manifests":[]}`,
+			want: "application/vnd.oci.image.index.v1+json",
+		},
+		{
+			name: "truncated index prefix",
+			body: `{"schemaVersion":2,"manifests":[`,
+			want: "application/vnd.oci.image.index.v1+json",
+		},
+		{
+			name: "nested manifests field is ignored",
+			body: `{"schemaVersion":2,"extension":{"manifests":[]},"config":{},"layers":[]}`,
+			want: "application/vnd.oci.image.manifest.v1+json",
+		},
+		{
+			name: "media type in annotation is ignored",
+			body: `{"schemaVersion":2,"annotations":{"example.com/note":"application/vnd.oci.image.index.v1+json"},"config":{},"layers":[]}`,
+			want: "application/vnd.oci.image.manifest.v1+json",
+		},
+		{
+			name: "opaque blob",
+			body: "not json",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := manifest.DetectContentType([]byte(test.body)); got != test.want {
+				t.Fatalf("DetectContentType() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDetectContentTypeFromReaderFindsLateIndexShape(t *testing.T) {
+	t.Parallel()
+
+	body := `{"schemaVersion":2,"padding":"` + strings.Repeat("x", 8*1024) + `","manifests":[]}`
+
+	if got := manifest.DetectContentTypeFromReader(strings.NewReader(body)); got != "application/vnd.oci.image.index.v1+json" {
+		t.Fatalf("DetectContentTypeFromReader() = %q, want OCI index", got)
 	}
 }
 
