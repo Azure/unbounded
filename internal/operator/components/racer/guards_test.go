@@ -204,6 +204,77 @@ func TestGuardContainmentBindingReadFailure(t *testing.T) {
 	assertControllerBindings(t, env, true)
 }
 
+func TestGuardContainmentRevokesBindingsIndependently(t *testing.T) {
+	for _, blockedKind := range []string{"RoleBinding", "ClusterRoleBinding"} {
+		for _, failure := range []string{"foreign", "read"} {
+			for _, retained := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/retained=%t", blockedKind, failure, retained), func(t *testing.T) {
+					env := testEnv(t, cacheObject("cache"))
+					initialize(t, env)
+
+					if retained {
+						require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
+					}
+
+					guard := &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: guardNames[1]}}
+					require.NoError(t, env.Client.Delete(t.Context(), guard))
+
+					var blocked, owned client.Object = &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: controllerName, Namespace: env.Namespace}}, &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: controllerName}}
+					if blockedKind == "ClusterRoleBinding" {
+						blocked, owned = owned, blocked
+					}
+
+					require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(blocked), blocked))
+					require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(owned), owned))
+
+					boom := errors.New("binding read unavailable")
+
+					if failure == "foreign" {
+						blocked.SetAnnotations(nil)
+						require.NoError(t, env.Client.Update(t.Context(), blocked))
+					} else {
+						env.APIReader = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+							Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+								if key == client.ObjectKeyFromObject(blocked) && fmt.Sprintf("%T", obj) == fmt.Sprintf("%T", blocked) {
+									return boom
+								}
+
+								return c.Get(ctx, key, obj, opts...)
+							},
+						})
+					}
+
+					before := blocked.DeepCopyObject()
+					plan, result, err := (Component{}).Plan(t.Context(), env, nil)
+					require.NoError(t, err)
+					require.Equal(t, "AdmissionGuardUnavailable", result.Reason)
+					require.Positive(t, result.RequeueAfter)
+					require.Len(t, plan.Operations, 1)
+					op := plan.Operations[0]
+					require.Equal(t, component.OpDelete, op.Kind)
+					require.Equal(t, owned.GetUID(), op.Object.GetUID())
+					require.Equal(t, owned.GetResourceVersion(), op.Object.GetResourceVersion())
+					persist(t, env, plan)
+					require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), client.ObjectKeyFromObject(owned), owned)))
+					require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(blocked), blocked))
+					require.Equal(t, before, blocked)
+
+					plan, _, err = (Component{}).Plan(t.Context(), env, nil)
+					if failure == "foreign" {
+						require.ErrorContains(t, err, "refusing adoption")
+					} else {
+						require.ErrorIs(t, err, boom)
+					}
+
+					require.Nil(t, plan)
+					require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), client.ObjectKeyFromObject(guard), guard)))
+					require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), client.ObjectKeyFromObject(owned), owned)))
+				})
+			}
+		}
+	}
+}
+
 func TestHealthyGuardsSurviveUnrelatedWriteFailure(t *testing.T) {
 	env := testEnv(t, cacheObject("cache"))
 	initialize(t, env)

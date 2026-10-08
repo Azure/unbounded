@@ -130,14 +130,15 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 		err := env.LiveReader().Get(ctx, client.ObjectKeyFromObject(obj), current)
 		if err == nil {
 			if err := validateRuntimeOwner(current, marker.UID); err != nil {
-				return nil, false, err
+				readErr = errors.Join(readErr, err)
+				continue
 			}
 
 			current.GetObjectKind().SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
 			bindings[i] = current
 			exists = true
 		} else if !apierrors.IsNotFound(err) {
-			return nil, false, err
+			readErr = errors.Join(readErr, err)
 		}
 	}
 
@@ -152,6 +153,8 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 			add(plan, component.OpDelete, obj)
 		}
 
+		// Revoke each verified grant even if another cannot be touched. The next
+		// pass reports remaining errors before any repair or regrant.
 		return plan, true, nil
 	}
 
