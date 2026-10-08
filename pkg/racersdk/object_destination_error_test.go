@@ -6,6 +6,7 @@ package racersdk
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -220,5 +221,42 @@ func TestDestinationFailureWrapping(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "destination failed: cause") {
 		t.Fatalf("message %q", err)
+	}
+
+	for _, sentinel := range []error{ErrDestination, fmt.Errorf("proxy: %w", ErrDestination)} {
+		err := destinationFailure(sentinel)
+		if err == sentinel {
+			t.Fatalf("%v passed through without the private marker", sentinel)
+		}
+
+		got := ioFailure("write", err)
+		assertIs(t, got, ErrDestination)
+		assertIs(t, got, sentinel)
+		assertNotIs(t, got, ErrUnavailable)
+	}
+}
+
+// TestObjectWriteToWriterReturnsErrDestination covers a writer that itself
+// returns ErrDestination, for example a nested WriteTo. The result must still
+// match only ErrDestination.
+func TestObjectWriteToWriterReturnsErrDestination(t *testing.T) {
+	for name, cause := range map[string]error{
+		"direct":  ErrDestination,
+		"wrapped": fmt.Errorf("proxy: %w", ErrDestination),
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := fakeClient(t, offsetOrigin(1000))
+
+			o, err := c.Get(t.Context(), Request{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeQuietly(o)
+
+			_, err = o.WriteTo(writeFunc(func([]byte) (int, error) { return 0, cause }))
+			assertIs(t, err, ErrDestination)
+			assertIs(t, err, cause)
+			assertNotIs(t, err, ErrUnavailable)
+		})
 	}
 }

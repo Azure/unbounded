@@ -188,9 +188,12 @@ func (e *destinationError) Unwrap() error { return e.err }
 func (e *destinationError) Is(target error) bool { return target == ErrDestination }
 
 // destinationFailure attributes err to the WriteTo destination. Nil and
-// errors already attributed pass through unchanged.
+// errors already carrying the private marker pass through unchanged. A writer
+// error that merely matches ErrDestination is still wrapped, because only the
+// marker keeps ioFailure from reclassifying it.
 func destinationFailure(err error) error {
-	if err == nil || errors.Is(err, ErrDestination) {
+	var dst *destinationError
+	if err == nil || errors.As(err, &dst) {
 		return err
 	}
 
