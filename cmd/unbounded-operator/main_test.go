@@ -16,19 +16,17 @@ import (
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 )
 
-func TestEnableRacerConfiguration(t *testing.T) {
+func TestObsoleteRacerEnvironmentIgnored(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		value   string
-		unset   bool
-		want    bool
-		wantErr bool
+		name  string
+		value string
+		unset bool
 	}{
-		{name: "unset defaults true", unset: true, want: true},
-		{name: "true", value: "true", want: true},
+		{name: "unset", unset: true},
+		{name: "true", value: "true"},
 		{name: "false", value: "false"},
-		{name: "empty rejected", wantErr: true},
-		{name: "invalid rejected", value: "yes", wantErr: true},
+		{name: "empty"},
+		{name: "invalid", value: "yes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			unsetenv(t, "UNBOUNDED_REAP_LEGACY_RESOURCES")
@@ -40,12 +38,8 @@ func TestEnableRacerConfiguration(t *testing.T) {
 			}
 
 			called := false
-			cmd := newCommand(func(_ context.Context, cfg config) error {
+			cmd := newCommand(func(_ context.Context, _ config) error {
 				called = true
-
-				if cfg.enableRacer != tc.want {
-					t.Errorf("enableRacer = %v, want %v", cfg.enableRacer, tc.want)
-				}
 
 				return nil
 			})
@@ -54,11 +48,7 @@ func TestEnableRacerConfiguration(t *testing.T) {
 			cmd.SilenceUsage = true
 
 			err := cmd.Execute()
-			if tc.wantErr {
-				if err == nil || !strings.Contains(err.Error(), "ENABLE_RACER") || called {
-					t.Fatalf("error = %v, called = %v", err, called)
-				}
-			} else if err != nil || !called {
+			if err != nil || !called {
 				t.Fatalf("error = %v, called = %v", err, called)
 			}
 		})

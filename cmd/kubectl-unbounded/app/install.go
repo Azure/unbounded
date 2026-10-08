@@ -318,8 +318,6 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 
 	reapLegacyResources := true
 
-	var enableRacer *bool
-
 	previousImageRegistry := ""
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
@@ -336,20 +334,11 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 			return fmt.Errorf("get existing unbounded-operator-config data: %w", err)
 		}
 
-		// The endpoint and management flags are cluster policy and are preserved across
+		// The endpoint and reaper flag are cluster policy and are preserved across
 		// reinstalls; the image registry is a build-artifact locator and is not.
 		endpoint = data["UNBOUNDED_API_SERVER_ENDPOINT"]
 
 		previousImageRegistry = data["UNBOUNDED_IMAGE_REGISTRY"]
-		if value, found := data["ENABLE_RACER"]; found {
-			parsed, err := strconv.ParseBool(value)
-			if err != nil {
-				return fmt.Errorf("parse existing ENABLE_RACER value %q: %w", value, err)
-			}
-
-			enableRacer = &parsed
-		}
-
 		if value, found := data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; found {
 			parsed, err := strconv.ParseBool(value)
 			if err != nil {
@@ -376,10 +365,6 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 		"UNBOUNDED_API_SERVER_ENDPOINT":   endpoint,
 		"UNBOUNDED_IMAGE_REGISTRY":        imageRegistry,
 		"UNBOUNDED_REAP_LEGACY_RESOURCES": strconv.FormatBool(reapLegacyResources),
-	}
-	// A missing live value keeps the default from the rendered manifest.
-	if enableRacer != nil {
-		h.operatorConfigData["ENABLE_RACER"] = strconv.FormatBool(*enableRacer)
 	}
 
 	return nil
