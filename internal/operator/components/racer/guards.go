@@ -10,11 +10,15 @@ import (
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
+	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
+	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -33,7 +37,7 @@ func guardPredicate() predicate.Predicate {
 }
 
 // This is eventual containment, not continuous enforcement. Privileged guard
-// integrity remains trusted. Revoke both grants in a separate pass before any
+// writers remain trusted. Revoke both grants in a separate pass before any
 // repair, even without caches. Keep workloads and durable identity intact;
 // removing these bindings contains their API writes without destroying state.
 func planGuardContainment(ctx context.Context, env *component.Env) (*component.Plan, bool, error) {
@@ -54,26 +58,53 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 		return nil, false, err
 	}
 
+	guards, err := env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "node-restriction.yaml"}, nil)
+	if err != nil {
+		return nil, false, err
+	}
+
 	var (
-		missing, terminating bool
-		readErr              error
+		unhealthy, terminating bool
+		readErr                error
 	)
 
-	for _, name := range guardNames {
-		for _, obj := range []client.Object{&admissionv1.ValidatingAdmissionPolicy{}, &admissionv1.ValidatingAdmissionPolicyBinding{}} {
-			err := env.LiveReader().Get(ctx, client.ObjectKey{Name: name}, obj)
-			switch {
-			case apierrors.IsNotFound(err):
-				missing = true
-			case err != nil:
-				readErr = errors.Join(readErr, err)
-			case obj.GetDeletionTimestamp() != nil:
-				missing, terminating = true, true
-			}
+	repairs := component.NewPlan()
+
+	for _, guard := range guards {
+		var expected, current client.Object
+
+		switch guard.GetKind() {
+		case "ValidatingAdmissionPolicy":
+			expected, current = &admissionv1.ValidatingAdmissionPolicy{}, &admissionv1.ValidatingAdmissionPolicy{}
+		case "ValidatingAdmissionPolicyBinding":
+			expected, current = &admissionv1.ValidatingAdmissionPolicyBinding{}, &admissionv1.ValidatingAdmissionPolicyBinding{}
+		default:
+			return nil, false, errors.New("unexpected admission guard kind")
+		}
+
+		if err := env.Scheme.Convert(guard, expected, nil); err != nil {
+			return nil, false, err
+		}
+
+		err := env.LiveReader().Get(ctx, client.ObjectKeyFromObject(expected), current)
+		switch {
+		case apierrors.IsNotFound(err):
+			unhealthy = true
+		case err != nil:
+			readErr = errors.Join(readErr, err)
+		case current.GetDeletionTimestamp() != nil:
+			unhealthy, terminating = true, true
+		case !equality.Semantic.DeepEqual(effectiveGuardSpec(expected), effectiveGuardSpec(current)):
+			unhealthy = true
+			base := component.ToUnstructured(current)
+			base.SetGroupVersionKind(guard.GroupVersionKind())
+			desired := base.DeepCopy()
+			desired.Object["spec"] = guard.DeepCopy().Object["spec"]
+			repairs.Add(component.Operation{Kind: component.OpMergePatch, Base: base, Object: desired, Component: name})
 		}
 	}
 
-	if !missing {
+	if !unhealthy {
 		return nil, false, readErr
 	}
 
@@ -93,7 +124,7 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 		if err == nil {
 			exists = true
 		} else if !apierrors.IsNotFound(err) {
-			// A known missing guard warrants revocation even if a grant cannot
+			// A known unhealthy guard warrants revocation even if a grant cannot
 			// be read. DeleteIfExists can still succeed independently of Get.
 			exists = true
 		}
@@ -116,7 +147,71 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 		return component.NewPlan(), true, nil
 	}
 
+	if repairs.Len() > 0 {
+		caches := &racerv1.ClusterCacheList{}
+		if err := env.LiveReader().List(ctx, caches, client.Limit(1)); err != nil {
+			return nil, false, err
+		}
+
+		if len(caches.Items) > 0 {
+			// Remove added fields too, then verify live integrity on the next pass.
+			// Applying an omitted field cannot remove another manager's value.
+			return repairs, true, nil
+		}
+	}
+
 	// Only a later live read proving both grants absent permits normal planning.
 	// Retained installations do not regrant until caches activate them again.
 	return nil, false, nil
+}
+
+// Compare only specs, normalizing API defaults on copies so persisted defaults
+// do not cause repeated revocation. Manifest decoding also retargets CEL identity.
+func effectiveGuardSpec(obj client.Object) any {
+	switch obj := obj.(type) {
+	case *admissionv1.ValidatingAdmissionPolicy:
+		spec := obj.Spec.DeepCopy()
+		if spec.FailurePolicy == nil {
+			spec.FailurePolicy = ptr.To(admissionv1.Fail)
+		}
+
+		spec.MatchConstraints = effectiveGuardMatch(spec.MatchConstraints)
+
+		return spec
+	case *admissionv1.ValidatingAdmissionPolicyBinding:
+		spec := obj.Spec.DeepCopy()
+		spec.MatchResources = effectiveGuardMatch(spec.MatchResources)
+
+		return spec
+	default:
+		return nil
+	}
+}
+
+func effectiveGuardMatch(match *admissionv1.MatchResources) *admissionv1.MatchResources {
+	if match == nil {
+		match = &admissionv1.MatchResources{}
+	}
+
+	if match.MatchPolicy == nil {
+		match.MatchPolicy = ptr.To(admissionv1.Equivalent)
+	}
+
+	if match.NamespaceSelector == nil {
+		match.NamespaceSelector = &metav1.LabelSelector{}
+	}
+
+	if match.ObjectSelector == nil {
+		match.ObjectSelector = &metav1.LabelSelector{}
+	}
+
+	for _, rules := range [][]admissionv1.NamedRuleWithOperations{match.ResourceRules, match.ExcludeResourceRules} {
+		for i := range rules {
+			if rules[i].Scope == nil {
+				rules[i].Scope = ptr.To(admissionv1.AllScopes)
+			}
+		}
+	}
+
+	return match
 }

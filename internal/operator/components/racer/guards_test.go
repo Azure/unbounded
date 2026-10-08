@@ -17,6 +17,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -239,4 +240,180 @@ func TestHealthyGuardsSurviveUnrelatedWriteFailure(t *testing.T) {
 	after := &admissionv1.ValidatingAdmissionPolicy{}
 	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: guardNames[0]}, after))
 	require.Equal(t, before, after)
+}
+
+func TestGuardContainmentSpecTampering(t *testing.T) {
+	cases := []struct {
+		name   string
+		object func() client.Object
+		mutate func(client.Object)
+	}{
+		{"validation", func() client.Object { return &admissionv1.ValidatingAdmissionPolicy{} }, func(obj client.Object) {
+			obj.(*admissionv1.ValidatingAdmissionPolicy).Spec.Validations[0].Expression = "true"
+		}},
+		{"identity", func() client.Object { return &admissionv1.ValidatingAdmissionPolicy{} }, func(obj client.Object) {
+			obj.(*admissionv1.ValidatingAdmissionPolicy).Spec.MatchConditions[0].Expression = "false"
+		}},
+		{"failure-policy", func() client.Object { return &admissionv1.ValidatingAdmissionPolicy{} }, func(obj client.Object) {
+			obj.(*admissionv1.ValidatingAdmissionPolicy).Spec.FailurePolicy = ptr.To(admissionv1.Ignore)
+		}},
+		{"resource-rules", func() client.Object { return &admissionv1.ValidatingAdmissionPolicy{} }, func(obj client.Object) {
+			obj.(*admissionv1.ValidatingAdmissionPolicy).Spec.MatchConstraints.ResourceRules[0].Resources = []string{"pods"}
+		}},
+		{"policy-name", func() client.Object { return &admissionv1.ValidatingAdmissionPolicyBinding{} }, func(obj client.Object) {
+			obj.(*admissionv1.ValidatingAdmissionPolicyBinding).Spec.PolicyName = "unrelated"
+		}},
+		{"validation-actions", func() client.Object { return &admissionv1.ValidatingAdmissionPolicyBinding{} }, func(obj client.Object) {
+			obj.(*admissionv1.ValidatingAdmissionPolicyBinding).Spec.ValidationActions = []admissionv1.ValidationAction{admissionv1.Audit}
+		}},
+		{"binding-selector", func() client.Object { return &admissionv1.ValidatingAdmissionPolicyBinding{} }, func(obj client.Object) {
+			obj.(*admissionv1.ValidatingAdmissionPolicyBinding).Spec.MatchResources = &admissionv1.MatchResources{
+				NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"bypass": "true"}},
+			}
+		}},
+	}
+	for _, retained := range []bool{false, true} {
+		for _, name := range guardNames {
+			for _, tc := range cases {
+				t.Run(fmt.Sprintf("retained=%t/%s/%s", retained, name, tc.name), func(t *testing.T) {
+					env := testEnv(t, cacheObject("cache"))
+					initialize(t, env)
+
+					guard := tc.object()
+					require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: name}, guard))
+					original := guard.DeepCopyObject().(client.Object)
+					tc.mutate(guard)
+					require.NoError(t, env.Client.Update(t.Context(), guard))
+
+					if retained {
+						require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
+					}
+
+					plan := planPass(t, env)
+					require.Len(t, plan.Operations, 2)
+
+					for _, op := range plan.Operations {
+						require.Equal(t, component.OpDelete, op.Kind)
+					}
+
+					require.Equal(t, plan.Summary(), planPass(t, env).Summary())
+					persist(t, env, plan)
+					assertControllerBindings(t, env, false)
+
+					if retained {
+						require.Zero(t, planPass(t, env).Len())
+						require.NoError(t, env.Client.Create(t.Context(), cacheObject("later")))
+					}
+
+					persist(t, env, planPass(t, env))
+					assertControllerBindings(t, env, false)
+					persist(t, env, planPass(t, env))
+					assertControllerBindings(t, env, true)
+					require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: name}, guard))
+					require.Equal(t, effectiveGuardSpec(original), effectiveGuardSpec(guard))
+					_, stop, err := planGuardContainment(t.Context(), env)
+					require.NoError(t, err)
+					require.False(t, stop)
+				})
+			}
+		}
+	}
+}
+
+func TestGuardContainmentFailedSpecRepair(t *testing.T) {
+	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
+		t.Run(kind, func(t *testing.T) {
+			env := testEnv(t, cacheObject("cache"))
+			initialize(t, env)
+
+			var guard client.Object = &admissionv1.ValidatingAdmissionPolicyBinding{}
+			if kind == "ValidatingAdmissionPolicy" {
+				guard = &admissionv1.ValidatingAdmissionPolicy{}
+			}
+
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: guardNames[0]}, guard))
+
+			switch guard := guard.(type) {
+			case *admissionv1.ValidatingAdmissionPolicy:
+				guard.Spec.Validations[0].Expression = "true"
+			case *admissionv1.ValidatingAdmissionPolicyBinding:
+				guard.Spec.PolicyName = "unrelated"
+			}
+
+			require.NoError(t, env.Client.Update(t.Context(), guard))
+			persist(t, env, planPass(t, env))
+			assertControllerBindings(t, env, false)
+			original := env.Client
+			env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if obj.GetObjectKind().GroupVersionKind().Kind == kind {
+						return errors.New("guard repair unavailable")
+					}
+
+					return c.Patch(ctx, obj, patch, opts...)
+				},
+			})
+			result, err := env.Execute(t.Context(), planPass(t, env))
+			require.NoError(t, err)
+			require.ErrorContains(t, result.Err(), "guard repair unavailable")
+			assertControllerBindings(t, env, false)
+			env.Client = interceptor.NewClient(original.(client.WithWatch), interceptor.Funcs{
+				Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+					return nil
+				},
+			})
+			persist(t, env, planPass(t, env))
+			stillDamaged := planPass(t, env)
+			require.Len(t, stillDamaged.Operations, 1)
+			require.Equal(t, component.OpMergePatch, stillDamaged.Operations[0].Kind)
+			assertControllerBindings(t, env, false)
+			env.Client = original
+			persist(t, env, planPass(t, env))
+			assertControllerBindings(t, env, false)
+			persist(t, env, planPass(t, env))
+			assertControllerBindings(t, env, true)
+		})
+	}
+}
+
+func TestGuardContainmentManifestDefaults(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	for _, name := range guardNames {
+		policy := &admissionv1.ValidatingAdmissionPolicy{}
+		require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: name}, policy))
+		require.Contains(t, policy.Spec.MatchConditions[0].Expression, ":custom-system:")
+		require.NotContains(t, policy.Spec.MatchConditions[0].Expression, ":unbounded-system:")
+		policy.Spec.FailurePolicy = nil
+		policy.Spec.MatchConstraints.MatchPolicy = ptr.To(admissionv1.Equivalent)
+		policy.Spec.MatchConstraints.NamespaceSelector = &metav1.LabelSelector{}
+		policy.Spec.MatchConstraints.ObjectSelector = &metav1.LabelSelector{}
+
+		for i := range policy.Spec.MatchConstraints.ResourceRules {
+			policy.Spec.MatchConstraints.ResourceRules[i].Scope = ptr.To(admissionv1.AllScopes)
+		}
+
+		policy.Labels = map[string]string{"unrelated": "metadata"}
+		require.NoError(t, env.Client.Update(t.Context(), policy))
+
+		binding := &admissionv1.ValidatingAdmissionPolicyBinding{}
+		require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: name}, binding))
+		binding.Spec.MatchResources = &admissionv1.MatchResources{
+			MatchPolicy: ptr.To(admissionv1.Equivalent), NamespaceSelector: &metav1.LabelSelector{}, ObjectSelector: &metav1.LabelSelector{},
+		}
+		require.NoError(t, env.Client.Update(t.Context(), binding))
+	}
+
+	for _, retained := range []bool{false, true} {
+		if retained {
+			require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
+		}
+
+		plan, stop, err := planGuardContainment(t.Context(), env)
+		require.NoError(t, err)
+		require.False(t, stop)
+		require.Nil(t, plan)
+		assertControllerBindings(t, env, true)
+	}
 }
