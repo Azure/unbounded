@@ -93,7 +93,7 @@ class TestACLImageResolution(unittest.TestCase):
     }
 
     def test_file_name_is_derived_from_the_build(self):
-        """A refreshed image must not be masked by a cached file.
+        """A refreshed image must not be masked by an earlier run's file.
 
         The harness reuses an image already in VM_DIR rather than downloading
         again. If every build landed under the same name, a machine that had run
@@ -123,7 +123,7 @@ class TestACLImageResolution(unittest.TestCase):
         self.assertEqual(file_name, "acl-2026091817.qcow2")
 
     def test_a_malformed_manifest_is_refused(self):
-        """The build names the cached file, so an empty or odd one could make
+        """The build names the image file, so an empty or odd one could make
         different builds share a name, or a path. And an unverified image boots,
         so whatever goes wrong afterwards looks like a product bug."""
         manifests = [dict(self.MANIFEST, build_id=build) for build in ("", None, 2026, "../x", "a b")]
@@ -158,7 +158,9 @@ class TestACLImageResolution(unittest.TestCase):
                 e2e.resolve_host_image()
 
             exported = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
-            self.assertEqual(output_file.read_text(), "build=2026091817\n")
+            # No step output: CI does not cache the image, so nothing is keyed
+            # by its build.
+            self.assertFalse(output_file.exists())
 
         e2e.acl_image_from_manifest.cache_clear()
         with patch.object(e2e, "ACL_IMAGE_URL", exported["ACL_IMAGE_URL"]), \

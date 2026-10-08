@@ -134,36 +134,19 @@ jobs:
           tenant-id: ${{ secrets.ACL_IMAGE_TENANT_ID }}
           subscription-id: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
 
-      # Exported for later e2e.py processes, so the job uses one build.
+      # Exported for later e2e.py processes, so the job uses one build. The
+      # image is downloaded and verified on every run, never put in the Actions
+      # cache: a pull request from a fork can restore the base branch's caches,
+      # and the image is only readable with the Azure login above.
       - name: Resolve the Azure Container Linux build
         if: matrix.host-base-os == 'acl'
-        id: acl-image
         run: python3 ./hack/agent/e2e-kind/e2e.py resolve-host-image
-
-      # Restore and save are separate because Cleanup deletes .vm-e2e before a
-      # combined action's post step would save it.
-      - name: Restore the host image
-        if: matrix.host-base-os == 'acl'
-        id: acl-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .vm-e2e/acl-${{ steps.acl-image.outputs.build }}.qcow2
-          key: acl-image-${{ steps.acl-image.outputs.build }}
 
       - name: Set up test control plane
         uses: ./.github/actions/agent-e2e-kind-control-plane
         with:
           cluster-name: ${{ env.KIND_CLUSTER_NAME }}
           vm-subnet: ${{ env.VM_SUBNET }}
-
-      # create-vm has downloaded and verified the image; saved now, so a later
-      # failure does not stop the next run reusing it.
-      - name: Save the host image
-        if: matrix.host-base-os == 'acl' && steps.acl-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .vm-e2e/acl-${{ steps.acl-image.outputs.build }}.qcow2
-          key: acl-image-${{ steps.acl-image.outputs.build }}
 
       - name: Set up machina resources
         uses: ./.github/actions/agent-e2e-machina-setup

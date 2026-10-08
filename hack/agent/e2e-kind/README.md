@@ -40,7 +40,9 @@ first-boot unit runs preflight and bootstrap.
 The image is resolved from the manifest published alongside it, so a refreshed
 build is picked up without a code change. It is fetched with a federated Azure
 login, because the storage account holding it disables anonymous access and
-shared keys alike. The image can be chosen in other ways:
+shared keys alike. CI downloads and verifies it on every run and never puts it
+in the Actions cache, which a pull request from a fork can restore. The image
+can be chosen in other ways:
 
 - `ACL_IMAGE_MANIFEST_URL` reads a different manifest.
 - `ACL_IMAGE_URL`, `ACL_IMAGE_SHA256` and `ACL_IMAGE_BUILD_ID`, set together,

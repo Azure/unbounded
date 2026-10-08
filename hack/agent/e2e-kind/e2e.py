@@ -1631,7 +1631,7 @@ def host_image() -> HostImage:
 # Azure Container Linux publishes no image to a public mirror, so the harness
 # resolves one from a manifest in the storage account that builds it. The
 # manifest names the blob, its size and its sha256, which is what lets the
-# download be verified and cached by build.
+# download be verified and named for its build.
 ACL_IMAGE_MANIFEST_URL = os.environ.get(
     "ACL_IMAGE_MANIFEST_URL",
     "https://aksflexaclimagestme.blob.core.windows.net/images/latest.json",
@@ -1708,15 +1708,15 @@ def acl_image_from_manifest() -> tuple[str, str, str]:
     if not url or not digest:
         die(f"{ACL_IMAGE_MANIFEST_URL} does not name a qcow2 url and sha256")
 
-    # Named for the build so a refreshed image does not reuse a cached file, and
-    # so a cache key can be derived from the name alone.
+    # Named for the build so a refreshed image does not reuse a file an earlier
+    # local run left in VM_DIR.
     log(f"Azure Container Linux build {build} ({qcow2.get('size', 0)} bytes, sha256 {digest[:12]})")
 
     return url, f"acl-{build}.qcow2", digest
 
 
 def _check_acl_build_id(build: object, source: str) -> None:
-    """The build names the cached image file, so it has to be a plain name."""
+    """The build names the image file, so it has to be a plain name."""
     if not isinstance(build, str) or not ACL_BUILD_ID_PATTERN.fullmatch(build):
         die(f"{source} {build!r} is not a build id")
 
@@ -1726,7 +1726,8 @@ def resolve_host_image() -> None:
 
     In GitHub Actions it is written to $GITHUB_ENV, so every later e2e.py
     process in the job uses the same build instead of reading the manifest
-    again, and the build is also written to $GITHUB_OUTPUT for the cache key.
+    again. CI downloads the image on every run rather than caching it, since a
+    pull request from a fork can restore the base branch's Actions caches.
     """
     if HOST_BASE_OS != "acl":
         die("resolve-host-image only applies to HOST_BASE_OS=acl")
@@ -1739,8 +1740,6 @@ def resolve_host_image() -> None:
     if github_env:
         with open(github_env, "a", encoding="utf-8") as env_file:
             env_file.write(exports)
-        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-            output.write(f"build={build}\n")
     else:
         print(exports, end="")
 
