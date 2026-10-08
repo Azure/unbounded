@@ -33,6 +33,7 @@ import (
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
+	"github.com/Azure/unbounded/internal/operator/components/racer"
 	"github.com/Azure/unbounded/internal/operator/components/tokenrefresher"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
@@ -91,7 +92,13 @@ type SiteReconciler struct {
 // singletons followed by the metalman per-Site component. The slice
 // order is the stable Site status condition order (cluster first, then site).
 func DefaultRegistry() *component.Registry {
-	return &component.Registry{
+	return DefaultRegistryWithRacer(true)
+}
+
+// DefaultRegistryWithRacer omits Racer planning and watches when disabled.
+// Disabling management does not delete an existing installation.
+func DefaultRegistryWithRacer(enabled bool) *component.Registry {
+	registry := &component.Registry{
 		Cluster: []component.ClusterComponent{
 			netcomponent.New(),
 			machina.New(),
@@ -102,6 +109,11 @@ func DefaultRegistry() *component.Registry {
 			metalman.New(),
 		},
 	}
+	if enabled {
+		registry.Cluster = append(registry.Cluster, racer.New())
+	}
+
+	return registry
 }
 
 // namespace returns the namespace the reconciler installs components into,

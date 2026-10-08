@@ -29,6 +29,23 @@ func validateFragment(t *testing.T, fragment string) error {
 	return ValidateErr([]SourcedEntry{entryFrom(t, fragment)})
 }
 
+func TestRacerOverrideIsControllerOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name, fragment string
+		wantErr        bool
+	}{
+		{name: "controller", fragment: "component: racer\nkind: Deployment"},
+		{name: "no dataplane", fragment: "component: racer\nkind: DaemonSet", wantErr: true},
+		{name: "no Sites", fragment: "component: racer\nkind: Deployment\nsites: [west]", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateFragment(t, tc.fragment+"\npatch:\n  spec:\n    replicas: 3"); (err != nil) != tc.wantErr {
+				t.Fatalf("validation error = %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateAcceptsRealisticEntries(t *testing.T) {
 	cases := []struct {
 		name     string

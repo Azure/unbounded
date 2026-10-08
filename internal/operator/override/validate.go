@@ -33,6 +33,7 @@ var knownComponents = map[string]struct {
 	"machina":         {perSite: false, kinds: []string{"Deployment"}},
 	"gantry":          {perSite: false, kinds: []string{"DaemonSet"}},
 	"token-refresher": {perSite: false, kinds: []string{"Deployment"}},
+	"racer":           {perSite: false, kinds: []string{"Deployment"}},
 	"metalman":        {perSite: true, kinds: []string{"Deployment"}},
 }
 

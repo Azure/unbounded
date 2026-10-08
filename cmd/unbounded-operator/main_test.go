@@ -12,7 +12,67 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 )
+
+func TestEnableRacerConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		unset   bool
+		want    bool
+		wantErr bool
+	}{
+		{name: "unset defaults true", unset: true, want: true},
+		{name: "true", value: "true", want: true},
+		{name: "false", value: "false"},
+		{name: "empty rejected", wantErr: true},
+		{name: "invalid rejected", value: "yes", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unsetenv(t, "UNBOUNDED_REAP_LEGACY_RESOURCES")
+
+			if tc.unset {
+				unsetenv(t, "ENABLE_RACER")
+			} else {
+				t.Setenv("ENABLE_RACER", tc.value)
+			}
+
+			called := false
+			cmd := newCommand(func(_ context.Context, cfg config) error {
+				called = true
+
+				if cfg.enableRacer != tc.want {
+					t.Errorf("enableRacer = %v, want %v", cfg.enableRacer, tc.want)
+				}
+
+				return nil
+			})
+			cmd.SetArgs(nil)
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+
+			err := cmd.Execute()
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "ENABLE_RACER") || called {
+					t.Fatalf("error = %v, called = %v", err, called)
+				}
+			} else if err != nil || !called {
+				t.Fatalf("error = %v, called = %v", err, called)
+			}
+		})
+	}
+}
+
+func TestRuntimeSchemeIncludesClusterCache(t *testing.T) {
+	scheme := runtimeScheme()
+	for _, kind := range []string{"ClusterCache", "ClusterCacheList"} {
+		if _, err := scheme.New(racerv1.GroupVersion.WithKind(kind)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func TestReapLegacyResourcesConfiguration(t *testing.T) {
 	cases := []struct {
