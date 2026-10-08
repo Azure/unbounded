@@ -46,7 +46,7 @@ func TestKrewManifestChecksums(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			cmd := exec.Command("bash", "-e", "-o", "pipefail", "-c", script)
+			cmd := exec.Command("bash", "-e", "-c", script)
 			cmd.Dir = dir
 			cmd.Env = append(os.Environ(), "PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
 

@@ -65,7 +65,7 @@ func TestGantryChartPushAndSign(t *testing.T) {
 		{name: "stdout digest", output: "printf 'Digest: " + digest + "\\n'"},
 		{name: "missing digest", output: "echo 'Pushed: chart' >&2", fail: true},
 		{name: "invalid digest", output: "echo 'Digest: sha256:invalid' >&2", fail: true},
-		{name: "failed push with digest", output: "echo 'Digest: " + digest + "' >&2; exit 7", fail: true},
+		{name: "failed push with digest", output: "echo 'Digest: " + digest + "' >&2; echo 'registry push denied' >&2; exit 7", fail: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -95,6 +95,17 @@ func TestGantryChartPushAndSign(t *testing.T) {
 			output, err := cmd.CombinedOutput()
 			if (err != nil) != tc.fail {
 				t.Fatalf("push and sign error = %v, output:\n%s", err, output)
+			}
+
+			if tc.name == "failed push with digest" {
+				if !strings.Contains(string(output), "registry push denied") {
+					t.Fatalf("push failure diagnostic was lost: %s", output)
+				}
+
+				exit, ok := err.(*exec.ExitError)
+				if !ok || exit.ExitCode() != 7 {
+					t.Fatalf("push failure exit code was not preserved: %v", err)
+				}
 			}
 
 			calls, err := os.ReadFile(log)
