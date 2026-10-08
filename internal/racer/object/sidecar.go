@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -114,6 +115,12 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 }
 
 func (s *sidecar) stream(w http.ResponseWriter, r *http.Request, request racersdk.Request, read sidecarRead) sidecarFailure {
+	// sidecarRange bounds both values by the int64 object size; keep the
+	// conversion explicit so an invariant break cannot wrap negative.
+	if read.offset > math.MaxInt64 || read.length > math.MaxInt64 {
+		return http.StatusInternalServerError
+	}
+
 	v, err := s.client.Get(r.Context(), request, racersdk.ReadOptions{
 		ETag: read.metadata.ETag, Offset: int64(read.offset), Length: int64(read.length),
 	})
