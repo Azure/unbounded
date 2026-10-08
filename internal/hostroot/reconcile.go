@@ -23,6 +23,11 @@ type MoveOptions struct {
 	// Files are the agent's files, relative to the root, that a move copies
 	// from LegacyPath and then removes there.
 	Files []string
+	// Dirs are directories, relative to the root, that hold only the agent's
+	// files. A move removes them under LegacyPath once Files are gone there,
+	// unless something else is left in them. Shared directories, such as bin,
+	// do not belong here.
+	Dirs []string
 	// Subdirs are created under the root after the move, as a fresh
 	// installation has them.
 	Subdirs []string
@@ -82,7 +87,7 @@ func reconcileMove(
 	case StateMoving:
 		log.Info("finishing the move of the agent's files to the host root", "path", root)
 
-		return completeMove(ctx, root, legacy, opts)
+		return completeMove(ctx, log, root, legacy, opts)
 	case StateLinked:
 	case StateAbsent, StateInstalled, StateOther:
 		return false, nil
@@ -114,10 +119,10 @@ func reconcileMove(
 		return false, err
 	}
 
-	return completeMove(ctx, root, legacy, opts)
+	return completeMove(ctx, log, root, legacy, opts)
 }
 
-func completeMove(ctx context.Context, root, legacy string, opts MoveOptions) (bool, error) {
+func completeMove(ctx context.Context, log *slog.Logger, root, legacy string, opts MoveOptions) (bool, error) {
 	// The units first, so nothing names the legacy files when they go.
 	if err := opts.RewriteUnits(ctx); err != nil {
 		return false, err
@@ -125,6 +130,19 @@ func completeMove(ctx context.Context, root, legacy string, opts MoveOptions) (b
 
 	for _, rel := range opts.Files {
 		if err := removeOwned(filepath.Join(legacy, rel)); err != nil {
+			return false, err
+		}
+	}
+
+	// Deepest first, so a directory nested in another is gone before its
+	// parent is checked.
+	dirs := slices.Clone(opts.Dirs)
+	slices.SortStableFunc(dirs, func(a, b string) int {
+		return strings.Count(filepath.Clean(b), string(filepath.Separator)) - strings.Count(filepath.Clean(a), string(filepath.Separator))
+	})
+
+	for _, rel := range dirs {
+		if err := removeEmptyDir(log, filepath.Join(legacy, rel)); err != nil {
 			return false, err
 		}
 	}
@@ -158,6 +176,37 @@ func completeMove(ctx context.Context, root, legacy string, opts MoveOptions) (b
 // not there fails with EROFS rather than ENOENT.
 func removeOwned(path string) error {
 	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	return removeIfExists(path)
+}
+
+// removeEmptyDir removes one of the agent's directories when it is there and
+// empty. Anything left in it is not the agent's, so the directory stays. Nor is
+// anything other than a directory at the path: a link there is an operator's.
+func removeEmptyDir(log *slog.Logger, path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", path, err)
+	}
+
+	if !info.IsDir() {
+		return nil
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	if len(entries) > 0 {
+		log.Info("keeping a directory under the legacy root that holds files the agent did not install", "path", path)
+
 		return nil
 	}
 

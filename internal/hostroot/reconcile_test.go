@@ -196,6 +196,48 @@ func TestReconcileMoveKeepsTheLegacyFilesUntilTheUnitsAreRewritten(t *testing.T)
 	assertMoved(t, l, opts)
 }
 
+// TestReconcileMoveRemovesTheAgentsDirectories checks the directories that hold
+// only the agent's files go with them, and only once the files are gone.
+func TestReconcileMoveRemovesTheAgentsDirectories(t *testing.T) {
+	t.Parallel()
+
+	l := legacyHost(t)
+	run := &moveRun{rewriteErr: errors.New("systemd is busy")}
+	opts := moveOptions(t, l, run)
+	recordBlue(t, l, opts)
+
+	// The parent is listed before the directory nested in it.
+	opts.Dirs = []string{"lib/agent", "lib/agent/nested", "libexec", "lib/kept", "lib/linked", "lib/missing"}
+
+	require.NoError(t, os.MkdirAll(filepath.Join(l.legacy, "lib/agent/nested"), 0o755))
+	touch(t, filepath.Join(l.legacy, "lib/kept/operator.conf"))
+
+	elsewhere := t.TempDir()
+	require.NoError(t, os.Symlink(elsewhere, filepath.Join(l.legacy, "lib/linked")))
+
+	_, err := reconcile(t, l, opts)
+	require.ErrorContains(t, err, "systemd is busy")
+	assert.DirExists(t, filepath.Join(l.legacy, "libexec"), "the directories stay while the files in them do")
+
+	run.rewriteErr = nil
+	restarted, err := reconcile(t, l, opts)
+	require.NoError(t, err)
+	assert.True(t, restarted)
+	assertMoved(t, l, opts)
+
+	for _, rel := range []string{"lib/agent", "libexec"} {
+		assert.NoDirExists(t, filepath.Join(l.legacy, rel))
+	}
+
+	assert.FileExists(t, filepath.Join(l.legacy, "lib/kept/operator.conf"), "a directory with other files in it stays")
+
+	info, err := os.Lstat(filepath.Join(l.legacy, "lib/linked"))
+	require.NoError(t, err)
+	assert.NotZero(t, info.Mode()&os.ModeSymlink, "a link is not the agent's directory")
+	assert.DirExists(t, elsewhere)
+	assert.DirExists(t, filepath.Join(l.legacy, "bin"), "a directory that is not listed stays")
+}
+
 // TestReconcileMoveResumes interrupts the move, runs what a restarted daemon
 // runs, Migrate and then ReconcileMove, and checks the move completes.
 func TestReconcileMoveResumes(t *testing.T) {

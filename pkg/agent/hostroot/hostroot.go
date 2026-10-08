@@ -82,7 +82,7 @@ func Prepare(ctx context.Context, log *slog.Logger, subdirs ...string) error {
 }
 
 // MoveOptions describes what ReconcileMove moves and how the agent follows it:
-// the agent's files and subdirectories under the root, where binaries that know
+// the agent's files and directories under the root, where binaries that know
 // the host root are recorded, the AgentUpgrade signal and blue-green links that
 // decide when the move is safe, and how to rewrite the units and restart the
 // daemon.
