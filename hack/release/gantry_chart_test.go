@@ -13,7 +13,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestGantryChartPushAndSign(t *testing.T) {
+func releaseWorkflowStep(t *testing.T, job, name string) string {
+	t.Helper()
+
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not on PATH")
 	}
@@ -37,15 +39,21 @@ func TestGantryChartPushAndSign(t *testing.T) {
 
 	var script string
 
-	for _, step := range workflow.Jobs["gantry-chart"].Steps {
-		if step.Name == "Push and sign Gantry chart" {
+	for _, step := range workflow.Jobs[job].Steps {
+		if step.Name == name {
 			script = step.Run
 		}
 	}
 
 	if script == "" {
-		t.Fatal("chart push and sign step missing")
+		t.Fatalf("step %q missing in job %q", name, job)
 	}
+
+	return script
+}
+
+func TestGantryChartPushAndSign(t *testing.T) {
+	script := releaseWorkflowStep(t, "gantry-chart", "Push and sign Gantry chart")
 
 	digest := "sha256:" + strings.Repeat("a", 64)
 	for _, tc := range []struct {

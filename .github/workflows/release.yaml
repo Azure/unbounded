@@ -1159,10 +1159,11 @@ jobs:
         run: |
           export VERSION="${{ needs.version.outputs.tag }}"
           export REPO="${{ github.repository }}"
-          export SHA_LINUX_AMD64=$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')
-          export SHA_LINUX_ARM64=$(sha256sum dist/kubectl-unbounded-linux-arm64.tar.gz | awk '{print $1}')
-          export SHA_DARWIN_AMD64=$(sha256sum dist/kubectl-unbounded-darwin-amd64.tar.gz | awk '{print $1}')
-          export SHA_DARWIN_ARM64=$(sha256sum dist/kubectl-unbounded-darwin-arm64.tar.gz | awk '{print $1}')
+          SHA_LINUX_AMD64="$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')"
+          SHA_LINUX_ARM64="$(sha256sum dist/kubectl-unbounded-linux-arm64.tar.gz | awk '{print $1}')"
+          SHA_DARWIN_AMD64="$(sha256sum dist/kubectl-unbounded-darwin-amd64.tar.gz | awk '{print $1}')"
+          SHA_DARWIN_ARM64="$(sha256sum dist/kubectl-unbounded-darwin-arm64.tar.gz | awk '{print $1}')"
+          export SHA_LINUX_AMD64 SHA_LINUX_ARM64 SHA_DARWIN_AMD64 SHA_DARWIN_ARM64
           envsubst < hack/krew-manifest.yaml > dist/unbounded.yaml
 
       - name: Generate and sign release BOM
