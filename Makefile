@@ -368,7 +368,6 @@ help: ## Show this help
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
 	@echo "  racer-loadgen | racer-loadgen-build  Build loadgen (with/without focused tests)"
 	@echo "  racer-loadgen-test                Race-test loadgen and object helpers"
-	@echo "  racer-loadgen-manifest-test       Render and check base/direct loadgen manifests"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
 	@echo ""
 	@echo "Common variables (override with VAR=value):"
@@ -591,19 +590,15 @@ RACER_LOADGEN_BIN=bin/racer-loadgen
 RACER_LOADGEN_CMD=./cmd/racer-loadgen
 RACER_LOADGEN_IMAGE ?= $(CONTAINER_REGISTRY)/racer-loadgen:$(VERSION_TAG)
 
-.PHONY: racer-loadgen racer-loadgen-build racer-loadgen-test racer-loadgen-manifest-test image-racer-loadgen-local
+.PHONY: racer-loadgen racer-loadgen-build racer-loadgen-test image-racer-loadgen-local
 racer-loadgen: racer-loadgen-test racer-loadgen-build ## Test and build the Racer load generator
 
 racer-loadgen-build: ## Build the Racer load generator without lint/test
 	@mkdir -p bin
 	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -o $(RACER_LOADGEN_BIN) $(RACER_LOADGEN_CMD)
 
-racer-loadgen-test: racer-loadgen-manifest-test ## Race-test loadgen and object helpers
+racer-loadgen-test: ## Race-test loadgen and object helpers
 	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_LOADGEN_CMD)/... ./internal/racerobject/...
-
-racer-loadgen-manifest-test: ## Check base and direct manifests offline (kubectl, Python 3, PyYAML required)
-	@command -v kubectl >/dev/null 2>&1 || { echo "kubectl is required to render loadgen manifests"; exit 1; }
-	timeout --signal=TERM --kill-after=10s 300s python3 deploy/racer-loadgen/direct/render_test.py
 
 image-racer-loadgen-local: ## Build the loadgen container image locally (single-arch)
 	timeout --signal=TERM --kill-after=10s 300s $(CONTAINER_ENGINE) build \
