@@ -390,6 +390,10 @@ pub mod identity {
         }
 
         /// Canonicalize unordered records, reject replay, and atomically install keys.
+        ///
+        /// The caller must authenticate the bundle's source and authorize it to
+        /// replace trust roots and install cache keys. Validation does not establish
+        /// that authority or require new roots to chain to existing roots.
         pub fn install(
             &self,
             mut bundle: racer_control_wire::KeyringBundle,
@@ -1000,6 +1004,10 @@ pub mod identity {
         }
 
         /// Validate a wire transfer and atomically publish a complete key epoch.
+        ///
+        /// The caller must authenticate the bundle's source and authorize it to
+        /// replace trust roots and install cache keys. Validation does not establish
+        /// that authority or require new roots to chain to existing roots.
         pub fn install(
             &self,
             bundle: racer_control_wire::KeyringBundle,

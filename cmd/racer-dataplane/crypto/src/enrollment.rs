@@ -202,6 +202,10 @@ impl<H: Host> Enrollment<H> {
 
     /// Validate all roots before atomically replacing the enrollment trust snapshot.
     /// Return Busy while acceptance or recovery holds trust across filesystem awaits.
+    ///
+    /// The caller must authenticate the source and authorize trust-root replacement.
+    /// Parsing and validity checks do not establish that authority or require new
+    /// roots to chain to existing roots.
     pub fn set_peer_trust_roots(&self, roots: Vec<Vec<u8>>) -> Result<(), Error> {
         let _guard = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
         identity::root_store(&roots).map_err(|_| Error::Unauthorized)?;
@@ -408,6 +412,11 @@ where
 
     /// Validate, durably publish identity, then durably remove the pending request.
     /// Publication errors are converted by the caller without discarding their phase.
+    ///
+    /// The caller must authenticate and authorize the source of the whole response.
+    /// Structural, certificate, correlation, and key-pair checks do not authenticate
+    /// the whole response: the certificate does not cover `schema_version`,
+    /// `enrollment`, or `block_devices`. The selector is copied, not authorized here.
     pub fn accept_response<'a>(
         &'a self,
         response: EnrollmentResponse,
