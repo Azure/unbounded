@@ -432,6 +432,8 @@ func NewHandler(client Client, auth authenticationChallenger, logger *slog.Logge
 // pinned resume; offsets for other kinds are ignored. The mirror owns parsing
 // the caller's Range header.
 func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref ifaces.OriginRef) {
+	writeRacerDownloadHeaders(w)
+
 	// Fresh opaque correlation, including for aborts after headers are committed.
 	id := rand.Text()
 	w.Header().Set("Gantry-Racer-Request-ID", id)
@@ -654,6 +656,14 @@ func writeRacerError(w http.ResponseWriter, err error) {
 
 // Downstream HTTP writes.
 
+// Registry objects are downloads, not browser documents. Attachment also covers
+// explicit HTML, SVG, and XML types, which nosniff alone does not make safe.
+// Preserve the original media type and bytes for OCI clients and digest checks.
+func writeRacerDownloadHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Disposition", "attachment")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
 // HTTPObservation reports actual downstream bytes, final HTTP status, and
 // handler duration. Aborted distinguishes incomplete responses after headers.
 type HTTPObservation struct {
@@ -790,6 +800,12 @@ func (w *racerResponseWriter) WriteHeader(status int) {
 		return
 	}
 
+	writeRacerDownloadHeaders(w.ResponseWriter)
+
+	if w.Header().Get("Content-Type") == "" {
+		w.ResponseWriter.Header().Set("Content-Type", "application/octet-stream")
+	}
+
 	if err := w.deadline(); err != nil {
 		panic(http.ErrAbortHandler)
 	}
@@ -807,6 +823,12 @@ func (w *racerResponseWriter) WriteHeader(status int) {
 
 func (w *racerResponseWriter) Write(p []byte) (int, error) {
 	if w.status == 0 {
+		// Untyped bodies must not be sniffed as HTML. Explicit header commits
+		// apply the same default in WriteHeader, including Flush and ReadFrom.
+		if w.Header().Get("Content-Type") == "" {
+			w.ResponseWriter.Header().Set("Content-Type", "application/octet-stream")
+		}
+
 		w.WriteHeader(http.StatusOK)
 	}
 
