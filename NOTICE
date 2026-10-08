@@ -875,6 +875,14 @@ notices:
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+  - dependency: subtle
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence. All rights reserved.
+      - Copyright (c) 2016-2024 Isis Agora Lovecruft. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://docs.rs/crate/subtle/2.6.1/source/LICENSE
   - dependency: x509-parser
     ecosystem: cargo
     copyright:

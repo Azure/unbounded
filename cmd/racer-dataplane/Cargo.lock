@@ -657,6 +657,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "uring-runtime",
  "x509-parser",
  "zeroize",

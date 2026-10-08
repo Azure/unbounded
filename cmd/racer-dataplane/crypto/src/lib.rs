@@ -30,6 +30,7 @@ use ed25519_dalek::{
     pkcs8::{DecodePrivateKey, EncodePrivateKey},
 };
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 /// Opaque failure of a cryptographic operation or input validation.
@@ -173,13 +174,13 @@ pub fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// Compare equal-length slices without data-dependent early exits.
+/// Compare equal-length slices in constant time using `subtle::ConstantTimeEq`.
 /// Lengths are not secret: unequal lengths return immediately.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+    bool::from(a.ct_eq(b))
 }
 
 /// CRC-64/XZ checksum. Detects accidental corruption, not malicious changes.

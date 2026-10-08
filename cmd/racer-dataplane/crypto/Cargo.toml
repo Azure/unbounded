@@ -26,6 +26,7 @@ cipher = { version = "0.5", features = ["zeroize"] }
 poly1305 = { version = "0.9", features = ["zeroize"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 sha2 = "0.10"
+subtle = "2.6"
 zeroize = "1"
 crc64fast = "1.1.0"
 
