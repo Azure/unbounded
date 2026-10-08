@@ -14,7 +14,7 @@ import (
 // Recover may finish staged initialization, but the operator's Plan is read-only.
 type planningWriter struct{}
 
-var errPlanningWrite = errors.New("racer initialization requires controller recovery, not operator planning")
+var errPlanningWrite = errors.New("racer initialization requires execution, not operator planning")
 
 func (planningWriter) Create(context.Context, client.Object, ...client.CreateOption) error {
 	return errPlanningWrite

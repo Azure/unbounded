@@ -67,35 +67,40 @@ func TestEnvtestControllerAdmission(t *testing.T) {
 			secret := func(name string) *corev1.Secret {
 				return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Type: corev1.SecretTypeOpaque}
 			}
+			credentials := secret("racer-credentials")
+			require.NoError(t, admin.Create(ctx, credentials))
 			// Both verdicts must work: fail-closed CEL errors cannot count as success.
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
-				require.NoError(c, controller.Create(ctx, cm("racer-installation"), client.DryRunAll))
-				require.NoError(c, controller.Create(ctx, secret("racer-credentials"), client.DryRunAll))
+				require.NoError(c, controller.Update(ctx, credentials.DeepCopy(), client.DryRunAll))
 				require.NoError(c, patch(`{"metadata":{"annotations":{"racer.unbounded-cloud.io/enrolled-shares":"1"}}}`))
-				require.ErrorContains(c, controller.Create(ctx, cm("other"), client.DryRunAll), "racer-runtime-write-restriction")
+
+				invalid := credentials.DeepCopy()
+				invalid.Annotations = map[string]string{corev1.ServiceAccountNameKey: "racer-controller"}
+				require.ErrorContains(c, controller.Update(ctx, invalid, client.DryRunAll), "racer-runtime-write-restriction")
 				require.ErrorContains(c, patch(`{"spec":{"unschedulable":true}}`), "racer-node-write-restriction")
 			}, 15*time.Second, 100*time.Millisecond)
 
-			for _, name := range []string{"racer-installation", "racer-version"} {
-				require.NoError(t, controller.Create(ctx, cm(name), client.DryRunAll))
+			for _, name := range []string{"racer-installation", "racer-version", "other"} {
+				require.True(t, apierrors.IsForbidden(controller.Create(ctx, cm(name), client.DryRunAll)))
 			}
 
 			for _, name := range []string{"other", "racer-controller-tls", "racer-config"} {
 				err := controller.Create(ctx, secret(name), client.DryRunAll)
 				require.True(t, apierrors.IsForbidden(err))
-				require.ErrorContains(t, err, "racer-runtime-write-restriction")
 			}
 
 			for _, key := range []string{corev1.ServiceAccountNameKey, corev1.ServiceAccountUIDKey} {
-				obj := secret("racer-credentials")
+				obj := credentials.DeepCopy()
 				obj.Annotations = map[string]string{key: ""}
-				require.ErrorContains(t, controller.Create(ctx, obj, client.DryRunAll), "racer-runtime-write-restriction")
+				require.ErrorContains(t, controller.Update(ctx, obj, client.DryRunAll), "racer-runtime-write-restriction")
 			}
 
-			obj := secret("racer-credentials")
+			obj := credentials.DeepCopy()
 			obj.Type = corev1.SecretTypeServiceAccountToken
 			obj.Annotations = map[string]string{corev1.ServiceAccountNameKey: "racer-controller"}
-			require.ErrorContains(t, controller.Create(ctx, obj, client.DryRunAll), "racer-runtime-write-restriction")
+			err = controller.Update(ctx, obj, client.DryRunAll)
+			require.True(t, apierrors.IsInvalid(err))
+			require.ErrorContains(t, err, "field is immutable")
 
 			for _, body := range []string{
 				`{"metadata":{"labels":{"other":"value"}}}`,

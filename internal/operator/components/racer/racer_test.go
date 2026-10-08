@@ -96,7 +96,7 @@ func persist(t *testing.T, env *component.Env, plan *component.Plan) {
 func initialize(t *testing.T, env *component.Env) racercore.Config {
 	t.Helper()
 
-	for range 6 {
+	for range 9 {
 		plan := planPass(t, env)
 		require.NotContains(t, plan.Summary(), "DaemonSet/")
 		persist(t, env, plan)

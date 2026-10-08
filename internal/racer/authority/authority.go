@@ -94,6 +94,33 @@ func (a *Authority) Recover(ctx context.Context, writer client.Writer) error {
 	return nil
 }
 
+// ValidatePersistedCredentials checks committed identity, key material, and
+// rotation consistency without writes or installing trust. It does not require
+// current signing readiness: the controller may need to recover expired issuers
+// or apply a longer certificate lifetime after a configuration change.
+func (a *Authority) ValidatePersistedCredentials(ctx context.Context) error {
+	if err := a.config.Validate(); err != nil {
+		return err
+	}
+
+	if err := a.gate.Acquire(ctx); err != nil {
+		return err
+	}
+	defer a.gate.Release()
+
+	version, _, err := readVersion(ctx, a.reader, a.config)
+	if err != nil {
+		return err
+	}
+
+	_, err = readBoundCredentials(ctx, a.reader, a.config, version.Annotations[credentialClaim], version)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	return err
+}
+
 // PublicationHandle is a response-only view. It cannot be installed or advanced.
 type PublicationHandle struct {
 	image *committedPublication
