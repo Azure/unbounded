@@ -420,6 +420,7 @@ func TestRunInvalidOptions(t *testing.T) {
 		"--concurrency=-1", "--layer-concurrency=0", "--pull-timeout=0", "--retry-delay=0",
 		"--interval=-1s", "--target=ftp://example.com", "--target=http://user:pass@example.com",
 		"--target=http://example.com?query=value", "--target=http://example.com#fragment",
+		"--target=http://example.com:0", "--target=http://example.com:65536",
 	} {
 		t.Run(arg, func(t *testing.T) {
 			opts, err := parseOptions([]string{

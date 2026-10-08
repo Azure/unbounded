@@ -590,6 +590,44 @@ func TestPullRunZeroConcurrency(t *testing.T) {
 	require.Zero(t, testutil.ToFloat64(metrics.pulls.WithLabelValues("canceled")))
 }
 
+func TestPullTargetPort(t *testing.T) {
+	img := pullTestImage(t)
+	for _, tc := range []struct {
+		target  string
+		wantErr bool
+	}{
+		{target: "http://host"},
+		{target: "https://host"},
+		{target: "http://host:1"},
+		{target: "https://host:65535"},
+		{target: "http://host:00080"},
+		{target: "http://[::1]"},
+		{target: "http://[::1]:1"},
+		{target: "https://[::1]:65535"},
+		{target: "http://host:0", wantErr: true},
+		{target: "http://host:65536", wantErr: true},
+		{target: "https://host:65536/base/", wantErr: true},
+		{target: "http://host:999999999999999999999999", wantErr: true},
+		{target: "http://[::1]:0", wantErr: true},
+		{target: "https://[::1]:65536", wantErr: true},
+	} {
+		t.Run(tc.target, func(t *testing.T) {
+			p, err := newPuller(img, pullTestOptions(tc.target), pullTestMetrics())
+			if p != nil {
+				t.Cleanup(p.close)
+			}
+
+			if tc.wantErr {
+				require.ErrorContains(t, err, "invalid pull target port")
+				require.Nil(t, p)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.target, p.target.String())
+			}
+		})
+	}
+}
+
 func TestPullOptions(t *testing.T) {
 	img := pullTestImage(t)
 	for _, target := range []string{

@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -129,6 +130,13 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 	if (target.Scheme != "http" && target.Scheme != "https") || target.Hostname() == "" || target.User != nil ||
 		target.RawQuery != "" || target.ForceQuery || strings.Contains(opts.Target, "#") || target.Opaque != "" {
 		return nil, errors.New("pull target must be an http or https URL with a host and no credentials, query, or fragment")
+	}
+
+	if port := target.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, errors.New("invalid pull target port")
+		}
 	}
 
 	base, ok := http.DefaultTransport.(*http.Transport)
