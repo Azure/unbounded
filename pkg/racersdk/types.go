@@ -171,7 +171,8 @@ var (
 	// failed, for example because a downstream client disconnected, a disk
 	// is full, or a write timed out. Racer and the origin are not at fault,
 	// and retrying the read does not help unless the destination recovers.
-	// The error also wraps the writer's own error.
+	// Check ErrDestination before other sentinels: the error also wraps the
+	// writer's own error, which may match SDK sentinels from a nested Racer read.
 	ErrDestination = errors.New("racersdk: destination failed")
 )
 
