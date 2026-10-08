@@ -5,6 +5,9 @@ GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
+ENVTEST_K8S_VERSION ?= 1.37.0
+SETUP_ENVTEST_VERSION ?= v0.25.2-0.20260923145615-d837464d41be
+SETUP_ENVTEST = $(CURDIR)/bin/setup-envtest-$(SETUP_ENVTEST_VERSION)
 GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./deploy/... ./e2e/... ./hack/... ./internal/... ./pkg/...
 # e2e packages hold nothing but files behind the e2e build tag, so `go list`
 # needs the tag to see them at all. Without it they are silently skipped by
@@ -356,6 +359,14 @@ help: ## Show this help
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
 	@echo ""
+	@echo "Racer Controller:"
+	@echo "  racer-controller                 Test and build the Go controller"
+	@echo "  racer-controller-build           Build the Go controller without lint/test"
+	@echo "  racer-test                       Lint and race-test the controller and deployment contracts"
+	@echo "  racer-envtest                    Run controller API-server tests with KUBEBUILDER_ASSETS"
+	@echo "  racer-envtest-ci                 Provision pinned assets and run controller API-server tests"
+	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
+	@echo ""
 	@echo "Common variables (override with VAR=value):"
 	@echo "  VERSION=$(VERSION)"
 	@echo "  GIT_COMMIT=$(GIT_COMMIT)"
@@ -540,6 +551,37 @@ e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
+
+.PHONY: racer-controller racer-controller-build racer-test racer-server-test racer-envtest racer-envtest-ci racer-generate
+racer-controller: racer-server-test racer-controller-build ## Test and build the Racer controller
+
+racer-controller-build: ## Build the Racer controller without lint/test
+	@mkdir -p bin
+	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controller ./cmd/racer-controller
+
+racer-server-test: ## Lint and race-test the Racer server
+	timeout --signal=TERM --kill-after=10s 300s $(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
+
+racer-test: racer-server-test ## Check the Racer controller
+
+$(SETUP_ENVTEST):
+	@mkdir -p bin tmp/envtest-tools
+	TMPDIR="$(CURDIR)/tmp/envtest-tools" GOBIN="$(CURDIR)/bin" timeout --signal=TERM --kill-after=10s 300s $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
+	mv bin/setup-envtest "$(SETUP_ENVTEST)"
+
+racer-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets and require Racer envtest
+	@mkdir -p tmp/racer-envtest
+	@assets=$$(TMPDIR="$(CURDIR)/tmp/racer-envtest" timeout --signal=TERM --kill-after=10s 300s "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
+		$(MAKE) racer-envtest KUBEBUILDER_ASSETS="$$assets"
+
+racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
+	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
+	@mkdir -p tmp/racer-envtest
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/racer ./internal/racer/authority -run '^TestEnvtest' -count=1 -v -timeout=5m
+
+racer-generate: ## Generate Racer deepcopy and CRD artifacts
+	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
 
 build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...
