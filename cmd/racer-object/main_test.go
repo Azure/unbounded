@@ -466,6 +466,32 @@ func TestSidecarLoopbackAndShutdown(t *testing.T) {
 	}
 }
 
+func TestSidecarTimeoutResponse(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+
+	address, cancel, done := startTestSidecar(t, handler, 100*time.Millisecond)
+	defer func() {
+		cancel()
+		waitSidecar(t, done)
+	}()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	defer client.CloseIdleConnections()
+
+	response, err := client.Get(address + "/bucket/key")
+	if err != nil {
+		t.Fatalf("timeout response failed: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
 func TestSidecarRequestCancellation(t *testing.T) {
 	for _, shutdown := range []bool{false, true} {
 		t.Run(map[bool]string{false: "timeout", true: "shutdown"}[shutdown], func(t *testing.T) {

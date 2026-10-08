@@ -35,6 +35,10 @@ import (
 // maxOriginRequestTimeout matches the Racer SDK's fixed origin operation deadline.
 const maxOriginRequestTimeout = time.Minute
 
+// The socket write deadline starts before the handler deadline. Allow time to
+// send a timeout response after the handler's context expires.
+const sidecarWriteGrace = 5 * time.Second
+
 type bucketsFlag []string
 
 func (b *bucketsFlag) String() string { return strings.Join(*b, ",") }
@@ -406,7 +410,7 @@ func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handl
 
 	server := &http.Server{
 		ReadHeaderTimeout: min(5*time.Second, requestTimeout),
-		ReadTimeout:       requestTimeout, WriteTimeout: requestTimeout, IdleTimeout: 30 * time.Second,
+		ReadTimeout:       requestTimeout, WriteTimeout: requestTimeout + sidecarWriteGrace, IdleTimeout: 30 * time.Second,
 		MaxHeaderBytes: 32 << 10, ErrorLog: log.New(io.Discard, "", 0),
 		BaseContext: func(net.Listener) context.Context { return lifetime },
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
