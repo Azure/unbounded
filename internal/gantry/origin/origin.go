@@ -477,11 +477,12 @@ func newRegistryHTTPClient() *http.Client {
 func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
 	u, err := url.Parse(ur.Endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("parse endpoint: %w", err)
+		// Parse errors can include credentials in both the URL and the cause.
+		return nil, errors.New("parse endpoint: invalid URL")
 	}
 
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("endpoint %q: scheme must be http or https", ur.Endpoint)
+		return nil, errors.New("endpoint: scheme must be http or https")
 	}
 
 	r := &registry{

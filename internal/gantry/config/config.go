@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -1046,7 +1047,7 @@ func (c *Config) Validate() error {
 		if ur.Endpoint == "" {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: required", i))
 		} else if !strings.HasPrefix(ur.Endpoint, "http://") && !strings.HasPrefix(ur.Endpoint, "https://") {
-			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint %q: must start with http:// or https://", i, ur.Endpoint))
+			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: must start with http:// or https://", i))
 		}
 	}
 
@@ -1282,13 +1283,26 @@ func (c *Config) ResolveUpstream(ns string) (UpstreamRegistry, bool) {
 	return UpstreamRegistry{}, false
 }
 
-// Redacted returns a copy of c suitable for logging. Currently, credentials
-// are referenced only by path, so nothing requires actual redaction; the
-// method exists so future secret-bearing fields have one obvious place to
-// be sanitized.
+// Redacted returns a copy of c suitable for logging, without endpoint userinfo.
+// Invalid endpoints are hidden because their credentials cannot be safely parsed.
 func (c *Config) Redacted() *Config {
 	cp := *c
+
 	cp.UpstreamRegistries = append([]UpstreamRegistry(nil), c.UpstreamRegistries...)
+	for i := range cp.UpstreamRegistries {
+		endpoint := cp.UpstreamRegistries[i].Endpoint
+		if endpoint == "" {
+			continue
+		}
+
+		u, err := url.Parse(endpoint)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			cp.UpstreamRegistries[i].Endpoint = "[REDACTED]"
+		} else if u.User != nil {
+			u.User = nil
+			cp.UpstreamRegistries[i].Endpoint = u.String()
+		}
+	}
 	// CredentialsPath is a path, not the secret; safe to log as-is.
 	return &cp
 }
