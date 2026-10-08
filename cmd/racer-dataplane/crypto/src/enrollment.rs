@@ -508,7 +508,9 @@ where
                     .await
                     {
                         Ok(bytes)
-                            if decode_pending(&bytes)?.enrollment == identity.enrollment.0 =>
+                            if decode_pending(&bytes).is_ok_and(|pending| {
+                                pending.enrollment == identity.enrollment.0
+                            }) =>
                         {
                             secure::remove(r, &dir, "pending.json", &scope).await?
                         }
@@ -1127,6 +1129,50 @@ mod tests {
         assert_ne!(fresh.enrollment, request.enrollment);
         drive(&files, e.load_identity(&scope)).unwrap().unwrap();
         assert!(sim.metadata(Path::new("/private/pending.json")).is_ok());
+    }
+
+    #[test]
+    fn identity_recovery_preserves_undecodable_and_unrelated_pending() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        let (ca, key) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let path = Path::new("/private/pending.json");
+        let matching = sim.read_file(path).unwrap();
+        let accepted = drive(
+            &files,
+            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+        )
+        .unwrap();
+        let unrelated = e.generate().unwrap();
+        assert_ne!(unrelated.enrollment, accepted.enrollment.0);
+        let unrelated = encode_private(&unrelated, wire::MAX_ENROLLMENT_BYTES).unwrap();
+        for (pending, removed) in [
+            (b"".as_slice(), false),
+            (b"not JSON".as_slice(), false),
+            (b"{\"enrollment\":".as_slice(), false),
+            (b"{}".as_slice(), false),
+            (matching.as_slice(), true),
+            (unrelated.as_slice(), false),
+        ] {
+            sim.write_file(path, pending).unwrap();
+            sim.chmod(path, 0o600).unwrap();
+            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+            assert_eq!(recovered.node(), accepted.node());
+            assert_eq!(recovered.enrollment, accepted.enrollment);
+            assert_eq!(recovered.certificate_chain(), accepted.certificate_chain());
+            if removed {
+                assert!(sim.metadata(path).is_err());
+            } else {
+                assert_eq!(sim.read_file(path).unwrap(), pending);
+            }
+        }
     }
 
     /// Live acceptance and a fresh owner recover the same optional selector.
