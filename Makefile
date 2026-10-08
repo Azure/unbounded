@@ -810,7 +810,7 @@ racer-object-build: ## Build the S3 read adapter without lint/test
 	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-object ./cmd/racer-object
 
 racer-object-test: ## Test the S3 read adapter and deployment examples
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m ./cmd/racer-object/... ./internal/racerobject/... ./deploy/racer-object/...
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m ./cmd/racer-object/... ./internal/racer/object/... ./deploy/racer-object/...
 
 image-racer-object-local: ## Build the S3 read adapter image locally (single-arch)
 	$(CONTAINER_ENGINE) build \

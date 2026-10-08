@@ -27,7 +27,7 @@ import (
 	"github.com/aws/smithy-go/logging"
 	"golang.org/x/sys/unix"
 
-	"github.com/Azure/unbounded/internal/racerobject"
+	"github.com/Azure/unbounded/internal/racer/object"
 	"github.com/Azure/unbounded/internal/version"
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
@@ -51,7 +51,6 @@ type options struct {
 	metadataTTL    time.Duration
 	requestTimeout time.Duration
 	listen         string
-	debugListen    string
 }
 
 func main() {
@@ -98,7 +97,6 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	cache := fs.String("cache", "racer-object", "Racer cache name")
 	fs.StringVar(&o.namespace, "namespace", "", "Required stable upstream identity; use the same value in origin and sidecar")
 	fs.Var(&o.buckets, "bucket", "Allowed bucket (repeatable; omitted allows all buckets)")
-	fs.StringVar(&o.debugListen, "debug-listen", "", "Optional pprof address (e.g. 127.0.0.1:6060); disabled when empty. Trusted diagnostic access only: nonloopback addresses such as :6060 expose unauthenticated profiles")
 
 	showVersion := fs.Bool("version", false, "Print version")
 	if o.mode == "origin" {
@@ -137,12 +135,12 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	closeResource(validationClient)
 
-	if _, err := racerobject.NewRequest(o.namespace, "validation", "validation", ""); err != nil {
+	if _, err := object.NewRequest(o.namespace, "validation", "validation", ""); err != nil {
 		return o, errors.New("--namespace must be a valid stable upstream identity")
 	}
 
 	for _, bucket := range o.buckets {
-		if _, err := racerobject.NewRequest(o.namespace, bucket, "validation", ""); err != nil {
+		if _, err := object.NewRequest(o.namespace, bucket, "validation", ""); err != nil {
 			return o, errors.New("invalid --bucket")
 		}
 	}
@@ -240,13 +238,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return nil
 	}
 
-	return runWithDebug(ctx, o.debugListen, func(ctx context.Context) error {
-		if o.mode == "origin" {
-			return runOrigin(ctx, o)
-		}
+	if o.mode == "origin" {
+		return runOrigin(ctx, o)
+	}
 
-		return runSidecar(ctx, o)
-	})
+	return runSidecar(ctx, o)
 }
 
 func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
@@ -283,7 +279,7 @@ func runOrigin(ctx context.Context, o options) error {
 		}
 	})
 
-	origin, err := racerobject.NewOrigin(client, racerobject.OriginConfig{
+	origin, err := object.NewOrigin(client, object.OriginConfig{
 		Namespace: o.namespace, Buckets: o.buckets, MetadataTTL: o.metadataTTL,
 	})
 	if err != nil {
@@ -366,7 +362,7 @@ func runSidecar(ctx context.Context, o options) error {
 	}
 	defer closeResource(client)
 
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: o.namespace, Buckets: o.buckets})
+	handler, err := object.NewSidecar(client, object.SidecarConfig{Namespace: o.namespace, Buckets: o.buckets})
 	if err != nil {
 		return errors.New("could not configure sidecar")
 	}
