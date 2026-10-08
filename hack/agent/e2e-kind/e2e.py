@@ -5135,14 +5135,12 @@ def _daemon_executable() -> str:
     ).stdout.strip()
 
 
-def validate_host_root_moved() -> None:
-    """Assert a host an older agent installed has been moved to the host root.
+def wait_for_host_root_move() -> None:
+    """Wait for migration completion and a daemon executing from the new root.
 
-    The daemon moves it at the first start after the AgentUpgrade that follows
-    the last older agent out of the slots, then restarts from the host root.
-    The reboot that follows in the suite runs the rewritten units.
+    This checks runtime progress, not labels. The interrupted-migration test
+    exercises the services before its separate label-correctness assertion.
     """
-
     log(f"Waiting for the agent's files to move to {HOST_ROOT}...")
     _wait_until(lambda: "" if (state := host_root_state()) == "dir"
                 else f"{HOST_ROOT} is {state!r}; the host was not moved to the host root", 300)
@@ -5151,11 +5149,15 @@ def validate_host_root_moved() -> None:
     _wait_until(lambda: "" if (executable := _daemon_executable()).startswith(f"{DAEMON_BIN_DIR}/")
                 else f"daemon runs {executable!r}, not a binary under {DAEMON_BIN_DIR}", 180)
 
+
+def validate_host_root_moved() -> None:
+    """Assert migration completed, the daemon uses the new root, and labels match policy."""
+    wait_for_host_root_move()
     validate_host_root()
     log(f"The agent's files moved from {LEGACY_HOST_ROOT} to {HOST_ROOT}")
 
 
-def _host_root_recovery_probe(action: str) -> None:
+def _host_root_recovery_probe(action: str, *, check: bool = True) -> None:
     """Run the guest-side fixture and retain its diagnostics even on failure."""
     script = Path(__file__).with_name("host-root-recovery.sh").read_text()
     command = shlex.join(["sudo", "bash", "-c", script, "--", action, HOST_ROOT,
@@ -5167,7 +5169,10 @@ def _host_root_recovery_probe(action: str) -> None:
     if output.strip():
         log(output.strip())
     if result.returncode != 0:
-        die(f"host root recovery {action} failed (exit {result.returncode}); see host-root-recovery-{action}.log")
+        message = f"host root recovery {action} failed (exit {result.returncode}); see host-root-recovery-{action}.log"
+        if check:
+            die(message)
+        log(f"[WARN] {message}")
 
 
 def validate_host_root_migration_recovery() -> None:
@@ -5193,10 +5198,27 @@ def validate_host_root_migration_recovery() -> None:
         # Never restart with the blocker still installed, including on failure.
         _host_root_recovery_probe("disarm")
 
-    _host_root_recovery_probe("resume")
-    _wait_until(lambda: "" if host_root_state() == "dir" else "resumed migration did not finish", 300)
-    # Check labels first: even if the host policy permits the mislabeled binary
-    # to execute, the missing preparation must not turn into a false pass.
+    try:
+        _host_root_recovery_probe("resume")
+        _host_root_recovery_probe("inspect", check=False)
+        wait_for_host_root_move()
+        _daemon_unit_runs(DAEMON_BIN_DIR)
+        # A running daemon alone does not exercise the nspawn pre/post-start
+        # helper or the OnFailure recovery script. Run both before checking
+        # metadata, without relabeling files or changing the shipped policy.
+        validate_host_reboot()
+        validate_agent_upgrade_rollback()
+        validate_workload()
+    finally:
+        # Keep service failures, process domains and AVCs even when one of the
+        # functional checks aborts. Diagnostic collection is not a new verdict.
+        try:
+            _host_root_recovery_probe("diagnose", check=False)
+        except Exception as exc:
+            log(f"[WARN] Could not collect host root recovery diagnostics: {exc}")
+
+    log("Functional recovery PASSED: daemon start, host reboot/nspawn hooks, workload/DNS, and AgentUpgrade rollback")
+    log("Checking SELinux label correctness separately; a failure here alone is not an execution denial")
     _host_root_recovery_probe("verify")
     validate_host_root_moved()
     log("Interrupted host root migration recovered with SELinux enforcing and no manual relabeling")
@@ -5914,7 +5936,7 @@ SUITES: dict[str, list[str]] = {
     # Keep the ordinary migration suite intact; this one requires SELinux.
     "migration-recovery": ["run-legacy-agent", "wait-for-node", "validate-agent-upgrade-operation",
                            "validate-host-root-linked", "validate-host-root-migration-recovery",
-                           "validate-host-reboot", "validate-host-root", "reset-agent"],
+                           "validate-host-root", "reset-agent"],
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
                            "validate-node-repave-upgrade", "validate-bootstrap-repair"],
 }

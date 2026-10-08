@@ -21,11 +21,19 @@ FIXTURE = Path(__file__).with_name("host-root-recovery.sh")
 
 
 class TestMigrationRecoverySequence(unittest.TestCase):
-    def run_recovery(self, events, fail_at="", checkpoint_reached=True):
-        def probe(action):
-            events.append(action)
-            if action == fail_at:
-                raise RuntimeError(f"failed {action}")
+    def run_recovery(self, events, fail_at="", checkpoint_reached=True, diagnostic_error=False):
+        def step(name):
+            events.append(name)
+            if name == fail_at:
+                raise RuntimeError(f"failed {name}")
+
+        def probe(action, *, check=True):
+            if check:
+                step(action)
+            else:
+                events.append(action)
+                if action == "diagnose" and diagnostic_error:
+                    raise OSError("cannot save diagnostics")
 
         def wait(check, _timeout):
             problem = check()
@@ -37,7 +45,11 @@ class TestMigrationRecoverySequence(unittest.TestCase):
                 patch.object(e2e, "validate_agent_upgrade_operation", side_effect=lambda: events.append("upgrade")), \
                 patch.object(e2e, "bounded_ssh", return_value=subprocess.CompletedProcess([], 0 if checkpoint_reached else 255, "", "")), \
                 patch.object(e2e, "_wait_until", side_effect=wait), \
-                patch.object(e2e, "host_root_state", return_value="dir"), \
+                patch.object(e2e, "wait_for_host_root_move", side_effect=lambda: step("running")), \
+                patch.object(e2e, "_daemon_unit_runs", side_effect=lambda _path: step("unit")), \
+                patch.object(e2e, "validate_host_reboot", side_effect=lambda: step("reboot")), \
+                patch.object(e2e, "validate_agent_upgrade_rollback", side_effect=lambda: step("rollback")), \
+                patch.object(e2e, "validate_workload", side_effect=lambda: step("workload")), \
                 patch.object(e2e, "validate_host_root_moved", side_effect=lambda: events.append("moved")):
             e2e.validate_host_root_migration_recovery()
 
@@ -45,7 +57,8 @@ class TestMigrationRecoverySequence(unittest.TestCase):
         events = []
         self.run_recovery(events)
         self.assertEqual(events, ["linked", "arm", "upgrade", "checkpoint", "interrupt",
-                                  "disarm", "resume", "verify", "moved"])
+                                  "disarm", "resume", "inspect", "running", "unit", "reboot",
+                                  "rollback", "workload", "diagnose", "verify", "moved"])
 
     def test_failure_does_not_resume_or_claim_recovery(self):
         for action in ("arm", "checkpoint", "interrupt", "disarm", "resume", "verify"):
@@ -59,6 +72,23 @@ class TestMigrationRecoverySequence(unittest.TestCase):
                     self.assertNotIn("resume", events)
                 if action == "arm":
                     self.assertNotIn("upgrade", events)
+
+    def test_functional_failures_are_reported_before_label_validation(self):
+        for action in ("running", "unit", "reboot", "rollback", "workload"):
+            with self.subTest(action=action):
+                events = []
+                with self.assertRaisesRegex(RuntimeError, f"failed {action}"):
+                    self.run_recovery(events, fail_at=action)
+                self.assertEqual(events[-1], "diagnose", "capture runtime evidence even when the operation fails")
+                self.assertNotIn("verify", events, "a label failure must not obscure the functional failure")
+                self.assertNotIn("moved", events)
+
+    def test_diagnostic_collection_error_does_not_replace_runtime_failure(self):
+        events = []
+        with self.assertRaisesRegex(RuntimeError, "failed reboot"):
+            self.run_recovery(events, fail_at="reboot", diagnostic_error=True)
+        self.assertEqual(events[-1], "diagnose")
+        self.assertNotIn("verify", events)
 
     def test_missing_checkpoint_does_not_pass_as_an_interruption(self):
         events = []
@@ -74,13 +104,25 @@ class TestMigrationRecoverySequence(unittest.TestCase):
                 e2e._host_root_recovery_probe("verify")
             self.assertEqual((Path(tmp) / "host-root-recovery-verify.log").read_text(), "wrong labels\ndenied\n")
 
+    def test_diagnostic_ssh_failure_is_nonfatal_and_keeps_output(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(e2e, "LOGS_DIR", Path(tmp)), \
+                patch.object(e2e, "bounded_ssh", return_value=subprocess.CompletedProcess([], 255, "", "SSH timed out\n")):
+            e2e._host_root_recovery_probe("diagnose", check=False)
+            self.assertEqual((Path(tmp) / "host-root-recovery-diagnose.log").read_text(), "SSH timed out\n")
+
     def test_suite_reaches_linked_host_before_fault_and_reboots_after_recovery(self):
         e2e.validate_suites()
         steps = e2e.SUITES["migration-recovery"]
         fault = steps.index("validate-host-root-migration-recovery")
         self.assertEqual(steps[:fault], ["run-legacy-agent", "wait-for-node",
                                        "validate-agent-upgrade-operation", "validate-host-root-linked"])
-        self.assertEqual(steps[fault + 1:], ["validate-host-reboot", "validate-host-root", "reset-agent"])
+        self.assertEqual(steps[fault + 1:], ["validate-host-root", "reset-agent"])
+        events = []
+        self.run_recovery(events)
+        self.assertLess(events.index("resume"), events.index("reboot"))
+        self.assertLess(events.index("reboot"), events.index("verify"))
+        self.assertEqual(events.count("reboot"), 1, "exercise the reboot before metadata can abort the suite")
 
 
 class TestMigrationRecoveryFixture(unittest.TestCase):
@@ -108,6 +150,9 @@ class TestMigrationRecoveryFixture(unittest.TestCase):
         self.tool("getenforce", 'printf "%s\\n" "$SELINUX_MODE"\n')
         self.tool("chcon", "exit 0\n")
         self.tool("ls", "echo 'fixture contexts (not a SELinux assertion)'\n")
+        self.tool("ps", "echo 'system_u:system_r:unconfined_service_t:s0 123 unbounded-agent'\n")
+        self.tool("journalctl", "echo 'fixture journal evidence'\n")
+        self.tool("ausearch", "echo 'fixture AVC evidence'\n")
         self.tool("systemctl", '''printf '%s\\n' "$*" >> "$SYSTEMCTL_CALLS"
 case "$*" in
     *--property=MainPID*) echo "${DAEMON_PID:-0}" ;;
@@ -207,6 +252,24 @@ fi
         self.assertFalse(self.drop_in.exists())
         self.assertFalse(self.probe.exists())
         self.assertTrue((self.root / ".moving").exists())
+
+    def test_inspection_captures_contexts_and_avcs_without_enforcing_label_correctness(self):
+        self.swap()
+        for action in ("inspect", "diagnose"):
+            with self.subTest(action=action):
+                result = self.require_action(action)
+                self.assertIn("Would relabel", result.stdout)
+                self.assertIn("unconfined_service_t", result.stdout)
+                self.assertIn("fixture journal evidence", result.stdout)
+                self.assertIn("fixture AVC evidence", result.stdout)
+        self.assertTrue((self.root / ".moving").exists())
+        self.assertTrue(all(line.startswith("-nvR ") for line in self.restore_calls.read_text().splitlines()))
+        # Missing files must not prevent collection of journal/AVC evidence.
+        self.tool("ls", "exit 1\n")
+        self.tool("restorecon", "exit 1\n")
+        result = self.require_action("diagnose")
+        self.assertIn("fixture journal evidence", result.stdout)
+        self.assertIn("fixture AVC evidence", result.stdout)
 
     def test_resume_requires_removing_hook_and_verify_rejects_unrepaired_labels(self):
         self.require_action("arm")

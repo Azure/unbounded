@@ -105,6 +105,28 @@ DROP_IN
         systemctl reset-failed "$unit"
         systemctl start "$unit"
         ;;
+    inspect|diagnose)
+        # Observations only. A label mismatch must not prevent the harness from
+        # exercising the real services, and failed services must still have
+        # their process contexts, journal and AVC evidence collected.
+        echo '=== SELinux mode ==='
+        getenforce || true
+        echo '=== File contexts and proposed label changes (read-only) ==='
+        ls -ldZ "$root" "$root/bin" "$root/bin/"* || true
+        restorecon -nvR "$root" || true
+        echo '=== Systemd execution results ==='
+        systemctl show "$unit" unbounded-agent-daemon-recovery.service \
+            unbounded-agent-regenerate-config@kube1.service unbounded-agent-regenerate-config@kube2.service \
+            systemd-nspawn@kube1.service systemd-nspawn@kube2.service \
+            --property=Id,ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus,ExecStart,ExecStartPre,ExecStartPost,SELinuxContext || true
+        echo '=== Running process contexts ==='
+        ps -e -o label,pid,comm || true
+        echo '=== Daemon, recovery and nspawn journal ==='
+        journalctl -b --no-pager -n 150 -u "$unit" -u unbounded-agent-daemon-recovery.service \
+            -u 'unbounded-agent-regenerate-config@*' -u 'systemd-nspawn@*' || true
+        echo '=== SELinux AVCs from this boot ==='
+        ausearch -m AVC,USER_AVC -ts boot || true
+        ;;
     verify)
         require_enforcing
         test ! -e "$probe"

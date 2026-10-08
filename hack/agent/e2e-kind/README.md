@@ -125,15 +125,27 @@ daemon unit and binaries still in place, and copied daemon binaries that a
 read-only `restorecon -nvR` inspection says need relabeling. It then kills the
 whole daemon service cgroup with SIGKILL, removes its wrapper and drop-in, and
 starts the daemon normally. It never changes the labels under `/opt/unbounded`
-or switches SELinux to permissive mode. Recovery must finish the move, leave
-labels matching policy, and run the daemon from the new root. The host then
-reboots and validates node readiness and workload/DNS before reset.
+or switches SELinux to permissive mode. Recovery must finish the move and run
+the daemon from the new root. Before checking label correctness, the harness:
+
+1. Reboots the host, exercising the nspawn configuration-regeneration and
+   post-start helpers, and validates node readiness and fresh workload/DNS.
+2. Delivers an intentionally failing AgentUpgrade through the existing rollback
+   scenario, exercising the real OnFailure recovery script and last-good binary.
+3. Validates fresh workload/DNS again after rollback.
+
+Only after those functional checks pass does it assert that labels match policy.
+A functional failure therefore stops the test with runtime evidence, rather than
+being hidden by an earlier metadata assertion. If all operations work, the log
+explicitly reports `Functional recovery PASSED` before the separate label check.
+A failure of that final check alone is **not** proof of an SELinux execution
+denial. The shipped policy is not tightened to manufacture one.
 
 This is a regression test, not an expected-failure test. An agent that resumes
-`StateMoving` without restoring labels should fail the label check even if the
-host policy happens to permit executing the mislabeled binaries. A host that
-never exhibits the pre-relabel checkpoint fails setup rather than claiming to
-have tested recovery. The production agent has no test-specific failpoint.
+`StateMoving` without restoring labels should still fail the final label check,
+even if the host policy permits the tested operations. A host that never
+exhibits the pre-relabel checkpoint fails setup rather than claiming to have
+tested recovery. The production agent has no test-specific failpoint.
 
 ```sh
 HOST_BASE_OS=almalinux9 E2E_SUITE=migration-recovery KEEP_ENV=1 \
@@ -141,5 +153,10 @@ HOST_BASE_OS=almalinux9 E2E_SUITE=migration-recovery KEEP_ENV=1 \
 ```
 
 Each guest-fixture action records its output in `logs/host-root-recovery-*.log`,
-uploaded alongside the daemon journal and SELinux AVC diagnostics. The hook is
-removed on failure too, but the harness does not repair the failed installation.
+uploaded alongside the daemon journal and SELinux AVC diagnostics. The `inspect`
+snapshot records labels and runtime state immediately after resume; `diagnose`
+captures them again after the functional checks, even on failure. These include
+unit execution results, process SELinux contexts, nspawn/recovery journal entries,
+and AVCs. Diagnostic collection errors do not replace the functional verdict.
+The hook is removed on failure too, but the harness does not repair the failed
+installation.
