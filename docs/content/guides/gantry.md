@@ -237,6 +237,12 @@ Racer mode uses requester-delegated registry authentication, not the shared
 registry credentials described above. Keep workload `imagePullSecrets` or
 kubelet credential providers configured for private HTTPS registries.
 
+**Warning:** Credentials authorize origin reads, not cached-object access. Anyone
+who can reach Gantry and knows an object's digest may read cached private content
+with different or missing credentials. Run Racer-backed Gantry only within a
+single trusted domain, restrict access to Gantry, and do not share it across
+mutually untrusted tenants.
+
 ### Helm-Managed Gantry
 
 Add `--set racer.enabled=true` to the OCI chart installation command above,
