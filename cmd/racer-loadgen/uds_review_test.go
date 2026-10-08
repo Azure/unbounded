@@ -92,12 +92,23 @@ func TestSDKFullReadUnpinnedMetadataValidation(t *testing.T) {
 }
 
 func TestUDSOriginProtocolReadiness(t *testing.T) {
-	for _, mode := range []string{"success", "status", "etag", "size", "expiry", "wrong-expiry", "content-type", "no-witness", "disconnect", "startup-canceled", "lifetime-canceled"} {
+	for _, mode := range []string{"success", "overlapping-head", "overlapping-wrong-expiry", "status", "etag", "size", "expiry", "wrong-expiry", "content-type", "no-witness", "wrong-witness", "disconnect", "startup-canceled", "lifetime-canceled"} {
 		t.Run(mode, func(t *testing.T) {
 			catalog, err := newBlobCatalog(t.Context(), "test/blob", "ready", 1, 1024)
 			require.NoError(t, err)
 			origin, key, err := syntheticOrigin(catalog, newMetrics(prometheus.NewRegistry()))
 			require.NoError(t, err)
+
+			var calls atomic.Int64
+
+			baseOrigin := origin
+			origin = func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				metadata, body, err := baseOrigin(ctx, request)
+				metadata.ExpiresAt = time.UnixMilli(1800000000000 + calls.Add(1))
+
+				return metadata, body, err
+			}
+
 			path := filepath.Join(t.TempDir(), "socket")
 			listener, err := net.Listen("unix", path)
 			require.NoError(t, err)
@@ -123,10 +134,27 @@ func TestUDSOriginProtocolReadiness(t *testing.T) {
 				defer client.Close()
 
 				server := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					metadata, err := client.Stat(r.Context(), racersdk.Request{Key: key})
+					request := racersdk.Request{Key: key, Metadata: r.Header.Get("Racer-Metadata")}
+					if mode == "wrong-witness" {
+						request.Metadata = "unrelated-head"
+					}
+
+					metadata, err := client.Stat(r.Context(), request)
 					if err != nil {
 						http.Error(w, "stat failed", http.StatusBadGateway)
 						return
+					}
+
+					if strings.HasPrefix(mode, "overlapping-") {
+						other, err := client.Stat(r.Context(), racersdk.Request{Key: key, Metadata: "unrelated-head"})
+						if err != nil {
+							http.Error(w, "overlapping stat failed", http.StatusBadGateway)
+							return
+						}
+
+						if mode == "overlapping-wrong-expiry" {
+							metadata.ExpiresAt = other.ExpiresAt
+						}
 					}
 					// Real SDK callbacks have returned, but readiness must still wait
 					// for a complete successful wire response from this Unix socket.
@@ -181,7 +209,7 @@ func TestUDSOriginProtocolReadiness(t *testing.T) {
 			failed := make(chan error, 1)
 
 			stop, err := startUDSOriginOnPath(ctx, startup, path, origin, key, func(err error) { failed <- err }, serve)
-			if mode == "success" {
+			if mode == "success" || mode == "overlapping-head" {
 				require.NoError(t, err)
 				require.NotNil(t, stop)
 				stop()
@@ -191,6 +219,10 @@ func TestUDSOriginProtocolReadiness(t *testing.T) {
 
 				if strings.HasSuffix(mode, "canceled") {
 					require.ErrorIs(t, err, context.Canceled)
+				}
+
+				if mode == "overlapping-wrong-expiry" {
+					require.ErrorContains(t, err, "invalid expiry metadata")
 				}
 			}
 

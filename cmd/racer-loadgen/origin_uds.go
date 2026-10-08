@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -187,7 +188,13 @@ func startUDSOriginOnPath(ctx, startup context.Context, path string, origin race
 	lifetime, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 
-	var witness atomic.Pointer[racersdk.Metadata]
+	type probeWitness struct {
+		token    string
+		metadata atomic.Pointer[racersdk.Metadata]
+	}
+
+	var activeProbe atomic.Pointer[probeWitness]
+	defer activeProbe.Store(nil)
 
 	go func() {
 		defer close(done)
@@ -195,7 +202,9 @@ func startUDSOriginOnPath(ctx, startup context.Context, path string, origin race
 		err := serve(lifetime, func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 			metadata, body, err := origin(ctx, request)
 			if err == nil && body == nil && request.Head && request.Key == probe {
-				witness.Store(&metadata)
+				if witness := activeProbe.Load(); witness != nil && request.Metadata == witness.token {
+					witness.metadata.CompareAndSwap(nil, &metadata)
+				}
 			}
 
 			return metadata, body, err
@@ -225,15 +234,20 @@ func startUDSOriginOnPath(ctx, startup context.Context, path string, origin race
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 	for {
+		witness := &probeWitness{token: rand.Text()}
+		activeProbe.Store(witness)
+
 		req, err := http.NewRequestWithContext(probeCtx, http.MethodHead, "http://racer/v1/objects/"+probe.String(), nil)
 		if err != nil {
 			stop()
 			return nil, err
 		}
 
+		req.Header.Set("Racer-Metadata", witness.token)
+
 		response, err := client.Do(req)
 		if err == nil {
-			validationErr := validateOriginProbe(response, probe, witness.Load())
+			validationErr := validateOriginProbe(response, probe, witness.metadata.Load())
 
 			closeErr := response.Body.Close()
 			if validationErr != nil || closeErr != nil {
