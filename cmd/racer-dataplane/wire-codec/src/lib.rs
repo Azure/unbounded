@@ -623,6 +623,9 @@ pub mod rest {
                     )
                     .await?;
                 let epoch = trust_epoch(trust.as_ref(), identity);
+                if let Some(identity) = identity {
+                    validate_client_key(identity)?;
+                }
                 if owner.upgrade().is_some()
                     && let Some(connection) = self.checkout(identity, epoch, scope)
                 {
@@ -1209,6 +1212,23 @@ pub mod rest {
             }
         }
         epoch.finalize().into()
+    }
+
+    /// Check the leaf SPKI before pool checkout without copying private key bytes.
+    fn validate_client_key(identity: Identity<'_>) -> Result<()> {
+        let private = rustls::pki_types::PrivatePkcs8KeyDer::from(identity.private_key).into();
+        let key = rustls::crypto::ring::sign::any_supported_type(&private)
+            .map_err(|_| Error::Unauthorized)?;
+        let leaf = identity
+            .certificate_chain
+            .first()
+            .ok_or(Error::Unauthorized)?;
+        rustls::sign::CertifiedKey::new(
+            vec![rustls::pki_types::CertificateDer::from(leaf.clone())],
+            key,
+        )
+        .keys_match()
+        .map_err(|_| Error::Unauthorized)
     }
 
     /// Build fresh TLS 1.3 trust and optional client authentication without resumption.
@@ -2468,6 +2488,60 @@ pub mod rest {
             ));
             assert!(transport.idle.borrow().is_none());
             assert_eq!(get().status, 204);
+            transport.close_idle();
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn pooled_connections_validate_client_key_before_reuse() {
+            let d = testing::Directory::new();
+            let (ca, key) = testing::ca();
+            let identity = TestIdentity::new(&ca, &key);
+            let unrelated = TestIdentity::new(&ca, &key);
+            let response = || ("/snapshot".to_owned(), 200, b"{}".to_vec());
+            let (endpoint, server) =
+                scripted_server(&d, &ca, &key, vec![vec![response(), response()]]);
+            let transport = Transport::new(endpoint);
+            transport.attach_io(Rc::new(FixtureIo));
+            let scope = testing::scope();
+            let invalid_keys = [unrelated.borrowed().private_key, b"corrupt PKCS#8"];
+            let connect_error = |private_key| {
+                futures::executor::block_on(transport.connect(
+                    Some(Identity {
+                        private_key,
+                        ..identity.borrowed()
+                    }),
+                    &scope,
+                ))
+                .err()
+            };
+            let cold_errors = invalid_keys.map(connect_error);
+            assert_eq!(
+                cold_errors,
+                [Some(testing::Error::Transport(Error::Unauthorized)); 2]
+            );
+            let get = || {
+                futures::executor::block_on(async {
+                    transport
+                        .authenticated(&identity, &scope)
+                        .await
+                        .unwrap()
+                        .request(
+                            testing::request(Method::Get, "/snapshot", None, 1024),
+                            &scope,
+                        )
+                        .await
+                        .unwrap()
+                })
+            };
+            assert_eq!(get().status, 200);
+            assert!(transport.idle.borrow().is_some());
+            for (private_key, cold_error) in invalid_keys.into_iter().zip(cold_errors) {
+                assert_eq!(connect_error(private_key), cold_error);
+                assert!(transport.idle.borrow().is_some());
+            }
+            assert_eq!(get().status, 200);
+            assert!(transport.idle.borrow().is_some());
             transport.close_idle();
             server.join().unwrap();
         }
