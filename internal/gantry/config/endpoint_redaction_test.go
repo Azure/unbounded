@@ -16,12 +16,19 @@ func TestRedactedEndpoints(t *testing.T) {
 	for _, tt := range []struct {
 		name, endpoint, want string
 	}{
-		{"password", "https://private-user:private-password@registry.example/prefix?ns=example#fragment", "https://registry.example/prefix?ns=example#fragment"},
+		{"password", "https://private-user:private-password@registry.example/prefix?token=private-token#private-fragment", "https://registry.example/prefix"},
 		{"username only", "http://private-user@registry.example:5000", "http://registry.example:5000"},
 		{"encoded credentials", "https://private%2Duser:private%2Dpassword@registry.example", "https://registry.example"},
 		{"empty password", "https://private-user:@registry.example", "https://registry.example"},
 		{"ipv6", "https://private-user:private-password@[::1]:5000/v2/", "https://[::1]:5000/v2/"},
-		{"public", "https://registry.example/prefix%2fpath?ns=example#fragment", "https://registry.example/prefix%2fpath?ns=example#fragment"},
+		{"public", "https://registry.example/prefix%2fpath", "https://registry.example/prefix%2fpath"},
+		{"query only", "https://registry.example/prefix?token=private-token", "https://registry.example/prefix"},
+		{"fragment only", "https://registry.example/prefix#private-fragment", "https://registry.example/prefix"},
+		{"query and fragment", "https://registry.example/prefix%2fpath?token=private-token#private-fragment", "https://registry.example/prefix%2fpath"},
+		{"encoded query and fragment", "https://registry.example?token=private%2Dtoken#private%2Dfragment", "https://registry.example"},
+		{"invalid query escape", "https://registry.example?token=private%zz", "https://registry.example"},
+		{"empty query", "https://registry.example?", "https://registry.example"},
+		{"empty query and fragment", "https://registry.example?#", "https://registry.example"},
 		{"empty", "", ""},
 		{"invalid escape", "https://private-user:private-password%zz@registry.example", "[REDACTED]"},
 		{"invalid port", "https://private-user:private-password@registry.example:bad", "[REDACTED]"},

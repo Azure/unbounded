@@ -1296,7 +1296,8 @@ func (c *Config) ResolveUpstream(ns string) (UpstreamRegistry, bool) {
 	return UpstreamRegistry{}, false
 }
 
-// Redacted returns a copy of c suitable for logging, without endpoint userinfo.
+// Redacted returns a copy of c suitable for logging, without endpoint userinfo,
+// queries, or fragments.
 // Invalid endpoints are hidden because their credentials cannot be safely parsed.
 func (c *Config) Redacted() *Config {
 	cp := *c
@@ -1311,8 +1312,12 @@ func (c *Config) Redacted() *Config {
 		u, err := url.Parse(endpoint)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 			cp.UpstreamRegistries[i].Endpoint = "[REDACTED]"
-		} else if u.User != nil {
+		} else {
 			u.User = nil
+			u.RawQuery = ""
+			u.ForceQuery = false
+			u.Fragment = ""
+			u.RawFragment = ""
 			cp.UpstreamRegistries[i].Endpoint = u.String()
 		}
 	}
