@@ -110,7 +110,11 @@
 //! exists at a time. Restore requires both thawing and draining all leases,
 //! including reads and abandoned I/O. It validates the whole ordered image before
 //! publication, seals an open tail, rebuilds free slots, and advances an epoch
-//! that clears the eviction cursor and recent-read state. Invalid or busy restores
+//! that clears the eviction cursor and recent-read state. Structural damage
+//! returns Corrupt and a generation below the live slot returns Stale. A Free
+//! image at the generation of an occupied live slot is published at the next
+//! generation, so old mappings cannot match reissued extents. Unavailable
+//! reports that increment or the epoch would wrap. Invalid or busy restores
 //! never partially publish.
 //! Raw file opening, table configuration, and manual eviction are simulation-only
 //! escape hatches. Production startup binds with [`Slab::open_configured`], and
