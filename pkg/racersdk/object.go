@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
@@ -91,7 +93,9 @@ func (o *Object) Read(p []byte) (int, error) {
 
 // WriteTo writes the rest of the object to w and returns the number of bytes
 // written. [io.Copy] calls it automatically. A nil error means the whole
-// selected range was written and Racer confirmed it complete.
+// selected range was written and Racer confirmed it complete. If w fails,
+// including a short write or a write timeout, the error matches
+// [ErrDestination] and wraps w's error.
 //
 // If w implements [io.ReaderFrom] and is backed by a file descriptor, such as
 // a [net.Conn], an [*os.File], or an HTTP/1 [http.ResponseWriter], data moves
@@ -336,14 +340,18 @@ func (o *Object) splice(dst *destination, raw *net.UnixConn) (int64, error) {
 	}
 
 	if err := dst.arm(); err != nil {
-		return 0, err
+		return 0, destinationFailure(err)
 	}
 
 	limited := &io.LimitedReader{R: raw, N: batch}
+
 	n, err := dst.rf.ReadFrom(limited)
+	if err != nil {
+		err = spliceFailure(raw, err)
+	}
 
 	if clearErr := dst.disarm(); err == nil {
-		err = clearErr
+		err = destinationFailure(clearErr)
 	}
 
 	_ = o.conn.SetReadDeadline(time.Time{}) //nolint:errcheck // Preserve bytes received before a peer close.
@@ -354,19 +362,76 @@ func (o *Object) splice(dst *destination, raw *net.UnixConn) (int64, error) {
 		n = 0
 
 		if err == nil {
-			err = io.ErrShortWrite
+			err = destinationFailure(io.ErrShortWrite)
 		}
 	}
 
 	if err == nil && limited.N != 0 {
+		// The destination took everything the socket delivered before EOF.
 		err = io.ErrUnexpectedEOF
 	}
 
 	if err == nil && n != batch {
-		err = io.ErrShortWrite
+		err = destinationFailure(io.ErrShortWrite)
 	}
 
-	return n, truncation(err)
+	return n, err
+}
+
+// spliceFailure attributes an error from a destination's ReadFrom. Splice
+// reports source and destination failures alike, so the Racer connection is
+// checked: a broken pipe can only come from writing, and an error while the
+// connection is still open came from the destination. A closed or failed
+// connection means Racer cut the transfer short. A timeout stays ambiguous,
+// because either side may have stalled and Racer may have given up since.
+func spliceFailure(raw *net.UnixConn, err error) error {
+	switch {
+	case errors.Is(err, unix.EPIPE):
+		return destinationFailure(err)
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return failure(wire.ErrorDeadline, "write", err)
+	case sourceOpen(raw):
+		return destinationFailure(err)
+	default:
+		return fmt.Errorf("%w: %w", io.ErrUnexpectedEOF, err)
+	}
+}
+
+// sourceOpen reports whether the Racer connection is still open, without
+// consuming any data from it.
+func sourceOpen(raw *net.UnixConn) bool {
+	rc, err := raw.SyscallConn()
+	if err != nil {
+		return false
+	}
+
+	var (
+		n       int
+		peekErr error
+	)
+
+	if err := rc.Read(func(fd uintptr) bool {
+		var b [1]byte
+
+		for {
+			n, _, peekErr = unix.Recvfrom(int(fd), b[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
+			if peekErr != unix.EINTR {
+				return true
+			}
+		}
+	}); err != nil {
+		return false
+	}
+
+	switch {
+	case peekErr == unix.EAGAIN:
+		return true
+	case peekErr != nil:
+		return false
+	default:
+		// Zero bytes is an orderly close; anything more is unread data.
+		return n > 0
+	}
 }
 
 // copy moves one batch through buffer. It reads once rather than filling the
@@ -668,7 +733,7 @@ func (d *destination) write(p []byte) (int64, error) {
 	}
 
 	if err := d.arm(); err != nil {
-		return 0, err
+		return 0, destinationFailure(err)
 	}
 
 	n, err := d.w.Write(p)
@@ -688,5 +753,5 @@ func (d *destination) write(p []byte) (int64, error) {
 		err = io.ErrShortWrite
 	}
 
-	return int64(n), err
+	return int64(n), destinationFailure(err)
 }

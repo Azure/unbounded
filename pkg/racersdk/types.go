@@ -132,13 +132,17 @@ type ReadOptions struct {
 	SmallObject bool
 }
 
-// Errors returned by [Client] methods and [Object] reads, and recognized when
-// returned by an [Origin]. Test for them with [errors.Is].
+// Errors returned by [Client] methods and [Object] reads, and, except for
+// [ErrDestination], recognized when returned by an [Origin]. Test for them
+// with [errors.Is].
 //
 // Other failures wrap the cause: [context.Canceled] or
 // [context.DeadlineExceeded] when a context ends, and [net.ErrClosed] after
-// [Client.Close] or [Object.Close]. Anything else is a protocol or origin
-// failure that callers usually report as a bad gateway.
+// [Client.Close] or [Object.Close]. When [Object.WriteTo] times out and
+// cannot tell whether Racer or the destination stalled, the error wraps
+// [os.ErrDeadlineExceeded] and matches neither [ErrUnavailable] nor
+// [ErrDestination]. Anything else is a protocol or origin failure that
+// callers usually report as a bad gateway.
 var (
 	// ErrInvalidRequest reports an invalid key, request value, option, or
 	// configuration.
@@ -158,7 +162,35 @@ var (
 	// overloaded or unreachable, or a transfer was cut short. Retrying may
 	// succeed.
 	ErrUnavailable = errors.New("racersdk: unavailable")
+	// ErrDestination reports that the writer passed to [Object.WriteTo]
+	// failed, for example because a downstream client disconnected, a disk
+	// is full, or a write timed out. Racer and the origin are not at fault,
+	// and retrying the read does not help unless the destination recovers.
+	// The error also wraps the writer's own error.
+	ErrDestination = errors.New("racersdk: destination failed")
 )
+
+// destinationError marks a failure of the writer passed to WriteTo, so it is
+// never mistaken for a Racer transport failure.
+type destinationError struct{ err error }
+
+func (e *destinationError) Error() string {
+	return "racersdk: write: destination failed: " + e.err.Error()
+}
+
+func (e *destinationError) Unwrap() error { return e.err }
+
+func (e *destinationError) Is(target error) bool { return target == ErrDestination }
+
+// destinationFailure attributes err to the WriteTo destination. Nil and
+// errors already attributed pass through unchanged.
+func destinationFailure(err error) error {
+	if err == nil || errors.Is(err, ErrDestination) {
+		return err
+	}
+
+	return &destinationError{err: err}
+}
 
 // sdkError carries a private classification that maps onto at most one
 // exported sentinel, plus a safe operation name and the underlying cause.
@@ -258,10 +290,15 @@ func closedError(op string) error {
 	return failure(wire.ErrorClosed, op, net.ErrClosed)
 }
 
-// ioFailure classifies a transport error, preserving SDK errors and context
-// errors. Nil and io.EOF pass through unchanged.
+// ioFailure classifies a transport error, preserving SDK errors, destination
+// errors, and context errors. Nil and io.EOF pass through unchanged.
 func ioFailure(op string, err error) error {
 	if err == nil || err == io.EOF {
+		return err
+	}
+
+	var dst *destinationError
+	if errors.As(err, &dst) {
 		return err
 	}
 

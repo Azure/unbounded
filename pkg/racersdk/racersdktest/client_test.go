@@ -37,7 +37,7 @@ func assertIs(t *testing.T, err, target error) {
 
 var sentinels = []error{
 	racersdk.ErrInvalidRequest, racersdk.ErrUnauthorized, racersdk.ErrForbidden, racersdk.ErrNotFound,
-	racersdk.ErrVersionMismatch, racersdk.ErrRangeNotSatisfiable, racersdk.ErrUnavailable,
+	racersdk.ErrVersionMismatch, racersdk.ErrRangeNotSatisfiable, racersdk.ErrUnavailable, racersdk.ErrDestination,
 }
 
 // assertBadGateway checks for a failure that matches no package error.
