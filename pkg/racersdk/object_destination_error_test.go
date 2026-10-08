@@ -139,7 +139,7 @@ func TestObjectWriteToSpliceEarlyReturn(t *testing.T) {
 }
 
 func TestObjectWriteToSpliceAmbiguousTimeout(t *testing.T) {
-	// With no queued source bytes, either side may have stalled.
+	// A ReadFrom timeout does not identify which endpoint stalled.
 	raw, _ := spliceUnixPair(t)
 	err := spliceFailure(raw, os.ErrDeadlineExceeded)
 	assertIs(t, err, os.ErrDeadlineExceeded)

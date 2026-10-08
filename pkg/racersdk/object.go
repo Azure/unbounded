@@ -93,11 +93,11 @@ func (o *Object) Read(p []byte) (int, error) {
 
 // WriteTo writes the rest of the object to w and returns the number of bytes
 // written. [io.Copy] calls it automatically. A nil error means the whole
-// selected range was written and Racer confirmed it complete. If w fails,
-// including a short write or a write timeout, the error matches
-// [ErrDestination] and wraps w's error. A splice timeout matches
-// [ErrDestination] only when unread source bytes identify a destination stall;
-// otherwise it matches neither [ErrDestination] nor [ErrUnavailable].
+// selected range was written and Racer confirmed it complete. A failure from
+// w.Write, including a short write or a write timeout, matches [ErrDestination]
+// and wraps w's error. A timeout from w.ReadFrom cannot be attributed to either
+// endpoint: it wraps [os.ErrDeadlineExceeded] and matches neither
+// [ErrDestination] nor [ErrUnavailable].
 //
 // If w implements [io.ReaderFrom] and is backed by a file descriptor, such as
 // a [*net.TCPConn], an [*os.File], or an HTTP/1 [http.ResponseWriter], data moves
@@ -396,17 +396,13 @@ func (o *Object) splice(dst *destination, raw *net.UnixConn) (int64, error) {
 // reports source and destination failures alike, so the Racer connection is
 // checked: a broken pipe can only come from writing, and an error while the
 // connection is still open came from the destination. A closed or failed
-// connection means Racer cut the transfer short. A timeout stays ambiguous
-// unless unread source bytes show that the destination stalled.
+// connection means Racer cut the transfer short. A timeout stays ambiguous:
+// source bytes may arrive after a read timeout but before we check the socket.
 func spliceFailure(raw *net.UnixConn, err error) error {
 	switch {
 	case errors.Is(err, unix.EPIPE):
 		return destinationFailure(err)
 	case errors.Is(err, os.ErrDeadlineExceeded):
-		if n, peekErr := peekSource(raw); peekErr == nil && n > 0 {
-			return destinationFailure(err)
-		}
-
 		return failure(wire.ErrorDeadline, "write", err)
 	case sourceOpen(raw):
 		return destinationFailure(err)

@@ -84,10 +84,12 @@
 // [ErrForbidden], [ErrVersionMismatch], [ErrRangeNotSatisfiable],
 // [ErrUnavailable], and [ErrInvalidRequest]. Errors caused by an ending
 // context wrap [context.Canceled] or [context.DeadlineExceeded], and calls
-// after Close wrap [net.ErrClosed]. A WriteTo timeout that cannot
-// be attributed to either side wraps [os.ErrDeadlineExceeded]. Any other
-// error means Racer or an origin misbehaved; a proxy should report it as a
-// bad gateway. Origins report failures by wrapping the same errors.
+// after Close wrap [net.ErrClosed]. A WriteTo timeout from the destination's
+// ReadFrom cannot be attributed to either endpoint. It wraps
+// [os.ErrDeadlineExceeded] and matches neither [ErrDestination] nor
+// [ErrUnavailable]. Any other error means Racer or an origin misbehaved; a
+// proxy should report it as a bad gateway. Origins report failures by wrapping
+// the same errors.
 //
 // # Testing
 //

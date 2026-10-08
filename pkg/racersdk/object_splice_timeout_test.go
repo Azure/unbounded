@@ -131,7 +131,7 @@ func TestSpliceFailureExpiredDeadline(t *testing.T) {
 				err := ioFailure("write", spliceFailure(raw, cause))
 				assertIs(t, err, cause)
 
-				wantDestination := pending || cause == unix.EPIPE || (state == "empty" && cause != os.ErrDeadlineExceeded)
+				wantDestination := cause != os.ErrDeadlineExceeded && (pending || cause == unix.EPIPE || state == "empty")
 				if wantDestination {
 					assertIs(t, err, ErrDestination)
 					assertNotIs(t, err, ErrUnavailable)
@@ -254,12 +254,11 @@ func TestObjectWriteToSpliceTCPTimeout(t *testing.T) {
 			}
 
 			assertIs(t, err, os.ErrDeadlineExceeded)
+			assertNotIs(t, err, ErrDestination)
 			assertNotIs(t, err, ErrUnavailable)
 			assertNotIs(t, err, io.ErrUnexpectedEOF)
 
 			if mode == "destination stall" {
-				assertIs(t, err, ErrDestination)
-
 				if queued, err := peekSource(raw); queued != 1 || err != nil {
 					t.Fatalf("destination stalled without pending source data: %d, %v", queued, err)
 				}
@@ -268,12 +267,53 @@ func TestObjectWriteToSpliceTCPTimeout(t *testing.T) {
 					t.Fatalf("splice = %d bytes; want partial write", n)
 				}
 			} else {
-				assertNotIs(t, err, ErrDestination)
-
 				if n != int64(size) {
 					t.Fatalf("splice = %d bytes; source sent %d", n, size)
 				}
 			}
 		})
+	}
+}
+
+type spliceReadFromFunc func(io.Reader) (int64, error)
+
+func (f spliceReadFromFunc) ReadFrom(r io.Reader) (int64, error) { return f(r) }
+
+func TestObjectSpliceLateSourceByte(t *testing.T) {
+	raw, source := spliceUnixPair(t)
+	conn, _ := spliceTCPPair(t)
+	o := &Object{conn: &clientConn{Conn: raw}, remaining: 1, timeout: 5 * time.Second}
+	dst := newDestination(t.Context(), conn, o.timeout)
+	dst.rf = spliceReadFromFunc(func(r io.Reader) (int64, error) {
+		// Expire only the source deadline. TCP ReadFrom still wraps its error
+		// as a TCP readfrom error, not as a Unix socket read error.
+		if err := raw.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+			t.Fatal(err)
+		}
+
+		n, err := conn.ReadFrom(r)
+		assertIs(t, err, os.ErrDeadlineExceeded)
+
+		// Queue a byte after the source timeout but before classification.
+		// No sleep or concurrent scheduling is needed to reproduce the race.
+		if _, writeErr := source.Write([]byte("x")); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+
+		if queued, peekErr := peekSource(raw); queued != 1 || peekErr != nil {
+			t.Fatalf("late source byte not queued: %d, %v", queued, peekErr)
+		}
+
+		return n, err
+	})
+
+	n, err := o.splice(dst, raw)
+	assertIs(t, err, os.ErrDeadlineExceeded)
+	assertNotIs(t, err, ErrDestination)
+	assertNotIs(t, err, ErrUnavailable)
+	assertNotIs(t, err, io.ErrUnexpectedEOF)
+
+	if n != 0 || o.remaining != 1 {
+		t.Fatalf("splice = %d bytes; remaining %d", n, o.remaining)
 	}
 }
