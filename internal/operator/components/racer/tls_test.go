@@ -310,8 +310,37 @@ func TestRetainedTLSMaintenanceDoesNotRepairController(t *testing.T) {
 
 	require.NoError(t, env.Client.Delete(t.Context(), secret))
 	plan, _, err := planAt(t.Context(), env, now.Add(9*caRotationInterval))
-	require.NoError(t, err)
-	require.Zero(t, plan.Len())
+	require.EqualError(t, err, "established Racer serving Secret missing; restore it")
+	require.Nil(t, plan)
+	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, tlsName), &corev1.Secret{})))
+}
+
+func TestRetainedTLSMissingSecretBeforeEstablishment(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		phases int
+	}{
+		{name: "unestablished", phases: 0},
+		{name: "reserved-claim", phases: 1},
+		{name: "staged-marker", phases: 2},
+		{name: "consumed-claim-pending-marker", phases: 3},
+		{name: "fresh-marker", phases: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testEnv(t)
+			for range tc.phases {
+				plan, _ := identityPlan(t, env)
+				persist(t, env, plan)
+			}
+
+			plan, result, err := planAt(t.Context(), env, time.Now())
+			require.NoError(t, err)
+			require.Zero(t, plan.Len())
+			require.Equal(t, component.ReasonDisabled, result.Reason)
+			require.Zero(t, result.RequeueAfter)
+			require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, tlsName), &corev1.Secret{})))
+		})
+	}
 }
 
 func TestTLSUncertainWritesAndForbiddenRotation(t *testing.T) {

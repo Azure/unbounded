@@ -87,14 +87,6 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 		return nil, result, fmt.Errorf("invalid retained Racer installation state")
 	}
 
-	if err := env.LiveReader().Get(ctx, objectKey(env, tlsName), &corev1.Secret{}); err != nil {
-		if apierrors.IsNotFound(err) {
-			return plan, result, nil
-		}
-
-		return nil, result, err
-	}
-
 	result.RequeueAfter = time.Hour
 	result.Message = "no ClusterCaches; maintaining retained Racer serving TLS only"
 
