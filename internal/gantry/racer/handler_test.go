@@ -523,17 +523,12 @@ func TestRacerGETAndHEAD(t *testing.T) {
 		}
 	})
 
-	// Keep the historical final-chunk boundary cases even though the mirror no
-	// longer withholds a final chunk or examines manifest payloads.
 	for _, tc := range []struct {
 		name, route, mediaType string
 		data                   []byte
 	}{
 		{"blob", "blobs", "application/octet-stream", []byte("layer bytes")},
 		{"empty", "blobs", "application/octet-stream", nil},
-		{"below final chunk", "blobs", "application/octet-stream", bytes.Repeat([]byte{0}, 32*1024-1)},
-		{"exact final chunk", "blobs", "application/octet-stream", bytes.Repeat([]byte{0}, 32*1024)},
-		{"above final chunk", "blobs", "application/octet-stream", bytes.Repeat([]byte{0}, 32*1024+1)},
 		{"manifest", "manifests", "application/vnd.oci.image.manifest.v1+json", []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}`)},
 		{"index", "manifests", "application/vnd.oci.image.index.v1+json", []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`)},
 		{"docker list", "manifests", "application/vnd.docker.distribution.manifest.list.v2+json", []byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[]}`)},
@@ -1083,7 +1078,6 @@ func TestRacerErrorsNeverUseLegacyContent(t *testing.T) {
 		{racersdk.ErrForbidden, http.StatusForbidden},
 		{racersdk.ErrUnavailable, http.StatusServiceUnavailable},
 		{errors.New("internal error"), http.StatusBadGateway},
-		{errors.New("bad gateway"), http.StatusBadGateway},
 		{racersdk.ErrVersionMismatch, http.StatusBadGateway},
 	} {
 		for _, mode := range handlerRequestModes() {

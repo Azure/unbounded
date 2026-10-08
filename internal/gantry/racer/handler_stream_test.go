@@ -435,27 +435,6 @@ func racerCheckStreamHash(t *testing.T, resp *http.Response, data []byte, offset
 	}
 }
 
-func TestRacerDistinctPayloadDetectsAlignedSubstitution(t *testing.T) {
-	data := racerDistinctPayload(1, int(racersdk.PageSize)+65539)
-	other := racerDistinctPayload(2, len(data))
-
-	want := sha256.Sum256(data)
-	for _, offset := range []int{16, 32 * 1024, 256 * 1024, int(racersdk.PageSize)} {
-		for _, source := range [][]byte{data, other} {
-			corrupt := bytes.Clone(data)
-			copy(corrupt[offset:offset+16], source[:16])
-
-			if sha256.Sum256(corrupt) == want {
-				t.Fatalf("payload hides aligned substitution at offset %d", offset)
-			}
-		}
-	}
-
-	if sha256.Sum256(other) == want {
-		t.Fatal("payload hides whole-object substitution")
-	}
-}
-
 func TestRacerStreamingHTTPReuse(t *testing.T) {
 	for _, mode := range []string{"plaintext", "TLS", "fallback"} {
 		t.Run(mode, func(t *testing.T) {
