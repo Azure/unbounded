@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -897,5 +898,21 @@ func TestSidecarEmptyStreamClosedBeforeCompletion(t *testing.T) {
 	failure := (sidecarRead{metadata: m}).writeBody(w, v)
 	if failure != 503 || len(w.Header()) != 0 || w.Body.Len() != 0 || w.Flushed {
 		t.Fatalf("empty failure committed success: failure=%d headers=%v body=%q", failure, w.Header(), w.Body.String())
+	}
+}
+
+func TestSidecarStreamRejectsOutOfRangeRead(t *testing.T) {
+	s := &sidecar{}
+
+	for _, read := range []sidecarRead{
+		{offset: math.MaxInt64 + 1, length: 1},
+		{offset: 0, length: math.MaxInt64 + 1},
+	} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+
+		if failure := s.stream(w, r, racersdk.Request{}, read); failure != http.StatusInternalServerError || w.Body.Len() != 0 {
+			t.Fatalf("read %+v: failure=%d body=%q", read, failure, w.Body.String())
+		}
 	}
 }
