@@ -473,16 +473,18 @@ func sidecarRangeNumber(s string) (uint64, bool) {
 		}
 	}
 
-	n, err := strconv.ParseUint(s, 10, 64)
-	if err != nil {
+	// Object sizes are int64, so clamping cannot change the selected range and
+	// keeps every offset and length convertible to int64.
+	n, err := strconv.ParseInt(s, 10, 64)
+	if errors.Is(err, strconv.ErrRange) {
+		if _, err := strconv.ParseUint(s, 10, 64); err != nil {
+			return 0, false
+		}
+
+		n = math.MaxInt64
+	} else if err != nil || n < 0 {
 		return 0, false
 	}
 
-	// Object sizes are int64, so clamping cannot change the selected range and
-	// keeps every offset and length convertible to int64.
-	if n > math.MaxInt64 {
-		n = math.MaxInt64
-	}
-
-	return n, true
+	return uint64(n), true
 }
