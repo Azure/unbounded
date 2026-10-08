@@ -367,7 +367,17 @@ func TestPolicyFailuresSkipBindingsAndStartup(t *testing.T) {
 				obj.SetKind(kind)
 				obj.SetName(policyName)
 				require.NoError(t, env.Client.Delete(t.Context(), obj))
+				containment := planPass(t, env)
+				require.Len(t, containment.Operations, 2)
+
+				for _, op := range containment.Operations {
+					require.Equal(t, component.OpDelete, op.Kind)
+				}
+
+				persist(t, env, containment)
+				assertControllerBindings(t, env, false)
 				plan := planPass(t, env)
+				original := env.Client
 				env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
 					Apply: func(ctx context.Context, c client.WithWatch, cfg runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
 						data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cfg)
@@ -390,6 +400,11 @@ func TestPolicyFailuresSkipBindingsAndStartup(t *testing.T) {
 						require.Equal(t, component.OpSkipped, op.Status)
 					}
 				}
+
+				assertControllerBindings(t, env, false)
+				env.Client = original
+				persist(t, env, planPass(t, env))
+				assertControllerBindings(t, env, true)
 			})
 		}
 	}

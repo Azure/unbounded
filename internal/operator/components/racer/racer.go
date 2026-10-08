@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -69,6 +70,10 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 }
 
 func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.Plan, component.Result, error) {
+	if plan, stop, err := planGuardContainment(ctx, env); stop || err != nil {
+		return plan, component.NotReadyAfter("AdmissionGuardUnavailable", "waiting for Racer admission guards and permission containment", 5*time.Second), err
+	}
+
 	caches := &racerv1.ClusterCacheList{}
 	if err := env.LiveReader().List(ctx, caches, client.Limit(1)); err != nil {
 		return nil, component.Result{}, err
@@ -241,6 +246,8 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 }
 
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
+	b.Watches(&admissionv1.ValidatingAdmissionPolicy{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
+	b.Watches(&admissionv1.ValidatingAdmissionPolicyBinding{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(startupConfigPredicate(env)))
