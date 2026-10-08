@@ -901,18 +901,28 @@ func TestSidecarEmptyStreamClosedBeforeCompletion(t *testing.T) {
 	}
 }
 
-func TestSidecarStreamRejectsOutOfRangeRead(t *testing.T) {
-	s := &sidecar{}
+func TestSidecarRangeClampsHugeNumbers(t *testing.T) {
+	const huge = "18446744073709551615"
 
-	for _, read := range []sidecarRead{
-		{offset: math.MaxInt64 + 1, length: 1},
-		{offset: 0, length: math.MaxInt64 + 1},
+	for _, tc := range []struct {
+		header         string
+		offset, length uint64
+		status         int
+	}{
+		{"bytes=2-" + huge, 2, 8, 0},
+		{"bytes=-" + huge, 0, 10, 0},
+		{"bytes=" + huge + "-", 0, 0, http.StatusRequestedRangeNotSatisfiable},
+		{"bytes=0-18446744073709551616", 0, 0, http.StatusBadRequest},
 	} {
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		h := http.Header{"Range": {tc.header}}
 
-		if failure := s.stream(w, r, racersdk.Request{}, read); failure != http.StatusInternalServerError || w.Body.Len() != 0 {
-			t.Fatalf("read %+v: failure=%d body=%q", read, failure, w.Body.String())
+		offset, length, _, status := sidecarRange(h, 10)
+		if offset != tc.offset || length != tc.length || status != tc.status {
+			t.Fatalf("%s: offset=%d length=%d status=%d", tc.header, offset, length, status)
 		}
+	}
+
+	if n, ok := sidecarRangeNumber(huge); !ok || n != math.MaxInt64 {
+		t.Fatalf("clamp: %d %v", n, ok)
 	}
 }

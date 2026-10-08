@@ -115,12 +115,6 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 }
 
 func (s *sidecar) stream(w http.ResponseWriter, r *http.Request, request racersdk.Request, read sidecarRead) sidecarFailure {
-	// sidecarRange bounds both values by the int64 object size; keep the
-	// conversion explicit so an invariant break cannot wrap negative.
-	if read.offset > math.MaxInt64 || read.length > math.MaxInt64 {
-		return http.StatusInternalServerError
-	}
-
 	v, err := s.client.Get(r.Context(), request, racersdk.ReadOptions{
 		ETag: read.metadata.ETag, Offset: int64(read.offset), Length: int64(read.length),
 	})
@@ -478,6 +472,15 @@ func sidecarRangeNumber(s string) (uint64, bool) {
 	}
 
 	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
 
-	return n, err == nil
+	// Object sizes are int64, so clamping cannot change the selected range and
+	// keeps every offset and length convertible to int64.
+	if n > math.MaxInt64 {
+		n = math.MaxInt64
+	}
+
+	return n, true
 }
