@@ -534,17 +534,6 @@ func renderStandaloneTemplates(t *testing.T) string {
 func renderChart(t *testing.T, operatorProfile bool, extraArgs ...string) string {
 	t.Helper()
 
-	directory, output, err := runChart(t, operatorProfile, extraArgs...)
-	if err != nil {
-		t.Fatalf("render Gantry chart: %v\n%s", err, output)
-	}
-
-	return directory
-}
-
-func runChart(t *testing.T, operatorProfile bool, extraArgs ...string) (string, []byte, error) {
-	t.Helper()
-
 	deployDir := filepath.Dir(sourceFile(t))
 	repositoryDir := filepath.Clean(filepath.Join(deployDir, "..", ".."))
 
@@ -579,8 +568,11 @@ func runChart(t *testing.T, operatorProfile bool, extraArgs ...string) (string, 
 	cmd := exec.Command(helm, args...)
 
 	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render Gantry chart: %v\n%s", err, output)
+	}
 
-	return filepath.Join(outputRoot, "gantry", "templates"), output, err
+	return filepath.Join(outputRoot, "gantry", "templates")
 }
 
 func renderedObjects(t *testing.T, directory string) map[string]map[string]any {

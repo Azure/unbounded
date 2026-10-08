@@ -12,9 +12,6 @@
 {{- end }}
 
 {{- define "gantry.validate" -}}
-{{- if not (kindIs "bool" .Values.racer.enabled) -}}
-{{- fail "racer.enabled must be a boolean" -}}
-{{- end -}}
 {{- $mountPath := trimSuffix "/" .Values.containerd.mountPath -}}
 {{- $socketPrefix := printf "%s/" $mountPath -}}
 {{- if not (hasPrefix $socketPrefix .Values.containerd.socketPath) -}}

@@ -34,7 +34,6 @@ spec:
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       terminationGracePeriodSeconds: 30
-      {{- if not .Values.racer.enabled }}
       initContainers:
         - name: chown-hostpaths
           image: mcr.microsoft.com/cbl-mariner/busybox:2.0
@@ -62,7 +61,6 @@ spec:
           volumeMounts:
             - name: libp2p
               mountPath: /var/lib/gantry/libp2p
-      {{- end }}
       containers:
         - name: gantry
           image: {{ include "gantry.image" . }}
@@ -71,10 +69,6 @@ spec:
             - agent
             - --config=/etc/gantry/config.yaml
           env:
-            {{- if .Values.racer.enabled }}
-            - name: GANTRY_RACER_ENABLED
-              value: "true"
-            {{- end }}
             - name: GANTRY_POD_IP
               valueFrom:
                 fieldRef:
@@ -89,7 +83,6 @@ spec:
               hostPort: 5000
               hostIP: 127.0.0.1
               protocol: TCP
-            {{- if not .Values.racer.enabled }}
             - name: transfer
               containerPort: 5001
               protocol: TCP
@@ -99,7 +92,6 @@ spec:
             - name: libp2p-tcp
               containerPort: 4001
               protocol: TCP
-            {{- end }}
             - name: metrics
               containerPort: 9095
               protocol: TCP
@@ -120,16 +112,9 @@ spec:
           resources:
             {{- toYaml .Values.resources.agent | nindent 12 }}
           securityContext:
-            {{- if .Values.racer.enabled }}
-            # Match root Racer's access to Gantry's private 0600 origin socket.
-            runAsNonRoot: false
-            runAsUser: 0
-            runAsGroup: 0
-            {{- else }}
             runAsNonRoot: true
             runAsUser: 65532
             runAsGroup: {{ .Values.containerd.socketGroup }}
-            {{- end }}
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -137,53 +122,33 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           volumeMounts:
-            {{- if .Values.racer.enabled }}
-            - name: racer-sockets
-              mountPath: /run/racer/gantry
-            {{- else }}
             - name: libp2p
               mountPath: /var/lib/gantry/libp2p
-            {{- end }}
             - name: config
               mountPath: /etc/gantry
               readOnly: true
-            {{- if not .Values.racer.enabled }}
             - name: registry-creds
               mountPath: /etc/gantry/registry
               readOnly: true
-            {{- end }}
             - name: tmp
               mountPath: /tmp
-            {{- if not .Values.racer.enabled }}
             - name: containerd-runtime
               mountPath: {{ .Values.containerd.mountPath }}
-            {{- end }}
       volumes:
-        {{- if .Values.racer.enabled }}
-        - name: racer-sockets
-          hostPath:
-            path: /run/racer/gantry
-            type: DirectoryOrCreate
-        {{- else }}
         - name: libp2p
           hostPath:
             path: /var/lib/gantry/libp2p
             type: DirectoryOrCreate
-        {{- end }}
         - name: config
           configMap:
             name: gantry-config
-        {{- if not .Values.racer.enabled }}
         - name: registry-creds
           secret:
             secretName: {{ .Values.registryCredentials.secretName }}
             optional: true
-        {{- end }}
         - name: tmp
           emptyDir: {}
-        {{- if not .Values.racer.enabled }}
         - name: containerd-runtime
           hostPath:
             path: {{ .Values.containerd.hostPath }}
             type: Directory
-        {{- end }}

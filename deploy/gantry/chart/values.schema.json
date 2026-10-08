@@ -6,7 +6,6 @@
     "image",
     "namespace",
     "manager",
-    "racer",
     "nodeSelector",
     "tolerations",
     "containerd",
@@ -16,17 +15,6 @@
     "gantry"
   ],
   "properties": {
-    "racer": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["enabled"],
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Enable Racer sockets and UID/GID 0 with all capabilities dropped. Provision Racer separately."
-        }
-      }
-    },
     "image": {
       "type": "object",
       "additionalProperties": false,
