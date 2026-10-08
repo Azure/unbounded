@@ -173,6 +173,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "http1"
+version = "0.1.0"
+dependencies = [
+ "flow-control",
+ "httparse",
+ "libc",
+ "uring-runtime",
+ "zeroize",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
