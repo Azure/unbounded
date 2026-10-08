@@ -46,9 +46,9 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
 	f.SetOutput(output)
-	f.StringVar(&opts.pull.Backend, "backend", "gantry", "Acquisition and origin transport: gantry (OCI HTTP), uds (direct Racer SDK), or s3 (HTTP object GET)")
+	f.StringVar(&opts.pull.Backend, "backend", "gantry", "Acquisition and origin transport: gantry (OCI HTTP), uds (direct Racer SDK), or s3 (S3 GetObject)")
 	f.StringVar(&opts.pull.Volume, "volume", "", "Racer cache name (compatibility flag); required for uds, using /run/racer/<cache>/{client,origin}/socket")
-	f.StringVar(&opts.s3.Endpoint, "endpoint", "", "S3 HTTP endpoint: racer-object sidecar or direct synthetic origin (default http://127.0.0.1:8080)")
+	f.StringVar(&opts.s3.Endpoint, "endpoint", "", "S3 endpoint for the standard S3 client: racer-object sidecar or synthetic origin (default http://127.0.0.1:8080)")
 	f.StringVar(&opts.s3.Bucket, "bucket", "", "Synthetic S3 bucket (default benchmark; requires backend=s3)")
 	f.IntVar(&opts.s3.Count, "object-count", 0, "Synthetic S3 object count, 1-512 (default 128)")
 	f.Int64Var(&opts.s3.Bytes, "object-bytes", 0, "Exact bytes per S3 object (default 67108864)")

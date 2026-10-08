@@ -367,7 +367,7 @@ help: ## Show this help
 	@echo "  racer-envtest-ci                 Provision pinned assets and run controller API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
 	@echo "  racer-loadgen | racer-loadgen-build  Build loadgen (with/without focused tests)"
-	@echo "  racer-loadgen-test                Race-test loadgen and object helpers"
+	@echo "  racer-loadgen-test                Race-test racer-loadgen"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
 	@echo ""
 	@echo "Common variables (override with VAR=value):"
@@ -597,8 +597,8 @@ racer-loadgen-build: ## Build the Racer load generator without lint/test
 	@mkdir -p bin
 	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -o $(RACER_LOADGEN_BIN) $(RACER_LOADGEN_CMD)
 
-racer-loadgen-test: ## Race-test loadgen and object helpers
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_LOADGEN_CMD)/... ./internal/racerobject/...
+racer-loadgen-test: ## Race-test racer-loadgen
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_LOADGEN_CMD)/...
 
 image-racer-loadgen-local: ## Build the loadgen container image locally (single-arch)
 	timeout --signal=TERM --kill-after=10s 300s $(CONTAINER_ENGINE) build \

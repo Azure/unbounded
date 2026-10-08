@@ -345,8 +345,13 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 
 	response, err := p.acquire(ctx, kind, desc)
 	if err != nil {
-		if p.opts.Backend == "uds" {
+		switch p.opts.Backend {
+		case "uds":
 			if code := sdkErrorStatus(err); code != 0 {
+				reason, status = failureStatus, code
+			}
+		case "s3":
+			if code := s3ErrorStatus(err); code != 0 {
 				reason, status = failureStatus, code
 			}
 		}

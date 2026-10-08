@@ -14,10 +14,13 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
-	"github.com/Azure/unbounded/internal/racerobject"
 )
 
 type s3Options struct {
@@ -65,7 +68,7 @@ func configureS3Options(opts *options, seen map[string]bool) error {
 		return errors.New("object-count must be in [1, 512] and object-bytes must be positive")
 	}
 
-	if _, err := racerobject.NewRequest("benchmark", opts.s3.Bucket, "validation", ""); err != nil {
+	if !validS3Bucket(opts.s3.Bucket) {
 		return errors.New("invalid S3 bucket")
 	}
 
@@ -92,7 +95,41 @@ func configureS3Options(opts *options, seen map[string]bool) error {
 	return nil
 }
 
+// validS3Bucket accepts the portable path-style subset of S3 bucket names:
+// 3-63 lowercase letters, digits, dots, and hyphens, starting and ending with
+// a letter or digit, without adjacent dots.
+func validS3Bucket(bucket string) bool {
+	if len(bucket) < 3 || len(bucket) > 63 || strings.Contains(bucket, "..") {
+		return false
+	}
+
+	alnum := func(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') }
+	for i := range len(bucket) {
+		if c := bucket[i]; !alnum(c) && c != '.' && c != '-' {
+			return false
+		}
+	}
+
+	return alnum(bucket[0]) && alnum(bucket[len(bucket)-1])
+}
+
 func s3ObjectKey(index int) string { return fmt.Sprintf("object-%06d", index) }
+
+// newS3Client builds a standard anonymous, path-style S3 client over the
+// puller's HTTP client. The SDK must not retry or follow redirects so that
+// every request and failure is reported exactly once.
+func (p *puller) newS3Client() *s3.Client {
+	return s3.New(s3.Options{
+		Region:                     "us-east-1",
+		BaseEndpoint:               aws.String(strings.TrimSuffix(p.target.String(), "/")),
+		UsePathStyle:               true,
+		Credentials:                aws.AnonymousCredentials{},
+		HTTPClient:                 p.client,
+		Retryer:                    aws.NopRetryer{},
+		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
+	})
+}
 
 // Keep S3 ETags opaque to the consumer: integrity comes from the expected SHA-256,
 // not from assuming the upstream uses MD5 or our synthetic ETag format.
@@ -102,29 +139,37 @@ func (p *puller) configureS3(catalog *blobCatalog, bucket string) {
 		keys[batch.blobs[0].descriptor.Digest] = s3ObjectKey(index)
 	}
 
+	client := p.newS3Client()
 	p.acquire = func(ctx context.Context, _ string, desc ocispec.Descriptor) (blobResponse, error) {
 		key, ok := keys[desc.Digest]
 		if !ok {
 			return blobResponse{}, errors.New("S3 object missing from catalog")
 		}
 
-		endpoint := *p.target
-		endpoint.Path, endpoint.RawPath = "/"+bucket+"/"+key, ""
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+		out, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
 		if err != nil {
 			return blobResponse{}, err
 		}
 
-		req.Header.Set("Accept", "application/octet-stream")
-
-		response, err := p.client.Do(req)
-		if err != nil {
-			return blobResponse{}, err
+		// The SDK accepts any 2xx; only a full 200 response is a complete object.
+		status := http.StatusOK
+		if raw, ok := awsmiddleware.GetRawResponse(out.ResultMetadata).(*smithyhttp.Response); ok {
+			status = raw.StatusCode
 		}
 
-		return blobResponse{body: response.Body, status: response.StatusCode, success: response.StatusCode == http.StatusOK}, nil
+		return blobResponse{body: out.Body, status: status, success: status == http.StatusOK}, nil
 	}
+}
+
+// s3ErrorStatus reports the HTTP status of an S3 error response, or zero when
+// the request failed before a response was received.
+func s3ErrorStatus(err error) int {
+	var response *awshttp.ResponseError
+	if errors.As(err, &response) {
+		return response.HTTPStatusCode()
+	}
+
+	return 0
 }
 
 // This is a read-only, unauthenticated S3 fixture, not an object store. The
