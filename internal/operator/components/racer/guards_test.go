@@ -137,7 +137,7 @@ func TestGuardContainmentRetriesFailedDeletion(t *testing.T) {
 	require.NoError(t, err)
 	require.ErrorContains(t, result.Err(), "delete unavailable")
 	plan := planPass(t, env)
-	require.Len(t, plan.Operations, 2)
+	require.Len(t, plan.Operations, 1)
 
 	for _, op := range plan.Operations {
 		require.Equal(t, component.OpDelete, op.Kind)
@@ -198,13 +198,10 @@ func TestGuardContainmentBindingReadFailure(t *testing.T) {
 			return c.Get(ctx, key, obj, opts...)
 		},
 	})
-	persist(t, env, planPass(t, env))
-	assertControllerBindings(t, env, false)
-
-	plan := planPass(t, env)
-	for _, op := range plan.Operations {
-		require.Equal(t, component.OpDelete, op.Kind)
-	}
+	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+	require.ErrorContains(t, err, "binding read unavailable")
+	require.Nil(t, plan)
+	assertControllerBindings(t, env, true)
 }
 
 func TestHealthyGuardsSurviveUnrelatedWriteFailure(t *testing.T) {
@@ -215,6 +212,13 @@ func TestHealthyGuardsSurviveUnrelatedWriteFailure(t *testing.T) {
 	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: guardNames[0]}, before))
 	require.NoError(t, env.Client.Delete(t.Context(), &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: controllerName, Namespace: env.Namespace}}))
 	env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == "Deployment" {
+				return errors.New("workload unavailable")
+			}
+
+			return c.Create(ctx, obj, opts...)
+		},
 		Apply: func(ctx context.Context, c client.WithWatch, cfg runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
 			data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cfg)
 			require.NoError(t, err)

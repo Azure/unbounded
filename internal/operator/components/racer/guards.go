@@ -54,7 +54,8 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 		return nil, false, nil
 	}
 
-	if _, err := claimedMarker(ctx, env, claim); err != nil {
+	marker, err := claimedMarker(ctx, env, claim)
+	if err != nil {
 		return nil, false, err
 	}
 
@@ -96,6 +97,12 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 			unhealthy, terminating = true, true
 		case !equality.Semantic.DeepEqual(effectiveGuardSpec(expected), effectiveGuardSpec(current)):
 			unhealthy = true
+
+			if err := validateRuntimeOwner(current, marker.UID); err != nil {
+				readErr = errors.Join(readErr, err)
+				continue
+			}
+
 			base := component.ToUnstructured(current)
 			base.SetGroupVersionKind(guard.GroupVersionKind())
 			desired := base.DeepCopy()
@@ -114,7 +121,7 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 	}
 	exists := false
 
-	for _, obj := range bindings {
+	for i, obj := range bindings {
 		current, ok := obj.DeepCopyObject().(client.Object)
 		if !ok {
 			return nil, false, errors.New("binding copy is not a client object")
@@ -122,17 +129,26 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 
 		err := env.LiveReader().Get(ctx, client.ObjectKeyFromObject(obj), current)
 		if err == nil {
+			if err := validateRuntimeOwner(current, marker.UID); err != nil {
+				return nil, false, err
+			}
+
+			current.GetObjectKind().SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+			bindings[i] = current
 			exists = true
 		} else if !apierrors.IsNotFound(err) {
-			// A known unhealthy guard warrants revocation even if a grant cannot
-			// be read. DeleteIfExists can still succeed independently of Get.
-			exists = true
+			return nil, false, err
 		}
 	}
 
 	if exists {
 		plan := component.NewPlan()
+
 		for _, obj := range bindings {
+			if obj.GetUID() == "" {
+				continue
+			}
+
 			add(plan, component.OpDelete, obj)
 		}
 

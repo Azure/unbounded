@@ -351,8 +351,11 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	current.SetGroupVersionKind(desired.GroupVersionKind())
 
 	key := client.ObjectKeyFromObject(desired)
+	comparable := desired.DeepCopy()
+	comparable.SetResourceVersion("")
+
 	if err := e.Client.Get(ctx, key, current); err == nil &&
-		current.GetLabels()[AppliedHashLabel] == hash && DesiredFieldsMatch(desired.Object, current.Object) {
+		current.GetLabels()[AppliedHashLabel] == hash && DesiredFieldsMatch(comparable.Object, current.Object) {
 		return nil
 	}
 
@@ -406,6 +409,8 @@ func DesiredFieldsMatch(desired, current any) bool {
 // characters, including the first and last characters required by label values.
 func AppliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
 	payload := obj.DeepCopy()
+	// Write preconditions are not part of the desired payload.
+	payload.SetResourceVersion("")
 	labels := payload.GetLabels()
 	delete(labels, AppliedHashLabel)
 	payload.SetLabels(labels)
@@ -444,7 +449,14 @@ func (e *Env) ListSites(ctx context.Context) ([]unboundedv1alpha3.Site, error) {
 
 // DeleteIfExists deletes an object, treating an already-absent object as success.
 func (e *Env) DeleteIfExists(ctx context.Context, obj client.Object) error {
-	if err := e.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+	var opts []client.DeleteOption
+
+	if uid := obj.GetUID(); uid != "" {
+		rv := obj.GetResourceVersion()
+		opts = append(opts, client.Preconditions{UID: &uid, ResourceVersion: &rv})
+	}
+
+	if err := e.Client.Delete(ctx, obj, opts...); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete %s %s/%s: %w",
 			obj.GetObjectKind().GroupVersionKind().Kind, obj.GetNamespace(), obj.GetName(), err)
 	}

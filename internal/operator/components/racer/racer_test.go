@@ -61,6 +61,10 @@ func testEnv(t *testing.T, objects ...client.Object) *component.Env {
 				return err
 			}
 
+			if (obj.GetUID() != "" && obj.GetUID() != current.GetUID()) || (obj.GetResourceVersion() != "" && obj.GetResourceVersion() != current.GetResourceVersion()) {
+				return apierrors.NewConflict(corev1.Resource(obj.GetKind()), obj.GetName(), errors.New("apply precondition failed"))
+			}
+
 			obj.SetResourceVersion(current.GetResourceVersion())
 			obj.SetUID(current.GetUID())
 
@@ -379,6 +383,13 @@ func TestPolicyFailuresSkipBindingsAndStartup(t *testing.T) {
 				plan := planPass(t, env)
 				original := env.Client
 				env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						if obj.GetObjectKind().GroupVersionKind().Kind == kind && obj.GetName() == policyName {
+							return errors.New("policy unavailable")
+						}
+
+						return c.Create(ctx, obj, opts...)
+					},
 					Apply: func(ctx context.Context, c client.WithWatch, cfg runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
 						data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cfg)
 						require.NoError(t, err)

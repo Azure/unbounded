@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -27,6 +28,10 @@ func preservedConfig(ctx context.Context, env *component.Env, plan *component.Pl
 	}
 
 	if err != nil {
+		return nil, err
+	}
+
+	if err := validateRuntimeOwner(current, types.UID(defaults.Annotations[installationAnnotation])); err != nil {
 		return nil, err
 	}
 
