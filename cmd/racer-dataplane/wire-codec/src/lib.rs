@@ -894,6 +894,7 @@ pub mod rest {
             self.check(scope)?;
             // Even a continuously readable peer must yield to other owner work.
             uring_runtime::drivers::yield_now().await;
+            self.check(scope)?;
             let mut progress = false;
             if self.tls.wants_write() {
                 match self.tls.write_tls(&mut self.socket.stream) {
@@ -1978,6 +1979,242 @@ pub mod rest {
     mod tests {
         use super::*;
         use testing::{FixtureIo, TestIdentity, TestTransport as _};
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum CancelError {
+            Runtime(uring_runtime::Error),
+            Fixture(testing::Error),
+        }
+
+        impl From<uring_runtime::Error> for CancelError {
+            fn from(error: uring_runtime::Error) -> Self {
+                Self::Runtime(error)
+            }
+        }
+
+        impl From<Error> for CancelError {
+            fn from(error: Error) -> Self {
+                Self::Fixture(error.into())
+            }
+        }
+
+        #[derive(Clone)]
+        struct CancelScope {
+            cancelled: Rc<std::cell::Cell<bool>>,
+            inner: testing::TestScope,
+        }
+
+        impl uring_runtime::Scope for CancelScope {
+            type Error = CancelError;
+
+            fn check(&self) -> Result<(), Self::Error> {
+                if self.cancelled.get() {
+                    return Err(uring_runtime::Error::Cancelled.into());
+                }
+                self.inner.check().map_err(CancelError::Fixture)
+            }
+        }
+
+        impl Scope for CancelScope {
+            fn deadline(&self) -> Instant {
+                self.inner.deadline()
+            }
+
+            fn narrowed(&self, until: Instant) -> Self {
+                Self {
+                    cancelled: self.cancelled.clone(),
+                    inner: self.inner.narrowed(until),
+                }
+            }
+        }
+
+        struct CancelIo;
+
+        impl Io for CancelIo {
+            type Error = CancelError;
+            type Scope = CancelScope;
+            type Lease = ();
+            type FileBytes = <FixtureIo as Io>::FileBytes;
+
+            fn lease(&self) -> Result<Option<Rc<()>>, Self::Error> {
+                FixtureIo.lease().map_err(CancelError::Fixture)
+            }
+
+            fn ready<'a>(
+                &'a self,
+                fd: Rc<Descriptor>,
+                read: bool,
+                write: bool,
+                lease: Option<Rc<()>>,
+                scope: &'a CancelScope,
+            ) -> Operation<'a, (), Self::Error> {
+                Box::pin(async move {
+                    FixtureIo
+                        .ready(fd, read, write, lease, &scope.inner)
+                        .await
+                        .map_err(CancelError::Fixture)
+                })
+            }
+
+            fn resolve<'a>(
+                &'a self,
+                host: &'a str,
+                port: u16,
+                scope: &'a CancelScope,
+            ) -> Operation<'a, Vec<SocketAddr>, Self::Error> {
+                Box::pin(async move {
+                    FixtureIo
+                        .resolve(host, port, &scope.inner)
+                        .await
+                        .map_err(CancelError::Fixture)
+                })
+            }
+
+            fn read_file<'a>(
+                &'a self,
+                path: &'a Path,
+                limit: usize,
+                scope: &'a CancelScope,
+            ) -> Operation<'a, Self::FileBytes, Self::Error> {
+                Box::pin(async move {
+                    FixtureIo
+                        .read_file(path, limit, &scope.inner)
+                        .await
+                        .map_err(CancelError::Fixture)
+                })
+            }
+        }
+
+        /// Synchronize at the yield with no handshake bytes left on either peer.
+        fn request_at_yield(cancel: bool) {
+            use std::{net::TcpListener, task::Context};
+
+            let (ca, ca_key) = testing::ca();
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+            let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+                .unwrap()
+                .signed_by(&key, &ca, &ca_key)
+                .unwrap();
+            let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+            config.send_tls13_tickets = 0;
+            let directory = testing::Directory::new();
+            let trust = directory.0.join("ca.crt");
+            std::fs::write(&trust, ca.pem()).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < until, "client did not connect");
+                            std::thread::yield_now();
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut tls = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+                while tls.is_handshaking() {
+                    tls.complete_io(&mut socket).unwrap();
+                }
+                (socket, tls)
+            });
+            let scope = CancelScope {
+                cancelled: Rc::new(std::cell::Cell::new(false)),
+                inner: testing::scope().narrowed(Instant::now() + Duration::from_secs(5)),
+            };
+            let transport = Transport::new(testing::config(format!("https://{address}"), trust));
+            transport.attach_io(Rc::new(CancelIo));
+            let mut connection =
+                futures::executor::block_on(transport.connect(None, &scope)).unwrap();
+            while connection.tls.wants_write() {
+                futures::executor::block_on(connection.step(&scope)).unwrap();
+            }
+            let (mut socket, mut tls) = server.join().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            assert_eq!(
+                socket.peek(&mut [0; 1]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                tls.reader().read(&mut [0; 1]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            socket.set_nonblocking(false).unwrap();
+            let mut request = connection.request(
+                testing::request(Method::Post, "/cancel-test", Some("test-token"), 1024),
+                &scope,
+            );
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            scope.cancelled.set(cancel);
+            let result = request.as_mut().poll(&mut cx);
+            if cancel {
+                drop(request);
+                // EOF must follow the handshake directly, with no request records.
+                assert_eq!(socket.read(&mut [0; 4096]).unwrap(), 0, "request leaked");
+                assert!(matches!(
+                    result,
+                    std::task::Poll::Ready(Err(CancelError::Runtime(
+                        uring_runtime::Error::Cancelled
+                    )))
+                ));
+            } else {
+                assert!(result.is_pending());
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert_ne!(tls.read_tls(&mut socket).unwrap(), 0);
+                    tls.process_new_packets().unwrap();
+                    let mut bytes = [0; 4096];
+                    loop {
+                        match tls.reader().read(&mut bytes) {
+                            Ok(0) => panic!("unexpected TLS EOF"),
+                            Ok(n) => head.extend_from_slice(&bytes[..n]),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("read request: {error}"),
+                        }
+                    }
+                }
+                let head = String::from_utf8(head).unwrap();
+                assert!(head.starts_with("POST /cancel-test HTTP/1.1\r\n"));
+                assert!(head.contains("\r\nAuthorization: Bearer test-token\r\n"));
+                tls.writer()
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+                while tls.wants_write() {
+                    tls.write_tls(&mut socket).unwrap();
+                }
+                assert_eq!(futures::executor::block_on(request).unwrap().status, 204);
+            }
+        }
+
+        #[test]
+        fn cancellation_during_tls_yield_sends_no_request_bytes() {
+            request_at_yield(true);
+        }
+
+        #[test]
+        fn active_scope_after_tls_yield_sends_request() {
+            request_at_yield(false);
+        }
 
         /// Access authenticated metadata only inside tests that mutate pool boundaries.
         fn authenticated(connection: &mut Connection<FixtureIo>) -> &mut Authenticated<FixtureIo> {
