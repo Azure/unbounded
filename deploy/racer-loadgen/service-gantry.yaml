@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: racer-loadgen-gantry
+  labels:
+    app.kubernetes.io/name: racer-loadgen
+spec:
+  internalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: gantry
+    app.kubernetes.io/component: agent
+  ports:
+    - name: mirror
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
