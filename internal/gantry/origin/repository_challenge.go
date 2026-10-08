@@ -57,6 +57,10 @@ func (c *Client) RepositoryAuthenticationChallenge(ctx context.Context, ref ifac
 	if err != nil {
 		return "", false, err
 	}
+
+	if ref.Kind == ifaces.KindManifest {
+		req.Header.Set("Accept", manifestAccept)
+	}
 	// Reuse configured transport/TLS trust, not the auth-bearing request path.
 	// A shallow client copy keeps redirect policy and cookies local to this probe.
 	hc := *r.hc

@@ -100,6 +100,80 @@ func TestRepositoryAuthenticationChallenge(t *testing.T) {
 	}
 }
 
+func TestRepositoryAuthenticationChallengeAccept(t *testing.T) {
+	const (
+		bearer         = `Bearer realm="https://auth.example/token",scope="repository:private/manifests/repo:pull",service="reg"`
+		manifestAccept = "application/vnd.oci.image.manifest.v1+json, " +
+			"application/vnd.oci.image.index.v1+json, " +
+			"application/vnd.docker.distribution.manifest.v2+json, " +
+			"application/vnd.docker.distribution.manifest.list.v2+json"
+	)
+
+	for _, resource := range []struct {
+		name   string
+		kind   ifaces.OriginRefKind
+		path   string
+		accept string
+	}{
+		{"manifest", ifaces.KindManifest, "manifests", manifestAccept},
+		{"blob", ifaces.KindBlob, "blobs", ""},
+		{"config", ifaces.KindConfig, "blobs", ""},
+	} {
+		t.Run(resource.name, func(t *testing.T) {
+			for _, response := range []struct {
+				name    string
+				status  int
+				wantErr bool
+				want    string
+			}{
+				{"challenge", http.StatusUnauthorized, false, bearer},
+				{"public", http.StatusOK, false, ""},
+				{"not found", http.StatusNotFound, true, ""},
+				{"not acceptable", http.StatusNotAcceptable, true, ""},
+			} {
+				t.Run(response.name, func(t *testing.T) {
+					d := digestOf([]byte("resource"))
+
+					var hits atomic.Int32
+
+					srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						hits.Add(1)
+
+						if r.Method != http.MethodHead || r.URL.Path != "/v2/private/manifests/repo/"+resource.path+"/"+d.String() {
+							t.Errorf("unexpected probe %s %s", r.Method, r.URL)
+						}
+
+						if got := r.Header.Get("Accept"); got != resource.accept {
+							t.Errorf("Accept = %q, want %q", got, resource.accept)
+							w.WriteHeader(http.StatusNotAcceptable)
+
+							return
+						}
+
+						w.Header().Set("WWW-Authenticate", bearer)
+						w.WriteHeader(response.status)
+					}))
+					defer srv.Close()
+
+					c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+					c.registries["reg"].hc = srv.Client()
+
+					got, required, err := c.RepositoryAuthenticationChallenge(context.Background(), ifaces.OriginRef{
+						Registry: "reg", Repository: "private/manifests/repo", Digest: d, Kind: resource.kind,
+					})
+					if (err != nil) != response.wantErr || got != response.want || required != (response.want != "") {
+						t.Errorf("challenge=%q required=%v err=%v", got, required, err)
+					}
+
+					if hits.Load() != 1 {
+						t.Errorf("probe requests = %d, want 1", hits.Load())
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestRepositoryAuthenticationChallengeRejectsInvalidTargets(t *testing.T) {
 	var hits atomic.Int32
 

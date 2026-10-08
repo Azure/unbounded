@@ -812,6 +812,11 @@ func (r *registry) do(ctx context.Context, method, urlStr string, offset int64) 
 	return r.doRange(ctx, method, urlStr, rangeValue)
 }
 
+const manifestAccept = "application/vnd.oci.image.manifest.v1+json, " +
+	"application/vnd.oci.image.index.v1+json, " +
+	"application/vnd.docker.distribution.manifest.v2+json, " +
+	"application/vnd.docker.distribution.manifest.list.v2+json"
+
 func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue string) (*http.Response, error) {
 	delegatedAuthorization := registryauth.Authorization(ctx)
 	if delegatedAuthorization != "" && !r.canSendBasicAuth() {
@@ -828,11 +833,7 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 		}
 
 		if strings.Contains(urlStr, "/manifests/") {
-			req.Header.Set("Accept",
-				"application/vnd.oci.image.manifest.v1+json, "+
-					"application/vnd.oci.image.index.v1+json, "+
-					"application/vnd.docker.distribution.manifest.v2+json, "+
-					"application/vnd.docker.distribution.manifest.list.v2+json")
+			req.Header.Set("Accept", manifestAccept)
 		}
 
 		if authorization != "" {
