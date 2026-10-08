@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // racer-loadgen serves deterministic synthetic blobs and repeatedly reads them
-// through Gantry or the Racer SDK, without a local content cache.
+// through Gantry, the Racer SDK, or S3, without a local content cache.
 package main
 
 import (
