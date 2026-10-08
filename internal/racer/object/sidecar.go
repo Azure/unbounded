@@ -107,7 +107,9 @@ func (s *sidecar) serve(w http.ResponseWriter, r *http.Request) sidecarFailure {
 
 	read := sidecarRead{m, version, offset, length, partial}
 	if r.Method == http.MethodHead {
+		read.partial = false
 		read.writeHeaders(w)
+
 		return 0
 	}
 

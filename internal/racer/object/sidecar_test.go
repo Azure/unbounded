@@ -93,17 +93,18 @@ func TestSidecarReads(t *testing.T) {
 	h, _ := sidecarTestHandler(t, sidecarTestOrigin(t, "0123456789", `"opaque,tag\\value"`, &calls))
 	for _, tc := range []struct {
 		name, method, rangeValue, body, contentRange string
-		status                                       int
+		status, contentLength                        int
 	}{
-		{"full", "GET", "", "0123456789", "", 200},
-		{"head", "HEAD", "", "", "", 200},
-		{"bounded", "GET", "bytes=2-5", "2345", "bytes 2-5/10", 206},
-		{"open", "GET", "bytes=7-", "789", "bytes 7-9/10", 206},
-		{"suffix", "GET", "bytes=-3", "789", "bytes 7-9/10", 206},
-		{"clamped", "GET", "bytes=8-999", "89", "bytes 8-9/10", 206},
-		{"large suffix", "GET", "bytes=-999", "0123456789", "bytes 0-9/10", 206},
-		{"one byte", "GET", "bytes=0-0", "0", "bytes 0-0/10", 206},
-		{"head range", "HEAD", "bytes=2-5", "", "bytes 2-5/10", 206},
+		{"full", "GET", "", "0123456789", "", 200, 10},
+		{"head", "HEAD", "", "", "", 200, 10},
+		{"bounded", "GET", "bytes=2-5", "2345", "bytes 2-5/10", 206, 4},
+		{"open", "GET", "bytes=7-", "789", "bytes 7-9/10", 206, 3},
+		{"suffix", "GET", "bytes=-3", "789", "bytes 7-9/10", 206, 3},
+		{"clamped", "GET", "bytes=8-999", "89", "bytes 8-9/10", 206, 2},
+		{"large suffix", "GET", "bytes=-999", "0123456789", "bytes 0-9/10", 206, 10},
+		{"one byte", "GET", "bytes=0-0", "0", "bytes 0-0/10", 206, 1},
+		{"head range", "HEAD", "bytes=2-5", "", "", 200, 4},
+		{"head suffix range", "HEAD", "bytes=-3", "", "", 200, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := calls.Load()
@@ -122,11 +123,11 @@ func TestSidecarReads(t *testing.T) {
 				t.Fatalf("headers: %v", w.Header())
 			}
 
-			if tc.method == "HEAD" {
-				if calls.Load()-before != 1 {
-					t.Fatal("HEAD opened a stream")
-				}
-			} else if w.Header().Get("Content-Length") != strconv.Itoa(len(tc.body)) {
+			if tc.method == "HEAD" && calls.Load()-before != 1 {
+				t.Fatal("HEAD opened a stream")
+			}
+
+			if w.Header().Get("Content-Length") != strconv.Itoa(tc.contentLength) {
 				t.Fatal("wrong content length")
 			}
 		})
@@ -314,13 +315,21 @@ func TestSidecarInvalidRanges(t *testing.T) {
 		{"", 400},
 	} {
 		t.Run(tc.value, func(t *testing.T) {
-			w := sidecarTestRequest(h, "GET", "/bucket/key", http.Header{"Range": {tc.value}})
-			if w.Code != tc.status {
-				t.Fatalf("status %d want %d", w.Code, tc.status)
-			}
+			for _, method := range []string{"GET", "HEAD"} {
+				t.Run(method, func(t *testing.T) {
+					w := sidecarTestRequest(h, method, "/bucket/key", http.Header{"Range": {tc.value}})
+					if w.Code != tc.status {
+						t.Fatalf("status %d want %d", w.Code, tc.status)
+					}
 
-			if tc.status == 416 && w.Header().Get("Content-Range") != "bytes */4" {
-				t.Fatal("missing unsatisfied range size")
+					if tc.status == 416 && w.Header().Get("Content-Range") != "bytes */4" {
+						t.Fatal("missing unsatisfied range size")
+					}
+
+					if method == "HEAD" && w.Body.Len() != 0 {
+						t.Fatal("HEAD error body")
+					}
+				})
 			}
 		})
 	}
