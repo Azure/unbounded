@@ -55,16 +55,19 @@ func (m *loadMetrics) instrument(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		response := &originResponse{ResponseWriter: w, code: http.StatusOK}
+
+		defer func() {
+			method := r.Method
+			if method != http.MethodGet && method != http.MethodHead {
+				method = "other"
+			}
+
+			m.originRequests.WithLabelValues(method, strconv.Itoa(response.code)).Inc()
+			m.originBytes.Add(float64(response.bytes))
+			m.originDuration.Observe(time.Since(start).Seconds())
+		}()
+
 		next.ServeHTTP(response, r)
-
-		method := r.Method
-		if method != http.MethodGet && method != http.MethodHead {
-			method = "other"
-		}
-
-		m.originRequests.WithLabelValues(method, strconv.Itoa(response.code)).Inc()
-		m.originBytes.Add(float64(response.bytes))
-		m.originDuration.Observe(time.Since(start).Seconds())
 	})
 }
 

@@ -144,6 +144,45 @@ func TestMetricsInstrumentPartialWrite(t *testing.T) {
 	}
 }
 
+func TestMetricsInstrumentS3Abort(t *testing.T) {
+	catalog := s3TestCatalog(t, 1, 1024)
+
+	for _, ranges := range []string{"", "bytes=7-15"} {
+		for _, accepted := range []int{0, 3} {
+			t.Run(fmt.Sprintf("range=%s/accepted=%d", ranges, accepted), func(t *testing.T) {
+				reg := prometheus.NewRegistry()
+				metrics := newMetrics(reg)
+				writer := &partialOriginWriter{ResponseRecorder: httptest.NewRecorder(), limit: accepted, err: io.ErrClosedPipe}
+				request := httptest.NewRequest(http.MethodGet, "/benchmark/"+s3ObjectKey(0), nil)
+				request.Header.Set("Range", ranges)
+
+				handler := metrics.instrument(catalog.s3Handler("benchmark"))
+
+				require.PanicsWithValue(t, http.ErrAbortHandler, func() {
+					handler.ServeHTTP(writer, request)
+				})
+
+				status := http.StatusOK
+				if ranges != "" {
+					status = http.StatusPartialContent
+				}
+
+				require.Equal(t, status, writer.Code)
+				require.Equal(t, accepted, writer.Body.Len())
+				families := gatherLoadgenMetrics(t, reg)
+				require.Len(t, families["racer_loadgen_origin_requests_total"].GetMetric(), 1)
+
+				labels := map[string]string{"method": http.MethodGet, "code": strconv.Itoa(status)}
+				require.Equal(t, float64(1), metricWithLabels(t, families["racer_loadgen_origin_requests_total"], labels).GetCounter().GetValue())
+				require.Equal(t, float64(accepted), metricWithLabels(t, families["racer_loadgen_origin_bytes_total"], nil).GetCounter().GetValue())
+				histogram := metricWithLabels(t, families["racer_loadgen_origin_request_duration_seconds"], nil).GetHistogram()
+				require.Equal(t, uint64(1), histogram.GetSampleCount())
+				require.Positive(t, histogram.GetSampleSum())
+			})
+		}
+	}
+}
+
 func TestMetricsInstrumentRegistryHeadRangeAndErrors(t *testing.T) {
 	img, err := newImage(t.Context(), imageOptions{Repository: "test/image", Layers: 1, LayerBytes: 1024, Seed: "metrics"})
 	require.NoError(t, err)
