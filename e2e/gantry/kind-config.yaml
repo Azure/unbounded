@@ -16,7 +16,7 @@
 # The kind node image does not enable certs.d registry configuration by
 # default. Tests install hosts.toml files dynamically, so point the CRI plugin
 # at that directory before containerd starts. The harness pins
-# kindest/node:v1.34.0, which ships containerd v2.1.4 with config format 2 and
+# kindest/node:v1.34.0, which ships containerd v2.1 with config format 2 and
 # the legacy CRI plugin key below.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4

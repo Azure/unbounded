@@ -137,7 +137,7 @@ The scenarios below are still gaps. Each should land as a focused commit.
 
 - The kind cluster boot takes ~60–120 s. The Makefile target reserves
   a 10-minute test timeout to absorb that.
-- The harness pins `kindest/node:v1.34.0`, which carries containerd v2.1.4.
+- The harness pins `kindest/node:v1.34.0`, which carries containerd v2.1.
   Its containerd uses namespace `k8s.io`, matching the gantry
   `containerd_namespace` default - no extra config is needed.
 - Containerd socket access is mandatory. The default DaemonSet runs with

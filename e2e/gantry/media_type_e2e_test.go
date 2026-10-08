@@ -101,8 +101,8 @@ func TestE2E_MultiArchIndexDigestPeerWithoutMediaTypeCache(t *testing.T) {
 		t.Fatalf("read containerd version on %s: %v", seedNode, err)
 	}
 
-	if !strings.Contains(version, "2.1.4") {
-		t.Fatalf("containerd version on %s does not contain 2.1.4:\n%s", seedNode, version)
+	if !strings.Contains(version, "v2.1.") {
+		t.Fatalf("containerd version on %s is not v2.1.x:\n%s", seedNode, version)
 	}
 
 	h.seedBareImageContent(ctx, seedNode, index.digest, nodePlatform)
