@@ -1353,7 +1353,7 @@ pub mod identity {
     }
 
     /// Shared enrollment/activation policy for bounded roots, client-auth chains,
-    /// canonical node URI, and a non-CA Ed25519 leaf without certificate-signing usage.
+    /// canonical node URI, and a non-CA Ed25519 leaf with only digitalSignature/clientAuth.
     pub(super) fn verify_chain(
         roots: &[Vec<u8>],
         chain: &[Vec<u8>],
@@ -1401,9 +1401,16 @@ pub mod identity {
             .extended_key_usage()
             .map_err(|_| Error::Unauthorized)?
             .ok_or(Error::Unauthorized)?;
-        if !usage.value.digital_signature()
-            || usage.value.key_cert_sign()
+        // Match the authority's exact digitalSignature and clientAuth usage sets.
+        if usage.value.flags != 1
             || !extended.value.client_auth
+            || extended.value.any
+            || extended.value.server_auth
+            || extended.value.code_signing
+            || extended.value.email_protection
+            || extended.value.time_stamping
+            || extended.value.ocsp_signing
+            || !extended.value.other.is_empty()
         {
             return Err(Error::Unauthorized);
         }

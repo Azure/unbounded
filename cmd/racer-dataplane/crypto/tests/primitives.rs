@@ -766,6 +766,67 @@ mod identity_workflows {
         );
     }
 
+    /// Acceptance, recovery, and peer verification require exact client usages.
+    #[test]
+    fn identity_paths_require_exact_client_certificate_usages() {
+        use rcgen::{ExtendedKeyUsagePurpose as Eku, KeyUsagePurpose as Ku};
+
+        for (case, extra_ku, extra_eku) in [
+            ("exact", None, None),
+            ("key-encipherment", Some(Ku::KeyEncipherment), None),
+            ("server-auth", None, Some(Eku::ServerAuth)),
+            ("unknown", None, Some(Eku::Other(vec![1, 2, 3, 4]))),
+            ("any", None, Some(Eku::Any)),
+            ("code-signing", None, Some(Eku::CodeSigning)),
+            ("email-protection", None, Some(Eku::EmailProtection)),
+            ("time-stamping", None, Some(Eku::TimeStamping)),
+            ("ocsp-signing", None, Some(Eku::OcspSigning)),
+        ] {
+            let (pending, chain, roots) = issued_with(|params| {
+                params.key_usages.extend(extra_ku);
+                params.extended_key_usages.extend(extra_eku);
+            });
+            let cluster = ClusterId(CLUSTER.into());
+            let node = NodeId(NODE.into());
+            let secret = pending.export_pkcs8_for_persistence().unwrap();
+            let signature = racer_crypto::SigningKey::from_pkcs8_der(&secret)
+                .unwrap()
+                .sign(b"message");
+            let expected = if case == "exact" {
+                Ok(())
+            } else {
+                Err(Error::Unauthorized)
+            };
+            assert_eq!(
+                pending
+                    .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+                    .map(|_| ()),
+                expected,
+                "accept: {case}"
+            );
+            assert_eq!(
+                SigningIdentity::from_pkcs8(
+                    cluster.clone(),
+                    node.clone(),
+                    &secret,
+                    chain.clone(),
+                    &roots,
+                )
+                .map(|_| ()),
+                expected,
+                "recover: {case}"
+            );
+            let certificates = Certificates::new(cluster, Rc::new(keyring(roots)));
+            assert_eq!(
+                certificates
+                    .verify_signed(&chain, &node, b"message", &signature)
+                    .map(|_| ()),
+                expected,
+                "peer: {case}"
+            );
+        }
+    }
+
     /// Exercise usage, validity, CA-leaf, and ambiguous URI rejection.
     #[test]
     fn rejects_missing_usage_ca_expiration_and_ambiguous_identity() {
