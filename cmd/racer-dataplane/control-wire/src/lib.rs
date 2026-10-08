@@ -23,6 +23,11 @@
 //! `racer_crypto::identity::BundleInstaller` owns canonical bundle replay tracking
 //! and installation into its keyring; `wire_codec::rest` owns reusable REST/TLS.
 //!
+//! Callers must obtain key bundles, trust roots, and enrollment responses from an
+//! authenticated, authorized source, such as a mutually authenticated control-plane
+//! channel or trusted provisioning. Syntax and certificate checks do not authorize
+//! trust-root replacement or authenticate the whole response.
+//!
 //! In the full application, publication adapters bind these wire records to the
 //! separate `controlplane` component's synchronization, immutable publication,
 //! retention, and generation-tagged rollout APIs. That component is application
