@@ -2083,6 +2083,20 @@ def initramfs_ip_karg() -> str:
             f"{IGNITION_INITRAMFS_INTERFACE}:none:8.8.8.8:8.8.4.4")
 
 
+# On the Azure platform the initramfs fetches the hostname from Azure's
+# metadata endpoint on the first boot, and retries it with no limit; under QEMU
+# nothing answers. The generic build of the image masks it already, the Azure
+# build does not. The harness writes /etc/hostname through Ignition instead.
+IGNITION_METADATA_HOSTNAME_MASK = "rd.systemd.mask=flatcar-metadata-hostname.service"
+
+
+def ignition_first_boot_kargs(config_url: str) -> str:
+    """Return what the harness adds to the first boot's command line: where
+    Ignition fetches its config, the initramfs address it fetches it over, and
+    the metadata hostname mask. None of it is needed on a later boot."""
+    return f"ignition.config.url={config_url} {initramfs_ip_karg()} {IGNITION_METADATA_HOSTNAME_MASK}"
+
+
 def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -> dict:
     """Add what the harness needs to drive the VM, and keep the image's own intent.
 
@@ -2103,9 +2117,10 @@ def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -
     files = doc.setdefault("storage", {}).setdefault("files", [])
 
     # The node registers under the host's hostname, and this image leaves it as
-    # "localhost": it masks the metadata hostname service and has no cloud-init
-    # to apply NoCloud's local-hostname. The cloud-init hosts get VM_NAME, so
-    # set the same thing here or the node joins under the wrong name.
+    # "localhost": the metadata hostname service is masked, by the generic
+    # build or by ignition_first_boot_kargs, and there is no cloud-init to
+    # apply NoCloud's local-hostname. The cloud-init hosts get VM_NAME, so set
+    # the same thing here or the node joins under the wrong name.
     files.append({
         "path": "/etc/hostname",
         "mode": 0o644,
@@ -2146,8 +2161,9 @@ def ovmf_firmware() -> tuple[Path, Path]:
 
 def launch_ignition_vm(ignition_json: str) -> None:
     """Boot the VM through its own bootloader with an Ignition config in place.
-    The config source and the initramfs address go on the command line through a
-    patched UKI addon; see ukiboot for why the boot chain is left intact.
+    The config source and the initramfs address go on the first boot's command
+    line through the patched first-boot addon; see ukiboot for why the boot
+    chain is left intact.
     """
     _, vm_disk = _create_vm_disk()
 
@@ -2160,9 +2176,8 @@ def launch_ignition_vm(ignition_json: str) -> None:
     serve_base = os.environ.get("IGNITION_SERVE_BASE", f"http://{VM_GATEWAY}:{SERVE_PORT}")
     config_url = f"{serve_base}/{IGNITION_CONFIG_NAME}"
 
-    log(f"Patching the ESP boot command line in {vm_disk}...")
-    patched = ukiboot.patch_uki_cmdline_addon(
-        vm_disk, f"ignition.config.url={config_url} {initramfs_ip_karg()}")
+    log(f"Patching the ESP first-boot command line in {vm_disk}...")
+    patched = ukiboot.patch_firstboot_cmdline(vm_disk, ignition_first_boot_kargs(config_url))
     log(f"Patched {patched.addon} ({patched.used}/{patched.capacity} bytes)")
 
     code, vars_template = ovmf_firmware()

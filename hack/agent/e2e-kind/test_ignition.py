@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import patch
 
 import e2e
+import ukiboot
 
 
 class TestPatchAgentConfig(unittest.TestCase):
@@ -76,6 +77,22 @@ class TestHarnessAccess(unittest.TestCase):
         initramfs_ip_karg."""
         fields = e2e.initramfs_ip_karg().removeprefix("ip=").split(":")
         self.assertEqual(fields[5], e2e.IGNITION_INITRAMFS_INTERFACE)
+
+    def test_the_first_boot_additions_fit_the_first_boot_addon(self):
+        """Both images pad the first-boot addon's .cmdline to 512 bytes and use
+        27 of them for flatcar.first_boot=detected. A VM name long enough to
+        overflow it fails the patch before the VM boots, so the longest one CI
+        uses is checked here. The metadata hostname mask has to be there: the
+        Azure build of the image otherwise waits on its first boot for a
+        metadata service QEMU does not have."""
+        with patch.object(e2e, "VM_NAME", "agent-e2e-acl-azlinux3"):
+            kargs = e2e.ignition_first_boot_kargs(f"http://{e2e.VM_GATEWAY}:{e2e.SERVE_PORT}/config.ign")
+            ip = e2e.initramfs_ip_karg()
+
+        self.assertIn("ignition.config.url=http://", kargs)
+        self.assertIn(ip, kargs.split())
+        self.assertIn("rd.systemd.mask=flatcar-metadata-hostname.service", kargs.split())
+        self.assertIsNotNone(ukiboot.fit_cmdline("flatcar.first_boot=detected", kargs, 512))
 
 
 class TestIgnitionHostBoundaries(unittest.TestCase):

@@ -72,12 +72,11 @@ default local run skips it there.
 
 Running this locally needs `ovmf` and `qemu-nbd` in addition to the usual
 prerequisites. The host boots through its own UEFI bootloader, and the Ignition
-config URL is appended to the kernel command line by patching a UKI addon on
-the EFI system partition; see `ukiboot.py` for why the boot chain is extended
-rather than replaced. The patched addon stays in place, so every later boot has
-the config URL and the static `ip=` argument on its command line too. Ignition
-ignores them after first boot, but the suite's reboots run with networking
-configured from the command line, which a production host does not have.
+config URL is appended to the first boot's kernel command line by patching the
+first-boot UKI addon on the EFI system partition; see `ukiboot.py` for why the
+boot chain is extended rather than replaced. ignition-quench deletes that addon
+after the first boot, so later boots, including the suite's reboots, run on the
+image's own command line, with networking from the units Ignition wrote.
 
 In CI this entry is skipped unless a federated Azure login is configured, and
 on pull requests from forks, because GitHub withholds secrets from
