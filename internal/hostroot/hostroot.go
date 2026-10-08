@@ -24,7 +24,13 @@ import (
 
 const (
 	// Path is where the agent's host-side files live.
-	Path = "/opt/unbounded"
+	//
+	// Its parent is not the agent's. Hosts stage files for the agent there,
+	// such as offline artifacts and OCI layouts, and the parent may already
+	// be a directory, or a mount, when an older agent's installation is
+	// linked. So the agent creates the parent when it is missing, never
+	// changes one that exists, and never removes it.
+	Path = "/opt/unbounded/agent"
 
 	// LegacyPath is where agents released before Path installed them.
 	LegacyPath = "/usr/local"
@@ -153,8 +159,10 @@ func migrate(log *slog.Logger, root, legacy string, markers []string) error {
 			return nil
 		}
 
-		if err := os.MkdirAll(filepath.Dir(root), 0o755); err != nil {
-			return fmt.Errorf("create %s: %w", filepath.Dir(root), err)
+		// The link goes inside the parent, which may already hold other files;
+		// see Path.
+		if err := mkdirMode(filepath.Dir(root), 0o755); err != nil {
+			return err
 		}
 
 		// Atomic, so a concurrent migration replaces an identical link.
@@ -238,14 +246,29 @@ func prepare(
 	return nil
 }
 
-// mkdirMode creates dir, and its parents, and sets its mode. An existing
-// directory keeps its mode, which may have been chosen by whoever made it.
+// mkdirMode creates dir, and each parent it lacks, with mode whatever the
+// umask. A directory that already exists keeps its mode, which may have been
+// chosen by whoever made it; the root's parent, in particular, is not the
+// agent's.
 func mkdirMode(dir string, mode os.FileMode) error {
-	if _, err := os.Stat(dir); err == nil {
+	_, err := os.Stat(dir)
+	if err == nil {
 		return nil
 	}
 
-	if err := os.MkdirAll(dir, mode); err != nil {
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect %s: %w", dir, err)
+	}
+
+	if err := mkdirMode(filepath.Dir(dir), mode); err != nil {
+		return err
+	}
+
+	// Another command may have made it since it was checked. It is theirs
+	// then, mode and all.
+	if err := os.Mkdir(dir, mode); errors.Is(err, os.ErrExist) {
+		return nil
+	} else if err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
 
@@ -271,7 +294,8 @@ func restoreLabels(ctx context.Context, log *slog.Logger, root string) {
 // link this package created is removed, and a real directory is removed along
 // with its now empty subdirectories. Anything not empty is left in place, and
 // a link pointing somewhere else is left for whoever made it. What an
-// unfinished move left behind, the staging copy and the marker, goes too.
+// unfinished move left behind, the staging copy and the marker, goes too. The
+// root's parent stays, whatever is in it; see Path.
 func Remove(log *slog.Logger) error {
 	return remove(log, Path, LegacyPath)
 }

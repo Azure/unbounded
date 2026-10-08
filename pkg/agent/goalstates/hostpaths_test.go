@@ -15,8 +15,8 @@ func TestHostPathsUnder(t *testing.T) {
 	t.Parallel()
 
 	for root, paths := range map[string]HostPaths{
-		"/opt/unbounded": hostPathsUnder("/opt/unbounded"),
-		"/usr/local":     LegacyHostPaths(),
+		"/opt/unbounded/agent": hostPathsUnder("/opt/unbounded/agent"),
+		"/usr/local":           LegacyHostPaths(),
 	} {
 		assert.Equal(t, HostPaths{
 			Root:                  root,

@@ -104,7 +104,8 @@ KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 OFFLINE_BOOTSTRAP = os.environ.get("OFFLINE_BOOTSTRAP", "").lower() in ("1", "true", "yes")
-OFFLINE_ARTIFACTS_DIR = "/var/lib/unbounded-e2e/artifacts"
+# Beside the host root, where the agent docs suggest hosts stage files.
+OFFLINE_ARTIFACTS_DIR = "/opt/unbounded/artifacts"
 
 # The last release before the host root. The migration suite installs it, and
 # returns to it after moving to this build.
@@ -159,8 +160,10 @@ E2E_WORKLOAD_IMAGE = "docker.io/library/busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
 # The agent's host root, and where agents released before it installed their
 # files. A host installed by an older agent keeps its files under the legacy
-# root, and the current agent links the host root to it.
-HOST_ROOT = "/opt/unbounded"
+# root, and the current agent links the host root to it. The root's parent is
+# not the agent's: hosts stage files there, such as offline artifacts.
+HOST_ROOT_PARENT = "/opt/unbounded"
+HOST_ROOT = f"{HOST_ROOT_PARENT}/agent"
 LEGACY_HOST_ROOT = "/usr/local"
 DAEMON_BIN_DIR = f"{HOST_ROOT}/bin"
 DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
@@ -5040,6 +5043,34 @@ def validate_host_agent_upgrade() -> None:
 # ---------------------------------------------------------------------------
 # The copy a move from the legacy root makes beside the host root.
 HOST_ROOT_STAGING = f"{HOST_ROOT}.staging"
+# A file a host staged beside the host root before any agent was installed, as
+# the docs suggest for a local OCI layout. Linking, moving and resetting the
+# host root must leave it alone.
+HOST_STAGED_FILE = f"{HOST_ROOT_PARENT}/images/e2e-staged/oci-layout"
+HOST_STAGED_CONTENT = "staged-before-install"
+
+
+def stage_host_files() -> None:
+    """Stage HOST_STAGED_FILE on a host nothing is installed on yet."""
+
+    if host_image().provisioning == "ignition":
+        die("staging files before install needs a cloud-init host; an Ignition host boots with the agent")
+
+    wait_for_cloud_init()
+    ssh_cmd("sudo sh -c " + shlex.quote(
+        f"mkdir -p {os.path.dirname(HOST_STAGED_FILE)} && printf %s {HOST_STAGED_CONTENT} > {HOST_STAGED_FILE}"
+    ))
+    log(f"Staged {HOST_STAGED_FILE} beside {HOST_ROOT}")
+
+
+def validate_host_staged_files() -> None:
+    """Assert HOST_STAGED_FILE is as stage_host_files left it."""
+
+    result = ssh_capture_quiet(f"sudo cat {HOST_STAGED_FILE}")
+    if result.returncode != 0 or result.stdout != HOST_STAGED_CONTENT:
+        die(f"{HOST_STAGED_FILE}, staged beside {HOST_ROOT}, was changed or removed: "
+            f"{(result.stdout + result.stderr).strip()!r}")
+    log(f"{HOST_STAGED_FILE} is untouched")
 
 
 def _wait_until(check: Callable[[], str], timeout_secs: int) -> None:
@@ -5080,7 +5111,7 @@ def validate_host_root() -> None:
 
     script = textwrap.dedent(f"""
         set -eu
-        for d in {HOST_ROOT} {HOST_ROOT}/bin {HOST_ROOT}/libexec; do
+        for d in {HOST_ROOT_PARENT} {HOST_ROOT} {HOST_ROOT}/bin {HOST_ROOT}/libexec; do
             got=$(stat -c '%a %U' "$d")
             [ "$got" = "755 root" ] || {{ echo "$d is $got, expected 755 root"; exit 1; }}
         done
@@ -5857,11 +5888,14 @@ SUITES: dict[str, list[str]] = {
     "configuration": ["validate-node-configs"],
     "fresh-bootstrap": ["run-agent", "wait-for-node", "validate-workload"],
     # A host installed before the host root, linked and then moved; see README.
-    "migration": ["run-legacy-agent", "wait-for-node", "validate-agent-upgrade-operation", "validate-host-root-linked", "validate-host-reboot",
+    # Files staged beside the host root before the install must survive each
+    # change to it.
+    "migration": ["stage-host-files", "run-legacy-agent", "wait-for-node", "validate-agent-upgrade-operation",
+                  "validate-host-root-linked", "validate-host-staged-files", "validate-host-reboot",
                   "validate-host-root-linked", "validate-agent-downgrade-to-legacy",
                   "validate-agent-upgrade-operation", "validate-host-root-linked",
-                  "validate-agent-upgrade-operation", "validate-host-root-moved", "validate-host-reboot",
-                  "validate-host-root", "reset-agent"],
+                  "validate-agent-upgrade-operation", "validate-host-root-moved", "validate-host-staged-files",
+                  "validate-host-reboot", "validate-host-root", "reset-agent", "validate-host-staged-files"],
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
                            "validate-node-repave-upgrade", "validate-bootstrap-repair"],
 }
@@ -5945,6 +5979,8 @@ COMMANDS: dict[str, Command] = {
     "validate-host-root": _without_node_config(validate_host_root),
     "validate-host-root-linked": _without_node_config(validate_host_root_linked),
     "validate-host-root-moved": _without_node_config(validate_host_root_moved),
+    "stage-host-files": _without_node_config(stage_host_files),
+    "validate-host-staged-files": _without_node_config(validate_host_staged_files),
     "run-legacy-agent": run_legacy_agent,
     "validate-agent-downgrade-to-legacy": _without_node_config(validate_agent_downgrade_to_legacy),
     "cleanup": _without_node_config(cleanup),

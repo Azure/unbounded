@@ -198,24 +198,33 @@ runcmd:
 
 ### Where the agent installs
 
-The agent keeps its own host-side files under `/opt/unbounded`: the daemon
-binaries and helper scripts in `/opt/unbounded/bin`, and the LocalDNS network
-helper in `/opt/unbounded/libexec`. Paths inside the nspawn machine are always
-relative to the machine directory, and `/etc/unbounded/agent` and
-`/var/lib/unbounded` are separate. `/opt/unbounded/bin` is not on the default
-`PATH`, so run the agent on the host as `/opt/unbounded/bin/unbounded-agent`.
+The agent keeps its own host-side files under `/opt/unbounded/agent`: the
+daemon binaries and helper scripts in `/opt/unbounded/agent/bin`, and the
+LocalDNS network helper in `/opt/unbounded/agent/libexec`. Paths inside the
+nspawn machine are always relative to the machine directory, and
+`/etc/unbounded/agent` and `/var/lib/unbounded` are separate.
+`/opt/unbounded/agent/bin` is not on the default `PATH`, so run the agent on the
+host as `/opt/unbounded/agent/bin/unbounded-agent`.
+
+`/opt/unbounded/agent` is reserved for the agent. The rest of `/opt/unbounded`
+is yours, for example for offline artifacts or a local OCI layout: the agent
+creates `/opt/unbounded` if it is missing, and otherwise never changes or
+removes it or anything else in it. Mount a volume at a subdirectory such as
+`/opt/unbounded/artifacts` rather than over `/opt/unbounded`, so it does not
+hide the agent.
 
 Releases up to v0.8.0 installed these files under `/usr/local`. A host installed
-by one of them moves to `/opt/unbounded` in two stages:
+by one of them moves to `/opt/unbounded/agent` in two stages:
 
 1. **Linked.** The first command of a newer agent that changes the host links
-   `/opt/unbounded` to `/usr/local`. That happens when the daemon starts after
-   an AgentUpgrade, when `start` or `agent-upgrade` runs, or when an nspawn
-   lifecycle hook runs. The files stay where they are and the units that run
-   them are unchanged. The older release is still the last-good binary, so the
-   daemon can roll back to it, and an AgentUpgrade back to it works.
+   `/opt/unbounded/agent` to `/usr/local`, creating `/opt/unbounded` if needed.
+   That happens when the daemon starts after an AgentUpgrade, when `start` or
+   `agent-upgrade` runs, or when an nspawn lifecycle hook runs. The files stay
+   where they are and the units that run them are unchanged. The older release
+   is still the last-good binary, so the daemon can roll back to it, and an
+   AgentUpgrade back to it works.
 2. **Moved.** Once neither the current nor the last-good binary is from v0.8.0
-   or earlier, the daemon copies the files into a real `/opt/unbounded`,
+   or earlier, the daemon copies the files into a real `/opt/unbounded/agent`,
    rewrites the units to use them, removes them from `/usr/local`, and restarts
    itself. That is at the first daemon start after the AgentUpgrade that
    follows the older release out of the last-good slot. To move a host that is
@@ -224,7 +233,7 @@ by one of them moves to `/opt/unbounded` in two stages:
    next daemon start.
 
 `unbounded-agent reset` removes the agent's files from both locations, and the
-link or the directory, at any stage.
+link or the directory at `/opt/unbounded/agent`, at any stage.
 
 After the move, releases up to v0.8.0 cannot run on the host, and an
 AgentUpgrade to one is not supported. Nothing refuses it: the operation reports
@@ -235,8 +244,8 @@ run `sudo ./unbounded-agent reset` with it and bootstrap the host again.
 
 The agent refuses to run on a host that has an installation under both
 locations, or an installation under `/usr/local` beside an existing
-`/opt/unbounded` directory, except while a move between them is under way. Run
-`unbounded-agent reset` first.
+`/opt/unbounded/agent` directory, except while a move between them is under way.
+Run `unbounded-agent reset` first.
 
 The install script also places the agent binary at
 `/usr/local/bin/unbounded-agent` where it can, because releases up to v0.8.0
@@ -246,8 +255,8 @@ look for it there. Newer releases do not use it, and the daemon removes it.
 
 Some images mount `/usr` read-only and provide no package manager, so there is
 no shell-based provisioning path at first boot. Azure Container Linux is one
-such image. `/opt`, and with it the agent's files, is on the writable root
-filesystem there.
+such image. `/opt`, and with it the agent's files under `/opt/unbounded/agent`,
+is on the writable root filesystem there.
 
 For these hosts, generate an Ignition config:
 

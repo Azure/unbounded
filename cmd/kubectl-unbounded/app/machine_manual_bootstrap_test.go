@@ -1235,7 +1235,7 @@ func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
 	require.NoError(t, json.Unmarshal(decoded, &written))
 	require.Equal(t, "test-node", written.MachineName)
 
-	binary, ok := paths["/opt/unbounded/bin/unbounded-agent"]
+	binary, ok := paths["/opt/unbounded/agent/bin/unbounded-agent"]
 	require.True(t, ok, "the agent binary must land under the host root, got %v", paths)
 	require.Equal(t, 0o755, binary.Mode)
 	require.Equal(t, "https://example.test/unbounded-agent-linux-amd64", binary.Contents.Source)
@@ -1252,10 +1252,10 @@ func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
 
 	// See ignitionBootstrapUnit for why each of these is there.
 	require.NotContains(t, unit.Contents, "Condition", "the unit runs every boot, and a missing binary must fail visibly")
-	require.Contains(t, unit.Contents, "AssertPathExists=/opt/unbounded/bin/unbounded-agent\n")
+	require.Contains(t, unit.Contents, "AssertPathExists=/opt/unbounded/agent/bin/unbounded-agent\n")
 	require.Contains(t, unit.Contents, " "+goalstates.DaemonUnit+"\n", "a reboot must not repair a daemon that is still starting")
-	require.Contains(t, unit.Contents, "ExecStartPre=/opt/unbounded/bin/unbounded-agent preflight\n")
-	require.Contains(t, unit.Contents, "ExecStart=/opt/unbounded/bin/unbounded-agent start\n")
+	require.Contains(t, unit.Contents, "ExecStartPre=/opt/unbounded/agent/bin/unbounded-agent preflight\n")
+	require.Contains(t, unit.Contents, "ExecStart=/opt/unbounded/agent/bin/unbounded-agent start\n")
 }
 
 // TestValidateRejectsIgnitionInputBeforeContactingTheCluster: validate runs

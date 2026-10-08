@@ -244,7 +244,7 @@ func TestRemoveAgentArtifactsRemovesTheRootLast(t *testing.T) {
 
 	var files []string
 	for _, name := range []string{"bin/unbounded-agent", "bin/unbounded-agent-current", "libexec/unbounded-localdns-network"} {
-		files = append(files, filepath.Join(root, "opt", "unbounded", name))
+		files = append(files, filepath.Join(root, "opt", "unbounded", "agent", name))
 	}
 
 	files = append(files, filepath.Join(root, "usr", "local", "bin", "unbounded-agent-install.sh"))

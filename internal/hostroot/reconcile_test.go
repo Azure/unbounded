@@ -86,6 +86,7 @@ func assertMoved(t *testing.T, l layout, opts MoveOptions) {
 
 	assert.FileExists(t, filepath.Join(l.legacy, "bin/unbounded-agent-install.sh"), "files outside the layout stay")
 	assert.NoFileExists(t, opts.Record, "only a linked host keeps the record")
+	assertArtifactsKept(t, l)
 	require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()), "a moved host is a plain installation")
 }
 

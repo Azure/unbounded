@@ -4,10 +4,11 @@
 
 """The harness side of the host root and of moving to it.
 
-A host installed by this build keeps the agent under /opt/unbounded. A host
-installed by a release before that keeps it under /usr/local, and the current
-agent links /opt/unbounded there until no older agent is left to roll back to,
-then moves the files. These cover what the harness asserts about each.
+A host installed by this build keeps the agent under /opt/unbounded/agent. A
+host installed by a release before that keeps it under /usr/local, and the
+current agent links /opt/unbounded/agent there until no older agent is left to
+roll back to, then moves the files. Anything else under /opt/unbounded is the
+host's. These cover what the harness asserts about each.
 """
 import hashlib
 import io
@@ -171,7 +172,7 @@ class TestDaemonLinks(unittest.TestCase):
         """The first upgrade in the migration suite starts on a host the
         current agent has not run on yet, where the host root does not exist."""
         with tempfile.TemporaryDirectory() as tmp:
-            root, legacy = Path(tmp, "opt", "unbounded"), Path(tmp, "usr", "local")
+            root, legacy = Path(tmp, "opt", "unbounded", "agent"), Path(tmp, "usr", "local")
             (legacy / "bin").mkdir(parents=True)
             (legacy / "bin" / "unbounded-agent-blue").write_text("")
             (legacy / "bin" / "unbounded-agent-current").symlink_to(legacy / "bin" / "unbounded-agent-blue")
@@ -199,8 +200,8 @@ class TestSuites(unittest.TestCase):
         so the suite ends on this build."""
         steps = e2e.SUITES["migration"]
 
-        self.assertEqual(steps[0], "run-legacy-agent")
-        self.assertEqual(steps[-1], "reset-agent")
+        self.assertEqual(steps[:2], ["stage-host-files", "run-legacy-agent"])
+        self.assertEqual(steps[-2:], ["reset-agent", "validate-host-staged-files"])
 
         downgrade = steps.index("validate-agent-downgrade-to-legacy")
         moved = steps.index("validate-host-root-moved")
@@ -211,6 +212,45 @@ class TestSuites(unittest.TestCase):
                       "one upgrade after the older release still leaves it in last-good")
         self.assertIn("validate-host-reboot", steps[moved:], "a moved host has to boot from its new units")
         e2e.validate_suites()
+
+    def test_migration_checks_staged_files_after_each_change_to_the_root(self):
+        """Hosts stage files under /opt/unbounded, beside the host root, and an
+        older agent's host may have them before the root is linked there."""
+        steps = e2e.SUITES["migration"]
+        checks = [i for i, step in enumerate(steps) if step == "validate-host-staged-files"]
+
+        linked = steps.index("validate-host-root-linked")
+        moved = steps.index("validate-host-root-moved")
+        reset = steps.index("reset-agent")
+        for change in (linked, moved, reset):
+            self.assertTrue(any(check > change for check in checks), f"no check after {steps[change]}")
+
+
+class TestStagedFiles(unittest.TestCase):
+    def test_staged_files_must_be_unchanged(self):
+        for stdout, returncode, ok in ((e2e.HOST_STAGED_CONTENT, 0, True), ("changed", 0, False), ("", 1, False)):
+            with self.subTest(stdout=stdout, returncode=returncode), \
+                    patch.object(e2e, "ssh_capture_quiet",
+                                 return_value=subprocess.CompletedProcess([], returncode, stdout, "")):
+                if ok:
+                    e2e.validate_host_staged_files()
+                else:
+                    with self.assertRaises(SystemExit):
+                        e2e.validate_host_staged_files()
+
+    def test_files_are_staged_beside_the_host_root(self):
+        self.assertEqual(os.path.dirname(e2e.HOST_ROOT), e2e.HOST_ROOT_PARENT)
+        self.assertTrue(e2e.HOST_STAGED_FILE.startswith(f"{e2e.HOST_ROOT_PARENT}/"))
+        self.assertFalse(e2e.HOST_STAGED_FILE.startswith(f"{e2e.HOST_ROOT}/"))
+        self.assertFalse(e2e.OFFLINE_ARTIFACTS_DIR.startswith(f"{e2e.HOST_ROOT}/"))
+
+    def test_an_ignition_host_is_refused(self):
+        """It boots with the agent already in place, so nothing can be staged first."""
+        with patch.object(e2e, "host_image") as image, patch.object(e2e, "ssh_cmd") as ssh:
+            image.return_value.provisioning = "ignition"
+            with self.assertRaises(SystemExit):
+                e2e.stage_host_files()
+        ssh.assert_not_called()
 
 
 if __name__ == "__main__":

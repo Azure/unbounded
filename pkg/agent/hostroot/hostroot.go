@@ -25,7 +25,9 @@ import (
 )
 
 const (
-	// Path is where an agent's host-side files live.
+	// Path is where an agent's host-side files live. Its parent, /opt/unbounded,
+	// is not the agent's: hosts stage files there, such as offline artifacts,
+	// so it is created when missing and otherwise never changed or removed.
 	Path = impl.Path
 
 	// LegacyPath is where releases that predate Path installed them.
@@ -37,8 +39,8 @@ const (
 //
 // Paths built from it are compared with symlink targets, which are resolved,
 // so they have to be resolved too. Building them from an unresolved Path on a
-// migrated host would name /opt/unbounded/bin/unbounded-agent-blue while the
-// current link resolves to /usr/local/bin/unbounded-agent-blue, and the two
+// migrated host would name /opt/unbounded/agent/bin/unbounded-agent-blue while
+// the current link resolves to /usr/local/bin/unbounded-agent-blue, and the two
 // would never compare equal.
 func Resolve() string {
 	return impl.Resolve()
@@ -57,10 +59,12 @@ func Planned(markers ...string) string {
 // not files a fresh installation also creates there.
 //
 // It is idempotent and does nothing on a host without a legacy installation.
-// It refuses a host with a legacy installation where Path is also a directory,
-// because either could be the live one. A link to LegacyPath with no
-// installation behind it, left by an older release's reset, is removed so a
-// fresh installation gets a real directory.
+// The link is made inside Path's parent, which is created if missing and
+// otherwise left as it is, along with anything else in it. It refuses a host
+// with a legacy installation where Path is also a directory, because either
+// could be the live one. A link to LegacyPath with no installation behind it,
+// left by an older release's reset, is removed so a fresh installation gets a
+// real directory.
 //
 // Commands that change the host call it first, before any path is resolved: a
 // path resolved on an unmigrated legacy host names Path, where nothing is
@@ -69,14 +73,15 @@ func Migrate(log *slog.Logger, markers ...string) error {
 	return impl.Migrate(log, markers...)
 }
 
-// Prepare creates Path and the given subdirectories as a new installation
-// needs them, with mode 0755 regardless of the umask, and restores their
-// SELinux labels where the policy tools are present. On a migrated host Path
-// is the existing installation and is left as it is.
+// Prepare creates Path, its parent if missing, and the given subdirectories as
+// a new installation needs them, with mode 0755 regardless of the umask, and
+// restores the SELinux labels under Path where the policy tools are present.
+// An existing parent keeps its mode. On a migrated host Path is the existing
+// installation and is left as it is.
 //
 // The labels matter because a directory takes its parent's label when it is
 // created. Under /opt that is usr_t, while the policy expects bin_t under
-// /opt/*/bin; files created later inherit the directory's label.
+// /opt/.../bin; files created later inherit the directory's label.
 func Prepare(ctx context.Context, log *slog.Logger, subdirs ...string) error {
 	return impl.Prepare(ctx, log, subdirs...)
 }

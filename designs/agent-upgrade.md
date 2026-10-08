@@ -24,7 +24,7 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 
 | Field | Purpose |
 |-------|---------|
-| `BinaryPath` | Compatibility path, normally `/opt/unbounded/bin/unbounded-agent`. |
+| `BinaryPath` | Compatibility path, normally `/opt/unbounded/agent/bin/unbounded-agent`. |
 | `BluePath` | First blue-green binary slot. |
 | `GreenPath` | Second blue-green binary slot. |
 | `CurrentPath` | Symlink used by the systemd daemon unit. |
@@ -37,23 +37,33 @@ root, applies environment overrides, and stores the resolved `CurrentPath`
 target in `CurrentTargetPath`. If `CurrentPath` does not exist, the
 compatibility `BinaryPath` is used as the current target.
 
-The host root is `/opt/unbounded`, resolved through symlinks before any path is
-built from it. On a host installed by a release before the host root, the agent
-links `/opt/unbounded` to `/usr/local`, where that release put its files, before
-it resolves anything. The slots then resolve to the paths that release wrote,
-so the resolved current target still compares equal to one of them, and the
-units that release wrote stay valid.
+The host root is `/opt/unbounded/agent`, resolved through symlinks before any
+path is built from it. On a host installed by a release before the host root,
+the agent links `/opt/unbounded/agent` to `/usr/local`, where that release put
+its files, before it resolves anything. The slots then resolve to the paths that
+release wrote, so the resolved current target still compares equal to one of
+them, and the units that release wrote stay valid.
+
+The root's parent, `/opt/unbounded`, is not the agent's. Hosts stage files
+there, such as offline artifacts and OCI layouts, as the agent docs suggest,
+so a host installed by an older release may already have it as a directory or a
+mount. The link and the move only create, replace or remove
+`/opt/unbounded/agent` and its staging copy inside it. The agent creates the
+parent with mode 0755 when it is missing, and otherwise never changes it; reset
+never removes it.
 
 The link lasts while the older release can still be rolled back to. Each daemon
 start on a linked host records the SHA-256 of its own binary in
 `/etc/unbounded/agent/host-root-agents`; older releases never do. Once the
 current and last-good targets are both recorded, and no AgentUpgrade signal is
-pending, the daemon moves the files into a real `/opt/unbounded` under
+pending, the daemon moves the files into a real `/opt/unbounded/agent` under
 installation ownership:
 
-1. Copy the layout from `/usr/local` into `/opt/unbounded.staging`, recreating
-   the slot links with targets under `/opt/unbounded`, and write a `.moving`
-   marker into the copy last.
+1. Copy the layout from `/usr/local` into `/opt/unbounded/agent.staging`,
+   recreating the slot links with targets under `/opt/unbounded/agent`, and
+   write a `.moving` marker into the copy last. The copy is beside the root, so
+   the rename below stays on one filesystem even when `/opt/unbounded` is a
+   mount.
 2. Remove the link and rename the copy into place, then restore SELinux labels.
 3. Rewrite the nspawn lifecycle hooks, the daemon and recovery units, the
    recovery script and the LocalDNS network unit, and reload systemd.

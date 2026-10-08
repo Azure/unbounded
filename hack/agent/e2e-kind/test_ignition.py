@@ -26,7 +26,7 @@ class TestPatchAgentConfig(unittest.TestCase):
         pointed at a loopback address. The binary's digest is the only thing
         proving the host got the build under test, so it is left alone."""
         config = json.dumps({"Kubelet": {"ApiServer": "https://127.0.0.1:6443"}})
-        binary = {"path": "/opt/unbounded/bin/unbounded-agent",
+        binary = {"path": e2e.DAEMON_BINARY,
                   "contents": {"source": "https://example.test/agent", "verification": {"hash": "sha256-abc"}}}
         doc = {"storage": {"files": [
             {"path": "/etc/unbounded/agent/config.json", "contents": {"source": e2e.ignition_data_url(config)}},

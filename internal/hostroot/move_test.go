@@ -16,12 +16,16 @@ import (
 
 // legacyHost lays out what an agent up to v0.8.0 leaves under the legacy root
 // after an upgrade to green, with the root linked to it as a newer agent
-// leaves it. The links name the legacy root the way that agent wrote them.
+// leaves it. The links name the legacy root the way that agent wrote them. The
+// root's parent holds files staged for the agent, which a move and a reset
+// must leave alone; see assertArtifactsKept.
 func legacyHost(t *testing.T) layout {
 	t.Helper()
 
 	l := newLayout(t)
 	bin := filepath.Join(l.legacy, "bin")
+
+	stageArtifacts(t, l)
 
 	for name, content := range map[string]string{
 		"unbounded-agent-blue":               "blue",
@@ -171,7 +175,7 @@ func TestStageRebasesLinksThroughALinkedLegacyRoot(t *testing.T) {
 
 	dir := t.TempDir()
 	real := filepath.Join(dir, "var", "usrlocal")
-	l := layout{root: filepath.Join(dir, "opt", "unbounded"), legacy: filepath.Join(dir, "usr", "local")}
+	l := layout{root: filepath.Join(dir, "opt", "unbounded", "agent"), legacy: filepath.Join(dir, "usr", "local")}
 
 	require.NoError(t, os.MkdirAll(filepath.Join(real, "bin"), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Dir(l.legacy), 0o755))
@@ -200,14 +204,14 @@ func TestRebase(t *testing.T) {
 	prefixes := []string{"/usr/local", "/var/usrlocal"}
 
 	for target, want := range map[string]string{
-		"/usr/local/bin/unbounded-agent-blue":    "/opt/unbounded/bin/unbounded-agent-blue",
-		"/var/usrlocal/bin/unbounded-agent-blue": "/opt/unbounded/bin/unbounded-agent-blue",
+		"/usr/local/bin/unbounded-agent-blue":    "/opt/unbounded/agent/bin/unbounded-agent-blue",
+		"/var/usrlocal/bin/unbounded-agent-blue": "/opt/unbounded/agent/bin/unbounded-agent-blue",
 		"unbounded-agent-blue":                   "unbounded-agent-blue",
 		"/srv/agent/unbounded-agent":             "/srv/agent/unbounded-agent",
 		// A sibling that only shares the prefix as a string is not under it.
 		"/usr/localother/bin/unbounded-agent": "/usr/localother/bin/unbounded-agent",
 	} {
-		assert.Equal(t, want, rebase(target, prefixes, "/opt/unbounded"), target)
+		assert.Equal(t, want, rebase(target, prefixes, "/opt/unbounded/agent"), target)
 	}
 }
 
@@ -237,6 +241,7 @@ func TestMove(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(canonical(l.root), "bin/unbounded-agent-green"), current,
 		"the current link leads to the copy, and compares equal to a slot built from the resolved root")
+	assertArtifactsKept(t, l)
 }
 
 func TestRemoveSeed(t *testing.T) {

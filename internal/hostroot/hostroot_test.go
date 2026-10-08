@@ -19,14 +19,45 @@ type layout struct {
 	root, legacy string
 }
 
+// newLayout mirrors the host: the root is nested in a parent that is not the
+// agent's, and the legacy root exists.
 func newLayout(t *testing.T) layout {
 	t.Helper()
 
 	dir := t.TempDir()
-	l := layout{root: filepath.Join(dir, "opt", "unbounded"), legacy: filepath.Join(dir, "usr", "local")}
+	l := layout{root: filepath.Join(dir, "opt", "unbounded", "agent"), legacy: filepath.Join(dir, "usr", "local")}
 	require.NoError(t, os.MkdirAll(filepath.Join(l.legacy, "bin"), 0o755))
 
 	return l
+}
+
+// stageArtifacts puts files under the root's parent, as a host does when it
+// stages offline artifacts there, and gives the parent a mode the agent would
+// not choose; see assertArtifactsKept.
+func stageArtifacts(t *testing.T, l layout) {
+	t.Helper()
+
+	artifact := artifactPath(l)
+	require.NoError(t, os.MkdirAll(filepath.Dir(artifact), 0o755))
+	require.NoError(t, os.WriteFile(artifact, []byte("manifest"), 0o644))
+	require.NoError(t, os.Chmod(filepath.Dir(l.root), 0o750))
+}
+
+func artifactPath(l layout) string {
+	return filepath.Join(filepath.Dir(l.root), "artifacts", "v1.34.2", "manifest.json")
+}
+
+// assertArtifactsKept checks what stageArtifacts made is untouched.
+func assertArtifactsKept(t *testing.T, l layout) {
+	t.Helper()
+
+	data, err := os.ReadFile(artifactPath(l))
+	require.NoError(t, err, "files beside the root are not the agent's")
+	assert.Equal(t, "manifest", string(data))
+
+	info, err := os.Stat(filepath.Dir(l.root))
+	require.NoError(t, err, "the root's parent is never removed")
+	assert.Equal(t, os.FileMode(0o750), info.Mode().Perm(), "the root's parent keeps its mode")
 }
 
 func touch(t *testing.T, path string) {
@@ -73,6 +104,8 @@ func TestMigrate(t *testing.T) {
 		wantErr  string
 		wantLink bool
 		wantDir  bool
+		// The setup staged artifacts beside the root, which must survive.
+		artifacts bool
 	}{
 		{
 			name:  "fresh host is left alone",
@@ -82,6 +115,24 @@ func TestMigrate(t *testing.T) {
 			name:     "legacy installation is linked",
 			setup:    func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue")) },
 			wantLink: true,
+		},
+		{
+			// Hosts stage offline artifacts under /opt/unbounded, as the agent
+			// docs suggest. The link goes in beside them.
+			name: "legacy installation is linked inside a parent that holds other files",
+			setup: func(t *testing.T, l layout) {
+				stageArtifacts(t, l)
+				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
+			},
+			wantLink:  true,
+			artifacts: true,
+		},
+		{
+			name: "a fresh host with files beside the root is left alone",
+			setup: func(t *testing.T, l layout) {
+				stageArtifacts(t, l)
+			},
+			artifacts: true,
 		},
 		{
 			name: "a dangling legacy link still counts as an installation",
@@ -190,8 +241,29 @@ func TestMigrate(t *testing.T) {
 			case tt.wantErr == "":
 				assert.ErrorIs(t, err, os.ErrNotExist, "root must not exist")
 			}
+
+			if tt.artifacts {
+				assertArtifactsKept(t, l)
+			}
 		})
 	}
+}
+
+// TestMigrateCreatesTheParentIgnoringTheUmask is not parallel because the umask
+// belongs to the process. Parallel tests are paused while it runs.
+func TestMigrateCreatesTheParentIgnoringTheUmask(t *testing.T) {
+	old := syscall.Umask(0o077)
+
+	t.Cleanup(func() { syscall.Umask(old) })
+
+	l := newLayout(t)
+	touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
+
+	require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()))
+
+	info, err := os.Stat(filepath.Dir(l.root))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm(), "the root's parent must be traversable")
 }
 
 func TestPlanned(t *testing.T) {
@@ -239,13 +311,31 @@ func TestPrepareIgnoresTheUmask(t *testing.T) {
 	require.NoError(t, prepare(t.Context(), discard(), l.root, []string{"bin", "libexec"},
 		func(_ context.Context, _ *slog.Logger, root string) { relabeled = root }))
 
-	for _, dir := range []string{l.root, filepath.Join(l.root, "bin"), filepath.Join(l.root, "libexec")} {
+	for _, dir := range []string{filepath.Dir(l.root), l.root, filepath.Join(l.root, "bin"), filepath.Join(l.root, "libexec")} {
 		info, err := os.Stat(dir)
 		require.NoError(t, err)
 		assert.Equal(t, os.FileMode(0o755), info.Mode().Perm(), dir)
 	}
 
 	assert.Equal(t, l.root, relabeled, "new directories take their parent's SELinux label until restored")
+}
+
+// TestPrepareLeavesTheParentAlone covers a fresh host that already has the
+// root's parent, holding files staged for the agent.
+func TestPrepareLeavesTheParentAlone(t *testing.T) {
+	t.Parallel()
+
+	l := newLayout(t)
+	stageArtifacts(t, l)
+
+	relabeled := ""
+
+	require.NoError(t, prepare(t.Context(), discard(), l.root, []string{"bin"},
+		func(_ context.Context, _ *slog.Logger, root string) { relabeled = root }))
+
+	assert.DirExists(t, filepath.Join(l.root, "bin"))
+	assert.Equal(t, l.root, relabeled, "only the root is relabeled")
+	assertArtifactsKept(t, l)
 }
 
 func TestPrepareLeavesAMigratedHostAlone(t *testing.T) {
@@ -273,6 +363,8 @@ func TestRemove(t *testing.T) {
 		setup      func(t *testing.T, l layout)
 		wantRoot   bool
 		wantLegacy bool
+		// The setup staged artifacts beside the root, which must survive.
+		artifacts bool
 	}{
 		{name: "absent root", setup: func(*testing.T, layout) {}, wantLegacy: true},
 		{
@@ -329,6 +421,24 @@ func TestRemove(t *testing.T) {
 			},
 			wantLegacy: true,
 		},
+		{
+			name: "a link beside files staged for the agent is removed, and only the link",
+			setup: func(t *testing.T, l layout) {
+				stageArtifacts(t, l)
+				require.NoError(t, os.Symlink(l.legacy, l.root))
+			},
+			wantLegacy: true,
+			artifacts:  true,
+		},
+		{
+			name: "a root beside files staged for the agent is removed, and only the root",
+			setup: func(t *testing.T, l layout) {
+				stageArtifacts(t, l)
+				require.NoError(t, os.MkdirAll(filepath.Join(l.root, "bin"), 0o755))
+			},
+			wantLegacy: true,
+			artifacts:  true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -338,7 +448,17 @@ func TestRemove(t *testing.T) {
 			l := newLayout(t)
 			tt.setup(t, l)
 
+			_, parentErr := os.Stat(filepath.Dir(l.root))
+
 			require.NoError(t, remove(discard(), l.root, l.legacy))
+
+			if parentErr == nil {
+				assert.DirExists(t, filepath.Dir(l.root), "the root's parent is never removed, even when empty")
+			}
+
+			if tt.artifacts {
+				assertArtifactsKept(t, l)
+			}
 
 			_, err := os.Lstat(l.root)
 			assert.Equal(t, tt.wantRoot, err == nil, "root present")

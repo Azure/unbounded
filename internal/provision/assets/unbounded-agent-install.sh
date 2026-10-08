@@ -89,8 +89,8 @@ chmod 0755 "${AGENT_BIN}"
 # selected independently of this script - by AGENT_VERSION, by AGENT_URL, or by
 # the default of tracking the latest published release - so it may be one that
 # never writes its own binary and looks for it here. Newer agents install under
-# /opt/unbounded and remove a lone seed, and a read-only /usr/local/bin only
-# means the host cannot run the older agents.
+# /opt/unbounded/agent and remove a lone seed, and a read-only /usr/local/bin
+# only means the host cannot run the older agents.
 #
 # The test follows symlinks on purpose. On a host this installation already owns
 # the path resolves through the compatibility symlink to a live blue-green slot,

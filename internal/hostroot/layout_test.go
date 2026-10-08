@@ -43,8 +43,9 @@ func TestOwnedFiles(t *testing.T) {
 	// Reset does not migrate, so on a host the migration refused the
 	// installation is under the legacy root while the root is a real
 	// directory. The installer scripts are written under the legacy root by
-	// cloud-init and netboot on every host.
-	want := append(append(layout("/opt/unbounded"), layout("/usr/local")...),
+	// cloud-init and netboot on every host. Nothing else under /opt/unbounded
+	// is the agent's.
+	want := append(append(layout("/opt/unbounded/agent"), layout("/usr/local")...),
 		"/usr/local/bin/unbounded-agent-install.sh",
 		"/usr/local/bin/unbounded-agent-uninstall.sh",
 	)

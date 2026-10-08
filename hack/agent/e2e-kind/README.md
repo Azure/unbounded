@@ -27,8 +27,8 @@ must already carry what the agent needs. It does.
 
 `/usr/local` is a real directory inside that read-only `/usr` rather than a
 symlink to somewhere writable, so an agent released before the host root cannot
-be installed there. The current agent installs under `/opt/unbounded` on every
-host, which is on the writable root filesystem here.
+be installed there. The current agent installs under `/opt/unbounded/agent` on
+every host, which is on the writable root filesystem here.
 
 Provisioning is Ignition rather than cloud-init, which inverts the usual order.
 An Ignition config is applied before the host boots and has to carry the
@@ -94,14 +94,17 @@ they do not assert resumable bootstrap or introduce new recovery operations.
 
 The `migration` suite starts from a host installed by the last release before
 the host root, `LEGACY_AGENT_VERSION` (default `v0.8.0`), fetched from its
-GitHub release by the install script. An AgentUpgrade to this build must link
-`/opt/unbounded` to `/usr/local` and leave that release's layout and units as
-they were, because the older release is now last-good and a rollback needs
-them. The host then reboots, returns to the older release, and upgrades to this
-build again, staying linked throughout. The next upgrade leaves no older release
-in either slot, and the daemon it starts must move the files into a real
-`/opt/unbounded`, point the units at them, remove them from `/usr/local`, and
-restart itself from there. The moved host reboots, then resets, which must
+GitHub release by the install script. Before installing it, the suite stages a
+file under `/opt/unbounded/images`, as a host keeping a local OCI layout beside
+the host root would, and checks it is untouched after the link, the move and
+reset. An AgentUpgrade to this build must link `/opt/unbounded/agent` to
+`/usr/local` and leave that release's layout and units as they were, because
+the older release is now last-good and a rollback needs them. The host then
+reboots, returns to the older release, and upgrades to this build again,
+staying linked throughout. The next upgrade leaves no older release in either
+slot, and the daemon it starts must move the files into a real
+`/opt/unbounded/agent`, point the units at them, remove them from `/usr/local`,
+and restart itself from there. The moved host reboots, then resets, which must
 leave neither root behind. The older release cannot be installed on an
 immutable host, so the suite needs a cloud-init host:
 
