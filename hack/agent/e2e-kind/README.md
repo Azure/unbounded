@@ -49,9 +49,10 @@ The image comes from one of two sources, chosen by `ACL_IMAGE_SOURCE`:
   exports it: it creates a temporary managed disk from the version in
   `ACL_IMAGE_RESOURCE_GROUP`, reads the disk's written pages (about 850 MiB of
   32.5 GiB) through a one-hour read SAS into a sparse VHD, revokes the SAS,
-  deletes the disk, and converts the VHD to qcow2. The disk is deleted whether
-  or not the export worked, and each export first deletes any export disk older
-  than six hours, which a cancelled job leaves behind. The version is the
+  deletes the disk, and converts the raw disk inside the VHD to qcow2 at its
+  exact size. The disk is deleted whether or not the export worked, and each
+  export first deletes any export disk older than six hours, which a cancelled
+  job leaves behind. The version is the
   gallery's latest unless `ACL_IMAGE_VERSION` pins one, and the disk has to be
   made in `ACL_IMAGE_GALLERY_LOCATION` (default `westus2`), the one region the
   image is replicated to. `ACL_IMAGE_SUBSCRIPTION` overrides az's default

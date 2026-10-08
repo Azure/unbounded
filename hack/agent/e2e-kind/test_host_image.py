@@ -402,19 +402,24 @@ class TestGalleryVersion(unittest.TestCase):
 
 
 class FakeAz:
-    """Answers the az calls the export makes, and records them."""
+    """Answers the az calls the export makes, and records them. It also
+    answers qemu-img info, which goes through the same capture."""
 
     SAS = "https://md-x.blob.core.windows.net/abcd/abcd?sv=2018-03-28&sr=b&sig=SECRET%3D"
 
-    def __init__(self, fail: set[str] = frozenset(), disks: list[dict] | None = None):
+    def __init__(self, fail: set[str] = frozenset(), disks: list[dict] | None = None,
+                 virtual_size: int = 0):
         self.calls: list[list[str]] = []
         self.fail = fail
         self.disks = disks or []
+        self.virtual_size = virtual_size
 
     def verb(self, args: list[str]) -> str:
         return " ".join(args[1:3])
 
     def __call__(self, args, **_kw):
+        if args[:2] == ["qemu-img", "info"]:
+            return json.dumps({"virtual-size": self.virtual_size})
         self.calls.append(args)
         verb = self.verb(args)
         if verb in self.fail:
@@ -431,20 +436,25 @@ class FakeAz:
 class TestGalleryExport(unittest.TestCase):
     """The temporary disk always goes, and only a converted image is kept."""
 
+    DISK = b"\x01" * 2048
+
     def _export(self, tmp, az, download=None, rg="rg"):
         destination = Path(tmp) / "acl-gallery-3.1.qcow2.part"
         downloads = []
+        self.converted = []
 
         def fake_download(sas, vhd, fetch=None):
             downloads.append(sas)
             if download:
                 download()
-            vhd.write_bytes(b"vhd")
+            vhd.write_bytes(_fixed_vhd(self.DISK))
 
         def fake_run(args, **_kw):
             if args[:2] == ["qemu-img", "convert"]:
+                self.converted.append((args[args.index("-f") + 1], Path(args[-2]).read_bytes()))
                 Path(args[-1]).write_bytes(b"qcow2")
 
+        az.virtual_size = az.virtual_size or len(self.DISK)
         with patch.object(e2e, "ACL_IMAGE_RESOURCE_GROUP", rg), \
                 patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", ""), \
                 patch.object(e2e, "capture", side_effect=az), \
@@ -452,6 +462,21 @@ class TestGalleryExport(unittest.TestCase):
                 patch.object(e2e, "run", side_effect=fake_run):
             e2e.export_gallery_image("/SharedGalleries/g/Images/i/Versions/3.1", destination)
         return destination, downloads
+
+    def test_the_raw_disk_is_converted_at_its_exact_size(self):
+        """The footer is cut off rather than read: qemu-img 8.2 sizes this VHD
+        from its CHS geometry, 640 KiB short, and the guest then finds no GPT."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._export(tmp, FakeAz())
+
+        self.assertEqual(self.converted, [("raw", self.DISK)])
+
+    def test_a_qcow2_of_another_size_is_refused(self):
+        az = FakeAz(virtual_size=len(self.DISK) - 512)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                self._export(tmp, az)
+            self.assertEqual(list(Path(tmp).iterdir()), [], "nothing is kept under any name")
 
     def test_the_disk_is_revoked_and_deleted_after_a_good_export(self):
         az = FakeAz()
