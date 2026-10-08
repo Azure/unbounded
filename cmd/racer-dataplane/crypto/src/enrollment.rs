@@ -1941,7 +1941,7 @@ mod tests {
         assert_eq!(recovered.private_key_der(), renewed.private_key_der());
     }
 
-    /// Every root is checked before configuration and again before persistence/load.
+    /// Malformed or entirely time-invalid roots cannot replace the last good trust.
     #[test]
     fn invalid_root_snapshots_preserve_last_good_identity_and_trust() {
         let sim = Simulation::new();
@@ -1998,7 +1998,8 @@ mod tests {
             let roots = match case {
                 "empty" => vec![],
                 "too-many" => vec![ca.der().to_vec(); 33],
-                // Even an unused bad anchor must not weaken the activation policy.
+                "expired" | "future" => vec![bad],
+                // Malformed anchors still reject the whole snapshot.
                 _ => vec![ca.der().to_vec(), bad],
             };
             assert_eq!(
@@ -2144,7 +2145,13 @@ mod tests {
         let clock = uring_runtime::environment::SimulationClock::new(105);
         let _time = clock.environment(0).enter();
         let (files, e, scope) = fixture();
-        let (ca, key) = identity::test_util::ca();
+        let (_, key) = identity::test_util::ca();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let now = uring_runtime::environment::wall_now();
+        params.not_before = (now - Duration::from_secs(60)).into();
+        params.not_after = (now + Duration::from_secs(60)).into();
+        let ca = params.self_signed(&key).unwrap();
         let good = vec![ca.der().to_vec()];
         e.set_peer_trust_roots(good.clone()).unwrap();
         let first = drive(
@@ -2164,13 +2171,8 @@ mod tests {
         .unwrap();
         let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let now = uring_runtime::environment::wall_now();
-        params.not_before = (now - Duration::from_secs(60)).into();
-        params.not_after = (now + Duration::from_secs(60)).into();
-        let short = params.self_signed(&key).unwrap();
-        e.set_peer_trust_roots(vec![ca.der().to_vec(), short.der().to_vec()])
+        let (unrelated, _) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec(), unrelated.der().to_vec()])
             .unwrap();
         clock.advance(Duration::from_secs(120));
         assert!(
@@ -2185,6 +2187,7 @@ mod tests {
             sim.read_file(Path::new("/private/pending.json")).unwrap(),
             pending
         );
+        clock.set_wall_time(now);
         e.set_peer_trust_roots(good.clone()).unwrap();
         let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
         assert_eq!(recovered.certificate_chain(), prior.certificate_chain());
@@ -2193,6 +2196,61 @@ mod tests {
                 .signing_identity(&good)
                 .unwrap()
                 .sign(b"still usable")
+                .is_ok()
+        );
+    }
+
+    /// An unrelated retiring root cannot expire held or persisted enrollment identities.
+    #[test]
+    fn unrelated_root_expiry_preserves_enrollment_identities() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let clock = uring_runtime::environment::SimulationClock::new(109);
+        let _time = clock.environment(0).enter();
+        let (files, e, scope) = fixture();
+        let (ca, key) = identity::test_util::ca();
+        let (_, retiring_key) = identity::test_util::ca();
+        let now = uring_runtime::environment::wall_now();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.not_before = now.into();
+        params.not_after = (now + Duration::from_secs(60)).into();
+        let retiring = params.self_signed(&retiring_key).unwrap();
+        let roots = vec![retiring.der().to_vec(), ca.der().to_vec()];
+        e.set_peer_trust_roots(roots.clone()).unwrap();
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let accepted = drive(
+            &files,
+            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+        )
+        .unwrap();
+        let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+        let signing = accepted.signing_identity(&roots).unwrap();
+        clock.advance(Duration::from_secs(120));
+        assert!(accepted.valid_now());
+        assert!(recovered.valid_now());
+        assert!(signing.sign(b"held identity").is_ok());
+        assert!(drive(&files, e.load_identity(&scope)).unwrap().is_some());
+        e.set_peer_trust_roots(roots.clone()).unwrap();
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let renewed = drive(
+            &files,
+            e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+        )
+        .unwrap();
+        assert!(
+            renewed
+                .signing_identity(&roots)
+                .unwrap()
+                .sign(b"renewed identity")
                 .is_ok()
         );
     }

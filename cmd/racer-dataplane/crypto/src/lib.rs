@@ -465,7 +465,7 @@ pub mod identity {
         node: NodeId,
     }
 
-    /// An authenticated leaf key and the conservative lifetime of its trust snapshot.
+    /// An authenticated leaf key and the validity bounds of its chain and anchor.
     pub(super) struct ValidatedChain {
         pub(super) key: VerifyingKey,
 
@@ -592,7 +592,7 @@ pub mod identity {
     }
 
     impl SigningIdentity {
-        /// Return the conservative expiry of the accepted chain and all roots.
+        /// Return the conservative expiry of the accepted chain and its trust anchor.
         pub fn expires_at_seconds(&self) -> u64 {
             self.expires
         }
@@ -1368,20 +1368,40 @@ pub mod identity {
         {
             return Err(Error::Unauthorized);
         }
-        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(root_store(roots)?),
-            Arc::new(rustls::crypto::ring::default_provider()),
-        )
-        .build()
-        .map_err(|_| Error::Unauthorized)?;
+        let now = unix_time();
+        let (store, root_bounds) = root_store_with_validity(roots, now)?;
         let leaf = CertificateDer::from(chain[0].as_slice());
         let intermediates: Vec<_> = chain[1..]
             .iter()
             .map(|c| CertificateDer::from(c.as_slice()))
             .collect();
-        verifier
-            .verify_client_cert(&leaf, &intermediates, unix_time())
+        let (chain_start, chain_end) = validity(chain.iter())?;
+        // rustls does not expose the chosen anchor. Validate each separately so
+        // unrelated roots cannot shorten a held identity's lifetime.
+        let mut bounds = None;
+        for (anchor, (start, end)) in store.roots.into_iter().zip(root_bounds) {
+            let valid_from = chain_start.max(start);
+            let expires = chain_end.min(end);
+            if now.as_secs() < valid_from || now.as_secs() >= expires {
+                continue;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(RootCertStore {
+                    roots: vec![anchor],
+                }),
+                Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .build()
             .map_err(|_| Error::Unauthorized)?;
+            if verifier
+                .verify_client_cert(&leaf, &intermediates, now)
+                .is_ok()
+            {
+                bounds = Some((valid_from, expires));
+                break;
+            }
+        }
+        let (valid_from, expires) = bounds.ok_or(Error::Unauthorized)?;
         let (rest, cert) = parse_x509_certificate(&chain[0]).map_err(|_| Error::Unauthorized)?;
         if !rest.is_empty()
             || cert.is_ca()
@@ -1439,7 +1459,6 @@ pub mod identity {
             .try_into()
             .map_err(|_| Error::Unauthorized)?;
         let key = VerifyingKey::from_bytes(key).map_err(|_| Error::Unauthorized)?;
-        let (valid_from, expires) = validity(chain.iter().chain(roots.iter()))?;
         Ok(ValidatedChain {
             key,
             valid_from,
@@ -1447,32 +1466,47 @@ pub mod identity {
         })
     }
 
-    /// Parse bounded CA roots and require every configured root to be valid now.
+    /// Parse bounded CA roots, skipping time-invalid roots but requiring a usable one.
     pub(super) fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
+        root_store_with_validity(roots, unix_time()).map(|(store, _)| store)
+    }
+
+    /// Keep each accepted anchor paired with the validity rustls does not retain.
+    fn root_store_with_validity(
+        roots: &[Vec<u8>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<(RootCertStore, Vec<(u64, u64)>)> {
         if roots.is_empty() || roots.len() > 32 {
             return Err(Error::Unauthorized);
         }
         let mut store = RootCertStore::empty();
+        let mut bounds = Vec::new();
         for root in roots {
             if root.is_empty() || root.len() > 16384 {
                 return Err(Error::Unauthorized);
             }
             let (rest, cert) = parse_x509_certificate(root).map_err(|_| Error::Unauthorized)?;
-            let now = unix_time().as_secs();
-            let now = i64::try_from(now).map_err(|_| Error::Unauthorized)?;
-            let now = x509_parser::time::ASN1Time::from_timestamp(now)
-                .map_err(|_| Error::Unauthorized)?;
-            if !rest.is_empty() || !cert.is_ca() || !cert.validity().is_valid_at(now) {
+            if !rest.is_empty() || !cert.is_ca() {
                 return Err(Error::Unauthorized);
+            }
+            let start = cert.validity().not_before.timestamp();
+            let end = cert.validity().not_after.timestamp();
+            let seconds = i64::try_from(now.as_secs()).map_err(|_| Error::Unauthorized)?;
+            if seconds < start || seconds >= end {
+                continue;
             }
             store
                 .add(CertificateDer::from(root.clone()))
                 .map_err(|_| Error::Unauthorized)?;
+            bounds.push((start.max(0) as u64, end as u64));
         }
-        Ok(store)
+        if store.is_empty() {
+            return Err(Error::Unauthorized);
+        }
+        Ok((store, bounds))
     }
 
-    /// Conservative validity intersection includes all configured trust anchors.
+    /// Conservatively intersect the validity of all supplied chain certificates.
     fn validity<'a>(certificates: impl Iterator<Item = &'a Vec<u8>>) -> Result<(u64, u64)> {
         let mut start = 0;
         let mut end = u64::MAX;
@@ -1667,6 +1701,191 @@ pub mod identity {
     mod certificate_tests {
         use super::tests::{CLUSTER, NODE, issued};
         use super::*;
+
+        /// Root filtering preserves healthy chains without extending the issuing CA's life.
+        #[test]
+        fn root_time_filtering_preserves_only_valid_signing_paths() {
+            use std::time::Duration;
+
+            for short_is_issuer in [false, true] {
+                let clock = environment::SimulationClock::new(107);
+                let _environment = clock.environment(0).enter();
+                let now = environment::wall_now();
+                let cluster = ClusterId(CLUSTER.into());
+                let node = NodeId(NODE.into());
+                let (long, long_key) = test_util::ca();
+                let (_, short_key) = test_util::ca();
+                let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+                params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+                params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+                params.not_before = now.into();
+                params.not_after = (now + Duration::from_secs(60)).into();
+                let short = params.self_signed(&short_key).unwrap();
+                let (issuer, key) = if short_is_issuer {
+                    (&short, &short_key)
+                } else {
+                    (&long, &long_key)
+                };
+                let (pending, chain) = test_util::issue(issuer, key, &cluster, &node, |_| {});
+                // Try the unrelated anchor first, including matching default CA names.
+                let mut roots = vec![short.der().to_vec(), long.der().to_vec()];
+                if short_is_issuer {
+                    roots.reverse();
+                }
+                let identity = Arc::new(
+                    pending
+                        .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+                        .unwrap(),
+                );
+                let (_, expected_end) =
+                    validity(chain.iter().chain(std::iter::once(&roots[1]))).unwrap();
+                assert_eq!(identity.expires_at_seconds(), expected_end);
+                let keys = Rc::new(Keyring::new(cluster.clone(), node.clone(), Arc::default()));
+                let bundle = |generation| racer_control_wire::KeyringBundle {
+                    schema_version: SCHEMA_VERSION,
+                    cluster: cluster.clone(),
+                    generation: BundleGeneration(generation),
+                    peer_trust_roots: roots.clone(),
+                    cache_keys: vec![],
+                };
+                keys.install(bundle(1)).unwrap();
+                keys.install_signing_identity(identity.clone()).unwrap();
+                let certs = Certificates::new(cluster.clone(), keys.clone());
+                let signature = identity.sign(b"root lifetime").unwrap();
+                certs
+                    .verify_signed(&chain, &node, b"root lifetime", &signature)
+                    .unwrap();
+                clock.set_wall_time(now + Duration::from_secs(59));
+                assert!(identity.sign(b"before expiry").is_ok());
+                for elapsed in [60, 120] {
+                    clock.set_wall_time(now + Duration::from_secs(elapsed));
+                    assert_eq!(identity.sign(b"after expiry").is_ok(), !short_is_issuer);
+                    assert_eq!(keys.signing_identity().is_ok(), !short_is_issuer);
+                    assert_eq!(
+                        certs
+                            .verify_signed(&chain, &node, b"root lifetime", &signature)
+                            .is_ok(),
+                        !short_is_issuer
+                    );
+                    let fresh = Certificates::new(cluster.clone(), keys.clone());
+                    assert_eq!(
+                        fresh
+                            .verify_signed(&chain, &node, b"root lifetime", &signature)
+                            .is_ok(),
+                        !short_is_issuer
+                    );
+                    assert_eq!(
+                        verify_chain(&roots, &chain, &cluster, &node).is_ok(),
+                        !short_is_issuer
+                    );
+                    keys.install(bundle(elapsed)).unwrap();
+                }
+                clock.set_wall_time(now - Duration::from_secs(1));
+                assert_eq!(identity.sign(b"rollback").is_ok(), !short_is_issuer);
+                assert_eq!(keys.signing_identity().is_ok(), !short_is_issuer);
+                assert_eq!(certs.verify(&chain, &node).is_ok(), !short_is_issuer);
+            }
+        }
+
+        /// A valid root cannot extend the life of an expired issuing intermediate.
+        #[test]
+        fn intermediate_expiry_blocks_held_signing_and_cached_verification() {
+            use std::time::Duration;
+
+            let clock = environment::SimulationClock::new(110);
+            let _environment = clock.environment(0).enter();
+            let now = environment::wall_now();
+            let cluster = ClusterId(CLUSTER.into());
+            let node = NodeId(NODE.into());
+            let (root, root_key) = test_util::ca();
+            let (_, issuer_key) = test_util::ca();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "intermediate");
+            params.not_before = now.into();
+            params.not_after = (now + Duration::from_secs(60)).into();
+            let issuer = params.signed_by(&issuer_key, &root, &root_key).unwrap();
+            let (pending, mut chain) =
+                test_util::issue(&issuer, &issuer_key, &cluster, &node, |_| {});
+            chain.push(issuer.der().to_vec());
+            let roots = vec![root.der().to_vec()];
+            let identity = Arc::new(
+                pending
+                    .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+                    .unwrap(),
+            );
+            assert_eq!(identity.expires_at_seconds(), unix_time().as_secs() + 60);
+            let keys = Rc::new(Keyring::new(cluster.clone(), node.clone(), Arc::default()));
+            keys.install(racer_control_wire::KeyringBundle {
+                schema_version: SCHEMA_VERSION,
+                cluster: cluster.clone(),
+                generation: BundleGeneration(1),
+                peer_trust_roots: roots,
+                cache_keys: vec![],
+            })
+            .unwrap();
+            keys.install_signing_identity(identity.clone()).unwrap();
+            let certs = Certificates::new(cluster.clone(), keys.clone());
+            let signature = identity.sign(b"intermediate lifetime").unwrap();
+            certs
+                .verify_signed(&chain, &node, b"intermediate lifetime", &signature)
+                .unwrap();
+            clock.set_wall_time(now + Duration::from_secs(60));
+            assert!(identity.sign(b"expired issuer").is_err());
+            assert!(keys.signing_identity().is_err());
+            assert!(
+                certs
+                    .verify_signed(&chain, &node, b"intermediate lifetime", &signature)
+                    .is_err()
+            );
+            assert!(
+                Certificates::new(cluster, keys)
+                    .verify(&chain, &node)
+                    .is_err()
+            );
+        }
+
+        /// A future or expired CA is skipped, never trusted before or after its lifetime.
+        #[test]
+        fn root_store_filters_time_invalid_roots_and_rejects_all_invalid_sets() {
+            use std::time::Duration;
+
+            let clock = environment::SimulationClock::new(108);
+            let _environment = clock.environment(0).enter();
+            let now = environment::wall_now();
+            let (pending, chain, good) = issued();
+            let (_, key) = test_util::ca();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.not_before = (now + Duration::from_secs(60)).into();
+            params.not_after = (now + Duration::from_secs(120)).into();
+            let future = params.clone().self_signed(&key).unwrap();
+            params.not_before = (now - Duration::from_secs(120)).into();
+            params.not_after = now.into();
+            let expired = params.self_signed(&key).unwrap();
+            let invalid = vec![expired.der().to_vec(), future.der().to_vec()];
+            assert!(root_store(&invalid).is_err());
+            assert!(root_store(&invalid[..1]).is_err());
+            assert!(root_store(&invalid[1..]).is_err());
+            let mut roots = invalid;
+            roots.extend(good);
+            assert_eq!(root_store(&roots).unwrap().len(), 1);
+            let cluster = ClusterId(CLUSTER.into());
+            let node = NodeId(NODE.into());
+            let identity = pending
+                .accept(cluster.clone(), node.clone(), chain, &roots)
+                .unwrap();
+            assert!(identity.sign(b"healthy root").is_ok());
+            let (_, future_chain) = test_util::issue(&future, &key, &cluster, &node, |_| {});
+            assert!(verify_chain(&roots, &future_chain, &cluster, &node).is_err());
+            clock.set_wall_time(now + Duration::from_secs(60));
+            assert!(verify_chain(&roots, &future_chain, &cluster, &node).is_ok());
+            roots.push(vec![0; 128]);
+            assert!(root_store(&roots).is_err());
+        }
 
         /// Both success paths recheck trust, but key-only rotation keeps trust valid.
         #[test]
