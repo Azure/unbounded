@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -275,4 +276,89 @@ func TestOriginResponseUnwrap(t *testing.T) {
 	require.Same(t, underlying, response.Unwrap())
 	require.NoError(t, http.NewResponseController(response).Flush())
 	require.True(t, underlying.Flushed)
+}
+
+func TestMetricsInstrumentContentTypes(t *testing.T) {
+	const payload = "<script>alert('origin')</script>\x00\xff"
+
+	for _, contentType := range []string{"", "application/octet-stream", "application/json", "application/xml", "application/vnd.oci.image.layer.v1.tar"} {
+		for _, explicit := range []bool{false, true} {
+			t.Run(fmt.Sprintf("type=%s/explicit=%t", contentType, explicit), func(t *testing.T) {
+				metrics := newMetrics(prometheus.NewRegistry())
+				server := httptest.NewServer(metrics.instrument(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if contentType != "" {
+						w.Header().Set("Content-Type", contentType)
+					}
+
+					if explicit {
+						w.WriteHeader(http.StatusAccepted)
+					}
+
+					_, _ = io.WriteString(w, r.URL.Query().Get("payload"))
+				})))
+				t.Cleanup(server.Close)
+
+				request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/?payload="+url.QueryEscape(payload), nil)
+				require.NoError(t, err)
+				response, err := server.Client().Do(request)
+				require.NoError(t, err)
+
+				defer response.Body.Close()
+
+				body, err := io.ReadAll(response.Body)
+				require.NoError(t, err)
+				require.Equal(t, payload, string(body))
+
+				wantType := contentType
+				if wantType == "" {
+					wantType = "application/octet-stream"
+				}
+
+				require.Equal(t, wantType, response.Header.Get("Content-Type"))
+				require.Equal(t, "nosniff", response.Header.Get("X-Content-Type-Options"))
+
+				wantStatus := http.StatusOK
+				if explicit {
+					wantStatus = http.StatusAccepted
+				}
+
+				require.Equal(t, wantStatus, response.StatusCode)
+			})
+		}
+	}
+}
+
+func TestMetricsInstrumentRegistryUntrustedRequests(t *testing.T) {
+	img, err := newImage(t.Context(), testImageOptions())
+	require.NoError(t, err)
+
+	metrics := newMetrics(prometheus.NewRegistry())
+	handler := metrics.instrument(img.handler())
+	path := "/v2/" + img.repository + "/blobs/" + img.Layers[0].Digest.String()
+
+	const payload = "<script>alert('origin')</script>"
+
+	for _, test := range []struct {
+		name        string
+		path        string
+		ranges      string
+		status      int
+		contentType string
+	}{
+		{"unknown path", "/" + url.PathEscape(payload), "", http.StatusNotFound, "application/json"},
+		{"unknown blob", "/v2/" + img.repository + "/blobs/" + url.PathEscape(payload), "", http.StatusNotFound, "application/json"},
+		{"invalid range", path, "bytes=" + payload, http.StatusRequestedRangeNotSatisfiable, "text/plain; charset=utf-8"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := registryRequest(handler, http.MethodGet, test.path, test.ranges)
+			require.Equal(t, test.status, response.Code)
+
+			result := response.Result()
+			defer result.Body.Close()
+
+			require.Equal(t, test.contentType, result.Header.Get("Content-Type"))
+			require.Equal(t, "nosniff", result.Header.Get("X-Content-Type-Options"))
+			require.NotContains(t, response.Body.String(), payload)
+		})
+	}
 }

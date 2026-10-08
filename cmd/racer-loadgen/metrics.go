@@ -85,11 +85,21 @@ func (w *originResponse) WriteHeader(code int) {
 		return
 	}
 
+	// Origin responses are data, not pages. Do not let browsers sniff untyped bodies as HTML.
+	if w.ResponseWriter.Header().Get("Content-Type") == "" {
+		w.ResponseWriter.Header().Set("Content-Type", "application/octet-stream")
+	}
+
+	w.ResponseWriter.Header().Set("X-Content-Type-Options", "nosniff")
 	w.code, w.wroteHeader = code, true
 	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *originResponse) Write(p []byte) (int, error) {
+	if w.ResponseWriter.Header().Get("Content-Type") == "" {
+		w.ResponseWriter.Header().Set("Content-Type", "application/octet-stream")
+	}
+
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
