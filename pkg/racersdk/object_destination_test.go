@@ -280,3 +280,66 @@ func TestDestinationCancellationDeadlineOrdering(t *testing.T) {
 		})
 	}
 }
+
+// TestObjectWriteToOwnsDestinationDeadline pins the documented contract:
+// WriteTo replaces a deadline the caller already set on w and leaves w with
+// no deadline when it returns.
+func TestObjectWriteToOwnsDestinationDeadline(t *testing.T) {
+	for _, httpWriter := range []bool{false, true} {
+		name := "direct"
+		if httpWriter {
+			name = "http wrapped"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			c := fakeClient(t, offsetOrigin(4<<10))
+
+			var (
+				mu      sync.Mutex
+				current time.Time
+				history []time.Time
+			)
+
+			w := &destinationDeadlineWriter{set: func(deadline time.Time) error {
+				mu.Lock()
+				defer mu.Unlock()
+
+				current = deadline
+				history = append(history, deadline)
+
+				return nil
+			}}
+
+			var writer io.Writer = w
+			if httpWriter {
+				writer = destinationHTTPWrapper{&destinationHTTPWriter{w}}
+			}
+
+			callerDeadline := time.Now().Add(time.Millisecond)
+			if err := w.SetWriteDeadline(callerDeadline); err != nil {
+				t.Fatal(err)
+			}
+
+			o, err := c.Get(t.Context(), Request{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeQuietly(o)
+
+			if n, err := o.WriteTo(writer); err != nil || n != 4<<10 {
+				t.Fatalf("WriteTo = %d, %v", n, err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if len(history) < 3 || !history[1].After(callerDeadline) {
+				t.Fatalf("caller deadline was not replaced: %v", history)
+			}
+
+			if !current.IsZero() {
+				t.Fatalf("deadline after WriteTo = %v, want none", current)
+			}
+		})
+	}
+}
