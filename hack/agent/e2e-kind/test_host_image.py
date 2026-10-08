@@ -464,8 +464,9 @@ class TestGalleryExport(unittest.TestCase):
         return destination, downloads
 
     def test_the_raw_disk_is_converted_at_its_exact_size(self):
-        """The footer is cut off rather than read: qemu-img 8.2 sizes this VHD
-        from its CHS geometry, 640 KiB short, and the guest then finds no GPT."""
+        """The footer is cut off rather than read: qemu-img before 10.0 sizes
+        this VHD from its CHS geometry, 640 KiB short, and the guest then finds
+        no GPT. A developer's host may still have one."""
         with tempfile.TemporaryDirectory() as tmp:
             self._export(tmp, FakeAz())
 
