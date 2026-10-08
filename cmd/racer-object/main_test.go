@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/racerobject"
+	"github.com/Azure/unbounded/internal/racer/object"
 	"github.com/Azure/unbounded/internal/version"
 	"github.com/Azure/unbounded/pkg/racersdk"
 	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
@@ -367,7 +367,7 @@ func TestSidecarLoopbackAndShutdown(t *testing.T) {
 	}
 	defer client.Close()
 
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: "store"})
+	handler, err := object.NewSidecar(client, object.SidecarConfig{Namespace: "store"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +518,7 @@ func TestSidecarShutdownReleasesSDKStream(t *testing.T) {
 		return metadata, body, nil
 	})
 
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: "store"})
+	handler, err := object.NewSidecar(client, object.SidecarConfig{Namespace: "store"})
 	if err != nil {
 		t.Fatal(err)
 	}
