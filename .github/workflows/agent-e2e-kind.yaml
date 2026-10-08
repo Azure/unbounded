@@ -78,7 +78,7 @@ jobs:
   # entry is left out rather than failed; see hack/agent/e2e-kind/README.md.
   select-hosts:
     name: select host matrix
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -128,7 +128,7 @@ jobs:
   agent-e2e:
     name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
     needs: select-hosts
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
@@ -202,7 +202,7 @@ jobs:
 
   agent-bootstrap-recovery:
     name: agent ${{ matrix.title }} (Ubuntu)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -250,7 +250,7 @@ jobs:
 
   agent-config-e2e:
     name: agent config e2e
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       KIND_CLUSTER_NAME: agent-config-e2e

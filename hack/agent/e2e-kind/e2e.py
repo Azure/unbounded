@@ -2442,10 +2442,11 @@ def export_gallery_image(version_id: str, destination: Path) -> None:
     fixed VHD, which is the raw disk followed by a footer.
 
     The footer is cut off and the raw disk converted, rather than the VHD.
-    qemu-img 8.2, which the CI runner has, sizes this VHD from its CHS geometry
-    and loses 640 KiB off the end, and with it the GPT's backup header; the
-    guest then finds no partitions at all. The qcow2 has to come out at the
-    disk's exact size.
+    qemu-img before 10.0 sizes a VHD Azure wrote from its CHS geometry, not
+    its footer's size, and loses 640 KiB off the end of this one, and with it
+    the GPT's backup header; the guest then finds no partitions at all. Ubuntu
+    24.04 ships 8.2. The qcow2 has to come out at the disk's exact size,
+    whatever qemu-img the host has.
 
     The gallery publishes no digest to check the result against. The transfer
     is TLS from Azure, the VHD footer and the qcow2 are checked, and the

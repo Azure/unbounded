@@ -5,8 +5,11 @@
 # includes, so a malformed workflow is caught before it is dispatched rather
 # than when someone tries to cut a release with it.
 
-# Labels for self-hosted runners actionlint cannot know about. `pve` is the
-# Proxmox host pool used by aks-ssh-quickstart.yaml.
+# Labels for runners actionlint cannot know about. `pve` is the Proxmox host
+# pool used by aks-ssh-quickstart.yaml. `ubuntu-26.04` is GitHub-hosted and
+# generally available since September 2026, but actionlint v1.7.12, its latest
+# release, predates it; drop it from here once ACTIONLINT_VERSION knows it.
 self-hosted-runner:
   labels:
     - pve
+    - ubuntu-26.04
