@@ -110,6 +110,7 @@ UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
 # points components at the same registry/org as the operator.
 UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
+UNBOUNDED_OPERATOR_ENABLE_RACER ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
 UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
@@ -578,7 +579,7 @@ racer-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets a
 racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
 	@mkdir -p tmp/racer-envtest
-	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/racer ./internal/racer/authority -run '^TestEnvtest' -count=1 -v -timeout=5m
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/racer ./internal/racer/authority ./deploy/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
@@ -1056,7 +1057,8 @@ unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy
 		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
 		--set ImageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
 		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
-		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES)
+		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES) \
+		--set EnableRacer=$(UNBOUNDED_OPERATOR_ENABLE_RACER)
 	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
 
 machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered

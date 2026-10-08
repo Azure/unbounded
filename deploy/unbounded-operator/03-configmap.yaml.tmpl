@@ -20,6 +20,9 @@ metadata:
     app.kubernetes.io/name: unbounded-operator
     app.kubernetes.io/component: controller
 data:
+  # Manage the Racer controller when a ClusterCache exists, even without Sites.
+  # False stops management but leaves existing resources and the CRD in place.
+  ENABLE_RACER: {{ default "true" .EnableRacer | quote }}
   # Full image-repository prefix (registry host plus org/namespace) for all
   # operator-managed first-party component images. The flat component name and
   # operator version are appended, so ghcr.io/azure yields ghcr.io/azure/machina.

@@ -10,6 +10,12 @@ metadata:
     app.kubernetes.io/name: unbounded-operator
     app.kubernetes.io/component: controller
 rules:
+  - apiGroups: ["racer.unbounded-cloud.io"]
+    resources: ["clustercaches"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites"]
     verbs: ["get", "list", "watch", "create"]

@@ -270,6 +270,7 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 			wantRegistry, err := (&installHandler{}).embeddedImageRegistry()
 			require.NoError(t, err)
 			require.Equal(t, map[string]string{
+				"ENABLE_RACER":                    "true",
 				"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
 				"UNBOUNDED_IMAGE_REGISTRY":        wantRegistry,
 				"UNBOUNDED_REAP_LEGACY_RESOURCES": tt.wantReaper,
