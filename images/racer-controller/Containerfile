@@ -16,14 +16,16 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     -ldflags "-X github.com/Azure/unbounded/internal/version.Version=${VERSION} -X github.com/Azure/unbounded/internal/version.GitCommit=${GIT_COMMIT} -X github.com/Azure/unbounded/internal/version.BuildTime=${BUILD_TIME}" \
     -o /out/racer-controller ./cmd/racer-controller
 
-FROM scratch
+FROM ubuntu:noble
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 LABEL org.opencontainers.image.title="racer-controller" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${GIT_COMMIT}"
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/racer-controller /usr/local/bin/racer-controller
 COPY LICENSE NOTICE /usr/share/licenses/racer-controller/
 USER 65532:65532
