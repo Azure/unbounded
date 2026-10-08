@@ -125,6 +125,27 @@ class TestSingleUKI(unittest.TestCase):
                     ukiboot.single_uki(names, Path("d"))
 
 
+class TestFirstbootAddon(unittest.TestCase):
+    """The harness's additions go only into the addon that is deleted after the
+    first boot, never into the one every boot reads."""
+
+    def test_the_first_boot_addon_is_chosen_among_the_others(self):
+        names = ["vmlinuz-6.6.157.1-1.azl3.addon.efi", "firstboot.addon.efi"]
+        self.assertEqual(ukiboot.find_firstboot_addon(names, "d"), "firstboot.addon.efi")
+
+    def test_the_name_is_matched_as_fat_does(self):
+        """FAT ignores case, and the patch has to read the file under the name
+        the directory gives it."""
+        self.assertEqual(ukiboot.find_firstboot_addon(["FIRSTBOOT.ADDON.EFI"], "d"), "FIRSTBOOT.ADDON.EFI")
+
+    def test_a_disk_that_has_booted_is_refused(self):
+        """ignition-quench has deleted the addon, and Ignition does not run on
+        a later boot, so a config appended anywhere else would never be read.
+        Failing here beats a VM that waits for a bootstrap that never comes."""
+        with self.assertRaisesRegex(RuntimeError, "already booted"):
+            ukiboot.find_firstboot_addon(["vmlinuz.addon.efi"], "d")
+
+
 class TestNbdServerStartup(unittest.TestCase):
     """A failed start must not leave the temporary directory behind, since
     __exit__ never runs for a constructor that raised."""
