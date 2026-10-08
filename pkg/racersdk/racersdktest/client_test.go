@@ -493,6 +493,76 @@ func TestFakeClientFreshGets(t *testing.T) {
 	}
 }
 
+func TestFakeClientPinnedVersionAfterKeyChanges(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		current  = `"1"`
+		versions = map[string]string{`"1"`: "one", `"2"`: "two"}
+	)
+
+	client, _ := startClient(t, func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		etag := r.ETag
+		if etag == "" {
+			etag = current
+		}
+
+		data, ok := versions[etag]
+		if !ok {
+			return racersdk.Metadata{}, nil, racersdk.ErrVersionMismatch
+		}
+
+		m := originMeta(int64(len(data)))
+		m.ETag = etag
+
+		if r.Head {
+			return m, nil, nil
+		}
+
+		return m, io.NopCloser(strings.NewReader(data)), nil
+	})
+
+	read := func(options ...racersdk.ReadOptions) (string, error) {
+		v, err := client.Get(context.Background(), racersdk.Request{}, options...)
+		if err != nil {
+			return "", err
+		}
+		defer v.Close()
+
+		data, err := io.ReadAll(v)
+
+		return string(data), err
+	}
+
+	stat, err := client.Stat(context.Background(), racersdk.Request{})
+	if err != nil || stat.ETag != `"1"` {
+		t.Fatal("stat did not report the first version", stat.ETag, err)
+	}
+
+	mu.Lock()
+	current = `"2"`
+	mu.Unlock()
+
+	if got, err := read(); err != nil || got != "two" {
+		t.Fatal("unpinned read did not see the new version", got, err)
+	}
+
+	pin := racersdk.ReadOptions{ETag: stat.ETag}
+	if got, err := read(pin); err != nil || got != "one" {
+		t.Fatal("pinned read did not return the older version", got, err)
+	}
+
+	mu.Lock()
+	delete(versions, `"1"`)
+	mu.Unlock()
+
+	if _, err := read(pin); !errors.Is(err, racersdk.ErrVersionMismatch) {
+		t.Fatal("pinned read of a removed version did not fail with ErrVersionMismatch", err)
+	}
+}
+
 func TestTemporarySockets(t *testing.T) {
 	parent := t.TempDir()
 	t.Setenv("TMPDIR", parent)

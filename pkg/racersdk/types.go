@@ -26,8 +26,10 @@ var _ [PageSize - wire.PageSize]struct{}
 
 var _ [wire.PageSize - PageSize]struct{}
 
-// Key names an immutable object in a Racer cache. It is usually a content
-// digest, for example the SHA-256 of a blob.
+// Key names an object in a Racer cache. The object's content may change
+// over time; each version is identified by the ETag in its [Metadata] and
+// must never change. A key is often a content digest, such as the SHA-256
+// of a blob, in which case the object has only one version.
 type Key [32]byte
 
 // ParseKey parses 64 lowercase hexadecimal characters.
@@ -78,7 +80,8 @@ func (r Request) wire(op wire.Operation) (wire.Request, error) {
 	return w, nil
 }
 
-// Metadata describes one immutable version of an object.
+// Metadata describes one version of an object. The bytes of a version,
+// identified by its ETag, must never change.
 type Metadata struct {
 	// Size is the object length in bytes.
 	Size int64
@@ -122,8 +125,10 @@ type ReadOptions struct {
 	// object. A range that extends past the end fails with
 	// [ErrRangeNotSatisfiable].
 	Length int64
-	// ETag pins the read to one version, typically from [Client.Stat]. If the
-	// object has changed, Get fails with [ErrVersionMismatch].
+	// ETag pins the read to one version, typically from [Client.Stat]. Use it
+	// when several reads of a key must see the same bytes, since separate
+	// unpinned reads may see different versions. If that version is no
+	// longer available, Get fails with [ErrVersionMismatch].
 	ETag string
 	// SmallObject declares that the object is at most [PageSize] bytes. Small
 	// reads use a separate admission queue so they are not delayed behind

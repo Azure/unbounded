@@ -33,6 +33,12 @@
 // without reading content. Use [ReadOptions] to read a byte range or to pin
 // a version by ETag.
 //
+// A [Key] names an object whose content may change. Each version has its own
+// ETag, and the bytes of a version never change. One Get reads a single
+// version from start to end, but two separate reads of the same key may see
+// different versions. To read the same version more than once, take the ETag
+// from [Client.Stat] or [Object.Metadata] and pass it in [ReadOptions].
+//
 // # Copy or no copy
 //
 // An [Object] can be consumed in exactly two ways. Pick one per object.
@@ -63,7 +69,7 @@
 // Implement [Origin] and pass it to [ServeOrigin]. Racer calls the origin for
 // metadata and for individual pages of up to [PageSize] bytes. Requests for
 // later pages are pinned to the ETag the origin returned for the first one,
-// so origins only need ranged reads of immutable versions. The SDK validates
+// so origins only need ranged reads of a fixed version. The SDK validates
 // every response, so a short, long, or mismatched body is reported to Racer
 // instead of being cached.
 //
