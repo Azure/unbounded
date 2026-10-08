@@ -636,13 +636,89 @@ mod codec {
         }
     }
 
+    /// Decode only escapes whose scalar can appear raw inside a JSON string.
+    fn raw_json_escape(b: &[u8]) -> Option<(char, usize)> {
+        /// Read exactly four hexadecimal digits without allocating decoded text.
+        fn hex(b: &[u8]) -> Option<u32> {
+            b.get(..4)?.iter().try_fold(0, |value, &digit| {
+                Some(value * 16 + char::from(digit).to_digit(16)?)
+            })
+        }
+        if b.get(..2)? == b"\\/" {
+            return Some(('/', 2));
+        }
+        if b.get(..2)? != b"\\u" {
+            return None;
+        }
+        let mut scalar = hex(&b[2..])?;
+        let mut consumed = 6;
+        if (0xd800..=0xdbff).contains(&scalar) {
+            if b.get(6..8)? != b"\\u" {
+                return None;
+            }
+            let low = hex(&b[8..])?;
+            if !(0xdc00..=0xdfff).contains(&low) {
+                return None;
+            }
+            scalar = 0x10000 + ((scalar - 0xd800) << 10) + low - 0xdc00;
+            consumed = 12;
+        }
+        let character = char::from_u32(scalar)?;
+        (scalar >= 0x20 && !matches!(character, '"' | '\\')).then_some((character, consumed))
+    }
+
+    /// Keep escaped base64 secrets out of serde_json's nonzeroizing string scratch.
+    fn canonicalize_json_strings(b: &[u8]) -> zeroize::Zeroizing<Vec<u8>> {
+        // Each replacement is a complete, valid escape for the same scalar, and
+        // never inserts a quote, backslash, or control character. String boundaries
+        // and decoded values are unchanged. Malformed escapes and bytes outside
+        // strings remain for serde_json to reject, so acceptance is unchanged too.
+        // UTF-8 takes at most four bytes versus six (or twelve) for Unicode escapes;
+        // copying all other bytes makes b.len() a hard bound, with no reallocation.
+        let mut out = zeroize::Zeroizing::new(Vec::with_capacity(b.len()));
+        let capacity = out.capacity();
+        let mut inside = false;
+        let mut i = 0;
+        while i < b.len() {
+            if inside && b[i] == b'\\' {
+                if let Some((character, consumed)) = raw_json_escape(&b[i..]) {
+                    let mut utf8 = zeroize::Zeroizing::new([0; 4]);
+                    out.extend_from_slice(character.encode_utf8(&mut *utf8).as_bytes());
+                    i += consumed;
+                    continue;
+                }
+                // Copy the escape introducer and its next byte together so an
+                // escaped quote or backslash cannot change the string state.
+                let end = (i + 2).min(b.len());
+                out.extend_from_slice(&b[i..end]);
+                i = end;
+            } else {
+                if b[i] == b'"' {
+                    inside = !inside;
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        debug_assert!(out.len() <= b.len());
+        debug_assert_eq!(out.capacity(), capacity);
+        out
+    }
+
     /// Parse one bounded JSON value, rejecting duplicate keys and excessive nesting.
     /// Application-specific DTO decoders also use this shared parsing policy.
     pub fn strict_json(b: &[u8], limit: usize) -> Result<Value> {
         if b.len() > limit {
             return Err(Error::Overloaded);
         }
-        let mut d = serde_json::Deserializer::from_slice(b);
+        // Remaining quote, backslash, and control-character escapes still use
+        // serde_json's ordinary scratch. Valid bundle material and persisted PKCS#8
+        // base64 contain none of these characters. This general parser cannot
+        // reject them without changing its contract; secret DTOs validate base64
+        // later. Malformed secret strings can therefore still reach that scratch.
+        let canonical = b.contains(&b'\\').then(|| canonicalize_json_strings(b));
+        let input = canonical.as_deref().map_or(b, Vec::as_slice);
+        let mut d = serde_json::Deserializer::from_slice(input);
         let mut v = JsonScratch(
             Strict(0)
                 .deserialize(&mut d)
@@ -1721,6 +1797,30 @@ mod codec {
             "/../../../internal/racer/wire/testdata/"
         );
 
+        /// Canonicalization preserves shared JSON and each generated rejection input.
+        #[test]
+        fn shared_vectors_preserve_json_escape_semantics() {
+            for entry in std::fs::read_dir(ROOT).unwrap() {
+                let path = entry.unwrap().path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    super::tests::assert_json_equivalent(&std::fs::read(path).unwrap());
+                }
+            }
+            let cases: Value = serde_json::from_slice(&fixture("rejections.json")).unwrap();
+            for case in cases.as_array().unwrap() {
+                let input = String::from_utf8(fixture(case["file"].as_str().unwrap())).unwrap();
+                let mutated = input.replacen(
+                    case["old"].as_str().unwrap(),
+                    case["new"].as_str().unwrap(),
+                    1,
+                );
+                super::tests::assert_json_equivalent(mutated.as_bytes());
+            }
+        }
+
         /// Canonical publication content and membership match Go's exact bytes.
         #[test]
         fn shared_publication_vectors() {
@@ -2262,6 +2362,190 @@ mod codec {
             env!("CARGO_MANIFEST_DIR"),
             "/../../../internal/racer/wire/testdata/bundle.json"
         ));
+
+        /// Compare JSON acceptance and values without requiring equal error offsets.
+        pub(super) fn assert_json_equivalent(input: &[u8]) {
+            let canonical = canonicalize_json_strings(input);
+            assert!(canonical.len() <= input.len());
+            assert_eq!(canonical.capacity(), input.len());
+            let before = serde_json::from_slice::<Value>(input);
+            let after = serde_json::from_slice::<Value>(&canonical);
+            assert_eq!(before.is_ok(), after.is_ok(), "{input:?}");
+            if let Ok(before) = before {
+                assert_eq!(before, after.unwrap(), "{input:?}");
+            }
+        }
+
+        /// Normalize only raw-safe scalars while retaining string and escape boundaries.
+        #[test]
+        fn json_canonicalizer_escape_kinds_and_boundaries() {
+            for (input, expected) in [
+                (
+                    r#""\/\u0041\u0020\u007f\u0080\u07ff\u0800\u2028\u2029\uffff""#,
+                    "\"/A \u{7f}\u{80}\u{7ff}\u{800}\u{2028}\u{2029}\u{ffff}\"",
+                ),
+                (
+                    r#""\uD800\uDC00\udbff\udfff\uD83d\uDe00""#,
+                    "\"\u{10000}\u{10ffff}\u{1f600}\"",
+                ),
+                (
+                    r#""\"\\\b\f\n\r\t\u0022\u005c""#,
+                    r#""\"\\\b\f\n\r\t\u0022\u005c""#,
+                ),
+                (
+                    r#"{"\u0061":"\u0041","slash":"\/"}"#,
+                    r#"{"a":"A","slash":"/"}"#,
+                ),
+                (
+                    r#"["\\u0041","\"\u0041","\\\u0041"]"#,
+                    r#"["\\u0041","\"A","\\A"]"#,
+                ),
+                (r#"\u0041 "\u0041" \/"#, r#"\u0041 "A" \/"#),
+            ] {
+                assert_eq!(
+                    &**canonicalize_json_strings(input.as_bytes()),
+                    expected.as_bytes()
+                );
+                assert_json_equivalent(input.as_bytes());
+            }
+            for scalar in (0..0x20).chain([0x22, 0x5c]) {
+                let input = format!(r#""\u{scalar:04x}""#);
+                assert_eq!(
+                    &**canonicalize_json_strings(input.as_bytes()),
+                    input.as_bytes()
+                );
+                assert_json_equivalent(input.as_bytes());
+            }
+            let duplicate = br#"{"a":1,"\u0061":2}"#;
+            assert_eq!(&**canonicalize_json_strings(duplicate), br#"{"a":1,"a":2}"#);
+            assert_eq!(
+                strict_json(duplicate, duplicate.len()),
+                Err(Error::InvalidRequest)
+            );
+            assert_eq!(strict_json(br#""\u0041""#, 3), Err(Error::Overloaded));
+        }
+
+        /// Leave malformed escapes, lone surrogates, and invalid UTF-8 for the parser.
+        #[test]
+        fn json_canonicalizer_preserves_invalid_input() {
+            for input in [
+                br#""\ud800""#.as_slice(),
+                br#""\udfff""#,
+                br#""\ud800\ud800""#,
+                br#""\ud800\u0000""#,
+                br#""\ud800x""#,
+                br#""\uZZZZ""#,
+                br#""\x41""#,
+                br#""\U0041""#,
+                br#""\u12""#,
+                br#""\"#,
+                br#"\u0041"#,
+                b"\"\xff\\n\"",
+                b"\"\xc0\x80\"",
+                b"\xff",
+            ] {
+                assert_eq!(&**canonicalize_json_strings(input), input);
+                assert_json_equivalent(input);
+                assert!(serde_json::from_slice::<Value>(input).is_err());
+                assert_eq!(strict_json(input, input.len()), Err(Error::InvalidRequest));
+            }
+            let invalid_utf8 = b"\"\xff\\u0041\xc0\x80\"";
+            assert_eq!(
+                &**canonicalize_json_strings(invalid_utf8),
+                b"\"\xffA\xc0\x80\""
+            );
+            assert_json_equivalent(invalid_utf8);
+            for input in [br#""\u0041""#.as_slice(), br#""\ud800\udc00""#] {
+                for length in 0..=input.len() {
+                    assert_json_equivalent(&input[..length]);
+                }
+            }
+        }
+
+        /// Exhaust BMP escapes and combine valid and malformed fragments in context.
+        #[test]
+        fn json_canonicalizer_equivalence_corpus() {
+            for scalar in 0..=0xffff {
+                let input = format!(r#"{{"\u{scalar:04x}":"\u{scalar:04X}"}}"#);
+                assert_json_equivalent(input.as_bytes());
+            }
+            let fragments = [
+                "",
+                "a",
+                "\"",
+                "\\",
+                r#"\""#,
+                r"\\",
+                r"\/",
+                r"\b",
+                r"\f",
+                r"\n",
+                r"\r",
+                r"\t",
+                r"\u0041",
+                r"\u005c",
+                r"\u0022",
+                r"\u0000",
+                r"\uD800",
+                r"\uDBFF",
+                r"\uDC00",
+                r"\uDFFF",
+                r"\ud83d\ude00",
+                r"\uZZZZ",
+                r"\u12",
+                "é",
+                "\n",
+                "\0",
+            ];
+            for first in fragments {
+                for second in fragments {
+                    for input in [
+                        format!(r#""{first}{second}""#),
+                        format!(r#"{{"{first}":["{second}",null,true,123]}}"#),
+                        format!(r#"{first} "{second}""#),
+                    ] {
+                        assert_json_equivalent(input.as_bytes());
+                    }
+                }
+            }
+        }
+
+        /// Every base64 character, including slash, reaches serde as borrowed text.
+        #[test]
+        fn escaped_bundle_material_matches_unescaped_keys() {
+            let mut bundle = decode_bundle(BUNDLE.as_bytes()).unwrap();
+            for key in &mut bundle.cache_keys {
+                key.material = [0xff; 32];
+            }
+            let original = String::from_utf8(encode_bundle(&bundle).unwrap()).unwrap();
+            let material = STANDARD.encode([0xff; 32]);
+            for escaped in [
+                material
+                    .chars()
+                    .map(|c| format!("\\u{:04x}", c as u32))
+                    .collect::<String>(),
+                material.replace('/', "\\/"),
+            ] {
+                let input = original.replace(&material, &escaped);
+                assert_ne!(input, original);
+                let canonical = canonicalize_json_strings(input.as_bytes());
+                assert_eq!(&**canonical, original.as_bytes());
+                // A borrowed str visitor fails if serde uses its scratch for escapes.
+                let quoted = format!("\"{escaped}\"");
+                let canonical = canonicalize_json_strings(quoted.as_bytes());
+                assert_eq!(
+                    serde_json::from_slice::<&str>(&canonical).unwrap(),
+                    material
+                );
+                let decoded = decode_bundle(input.as_bytes()).unwrap();
+                assert_eq!(decoded.cache_keys.len(), bundle.cache_keys.len());
+                for (actual, expected) in decoded.cache_keys.iter().zip(&bundle.cache_keys) {
+                    assert_eq!(actual.key, expected.key);
+                    assert_eq!(actual.state, expected.state);
+                    assert_eq!(actual.material, expected.material);
+                }
+            }
+        }
 
         /// NIC GIDs round-trip only with exact lowercase hexadecimal spelling.
         #[test]
