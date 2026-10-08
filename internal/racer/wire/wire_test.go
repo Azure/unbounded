@@ -1661,6 +1661,7 @@ func regenerateRejections(t *testing.T) {
 	}
 
 	for _, addition := range []struct{ name, file, old, new string }{
+		{"duplicate key material", "bundle.json", "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
 		{"missing bootstrap NIC report", "bootstrap-request.json", `"rdma_nics":[],`, ""},
 		{"null bootstrap NIC report", "bootstrap-request.json", `"rdma_nics":[]`, `"rdma_nics":null`},
 		{"legacy bootstrap rails", "bootstrap-request.json", `"rdma_nics":[]`, `"rails":[]`},
