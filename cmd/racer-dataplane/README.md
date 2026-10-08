@@ -40,3 +40,16 @@ timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/runtime-miri.py
 
 Run the `offload`, `scheduler`, and `memory` groups separately with the same script.
 Each group verifies that every exact allowlisted test actually ran.
+
+The `page-alloc` library provides worker-local aligned buffers, lease-fenced slab
+I/O, and bounded segment reclamation. Test it separately from runtime/workspace
+tests so feature unification cannot enable simulation in its production gate:
+
+```sh
+PAGE_ALLOC_REQUIRE_REAL_IO=1 timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --no-default-features -j 2 -- --test-threads=1
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --no-default-features --features simulation -j 2 -- --test-threads=1
+```
+
+The production gate requires real io_uring and direct-I/O support: capability
+skips fail when `PAGE_ALLOC_REQUIRE_REAL_IO=1`. CI also checks all targets and
+runs strict Clippy for each allocator mode.
