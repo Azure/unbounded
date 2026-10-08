@@ -86,12 +86,12 @@ func (d *countingPeerDialer) Calls(addr string) int {
 func (s *stubColdStart) Resolve(_ context.Context, d digest.Digest, _ ifaces.OriginRefKind, _, _ string, _ int64) (*mirror.ColdStartResolution, error) {
 	atomic.AddInt32(&s.calls, 1)
 
-	if s.err != nil {
-		return nil, s.err
-	}
-
 	if s.onResolve != nil {
 		s.onResolve(d)
+	}
+
+	if s.err != nil {
+		return nil, s.err
 	}
 
 	return &mirror.ColdStartResolution{Providers: s.providers, Outcome: "stub"}, nil
