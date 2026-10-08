@@ -73,6 +73,42 @@ func TestOptionsDefaults(t *testing.T) {
 	}
 }
 
+func TestRequestTimeoutFlag(t *testing.T) {
+	for _, tt := range []struct {
+		mode    string
+		value   string
+		want    time.Duration
+		wantErr string
+	}{
+		{mode: "origin", value: "1ns", want: time.Nanosecond},
+		{mode: "origin", value: "30s", want: 30 * time.Second},
+		{mode: "origin", value: "1m", want: time.Minute},
+		{mode: "origin", value: "61s", wantErr: "--request-timeout must not exceed 1m in origin mode"},
+		{mode: "origin", value: "2m", wantErr: "--request-timeout must not exceed 1m in origin mode"},
+		{mode: "sidecar", value: "5m", want: 5 * time.Minute},
+		{mode: "sidecar", value: "10m", want: 10 * time.Minute},
+	} {
+		t.Run(tt.mode+"/"+tt.value, func(t *testing.T) {
+			o, err := parseOptions([]string{tt.mode, "--namespace=store", "--request-timeout=" + tt.value}, io.Discard)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if o.requestTimeout != tt.want {
+				t.Fatalf("request timeout = %v, want %v", o.requestTimeout, tt.want)
+			}
+		})
+	}
+}
+
 func TestCacheFlag(t *testing.T) {
 	for _, mode := range []string{"origin", "sidecar"} {
 		t.Run(mode, func(t *testing.T) {

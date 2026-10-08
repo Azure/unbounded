@@ -136,7 +136,10 @@ Origin options:
 | `--endpoint` | Optional S3-compatible endpoint; omitted uses AWS endpoint resolution |
 | `--path-style` | `true`; use `false` if the upstream requires virtual-host addressing |
 | `--metadata-ttl` | `30s` |
-| `--request-timeout` | `1m` |
+| `--request-timeout` | `1m`; positive per-attempt S3 HTTP timeout, capped at `1m` |
+
+Retries can exceed this per-attempt timeout. The Racer SDK fixes the total origin
+operation deadline at one minute.
 
 For a non-AWS upstream, set `--endpoint` to its HTTPS URL and configure the region
 and credentials it expects. The URL must not contain credentials, a path prefix,

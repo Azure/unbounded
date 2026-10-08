@@ -32,6 +32,9 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
+// maxOriginRequestTimeout matches the Racer SDK's fixed origin operation deadline.
+const maxOriginRequestTimeout = time.Minute
+
 type bucketsFlag []string
 
 func (b *bucketsFlag) String() string { return strings.Join(*b, ",") }
@@ -104,7 +107,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		fs.StringVar(&o.endpoint, "endpoint", "", "Optional HTTP(S) upstream origin, without a path or credentials")
 		fs.BoolVar(&o.pathStyle, "path-style", true, "Use path-style upstream addressing")
 		fs.DurationVar(&o.metadataTTL, "metadata-ttl", 30*time.Second, "Metadata lifetime; zero expires immediately")
-		fs.DurationVar(&o.requestTimeout, "request-timeout", time.Minute, "Positive origin request timeout")
+		fs.DurationVar(&o.requestTimeout, "request-timeout", maxOriginRequestTimeout, "Positive per-attempt S3 request timeout, at most 1m")
 	} else {
 		fs.StringVar(&o.listen, "listen", "127.0.0.1:8080", "Loopback IP literal and port")
 		fs.DurationVar(&o.requestTimeout, "request-timeout", 5*time.Minute, "Positive sidecar request timeout")
@@ -150,6 +153,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 
 	if o.mode == "origin" {
+		if o.requestTimeout > maxOriginRequestTimeout {
+			return o, errors.New("--request-timeout must not exceed 1m in origin mode")
+		}
+
 		if o.metadataTTL < 0 {
 			return o, errors.New("--metadata-ttl must not be negative")
 		}
