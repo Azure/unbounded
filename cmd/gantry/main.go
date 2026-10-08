@@ -143,10 +143,6 @@ func runAgent(args []string) error {
 		slog.Any("config", c.Redacted()),
 	)
 
-	if c.RacerEnabled {
-		return runRacerAgent(c, logger)
-	}
-
 	// Metrics registry + 2 instruments.
 	reg := metrics.New()
 	reg.RegisterDefaultCollectors()

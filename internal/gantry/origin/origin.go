@@ -31,7 +31,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -53,10 +52,9 @@ import (
 // Client is the concrete OriginPuller. It fans out to one *registry per
 // configured upstream and routes calls by OriginRef.Registry.
 type Client struct {
-	logger                   *slog.Logger
-	registries               map[string]*registry // keyed by both Name and NSAlias
-	metrics                  metricsHooks
-	delegatedCredentialsOnly bool
+	logger     *slog.Logger
+	registries map[string]*registry // keyed by both Name and NSAlias
+	metrics    metricsHooks
 }
 
 // metricsHooks lets the origin client emit counters without importing the
@@ -79,18 +77,10 @@ type metricsHooks struct {
 	onPullStart   func(kind string)        // before request
 	onPullFailure func(kind, class string) // any non-success terminal status
 	onBytesRead   func(kind string, bytes int64)
-	onRequest     func(method string, statusCode int)
 }
 
 // Option configures a Client.
 type Option func(*Client)
-
-// WithDelegatedCredentialsOnly disables configured shared credentials, including
-// endpoint user information. Anonymous Bearer exchange remains available.
-// Request-scoped credentials are never replaced with a shared identity.
-func WithDelegatedCredentialsOnly() Option {
-	return func(c *Client) { c.delegatedCredentialsOnly = true }
-}
 
 // WithLogger plumbs a structured logger.
 func WithLogger(l *slog.Logger) Option {
@@ -103,7 +93,7 @@ func WithLogger(l *slog.Logger) Option {
 
 // WithMetrics registers metric callbacks.
 //
-// start fires once at the top of every Pull or PullRange invocation, before the
+// start fires once at the top of every Pull invocation, before the
 // registry lookup. failure fires once on any terminal error path
 // (unknown registry, transport error, non-2xx response, auth
 // failure). Success is NOT emitted here - see the metricsHooks doc
@@ -118,42 +108,15 @@ func WithMetrics(start func(kind string), failure func(kind, class string)) Opti
 // WithByteMetrics registers a callback for bytes actually read from upstream
 // response bodies. It includes partial failed transfers and retries, and does
 // not count HEAD requests. The callback fires once when the body reaches a
-// terminal read result or is closed. Hooks must support concurrent calls.
+// terminal read result or is closed.
 func WithByteMetrics(onBytesRead func(kind string, bytes int64)) Option {
 	return func(c *Client) {
 		c.metrics.onBytesRead = onBytesRead
 	}
 }
 
-// WithRequestMetrics observes each HTTP transport round trip, including HEAD,
-// GET, redirects, manifest fallbacks, and authentication exchanges. statusCode
-// is zero for transport failures. It does not expose URLs or credentials.
-// Transport-internal retries are part of the same round trip. Hooks must be
-// concurrency-safe. This is independent of the logical pull hooks in WithMetrics.
-func WithRequestMetrics(onRequest func(method string, statusCode int)) Option {
-	return func(c *Client) { c.metrics.onRequest = onRequest }
-}
-
-type meteredTransport struct {
-	http.RoundTripper
-	onRequest func(string, int)
-}
-
-func (t meteredTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.RoundTripper.RoundTrip(req)
-
-	status := 0
-	if resp != nil {
-		status = resp.StatusCode
-	}
-
-	t.onRequest(req.Method, status)
-
-	return resp, err
-}
-
-// New builds a Client from the operator config. Unless shared credentials are
-// disabled, it returns an error if an upstream credentials file cannot be read.
+// New builds a Client from the operator config. Returns an error if any
+// upstream credentials file cannot be read.
 func New(cfg *config.Config, opts ...Option) (*Client, error) {
 	if cfg == nil || len(cfg.UpstreamRegistries) == 0 {
 		return nil, errors.New("origin: at least one upstream registry required")
@@ -168,21 +131,9 @@ func New(cfg *config.Config, opts ...Option) (*Client, error) {
 	}
 
 	for _, ur := range cfg.UpstreamRegistries {
-		if c.delegatedCredentialsOnly {
-			ur.CredentialsPath = ""
-		}
-
 		r, err := newRegistry(ur, c.logger)
 		if err != nil {
 			return nil, fmt.Errorf("origin: registry %q: %w", ur.Name, err)
-		}
-
-		if c.delegatedCredentialsOnly {
-			r.base.User = nil
-		}
-
-		if c.metrics.onRequest != nil {
-			r.hc.Transport = meteredTransport{RoundTripper: r.hc.Transport, onRequest: c.metrics.onRequest}
 		}
 
 		c.registries[ur.Name] = r
@@ -208,28 +159,6 @@ func New(cfg *config.Config, opts ...Option) (*Client, error) {
 // the body; io.Copy + cache.Commit failures both fire Close on a
 // deferred path).
 func (c *Client) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
-	body, size, _, err := c.pull(ctx, ref, 0)
-	return body, size, err
-}
-
-// PullRange implements ifaces.OriginRangePuller without a metadata round trip.
-func (c *Client) PullRange(ctx context.Context, ref ifaces.OriginRef, length int64) (io.ReadCloser, int64, string, error) {
-	if length <= 0 || ref.Offset < 0 || length-1 > math.MaxInt64-ref.Offset {
-		kind := ref.Kind.MetricLabel()
-		if c.metrics.onPullStart != nil {
-			c.metrics.onPullStart(kind)
-		}
-
-		err := &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: errors.New("invalid bounded origin range")}
-		c.recordFailure(kind, err)
-
-		return nil, 0, "", err
-	}
-
-	return c.pull(ctx, ref, length)
-}
-
-func (c *Client) pull(ctx context.Context, ref ifaces.OriginRef, length int64) (io.ReadCloser, int64, string, error) {
 	kind := ref.Kind.MetricLabel()
 	if c.metrics.onPullStart != nil {
 		c.metrics.onPullStart(kind)
@@ -239,7 +168,7 @@ func (c *Client) pull(ctx context.Context, ref ifaces.OriginRef, length int64) (
 		err := &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: verr}
 		c.recordFailure(kind, err)
 
-		return nil, 0, "", err
+		return nil, 0, err
 	}
 
 	r, ok := c.registries[ref.Registry]
@@ -251,24 +180,13 @@ func (c *Client) pull(ctx context.Context, ref ifaces.OriginRef, length int64) (
 		}
 		c.recordFailure(kind, err)
 
-		return nil, 0, "", err
+		return nil, 0, err
 	}
 
-	var (
-		rc          io.ReadCloser
-		size        int64
-		contentType string
-		err         error
-	)
-	if length == 0 {
-		rc, size, err = r.pull(ctx, ref)
-	} else {
-		rc, size, contentType, err = r.pullRange(ctx, ref, length)
-	}
-
+	rc, size, err := r.pull(ctx, ref)
 	if err != nil {
 		c.recordFailure(kind, err)
-		return nil, 0, "", err
+		return nil, 0, err
 	}
 
 	if c.metrics.onBytesRead != nil {
@@ -280,29 +198,23 @@ func (c *Client) pull(ctx context.Context, ref ifaces.OriginRef, length int64) (
 		}
 	}
 
-	return rc, size, contentType, nil
+	return rc, size, nil
 }
 
 type countingReadCloser struct {
 	io.ReadCloser
 	onFinish func(bytes int64)
-	mu       sync.Mutex
 	bytes    int64
-	active   int
-	finished bool
-	reported bool
+	once     sync.Once
 }
 
 func (r *countingReadCloser) Read(p []byte) (int, error) {
-	r.mu.Lock()
-	r.active++
-	r.mu.Unlock()
 	n, err := r.ReadCloser.Read(p)
-	r.mu.Lock()
 	r.bytes += int64(n)
-	r.active--
-	r.finished = r.finished || err != nil
-	r.reportLocked()
+
+	if err != nil {
+		r.finish()
+	}
 
 	return n, err
 }
@@ -315,24 +227,11 @@ func (r *countingReadCloser) Close() error {
 }
 
 func (r *countingReadCloser) finish() {
-	r.mu.Lock()
-	r.finished = true
-	r.reportLocked()
-}
-
-func (r *countingReadCloser) reportLocked() {
-	if !r.finished || r.active != 0 || r.reported {
-		r.mu.Unlock()
-		return
-	}
-
-	r.reported = true
-	n := r.bytes
-	r.mu.Unlock()
-
-	if r.onFinish != nil && n > 0 {
-		r.onFinish(n)
-	}
+	r.once.Do(func() {
+		if r.onFinish != nil && r.bytes > 0 {
+			r.onFinish(r.bytes)
+		}
+	})
 }
 
 func (c *Client) recordFailure(kind string, err error) {
@@ -408,10 +307,7 @@ func (c *Client) Head(ctx context.Context, ref ifaces.OriginRef) (int64, string,
 }
 
 // Compile-time check.
-var (
-	_ ifaces.OriginPuller      = (*Client)(nil)
-	_ ifaces.OriginRangePuller = (*Client)(nil)
-)
+var _ ifaces.OriginPuller = (*Client)(nil)
 
 // ---------------------------------------------------------------------------
 // per-registry client
@@ -461,10 +357,7 @@ func newRegistryHTTPClient() *http.Client {
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: originDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          256,
-		MaxIdleConnsPerHost:   64,
-		MaxConnsPerHost:       128,
-		DisableCompression:    true,
+		MaxIdleConns:          100,
 		IdleConnTimeout:       originIdleConnTimeout,
 		TLSHandshakeTimeout:   originTLSHandshakeTimeout,
 		ExpectContinueTimeout: time.Second,
@@ -596,7 +489,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 
 	resp, err := r.do(ctx, http.MethodGet, path, ref.Offset)
 	if err != nil {
-		return nil, 0, &ifaces.OriginError{Ref: ref, Class: classOf(err), StatusCode: statusOf(err), Err: err}
+		return nil, 0, &ifaces.OriginError{Ref: ref, Class: classOf(err), Err: err}
 	}
 
 	if resp.StatusCode == http.StatusNotFound && ref.Kind != ifaces.KindManifest && ref.Offset == 0 {
@@ -648,21 +541,17 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 			// Transport error on the manifest fallback (DNS, RST, ctx
 			// deadline). Must not poison the cluster-wide negative cache
 			// with a definitive NotFound based on a transient blip.
-			return nil, 0, &ifaces.OriginError{Ref: ref, Class: classOf(mErr), StatusCode: statusOf(mErr), Err: mErr}
+			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: mErr}
 		}
 
 		// Both blob and manifest returned 404 - classify as not-found
 		// without re-issuing the original request.
-		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, StatusCode: http.StatusNotFound, Err: fmt.Errorf("origin: %s not found (blob 404, manifest 404)", ref.Digest)}
+		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: fmt.Errorf("origin: %s not found (blob 404, manifest 404)", ref.Digest)}
 	}
 
 	if ref.Offset > 0 {
 		if resp.StatusCode != http.StatusPartialContent {
 			defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
-
-			if resp.StatusCode != http.StatusOK {
-				return nil, 0, r.classify(ref, resp)
-			}
 
 			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: &ifaces.ErrRangeUnsupported{Offset: ref.Offset, Reason: "status " + resp.Status}}
 		}
@@ -714,7 +603,7 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 
 	resp, err := r.do(ctx, http.MethodHead, path, 0)
 	if err != nil {
-		return 0, "", &ifaces.OriginError{Ref: ref, Class: classOf(err), StatusCode: statusOf(err), Err: err}
+		return 0, "", &ifaces.OriginError{Ref: ref, Class: classOf(err), Err: err}
 	}
 
 	if resp.StatusCode == http.StatusNotFound && ref.Kind != ifaces.KindManifest {
@@ -748,10 +637,10 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 		} else if mErr != nil {
 			// Transport error on the manifest fallback HEAD. Must not
 			// classify as NotFound from a transient failure.
-			return 0, "", &ifaces.OriginError{Ref: ref, Class: classOf(mErr), StatusCode: statusOf(mErr), Err: mErr}
+			return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: mErr}
 		}
 
-		return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, StatusCode: http.StatusNotFound, Err: fmt.Errorf("origin HEAD: %s not found (blob 404, manifest 404)", ref.Digest)}
+		return 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: fmt.Errorf("origin HEAD: %s not found (blob 404, manifest 404)", ref.Digest)}
 	}
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
@@ -787,15 +676,6 @@ func (r *registry) urlFor(ref ifaces.OriginRef) string {
 // this node's configured credentials. Without delegated auth, the legacy
 // credentials-file bearer-token flow remains available.
 func (r *registry) do(ctx context.Context, method, urlStr string, offset int64) (*http.Response, error) {
-	rangeValue := ""
-	if offset > 0 {
-		rangeValue = fmt.Sprintf("bytes=%d-", offset)
-	}
-
-	return r.doRange(ctx, method, urlStr, rangeValue)
-}
-
-func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue string) (*http.Response, error) {
 	delegatedAuthorization := registryauth.Authorization(ctx)
 	if delegatedAuthorization != "" && !r.canSendBasicAuth() {
 		return nil, &tokenError{
@@ -822,8 +702,8 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 			req.Header.Set("Authorization", authorization)
 		}
 
-		if rangeValue != "" {
-			req.Header.Set("Range", rangeValue)
+		if offset > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 		}
 
 		return req, nil
@@ -868,16 +748,7 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 
 	if !strings.HasPrefix(strings.ToLower(challenge), "bearer ") {
 		// No bearer challenge - return 401 verbatim so classify reports auth.
-		retry, err := build("")
-		if err != nil {
-			return nil, err
-		}
-
-		if r.canSendBasicAuth() && r.username != "" {
-			retry.SetBasicAuth(r.username, r.password)
-		}
-
-		return r.hc.Do(retry)
+		return r.repeatWithoutToken(ctx, method, urlStr, offset)
 	}
 
 	tok, ttl, err := r.fetchBearerToken(ctx, challenge)
@@ -893,6 +764,26 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 	}
 
 	return r.hc.Do(req2)
+}
+
+// repeatWithoutToken re-issues a request that received a 401 but no usable
+// bearer challenge. Returns the 401 response so the caller can classify it
+// as FailureAuth.
+func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string, offset int64) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if r.canSendBasicAuth() && r.username != "" {
+		req.SetBasicAuth(r.username, r.password)
+	}
+
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
+
+	return r.hc.Do(req)
 }
 
 func parseOriginContentRange(value string) (start, end, size int64, ok bool) {
@@ -936,16 +827,16 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 
 	realm := params["realm"]
 	if realm == "" {
-		return "", 0, errors.New("bearer challenge missing realm")
+		return "", 0, fmt.Errorf("bearer challenge missing realm: %q", challenge)
 	}
 
 	realmURL, err := url.Parse(realm)
 	if err != nil {
-		return "", 0, errors.New("bearer challenge invalid realm")
+		return "", 0, fmt.Errorf("bearer challenge invalid realm %q: %w", realm, err)
 	}
 
-	if !realmURL.IsAbs() || realmURL.Host == "" || realmURL.User != nil || !strings.EqualFold(realmURL.Scheme, "https") {
-		return "", 0, errors.New("bearer challenge realm: token endpoint must be an absolute https URL without user information")
+	if !realmURL.IsAbs() || realmURL.Host == "" || !strings.EqualFold(realmURL.Scheme, "https") {
+		return "", 0, fmt.Errorf("bearer challenge realm %q: token endpoint must be an absolute https URL", realm)
 	}
 
 	scope := params["scope"]
@@ -985,11 +876,11 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 	if resp.StatusCode != http.StatusOK {
 		switch resp.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
-			return "", 0, &tokenError{class: ifaces.FailureAuth, status: resp.StatusCode, err: fmt.Errorf("token endpoint auth failure: %s", resp.Status)}
+			return "", 0, &tokenError{class: ifaces.FailureAuth, err: fmt.Errorf("token endpoint auth failure: %s", resp.Status)}
 		case http.StatusTooManyRequests:
-			return "", 0, &tokenError{class: ifaces.FailureRateLimited, status: resp.StatusCode, err: fmt.Errorf("token endpoint rate limited: %s", resp.Status)}
+			return "", 0, &tokenError{class: ifaces.FailureRateLimited, err: fmt.Errorf("token endpoint rate limited: %s", resp.Status)}
 		default:
-			return "", 0, &tokenError{class: ifaces.FailureTransient, status: resp.StatusCode, err: fmt.Errorf("token endpoint returned %s", resp.Status)}
+			return "", 0, &tokenError{class: ifaces.FailureTransient, err: fmt.Errorf("token endpoint returned %s", resp.Status)}
 		}
 	}
 
@@ -1112,10 +1003,9 @@ func (r *registry) classify(ref ifaces.OriginRef, resp *http.Response) error {
 	}
 
 	oe := &ifaces.OriginError{
-		Ref:        ref,
-		Class:      class,
-		StatusCode: resp.StatusCode,
-		Err:        fmt.Errorf("upstream returned %s", resp.Status),
+		Ref:   ref,
+		Class: class,
+		Err:   fmt.Errorf("upstream returned %s", resp.Status),
 	}
 	if class == ifaces.FailureAuth {
 		if challenge, err := validatedAuthenticationChallenge(resp); err == nil {
@@ -1143,7 +1033,7 @@ func validatedAuthenticationChallenge(resp *http.Response) (string, error) {
 		switch challenge.Scheme {
 		case dockerauth.BearerAuth:
 			realm, err := url.Parse(challenge.Parameters["realm"])
-			if err != nil || !realm.IsAbs() || realm.Host == "" || realm.User != nil || !strings.EqualFold(realm.Scheme, "https") {
+			if err != nil || !realm.IsAbs() || realm.Host == "" || !strings.EqualFold(realm.Scheme, "https") {
 				continue
 			}
 
@@ -1181,18 +1071,8 @@ func validatedAuthenticationChallenge(resp *http.Response) (string, error) {
 // pull/head can wrap it in an *OriginError without losing the actual cause
 // (auth, rate-limit) under a blanket FailureTransient.
 type tokenError struct {
-	class  ifaces.FailureClass
-	status int
-	err    error
-}
-
-func statusOf(err error) int {
-	var te *tokenError
-	if errors.As(err, &te) {
-		return te.status
-	}
-
-	return 0
+	class ifaces.FailureClass
+	err   error
 }
 
 func (e *tokenError) Error() string { return e.err.Error() }

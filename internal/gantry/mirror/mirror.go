@@ -68,26 +68,14 @@ type AuthenticationChallenger interface {
 	AuthenticationChallenge(ctx context.Context, registry string) (challenge string, required bool, err error)
 }
 
-// ContentBackend serves content after reference validation and authentication
-// preflight. It replaces the local store, peer, and origin paths without fallback.
-type ContentBackend interface {
-	ServeContent(http.ResponseWriter, *http.Request, ifaces.OriginRef)
-}
-
-// WithContentBackend replaces the mirror's content paths with backend.
-func WithContentBackend(backend ContentBackend) Option {
-	return func(s *Server) { s.contentBackend = backend }
-}
-
 // Server is the mirror HTTP handler.
 type Server struct {
-	contentBackend ContentBackend
-	cfg            *config.Config
-	store          ifaces.LocalContentStore
-	origin         ifaces.OriginPuller
-	auth           AuthenticationChallenger
-	logger         *slog.Logger
-	metrics        metricsHooks
+	cfg     *config.Config
+	store   ifaces.LocalContentStore
+	origin  ifaces.OriginPuller
+	auth    AuthenticationChallenger
+	logger  *slog.Logger
+	metrics metricsHooks
 
 	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.
@@ -829,24 +817,6 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
-	}
-
-	if s.contentBackend != nil {
-		contentRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
-		if kind == ifaces.KindBlob {
-			contentRef.Offset, _ = parseOriginRetryRange(r.Header.Get("Range"))
-		}
-
-		s.contentBackend.ServeContent(w, r, contentRef)
-
-		return
-	}
-
-	if s.cfg.RacerEnabled {
-		s.logger.Error("mirror: Racer enabled without a content backend")
-		http.Error(w, "Racer unavailable", http.StatusServiceUnavailable)
-
-		return
 	}
 
 	s.serveDigest(w, r, upstream, repo, d, kind)

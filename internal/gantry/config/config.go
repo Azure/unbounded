@@ -53,18 +53,10 @@ const (
 
 // Config is the typed configuration surface.
 //
-// Fields carry YAML tags matching the file names, except environment-only
-// switches such as RacerEnabled. Defaults are set by
+// Every field carries a yaml/json tag matching the file/env name and a comment
+// citing the design-doc section it derives from. Defaults are set by
 // NewDefault; see Validate for hard correctness constraints.
 type Config struct {
-	// RacerEnabled is an environment-only opt-in (GANTRY_RACER_ENABLED).
-	// The Racer cache name is fixed to gantry.
-	RacerEnabled bool `yaml:"-"`
-
-	// Zero resource limits select SDK defaults. Negative values are invalid.
-	RacerMaxConnections           int `yaml:"racer_max_connections"`
-	RacerOriginConcurrentRequests int `yaml:"racer_origin_concurrent_requests"`
-
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
@@ -227,8 +219,7 @@ type Config struct {
 	// background origin pulls (storage_mode=containerd is the only
 	// supported mode; see).
 	//
-	// REQUIRED in legacy mode. Racer mode does not use containerd.
-	// Validate rejects an empty value in legacy mode when
+	// REQUIRED. Validate rejects an empty value when
 	// storage_mode=containerd (the only accepted storage_mode), which
 	// is enforced at startup. The default deploy manifests set it to
 	// "/run/containerd/containerd.sock"; operators on non-default
@@ -483,20 +474,17 @@ type LegacyDeprecatedConfig struct {
 // All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
 	return &Config{
-		RacerEnabled:                  false,
-		RacerMaxConnections:           64,
-		RacerOriginConcurrentRequests: 64,
-		MirrorListen:                  "127.0.0.1:5000",
-		MirrorBindAllowNonLoopback:    false,
-		TransferListen:                "0.0.0.0:5001",
-		MetricsListen:                 "0.0.0.0:9095",
-		PprofListen:                   "",
-		Libp2pListen:                  nil,
-		Libp2pIdentityPath:            "/var/lib/gantry/libp2p.key",
-		Libp2pConnManagerHigh:         900,
-		Libp2pConnManagerLow:          600,
-		Libp2pConnManagerGrace:        time.Minute,
-		ChairListen:                   "0.0.0.0:5002",
+		MirrorListen:               "127.0.0.1:5000",
+		MirrorBindAllowNonLoopback: false,
+		TransferListen:             "0.0.0.0:5001",
+		MetricsListen:              "0.0.0.0:9095",
+		PprofListen:                "",
+		Libp2pListen:               nil,
+		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
+		Libp2pConnManagerHigh:      900,
+		Libp2pConnManagerLow:       600,
+		Libp2pConnManagerGrace:     time.Minute,
+		ChairListen:                "0.0.0.0:5002",
 
 		NodeName:          "",
 		MembersKubeconfig: "",
@@ -679,9 +667,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 		}
 	}
 
-	setBool("RACER_ENABLED", &c.RacerEnabled)
-	setInt("RACER_MAX_CONNECTIONS", &c.RacerMaxConnections)
-	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
@@ -779,8 +764,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 // BindFlags registers command-line flags on fs that overlay c. Call after
 // LoadYAML / LoadEnv but before fs.Parse so flags win.
 func (c *Config) BindFlags(fs *flag.FlagSet) {
-	fs.IntVar(&c.RacerMaxConnections, "racer-max-connections", c.RacerMaxConnections, "Racer bulk connection and live value limit (0 uses 64)")
-	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
@@ -935,11 +918,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	mustAddr("mirror_listen", c.MirrorListen)
-
-	if !c.RacerEnabled {
-		mustAddr("transfer_listen", c.TransferListen)
-	}
-
+	mustAddr("transfer_listen", c.TransferListen)
 	mustAddr("metrics_listen", c.MetricsListen)
 
 	if c.PprofListen != "" {
@@ -989,34 +968,32 @@ func (c *Config) Validate() error {
 	// breaking change). We do neither; the fields exist as no-ops
 	// until a future major version removes them.
 
-	if !c.RacerEnabled {
-		switch c.StorageMode {
-		case StorageModeContainerd:
-			// valid
-		case storageModeGantryCache:
-			errs = append(errs, errors.New("storage_mode \"gantry-cache\" was removed in ; set storage_mode: containerd and remove the cache_dir/cache_budget_bytes hostPath volume from your DaemonSet"))
-		case "":
-			errs = append(errs, errors.New("storage_mode: required (must be \"containerd\")"))
-		default:
-			errs = append(errs, fmt.Errorf("storage_mode %q: must be \"containerd\"", c.StorageMode))
+	switch c.StorageMode {
+	case StorageModeContainerd:
+		// valid
+	case storageModeGantryCache:
+		errs = append(errs, errors.New("storage_mode \"gantry-cache\" was removed in ; set storage_mode: containerd and remove the cache_dir/cache_budget_bytes hostPath volume from your DaemonSet"))
+	case "":
+		errs = append(errs, errors.New("storage_mode: required (must be \"containerd\")"))
+	default:
+		errs = append(errs, fmt.Errorf("storage_mode %q: must be \"containerd\"", c.StorageMode))
+	}
+
+	if c.StorageMode == StorageModeContainerd && c.ContainerdSocket == "" {
+		errs = append(errs, errors.New("storage_mode=containerd requires containerd_socket to be set"))
+	}
+
+	if c.StorageMode == StorageModeContainerd {
+		// mandates a 30m–120m TTL. We accept a wider
+		// range with warnings deferred to log; pure validation just
+		// requires positive values so the cleanup interval cannot
+		// degenerate into a tight loop.
+		if c.ContainerdLeaseTTL <= 0 {
+			errs = append(errs, fmt.Errorf("containerd_lease_ttl: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseTTL))
 		}
 
-		if c.StorageMode == StorageModeContainerd && c.ContainerdSocket == "" {
-			errs = append(errs, errors.New("storage_mode=containerd requires containerd_socket to be set"))
-		}
-
-		if c.StorageMode == StorageModeContainerd {
-			// mandates a 30m–120m TTL. We accept a wider
-			// range with warnings deferred to log; pure validation just
-			// requires positive values so the cleanup interval cannot
-			// degenerate into a tight loop.
-			if c.ContainerdLeaseTTL <= 0 {
-				errs = append(errs, fmt.Errorf("containerd_lease_ttl: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseTTL))
-			}
-
-			if c.ContainerdLeaseCleanupInterval <= 0 {
-				errs = append(errs, fmt.Errorf("containerd_lease_cleanup_interval: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseCleanupInterval))
-			}
+		if c.ContainerdLeaseCleanupInterval <= 0 {
+			errs = append(errs, fmt.Errorf("containerd_lease_cleanup_interval: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseCleanupInterval))
 		}
 	}
 
@@ -1048,31 +1025,6 @@ func (c *Config) Validate() error {
 		} else if !strings.HasPrefix(ur.Endpoint, "http://") && !strings.HasPrefix(ur.Endpoint, "https://") {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint %q: must start with http:// or https://", i, ur.Endpoint))
 		}
-	}
-
-	switch c.LogLevel {
-	case "debug", "info", "warn", "error":
-	default:
-		errs = append(errs, fmt.Errorf("log_level %q: must be debug|info|warn|error", c.LogLevel))
-	}
-
-	switch c.LogFormat {
-	case "json", "text":
-	default:
-		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
-	}
-
-	if c.RacerEnabled {
-		for field, value := range map[string]int{
-			"racer_max_connections":            c.RacerMaxConnections,
-			"racer_origin_concurrent_requests": c.RacerOriginConcurrentRequests,
-		} {
-			if value < 0 {
-				errs = append(errs, fmt.Errorf("%s: must be >= 0 (zero selects the default)", field))
-			}
-		}
-
-		return errors.Join(errs...)
 	}
 
 	if c.HRWK < 1 {
@@ -1257,6 +1209,18 @@ func (c *Config) Validate() error {
 		if !validClasses[cls] {
 			errs = append(errs, fmt.Errorf("origin_failure_classes_trusted_cluster_wide: unknown class %q (valid: auth, not_found, rate_limited, transient)", cls))
 		}
+	}
+
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		errs = append(errs, fmt.Errorf("log_level %q: must be debug|info|warn|error", c.LogLevel))
+	}
+
+	switch c.LogFormat {
+	case "json", "text":
+	default:
+		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
 	}
 
 	// A chair publishes its dialable addresses on its Lease, and those are

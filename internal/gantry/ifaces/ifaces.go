@@ -128,8 +128,7 @@ type OriginRef struct {
 	Repository string // e.g. "library/nginx"
 	Digest     digest.Digest
 	// Offset requests bytes starting at this position when fetching from a
-	// peer or origin registry. Zero requests the full object with Pull; with
-	// PullRange it is the start of a bounded range, including the first page.
+	// peer or origin registry. Zero requests the full object.
 	Offset int64
 
 	// Kind discriminates the OCI Distribution Spec URL family for this
@@ -241,28 +240,14 @@ type OriginPuller interface {
 	Head(ctx context.Context, ref OriginRef) (size int64, contentType string, err error)
 }
 
-// OriginRangePuller is the optional bounded-read capability of an OriginPuller.
-// PullRange requests exactly length bytes starting at ref.Offset, clamped only
-// at EOF. length must be positive and offset+length-1 must fit in int64.
-// It returns the full object size and upstream Content-Type from GET, without
-// requiring HEAD. Empty objects at offset zero return an empty body and size 0.
-// The caller owns the body and verifies the final OCI digest. Implementations
-// reject ignored or incorrectly bounded ranges rather than downloading a tail.
-// A complete 200 response is allowed at offset zero only when its known length
-// fits the requested range, for registries with non-range-aware manifests.
-type OriginRangePuller interface {
-	PullRange(ctx context.Context, ref OriginRef, length int64) (body io.ReadCloser, totalSize int64, contentType string, err error)
-}
-
 // OriginError is the error returned by OriginPuller.Pull for terminal
 // failures. The Class field is the classification used by the negative
 // cache and propagated via PullIntentResponse.failure_class.
 type OriginError struct {
-	Ref        OriginRef
-	Class      FailureClass
-	StatusCode int // upstream HTTP status, when available
-	Challenge  string
-	Err        error
+	Ref       OriginRef
+	Class     FailureClass
+	Challenge string
+	Err       error
 }
 
 func (e *OriginError) Error() string {
