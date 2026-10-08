@@ -35,10 +35,17 @@ func (*startupRacerClient) Stat(context.Context, racersdk.Request) (racersdk.Met
 func (c *startupRacerClient) Close() error { c.closed.Store(true); return nil }
 
 func TestRacerStartupSelection(t *testing.T) {
-	// Both modes read the same config. The Racer path reaches origin construction
+	// Both modes read the same config. The Racer path reaches mirror listener setup
 	// despite missing legacy requirements; legacy mode rejects those requirements.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = listener.Close() })
+
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("containerd_socket: ''\ntransfer_listen: ''\nchair_listen: ''\nupstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com/%zz\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("mirror_listen: '"+listener.Addr().String()+"'\ncontainerd_socket: ''\ntransfer_listen: ''\nchair_listen: ''\nupstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -50,7 +57,7 @@ func TestRacerStartupSelection(t *testing.T) {
 		enabled    string
 		wantPrefix string
 	}{
-		{"true", "racer origin client:"},
+		{"true", "racer mirror listen:"},
 		{"false", "config:"},
 	} {
 		t.Run(test.enabled, func(t *testing.T) {
