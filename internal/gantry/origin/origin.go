@@ -531,11 +531,8 @@ func (r *registry) authenticationChallenge(ctx context.Context) (string, bool, e
 		return "", false, nil
 	}
 
-	u := *r.base
+	u := r.urlWithPath("/v2/")
 	u.User = nil
-	u.Path = strings.TrimRight(u.Path, "/") + "/v2/"
-	u.RawQuery = ""
-	u.Fragment = ""
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -774,12 +771,27 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 
 // urlFor returns the full URL for an OriginRef.
 func (r *registry) urlFor(ref ifaces.OriginRef) string {
+	resource := "blobs"
+
 	switch ref.Kind {
 	case ifaces.KindManifest:
-		return r.base.String() + "/v2/" + ref.Repository + "/manifests/" + ref.Digest.String()
-	default:
-		return r.base.String() + "/v2/" + ref.Repository + "/blobs/" + ref.Digest.String()
+		resource = "manifests"
 	}
+
+	u := r.urlWithPath("/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String())
+
+	return u.String()
+}
+
+func (r *registry) urlWithPath(path string) url.URL {
+	u := *r.base
+	suffix := url.URL{Path: path}
+	u.RawPath = strings.TrimRight(u.EscapedPath(), "/") + suffix.EscapedPath()
+	u.Path, _ = url.PathUnescape(u.RawPath) //nolint:errcheck // Both parts come from EscapedPath, so unescaping cannot fail.
+	u.RawQuery, u.Fragment, u.RawFragment = "", "", ""
+	u.ForceQuery = false
+
+	return u
 }
 
 // do issues a request, preferring request-scoped delegated Basic/Bearer auth. A

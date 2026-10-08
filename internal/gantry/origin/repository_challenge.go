@@ -47,11 +47,8 @@ func (c *Client) RepositoryAuthenticationChallenge(ctx context.Context, ref ifac
 		return "", false, errors.New("authentication challenge requires an HTTPS registry endpoint")
 	}
 
-	u := *r.base
+	u := r.urlWithPath("/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String())
 	u.User = nil
-	u.Path = strings.TrimRight(u.Path, "/") + "/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String()
-	u.RawPath, u.RawQuery, u.Fragment, u.RawFragment = "", "", "", ""
-	u.ForceQuery = false
 
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
