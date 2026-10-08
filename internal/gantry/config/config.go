@@ -1064,6 +1064,19 @@ func (c *Config) Validate() error {
 	}
 
 	if c.RacerEnabled {
+		for i, ur := range c.UpstreamRegistries {
+			if ur.Name == "" {
+				continue
+			}
+
+			// Match racer.validRegistry without importing the Racer adapter.
+			u, err := url.Parse("//" + ur.Name)
+			if err != nil || u.Host != ur.Name || u.Hostname() == "" || u.User != nil ||
+				u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+				errs = append(errs, fmt.Errorf("upstream_registries[%d].name: must be a host without a scheme, userinfo, path, query, or fragment in Racer mode", i))
+			}
+		}
+
 		for field, value := range map[string]int{
 			"racer_max_connections":            c.RacerMaxConnections,
 			"racer_origin_concurrent_requests": c.RacerOriginConcurrentRequests,
