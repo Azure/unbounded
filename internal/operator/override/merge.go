@@ -164,14 +164,15 @@ func strategicMerge(original, patch map[string]any, kind string) (map[string]any
 
 // identity is the set of fields re-stamped after merging.
 type identity struct {
-	apiVersion  string
-	kind        string
-	name        string
-	namespace   string
-	ownerRefs   []any
-	finalizers  []any
-	selector    map[string]any
-	templateSet map[string]any
+	apiVersion           string
+	kind                 string
+	name                 string
+	namespace            string
+	ownerRefs            []any
+	finalizers           []any
+	selector             map[string]any
+	templateSet          map[string]any
+	ownershipAnnotations map[string]string
 }
 
 func captureIdentity(workload *unstructured.Unstructured) identity {
@@ -185,6 +186,14 @@ func captureIdentity(workload *unstructured.Unstructured) identity {
 	captured.ownerRefs = nestedSlice(workload.Object, "metadata", "ownerReferences")
 	captured.finalizers = nestedSlice(workload.Object, "metadata", "finalizers")
 	captured.selector = nestedMap(workload.Object, "spec", "selector")
+	captured.ownershipAnnotations = map[string]string{}
+
+	annotations := workload.GetAnnotations()
+	for _, key := range ownershipAnnotationKeys {
+		if value, ok := annotations[key]; ok {
+			captured.ownershipAnnotations[key] = value
+		}
+	}
 
 	// Only the template labels the selector actually matches are restored. The
 	// rest are the user's to set: a workload whose template labels stop
@@ -208,6 +217,25 @@ func restoreIdentity(workload *unstructured.Unstructured, captured identity) err
 	workload.SetKind(captured.kind)
 	workload.SetName(captured.name)
 	workload.SetNamespace(captured.namespace)
+
+	annotations := workload.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+
+	for _, key := range ownershipAnnotationKeys {
+		delete(annotations, key)
+
+		if value, ok := captured.ownershipAnnotations[key]; ok {
+			annotations[key] = value
+		}
+	}
+
+	if len(annotations) > 0 {
+		workload.SetAnnotations(annotations)
+	} else {
+		unstructured.RemoveNestedField(workload.Object, "metadata", "annotations")
+	}
 
 	if err := setOrClearSlice(workload, captured.ownerRefs, "metadata", "ownerReferences"); err != nil {
 		return err

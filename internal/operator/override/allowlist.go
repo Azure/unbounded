@@ -18,6 +18,13 @@ import (
 // can share it without an import cycle.
 const ReservedPrefix = unbounded.ReservedPrefix
 
+// These annotations bind Racer runtime resources to their operator installation.
+// Keep the keys aligned with internal/operator/components/racer/racer.go.
+var ownershipAnnotationKeys = []string{
+	"racer.unbounded-cloud.io/manager",
+	"racer.unbounded-cloud.io/installation-uid",
+}
+
 // wildcard matches any single path element: a list index, or an arbitrary
 // user-chosen map key such as a label name.
 const wildcard = "*"
