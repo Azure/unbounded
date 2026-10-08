@@ -249,6 +249,9 @@ func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
 	load := []func(*config.LoadOptions) error{
 		config.WithHTTPClient(&http.Client{Timeout: o.requestTimeout}),
 		config.WithLogger(logging.NewStandardLogger(io.Discard)),
+		// S3-compatible backends may reject the SDK's default optional checksums.
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	}
 	if o.region != "" {
 		load = append(load, config.WithRegion(o.region))
