@@ -6,6 +6,7 @@ package config
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -107,6 +108,37 @@ func TestValidateEndpointErrorsDoNotLeakCredentials(t *testing.T) {
 	}
 }
 
+func TestValidateEndpointParseErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name, endpoint string
+	}{
+		{"userinfo escape", "private-user:private-password%zz@registry.example"},
+		{"port", "private-user:private-password@registry.example:bad"},
+		{"port includes secret", "registry.example:private-password"},
+		{"control", "private-user:private-password\n@registry.example"},
+		{"path escape", "private-user:private-password@registry.example/private-path%zz?private-query#private-fragment"},
+		{"fragment escape", "registry.example/private-path?private-query#private-fragment%zz"},
+		{"ipv6", "private-user:private-password@[::1"},
+		{"empty bracketed host", "[]:443/private-path"},
+	} {
+		for _, scheme := range []string{"http://", "https://"} {
+			for _, racer := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/racer=%t", tt.name, scheme, racer), func(t *testing.T) {
+					c := NewDefault()
+					c.RacerEnabled = racer
+					c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example", Endpoint: scheme + tt.endpoint}}
+
+					const want = "upstream_registries[0].endpoint: invalid URL"
+
+					if err := c.Validate(); err == nil || err.Error() != want {
+						t.Fatalf("expected generic endpoint validation error %q, got %v", want, err)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestValidateEndpointValidHostname(t *testing.T) {
 	for _, endpoint := range []string{
 		"https://registry.example",
@@ -115,6 +147,8 @@ func TestValidateEndpointValidHostname(t *testing.T) {
 		"https://[::1]/prefix",
 		"https://[::1]:443/prefix",
 		"https://private-user:private-password@registry.example:443/prefix?private-query#private-fragment",
+		"http://private%2Duser:private%2Dpassword@registry.example:5000/prefix%2Fpath",
+		"https://private%2Duser:private%2Dpassword@registry.example:443/prefix%2Fpath",
 	} {
 		t.Run(endpoint, func(t *testing.T) {
 			for _, racer := range []bool{false, true} {
