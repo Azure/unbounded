@@ -372,8 +372,15 @@ func (o *Object) splice(dst *destination, raw *net.UnixConn) (int64, error) {
 	}
 
 	if err == nil && limited.N != 0 {
-		// The destination took everything the socket delivered before EOF.
-		err = io.ErrUnexpectedEOF
+		if sourceOpen(raw) {
+			// The destination stopped reading while Racer still had bytes
+			// to send, the splice equivalent of a short write.
+			err = destinationFailure(io.ErrShortWrite)
+		} else {
+			// The destination took everything the socket delivered before
+			// EOF.
+			err = io.ErrUnexpectedEOF
+		}
 	}
 
 	if err == nil && n != batch {

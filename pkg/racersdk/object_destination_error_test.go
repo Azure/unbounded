@@ -23,7 +23,9 @@ import (
 type spliceDestination struct {
 	err error
 	// drain reads the source to EOF and fails only if it ends early.
-	drain   bool
+	drain bool
+	// stop, when positive, reads that many bytes and returns without error.
+	stop    int64
 	spliced bool
 }
 
@@ -31,6 +33,10 @@ func (d *spliceDestination) Write(p []byte) (int, error) { return len(p), nil }
 
 func (d *spliceDestination) ReadFrom(r io.Reader) (int64, error) {
 	d.spliced = true
+	if d.stop > 0 {
+		return io.CopyN(io.Discard, r, d.stop)
+	}
+
 	if !d.drain {
 		return 0, d.err
 	}
@@ -100,6 +106,38 @@ func TestObjectWriteToSpliceDestinationFailure(t *testing.T) {
 	}
 }
 
+func TestObjectWriteToSpliceEarlyReturn(t *testing.T) {
+	const stop = 1000
+
+	c := fakeClient(t, offsetOrigin(4<<20))
+
+	o, err := c.Get(t.Context(), Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeQuietly(o)
+
+	dst := &spliceDestination{stop: stop}
+
+	n, err := o.WriteTo(dst)
+	if !dst.spliced {
+		t.Fatal("WriteTo never spliced")
+	}
+
+	if n < stop {
+		t.Fatalf("WriteTo = %d bytes; destination took at least %d", n, stop)
+	}
+
+	assertIs(t, err, ErrDestination)
+	assertIs(t, err, io.ErrShortWrite)
+	assertNotIs(t, err, ErrUnavailable)
+	assertNotIs(t, err, io.ErrUnexpectedEOF)
+
+	if got := len(c.bulk.slots); got != 0 {
+		t.Fatalf("retained %d admission slots", got)
+	}
+}
+
 func TestObjectWriteToSpliceAmbiguousTimeout(t *testing.T) {
 	c := fakeClient(t, offsetOrigin(4<<20))
 
@@ -127,39 +165,49 @@ func TestObjectWriteToSpliceSourceTruncated(t *testing.T) {
 		sent = size / 2
 	)
 
-	c := rawServer(t, func(conn net.Conn, _ *bufio.Reader, _ []byte) {
-		if _, err := io.WriteString(conn, subscriptionHead(size, 0, size)); err != nil {
-			return
-		}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"reset", unix.ECONNRESET},
+		{"early nil return", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := rawServer(t, func(conn net.Conn, _ *bufio.Reader, _ []byte) {
+				if _, err := io.WriteString(conn, subscriptionHead(size, 0, size)); err != nil {
+					return
+				}
 
-		if err := writeFrame(conn, wire.PageFrame, 0, 0, size); err != nil {
-			return
-		}
+				if err := writeFrame(conn, wire.PageFrame, 0, 0, size); err != nil {
+					return
+				}
 
-		// Cut the page short, then close.
-		_, _ = io.WriteString(conn, strings.Repeat("x", sent))
-	})
+				// Cut the page short, then close.
+				_, _ = io.WriteString(conn, strings.Repeat("x", sent))
+			})
 
-	o, err := c.Get(t.Context(), Request{})
-	if err != nil {
-		t.Fatal(err)
+			o, err := c.Get(t.Context(), Request{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeQuietly(o)
+
+			dst := &spliceDestination{err: tc.err, drain: true}
+
+			n, err := o.WriteTo(dst)
+			if !dst.spliced {
+				t.Fatal("WriteTo never spliced")
+			}
+
+			if n > sent {
+				t.Fatalf("WriteTo = %d bytes; source sent only %d", n, sent)
+			}
+
+			assertIs(t, err, io.ErrUnexpectedEOF)
+			assertIs(t, err, ErrUnavailable)
+			assertNotIs(t, err, ErrDestination)
+		})
 	}
-	defer closeQuietly(o)
-
-	dst := &spliceDestination{err: unix.ECONNRESET, drain: true}
-
-	n, err := o.WriteTo(dst)
-	if !dst.spliced {
-		t.Fatal("WriteTo never spliced")
-	}
-
-	if n > sent {
-		t.Fatalf("WriteTo = %d bytes; source sent only %d", n, sent)
-	}
-
-	assertIs(t, err, io.ErrUnexpectedEOF)
-	assertIs(t, err, ErrUnavailable)
-	assertNotIs(t, err, ErrDestination)
 }
 
 func TestObjectWriteToClosedSocketDestination(t *testing.T) {
