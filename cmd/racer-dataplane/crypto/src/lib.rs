@@ -235,10 +235,7 @@ pub mod identity {
         BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KeyId, NodeId,
         SCHEMA_VERSION,
     };
-    use rustls::{
-        RootCertStore,
-        pki_types::{CertificateDer, PrivatePkcs8KeyDer},
-    };
+    use rustls::{RootCertStore, pki_types::CertificateDer};
     use sha2::{Digest, Sha256};
     use std::{
         cell::RefCell,
@@ -278,6 +275,28 @@ pub mod identity {
     /// A locally owned Ed25519 key awaiting an authenticated certificate chain.
     pub struct PendingIdentity {
         key: SigningKey,
+    }
+
+    /// rcgen signs through a dalek owner that wipes its secret on drop, never PKCS8.
+    struct RemoteSigningKey {
+        key: ed25519_dalek::SigningKey,
+
+        public: [u8; 32],
+    }
+
+    impl rcgen::RemoteKeyPair for RemoteSigningKey {
+        fn public_key(&self) -> &[u8] {
+            &self.public
+        }
+
+        fn sign(&self, msg: &[u8]) -> std::result::Result<Vec<u8>, rcgen::Error> {
+            use ed25519_dalek::Signer;
+            Ok(self.key.sign(msg).to_bytes().to_vec())
+        }
+
+        fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+            &rcgen::PKCS_ED25519
+        }
     }
 
     /// An accepted node certificate paired with its locally held signing key.
@@ -525,10 +544,7 @@ pub mod identity {
 
         /// The control server assigns the node SAN from authenticated enrollment.
         pub fn csr_der(&self) -> Result<Vec<u8>> {
-            let bytes = self.export_pkcs8_for_persistence()?;
-            let der = PrivatePkcs8KeyDer::from(bytes.as_slice());
-            let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&der, &rcgen::PKCS_ED25519)
-                .map_err(|_| Error::Unavailable)?;
+            let key = self.rcgen_key_pair()?;
             let params = rcgen::CertificateParams::new(Vec::<String>::new())
                 .map_err(|_| Error::Unavailable)?;
             Ok(params
@@ -536,6 +552,15 @@ pub mod identity {
                 .map_err(|_| Error::Unavailable)?
                 .der()
                 .to_vec())
+        }
+
+        /// Keep rcgen's private-key storage empty; the cloned dalek key wipes on drop.
+        pub(crate) fn rcgen_key_pair(&self) -> Result<rcgen::KeyPair> {
+            rcgen::KeyPair::from_remote(Box::new(RemoteSigningKey {
+                key: self.key.0.clone(),
+                public: *self.key.verifying_key().as_bytes(),
+            }))
+            .map_err(|_| Error::Unavailable)
         }
 
         /// Accept only a trusted node chain whose leaf matches this private key.
@@ -1492,12 +1517,7 @@ pub mod identity {
             node: &NodeId,
             customize: impl FnOnce(&mut rcgen::CertificateParams),
         ) -> (PendingIdentity, Vec<Vec<u8>>) {
-            let secret = pending.export_pkcs8_for_persistence().unwrap();
-            let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-                &PrivatePkcs8KeyDer::from(secret.as_slice()),
-                &rcgen::PKCS_ED25519,
-            )
-            .unwrap();
+            let key = pending.rcgen_key_pair().unwrap();
             let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             params.subject_alt_names = vec![rcgen::SanType::URI(
                 format!("spiffe://{}/node/{}", cluster.0, node.0)
@@ -2288,6 +2308,64 @@ pub mod identity {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The adapter uses the remote path and retains a wiping key owner.
+        #[test]
+        fn rcgen_signer_is_remote_and_uses_zeroizing_dalek_key() {
+            fn requires_zeroize_on_drop(_: &impl zeroize::ZeroizeOnDrop) {}
+
+            let pending = PendingIdentity {
+                key: SigningKey::from_seed(&[7; 32]),
+            };
+            requires_zeroize_on_drop(&pending.key.0);
+            let public = pending.key.verifying_key();
+            let key = pending.rcgen_key_pair().unwrap();
+            drop(pending);
+            let remote = key.as_remote().expect("no rcgen private-key import");
+            assert_eq!(remote.public_key(), public.as_bytes());
+            assert_eq!(remote.algorithm(), &rcgen::PKCS_ED25519);
+            for message in [b"".as_slice(), b"CSR signing"] {
+                let signature = remote.sign(message).unwrap();
+                assert_eq!(signature.len(), 64);
+                public.verify_strict(message, &signature).unwrap();
+                assert!(public.verify_strict(b"changed", &signature).is_err());
+            }
+        }
+
+        /// CSR encoding preserves the identity key, default subject, and signature.
+        #[test]
+        fn pending_csr_public_key_and_signature_match_identity() {
+            use x509_parser::{certification_request::X509CertificationRequest, prelude::FromDer};
+
+            let pending = PendingIdentity {
+                key: SigningKey::from_seed(&[7; 32]),
+            };
+            let mut der = pending.csr_der().unwrap();
+            let (rest, csr) = X509CertificationRequest::from_der(&der).unwrap();
+            assert!(rest.is_empty());
+            let info = &csr.certification_request_info;
+            assert_eq!(
+                info.subject_pki.subject_public_key.data.as_ref(),
+                pending.key.verifying_key().as_bytes()
+            );
+            assert_eq!(
+                csr.signature_algorithm.algorithm.to_id_string(),
+                "1.3.101.112"
+            );
+            assert_eq!(
+                info.subject
+                    .iter_common_name()
+                    .next()
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                "rcgen self signed cert"
+            );
+            csr.verify_signature().unwrap();
+            *der.last_mut().unwrap() ^= 1;
+            let (_, corrupted) = X509CertificationRequest::from_der(&der).unwrap();
+            assert!(corrupted.verify_signature().is_err());
+        }
 
         /// Canonical cluster shared by private fixtures.
         pub(crate) const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
