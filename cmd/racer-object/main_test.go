@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+
 	"github.com/Azure/unbounded/internal/racer/object"
 	"github.com/Azure/unbounded/internal/version"
 	"github.com/Azure/unbounded/pkg/racersdk"
@@ -252,6 +254,33 @@ func TestAWSRegionAndCredentialChain(t *testing.T) {
 
 	if _, err := originAWSConfig(context.Background(), o); err == nil {
 		t.Fatal("accepted invalid AWS configuration")
+	}
+}
+
+func TestOriginAWSConfigRequiredChecksums(t *testing.T) {
+	dir := t.TempDir()
+	for key, value := range map[string]string{
+		"AWS_CONFIG_FILE": filepath.Join(dir, "config"), "AWS_SHARED_CREDENTIALS_FILE": filepath.Join(dir, "credentials"),
+		"AWS_PROFILE": "", "AWS_DEFAULT_PROFILE": "", "AWS_EC2_METADATA_DISABLED": "true",
+		"AWS_ACCESS_KEY_ID": "test-access", "AWS_SECRET_ACCESS_KEY": "test-secret", "AWS_SESSION_TOKEN": "test-session",
+		"AWS_REQUEST_CHECKSUM_CALCULATION": "when_supported", "AWS_RESPONSE_CHECKSUM_VALIDATION": "when_supported",
+	} {
+		t.Setenv(key, value)
+	}
+
+	o := options{region: "us-east-1", requestTimeout: time.Second}
+
+	cfg, err := originAWSConfig(context.Background(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.RequestChecksumCalculation != aws.RequestChecksumCalculationWhenRequired {
+		t.Errorf("request checksum calculation = %v, want WhenRequired", cfg.RequestChecksumCalculation)
+	}
+
+	if cfg.ResponseChecksumValidation != aws.ResponseChecksumValidationWhenRequired {
+		t.Errorf("response checksum validation = %v, want WhenRequired", cfg.ResponseChecksumValidation)
 	}
 }
 
