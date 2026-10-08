@@ -2524,29 +2524,38 @@ mod codec {
         #[test]
         fn escaped_bundle_material_matches_unescaped_keys() {
             let mut bundle = decode_bundle(BUNDLE.as_bytes()).unwrap();
-            for key in &mut bundle.cache_keys {
+            // Keep materials distinct (duplicates are rejected) yet slash-heavy.
+            for (i, key) in bundle.cache_keys.iter_mut().enumerate() {
                 key.material = [0xff; 32];
+                key.material[31] = 0xff - u8::try_from(i).unwrap();
             }
             let original = String::from_utf8(encode_bundle(&bundle).unwrap()).unwrap();
-            let material = STANDARD.encode([0xff; 32]);
-            for escaped in [
-                material
-                    .chars()
-                    .map(|c| format!("\\u{:04x}", c as u32))
-                    .collect::<String>(),
-                material.replace('/', "\\/"),
-            ] {
-                let input = original.replace(&material, &escaped);
+            let materials: Vec<String> = bundle
+                .cache_keys
+                .iter()
+                .map(|key| STANDARD.encode(key.material))
+                .collect();
+            type Escape = fn(&str) -> String;
+            let escapes: [Escape; 2] = [
+                |m| m.chars().map(|c| format!("\\u{:04x}", c as u32)).collect(),
+                |m| m.replace('/', "\\/"),
+            ];
+            for escape in escapes {
+                let mut input = original.clone();
+                for material in &materials {
+                    let escaped = escape(material);
+                    input = input.replace(material.as_str(), &escaped);
+                    // A borrowed str visitor fails if serde uses its scratch for escapes.
+                    let quoted = format!("\"{escaped}\"");
+                    let canonical = canonicalize_json_strings(quoted.as_bytes());
+                    assert_eq!(
+                        serde_json::from_slice::<&str>(&canonical).unwrap(),
+                        material
+                    );
+                }
                 assert_ne!(input, original);
                 let canonical = canonicalize_json_strings(input.as_bytes());
                 assert_eq!(&**canonical, original.as_bytes());
-                // A borrowed str visitor fails if serde uses its scratch for escapes.
-                let quoted = format!("\"{escaped}\"");
-                let canonical = canonicalize_json_strings(quoted.as_bytes());
-                assert_eq!(
-                    serde_json::from_slice::<&str>(&canonical).unwrap(),
-                    material
-                );
                 let decoded = decode_bundle(input.as_bytes()).unwrap();
                 assert_eq!(decoded.cache_keys.len(), bundle.cache_keys.len());
                 for (actual, expected) in decoded.cache_keys.iter().zip(&bundle.cache_keys) {
