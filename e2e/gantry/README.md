@@ -14,9 +14,10 @@ peer fetch.
    `registry.k8s.io/e2e-test-images/agnhost:2.39` on two workers, and
    asserts advertise + peer-fetch metrics increase.
 - ✅ Multi-arch index digest with missing media-type metadata - seeds a real
-   index and node-platform graph as bare content on one node, verifies the peer
-   response labels the index correctly, then pulls the digest through Gantry
-   from a nonexistent repository so origin fallback cannot hide a failure.
+   index and node-platform graph on one node, removes its image metadata,
+   restarts the seed Gantry process, verifies the peer response labels the
+   remaining bare index correctly, then pulls the digest through Gantry from a
+   nonexistent repository so origin fallback cannot hide a failure.
 - ✅ Cold-start designated origin puller - two concurrent pulls
    across two workers, asserts the **per-digest HRW invariant**: every
    blob's `please_pull served` log line appears on at most one pod (no
@@ -86,7 +87,7 @@ prereq CLIs:
 | `waitForRollout()` | polls `kubectl rollout status ds/gantry -n unbounded-system` |
 | `checkReadyz()` | port-forwards one Gantry pod and curls `/readyz` on port 9095 |
 | pull-through check | installs `hosts.toml` on each kind node, removes the test image from node-local containerd, schedules a pull on worker A, waits for advertise metrics, then schedules the same image on worker B and waits for `p2p_peer_fetch_total{outcome="hit"}` |
-| multi-arch cache-miss check | stores a real multi-platform graph with `ctr content fetch` but no image record, verifies the index response from the seed's transfer endpoint, then pulls the index digest from another node using a nonexistent origin repository |
+| multi-arch cache-miss check | stores a real multi-platform graph, removes its image record, restarts the seed Gantry pod, verifies the index response from the seed's transfer endpoint, then pulls the index digest from another node using a nonexistent origin repository |
 | `teardown()` | `kind delete cluster` (skipped when `E2E_KEEP=1`) |
 
 The smoke test also installs a `hosts.toml` mirror entry for

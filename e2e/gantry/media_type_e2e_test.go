@@ -41,9 +41,11 @@ type resolvedImageIndex struct {
 //  1. Purge the source image before Gantry starts so no descriptor walk can
 //     populate its in-memory media-type cache.
 //  2. Use `ctr content fetch` on one node to store a real multi-platform index
-//     and its node-platform graph without creating an image record. Gantry
-//     advertises the bare content through periodic inventory, but its
-//     descriptor cache remains empty because no image event occurred.
+//     and its node-platform graph, protect the graph from GC, then remove the
+//     image record and restart the seed's Gantry pod. Gantry advertises the
+//     remaining bare content through periodic inventory, while the restarted
+//     process has no image descriptor from which to rebuild its media-type
+//     cache.
 //  3. Verify the peer transfer endpoint labels the index bytes as an index.
 //  4. Pull the same digest on another node under a deliberately nonexistent
 //     repository. Origin fallback can only return 404, so the workload can
@@ -106,6 +108,20 @@ func TestE2E_MultiArchIndexDigestPeerWithoutMediaTypeCache(t *testing.T) {
 	}
 
 	h.seedBareImageContent(ctx, seedNode, index.digest, nodePlatform)
+
+	// `ctr content fetch` creates an image event before seedBareImageContent
+	// removes the resulting image record. Restart this one Gantry process after
+	// removal so any descriptor metadata learned from that event is gone. Its
+	// startup image walk cannot relearn the index because only bare content
+	// remains.
+	if err := h.run(ctx, "kubectl", "-n", namespace, "delete", "pod/"+seedPod,
+		"--wait=true", "--timeout=60s"); err != nil {
+		t.Fatalf("restart seed Gantry pod %s: %v", seedPod, err)
+	}
+
+	h.waitForRollout(ctx)
+	seedPod = h.gantryPodOnNode(ctx, seedNode)
+	h.verifyContainerdSocketAccess(ctx, seedPod)
 
 	// Verify the exact transfer response before involving the requester. The
 	// body comparison proves the response came from the raw containerd content
@@ -254,9 +270,10 @@ func (h *harness) seedBareImageContent(
 		"ctr -n k8s.io content fetch --platform " + shellQuote(platform) +
 			" --label " + shellQuote(gcRootLabel) + " " + shellQuote(e2ePullImage) + " >/dev/null",
 		"ctr -n k8s.io content label " + shellQuote(indexDigest.String()) + " " + shellQuote(gcRootLabel) + " >/dev/null",
+		"ctr -n k8s.io images rm " + shellQuote(e2ePullImage) + " >/dev/null 2>&1 || true",
 		"ctr -n k8s.io content get " + shellQuote(indexDigest.String()) + " >/dev/null",
 		"if ctr -n k8s.io images ls -q | grep -Fx " + shellQuote(e2ePullImage) + " >/dev/null; then " +
-			"echo " + shellQuote("ctr content fetch unexpectedly created image metadata for "+e2ePullImage) + " >&2; exit 1; fi",
+			"echo " + shellQuote("image metadata still exists after removing "+e2ePullImage) + " >&2; exit 1; fi",
 	}, "; ")
 
 	if err := h.run(ctx, h.containerEngine, "exec", node, "sh", "-c", cmd); err != nil {
