@@ -103,8 +103,13 @@ func (o *Object) Read(p []byte) (int, error) {
 // process memory. Other writers receive data through a reused 256 KiB buffer.
 //
 // When w supports SetWriteDeadline, directly or through an HTTP response
-// controller, WriteTo bounds each write and interrupts it if the Get context
-// ends. It clears its deadlines before returning and never closes w. Set HTTP
+// controller, WriteTo takes over w's write deadline for the whole call. It
+// replaces any deadline already set on w, including one derived from
+// [http.Server.WriteTimeout], with a fixed timeout for each write, and moves
+// it to the present to interrupt a blocked write if the Get context ends.
+// Before returning, it clears the deadline, so w has no write deadline
+// afterward. To keep an overall write budget, bound the Get context and set
+// the deadline again after WriteTo returns. WriteTo never closes w. Set HTTP
 // response headers, including Content-Length, before calling WriteTo.
 // Without supported write deadlines, neither context cancellation nor
 // [Object.Close] can interrupt an already-blocked write to w; that write must
