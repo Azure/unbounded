@@ -22,20 +22,18 @@ import (
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-func TestRacerRegistryGate(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		reg := DefaultRegistryWithRacer(enabled)
-		if err := reg.Validate(); err != nil {
-			t.Fatal(err)
-		}
+func TestRacerAlwaysRegistered(t *testing.T) {
+	reg := DefaultRegistry()
+	if err := reg.Validate(); err != nil {
+		t.Fatal(err)
+	}
 
-		if reg.Knows("racer") != enabled {
-			t.Fatalf("racer registered with enabled=%v", enabled)
-		}
+	if !reg.Knows("racer") {
+		t.Fatal("racer is not registered")
+	}
 
-		if len(reg.Site) != len(DefaultRegistry().Site) {
-			t.Fatal("gate changed per-Site components")
-		}
+	if len(reg.Site) != 1 || reg.Site[0].Name() != "metalman" {
+		t.Fatal("unexpected per-Site components")
 	}
 }
 
@@ -91,18 +89,16 @@ func TestRacerReconcilesWithoutSites(t *testing.T) {
 
 	for _, tc := range []struct {
 		name       string
-		enabled    bool
 		cache      bool
 		failList   bool
 		failCreate bool
 		wantClaim  bool
 		wantErr    bool
 	}{
-		{name: "first cache starts installation", enabled: true, cache: true, wantClaim: true},
-		{name: "no cache is inert", enabled: true},
-		{name: "list failure is retryable", enabled: true, failList: true, wantErr: true},
-		{name: "claim write failure is retryable", enabled: true, cache: true, failCreate: true, wantErr: true},
-		{name: "disabled does not read caches", cache: true, failList: true},
+		{name: "first cache starts installation", cache: true, wantClaim: true},
+		{name: "no cache is inert"},
+		{name: "list failure is retryable", failList: true, wantErr: true},
+		{name: "claim write failure is retryable", cache: true, failCreate: true, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := newReconcilerTestScheme(t)
@@ -134,7 +130,7 @@ func TestRacerReconcilesWithoutSites(t *testing.T) {
 			// Use the real registered component, without unrelated cluster services.
 			reg := &component.Registry{}
 
-			for _, c := range DefaultRegistryWithRacer(tc.enabled).Cluster {
+			for _, c := range DefaultRegistry().Cluster {
 				if c.Name() == "racer" {
 					reg.Cluster = append(reg.Cluster, c)
 				}

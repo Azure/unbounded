@@ -53,13 +53,6 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 		Use:   "unbounded-operator",
 		Short: "Controller for top-level Unbounded Site configuration",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			enableRacer, err := envBoolDefault("ENABLE_RACER", true)
-			if err != nil {
-				return err
-			}
-
-			cfg.enableRacer = enableRacer
-
 			if !cmd.Flags().Changed("reap-legacy-resources") {
 				reapLegacyResources, err := envBoolDefault("UNBOUNDED_REAP_LEGACY_RESOURCES", true)
 				if err != nil {
@@ -100,7 +93,6 @@ type config struct {
 	imageRegistry           string
 	apiServerEndpoint       string
 	reapLegacyResources     bool
-	enableRacer             bool
 }
 
 func envStringDefault(name, fallback string) string {
@@ -231,7 +223,7 @@ func run(ctx context.Context, cfg config) error {
 		Client:    mgr.GetClient(),
 		Scheme:    scheme,
 		Namespace: namespace,
-		Registry:  operator.DefaultRegistryWithRacer(cfg.enableRacer),
+		Registry:  operator.DefaultRegistry(),
 		APIReader: mgr.GetAPIReader(),
 		Recorder:  mgr.GetEventRecorder("unbounded-operator"),
 		Config: operator.Config{

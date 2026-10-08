@@ -51,8 +51,8 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 
 	readYAML(t, filepath.Join(outputDir, "03-configmap.yaml"), &cm)
 
-	if got := cm.Data["ENABLE_RACER"]; got != "true" {
-		t.Fatalf("default ENABLE_RACER = %q, want true", got)
+	if _, found := cm.Data["ENABLE_RACER"]; found {
+		t.Fatal("configmap contains obsolete ENABLE_RACER")
 	}
 
 	if got := cm.Data["UNBOUNDED_API_SERVER_ENDPOINT"]; got != endpoint {
@@ -184,7 +184,7 @@ func contains(values []string, want string) bool {
 func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 	t.Parallel()
 
-	renderHash := func(endpoint, registry, reapLegacyResources, enableRacer string) string {
+	renderHash := func(endpoint, registry, reapLegacyResources string) string {
 		t.Helper()
 
 		outputDir := t.TempDir()
@@ -194,7 +194,6 @@ func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 			"ImageRegistry":       registry,
 			"APIServerEndpoint":   endpoint,
 			"ReapLegacyResources": reapLegacyResources,
-			"EnableRacer":         enableRacer,
 		}); err != nil {
 			t.Fatalf("render.Render: %v", err)
 		}
@@ -203,10 +202,6 @@ func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 			Data map[string]string `yaml:"data"`
 		}
 		readYAML(t, filepath.Join(outputDir, "03-configmap.yaml"), &cm)
-
-		if got := cm.Data["ENABLE_RACER"]; got != enableRacer {
-			t.Fatalf("ENABLE_RACER = %q, want %q", got, enableRacer)
-		}
 
 		if got := cm.Data["UNBOUNDED_API_SERVER_ENDPOINT"]; got != endpoint {
 			t.Fatalf("configmap endpoint = %q, want %q", got, endpoint)
@@ -243,21 +238,17 @@ func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 		return gotHash
 	}
 
-	baseline := renderHash("https://api.example.test:6443", "ghcr.io", "true", "true")
-	if got := renderHash("https://other.example.test:6443", "ghcr.io", "true", "true"); got == baseline {
+	baseline := renderHash("https://api.example.test:6443", "ghcr.io", "true")
+	if got := renderHash("https://other.example.test:6443", "ghcr.io", "true"); got == baseline {
 		t.Fatal("changing UNBOUNDED_API_SERVER_ENDPOINT did not change the rendered config hash")
 	}
 
-	if got := renderHash("https://api.example.test:6443", "ghcr.io", "false", "true"); got == baseline {
+	if got := renderHash("https://api.example.test:6443", "ghcr.io", "false"); got == baseline {
 		t.Fatal("changing UNBOUNDED_REAP_LEGACY_RESOURCES did not change the rendered config hash")
 	}
 
-	if got := renderHash("https://api.example.test:6443", "registry.example.com", "true", "true"); got == baseline {
+	if got := renderHash("https://api.example.test:6443", "registry.example.com", "true"); got == baseline {
 		t.Fatal("changing UNBOUNDED_IMAGE_REGISTRY did not change the rendered config hash")
-	}
-
-	if got := renderHash("https://api.example.test:6443", "ghcr.io", "true", "false"); got == baseline {
-		t.Fatal("changing ENABLE_RACER did not change the rendered config hash")
 	}
 }
 

@@ -110,7 +110,6 @@ UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
 # points components at the same registry/org as the operator.
 UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
 UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
-UNBOUNDED_OPERATOR_ENABLE_RACER ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
 UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
@@ -1057,8 +1056,7 @@ unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy
 		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
 		--set ImageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
 		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
-		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES) \
-		--set EnableRacer=$(UNBOUNDED_OPERATOR_ENABLE_RACER)
+		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES)
 	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
 
 machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered
