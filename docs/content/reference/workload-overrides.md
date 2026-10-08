@@ -225,6 +225,7 @@ does not depend on the check being exhaustive:
 | `spec.template.spec.serviceAccountName` | Retargeting borrows another identity's API permissions. |
 | `hostNetwork`, `hostPID`, `hostIPC` | Deliberate per-component decisions. |
 | Labels and annotations under `unbounded-cloud.io/` | They carry config hashes, Site scoping and override visibility. |
+| Annotations `racer.unbounded-cloud.io/manager` and `racer.unbounded-cloud.io/installation-uid` | They bind Racer resources to the operator installation. |
 | `spec.replicas` on `metalman` | The Site owns it: set `spec.components.metalman.replicas`. See below. |
 | Repointing an operator-declared mount | Mount identity is `(container, mountPath)`, because `volumeMounts` merge on `mountPath` rather than on name, so protecting them by name would be bypassable. Mounting a *different* volume at a path the operator already mounts is refused; adjusting the same mount, for example `readOnly`, is not. |
 | Operator-declared volumes | `volumes` merge on `name`, so redefining one repoints every mount that uses it without naming a `mountPath` anywhere. Adding volumes under new names is fine. |
