@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -44,6 +45,11 @@ func TestOriginSocketPublicationMode(t *testing.T) {
 			info, err := os.Lstat(path)
 			require.NoError(t, err)
 			require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+
+			// ServeOrigin documents that the socket belongs to its effective user.
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			require.True(t, ok)
+			require.Equal(t, uint32(os.Geteuid()), stat.Uid)
 
 			conn, err := net.DialTimeout("unix", path, time.Second)
 			require.NoError(t, err)
