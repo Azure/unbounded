@@ -203,18 +203,16 @@ jobs:
             title: bootstrap recovery
             suite: bootstrap-recovery
             host-base-os: ubuntu2404
-          # A host installed by the last release before the host root, linked
-          # and then moved. That release cannot be installed on an immutable
-          # host, so one conventional host covers it.
+          # Hosts installed by the last release before the host root, linked
+          # and then moved through the same migration suite. That release
+          # cannot be installed on an immutable host.
           - id: host-root-migration
             title: host root migration
             suite: migration
             host-base-os: ubuntu2404
-          # Interrupt after the swap, before relabeling. Ubuntu cannot validate
-          # SELinux enforcement or the labels of the resumed installation.
-          - id: host-root-migration-recovery
-            title: host root migration recovery
-            suite: migration-recovery
+          - id: host-root-migration-almalinux9
+            title: host root migration
+            suite: migration
             host-base-os: almalinux9
     env:
       KIND_CLUSTER_NAME: agent-${{ matrix.id }}

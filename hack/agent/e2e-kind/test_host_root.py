@@ -110,6 +110,31 @@ class TestHostRootMoved(unittest.TestCase):
         self.assertEqual(slept.call_count, 2)
         validate.assert_called_once()
 
+    def test_waits_for_the_daemon_to_start_from_the_moved_root(self):
+        executables = ["", f"{e2e.LEGACY_HOST_ROOT}/bin/unbounded-agent-blue",
+                       f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-blue"]
+        with patch.object(e2e, "host_root_state", return_value="dir"), \
+                patch.object(e2e, "_daemon_executable", side_effect=executables), \
+                patch.object(e2e, "validate_host_root") as validate, \
+                patch.object(e2e.time, "sleep") as slept:
+            e2e.validate_host_root_moved()
+
+        self.assertEqual(slept.call_count, 2)
+        validate.assert_called_once()
+
+    def test_a_moved_directory_does_not_hide_a_failed_daemon_start(self):
+        for executable in ("", f"{e2e.LEGACY_HOST_ROOT}/bin/unbounded-agent-blue"):
+            with self.subTest(executable=executable), \
+                    patch.object(e2e, "host_root_state", return_value="dir"), \
+                    patch.object(e2e, "_daemon_executable", return_value=executable), \
+                    patch.object(e2e, "validate_host_root") as validate, \
+                    patch.object(e2e.time, "monotonic", side_effect=[0, 0, 181]), \
+                    patch.object(e2e, "die", side_effect=SystemExit) as died:
+                with self.assertRaises(SystemExit):
+                    e2e.validate_host_root_moved()
+                died.assert_called_once_with(f"daemon runs {executable!r}, not a binary under {e2e.DAEMON_BIN_DIR}")
+                validate.assert_not_called()
+
 
 class TestLegacyAgent(unittest.TestCase):
     def test_version_must_be_a_release_tag(self):

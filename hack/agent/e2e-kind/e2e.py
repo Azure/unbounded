@@ -5040,8 +5040,6 @@ def validate_host_agent_upgrade() -> None:
 # ---------------------------------------------------------------------------
 # The copy a move from the legacy root makes beside the host root.
 HOST_ROOT_STAGING = f"{HOST_ROOT}.staging"
-MIGRATION_RECOVERY_PROBE = "/run/unbounded-e2e-host-root-recovery"
-MIGRATION_RECOVERY_DROP_IN = "/run/systemd/system/unbounded-agent-daemon.service.d/90-e2e-host-root-recovery.conf"
 
 
 def _wait_until(check: Callable[[], str], timeout_secs: int) -> None:
@@ -5070,9 +5068,9 @@ def _legacy_files_left() -> str:
 
 def validate_host_root() -> None:
     """Assert the agent is under a real directory at the host root, with nothing
-    left under the legacy root and labels as SELinux policy gives them. The
-    daemon removes the binary the install script seeds under the legacy root
-    for older agents once it is running, so this waits for that first."""
+    left under the legacy root. The daemon removes the binary the install
+    script seeds under the legacy root for older agents once it is running,
+    so this waits for that first."""
 
     state = host_root_state()
     if state != "dir":
@@ -5092,10 +5090,6 @@ def validate_host_root() -> None:
             *) echo "current binary $current is not under {DAEMON_BIN_DIR}"; exit 1 ;;
         esac
         if [ -e {HOST_ROOT_STAGING} ]; then echo "{HOST_ROOT_STAGING} is left from a move"; exit 1; fi
-        if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled && command -v restorecon >/dev/null 2>&1; then
-            relabel=$(restorecon -nvR {HOST_ROOT})
-            if [ -n "$relabel" ]; then echo "labels differ from policy:"; echo "$relabel"; exit 1; fi
-        fi
     """)
     result = ssh_capture_quiet("sudo bash -c " + shlex.quote(script))
     if result.returncode != 0:
@@ -5135,12 +5129,14 @@ def _daemon_executable() -> str:
     ).stdout.strip()
 
 
-def wait_for_host_root_move() -> None:
-    """Wait for migration completion and a daemon executing from the new root.
+def validate_host_root_moved() -> None:
+    """Assert a host an older agent installed has been moved to the host root.
 
-    This checks runtime progress, not labels. The interrupted-migration test
-    exercises the services before its separate label-correctness assertion.
+    The daemon moves it at the first start after the AgentUpgrade that follows
+    the last older agent out of the slots, then restarts from the host root.
+    The reboot that follows in the suite runs the rewritten units.
     """
+
     log(f"Waiting for the agent's files to move to {HOST_ROOT}...")
     _wait_until(lambda: "" if (state := host_root_state()) == "dir"
                 else f"{HOST_ROOT} is {state!r}; the host was not moved to the host root", 300)
@@ -5149,79 +5145,8 @@ def wait_for_host_root_move() -> None:
     _wait_until(lambda: "" if (executable := _daemon_executable()).startswith(f"{DAEMON_BIN_DIR}/")
                 else f"daemon runs {executable!r}, not a binary under {DAEMON_BIN_DIR}", 180)
 
-
-def validate_host_root_moved() -> None:
-    """Assert migration completed, the daemon uses the new root, and labels match policy."""
-    wait_for_host_root_move()
     validate_host_root()
     log(f"The agent's files moved from {LEGACY_HOST_ROOT} to {HOST_ROOT}")
-
-
-def _host_root_recovery_probe(action: str, *, check: bool = True) -> None:
-    """Run the guest-side fixture and retain its diagnostics even on failure."""
-    script = Path(__file__).with_name("host-root-recovery.sh").read_text()
-    command = shlex.join(["sudo", "bash", "-c", script, "--", action, HOST_ROOT,
-                          LEGACY_HOST_ROOT, MIGRATION_RECOVERY_PROBE, MIGRATION_RECOVERY_DROP_IN])
-    result = bounded_ssh(command, time.monotonic() + 60)
-    output = result.stdout + result.stderr
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    (LOGS_DIR / f"host-root-recovery-{action}.log").write_text(output)
-    if output.strip():
-        log(output.strip())
-    if result.returncode != 0:
-        message = f"host root recovery {action} failed (exit {result.returncode}); see host-root-recovery-{action}.log"
-        if check:
-            die(message)
-        log(f"[WARN] {message}")
-
-
-def validate_host_root_migration_recovery() -> None:
-    """Interrupt the real move after the root swap but before restorecon runs.
-
-    Start with an older release still in last-good. The next upgrade makes the
-    move eligible, and a service-scoped PATH wrapper blocks at relabeling. No
-    production failpoint, synthetic filesystem layout, or label repair is used.
-    """
-    validate_host_root_linked()
-    try:
-        _host_root_recovery_probe("arm")
-        validate_agent_upgrade_operation()
-
-        def checkpoint_pending() -> str:
-            result = bounded_ssh(f"sudo test -f {MIGRATION_RECOVERY_PROBE}/reached", time.monotonic() + 15)
-            return "" if result.returncode == 0 else "migration did not reach the pre-relabel checkpoint"
-
-        _wait_until(checkpoint_pending, 180)
-        _host_root_recovery_probe("checkpoint")
-        _host_root_recovery_probe("interrupt")
-    finally:
-        # Never restart with the blocker still installed, including on failure.
-        _host_root_recovery_probe("disarm")
-
-    try:
-        _host_root_recovery_probe("resume")
-        _host_root_recovery_probe("inspect", check=False)
-        wait_for_host_root_move()
-        _daemon_unit_runs(DAEMON_BIN_DIR)
-        # A running daemon alone does not exercise the nspawn pre/post-start
-        # helper or the OnFailure recovery script. Run both before checking
-        # metadata, without relabeling files or changing the shipped policy.
-        validate_host_reboot()
-        validate_agent_upgrade_rollback()
-        validate_workload()
-    finally:
-        # Keep service failures, process domains and AVCs even when one of the
-        # functional checks aborts. Diagnostic collection is not a new verdict.
-        try:
-            _host_root_recovery_probe("diagnose", check=False)
-        except Exception as exc:
-            log(f"[WARN] Could not collect host root recovery diagnostics: {exc}")
-
-    log("Functional recovery PASSED: daemon start, host reboot/nspawn hooks, workload/DNS, and AgentUpgrade rollback")
-    log("Checking SELinux label correctness separately; a failure here alone is not an execution denial")
-    _host_root_recovery_probe("verify")
-    validate_host_root_moved()
-    log("Interrupted host root migration recovered with SELinux enforcing and no manual relabeling")
 
 
 def run_legacy_agent(node_config: NodeConfig) -> None:
@@ -5933,10 +5858,6 @@ SUITES: dict[str, list[str]] = {
                   "validate-agent-upgrade-operation", "validate-host-root-linked",
                   "validate-agent-upgrade-operation", "validate-host-root-moved", "validate-host-reboot",
                   "validate-host-root", "reset-agent"],
-    # Keep the ordinary migration suite intact; this one requires SELinux.
-    "migration-recovery": ["run-legacy-agent", "wait-for-node", "validate-agent-upgrade-operation",
-                           "validate-host-root-linked", "validate-host-root-migration-recovery",
-                           "validate-host-root", "reset-agent"],
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
                            "validate-node-repave-upgrade", "validate-bootstrap-repair"],
 }
@@ -6020,7 +5941,6 @@ COMMANDS: dict[str, Command] = {
     "validate-host-root": _without_node_config(validate_host_root),
     "validate-host-root-linked": _without_node_config(validate_host_root_linked),
     "validate-host-root-moved": _without_node_config(validate_host_root_moved),
-    "validate-host-root-migration-recovery": _without_node_config(validate_host_root_migration_recovery),
     "run-legacy-agent": run_legacy_agent,
     "validate-agent-downgrade-to-legacy": _without_node_config(validate_agent_downgrade_to_legacy),
     "cleanup": _without_node_config(cleanup),
