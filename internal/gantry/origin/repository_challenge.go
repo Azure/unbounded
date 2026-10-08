@@ -17,8 +17,9 @@ import (
 
 // RepositoryAuthenticationChallenge recovers a challenge after a remote origin
 // rejects a request. The registry root can be public, and another node's cached
-// challenge is not available here. Probe only the caller's resource, anonymously,
-// without redirects, token exchange, content fallback, or a cross-repository cache.
+// challenge is not available here. Probe the caller's resource anonymously, with
+// one manifest HEAD fallback on a blob 404 for the same repository and digest.
+// Never follow redirects, exchange tokens, fetch content, or cache the challenge.
 func (c *Client) RepositoryAuthenticationChallenge(ctx context.Context, ref ifaces.OriginRef) (string, bool, error) {
 	if err := oci.ValidateRepositoryName(ref.Repository); err != nil {
 		return "", false, err
@@ -47,40 +48,48 @@ func (c *Client) RepositoryAuthenticationChallenge(ctx context.Context, ref ifac
 		return "", false, errors.New("authentication challenge requires an HTTPS registry endpoint")
 	}
 
-	u := r.urlWithPath("/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String())
-	u.User = nil
-
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u.String(), nil)
-	if err != nil {
-		return "", false, err
-	}
-
-	if ref.Kind == ifaces.KindManifest {
-		req.Header.Set("Accept", manifestAccept)
-	}
 	// Reuse configured transport/TLS trust, not the auth-bearing request path.
 	// A shallow client copy keeps redirect policy and cookies local to this probe.
 	hc := *r.hc
 	hc.Jar = nil
 	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
-	resp, err := hc.Do(req)
-	if err != nil {
-		return "", false, fmt.Errorf("probe repository authentication: %w", err)
-	}
+	for {
+		u := r.urlWithPath("/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String())
+		u.User = nil
 
-	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, u.String(), nil)
+		if err != nil {
+			return "", false, err
+		}
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-		return "", false, nil
-	case http.StatusUnauthorized:
-		challenge, err := validatedAuthenticationChallenge(resp)
-		return challenge, err == nil, err
-	default:
-		return "", false, fmt.Errorf("repository authentication probe returned HTTP %d", resp.StatusCode)
+		if resource == "manifests" {
+			req.Header.Set("Accept", manifestAccept)
+		}
+
+		resp, err := hc.Do(req)
+		if err != nil {
+			return "", false, fmt.Errorf("probe repository authentication: %w", err)
+		}
+
+		_ = resp.Body.Close() //nolint:errcheck // HEAD has no content to consume.
+
+		if resp.StatusCode == http.StatusNotFound && resource == "blobs" {
+			resource = "manifests"
+			continue
+		}
+
+		switch resp.StatusCode {
+		case http.StatusOK:
+			return "", false, nil
+		case http.StatusUnauthorized:
+			challenge, err := validatedAuthenticationChallenge(resp)
+			return challenge, err == nil, err
+		default:
+			return "", false, fmt.Errorf("repository authentication probe returned HTTP %d", resp.StatusCode)
+		}
 	}
 }

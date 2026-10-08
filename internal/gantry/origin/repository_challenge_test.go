@@ -130,6 +130,10 @@ func TestRepositoryAuthenticationChallengeAccept(t *testing.T) {
 				{"public", http.StatusOK, false, ""},
 				{"not found", http.StatusNotFound, true, ""},
 				{"not acceptable", http.StatusNotAcceptable, true, ""},
+				{"forbidden", http.StatusForbidden, true, ""},
+				{"method unsupported", http.StatusMethodNotAllowed, true, ""},
+				{"unavailable", http.StatusServiceUnavailable, true, ""},
+				{"redirect", http.StatusTemporaryRedirect, true, ""},
 			} {
 				t.Run(response.name, func(t *testing.T) {
 					d := digestOf([]byte("resource"))
@@ -137,14 +141,19 @@ func TestRepositoryAuthenticationChallengeAccept(t *testing.T) {
 					var hits atomic.Int32
 
 					srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						hits.Add(1)
+						hit := hits.Add(1)
 
-						if r.Method != http.MethodHead || r.URL.Path != "/v2/private/manifests/repo/"+resource.path+"/"+d.String() {
+						path, accept := resource.path, resource.accept
+						if hit == 2 && response.status == http.StatusNotFound && resource.kind != ifaces.KindManifest {
+							path, accept = "manifests", manifestAccept
+						}
+
+						if r.Method != http.MethodHead || r.URL.Path != "/v2/private/manifests/repo/"+path+"/"+d.String() {
 							t.Errorf("unexpected probe %s %s", r.Method, r.URL)
 						}
 
-						if got := r.Header.Get("Accept"); got != resource.accept {
-							t.Errorf("Accept = %q, want %q", got, resource.accept)
+						if got := r.Header.Get("Accept"); got != accept {
+							t.Errorf("Accept = %q, want %q", got, accept)
 							w.WriteHeader(http.StatusNotAcceptable)
 
 							return
@@ -165,8 +174,13 @@ func TestRepositoryAuthenticationChallengeAccept(t *testing.T) {
 						t.Errorf("challenge=%q required=%v err=%v", got, required, err)
 					}
 
-					if hits.Load() != 1 {
-						t.Errorf("probe requests = %d, want 1", hits.Load())
+					wantHits := int32(1)
+					if response.status == http.StatusNotFound && resource.kind != ifaces.KindManifest {
+						wantHits = 2
+					}
+
+					if hits.Load() != wantHits {
+						t.Errorf("probe requests = %d, want %d", hits.Load(), wantHits)
 					}
 				})
 			}
