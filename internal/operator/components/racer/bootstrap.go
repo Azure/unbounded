@@ -180,8 +180,8 @@ func bootstrapAuthority(ctx context.Context, env *component.Env, expectedMarker,
 		return err
 	}
 
-	if tls.DeletionTimestamp != nil {
-		return fmt.Errorf("racer bootstrap TLS is terminating")
+	if err := validateRuntimeOwner(tls, marker.UID); err != nil {
+		return err
 	}
 
 	if _, err := renewTLS(tls, env.Namespace, time.Now()); err != nil {

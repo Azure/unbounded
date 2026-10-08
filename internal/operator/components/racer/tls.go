@@ -22,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -90,7 +91,7 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 	result.RequeueAfter = time.Hour
 	result.Message = "no ClusterCaches; maintaining retained Racer serving TLS only"
 
-	secret, err := planTLSAt(ctx, env, plan, false, now)
+	secret, err := planTLSAt(ctx, env, plan, marker.UID, false, now)
 	if err != nil {
 		return nil, result, err
 	}
@@ -105,11 +106,13 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 
 	want := string(servingRoots(secret))
 	if apierrors.IsNotFound(err) {
-		add(plan, component.OpCreateIfAbsent, &corev1.ConfigMap{
+		trust = &corev1.ConfigMap{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 			ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace},
 			Data:       map[string]string{"ca.crt": want},
-		})
+		}
+		bindRuntime(trust, marker.UID)
+		add(plan, component.OpCreateIfAbsent, trust)
 
 		result.RequeueAfter = 5 * time.Second
 
@@ -120,8 +123,8 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 		return nil, result, err
 	}
 
-	if trust.DeletionTimestamp != nil {
-		return nil, result, fmt.Errorf("retained Racer bootstrap trust is being deleted")
+	if err := validateRuntimeOwner(trust, marker.UID); err != nil {
+		return nil, result, err
 	}
 
 	if trust.Data["ca.crt"] != want {
@@ -143,7 +146,7 @@ func planRetainedTLS(ctx context.Context, env *component.Env, now time.Time) (*c
 
 // Persist before publishing derived trust: a lost create/CAS race must not
 // deploy an uncommitted certificate.
-func planTLSAt(ctx context.Context, env *component.Env, plan *component.Plan, fresh bool, now time.Time) (*corev1.Secret, error) {
+func planTLSAt(ctx context.Context, env *component.Env, plan *component.Plan, installation types.UID, fresh bool, now time.Time) (*corev1.Secret, error) {
 	secret := &corev1.Secret{}
 
 	err := env.LiveReader().Get(ctx, objectKey(env, tlsName), secret)
@@ -161,6 +164,7 @@ func planTLSAt(ctx context.Context, env *component.Env, plan *component.Plan, fr
 			return nil, err
 		}
 
+		bindRuntime(secret, installation)
 		add(plan, component.OpCreateIfAbsent, secret)
 
 		return nil, nil
@@ -170,8 +174,8 @@ func planTLSAt(ctx context.Context, env *component.Env, plan *component.Plan, fr
 		return nil, err
 	}
 
-	if secret.DeletionTimestamp != nil {
-		return nil, fmt.Errorf("racer serving Secret is being deleted")
+	if err := validateRuntimeOwner(secret, installation); err != nil {
+		return nil, err
 	}
 
 	updated, err := renewTLS(secret, env.Namespace, now)

@@ -125,10 +125,12 @@ func TestTLSClockSkew(t *testing.T) {
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					secret := generation.secret.DeepCopy()
+					bindRuntime(secret, "test-installation")
+					secret.UID = "test-tls"
 					env := testEnv(t, secret)
 					plan := component.NewPlan()
 					now := stateOf(t, secret).CreatedAt.Add(-tc.skew)
-					stored, err := planTLSAt(t.Context(), env, plan, false, now)
+					stored, err := planTLSAt(t.Context(), env, plan, "test-installation", false, now)
 					require.Zero(t, plan.Len())
 
 					if tc.wantErr {
@@ -158,10 +160,12 @@ func TestTLSCorruptionAndExpiredCAFailsClosed(t *testing.T) {
 	for _, key := range []string{tlsStateKey, previousCAKey, "ca.key", "ca.crt", corev1.TLSCertKey, corev1.TLSPrivateKeyKey} {
 		t.Run(key, func(t *testing.T) {
 			secret := rotated.DeepCopy()
+			bindRuntime(secret, "test-installation")
+			secret.UID = "test-tls"
 			delete(secret.Data, key)
 			env := testEnv(t, secret)
 			plan := component.NewPlan()
-			value, err := planTLSAt(t.Context(), env, plan, false, now.Add(caRotationInterval))
+			value, err := planTLSAt(t.Context(), env, plan, "test-installation", false, now.Add(caRotationInterval))
 			require.Error(t, err)
 			require.Nil(t, value)
 			require.Zero(t, plan.Len())
@@ -211,7 +215,7 @@ func TestTLSPersistBeforeTrustAndCAS(t *testing.T) {
 
 	first, second := component.NewPlan(), component.NewPlan()
 	for _, plan := range []*component.Plan{first, second} {
-		secret, err := planTLSAt(t.Context(), env, plan, true, now)
+		secret, err := planTLSAt(t.Context(), env, plan, "test-installation", true, now)
 		require.NoError(t, err)
 		require.Nil(t, secret)
 		require.Len(t, plan.Operations, 1)
@@ -219,7 +223,7 @@ func TestTLSPersistBeforeTrustAndCAS(t *testing.T) {
 
 	persist(t, env, first)
 	persist(t, env, second)
-	winner, err := planTLSAt(t.Context(), env, component.NewPlan(), false, now)
+	winner, err := planTLSAt(t.Context(), env, component.NewPlan(), "test-installation", false, now)
 	require.NoError(t, err)
 	require.NotNil(t, winner)
 
@@ -227,7 +231,7 @@ func TestTLSPersistBeforeTrustAndCAS(t *testing.T) {
 
 	at := now.Add(caRotationInterval)
 	for _, plan := range []*component.Plan{first, second} {
-		secret, err := planTLSAt(t.Context(), env, plan, false, at)
+		secret, err := planTLSAt(t.Context(), env, plan, "test-installation", false, at)
 		require.NoError(t, err)
 		require.Nil(t, secret)
 	}
@@ -238,7 +242,7 @@ func TestTLSPersistBeforeTrustAndCAS(t *testing.T) {
 	require.Len(t, result.Deferred, 1)
 
 	restart := component.NewPlan()
-	stored, err := planTLSAt(t.Context(), env, restart, false, at)
+	stored, err := planTLSAt(t.Context(), env, restart, "test-installation", false, at)
 	require.NoError(t, err)
 	require.Zero(t, restart.Len())
 	require.NoError(t, verifyServing(t, stored, winner.Data["ca.crt"], at))
@@ -265,7 +269,7 @@ func TestTLSReadFailuresAndMissingState(t *testing.T) {
 			}
 
 			plan := component.NewPlan()
-			_, err := planTLSAt(t.Context(), env, plan, scenario != "established-missing", time.Now())
+			_, err := planTLSAt(t.Context(), env, plan, "test-installation", scenario != "established-missing", time.Now())
 			require.Error(t, err)
 			require.Zero(t, plan.Len())
 		})
@@ -353,11 +357,12 @@ func TestTLSUncertainWritesAndForbiddenRotation(t *testing.T) {
 			if !fresh {
 				secret, err := newTLS(env.Namespace, now.Add(-caRotationInterval))
 				require.NoError(t, err)
+				bindRuntime(secret, "test-installation")
 				require.NoError(t, env.Client.Create(t.Context(), secret))
 			}
 
 			plan := component.NewPlan()
-			value, err := planTLSAt(t.Context(), env, plan, fresh, now)
+			value, err := planTLSAt(t.Context(), env, plan, "test-installation", fresh, now)
 			require.NoError(t, err)
 			require.Nil(t, value)
 
@@ -382,7 +387,7 @@ func TestTLSUncertainWritesAndForbiddenRotation(t *testing.T) {
 			require.Error(t, result.Err())
 
 			restart := component.NewPlan()
-			value, err = planTLSAt(t.Context(), env, restart, false, now)
+			value, err = planTLSAt(t.Context(), env, restart, "test-installation", false, now)
 			require.NoError(t, err)
 
 			if scenario == "patch-forbidden" {

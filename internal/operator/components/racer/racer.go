@@ -124,7 +124,7 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 		}
 	}
 
-	secret, err := planTLSAt(ctx, env, plan, fresh, now)
+	secret, err := planTLSAt(ctx, env, plan, marker.UID, fresh, now)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
@@ -133,7 +133,7 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 		return plan, pending(), nil
 	}
 
-	if err := runtimePlan(ctx, env, plan, marker.Data["cluster"], secret); err != nil {
+	if err := runtimePlan(ctx, env, plan, marker, secret); err != nil {
 		return nil, component.Result{}, err
 	}
 
@@ -153,7 +153,7 @@ func decodeRuntimeManifests(env *component.Env) ([]*unstructured.Unstructured, e
 	return env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml"}, nil)
 }
 
-func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, cluster string, secret *corev1.Secret) error {
+func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) error {
 	objects, err := decodeRuntimeManifests(env)
 	if err != nil {
 		return err
@@ -168,7 +168,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 		switch obj.GetKind() {
 		case "ConfigMap":
 			values := map[string]string{
-				"RACER_CLUSTER_ID":                  cluster,
+				"RACER_CLUSTER_ID":                  marker.Data["cluster"],
 				"RACER_INSTALLATION_CONFIGMAP_NAME": markerName,
 				"RACER_VERSION_CONFIGMAP_NAME":      versionName,
 				"RACER_CREDENTIALS_SECRET_NAME":     "racer-credentials",
@@ -190,6 +190,8 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			if err := env.Scheme.Convert(obj, cm, nil); err != nil {
 				return err
 			}
+
+			bindRuntime(cm, marker.UID)
 
 			cm, err = preservedConfig(ctx, env, plan, cm, values)
 			if err != nil {
@@ -238,14 +240,26 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			op.DependsOn = append(op.DependsOn, prerequisites...)
 		}
 
+		op, err = ownedRuntimeOperation(ctx, env, op, marker.UID)
+		if err != nil {
+			return err
+		}
+
 		plan.Add(op)
 	}
 
-	add(plan, component.OpApply, &corev1.ConfigMap{
+	trust := &corev1.ConfigMap{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace},
 		Data:       map[string]string{"ca.crt": string(servingRoots(secret))},
-	})
+	}
+
+	op, err := ownedRuntimeOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(trust), Component: name}, marker.UID)
+	if err != nil {
+		return err
+	}
+
+	plan.Add(op)
 
 	return nil
 }
