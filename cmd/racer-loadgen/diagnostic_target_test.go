@@ -67,7 +67,7 @@ func runDiagnosticTarget(ctx context.Context, cfg diagnosticTargetConfig) error 
 	if err != nil {
 		return err
 	}
-	defer p.transport.CloseIdleConnections()
+	defer p.close()
 
 	startupCtx, stop := context.WithTimeout(ctx, startup)
 	defer stop()
