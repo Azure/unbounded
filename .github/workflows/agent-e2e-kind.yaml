@@ -6,6 +6,8 @@ name: unbounded agent e2e
 on:
   pull_request:
     paths:
+      - internal/hostroot/**
+      - internal/fsutil/**
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
       - internal/cloudprovider/**
@@ -31,6 +33,8 @@ on:
     # path-filtered with no branch filter, so it already covers release branches.
     branches: [main, release-*]
     paths:
+      - internal/hostroot/**
+      - internal/fsutil/**
       - cmd/agent/**
       - cmd/kubectl-unbounded/**
       - internal/cloudprovider/**
@@ -188,7 +192,7 @@ jobs:
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup
 
   agent-bootstrap-recovery:
-    name: agent ${{ matrix.title }} (Ubuntu)
+    name: agent ${{ matrix.title }} (${{ matrix.host-base-os }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -198,19 +202,27 @@ jobs:
           - id: bootstrap-recovery
             title: bootstrap recovery
             suite: bootstrap-recovery
+            host-base-os: ubuntu2404
           # A host installed by the last release before the host root, linked
           # and then moved. That release cannot be installed on an immutable
           # host, so one conventional host covers it.
           - id: host-root-migration
             title: host root migration
             suite: migration
+            host-base-os: ubuntu2404
+          # Interrupt after the swap, before relabeling. Ubuntu cannot validate
+          # SELinux enforcement or the labels of the resumed installation.
+          - id: host-root-migration-recovery
+            title: host root migration recovery
+            suite: migration-recovery
+            host-base-os: almalinux9
     env:
       KIND_CLUSTER_NAME: agent-${{ matrix.id }}
       VM_NAME: agent-${{ matrix.id }}
       VM_SUBNET: "192.168.100"
       VM_IP: "192.168.100.10"
       AGENT_MACHINE_NAME: agent-${{ matrix.id }}
-      HOST_BASE_OS: ubuntu2404
+      HOST_BASE_OS: ${{ matrix.host-base-os }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

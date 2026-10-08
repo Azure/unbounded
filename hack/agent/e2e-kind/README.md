@@ -1,7 +1,7 @@
 # Agent e2e: local and CI
 
 `e2e.py` defines shared `setup`, `lifecycle`, `configuration`, `fresh-bootstrap`,
-`bootstrap-recovery`, and `migration` suites. Run
+`bootstrap-recovery`, `migration`, and `migration-recovery` suites. Run
 `e2e.py list-suite --suite lifecycle` to inspect the exact sequence.
 The host lifecycle includes existing upgrade/rollback, reset/reinstall, and repave
 operations plus an unassisted host reboot with fresh node identity and workload/DNS.
@@ -109,3 +109,37 @@ immutable host, so the suite needs a cloud-init host:
 HOST_BASE_OS=ubuntu2404 E2E_SUITE=migration KEEP_ENV=1 \
   bash hack/agent/e2e-kind/run-local.sh
 ```
+
+### Interrupted migration with SELinux enforcing
+
+The `migration-recovery` suite runs on an AlmaLinux 9 guest in GitHub Actions.
+It installs the legacy release and upgrades once to establish a linked host.
+Before the second upgrade, a runtime systemd drop-in gives only the daemon a
+`restorecon` wrapper in its PATH, disables automatic restart, and treats the
+injected SIGKILL as a successful exit so OnFailure recovery does not roll back
+the slots. The wrapper blocks the real migration after the root swap, before
+`restorecon -R /opt/unbounded` changes any labels.
+
+The harness requires SELinux **Enforcing**, the `.moving` marker, the legacy
+daemon unit and binaries still in place, and copied daemon binaries that a
+read-only `restorecon -nvR` inspection says need relabeling. It then kills the
+whole daemon service cgroup with SIGKILL, removes its wrapper and drop-in, and
+starts the daemon normally. It never changes the labels under `/opt/unbounded`
+or switches SELinux to permissive mode. Recovery must finish the move, leave
+labels matching policy, and run the daemon from the new root. The host then
+reboots and validates node readiness and workload/DNS before reset.
+
+This is a regression test, not an expected-failure test. An agent that resumes
+`StateMoving` without restoring labels should fail the label check even if the
+host policy happens to permit executing the mislabeled binaries. A host that
+never exhibits the pre-relabel checkpoint fails setup rather than claiming to
+have tested recovery. The production agent has no test-specific failpoint.
+
+```sh
+HOST_BASE_OS=almalinux9 E2E_SUITE=migration-recovery KEEP_ENV=1 \
+  bash hack/agent/e2e-kind/run-local.sh
+```
+
+Each guest-fixture action records its output in `logs/host-root-recovery-*.log`,
+uploaded alongside the daemon journal and SELinux AVC diagnostics. The hook is
+removed on failure too, but the harness does not repair the failed installation.
