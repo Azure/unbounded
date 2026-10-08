@@ -1382,9 +1382,31 @@ mod tests {
         .unwrap();
         let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
-        for case in ["key-cert-sign", "ca", "missing-usage", "future", "expired"] {
+        for case in [
+            "key-cert-sign",
+            "key-encipherment",
+            "server-auth",
+            "unknown-eku",
+            "any-eku",
+            "ca",
+            "missing-usage",
+            "future",
+            "expired",
+        ] {
             let response = issue(&request, &ca, &key, |params| match case {
                 "key-cert-sign" => params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign),
+                "key-encipherment" => params
+                    .key_usages
+                    .push(rcgen::KeyUsagePurpose::KeyEncipherment),
+                "server-auth" => params
+                    .extended_key_usages
+                    .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth),
+                "unknown-eku" => params
+                    .extended_key_usages
+                    .push(rcgen::ExtendedKeyUsagePurpose::Other(vec![1, 2, 3, 4])),
+                "any-eku" => params
+                    .extended_key_usages
+                    .push(rcgen::ExtendedKeyUsagePurpose::Any),
                 "ca" => params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained),
                 "missing-usage" => params.key_usages.clear(),
                 "future" => {
