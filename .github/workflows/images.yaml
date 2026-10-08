@@ -61,9 +61,6 @@ jobs:
           fi
 
           file="images/${name}/Containerfile"
-          if [[ ! -f "$file" ]]; then
-            file="images/${name}/Dockerfile"
-          fi
 
           if [[ ( "$name" == playpen || "$name" == playpen-* ) && "${{ github.event_name }}" != "workflow_dispatch" ]]; then
             echo "::notice::Skipping ${name}; playpen images are manual-only. Dispatch this workflow with image=${name}."
@@ -72,7 +69,7 @@ jobs:
           fi
 
           if [[ ! -f "$file" ]]; then
-            echo "::error::No Containerfile or Dockerfile found for ${name}"
+            echo "::error::No Containerfile found at ${file}"
             exit 1
           fi
 
