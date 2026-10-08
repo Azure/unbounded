@@ -501,7 +501,7 @@ func TestRacerGETAndHEAD(t *testing.T) {
 			contentType string
 		}{
 			{ifaces.KindBlob, "application/octet-stream"},
-			{ifaces.KindManifest, "application/vnd.oci.image.manifest.v1+json"},
+			{ifaces.KindManifest, ""},
 			{ifaces.KindConfig, ""},
 		} {
 			for _, supplied := range []string{"", "application/custom"} {
@@ -620,10 +620,26 @@ func TestRacerMirrorPolicyParity(t *testing.T) {
 					legacy.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/v2/library/image/"+route+"/"+d.String(), nil))
 
 					racerResponse := httptest.NewRecorder()
-					writeRacerHeaders(racerResponse, d, metadata, kind)
+					client := racerMetadataClient{metadata: metadata}
+					NewHandler(client, nil, nil).ServeContent(racerResponse, httptest.NewRequest(http.MethodHead, "/", nil), ifaces.OriginRef{
+						Registry: "registry.example", Repository: "library/image", Digest: d, Kind: kind,
+					})
 
 					if w.Code != http.StatusOK {
 						t.Fatalf("mirror HEAD failed: %d", w.Code)
+					}
+
+					// Racer rejects unknown manifest types instead of using the legacy default.
+					if kind == ifaces.KindManifest && contentType == "" {
+						if racerResponse.Code != http.StatusBadGateway || racerResponse.Header().Get("Gantry-Mirrored") != "" {
+							t.Fatalf("unknown manifest type accepted: status=%d headers=%v", racerResponse.Code, racerResponse.Header())
+						}
+
+						continue
+					}
+
+					if racerResponse.Code != http.StatusOK {
+						t.Fatalf("Racer HEAD failed: %d", racerResponse.Code)
 					}
 
 					for _, header := range []string{"Content-Type", "Content-Length", "Docker-Content-Digest"} {

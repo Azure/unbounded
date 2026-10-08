@@ -483,7 +483,8 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 	defer func() { _ = value.Close() }() //nolint:errcheck // best-effort close
 
 	actual := value.Metadata()
-	if !validRacerMetadata(actual, d) || (ranged && (actual.Size != metadata.Size ||
+	// The manifest route also serves indexes, so an absent media type is ambiguous.
+	if !validRacerMetadata(actual, d) || (kind == ifaces.KindManifest && actual.ContentType == "") || (ranged && (actual.Size != metadata.Size ||
 		actual.ContentType != metadata.ContentType)) {
 		s.logRacerFailure(id, "get_metadata", errors.New("invalid metadata"), -1, 0)
 		http.Error(w, "invalid Racer metadata", http.StatusBadGateway)
@@ -526,7 +527,7 @@ func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id str
 		return racersdk.Metadata{}, nil, true
 	}
 
-	if !validRacerMetadata(metadata, ref.Digest) {
+	if !validRacerMetadata(metadata, ref.Digest) || (ref.Kind == ifaces.KindManifest && metadata.ContentType == "") {
 		s.logRacerFailure(id, "stat_metadata", errors.New("invalid metadata"), -1, 0)
 		http.Error(w, "invalid Racer metadata", http.StatusBadGateway)
 
@@ -593,14 +594,9 @@ func validRacerMetadata(metadata racersdk.Metadata, d digest.Digest) bool {
 func writeRacerHeaders(w http.ResponseWriter, d digest.Digest, metadata racersdk.Metadata, kind ifaces.OriginRefKind) {
 	w.Header().Set("Content-Type", metadata.ContentType)
 	w.Header().Set("Docker-Content-Digest", d.String())
-	// Match mirror headers without payload sniffing: Racer owns the body stream.
-	if metadata.ContentType == "" {
-		switch kind {
-		case ifaces.KindManifest:
-			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-		case ifaces.KindBlob:
-			w.Header().Set("Content-Type", "application/octet-stream")
-		}
+
+	if metadata.ContentType == "" && kind == ifaces.KindBlob {
+		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 
 	if size := int64(metadata.Size); size >= 0 {
