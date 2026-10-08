@@ -1434,7 +1434,7 @@ mod codec {
         if roots.iter().collect::<HashSet<_>>().len() != roots.len() {
             return Err(Error::InvalidRequest);
         }
-        let mut keys = Vec::new();
+        let mut keys: Vec<CacheEncryptionKey> = Vec::new();
         let mut seen = HashSet::new();
         let mut active = BTreeMap::new();
         for k in r.cache_keys {
@@ -1458,6 +1458,11 @@ mod codec {
             }
             let material = key_material(&k.material.0)?;
             if !seen.insert((k.cache.clone(), k.purpose.clone(), id)) {
+                return Err(Error::InvalidRequest);
+            }
+            // Compare borrowed secrets, not copies in a nonzeroizing set.
+            // The 512 KiB wire bound keeps this below 4096 keys.
+            if keys.iter().any(|key| key.material == *material) {
                 return Err(Error::InvalidRequest);
             }
             *active
@@ -2606,6 +2611,53 @@ mod codec {
                     decode_bundle(&serde_json::to_vec(&bundle).unwrap()),
                     Err(Error::InvalidRequest)
                 ));
+            }
+        }
+
+        /// Material must be unique across references and states in either codec direction.
+        #[test]
+        fn bundle_duplicate_material_parity() {
+            for scope in ["id", "purpose", "cache"] {
+                for reverse in [false, true] {
+                    let mut bundle = decode_bundle(BUNDLE.as_bytes()).unwrap();
+                    bundle.cache_keys.truncate(1);
+                    let mut second = bundle.cache_keys[0].clone();
+                    match scope {
+                        "id" => {
+                            second.key.id.0[15] += 1;
+                            second.state = CacheKeyState::Prepared;
+                        }
+                        "purpose" => second.key.purpose = CacheKeyPurpose::OriginCredentials,
+                        "cache" => {
+                            second.key.cache =
+                                CacheId("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into());
+                        }
+                        _ => unreachable!(),
+                    }
+                    second.material[0] ^= 0xff;
+                    bundle.cache_keys.push(second);
+                    if reverse {
+                        bundle.cache_keys.reverse();
+                    }
+                    let valid = encode_bundle(&bundle).expect("distinct material rejected");
+                    assert!(decode_bundle(&valid).is_ok(), "{scope}, reverse={reverse}");
+
+                    let mut document: Value = serde_json::from_slice(&valid).unwrap();
+                    document["cache_keys"][1]["material"] =
+                        document["cache_keys"][0]["material"].clone();
+                    assert_eq!(
+                        decode_bundle(&serde_json::to_vec(&document).unwrap()).err(),
+                        Some(Error::InvalidRequest),
+                        "decoder: {scope}, reverse={reverse}"
+                    );
+
+                    bundle.cache_keys[1].material = bundle.cache_keys[0].material;
+                    assert_eq!(
+                        encode_bundle(&bundle).err(),
+                        Some(Error::InvalidRequest),
+                        "encoder: {scope}, reverse={reverse}"
+                    );
+                }
             }
         }
 
