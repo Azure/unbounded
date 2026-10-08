@@ -216,11 +216,7 @@ impl<H: Host> Enrollment<H> {
         }
         let key = identity::PendingIdentity::generate().map_err(|_| Error::Io)?;
         let private = key.export_pkcs8_for_persistence().map_err(|_| Error::Io)?;
-        let signing = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-            &rustls::pki_types::PrivatePkcs8KeyDer::from(private.as_slice()),
-            &rcgen::PKCS_ED25519,
-        )
-        .map_err(|_| Error::Io)?;
+        let signing = key.rcgen_key_pair().map_err(|_| Error::Io)?;
         let mut params =
             rcgen::CertificateParams::new(Vec::<String>::new()).map_err(|_| Error::Io)?;
         params.distinguished_name = rcgen::DistinguishedName::new();
@@ -1009,6 +1005,33 @@ mod tests {
             enrollment: request.enrollment.clone(),
             certificate_chain: vec![csr.signed_by(ca, key).unwrap().der().to_vec()],
         }
+    }
+
+    /// Enrollment keeps an empty subject and signs with the persisted identity key.
+    #[test]
+    fn generated_csr_public_key_and_signature_match_persisted_identity() {
+        use x509_parser::{certification_request::X509CertificationRequest, prelude::FromDer};
+
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (_, enrollment, _) = fixture();
+        let pending = enrollment.generate().unwrap();
+        let private = decode_private_key(&pending.private_key).unwrap();
+        let key = crate::SigningKey::from_pkcs8_der(&private).unwrap();
+        let der = STANDARD.decode(&pending.csr).unwrap();
+        let (rest, csr) = X509CertificationRequest::from_der(&der).unwrap();
+        assert!(rest.is_empty());
+        let info = &csr.certification_request_info;
+        assert_eq!(info.subject.iter().count(), 0);
+        assert_eq!(
+            info.subject_pki.subject_public_key.data.as_ref(),
+            key.verifying_key().as_bytes()
+        );
+        assert_eq!(
+            csr.signature_algorithm.algorithm.to_id_string(),
+            "1.3.101.112"
+        );
+        csr.verify_signature().unwrap();
     }
 
     /// Retry persistence, inventory refresh, token rotation and recovery share one path.
