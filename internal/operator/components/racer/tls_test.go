@@ -96,6 +96,58 @@ func TestTLSProjectionOrdersAndBoundedRotation(t *testing.T) {
 	}
 }
 
+func TestTLSClockSkew(t *testing.T) {
+	createdAt := time.Date(2026, time.October, 8, 12, 0, 0, 0, time.UTC)
+	original, err := newTLS("custom-system", createdAt)
+	require.NoError(t, err)
+	rotated, err := renewTLS(original, "custom-system", createdAt.Add(caRotationInterval))
+	require.NoError(t, err)
+	require.NotNil(t, rotated)
+
+	for _, generation := range []struct {
+		name   string
+		secret *corev1.Secret
+	}{
+		{name: "initial", secret: original},
+		{name: "rotated", secret: rotated},
+	} {
+		t.Run(generation.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name    string
+				skew    time.Duration
+				wantErr bool
+			}{
+				{name: "same-clock"},
+				{name: "one-second-behind", skew: time.Second},
+				{name: "inside-backdating-window", skew: time.Hour - time.Second},
+				{name: "at-not-before", skew: time.Hour},
+				{name: "before-not-before", skew: time.Hour + time.Second, wantErr: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					secret := generation.secret.DeepCopy()
+					env := testEnv(t, secret)
+					plan := component.NewPlan()
+					now := stateOf(t, secret).CreatedAt.Add(-tc.skew)
+					stored, err := planTLSAt(t.Context(), env, plan, false, now)
+					require.Zero(t, plan.Len())
+
+					if tc.wantErr {
+						require.ErrorContains(t, err, "certificates are not yet valid")
+						require.Nil(t, stored)
+
+						return
+					}
+
+					require.NoError(t, err)
+					require.NotNil(t, stored)
+					require.Equal(t, secret.Data, stored.Data)
+					require.NoError(t, verifyServing(t, stored, original.Data["ca.crt"], now))
+				})
+			}
+		})
+	}
+}
+
 func TestTLSCorruptionAndExpiredCAFailsClosed(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	original, err := newTLS("custom-system", now)
@@ -116,7 +168,7 @@ func TestTLSCorruptionAndExpiredCAFailsClosed(t *testing.T) {
 		})
 	}
 
-	for _, corruption := range []string{"overlap", "version", "chain", "marker", "trailing"} {
+	for _, corruption := range []string{"overlap", "version", "chain", "marker", "trailing", "created-before-ca", "created-after-ca"} {
 		t.Run(corruption, func(t *testing.T) {
 			secret := rotated.DeepCopy()
 			state := stateOf(t, secret)
@@ -134,6 +186,12 @@ func TestTLSCorruptionAndExpiredCAFailsClosed(t *testing.T) {
 				delete(secret.Annotations, tlsStateAnnotation)
 			case "trailing":
 				secret.Data[tlsStateKey] = append(secret.Data[tlsStateKey], []byte(" {}")...)
+			case "created-before-ca":
+				state.CreatedAt = state.CreatedAt.Add(-time.Second)
+				require.NoError(t, writeTLSState(secret, state))
+			case "created-after-ca":
+				state.CreatedAt = state.CreatedAt.Add(time.Second)
+				require.NoError(t, writeTLSState(secret, state))
 			}
 
 			_, err := renewTLS(secret, "custom-system", now.Add(caRotationInterval))

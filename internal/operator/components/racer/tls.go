@@ -520,7 +520,7 @@ func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (t
 		return state, fmt.Errorf("trailing Racer serving rotation state")
 	}
 
-	if state.Version != 1 || secret.Annotations[tlsStateAnnotation] != "1" || !state.CreatedAt.Equal(ca.NotBefore.Add(time.Hour)) || state.CreatedAt.After(now) || !ca.NotAfter.Equal(state.CreatedAt.Add(caLifetime)) || len(state.Previous) > maxPreviousCAs {
+	if state.Version != 1 || secret.Annotations[tlsStateAnnotation] != "1" || !state.CreatedAt.Equal(ca.NotBefore.Add(time.Hour)) || !ca.NotAfter.Equal(state.CreatedAt.Add(caLifetime)) || len(state.Previous) > maxPreviousCAs {
 		return state, fmt.Errorf("invalid Racer serving rotation policy state")
 	}
 
