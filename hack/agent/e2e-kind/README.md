@@ -105,15 +105,22 @@ image's own command line, with networking from the units Ignition wrote.
 In CI this entry is skipped unless a federated Azure login is configured, and
 on pull requests from forks, because GitHub withholds secrets from
 fork-triggered workflows. It is left out of the matrix rather than added and
-failed, so it appears on its own once `ACL_IMAGE_CLIENT_ID`,
-`ACL_IMAGE_TENANT_ID` and `ACL_IMAGE_SUBSCRIPTION_ID` exist as repository
-secrets. They have to be repository secrets rather than environment ones: the
-`azure-ci` environment requires a reviewer, which would put a manual approval
-in front of every pull request. The identity's federated credentials have to
-trust the subject of every trigger that adds the entry: pull requests, pushes
-to `main` and to `release-*` branches, and manual runs on the branches they run
-on. A trigger whose subject is not trusted fails at the Azure login rather than
-being skipped.
+failed, so it appears on its own once all three of the selected source's
+secrets exist: `ACL_GALLERY_CLIENT_ID`, `ACL_GALLERY_TENANT_ID` and
+`ACL_GALLERY_SUBSCRIPTION_ID` for the gallery, which CI uses, or
+`ACL_IMAGE_CLIENT_ID`, `ACL_IMAGE_TENANT_ID` and `ACL_IMAGE_SUBSCRIPTION_ID`
+for the manifest. A secret missing from the selected set never falls back to
+the other set. The workflow sets `ACL_IMAGE_SOURCE` and
+`ACL_IMAGE_RESOURCE_GROUP`. They have to be repository secrets rather than
+environment ones: the `azure-ci` environment requires a reviewer, which would
+put a manual approval in front of every pull request.
+
+Each identity's federated credentials have to trust the subject of every
+trigger that adds the entry: pull requests, pushes to `main` and to `release-*`
+branches, and manual runs on the branches they run on. Each is configured for
+pull requests from this repository and pushes to `main`, so a `release-*` push
+or a manual run elsewhere fails at the Azure login rather than being skipped,
+until it has a federated credential of its own.
 
 Every other host downloads from a public mirror and runs normally in all of
 these cases.
