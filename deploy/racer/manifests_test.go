@@ -5,10 +5,12 @@ package racer_test
 
 import (
 	"io/fs"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	manifests "github.com/Azure/unbounded/deploy/racer"
@@ -34,6 +36,32 @@ func TestEmbeddedInventoryIsControllerOnly(t *testing.T) {
 				}
 
 				require.NotContains(t, obj.GetName(), "dataplane")
+
+				if obj.GetKind() == "Role" || obj.GetKind() == "ClusterRole" {
+					role := &rbacv1.ClusterRole{}
+					require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, role))
+
+					for _, rule := range role.Rules {
+						if !slices.Contains(rule.APIGroups, "") && !slices.Contains(rule.APIGroups, "*") {
+							continue
+						}
+
+						for _, resource := range []string{"configmaps", "secrets"} {
+							if slices.Contains(rule.Resources, resource) || slices.Contains(rule.Resources, "*") {
+								require.NotContains(t, rule.Verbs, "create")
+								require.NotContains(t, rule.Verbs, "*")
+
+								if resource == "secrets" {
+									require.Equal(t, []string{"racer-credentials"}, rule.ResourceNames)
+								} else {
+									require.ElementsMatch(t, []string{"racer-installation", "racer-version"}, rule.ResourceNames)
+								}
+
+								require.ElementsMatch(t, []string{"get", "list", "watch", "update", "patch"}, rule.Verbs)
+							}
+						}
+					}
+				}
 
 				if obj.GetKind() == "ValidatingAdmissionPolicy" {
 					policy := &admissionv1.ValidatingAdmissionPolicy{}

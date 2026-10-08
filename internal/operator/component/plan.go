@@ -4,6 +4,7 @@
 package component
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -43,6 +44,9 @@ const (
 
 	// OpDelete removes the object, treating absence as success.
 	OpDelete
+
+	// OpRun calls Run. Object anchors ordering and results but is not written.
+	OpRun
 )
 
 // String renders an OpKind for error messages and test failures.
@@ -56,6 +60,8 @@ func (k OpKind) String() string {
 		return "MergePatch"
 	case OpDelete:
 		return "Delete"
+	case OpRun:
+		return "Run"
 	default:
 		return fmt.Sprintf("OpKind(%d)", int(k))
 	}
@@ -92,6 +98,12 @@ func RefOf(obj *unstructured.Unstructured) ObjectRef {
 type Operation struct {
 	Kind   OpKind
 	Object *unstructured.Unstructured
+
+	// Run is required only for OpRun and runs after validation and dependencies.
+	// It must be idempotent and honor context cancellation. It may capture a
+	// client; the executor does not write Object or set its owner references.
+	// OpRun cannot use SharedKey or Overridable.
+	Run func(context.Context) error
 
 	// Base is the observed state for OpMergePatch, and is ignored otherwise.
 	// The executor computes the patch from Base to Object.

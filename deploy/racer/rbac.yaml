@@ -44,10 +44,6 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "serviceaccounts"]
     verbs: ["get", "list", "watch"]
-  # Admission must restrict create before the RoleBinding grants it.
-  - apiGroups: [""]
-    resources: ["secrets", "configmaps"]
-    verbs: ["create"]
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames: ["racer-credentials"]

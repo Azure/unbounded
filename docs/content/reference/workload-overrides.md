@@ -232,6 +232,14 @@ does not depend on the check being exhaustive:
 Strategic merge directives (any `$`-prefixed key) and explicit `null` values are
 rejected everywhere, because both can delete operator-managed content.
 
+For the `racer` Deployment, the merged `controller` container must keep
+the operator's `env` and `envFrom` exactly, including source order and prefixes.
+Use ConfigMap `racer-config` for configuration tuning so the controller and
+trusted bootstrap use the same settings. This check runs against the rendered
+workload, not during offline validation. A mismatch withholds the Deployment
+rather than applying it without the override. Other permitted pod tuning,
+security settings, resources, and sidecars remain available.
+
 **An override cannot delete a field.** Explicit `null` is refused everywhere,
 because that is how strategic merge removes operator-managed content. Replacing
 a list wholesale is still possible, and `args` is the case where that matters:

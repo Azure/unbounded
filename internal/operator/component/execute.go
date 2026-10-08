@@ -219,6 +219,18 @@ type plannedOp struct {
 // the code that built it. Catching it here names the component instead.
 func validatePlan(plan *Plan) error {
 	for _, op := range plan.Operations {
+		if op.Kind == OpRun {
+			if op.Run == nil {
+				return fmt.Errorf("component %q planned a Run operation with no callback", op.Component)
+			}
+
+			if op.SharedKey != "" || op.Overridable {
+				return fmt.Errorf("component %q planned a Run operation with SharedKey or Overridable", op.Component)
+			}
+		} else if op.Run != nil {
+			return fmt.Errorf("component %q planned a %s operation with a Run callback", op.Component, op.Kind)
+		}
+
 		if op.Object == nil {
 			return fmt.Errorf("component %q planned a %s operation with no object", op.Component, op.Kind)
 		}
@@ -457,6 +469,13 @@ func (e *Env) execute(ctx context.Context, op Operation) error {
 
 	case OpDelete:
 		return e.DeleteIfExists(ctx, op.Object)
+
+	case OpRun:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		return op.Run(ctx)
 
 	default:
 		return fmt.Errorf("unknown operation kind %s for %s", op.Kind, op.Ref())

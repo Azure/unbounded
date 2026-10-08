@@ -106,7 +106,7 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 
 		err := env.LiveReader().Get(ctx, objectKey(env, versionName), version)
 		if !apierrors.IsNotFound(err) {
-			// Only the controller may finish its staged startup commitment.
+			// The execution phase finishes the staged startup commitment.
 			if err != nil || marker.Data["initialization_protocol"] != "staged-v1" || version.Annotations["racer.unbounded-cloud.io/initialization"] != "staged-v1" || version.Annotations[installationAnnotation] != string(marker.UID) {
 				return nil, component.Result{}, fmt.Errorf("fresh Racer marker requires absent or bound staged version state (read: %v)", err)
 			}
@@ -137,8 +137,13 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 		return nil, component.Result{}, err
 	}
 
-	if fresh {
-		return plan, pending(), nil
+	bootstrap, needed, err := planBootstrap(ctx, env, plan, marker)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	if needed {
+		return bootstrap, pending(), nil
 	}
 
 	return plan, component.ReconciledAfter("Racer controller installation reconciled", time.Hour), nil
