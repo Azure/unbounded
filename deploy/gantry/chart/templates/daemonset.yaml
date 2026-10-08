@@ -147,9 +147,11 @@ spec:
             - name: config
               mountPath: /etc/gantry
               readOnly: true
+            {{- if not .Values.racer.enabled }}
             - name: registry-creds
               mountPath: /etc/gantry/registry
               readOnly: true
+            {{- end }}
             - name: tmp
               mountPath: /tmp
             {{- if not .Values.racer.enabled }}
@@ -171,10 +173,12 @@ spec:
         - name: config
           configMap:
             name: gantry-config
+        {{- if not .Values.racer.enabled }}
         - name: registry-creds
           secret:
             secretName: {{ .Values.registryCredentials.secretName }}
             optional: true
+        {{- end }}
         - name: tmp
           emptyDir: {}
         {{- if not .Values.racer.enabled }}

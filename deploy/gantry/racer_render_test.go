@@ -4,6 +4,7 @@
 package gantry
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -115,6 +116,69 @@ func TestRacerChartProfile(t *testing.T) {
 	}
 }
 
+func TestRacerChartRegistryCredentials(t *testing.T) {
+	t.Parallel()
+
+	for _, operator := range []bool{false, true} {
+		for _, enabled := range []bool{false, true} {
+			for _, secretName := range []string{"gantry-registry-credentials", "private-registry-credentials"} {
+				t.Run(fmt.Sprintf("operator=%t/racer=%t/secret=%s", operator, enabled, secretName), func(t *testing.T) {
+					directory := renderChart(t, operator,
+						"--set", fmt.Sprintf("racer.enabled=%t", enabled),
+						"--set", "registryCredentials.secretName="+secretName,
+					)
+					ds := readChartDaemonSet(t, directory)
+					assertRegistryCredentials(t, ds.Spec.Template.Spec, secretName, !enabled)
+				})
+			}
+		}
+	}
+}
+
+func assertRegistryCredentials(t *testing.T, pod corev1.PodSpec, secretName string, retained bool) {
+	t.Helper()
+
+	var mounts []corev1.VolumeMount
+
+	for _, container := range append(pod.InitContainers, pod.Containers...) {
+		for _, mount := range container.VolumeMounts {
+			if mount.Name == "registry-creds" || mount.MountPath == "/etc/gantry/registry" {
+				mounts = append(mounts, mount)
+			}
+		}
+	}
+
+	var volumes []corev1.Volume
+
+	for _, volume := range pod.Volumes {
+		if volume.Name == "registry-creds" || (volume.Secret != nil && volume.Secret.SecretName == secretName) {
+			volumes = append(volumes, volume)
+		}
+	}
+
+	if !retained {
+		if len(mounts) != 0 || len(volumes) != 0 {
+			t.Fatalf("Racer retains legacy credentials: mounts=%+v volumes=%+v", mounts, volumes)
+		}
+
+		return
+	}
+
+	optional := true
+	wantMounts := []corev1.VolumeMount{{Name: "registry-creds", MountPath: "/etc/gantry/registry", ReadOnly: true}}
+
+	wantVolumes := []corev1.Volume{{
+		Name: "registry-creds",
+		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName: secretName,
+			Optional:   &optional,
+		}},
+	}}
+	if !reflect.DeepEqual(mounts, wantMounts) || !reflect.DeepEqual(volumes, wantVolumes) {
+		t.Fatalf("legacy credentials changed: mounts=%+v volumes=%+v", mounts, volumes)
+	}
+}
+
 func TestRacerChartSchema(t *testing.T) {
 	t.Parallel()
 
@@ -184,7 +248,11 @@ func TestRacerOperatorOverrideMatchesChartSocketAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	legacy := readChartDaemonSet(t, renderChart(t, true))
+	const secretName = "private-registry-credentials"
+
+	legacy := readChartDaemonSet(t, renderChart(t, true, "--set", "registryCredentials.secretName="+secretName))
+	assertRegistryCredentials(t, legacy.Spec.Template.Spec, secretName, true)
+
 	plan := component.NewPlan()
 	plan.Add(component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(&legacy), Component: "gantry", Overridable: true})
 
@@ -197,10 +265,13 @@ func TestRacerOperatorOverrideMatchesChartSocketAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := readChartDaemonSet(t, renderChart(t, true, "--values", filepath.Join(deployDir, "chart", "values-racer.yaml")))
+	want := readChartDaemonSet(t, renderChart(t, true, "--values", filepath.Join(deployDir, "chart", "values-racer.yaml"), "--set", "registryCredentials.secretName="+secretName))
+	assertRegistryCredentials(t, want.Spec.Template.Spec, secretName, false)
+	assertRegistryCredentials(t, actual.Spec.Template.Spec, secretName, true)
 	// Overrides intentionally cannot remove operator-managed content. The
 	// inherited init only mounts libp2p, never Racer's directory. Normalize the
-	// retained legacy resources before comparing the effective Racer pod spec.
+	// retained legacy resources, including the credential exposure checked above,
+	// before comparing the effective Racer pod spec.
 	for _, init := range actual.Spec.Template.Spec.InitContainers {
 		for _, mount := range init.VolumeMounts {
 			if mount.Name != "libp2p" {
@@ -211,11 +282,11 @@ func TestRacerOperatorOverrideMatchesChartSocketAccess(t *testing.T) {
 
 	actual.Spec.Template.Spec.InitContainers = nil
 	actual.Spec.Template.Spec.Volumes = slices.DeleteFunc(actual.Spec.Template.Spec.Volumes, func(v corev1.Volume) bool {
-		return v.Name == "libp2p" || v.Name == "containerd-runtime"
+		return v.Name == "libp2p" || v.Name == "containerd-runtime" || v.Name == "registry-creds"
 	})
 	agent := &actual.Spec.Template.Spec.Containers[0]
 	agent.VolumeMounts = slices.DeleteFunc(agent.VolumeMounts, func(v corev1.VolumeMount) bool {
-		return v.Name == "libp2p" || v.Name == "containerd-runtime"
+		return v.Name == "libp2p" || v.Name == "containerd-runtime" || v.Name == "registry-creds"
 	})
 	agent.Ports = slices.DeleteFunc(agent.Ports, func(p corev1.ContainerPort) bool {
 		return p.Name == "transfer" || p.Name == "chaircall" || p.Name == "libp2p-tcp"

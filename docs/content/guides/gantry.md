@@ -261,6 +261,8 @@ The setting runs Gantry as UID/GID 0 and mounts `/run/racer/gantry` read-write f
 its client and origin sockets. Authorize that hostPath and root workload narrowly.
 The container still drops all capabilities, disables privilege escalation, and
 uses a read-only root filesystem and the runtime's default seccomp profile.
+The chart omits the legacy registry credential mount and Secret volume when
+Racer is enabled, even if `registryCredentials.secretName` is configured.
 
 ### Operator-Managed Gantry
 
@@ -277,6 +279,10 @@ The example enables `GANTRY_RACER_ENABLED`, selects UID/GID 0, and mounts
 `GANTRY_RACER_*` tuning and registry configuration as appropriate for your release.
 Unlike the Helm Racer profile, this additive override retains the legacy mounts,
 ports, and libp2p init container. The init container does not mount Racer's directory.
+It also retains the `gantry-registry-credentials` Secret mount: overrides cannot
+remove or replace operator-managed volumes. Do not use this profile while that
+Secret contains credentials, because the root container can still read them
+even though Racer does not use them.
 
 ### Verify Racer Mode
 

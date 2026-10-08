@@ -1,5 +1,8 @@
 # Merge this data key into an existing overrides ConfigMap when one is present.
 # Provision ClusterCache/gantry before activating the workload.
+# Overrides cannot remove the inherited registry-creds mount or Secret volume.
+# Do not use this profile while gantry-registry-credentials contains credentials:
+# the root container can still read them even though Racer does not use them.
 apiVersion: v1
 kind: ConfigMap
 metadata:
