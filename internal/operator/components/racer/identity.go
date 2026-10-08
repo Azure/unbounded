@@ -8,9 +8,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -121,33 +119,27 @@ func checkNewInstallation(ctx context.Context, env *component.Env) error {
 // Existing controller state cannot be adopted or overwritten with a new identity.
 // External dataplane workloads are not installation evidence owned by this component.
 func checkInstallationResources(ctx context.Context, env *component.Env, stagedMarker bool) error {
-	for _, obj := range []client.Object{&rbacv1.ClusterRole{}, &rbacv1.ClusterRoleBinding{}} {
-		err := env.LiveReader().Get(ctx, client.ObjectKey{Name: controllerName}, obj)
-		if err == nil {
-			return fmt.Errorf("racer cluster RBAC exists without an operator claim; standalone installations are not adopted")
-		}
-
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
+	manifests, err := decodeRuntimeManifests(env)
+	if err != nil {
+		return err
 	}
 
 	objects := []client.Object{
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: markerName}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: configName}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: trustName}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tlsName}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "racer-credentials"}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: controllerName}},
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: controllerName}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tlsName, Namespace: env.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "racer-credentials", Namespace: env.Namespace}},
 	}
-	for _, obj := range objects {
-		if stagedMarker && obj.GetName() == markerName {
-			continue
-		}
+	if !stagedMarker {
+		objects = append(objects, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: markerName, Namespace: env.Namespace}})
+	}
 
-		err := env.LiveReader().Get(ctx, objectKey(env, obj.GetName()), obj)
+	for _, obj := range manifests {
+		objects = append(objects, obj)
+	}
+
+	for _, obj := range objects {
+		err := env.LiveReader().Get(ctx, client.ObjectKeyFromObject(obj), obj)
 		if err == nil {
 			return fmt.Errorf("racer resource %s exists without an operator installation; standalone installations are not adopted and lost claims must be restored", obj.GetName())
 		}

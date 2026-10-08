@@ -139,8 +139,12 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 	return plan, component.ReconciledAfter("Racer controller installation reconciled", time.Hour), nil
 }
 
+func decodeRuntimeManifests(env *component.Env) ([]*unstructured.Unstructured, error) {
+	return env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml"}, nil)
+}
+
 func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, cluster string, secret *corev1.Secret) error {
-	objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml"}, nil)
+	objects, err := decodeRuntimeManifests(env)
 	if err != nil {
 		return err
 	}

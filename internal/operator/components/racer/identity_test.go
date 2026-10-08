@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
 	racercore "github.com/Azure/unbounded/internal/racer"
 )
@@ -209,4 +210,80 @@ func TestIdentityRejectsCorruptCandidates(t *testing.T) {
 			require.Zero(t, plan.Len())
 		})
 	}
+}
+
+func TestIdentityRejectsManifestCollisions(t *testing.T) {
+	objects, err := testEnv(t).DecodeManifestFS(manifests.Manifests, nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, objects)
+
+	for _, obj := range objects {
+		for _, phase := range []string{"absent", "reserved", "staged", "legacy"} {
+			t.Run(obj.GetKind()+"/"+obj.GetName()+"/"+phase, func(t *testing.T) {
+				env := testEnv(t, cacheObject("cache"))
+				if phase != "absent" {
+					plan, _ := identityPlan(t, env)
+					persist(t, env, plan)
+				}
+
+				if phase == "staged" {
+					plan, _ := identityPlan(t, env)
+					persist(t, env, plan)
+				}
+
+				if phase == "legacy" {
+					claim := &corev1.ConfigMap{}
+					require.NoError(t, env.Client.Get(t.Context(), objectKey(env, claimName), claim))
+					delete(claim.Data, operatorInitialization)
+					require.NoError(t, env.Client.Update(t.Context(), claim))
+				}
+
+				existing := obj.DeepCopy()
+				require.NoError(t, env.Client.Create(t.Context(), existing))
+				before := existing.DeepCopy()
+				require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(existing), before))
+
+				plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+				require.ErrorContains(t, err, "standalone installations are not adopted")
+				require.Nil(t, plan)
+				require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(existing), existing))
+				require.Equal(t, before, existing)
+			})
+		}
+	}
+}
+
+func TestIdentityInventoryScope(t *testing.T) {
+	env := testEnv(t)
+	objects, err := env.DecodeManifestFS(manifests.Manifests, nil)
+	require.NoError(t, err)
+
+	for _, obj := range objects {
+		if obj.GetNamespace() != "" {
+			obj.SetNamespace("other-system")
+		} else {
+			obj.SetName(obj.GetName() + "-other")
+		}
+
+		require.NoError(t, env.Client.Create(t.Context(), obj))
+	}
+
+	finishIdentity(t, env)
+}
+
+func TestIdentityInventoryReadFailure(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	boom := errors.New("inventory unavailable")
+	env.APIReader = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == "ServiceAccount" && key == objectKey(env, controllerName) {
+				return boom
+			}
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+	require.ErrorIs(t, err, boom)
+	require.Nil(t, plan)
 }
