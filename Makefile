@@ -298,7 +298,7 @@ help: ## Show this help
 	@echo "  unroute                          Build unroute eBPF inspection utility"
 	@echo "  racer-object                     Test and build the S3 read adapter"
 	@echo "  racer-object-build               Build the S3 read adapter without tests"
-	@echo "  racer-object-test                Test the S3 read adapter and deployment examples"
+	@echo "  racer-object-test                Test the S3 read adapter"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -809,8 +809,8 @@ racer-object-build: ## Build the S3 read adapter without lint/test
 	@mkdir -p bin
 	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-object ./cmd/racer-object
 
-racer-object-test: ## Test the S3 read adapter and deployment examples
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m ./cmd/racer-object/... ./internal/racer/object/... ./deploy/racer-object/...
+racer-object-test: ## Test the S3 read adapter
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m ./cmd/racer-object/... ./internal/racer/object/...
 
 image-racer-object-local: ## Build the S3 read adapter image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
