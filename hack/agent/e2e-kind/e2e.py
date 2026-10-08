@@ -2439,7 +2439,13 @@ def export_gallery_image(version_id: str, destination: Path) -> None:
     managed disk in ACL_IMAGE_RESOURCE_GROUP and read through a read-only SAS,
     and the disk is deleted whether or not that worked. Only the pages the disk
     has written are fetched, about 850 MiB of a 32.5 GiB disk, into a sparse
-    fixed VHD that qemu-img converts.
+    fixed VHD, which is the raw disk followed by a footer.
+
+    The footer is cut off and the raw disk converted, rather than the VHD.
+    qemu-img 8.2, which the CI runner has, sizes this VHD from its CHS geometry
+    and loses 640 KiB off the end, and with it the GPT's backup header; the
+    guest then finds no partitions at all. The qcow2 has to come out at the
+    disk's exact size.
 
     The gallery publishes no digest to check the result against. The transfer
     is TLS from Azure, the VHD footer and the qcow2 are checked, and the
@@ -2475,8 +2481,13 @@ def export_gallery_image(version_id: str, destination: Path) -> None:
                                 f"delete disk {disk}")
 
         log("Converting the exported disk to qcow2...")
-        run(["qemu-img", "convert", "-f", "vpc", "-O", "qcow2", str(vhd), str(destination)])
+        disk_bytes = vhd.stat().st_size - VHD_FOOTER_SIZE
+        os.truncate(vhd, disk_bytes)
+        run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(vhd), str(destination)])
         run(["qemu-img", "check", "-f", "qcow2", str(destination)])
+        info = json.loads(capture(["qemu-img", "info", "-f", "qcow2", "--output=json", str(destination)]))
+        if info.get("virtual-size") != disk_bytes:
+            raise RuntimeError(f"the qcow2 is {info.get('virtual-size')} bytes, the disk {disk_bytes}")
     except (RuntimeError, subprocess.CalledProcessError) as exc:
         destination.unlink(missing_ok=True)
         die(f"exporting {version_id} failed: {exc}")
