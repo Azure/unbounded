@@ -310,5 +310,5 @@ func (nspawnNodeOperator) RestartAgentDaemon(ctx context.Context, log *slog.Logg
 }
 
 func (op nspawnNodeOperator) ReconcileHostRoot(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
-	return reconcileHostRoot(ctx, log, newHostRootHost(log, active, op))
+	return reconcileHostRoot(ctx, log, op, active)
 }

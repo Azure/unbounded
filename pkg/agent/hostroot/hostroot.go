@@ -13,7 +13,8 @@
 // from Resolve, so on such a host it names the files where they already are,
 // and the units and links the older release wrote stay valid for it as well as
 // for the new one. That is what lets an upgrade from the older release roll
-// back to it.
+// back to it. Once no older release is left to roll back to, ReconcileMove
+// moves the files into a real directory at Path.
 package hostroot
 
 import (
@@ -78,4 +79,25 @@ func Migrate(log *slog.Logger, markers ...string) error {
 // /opt/*/bin; files created later inherit the directory's label.
 func Prepare(ctx context.Context, log *slog.Logger, subdirs ...string) error {
 	return impl.Prepare(ctx, log, subdirs...)
+}
+
+// MoveOptions describes what ReconcileMove moves and how the agent follows it:
+// the agent's files and subdirectories under the root, where binaries that know
+// the host root are recorded, the AgentUpgrade signal and blue-green links that
+// decide when the move is safe, and how to rewrite the units and restart the
+// daemon.
+type MoveOptions = impl.MoveOptions
+
+// ReconcileMove moves a host a release before Path installed from LegacyPath
+// into a real directory at Path, once neither the current nor the last-good
+// binary predates Path, and finishes a move that was interrupted. Call it from
+// the daemon after Migrate, while holding what keeps an upgrade or a reset from
+// changing the layout. It reports whether it restarted the daemon.
+//
+// Each call on a linked host records the running binary's digest in
+// MoveOptions.Record, which is how a binary that predates Path is told apart:
+// it never records itself. The files under LegacyPath stay until
+// MoveOptions.RewriteUnits has pointed the units at the new ones.
+func ReconcileMove(ctx context.Context, log *slog.Logger, opts MoveOptions) (bool, error) {
+	return impl.ReconcileMove(ctx, log, opts)
 }

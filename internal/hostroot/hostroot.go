@@ -2,13 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package hostroot implements the host root that pkg/agent/hostroot exposes,
-// and the parts of it only the unbounded agent uses: its own layout, moving a
-// linked host into a real directory, and removing the root on reset.
-//
-// Once no older agent is left to roll back to, the daemon moves the files into
-// a real directory at Path with Move, and FinishMove marks the move done once
-// the units name the new paths and the old files are gone. A move interrupted
-// after the copy is in place is resumed from the marker Move writes.
+// and the parts of it only the unbounded agent uses: its own layout and
+// removing the root on reset.
 package hostroot
 
 import (
@@ -338,12 +333,12 @@ func removeIfExists(path string) error {
 	return nil
 }
 
-// Move copies files, given relative to the root, from LegacyPath into a
-// staging directory beside Path, puts the copy in place of the link at Path,
-// then creates any of subdirs the copy lacks and restores SELinux labels, as
+// move copies files, given relative to the root, from legacy into a staging
+// directory beside root, puts the copy in place of the link at root, then
+// creates any of subdirs the copy lacks and restores SELinux labels, as
 // Prepare does for a new installation. The copy carries a marker that keeps
-// the host in StateMoving until FinishMove. Files that are not there are
-// skipped.
+// the host in StateMoving until completeMove removes it. Files that are not
+// there are skipped.
 //
 // Symlinks are recreated rather than copied, and a target under LegacyPath is
 // rewritten to the same file under Path, so the blue-green links in the copy
@@ -353,10 +348,6 @@ func removeIfExists(path string) error {
 // Nothing that is in use changes before the swap: the units, the blue-green
 // links and the recovery script all name LegacyPath, whose files stay. A staging
 // directory left by an earlier attempt is replaced.
-func Move(ctx context.Context, log *slog.Logger, files []string, subdirs ...string) error {
-	return move(ctx, log, Path, LegacyPath, files, subdirs, restoreLabels)
-}
-
 func move(
 	ctx context.Context,
 	log *slog.Logger,
@@ -464,12 +455,6 @@ func rebase(target string, prefixes []string, root string) string {
 	}
 
 	return target
-}
-
-// FinishMove marks the move finished. Call it once nothing names the files
-// under LegacyPath any more and they have been removed.
-func FinishMove() error {
-	return removeIfExists(filepath.Join(Path, movingMarker))
 }
 
 // RemoveSeed removes SeedFile under LegacyPath. Call it only on a host in
