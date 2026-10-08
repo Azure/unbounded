@@ -174,6 +174,8 @@ var (
 	// and retrying the read does not help unless the destination recovers.
 	// Check ErrDestination before other sentinels: the error also wraps the
 	// writer's own error, which may match SDK sentinels from a nested Racer read.
+	// Timeouts from the destination's ReadFrom remain ambiguous and match
+	// neither ErrDestination nor [ErrUnavailable].
 	ErrDestination = errors.New("racersdk: destination failed")
 )
 

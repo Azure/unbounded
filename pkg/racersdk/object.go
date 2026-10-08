@@ -439,7 +439,8 @@ func peekSource(raw *net.UnixConn) (int, error) {
 		peekErr error
 	)
 
-	// Control ignores the read deadline, which may have expired during splice.
+	// Control ignores the read deadline, which may have expired even when
+	// splice returned a non-timeout error.
 	// MSG_DONTWAIT keeps the receive nonblocking.
 	if err := rc.Control(func(fd uintptr) {
 		var b [1]byte
