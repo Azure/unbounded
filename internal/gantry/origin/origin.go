@@ -485,6 +485,10 @@ func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, er
 		return nil, errors.New("endpoint: scheme must be http or https")
 	}
 
+	if u.Hostname() == "" {
+		return nil, errors.New("endpoint: hostname is required")
+	}
+
 	r := &registry{
 		name:   ur.Name,
 		base:   u,

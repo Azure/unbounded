@@ -82,17 +82,50 @@ func TestValidateEndpointErrorsDoNotLeakCredentials(t *testing.T) {
 		"ftp://private-user:private-password@registry.example",
 		"private-user:private-password@registry.example",
 		"https:private-user:private-password@registry.example",
+		"https://",
+		"https:///prefix",
+		"https://:443/prefix",
+		"https://private-user:private-password@/prefix?private-query#private-fragment",
+		"http://private-user:private-password@:5000/private-path",
 	} {
-		c := NewDefault()
-		c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example", Endpoint: endpoint}}
+		t.Run(endpoint, func(t *testing.T) {
+			for _, racer := range []bool{false, true} {
+				c := NewDefault()
+				c.RacerEnabled = racer
+				c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example", Endpoint: endpoint}}
 
-		err := c.Validate()
-		if err == nil || !strings.Contains(err.Error(), "upstream_registries[0].endpoint") {
-			t.Fatalf("expected endpoint validation error, got %v", err)
-		}
+				err := c.Validate()
+				if err == nil || !strings.Contains(err.Error(), "upstream_registries[0].endpoint") {
+					t.Fatalf("RacerEnabled=%t: expected endpoint validation error, got %v", racer, err)
+				}
 
-		if strings.Contains(err.Error(), "private") {
-			t.Fatalf("validation leaked endpoint credentials: %v", err)
-		}
+				if strings.Contains(err.Error(), "private") {
+					t.Fatalf("validation leaked endpoint credentials: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateEndpointValidHostname(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://registry.example",
+		"http://localhost:5000/prefix",
+		"https://127.0.0.1:443/prefix",
+		"https://[::1]/prefix",
+		"https://[::1]:443/prefix",
+		"https://private-user:private-password@registry.example:443/prefix?private-query#private-fragment",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			for _, racer := range []bool{false, true} {
+				c := NewDefault()
+				c.RacerEnabled = racer
+				c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example", Endpoint: endpoint}}
+
+				if err := c.Validate(); err != nil {
+					t.Fatalf("RacerEnabled=%t: %v", racer, err)
+				}
+			}
+		})
 	}
 }

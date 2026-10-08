@@ -1048,6 +1048,8 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: required", i))
 		} else if !strings.HasPrefix(ur.Endpoint, "http://") && !strings.HasPrefix(ur.Endpoint, "https://") {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: must start with http:// or https://", i))
+		} else if u, err := url.Parse(ur.Endpoint); err == nil && u.Hostname() == "" {
+			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: hostname is required", i))
 		}
 	}
 

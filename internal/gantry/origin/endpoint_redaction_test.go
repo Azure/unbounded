@@ -28,6 +28,13 @@ func TestEndpointStartupErrorsDoNotLeakCredentials(t *testing.T) {
 		{"control", "https://private-user:private-password\n@registry.example", "parse endpoint: invalid URL"},
 		{"path", "https://private-user:private-password@registry.example/%zz", "parse endpoint: invalid URL"},
 		{"ipv6", "https://private-user:private-password@[::1", "parse endpoint: invalid URL"},
+		{"empty host", "https://", "endpoint: hostname is required"},
+		{"path without host", "https:///prefix", "endpoint: hostname is required"},
+		{"port without host", "https://:443/prefix", "endpoint: hostname is required"},
+		{"userinfo without host", "https://private-user:private-password@/prefix?private-query#private-fragment", "endpoint: hostname is required"},
+		{"userinfo and port without host", "http://private-user:private-password@:5000/private-path", "endpoint: hostname is required"},
+		{"empty bracketed host", "https://[]:443/prefix", "parse endpoint: invalid URL"},
+		{"opaque", "https:private-secret", "endpoint: hostname is required"},
 	} {
 		for _, delegated := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/delegated=%t", tt.name, delegated), func(t *testing.T) {
@@ -38,13 +45,48 @@ func TestEndpointStartupErrorsDoNotLeakCredentials(t *testing.T) {
 					opts = append(opts, WithDelegatedCredentialsOnly())
 				}
 
-				_, err := New(cfg, opts...)
+				client, err := New(cfg, opts...)
 				if err == nil || !strings.Contains(err.Error(), tt.want) || !strings.Contains(err.Error(), `registry "registry.example"`) {
 					t.Fatalf("expected registry endpoint error, got %v", err)
 				}
 
+				if client != nil {
+					t.Fatal("invalid endpoint returned a client")
+				}
+
 				if strings.Contains(fmt.Sprintf("%+v", err), "private") {
 					t.Fatalf("startup error leaked credentials: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestEndpointStartupValidHostname(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://registry.example",
+		"http://localhost:5000/prefix",
+		"https://127.0.0.1:443/prefix",
+		"https://[::1]/prefix",
+		"https://[::1]:443/prefix",
+		"https://private-user:private-password@registry.example:443/prefix?private-query#private-fragment",
+	} {
+		for _, delegated := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/delegated=%t", endpoint, delegated), func(t *testing.T) {
+				cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg", Endpoint: endpoint}}}
+
+				var opts []Option
+				if delegated {
+					opts = append(opts, WithDelegatedCredentialsOnly())
+				}
+
+				client, err := New(cfg, opts...)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if client.registries["reg"].base.Hostname() == "" {
+					t.Fatal("constructed registry has no hostname")
 				}
 			})
 		}
