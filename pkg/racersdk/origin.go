@@ -146,11 +146,16 @@ func (c OriginConfig) limits() (originLimits, error) {
 
 // ServeOrigin serves origin to Racer until ctx is canceled, then closes all
 // connections and bodies and returns ctx.Err(). It does not wait for
-// callbacks that ignore cancellation. The socket is created with mode 0600,
-// so the origin must run as the same user as the Racer dataplane, usually
-// root. On return it removes the socket it created. A process that exits
-// without returning leaves the socket behind; see
-// [OriginConfig.RecoverStaleSocket].
+// callbacks that ignore cancellation. On return it removes the socket it
+// created. A process that exits without returning leaves the socket behind;
+// see [OriginConfig.RecoverStaleSocket].
+//
+// ServeOrigin does not need root. It needs write and search permission on
+// the socket directory, where it creates the socket with mode 0600, owned by
+// its effective user. Only a process with that user, or one allowed to
+// bypass file permissions such as root with CAP_DAC_OVERRIDE, can connect to
+// it, so the Racer dataplane must run as the same user as the origin or with
+// that capability.
 func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error {
 	return serveOrigin(ctx, config, origin, "/run/racer/"+config.Cache+"/origin/socket")
 }
