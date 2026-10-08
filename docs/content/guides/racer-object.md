@@ -82,20 +82,24 @@ make image-racer-object-local VERSION=dev
 
 The binary is `bin/racer-object`. The image includes CA certificates and version
 metadata. It uses the repository's existing AWS SDK dependencies. Push the image
-to your own registry or load it onto your test nodes, then replace
-`racer-object:dev` in both example manifests with your image, preferably by digest.
-The local build alone does not make the image available to cluster nodes.
+to your own registry or load it onto your test nodes, and reference it by digest
+in your workloads. The local build alone does not make the image available to
+cluster nodes.
 
-The examples are in
-[`deploy/racer-object`](https://github.com/Azure/unbounded/tree/main/deploy/racer-object).
-They use `example-store`, `example-bucket`, and `us-east-1` as placeholders. Edit
-them before applying. Commands below use the existing `unbounded-system`
-Kubernetes namespace; use your chosen workload namespace if different.
+The commands below use `example-store`, `example-bucket`, and `us-east-1` as
+placeholders. Replace them with your own values.
 
 ## 2. Create the Cache and Configure the Origin
 
+Create a ClusterCache named `racer-object`:
+
 ```bash
-kubectl apply -f deploy/racer-object/cache.yaml
+kubectl apply -f - <<'EOF'
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: racer-object
+EOF
 kubectl get ccache racer-object
 ```
 
@@ -106,23 +110,16 @@ using the Racer guide's checks before starting consumers.
 
 Configure upstream access on **every** origin. Prefer workload identity or another
 short-lived AWS credential provider. Set the service account, projected token,
-environment variables, and mounts required by your provider; the example disables
-automatic Kubernetes API token mounting and does not configure a cloud identity.
-Grant only the required object read permissions, including version reads if used.
+environment variables, and mounts required by your provider. The origin does not
+need a Kubernetes API token. Grant only the required object read permissions,
+including version reads if used.
 
-For an environment-based credential setup, the origin has an optional
-`secretRef` named `racer-object-aws`. Create it in the workload namespace from an
-existing protected environment file outside source control:
-
-```bash
-kubectl -n unbounded-system create secret generic racer-object-aws \
-  --from-env-file="$AWS_ENV_FILE"
-```
-
-The file can contain `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and, for temporary
-credentials, `AWS_SESSION_TOKEN`. Do not put credentials in manifests, command
+For an environment-based credential setup, load the origin's environment from a
+Kubernetes Secret created from a protected environment file outside source
+control. The file can contain `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and,
+for temporary credentials, `AWS_SESSION_TOKEN`. Do not put credentials in manifests, command
 flags, images, or source control. Rotate them through your normal secret process;
-environment-based changes require restarting origin pods. If the Secret is absent,
+environment-based changes require restarting origin pods. Without such a Secret,
 the AWS default credential chain must obtain credentials another way.
 
 Origin options:
@@ -145,45 +142,51 @@ For a non-AWS upstream, set `--endpoint` to its HTTPS URL and configure the regi
 and credentials it expects. The URL must not contain credentials, a path prefix,
 query parameters, or a fragment. The endpoint is configured only on the origin.
 
+Run the origin as a DaemonSet with arguments like these:
+
 ```bash
-kubectl -n unbounded-system apply -f deploy/racer-object/origin.yaml
-kubectl -n unbounded-system rollout status daemonset/racer-object-origin --timeout=5m
+racer-object origin --cache=racer-object --namespace=example-store \
+  --bucket=example-bucket --region=us-east-1
 ```
 
 Run exactly one origin per cache on every eligible Racer origin-serving node,
-not just on nodes hosting application pods. The example follows Racer's default
-Linux placement and excludes nodes with the `racer.unbounded-cloud.io/exclude`
-label. Match any custom Racer selectors, affinity, and tolerations, including all
+not just on nodes hosting application pods. Follow Racer's default Linux
+placement and exclude nodes with the `racer.unbounded-cloud.io/exclude` label.
+Match any custom Racer selectors, affinity, and tolerations, including all
 eligible nodes in mixed-network installations. A running origin pod alone does
 not prove upstream access; check a real object read.
 
 ## 3. Start the Sidecar and Read an Object
 
+Add the sidecar as a container in the application pod:
+
 ```bash
-kubectl -n unbounded-system apply -f deploy/racer-object/sidecar-pod.yaml
-kubectl -n unbounded-system wait --for=condition=Ready pod/racer-object-example --timeout=5m
-kubectl -n unbounded-system exec racer-object-example -c app -- \
-  curl --fail --show-error --path-as-is --max-time 300 \
+racer-object sidecar --cache=racer-object --namespace=example-store \
+  --bucket=example-bucket
+```
+
+Then read from the application container:
+
+```bash
+curl --fail --show-error --path-as-is --max-time 300 \
   http://127.0.0.1:8080/example-bucket/example-key
-kubectl -n unbounded-system exec racer-object-example -c app -- \
-  curl --fail --show-error --path-as-is --max-time 300 --head \
+curl --fail --show-error --path-as-is --max-time 300 --head \
   http://127.0.0.1:8080/example-bucket/example-key
-kubectl -n unbounded-system exec racer-object-example -c app -- \
-  curl --fail --show-error --path-as-is --max-time 300 -H 'Range: bytes=0-1023' \
+curl --fail --show-error --path-as-is --max-time 300 -H 'Range: bytes=0-1023' \
   http://127.0.0.1:8080/example-bucket/example-key
 ```
 
 Replace `example-key` with an existing object. For conditions, pass an upstream
 ETag including its quotes, for example `-H 'If-Match: "ETAG"'`. For a versioned
-read, append `?versionId=VERSION_ID`, URL-encoding the version ID. The example
-application has no AWS credentials and no hostPath mount.
+read, append `?versionId=VERSION_ID`, URL-encoding the version ID. The application
+container needs no AWS credentials and no hostPath mount.
 
 The sidecar shares `--cache`, `--namespace`, and repeatable `--bucket` options with
 the origin. The `--volume` flag is not accepted. Its listener defaults to
 `--listen=127.0.0.1:8080` and rejects non-loopback addresses. Its default request
 timeout is `--request-timeout=5m`.
-Place application pods only on nodes running Racer. The examples have no HTTP
-readiness probe: Kubernetes probes target the pod IP, not pod loopback. Pod
+Place application pods only on nodes running Racer. Do not add an HTTP readiness
+probe for the sidecar: Kubernetes probes target the pod IP, not pod loopback. Pod
 readiness therefore does not establish cache or upstream readiness.
 
 ### Socket Mounts and Security
@@ -207,8 +210,8 @@ trusted and free of symlinks. Never remove a live socket to bypass another owner
 timeout --signal=TERM --kill-after=10s 300s make racer-object-test VERSION=dev
 ```
 
-The focused tests cover adapter behavior through the Go SDK test bridge and check
-the example deployment contracts. The bridge does not cache data. These tests do
+The focused tests cover adapter behavior through the Go SDK test bridge. The
+bridge does not cache data. These tests do
 not establish live multi-node mesh reuse, Kubernetes admission compatibility, or
 compatibility with every S3 provider. Validate those in your own environment.
 
