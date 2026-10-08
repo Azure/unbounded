@@ -95,10 +95,12 @@ func (o *Object) Read(p []byte) (int, error) {
 // written. [io.Copy] calls it automatically. A nil error means the whole
 // selected range was written and Racer confirmed it complete. If w fails,
 // including a short write or a write timeout, the error matches
-// [ErrDestination] and wraps w's error.
+// [ErrDestination] and wraps w's error. A splice timeout matches
+// [ErrDestination] only when unread source bytes identify a destination stall;
+// otherwise it matches neither [ErrDestination] nor [ErrUnavailable].
 //
 // If w implements [io.ReaderFrom] and is backed by a file descriptor, such as
-// a [net.Conn], an [*os.File], or an HTTP/1 [http.ResponseWriter], data moves
+// a [*net.TCPConn], an [*os.File], or an HTTP/1 [http.ResponseWriter], data moves
 // from Racer's socket to w inside the kernel with splice(2), with no copy into
 // process memory. Other writers receive data through a reused 256 KiB buffer.
 //
@@ -394,13 +396,17 @@ func (o *Object) splice(dst *destination, raw *net.UnixConn) (int64, error) {
 // reports source and destination failures alike, so the Racer connection is
 // checked: a broken pipe can only come from writing, and an error while the
 // connection is still open came from the destination. A closed or failed
-// connection means Racer cut the transfer short. A timeout stays ambiguous,
-// because either side may have stalled and Racer may have given up since.
+// connection means Racer cut the transfer short. A timeout stays ambiguous
+// unless unread source bytes show that the destination stalled.
 func spliceFailure(raw *net.UnixConn, err error) error {
 	switch {
 	case errors.Is(err, unix.EPIPE):
 		return destinationFailure(err)
 	case errors.Is(err, os.ErrDeadlineExceeded):
+		if n, peekErr := peekSource(raw); peekErr == nil && n > 0 {
+			return destinationFailure(err)
+		}
+
 		return failure(wire.ErrorDeadline, "write", err)
 	case sourceOpen(raw):
 		return destinationFailure(err)
@@ -412,9 +418,24 @@ func spliceFailure(raw *net.UnixConn, err error) error {
 // sourceOpen reports whether the Racer connection is still open, without
 // consuming any data from it.
 func sourceOpen(raw *net.UnixConn) bool {
+	n, err := peekSource(raw)
+
+	switch {
+	case err == unix.EAGAIN:
+		return true
+	case err != nil:
+		return false
+	default:
+		// Zero bytes is an orderly close; anything more is unread data.
+		return n > 0
+	}
+}
+
+// peekSource checks for unread bytes without consuming data or waiting.
+func peekSource(raw *net.UnixConn) (int, error) {
 	rc, err := raw.SyscallConn()
 	if err != nil {
-		return false
+		return 0, err
 	}
 
 	var (
@@ -422,28 +443,22 @@ func sourceOpen(raw *net.UnixConn) bool {
 		peekErr error
 	)
 
-	if err := rc.Read(func(fd uintptr) bool {
+	// Control ignores the read deadline, which may have expired during splice.
+	// MSG_DONTWAIT keeps the receive nonblocking.
+	if err := rc.Control(func(fd uintptr) {
 		var b [1]byte
 
 		for {
 			n, _, peekErr = unix.Recvfrom(int(fd), b[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
 			if peekErr != unix.EINTR {
-				return true
+				return
 			}
 		}
 	}); err != nil {
-		return false
+		return 0, err
 	}
 
-	switch {
-	case peekErr == unix.EAGAIN:
-		return true
-	case peekErr != nil:
-		return false
-	default:
-		// Zero bytes is an orderly close; anything more is unread data.
-		return n > 0
-	}
+	return n, peekErr
 }
 
 // copy moves one batch through buffer. It reads once rather than filling the

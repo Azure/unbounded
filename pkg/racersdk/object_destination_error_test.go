@@ -139,21 +139,9 @@ func TestObjectWriteToSpliceEarlyReturn(t *testing.T) {
 }
 
 func TestObjectWriteToSpliceAmbiguousTimeout(t *testing.T) {
-	c := fakeClient(t, offsetOrigin(4<<20))
-
-	o, err := c.Get(t.Context(), Request{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeQuietly(o)
-
-	dst := &spliceDestination{err: os.ErrDeadlineExceeded}
-
-	_, err = o.WriteTo(dst)
-	if !dst.spliced {
-		t.Fatal("WriteTo never spliced")
-	}
-
+	// With no queued source bytes, either side may have stalled.
+	raw, _ := spliceUnixPair(t)
+	err := spliceFailure(raw, os.ErrDeadlineExceeded)
 	assertIs(t, err, os.ErrDeadlineExceeded)
 	assertNotIs(t, err, ErrDestination)
 	assertNotIs(t, err, ErrUnavailable)
