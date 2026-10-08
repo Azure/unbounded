@@ -21,13 +21,20 @@ from unittest.mock import patch
 import e2e
 
 
-def clear_image_pin(test: unittest.TestCase) -> None:
-    """Resolve from the manifest regardless of the environment. CI exports a
-    pinned build for the job, which these tests must not inherit."""
-    for name in ("ACL_IMAGE_URL", "ACL_IMAGE_SHA256", "ACL_IMAGE_BUILD_ID"):
+def clear_image_pin(test: unittest.TestCase, source: str = "manifest") -> None:
+    """Resolve from the given source regardless of the environment. CI exports
+    the source and a pinned build or version for the job, which these tests
+    must not inherit, and the lookups are cached for a real run's sake."""
+    for name in ("ACL_IMAGE_URL", "ACL_IMAGE_SHA256", "ACL_IMAGE_BUILD_ID", "ACL_IMAGE_VERSION"):
         patcher = patch.object(e2e, name, "")
         patcher.start()
         test.addCleanup(patcher.stop)
+    patcher = patch.object(e2e, "ACL_IMAGE_SOURCE", source)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    e2e.acl_image_from_manifest.cache_clear()
+    e2e.acl_gallery_version.cache_clear()
+    test.addCleanup(e2e.acl_gallery_version.cache_clear)
 
 
 class TestHostImageSelection(unittest.TestCase):
@@ -288,6 +295,346 @@ class TestCurlAuthConfig(unittest.TestCase):
         self.assertIn("--config", args)
         self.assertIn('header = "Authorization: Bearer secret-token"', kw["input"])
         printed.assert_any_call("::add-mask::secret-token", flush=True)
+
+
+class TestACLImageSource(unittest.TestCase):
+    """Which source an Azure Container Linux run boots from."""
+
+    def setUp(self):
+        clear_image_pin(self, "gallery")
+
+    def test_the_gallery_image_is_exported_rather_than_downloaded(self):
+        """It names a gallery version and no URL, so acquire_host_image exports
+        it, and it carries no storage token, which the export does not use."""
+        with patch.dict(os.environ, {"HOST_IMAGE_PATH": ""}), \
+                patch.object(e2e, "HOST_BASE_OS", "acl"), \
+                patch.object(e2e, "ACL_IMAGE_VERSION", "3.20261007.1021"):
+            image = e2e.resolved_host_image()
+
+        self.assertEqual(image.gallery, f"{e2e.ACL_IMAGE_GALLERY_IMAGE}/Versions/3.20261007.1021")
+        self.assertEqual(image.file_name, "acl-gallery-3.20261007.1021.qcow2")
+        self.assertEqual((image.url, image.auth, image.sha256), ("", "", ""))
+
+    def test_a_local_image_wins_over_the_gallery(self):
+        with patch.dict(os.environ, {"HOST_IMAGE_PATH": __file__}), \
+                patch.object(e2e, "HOST_BASE_OS", "acl"), \
+                patch.object(e2e, "capture", side_effect=AssertionError("no az call")):
+            image = e2e.resolved_host_image()
+
+        self.assertTrue(image.url.startswith("file://"))
+        self.assertEqual(image.gallery, "")
+
+    def test_settings_for_the_other_source_are_refused(self):
+        """Ignoring them would boot an image other than the one asked for."""
+        cases = [("gallery", "ACL_IMAGE_URL"), ("gallery", "ACL_IMAGE_SHA256"),
+                 ("gallery", "ACL_IMAGE_BUILD_ID"), ("manifest", "ACL_IMAGE_VERSION")]
+        for source, setting in cases:
+            with self.subTest(source=source, setting=setting):
+                with patch.object(e2e, "ACL_IMAGE_SOURCE", source), patch.object(e2e, setting, "x"):
+                    with self.assertRaises(SystemExit):
+                        e2e.acl_image_source()
+
+        with patch.object(e2e, "ACL_IMAGE_SOURCE", "blob"):
+            with self.assertRaises(SystemExit):
+                e2e.acl_image_source()
+
+
+class TestGalleryVersion(unittest.TestCase):
+    """Naming the gallery version, which names the cached image."""
+
+    def setUp(self):
+        clear_image_pin(self, "gallery")
+
+    def test_latest_is_resolved_where_the_image_is_replicated(self):
+        with patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", "sub"), \
+                patch.object(e2e, "capture", return_value="3.20261007.1021") as az:
+            self.assertEqual(e2e.acl_gallery_version(), "3.20261007.1021")
+
+        args = az.call_args.args[0]
+        self.assertEqual(args[:4], ["az", "sig", "image-version", "show-shared"])
+        for flag, value in (("--gallery-unique-name", "b3e01d89-bd55-414f-bbb4-cdfeb2628caa-ACL"),
+                            ("--gallery-image-definition", "acl-1es-eval"),
+                            ("--gallery-image-version", "latest"),
+                            ("--location", e2e.ACL_IMAGE_GALLERY_LOCATION),
+                            ("--subscription", "sub")):
+            self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_a_pinned_version_is_not_looked_up(self):
+        with patch.object(e2e, "ACL_IMAGE_VERSION", "3.1"), \
+                patch.object(e2e, "capture", side_effect=AssertionError("no az call")):
+            self.assertEqual(e2e.acl_gallery_version(), "3.1")
+
+    def test_a_version_that_is_not_a_plain_name_is_refused(self):
+        """It names the cached file, so it must not hold a path or be empty."""
+        for version in ("", "../x", "a b"):
+            with self.subTest(version=version):
+                e2e.acl_gallery_version.cache_clear()
+                with patch.object(e2e, "capture", return_value=version):
+                    with self.assertRaises(SystemExit):
+                        e2e.acl_gallery_version()
+
+    def test_a_malformed_gallery_image_is_refused(self):
+        with patch.object(e2e, "ACL_IMAGE_GALLERY_IMAGE", "/SharedGalleries/g/Images"):
+            with self.assertRaises(SystemExit):
+                e2e.acl_gallery_image()
+
+    def test_resolve_host_image_exports_a_version_that_reads_back(self):
+        """Later steps of the job boot the version resolved once, and the image
+        file is named for it. Nothing goes to the step outputs: CI does not
+        cache the image, so nothing is keyed by its version."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file, output_file = Path(tmp) / "env", Path(tmp) / "output"
+            with patch.object(e2e, "HOST_BASE_OS", "acl"), \
+                    patch.object(e2e, "capture", return_value="3.20261007.1021"), \
+                    patch.dict(os.environ, {"GITHUB_ENV": str(env_file), "GITHUB_OUTPUT": str(output_file)}):
+                e2e.resolve_host_image()
+
+            exported = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
+            self.assertFalse(output_file.exists())
+
+        self.assertEqual(exported, {"ACL_IMAGE_SOURCE": "gallery", "ACL_IMAGE_VERSION": "3.20261007.1021"})
+        e2e.acl_gallery_version.cache_clear()
+        with patch.dict(os.environ, {"HOST_IMAGE_PATH": ""}), \
+                patch.object(e2e, "HOST_BASE_OS", "acl"), \
+                patch.object(e2e, "ACL_IMAGE_VERSION", exported["ACL_IMAGE_VERSION"]), \
+                patch.object(e2e, "capture", side_effect=AssertionError("no az call")):
+            self.assertEqual(e2e.resolved_host_image().file_name, "acl-gallery-3.20261007.1021.qcow2")
+
+
+class FakeAz:
+    """Answers the az calls the export makes, and records them."""
+
+    SAS = "https://md-x.blob.core.windows.net/abcd/abcd?sv=2018-03-28&sr=b&sig=SECRET%3D"
+
+    def __init__(self, fail: set[str] = frozenset(), disks: list[dict] | None = None):
+        self.calls: list[list[str]] = []
+        self.fail = fail
+        self.disks = disks or []
+
+    def verb(self, args: list[str]) -> str:
+        return " ".join(args[1:3])
+
+    def __call__(self, args, **_kw):
+        self.calls.append(args)
+        verb = self.verb(args)
+        if verb in self.fail:
+            raise e2e.subprocess.CalledProcessError(1, args, "", f"{verb} refused")
+        return {
+            "disk list": json.dumps(self.disks),
+            "disk grant-access": json.dumps({"accessSas": self.SAS}),
+        }.get(verb, "")
+
+    def verbs(self) -> list[str]:
+        return [self.verb(args) for args in self.calls]
+
+
+class TestGalleryExport(unittest.TestCase):
+    """The temporary disk always goes, and only a converted image is kept."""
+
+    def _export(self, tmp, az, download=None, rg="rg"):
+        destination = Path(tmp) / "acl-gallery-3.1.qcow2.part"
+        downloads = []
+
+        def fake_download(sas, vhd, fetch=None):
+            downloads.append(sas)
+            if download:
+                download()
+            vhd.write_bytes(b"vhd")
+
+        def fake_run(args, **_kw):
+            if args[:2] == ["qemu-img", "convert"]:
+                Path(args[-1]).write_bytes(b"qcow2")
+
+        with patch.object(e2e, "ACL_IMAGE_RESOURCE_GROUP", rg), \
+                patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", ""), \
+                patch.object(e2e, "capture", side_effect=az), \
+                patch.object(e2e, "download_page_blob", side_effect=fake_download), \
+                patch.object(e2e, "run", side_effect=fake_run):
+            e2e.export_gallery_image("/SharedGalleries/g/Images/i/Versions/3.1", destination)
+        return destination, downloads
+
+    def test_the_disk_is_revoked_and_deleted_after_a_good_export(self):
+        az = FakeAz()
+        with tempfile.TemporaryDirectory() as tmp:
+            destination, downloads = self._export(tmp, az)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), [destination.name],
+                             "only the converted image is kept")
+
+        self.assertEqual(az.verbs(), ["disk list", "disk create", "disk grant-access",
+                                      "disk revoke-access", "disk delete"])
+        self.assertEqual(downloads, [FakeAz.SAS])
+        create = az.calls[1]
+        self.assertEqual(create[create.index("--gallery-image-reference") + 1],
+                         "/SharedGalleries/g/Images/i/Versions/3.1")
+        self.assertIn(f"purpose={e2e.ACL_EXPORT_DISK_TAG}", create)
+        disk = create[create.index("-n") + 1]
+        for call in az.calls[3:]:
+            self.assertEqual(call[call.index("-n") + 1], disk)
+
+    def test_a_failed_download_still_revokes_and_deletes(self):
+        def fail():
+            raise RuntimeError("blob storage answered HTTP 403 Forbidden")
+
+        az = FakeAz()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                self._export(tmp, az, download=fail)
+            self.assertEqual(list(Path(tmp).iterdir()), [], "neither the VHD nor a partial image is left")
+
+        self.assertEqual(az.verbs()[-2:], ["disk revoke-access", "disk delete"])
+
+    def test_a_failed_cleanup_does_not_fail_the_export(self):
+        """The image is good; the next export's sweep removes the disk."""
+        az = FakeAz(fail={"disk revoke-access", "disk delete"})
+        with tempfile.TemporaryDirectory() as tmp:
+            destination, _ = self._export(tmp, az)
+            self.assertEqual(destination.read_bytes(), b"qcow2")
+
+    def test_the_resource_group_is_required(self):
+        az = FakeAz()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                self._export(tmp, az, rg="")
+
+        self.assertEqual(az.calls, [])
+
+    def test_the_sas_is_masked_and_on_no_command_line(self):
+        """A failed command prints its arguments, and GitHub prints whatever
+        is not masked."""
+        az = FakeAz()
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch("builtins.print") as printed:
+            self._export(tmp, az)
+
+        self.assertFalse([args for args in az.calls if any("SECRET" in arg for arg in args)])
+        printed.assert_any_call(f"::add-mask::{FakeAz.SAS}", flush=True)
+
+
+class TestExportSweep(unittest.TestCase):
+    """Cancelled jobs leave disks behind. Only old ones carrying the export's
+    tag are deleted, so a running export elsewhere is never touched."""
+
+    NOW = 1_800_000_000.0
+
+    def _sweep(self, az):
+        with patch.object(e2e, "ACL_IMAGE_RESOURCE_GROUP", "rg"), \
+                patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", ""), \
+                patch.object(e2e, "capture", side_effect=az):
+            e2e.sweep_stale_export_disks(now=self.NOW)
+
+    @staticmethod
+    def _iso(seconds_ago):
+        stamp = e2e.datetime.datetime.fromtimestamp(TestExportSweep.NOW - seconds_ago, e2e.datetime.timezone.utc)
+        # ARM reports seven fractional digits.
+        return stamp.strftime("%Y-%m-%dT%H:%M:%S.1234567+00:00")
+
+    def test_only_stale_disks_are_deleted(self):
+        az = FakeAz(disks=[
+            {"name": "old-sas", "created": self._iso(7 * 3600), "state": "ActiveSAS"},
+            {"name": "old", "created": self._iso(7 * 3600), "state": "Unattached"},
+            {"name": "running", "created": self._iso(600), "state": "ActiveSAS"},
+        ])
+        self._sweep(az)
+
+        query = az.calls[0][az.calls[0].index("--query") + 1]
+        self.assertIn(f"tags.purpose=='{e2e.ACL_EXPORT_DISK_TAG}'", query)
+        touched = [(az.verb(args), args[args.index("-n") + 1]) for args in az.calls[1:]]
+        self.assertEqual(touched, [("disk revoke-access", "old-sas"), ("disk delete", "old-sas"),
+                                   ("disk delete", "old")])
+
+    def test_a_failed_listing_is_not_fatal(self):
+        az = FakeAz(fail={"disk list"})
+        self._sweep(az)
+        self.assertEqual(az.verbs(), ["disk list"])
+
+
+def _fixed_vhd(data: bytes) -> bytes:
+    footer = bytearray(e2e.VHD_FOOTER_SIZE)
+    footer[:8] = b"conectix"
+    footer[48:56] = len(data).to_bytes(8, "big")
+    footer[60:64] = (2).to_bytes(4, "big")
+    return data + bytes(footer)
+
+
+class TestPageBlobDownload(unittest.TestCase):
+    """Only the written pages of a disk are fetched, and they land where the
+    disk has them."""
+
+    def test_page_ranges_are_split_into_bounded_chunks(self):
+        chunks = e2e.page_chunks([(0, 511), (1024, 1024 + 2500 - 1)], chunk=1000)
+        self.assertEqual(chunks, [(0, 511), (1024, 2023), (2024, 3023), (3024, 3523)])
+
+    def _serve(self, disk: bytes, ranges: list[tuple[int, int]]):
+        """Serve a page blob in two page-list pages, as storage does for a
+        disk with many ranges."""
+        requests = []
+
+        def fetch(url, headers):
+            requests.append((url, headers))
+            meta = {"x-ms-blob-content-length": str(len(disk))}
+            if "comp=pagelist" in url:
+                page = ranges[1:] if "marker=" in url else ranges[:1]
+                body = "<PageList>" + "".join(
+                    f"<PageRange><Start>{s}</Start><End>{e}</End></PageRange>" for s, e in page)
+                body += "" if "marker=" in url else "<NextMarker>next page</NextMarker>"
+                return (body + "</PageList>").encode(), meta
+            start, stop = map(int, headers["Range"].removeprefix("bytes=").split("-"))
+            return disk[start:stop + 1], meta
+
+        return fetch, requests
+
+    def test_written_pages_land_at_their_offsets(self):
+        data = bytearray(8192)
+        data[0:512] = b"\x01" * 512
+        data[4096:4608] = b"\x02" * 512
+        disk = _fixed_vhd(bytes(data))
+        # The middle range is listed but holds zeros, and the footer is a page.
+        ranges = [(0, 511), (2048, 2559), (4096, 4607), (len(disk) - 512, len(disk) - 1)]
+        fetch, requests = self._serve(disk, ranges)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "disk.vhd"
+            e2e.download_page_blob("https://sas?sig=x", target, fetch=fetch)
+            self.assertEqual(target.read_bytes(), disk)
+
+        self.assertTrue(any("marker=next%20page" in url for url, _ in requests), "the second page is listed")
+
+    def test_a_disk_that_is_not_a_fixed_vhd_is_refused(self):
+        disk = bytes(4096)
+        fetch, _ = self._serve(disk, [(0, 511), (len(disk) - 512, len(disk) - 1)])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "not a fixed VHD"):
+                e2e.download_page_blob("https://sas?sig=x", Path(tmp) / "disk.vhd", fetch=fetch)
+
+    def test_errors_do_not_name_the_url(self):
+        """The URL is the SAS."""
+        url = FakeAz.SAS
+        denied = e2e.urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+        with patch.object(e2e.urllib.request, "urlopen", side_effect=denied):
+            with self.assertRaises(RuntimeError) as raised:
+                e2e._blob_request(url, {})
+        self.assertNotIn("SECRET", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_transient_failures_are_retried(self):
+        class Response:
+            headers = {"X-Ms-Blob-Content-Length": "3"}
+
+            def read(self):
+                return b"abc"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        busy = e2e.urllib.error.HTTPError("https://example.test/u", 503, "Server Busy", {}, None)
+        with patch.object(e2e.urllib.request, "urlopen", side_effect=[busy, OSError("reset"), Response()]), \
+                patch.object(e2e.time, "sleep"):
+            body, headers = e2e._blob_request("https://example.test/u", {})
+        self.assertEqual((body, headers["x-ms-blob-content-length"]), (b"abc", "3"))
 
 
 if __name__ == "__main__":

@@ -41,20 +41,44 @@ config and unit over SSH instead. The VM fetches the config and the binary from
 the runner, at `IGNITION_SERVE_BASE` when set and otherwise the bridge
 gateway.
 
-The image is resolved from the manifest published alongside it, so a refreshed
-build is picked up without a code change. It is fetched with a federated Azure
-login, because the storage account holding it disables anonymous access and
-shared keys alike. CI downloads and verifies it on every run and never puts it
-in the Actions cache, which a pull request from a fork can restore. The image
-can be chosen in other ways:
+The image comes from one of two sources, chosen by `ACL_IMAGE_SOURCE`:
 
-- `ACL_IMAGE_MANIFEST_URL` reads a different manifest.
-- `ACL_IMAGE_URL`, `ACL_IMAGE_SHA256` and `ACL_IMAGE_BUILD_ID`, set together,
-  pin a build and skip the manifest. `e2e.py resolve-host-image` prints them for
-  the current build; CI runs it once per job.
-- `ACL_IMAGE_BUILD_ID` alone fails the run unless the manifest publishes that
+- `gallery`, the default, is the Azure build of the image, published to the
+  shared compute gallery `ACL_IMAGE_GALLERY_IMAGE` (default
+  `acl-1es-eval`). A gallery image cannot be downloaded as such, so the harness
+  exports it: it creates a temporary managed disk from the version in
+  `ACL_IMAGE_RESOURCE_GROUP`, reads the disk's written pages (about 850 MiB of
+  32.5 GiB) through a one-hour read SAS into a sparse VHD, revokes the SAS,
+  deletes the disk, and converts the VHD to qcow2. The disk is deleted whether
+  or not the export worked, and each export first deletes any export disk older
+  than six hours, which a cancelled job leaves behind. The version is the
+  gallery's latest unless `ACL_IMAGE_VERSION` pins one, and the disk has to be
+  made in `ACL_IMAGE_GALLERY_LOCATION` (default `westus2`), the one region the
+  image is replicated to. `ACL_IMAGE_SUBSCRIPTION` overrides az's default
+  subscription. The gallery publishes no digest; the qcow2's sha256 is logged.
+- `manifest` is the generic build, resolved from the manifest published
+  alongside it in a storage account that disables anonymous access and shared
+  keys alike, and fetched with an Azure login. `ACL_IMAGE_MANIFEST_URL` reads a
+  different manifest. `ACL_IMAGE_URL`, `ACL_IMAGE_SHA256` and
+  `ACL_IMAGE_BUILD_ID`, set together, pin a build and skip the manifest;
+  `ACL_IMAGE_BUILD_ID` alone fails the run unless the manifest publishes that
   build.
-- `HOST_IMAGE_PATH` boots a local file with no Azure login at all:
+
+Either way the image is cached as `acl-<build>.qcow2`, so a newer one is picked
+up without a code change and never masked by an older download. `e2e.py
+resolve-host-image` prints the settings that pin the current build; CI runs it
+once per job. Settings that belong to the other source fail the run rather than
+being ignored.
+
+The gallery export needs, for the identity az is logged in as: on the resource
+group, `Microsoft.Compute/disks/read`, `write`, `delete`,
+`beginGetAccess/action` and `endGetAccess/action` (CI assigns the built-in
+roles Disk Restore Operator and Azure Backup Snapshot Contributor); and on the
+subscription, read access to the shared gallery and to disk operations (CI
+assigns Reader). The identity has to be in a tenant the gallery is shared with.
+
+`HOST_IMAGE_PATH` boots a local file with no Azure login at all, whichever the
+source:
 
 ```sh
 HOST_BASE_OS=acl E2E_SUITE=lifecycle HOST_IMAGE_PATH="$PWD/acl.qcow2" \
