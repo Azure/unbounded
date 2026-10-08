@@ -213,7 +213,7 @@ removes it or anything else in it. Mount a volume at a subdirectory such as
 `/opt/unbounded/artifacts` rather than over `/opt/unbounded`, so it does not
 hide the agent.
 
-Releases up to v0.8.0 installed these files under `/usr/local`. A host installed
+Releases up to v0.10.0 installed these files under `/usr/local`. A host installed
 by one of them moves to `/opt/unbounded/agent` in two stages:
 
 1. **Linked.** The first command of a newer agent that changes the host links
@@ -223,7 +223,7 @@ by one of them moves to `/opt/unbounded/agent` in two stages:
    where they are and the units that run them are unchanged. The older release
    is still the last-good binary, so the daemon can roll back to it, and an
    AgentUpgrade back to it works.
-2. **Moved.** Once neither the current nor the last-good binary is from v0.8.0
+2. **Moved.** Once neither the current nor the last-good binary is from v0.10.0
    or earlier, the daemon copies the files into a real `/opt/unbounded/agent`,
    rewrites the units to use them, removes them from `/usr/local`, and restarts
    itself. That is at the first daemon start after the AgentUpgrade that
@@ -235,7 +235,7 @@ by one of them moves to `/opt/unbounded/agent` in two stages:
 `unbounded-agent reset` removes the agent's files from both locations, and the
 link or the directory at `/opt/unbounded/agent`, at any stage.
 
-After the move, releases up to v0.8.0 cannot run on the host, and an
+After the move, releases up to v0.10.0 cannot run on the host, and an
 AgentUpgrade to one is not supported. Nothing refuses it: the operation reports
 success, and the next AgentUpgrade fails because that release looks for its
 files under `/usr/local`. To recover, copy a newer release's `unbounded-agent`
@@ -248,7 +248,7 @@ locations, or an installation under `/usr/local` beside an existing
 Run `unbounded-agent reset` first.
 
 The install script also places the agent binary at
-`/usr/local/bin/unbounded-agent` where it can, because releases up to v0.8.0
+`/usr/local/bin/unbounded-agent` where it can, because releases up to v0.10.0
 look for it there. Newer releases do not use it, and the daemon removes it.
 
 ### Immutable hosts (read-only /usr)
@@ -258,13 +258,16 @@ no shell-based provisioning path at first boot. Azure Container Linux is one
 such image. `/opt`, and with it the agent's files under `/opt/unbounded/agent`,
 is on the writable root filesystem there.
 
-For these hosts, generate an Ignition config:
+For these hosts, generate an Ignition config. The agent has to be a release
+after v0.10.0: earlier releases install under `/usr/local`, which is read-only
+on these hosts. Set `VERSION` to that release's tag:
 
 ```bash
-curl -fsSLO https://github.com/Azure/unbounded/releases/download/v0.8.1/checksums.txt
+VERSION=vX.Y.Z
+curl -fsSLO "https://github.com/Azure/unbounded/releases/download/${VERSION}/checksums.txt"
 kubectl unbounded machine manual-bootstrap my-node --site mysite \
     --variant ignition \
-    --agent-url https://github.com/Azure/unbounded/releases/download/v0.8.1/unbounded-agent-linux-amd64 \
+    --agent-url "https://github.com/Azure/unbounded/releases/download/${VERSION}/unbounded-agent-linux-amd64" \
     --agent-sha256 "$(grep ' unbounded-agent-linux-amd64$' checksums.txt)" \
     > config.ign
 ```

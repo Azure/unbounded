@@ -77,7 +77,7 @@ staging copy beside a link discards it and starts over. The files under
 can start at every step.
 
 After the move, the last-good binary is a release that knows the host root, so
-automatic rollback is unaffected. An AgentUpgrade to a release up to v0.8.0 is
+automatic rollback is unaffected. An AgentUpgrade to a release up to v0.10.0 is
 not supported and not refused: that release looks for its files under
 `/usr/local`, so its own next upgrade fails to resolve the current binary.
 

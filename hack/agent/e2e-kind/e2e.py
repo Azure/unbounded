@@ -107,8 +107,9 @@ OFFLINE_BOOTSTRAP = os.environ.get("OFFLINE_BOOTSTRAP", "").lower() in ("1", "tr
 # Beside the host root, where the agent docs suggest hosts stage files.
 OFFLINE_ARTIFACTS_DIR = "/opt/unbounded/artifacts"
 
-# The last release before the host root. The migration suite installs it, and
-# returns to it after moving to this build.
+# A release before the host root. The migration suite installs it, and returns
+# to it after moving to this build. v0.10.0 is the last such release and lays
+# the host out as v0.8.0 does; the default moves to it once it is published.
 LEGACY_AGENT_VERSION = os.environ.get("LEGACY_AGENT_VERSION", "v0.8.0")
 LEGACY_AGENT_RELEASE_URL = f"https://github.com/Azure/unbounded/releases/download/{LEGACY_AGENT_VERSION}"
 LEGACY_AGENT_TARBALL = "unbounded-agent-linux-amd64.tar.gz"
@@ -5184,8 +5185,9 @@ def validate_host_root_moved() -> None:
 
 
 def run_legacy_agent(node_config: NodeConfig) -> None:
-    """Install the last release before the host root, through the install script
-    from the published release, as a host installed before the host root got it.
+    """Install LEGACY_AGENT_VERSION, a release before the host root, through the
+    install script from the published release, as a host installed before the
+    host root got it.
     """
 
     if not re.fullmatch(r"v\d+\.\d+\.\d+", LEGACY_AGENT_VERSION):
@@ -5232,9 +5234,10 @@ def _download_legacy_agent_tarball() -> Path:
 
 
 def validate_agent_downgrade_to_legacy() -> None:
-    """Validate AgentUpgrade back to the last release before the host root, while
-    the host is still linked: the link must leave nothing an older agent cannot
-    run with, and the host must not move while that agent is in a slot.
+    """Validate AgentUpgrade back to LEGACY_AGENT_VERSION, a release before the
+    host root, while the host is still linked: the link must leave nothing an
+    older agent cannot run with, and the host must not move while that agent is
+    in a slot.
     """
 
     before_current = read_daemon_current_target()

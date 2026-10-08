@@ -85,7 +85,7 @@ curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
 AGENT_BIN="${tmp_dir}/unbounded-agent"
 chmod 0755 "${AGENT_BIN}"
 
-# Seed the daemon binary path used by agents up to v0.8.0. The agent version is
+# Seed the daemon binary path used by agents up to v0.10.0. The agent version is
 # selected independently of this script - by AGENT_VERSION, by AGENT_URL, or by
 # the default of tracking the latest published release - so it may be one that
 # never writes its own binary and looks for it here. Newer agents install under
@@ -100,7 +100,7 @@ chmod 0755 "${AGENT_BIN}"
 AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"
 if [ ! -x "${AGENT_BIN_TARGET}" ]; then
     if ! { rm -f "${AGENT_BIN_TARGET}" && install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"; } 2>/dev/null; then
-        echo "Not seeding ${AGENT_BIN_TARGET}: it is not writable. Only agents up to v0.8.0 use it."
+        echo "Not seeding ${AGENT_BIN_TARGET}: it is not writable. Only agents up to v0.10.0 use it."
     fi
 fi
 

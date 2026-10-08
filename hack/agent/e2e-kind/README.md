@@ -94,21 +94,22 @@ they do not assert resumable bootstrap or introduce new recovery operations.
 
 ## Host root migration
 
-The `migration` suite starts from a host installed by the last release before
-the host root, `LEGACY_AGENT_VERSION` (default `v0.8.0`), fetched from its
-GitHub release by the install script. Before installing it, the suite stages a
-file under `/opt/unbounded/images`, as a host keeping a local OCI layout beside
-the host root would, and checks it is untouched after the link, the move and
-reset. An AgentUpgrade to this build must link `/opt/unbounded/agent` to
-`/usr/local` and leave that release's layout and units as they were, because
-the older release is now last-good and a rollback needs them. The host then
-reboots, returns to the older release, and upgrades to this build again,
-staying linked throughout. The next upgrade leaves no older release in either
-slot, and the daemon it starts must move the files into a real
+The `migration` suite starts from a host installed by a release before the host
+root, `LEGACY_AGENT_VERSION` (default `v0.8.0`), fetched from its GitHub release
+by the install script. v0.10.0 is the last such release and lays the host out
+the same way; the default moves to it once it is published. Before installing
+it, the suite stages a file under `/opt/unbounded/images`, as a host keeping a
+local OCI layout beside the host root would, and checks it is untouched after
+the link, the move and reset. An AgentUpgrade to this build must link
+`/opt/unbounded/agent` to `/usr/local` and leave that release's layout and units
+as they were, because the older release is now last-good and a rollback needs
+them. The host then reboots, returns to the older release, and upgrades to this
+build again, staying linked throughout. The next upgrade leaves no older release
+in either slot, and the daemon it starts must move the files into a real
 `/opt/unbounded/agent`, point the units at them, remove them from `/usr/local`,
 and restart itself from there. The moved host reboots, then resets, which must
-leave neither root behind. The older release cannot be installed on an
-immutable host, so the suite needs a cloud-init host:
+leave neither root behind. The older release cannot be installed on an immutable
+host, so the suite needs a cloud-init host:
 
 ```sh
 HOST_BASE_OS=ubuntu2404 E2E_SUITE=migration KEEP_ENV=1 \
