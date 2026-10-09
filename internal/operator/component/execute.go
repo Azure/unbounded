@@ -256,18 +256,17 @@ func validatePlan(plan *Plan) error {
 //   - a declared DependsOn that failed
 //   - an earlier operation on the same object that failed, since patching an
 //     object whose creation failed only produces a second, more confusing error
-//   - an earlier tier that failed for the same component and Site, which is the
-//     inferred form: a component's workload is not attempted when that
-//     component's own ConfigMap, RBAC or Namespace did not get written
+//   - an earlier tier that failed for the same component, Site, and
+//     FailureDomain, which is the inferred form: a workload is not attempted
+//     when its domain's ConfigMap or RBAC did not get written
 //
-// The inferred gate is scoped to one component and Site deliberately. Skipping
-// every workload in the cluster because one component's ConfigMap failed would
-// turn a contained failure into an outage; skipping only the component that
-// owns the missing dependency keeps the blast radius where the failure is.
+// The inferred gate is scoped to one component, Site, and FailureDomain so a
+// failure does not block unrelated workloads. Different FailureDomain values
+// bypass only this gate, not declared dependencies or same-object failures.
 //
 // A failed Namespace is the exception and gates every namespaced object in it,
-// whichever component planned it, because nothing can be written into a
-// namespace that does not exist.
+// regardless of component, Site, or FailureDomain, because nothing can be
+// written into a namespace that does not exist.
 func (e *Env) run(ctx context.Context, ordered []plannedOp) ExecutionResult {
 	var (
 		result    ExecutionResult
@@ -392,8 +391,8 @@ func dependsOnStale(op plannedOp, staleRef map[ObjectRef]bool) (ObjectRef, bool)
 	return ObjectRef{}, false
 }
 
-// subject identifies the component and Site an operation was planned for, which
-// is the scope the inferred tier gate applies to.
+// subject identifies the component, Site, and FailureDomain an operation was
+// planned for, which together define the scope of the inferred tier gate.
 type subject struct {
 	Component     string
 	Site          string
