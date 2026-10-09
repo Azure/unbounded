@@ -345,6 +345,8 @@ func TestHealthyGuardsSurviveUnrelatedWriteFailure(t *testing.T) {
 
 	after := &admissionv1.ValidatingAdmissionPolicy{}
 	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: guardNames[0]}, after))
+	// The fake increments the revision on every UID-fenced apply, even a no-op.
+	after.ResourceVersion = before.ResourceVersion
 	require.Equal(t, before, after)
 }
 

@@ -47,11 +47,11 @@ func TestApplyPreservesPreconditionsWithoutHashChurn(t *testing.T) {
 	}).Build()
 	env := &Env{Client: c}
 	require.NoError(t, env.ApplyObject(t.Context(), desired))
-	require.Zero(t, applies)
+	require.Equal(t, 1, applies, "UID preconditions must reach the apiserver even for matching payloads")
 
 	desired.Data["key"] = "changed"
 	require.NoError(t, env.ApplyObject(t.Context(), desired))
-	require.Equal(t, 1, applies)
+	require.Equal(t, 2, applies)
 }
 
 func TestDeleteCarriesObservedPreconditions(t *testing.T) {

@@ -331,6 +331,8 @@ func DeleteOperation(obj client.Object, componentName, site string) Operation {
 // It skips the write when the cached object carries the hash of the exact same
 // desired payload. Read failures are deliberately treated as cache misses so
 // reconciliation still attempts the authoritative write and surfaces its error.
+// UID-pinned applies always reach the apiserver so a stale cache cannot bypass
+// the UID precondition after an object is deleted and recreated.
 func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	desired := ToUnstructured(obj).DeepCopy()
 
@@ -354,9 +356,11 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	comparable := desired.DeepCopy()
 	comparable.SetResourceVersion("")
 
-	if err := e.Client.Get(ctx, key, current); err == nil &&
-		current.GetLabels()[AppliedHashLabel] == hash && DesiredFieldsMatch(comparable.Object, current.Object) {
-		return nil
+	if desired.GetUID() == "" {
+		if err := e.Client.Get(ctx, key, current); err == nil &&
+			current.GetLabels()[AppliedHashLabel] == hash && DesiredFieldsMatch(comparable.Object, current.Object) {
+			return nil
+		}
 	}
 
 	applyCfg := client.ApplyConfigurationFromUnstructured(desired)
