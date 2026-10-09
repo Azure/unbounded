@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: racer-loadgen-control
+  namespace: unbounded-system
+data:
+  concurrency: "8"

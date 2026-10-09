@@ -1,0 +1,76 @@
+{
+  "id": null,
+  "uid": "racer-direct-zipf",
+  "title": "Racer Direct Zipf | 512 x 512 MiB",
+  "description": "Balanced-config experiment: 512 x 536870912-byte blobs, seed zipf-balanced-v1, Zipf exponent 0.5, owned-only disk retention (admission disabled), 4 GiB plaintext, 8 GiB ciphertext, and 2 GiB each for dirty and registered buffers. Balanced describes the configuration goal, not measured hit shares. Wait a full five-minute new-pod window after rollout; historical 64 MiB samples are invalid under this multiplier. Successful payload is not wire traffic or verified goodput. Cache-hit event shares are not client attribution.",
+  "tags": ["racer", "zipf"],
+  "schemaVersion": 39,
+  "version": 2,
+  "editable": false,
+  "timezone": "browser",
+  "refresh": "1m",
+  "time": {"from": "now-1h", "to": "now"},
+  "graphTooltip": 1,
+  "annotations": {"list": []},
+  "templating": {
+    "list": [
+      {"name": "namespace", "label": "Namespace", "type": "textbox", "query": "unbounded-system", "current": {"text": "unbounded-system", "value": "unbounded-system"}, "options": []}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Total successful client payload (Gbit/s)",
+      "description": "Successful generic blob operations times exactly 536870912 bytes (512 MiB). Catalog: 512 blobs, seed zipf-balanced-v1, Zipf exponent 0.5. Includes only completed successes, with or without client hashing. Not wire traffic. Wait until all new pods are ready and the full five-minute window excludes old 64 MiB pod samples. Mixed workloads or historical old-size intervals invalidate this calculation.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "suffix:Gbit/s", "min": 0, "decimals": 2, "noValue": "No data"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"refId": "A", "legendFormat": "Successful payload", "expr": "sum(rate(racer_loadgen_pulls_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",result=\"success\"}[5m])) * 536870912 * 8 / 1e9"}
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Successful payload per discovered Racer node (Gbit/s)",
+      "description": "Total successful client payload divided by distinct nodes with discovered Racer dataplane scrape targets, including down targets. Removed targets disappear; this is not expected fleet inventory or per-server traffic attribution. No traffic, missing scrapes, and missing discovery must be checked separately.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "suffix:Gbit/s", "min": 0, "decimals": 2, "noValue": "No data"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"refId": "A", "legendFormat": "Average per discovered node", "expr": "(sum(rate(racer_loadgen_pulls_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",result=\"success\"}[5m])) * 536870912 * 8 / 1e9) / count(group by (node) (up{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}))"}
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Observed cache-hit event mix (not client attribution)",
+      "description": "Each event rate divided by memory + disk + peer hit event rates. These are shares of observed cache-hit events, not client hit probabilities, byte shares, or lookup hit ratios. Origin fills are excluded. Peer reception and memory/disk serving can count the same page on different nodes; coalesced work is not one event per client read. Idle denominators remain undefined.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 9},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "decimals": 1, "noValue": "No data"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"refId": "A", "legendFormat": "Peer events", "expr": "sum(rate(racer_peer_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])) / (sum(rate(racer_memory_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])) + sum(rate(racer_disk_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])) + sum(rate(racer_peer_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])))"},
+        {"refId": "B", "legendFormat": "Disk events", "expr": "sum(rate(racer_disk_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])) / (sum(rate(racer_memory_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])) + sum(rate(racer_disk_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])) + sum(rate(racer_peer_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])))"},
+        {"refId": "C", "legendFormat": "Memory events", "expr": "sum(rate(racer_memory_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])) / (sum(rate(racer_memory_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])) + sum(rate(racer_disk_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])) + sum(rate(racer_peer_hits_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}[5m])))"}
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Average Racer-host CPU (non-idle)",
+      "description": "Mean non-idle fraction per host, then an equal-weight mean across discovered Racer hosts with CPU samples. Includes all host workloads and I/O wait, not just Racer. Missing host CPU series are not zero. System-only nodes are excluded by the Racer node join.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 9},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "decimals": 1, "noValue": "No data"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"refId": "A", "legendFormat": "Mean host non-idle CPU", "expr": "avg((1 - avg by (node) (rate(node_cpu_seconds_total{job=\"node-exporter\",mode=\"idle\"}[5m]))) and on (node) group by (node) (up{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}))"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+apiVersion: overrides.unbounded-cloud.io/v1alpha1
+overrides:
+  - component: racer
+    kind: Deployment
+    name: racer-controller
+    patch:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: controller
+                image: ghcr.io/azure/racer-controller:f9a088a22a29cf8549e1945af833f508a14199d1
+  - component: racer
+    kind: DaemonSet
+    name: racer-dataplane
+    patch:
+      spec:
+        updateStrategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 100%
+            maxSurge: 0
+        template:
+          metadata:
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "9090"
+              prometheus.io/path: /metrics
+          spec:
+            nodeSelector:
+              agentpool: ddsv6
+            terminationGracePeriodSeconds: 0
+            containers:
+              - name: dataplane
+                image: ghcr.io/azure/racer-dataplane:f9a088a22a29cf8549e1945af833f508a14199d1
+                env:
+                  - name: RACER_PLAINTEXT_BYTES
+                    value: "4294967296"
+                  - name: RACER_CIPHERTEXT_BYTES
+                    value: "8589934592"
+                  - name: RACER_DIRTY_BYTES
+                    value: "2147483648"
+                  - name: RACER_REGISTERED_BYTES
+                    value: "2147483648"
+                  - name: RACER_REQUEST_CONTEXT_BYTES
+                    value: "268435456"
+                  - name: RACER_FLIGHTS
+                    value: "512"
+                  - name: RACER_QUEUE_ENTRIES
+                    value: "4096"
+                  - name: RACER_CLIENT_CONNECTIONS
+                    value: "1024"
+                  - name: RACER_PIPES
+                    value: "256"
+                  - name: RACER_RELAY_TRANSFERS
+                    value: "256"
+                  - name: RACER_ADMISSION_MODE
+                    value: disabled
