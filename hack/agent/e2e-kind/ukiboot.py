@@ -27,9 +27,9 @@ image: the Azure build of the image uses 483 of the 512 bytes in it, which
 leaves no room for even the config URL.
 
 The addon's .cmdline section is padded well beyond its contents, so it can be
-extended in place: no cluster allocation, no directory entry changes, just
-bytes rewritten inside an existing file and the section header's VirtualSize
-adjusted to match.
+extended in place, within its raw size and short of the next section in memory:
+no cluster allocation, no directory entry changes, just bytes rewritten inside
+an existing file and the section header's VirtualSize adjusted to match.
 
 Writes go through qemu-nbd over a unix socket, so no loop device, no nbd kernel
 module and no privileges are involved. Point this at a qcow2 overlay and the
@@ -386,6 +386,15 @@ def fit_cmdline(current: str, extra: str, raw_size: int) -> bytes | None:
     return encoded
 
 
+def extend_cmdline(header: bytes, current: str, extra: str) -> tuple[bytes | None, int]:
+    """Return the command line current extended by extra, encoded, or None if
+    it does not fit the addon whose PE header is header, and the room the
+    .cmdline section has. The room is cmdline_room's, not the raw size: a
+    longer VirtualSize must not reach the next section."""
+    room = cmdline_room(header)
+    return fit_cmdline(current, extra, room), room
+
+
 def find_firstboot_addon(names: list[str], addon_dir: str) -> str:
     """Return the first-boot addon's name as the directory spells it. FAT
     lookups ignore case, so this does too.
@@ -425,9 +434,8 @@ def patch_firstboot_cmdline(image: Path, extra_args: str,
             vsize, _vaddr, rsize, rptr, entry = sections[".cmdline"]
             current = fat.read_file(cluster, size, rptr, min(vsize, rsize) if vsize else rsize)
             current = current.split(b"\x00")[0].decode("utf-8", "replace").strip()
-            room = cmdline_room(header)
 
-            merged = fit_cmdline(current, extra_args, room)
+            merged, room = extend_cmdline(header, current, extra_args)
             if merged is None:
                 raise RuntimeError(
                     f"{addon_dir}/{addon} holds {room} bytes and has {len(current.encode())} in use; "
