@@ -30,11 +30,13 @@ import (
 
 const (
 	day                = 24 * time.Hour
-	caRotationInterval = 7 * day
-	leafLifetime       = 14 * day
-	leafRenewBefore    = 7 * day
-	caLifetime         = 28 * day
-	trustOverlap       = 14 * day
+	caRotationInterval = 180 * day
+	leafLifetime       = 365 * day
+	leafRenewBefore    = 30 * day
+	caLifetime         = 10 * 365 * day
+	trustOverlap       = 360 * day
+	legacyCALifetime   = 28 * day
+	legacyTrustOverlap = 14 * day
 	tlsStateKey        = "rotation.json"
 	previousCAKey      = "previous-ca.crt"
 	caBundleKey        = "ca-bundle.crt"
@@ -234,13 +236,15 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 		return nil, fmt.Errorf("racer serving certificates are not yet valid")
 	}
 
-	if !now.Before(ca.NotAfter) {
-		return nil, fmt.Errorf("racer serving CA expired; restore valid serving state")
-	}
-	// Expired leaves can be renewed, but invalid usage is not silently repaired.
+	// Check expired certificates at their last shared valid instant. Expiration
+	// permits reissue, but does not bypass signature, usage, or state validation.
 	verifyAt := now
 	if !verifyAt.Before(leaf.NotAfter) {
 		verifyAt = leaf.NotAfter.Add(-time.Second)
+	}
+
+	if !verifyAt.Before(ca.NotAfter) {
+		verifyAt = ca.NotAfter.Add(-time.Second)
 	}
 
 	roots := x509.NewCertPool()
@@ -272,7 +276,12 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 		}
 	}
 
-	rotate := !now.Before(state.CreatedAt.Add(caRotationInterval))
+	interval := caRotationInterval
+	if ca.NotAfter.Equal(state.CreatedAt.Add(legacyCALifetime)) {
+		interval = 7 * day
+	}
+
+	rotate := !now.Before(state.CreatedAt.Add(interval))
 	if rotate {
 		newKey, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if keyErr != nil {
@@ -284,17 +293,24 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 			return nil, issueErr
 		}
 
-		cross, crossErr := crossSign(newCA, ca, key)
-		if crossErr != nil {
-			return nil, crossErr
+		if now.Before(ca.NotAfter) {
+			cross, crossErr := crossSign(newCA, ca, key)
+			if crossErr != nil {
+				return nil, crossErr
+			}
+
+			retireAt := now.Add(trustOverlap)
+			if ca.NotAfter.Before(retireAt) {
+				retireAt = ca.NotAfter
+			}
+
+			state.Previous = append([]previousCA{{Root: updated.Data["ca.crt"], Cross: cross, RetireAt: retireAt}}, state.Previous...)
+		} else {
+			// No valid path can pass through the expired CA. Clients must load
+			// the republished trust bundle before they can use the new endpoint.
+			state.Previous = nil
 		}
 
-		retireAt := now.Add(trustOverlap)
-		if ca.NotAfter.Before(retireAt) {
-			retireAt = ca.NotAfter
-		}
-
-		state.Previous = append([]previousCA{{Root: updated.Data["ca.crt"], Cross: cross, RetireAt: retireAt}}, state.Previous...)
 		state.CreatedAt = newCA.NotBefore.Add(time.Hour)
 		updated.Data["ca.crt"] = caPEM
 
@@ -516,7 +532,8 @@ func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (t
 		return state, fmt.Errorf("trailing Racer serving rotation state")
 	}
 
-	if state.Version != 1 || secret.Annotations[tlsStateAnnotation] != "1" || !state.CreatedAt.Equal(ca.NotBefore.Add(time.Hour)) || !ca.NotAfter.Equal(state.CreatedAt.Add(caLifetime)) || len(state.Previous) > maxPreviousCAs {
+	validLifetime := ca.NotAfter.Equal(state.CreatedAt.Add(caLifetime)) || ca.NotAfter.Equal(state.CreatedAt.Add(legacyCALifetime))
+	if state.Version != 1 || secret.Annotations[tlsStateAnnotation] != "1" || !state.CreatedAt.Equal(ca.NotBefore.Add(time.Hour)) || !validLifetime || len(state.Previous) > maxPreviousCAs {
 		return state, fmt.Errorf("invalid Racer serving rotation policy state")
 	}
 
@@ -542,7 +559,12 @@ func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (t
 			expires = root.NotAfter
 		}
 
-		retireAt := child.NotBefore.Add(time.Hour + trustOverlap)
+		overlap := trustOverlap
+		if child.NotAfter.Equal(child.NotBefore.Add(time.Hour + legacyCALifetime)) {
+			overlap = legacyTrustOverlap
+		}
+
+		retireAt := child.NotBefore.Add(time.Hour + overlap)
 		if expires.Before(retireAt) {
 			retireAt = expires
 		}

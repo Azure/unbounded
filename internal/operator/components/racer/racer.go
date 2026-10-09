@@ -70,10 +70,53 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 }
 
 func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.Plan, component.Result, error) {
-	if plan, stop, err := planGuardContainment(ctx, env); stop || err != nil {
-		return plan, component.NotReadyAfter("AdmissionGuardUnavailable", "waiting for Racer admission guards and permission containment", 5*time.Second), err
+	// Maintain only bound, established TLS before unrelated admission, cache,
+	// or durable-state checks. This cannot initialize identity or repair workloads.
+	tlsPlan, _, tlsErr := planRetainedTLS(ctx, env, now)
+	guardPlan, stop, guardErr := planGuardContainment(ctx, env)
+	guardResult := component.NotReadyAfter("AdmissionGuardUnavailable", "waiting for Racer admission guards and permission containment", 5*time.Second)
+
+	if stop && guardErr == nil {
+		// Containment must not wait for TLS writes to succeed. These operations
+		// have no dependencies on each other and never grant new permissions.
+		if tlsErr == nil {
+			for _, op := range tlsPlan.Operations {
+				guardPlan.Add(op)
+			}
+		}
+
+		return guardPlan, guardResult, nil
 	}
 
+	if tlsErr != nil {
+		return nil, component.Result{}, tlsErr
+	}
+
+	if tlsPlan.Len() != 0 && tlsPlan.Operations[0].Object.GetName() == tlsName {
+		return tlsPlan, component.NotReadyAfter("TLSMaintenance", "updating Racer serving TLS and trust", 5*time.Second), nil
+	}
+
+	plan, result, err := guardPlan, guardResult, guardErr
+	if err == nil {
+		plan, result, err = planRuntimeAt(ctx, env, now)
+	}
+
+	if tlsPlan.Len() != 0 && err != nil {
+		// Before the first runtime deployment there may be no trust to repair.
+		// Keep startup errors visible rather than starting a new publication.
+		if tlsPlan.Operations[0].Kind == component.OpCreateIfAbsent {
+			if readErr := env.LiveReader().Get(ctx, objectKey(env, controllerName), &appsv1.Deployment{}); readErr != nil {
+				return plan, result, err
+			}
+		}
+
+		return tlsPlan, component.NotReadyAfter("TLSMaintenance", "updating Racer serving trust before runtime repair", 5*time.Second), nil
+	}
+
+	return plan, result, err
+}
+
+func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*component.Plan, component.Result, error) {
 	caches := &racerv1.ClusterCacheList{}
 	if err := env.LiveReader().List(ctx, caches, client.Limit(1)); err != nil {
 		return nil, component.Result{}, err

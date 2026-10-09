@@ -5,21 +5,27 @@ package racer
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -164,11 +170,14 @@ func TestTLSCorruptionAndExpiredCAFailsClosed(t *testing.T) {
 			secret.UID = "test-tls"
 			delete(secret.Data, key)
 			env := testEnv(t, secret)
+
 			plan := component.NewPlan()
-			value, err := planTLSAt(t.Context(), env, plan, "test-installation", false, now.Add(caRotationInterval))
-			require.Error(t, err)
-			require.Nil(t, value)
-			require.Zero(t, plan.Len())
+			for _, at := range []time.Time{now.Add(caRotationInterval), now.Add(caRotationInterval + caLifetime)} {
+				value, err := planTLSAt(t.Context(), env, plan, "test-installation", false, at)
+				require.Error(t, err)
+				require.Nil(t, value)
+				require.Zero(t, plan.Len())
+			}
 		})
 	}
 
@@ -198,13 +207,15 @@ func TestTLSCorruptionAndExpiredCAFailsClosed(t *testing.T) {
 				require.NoError(t, writeTLSState(secret, state))
 			}
 
-			_, err := renewTLS(secret, "custom-system", now.Add(caRotationInterval))
-			require.Error(t, err)
+			for _, at := range []time.Time{now.Add(caRotationInterval), now.Add(caRotationInterval + caLifetime)} {
+				_, err := renewTLS(secret, "custom-system", at)
+				require.Error(t, err)
+			}
 		})
 	}
 
-	_, err = renewTLS(original, "custom-system", now.Add(caLifetime))
-	require.ErrorContains(t, err, "CA expired")
+	_, err = renewTLS(original, "other-system", now.Add(caLifetime))
+	require.Error(t, err)
 	_, err = renewTLS(original, "other-system", now)
 	require.Error(t, err)
 }
@@ -296,7 +307,13 @@ func TestRetainedTLSMaintenanceDoesNotRepairController(t *testing.T) {
 		for _, kind := range []string{"Secret", "ConfigMap"} {
 			plan, result, err := planAt(t.Context(), env, at)
 			require.NoError(t, err)
-			require.Equal(t, component.ReasonDisabled, result.Reason)
+
+			if kind == "Secret" {
+				require.Equal(t, "TLSMaintenance", result.Reason)
+			} else {
+				require.Equal(t, component.ReasonDisabled, result.Reason)
+			}
+
 			require.Len(t, plan.Operations, 1)
 			require.Equal(t, kind, plan.Operations[0].Object.GetKind())
 			persist(t, env, plan)
@@ -348,14 +365,19 @@ func TestRetainedTLSMissingSecretBeforeEstablishment(t *testing.T) {
 }
 
 func TestTLSUncertainWritesAndForbiddenRotation(t *testing.T) {
-	for _, scenario := range []string{"create-response-lost", "patch-response-lost", "patch-forbidden"} {
+	for _, scenario := range []string{"create-response-lost", "patch-response-lost", "patch-forbidden", "expired-patch-response-lost", "expired-patch-forbidden"} {
 		t.Run(scenario, func(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Second)
 			env := testEnv(t)
 
 			fresh := scenario == "create-response-lost"
 			if !fresh {
-				secret, err := newTLS(env.Namespace, now.Add(-caRotationInterval))
+				age := caRotationInterval
+				if scenario == "expired-patch-response-lost" || scenario == "expired-patch-forbidden" {
+					age = caLifetime
+				}
+
+				secret, err := newTLS(env.Namespace, now.Add(-age))
 				require.NoError(t, err)
 				bindRuntime(secret, "test-installation")
 				require.NoError(t, env.Client.Create(t.Context(), secret))
@@ -373,7 +395,7 @@ func TestTLSUncertainWritesAndForbiddenRotation(t *testing.T) {
 					return errors.New("lost create response")
 				},
 				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-					if scenario == "patch-forbidden" {
+					if scenario == "patch-forbidden" || scenario == "expired-patch-forbidden" {
 						return apierrors.NewForbidden(corev1.Resource("secrets"), tlsName, errors.New("denied"))
 					}
 
@@ -390,7 +412,7 @@ func TestTLSUncertainWritesAndForbiddenRotation(t *testing.T) {
 			value, err = planTLSAt(t.Context(), env, restart, "test-installation", false, now)
 			require.NoError(t, err)
 
-			if scenario == "patch-forbidden" {
+			if scenario == "patch-forbidden" || scenario == "expired-patch-forbidden" {
 				require.Nil(t, value)
 				require.Len(t, restart.Operations, 1)
 			} else {
@@ -435,4 +457,264 @@ func TestDerivedBundleAndRetainedTrustRepair(t *testing.T) {
 	require.Equal(t, component.OpCreateIfAbsent, plan.Operations[0].Kind)
 	persist(t, env, plan)
 	require.Zero(t, planPass(t, env).Len())
+}
+
+func legacyTLS(t *testing.T, now time.Time) *corev1.Secret {
+	t.Helper()
+
+	secret, err := newTLS("custom-system", now)
+	require.NoError(t, err)
+	caPair, err := tls.X509KeyPair(secret.Data["ca.crt"], secret.Data["ca.key"])
+	require.NoError(t, err)
+	ca, err := singleCertificate(secret.Data["ca.crt"])
+	require.NoError(t, err)
+
+	ca.NotAfter = now.Add(legacyCALifetime)
+	key := caPair.PrivateKey.(*ecdsa.PrivateKey)
+	der, err := x509.CreateCertificate(rand.Reader, ca, ca, ca.PublicKey, key)
+	require.NoError(t, err)
+
+	secret.Data["ca.crt"] = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	leaf, err := singleCertificate(secret.Data[corev1.TLSCertKey])
+	require.NoError(t, err)
+
+	leaf.NotAfter = now.Add(14 * day)
+	der, err = x509.CreateCertificate(rand.Reader, leaf, ca, leaf.PublicKey, key)
+	require.NoError(t, err)
+
+	secret.Data[corev1.TLSCertKey] = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	require.NoError(t, writeTLSState(secret, tlsState{Version: 1, CreatedAt: now}))
+
+	return secret
+}
+
+func TestTLSExpiredCAReissue(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, legacy := range []bool{false, true} {
+		original, err := newTLS("custom-system", now)
+		require.NoError(t, err)
+
+		if legacy {
+			original = legacyTLS(t, now)
+		}
+
+		ca, err := singleCertificate(original.Data["ca.crt"])
+		require.NoError(t, err)
+
+		for _, at := range []time.Time{ca.NotAfter.Add(-time.Second), ca.NotAfter, ca.NotAfter.Add(365 * day)} {
+			next, err := renewTLS(original, "custom-system", at)
+			require.NoError(t, err)
+			require.NotNil(t, next)
+			require.NotEqual(t, original.Data["ca.key"], next.Data["ca.key"])
+			require.NoError(t, verifyServing(t, next, next.Data[caBundleKey], at))
+
+			if at.Before(ca.NotAfter) {
+				require.NoError(t, verifyServing(t, next, original.Data["ca.crt"], at))
+			} else {
+				require.Empty(t, stateOf(t, next).Previous)
+				require.Error(t, verifyServing(t, next, original.Data["ca.crt"], at))
+			}
+
+			unchanged, err := renewTLS(next, "custom-system", at)
+			require.NoError(t, err)
+			require.Nil(t, unchanged)
+		}
+	}
+}
+
+func TestTLSLegacyRotationMigration(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	previous := legacyTLS(t, now)
+	current := legacyTLS(t, now.Add(7*day))
+	parent, err := singleCertificate(previous.Data["ca.crt"])
+	require.NoError(t, err)
+	child, err := singleCertificate(current.Data["ca.crt"])
+	require.NoError(t, err)
+	pair, err := tls.X509KeyPair(previous.Data["ca.crt"], previous.Data["ca.key"])
+	require.NoError(t, err)
+	cross, err := crossSign(child, parent, pair.PrivateKey.(*ecdsa.PrivateKey))
+	require.NoError(t, err)
+	state := stateOf(t, current)
+	state.Previous = []previousCA{{Root: previous.Data["ca.crt"], Cross: cross, RetireAt: now.Add(21 * day)}}
+	require.NoError(t, writeTLSState(current, state))
+
+	for _, at := range []time.Time{now.Add(14 * day), now.Add(60 * day)} {
+		next, err := renewTLS(current, "custom-system", at)
+		require.NoError(t, err)
+		require.NotNil(t, next)
+		require.NoError(t, verifyServing(t, next, next.Data[caBundleKey], at))
+		ca, err := singleCertificate(next.Data["ca.crt"])
+		require.NoError(t, err)
+		require.Equal(t, at.Add(caLifetime), ca.NotAfter)
+		unchanged, err := renewTLS(next, "custom-system", at)
+		require.NoError(t, err)
+		require.Nil(t, unchanged)
+	}
+}
+
+func TestTLSExpiredCARejectsInvalidUsageAndOwnership(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	for _, failure := range []string{"leaf-usage", "ca-key", "leaf-key", "owner", "future"} {
+		t.Run(failure, func(t *testing.T) {
+			secret, err := newTLS("custom-system", now)
+			require.NoError(t, err)
+			bindRuntime(secret, "test-installation")
+			secret.UID = "test-tls"
+			at := now.Add(caLifetime)
+
+			switch failure {
+			case "leaf-usage":
+				leaf, err := singleCertificate(secret.Data[corev1.TLSCertKey])
+				require.NoError(t, err)
+
+				leaf.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+				ca, err := singleCertificate(secret.Data["ca.crt"])
+				require.NoError(t, err)
+				pair, err := tls.X509KeyPair(secret.Data["ca.crt"], secret.Data["ca.key"])
+				require.NoError(t, err)
+				der, err := x509.CreateCertificate(rand.Reader, leaf, ca, leaf.PublicKey, pair.PrivateKey)
+				require.NoError(t, err)
+
+				secret.Data[corev1.TLSCertKey] = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+			case "ca-key", "leaf-key":
+				other, err := newTLS("custom-system", now)
+				require.NoError(t, err)
+
+				key := "ca.key"
+				if failure == "leaf-key" {
+					key = corev1.TLSPrivateKeyKey
+				}
+
+				secret.Data[key] = other.Data[key]
+			case "owner":
+				bindRuntime(secret, "other-installation")
+			case "future":
+				at = now.Add(-2 * time.Hour)
+			}
+
+			env := testEnv(t, secret)
+			plan := component.NewPlan()
+			value, err := planTLSAt(t.Context(), env, plan, "test-installation", false, at)
+			require.Error(t, err)
+			require.Nil(t, value)
+			require.Zero(t, plan.Len())
+		})
+	}
+}
+
+func TestTLSExpiredCAConcurrentReissue(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	old := &corev1.Secret{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), old))
+	now := stateOf(t, old).CreatedAt.Add(caLifetime)
+	first, _, err := planAt(t.Context(), env, now)
+	require.NoError(t, err)
+	second, _, err := planAt(t.Context(), env, now)
+	require.NoError(t, err)
+
+	for _, plan := range []*component.Plan{first, second} {
+		require.Len(t, plan.Operations, 1)
+		require.Equal(t, tlsName, plan.Operations[0].Object.GetName())
+	}
+
+	persist(t, env, first)
+	result, err := env.Execute(t.Context(), second)
+	require.NoError(t, err)
+	require.Len(t, result.Deferred, 1)
+
+	trust := &corev1.ConfigMap{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, trustName), trust))
+	require.Equal(t, string(servingRoots(old)), trust.Data["ca.crt"])
+	plan, _, err := planAt(t.Context(), env, now)
+	require.NoError(t, err)
+	persist(t, env, plan)
+
+	stored := &corev1.Secret{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, trustName), trust))
+	require.Equal(t, string(servingRoots(stored)), trust.Data["ca.crt"])
+	require.NoError(t, verifyServing(t, stored, []byte(trust.Data["ca.crt"]), now))
+}
+
+func TestTLSEstablishedMaintenanceBeforeUnrelatedFailures(t *testing.T) {
+	for _, failure := range []string{"guards", "cache-list", "durable-state"} {
+		t.Run(failure, func(t *testing.T) {
+			env := testEnv(t, cacheObject("cache"))
+			initialize(t, env)
+
+			secret := &corev1.Secret{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), secret))
+			at := stateOf(t, secret).CreatedAt.Add(caLifetime)
+			old := secret.DeepCopy()
+
+			env.APIReader = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					_, guard := obj.(*admissionv1.ValidatingAdmissionPolicy)
+					if (failure == "guards" && guard) || (failure == "durable-state" && key.Name == versionName) {
+						return errors.New("unrelated failure")
+					}
+
+					return c.Get(ctx, key, obj, opts...)
+				},
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, caches := list.(*racerv1.ClusterCacheList); failure == "cache-list" && caches {
+						return errors.New("unrelated failure")
+					}
+
+					return c.List(ctx, list, opts...)
+				},
+			})
+			for _, name := range []string{tlsName, trustName} {
+				plan, _, err := planAt(t.Context(), env, at)
+				require.NoError(t, err)
+				require.Len(t, plan.Operations, 1)
+				require.Equal(t, name, plan.Operations[0].Object.GetName())
+				persist(t, env, plan)
+			}
+
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), secret))
+
+			trust := &corev1.ConfigMap{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, trustName), trust))
+			require.NoError(t, verifyServing(t, secret, []byte(trust.Data["ca.crt"]), at))
+			require.Error(t, verifyServing(t, secret, old.Data["ca.crt"], at))
+			plan, _, err := planAt(t.Context(), env, at)
+			require.Error(t, err)
+			require.Nil(t, plan)
+		})
+	}
+}
+
+func TestTLSWriteFailureDoesNotDelayGuardContainment(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	secret := &corev1.Secret{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), secret))
+	at := stateOf(t, secret).CreatedAt.Add(caLifetime)
+	guard := &admissionv1.ValidatingAdmissionPolicy{}
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: guardNames[0]}, guard))
+	guard.Spec.Validations = nil
+	require.NoError(t, env.Client.Update(t.Context(), guard))
+	plan, _, err := planAt(t.Context(), env, at)
+	require.NoError(t, err)
+	require.Len(t, plan.Operations, 3)
+
+	env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+		Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+			return errors.New("TLS write denied")
+		},
+	})
+	result, err := env.Execute(t.Context(), plan)
+	require.NoError(t, err)
+	require.ErrorContains(t, result.Err(), "TLS write denied")
+	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, controllerName), &rbacv1.RoleBinding{})))
+	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), client.ObjectKey{Name: controllerName}, &rbacv1.ClusterRoleBinding{})))
+
+	stored := &corev1.Secret{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
+	require.Equal(t, secret.Data, stored.Data)
 }
