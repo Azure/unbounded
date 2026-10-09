@@ -35,24 +35,32 @@ overrides:
                 image: ghcr.io/azure/racer-dataplane:f9a088a22a29cf8549e1945af833f508a14199d1
                 env:
                   - name: RACER_PLAINTEXT_BYTES
-                    value: "8589934592"
+                    value: "34359738368"
                   - name: RACER_CIPHERTEXT_BYTES
-                    value: "17179869184"
+                    value: "68719476736"
                   - name: RACER_DIRTY_BYTES
                     value: "2147483648"
                   - name: RACER_REGISTERED_BYTES
                     value: "2147483648"
                   - name: RACER_REQUEST_CONTEXT_BYTES
-                    value: "268435456"
+                    value: "1073741824"
                   - name: RACER_FLIGHTS
-                    value: "512"
+                    value: "2048"
                   - name: RACER_QUEUE_ENTRIES
-                    value: "4096"
+                    value: "16384"
                   - name: RACER_CLIENT_CONNECTIONS
-                    value: "1024"
+                    value: "16384"
                   - name: RACER_PIPES
-                    value: "256"
+                    value: "1024"
                   - name: RACER_RELAY_TRANSFERS
-                    value: "256"
+                    value: "1024"
+                  - name: RACER_CONNECTIONS_PER_NEIGHBOR
+                    value: "8"
+                  - name: RACER_PEER_INFLIGHT_MAX
+                    value: "1024"
+                  - name: RACER_PEER_PER_NEIGHBOR_MAX
+                    value: "128"
+                  - name: RACER_ACTIVE_PATH_SEARCHES
+                    value: "64"
                   - name: RACER_ADMISSION_MODE
                     value: disabled

@@ -4,4 +4,4 @@ metadata:
   name: racer-loadgen-control
   namespace: unbounded-system
 data:
-  concurrency: "8"
+  concurrency: "16"

@@ -1,7 +1,7 @@
 # Racer-only Zipf benchmark
 
 Direct UDS, 512 x 2 GiB generic blobs (1 TiB shared), Zipf 0.5,
-seed `zipf-balanced-v1`, concurrency 8, no client
+seed `zipf-balanced-v1`, concurrency 16, no client
 hash verification. Loadgen and dataplane select `agentpool=ddsv6`. The overlay
 pins all three images to source tag `f9a088a22a29cf8549e1945af833f508a14199d1`.
 Confirm builds and image digests before deployment. SHA tags are not digest pins.
@@ -11,15 +11,23 @@ This is an owned-only disk-retention comparison, not the default retention polic
 admission and integrity checks remain active. The seed stays `zipf-balanced-v1`;
 larger blobs change content digests. Do not erase existing disk data.
 
-Node budgets are plaintext 8 GiB, ciphertext 16 GiB, dirty 2 GiB, registered 2 GiB,
-and request contexts 256 MiB. Counts are flights 512, queue entries 4096, client
-connections 1024, pipes 256, and relay transfers 256. Worker sizing stays automatic;
+Node budgets are plaintext 32 GiB, ciphertext 64 GiB, dirty 2 GiB, registered 2 GiB,
+and request contexts 1 GiB. Counts are flights 2048, queue entries 16384, client
+connections 16384, pipes 1024, and relay transfers 1024. Per-neighbor connections
+are 8, peer inflight maximum 1024, peer per-neighbor maximum 128, and active path
+searches 64. Optional path-cache settings remain unchanged. Worker sizing stays automatic;
 the target nodes select 21 I/O and 11 crypto workers. No Kubernetes limits are set.
-These resident budgets preserve about 390 MiB plaintext and 780 MiB ciphertext
-per I/O worker. The authorized experiment doubles only plaintext and ciphertext
-from 4/8 GiB to 8/16 GiB. Keep automatic threads, all other budgets, no CPU or
-memory limits, and three approved NVMe devices per node unchanged. Patch only
-the two explicit dataplane env values, matching their names and old values.
+These budgets provide about 1.52 GiB plaintext and 3.05 GiB ciphertext per I/O
+worker. Phase 3 retains phase 2's payload budgets and raises the capacity package
+listed above together. Node quotas are divided by I/O workers, then outbound
+connections get one quarter: 195 slots per worker at 21 workers
+(`cmd/racer-dataplane/src/app.rs:2399-2414`, `admission.rs:134-142`). Total and
+ingress connection capacity also rise. Keep all other budgets, automatic threads,
+no CPU or memory limits, and three approved NVMe devices per node unchanged.
+Require fresh MemAvailable above 128 GiB on every node before changing budgets.
+Patch only the authorized capacity env values with JSON tests for resourceVersion,
+spec, and old env. Env names and defaults are in
+`cmd/racer-dataplane/src/config.rs:195-240`.
 Keep the existing 100% rollout and zero grace. Leave loadgens running with their
 current template, including the user's live `--blob-concurrency=4`, to avoid
 hashing the catalog again. Do not apply the loadgen overlay for this experiment.
@@ -29,18 +37,36 @@ template. Each generic operation contains one blob, so `--blob-concurrency=4`
 does not increase parallel reads for this workload. Changing the Pod template
 restarts catalog hashing. Leave loadgen running when the experiment ends.
 
-With 8/16 GiB budgets, the October 9 tests rejected C12 and C16: failed pulls
-were about 36% and 83%, respectively. Peer overloads exhausted candidate budgets
-and truncated reads; the resource causing the first overload was not proven.
-Retain C8 until that failure is addressed. A fresh C8 recovery window delivered
-1,494 Gbit/s with 0.165% failed pulls; larger caches did not remove all errors.
+October 9 results across all 100 loadgens (C means request concurrency):
+
+| Configuration | Concurrency | Gbit/s | Failed pulls |
+| --- | --- | --- | --- |
+| Connections only: 4096, payload 8/16 GiB | C16 | 945.0 | 83.66% |
+| Payload 32/64 GiB, connections 4096 | C16 | 1,116.6 | 78.05% |
+| Full capacity package above, final window | C16 | 1,668.3 | 0.0135% |
+| Full capacity package | C32 | 1,674.3 | 0.0135% |
+| Full capacity package, sustained 147-second check | C64 | 1,727.8 | 1.183% |
+
+C16 is the final setting. C32 missed the required 5% throughput gain; sustained
+C64 exceeded the 1% failure limit. Final C16 had 7,405 successes and one timeout,
+about 11.7% more throughput than the original 1,494 Gbit/s C8 reference. These
+tests do not isolate which limit helped or prove long-term reliability.
+
+The aggressive dataplane rollout caused NVMe device-busy errors and file-slab
+fallback on 93 nodes. Check raw-device selection after each rollout; recovery
+verified all 300 approved devices across 100 nodes, with 21/11 workers and no
+resource limits. Loadgens did not restart.
+
+`control.yaml` and the source startup fallback select 16. The live startup
+fallback remains 8; its mounted control file selects 16. Live
+`--blob-concurrency=4` and source `--blob-concurrency=1` remain unchanged.
 
 Each loadgen hashes the full catalog before origin readiness. Health and metrics
 start first; readiness remains false during hashing. Startup is bounded by
 `--startup-timeout=60m` and a readiness startup probe with 390 attempts at 10-second
 intervals (65 minutes). The probe leaves room for the application deadline.
 The prior 256 GiB catalog took about six minutes to hash; 1 TiB needs more headroom
-than the prior 25-minute deadline. This is not a workload duration; C8 continues
+than the prior 25-minute deadline. This is not a workload duration; configured load continues
 after startup. Observe startup in bounded five-minute phases, not a full-length
 rollout wait. Record startup logs and restarts; readiness is false during hashing.
 The flatter exponent changes popularity only, not content. Changing it requires
@@ -52,13 +78,14 @@ logical delivery is not network traffic or client-verified content. Measure fres
 counter increments after warmup. Memory, disk, and peer counters count acquisition
 events across providers and requesters, not exclusive client-read outcomes.
 
-For an existing C8 deployment, grow the catalog by patching only the loadgen:
+Only for a separately authorized catalog rollout, patch the loadgen as follows.
+Do not run this on the active C16 test; it restarts catalog hashing:
 
 ```sh
 timeout --signal=TERM --kill-after=10s 60s kubectl --context=joolshev-nvme-test -n unbounded-system patch daemonset racer-loadgen --type=strategic --patch-file=deploy/racer-loadgen/zipf/daemonset-patch.yaml
 ```
 
-First check the live context, C8 control ConfigMap, image, and dataplane Pod UIDs.
+First check the live context, control ConfigMap, image, and dataplane Pod UIDs.
 Verify those UIDs are unchanged afterward. This keeps the existing image, buffers,
 dataplane, volume, and control ConfigMap; do not apply the full overlay for this
 change. The 100% rollout restarts all loadgens and interrupts load during hashing.
@@ -171,7 +198,7 @@ timeout --signal=TERM --kill-after=10s 60s kubectl --context=joolshev-nvme-test 
 timeout --signal=TERM --kill-after=10s 60s bash -o pipefail -c 'kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/racer-loadgen/zipf | kubectl --context=joolshev-nvme-test apply -f -'
 ```
 
-The last command starts at C8. For a paused first deployment, use
+The last command starts at C16. For a paused first deployment, use
 `deploy/racer-loadgen/zipf-paused` instead of `deploy/racer-loadgen/zipf` in the
 render/apply command. This changes the control ConfigMap to `"0"`.
 For an existing deployment, the following pauses reads without removing origins:
@@ -181,7 +208,8 @@ timeout --signal=TERM --kill-after=10s 60s kubectl --context=joolshev-nvme-test 
 ```
 
 Wait for projected ConfigMap updates, applied concurrency zero, and in-flight zero
-on every loadgen. Resume with the same command using `"8"`. Reapplying the overlay
-also restores C8; do not reapply it while a pause must be retained. A readiness
+on every loadgen. For a new deployment, start cautiously at `"8"` and validate
+before raising concurrency. Reapplying the overlay selects C16 and may restart
+loadgens; do not use it to control an active experiment or retain a pause. A readiness
 probe proves origin readiness, not successful cache reads. Inspect acquisition
 errors and received bytes; verify=false does not credit verified-byte metrics.

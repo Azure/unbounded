@@ -60,11 +60,13 @@ class DashboardTest(unittest.TestCase):
 
     def test_experiment_buffer_descriptions(self):
         readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
+        self.assertEqual(DASHBOARD["version"], 5)
         for text in (DASHBOARD["description"], readme):
-            self.assertIn("8 GiB plaintext, 16 GiB ciphertext", text)
+            self.assertIn("32 GiB plaintext, 64 GiB ciphertext", text)
             self.assertIn("2 GiB each for dirty and", text)
-            self.assertNotIn("4 GiB plaintext", text)
-            self.assertNotIn("8 GiB ciphertext", text)
+            for stale in ("4 GiB plaintext", "8 GiB plaintext",
+                          "8 GiB ciphertext", "16 GiB ciphertext"):
+                self.assertNotIn(stale, text)
 
     def test_rollout_gate_excludes_old_size_and_missing_process_metrics(self):
         boundary = int(datetime.datetime(2026, 10, 9, 20, 5, 50,

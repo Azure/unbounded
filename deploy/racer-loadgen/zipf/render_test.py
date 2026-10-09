@@ -42,7 +42,8 @@ class OverlayTest(unittest.TestCase):
                            "catalog-blobs": "512", "blob-bytes": "2147483648",
                            "seed": "zipf-balanced-v1", "startup-timeout": "60m",
                            "profile": "zipf", "zipf-exponent": "0.5",
-                           "verify": "false", "concurrency": "8"}.items():
+                           "verify": "false", "concurrency": "16",
+                           "blob-concurrency": "1"}.items():
             self.assertEqual(args[key], value)
         self.assertEqual(container["image"], "ghcr.io/azure/racer-loadgen:" + SHA)
         self.assertEqual(pod["nodeSelector"]["agentpool"], "ddsv6")
@@ -62,7 +63,8 @@ class OverlayTest(unittest.TestCase):
         self.assertTrue(any(v.get("configMap", {}).get("name") == "racer-loadgen-control"
                             for v in pod["volumes"]))
         cm = next(o for o in objects if o["kind"] == "ConfigMap")
-        self.assertEqual(cm["data"]["concurrency"], "8")
+        self.assertEqual(cm["data"]["concurrency"], "16")
+        self.assertEqual(args["concurrency"], cm["data"]["concurrency"])
         volume = next(o for o in objects if o["kind"] == "ClusterVolume")
         self.assertNotIn("namespace", volume["metadata"])
 
@@ -97,22 +99,35 @@ class OverlayTest(unittest.TestCase):
         self.assertEqual(dp["template"]["spec"]["nodeSelector"], {"agentpool": "ddsv6"})
         self.assertEqual(dp["updateStrategy"]["rollingUpdate"]["maxSurge"], 0)
         env = {e["name"]: e["value"] for e in dp["template"]["spec"]["containers"][0]["env"]}
-        for key, value in {"RACER_PLAINTEXT_BYTES": "8589934592",
-                           "RACER_CIPHERTEXT_BYTES": "17179869184",
+        for key, value in {"RACER_PLAINTEXT_BYTES": "34359738368",
+                           "RACER_CIPHERTEXT_BYTES": "68719476736",
                            "RACER_DIRTY_BYTES": "2147483648",
                            "RACER_REGISTERED_BYTES": "2147483648",
-                           "RACER_REQUEST_CONTEXT_BYTES": "268435456",
+                           "RACER_REQUEST_CONTEXT_BYTES": "1073741824",
+                           "RACER_FLIGHTS": "2048",
+                           "RACER_QUEUE_ENTRIES": "16384",
+                           "RACER_CLIENT_CONNECTIONS": "16384",
+                           "RACER_PIPES": "1024",
+                           "RACER_RELAY_TRANSFERS": "1024",
+                           "RACER_CONNECTIONS_PER_NEIGHBOR": "8",
+                           "RACER_PEER_INFLIGHT_MAX": "1024",
+                           "RACER_PEER_PER_NEIGHBOR_MAX": "128",
+                           "RACER_ACTIVE_PATH_SEARCHES": "64",
                            "RACER_ADMISSION_MODE": "disabled"}.items():
             self.assertEqual(env[key], value)
         self.assertNotIn("RACER_MAX_THREADS", env)
-        self.assertGreater(int(env["RACER_PLAINTEXT_BYTES"]) // 21, 128 * 2**20)
-        self.assertGreater(int(env["RACER_CIPHERTEXT_BYTES"]) // 21, 256 * 2**20)
+        self.assertEqual(int(env["RACER_PLAINTEXT_BYTES"]) // 21, 1636178017)
+        self.assertEqual(int(env["RACER_CIPHERTEXT_BYTES"]) // 21, 3272356035)
+        self.assertEqual((int(env["RACER_CLIENT_CONNECTIONS"]) // 21) // 4, 195)
+        for key in ("RACER_PLACEMENT_CACHE_BYTES", "RACER_CACHED_PATHS",
+                    "RACER_PATH_CACHE_BYTES", "RACER_RETAINED_SNAPSHOTS"):
+            self.assertNotIn(key, env)
 
     def test_dashboard_workload_contract(self):
         dashboard = json.loads((ROOT.parent.parent / "racer/grafana-direct-zipf.json").read_text())
         description = dashboard["description"]
         for value in ("512 x 2147483648-byte", "zipf-balanced-v1", "exponent 0.5",
-                      "8 GiB plaintext", "16 GiB ciphertext",
+                      "32 GiB plaintext", "64 GiB ciphertext",
                       "2 GiB each for dirty and registered", "owned-only"):
             self.assertIn(value, description)
         for panel in dashboard["panels"][:2]:

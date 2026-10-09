@@ -9,7 +9,7 @@ Run only the intended `racer-loadgen` workload in the selected namespace:
 direct UDS, `--catalog-blobs=512`, `--blob-bytes=2147483648`,
 `--seed=zipf-balanced-v1`, `--profile=zipf`, and `--zipf-exponent=0.5`.
 The balanced-config experiment uses owned-only disk retention (admission
-disabled), 8 GiB plaintext, 16 GiB ciphertext, and 2 GiB each for dirty and
+disabled), 32 GiB plaintext, 64 GiB ciphertext, and 2 GiB each for dirty and
 registered buffers. This is a workload description, not a claim
 that measured memory, disk, and peer event shares are balanced.
 Successful payload is completed successful operations times that exact size.
