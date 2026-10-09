@@ -30,6 +30,7 @@
 package transfer
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -43,6 +44,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/manifest"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 )
@@ -50,6 +52,8 @@ import (
 // MirroredHeader is the OCI-extension header peers MUST include on every
 // transfer-endpoint request. It is the loop-breaker described in the design doc.
 const MirroredHeader = "Gantry-Mirrored"
+
+const manifestContentTypePrefixSize = 4 * 1024
 
 // Server serves peer-fetch requests from the local content store.
 type Server struct {
@@ -270,8 +274,25 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 
 	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
 
+	contentReader := io.Reader(rc)
+	mediaTypeHint := s.lookupMediaType(d)
+	bodyContentType := ""
+
+	if kind == ifaces.KindManifest && mediaTypeHint == "" {
+		if readerAt, ok := rc.(io.ReaderAt); ok && size >= 0 {
+			bodyContentType = manifest.DetectContentTypeFromReader(io.NewSectionReader(readerAt, 0, size))
+		} else {
+			buffered := bufio.NewReaderSize(rc, manifestContentTypePrefixSize)
+			if peek, _ := buffered.Peek(manifestContentTypePrefixSize); len(peek) > 0 { //nolint:errcheck // best-effort sniff
+				bodyContentType = manifest.DetectContentType(peek)
+			}
+
+			contentReader = buffered
+		}
+	}
+
 	w.Header().Set("Docker-Content-Digest", d.String())
-	w.Header().Set("Content-Type", contentTypeFor(kind, s.lookupMediaType(d)))
+	w.Header().Set("Content-Type", contentTypeFor(kind, mediaTypeHint, bodyContentType))
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	rng := r.Header.Get("Range")
@@ -284,7 +305,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 			return
 		}
 
-		written, err := streamcopy.CopyN(w, rc, size)
+		written, err := streamcopy.CopyN(w, contentReader, size)
 		s.bumpServeBytes(kind, written)
 
 		if err != nil {
@@ -318,7 +339,7 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 	rs, isSeeker := rc.(io.ReadSeeker)
 	if !isSeeker {
 		// Fall back to discarding the unwanted prefix.
-		if _, err := streamcopy.CopyN(io.Discard, rc, start); err != nil {
+		if _, err := streamcopy.CopyN(io.Discard, contentReader, start); err != nil {
 			s.logger.Warn("transfer: discard prefix failed", slog.Any("err", err))
 			http.Error(w, "range positioning failed", http.StatusInternalServerError)
 
@@ -329,13 +350,15 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 		http.Error(w, "range positioning failed", http.StatusInternalServerError)
 
 		return
+	} else {
+		contentReader = rs
 	}
 
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.WriteHeader(http.StatusPartialContent)
 
-	written, err := streamcopy.CopyN(w, rc, length)
+	written, err := streamcopy.CopyN(w, contentReader, length)
 	s.bumpServeBytes(kind, written)
 
 	if err != nil {
@@ -387,23 +410,19 @@ func (s *Server) lookupMediaType(d digest.Digest) string {
 	return s.describer.LookupMediaType(d)
 }
 
-// contentTypeFor selects the response Content-Type for a digest-keyed
-// transfer response. The descriptor-index hint wins; otherwise we
-// fall back to a kind-appropriate default. Blob digests can legitimately
-// carry either layer bytes or a manifest body (origin sometimes serves
-// manifests under /blobs/<digest>), but at the peer transfer
-// boundary the requester drove the URL path so kind is authoritative.
-func contentTypeFor(kind ifaces.OriginRefKind, hint string) string {
+// contentTypeFor selects the response Content-Type for a digest-keyed transfer
+// response. The descriptor-index hint wins, followed by the stored manifest
+// body's media type, then a kind-appropriate default.
+func contentTypeFor(kind ifaces.OriginRefKind, hint, bodyContentType string) string {
 	if hint != "" {
 		return hint
 	}
 
+	if bodyContentType != "" {
+		return bodyContentType
+	}
+
 	if kind == ifaces.KindManifest {
-		// Safe OCI manifest default - containerd's CRI plugin
-		// dispatches on the schemaVersion/mediaType inside the
-		// body, not the wire Content-Type. See mirror.go
-		// writeBlobHeadersWithPrefix for the same rationale on
-		// the local-pull side.
 		return "application/vnd.oci.image.manifest.v1+json"
 	}
 

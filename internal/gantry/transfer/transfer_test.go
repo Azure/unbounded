@@ -537,6 +537,26 @@ type stubDescriber struct{ m map[string]string }
 
 func (s *stubDescriber) LookupMediaType(d digest.Digest) string { return s.m[d.String()] }
 
+type readerAtStore struct {
+	*fakes.Cache
+	digest digest.Digest
+	body   []byte
+}
+
+func (s *readerAtStore) Open(ctx context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
+	if d != s.digest {
+		return s.Cache.Open(ctx, d)
+	}
+
+	return &readerAtReadCloser{Reader: bytes.NewReader(s.body)}, int64(len(s.body)), nil
+}
+
+type readerAtReadCloser struct {
+	*bytes.Reader
+}
+
+func (r *readerAtReadCloser) Close() error { return nil }
+
 // TestServeManifestDescriberHintWins verifies that when a Describer
 // is registered AND it returns a non-empty media type for a digest,
 // the response Content-Type uses that hint instead of the default
@@ -592,6 +612,155 @@ func TestServeManifestDefaultMediaType(t *testing.T) {
 
 	if got := resp.Header.Get("Content-Type"); got != "application/vnd.oci.image.manifest.v1+json" {
 		t.Errorf("Content-Type = %q, want oci manifest media type", got)
+	}
+}
+
+func TestServeManifestDetectsIndexMediaTypeWithoutDescriberHint(t *testing.T) {
+	tests := []struct {
+		name        string
+		method      string
+		body        string
+		contentType string
+	}{
+		{
+			name:        "OCI index GET",
+			method:      http.MethodGet,
+			body:        `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
+			contentType: "application/vnd.oci.image.index.v1+json",
+		},
+		{
+			name:        "OCI index HEAD",
+			method:      http.MethodHead,
+			body:        `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`,
+			contentType: "application/vnd.oci.image.index.v1+json",
+		},
+		{
+			name:        "Docker manifest list GET",
+			method:      http.MethodGet,
+			body:        `{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[]}`,
+			contentType: "application/vnd.docker.distribution.manifest.list.v2+json",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cache := fakes.NewCache()
+			body := []byte(test.body)
+			d := mustDigest(body)
+			cache.Put(d, body)
+
+			s := New(cache, WithDescriber(&stubDescriber{m: map[string]string{}}))
+			ts := httptest.NewServer(s.Handler())
+			t.Cleanup(ts.Close)
+
+			req, err := http.NewRequest(test.method, ts.URL+"/v2/library/foo/manifests/"+d.String(), nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+
+			req.Header.Set(MirroredHeader, "1")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if got := resp.Header.Get("Content-Type"); got != test.contentType {
+				t.Fatalf("Content-Type = %q, want %q", got, test.contentType)
+			}
+
+			gotBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("ReadAll: %v", err)
+			}
+
+			if test.method == http.MethodGet && !bytes.Equal(gotBody, body) {
+				t.Fatalf("body = %q, want %q", gotBody, body)
+			}
+
+			if test.method == http.MethodHead && len(gotBody) != 0 {
+				t.Fatalf("HEAD body length = %d, want 0", len(gotBody))
+			}
+		})
+	}
+}
+
+func TestServeManifestDetectsIndexBeyondPrefix(t *testing.T) {
+	body := []byte(`{"schemaVersion":2,"padding":"` + strings.Repeat("x", 8*1024) + `","manifests":[]}`)
+	d := mustDigest(body)
+	cache := fakes.NewCache()
+	cache.Put(d, body)
+	store := &readerAtStore{Cache: cache, digest: d, body: body}
+
+	s := New(store, WithDescriber(&stubDescriber{m: map[string]string{}}))
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	tests := []struct {
+		name       string
+		method     string
+		byteRange  string
+		statusCode int
+		wantBody   []byte
+	}{
+		{
+			name:       "GET",
+			method:     http.MethodGet,
+			statusCode: http.StatusOK,
+			wantBody:   body,
+		},
+		{
+			name:       "HEAD",
+			method:     http.MethodHead,
+			statusCode: http.StatusOK,
+		},
+		{
+			name:       "range GET",
+			method:     http.MethodGet,
+			byteRange:  "bytes=17-60",
+			statusCode: http.StatusPartialContent,
+			wantBody:   body[17:61],
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req, err := http.NewRequest(test.method, ts.URL+"/v2/library/foo/manifests/"+d.String(), nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+
+			req.Header.Set(MirroredHeader, "1")
+
+			if test.byteRange != "" {
+				req.Header.Set("Range", test.byteRange)
+			}
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+
+			gotBody, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+
+			if readErr != nil {
+				t.Fatalf("ReadAll: %v", readErr)
+			}
+
+			if resp.StatusCode != test.statusCode {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, test.statusCode)
+			}
+
+			if got := resp.Header.Get("Content-Type"); got != "application/vnd.oci.image.index.v1+json" {
+				t.Fatalf("Content-Type = %q, want OCI index", got)
+			}
+
+			if !bytes.Equal(gotBody, test.wantBody) {
+				t.Fatalf("body = %q, want %q", gotBody, test.wantBody)
+			}
+		})
 	}
 }
 

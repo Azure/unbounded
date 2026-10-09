@@ -2,24 +2,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package manifest parses OCI v1 / Docker v2 schema-2 image manifests
-// just enough to extract the layer and config digests they reference.
+// just enough to classify them and extract the layer and config digests they
+// reference.
 //
 // This is a deliberately narrow parser. We do NOT validate the full
 // OCI schema, do NOT cross-check media types, and do NOT verify
 // signatures. The bytes have already been digest-verified by the
 // cache pipeline before they reach this code, and containerd is the
-// authoritative consumer that performs full validation. The only
-// consumer here is the mirror's speculative layer-prefetch path
-// (the design doc detailed-design.md L332 / architecture.md L180).
+// authoritative consumer that performs full validation.
 package manifest
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
+
+const (
+	ociImageIndexMediaType      = "application/vnd.oci.image.index.v1+json"
+	ociImageManifestMediaType   = "application/vnd.oci.image.manifest.v1+json"
+	dockerManifestListMediaType = "application/vnd.docker.distribution.manifest.list.v2+json"
+	dockerManifestMediaType     = "application/vnd.docker.distribution.manifest.v2+json"
+)
+
+// Keep detection within the repository's 4 MiB manifest parsing bound so a
+// blob requested through a /manifests/ URL cannot force an unbounded scan.
+const maxContentTypeDetectionBytes int64 = 4 * 1024 * 1024
 
 // schema is the subset of the OCI / Docker schema-2 manifest layout
 // the prefetch path needs.
@@ -40,6 +52,140 @@ type descriptor struct {
 	Digest    string   `json:"digest"`
 	Size      int64    `json:"size"`
 	URLs      []string `json:"urls"`
+}
+
+// DetectContentType returns the OCI/Docker Content-Type described by a
+// manifest body or body prefix. It returns an empty string when the bytes do
+// not look like a schema-2 manifest envelope.
+func DetectContentType(prefix []byte) string {
+	return DetectContentTypeFromReader(bytes.NewReader(prefix))
+}
+
+// DetectContentTypeFromReader classifies the top-level fields of a manifest
+// JSON stream. It does not match nested extension fields or annotation values,
+// and it stops as soon as the top-level mediaType or object shape is known.
+func DetectContentTypeFromReader(body io.Reader) string {
+	decoder := json.NewDecoder(io.LimitReader(body, maxContentTypeDetectionBytes))
+
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return ""
+	}
+
+	schemaVersionTwo := false
+	hasManifestFields := false
+	hasManifests := false
+
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			break
+		}
+
+		field, ok := token.(string)
+		if !ok {
+			break
+		}
+
+		switch field {
+		case "mediaType":
+			var mediaType string
+			if err := decoder.Decode(&mediaType); err != nil {
+				return contentTypeForShape(hasManifestFields, hasManifests, schemaVersionTwo)
+			}
+
+			if contentType := knownContentType(mediaType); contentType != "" {
+				return contentType
+			}
+		case "manifests":
+			hasManifests = true
+			if err := discardJSONValue(decoder); err != nil {
+				return contentTypeForShape(hasManifestFields, hasManifests, schemaVersionTwo)
+			}
+		case "config", "layers":
+			hasManifestFields = true
+			if err := discardJSONValue(decoder); err != nil {
+				return contentTypeForShape(hasManifestFields, hasManifests, schemaVersionTwo)
+			}
+		case "schemaVersion":
+			var schemaVersion int
+			if err := decoder.Decode(&schemaVersion); err != nil {
+				return ""
+			}
+
+			schemaVersionTwo = schemaVersion == 2
+		default:
+			if err := discardJSONValue(decoder); err != nil {
+				return contentTypeForShape(hasManifestFields, hasManifests, schemaVersionTwo)
+			}
+		}
+	}
+
+	return contentTypeForShape(hasManifestFields, hasManifests, schemaVersionTwo)
+}
+
+func knownContentType(mediaType string) string {
+	switch mediaType {
+	case ociImageIndexMediaType,
+		ociImageManifestMediaType,
+		dockerManifestListMediaType,
+		dockerManifestMediaType:
+		return mediaType
+	default:
+		return ""
+	}
+}
+
+func contentTypeForShape(hasManifestFields, hasManifests, schemaVersionTwo bool) string {
+	if !schemaVersionTwo {
+		return ""
+	}
+
+	switch {
+	case hasManifestFields:
+		return ociImageManifestMediaType
+	case hasManifests:
+		return ociImageIndexMediaType
+	default:
+		return ociImageManifestMediaType
+	}
+}
+
+func discardJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+
+	switch delim {
+	case '{':
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return err
+			}
+
+			if err := discardJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := discardJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("manifest: unexpected JSON delimiter %q", delim)
+	}
+
+	_, err = decoder.Token()
+
+	return err
 }
 
 // ChildDigests parses body as an OCI / Docker schema-2 image manifest
