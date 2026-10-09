@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation.
-// SPDX-License-Identifier: Apache-2.0
-
 package main
 
 import (
@@ -12,8 +9,6 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-const cacheName = "racer-demo"
-
 func main() {
 	if err := runGet(); err != nil {
 		panic(err)
@@ -21,12 +16,11 @@ func main() {
 }
 
 func runGet() error {
-	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: cacheName})
+	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: "racer-demo"})
 	if err != nil {
 		return err
 	}
-
-	defer func() { _ = client.Close() }() //nolint:errcheck
+	defer client.Close()
 
 	obj, err := client.Get(context.TODO(), racersdk.Request{
 		Key: sha256.Sum256([]byte("0")),
@@ -34,8 +28,7 @@ func runGet() error {
 	if err != nil {
 		return err
 	}
-
-	defer func() { _ = obj.Close() }() //nolint:errcheck
+	defer obj.Close()
 
 	_, err = io.Copy(os.Stdout, obj)
 

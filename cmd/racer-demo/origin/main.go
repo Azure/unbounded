@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation.
-// SPDX-License-Identifier: Apache-2.0
-
 package main
 
 import (
@@ -16,7 +13,7 @@ import (
 const docSize = 42 << 20 // 42 MiB
 
 var words = [...]string{
-	"Clippy", "BSOD", "Zune", "Steve Ballmer", "ctrl-alt-del", "Can You See My Screen", "Update Tuesday", "sev0",
+	"Clippy", "BSOD", "Zune", "Ballmer Peak", "ctrl-alt-del", "Can You See My Screen", "Patch Tuesday", "sev0",
 }
 
 func main() {
