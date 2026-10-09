@@ -14,6 +14,6 @@ mkdir -p "$(dirname "$2")"
 # pkg-config emits compiler/linker argument lists, intentionally word-split.
 # shellcheck disable=SC2046
 "${CC:-cc}" $(pkg-config --cflags libibverbs) \
-    -O2 -g -std=gnu11 -Wall -Wextra -Werror -fPIC -shared \
+    -O2 -g -fno-omit-frame-pointer -std=gnu11 -Wall -Wextra -Werror -fPIC -shared \
     -Wl,-soname,librdma_verbs.so.1 -Wl,-z,defs \
     -o "$2" "$1" $(pkg-config --libs libibverbs)

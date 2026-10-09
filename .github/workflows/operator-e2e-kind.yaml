@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-name: unbounded-operator reaper e2e
+name: unbounded-operator fresh-install e2e
 
 on:
   pull_request:
@@ -44,11 +44,11 @@ permissions:
 env:
   # Pinned to match the kind release validated locally. Bump alongside the
   # kindest/node image kind selects by default for this version.
-  KIND_VERSION: v0.29.0
+  KIND_VERSION: v0.30.0
 
 jobs:
-  operator-reaper-e2e:
-    name: operator reaper e2e (kind)
+  operator-e2e:
+    name: operator fresh-install e2e (kind)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -70,7 +70,7 @@ jobs:
 
       # Fail fast if the runner is missing tooling, so the suite (which would
       # otherwise t.Skip on absent binaries) cannot silently pass without
-      # exercising the reaper.
+      # exercising the operator.
       - name: Verify e2e prerequisites
         run: |
           set -euo pipefail
@@ -79,5 +79,8 @@ jobs:
           done
           docker info >/dev/null
 
-      - name: Run operator reaper e2e
-        run: go test -tags=e2e -count=1 -timeout=900s -v ./e2e/operator/...
+      - name: Render embedded component manifests
+        run: timeout --signal=TERM --kill-after=10s 300s make machina-manifests net-manifests gantry-manifests racer-manifests token-refresher-manifests
+
+      - name: Run operator fresh-install and override e2e
+        run: timeout --signal=TERM --kill-after=10s 300s go test -tags=e2e -count=1 -timeout=5m -v ./e2e/operator/...

@@ -1,0 +1,96 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG RUST_IMAGE=docker.io/library/rust:1.96.0-bookworm
+ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim
+# Build on the target platform: both Rust and the verbs adapter use its ABI.
+FROM ${RUST_IMAGE} AS builder
+ARG RACER_NATIVE_RDMA=true
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
+WORKDIR /src
+
+RUN case "$RACER_NATIVE_RDMA" in \
+        true) apt-get update && apt-get install -y --no-install-recommends \
+            libibverbs-dev pkg-config && rm -rf /var/lib/apt/lists/* ;; \
+        false) ;; \
+        *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
+    esac
+
+# Copy only build inputs, never host target trees or deployment credentials.
+COPY cmd/racer-dataplane/Cargo.toml cmd/racer-dataplane/Cargo.lock ./
+COPY cmd/racer-dataplane/src ./src
+COPY cmd/racer-dataplane/control-wire/Cargo.toml ./control-wire/Cargo.toml
+COPY cmd/racer-dataplane/control-wire/src ./control-wire/src
+COPY cmd/racer-dataplane/controlplane/Cargo.toml ./controlplane/Cargo.toml
+COPY cmd/racer-dataplane/controlplane/src ./controlplane/src
+COPY cmd/racer-dataplane/peer-wire/Cargo.toml ./peer-wire/Cargo.toml
+COPY cmd/racer-dataplane/peer-wire/src ./peer-wire/src
+COPY cmd/racer-dataplane/object-wire/Cargo.toml ./object-wire/Cargo.toml
+COPY cmd/racer-dataplane/object-wire/src ./object-wire/src
+COPY cmd/racer-dataplane/env-config/Cargo.toml ./env-config/Cargo.toml
+COPY cmd/racer-dataplane/env-config/src ./env-config/src
+COPY cmd/racer-dataplane/runtime/Cargo.toml ./runtime/Cargo.toml
+COPY cmd/racer-dataplane/runtime/src ./runtime/src
+COPY cmd/racer-dataplane/alloc/Cargo.toml ./alloc/Cargo.toml
+COPY cmd/racer-dataplane/alloc/src ./alloc/src
+COPY cmd/racer-dataplane/flow/Cargo.toml ./flow/Cargo.toml
+COPY cmd/racer-dataplane/flow/src ./flow/src
+COPY cmd/racer-dataplane/crypto/Cargo.toml ./crypto/Cargo.toml
+COPY cmd/racer-dataplane/crypto/src ./crypto/src
+COPY cmd/racer-dataplane/verbs/Cargo.toml ./verbs/Cargo.toml
+COPY cmd/racer-dataplane/verbs/src ./verbs/src
+COPY cmd/racer-dataplane/verbs/native/verbs.c ./verbs/native/verbs.c
+COPY cmd/racer-dataplane/http/Cargo.toml ./http/Cargo.toml
+COPY cmd/racer-dataplane/http/src ./http/src
+COPY cmd/racer-dataplane/http/tests ./http/tests
+COPY cmd/racer-dataplane/topology/Cargo.toml ./topology/Cargo.toml
+COPY cmd/racer-dataplane/topology/src ./topology/src
+COPY cmd/racer-dataplane/telemetry/Cargo.toml ./telemetry/Cargo.toml
+COPY cmd/racer-dataplane/telemetry/src ./telemetry/src
+COPY cmd/racer-dataplane/uds-endpoint/Cargo.toml ./uds-endpoint/Cargo.toml
+COPY cmd/racer-dataplane/uds-endpoint/src ./uds-endpoint/src
+COPY cmd/racer-dataplane/wire-codec/Cargo.toml ./wire-codec/Cargo.toml
+COPY cmd/racer-dataplane/wire-codec/src ./wire-codec/src
+COPY cmd/racer-dataplane/wire-codec/tests ./wire-codec/tests
+COPY images/racer-dataplane/build-native.sh ./build-native.sh
+COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh
+RUN set -eu; \
+    mkdir -p /out/usr/local/bin /out/usr/local/lib; \
+    if [ "$RACER_NATIVE_RDMA" = true ]; then \
+        cargo build --locked --release --bin racer-dataplane --no-default-features --features rdma; \
+        sh ./build-native.sh verbs/native/verbs.c /out/usr/local/lib/librdma_verbs.so.1; \
+    else \
+        cargo build --locked --release --bin racer-dataplane --no-default-features; \
+    fi; \
+    sh ./check-debug-info.sh target/release/racer-dataplane; \
+    install -m 0755 target/release/racer-dataplane /out/usr/local/bin/racer-dataplane
+
+FROM ${RUNTIME_IMAGE}
+ARG RACER_NATIVE_RDMA=true
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.title="racer-dataplane" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}"
+RUN set -eu; \
+    case "$RACER_NATIVE_RDMA" in \
+        true) set -- libibverbs1 ibverbs-providers ;; \
+        false) set -- ;; \
+        *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libgcc-s1 "$@"; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /run/racer /var/lib/racer/identity /var/lib/racer/slabs; \
+    chown -R 65532:65532 /run/racer /var/lib/racer; \
+    chmod 0700 /var/lib/racer/identity /var/lib/racer/slabs
+COPY --from=builder /out/ /
+COPY LICENSE NOTICE /usr/share/licenses/racer-dataplane/
+RUN ldconfig
+USER 65532:65532
+WORKDIR /
+# Peer HTTP and loopback diagnostics. Client/origin traffic uses mounted UDS paths.
+EXPOSE 7443 9090
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/racer-dataplane"]

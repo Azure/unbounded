@@ -1,0 +1,58 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Racer Loadgen
+
+on:
+  pull_request:
+    paths:
+      - cmd/racer-loadgen/**
+      - internal/racerobject/**
+      - internal/gantry/**
+      - pkg/racersdk/**
+      - go.mod
+      - go.sum
+      - deploy/racer-loadgen/**
+      - images/racer-loadgen/**
+      - .github/workflows/racer-loadgen.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: racer-loadgen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Test and Build Racer Loadgen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify module dependencies
+        run: timeout --signal=TERM --kill-after=10s 300s go mod tidy -diff
+
+      - name: Test with race detector
+        run: timeout --signal=TERM --kill-after=10s 300s go test -race -timeout=5m ./cmd/racer-loadgen ./internal/racerobject
+
+      - name: Build
+        run: timeout --signal=TERM --kill-after=10s 300s go build -o /dev/null ./cmd/racer-loadgen
+
+      - name: Prepare offline manifest checks
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s kubectl version --client
+          timeout --signal=TERM --kill-after=10s 300s python3 -m venv "$RUNNER_TEMP/racer-loadgen-venv"
+          timeout --signal=TERM --kill-after=10s 300s "$RUNNER_TEMP/racer-loadgen-venv/bin/python" -m pip install PyYAML==6.0.2
+
+      - name: Check base and direct manifests
+        run: timeout --signal=TERM --kill-after=10s 300s "$RUNNER_TEMP/racer-loadgen-venv/bin/python" deploy/racer-loadgen/direct/render_test.py

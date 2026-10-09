@@ -5,9 +5,27 @@ GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
+RACER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+RACER_CLUSTER_ID ?=
+RACER_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controller:$(VERSION_TAG)
+RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
+RACER_OBJECT_IMAGE ?= $(CONTAINER_REGISTRY)/racer-object:$(VERSION_TAG)
+# Rust dataplane packaging is independent of the Go controller scaffold.
+RACER_CARGO ?= cargo
+RACER_DATAPLANE_BIN ?= bin/racer-dataplane
+RACER_CARGO_TARGET_DIR ?= $(CURDIR)/bin/racer-cargo
+RACER_TEST_ARGS ?=
+RACER_DST_FILTER ?= dst
+RACER_CONTENTION_BUILD_JOBS ?= 2
 ENVTEST_K8S_VERSION ?= 1.37.0
 SETUP_ENVTEST_VERSION ?= v0.25.2-0.20260923145615-d837464d41be
 SETUP_ENVTEST = $(CURDIR)/bin/setup-envtest-$(SETUP_ENVTEST_VERSION)
+RACER_NATIVE_RDMA ?= false
+RACER_NATIVE_LIB ?= bin/librdma_verbs.so.1
+RACER_PREFIX ?= /usr/local
+RACER_LIBDIR ?= $(RACER_PREFIX)/lib
+RACER_RUST_IMAGE ?= docker.io/library/rust:1.96.0-bookworm
+RACER_RUNTIME_IMAGE ?= docker.io/library/debian:bookworm-slim
 GO_PACKAGE_PATTERNS=./api/... ./cmd/... ./deploy/... ./e2e/... ./hack/... ./internal/... ./pkg/...
 # e2e packages hold nothing but files behind the e2e build tag, so `go list`
 # needs the tag to see them at all. Without it they are silently skipped by
@@ -109,7 +127,6 @@ UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
 # image: overriding CONTAINER_REGISTRY (as the release workflow does per fork)
 # points components at the same registry/org as the operator.
 UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
-UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
 UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
@@ -237,7 +254,7 @@ REACT_DEV ?= false
 
 ##@ General
 
-all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry racer-object ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -260,9 +277,11 @@ help: ## Show this help
 	@echo "  vulncheck                        Run govulncheck; fails only on vulnerabilities with final fixes"
 	@echo "  gomod                            go mod tidy"
 	@echo "  e2e-gantry                       Run the kind-based Gantry e2e suite"
+	@echo "  e2e-racer                        Run the operator-installed Racer e2e suite (prebuilt images)"
+	@echo "  racer-sdk-conformance             Run the opt-in Go SDK / Rust wire integration test"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
 	@echo "  license-check                    Verify project-owned license declarations"
-	@echo "  notice                           Regenerate NOTICE from Go and npm dependencies"
+	@echo "  notice                           Regenerate NOTICE from Go, npm, and Cargo dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
 	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
 	@echo "  toolchain-build                  Rebuild the toolchain container image (honors TOOLCHAIN_FLAVOR)"
@@ -359,13 +378,34 @@ help: ## Show this help
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
 	@echo ""
-	@echo "Racer Controller:"
+	@echo "Racer:"
 	@echo "  racer-controller                 Test and build the Go controller"
 	@echo "  racer-controller-build           Build the Go controller without lint/test"
 	@echo "  racer-test                       Lint and race-test the controller and deployment contracts"
 	@echo "  racer-envtest                    Run controller API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run controller API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
+	@echo "  racer-loadgen | racer-loadgen-build  Build loadgen (with/without focused tests)"
+	@echo "  racer-loadgen-test                Race-test loadgen and object helpers"
+	@echo "  racer-loadgen-manifest-test       Render and check base/direct loadgen manifests"
+	@echo "  image-racer-loadgen-local         Build the loadgen container image"
+	@echo "  racer-object                     Test and build the S3 read adapter"
+	@echo "  racer-object-build               Build the S3 read adapter without tests"
+	@echo "  racer-object-test                Test the S3 read adapter and deployment examples"
+	@echo "  image-racer-object-local         Build the S3 read adapter image locally"
+	@echo "  racer-test | racer-generate | racer-manifests  Test/generate/render Racer artifacts"
+	@echo "  racer-dataplane-build             Build the locked Rust release binary into bin/"
+	@echo "  racer-dataplane-test              Run Rust unit and helper integration tests (RACER_TEST_ARGS)"
+	@echo "  racer-dataplane-dst               Run DST-filtered Rust tests under 16 GiB/no-swap cgroup limits"
+	@echo "  racer-dataplane-dst-10m            Build once, then run a 600-second DST campaign with fresh seeds"
+	@echo "  racer-dataplane-contention        Run metadata contention tests under 16 GiB/no-swap cgroup limits"
+	@echo "  racer-dataplane-native-build      Build the optional real-libibverbs adapter into bin/"
+	@echo "  racer-process-restart             Run only the three privileged restart tests"
+	@echo "  racer-sdk-age-build | racer-sdk-age  Prebuild/run the dedicated SDK connection-age test"
+	@echo "  runtime-check                    Strict runtime clippy and default-feature compile"
+	@echo "  runtime-miri                     Pinned pure Miri group (RUNTIME_MIRI_GROUP=list)"
+	@echo "  racer-dataplane-native-install    Install adapter (DESTDIR, RACER_PREFIX, RACER_LIBDIR)"
+	@echo "  image-racer-dataplane-local       Build local image (RACER_NATIVE_RDMA=false|true)"
 	@echo ""
 	@echo "Common variables (override with VAR=value):"
 	@echo "  VERSION=$(VERSION)"
@@ -534,13 +574,13 @@ lint-actions: ## Run actionlint over .github/workflows
 ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
-test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
+test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Run all tests with race detector
 	$(GOTEST) -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
-test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
+test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Run all tests (implies lint)
 	$(GOTEST) ./...
 
 endif
@@ -549,21 +589,191 @@ e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
 		$(GOTEST) -tags=e2e -count=1 -timeout=120m -v ./e2e/gantry
 
+.PHONY: e2e-racer
+e2e-racer: ## Run the operator-installed Racer e2e suite with prebuilt Docker images
+	KIND_EXPERIMENTAL_PROVIDER=docker PATH="$(CURDIR)/bin:$$PATH" \
+		$(GOTEST) -tags=e2e -count=1 -timeout=10m -v ./e2e/racer
+
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-.PHONY: racer-controller racer-controller-build racer-test racer-server-test racer-envtest racer-envtest-ci racer-generate
+.PHONY: racer-controller racer-controller-build racer-test racer-rust-test racer-sdk-conformance racer-server-test racer-envtest racer-envtest-ci racer-scale racer-generate racer-manifests
 racer-controller: racer-server-test racer-controller-build ## Test and build the Racer controller
 
 racer-controller-build: ## Build the Racer controller without lint/test
 	@mkdir -p bin
 	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controller ./cmd/racer-controller
 
-racer-server-test: ## Lint and race-test the Racer server
-	timeout --signal=TERM --kill-after=10s 300s $(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
+RACER_LOADGEN_BIN=bin/racer-loadgen
+RACER_LOADGEN_CMD=./cmd/racer-loadgen
+RACER_LOADGEN_IMAGE ?= $(CONTAINER_REGISTRY)/racer-loadgen:$(VERSION_TAG)
 
-racer-test: racer-server-test ## Check the Racer controller
+.PHONY: racer-loadgen racer-loadgen-build racer-loadgen-test racer-loadgen-manifest-test image-racer-loadgen-local
+racer-loadgen: racer-loadgen-test racer-loadgen-build ## Test and build the Racer load generator
+
+racer-loadgen-build: ## Build the Racer load generator without lint/test
+	@mkdir -p bin
+	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -o $(RACER_LOADGEN_BIN) $(RACER_LOADGEN_CMD)
+
+racer-loadgen-test: racer-loadgen-manifest-test ## Race-test loadgen and object helpers
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_LOADGEN_CMD)/... ./internal/racerobject/...
+
+racer-loadgen-manifest-test: ## Check base and direct manifests offline (kubectl, Python 3, PyYAML required)
+	@command -v kubectl >/dev/null 2>&1 || { echo "kubectl is required to render loadgen manifests"; exit 1; }
+	timeout --signal=TERM --kill-after=10s 300s python3 deploy/racer-loadgen/direct/render_test.py
+
+image-racer-loadgen-local: ## Build the loadgen container image locally (single-arch)
+	timeout --signal=TERM --kill-after=10s 300s $(CONTAINER_ENGINE) build \
+		-t racer-loadgen:$(VERSION_TAG) -t $(RACER_LOADGEN_IMAGE) \
+		-f ./images/racer-loadgen/Containerfile .
+	$(call trivy-maybe,$(RACER_LOADGEN_IMAGE))
+
+.PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
+racer-object: racer-object-test racer-object-build ## Test and build the S3 read adapter
+
+racer-object-build: ## Build the S3 read adapter without lint/test
+	@mkdir -p bin
+	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-object ./cmd/racer-object
+
+racer-object-test: ## Test the S3 read adapter and deployment examples
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m ./cmd/racer-object/... ./internal/racerobject/... ./deploy/racer-object/...
+
+image-racer-object-local: ## Build the S3 read adapter image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION="$(VERSION)" --build-arg GIT_COMMIT="$(GIT_COMMIT)" \
+		--build-arg BUILD_TIME="$(BUILD_TIME)" \
+		-t racer-object:$(VERSION_TAG) -t $(RACER_OBJECT_IMAGE) \
+		-f ./images/racer-object/Dockerfile .
+	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
+
+.PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-dst racer-dataplane-dst-10m racer-dataplane-contention racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
+racer-dataplane-test: ## Run Rust unit and helper integration tests with all features (RACER_TEST_ARGS)
+	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-features --lib --bins -- $(RACER_TEST_ARGS)
+	@# --lib --bins excludes integration tests; discover helper suites without the full Racer suite.
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		--workspace --exclude racer-dataplane --all-features --tests -- $(RACER_TEST_ARGS)
+
+# The wrapper starts before Cargo so compilation and all test descendants share
+# the same hard memory limit. It fails before Cargo if enforcement is unavailable.
+racer-dataplane-dst: ## Run DST tests with cgroup v2 memory <= 16 GiB and swap disabled
+	bash hack/scripts/memory-safe-run.sh -- $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		--all-features "$(RACER_DST_FILTER)" -- --test-threads=1 $(RACER_TEST_ARGS)
+
+# Keep compilation inside the same fail-closed cgroup gate as the DST runner.
+racer-dataplane-dst-10m: ## Build once, then run 600 seconds of default and distinct-seed DSTs
+	@test -z "$(RACER_TEST_ARGS)" -a "$(RACER_DST_FILTER)" = dst || \
+		{ echo "racer-dataplane-dst-10m does not accept test arguments or filters" >&2; exit 1; }
+	bash hack/scripts/memory-safe-run.sh -- python3 hack/scripts/racer-dst-campaign.py \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" -- $(RACER_CARGO)
+
+# Keep compilation inside the same fail-closed cgroup gate as the DST runner.
+racer-dataplane-contention: ## Run metadata contention tests with bounded memory and compilation jobs
+	bash hack/scripts/memory-safe-run.sh -- $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		--jobs "$(RACER_CONTENTION_BUILD_JOBS)" --all-features --lib contention:: -- \
+		--test-threads=1 --nocapture $(RACER_TEST_ARGS)
+
+racer-dataplane-build: ## Build the locked Rust release binary; optionally enable the RDMA loader
+	@case "$(RACER_NATIVE_RDMA)" in true|false) ;; *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; esac
+	RUSTFLAGS="$(RUSTFLAGS) -C force-frame-pointers=yes" $(RACER_CARGO) build --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" --bin racer-dataplane \
+		--no-default-features $(if $(filter true,$(RACER_NATIVE_RDMA)),--features rdma)
+	sh images/racer-dataplane/check-debug-info.sh "$(RACER_CARGO_TARGET_DIR)/release/racer-dataplane"
+	install -D -m 0755 "$(RACER_CARGO_TARGET_DIR)/release/racer-dataplane" "$(RACER_DATAPLANE_BIN)"
+
+racer-dataplane-native-build: ## Compile against installed libibverbs headers and libraries
+	CC="$(CC)" sh images/racer-dataplane/build-native.sh \
+		cmd/racer-dataplane/verbs/native/verbs.c "$(RACER_NATIVE_LIB)"
+
+racer-dataplane-native-install: racer-dataplane-native-build ## Stage or install the optional native library
+	install -D -m 0755 "$(RACER_NATIVE_LIB)" "$(DESTDIR)$(RACER_LIBDIR)/librdma_verbs.so.1"
+
+image-racer-dataplane-local: ## Build the Racer dataplane image locally (single-arch)
+	@case "$(RACER_NATIVE_RDMA)" in true|false) ;; *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; esac
+	$(CONTAINER_ENGINE) build \
+		--build-arg RUST_IMAGE="$(RACER_RUST_IMAGE)" \
+		--build-arg RUNTIME_IMAGE="$(RACER_RUNTIME_IMAGE)" \
+		--build-arg RACER_NATIVE_RDMA="$(RACER_NATIVE_RDMA)" \
+		--build-arg VERSION="$(VERSION)" --build-arg GIT_COMMIT="$(GIT_COMMIT)" \
+		-t racer-dataplane:$(VERSION_TAG) -t $(RACER_DATAPLANE_IMAGE) \
+		-f ./images/racer-dataplane/Containerfile .
+	$(call trivy-maybe,$(RACER_DATAPLANE_IMAGE))
+
+racer-server-test: ## Lint and race-test the Racer server and deployment contracts
+	timeout --signal=TERM --kill-after=10s 300s $(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/... ./deploy/racer/...
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/... ./deploy/racer/...
+
+racer-test: racer-server-test ## Check Racer server and committed Rust contracts
+	$(MAKE) racer-rust-test
+
+.PHONY: racer-alloc-test
+racer-alloc-test: ## Test allocator without workspace feature unification (CI requires real I/O)
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		-p page-alloc --no-default-features -- $(RACER_TEST_ARGS)
+
+racer-rust-test: ## Check the complete Rust suite, including integration tests and doctests
+	@# Integration fixtures use this scratch root even with a separate Cargo target-dir.
+	@mkdir -p cmd/racer-dataplane/target
+	$(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all --check
+	$(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-targets --all-features
+	@# Keep strict unsafe-block documentation and warning checks scoped to uds-endpoint.
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) clippy --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		-p uds-endpoint --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-features -- $(RACER_TEST_ARGS)
+
+.PHONY: controlplane-check
+controlplane-check: ## Check generic control mechanisms without dataplane feature unification
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" -p controlplane --no-default-features -j 2
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" -p controlplane --no-default-features -j 2 -- $(RACER_TEST_ARGS)
+
+.PHONY: runtime-check runtime-miri
+runtime-check: ## Strict runtime lint plus default-feature production compile
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" -p uring-runtime --all-targets --all-features -j 2 -- -D warnings
+	timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" -p uring-runtime --no-default-features -j 2
+
+RUNTIME_MIRI_GROUP ?= memory
+runtime-miri: ## Pinned pure Miri group (channel, offload, scheduler, memory, or list)
+	timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/runtime-miri.py "$(RUNTIME_MIRI_GROUP)"
+
+racer-sdk-conformance: ## Run the ignored real Go SDK / Rust conformance test (requires Go and Linux)
+	@# The fixture uses these paths independently of Cargo's build cache.
+	@mkdir -p cmd/racer-dataplane/target tmp
+	RACER_SDK_ROOT="$(CURDIR)" $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		--all-features --test client_origin_conformance \
+		sdk::sdk_client_to_rust_http_and_request_parser_over_uds -- \
+		--exact --ignored --test-threads=1 --nocapture
+
+# These explicit allowlists must not pick up throughput campaigns or new ignored tests.
+.PHONY: racer-process-restart racer-sdk-age-build racer-sdk-age
+racer-process-restart: ## Run exactly the three privileged executable restart tests
+	@set -eu; for test in \
+		graceful_process_restart_recovers_encrypted_multipage_pin_without_origin \
+		interrupted_process_restart_refetches_safely_after_partial_origin_body \
+		periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss; do \
+		timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked \
+			--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+			--all-features --test process_restart -- "$$test" \
+			--exact --ignored --test-threads=1 --nocapture; \
+	done
+
+RACER_SDK_AGE_BINARY ?= $(CURDIR)/bin/racer-sdk-age.test
+racer-sdk-age-build: ## Prebuild the SDK fixture without privilege escalation
+	@mkdir -p bin
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -c -timeout=5m -o "$(RACER_SDK_AGE_BINARY)" ./pkg/racersdk
+
+racer-sdk-age: ## Run only SDK connection-age integration with a prebuilt Go fixture
+	@test -x "$(RACER_SDK_AGE_BINARY)" || { echo "Run make racer-sdk-age-build first" >&2; exit 1; }
+	@mkdir -p cmd/racer-dataplane/target
+	RACER_SDK_AGE_BINARY="$(RACER_SDK_AGE_BINARY)" timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		--all-features --test process_restart -- real_sdk_connection_age_sustained \
+		--exact --ignored --test-threads=1 --nocapture
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
@@ -578,18 +788,38 @@ racer-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets a
 racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
 	@mkdir -p tmp/racer-envtest
-	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/racer ./internal/racer/authority -run '^TestEnvtest' -count=1 -v -timeout=5m
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/racer ./internal/racer/authority ./deploy/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
+	$(MAKE) racer-admission-envtest KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)"
+
+.PHONY: racer-admission-envtest
+racer-admission-envtest: ## Verify Racer operator RBAC, admission, identity recovery, dataplane and strategy with a real API server
+	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
+	@mkdir -p tmp/racer-envtest
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./internal/operator/components/racer -run '^Test.*Envtest' -count=1 -v -timeout=5m
+
+racer-scale: ## Measure 100,000-member reconciliation and publication waiters (not HTTPS capacity)
+	@mkdir -p tmp/racer-scale
+	TMPDIR="$(CURDIR)/tmp/racer-scale" RACER_SCALE=1 GOMAXPROCS=8 $(GOTEST) ./internal/racer -run '^TestServerScale$$' -count=1 -v -timeout=3m
 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
 
-build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
+racer-manifests: ## Render Racer controller manifests
+	@mkdir -p deploy/racer/rendered/crd
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir deploy/racer --output-dir deploy/racer/rendered \
+		--set Namespace=$(RACER_NAMESPACE) --set ClusterID=$(RACER_CLUSTER_ID) \
+		--set InitializationState=$(RACER_INITIALIZATION_STATE) \
+		--set ControllerImage=$(RACER_CONTROLLER_IMAGE) --set DataplaneImage=$(RACER_DATAPLANE_IMAGE)
+	@cp deploy/racer/crd/*.yaml deploy/racer/rendered/crd/
+
+build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Build all Go packages
 	$(GOBUILD) ./...
 
 generate: install-protoc ## Run go generate for API types (deepcopy, CRDs) and protobuf
 	PATH="$(PROTOC_DIR)/bin:$$PATH" $(GOCMD) generate $(GO_PACKAGES)
 
-vulncheck: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run govulncheck; fails only on reachable vulnerabilities that have a final-release fix
+vulncheck: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Run govulncheck; fails only on reachable vulnerabilities that have a final-release fix
 	@# The JSON stream is the documented programmatic interface. The gate owns
 	@# the verdict, so govulncheck is not asked for one: in JSON mode it exits 0
 	@# whether or not it found anything, and a non-zero exit here means the scan
@@ -640,7 +870,7 @@ license-check: ## Verify project-owned source license declarations
 		exit 1; \
 	fi
 
-notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
+notice: ## Regenerate NOTICE from Go, npm, and Cargo dependencies (run locked cargo fetch first)
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -648,7 +878,7 @@ notice: ## Regenerate NOTICE from Go, npm, Cargo, and pinned native dependencies
 	fi
 	$(GOCMD) run ./hack/cmd/notice generate --output NOTICE
 
-notice-check: ## Verify NOTICE is in sync with Go, npm, Cargo, and pinned native dependencies
+notice-check: ## Verify NOTICE is in sync with Go, npm, and Cargo dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -765,7 +995,7 @@ metalman-build: ## Build the metalman binary (no lint/test)
 
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
-unbounded-operator-build: machina-manifests token-refresher-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
+unbounded-operator-build: machina-manifests token-refresher-manifests net-manifests unbounded-operator-manifests gantry-manifests racer-manifests ## Build the unbounded-operator binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
@@ -1015,7 +1245,7 @@ PLAYPEN_ARM64_RUNNERS ?= 2
 PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START ?= 51820
 PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END ?= 51899
 PLAYPEN_CONTROL_PLANE_COUNT ?= 1
-PLAYPEN_CONTROL_PLANE_VERSIONS ?= v1.33.0
+PLAYPEN_CONTROL_PLANE_VERSIONS ?= v1.34.0
 PLAYPEN_CONTROL_PLANE_IMAGE ?= rancher/k3s:{version}-k3s1
 PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_START ?= 16443
 PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_END ?= 16499
@@ -1055,8 +1285,7 @@ unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy
 		--set Namespace=$(UNBOUNDED_OPERATOR_NAMESPACE) \
 		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
 		--set ImageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
-		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
-		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES)
+		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}"
 	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
 
 machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered
