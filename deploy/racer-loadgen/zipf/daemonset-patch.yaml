@@ -19,7 +19,7 @@ spec:
             - --volume=racer-loadgen
             - --metrics-listen=:9090
             - --catalog-blobs=512
-            - --blob-bytes=536870912
+            - --blob-bytes=2147483648
             - --seed=zipf-balanced-v1
             - --profile=zipf
             - --zipf-exponent=0.5
@@ -31,14 +31,14 @@ spec:
             - --interval=0s
             - --verify=false
             - --start-delay=10s
-            - --startup-timeout=25m
+            - --startup-timeout=60m
           startupProbe:
             httpGet:
               path: /readyz
               port: metrics
             periodSeconds: 10
             timeoutSeconds: 2
-            failureThreshold: 180
+            failureThreshold: 390
           volumeMounts:
             - name: load-control
               mountPath: /etc/racer-loadgen-control

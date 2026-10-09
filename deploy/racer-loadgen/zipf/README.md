@@ -1,6 +1,6 @@
 # Racer-only Zipf benchmark
 
-Direct UDS, 512 x 512 MiB generic blobs (256 GiB shared), Zipf 0.5,
+Direct UDS, 512 x 2 GiB generic blobs (1 TiB shared), Zipf 0.5,
 seed `zipf-balanced-v1`, concurrency 8, no client
 hash verification. Loadgen and dataplane select `agentpool=ddsv6`. The overlay
 pins all three images to source tag `f9a088a22a29cf8549e1945af833f508a14199d1`.
@@ -8,8 +8,8 @@ Confirm builds and image digests before deployment. SHA tags are not digest pins
 
 This is an owned-only disk-retention comparison, not the default retention policy.
 `RACER_ADMISSION_MODE=disabled` disables second-sight disk admission only; resource
-admission and integrity checks remain active. A new shared seed avoids reuse of
-the prior fully replicated catalog. Do not erase existing disk data.
+admission and integrity checks remain active. The seed stays `zipf-balanced-v1`;
+larger blobs change content digests. Do not erase existing disk data.
 
 Node budgets are plaintext 4 GiB, ciphertext 8 GiB, dirty 2 GiB, registered 2 GiB,
 and request contexts 256 MiB. Counts are flights 512, queue entries 4096, client
@@ -21,16 +21,31 @@ dataplane alone; leave loadgens running to avoid hashing the catalog again.
 
 Each loadgen hashes the full catalog before origin readiness. Health and metrics
 start first; readiness remains false during hashing. Startup is bounded by
-`--startup-timeout=25m` and a readiness startup probe with 180 attempts at 10-second
-intervals. This is not a workload duration; C8 continues after startup.
+`--startup-timeout=60m` and a readiness startup probe with 390 attempts at 10-second
+intervals (65 minutes). The probe leaves room for the application deadline.
+The prior 256 GiB catalog took about six minutes to hash; 1 TiB needs more headroom
+than the prior 25-minute deadline. This is not a workload duration; C8 continues
+after startup. Observe startup in bounded five-minute phases, not a full-length
+rollout wait. Record startup logs and restarts; readiness is false during hashing.
 The flatter exponent changes popularity only, not content. Changing it requires
 a loadgen restart and catalog hashing; existing dataplane cache data is retained.
 
-Use **536870912 bytes per successful pull** for logical throughput. Do not reuse
+Use **2147483648 bytes per successful pull** for logical throughput. Do not reuse
 the old 64 MiB dashboard multiplier. Received bytes include failed partial reads;
 logical delivery is not network traffic or client-verified content. Measure fresh
 counter increments after warmup. Memory, disk, and peer counters count acquisition
 events across providers and requesters, not exclusive client-read outcomes.
+
+For an existing C8 deployment, grow the catalog by patching only the loadgen:
+
+```sh
+timeout --signal=TERM --kill-after=10s 60s kubectl --context=joolshev-nvme-test -n unbounded-system patch daemonset racer-loadgen --type=strategic --patch-file=deploy/racer-loadgen/zipf/daemonset-patch.yaml
+```
+
+First check the live context, C8 control ConfigMap, image, and dataplane Pod UIDs.
+Verify those UIDs are unchanged afterward. This keeps the existing image, buffers,
+dataplane, volume, and control ConfigMap; do not apply the full overlay for this
+change. The 100% rollout restarts all loadgens and interrupts load during hashing.
 
 ## Standalone bootstrap for operator v0.8.0
 

@@ -39,8 +39,8 @@ class OverlayTest(unittest.TestCase):
         container = pod["containers"][0]
         args = dict(a[2:].split("=", 1) for a in container["args"])
         for key, value in {"backend": "uds", "volume": "racer-loadgen",
-                           "catalog-blobs": "512", "blob-bytes": "536870912",
-                           "seed": "zipf-balanced-v1", "startup-timeout": "25m",
+                           "catalog-blobs": "512", "blob-bytes": "2147483648",
+                           "seed": "zipf-balanced-v1", "startup-timeout": "60m",
                            "profile": "zipf", "zipf-exponent": "0.5",
                            "verify": "false", "concurrency": "8"}.items():
             self.assertEqual(args[key], value)
@@ -51,8 +51,13 @@ class OverlayTest(unittest.TestCase):
         self.assertNotIn("limits", container["resources"])
         self.assertNotIn("duration", args)
         self.assertEqual(container["startupProbe"]["httpGet"]["path"], "/readyz")
-        self.assertEqual(container["startupProbe"]["failureThreshold"], 180)
+        self.assertEqual(int(args["catalog-blobs"]) * int(args["blob-bytes"]), 2**40)
+        self.assertEqual(container["startupProbe"]["failureThreshold"], 390)
         self.assertEqual(container["startupProbe"]["periodSeconds"], 10)
+        probe_budget = (container["startupProbe"]["failureThreshold"]
+                        * container["startupProbe"]["periodSeconds"])
+        self.assertGreater(probe_budget, int(args["startup-timeout"][:-1]) * 60)
+        self.assertLessEqual(probe_budget, 65 * 60)
         self.assertEqual(args["concurrency-file"], "/etc/racer-loadgen-control/concurrency")
         self.assertTrue(any(v.get("configMap", {}).get("name") == "racer-loadgen-control"
                             for v in pod["volumes"]))
@@ -106,13 +111,13 @@ class OverlayTest(unittest.TestCase):
     def test_dashboard_workload_contract(self):
         dashboard = json.loads((ROOT.parent.parent / "racer/grafana-direct-zipf.json").read_text())
         description = dashboard["description"]
-        for value in ("512 x 536870912-byte", "zipf-balanced-v1", "exponent 0.5",
+        for value in ("512 x 2147483648-byte", "zipf-balanced-v1", "exponent 0.5",
                       "4 GiB plaintext", "8 GiB ciphertext",
                       "2 GiB each for dirty and registered", "owned-only"):
             self.assertIn(value, description)
         for panel in dashboard["panels"][:2]:
             expression = panel["targets"][0]["expr"]
-            self.assertIn("* 536870912 * 8 / 1e9", expression)
+            self.assertIn("* 2147483648 * 8 / 1e9", expression)
             self.assertIn('result="success"', expression)
 
 

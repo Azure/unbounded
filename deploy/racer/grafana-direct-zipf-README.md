@@ -1,12 +1,12 @@
-# Direct Zipf dashboard: 512 x 512 MiB
+# Direct Zipf dashboard: 512 x 2 GiB (1 TiB catalog)
 
-`grafana-direct-zipf.json` has four panels. Its UID is `racer-direct-zipf`.
+`grafana-direct-zipf.json` has five panels. Its UID is `racer-direct-zipf`.
 Use datasource UID `prometheus`, 60-second scrapes, and the existing
 `kubernetes-pods` and `node-exporter` jobs. The default namespace is
 `unbounded-system`.
 
 Run only the intended `racer-loadgen` workload in the selected namespace:
-direct UDS, `--catalog-blobs=512`, `--blob-bytes=536870912`,
+direct UDS, `--catalog-blobs=512`, `--blob-bytes=2147483648`,
 `--seed=zipf-balanced-v1`, `--profile=zipf`, and `--zipf-exponent=0.5`.
 The balanced-config experiment uses owned-only disk retention (admission
 disabled), 4 GiB plaintext, 8 GiB ciphertext, and 2 GiB each for dirty and
@@ -17,17 +17,44 @@ It works without client hashing but is not verified goodput or wire traffic.
 The node average divides by distinct discovered `racer-dataplane` nodes,
 including down scrape targets, not expected fleet size.
 
-The size multiplier is fixed and there is no benchmark label selector. After a
-size change, wait for all new loadgen pods to be ready and a full five-minute
-window with only new-pod samples before interpreting throughput. Historical
-64 MiB intervals and rollout windows are invalid under the 512 MiB multiplier.
-Do not mix other loadgen sizes in the selected namespace.
+The size multiplier is fixed. The success counter has no blob-size label.
+Both throughput queries join on job, namespace, and pod with
+`process_start_time_seconds >= 1791576350` (2026-10-09 20:05:50 UTC).
+This rollout boundary excludes old 512 MiB and 64 MiB processes, including
+historical windows. All 100 new processes were observed starting after that
+boundary. Missing process metrics or successful new-pod samples leave no data,
+not a zero or an inflated old-size result. Wait for new-pod readiness and a full
+five-minute window before interpreting throughput. The boundary is not a size
+label: do not mix later loadgen sizes in this namespace. When reusing this
+dashboard for another size, change both multipliers and the rollout boundary.
 
 The cache panel shows shares of memory, disk, and peer **hit events**, excluding
 origin fills. It is not a client cache-hit ratio or byte breakdown. A peer page
 can also count as a memory or disk hit on its serving node. Host CPU includes
 all workloads and I/O wait, with equal weight per sampled Racer host. Missing
 data and idle ratios stay undefined.
+
+The disk panel uses IEC byte units. It sums `racer_disk_size_bytes` for total
+assigned physical segment capacity and `racer_disk_used_bytes` for reserved
+physical record bytes. These share the same accounting basis, unlike physical
+capacity and indexed payload bytes. Total excludes raw-device guards and
+unassigned remainder. Used includes aligned record overhead, padding, and
+reservations until segment recycle; it does not count unused sealed tails.
+It is not live payload, filesystem usage, or effective payload capacity.
+Total minus used is therefore not guaranteed writable payload space. Both
+series include only scraped dataplanes; verify disk metrics cover all 100 nodes.
+
+The source contract is in `cmd/racer-dataplane/alloc/src/segments.rs`
+(`configure_usage_groups`, `usage`, and `append`),
+`cmd/racer-dataplane/src/store.rs` (`observe_disks` and aligned record allocation),
+and `cmd/racer-dataplane/src/telemetry.rs` (`write_disks`). Workers sharing a disk
+are summed once by disk label before scrape export.
+
+Run the dashboard checks with:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s python3 deploy/racer/grafana_direct_zipf_test.py
+```
 
 Merge only the `racer-direct-zipf.json` data key into the existing
 `monitoring/grafana-dashboards` ConfigMap. Preserve other keys. The current
