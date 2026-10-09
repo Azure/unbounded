@@ -114,6 +114,102 @@ func TestState(t *testing.T) {
 	}
 }
 
+// TestLegacyReleased covers when nothing the agent runs is under the legacy
+// root any more, so the binary install scripts leave there can go.
+func TestLegacyReleased(t *testing.T) {
+	t.Parallel()
+
+	linkTo := func(target func(l layout) string) func(t *testing.T, l layout) {
+		return func(t *testing.T, l layout) {
+			require.NoError(t, os.MkdirAll(filepath.Dir(l.root), 0o755))
+			require.NoError(t, os.Symlink(target(l), l.root))
+		}
+	}
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, l layout)
+		want  bool
+	}{
+		{name: "absent", setup: func(*testing.T, layout) {}},
+		{name: "linked", setup: linkTo(func(l layout) string { return l.legacy })},
+		{name: "moving", setup: func(t *testing.T, l layout) { touch(t, filepath.Join(l.root, movingMarker)) }},
+		{
+			name:  "installed",
+			setup: func(t *testing.T, l layout) { require.NoError(t, os.MkdirAll(l.root, 0o755)) },
+			want:  true,
+		},
+		{
+			name: "a link an operator made to somewhere else",
+			setup: func(t *testing.T, l layout) {
+				elsewhere := filepath.Join(filepath.Dir(l.legacy), "data")
+				require.NoError(t, os.MkdirAll(elsewhere, 0o755))
+				linkTo(func(layout) string { return elsewhere })(t, l)
+			},
+			want: true,
+		},
+		{
+			// Not the link Migrate makes, but it leads to the same files.
+			name: "a link an operator made to the legacy root, spelled differently",
+			setup: linkTo(func(l layout) string {
+				return l.legacy + "/"
+			}),
+		},
+		{
+			name: "a link an operator made into the legacy root",
+			setup: linkTo(func(l layout) string {
+				return filepath.Join(l.legacy, "bin")
+			}),
+		},
+		{
+			name:  "a link that leads nowhere",
+			setup: linkTo(func(l layout) string { return filepath.Join(filepath.Dir(l.legacy), "missing") }),
+		},
+		{
+			name: "a link to a file",
+			setup: func(t *testing.T, l layout) {
+				file := filepath.Join(filepath.Dir(l.legacy), "file")
+				touch(t, file)
+				linkTo(func(layout) string { return file })(t, l)
+			},
+		},
+		{name: "a file", setup: func(t *testing.T, l layout) { touch(t, l.root) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			l := newLayout(t)
+			tt.setup(t, l)
+
+			got, err := legacyReleased(l.root, l.legacy)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestStageDoesNotFollowALinkAtTheStagingName covers a link left where the copy
+// is made: the copy goes in a directory of its own, never where the link leads.
+func TestStageDoesNotFollowALinkAtTheStagingName(t *testing.T) {
+	t.Parallel()
+
+	l := legacyHost(t)
+	elsewhere := t.TempDir()
+	require.NoError(t, os.Symlink(elsewhere, l.root+stagingSuffix))
+
+	require.NoError(t, stage(l.root, l.legacy, Layout()))
+
+	info, err := os.Lstat(l.root + stagingSuffix)
+	require.NoError(t, err)
+	assert.True(t, info.IsDir(), "the copy is in a real directory")
+
+	entries, err := os.ReadDir(elsewhere)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "nothing was copied where the link led")
+}
+
 // TestStage checks the copy is complete and self-contained, and that nothing
 // in use changes while it is made.
 func TestStage(t *testing.T) {

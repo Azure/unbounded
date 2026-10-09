@@ -80,6 +80,49 @@ func installed(root, legacy string) (bool, error) {
 	return current == StateInstalled, err
 }
 
+// LegacyReleased is documented in pkg/agent/hostroot.
+func LegacyReleased() (bool, error) {
+	return legacyReleased(Path, LegacyPath)
+}
+
+func legacyReleased(root, legacy string) (bool, error) {
+	current, err := state(root, legacy)
+	if err != nil {
+		return false, err
+	}
+
+	switch current {
+	case StateInstalled:
+		return true, nil
+	case StateOther:
+	case StateAbsent, StateLinked, StateMoving:
+		return false, nil
+	}
+
+	// A link an operator made releases the legacy root unless it leads back
+	// there. Anything else in the way, or a link that leads nowhere, says
+	// nothing about where the agent runs from.
+	info, err := os.Lstat(root)
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w", root, err)
+	}
+
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false, nil //nolint:nilerr // A dangling link releases nothing.
+	}
+
+	if target, err := os.Stat(resolved); err != nil || !target.IsDir() {
+		return false, nil //nolint:nilerr // Neither does a link to something that is not a directory.
+	}
+
+	return !atOrUnder(resolved, legacy), nil
+}
+
 func state(root, legacy string) (State, error) {
 	info, err := os.Lstat(root)
 
@@ -173,6 +216,12 @@ func Migrate(log *slog.Logger, markers ...string) error {
 }
 
 func migrate(log *slog.Logger, root, legacy string, markers []string) error {
+	// On every host, fresh ones included: commands call this first, before
+	// they install anything under the root.
+	if err := checkRoot(root, legacy); err != nil {
+		return err
+	}
+
 	current, err := state(root, legacy)
 	if err != nil {
 		return err
@@ -246,16 +295,20 @@ func holdsAny(root string, markers []string) bool {
 
 // Prepare is documented in pkg/agent/hostroot.
 func Prepare(ctx context.Context, log *slog.Logger, subdirs ...string) error {
-	return prepare(ctx, log, Path, subdirs, restoreLabels)
+	return prepare(ctx, log, Path, LegacyPath, subdirs, restoreLabels)
 }
 
 func prepare(
 	ctx context.Context,
 	log *slog.Logger,
-	root string,
+	root, legacy string,
 	subdirs []string,
 	relabel func(context.Context, *slog.Logger, string),
 ) error {
+	if err := checkRoot(root, legacy); err != nil {
+		return err
+	}
+
 	if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil
 	}
@@ -290,8 +343,15 @@ func mkdirMode(dir string, mode os.FileMode) error {
 	}
 
 	// Another command may have made it since it was checked. It is theirs
-	// then, mode and all.
+	// then, mode and all, as long as it is a directory: a link that appears
+	// in that window is not followed.
 	if err := os.Mkdir(dir, mode); errors.Is(err, os.ErrExist) {
+		if info, err := os.Lstat(dir); err != nil {
+			return fmt.Errorf("inspect %s: %w", dir, err)
+		} else if !info.IsDir() {
+			return fmt.Errorf("%s appeared while it was being created, and is not a directory", dir)
+		}
+
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
@@ -432,8 +492,19 @@ func stage(root, legacy string, files []string) error {
 		return fmt.Errorf("remove %s: %w", staging, err)
 	}
 
-	if err := mkdirMode(staging, 0o755); err != nil {
+	// The root's parent, which is not the agent's; see Path.
+	if err := mkdirMode(filepath.Dir(staging), 0o755); err != nil {
 		return err
+	}
+
+	// Made here, never found: whatever is at the name now was put there since
+	// it was removed, and the copy must not go where it leads.
+	if err := os.Mkdir(staging, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", staging, err)
+	}
+
+	if err := os.Chmod(staging, 0o755); err != nil {
+		return fmt.Errorf("set mode of %s: %w", staging, err)
 	}
 
 	final := filepath.Join(canonical(filepath.Dir(root)), filepath.Base(root))
@@ -500,10 +571,10 @@ func rebase(target string, prefixes []string, root string) string {
 	return target
 }
 
-// RemoveSeed removes SeedFile under LegacyPath. Call it only on a host in
-// StateInstalled, where Migrate has found no installation under LegacyPath.
-// Only a regular file is removed, because that is what the scripts write; a
-// link there is an operator's.
+// RemoveSeed removes SeedFile under LegacyPath. Call it only where
+// LegacyReleased reports true, so nothing the agent runs is there. Only a
+// regular file is removed, because that is what the scripts write; a link
+// there is an operator's.
 func RemoveSeed(log *slog.Logger) error {
 	return removeSeed(log, LegacyPath, SeedFile)
 }

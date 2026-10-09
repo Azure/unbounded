@@ -18,14 +18,24 @@ import (
 
 // moveRun records what ReconcileMove asked of the agent.
 type moveRun struct {
-	rewrites, restarts     int
-	rewriteErr, restartErr error
+	rewrites, restarts, verifies      int
+	rewriteErr, restartErr, verifyErr error
 	// What RewriteUnits saw: the units are rewritten while the legacy files
 	// are still in place and the host is marked as moving.
 	legacyDuringRewrite string
 	stateDuringRewrite  State
+	// What Verify saw: the root it was given, and how many times the units
+	// had been rewritten by then.
+	verifiedRoot      string
+	rewritesAtVerify  int
+	stateDuringVerify State
 	// The root whose SELinux labels were restored, if any.
 	relabeled string
+	// What the host reports about the root's filesystem.
+	noexec    bool
+	noexecErr error
+	// The paths noexec was asked about.
+	noexecChecked []string
 }
 
 func moveOptions(t *testing.T, l layout, run *moveRun) MoveOptions {
@@ -48,6 +58,14 @@ func moveOptions(t *testing.T, l layout, run *moveRun) MoveOptions {
 
 			return run.rewriteErr
 		},
+		Verify: func(_ context.Context, root string) error {
+			run.verifies++
+			run.verifiedRoot = root
+			run.rewritesAtVerify = run.rewrites
+			run.stateDuringVerify, _ = state(l.root, l.legacy) //nolint:errcheck // Compared by the caller.
+
+			return run.verifyErr
+		},
 		Restart: func(context.Context) error {
 			run.restarts++
 
@@ -67,10 +85,15 @@ func fromRoot(l layout) string { return filepath.Join(l.root, "bin", BinaryGreen
 func reconcile(t *testing.T, l layout, opts MoveOptions, run *moveRun, self string) (bool, error) {
 	t.Helper()
 
-	executable := func() (string, error) { return self, nil }
-	relabel := func(_ context.Context, _ *slog.Logger, root string) { run.relabeled = root }
+	return reconcileMove(t.Context(), discard(), l.root, l.legacy, opts, moveHost{
+		executable: func() (string, error) { return self, nil },
+		relabel:    func(_ context.Context, _ *slog.Logger, root string) { run.relabeled = root },
+		noexec: func(path string) (bool, error) {
+			run.noexecChecked = append(run.noexecChecked, path)
 
-	return reconcileMove(t.Context(), discard(), l.root, l.legacy, opts, executable, relabel)
+			return run.noexec, run.noexecErr
+		},
+	})
 }
 
 func recordBlue(t *testing.T, l layout, opts MoveOptions) {
@@ -194,9 +217,15 @@ func TestReconcileMove(t *testing.T) {
 		assert.Equal(t, 1, run.rewrites)
 		assert.Equal(t, StateMoving, run.stateDuringRewrite)
 		assert.Equal(t, "green", run.legacyDuringRewrite, "the legacy files stay until the units name the new ones")
+		assert.Equal(t, 1, run.verifies)
+		assert.Equal(t, l.root, run.verifiedRoot)
+		assert.Zero(t, run.rewritesAtVerify, "the copy is run before any unit names it")
+		assert.Equal(t, StateMoving, run.stateDuringVerify)
+		assert.Equal(t, []string{filepath.Dir(l.root)}, run.noexecChecked, "the copy's filesystem is checked before it is made")
 
 		finish(t, l, opts, run)
 		assert.Equal(t, 2, run.rewrites, "the units are rewritten again before the legacy files go")
+		assert.Equal(t, 1, run.verifies, "a daemon running from the copy has shown it runs there")
 	})
 
 	t.Run("other hosts are left alone", func(t *testing.T) {
@@ -384,6 +413,169 @@ func TestReconcileMoveResumes(t *testing.T) {
 			assert.Equal(t, l.root, run.relabeled, "a resumed move restores the labels too")
 		})
 	}
+}
+
+// assertStillLinked checks a host the move left as it found it: linked, with
+// no copy, the legacy layout intact, and the record kept for the next try.
+func assertStillLinked(t *testing.T, l layout, opts MoveOptions) {
+	t.Helper()
+
+	got, err := state(l.root, l.legacy)
+	require.NoError(t, err)
+	assert.Equal(t, StateLinked, got)
+
+	_, err = os.Lstat(l.root + stagingSuffix)
+	assert.ErrorIs(t, err, os.ErrNotExist, "no copy is left beside the root")
+
+	for _, path := range LayoutUnder(l.legacy) {
+		_, err := os.Lstat(path)
+		assert.NoError(t, err, "%s was removed from a host that stays linked", path)
+	}
+
+	assert.Equal(t, "green", readLinked(t, filepath.Join(l.root, "bin", BinaryCurrentName)), "the units reach the legacy files through the link")
+	assert.FileExists(t, opts.Record, "the next start tries again")
+	assertArtifactsKept(t, l)
+}
+
+// TestReconcileMoveSkipsARootMountedNoexec covers a host whose root's
+// filesystem does not allow running programs: nothing is copied, and the host
+// stays linked.
+func TestReconcileMoveSkipsARootMountedNoexec(t *testing.T) {
+	t.Parallel()
+
+	l := legacyHost(t)
+	run := &moveRun{noexec: true}
+	opts := moveOptions(t, l, run)
+	recordBlue(t, l, opts)
+
+	restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
+	require.NoError(t, err, "the daemon is healthy where it is")
+	assert.False(t, restarted)
+	assert.Zero(t, run.verifies)
+	assert.Zero(t, run.rewrites)
+	assert.Empty(t, run.relabeled)
+	assertStillLinked(t, l, opts)
+
+	run.noexec, run.noexecErr = false, errors.New("statfs failed")
+	_, err = reconcile(t, l, opts, run, fromLegacy(l))
+	require.ErrorContains(t, err, "statfs failed")
+	assertStillLinked(t, l, opts)
+
+	run.noexecErr = nil
+	restarted, err = reconcile(t, l, opts, run, fromLegacy(l))
+	assertRestarting(t, l, opts, run, restarted, err)
+	finish(t, l, opts, run)
+}
+
+// TestReconcileMoveUndoesACopyThatCannotRun covers a copy the daemon cannot run
+// from: the link replaces it again, the units are pointed back at the legacy
+// root, and the next start tries again.
+func TestReconcileMoveUndoesACopyThatCannotRun(t *testing.T) {
+	t.Parallel()
+
+	l := legacyHost(t)
+	run := &moveRun{verifyErr: errors.New("permission denied")}
+	opts := moveOptions(t, l, run)
+	recordBlue(t, l, opts)
+
+	restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
+	require.ErrorContains(t, err, "permission denied")
+	require.ErrorContains(t, err, "stays linked")
+	assert.False(t, restarted)
+	assert.Zero(t, run.restarts)
+	assert.Equal(t, 1, run.verifies)
+	assert.Equal(t, 1, run.rewrites, "the units are pointed back once the link is in place")
+	assert.Equal(t, StateLinked, run.stateDuringRewrite)
+	assertStillLinked(t, l, opts)
+
+	run.verifyErr = nil
+	restarted, err = reconcile(t, l, opts, run, fromLegacy(l))
+	assertRestarting(t, l, opts, run, restarted, err)
+	finish(t, l, opts, run)
+}
+
+// TestReconcileMoveUndoesAResumedMove covers a copy that ran once and no longer
+// does when the move is resumed, after the units were already pointed at it:
+// they are pointed back.
+func TestReconcileMoveUndoesAResumedMove(t *testing.T) {
+	t.Parallel()
+
+	l := legacyHost(t)
+	run := &moveRun{restartErr: errors.New("restart refused")}
+	opts := moveOptions(t, l, run)
+	recordBlue(t, l, opts)
+
+	_, err := reconcile(t, l, opts, run, fromLegacy(l))
+	require.ErrorContains(t, err, "restart refused")
+	require.Equal(t, 1, run.rewrites)
+	require.Equal(t, StateMoving, run.stateDuringRewrite, "the units were pointed at the copy")
+
+	run.restartErr = nil
+	run.verifyErr = errors.New("permission denied")
+	restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
+	require.ErrorContains(t, err, "permission denied")
+	assert.False(t, restarted)
+	assert.Equal(t, 2, run.verifies, "a resumed move checks the copy again")
+	assert.Equal(t, 2, run.rewrites)
+	assert.Equal(t, StateLinked, run.stateDuringRewrite, "the units are pointed back at the legacy root")
+	assertStillLinked(t, l, opts)
+}
+
+// TestReconcileMoveReportsAFailureToPointTheUnitsBack covers an undo whose
+// rewrite fails: the error says so, and the link is back regardless, through
+// which the units reach the legacy files.
+func TestReconcileMoveReportsAFailureToPointTheUnitsBack(t *testing.T) {
+	t.Parallel()
+
+	l := legacyHost(t)
+	run := &moveRun{verifyErr: errors.New("permission denied"), rewriteErr: errors.New("systemd is busy")}
+	opts := moveOptions(t, l, run)
+	recordBlue(t, l, opts)
+
+	_, err := reconcile(t, l, opts, run, fromLegacy(l))
+	require.ErrorContains(t, err, "permission denied")
+	require.ErrorContains(t, err, "pointing the host back")
+	require.ErrorContains(t, err, "systemd is busy")
+	assertStillLinked(t, l, opts)
+}
+
+func TestReconcileMoveRequiresVerify(t *testing.T) {
+	t.Parallel()
+
+	l := legacyHost(t)
+	run := &moveRun{}
+	opts := moveOptions(t, l, run)
+	recordBlue(t, l, opts)
+	opts.Verify = nil
+
+	_, err := reconcile(t, l, opts, run, fromLegacy(l))
+	require.ErrorContains(t, err, "Verify is required")
+	assertStillLinked(t, l, opts)
+}
+
+// TestReconcileMoveRefusesARootOthersCanReplace covers a root's parent that
+// others can write to: the copy would go where they could replace it.
+func TestReconcileMoveRefusesARootOthersCanReplace(t *testing.T) {
+	t.Parallel()
+
+	l := legacyHost(t)
+	run := &moveRun{}
+	opts := moveOptions(t, l, run)
+	recordBlue(t, l, opts)
+	require.NoError(t, os.Chmod(filepath.Dir(l.root), 0o777))
+
+	restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
+	require.ErrorIs(t, err, errUntrusted)
+	assert.False(t, restarted)
+	assert.Zero(t, run.verifies)
+	assert.Zero(t, run.rewrites)
+
+	got, err := state(l.root, l.legacy)
+	require.NoError(t, err)
+	assert.Equal(t, StateLinked, got)
+
+	_, err = os.Lstat(l.root + stagingSuffix)
+	assert.ErrorIs(t, err, os.ErrNotExist, "nothing is copied")
 }
 
 func TestRecordDigest(t *testing.T) {

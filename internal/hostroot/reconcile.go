@@ -15,6 +15,9 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/google/renameio/v2"
+	"golang.org/x/sys/unix"
+
 	"github.com/Azure/unbounded/internal/fsutil"
 )
 
@@ -44,12 +47,29 @@ type MoveOptions struct {
 	// RewriteUnits points every unit and script that names the agent's files
 	// at the files under the root, reloads systemd, and makes them durable
 	// before it returns. It runs on every pass of an unfinished move, so it
-	// has to be idempotent.
+	// has to be idempotent. A move that is undone calls it once more with the
+	// root linked to LegacyPath again, to point them back.
 	RewriteUnits func(context.Context) error
+	// Verify runs the daemon binary from the copy under root, before any unit
+	// names it, and fails if it cannot run there, for example because
+	// something denies running programs from that filesystem. The move is
+	// then undone. It is required.
+	Verify func(ctx context.Context, root string) error
 	// Restart restarts the daemon from the rewritten units, so it runs from
 	// the root. It may only queue the restart; the caller must not carry on
 	// as the running daemon when ReconcileMove reports it.
 	Restart func(context.Context) error
+}
+
+// moveHost is what a move asks of the host, which tests replace.
+type moveHost struct {
+	// executable returns the running daemon's executable.
+	executable func() (string, error)
+	// relabel restores the SELinux labels under a root.
+	relabel func(context.Context, *slog.Logger, string)
+	// noexec reports whether the filesystem holding a path is mounted
+	// without permission to run programs from it.
+	noexec func(string) (bool, error)
 }
 
 // ReconcileMove moves a host an older agent installed from LegacyPath into a
@@ -65,16 +85,29 @@ type MoveOptions struct {
 // older agent out of last-good.
 //
 // A move takes two daemon starts. The first copies the files into the root,
-// restores its labels, points the units at it, and restarts the daemon. The
-// second, running from the root, removes the files under LegacyPath. So nothing
-// is removed until the daemon has been restarted from the copy, and the daemon
-// never runs from a binary that is gone. A failed restart leaves the move to
-// the next start, with every file the old and new units name in place.
+// restores its labels, checks the daemon runs from the copy, points the units
+// at it, and restarts the daemon. The second, running from the root, removes
+// the files under LegacyPath. So nothing is removed until the daemon has been
+// restarted from the copy, and the daemon never runs from a binary that is
+// gone. A failed restart leaves the move to the next start, with every file
+// the old and new units name in place.
+//
+// A host whose root cannot run programs is not moved. Where the filesystem is
+// mounted noexec no copy is made; where MoveOptions.Verify fails, the copy is
+// replaced with the link again and the units pointed back at LegacyPath. The
+// host stays linked either way, and the next start tries again.
+//
+// It refuses a host where someone other than root could replace the files
+// under the root, as Migrate does.
 //
 // It reports whether it restarted the daemon, which it may only have queued.
 // The caller must then wait to be replaced rather than carry on.
 func ReconcileMove(ctx context.Context, log *slog.Logger, opts MoveOptions) (bool, error) {
-	return reconcileMove(ctx, log, Path, LegacyPath, opts, os.Executable, restoreLabels)
+	return reconcileMove(ctx, log, Path, LegacyPath, opts, moveHost{
+		executable: os.Executable,
+		relabel:    restoreLabels,
+		noexec:     mountedNoexec,
+	})
 }
 
 func reconcileMove(
@@ -82,8 +115,7 @@ func reconcileMove(
 	log *slog.Logger,
 	root, legacy string,
 	opts MoveOptions,
-	executable func() (string, error),
-	relabel func(context.Context, *slog.Logger, string),
+	host moveHost,
 ) (bool, error) {
 	current, err := state(root, legacy)
 	if err != nil {
@@ -96,7 +128,16 @@ func reconcileMove(
 		return false, nil
 	}
 
-	self, err := executable()
+	if opts.Verify == nil {
+		return false, errors.New("hostroot: MoveOptions.Verify is required")
+	}
+
+	// The copy goes beside the root, and then in its place.
+	if err := checkRoot(root, legacy); err != nil {
+		return false, err
+	}
+
+	self, err := host.executable()
 	if err != nil {
 		return false, fmt.Errorf("resolve the daemon's executable: %w", err)
 	}
@@ -104,7 +145,7 @@ func reconcileMove(
 	if current == StateMoving {
 		log.Info("finishing the move of the agent's files to the host root", "path", root)
 
-		return completeMove(ctx, log, root, legacy, opts, self, relabel)
+		return completeMove(ctx, log, root, legacy, opts, self, host)
 	}
 
 	if err := recordDigest(opts.Record, self); err != nil {
@@ -122,13 +163,24 @@ func reconcileMove(
 		return false, nil
 	}
 
+	// Verify would catch it too, but only after a full copy, at every start.
+	parent := filepath.Dir(root)
+	if noexec, err := host.noexec(parent); err != nil {
+		return false, fmt.Errorf("inspect the filesystem of %s: %w", parent, err)
+	} else if noexec {
+		log.Warn("keeping the agent's files under the legacy root: the host root's filesystem is mounted noexec",
+			"path", parent, "legacy", legacy)
+
+		return false, nil
+	}
+
 	log.Info("moving the agent's files to the host root", "from", legacy, "to", root)
 
 	if err := move(log, root, legacy, opts.Files); err != nil {
 		return false, err
 	}
 
-	return completeMove(ctx, log, root, legacy, opts, self, relabel)
+	return completeMove(ctx, log, root, legacy, opts, self, host)
 }
 
 // completeMove finishes a move whose copy is in place at root. self is the
@@ -139,13 +191,24 @@ func completeMove(
 	root, legacy string,
 	opts MoveOptions,
 	self string,
-	relabel func(context.Context, *slog.Logger, string),
+	host moveHost,
 ) (bool, error) {
 	// Laid out and labeled as a fresh installation is, before any unit runs
 	// from it. A move interrupted after the rename has not done it yet, and
 	// doing it again is harmless.
-	if err := prepare(ctx, log, root, opts.Subdirs, relabel); err != nil {
+	if err := prepare(ctx, log, root, legacy, opts.Subdirs, host.relabel); err != nil {
 		return false, err
+	}
+
+	// Before any unit names the copy: once one does, a daemon that cannot run
+	// from it does not start again, and nothing rolls it back, since the
+	// recovery unit only acts on an AgentUpgrade. A daemon already running
+	// from the copy has shown it runs there.
+	running := under(self, legacy)
+	if running {
+		if err := opts.Verify(ctx, root); err != nil {
+			return false, undoMove(ctx, log, root, legacy, opts, err)
+		}
 	}
 
 	if err := opts.RewriteUnits(ctx); err != nil {
@@ -156,7 +219,7 @@ func completeMove(
 	// before they go, and the restarted daemon removes them. Until then the
 	// files the old units named are all in place, so a restart that fails
 	// strands nothing, and the next start tries again.
-	if under(self, legacy) {
+	if running {
 		log.Info("restarting the daemon from the host root; it removes the files under the legacy root",
 			"path", root, "running", self)
 
@@ -204,6 +267,79 @@ func completeMove(
 	log.Info("moved the agent's files to the host root", "path", root, "from", legacy)
 
 	return false, nil
+}
+
+// undoMove puts the link to legacy back in place of a copy the daemon cannot
+// run from, and points the units back at legacy, which an earlier pass of the
+// same move may have rewritten. The legacy files are all still there, since
+// only a daemon running from the copy removes them. The record stays, so the
+// next start tries the move again. It returns why the move was undone, and
+// why undoing it failed if it did.
+func undoMove(ctx context.Context, log *slog.Logger, root, legacy string, opts MoveOptions, cause error) error {
+	log.Warn("the agent cannot run from the host root; keeping its files under the legacy root",
+		"path", root, "legacy", legacy, "error", cause)
+
+	err := relink(root, legacy)
+	if err == nil {
+		err = opts.RewriteUnits(ctx)
+	}
+
+	if err != nil {
+		return fmt.Errorf("the agent cannot run from %s: %w; and pointing the host back at %s failed: %w", root, cause, legacy, err)
+	}
+
+	return fmt.Errorf("the agent cannot run from %s, so it stays linked to %s: %w", root, legacy, cause)
+}
+
+// relink replaces the copy at root with the link to legacy that Migrate makes.
+// Units that name paths under root reach the legacy files through it, so they
+// work whether or not they have been pointed back yet.
+func relink(root, legacy string) error {
+	aside := root + stagingSuffix
+
+	if err := os.RemoveAll(aside); err != nil {
+		return fmt.Errorf("remove %s: %w", aside, err)
+	}
+
+	// A link cannot replace a directory, so the copy is set aside first.
+	// Until the link is in place there is no root, which Migrate would link
+	// the same way.
+	if err := os.Rename(root, aside); err != nil {
+		return fmt.Errorf("move %s to %s: %w", root, aside, err)
+	}
+
+	if err := renameio.Symlink(legacy, root); err != nil {
+		return fmt.Errorf("link %s to %s: %w", root, legacy, err)
+	}
+
+	if err := fsutil.SyncDir(filepath.Dir(root)); err != nil {
+		return err
+	}
+
+	if err := os.RemoveAll(aside); err != nil {
+		return fmt.Errorf("remove %s: %w", aside, err)
+	}
+
+	return nil
+}
+
+// mountedNoexec reports whether the filesystem holding path is mounted
+// without permission to run programs from it.
+func mountedNoexec(path string) (bool, error) {
+	var fs unix.Statfs_t
+	if err := unix.Statfs(path, &fs); err != nil {
+		return false, err
+	}
+
+	return fs.Flags&unix.ST_NOEXEC != 0, nil
+}
+
+// atOrUnder reports whether path is the legacy root or under it, as given or
+// with symlinks resolved.
+func atOrUnder(path, legacy string) bool {
+	clean := filepath.Clean(path)
+
+	return clean == filepath.Clean(legacy) || clean == canonical(legacy) || under(clean, legacy)
 }
 
 // under reports whether path is under the legacy root, as given or with

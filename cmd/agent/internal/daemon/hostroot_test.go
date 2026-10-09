@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
@@ -88,6 +90,26 @@ func TestReconcileHostRootUnderLock(t *testing.T) {
 
 		assert.Zero(t, op.hostRootCalls)
 	})
+}
+
+// TestVerifyMovedDaemon runs the current daemon link in a copy of the layout,
+// which is what a move checks before any unit names the copy.
+func TestVerifyMovedDaemon(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	require.NoError(t, os.MkdirAll(bin, 0o755))
+
+	require.ErrorContains(t, verifyMovedDaemon(t.Context(), root), hostroot.BinaryCurrentName, "a missing binary cannot run")
+
+	green := filepath.Join(bin, hostroot.BinaryGreenName)
+	require.NoError(t, os.WriteFile(green, []byte("#!/bin/sh\n[ \"$1\" = version ]\n"), 0o755))
+	require.NoError(t, os.Symlink(green, filepath.Join(bin, hostroot.BinaryCurrentName)))
+	require.NoError(t, verifyMovedDaemon(t.Context(), root))
+
+	require.NoError(t, os.Chmod(green, 0o644))
+	require.Error(t, verifyMovedDaemon(t.Context(), root), "a binary that cannot run fails")
 }
 
 // TestAwaitReplacement: a daemon that queued its own restart does nothing until

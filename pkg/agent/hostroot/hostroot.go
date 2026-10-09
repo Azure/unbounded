@@ -71,6 +71,14 @@ func Planned(markers ...string) string {
 // fresh installation gets a real directory. A link to anywhere else is an
 // operator's, and is kept.
 //
+// On every host, it also refuses one where a user other than root could
+// replace the files under Path: where a directory on the way to Path, such as
+// /opt or /opt/unbounded, or Path itself, is owned by another user or can be
+// written to by group or others. Links are followed, so a link an operator
+// made is checked where it leads. A Path linked to LegacyPath is checked up to
+// the link; LegacyPath is trusted as it is, as every earlier release trusted
+// it.
+//
 // Commands that change the host call it first, before any path is resolved: a
 // path resolved on an unmigrated legacy host names Path, where nothing is
 // installed.
@@ -82,7 +90,8 @@ func Migrate(log *slog.Logger, markers ...string) error {
 // a new installation needs them, with mode 0755 regardless of the umask, and
 // restores the SELinux labels under Path where the policy tools are present.
 // An existing parent keeps its mode. On a migrated host Path is the existing
-// installation and is left as it is.
+// installation and is left as it is. It refuses a host where a user other than
+// root could replace the files under Path, as Migrate does.
 //
 // The labels matter because a directory takes its parent's label when it is
 // created. Under /opt that is usr_t, while the policy expects bin_t under
@@ -93,18 +102,28 @@ func Prepare(ctx context.Context, log *slog.Logger, subdirs ...string) error {
 
 // Installed reports whether Path is a real directory holding a finished
 // installation: not missing, not a link to LegacyPath or anywhere else, and not
-// partway through a move by ReconcileMove. Until it is, files under LegacyPath
-// may still be in use, even ones the install scripts leave there for older
-// releases, so an agent removes nothing there before it reports true.
+// partway through a move by ReconcileMove.
 func Installed() (bool, error) {
 	return impl.Installed()
+}
+
+// LegacyReleased reports whether nothing an agent runs is under LegacyPath any
+// more: Path is a real directory holding a finished installation, or a link an
+// operator made that leads to a directory outside LegacyPath. Until it is,
+// files under LegacyPath may still be in use, even ones the install scripts
+// leave there for older releases, so an agent removes nothing there before it
+// reports true. A binary left there for older releases is also what one of
+// them would adopt after an AgentUpgrade back to it, so where it reports true
+// that binary should be gone before such an upgrade can start.
+func LegacyReleased() (bool, error) {
+	return impl.LegacyReleased()
 }
 
 // MoveOptions describes what ReconcileMove moves and how the agent follows it:
 // the agent's files and directories under the root, where binaries that know
 // the host root are recorded, the AgentUpgrade signal and blue-green links that
-// decide when the move is safe, and how to rewrite the units and restart the
-// daemon.
+// decide when the move is safe, how to check the daemon runs from the copy, and
+// how to rewrite the units and restart the daemon.
 type MoveOptions = impl.MoveOptions
 
 // ReconcileMove moves a host a release before Path installed from LegacyPath
@@ -118,12 +137,21 @@ type MoveOptions = impl.MoveOptions
 // it never records itself.
 //
 // A move spans two daemon starts. The first copies the files into Path,
-// restores their SELinux labels, calls MoveOptions.RewriteUnits and then
-// MoveOptions.Restart, and reports true. The daemon must then stop taking work
-// and wait to be replaced. The second start, running from Path, rewrites the
-// units again and removes the files under LegacyPath. Nothing is removed while
-// the daemon still runs from LegacyPath, so a restart that fails leaves every
-// file in place and the next start tries again.
+// restores their SELinux labels, calls MoveOptions.Verify, then
+// MoveOptions.RewriteUnits and MoveOptions.Restart, and reports true. The
+// daemon must then stop taking work and wait to be replaced. The second start,
+// running from Path, rewrites the units again and removes the files under
+// LegacyPath. Nothing is removed while the daemon still runs from LegacyPath,
+// so a restart that fails leaves every file in place and the next start tries
+// again.
+//
+// A host that cannot run programs from Path stays linked. Where its filesystem
+// is mounted noexec, nothing is copied. Where Verify fails, the copy is
+// replaced with the link again, RewriteUnits is called to point the units back
+// at LegacyPath, and the error is returned. The next start tries again.
+//
+// It refuses a host where a user other than root could replace the files
+// under Path, as Migrate does.
 func ReconcileMove(ctx context.Context, log *slog.Logger, opts MoveOptions) (bool, error) {
 	return impl.ReconcileMove(ctx, log, opts)
 }

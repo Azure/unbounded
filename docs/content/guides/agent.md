@@ -213,6 +213,15 @@ removes it or anything else in it. Mount a volume at a subdirectory such as
 `/opt/unbounded/artifacts` rather than over `/opt/unbounded`, so it does not
 hide the agent.
 
+Systemd runs the agent's files as root, so the agent refuses to run where a user
+other than root could replace them. `/opt`, `/opt/unbounded`, and
+`/opt/unbounded/agent` must be owned by root and not writable by group or
+others, and so must every directory that a link along the way leads to. If an
+account other than root stages files for the agent, give it a subdirectory of
+its own, such as `/opt/unbounded/artifacts`, rather than `/opt/unbounded`
+itself. The filesystem that holds `/opt/unbounded/agent` must also allow running
+programs, so `/opt` must not be mounted `noexec`.
+
 Releases up to v0.10.0 installed these files under `/usr/local`. A host installed
 by one of them moves to `/opt/unbounded/agent` in two stages:
 
@@ -231,6 +240,12 @@ by one of them moves to `/opt/unbounded/agent` in two stages:
    of the last-good slot. To move a host that is not due another upgrade, apply
    the release it already runs as an AgentUpgrade. A move that is interrupted is
    finished or started over at the next daemon start.
+
+   Before any unit names the copy, the daemon runs it. A host whose `/opt` is
+   mounted `noexec`, or where the copy does not run for another reason, stays
+   linked: the daemon logs why, removes the copy, points the units back at
+   `/usr/local` if a move that was interrupted had already pointed them at the
+   copy, and tries again at its next start.
 
 `unbounded-agent reset` removes the agent's files from both locations at any
 stage, then `/opt/unbounded/agent` itself: the link the agent made, or the
@@ -261,7 +276,10 @@ Run `unbounded-agent reset` first.
 
 The install script also places the agent binary at
 `/usr/local/bin/unbounded-agent` where it can, because releases up to v0.10.0
-look for it there. Newer releases do not use it, and the daemon removes it.
+look for it there. Newer releases do not use it, and the daemon removes it once
+nothing it runs is under `/usr/local`: once the host is installed in a real
+`/opt/unbounded/agent`, or in a directory outside `/usr/local` that you linked
+`/opt/unbounded/agent` to.
 
 ### Immutable hosts (read-only /usr)
 

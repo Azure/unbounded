@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/internal/hostroot"
+	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 )
@@ -78,16 +79,18 @@ func awaitReplacement(ctx context.Context, log *slog.Logger, wait time.Duration)
 }
 
 // reconcileHostRoot moves a host an older agent installed to the host root
-// once that cannot strand a rollback, and on a host installed under the host
-// root removes the binary install scripts seed under the legacy root for older
+// once that cannot strand a rollback, and, once nothing the agent runs is under
+// the legacy root, removes the binary install scripts seed there for older
 // agents. It reports whether it queued the daemon's restart.
 func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOperator, active *ActiveMachine) (bool, error) {
-	state, err := hostroot.CurrentState()
+	released, err := hostroot.LegacyReleased()
 	if err != nil {
 		return false, err
 	}
 
-	if state == hostroot.StateInstalled {
+	// Installed under the host root, or under a link an operator made to
+	// somewhere else, so there is nothing to move.
+	if released {
 		return false, hostroot.RemoveSeed(log)
 	}
 
@@ -107,10 +110,17 @@ func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOpera
 		RewriteUnits: func(ctx context.Context) error {
 			return rewriteHostRootUnits(ctx, log, operator, active)
 		},
+		Verify: verifyMovedDaemon,
 		Restart: func(ctx context.Context) error {
 			return operator.RestartAgentDaemon(ctx, log)
 		},
 	})
+}
+
+// verifyMovedDaemon runs the current daemon binary from a copy of the layout
+// under root.
+func verifyMovedDaemon(ctx context.Context, root string) error {
+	return agentbinary.Verify(ctx, filepath.Join(root, "bin", hostroot.BinaryCurrentName))
 }
 
 // rewriteHostRootUnits points every unit and script that names the agent's
