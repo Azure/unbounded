@@ -27,11 +27,13 @@ spec:
     - name: oldAnnotations
       expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
   validations:
+    # Compare both directions so additions and removals cannot bypass the guard.
     - expression: >-
         object.all(k, k == 'metadata' || (k in oldObject && object[k] == oldObject[k])) &&
         oldObject.all(k, k == 'metadata' || (k in object && oldObject[k] == object[k]))
       message: Racer may not change Node fields outside metadata
       reason: Forbidden
+    # managedFields is API-server field-management bookkeeping, not Node state.
     - expression: >-
         object.metadata.all(k, k in ['annotations', 'managedFields'] ||
           (k in oldObject.metadata && object.metadata[k] == oldObject.metadata[k])) &&
