@@ -275,6 +275,58 @@ class TestAcquireHostImage(unittest.TestCase):
             self.assertFalse((Path(tmp) / "acl-b.qcow2.part").exists())
 
 
+class TestAcquireGalleryImage(unittest.TestCase):
+    """A gallery image is exported rather than downloaded, and has no digest
+    to check, so it is trusted by the version that names its file."""
+
+    VERSION_ID = "/SharedGalleries/g/Images/i/Versions/3.20261007.1021"
+
+    def _image(self):
+        return e2e.HostImage(url="", file_name="acl-gallery-3.20261007.1021.qcow2", backing_format="qcow2",
+                             sudo_group="sudo", packages=[], ssh_user="core", provisioning="ignition",
+                             sha256="", auth="", gallery=self.VERSION_ID)
+
+    def _acquire(self, tmp, export):
+        exports = []
+
+        def fake_export(version_id, destination):
+            exports.append((version_id, destination.name))
+            export(destination)
+
+        with patch.object(e2e, "VM_DIR", Path(tmp)), \
+                patch.object(e2e, "export_gallery_image", side_effect=fake_export), \
+                patch.object(e2e, "download_file", side_effect=AssertionError("a gallery image is not downloaded")), \
+                patch.object(e2e, "run"):
+            e2e.acquire_host_image(self._image())
+        return exports
+
+    def test_the_export_is_renamed_once_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exports = self._acquire(tmp, lambda destination: destination.write_bytes(b"exported"))
+            self.assertEqual(exports, [(self.VERSION_ID, "acl-gallery-3.20261007.1021.qcow2.part")])
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["acl-gallery-3.20261007.1021.qcow2"])
+
+    def test_an_existing_export_is_reused(self):
+        """Within a job, fresh-bootstrap boots the image lifecycle exported."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "acl-gallery-3.20261007.1021.qcow2").write_bytes(b"exported")
+            self.assertEqual(self._acquire(tmp, lambda destination: None), [])
+
+    def test_a_failed_export_leaves_nothing_under_the_trusted_name(self):
+        def fail(destination):
+            destination.write_bytes(b"half")
+            raise SystemExit(1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                self._acquire(tmp, fail)
+            self.assertFalse((Path(tmp) / "acl-gallery-3.20261007.1021.qcow2").exists())
+
+            # The next attempt starts from a clean partial file.
+            self._acquire(tmp, lambda destination: destination.write_bytes(b"exported"))
+            self.assertEqual((Path(tmp) / "acl-gallery-3.20261007.1021.qcow2").read_bytes(), b"exported")
+
+
 class TestCurlAuthConfig(unittest.TestCase):
     """The storage token must not reach curl's arguments, which a failed
     command prints."""
@@ -341,7 +393,7 @@ class TestACLImageSource(unittest.TestCase):
 
 
 class TestGalleryVersion(unittest.TestCase):
-    """Naming the gallery version, which names the cached image."""
+    """Naming the gallery version, which names the image file."""
 
     def setUp(self):
         clear_image_pin(self, "gallery")
@@ -366,7 +418,7 @@ class TestGalleryVersion(unittest.TestCase):
             self.assertEqual(e2e.acl_gallery_version(), "3.1")
 
     def test_a_version_that_is_not_a_plain_name_is_refused(self):
-        """It names the cached file, so it must not hold a path or be empty."""
+        """It names the image file, so it must not hold a path or be empty."""
         for version in ("", "../x", "a b"):
             with self.subTest(version=version):
                 e2e.acl_gallery_version.cache_clear()

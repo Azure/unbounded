@@ -1763,8 +1763,8 @@ def acl_gallery_image() -> tuple[str, str]:
 @functools.cache
 def acl_gallery_version() -> str:
     """Return the gallery image version to boot: ACL_IMAGE_VERSION, or the one
-    "latest" names now. It names the cached file, so a newer version is picked
-    up without a code change and never masked by an older download."""
+    "latest" names now. It names the image file in VM_DIR, so a newer version
+    is picked up without a code change and never masked by an earlier export."""
     version = ACL_IMAGE_VERSION
     if not version:
         gallery, image = acl_gallery_image()

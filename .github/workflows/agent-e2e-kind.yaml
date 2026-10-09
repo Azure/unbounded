@@ -67,8 +67,10 @@ permissions:
 env:
   # Where the Azure Container Linux image comes from; see
   # hack/agent/e2e-kind/README.md. The gallery export creates its temporary
-  # disk in this resource group, in the gallery image's region. "manifest"
-  # switches back to the storage-account image and its identity.
+  # disk in this resource group, in the gallery image's region, and its
+  # identity can delete disks there from any pull request in this repository,
+  # so the group should hold nothing but export disks. "manifest" switches back
+  # to the storage-account image and its read-only identity.
   ACL_IMAGE_SOURCE: gallery
   ACL_IMAGE_RESOURCE_GROUP: unbounded-dev-infra-westus2
 
