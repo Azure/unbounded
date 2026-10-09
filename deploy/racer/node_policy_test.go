@@ -132,6 +132,7 @@ func TestEnvtestRenderedNodePolicy(t *testing.T) {
 				t.Helper()
 				require.True(t, apierrors.IsForbidden(err), "%v", err)
 				require.Contains(t, err.Error(), "racer-node-write-restriction", "must be denied by admission, not just RBAC")
+				require.Contains(t, err.Error(), "Racer may", "must fail validation, not CEL evaluation")
 			}
 
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
@@ -144,6 +145,7 @@ func TestEnvtestRenderedNodePolicy(t *testing.T) {
 				err := patch(controller, `{"spec":{"unschedulable":true}}`)
 				require.True(c, apierrors.IsForbidden(err), "%v", err)
 				require.ErrorContains(c, err, "racer-node-write-restriction")
+				require.ErrorContains(c, err, "Racer may not change Node fields outside metadata")
 			}, 15*time.Second, 100*time.Millisecond)
 
 			t.Run("empty-fields-and-allowed-annotations", func(t *testing.T) {

@@ -28,16 +28,16 @@ spec:
       expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
   validations:
     - expression: >-
-        object.all(k, k == 'metadata' || (k in oldObject && object[k] == oldObject[k])) &&
-        oldObject.all(k, k == 'metadata' || (k in object && oldObject[k] == object[k]))
+        dyn(object).all(k, k == 'metadata' || (k in dyn(oldObject) && dyn(object)[k] == dyn(oldObject)[k])) &&
+        dyn(oldObject).all(k, k == 'metadata' || (k in dyn(object) && dyn(oldObject)[k] == dyn(object)[k]))
       message: Racer may not change Node fields outside metadata
       reason: Forbidden
     # managedFields is maintained by the API server for each field manager.
     - expression: >-
-        object.metadata.all(k, k in ['annotations', 'managedFields'] ||
-          (k in oldObject.metadata && object.metadata[k] == oldObject.metadata[k])) &&
-        oldObject.metadata.all(k, k in ['annotations', 'managedFields'] ||
-          (k in object.metadata && oldObject.metadata[k] == object.metadata[k]))
+        dyn(object.metadata).all(k, k in ['annotations', 'managedFields'] ||
+          (k in dyn(oldObject.metadata) && dyn(object.metadata)[k] == dyn(oldObject.metadata)[k])) &&
+        dyn(oldObject.metadata).all(k, k in ['annotations', 'managedFields'] ||
+          (k in dyn(object.metadata) && dyn(oldObject.metadata)[k] == dyn(object.metadata)[k]))
       message: Racer may not change other Node metadata
       reason: Forbidden
     - expression: >-

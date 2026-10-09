@@ -21,7 +21,7 @@ spec:
         request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':racer-controller' &&
         ((request.resource.resource == 'configmaps' && object.metadata.name in [{{ .InstallationConfigMapName | default "racer-installation" | toJson }}, {{ .VersionConfigMapName | default "racer-version" | toJson }}]) ||
          (request.resource.resource == 'secrets' && object.metadata.name == {{ .CredentialsSecretName | default "racer-credentials" | toJson }} &&
-          object.type == 'Opaque' &&
+          dyn(object).type == 'Opaque' &&
           (!has(object.metadata.annotations) ||
            (!('kubernetes.io/service-account.name' in object.metadata.annotations) &&
             !('kubernetes.io/service-account.uid' in object.metadata.annotations)))))
