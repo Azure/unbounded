@@ -209,6 +209,50 @@ func TestNodeCapProjectionAndFallback(t *testing.T) {
 	require.Zero(t, n)
 }
 
+func TestNodeCapMalformedGlobalLowersAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		cap       int
+		effective int
+	}{
+		{"pause", 0, 8},
+		{"lower", 2, 8},
+		{"already-paused", 2, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			opts := pullOptions{ConcurrencyFile: filepath.Join(root, "concurrency"), NodeCapsFile: filepath.Join(root, "caps"), NodeName: "node-a"}
+			s := nodeCapState{global: 8, cap: 8, effective: tc.effective}
+			wantEffective := min(tc.effective, tc.cap)
+
+			for i, step := range []struct {
+				global, caps string
+			}{
+				{"bad", fmt.Sprintf(`{"version":1,"caps":{"node-a":%d}}`, tc.cap)},
+				{"bad", `{"version":1,"caps":{"node-a":12}}`},
+				{"bad", `{"version":1,"caps":{}}`},
+				{"bad", "broken"},
+				{"12", "broken"},
+			} {
+				capProjection(t, root, fmt.Sprint(i), step.global, step.caps)
+
+				n, err := s.poll(opts)
+				require.Error(t, err)
+				require.Equal(t, tc.cap, s.cap, "step %d", i)
+				require.Equal(t, wantEffective, s.effective, "step %d", i)
+				require.Equal(t, wantEffective, n, "step %d", i)
+			}
+
+			capProjection(t, root, "recovered", "6", `{"version":1,"caps":{"node-a":10}}`)
+
+			n, err := s.poll(opts)
+			require.NoError(t, err)
+			require.Equal(t, nodeCapState{global: 6, cap: 10, effective: 6}, s)
+			require.Equal(t, 6, n)
+		})
+	}
+}
+
 func TestNodeCapOptions(t *testing.T) {
 	parsed, err := parseOptions([]string{"--concurrency-file=/control/concurrency", "--node-concurrency-caps-file=/control/caps", "--node-name=node-a"}, io.Discard)
 	require.NoError(t, err)

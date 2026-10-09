@@ -170,6 +170,10 @@ func (s *nodeCapState) poll(opts pullOptions) (int, error) {
 		s.cap = capValue
 		s.effective = min(s.global, s.cap)
 	} else {
+		if capErr == nil {
+			s.cap = min(s.cap, capValue)
+		}
+
 		// Initial effective is zero. Errors can never resume a paused reader or
 		// increase its admission, even if the global value has increased.
 		s.effective = min(s.effective, s.global, s.cap)
