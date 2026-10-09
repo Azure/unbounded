@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675">
+  <defs><marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0L9 3L0 6Z" fill="#8bb8e8"/></marker></defs>
+  <rect width="1200" height="675" fill="#07111f"/>
+  <text x="60" y="70" fill="#f4f8ff" font-family="Arial" font-size="38" font-weight="700">Unbounded Certification Architecture</text>
+  <text x="60" y="105" fill="#9fb5cc" font-family="Arial" font-size="19">Policy and trust stay separate from workflow execution</text>
+  <rect x="55" y="150" width="1090" height="150" rx="20" fill="#10233a" stroke="#31577d"/>
+  <text x="80" y="185" fill="#51dfd0" font-family="Arial" font-size="20" font-weight="700">CONTROL PLANE</text>
+  <g font-family="Arial" text-anchor="middle"><rect x="95" y="210" width="250" height="65" rx="12" fill="#173b5f"/><text x="220" y="248" fill="white" font-size="20">Certification Controller</text>
+  <rect x="475" y="210" width="250" height="65" rx="12" fill="#30345f"/><text x="600" y="248" fill="white" font-size="20">Profiles and Run API</text>
+  <rect x="855" y="210" width="250" height="65" rx="12" fill="#173b5f"/><text x="980" y="248" fill="white" font-size="20">Workflow Engine</text></g>
+  <path d="M345 242H470M730 242H850" stroke="#8bb8e8" stroke-width="3" marker-end="url(#a)"/>
+  <rect x="55" y="340" width="1090" height="135" rx="20" fill="#10233a" stroke="#31577d"/>
+  <text x="80" y="375" fill="#ffd166" font-family="Arial" font-size="20" font-weight="700">EXECUTION PLANE</text>
+  <g font-family="Arial" text-anchor="middle"><rect x="115" y="395" width="270" height="55" rx="12" fill="#4b352b"/><text x="250" y="429" fill="white" font-size="19">Private Suite Runners</text>
+  <rect x="465" y="395" width="270" height="55" rx="12" fill="#4b352b"/><text x="600" y="429" fill="white" font-size="19">Coordinated Test Graphs</text>
+  <rect x="815" y="395" width="270" height="55" rx="12" fill="#4b352b"/><text x="950" y="429" fill="white" font-size="19">Target Capacity</text></g>
+  <path d="M980 275V335H250V390M600 335V390M950 335V390" fill="none" stroke="#8bb8e8" stroke-width="3" marker-end="url(#a)"/>
+  <rect x="55" y="515" width="1090" height="105" rx="20" fill="#10233a" stroke="#31577d"/>
+  <text x="80" y="550" fill="#79d99b" font-family="Arial" font-size="20" font-weight="700">EVIDENCE PLANE</text>
+  <g font-family="Arial" text-anchor="middle" font-size="18" fill="white"><text x="270" y="590">Immutable Evidence</text><text x="600" y="590">Audit, Logs, Metrics, Traces</text><text x="930" y="590">Eligibility and Remediation</text></g>
+</svg>

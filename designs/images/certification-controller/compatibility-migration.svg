@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675">
+  <rect width="1200" height="675" fill="#07111f"/><text x="60" y="72" fill="white" font-family="Arial" font-size="38" font-weight="700">Compatibility Migration</text>
+  <text x="60" y="108" fill="#9fb5cc" font-family="Arial" font-size="19">Preserve behavior first. Expand policy only after parity.</text>
+  <g font-family="Arial" text-anchor="middle">
+    <rect x="55" y="185" width="245" height="250" rx="18" fill="#173b5f"/><text x="177" y="235" fill="white" font-size="24" font-weight="700">1. Wrap</text><text x="177" y="285" fill="#b7cee5" font-size="17">current-equivalent suite</text><text x="177" y="320" fill="#b7cee5" font-size="17">new result and evidence</text><text x="177" y="355" fill="#b7cee5" font-size="17">existing authority remains</text>
+    <rect x="335" y="185" width="245" height="250" rx="18" fill="#4b352b"/><text x="457" y="235" fill="white" font-size="24" font-weight="700">2. Shadow</text><text x="457" y="285" fill="#f4dda4" font-size="17">compare targeting</text><text x="457" y="320" fill="#f4dda4" font-size="17">compare measurements</text><text x="457" y="355" fill="#f4dda4" font-size="17">one mutation writer</text>
+    <rect x="615" y="185" width="245" height="250" rx="18" fill="#46345c"/><text x="737" y="235" fill="white" font-size="24" font-weight="700">3. Cut Over</text><text x="737" y="285" fill="#ded4f5" font-size="17">controller owns eligibility</text><text x="737" y="320" fill="#ded4f5" font-size="17">legacy outputs remain</text><text x="737" y="355" fill="#ded4f5" font-size="17">rollback is tested</text>
+    <rect x="895" y="185" width="245" height="250" rx="18" fill="#24533d"/><text x="1017" y="235" fill="white" font-size="24" font-weight="700">4. Expand</text><text x="1017" y="285" fill="#c7eed6" font-size="17">add advisory gates</text><text x="1017" y="320" fill="#c7eed6" font-size="17">validate operations</text><text x="1017" y="355" fill="#c7eed6" font-size="17">promote by new version</text>
+  </g>
+  <text x="600" y="520" fill="#ffd166" font-family="Arial" font-size="22" font-weight="700" text-anchor="middle">Additional evidence is allowed. A different compatibility verdict is not.</text>
+</svg>
