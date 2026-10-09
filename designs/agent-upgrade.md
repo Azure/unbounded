@@ -199,6 +199,8 @@ locking, and rollback behavior.
 ```text
 Pending MachineOperation
         |
+        +-- this daemon already scheduled its restart ---> Left for the restarted daemon
+        |
         v
 Acquire shared host activation lock
         |
@@ -227,9 +229,9 @@ Switch last-good and current symlinks
 Write pending JSON signal
         |
         v
-Restart unbounded-agent-daemon.service
+Schedule a restart of unbounded-agent-daemon.service
         |
-        +-- restart command failure ---------------------> Failed, clear signal
+        +-- scheduling failure --------------------------> Failed, clear signal
         |
         v
 Old process exits, new daemon starts
@@ -243,11 +245,23 @@ Old process exits, new daemon starts
 
 The daemon first acquires the same host activation lock used by the direct
 `unbounded-agent agent-upgrade` command. It holds the lock through archive
-staging, link switching, pending signal creation, and the systemd restart
-request. Lock contention leaves the operation Pending and requeues it instead
-of failing it. Process termination during restart releases the lock, while the
-pending signal prevents a direct host activation from entering the remaining
-startup window.
+staging, link switching, pending signal creation, and scheduling the restart.
+Lock contention leaves the operation Pending and requeues it instead of failing
+it. The pending signal prevents a direct host activation from entering the
+window between the lock's release and the restarted daemon's startup.
+
+The daemon does not run the restart itself. A `systemctl` it runs is in the
+daemon's cgroup, which stopping the daemon kills, and when the kill lands before
+`systemctl` exits the daemon would fail the operation and clear its signal for a
+restart already under way. It schedules the restart with
+`systemd-run --on-active=1s` instead, which runs `systemctl restart` from a
+transient unit outside that cgroup once the daemon has returned. Only a failure
+to schedule it fails the operation. Until the restart, an operation this daemon
+staged is InProgress but not finished, so it can be reconciled again. Once the
+daemon has scheduled its restart it takes no further AgentUpgrade: staging again
+would switch the slots back. The restarted daemon reports the staged operation
+from the pending signal, and enqueues any other that is still Pending when it
+starts watching.
 
 The daemon reads `spec.parameters["downloadURL"]` and the optional
 `spec.parameters["sha256"]` from the `MachineOperation`, resolves the current
@@ -326,7 +340,7 @@ startup signal path.
 | Download or extraction failure | `Failed`, `ExecutionFailed` | Current remains unchanged. Last-good changes to current only when needed to protect an inactive slot that it referenced. |
 | Empty archive entry | `Failed`, `ExecutionFailed` | Current remains unchanged. Last-good changes to current only when needed to protect an inactive slot that it referenced. |
 | Staged binary fails `version` | `Failed`, `ExecutionFailed` | Current remains unchanged. A distinct last-good target remains unchanged. |
-| Restart command fails | `Failed` | Signal is cleared. Links may already point to the staged binary. |
+| Scheduling the restart fails | `Failed` | Signal is cleared. Links may already point to the staged binary. |
 | Upgraded daemon fails under systemd | `Failed`, `DaemonFailed` | Recovery restores current to last-good. |
 
 ## Sequential upgrades

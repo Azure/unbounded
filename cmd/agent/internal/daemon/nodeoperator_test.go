@@ -5,9 +5,12 @@ package daemon
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -175,4 +178,85 @@ func TestFindActiveMachine_Kube1(t *testing.T) {
 	_ = origPath // Note: nspawnNodeOperator uses the const, so this test
 	// validates the serialization/deserialization roundtrip rather than
 	// the full active-machine discovery flow (which requires root filesystem access).
+}
+
+func TestDaemonRestartArgs(t *testing.T) {
+	now := time.Unix(1791572155, 123)
+
+	assert.Equal(t, []string{
+		"--quiet",
+		"--collect",
+		"--unit=unbounded-agent-daemon-restart-1791572155000000123",
+		"--on-active=1s",
+		"--timer-property=AccuracySec=100ms",
+		"/usr/bin/systemctl", "restart", goalstates.DaemonUnit,
+	}, daemonRestartArgs("/usr/bin/systemctl", now))
+
+	// A restart scheduled while an earlier one is still pending is a second
+	// unit, not a clash with the first.
+	assert.NotEqual(t, daemonRestartArgs("/usr/bin/systemctl", now)[2],
+		daemonRestartArgs("/usr/bin/systemctl", now.Add(time.Nanosecond))[2])
+}
+
+// fakeRestartCommands puts recording systemd-run and systemctl commands first
+// on PATH, and only them, and returns where each records its arguments.
+// systemdRunExit is what systemd-run exits with; withSystemctl leaves systemctl
+// out.
+func fakeRestartCommands(t *testing.T, systemdRunExit int, withSystemctl bool) (dir, systemdRunCalls, systemctlCalls string) {
+	t.Helper()
+
+	dir = t.TempDir()
+	systemdRunCalls = filepath.Join(dir, "systemd-run.calls")
+	systemctlCalls = filepath.Join(dir, "systemctl.calls")
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "systemd-run"),
+		fmt.Appendf(nil, "#!/bin/sh\nprintf '%%s\\n' \"$@\" > %q\nexit %d\n", systemdRunCalls, systemdRunExit), 0o755))
+
+	if withSystemctl {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "systemctl"),
+			fmt.Appendf(nil, "#!/bin/sh\nprintf '%%s\\n' \"$@\" > %q\n", systemctlCalls), 0o755))
+	}
+
+	t.Setenv("PATH", dir)
+
+	return dir, systemdRunCalls, systemctlCalls
+}
+
+// TestRestartAgentDaemonSchedulesTheRestart covers why the daemon does not
+// run systemctl itself: that systemctl is in the daemon's cgroup, which the
+// restart kills, and the daemon would report a restart under way as failed.
+func TestRestartAgentDaemonSchedulesTheRestart(t *testing.T) {
+	dir, systemdRunCalls, systemctlCalls := fakeRestartCommands(t, 0, true)
+
+	require.NoError(t, nspawnNodeOperator{}.RestartAgentDaemon(t.Context(), discardLogger()))
+
+	assert.NoFileExists(t, systemctlCalls, "the daemon must not run systemctl itself")
+
+	recorded, err := os.ReadFile(systemdRunCalls)
+	require.NoError(t, err)
+
+	args := strings.Split(strings.TrimSuffix(string(recorded), "\n"), "\n")
+	require.Len(t, args, 8, "systemd-run arguments: %q", args)
+	assert.Regexp(t, `^--unit=unbounded-agent-daemon-restart-[0-9]+$`, args[2])
+	assert.Equal(t, []string{
+		"--quiet", "--collect", args[2], "--on-active=1s", "--timer-property=AccuracySec=100ms",
+		filepath.Join(dir, "systemctl"), "restart", goalstates.DaemonUnit,
+	}, args)
+}
+
+func TestRestartAgentDaemonFailsWhenItCannotSchedule(t *testing.T) {
+	_, systemdRunCalls, systemctlCalls := fakeRestartCommands(t, 1, true)
+
+	err := nspawnNodeOperator{}.RestartAgentDaemon(t.Context(), discardLogger())
+	require.ErrorContains(t, err, "schedule a restart of "+goalstates.DaemonUnit)
+	assert.FileExists(t, systemdRunCalls)
+	assert.NoFileExists(t, systemctlCalls)
+}
+
+func TestRestartAgentDaemonFailsWithoutSystemctl(t *testing.T) {
+	_, systemdRunCalls, _ := fakeRestartCommands(t, 0, false)
+
+	err := nspawnNodeOperator{}.RestartAgentDaemon(t.Context(), discardLogger())
+	require.ErrorContains(t, err, "schedule a restart of "+goalstates.DaemonUnit)
+	assert.NoFileExists(t, systemdRunCalls, "nothing is scheduled without a systemctl to run")
 }
