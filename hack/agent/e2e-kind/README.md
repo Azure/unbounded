@@ -44,19 +44,22 @@ gateway.
 The image comes from one of two sources, chosen by `ACL_IMAGE_SOURCE`:
 
 - `gallery`, the default, is the Azure build of the image, published to the
-  shared compute gallery `ACL_IMAGE_GALLERY_IMAGE` (default
-  `acl-1es-eval`). A gallery image cannot be downloaded as such, so the harness
-  exports it: it creates a temporary managed disk from the version in
+  shared compute gallery image `ACL_IMAGE_GALLERY_IMAGE` (default
+  `/SharedGalleries/b3e01d89-bd55-414f-bbb4-cdfeb2628caa-ACL/Images/acl-1es-eval`).
+  A gallery image cannot be downloaded as such, so the harness exports it: it
+  creates a temporary managed disk from the version in
   `ACL_IMAGE_RESOURCE_GROUP`, reads the disk's written pages (about 850 MiB of
-  32.5 GiB) through a one-hour read SAS into a sparse VHD, revokes the SAS,
+  32.5 GiB) through a ten-minute read SAS into a sparse VHD, revokes the SAS,
   deletes the disk, and converts the raw disk inside the VHD to qcow2 at its
   exact size. The disk is deleted whether or not the export worked, and each
-  export first deletes any export disk older than six hours, which a cancelled
-  job leaves behind. The version is the
-  gallery's latest unless `ACL_IMAGE_VERSION` pins one, and the disk has to be
-  made in `ACL_IMAGE_GALLERY_LOCATION` (default `westus2`), the one region the
-  image is replicated to. `ACL_IMAGE_SUBSCRIPTION` overrides az's default
+  export first deletes any export disk older than six hours, which a canceled
+  job leaves behind; a disk whose age cannot be read is left alone. The version
+  is the gallery's latest unless `ACL_IMAGE_VERSION` pins one, and the disk has
+  to be made in `ACL_IMAGE_GALLERY_LOCATION` (default `westus2`), the one region
+  the image is replicated to. `ACL_IMAGE_SUBSCRIPTION` overrides az's default
   subscription. The gallery publishes no digest; the qcow2's sha256 is logged.
+  The SAS is on no command line and in no error message, and is masked in the
+  log, its signature on its own too.
 - `manifest` is the generic build, resolved from the manifest published
   alongside it in a storage account that disables anonymous access and shared
   keys alike, and fetched with an Azure login. `ACL_IMAGE_MANIFEST_URL` reads a
@@ -65,18 +68,24 @@ The image comes from one of two sources, chosen by `ACL_IMAGE_SOURCE`:
   `ACL_IMAGE_BUILD_ID` alone fails the run unless the manifest publishes that
   build.
 
-Either way the image is cached as `acl-<build>.qcow2`, so a newer one is picked
-up without a code change and never masked by an older download. `e2e.py
-resolve-host-image` prints the settings that pin the current build; CI runs it
-once per job. Settings that belong to the other source fail the run rather than
-being ignored.
+Either way the image file in the VM directory is named for its build,
+`acl-<build>.qcow2` or `acl-gallery-<version>.qcow2`, so a newer one is picked
+up without a code change and never masked by an earlier run's file. CI exports
+or downloads it on every run and never puts it in the Actions cache, which a
+pull request from a fork can restore; the export takes about two minutes. Within
+a job, the fresh-bootstrap suite reuses the file the lifecycle suite made.
+`e2e.py resolve-host-image` prints the settings that pin the current build; CI
+runs it once per job. Settings that belong to the other source fail the run
+rather than being ignored.
 
-The gallery export needs, for the identity az is logged in as: on the resource
-group, `Microsoft.Compute/disks/read`, `write`, `delete`,
-`beginGetAccess/action` and `endGetAccess/action` (CI assigns the built-in
-roles Disk Restore Operator and Azure Backup Snapshot Contributor); and on the
-subscription, read access to the shared gallery and to disk operations (CI
-assigns Reader). The identity has to be in a tenant the gallery is shared with.
+The gallery export needs, for the identity az is logged in as, on the resource
+group: `Microsoft.Compute/disks/read`, `write`, `delete`,
+`beginGetAccess/action` and `endGetAccess/action`, and read access to the
+shared gallery image. The identity has to be in a tenant the gallery is shared
+with. Grant no more than that: any pull request from this repository can log in
+as it. A resource group that holds only the export disks, with a custom role
+carrying exactly those actions, keeps a pull request from reading or deleting
+any other disk.
 
 `HOST_IMAGE_PATH` boots a local file with no Azure login at all, whichever the
 source:
@@ -86,10 +95,12 @@ HOST_BASE_OS=acl E2E_SUITE=lifecycle HOST_IMAGE_PATH="$PWD/acl.qcow2" \
   bash hack/agent/e2e-kind/run-local.sh
 ```
 
-An image URL from the manifest or a pin has to be https on
-`*.blob.core.windows.net`, because the storage token is sent to it, and its
-sha256 has to be 64 hex characters. An image already in the VM directory is
-checked against the sha256 again, and downloaded again if it does not match.
+For the manifest source, an image URL from the manifest or a pin has to be
+https on `*.blob.core.windows.net`, because the storage token is sent to it,
+and its sha256 has to be 64 hex characters. An image already in the VM
+directory is checked against the sha256 again, and downloaded again if it does
+not match. The gallery source has no URL or digest to check: its version is
+checked as a plain name, and an existing export is reused by that name.
 
 The configuration suite does not run on this host: its scenarios supply their
 own agent, and the Ignition path only boots the agent it staged itself. The
