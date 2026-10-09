@@ -21,6 +21,49 @@ capacity enters the production training pool.
 - Durable per-asset history carries certification, fault, repair, failover, and
   recovery evidence across Node replacement and customer delivery.
 
+## Requirements
+
+The certification system must:
+
+1. Own the production-trust decision for accelerator capacity through a
+   Kubernetes-native controller and API.
+2. Bind trust to a durable provider asset identity while projecting current
+   state onto the active Kubernetes Node.
+3. Keep new, repaired, stale, and actively failing capacity blocked until the
+   required profile produces current evidence.
+4. Support initial burn-in, continuous monitoring, idle revalidation, and
+   workload preflight as distinct execution modes with independent disruption,
+   timeout, retry, and admission policy.
+5. Validate node, local-fabric, rack, cross-rack fabric, Kubernetes platform,
+   external network, external storage, and representative-workload behavior.
+6. Compare declared hardware capability, observed inventory, and measured
+   throughput so partial device availability and data-path regressions affect
+   eligibility.
+7. Execute the initial node burn-in suite for four consecutive six-hour
+   repetitions and evaluate both each run and cross-run drift.
+8. Produce typed results and durable evidence containing profile, test,
+   runner, topology, participant, measurement, counter, artifact, and cleanup
+   identity.
+9. Preserve certification, runtime fault, remediation, failover, repair, and
+   recovery history across Node recreation and customer delivery.
+10. Classify evidence as healthy, degraded, failed, inconclusive, repairing, or
+    verification-required and map each classification to explicit scheduler and
+    remediation policy.
+11. Publish bounded Node Conditions, eligibility labels, and scheduling taints
+    while retaining per-device, per-link, per-test, and per-attempt details in
+    certification resources and evidence storage.
+12. Integrate lifecycle actions through `MachineOperation` and the existing
+    ownership boundaries of machina, metalman, the Unbounded agent,
+    unbounded-net, device operators, and the scheduler.
+13. Require post-remediation verification before restored production
+    eligibility and use repeated-failure history to drive quarantine and
+    replacement policy.
+14. Apply fleet, rack, and fabric blast-radius controls to automated
+    quarantine and remediation.
+15. Support versioned test definitions and profiles so new diagnostics,
+    thresholds, execution primitives, and hardware generations extend the
+    system through declared policy.
+
 ## Prior art and design inputs
 
 The design incorporates lessons from existing certification, monitoring, and
