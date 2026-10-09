@@ -34,10 +34,10 @@ new certification run passes.
   introducing a second repair executor.
 - Argo Workflows owns execution of suite graphs, including retries, deadlines,
   synchronization, fan-out, cancellation, and cleanup sequencing.
-- Coordinated multi-node suites do not require `MPIJob` in the public contract.
-  A portable runner can use an Indexed Job, rendezvous Service, participant
-  reservation, and suite-local barrier while preserving `MPIJob` as an optional
-  compatibility adapter.
+- Coordinated suites resolve to an approved execution backend already supported
+  by the cluster, such as `MPIJob`, `JobSet`, `RayJob`, or an Indexed Job. The
+  selected backend is an implementation detail recorded in evidence, not part
+  of the profile's verdict contract.
 - A certification suite is the stable execution boundary. A suite may contain
   one command or a coordinated diagnostic procedure with internal discovery,
   monitors, collectors, stages, cooldown, and evaluation.
@@ -92,6 +92,7 @@ The system must:
 | `SuiteResult` | Typed execution state, verdict, measurements, observations, failure category, and evidence references |
 | `EvidenceManifest` | Immutable index of inputs, results, artifacts, checksums, topology, observation coverage, and cleanup |
 | `CertificationRecord` | Durable asset-keyed history of runs, faults, remediation, and recovery |
+| `ExecutionBackend` | Cluster-local registration of an approved workload adapter, capabilities, version, admission path, and preference |
 
 ## Architecture
 
@@ -240,13 +241,112 @@ spec:
 Execution state answers whether the procedure ran correctly. Verdict answers
 what the completed evidence says about the target.
 
-## Coordinated multi-node execution and MPIJob compatibility
+## Coordinated multi-node execution backends
 
 Project Signal treats a coordinated collective as one suite execution. Argo
 creates one suite task; the runner owns ranks, rendezvous, the start barrier,
-collective cancellation, and aggregation. Project Signal may use `MPIJob` as an
-execution adapter, but the public suite contract does not depend on that
-resource type.
+collective cancellation, and aggregation. The cluster may execute that logical
+suite through `MPIJob`, `JobSet`, `RayJob`, or an Indexed Job without changing
+the profile or normalized result contract.
+
+### Backend registration and resolution
+
+Project Signal must not infer support only from the presence of a CRD. A
+cluster-local `ExecutionBackend` registration states that an adapter is
+installed, configured, authorized, and approved for certification use.
+
+```yaml
+apiVersion: certification.unbounded.io/v1alpha1
+kind: ExecutionBackend
+metadata:
+  name: coordinated-jobset
+spec:
+  type: JobSet
+  capabilities:
+    fixedSizeCollective: true
+    gangAdmission: true
+    exactParticipantSet: true
+    stableRanks: true
+  admission:
+    queue: certification
+  preference: 20
+  adapterVersion: sha256:...
+```
+
+A suite declares requirements and the adapters whose behavior has been
+validated for that suite:
+
+```yaml
+apiVersion: certification.unbounded.io/v1alpha1
+kind: CertificationSuite
+metadata:
+  name: coordinated-collective-v1
+spec:
+  execution:
+    requirements:
+      fixedSizeCollective: true
+      gangAdmission: true
+      exactParticipantSet: true
+      stableRanks: true
+    approvedBackendTypes:
+      - MPIJob
+      - JobSet
+```
+
+Backend resolution is deterministic:
+
+1. Resolve the suite and participant set.
+2. List healthy cluster-local backends approved by the suite.
+3. Remove backends that do not satisfy every required capability.
+4. Apply profile policy and configured preference.
+5. Require exactly one highest-priority backend.
+6. Record its type, adapter version, configuration digest, queue, and generated
+   workload identity in the immutable `CertificationRun`.
+
+```text
+CertificationProfile
+        |
+        v
+logical CertificationSuite
+        |
+        v
+execution requirements
+        |
+        +-- cluster A --> MPIJob backend
+        |
+        +-- cluster B --> JobSet backend
+        |
+        +-- cluster C --> RayJob backend
+        |
+        +-- cluster D --> Indexed Job backend
+        |
+        v
+same SuiteResult and evidence contract
+```
+
+The controller does not change backends after an attempt starts. If the chosen
+backend becomes unavailable, the attempt is interrupted and a new attempt must
+resolve a backend again. It may fall back to a different backend only when that
+backend is explicitly approved for the same suite version and equivalence
+contract. Otherwise the suite waits or fails closed rather than silently
+changing test semantics.
+
+The adapter owns translation from the common execution request into its native
+resource:
+
+| Backend | Native responsibility |
+|---|---|
+| `MPIJob` | MPI launcher and worker roles, rank environment, gang admission, and MPI cleanup |
+| `JobSet` | Replicated Jobs, coordinator role, stable networking, failure policy, and gang admission integration |
+| `RayJob` | Fixed Ray cluster, submission, worker placement, distributed task launch, and cluster cleanup |
+| Indexed Job | Completion-index ranks, rendezvous Service, participant placement, barrier, and whole-Job cancellation |
+
+Every adapter must produce the same normalized execution states, verdict
+schema, participant mapping, evidence manifest, and cleanup result. Backend
+specific status remains supplemental evidence and cannot directly determine
+eligibility.
+
+### Portable Indexed Job adapter
 
 The target portable execution shape is:
 
@@ -270,7 +370,7 @@ flowchart TB
     Barrier --> Collective --> Result --> Cleanup
 ```
 
-### Rank and rendezvous contract
+#### Rank and rendezvous contract
 
 For a participant set of size `N`, the runner creates an Indexed Job with:
 
@@ -306,7 +406,7 @@ rank-to-Node assignment is recorded after scheduling in the evidence manifest;
 the collective does not assume that a particular Node has a predetermined
 rank.
 
-### Reservation and admission
+#### Reservation and admission
 
 An Indexed Job supplies stable ranks but does not by itself guarantee that all
 pods are admitted together. Project Signal must not start a tightly coupled
@@ -327,7 +427,7 @@ available to the Job. If neither mechanism can provide that invariant, the
 suite remains waiting or becomes `Inconclusive`; it must not silently run with
 fewer ranks.
 
-### Start barrier and result semantics
+#### Start barrier and result semantics
 
 Pod startup is not the start of the test. Each rank first registers its rank,
 Node identity, device inventory, and transport information with the suite-local
@@ -373,7 +473,7 @@ The result distinguishes:
 - Hardware verdict: completed evidence attributes health or failure to the
   tested participants.
 
-### Compatibility path
+### Compatibility and migration
 
 The logical suite name remains stable regardless of its execution adapter:
 
@@ -382,6 +482,10 @@ coordinated-collective suite
         |
         +-- compatibility adapter --> MPIJob
         |
+        +-- generic adapter -------> JobSet
+        |
+        +-- distributed adapter ---> RayJob
+        |
         +-- portable adapter -------> Indexed Job + Service + reservation
 ```
 
@@ -389,8 +493,8 @@ The first implementation should retain an existing `MPIJob` adapter whenever
 exact behavior depends on its gang scheduling, rank launch, cleanup, or failure
 semantics. Removing that dependency is an implementation migration, not a
 change to profiles, result schemas, evidence semantics, or eligibility policy.
-The portable adapter becomes authoritative only after it demonstrates
-equivalent placement, synchronization, cancellation, and verdict behavior.
+Another adapter becomes authoritative only after it demonstrates equivalent
+placement, synchronization, cancellation, evidence, and verdict behavior.
 
 ## Profiles and gate graphs
 
