@@ -65,7 +65,7 @@ The system must:
 
 ## Architecture
 
-![Certification system architecture](images/certification-controller/system-architecture.svg)
+![Certification system architecture](images/certification-controller/system-architecture.png)
 
 ### Ownership
 
@@ -81,7 +81,7 @@ The system must:
 
 ## End-to-end lifecycle
 
-![Certification lifecycle](images/certification-controller/run-lifecycle.svg)
+![Certification lifecycle](images/certification-controller/run-lifecycle.png)
 
 1. The controller observes capacity that requires certification.
 2. It binds the Kubernetes Node to durable asset identity and current repair
@@ -101,7 +101,7 @@ not substitute a smaller suite merely because resources are unavailable.
 
 ## Suite execution contract
 
-![Suite contract](images/certification-controller/suite-contract.svg)
+![Suite contract](images/certification-controller/suite-contract.png)
 
 A suite is a complete gate-level procedure. It may internally implement:
 
@@ -157,7 +157,7 @@ what the completed evidence says about the target.
 
 ## Profiles and gate graphs
 
-![Profile resolution and gates](images/certification-controller/profile-gates.svg)
+![Profile resolution and gates](images/certification-controller/profile-gates.png)
 
 A profile selects suites based on declared capabilities and certification
 class. Different environments may select different profiles while using the
@@ -231,7 +231,7 @@ gate.
 
 ## Evidence and data flow
 
-![Evidence and audit data flow](images/certification-controller/evidence-audit.svg)
+![Evidence and audit data flow](images/certification-controller/evidence-audit.png)
 
 Each run writes an immutable prefix:
 
@@ -281,7 +281,7 @@ correlation.
 | Distributed traces | One-run path across controller, workflow engine, runners, stores, publishers, and lifecycle APIs |
 | Evidence manifest | Reproducible inputs and outputs that anchor the verdict |
 
-![Audit event sequence](images/certification-controller/audit-sequence.svg)
+![Audit event sequence](images/certification-controller/audit-sequence.png)
 
 Minimum audit sequence:
 
@@ -306,7 +306,7 @@ unrestricted environment dumps must not enter logs or evidence.
 
 ## Compatibility mode
 
-![Compatibility migration](images/certification-controller/compatibility-migration.svg)
+![Compatibility migration](images/certification-controller/compatibility-migration.png)
 
 Compatibility mode brings an existing certification procedure into the new
 control plane without translating every internal operation into a separate
