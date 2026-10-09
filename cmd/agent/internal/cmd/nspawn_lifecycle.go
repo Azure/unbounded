@@ -49,10 +49,6 @@ func newCmdNSpawnLifecyclePhase(
 
 			cmdCtx.Setup()
 
-			if err := daemon.MigrateHostRoot(cmdCtx.Logger); err != nil {
-				return err
-			}
-
 			return run(cmd.Context(), cmdCtx.Logger, args[0])
 		},
 	}
@@ -71,12 +67,33 @@ func newNSpawnLifecycle(log *slog.Logger) (*nspawnlifecycle.Lifecycle, error) {
 }
 
 func runNSpawnLifecyclePreStart(ctx context.Context, log *slog.Logger, machineName string) error {
-	lifecycle, err := newNSpawnLifecycle(log)
-	if err != nil {
-		return err
+	return preStartAfterMigrate(log, daemon.MigrateHostRoot, func() error {
+		lifecycle, err := newNSpawnLifecycle(log)
+		if err != nil {
+			return err
+		}
+
+		return lifecycle.PreStart(ctx, machineName)
+	})
+}
+
+// preStartAfterMigrate regenerates the machine's nspawn config once the host
+// root is migrated, since the config names the lifecycle helper under it. It is
+// the only hook that writes a path under the host root; the others do not
+// migrate it.
+//
+// If the host root cannot be migrated, the machine starts with the config it
+// has rather than not at all. The daemon refuses to start on such a host, which
+// is where the problem is reported.
+func preStartAfterMigrate(log *slog.Logger, migrate func(*slog.Logger) error, regenerate func() error) error {
+	if err := migrate(log); err != nil {
+		log.Warn("not regenerating the nspawn config: the host root cannot be migrated; the machine starts with the config it has",
+			"error", err)
+
+		return nil
 	}
 
-	return lifecycle.PreStart(ctx, machineName)
+	return regenerate()
 }
 
 func runNSpawnLifecyclePostStart(ctx context.Context, log *slog.Logger, machineName string) error {
