@@ -821,12 +821,17 @@ mod buffer_tests {
         assert_eq!(Extent::new(u64::MAX - 1, 1).unwrap().offset(), u64::MAX - 1);
     }
 
-    /// Non-power-of-two units use the LCM and reject overflow before allocation.
+    /// Discovered units use the LCM and reject overflow before allocation.
     #[test]
     fn arbitrary_units_preserve_lcm_rounding_and_detect_overflow() {
-        for (offset_unit, length_unit, lcm) in [(3, 5, 15), (6, 9, 18), (768, 512, 1536)] {
-            let alignment = Alignment::new(64, offset_unit, length_unit).unwrap();
-            assert_eq!(alignment.memory(), 64);
+        for (memory, offset_unit, length_unit, lcm) in [
+            (64, 3, 5, 15),
+            (64, 6, 9, 18),
+            (64, 768, 512, 1536),
+            (512, 512, 1024, 1024),
+        ] {
+            let alignment = Alignment::new(memory, offset_unit, length_unit).unwrap();
+            assert_eq!(alignment.memory(), memory);
             assert_eq!(alignment.offset(), offset_unit);
             assert_eq!(alignment.length(), length_unit);
             for (logical, expected) in [(1, lcm), (lcm, lcm), (lcm + 1, lcm * 2)] {
@@ -837,6 +842,10 @@ mod buffer_tests {
                 alignment.check(extent, &buffer).unwrap();
             }
             assert_eq!(alignment.extent(1, 1), Err(Error::InvalidConfiguration));
+            assert_eq!(
+                alignment.extent(0, usize::MAX),
+                Err(Error::InvalidConfiguration)
+            );
         }
         for alignment in [
             Alignment::new(1, u64::MAX, usize::MAX - 1).unwrap(),
@@ -845,7 +854,15 @@ mod buffer_tests {
         ] {
             assert_eq!(alignment.extent(0, 2), Err(Error::InvalidConfiguration));
         }
-        for (memory, offset, length) in [(0, 1, 1), (3, 1, 1), (1, 0, 1), (1, 1, 0)] {
+        for (memory, offset, length) in [
+            (0, 1, 1),
+            (3, 1, 1),
+            (1, 0, 1),
+            (1, 1, 0),
+            (3, 512, 512),
+            (512, 0, 512),
+            (512, 512, 0),
+        ] {
             assert_eq!(
                 Alignment::new(memory, offset, length),
                 Err(Error::Unsupported)
@@ -855,6 +872,16 @@ mod buffer_tests {
             Alignment::new(1usize << (usize::BITS - 1), 1, 1),
             Err(Error::Unsupported)
         );
+        let alignment = Alignment::new(512, 768, 512).unwrap();
+        assert_eq!(alignment.extent(0, 513).unwrap().length(), 1536);
+        let buffer = alignment.allocate(512, ()).unwrap();
+        assert!(!buffer.is_empty());
+        for extent in [Extent::new(1, 512).unwrap(), Extent::new(0, 1024).unwrap()] {
+            assert_eq!(
+                alignment.check(extent, &buffer),
+                Err(Error::InvalidConfiguration)
+            );
+        }
     }
 
     /// Moving a buffer preserves its address and initialized runtime-visible bytes.
@@ -932,75 +959,96 @@ mod buffer_tests {
     /// Pooling retains primary accounting while releasing completion-only guards.
     #[test]
     fn pool_transfers_allocation_and_primary_charge_but_not_retained_guards() {
-        let live = Rc::new(Cell::new(0));
-        let pool = Rc::new(RefCell::new(None));
-        let alignment = Alignment::new(64, 3, 5).unwrap();
-        let mut buffer = alignment
-            .allocate(15, TrackedCharge::new(&live, 15))
-            .unwrap()
-            .pooled(&pool);
-        let pointer = buffer.as_slice().as_ptr();
-        buffer.as_mut_slice().fill(42);
-        let extra = Rc::new(TrackedCharge::new(&live, 7));
-        let weak = Rc::downgrade(&extra);
-        buffer.retain(extra);
-        assert_eq!(live.get(), 22);
-        drop(buffer);
-        assert_eq!(live.get(), 15);
-        assert!(weak.upgrade().is_none());
-        let mut reused = pool.borrow_mut().take().unwrap();
-        assert_eq!(reused.as_slice().as_ptr(), pointer);
-        assert_eq!(reused.as_slice(), &[0; 15]);
-        reused.rebind(TrackedCharge::new(&live, 20)).unwrap();
-        assert_eq!(live.get(), 20);
-        drop(reused.pooled(&pool));
-        drop(pool);
-        assert_eq!(live.get(), 0);
+        for (alignment, length, retained, replacement) in [
+            (Alignment::new(64, 3, 5).unwrap(), 15, 7, 20),
+            (Alignment::new(512, 512, 512).unwrap(), 512, 512, 512),
+        ] {
+            let live = Rc::new(Cell::new(0));
+            let pool = Rc::new(RefCell::new(None));
+            let mut buffer = alignment
+                .allocate(length, TrackedCharge::new(&live, length))
+                .unwrap()
+                .pooled(&pool);
+            let pointer = buffer.bytes().unwrap().as_ptr();
+            buffer.bytes_mut().unwrap().fill(42);
+            let extra = Rc::new(TrackedCharge::new(&live, retained));
+            let weak = Rc::downgrade(&extra);
+            buffer.retain(extra);
+            assert_eq!(live.get(), length + retained);
+            drop(buffer);
+            assert_eq!(live.get(), length);
+            assert!(weak.upgrade().is_none());
+            let mut reused = pool.borrow_mut().take().unwrap();
+            assert_eq!(reused.bytes().unwrap().as_ptr(), pointer);
+            assert_eq!(reused.bytes().unwrap(), vec![0; length]);
+            reused
+                .rebind(TrackedCharge::new(&live, replacement))
+                .unwrap();
+            assert_eq!(live.get(), replacement);
+            drop(reused.pooled(&pool));
+            drop(pool);
+            assert_eq!(live.get(), 0);
+        }
     }
 
     /// An unusable return slot frees storage exactly once instead of panicking.
     #[test]
     fn unavailable_borrowed_and_occupied_pools_release_exactly_once() {
-        let alignment = Alignment::new(8, 1, 1).unwrap();
-        for scenario in 0..4 {
-            let live = Rc::new(Cell::new(0));
-            let pool = Rc::new(RefCell::new(None));
-            let mut buffer = alignment
-                .allocate(8, TrackedCharge::new(&live, 8))
-                .unwrap()
-                .pooled(&pool);
-            buffer.as_mut_slice().fill(0x5a);
-            let wipes = buffer.allocation().wipes.clone();
-            buffer.retain(Rc::new(TrackedCharge::new(&live, 3)));
-            match scenario {
-                0 => {
-                    drop(pool);
-                    drop(buffer);
+        for (alignment, length, retained) in [
+            (Alignment::new(8, 1, 1).unwrap(), 8, 3),
+            (Alignment::new(512, 512, 512).unwrap(), 512, 0),
+        ] {
+            for scenario in 0..4 {
+                let live = Rc::new(Cell::new(0));
+                assert!(matches!(
+                    alignment.allocate(length, TrackedCharge::new(&live, length - 1)),
+                    Err(Error::InvalidConfiguration)
+                ));
+                assert_eq!(live.get(), 0);
+                let pool = Rc::new(RefCell::new(None));
+                let mut buffer = alignment
+                    .allocate(length, TrackedCharge::new(&live, length))
+                    .unwrap()
+                    .pooled(&pool);
+                let wipes = buffer.allocation().wipes.clone();
+                if retained != 0 {
+                    buffer.as_mut_slice().fill(0x5a);
+                    buffer.retain(Rc::new(TrackedCharge::new(&live, retained)));
                 }
-                1 => {
-                    let borrow = pool.borrow();
-                    drop(buffer);
-                    assert_eq!(live.get(), 0);
-                    assert!(borrow.is_none());
+                match scenario {
+                    0 => {
+                        drop(pool);
+                        drop(buffer);
+                    }
+                    1 => {
+                        let borrow = pool.borrow();
+                        drop(buffer);
+                        assert_eq!(live.get(), 0);
+                        assert!(borrow.is_none());
+                    }
+                    2 => {
+                        let borrow = pool.borrow_mut();
+                        drop(buffer);
+                        assert_eq!(live.get(), 0);
+                        assert!(borrow.is_none());
+                        drop(borrow);
+                        assert!(pool.borrow().is_none());
+                    }
+                    _ => {
+                        let idle = alignment
+                            .allocate(length, TrackedCharge::new(&live, length))
+                            .unwrap();
+                        let pointer = idle.as_slice().as_ptr();
+                        *pool.borrow_mut() = Some(idle);
+                        drop(buffer);
+                        assert_eq!(live.get(), length);
+                        assert_eq!(pool.borrow().as_ref().unwrap().as_slice().as_ptr(), pointer);
+                        drop(pool);
+                    }
                 }
-                2 => {
-                    let borrow = pool.borrow_mut();
-                    drop(buffer);
-                    assert_eq!(live.get(), 0);
-                    assert!(borrow.is_none());
-                }
-                _ => {
-                    let idle = alignment.allocate(8, TrackedCharge::new(&live, 8)).unwrap();
-                    let pointer = idle.as_slice().as_ptr();
-                    *pool.borrow_mut() = Some(idle);
-                    drop(buffer);
-                    assert_eq!(live.get(), 8);
-                    assert_eq!(pool.borrow().as_ref().unwrap().as_slice().as_ptr(), pointer);
-                    drop(pool);
-                }
+                assert_eq!(live.get(), 0);
+                assert_eq!(wipes.get(), usize::from(retained != 0));
             }
-            assert_eq!(live.get(), 0);
-            assert_eq!(wipes.get(), 1);
         }
     }
 
