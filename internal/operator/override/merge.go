@@ -164,15 +164,22 @@ func strategicMerge(original, patch map[string]any, kind string) (map[string]any
 
 // identity is the set of fields re-stamped after merging.
 type identity struct {
-	apiVersion           string
-	kind                 string
-	name                 string
-	namespace            string
-	ownerRefs            []any
-	finalizers           []any
-	selector             map[string]any
-	templateSet          map[string]any
-	ownershipAnnotations map[string]string
+	apiVersion       string
+	kind             string
+	name             string
+	namespace        string
+	ownerRefs        []any
+	finalizers       []any
+	selector         map[string]any
+	templateSet      map[string]any
+	reservedMetadata map[string]map[string]any
+}
+
+var reservedMetadataPaths = [][]string{
+	{"metadata", "annotations"},
+	{"metadata", "labels"},
+	{"spec", "template", "metadata", "annotations"},
+	{"spec", "template", "metadata", "labels"},
 }
 
 func captureIdentity(workload *unstructured.Unstructured) identity {
@@ -186,13 +193,18 @@ func captureIdentity(workload *unstructured.Unstructured) identity {
 	captured.ownerRefs = nestedSlice(workload.Object, "metadata", "ownerReferences")
 	captured.finalizers = nestedSlice(workload.Object, "metadata", "finalizers")
 	captured.selector = nestedMap(workload.Object, "spec", "selector")
-	captured.ownershipAnnotations = map[string]string{}
+	captured.reservedMetadata = map[string]map[string]any{}
 
-	annotations := workload.GetAnnotations()
-	for _, key := range ownershipAnnotationKeys {
-		if value, ok := annotations[key]; ok {
-			captured.ownershipAnnotations[key] = value
+	for _, path := range reservedMetadataPaths {
+		values := map[string]any{}
+
+		for key, value := range nestedMap(workload.Object, path...) {
+			if strings.HasPrefix(key, ReservedPrefix) {
+				values[key] = deepCopyValue(value)
+			}
 		}
+
+		captured.reservedMetadata[strings.Join(path, ".")] = values
 	}
 
 	// Only the template labels the selector actually matches are restored. The
@@ -218,23 +230,29 @@ func restoreIdentity(workload *unstructured.Unstructured, captured identity) err
 	workload.SetName(captured.name)
 	workload.SetNamespace(captured.namespace)
 
-	annotations := workload.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-
-	for _, key := range ownershipAnnotationKeys {
-		delete(annotations, key)
-
-		if value, ok := captured.ownershipAnnotations[key]; ok {
-			annotations[key] = value
+	for _, path := range reservedMetadataPaths {
+		values := nestedMap(workload.Object, path...)
+		if values == nil {
+			values = map[string]any{}
 		}
-	}
 
-	if len(annotations) > 0 {
-		workload.SetAnnotations(annotations)
-	} else {
-		unstructured.RemoveNestedField(workload.Object, "metadata", "annotations")
+		for key := range values {
+			if strings.HasPrefix(key, ReservedPrefix) {
+				delete(values, key)
+			}
+		}
+
+		for key, value := range captured.reservedMetadata[strings.Join(path, ".")] {
+			values[key] = value
+		}
+
+		if len(values) > 0 {
+			if err := setNestedMap(workload.Object, values, path...); err != nil {
+				return fmt.Errorf("restore reserved metadata %v: %w", path, err)
+			}
+		} else {
+			unstructured.RemoveNestedField(workload.Object, path...)
+		}
 	}
 
 	if err := setOrClearSlice(workload, captured.ownerRefs, "metadata", "ownerReferences"); err != nil {

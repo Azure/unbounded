@@ -14,6 +14,8 @@ import (
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
+const runtimeInstallationAnnotation = "unbounded-cloud.io/racer-installation-uid"
+
 func bindRuntime(obj client.Object, installation types.UID) {
 	annotations := obj.GetAnnotations()
 	if annotations == nil {
@@ -21,12 +23,12 @@ func bindRuntime(obj client.Object, installation types.UID) {
 	}
 
 	annotations[managerAnnotation] = component.FieldOwner
-	annotations[installationAnnotation] = string(installation)
+	annotations[runtimeInstallationAnnotation] = string(installation)
 	obj.SetAnnotations(annotations)
 }
 
 func validateRuntimeOwner(obj client.Object, installation types.UID) error {
-	if installation == "" || obj.GetUID() == "" || obj.GetResourceVersion() == "" || obj.GetDeletionTimestamp() != nil || obj.GetAnnotations()[managerAnnotation] != component.FieldOwner || obj.GetAnnotations()[installationAnnotation] != string(installation) {
+	if installation == "" || obj.GetUID() == "" || obj.GetResourceVersion() == "" || obj.GetDeletionTimestamp() != nil || obj.GetAnnotations()[managerAnnotation] != component.FieldOwner || obj.GetAnnotations()[runtimeInstallationAnnotation] != string(installation) {
 		return fmt.Errorf("racer resource %s is not owned by this installation; refusing adoption", obj.GetName())
 	}
 
