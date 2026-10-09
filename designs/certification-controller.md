@@ -546,3 +546,371 @@ Acceptance requires:
   publishers.
 - Initial scheduler and failure-domain lock implementation.
 - Policy for promotion from advisory to required gates.
+
+## Appendix A: Flex Node Day 0, Day 1, and Day 2 lifecycle
+
+This appendix follows one Flex Node from initial cluster join through normal
+operation and a later repair. It shows how the control plane, execution plane,
+and evidence plane cooperate without merging their ownership boundaries.
+
+### Component map
+
+```text
+                         KUBERNETES CONTROL PLANE
++-----------------------------------------------------------------------------+
+|                                                                             |
+|  Infrastructure       Machine / Node      Project Signal       Workflow      |
+|  controller           controllers         Controller           engine        |
+|       |                     |                   |                   |         |
+|       | create/repair       |                   |                   |         |
+|       +-------------------->|                   |                   |         |
+|       |                     | Machine + Node    |                   |         |
+|       |                     +------------------>|                   |         |
+|       |                     |                   | select profile    |         |
+|       |                     |                   | block scheduling  |         |
+|       |                     |                   | create run        |         |
+|       |                     |                   +------------------>|         |
+|       |                     |                   |                   |         |
+|  +----v---------------------v-------------------v-------------------v------+  |
+|  | Kubernetes API                                                      |  |
+|  | Machine, Node, profiles, runs, workflows, Conditions, labels, taints |  |
+|  +---------------------------------------------------------------------+  |
++-----------------------------------------------------------------------------+
+                                         |
+                                         | schedule suite
+                                         v
+                               FLEX NODE EXECUTION PLANE
++-----------------------------------------------------------------------------+
+|                                                                             |
+|  Node agent              Network and device setup       Suite runner        |
+|       |                            |                          |              |
+|       +-- joins Node ------------>|                          |              |
+|       |                            +-- exposes resources ---->|              |
+|       |                            |                          |              |
+|       |                            |       discovery and preflight           |
+|       |                            |       observers and active stages       |
+|       |                            |       cooldown and evaluation           |
+|       |                            |       cleanup                           |
+|       |                            |                          |              |
++-------+----------------------------+--------------------------+--------------+
+        |                            |                          |
+        | telemetry                  | topology                 | results
+        v                            v                          v
++-----------------------------------------------------------------------------+
+|                         EVIDENCE AND OPERATIONS                             |
+|                                                                             |
+|  Kubernetes status       Logs, metrics, and traces       Immutable evidence |
+|  current run state       operational debugging           results and proof  |
+|                                                                             |
+|                    Append-only audit journal                                |
+|       requested -> resolved -> executed -> decided -> published             |
++-----------------------------------------------------------------------------+
+                                         |
+                                         v
+                              PROJECT SIGNAL DECISION
+
+                 +--------------+-----------------+----------------+
+                 | PASS         | INCONCLUSIVE    | FAIL           |
+                 v              v                 v
+             Admit Node     Retry or inspect   Keep blocked
+             to canary or   without declaring  and request
+             production     hardware failure   remediation
+```
+
+### Day 0: join and establish trust
+
+Day 0 begins when new capacity is created and ends when the Node is admitted or
+kept out of production.
+
+```text
+Provision
+   |
+   v
+Machine exists
+   |
+   v
+Agent joins Kubernetes
+   |
+   v
+Node becomes Ready
+   |
+   v
+Networking and devices become available
+   |
+   v
+Project Signal observes Node
+   |
+   +-- Bind Node to durable asset identity
+   +-- Record lifecycle and repair generation
+   +-- Resolve exactly one CertificationProfile
+   +-- Add blocked/testing scheduling protection
+   +-- Create CertificationRun
+             |
+             v
+       Wait for capacity,
+       quota, and domain lease
+             |
+             v
+       Submit workflow
+             |
+             v
+  +---------------------------+
+  | Certification suite       |
+  |                           |
+  | 1. Discover hardware      |
+  | 2. Validate inventory     |
+  | 3. Start observers        |
+  | 4. Run active stages      |
+  | 5. Observe cooldown       |
+  | 6. Evaluate thresholds    |
+  | 7. Stop and clean up      |
+  | 8. Publish evidence       |
+  +---------------------------+
+             |
+             v
+       Controller evaluates
+       all required gates
+```
+
+Day 0 ownership:
+
+| Component | Responsibility |
+|---|---|
+| Infrastructure controller | Creates or repairs the machine and reports durable asset identity |
+| Machine controller | Tracks provisioning, readiness, and lifecycle generation |
+| Node agent | Registers the Node and reports node-local state |
+| Network and device operators | Make networking, accelerators, storage, and device resources available |
+| Project Signal Controller | Selects policy, blocks scheduling, creates the run, and owns admission |
+| Workflow engine | Executes the selected suite graph |
+| Suite runner | Performs discovery, testing, observation, evaluation, and cleanup |
+| Evidence service | Stores immutable results and artifacts |
+| Audit pipeline | Records decisions and state mutations |
+| Scheduler | Keeps the Node out of production until eligibility advances |
+
+Day 0 result handling:
+
+```text
+PASS
+  execution = Completed
+  verdict = Pass
+  evidence = Complete
+  cleanup = Complete
+      |
+      v
+  eligibility = canary or production
+
+INTERRUPTION
+  execution = Interrupted
+  verdict = Inconclusive
+      |
+      +-- preserve partial evidence
+      +-- keep Node blocked
+      +-- retry under infrastructure policy
+
+FAILURE
+  execution = Completed
+  verdict = Fail
+      |
+      +-- preserve complete evidence
+      +-- keep Node blocked
+      +-- classify failure
+      +-- request remediation when policy allows
+```
+
+### Day 1: operate and maintain trust
+
+Day 1 is the normal lifecycle after admission.
+
+```text
+                 +----------------------+
+                 | Production Node      |
+                 | eligibility=prod     |
+                 +----------+-----------+
+                            |
+           +----------------+------------------+
+           |                |                  |
+           v                v                  v
+    Runtime signals    Evidence aging     Explicit request
+    and Conditions     policy             or maintenance
+           |                |                  |
+           +----------------+------------------+
+                            v
+                  Project Signal evaluates
+                            |
+               +------------+-------------+
+               |            |             |
+               v            v             v
+           No action   Idle revalidation  Immediate block
+```
+
+Lightweight runtime observation can report device, kernel, network, storage,
+temperature, clock, error-counter, and service signals. These signals do not
+rewrite prior certification history. They produce new evidence or a reason to
+recertify.
+
+Idle revalidation:
+
+```text
+Evidence becomes stale
+        |
+        v
+Check Node eligibility
+        |
+        +-- active workload --> defer
+        |
+        +-- idle
+             |
+             v
+       Acquire disruption lease
+             |
+             v
+       Temporarily block scheduling
+             |
+             v
+       Run bounded active suite
+             |
+             v
+       Cooldown and evaluate
+             |
+       +-----+---------------+
+       |                     |
+       v                     v
+   Evidence fresh        New failure
+   return to service     block Node
+```
+
+A Day 1 profile may be less disruptive than the Day 0 profile. The profile
+explicitly identifies required, advisory, and shadow gates.
+
+### Day 2: fault, repair, and return to service
+
+Day 2 represents a later operational incident requiring intervention.
+
+```text
+Production Node
+      |
+      v
+Runtime fault or repeated degradation
+      |
+      v
+Project Signal correlates:
+  - current signal
+  - certification history
+  - previous failures
+  - repair generation
+  - workload state
+  - fleet safety limits
+      |
+      v
+Keep eligible, degrade, or block
+      |
+      v
+Remediation requested
+      |
+      v
+Lifecycle controller performs action
+      |
+      +-- reboot
+      +-- reconfigure
+      +-- repair
+      +-- replace
+      |
+      v
+Machine reports new repair generation
+      |
+      v
+VerificationRequired
+      |
+      v
+Run post-repair CertificationProfile
+      |
+      +-- Pass ---------> restore eligibility
+      +-- Inconclusive -> retry while blocked
+      +-- Fail ---------> remediate again or quarantine
+```
+
+Repair generation prevents stale trust:
+
+```text
+certified generation 7 + repaired generation 8
+                  !=
+       production-eligible generation 8
+```
+
+A successful result from generation 7 cannot admit generation 8. Repair
+invalidates the relevant trust evidence and requires a new verification run.
+
+Repeated-failure path:
+
+```text
+Failure
+   |
+   v
+Repair
+   |
+   v
+Verification failure
+   |
+   v
+Repeat count or policy threshold
+   |
+   +-- below threshold --> another controlled repair
+   |
+   +-- threshold reached
+              |
+              v
+          Quarantined
+              |
+              +-- no automatic admission
+              +-- preserve complete history
+              +-- require explicit recovery or replacement policy
+```
+
+### Combined lifecycle state story
+
+```text
+DAY 0                         DAY 1                         DAY 2
+Establish trust               Maintain trust               Restore trust
+
+Observed                      Eligible                     RuntimeFault
+   |                             |                             |
+IdentityResolved                +-- healthy -------------------+
+   |                             |
+ProfileResolved                 +-- evidence stale
+   |                             |        |
+Blocked                         |        v
+   |                             |   Revalidation
+WaitingForLease                 |        |
+   |                             |        +-- pass --> Eligible
+WorkflowPending                 |        |
+   |                             |        +-- fail --> Blocked
+Running                         |
+   |                             |
+Evaluating                      |
+   |                             |
+   +-- pass ---------> Eligible-+
+   +-- interrupted --> Retry
+   +-- fail ---------> RemediationRequested
+                                |
+                                v
+                            Repairing
+                                |
+                                v
+                       VerificationRequired
+                                |
+                                v
+                         CertificationDue
+                                |
+                 +--------------+---------------+
+                 |              |               |
+                 v              v               v
+             Eligible       Retry blocked   Quarantined
+```
+
+The durable trust loop is:
+
+```text
+Provision -> Certify -> Admit -> Observe -> Revalidate
+                ^                     |
+                +-- Verify <- Repair <- Fault
+```
