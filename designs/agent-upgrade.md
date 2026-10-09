@@ -157,8 +157,10 @@ version ordering and may also be used for reinstall, repair, or downgrade.
 
 Without `--preflight`, the command performs one transactional activation:
 
-1. Require sufficient host privileges and acquire an exclusive activation
-   lock.
+1. Require sufficient host privileges, link the host root to `/usr/local` on a
+   host an older release installed (see Host paths), and acquire an exclusive
+   activation lock. The link is made before the lock, as every command that
+   changes the host makes it before it resolves a path.
 2. Open the executing candidate once and copy that inode into a private,
    root-owned snapshot so later path replacement cannot change the bytes being
    activated.
@@ -209,6 +211,10 @@ service status. It must not:
 - Write service units or drop-ins.
 - Reload, start, stop, or restart a service.
 - Create an AgentUpgrade signal.
+
+Preflight does not link the host root either. It resolves the paths the host
+will have once linked, so on a host an older release installed it plans against
+`/usr/local`.
 
 Preflight exits nonzero when it finds a condition that would block activation.
 Because host state can change after preflight, the applying command repeats all

@@ -92,11 +92,14 @@ chmod 0755 "${AGENT_BIN}"
 # /opt/unbounded/agent and remove a lone seed, and a read-only /usr/local/bin
 # only means the host cannot run the older agents.
 #
-# The test follows symlinks on purpose. On a host this installation already owns
-# the path resolves through the compatibility symlink to a live blue-green slot,
-# so it is left untouched and admission still runs from the staged executable
-# above. A dangling link resolves to nothing and is replaced, because install
-# would otherwise write through it to a stale location.
+# The test follows symlinks on purpose. On a host an older agent installed, or
+# one linked to it, the path resolves through the compatibility symlink to a
+# live blue-green slot, so it is left untouched and admission still runs from
+# the staged executable above. A dangling link resolves to nothing and is
+# replaced, because install would otherwise write through it to a stale
+# location. On a host installed under /opt/unbounded/agent the daemon has
+# removed the seed, so running this again seeds it again, and the daemon
+# removes it again.
 AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"
 if [ ! -x "${AGENT_BIN_TARGET}" ]; then
     if ! { rm -f "${AGENT_BIN_TARGET}" && install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"; } 2>/dev/null; then

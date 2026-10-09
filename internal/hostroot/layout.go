@@ -69,10 +69,11 @@ func LayoutUnder(root string) []string {
 	return files
 }
 
-// OwnedFiles returns every host file outside the config directory that
-// teardown removes: the agent's files under Path and under LegacyPath, and the
-// installer scripts under LegacyPath. On a linked host the first set reaches
-// the second through the link, and the second finds nothing.
+// OwnedFiles returns the agent's own files that teardown removes one by one:
+// its layout under Path and under LegacyPath, and the installer scripts under
+// LegacyPath. Units, the config directory, the machines and the rest are
+// removed by other reset tasks. On a linked host the first set reaches the
+// second through the link, and the second finds nothing.
 //
 // The legacy layout is swept on every host so teardown does not depend on the
 // host having been migrated. Reset is what an operator runs when Migrate

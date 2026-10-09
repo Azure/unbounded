@@ -220,9 +220,9 @@ by one of them moves to `/opt/unbounded/agent` in two stages:
    `/opt/unbounded/agent` to `/usr/local`, creating `/opt/unbounded` if needed.
    That happens when the daemon starts after an AgentUpgrade, when `start` or
    `agent-upgrade` runs, or when an nspawn lifecycle hook runs. The files stay
-   where they are and the units that run them are unchanged. The older release
-   is still the last-good binary, so the daemon can roll back to it, and an
-   AgentUpgrade back to it works.
+   where they are, and every path the units name is unchanged. The older
+   release is still the last-good binary, so the daemon can roll back to it, and
+   an AgentUpgrade back to it works.
 2. **Moved.** Once neither the current nor the last-good binary is from v0.10.0
    or earlier, the daemon copies the files into a real `/opt/unbounded/agent`,
    rewrites the units to use them, and restarts itself from there. The
@@ -232,15 +232,27 @@ by one of them moves to `/opt/unbounded/agent` in two stages:
    the release it already runs as an AgentUpgrade. A move that is interrupted is
    finished or started over at the next daemon start.
 
-`unbounded-agent reset` removes the agent's files from both locations, and the
-link or the directory at `/opt/unbounded/agent`, at any stage.
+`unbounded-agent reset` removes the agent's files from both locations at any
+stage, then `/opt/unbounded/agent` itself: the link the agent made, or the
+directory once nothing else is left in it.
 
-After the move, releases up to v0.10.0 cannot run on the host, and an
-AgentUpgrade to one is not supported. Nothing refuses it: the operation reports
-success, and the next AgentUpgrade fails because that release looks for its
-files under `/usr/local`. To recover, copy a newer release's `unbounded-agent`
-binary to the host and run `sudo ./unbounded-agent agent-upgrade` with it, or
-run `sudo ./unbounded-agent reset` with it and bootstrap the host again.
+Releases up to v0.10.0 cannot run on a host whose agent is in a real
+`/opt/unbounded/agent`, whether it was installed there or moved there, and an
+AgentUpgrade to one is not supported. Nothing refuses it, and what happens
+depends on `/usr/local`:
+
+- Where it is read-only, that release's daemon fails at startup, because it
+  writes its nspawn lifecycle helper there. The agent rolls back to the
+  last-good binary and the operation fails.
+- Where it is writable, the operation reports success, and the next
+  AgentUpgrade fails, because that release looks for its binaries under
+  `/usr/local`.
+
+To recover, copy a newer release's `unbounded-agent` binary to the host and run
+`sudo ./unbounded-agent agent-upgrade` with it. That leaves the older release
+as the last-good binary, so apply the newer release as an AgentUpgrade once
+more to replace it there. Alternatively, run `sudo ./unbounded-agent reset`
+with the newer binary and bootstrap the host again.
 
 The agent refuses to run on a host that has an installation under both
 locations, or an installation under `/usr/local` beside an existing
@@ -277,6 +289,17 @@ resolve a version, detect an architecture, or extract an archive at boot. It
 therefore requires `--agent-url` pointing at the *bare agent binary* rather
 than the release tarball, and `--agent-sha256` to verify it. The digest for
 each release binary is published in `checksums.txt`.
+
+The config writes the agent config and the binary, and enables
+`unbounded-agent-bootstrap.service`, which runs `preflight` and then `start` on
+every boot. On an installed host that does nothing unless the daemon needs
+repair. It retries a failed bootstrap with a delay that grows to five minutes
+on systemd 254 and later, and every 10 seconds on older versions. Follow it on
+the host with `journalctl -u unbounded-agent-bootstrap.service`.
+`unbounded-agent reset` stops, disables, and removes it.
+
+`config.ign` carries the agent config, including the bootstrap token. Treat it
+as a secret, and deliver it only to the host it is for.
 
 ### Customizing the agent download
 

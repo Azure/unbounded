@@ -18,8 +18,10 @@ import (
 )
 
 // defaultLockWait bounds how long Run waits for another lifecycle operation to
-// release the installation lock. On a reboot the daemon holds it briefly while
-// it migrates the host on startup, and the first-boot unit runs start then.
+// release the installation lock. On every boot the daemon holds it while it
+// reconciles the nspawn hooks, and the Ignition bootstrap unit, ordered after
+// the daemon unit, runs start then. On a host an older release installed the
+// daemon also holds it while it moves the files to the host root.
 const defaultLockWait = 30 * time.Second
 
 type Identity struct{ MachineName, ConfigFingerprint string }

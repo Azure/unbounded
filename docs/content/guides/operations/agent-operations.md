@@ -86,7 +86,8 @@ version crashes on startup.
 After a successful operation, confirm the agent version on the host:
 
 ```bash
-# From the host
+# From the host. On a host installed by v0.10.0 or earlier that no newer agent
+# has run on yet, the binary is /usr/local/bin/unbounded-agent instead.
 /opt/unbounded/agent/bin/unbounded-agent version
 
 # From the cluster, check the machine status
@@ -135,6 +136,9 @@ If you have SSH or console access to the host, you can reset directly:
 sudo /opt/unbounded/agent/bin/unbounded-agent reset
 ```
 
+On a host installed by v0.10.0 or earlier that no newer agent has run on yet,
+run `sudo /usr/local/bin/unbounded-agent reset` instead.
+
 This is the inverse of `unbounded-agent start` and performs the same cleanup as
 the MachineOperation path.
 
@@ -154,8 +158,14 @@ The reset process performs these steps in order:
    `/var/lib/machines/kube2`.
 6. **Cleans up routing** - removes policy routing rules and flushes routing
    tables.
-7. **Removes agent binaries** - deletes the agent binary and config artifacts.
-8. **Reloads systemd** - picks up all configuration changes.
+7. **Removes the first-boot bootstrap unit** - stops, disables, and deletes
+   `unbounded-agent-bootstrap.service` on a host provisioned through Ignition.
+8. **Removes agent binaries** - deletes the agent's files under both
+   `/opt/unbounded/agent` and `/usr/local`, and the config artifacts. Then it
+   removes `/opt/unbounded/agent` itself, as a link or an emptied directory,
+   along with what an unfinished move left. The rest of `/opt/unbounded` is
+   left alone.
+9. **Reloads systemd** - picks up all configuration changes.
 
 The reset is **idempotent** and safe to run multiple times. It unconditionally
 cleans up both possible nspawn machine names (`kube1` and `kube2`) so it works

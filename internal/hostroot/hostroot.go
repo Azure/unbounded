@@ -109,12 +109,26 @@ func Planned(markers ...string) string {
 	return planned(Path, LegacyPath, markers)
 }
 
+// planned follows what migrate does to the root, without doing it.
 func planned(root, legacy string, markers []string) string {
-	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) && holdsAny(legacy, markers) {
-		return canonical(legacy)
+	current, err := state(root, legacy)
+	if err != nil {
+		return canonical(root)
 	}
 
-	return canonical(root)
+	installed := holdsAny(legacy, markers)
+
+	switch {
+	case current == StateAbsent && installed:
+		// Migrate links it.
+		return canonical(legacy)
+	case current == StateLinked && !installed:
+		// Migrate removes a link with no installation behind it, and a fresh
+		// installation makes a directory in its place.
+		return filepath.Join(canonical(filepath.Dir(root)), filepath.Base(root))
+	default:
+		return canonical(root)
+	}
 }
 
 // canonical resolves symlinks in the longest leading part of path that exists
@@ -290,10 +304,11 @@ func restoreLabels(ctx context.Context, log *slog.Logger, root string) {
 	}
 }
 
-// Remove removes the host root once reset has removed the files in it. A
-// link this package created is removed, and a real directory is removed along
-// with its now empty subdirectories. Anything not empty is left in place, and
-// a link pointing somewhere else is left for whoever made it. What an
+// Remove removes the host root once reset has removed the files in it. A link
+// to LegacyPath, which Migrate makes, is removed, and a real directory is
+// removed along with those of its immediate subdirectories that are empty.
+// Anything not empty is left in place, and a link pointing somewhere else is
+// left for whoever made it. What an
 // unfinished move left behind, the staging copy and the marker, goes too. The
 // root's parent stays, whatever is in it; see Path.
 func Remove(log *slog.Logger) error {

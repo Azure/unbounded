@@ -125,7 +125,7 @@ class TestACLImageResolution(unittest.TestCase):
     def test_a_malformed_manifest_is_refused(self):
         """The build names the image file, so an empty or odd one could make
         different builds share a name, or a path. And an unverified image boots,
-        so whatever goes wrong afterwards looks like a product bug."""
+        so whatever goes wrong afterward looks like a product bug."""
         manifests = [dict(self.MANIFEST, build_id=build) for build in ("", None, 2026, "../x", "a b")]
         manifests += [dict(self.MANIFEST, qcow2=qcow2)
                       for qcow2 in ({}, {"url": "https://example.test/a.qcow2"}, {"sha256": "abc"})]

@@ -309,9 +309,10 @@ func (t *removeFirstBootUnit) Do(ctx context.Context) error {
 
 	t.log.Info("removing first-boot bootstrap unit", "unit", provision.FirstBootBootstrapUnit)
 
-	// --now, because the unit has RemainAfterExit=yes and stays active after it
-	// has run, file or no file. A host provisioned again would then find it
-	// already active, and the agent would never run.
+	// --now. A unit still retrying a failed bootstrap keeps retrying after its
+	// file is gone, and would bootstrap the reset host again. One that has run
+	// stays active because of RemainAfterExit=yes, so a unit of the same name
+	// installed again before a reboot would be found active and never run.
 	if err := executil.RunCmd(ctx, t.log, executil.Systemctl(), "disable", "--now", provision.FirstBootBootstrapUnit); err != nil {
 		return fmt.Errorf("disable %s: %w", provision.FirstBootBootstrapUnit, err)
 	}

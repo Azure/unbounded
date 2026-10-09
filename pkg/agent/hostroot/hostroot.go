@@ -35,7 +35,10 @@ const (
 )
 
 // Resolve returns the directory Path refers to on this host, with symlinks
-// resolved: LegacyPath on a migrated host, and Path itself on any other.
+// resolved: LegacyPath on a host Migrate linked, and otherwise Path with any
+// link along it resolved, such as /opt being a link, or a link at Path that an
+// operator made. A Path that does not exist yet resolves to where it will be
+// once created.
 //
 // Paths built from it are compared with symlink targets, which are resolved,
 // so they have to be resolved too. Building them from an unresolved Path on a
@@ -58,13 +61,15 @@ func Planned(markers ...string) string {
 // LegacyPath identifies such an installation: the product's own binary layout,
 // not files a fresh installation also creates there.
 //
-// It is idempotent and does nothing on a host without a legacy installation.
-// The link is made inside Path's parent, which is created if missing and
-// otherwise left as it is, along with anything else in it. It refuses a host
-// with a legacy installation where Path is also a directory, because either
-// could be the live one. A link to LegacyPath with no installation behind it,
-// left by an older release's reset, is removed so a fresh installation gets a
-// real directory.
+// It is idempotent and does nothing on a host without a legacy installation,
+// or while a move by ReconcileMove is under way. The link is made inside Path's
+// parent, which is created if missing and otherwise left as it is, along with
+// anything else in it. It refuses a host with a legacy installation where Path
+// is also a directory, because either could be the live one, and a host where
+// Path is neither a directory nor a link. A link to LegacyPath with no
+// installation behind it, left by an older release's reset, is removed so a
+// fresh installation gets a real directory. A link to anywhere else is an
+// operator's, and is kept.
 //
 // Commands that change the host call it first, before any path is resolved: a
 // path resolved on an unmigrated legacy host names Path, where nothing is

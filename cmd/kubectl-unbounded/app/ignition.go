@@ -159,8 +159,11 @@ func (h *manualBootstrapHandler) renderIgnition(cfg *provision.UnboundedAgentCon
 // marker would be a second record that could disagree with it. On a complete
 // host preflight and start return at once, or start repairs a daemon that is
 // not running, so a stopped or damaged daemon comes back on reboot. Ordering
-// after the daemon unit keeps a reboot from repairing a daemon that is still
-// starting; on first boot it does not exist yet.
+// after the daemon unit keeps start from running ahead of the daemon's own
+// start job on a reboot, so a daemon systemd is about to start is not repaired.
+// The daemon is Type=simple, so this waits only for its process to be started,
+// not for it to be ready; start waits for the installation lock the daemon
+// holds while it starts up. On first boot the daemon unit does not exist yet.
 //
 // AssertPathExists, unlike a Condition, fails visibly when Ignition never placed
 // the binary. Restart covers DNS that is not answering yet on first boot,

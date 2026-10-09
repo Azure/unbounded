@@ -296,6 +296,24 @@ func TestPlanned(t *testing.T) {
 		require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()))
 		assert.Equal(t, canonical(l.legacy), planned(l.root, l.legacy, Markers()))
 	})
+
+	// An older release's reset removed the files but not the link, which
+	// Migrate then removes.
+	t.Run("a link with no installation behind it", func(t *testing.T) {
+		t.Parallel()
+
+		l := newLayout(t)
+		require.NoError(t, os.MkdirAll(filepath.Dir(l.root), 0o755))
+		require.NoError(t, os.Symlink(l.legacy, l.root))
+
+		got := planned(l.root, l.legacy, Markers())
+		info, err := os.Lstat(l.root)
+		require.NoError(t, err)
+		assert.NotZero(t, info.Mode()&os.ModeSymlink, "planning must not change the host")
+
+		require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()))
+		assert.Equal(t, canonical(l.root), got, "planned where the root will be once migrated")
+	})
 }
 
 // TestPrepareIgnoresTheUmask is not parallel because the umask belongs to the
