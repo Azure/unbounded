@@ -4,6 +4,7 @@
 package racer
 
 import (
+	"context"
 	"os"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -150,6 +152,15 @@ func TestRuntimeStatusWriteBeforeApply(t *testing.T) {
 	testRuntimeStatusWriteBeforeApply(t, testEnv(t))
 }
 
+type runtimeCachedClient struct {
+	client.Client
+	cache client.Reader
+}
+
+func (c runtimeCachedClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.cache.Get(ctx, key, obj, opts...)
+}
+
 func TestEnvtestRuntimeStatusWriteBeforeApply(t *testing.T) {
 	assets := os.Getenv("KUBEBUILDER_ASSETS")
 	if assets == "" {
@@ -221,6 +232,32 @@ func testRuntimeStatusWriteBeforeApply(t *testing.T, env *component.Env) {
 			require.True(t, found)
 			require.Equal(t, int64(2), status)
 
+			// Keep the matching cached object while authoritative state changes.
+			cachedEnv := *env
+			cachedEnv.Client = runtimeCachedClient{
+				Client: env.Client,
+				cache:  fake.NewClientBuilder().WithScheme(env.Scheme).WithObjects(current.DeepCopy()).Build(),
+			}
+			persist(t, &cachedEnv, plan)
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(current), current))
+			require.Equal(t, "updated", current.GetLabels()["ownership-test"])
+
+			t.Run("stale-cache-drift", func(t *testing.T) {
+				labels := current.GetLabels()
+				labels["ownership-test"] = "drifted"
+				current.SetLabels(labels)
+				require.NoError(t, env.Client.Update(t.Context(), current))
+				require.NoError(t, unstructured.SetNestedField(current.Object, int64(3), "status", statusField))
+				require.NoError(t, env.Client.Status().Update(t.Context(), current))
+				persist(t, &cachedEnv, plan)
+				require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(current), current))
+				require.Equal(t, "updated", current.GetLabels()["ownership-test"])
+				status, found, err = unstructured.NestedInt64(current.Object, "status", statusField)
+				require.NoError(t, err)
+				require.True(t, found)
+				require.Equal(t, int64(3), status)
+			})
+
 			require.NoError(t, env.Client.Delete(t.Context(), current))
 
 			replacement := candidate.DeepCopy()
@@ -228,7 +265,7 @@ func testRuntimeStatusWriteBeforeApply(t *testing.T, env *component.Env) {
 			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(replacement), replacement))
 			require.NotEqual(t, op.Object.GetUID(), replacement.GetUID())
 			before := replacement.DeepCopy()
-			result, err := env.Execute(t.Context(), plan)
+			result, err := cachedEnv.Execute(t.Context(), plan)
 			require.NoError(t, err)
 			require.Len(t, result.Results, 1)
 			require.NotEqual(t, component.OpSucceeded, result.Results[0].Status)
