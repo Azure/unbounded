@@ -34,6 +34,10 @@ new certification run passes.
   introducing a second repair executor.
 - Argo Workflows owns execution of suite graphs, including retries, deadlines,
   synchronization, fan-out, cancellation, and cleanup sequencing.
+- Coordinated multi-node suites do not require `MPIJob` in the public contract.
+  A portable runner can use an Indexed Job, rendezvous Service, participant
+  reservation, and suite-local barrier while preserving `MPIJob` as an optional
+  compatibility adapter.
 - A certification suite is the stable execution boundary. A suite may contain
   one command or a coordinated diagnostic procedure with internal discovery,
   monitors, collectors, stages, cooldown, and evaluation.
@@ -235,6 +239,158 @@ spec:
 
 Execution state answers whether the procedure ran correctly. Verdict answers
 what the completed evidence says about the target.
+
+## Coordinated multi-node execution and MPIJob compatibility
+
+Project Signal treats a coordinated collective as one suite execution. Argo
+creates one suite task; the runner owns ranks, rendezvous, the start barrier,
+collective cancellation, and aggregation. Project Signal may use `MPIJob` as an
+execution adapter, but the public suite contract does not depend on that
+resource type.
+
+The target portable execution shape is:
+
+```mermaid
+flowchart TB
+    Run["CertificationRun<br/>participant set and deadline"]
+    Reserve["Reserve and protect all participants"]
+    Service["Headless rendezvous Service"]
+    Job["Indexed Job<br/>completions = parallelism = participants"]
+    Rank0["Index 0<br/>rank 0 and coordinator"]
+    RankN["Indexes 1..N-1<br/>worker ranks"]
+    Barrier["All-rank readiness barrier"]
+    Collective["Coordinated collective"]
+    Result["One SuiteResult<br/>per-rank evidence"]
+    Cleanup["Cancel and clean up<br/>Job, Service, and reservations"]
+    Run --> Reserve --> Service --> Job
+    Job --> Rank0
+    Job --> RankN
+    Rank0 --> Barrier
+    RankN --> Barrier
+    Barrier --> Collective --> Result --> Cleanup
+```
+
+### Rank and rendezvous contract
+
+For a participant set of size `N`, the runner creates an Indexed Job with:
+
+```yaml
+spec:
+  completionMode: Indexed
+  completions: N
+  parallelism: N
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+```
+
+Each pod uses its completion index as its rank:
+
+```text
+RANK        = JOB_COMPLETION_INDEX
+WORLD_SIZE  = N
+MASTER_ADDR = <job-name>-0.<service-name>
+MASTER_PORT = <suite-configured port>
+RUN_UID     = CertificationRun UID
+```
+
+A headless Service selects pods for the run and publishes addresses before
+readiness so that every rank can resolve the deterministic hostname for rank
+zero. Ranks do not query the Kubernetes API to discover peer pod IP addresses.
+
+All pods share one template. The template restricts placement to the resolved
+participant Nodes and uses required pod anti-affinity on
+`kubernetes.io/hostname` so that no two ranks occupy the same Node. The
+rank-to-Node assignment is recorded after scheduling in the evidence manifest;
+the collective does not assume that a particular Node has a predetermined
+rank.
+
+### Reservation and admission
+
+An Indexed Job supplies stable ranks but does not by itself guarantee that all
+pods are admitted together. Project Signal must not start a tightly coupled
+collective when only part of the participant set is available.
+
+Before creating the Job, the controller:
+
+1. Resolves the complete participant set.
+2. Acquires run and failure-domain leases.
+3. Applies scheduling protection that reserves those Nodes for the run.
+4. Verifies that every participant exposes the required resources.
+5. Submits the Job through a batch admission layer with gang semantics when
+   that capability is available.
+
+If the cluster has no gang-capable batch admission, the reservation and
+scheduling protection must make the complete participant set immediately
+available to the Job. If neither mechanism can provide that invariant, the
+suite remains waiting or becomes `Inconclusive`; it must not silently run with
+fewer ranks.
+
+### Start barrier and result semantics
+
+Pod startup is not the start of the test. Each rank first registers its rank,
+Node identity, device inventory, and transport information with the suite-local
+coordinator. Rank zero releases the start barrier only after all `N` ranks have
+registered and passed preflight.
+
+```text
+N ranks scheduled
+        |
+        v
+all ranks register and pass preflight
+        |
+   +----+----+
+   |         |
+ timeout    complete
+   |         |
+   v         v
+Interrupt   release barrier
+whole run        |
+                 v
+          execute collective
+                 |
+          +------+------+
+          |             |
+          v             v
+     any rank fails   all ranks finish
+          |             |
+          v             v
+   cancel all ranks   aggregate result
+```
+
+A collective produces one `SuiteResult` with per-rank observations and the
+actual rank-to-Node mapping. A missing, failed, or timed-out rank terminates the
+whole attempt. Project Signal never retries one rank inside an existing
+collective; an infrastructure retry creates a new complete Job with a new
+attempt identity.
+
+The result distinguishes:
+
+- Admission failure: the complete rank set could not be scheduled.
+- Initialization failure: a rank could not initialize its device or transport.
+- Collective failure: all ranks started, but the coordinated operation failed.
+- Hardware verdict: completed evidence attributes health or failure to the
+  tested participants.
+
+### Compatibility path
+
+The logical suite name remains stable regardless of its execution adapter:
+
+```text
+coordinated-collective suite
+        |
+        +-- compatibility adapter --> MPIJob
+        |
+        +-- portable adapter -------> Indexed Job + Service + reservation
+```
+
+The first implementation should retain an existing `MPIJob` adapter whenever
+exact behavior depends on its gang scheduling, rank launch, cleanup, or failure
+semantics. Removing that dependency is an implementation migration, not a
+change to profiles, result schemas, evidence semantics, or eligibility policy.
+The portable adapter becomes authoritative only after it demonstrates
+equivalent placement, synchronization, cancellation, and verdict behavior.
 
 ## Profiles and gate graphs
 
