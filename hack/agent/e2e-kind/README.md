@@ -33,9 +33,13 @@ every host, which is on the writable root filesystem here.
 Provisioning is Ignition rather than cloud-init, which inverts the usual order.
 An Ignition config is applied before the host boots and has to carry the
 bootstrap token and the API server address, so `create-vm` acquires the image
-and stops; `run-agent` renders the config and launches the VM. Nothing is
-delivered over SSH: Ignition places the binary and the agent config, and a
-first-boot unit runs preflight and bootstrap.
+and stops; `run-agent` renders the config and launches the VM. On first boot
+nothing is delivered over SSH: Ignition places the binary and the agent config,
+and a first-boot unit runs preflight and bootstrap. Ignition runs only on first
+boot, so the lifecycle's reinstall on the same disk copies the same binary,
+config and unit over SSH instead. The VM fetches the config and the binary from
+the runner, at `IGNITION_SERVE_BASE` when set and otherwise the bridge
+gateway.
 
 The image is resolved from the manifest published alongside it, so a refreshed
 build is picked up without a code change. It is fetched with a federated Azure
@@ -57,14 +61,23 @@ HOST_BASE_OS=acl E2E_SUITE=lifecycle HOST_IMAGE_PATH="$PWD/acl.qcow2" \
   bash hack/agent/e2e-kind/run-local.sh
 ```
 
+An image URL from the manifest or a pin has to be https on
+`*.blob.core.windows.net`, because the storage token is sent to it, and its
+sha256 has to be 64 hex characters. An image already in the VM directory is
+checked against the sha256 again, and downloaded again if it does not match.
+
 The configuration suite does not run on this host: its scenarios supply their
-own agent, and the Ignition path only boots the agent it staged itself.
+own agent, and the Ignition path only boots the agent it staged itself. The
+default local run skips it there.
 
 Running this locally needs `ovmf` and `qemu-nbd` in addition to the usual
 prerequisites. The host boots through its own UEFI bootloader, and the Ignition
 config URL is appended to the kernel command line by patching a UKI addon on
 the EFI system partition; see `ukiboot.py` for why the boot chain is extended
-rather than replaced.
+rather than replaced. The patched addon stays in place, so every later boot has
+the config URL and the static `ip=` argument on its command line too. Ignition
+ignores them after first boot, but the suite's reboots run with networking
+configured from the command line, which a production host does not have.
 
 In CI this entry is skipped unless a federated Azure login is configured, and
 on pull requests from forks, because GitHub withholds secrets from
@@ -73,7 +86,11 @@ failed, so it appears on its own once `ACL_IMAGE_CLIENT_ID`,
 `ACL_IMAGE_TENANT_ID` and `ACL_IMAGE_SUBSCRIPTION_ID` exist as repository
 secrets. They have to be repository secrets rather than environment ones: the
 `azure-ci` environment requires a reviewer, which would put a manual approval
-in front of every pull request.
+in front of every pull request. The identity's federated credentials have to
+trust the subject of every trigger that adds the entry: pull requests, pushes
+to `main` and to `release-*` branches, and manual runs on the branches they run
+on. A trigger whose subject is not trusted fails at the Azure login rather than
+being skipped.
 
 Every other host downloads from a public mirror and runs normally in all of
 these cases.

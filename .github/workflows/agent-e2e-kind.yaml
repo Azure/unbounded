@@ -80,8 +80,10 @@ jobs:
         env:
           # Absent for non-pull_request events, where secrets are available.
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          # Checked for presence only.
-          ACL_CREDENTIAL: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
+          # Checked for presence only; the Azure login needs all three.
+          ACL_CLIENT_ID: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
+          ACL_TENANT_ID: ${{ secrets.ACL_IMAGE_TENANT_ID }}
+          ACL_SUBSCRIPTION_ID: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
         run: |
           set -euo pipefail
 
@@ -102,8 +104,8 @@ jobs:
 
           if [ -n "${HEAD_REPO}" ] && [ "${HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]; then
             echo "::notice::Azure Container Linux is skipped for forks: its image needs Azure credentials"
-          elif [ -z "${ACL_CREDENTIAL}" ]; then
-            echo "::notice::Azure Container Linux is skipped: ACL_IMAGE_CLIENT_ID is not configured"
+          elif [ -z "${ACL_CLIENT_ID}" ] || [ -z "${ACL_TENANT_ID}" ] || [ -z "${ACL_SUBSCRIPTION_ID}" ]; then
+            echo "::notice::Azure Container Linux is skipped: ACL_IMAGE_CLIENT_ID, ACL_IMAGE_TENANT_ID and ACL_IMAGE_SUBSCRIPTION_ID are not all configured"
           else
             hosts="$(printf '%s' "${hosts}" | jq -c ". + [${acl}]")"
           fi
@@ -118,7 +120,10 @@ jobs:
     permissions:
       contents: read
       packages: read
-      # The federated login for the Azure Container Linux image.
+      # The federated login for the Azure Container Linux image. Permissions
+      # cannot vary by matrix entry, so every entry gets it, and only the ACL
+      # entry's Azure login step uses it. Pull requests from forks never get
+      # an OIDC token, whatever this says.
       id-token: write
     strategy:
       fail-fast: false

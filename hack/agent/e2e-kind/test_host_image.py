@@ -14,6 +14,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -76,6 +77,7 @@ class TestHostImageSelection(unittest.TestCase):
         self.assertEqual(image.sha256, "", "a local file has no published digest to check")
         self.assertTrue(image.url.startswith("file://"))
 
+
 class TestACLImageResolution(unittest.TestCase):
     """Resolving the image from the published manifest."""
 
@@ -86,7 +88,7 @@ class TestACLImageResolution(unittest.TestCase):
     MANIFEST = {
         "build_id": "2026091817",
         "qcow2": {
-            "url": "https://example.test/images/2026091817/acl.qcow2",
+            "url": "https://example.blob.core.windows.net/images/2026091817/acl.qcow2",
             "sha256": "7c45558dac005626c06d40594567964739fc96eefab22fdb62e7275191231f45",
             "size": 661192704,
         },
@@ -136,6 +138,37 @@ class TestACLImageResolution(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         e2e.acl_image_from_manifest()
 
+    def test_image_values_must_be_safe_to_export_and_to_send_the_token_to(self):
+        """The image URL gets the storage token, and resolve-host-image writes
+        it and the digest to $GITHUB_ENV, one variable per line."""
+        good_url, good_digest = self.MANIFEST["qcow2"]["url"], self.MANIFEST["qcow2"]["sha256"]
+        bad = [
+            ("http://example.blob.core.windows.net/a.qcow2", good_digest),
+            ("https://example.test/a.qcow2", good_digest),
+            ("https://example.blob.core.windows.net.example.test/a.qcow2", good_digest),
+            ("https://example.blob.core.windows.net/a.qcow2\nGITHUB_PATH=/tmp", good_digest),
+            ("file:///tmp/a.qcow2", good_digest),
+            (good_url, "abc"),
+            (good_url, good_digest + "\nX=1"),
+            (good_url, "g" * 64),
+        ]
+        for url, digest in bad:
+            manifest = dict(self.MANIFEST, qcow2={"url": url, "sha256": digest})
+            with self.subTest(source="manifest", url=url, digest=digest):
+                e2e.acl_image_from_manifest.cache_clear()
+                with patch.object(e2e, "http_get", return_value=json.dumps(manifest)):
+                    with self.assertRaises(SystemExit):
+                        e2e.acl_image_from_manifest()
+            with self.subTest(source="pin", url=url, digest=digest):
+                e2e.acl_image_from_manifest.cache_clear()
+                with patch.object(e2e, "ACL_IMAGE_URL", url), \
+                        patch.object(e2e, "ACL_IMAGE_SHA256", digest), \
+                        patch.object(e2e, "ACL_IMAGE_BUILD_ID", "2026091817"), \
+                        patch.object(e2e, "http_get") as get:
+                    with self.assertRaises(SystemExit):
+                        e2e.acl_image_from_manifest()
+                get.assert_not_called()
+
     def test_a_partial_pin_is_refused(self):
         for url, digest, build in (("u", "", "b"), ("", "d", "b"), ("u", "d", "")):
             with self.subTest(url=url, digest=digest, build=build):
@@ -171,6 +204,7 @@ class TestACLImageResolution(unittest.TestCase):
                 self.MANIFEST["qcow2"]["url"], "acl-2026091817.qcow2", self.MANIFEST["qcow2"]["sha256"]))
         get.assert_not_called()
 
+
 class TestAcquireHostImage(unittest.TestCase):
     """Only a verified image is kept under the name later runs trust."""
 
@@ -199,6 +233,26 @@ class TestAcquireHostImage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "acl-b.qcow2").write_bytes(self.GOOD)
             self.assertEqual(self._acquire(tmp, self.GOOD), [])
+
+    def test_an_existing_image_that_does_not_match_is_downloaded_again(self):
+        """A build republished under the same id must not keep booting the
+        earlier image."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "acl-b.qcow2").write_bytes(b"an earlier image")
+            downloads = self._acquire(tmp, self.GOOD)
+            self.assertEqual([p.name for p in downloads], ["acl-b.qcow2.part"])
+            self.assertEqual((Path(tmp) / "acl-b.qcow2").read_bytes(), self.GOOD)
+
+    def test_a_local_image_with_a_digest_is_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.qcow2"
+            source.write_bytes(b"something else")
+            image = replace(self._image(), url=f"file://{source}")
+            with patch.object(e2e, "VM_DIR", Path(tmp) / "vm"), patch.object(e2e, "run"):
+                (Path(tmp) / "vm").mkdir()
+                with self.assertRaises(SystemExit):
+                    e2e.acquire_host_image(image)
+            self.assertTrue(source.exists(), "only the link to a local image is removed")
 
     def test_a_download_is_renamed_only_once_verified(self):
         with tempfile.TemporaryDirectory() as tmp:

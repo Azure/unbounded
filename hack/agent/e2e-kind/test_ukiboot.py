@@ -17,7 +17,8 @@ from unittest.mock import patch
 import ukiboot
 
 
-def _pe(sections: list[tuple[str, int, int, int, int]], opt_size: int = 240) -> bytes:
+def _pe(sections: list[tuple[str, int, int, int, int]], opt_size: int = 240,
+        size_of_image: int = 0x100000) -> bytes:
     """Build a PE header with the given (name, vsize, vaddr, rsize, rptr) sections.
 
     Only the fields ukiboot reads are populated. The point is to be able to
@@ -30,6 +31,7 @@ def _pe(sections: list[tuple[str, int, int, int, int]], opt_size: int = 240) -> 
     out[lfanew:lfanew + 4] = b"PE\x00\x00"
     struct.pack_into("<H", out, lfanew + 6, len(sections))
     struct.pack_into("<H", out, lfanew + 20, opt_size)
+    struct.pack_into("<I", out, lfanew + 24 + 56, size_of_image)
 
     table = lfanew + 24 + opt_size
     for i, (name, vsize, vaddr, rsize, rptr) in enumerate(sections):
@@ -91,6 +93,26 @@ class TestAddonCapacity(unittest.TestCase):
         for (current, extra, raw_size), want in cases:
             with self.subTest(extra=extra[:4], raw_size=raw_size):
                 self.assertEqual(ukiboot.fit_cmdline(current, extra, raw_size), want)
+
+
+class TestCmdlineRoom(unittest.TestCase):
+    """VirtualSize grows with the command line, and the section must not reach
+    into the next one in memory, whatever its raw size allows."""
+
+    def test_room_is_bounded_by_raw_size_next_section_and_image_size(self):
+        cases = [
+            # The raw size is the tighter bound.
+            ([(".cmdline", 0x10, 0x2000, 0x200, 0x400), (".linux", 0x10, 0x3000, 0x200, 0x600)], 0x100000, 0x200),
+            # The next section in memory is closer than the raw size allows.
+            ([(".cmdline", 0x10, 0x2000, 0x1000, 0x400), (".linux", 0x10, 0x2100, 0x200, 0x1400)], 0x100000, 0x100),
+            # A section before it in memory does not bound it.
+            ([(".text", 0x10, 0x1000, 0x200, 0x200), (".cmdline", 0x10, 0x2000, 0x200, 0x400)], 0x100000, 0x200),
+            # The last section ends at SizeOfImage.
+            ([(".cmdline", 0x10, 0x2000, 0x1000, 0x400)], 0x2080, 0x80),
+        ]
+        for sections, size_of_image, want in cases:
+            with self.subTest(sections=sections, size_of_image=size_of_image):
+                self.assertEqual(ukiboot.cmdline_room(_pe(sections, size_of_image=size_of_image)), want)
 
 
 class TestSingleUKI(unittest.TestCase):

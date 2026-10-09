@@ -259,7 +259,12 @@ python3 "$E2E" "${E2E_ARGS[@]}" retire-lifecycle-vm
 python3 "$E2E" "${E2E_ARGS[@]}" launch-vm
 python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite fresh-bootstrap
 python3 "$E2E" "${E2E_ARGS[@]}" retire-lifecycle-vm
-python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite configuration
+# Its scenarios supply their own agent, which an Ignition host never boots.
+if [[ "${HOST_BASE_OS:-}" == "acl" ]]; then
+    echo "Skipping the configuration suite, which does not run on Azure Container Linux"
+else
+    python3 "$E2E" "${E2E_ARGS[@]}" run-suite --suite configuration
+fi
 
 # ---------------------------------------------------------------------------
 # Done (cleanup runs via trap)

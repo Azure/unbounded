@@ -127,6 +127,8 @@ func activateDaemonUnit(ctx context.Context, log *slog.Logger, sc func(context.C
 		return fmt.Errorf("systemctl start %s: %w", goalstates.DaemonUnit, err)
 	}
 
+	// The agent e2e looks for this message to tell that start repaired the
+	// daemon on a reboot; keep the two in step (ignition_reboot_problems).
 	log.Info("daemon unit started", "unit", goalstates.DaemonUnit)
 
 	return nil

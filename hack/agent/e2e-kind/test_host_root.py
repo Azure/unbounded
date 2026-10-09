@@ -34,11 +34,53 @@ class TestResetCleanup(unittest.TestCase):
             e2e.validate_reset_cleanup()
 
         checks = capture.call_args.args[0]
+        self.assertIn("/var/lib/unbounded/agent/install-state.json", checks, "ownership goes too")
         self.assertIn(f'[ -L "{e2e.HOST_ROOT}" ]', checks)
         self.assertIn(f'[ -e "{e2e.HOST_ROOT_STAGING}" ]', checks, "an interrupted move's copy goes too")
         for root in (e2e.HOST_ROOT, e2e.LEGACY_HOST_ROOT):
             self.assertIn(f"{root}/bin/unbounded-agent-current", checks)
             self.assertIn(f"{root}/libexec/unbounded-localdns-network", checks)
+
+
+class TestIgnitionResetCleanup(unittest.TestCase):
+    def test_the_bootstrap_unit_and_its_enablement_are_checked(self):
+        """Either left behind bootstraps the reset host again on the next boot."""
+        with patch.object(e2e, "ssh_capture", return_value="") as capture, \
+                patch.object(e2e, "host_image") as image:
+            image.return_value.provisioning = "ignition"
+            e2e.validate_reset_cleanup()
+
+        checks = capture.call_args.args[0]
+        self.assertIn(f"/etc/systemd/system/{e2e.IGNITION_BOOTSTRAP_UNIT}", checks)
+        self.assertIn(f"/etc/systemd/system/multi-user.target.wants/{e2e.IGNITION_BOOTSTRAP_UNIT}", checks)
+
+
+class TestAgentUpgradeSlots(unittest.TestCase):
+    """The upgrade check compares slots by name only when the host root moved
+    while it ran; otherwise a last-good under the wrong root would pass."""
+
+    def _validate(self, states, before, after, last_good):
+        targets = iter([before, after])
+        with patch.object(e2e, "host_root_state", side_effect=states), \
+                patch.object(e2e, "read_daemon_current_target", side_effect=lambda: next(targets)), \
+                patch.object(e2e, "read_daemon_last_good_target", return_value=last_good), \
+                patch.object(e2e, "_build_agent_upgrade_tarball"), \
+                patch.object(e2e, "_serve_agent_upgrade_tarball",
+                             return_value={"status": {"message": "AgentUpgrade completed"}}), \
+                patch.object(e2e, "wait_for_daemon_active"), \
+                patch.object(e2e, "kubectl"):
+            e2e.validate_agent_upgrade_operation()
+
+    def test_paths_must_match_while_the_root_stays(self):
+        blue, green = f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-blue", f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-green"
+        self._validate(["dir", "dir"], blue, green, blue)
+        with self.assertRaises(SystemExit):
+            self._validate(["dir", "dir"], blue, green, f"{e2e.LEGACY_HOST_ROOT}/bin/unbounded-agent-blue")
+
+    def test_slots_are_compared_by_name_once_the_root_moves(self):
+        legacy_blue = f"{e2e.LEGACY_HOST_ROOT}/bin/unbounded-agent-blue"
+        self._validate([f"link:{e2e.LEGACY_HOST_ROOT}", "moving"], legacy_blue,
+                       f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-green", f"{e2e.DAEMON_BIN_DIR}/unbounded-agent-blue")
 
 
 class TestHostRootStates(unittest.TestCase):
@@ -54,7 +96,10 @@ class TestHostRootStates(unittest.TestCase):
     }
 
     def _check(self, name, state, bin_dir, unit_dir=None):
-        unit = f"ExecStart={unit_dir or bin_dir}/unbounded-agent-current daemon\n"
+        units = unit_dir or bin_dir
+        unit = (f"ExecStart={units}/unbounded-agent-current daemon\n"
+                f"ExecStart={units}/unbounded-agent-daemon-recovery.sh\n"
+                f"ExecStartPost={units}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1\n")
         with patch.object(e2e, "host_root_state", return_value=state), \
                 patch.object(e2e, "read_daemon_current_target", return_value=f"{bin_dir}/unbounded-agent-blue"), \
                 patch.object(e2e, "present_on_host", return_value=[]), \
@@ -71,6 +116,19 @@ class TestHostRootStates(unittest.TestCase):
     def test_an_unfinished_move_is_not_installed(self):
         with self.assertRaises(SystemExit):
             self._check("validate_host_root", "moving", e2e.DAEMON_BIN_DIR)
+
+    def test_every_unit_must_name_the_expected_root(self):
+        """The recovery unit and the machine's hooks follow the daemon unit;
+        one left naming the other root would run a file the move removed."""
+        bin_dir = e2e.DAEMON_BIN_DIR
+        complete = (f"ExecStart={bin_dir}/unbounded-agent-current daemon\n"
+                    f"ExecStart={bin_dir}/unbounded-agent-daemon-recovery.sh\n"
+                    f"ExecStartPost={bin_dir}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1\n")
+        for missing in complete.splitlines():
+            units = complete.replace(missing + "\n", "")
+            with self.subTest(missing=missing), patch.object(e2e, "ssh_capture", return_value=units):
+                with self.assertRaises(SystemExit):
+                    e2e._daemon_unit_runs(bin_dir)
 
     def test_the_daemon_unit_must_name_the_expected_root(self):
         """A fresh host's unit runs the agent under the host root. A linked
@@ -113,6 +171,13 @@ class TestHostRootMoved(unittest.TestCase):
 
 
 class TestLegacyAgent(unittest.TestCase):
+    def test_version_is_checked_before_any_download(self):
+        with patch.object(e2e, "LEGACY_AGENT_VERSION", "../v0.8.0"), \
+                patch.object(e2e, "http_get") as get:
+            with self.assertRaises(SystemExit):
+                e2e._download_legacy_agent_tarball()
+        get.assert_not_called()
+
     def test_version_must_be_a_release_tag(self):
         """It is interpolated into a URL and a shell command line."""
         config = e2e.NodeConfig(name="default", node_labels={}, register_with_taints=[])
