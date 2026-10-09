@@ -5,14 +5,20 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/opencontainers/go-digest"
+
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 type failureReason uint8
@@ -50,8 +56,8 @@ func (r failureReason) String() string {
 	}
 }
 
-// Preserve errors.Is/As and the original returned diagnostic, but never emit
-// that diagnostic in logs or labels: transport errors may contain URLs/secrets.
+// Preserve errors.Is/As and the original returned diagnostic. Logs use typed
+// causes instead of raw error text, which may contain URLs or server secrets.
 type pullFailure struct {
 	err       error
 	reason    failureReason
@@ -86,6 +92,79 @@ func safeSHA256(value string) string {
 
 func (e *pullFailure) Error() string { return e.err.Error() }
 func (e *pullFailure) Unwrap() error { return e.err }
+
+// Only render trusted values, not wrapper messages, URLs, DNS names, certificate
+// contents, or server text. Unknown causes still expose their concrete type.
+func failureDiagnostic(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		switch {
+		case dns.IsNotFound:
+			return "DNS lookup: no such host"
+		case dns.IsTimeout:
+			return "DNS lookup: timeout"
+		case dns.IsTemporary:
+			return "DNS lookup: temporary failure"
+		default:
+			return "DNS lookup failed"
+		}
+	}
+
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno.Error()
+	}
+
+	var (
+		unknownAuthority x509.UnknownAuthorityError
+		hostname         x509.HostnameError
+		invalidCert      x509.CertificateInvalidError
+		tlsRecord        tls.RecordHeaderError
+	)
+
+	switch {
+	case errors.As(err, &unknownAuthority):
+		return "TLS: certificate signed by unknown authority"
+	case errors.As(err, &hostname):
+		return "TLS: certificate hostname mismatch"
+	case errors.As(err, &invalidCert):
+		return fmt.Sprintf("TLS: invalid certificate (reason %d)", invalidCert.Reason)
+	case errors.As(err, &tlsRecord):
+		return "TLS: invalid record header"
+	}
+
+	for _, known := range []error{
+		context.Canceled, context.DeadlineExceeded, io.ErrUnexpectedEOF, io.EOF,
+		io.ErrClosedPipe, io.ErrShortWrite, net.ErrClosed,
+		racersdk.ErrInvalidRequest, racersdk.ErrUnauthorized, racersdk.ErrForbidden,
+		racersdk.ErrNotFound, racersdk.ErrVersionMismatch, racersdk.ErrRangeNotSatisfiable,
+		racersdk.ErrUnavailable,
+	} {
+		if errors.Is(err, known) {
+			return known.Error()
+		}
+	}
+
+	var network net.Error
+	if errors.As(err, &network) && network.Timeout() {
+		return "network timeout"
+	}
+
+	for range 64 {
+		cause := errors.Unwrap(err)
+		if cause == nil {
+			break
+		}
+
+		err = cause
+	}
+
+	return fmt.Sprintf("unrecognized cause (%T); details redacted", err)
+}
 
 func classifyFailure(err error) failureReason {
 	var timeout net.Error
@@ -160,6 +239,8 @@ func (p *puller) reportPullFailure(err error, now time.Time, logger *slog.Logger
 	}
 
 	attrs := []any{"reason", reason.String(), "kind", kind, "http_status", status, "suppressed", suppressed}
+	attrs = append(attrs, "error", failureDiagnostic(err))
+
 	if reason == failureDigest && failure != nil && failure.integrity != nil {
 		evidence := failure.integrity
 		expected := safeSHA256(evidence.expectedDigest)

@@ -6,6 +6,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,7 +28,116 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
+
+func TestFailureDiagnostic(t *testing.T) {
+	secret := "https://user:password@private.invalid/path?token=secret\nforged"
+	for _, test := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"success", nil, ""},
+		{"refused", syscall.ECONNREFUSED, "connection refused"},
+		{"reset", syscall.ECONNRESET, "connection reset by peer"},
+		{"broken pipe", syscall.EPIPE, "broken pipe"},
+		{"socket missing", &os.PathError{Op: secret, Path: secret, Err: syscall.ENOENT}, "no such file or directory"},
+		{"DNS missing", &net.DNSError{Name: secret, Server: secret, Err: secret, IsNotFound: true}, "DNS lookup: no such host"},
+		{"DNS timeout", &net.DNSError{Name: secret, Err: secret, IsTimeout: true}, "DNS lookup: timeout"},
+		{"DNS temporary", &net.DNSError{Name: secret, Err: secret, IsTemporary: true}, "DNS lookup: temporary failure"},
+		{"DNS other", &net.DNSError{Name: secret, Err: secret}, "DNS lookup failed"},
+		{"TLS trust", x509.UnknownAuthorityError{Cert: &x509.Certificate{DNSNames: []string{secret}}}, "TLS: certificate signed by unknown authority"},
+		{"TLS hostname", x509.HostnameError{Host: secret}, "TLS: certificate hostname mismatch"},
+		{"TLS expired", x509.CertificateInvalidError{Reason: x509.Expired, Detail: secret}, "TLS: invalid certificate (reason 1)"},
+		{"TLS record", tls.RecordHeaderError{Msg: secret}, "TLS: invalid record header"},
+		{"deadline", context.DeadlineExceeded, "context deadline exceeded"},
+		{"network timeout", os.ErrDeadlineExceeded, "network timeout"},
+		{"canceled", context.Canceled, "context canceled"},
+		{"truncated", io.ErrUnexpectedEOF, "unexpected EOF"},
+		{"EOF", io.EOF, "EOF"},
+		{"closed", net.ErrClosed, "use of closed network connection"},
+		{"SDK unavailable", racersdk.ErrUnavailable, racersdk.ErrUnavailable.Error()},
+		{"SDK version", racersdk.ErrVersionMismatch, racersdk.ErrVersionMismatch.Error()},
+		{"unknown", errors.New(secret), "unrecognized cause (*errors.errorString); details redacted"},
+		{"oversized", errors.New(strings.Repeat(secret, 4096)), "unrecognized cause (*errors.errorString); details redacted"},
+		{"joined", errors.Join(errors.New(secret), syscall.ECONNRESET), "connection reset by peer"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.err
+			if err != nil {
+				// Match the pull, HTTP, and socket wrappers without trusting their text.
+				err = &pullFailure{reason: failureTransport, err: fmt.Errorf("%s: %w", secret,
+					&url.Error{Op: secret, URL: secret, Err: &net.OpError{Op: secret, Net: secret, Err: err}})}
+			}
+
+			require.Equal(t, test.want, failureDiagnostic(err))
+
+			if test.err != nil {
+				require.ErrorIs(t, err, test.err, "diagnostics must not alter the returned error chain")
+			}
+		})
+	}
+}
+
+func TestPullFailureLogsUnderlyingCause(t *testing.T) {
+	for _, cause := range []syscall.Errno{syscall.ECONNREFUSED, syscall.ECONNRESET} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			p := &puller{metrics: pullTestMetrics()}
+
+			var output bytes.Buffer
+
+			logger := slog.New(slog.NewJSONHandler(&output, nil))
+			err := &pullFailure{reason: failureTransport, kind: "blob", err: &url.Error{
+				Op: "Get", URL: "https://user:password@private.invalid/path?token=secret", Err: cause,
+			}}
+			p.reportPullFailure(err, time.Now(), logger)
+
+			var record struct {
+				Reason string `json:"reason"`
+				Error  string `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(output.Bytes(), &record))
+			require.Equal(t, "transport", record.Reason)
+			require.Equal(t, cause.Error(), record.Error)
+
+			for _, secret := range []string{"password", "private.invalid", "path", "token", "secret"} {
+				require.NotContains(t, output.String(), secret)
+			}
+		})
+	}
+}
+
+func TestFailureDiagnosticHTTPAcquisition(t *testing.T) {
+	opts := pullTestOptions("http://private.invalid")
+	opts.Namespace = "token=secret"
+	p, _ := pullTestNew(t, pullTestImage(t), opts)
+	p.transport.Proxy = nil
+	p.transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}
+	}
+
+	err := p.fetch(t.Context(), "manifest", p.img.Manifest)
+	require.ErrorIs(t, err, syscall.ECONNREFUSED)
+	require.Contains(t, err.Error(), "secret", "the original HTTP error contains the namespace URL query")
+	require.Equal(t, "connection refused", failureDiagnostic(err))
+}
+
+func TestFailureDiagnosticS3ServerText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "<Error><Code>AccessDenied</Code><Message>token=secret</Message></Error>")
+	}))
+	t.Cleanup(server.Close)
+	catalog := s3TestCatalog(t, 1, 123)
+	p, _ := s3TestPuller(t, catalog, server.URL)
+	err := p.fetch(t.Context(), "blob", catalog.batches[0].blobs[0].descriptor)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "token=secret", "the SDK preserves untrusted server text")
+	require.Equal(t, failureStatus, classifyFailure(err))
+	require.Equal(t, "unrecognized cause (*smithy.GenericAPIError); details redacted", failureDiagnostic(err))
+}
 
 func TestClassifyPullFailure(t *testing.T) {
 	for _, test := range []struct {
