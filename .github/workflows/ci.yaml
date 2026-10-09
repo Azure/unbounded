@@ -594,6 +594,23 @@ jobs:
           outputs: type=oci,dest=${{ runner.temp }}/net-node.oci.tar,oci-mediatypes=true
           provenance: false
 
+      - name: Build racer-loadgen image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        timeout-minutes: 5
+        with:
+          context: .
+          file: images/racer-loadgen/Containerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: racer-loadgen:ci
+          cache-from: type=gha,scope=racer-loadgen-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=racer-loadgen-${{ matrix.arch }}
+          provenance: false
+
+      - name: Smoke-test racer-loadgen entrypoint
+        run: timeout --signal=TERM --kill-after=10s 300s docker run --rm --network=none racer-loadgen:ci --help
+
       - name: Verify OCI image layouts
         run: |
           set -euo pipefail
