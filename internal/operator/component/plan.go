@@ -118,6 +118,8 @@ type Operation struct {
 	Component string
 	Site      string
 
+	FailureDomain string
+
 	// Overridable marks the workloads user-supplied overrides may target. Only
 	// these are merge candidates, and only these are dropped when an override
 	// document fails preflight, so an override typo cannot stop RBAC, Services

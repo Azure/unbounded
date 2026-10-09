@@ -395,12 +395,13 @@ func dependsOnStale(op plannedOp, staleRef map[ObjectRef]bool) (ObjectRef, bool)
 // subject identifies the component and Site an operation was planned for, which
 // is the scope the inferred tier gate applies to.
 type subject struct {
-	Component string
-	Site      string
+	Component     string
+	Site          string
+	FailureDomain string
 }
 
 func (o plannedOp) subject() subject {
-	return subject{Component: o.Component, Site: o.Site}
+	return subject{Component: o.Component, Site: o.Site, FailureDomain: o.FailureDomain}
 }
 
 // aliasSubjects returns the contributors that were deduplicated into this
@@ -408,7 +409,7 @@ func (o plannedOp) subject() subject {
 func (o plannedOp) aliasSubjects() []subject {
 	out := make([]subject, 0, len(o.aliases))
 	for _, alias := range o.aliases {
-		out = append(out, subject{Component: alias.Component, Site: alias.Site})
+		out = append(out, subject{Component: alias.Component, Site: alias.Site, FailureDomain: alias.FailureDomain})
 	}
 
 	return out
