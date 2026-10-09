@@ -26,8 +26,6 @@ import (
 	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
 	racercore "github.com/Azure/unbounded/internal/racer"
-	"github.com/Azure/unbounded/internal/racer/authority"
-	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
 const (
@@ -155,17 +153,6 @@ func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*com
 				return nil, component.Result{}, fmt.Errorf("fresh Racer marker requires absent or bound staged version state (read: %v)", err)
 			}
 		}
-	} else {
-		owner := authority.New(authority.Config{
-			Cluster: wire.ClusterID(marker.Data["cluster"]), Namespace: env.Namespace,
-			InstallationConfigMapName: markerName, VersionConfigMapName: versionName,
-			CredentialsSecretName: "racer-credentials", DaemonSetName: "racer-dataplane",
-			DataplaneServiceAccount: "racer-dataplane", ControllerServiceAccount: controllerName,
-			Rotation: authority.RotationPolicy{Interval: 24 * time.Hour, PrepareFor: time.Hour, RetainFor: 48 * time.Hour},
-		}, authority.Dependencies{Reader: env.LiveReader()})
-		if err := owner.Recover(ctx, planningWriter{}); err != nil {
-			return nil, component.Result{}, fmt.Errorf("racer durable state: %w", err)
-		}
 	}
 
 	secret, err := planTLSAt(ctx, env, plan, marker.UID, fresh, now)
@@ -215,7 +202,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 				"RACER_CLUSTER_ID":                  marker.Data["cluster"],
 				"RACER_INSTALLATION_CONFIGMAP_NAME": markerName,
 				"RACER_VERSION_CONFIGMAP_NAME":      versionName,
-				"RACER_CREDENTIALS_SECRET_NAME":     "racer-credentials",
+				"RACER_CREDENTIALS_SECRET_NAME":     credentialsName,
 				"RACER_DAEMONSET_NAME":              "racer-dataplane",
 				"RACER_DATAPLANE_SERVICE_ACCOUNT":   "racer-dataplane",
 				"RACER_CONTROLLER_SERVICE_ACCOUNT":  controllerName,

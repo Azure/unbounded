@@ -103,6 +103,9 @@ type Operation struct {
 	// It must be idempotent and honor context cancellation. It may capture a
 	// client; the executor does not write Object or set its owner references.
 	// OpRun cannot use SharedKey or Overridable.
+	// Racer uses it for trusted bootstrap: RBAC cannot scope Secret create by
+	// name, so the runtime controller must not initialize its own credentials.
+	// Bootstrap limits its writes and keeps planning read-only.
 	Run func(context.Context) error
 
 	// Base is the observed state for OpMergePatch, and is ignored otherwise.
