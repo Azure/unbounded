@@ -94,7 +94,7 @@ func TestMirror_Rediscover_PicksUpFinisherMidSwarm(t *testing.T) {
 	// spinning in its re-discovery loop.
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		dht.Inject(d, ifaces.Provider{NodeID: "finisher", Addr: peerAddr})
+		dht.Inject(d, ifaces.Provider{PeerID: "finisher", Addr: peerAddr})
 	}()
 
 	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
@@ -113,8 +113,8 @@ func TestMirror_Rediscover_PicksUpFinisherMidSwarm(t *testing.T) {
 		t.Errorf("body mismatch: got %q, want %q", got, body)
 	}
 
-	if n := atomic.LoadInt32(&originHits); n != 0 {
-		t.Errorf("origin hits = %d, want 0 (re-discovery should have served from the finisher)", n)
+	if n := atomic.LoadInt32(&originHits); n != 1 {
+		t.Errorf("origin requests = %d, want 1 metadata HEAD (body comes from finisher)", n)
 	}
 
 	if n := atomic.LoadInt32(&peerFetches); n != 1 {
@@ -159,7 +159,6 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 	coldStart := &stubColdStart{err: mirror.ErrColdStartExhausted}
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, dialer),
 		mirror.WithColdStart(coldStart),
 		mirror.WithPeerBudgets(time.Second, time.Second, 20),
@@ -188,7 +187,7 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 		t.Fatalf("peer calls before advertise = %d, want 0", got)
 	}
 
-	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
+	dht.Inject(d, ifaces.Provider{PeerID: "late-seed", Addr: lateAddr})
 
 	got, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -243,7 +242,6 @@ func TestMirror_Rediscover_SilentNoProviderRoundFlushesHeaders(t *testing.T) {
 	coldStart := &stubColdStart{}
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, dialer),
 		mirror.WithColdStart(coldStart),
 		mirror.WithPeerBudgets(time.Second, time.Second, 20),
@@ -271,7 +269,7 @@ func TestMirror_Rediscover_SilentNoProviderRoundFlushesHeaders(t *testing.T) {
 		t.Fatalf("peer calls before advertise = %d, want 0", got)
 	}
 
-	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
+	dht.Inject(d, ifaces.Provider{PeerID: "late-seed", Addr: lateAddr})
 
 	got, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -314,7 +312,6 @@ func TestMirror_Rediscover_DisabledStillFallsThroughToOrigin(t *testing.T) {
 	}
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(fakes.NewDHT(), newCountingPeerDialer()),
 		mirror.WithColdStart(&stubColdStart{}),
 		mirror.WithPeerBudgets(time.Second, time.Second, 20),
@@ -386,7 +383,6 @@ func TestMirror_Rediscover_HeadersFlushedBeforeBlockingColdStart(t *testing.T) {
 	coldStart := &stubColdStart{onResolve: func(digest.Digest) { <-gate }}
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, dialer),
 		mirror.WithColdStart(coldStart),
 		mirror.WithPeerBudgets(time.Second, time.Second, 20),
@@ -415,7 +411,7 @@ func TestMirror_Rediscover_HeadersFlushedBeforeBlockingColdStart(t *testing.T) {
 		t.Fatalf("Content-Length = %d, want %d", got, len(body))
 	}
 
-	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
+	dht.Inject(d, ifaces.Provider{PeerID: "late-seed", Addr: lateAddr})
 	release()
 
 	got, err := io.ReadAll(resp.Body)

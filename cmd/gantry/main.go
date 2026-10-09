@@ -143,6 +143,10 @@ func runAgent(args []string) error {
 		slog.Any("config", c.Redacted()),
 	)
 
+	if c.RacerEnabled {
+		return runRacerAgent(c, logger)
+	}
+
 	// Metrics registry + 2 instruments.
 	reg := metrics.New()
 	reg.RegisterDefaultCollectors()
@@ -152,7 +156,7 @@ func runAgent(args []string) error {
 	p9 := newPhase9Metrics(reg)
 	// Storage mode info: emit a single time-series at 1 for the
 	// active backend so dashboards can filter by it.
-	p9.storageMode.WithLabelValues(config.StorageModeContainerd).Set(1)
+	p9.storageMode.WithLabelValues("containerd").Set(1)
 
 	// Origin clients (+ live-stream split). See agent_origin.go
 	// for the full rationale of the two-client split and the
@@ -234,7 +238,7 @@ func runAgent(args []string) error {
 	noDialableTransferAddr := transferAddrFamilyMismatch(c.TransferListen, c.PodIP)
 
 	if c.ChairNamespace != "" {
-		chairClient, err = chairs.NewClientset(c.MembersKubeconfig)
+		chairClient, err = chairs.NewClientset(c.ChairKubeconfig)
 		if err != nil {
 			return err
 		}
@@ -313,10 +317,7 @@ func runAgent(args []string) error {
 		}),
 	)
 
-	coordClient := coord.NewClient(disco.LibP2P(),
-		coord.WithClientLogger(logger),
-		coord.WithClientMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
-	)
+	coordClient := coord.NewClient(disco.LibP2P())
 
 	var chairManager *chairs.Manager
 
@@ -392,16 +393,12 @@ func runAgent(args []string) error {
 	coordOpts := []coord.Option{
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
-			OnPullIntentServed:             func() { p3.coordPullIntentServed.Inc() },
-			OnPullIntentStorageUnavailable: func() { p3.coordPullIntentStorageUnavailable.Inc() },
-			OnPleasePullServed:             func() { p3.coordPleasePullServed.Inc() },
-			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
-			OnPleasePullDeclined:           func(reason string) { p3.coordPleasePullDeclined.WithLabelValues(reason).Inc() },
-			OnStreamError:                  func() { p3.coordStreamError.Inc() },
+			OnPleasePullServed:   func() { p3.coordPleasePullServed.Inc() },
+			OnPleasePullStarted:  func() { p3.coordPleasePullStarted.Inc() },
+			OnPleasePullDeclined: func(reason string) { p3.coordPleasePullDeclined.WithLabelValues(reason).Inc() },
+			OnStreamError:        func() { p3.coordStreamError.Inc() },
 		}),
-		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
-		coord.WithRequireChairAssignment(c.CoordRequireChairAssignment),
 		coord.WithMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 	}
 	if chairManager != nil {
@@ -411,7 +408,7 @@ func runAgent(args []string) error {
 		)
 	}
 
-	coordServer := coord.NewServer(cstore, inflightMap, coordOpts...)
+	coordServer := coord.NewServer(coordOpts...)
 	coordServer.Bind(disco.LibP2P())
 
 	chairPort, err := listenPort(c.ChairListen)
@@ -452,7 +449,7 @@ func runAgent(args []string) error {
 			Coord:        chairCoord,
 			LocalPull:    coordServer,
 			Inflight:     inflightMap,
-			SelfPeerID:   ifaces.NodeID(disco.PeerID().String()),
+			SelfPeerID:   ifaces.PeerID(disco.PeerID().String()),
 			CurrentEpoch: chairManager.CurrentEpoch,
 			InstallHolder: func(holder chairs.Holder) error {
 				return installChairHolder(disco.LibP2P().Peerstore(), holder)
@@ -565,7 +562,6 @@ func runAgent(args []string) error {
 	// responses with the content later becoming openable in containerd.
 	mirrorSrv := mirror.New(c, cstore, mirrorOriginClient,
 		mirror.WithLogger(logger),
-		mirror.WithLiveStreamThrough(),
 		mirror.WithMetrics(
 			func() { inst.cacheHit.Inc() },
 			func() { inst.cacheMiss.Inc() },
@@ -597,8 +593,7 @@ func runAgent(args []string) error {
 		mirror.WithDiscovery(disco, peerClient),
 		mirror.WithPeerBudgets(0, c.PeerFetchTimeout, 0),
 		mirror.WithPeerRediscover(c.PeerRediscoverBudget, c.PeerRediscoverBackoff),
-		mirror.WithSelfNodeID(ifaces.NodeID(disco.PeerID().String())),
-		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),
+		mirror.WithSelfPeerID(ifaces.PeerID(disco.PeerID().String())),
 		mirror.WithPeerMetrics(
 			func(outcome string) {
 				p2.peerFetch.WithLabelValues(outcome).Inc()
@@ -621,9 +616,6 @@ func runAgent(args []string) error {
 		mirror.WithDhtLookupMetric(func(outcome string, dur time.Duration) {
 			p2.dhtLookup.WithLabelValues(outcome).Inc()
 			p2.dhtLookupDur.WithLabelValues(outcome).Observe(dur.Seconds())
-		}),
-		mirror.WithProvideErrorMetric(func(op string) {
-			p2.dhtProvideErr.WithLabelValues(op).Inc()
 		}),
 		mirror.WithDhtStaleOnlyMetric(func() {
 			p9.dhtStaleOnly.Inc()
@@ -670,13 +662,12 @@ func runAgent(args []string) error {
 	// directly in containerd mode; every event is routed through the
 	// advertiser so one component owns the announced set and delete
 	// events can trigger best-effort Withdraw.
-	cdSub := cdsub.New(cdsubSrc, nil,
+	cdSub := cdsub.New(cdsubSrc,
 		cdsub.WithLogger(logger),
 		cdsub.WithNotifier(func(ctx context.Context, d digest.Digest, present bool) {
 			adv.Notify(ctx, d, present)
 		}),
 		cdsub.WithMetrics(
-			nil,
 			nil,
 			func(int) { p2.dhtReconcile.Inc() },
 			func() { p2.cdsubReconnect.Inc() },
@@ -1239,7 +1230,7 @@ func chairSelfHolder(c *config.Config, disco *discovery.Host) chairs.Holder {
 	}
 
 	return chairs.Holder{
-		PeerID:       ifaces.NodeID(peerID.String()),
+		PeerID:       ifaces.PeerID(peerID.String()),
 		P2PAddrs:     addresses,
 		TransferAddr: advertisedTransferAddr(c.TransferListen, c.PodIP),
 	}
@@ -1263,7 +1254,7 @@ func connectedChairCandidates(disco *discovery.Host) []chairs.Holder {
 			rawAddresses = append(rawAddresses, address.String())
 		}
 
-		candidates = append(candidates, chairs.Holder{PeerID: ifaces.NodeID(peerID.String()), P2PAddrs: rawAddresses})
+		candidates = append(candidates, chairs.Holder{PeerID: ifaces.PeerID(peerID.String()), P2PAddrs: rawAddresses})
 	}
 
 	return candidates
@@ -2270,23 +2261,6 @@ func isCredentialSpecificOriginFailure(class ifaces.FailureClass) bool {
 	default:
 		return false
 	}
-}
-
-// negCacheAdapter bridges *negcache.Cache to coord.NegativeCache.
-// Required because internal/negcache must not import internal/coord
-// (would cycle on the metric hooks the coord server uses).
-type negCacheAdapter struct{ c *negcache.Cache }
-
-func (a negCacheAdapter) Lookup(d digest.Digest) (coord.NegativeEntry, bool) {
-	e, ok := a.c.Lookup(d)
-	if !ok {
-		return coord.NegativeEntry{}, false
-	}
-
-	return coord.NegativeEntry{
-		CooldownUntil: e.CooldownUntil,
-		Class:         e.Class,
-	}, true
 }
 
 // mirrorNegCacheRecorder bridges *negcache.Cache to

@@ -112,9 +112,9 @@ func TestRankOf_Consistent(t *testing.T) {
 
 	top := TopK(nodes, d, len(nodes))
 	for i, s := range top {
-		got := RankOf(nodes, s.Node.ID, d)
-		if got != int32(i) {
-			t.Errorf("RankOf(%s) = %d, want %d", s.Node.ID, got, i)
+		prefix := TopK(nodes, d, i+1)
+		if prefix[i].Node.ID != s.Node.ID {
+			t.Errorf("TopK prefix %d disagrees with full ordering", i)
 		}
 	}
 }
@@ -123,8 +123,10 @@ func TestRankOf_AbsentReturnsNegOne(t *testing.T) {
 	nodes := makeNodes(5, "")
 
 	d := digest.MustParse("sha256:" + repeat('f', 64))
-	if got := RankOf(nodes, "not-a-member", d); got != -1 {
-		t.Errorf("RankOf(absent) = %d, want -1", got)
+	for _, got := range TopK(nodes, d, len(nodes)+1) {
+		if got.Node.ID == "not-a-member" {
+			t.Fatal("TopK returned absent candidate")
+		}
 	}
 }
 
@@ -180,7 +182,7 @@ func TestCandidates_ZoneFiltersByZone(t *testing.T) {
 	}
 
 	if got[0].ID != "a" || got[1].ID != "c" {
-		t.Errorf("got IDs %v; want [a c]", []ifaces.NodeID{got[0].ID, got[1].ID})
+		t.Errorf("got IDs %v; want [a c]", []ifaces.PeerID{got[0].ID, got[1].ID})
 	}
 }
 
@@ -221,7 +223,7 @@ func TestParseScope(t *testing.T) {
 func makeNodes(n int, zone string) []ifaces.Node {
 	out := make([]ifaces.Node, n)
 	for i := range out {
-		out[i] = ifaces.Node{ID: ifaces.NodeID("node-" + strconv.Itoa(i)), Zone: zone}
+		out[i] = ifaces.Node{ID: ifaces.PeerID("node-" + strconv.Itoa(i)), Zone: zone}
 	}
 
 	return out

@@ -100,6 +100,12 @@ func serveChairHTTP(w http.ResponseWriter, r *http.Request, local ifaces.LocalCh
 		return
 	}
 
+	kind, err := pleasePullKindFromProto(req.GetKind())
+	if err != nil {
+		http.Error(w, "missing or unknown kind", http.StatusBadRequest)
+		return
+	}
+
 	digests := make([]digest.Digest, 0, len(req.GetDigests()))
 
 	for _, raw := range req.GetDigests() {
@@ -114,14 +120,32 @@ func serveChairHTTP(w http.ResponseWriter, r *http.Request, local ifaces.LocalCh
 	}
 
 	assignment := chairAssignmentFromProto(req.GetChairAssignment())
+	if req.GetChairAssignment() == nil || assignment.Generation <= 0 || assignment.AssignmentEpoch <= 0 {
+		http.Error(w, "missing or invalid chair assignment", http.StatusBadRequest)
+		return
+	}
+
+	limit := DefaultMaxDigestsPerPleasePull
+	if bounded, ok := local.(interface{ MaxDigestsPerRequest() int }); ok && bounded.MaxDigestsPerRequest() > 0 {
+		limit = bounded.MaxDigestsPerRequest()
+	}
+
+	if len(digests) > limit {
+		http.Error(w, "too many digests", http.StatusBadRequest)
+		return
+	}
 
 	// The delegated credential rides the request context exactly as the libp2p
 	// path does; it is never logged or persisted.
 	ctx := registryauth.WithAuthorization(r.Context(), req.GetAuthorization())
+	if req.GetAuthorization() != "" && registryauth.Authorization(ctx) == "" {
+		http.Error(w, "invalid authorization", http.StatusBadRequest)
+		return
+	}
 
 	outcomes, err := local.StartLocalChairPull(ctx,
 		req.GetUpstreamRegistry(), req.GetRepository(),
-		pleasePullKindFromProto(req.GetKind()), digests, assignment)
+		kind, digests, assignment)
 	if err != nil {
 		logger.Debug("chaircall: local pull failed", slog.Any("err", err))
 		http.Error(w, "pull failed", http.StatusServiceUnavailable)

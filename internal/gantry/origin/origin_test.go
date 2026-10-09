@@ -14,8 +14,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -374,9 +372,8 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 	tokenMux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&tokenReqs, 1)
 
-		user, pass, ok := r.BasicAuth()
-		if !ok || user != "alice" || pass != "secret" {
-			t.Errorf("token auth missing/wrong: ok=%v user=%q", ok, user)
+		if r.Header.Get("Authorization") != "" {
+			t.Error("anonymous token exchange sent authorization")
 		}
 
 		_ = json.NewEncoder(w).Encode(map[string]any{"token": "deadbeef"}) //nolint:errcheck // best-effort
@@ -405,14 +402,7 @@ func TestPull_BearerTokenFlow(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dir := t.TempDir()
-
-	credsPath := filepath.Join(dir, "creds")
-	if err := os.WriteFile(credsPath, []byte("alice:secret\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
 	c.registries["reg"].hc = srv.Client()
 
 	rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{
@@ -535,7 +525,12 @@ func TestAuthenticationChallenge_Anonymous(t *testing.T) {
 	}
 }
 
+// Requester authorization replaces the removed shared registry identity.
 func TestAuthenticationChallenge_ConfiguredCredentialsUseSharedIdentityMode(t *testing.T) {
+	TestAuthenticationChallenge_NoSharedIdentityBypass(t)
+}
+
+func TestAuthenticationChallenge_NoSharedIdentityBypass(t *testing.T) {
 	var hits int32
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -545,12 +540,7 @@ func TestAuthenticationChallenge_ConfiguredCredentialsUseSharedIdentityMode(t *t
 	}))
 	defer srv.Close()
 
-	credsPath := filepath.Join(t.TempDir(), "creds")
-	if err := os.WriteFile(credsPath, []byte("shared:secret\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
 	c.registries["reg"].hc = srv.Client()
 
 	challenge, required, err := c.AuthenticationChallenge(context.Background(), "reg")
@@ -558,12 +548,12 @@ func TestAuthenticationChallenge_ConfiguredCredentialsUseSharedIdentityMode(t *t
 		t.Fatalf("AuthenticationChallenge: %v", err)
 	}
 
-	if required || challenge != "" {
-		t.Fatalf("AuthenticationChallenge = %q, %v; want shared identity mode", challenge, required)
+	if !required || challenge != `Basic realm="private"` {
+		t.Fatalf("AuthenticationChallenge = %q, %v; want requester challenge", challenge, required)
 	}
 
-	if got := atomic.LoadInt32(&hits); got != 0 {
-		t.Fatalf("authentication probe hits = %d, want 0", got)
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("authentication probe hits = %d, want 1", got)
 	}
 }
 
@@ -675,12 +665,7 @@ func TestPull_DelegatedBearerRejectionDoesNotUseLocalCredentials(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	credsPath := filepath.Join(t.TempDir(), "creds")
-	if err := os.WriteFile(credsPath, []byte("local:credentials\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
 	c.registries["reg"].hc = srv.Client()
 
 	ctx := registryauth.WithAuthorization(context.Background(), "Bearer rejected-requester-token")
@@ -738,10 +723,8 @@ func TestFetchBearerTokenRejectsHTTPRealm(t *testing.T) {
 	defer tokenSrv.Close()
 
 	r := &registry{
-		base:     mustParseURL(t, "https://reg.example.com"),
-		username: "alice",
-		password: "secret",
-		hc:       tokenSrv.Client(),
+		base: mustParseURL(t, "https://reg.example.com"),
+		hc:   tokenSrv.Client(),
 	}
 
 	_, _, err := r.fetchBearerToken(context.Background(), `Bearer realm="`+tokenSrv.URL+`/token",service="reg"`)
@@ -764,9 +747,8 @@ func TestFetchBearerTokenAllowsCrossHostHTTPSRealm(t *testing.T) {
 	tokenSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&tokenReqs, 1)
 
-		user, pass, ok := r.BasicAuth()
-		if !ok || user != "alice" || pass != "secret" {
-			t.Errorf("token auth missing/wrong: ok=%v user=%q", ok, user)
+		if r.Header.Get("Authorization") != "" {
+			t.Error("anonymous token exchange sent authorization")
 		}
 
 		if r.URL.Query().Get("service") != "reg" {
@@ -778,10 +760,8 @@ func TestFetchBearerTokenAllowsCrossHostHTTPSRealm(t *testing.T) {
 	defer tokenSrv.Close()
 
 	r := &registry{
-		base:     mustParseURL(t, "https://reg.example.com"),
-		username: "alice",
-		password: "secret",
-		hc:       tokenSrv.Client(),
+		base: mustParseURL(t, "https://reg.example.com"),
+		hc:   tokenSrv.Client(),
 	}
 
 	tok, _, err := r.fetchBearerToken(context.Background(), `Bearer realm="`+tokenSrv.URL+`/token",service="reg"`)
@@ -827,14 +807,7 @@ func TestHTTPRegistryDoesNotSendBasicToTokenEndpoint(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dir := t.TempDir()
-
-	credsPath := filepath.Join(dir, "creds")
-	if err := os.WriteFile(credsPath, []byte("alice:secret\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
 	c.registries["reg"].hc = tokenSrv.Client()
 
 	rc, _, err := c.Pull(context.Background(), ifaces.OriginRef{
@@ -871,14 +844,7 @@ func TestHTTPRegistryRepeatWithoutTokenDoesNotSendBasic(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dir := t.TempDir()
-
-	credsPath := filepath.Join(dir, "creds")
-	if err := os.WriteFile(credsPath, []byte("alice:secret\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL, CredentialsPath: credsPath})
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
 	d := digestOf([]byte("x"))
 
 	_, _, err := c.Pull(context.Background(), ifaces.OriginRef{Registry: "reg", Repository: "library/nginx", Digest: d})
@@ -1069,18 +1035,9 @@ func TestNSAliasResolves(t *testing.T) {
 }
 
 func TestNewRejectsBadCredentialsFile(t *testing.T) {
-	dir := t.TempDir()
-
-	credsPath := filepath.Join(dir, "creds")
-	if err := os.WriteFile(credsPath, []byte("no-colon-here\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{
-		{Name: "reg", Endpoint: "https://reg.example.com", CredentialsPath: credsPath},
-	}}
-	if _, err := New(cfg); err == nil {
-		t.Fatal("expected New() to reject malformed credentials")
+	cfg := config.NewDefault()
+	if err := cfg.LoadYAML(strings.NewReader("upstream_registries:\n- name: reg\n  endpoint: https://reg.example.com\n  credentials_path: /obsolete/creds\n")); err == nil {
+		t.Fatal("credentials file configuration was accepted")
 	}
 }
 

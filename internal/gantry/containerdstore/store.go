@@ -77,7 +77,7 @@ type Store struct {
 	namespace string
 	refPrefix string
 
-	// leases is optional. When nil, AttachLease and
+	// leases is optional. When nil, CreateLease and
 	// CleanupExpiredLeases return ErrNoLeaseManager and ingest
 	// proceeds without lease protection (suitable for tests / dev
 	// wiring; production containerd-only wiring should always

@@ -263,7 +263,7 @@ func TestMirror_HEAD_CacheMiss_DHTProviders_UsesPeerMetadata(t *testing.T) {
 
 	stack := newHeadTestStack(t,
 		map[digest.Digest][]byte{d: body},
-		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "peer-a", Addr: peerAddr}}},
+		map[digest.Digest][]ifaces.Provider{d: {{PeerID: "peer-a", Addr: peerAddr}}},
 	)
 
 	req, _ := http.NewRequest(http.MethodHead, stack.srv.URL+"/v2/r/blobs/"+d.String(), nil)
@@ -304,7 +304,7 @@ func TestMirror_HEAD_CacheMiss_StaleProviderFallsBackToOrigin(t *testing.T) {
 	peerAddr := startPeerTransfer(t, fakes.NewCache())
 	stack := newHeadTestStack(t,
 		map[digest.Digest][]byte{d: body},
-		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "stale-peer", Addr: peerAddr}}},
+		map[digest.Digest][]ifaces.Provider{d: {{PeerID: "stale-peer", Addr: peerAddr}}},
 	)
 
 	req, _ := http.NewRequest(http.MethodHead, stack.srv.URL+"/v2/r/blobs/"+d.String(), nil)
@@ -332,7 +332,7 @@ func TestMirror_HEAD_CacheMiss_StaleProviderFallsBackToOrigin(t *testing.T) {
 func TestMirror_HEAD_CanceledRequestDoesNotQuarantinePeer(t *testing.T) {
 	body := []byte("peer-metadata-after-canceled-request")
 	d := digestOf(body)
-	provider := ifaces.Provider{NodeID: "peer-a", Addr: "peer-a:5001"}
+	provider := ifaces.Provider{PeerID: "peer-a", Addr: "peer-a:5001"}
 	dht := fakes.NewDHT()
 	dht.Inject(d, provider)
 
@@ -390,8 +390,7 @@ func TestMirror_GET_LiveStreamEarlyHeadersUsePeerMetadata(t *testing.T) {
 	peerAddr := startPeerTransfer(t, peerCache)
 	stack := newHeadTestStack(t,
 		map[digest.Digest][]byte{d: body},
-		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "peer-a", Addr: peerAddr}}},
-		mirror.WithLiveStreamThrough(),
+		map[digest.Digest][]ifaces.Provider{d: {{PeerID: "peer-a", Addr: peerAddr}}},
 		mirror.WithPeerRediscover(time.Second, 10*time.Millisecond),
 	)
 

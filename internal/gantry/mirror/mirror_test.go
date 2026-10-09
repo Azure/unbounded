@@ -288,7 +288,7 @@ func TestMirrorOriginRangeRetry(t *testing.T) {
 	origin := &rangeCapturingOrigin{body: body, seen: make(chan rangeOriginRequest, 1)}
 	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "https://reg.example.com"}}}
 
-	srv := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), origin, mirror.WithLiveStreamThrough()).Handler())
+	srv := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), origin).Handler())
 	defer srv.Close()
 
 	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v2/repo/blobs/"+d.String(), nil)
@@ -561,7 +561,13 @@ func TestMirror_BlobMissPullsFromOriginAndCaches(t *testing.T) {
 		t.Errorf("Docker-Content-Digest header missing")
 	}
 
-	// Second GET: should hit cache, not origin.
+	// Simulate the caller's containerd commit before the second GET.
+	if ok, _ := f.cache.Has(context.Background(), d); ok {
+		t.Fatal("mirror wrote live bytes into containerd")
+	}
+
+	f.cache.Put(d, body)
+	// Second GET: should hit the externally populated cache, not origin.
 	resp2, err := http.Get(url)
 	if err != nil {
 		t.Fatal(err)
@@ -755,11 +761,11 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		}
 
 		m := mirror.New(f.cfg, f.cache, oc,
-			mirror.WithOriginSuccessMetric(func(kind string, _ int64) {
+			mirror.WithOriginStreamMetrics(nil, func(kind string) {
 				atomic.AddInt32(&successCalls, 1)
 
 				successKinds = append(successKinds, kind)
-			}),
+			}, nil),
 		)
 
 		srv := httptest.NewServer(m.Handler())
@@ -811,9 +817,9 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		}
 
 		m := mirror.New(f.cfg, f.cache, oc,
-			mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
+			mirror.WithOriginStreamMetrics(nil, func(_ string) {
 				atomic.AddInt32(&successCalls, 1)
-			}),
+			}, nil),
 		)
 
 		srv := httptest.NewServer(m.Handler())
@@ -886,14 +892,13 @@ func TestMirror_OriginSuccessMetric_FiresOnlyOnCacheCommit(t *testing.T) {
 		}
 
 		m := mirror.New(cfg, c, oc,
-			mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
+			mirror.WithOriginStreamMetrics(nil, func(_ string) {
 				atomic.AddInt32(&successCalls, 1)
-			}),
-			mirror.WithDownstreamFailureMetric(func(kind, class string) {
+			}, func(kind string) {
 				atomic.AddInt32(&downstreamCalls, 1)
 
 				downstreamKinds = append(downstreamKinds, kind)
-				downstreamClasses = append(downstreamClasses, class)
+				downstreamClasses = append(downstreamClasses, string(ifaces.FailureTransient))
 			}),
 		)
 
@@ -998,10 +1003,9 @@ func TestMirror_OriginPullArithmeticIdentity(t *testing.T) {
 	}
 
 	m := mirror.New(cfg, c, oc,
-		mirror.WithOriginSuccessMetric(func(_ string, _ int64) {
+		mirror.WithOriginStreamMetrics(nil, func(_ string) {
 			atomic.AddInt32(&successes, 1)
-		}),
-		mirror.WithDownstreamFailureMetric(func(_, _ string) {
+		}, func(_ string) {
 			atomic.AddInt32(&downstream, 1)
 		}),
 	)
@@ -1094,7 +1098,6 @@ func TestMirror_LiveStreamThrough_OriginBypassesLocalWriter(t *testing.T) {
 	var started, completed, failed, liveCompleted int32
 
 	m := mirror.New(cfg, local, originSrc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithOriginStreamMetrics(
 			func(string) { atomic.AddInt32(&started, 1) },
 			func(string) { atomic.AddInt32(&completed, 1) },
@@ -1166,12 +1169,11 @@ func TestMirror_LiveStreamThrough_PeerBypassesLocalWriterAndReadvertise(t *testi
 	peerDialer.Register("10.0.0.8:5001", peerCache)
 
 	dht := fakes.NewDHT()
-	dht.Inject(d, ifaces.Provider{NodeID: ifaces.NodeID("peer-a"), Addr: "10.0.0.8:5001"})
+	dht.Inject(d, ifaces.Provider{PeerID: "peer-a", Addr: "10.0.0.8:5001"})
 
 	var liveCompleted int32
 
 	m := mirror.New(cfg, local, originSrc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, peerDialer),
 		mirror.WithLiveStreamCompletedHook(func(got digest.Digest) {
 			if got != d {

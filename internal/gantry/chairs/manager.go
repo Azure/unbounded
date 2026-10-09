@@ -221,7 +221,7 @@ func (m *Manager) ValidateChair(_ context.Context, assignment ifaces.ChairAssign
 		(assignment.AssignmentEpoch == epoch || assignment.AssignmentEpoch == epoch-1)
 }
 
-func (m *Manager) AcceptChair(ctx context.Context, proposer ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
+func (m *Manager) AcceptChair(ctx context.Context, proposer ifaces.PeerID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
 	if assignment.ChairID >= uint64(m.opts.ChairCount) || assignment.AssignmentEpoch != m.CurrentEpoch()+1 {
 		return ifaces.PeerEndpoint{}, false
 	}
@@ -374,14 +374,14 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 	reserved := m.reserved != nil
 	selectionReady := m.selectionReady
 	bootstrapReady := m.bootstrapReady
-	legacySkipClaim := held || reserved || m.knownFull || m.claiming ||
+	fixedTargetSkipClaim := held || reserved || m.knownFull || m.claiming ||
 		(selectionReady && bootstrapReady && !m.participating)
 
 	// Bootstrap failure is a separate condition from a completed election. A
 	// non-holder whose initial dials all failed still needs the snapshot below,
 	// because observe is what retries Connect; returning here on knownFull
 	// alone would leave it disconnected until the next epoch.
-	if m.opts.HolderTarget == nil && legacySkipClaim && bootstrapReady {
+	if m.opts.HolderTarget == nil && fixedTargetSkipClaim && bootstrapReady {
 		m.mu.Unlock()
 		return
 	}
@@ -708,7 +708,7 @@ func (m *Manager) prepareRotation(ctx context.Context, held Chair) {
 
 	m.observe(ctx, snapshot)
 
-	chairHolders := make(map[ifaces.NodeID]struct{}, len(snapshot.Chairs))
+	chairHolders := make(map[ifaces.PeerID]struct{}, len(snapshot.Chairs))
 	for _, chair := range snapshot.Chairs {
 		if chair.Occupied() {
 			chairHolders[chair.Holder.PeerID] = struct{}{}
@@ -916,7 +916,7 @@ func (m *Manager) apiContext(parent context.Context) (context.Context, context.C
 	return context.WithTimeout(parent, m.opts.APITimeout)
 }
 
-func claimEligible(peerID ifaces.NodeID, epoch int64, round, initialDivisor uint64) bool {
+func claimEligible(peerID ifaces.PeerID, epoch int64, round, initialDivisor uint64) bool {
 	divisor := initialDivisor
 	for index := uint64(0); index < round && divisor > 1; index++ {
 		divisor = (divisor + 1) / 2

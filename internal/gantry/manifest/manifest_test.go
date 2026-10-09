@@ -107,7 +107,7 @@ const manifestWithForeignLayer = `{
 }`
 
 func TestChildDigests_OCIManifest(t *testing.T) {
-	got, err := manifest.ChildDigests([]byte(ociImageManifest))
+	got, err := manifest.TypedChildren([]byte(ociImageManifest))
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
@@ -122,8 +122,8 @@ func TestChildDigests_OCIManifest(t *testing.T) {
 	}
 
 	for i, d := range want {
-		if got[i].String() != d.String() {
-			t.Fatalf("digest[%d]: got %s want %s", i, got[i], d)
+		if got[i].Digest != d {
+			t.Fatalf("digest[%d]: got %s want %s", i, got[i].Digest, d)
 		}
 	}
 }
@@ -218,7 +218,7 @@ func TestDetectContentTypeFromReaderFindsLateIndexShape(t *testing.T) {
 }
 
 func TestChildDigests_DockerManifest(t *testing.T) {
-	got, err := manifest.ChildDigests([]byte(dockerImageManifest))
+	got, err := manifest.TypedChildren([]byte(dockerImageManifest))
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
@@ -232,14 +232,14 @@ func TestChildDigests_DockerManifest(t *testing.T) {
 	}
 
 	for i, d := range want {
-		if got[i].String() != d {
-			t.Fatalf("digest[%d]: got %s want %s", i, got[i], d)
+		if got[i].Digest.String() != d {
+			t.Fatalf("digest[%d]: got %s want %s", i, got[i].Digest, d)
 		}
 	}
 }
 
 func TestChildDigests_ImageIndexReturnsEmpty(t *testing.T) {
-	got, err := manifest.ChildDigests([]byte(ociImageIndex))
+	got, err := manifest.TypedChildren([]byte(ociImageIndex))
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestChildDigests_ImageIndexReturnsEmpty(t *testing.T) {
 }
 
 func TestChildDigests_SkipsForeignLayers(t *testing.T) {
-	got, err := manifest.ChildDigests([]byte(manifestWithForeignLayer))
+	got, err := manifest.TypedChildren([]byte(manifestWithForeignLayer))
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
@@ -269,21 +269,21 @@ func TestChildDigests_SkipsForeignLayers(t *testing.T) {
 	}
 
 	for i, d := range want {
-		if got[i].String() != d {
-			t.Fatalf("digest[%d]: got %s want %s", i, got[i], d)
+		if got[i].Digest.String() != d {
+			t.Fatalf("digest[%d]: got %s want %s", i, got[i].Digest, d)
 		}
 	}
 }
 
 func TestChildDigests_MalformedJSON(t *testing.T) {
-	_, err := manifest.ChildDigests([]byte("{this is not JSON"))
+	_, err := manifest.TypedChildren([]byte("{this is not JSON"))
 	if err == nil {
 		t.Fatalf("ChildDigests on garbage: expected error, got nil")
 	}
 }
 
 func TestChildDigests_EmptyBody(t *testing.T) {
-	_, err := manifest.ChildDigests([]byte(""))
+	_, err := manifest.TypedChildren([]byte(""))
 	if err == nil {
 		t.Fatalf("ChildDigests on empty body: expected error, got nil")
 	}
@@ -300,7 +300,7 @@ func TestChildDigests_MalformedInnerDigestSkipped(t *testing.T) {
   ]
 }`
 
-	got, err := manifest.ChildDigests([]byte(body))
+	got, err := manifest.TypedChildren([]byte(body))
 	if err != nil {
 		t.Fatalf("ChildDigests: %v", err)
 	}
@@ -309,8 +309,8 @@ func TestChildDigests_MalformedInnerDigestSkipped(t *testing.T) {
 		t.Fatalf("expected 1 digest, got %d (%v)", len(got), got)
 	}
 
-	if got[0].String() != "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
-		t.Fatalf("got %s", got[0])
+	if got[0].Digest.String() != "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || got[0].Kind != ifaces.KindBlob {
+		t.Fatalf("got %+v", got[0])
 	}
 }
 
@@ -391,17 +391,14 @@ func TestTypedChildren_ImageIndexReturnsNil(t *testing.T) {
 	}
 }
 
-// TestChildDigests_MatchesTypedChildren proves the back-compat path
-// is byte-equivalent in ordering and content with the new typed API.
-// If either drifts, both callers (pre-Kind PrefetchLayers and the
-// new PrefetchChildren) would see inconsistent prefetch sets - this
-// guards against that regression.
+// TestChildDigests_MatchesTypedChildren pins source ordering and kinds.
 func TestChildDigests_MatchesTypedChildren(t *testing.T) {
 	t.Parallel()
 
-	flat, err := manifest.ChildDigests([]byte(ociImageManifest))
-	if err != nil {
-		t.Fatalf("ChildDigests: %v", err)
+	flat := []manifest.TypedChild{
+		{Digest: digest.MustParse("sha256:1111111111111111111111111111111111111111111111111111111111111111"), Kind: ifaces.KindConfig},
+		{Digest: digest.MustParse("sha256:2222222222222222222222222222222222222222222222222222222222222222"), Kind: ifaces.KindBlob},
+		{Digest: digest.MustParse("sha256:3333333333333333333333333333333333333333333333333333333333333333"), Kind: ifaces.KindBlob},
 	}
 
 	typed, err := manifest.TypedChildren([]byte(ociImageManifest))
@@ -414,8 +411,8 @@ func TestChildDigests_MatchesTypedChildren(t *testing.T) {
 	}
 
 	for i := range flat {
-		if flat[i] != typed[i].Digest {
-			t.Errorf("index %d: flat=%s typed=%s", i, flat[i], typed[i].Digest)
+		if flat[i] != typed[i] {
+			t.Errorf("index %d: want=%+v got=%+v", i, flat[i], typed[i])
 		}
 	}
 }

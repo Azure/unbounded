@@ -249,11 +249,10 @@ type TypedChild struct {
 	Kind   ifaces.OriginRefKind
 }
 
-// TypedChildren is the kind-preserving cousin of ChildDigests. Source
-// order is the same: config first, then layers top-to-bottom.
-// Foreign-layer descriptors (non-empty `urls`) and image indexes
-// (.manifests with no .layers) are handled exactly as in
-// ChildDigests; only the return type changes. The config digest is
+// TypedChildren returns config first, then layers top-to-bottom.
+// Foreign-layer descriptors (non-empty `urls`) are skipped; image indexes
+// (.manifests with no .layers) return no children. Invalid child digests are
+// skipped, but malformed JSON returns an error. The config digest is
 // tagged KindConfig; every layer is tagged KindBlob (KindLayer is
 // intentionally NOT introduced - the OCI URL family is /blobs/ for
 // both and downstream pullers do not need to distinguish, only the
@@ -263,7 +262,7 @@ func TypedChildren(body []byte) ([]TypedChild, error) {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, fmt.Errorf("manifest: parse: %w", err)
 	}
-	// Image index detection (see ChildDigests): index has .manifests,
+	// Image index detection: index has .manifests,
 	// image manifest has .layers. If both happen to be populated,
 	// prefer image-manifest interpretation (defensive against weird
 	// hand-crafted bodies).

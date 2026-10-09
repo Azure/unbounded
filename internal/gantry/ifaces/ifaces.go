@@ -69,47 +69,29 @@ type ContentWriter interface {
 }
 
 // ---------------------------------------------------------------------------
-// Members: cluster-membership view, sourced from a Kubernetes informer.
-// Implemented by internal/members .
+// Stable identifiers used by chair selection and peer discovery.
 // ---------------------------------------------------------------------------
 
-// NodeID is the stable identity used by HRW (the step 3) - typically the
-// pod or node name. It MUST be stable across an individual node's lifetime
-// and identical across all agents' views (modulo informer lag, the design doc).
-type NodeID string
+// PeerID is the serialized libp2p identity, never a Kubernetes node name.
+type PeerID string
 
-// Node is one entry in the cluster-membership view.
+// Node is a rendezvous-hash candidate. Chair selection uses fixed chair names;
+// no Kubernetes membership informer is involved.
 type Node struct {
-	ID NodeID
+	ID PeerID
 
-	// Addr is the network address to reach this node's transfer
-	// endpoint (HTTP/2 on the configured transfer port). When the
-	// transfer port is known (production deploy), Addr is "ip:port";
-	// for back-compat with older snapshots it may be a bare IP and
-	// callers must append the port.
+	// Addr is an optional transfer address for candidate filtering.
 	Addr string
 
 	// Zone is the optional topology label `topology.kubernetes.io/zone`.
 	// Empty when not topology-aware (the design doc).
 	Zone string
-
-	// PeerID is the libp2p peer.ID (CID-encoded string form) the node
-	// publishes via its pod annotation. Empty until the peer announces.
-	// coord.Client uses this to dial via libp2p without requiring that
-	// NodeID itself be a peer.ID string.
-	PeerID string
-
-	// P2PAddrs lists the node's libp2p listen multiaddrs published via
-	// pod annotation. Empty until the peer announces. main.go reads
-	// this on startup to seed disco.Connect for DHT bootstrap (the design doc)
-	// without needing operator-supplied bootstrap_peers.
-	P2PAddrs []string
 }
 
 // PeerEndpoint is a libp2p identity plus the addresses needed for
 // coordination, DHT bootstrap, and content transfer.
 type PeerEndpoint struct {
-	PeerID       NodeID
+	PeerID       PeerID
 	P2PAddrs     []string
 	TransferAddr string
 }
@@ -128,7 +110,8 @@ type OriginRef struct {
 	Repository string // e.g. "library/nginx"
 	Digest     digest.Digest
 	// Offset requests bytes starting at this position when fetching from a
-	// peer or origin registry. Zero requests the full object.
+	// peer or origin registry. Zero requests the full object with Pull; with
+	// PullRange it is the start of a bounded range, including the first page.
 	Offset int64
 
 	// Kind discriminates the OCI Distribution Spec URL family for this
@@ -240,14 +223,28 @@ type OriginPuller interface {
 	Head(ctx context.Context, ref OriginRef) (size int64, contentType string, err error)
 }
 
+// OriginRangePuller is the optional bounded-read capability of an OriginPuller.
+// PullRange requests exactly length bytes starting at ref.Offset, clamped only
+// at EOF. length must be positive and offset+length-1 must fit in int64.
+// It returns the full object size and upstream Content-Type from GET, without
+// requiring HEAD. Empty objects at offset zero return an empty body and size 0.
+// The caller owns the body and verifies the final OCI digest. Implementations
+// reject ignored or incorrectly bounded ranges rather than downloading a tail.
+// A complete 200 response is allowed at offset zero only when its known length
+// fits the requested range, for registries with non-range-aware manifests.
+type OriginRangePuller interface {
+	PullRange(ctx context.Context, ref OriginRef, length int64) (body io.ReadCloser, totalSize int64, contentType string, err error)
+}
+
 // OriginError is the error returned by OriginPuller.Pull for terminal
 // failures. The Class field is the classification used by the negative
 // cache and propagated via PullIntentResponse.failure_class.
 type OriginError struct {
-	Ref       OriginRef
-	Class     FailureClass
-	Challenge string
-	Err       error
+	Ref        OriginRef
+	Class      FailureClass
+	StatusCode int // upstream HTTP status, when available
+	Challenge  string
+	Err        error
 }
 
 func (e *OriginError) Error() string {
@@ -307,7 +304,7 @@ type PeerMetadataDialer interface {
 
 // Provider is one entry returned by DHT.FindProviders.
 type Provider struct {
-	NodeID NodeID
+	PeerID PeerID
 	Addr   string
 }
 
@@ -345,17 +342,6 @@ type DHT interface {
 // Implemented by internal/coord .
 // ---------------------------------------------------------------------------
 
-// PullIntent is the requester-side view of a PullIntentResponse.
-type PullIntent struct {
-	HasCached      bool
-	InFlight       bool
-	StartedAt      time.Time
-	RecipientRank  int32
-	RecentlyFailed bool
-	CooldownUntil  time.Time
-	FailureClass   FailureClass
-}
-
 // PleasePullOutcome is the requester-side view of a single
 // PleasePullResponse.Result.
 type PleasePullOutcome struct {
@@ -367,8 +353,7 @@ type PleasePullOutcome struct {
 }
 
 // ChairAssignment identifies the Lease generation that authorized an origin
-// seed pull. It is optional on the wire so membership-based agents can
-// interoperate with chair-aware agents during a rolling deployment.
+// seed pull. Required for HTTPS chair requests.
 type ChairAssignment struct {
 	ChairID         uint64
 	Generation      int64
@@ -387,13 +372,6 @@ const (
 	PleasePullStaleChair
 )
 
-// Coordinator issues coordination RPCs to peers. Implementations are
-// expected to open one libp2p stream per call.
-type Coordinator interface {
-	PullIntentQuery(ctx context.Context, peer NodeID, d digest.Digest) (PullIntent, error)
-	PleasePull(ctx context.Context, peer NodeID, registry, repository string, kind OriginRefKind, digests []digest.Digest) ([]PleasePullOutcome, error)
-}
-
 // ChairCoordinator issues a chair-authorized please_pull request.
 type ChairCoordinator interface {
 	PleasePullChair(ctx context.Context, endpoint PeerEndpoint, registry, repository string, kind OriginRefKind, digests []digest.Digest, assignment ChairAssignment) ([]PleasePullOutcome, error)
@@ -402,24 +380,12 @@ type ChairCoordinator interface {
 // ChairRotationCoordinator asks a peer to reserve a chair for the next
 // assignment epoch.
 type ChairRotationCoordinator interface {
-	OfferChair(ctx context.Context, peer NodeID, assignment ChairAssignment) (PeerEndpoint, bool, error)
+	OfferChair(ctx context.Context, peer PeerID, assignment ChairAssignment) (PeerEndpoint, bool, error)
 }
 
 // ChairSuccessor accepts or declines a planned chair assignment.
 type ChairSuccessor interface {
-	AcceptChair(ctx context.Context, proposer NodeID, assignment ChairAssignment) (PeerEndpoint, bool)
-}
-
-// LocalIntentProvider computes the PullIntent for self synchronously,
-// without going through a libp2p coord stream. The cold-start
-// orchestrator uses it to include self as a first-class participant
-// in the rule cascade so that when self is HRW rank 0, self
-// pulls instead of delegating to rank 1 (which violates the
-// "one origin pull per digest" thundering-herd invariant - every
-// requester must converge on the same designated puller, and that
-// puller MAY be self).
-type LocalIntentProvider interface {
-	LocalPullIntent(ctx context.Context, d digest.Digest) PullIntent
+	AcceptChair(ctx context.Context, proposer PeerID, assignment ChairAssignment) (PeerEndpoint, bool)
 }
 
 // LocalPullStarter starts an origin pull on the local node without

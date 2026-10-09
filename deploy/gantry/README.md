@@ -9,8 +9,8 @@ The Helm chart under `chart/` is the source of truth for resources shared by
 standalone and operator-managed installations. `make gantry-manifests` renders
 the internal operator profile into `deploy/gantry/rendered/`; the Unbounded
 operator embeds those files and applies its own image, ConfigMap, and Lease
-ownership semantics. The target also renders the standalone node configurator
-and examples used by development and benchmark tooling.
+ownership semantics. The target also renders examples used by development and
+benchmark tooling; the node configurator is rendered only by the standalone chart.
 
 | Source | Rendered to | Purpose |
 | --- | --- | --- |
@@ -19,7 +19,6 @@ and examples used by development and benchmark tooling.
 | `chart/templates/configmap.yaml` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
 | `chart/templates/rendezvous-leases.yaml` | `rendered/rendezvous-leases.yaml` | Fixed chair Lease set. |
 | `chart/templates/node-config.yaml` | Standalone chart only | Continuously reconciles containerd's default Gantry mirror route. |
-| `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
 
@@ -140,7 +139,7 @@ derived from `hosts.toml.template` (substitute `${REGISTRY_SERVER}`
 with the registry's `https://...` URL). containerd reloads `certs.d`
 on its own; no restart needed.
 
-## What to verify after rollout
+## What to verify after rollout (legacy backend)
 
 | Check | How |
 | --- | --- |
@@ -222,7 +221,7 @@ to production:
 | Origin registry egress | `examples/networkpolicy.yaml` | The egress to TCP/443 for origin pulls also defaults to `0.0.0.0/0`. If the cluster only pulls from a known set of registry endpoints (your private registry, ghcr.io, etc.), restrict this rule to those IPs or labels. |
 | Kubelet probe source | `examples/networkpolicy.yaml` | Metrics ingress on TCP/9095 currently allows `0.0.0.0/0` so kubelet liveness/readiness probes (sourced from the node IP) reach the pod on strict CNIs. Replace with the node CIDR - `kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'`. |
 | Mirror port 5000 source | `examples/networkpolicy.yaml` | Ingress on TCP/5000 defaults to a deliberately-narrow `127.0.0.1/32` placeholder. Most CNIs (Calico, Cilium, and managed offerings) SNAT hostPort traffic so the in-pod source-IP after DNAT is the node IP, NOT 127.0.0.1 - the placeholder will then drop containerd's mirror pulls. Replace with the node CIDR (same command as the kubelet probe row). MUST NOT widen to the pod-network CIDR: that bypasses the `hostIP: 127.0.0.1` binding's loopback-only intent. |
-| containerd socket access | `daemonset.yaml` | The pod mounts `/run/containerd`, rather than the socket file, so reconnects observe the replacement socket after containerd restarts. It runs with non-root UID 65532 and primary GID 0 because many nodes expose `containerd.sock` as `root:root` mode 0660. Validate this on your target node pool before production. If your runtime uses a dedicated socket group, patch `runAsGroup`/`fsGroup` to that group; if your policy forbids GID 0, adjust node socket ownership or run a site-specific privileged wrapper. **Clearing `containerd_socket` is no longer a valid escape hatch** - after plan-final-copilot-v2 §Phase 8 containerd is Gantry's sole storage backend; without socket access the agent has no content store to read from or write to. The `storage_mode` config value must remain `containerd`. |
+| containerd socket access | `daemonset.yaml` | The pod mounts `/run/containerd`, rather than the socket file, so reconnects observe the replacement socket after containerd restarts. It runs with non-root UID 65532 and primary GID 0 because many nodes expose `containerd.sock` as `root:root` mode 0660. Validate this on your target node pool before production. If your runtime uses a dedicated socket group, patch `runAsGroup`/`fsGroup` to that group; if your policy forbids GID 0, adjust node socket ownership or run a site-specific privileged wrapper. The default containerd backend requires socket access; Racer mode uses its own storage and does not require this socket. |
 | Kubernetes RBAC scope | `serviceaccount.yaml` | The agent's only Kubernetes access is `leases` (`get`, `list`, `create`, `update`) on the configured chair Leases in its own namespace and `get` on its own DaemonSet for capacity. It runs no informer and opens no watch, and it needs no access to Pods or Nodes. Review the `Role` to confirm scope hasn't drifted; a `ClusterRole` should not exist. |
 
 ### HEAD semantics on cache miss

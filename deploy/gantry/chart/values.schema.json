@@ -6,15 +6,26 @@
     "image",
     "namespace",
     "manager",
+    "racer",
     "nodeSelector",
     "tolerations",
     "containerd",
     "nodeConfig",
-    "registryCredentials",
     "resources",
     "gantry"
   ],
   "properties": {
+    "racer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable Racer sockets and UID/GID 0 with all capabilities dropped. Provision Racer separately."
+        }
+      }
+    },
     "image": {
       "type": "object",
       "additionalProperties": false,
@@ -143,19 +154,6 @@
         }
       }
     },
-    "registryCredentials": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "secretName"
-      ],
-      "properties": {
-        "secretName": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
     "resources": {
       "type": "object",
       "additionalProperties": false,
@@ -218,9 +216,6 @@
               "endpoint": {
                 "type": "string",
                 "pattern": "^https?://"
-              },
-              "credentialsPath": {
-                "type": "string"
               },
               "namespaceAlias": {
                 "type": "string"

@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -36,27 +37,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Recognized StorageMode values.
-const (
-	// StorageModeContainerd routes reads/writes through the local
-	// containerd content store (plan). This is the only
-	// accepted storage mode; the legacy hostPath "gantry-cache" mode
-	// was removed in plan .
-	StorageModeContainerd = "containerd"
-
-	// storageModeGantryCache is the legacy hostPath cache mode that
-	// was removed in plan . It is referenced only by
-	// Validate to surface a clear migration error to operators who
-	// still have storage_mode: gantry-cache in their ConfigMap.
-	storageModeGantryCache = "gantry-cache"
-)
-
 // Config is the typed configuration surface.
 //
-// Every field carries a yaml/json tag matching the file/env name and a comment
-// citing the design-doc section it derives from. Defaults are set by
+// Fields carry YAML tags matching the file names, except environment-only
+// switches such as RacerEnabled. Defaults are set by
 // NewDefault; see Validate for hard correctness constraints.
 type Config struct {
+	// RacerEnabled selects the Racer-backed agent. This opt-in is environment-only
+	// (GANTRY_RACER_ENABLED); the volume name is fixed to gantry.
+	RacerEnabled bool `yaml:"-"`
+
+	// Racer resource limits use SDK defaults when zero; negative values are invalid.
+	RacerMaxConnections           int `yaml:"racer_max_connections"`
+	RacerOriginConcurrentRequests int `yaml:"racer_origin_concurrent_requests"`
+
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
@@ -147,19 +141,19 @@ type Config struct {
 	// port by convention, the same way they share the transfer port.
 	ChairListen string `yaml:"chair_listen"`
 
-	// ---------- Kubernetes identity and legacy membership fields ----------
+	// ---------- Kubernetes identity and chair access ----------
 
-	// NodeName is retained for configuration compatibility. Chair selection
-	// uses the persistent libp2p peer ID instead.
+	// NodeName identifies this node in layer-completion metrics. Chair
+	// selection uses the persistent libp2p peer ID instead.
 	NodeName string `yaml:"node_name"`
 
 	// PodIP rewrites wildcard listeners into the addresses stored in chair
 	// Leases.
 	PodIP string `yaml:"pod_ip"`
 
-	// MembersKubeconfig is retained by name for compatibility and is used by
-	// the chair Lease client. Empty selects in-cluster credentials.
-	MembersKubeconfig string `yaml:"members_kubeconfig"`
+	// ChairKubeconfig is used by the chair Lease client. Empty selects
+	// in-cluster credentials.
+	ChairKubeconfig string `yaml:"chair_kubeconfig"`
 
 	// ---------- Lease chairs ----------
 
@@ -180,34 +174,8 @@ type Config struct {
 	// ChairHolderCount is the deprecated name for ChairCount.
 	ChairHolderCount *int `yaml:"chair_holder_count,omitempty"`
 	// ChairSeedCount is the per-digest replica count at a full holder pool.
-	ChairSeedCount int `yaml:"chair_seed_count"`
-	// ChairSeedPercentage is accepted for compatibility with the short-lived
-	// capacity-coupled configuration. Holder and seed sizing ignore it.
-	ChairSeedPercentage int           `yaml:"chair_seed_percentage,omitempty"`
-	ChairAPITimeout     time.Duration `yaml:"chair_api_timeout"`
-
-	// ---------- Storage backend ----------
-
-	// StorageMode selects which backend the agent uses as the read/write
-	// content store. Only "containerd" is supported - the legacy
-	// "gantry-cache" hostPath backend was removed. The field is
-	// retained so existing ConfigMaps that still set it to "containerd"
-	// continue to parse, and so a clear migration error surfaces for
-	// any operator still on "gantry-cache". It is not exposed as a
-	// CLI flag or env var because there is no other valid value to
-	// select.
-	//
-	// Default is "containerd". Exposed via the
-	// gantry_storage_mode_info metric for observability.
-	StorageMode string `yaml:"storage_mode"`
-
-	// LegacyDeprecated captures YAML fields that used to live on
-	// Config but are no longer consumed by any code path. They are
-	// kept here purely so existing ConfigMaps that still set
-	// `cache_dir`, `cache_budget_bytes`, etc. continue to parse
-	// (LoadYAML uses KnownFields=true). New deployments should not
-	// set them. A future major version will remove the struct.
-	LegacyDeprecated LegacyDeprecatedConfig `yaml:",inline"`
+	ChairSeedCount  int           `yaml:"chair_seed_count"`
+	ChairAPITimeout time.Duration `yaml:"chair_api_timeout"`
 
 	// ---------- containerd integration (cdsub) ----------
 
@@ -216,12 +184,10 @@ type Config struct {
 	// and announce them on the DHT (the design doc image-event -> Provide loop),
 	// that the transfer endpoint reads from on cache miss to serve
 	// peers without a re-download, and that the puller writes into on
-	// background origin pulls (storage_mode=containerd is the only
-	// supported mode; see).
+	// background origin pulls in the containerd backend.
 	//
-	// REQUIRED. Validate rejects an empty value when
-	// storage_mode=containerd (the only accepted storage_mode), which
-	// is enforced at startup. The default deploy manifests set it to
+	// REQUIRED in legacy mode, where Validate rejects an empty value.
+	// Racer mode does not use containerd. The default deploy manifests set it to
 	// "/run/containerd/containerd.sock"; operators on non-default
 	// socket paths override via `containerd_socket` in the ConfigMap
 	// or GANTRY_CONTAINERD_SOCKET in the environment. The agent will
@@ -255,61 +221,7 @@ type Config struct {
 	// one of these once more than one is configured.
 	UpstreamRegistries []UpstreamRegistry `yaml:"upstream_registries"`
 
-	// ---------- HRW / coordination ----------
-
-	// HRWK is the top-K size for HRW probe (the step 3 default 3; the design doc
-	// open question).
-	HRWK int `yaml:"hrw_k"`
-
-	// PrefetchPullerReplicas is how many distinct HRW-ranked pullers each
-	// prefetched layer digest is dispatched to. 1 designates a single origin
-	// puller per layer (tightest dedup), but the whole swarm then fans out
-	// from ONE initial seed, which bottlenecks a cold thundering-herd (peer
-	// transfers pile onto the lone seed and stall). N>1 asks the top-N pullers
-	// to origin-pull the layer in parallel, giving N initial seeds so peer
-	// transfers fan out N-fold, at the cost of up to N origin copies of each
-	// layer. The default is 8.
-	PrefetchPullerReplicas int `yaml:"prefetch_puller_replicas"`
-
-	// PrefetchPullerFraction dynamically sizes the initial puller set from the
-	// eligible HRW candidate count. Values are fractions in (0, 1], so 0.02
-	// selects ceil(nodes * 0.02) pullers. Zero disables dynamic sizing and uses
-	// PrefetchPullerReplicas for backward compatibility. Selection is uncapped
-	// except by the number of eligible nodes.
-	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
-
-	// PrefetchCoordinatorReplicas limits remote speculative prefetch dispatch
-	// to a deterministic HRW-ranked subset of manifest consumers. Local
-	// self-selected pulls still run on every consumer. The default is 3.
-	PrefetchCoordinatorReplicas int `yaml:"prefetch_coordinator_replicas"`
-
-	// PrefetchMaxConcurrentGroups caps simultaneous outbound prefetch groups
-	// per manifest. Group dispatch is best effort and target-side deduplicated.
-	PrefetchMaxConcurrentGroups int `yaml:"prefetch_max_concurrent_groups"`
-
-	// PrefetchDispatchJitter spreads manifest prefetch across requesters. Each
-	// node derives a stable delay in [0, jitter) from itself and the manifest.
-	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
-
-	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
-	// (HRW within the requester's zone) - the design doc / the design doc open question.
-	HRWTopologyScope string `yaml:"hrw_topology_scope"`
-
-	// ZoneLabelKey is the Kubernetes node label that identifies the zone
-	// when HRWTopologyScope == "zone". Default
-	// `topology.kubernetes.io/zone` (the design doc).
-	ZoneLabelKey string `yaml:"zone_label_key"`
-
-	// CoordPeerAuthzEnforce is retained so existing ConfigMaps parse, but
-	// coord peer authorization was removed with the membership view it
-	// compared against. Validate rejects true rather than accepting a
-	// setting that would silently do nothing.
-	CoordPeerAuthzEnforce bool `yaml:"coord_peer_authz_enforce"`
-
-	// CoordRequireChairAssignment rejects legacy please_pull requests that do
-	// not carry a Lease chair generation. Keep false during a mixed-version
-	// rollout, then enable it after every agent supports chair metadata.
-	CoordRequireChairAssignment bool `yaml:"coord_require_chair_assignment"`
+	// ---------- Coordination ----------
 
 	// CoordMaxDigestsPerRequest caps a single please_pull batch. The default
 	// 256 is intentionally far above normal manifest child counts while staying
@@ -396,10 +308,6 @@ type Config struct {
 	// supersedes BootstrapWindow once met (the design doc default 25%).
 	BootstrapRoutingTablePct int `yaml:"bootstrap_routing_table_pct"`
 
-	// TopKExpansionFactorDegraded is the multiplier applied to HRWK when
-	// expanding top-K under Degraded health (the step 5 / the design doc default 2).
-	TopKExpansionFactorDegraded int `yaml:"topk_expansion_factor_degraded"`
-
 	// ---------- Origin-failure circuit breaker (the design doc) ----------
 
 	OriginFailureCooldownInitial    time.Duration `yaml:"origin_failure_cooldown_initial"`
@@ -432,62 +340,32 @@ type UpstreamRegistry struct {
 	// "https://registry.example.com".
 	Endpoint string `yaml:"endpoint"`
 
-	// CredentialsPath is an optional fallback file containing registry
-	// credentials. Format: "username:password" (or "_json_key:<json>" for
-	// the well-known GCR pattern). A request-scoped Basic/Bearer credential
-	// delegated by containerd takes precedence and is never cached. Setting
-	// this file opts the registry into legacy shared-identity mode for requests
-	// without delegated auth; leaving it empty enables containerd challenge
-	// negotiation for private HTTPS registries.
-	CredentialsPath string `yaml:"credentials_path"`
-
 	// NSAlias lets containerd's ?ns= use a different name than Name.
 	// Empty means ?ns= must equal Name.
 	NSAlias string `yaml:"ns_alias"`
-}
-
-// LegacyDeprecatedConfig captures YAML field names that used to live
-// on Config but no longer have any effect. They are accepted here
-// purely so existing ConfigMaps that still set them parse without
-// error under KnownFields=true. None of these fields are exposed via
-// CLI flags or environment variables - setting them via env/flag is
-// not supported, only YAML round-trips for back-compat. A future
-// major version will remove this struct entirely.
-//
-// Removal trail :
-// - cache_dir / cache_budget_bytes / cache_forced_eviction_headroom_pct
-// / eviction_provider_count_threshold:
-// the hostPath cache backend was deleted; containerd's own GC owns
-// blob lifetime now.
-type LegacyDeprecatedConfig struct {
-	CacheDir                       string        `yaml:"cache_dir,omitempty"`
-	CacheBudgetBytes               int64         `yaml:"cache_budget_bytes,omitempty"`
-	CacheForcedEvictionHeadroomPct int           `yaml:"cache_forced_eviction_headroom_pct,omitempty"`
-	EvictionProviderCountThreshold int           `yaml:"eviction_provider_count_threshold,omitempty"`
-	PodName                        string        `yaml:"pod_name,omitempty"`
-	MembersNamespace               string        `yaml:"members_namespace,omitempty"`
-	MembersLabelSelector           string        `yaml:"members_label_selector,omitempty"`
-	MembersSyncTimeout             time.Duration `yaml:"members_sync_timeout,omitempty"`
 }
 
 // NewDefault returns a Config populated with the design-doc defaults.
 // All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
 	return &Config{
-		MirrorListen:               "127.0.0.1:5000",
-		MirrorBindAllowNonLoopback: false,
-		TransferListen:             "0.0.0.0:5001",
-		MetricsListen:              "0.0.0.0:9095",
-		PprofListen:                "",
-		Libp2pListen:               nil,
-		Libp2pIdentityPath:         "/var/lib/gantry/libp2p.key",
-		Libp2pConnManagerHigh:      900,
-		Libp2pConnManagerLow:       600,
-		Libp2pConnManagerGrace:     time.Minute,
-		ChairListen:                "0.0.0.0:5002",
+		RacerEnabled:                  false,
+		RacerMaxConnections:           64,
+		RacerOriginConcurrentRequests: 64,
+		MirrorListen:                  "127.0.0.1:5000",
+		MirrorBindAllowNonLoopback:    false,
+		TransferListen:                "0.0.0.0:5001",
+		MetricsListen:                 "0.0.0.0:9095",
+		PprofListen:                   "",
+		Libp2pListen:                  nil,
+		Libp2pIdentityPath:            "/var/lib/gantry/libp2p.key",
+		Libp2pConnManagerHigh:         900,
+		Libp2pConnManagerLow:          600,
+		Libp2pConnManagerGrace:        time.Minute,
+		ChairListen:                   "0.0.0.0:5002",
 
-		NodeName:          "",
-		MembersKubeconfig: "",
+		NodeName:        "",
+		ChairKubeconfig: "",
 
 		ChairNamespace:           "",
 		ChairLeaseDuration:       5 * time.Minute,
@@ -504,8 +382,6 @@ func NewDefault() *Config {
 		ChairSeedCount:           8,
 		ChairAPITimeout:          5 * time.Second,
 
-		StorageMode: StorageModeContainerd,
-
 		ContainerdSocket:               "/run/containerd/containerd.sock",
 		ContainerdNamespace:            "k8s.io",
 		ContainerdLeaseTTL:             60 * time.Minute,
@@ -513,17 +389,6 @@ func NewDefault() *Config {
 
 		UpstreamRegistries: nil,
 
-		HRWK:                        3,
-		PrefetchPullerReplicas:      8,
-		PrefetchPullerFraction:      0,
-		PrefetchCoordinatorReplicas: 3,
-		PrefetchMaxConcurrentGroups: 64,
-		PrefetchDispatchJitter:      time.Second,
-		HRWTopologyScope:            "cluster",
-		ZoneLabelKey:                "topology.kubernetes.io/zone",
-
-		CoordPeerAuthzEnforce:       false,
-		CoordRequireChairAssignment: false,
 		CoordMaxDigestsPerRequest:   256,
 		CoordMaxConcurrentPulls:     16,
 		OriginPullProgressTimeout:   5 * time.Minute,
@@ -533,12 +398,11 @@ func NewDefault() *Config {
 		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
 		AdvertiseReconcileInterval:  time.Minute,
 
-		NF5JitterBase:               3 * time.Second,
-		NF5JitterCap:                0, // no cap by default (original behavior)
-		NF5PerNodeRateLimit:         2,
-		BootstrapWindow:             30 * time.Second,
-		BootstrapRoutingTablePct:    25,
-		TopKExpansionFactorDegraded: 2,
+		NF5JitterBase:            3 * time.Second,
+		NF5JitterCap:             0, // no cap by default (original behavior)
+		NF5PerNodeRateLimit:      2,
+		BootstrapWindow:          30 * time.Second,
+		BootstrapRoutingTablePct: 25,
 
 		OriginFailureCooldownInitial:    10 * time.Second,
 		OriginFailureCooldownMax:        10 * time.Minute,
@@ -633,17 +497,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 		return n, true
 	}
-	setFloat := func(key string, dst *float64) {
-		if v, ok := lookup(env, key); ok {
-			n, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
-				return
-			}
-
-			*dst = n
-		}
-	}
 	setDur := func(key string, dst *time.Duration) {
 		if v, ok := lookup(env, key); ok {
 			d, err := time.ParseDuration(v)
@@ -667,6 +520,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 		}
 	}
 
+	setBool("RACER_ENABLED", &c.RacerEnabled)
+	setInt("RACER_MAX_CONNECTIONS", &c.RacerMaxConnections)
+	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
@@ -680,7 +536,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 	setStr("NODE_NAME", &c.NodeName)
 	setStr("POD_IP", &c.PodIP)
-	setStr("MEMBERS_KUBECONFIG", &c.MembersKubeconfig)
+	setStr("CHAIR_KUBECONFIG", &c.ChairKubeconfig)
 	setStr("CHAIR_NAMESPACE", &c.ChairNamespace)
 	setDur("CHAIR_LEASE_DURATION", &c.ChairLeaseDuration)
 	setDur("CHAIR_RENEW_PERIOD", &c.ChairRenewPeriod)
@@ -707,33 +563,13 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	}
 
 	setInt("CHAIR_SEED_COUNT", &c.ChairSeedCount)
-	setInt("CHAIR_SEED_PERCENTAGE", &c.ChairSeedPercentage)
 	setDur("CHAIR_API_TIMEOUT", &c.ChairAPITimeout)
-
-	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
-	// GANTRY_CACHE_FORCED_EVICTION_HEADROOM_PCT,
-	// GANTRY_EVICTION_PROVIDER_COUNT_THRESHOLD, GANTRY_STORAGE_MODE)
-	// are no longer read. The fields they used to write to are either
-	// removed (cache_*) or no longer operator-tunable (storage_mode is
-	// fixed to "containerd" - see Validate). Existing ConfigMaps that
-	// still set them in YAML continue to parse via
-	// LegacyDeprecatedConfig.
 
 	setStr("CONTAINERD_SOCKET", &c.ContainerdSocket)
 	setStr("CONTAINERD_NAMESPACE", &c.ContainerdNamespace)
 	setDur("CONTAINERD_LEASE_TTL", &c.ContainerdLeaseTTL)
 	setDur("CONTAINERD_LEASE_CLEANUP_INTERVAL", &c.ContainerdLeaseCleanupInterval)
 
-	setInt("HRW_K", &c.HRWK)
-	setInt("PREFETCH_PULLER_REPLICAS", &c.PrefetchPullerReplicas)
-	setFloat("PREFETCH_PULLER_FRACTION", &c.PrefetchPullerFraction)
-	setInt("PREFETCH_COORDINATOR_REPLICAS", &c.PrefetchCoordinatorReplicas)
-	setInt("PREFETCH_MAX_CONCURRENT_GROUPS", &c.PrefetchMaxConcurrentGroups)
-	setDur("PREFETCH_DISPATCH_JITTER", &c.PrefetchDispatchJitter)
-	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
-	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
-	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
-	setBool("COORD_REQUIRE_CHAIR_ASSIGNMENT", &c.CoordRequireChairAssignment)
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
 	setDur("ORIGIN_PULL_PROGRESS_TIMEOUT", &c.OriginPullProgressTimeout)
@@ -748,7 +584,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("NF5_PER_NODE_RATE_LIMIT", &c.NF5PerNodeRateLimit)
 	setDur("BOOTSTRAP_WINDOW", &c.BootstrapWindow)
 	setInt("BOOTSTRAP_ROUTING_TABLE_PCT", &c.BootstrapRoutingTablePct)
-	setInt("TOPK_EXPANSION_FACTOR_DEGRADED", &c.TopKExpansionFactorDegraded)
 
 	setDur("ORIGIN_FAILURE_COOLDOWN_INITIAL", &c.OriginFailureCooldownInitial)
 	setDur("ORIGIN_FAILURE_COOLDOWN_MAX", &c.OriginFailureCooldownMax)
@@ -764,6 +599,8 @@ func (c *Config) LoadEnv(env func(string) string) error {
 // BindFlags registers command-line flags on fs that overlay c. Call after
 // LoadYAML / LoadEnv but before fs.Parse so flags win.
 func (c *Config) BindFlags(fs *flag.FlagSet) {
+	fs.IntVar(&c.RacerMaxConnections, "racer-max-connections", c.RacerMaxConnections, "Racer bulk connection and live value limit (0 uses 64)")
+	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
@@ -775,9 +612,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.Libp2pConnManagerGrace, "libp2p-conn-manager-grace", c.Libp2pConnManagerGrace, "minimum connection age before it becomes a trim candidate")
 	fs.StringVar(&c.ChairListen, "chair-listen", c.ChairListen, "address for the HTTPS cold-start please_pull endpoint")
 
-	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
+	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name used in layer-completion metrics")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
-	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional kubeconfig for chair Lease access (empty = in-cluster)")
+	fs.StringVar(&c.ChairKubeconfig, "chair-kubeconfig", c.ChairKubeconfig, "optional kubeconfig for chair Lease access (empty = in-cluster)")
 	fs.StringVar(&c.ChairNamespace, "chair-namespace", c.ChairNamespace, "namespace containing the Gantry chair Leases")
 	fs.DurationVar(&c.ChairLeaseDuration, "chair-lease-duration", c.ChairLeaseDuration, "heartbeat expiry for a chair holder")
 	fs.DurationVar(&c.ChairRenewPeriod, "chair-renew-period", c.ChairRenewPeriod, "chair heartbeat renewal period")
@@ -813,33 +650,13 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.Func("chair-count", "number of agents holding fixed chair Leases", setChairCountFlag("chair-count"))
 	fs.Func("chair-holder-count", "deprecated alias for --chair-count", setChairCountFlag("chair-holder-count"))
 	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "per-digest seed replicas at a full holder pool")
-	fs.IntVar(&c.ChairSeedPercentage, "chair-seed-percentage", c.ChairSeedPercentage, "deprecated and ignored")
 	fs.DurationVar(&c.ChairAPITimeout, "chair-api-timeout", c.ChairAPITimeout, "timeout for one Kubernetes chair Lease API operation")
 
-	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
-	// --cache-forced-eviction-headroom-pct,
-	// --eviction-provider-count-threshold) and --storage-mode were
-	// removed in plan . The cache fields are no-ops under
-	// containerd-only storage; storage_mode itself is no longer an
-	// operator knob because "containerd" is the only accepted value
-	// (Validate enforces it). YAML-only back-compat for these names
-	// lives in Config.StorageMode and Config.LegacyDeprecated.
-
-	fs.StringVar(&c.ContainerdSocket, "containerd-socket", c.ContainerdSocket, "containerd gRPC socket path (REQUIRED; storage_mode=containerd is the only supported mode and Validate() rejects an empty value)")
+	fs.StringVar(&c.ContainerdSocket, "containerd-socket", c.ContainerdSocket, "containerd gRPC socket path (required in legacy mode; unused with GANTRY_RACER_ENABLED=true)")
 	fs.StringVar(&c.ContainerdNamespace, "containerd-namespace", c.ContainerdNamespace, "containerd namespace cdsub watches (default k8s.io)")
-	fs.DurationVar(&c.ContainerdLeaseTTL, "containerd-lease-ttl", c.ContainerdLeaseTTL, "TTL for containerd content leases attached by Gantry on ingest (storage_mode=containerd only)")
-	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop (storage_mode=containerd only)")
+	fs.DurationVar(&c.ContainerdLeaseTTL, "containerd-lease-ttl", c.ContainerdLeaseTTL, "TTL for containerd content leases attached by Gantry on ingest")
+	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop")
 
-	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "legacy no-op membership HRW size")
-	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "legacy no-op prefetch replica count")
-	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "legacy no-op prefetch fraction")
-	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "legacy no-op prefetch coordinator count")
-	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "legacy no-op prefetch concurrency")
-	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "legacy no-op prefetch dispatch jitter")
-	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, "legacy no-op membership HRW scope")
-	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "legacy no-op zone label key")
-	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "unsupported in Lease-chair mode; validation requires false")
-	fs.BoolVar(&c.CoordRequireChairAssignment, "coord-require-chair-assignment", c.CoordRequireChairAssignment, "reject legacy please_pull requests without Lease-chair metadata after rollout")
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
 	fs.DurationVar(&c.OriginPullProgressTimeout, "origin-pull-progress-timeout", c.OriginPullProgressTimeout, "maximum time a detached origin response body may make no progress (0 disables)")
@@ -854,7 +671,6 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.NF5PerNodeRateLimit, "nf5-per-node-rate-limit", c.NF5PerNodeRateLimit, "per-node direct-origin fallback rate (per minute)")
 	fs.DurationVar(&c.BootstrapWindow, "bootstrap-window", c.BootstrapWindow, "time after startup during which DHT-empty is not trusted as cold-start")
 	fs.IntVar(&c.BootstrapRoutingTablePct, "bootstrap-routing-table-pct", c.BootstrapRoutingTablePct, "routing-table-size percent that ends the bootstrap window")
-	fs.IntVar(&c.TopKExpansionFactorDegraded, "topk-expansion-factor-degraded", c.TopKExpansionFactorDegraded, "multiplier applied to HRW K when expanding under Degraded health")
 
 	fs.DurationVar(&c.OriginFailureCooldownInitial, "origin-failure-cooldown-initial", c.OriginFailureCooldownInitial, "initial cooldown for the origin-failure circuit breaker")
 	fs.DurationVar(&c.OriginFailureCooldownMax, "origin-failure-cooldown-max", c.OriginFailureCooldownMax, "max cooldown for the origin-failure circuit breaker")
@@ -918,7 +734,6 @@ func (c *Config) Validate() error {
 		}
 	}
 	mustAddr("mirror_listen", c.MirrorListen)
-	mustAddr("transfer_listen", c.TransferListen)
 	mustAddr("metrics_listen", c.MetricsListen)
 
 	if c.PprofListen != "" {
@@ -959,44 +774,6 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Deprecated cache fields (CacheDir, CacheBudgetBytes,
-	// CacheForcedEvictionHeadroomPct, EvictionProviderCountThreshold)
-	// are no longer validated - they are silently ignored under
-	// storage_mode=containerd. Validation here would force operators
-	// to either keep sensible-looking values (defeating the
-	// "deprecated" signal) or remove them from their ConfigMap (a
-	// breaking change). We do neither; the fields exist as no-ops
-	// until a future major version removes them.
-
-	switch c.StorageMode {
-	case StorageModeContainerd:
-		// valid
-	case storageModeGantryCache:
-		errs = append(errs, errors.New("storage_mode \"gantry-cache\" was removed in ; set storage_mode: containerd and remove the cache_dir/cache_budget_bytes hostPath volume from your DaemonSet"))
-	case "":
-		errs = append(errs, errors.New("storage_mode: required (must be \"containerd\")"))
-	default:
-		errs = append(errs, fmt.Errorf("storage_mode %q: must be \"containerd\"", c.StorageMode))
-	}
-
-	if c.StorageMode == StorageModeContainerd && c.ContainerdSocket == "" {
-		errs = append(errs, errors.New("storage_mode=containerd requires containerd_socket to be set"))
-	}
-
-	if c.StorageMode == StorageModeContainerd {
-		// mandates a 30m–120m TTL. We accept a wider
-		// range with warnings deferred to log; pure validation just
-		// requires positive values so the cleanup interval cannot
-		// degenerate into a tight loop.
-		if c.ContainerdLeaseTTL <= 0 {
-			errs = append(errs, fmt.Errorf("containerd_lease_ttl: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseTTL))
-		}
-
-		if c.ContainerdLeaseCleanupInterval <= 0 {
-			errs = append(errs, fmt.Errorf("containerd_lease_cleanup_interval: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseCleanupInterval))
-		}
-	}
-
 	if len(c.UpstreamRegistries) == 0 {
 		errs = append(errs, errors.New("upstream_registries: at least one entry required"))
 	}
@@ -1023,12 +800,52 @@ func (c *Config) Validate() error {
 		if ur.Endpoint == "" {
 			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: required", i))
 		} else if !strings.HasPrefix(ur.Endpoint, "http://") && !strings.HasPrefix(ur.Endpoint, "https://") {
-			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint %q: must start with http:// or https://", i, ur.Endpoint))
+			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: must start with http:// or https://", i))
+		} else if u, err := url.Parse(ur.Endpoint); err != nil {
+			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: invalid URL", i))
+		} else if u.Hostname() == "" {
+			errs = append(errs, fmt.Errorf("upstream_registries[%d].endpoint: hostname is required", i))
 		}
 	}
 
-	if c.HRWK < 1 {
-		errs = append(errs, fmt.Errorf("hrw_k: must be >= 1, got %d", c.HRWK))
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		errs = append(errs, fmt.Errorf("log_level %q: must be debug|info|warn|error", c.LogLevel))
+	}
+
+	switch c.LogFormat {
+	case "json", "text":
+	default:
+		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
+	}
+
+	// Racer uses the common settings and its own resource limits.
+	if c.RacerEnabled {
+		for field, value := range map[string]int64{
+			"racer_max_connections":            int64(c.RacerMaxConnections),
+			"racer_origin_concurrent_requests": int64(c.RacerOriginConcurrentRequests),
+		} {
+			if value < 0 {
+				errs = append(errs, fmt.Errorf("%s: must be >= 0 (zero selects the default)", field))
+			}
+		}
+
+		return errors.Join(errs...)
+	}
+
+	mustAddr("transfer_listen", c.TransferListen)
+
+	if c.ContainerdSocket == "" {
+		errs = append(errs, errors.New("containerd_socket: required for the containerd backend"))
+	}
+
+	if c.ContainerdLeaseTTL <= 0 {
+		errs = append(errs, fmt.Errorf("containerd_lease_ttl: must be > 0, got %s", c.ContainerdLeaseTTL))
+	}
+
+	if c.ContainerdLeaseCleanupInterval <= 0 {
+		errs = append(errs, fmt.Errorf("containerd_lease_cleanup_interval: must be > 0, got %s", c.ContainerdLeaseCleanupInterval))
 	}
 
 	if c.ChairLeaseDuration <= 0 {
@@ -1101,38 +918,8 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("chair_api_timeout: must be > 0, got %v", c.ChairAPITimeout))
 	}
 
-	if c.CoordPeerAuthzEnforce {
-		errs = append(errs, errors.New("coord_peer_authz_enforce cannot be enabled with Lease-chair discovery: the design has no pod-membership identity oracle"))
-	}
-
-	if c.PrefetchPullerReplicas < 1 {
-		errs = append(errs, fmt.Errorf("prefetch_puller_replicas: must be >= 1, got %d", c.PrefetchPullerReplicas))
-	}
-
-	if c.PrefetchPullerFraction != c.PrefetchPullerFraction || c.PrefetchPullerFraction < 0 || c.PrefetchPullerFraction > 1 {
-		errs = append(errs, fmt.Errorf("prefetch_puller_fraction: must be between 0 and 1, got %g", c.PrefetchPullerFraction))
-	}
-
-	if c.PrefetchCoordinatorReplicas < 1 {
-		errs = append(errs, fmt.Errorf("prefetch_coordinator_replicas: must be >= 1, got %d", c.PrefetchCoordinatorReplicas))
-	}
-
-	switch c.HRWTopologyScope {
-	case "cluster", "zone":
-	default:
-		errs = append(errs, fmt.Errorf("hrw_topology_scope %q: must be \"cluster\" or \"zone\"", c.HRWTopologyScope))
-	}
-
 	if c.CoordMaxDigestsPerRequest < 1 {
 		errs = append(errs, fmt.Errorf("coord_max_digests_per_request: must be >= 1, got %d", c.CoordMaxDigestsPerRequest))
-	}
-
-	if c.PrefetchMaxConcurrentGroups < 1 {
-		errs = append(errs, fmt.Errorf("prefetch_max_concurrent_groups: must be >= 1, got %d", c.PrefetchMaxConcurrentGroups))
-	}
-
-	if c.PrefetchDispatchJitter < 0 {
-		errs = append(errs, fmt.Errorf("prefetch_dispatch_jitter: must be >= 0, got %v", c.PrefetchDispatchJitter))
 	}
 
 	if c.CoordMaxConcurrentPulls < 1 {
@@ -1187,10 +974,6 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("bootstrap_routing_table_pct: must be in [1,100], got %d", c.BootstrapRoutingTablePct))
 	}
 
-	if c.TopKExpansionFactorDegraded < 1 {
-		errs = append(errs, fmt.Errorf("topk_expansion_factor_degraded: must be >= 1, got %d", c.TopKExpansionFactorDegraded))
-	}
-
 	if c.OriginFailureCooldownInitial <= 0 {
 		errs = append(errs, fmt.Errorf("origin_failure_cooldown_initial: must be > 0, got %v", c.OriginFailureCooldownInitial))
 	}
@@ -1209,18 +992,6 @@ func (c *Config) Validate() error {
 		if !validClasses[cls] {
 			errs = append(errs, fmt.Errorf("origin_failure_classes_trusted_cluster_wide: unknown class %q (valid: auth, not_found, rate_limited, transient)", cls))
 		}
-	}
-
-	switch c.LogLevel {
-	case "debug", "info", "warn", "error":
-	default:
-		errs = append(errs, fmt.Errorf("log_level %q: must be debug|info|warn|error", c.LogLevel))
-	}
-
-	switch c.LogFormat {
-	case "json", "text":
-	default:
-		errs = append(errs, fmt.Errorf("log_format %q: must be json|text", c.LogFormat))
 	}
 
 	// A chair publishes its dialable addresses on its Lease, and those are

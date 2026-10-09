@@ -133,7 +133,11 @@ func TestContainerdResumesInterruptedGantryBodyWithoutOriginReplay(t *testing.T)
 		originBytes  atomic.Int64
 	)
 
+	originFinished := make(chan struct{}, 2)
+
 	originServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { originFinished <- struct{}{} }()
+
 		rangeHeader := r.Header.Get("Range")
 		if rangeHeader == "" && firstRequest.CompareAndSwap(false, true) {
 			w.Header().Set("Content-Length", strconv.FormatInt(layerSize, 10))
@@ -169,10 +173,14 @@ func TestContainerdResumesInterruptedGantryBodyWithoutOriginReplay(t *testing.T)
 		t.Fatalf("origin.New: %v", err)
 	}
 
-	gantryServer := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), originClient, mirror.WithLiveStreamThrough()).Handler())
+	gantryServer := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), originClient).Handler())
 	defer gantryServer.Close()
 
 	fetchGeneratedLayer(t, []docker.RegistryHost{containerdRegistryHost(t, gantryServer)}, d, layerSize)
+	// Receiving the last body byte does not synchronize with the upstream
+	// handler's accounting after Write. Wait for both handlers before asserting.
+	<-originFinished
+	<-originFinished
 
 	if got := originBytes.Load(); got != layerSize {
 		t.Fatalf("origin bytes = %d; want %d without prefix replay", got, layerSize)

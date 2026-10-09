@@ -170,6 +170,32 @@ func (o *OriginPuller) Pull(_ context.Context, ref ifaces.OriginRef) (io.ReadClo
 	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
 }
 
+// PullRange implements the bounded origin capability without a HEAD lookup.
+func (o *OriginPuller) PullRange(ctx context.Context, ref ifaces.OriginRef, length int64) (io.ReadCloser, int64, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, "", err
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.pullCount[ref.Digest.String()]++
+
+	b, ok := o.entries[ref.Digest.String()]
+	if !ok {
+		return nil, 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, StatusCode: 404}
+	}
+
+	size := int64(len(b))
+	if ref.Offset < 0 || length <= 0 || ref.Offset > size || ref.Offset == size && size != 0 {
+		return nil, 0, "", &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, StatusCode: 416}
+	}
+
+	end := ref.Offset + min(length, size-ref.Offset)
+
+	return io.NopCloser(bytes.NewReader(b[ref.Offset:end])), size, "", nil
+}
+
 // Head implements ifaces.OriginPuller. The fake returns the same size
 // it would have served from Pull (so callers that HEAD-then-GET see a
 // consistent Content-Length) without consuming a Pull slot. The fake
@@ -416,85 +442,12 @@ func (d *DHT) FindProviders(_ context.Context, dg digest.Digest) ([]ifaces.Provi
 	return out, nil
 }
 
-// ---------------------------------------------------------------------------
-// Coordinator
-// ---------------------------------------------------------------------------
-
-// Coordinator is an in-memory ifaces.Coordinator. Per-peer responses are
-// programmed via Program.
-type Coordinator struct {
-	mu sync.Mutex
-
-	intent     map[key]ifaces.PullIntent
-	pleasePull map[key][]ifaces.PleasePullOutcome
-}
-
-type key struct {
-	peer   ifaces.NodeID
-	digest string
-}
-
-func NewCoordinator() *Coordinator {
-	return &Coordinator{
-		intent:     map[key]ifaces.PullIntent{},
-		pleasePull: map[key][]ifaces.PleasePullOutcome{},
-	}
-}
-
-// ProgramIntent sets the canned PullIntent response for (peer, d).
-func (c *Coordinator) ProgramIntent(peer ifaces.NodeID, d digest.Digest, intent ifaces.PullIntent) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.intent[key{peer, d.String()}] = intent
-}
-
-// ProgramPleasePull sets the canned per-digest outcome for (peer, d). Tests
-// programming a batched please_pull MUST seed each digest.
-func (c *Coordinator) ProgramPleasePull(peer ifaces.NodeID, d digest.Digest, outcome ifaces.PleasePullOutcome) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.pleasePull[key{peer, d.String()}] = append(c.pleasePull[key{peer, d.String()}], outcome)
-}
-
-func (c *Coordinator) PullIntentQuery(_ context.Context, peer ifaces.NodeID, d digest.Digest) (ifaces.PullIntent, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	intent, ok := c.intent[key{peer, d.String()}]
-	if !ok {
-		return ifaces.PullIntent{}, fmt.Errorf("fakes: no intent programmed for (%s, %s)", peer, d)
-	}
-
-	return intent, nil
-}
-
-func (c *Coordinator) PleasePull(_ context.Context, peer ifaces.NodeID, _, _ string, _ ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	out := make([]ifaces.PleasePullOutcome, 0, len(digests))
-	for _, d := range digests {
-		queue := c.pleasePull[key{peer, d.String()}]
-		if len(queue) == 0 {
-			return nil, fmt.Errorf("fakes: no please_pull outcome programmed for (%s, %s)", peer, d)
-		}
-
-		out = append(out, queue[0])
-		c.pleasePull[key{peer, d.String()}] = queue[1:]
-	}
-
-	return out, nil
-}
-
 // Compile-time assertions that the fakes implement the interfaces.
 var (
 	_ ifaces.LocalContentStore = (*Cache)(nil)
 	_ ifaces.OriginPuller      = (*OriginPuller)(nil)
 	_ ifaces.PeerDialer        = (*PeerDialer)(nil)
 	_ ifaces.DHT               = (*DHT)(nil)
-	_ ifaces.Coordinator       = (*Coordinator)(nil)
 )
 
 // helper to keep go vet happy on unused time import in case of future trims

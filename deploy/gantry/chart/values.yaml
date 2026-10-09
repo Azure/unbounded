@@ -10,6 +10,12 @@ namespace:
 
 manager: helm
 
+# Opt into the Racer backend and its root-owned Unix socket deployment model.
+# Requires a separate ClusterVolume named gantry with spec.type: Cache.
+# Runtime tuning remains in gantry.config (the complete Gantry config YAML).
+racer:
+  enabled: false
+
 nodeSelector:
   kubernetes.io/os: linux
 
@@ -28,8 +34,6 @@ nodeConfig:
   hostPath: /etc/containerd/certs.d
   reconcileIntervalSeconds: 5
 
-registryCredentials:
-  secretName: gantry-registry-credentials
 
 resources:
   agent:
@@ -62,5 +66,4 @@ gantry:
   upstreamRegistries:
     - name: registry.example.com
       endpoint: https://registry.example.com
-      credentialsPath: ""
       namespaceAlias: ""

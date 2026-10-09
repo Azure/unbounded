@@ -41,7 +41,7 @@ type ChairOptions struct {
 	Coord                 ifaces.ChairCoordinator
 	LocalPull             ifaces.LocalChairPullStarter
 	Inflight              *inflight.Map
-	SelfPeerID            ifaces.NodeID
+	SelfPeerID            ifaces.PeerID
 	CurrentEpoch          func() int64
 	InstallHolder         func(chairs.Holder) error
 	Claimer               ChairClaimer
@@ -405,7 +405,7 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 	}
 
 	type groupKey struct {
-		peer       ifaces.NodeID
+		peer       ifaces.PeerID
 		chair      chairs.ID
 		generation int64
 		epoch      int64
