@@ -4,6 +4,25 @@
 
 This document describes all configuration options for unbounded-net components.
 
+## Supported Kubernetes baseline
+
+Unbounded supports Kubernetes **1.34 or newer**. Use current matching controller,
+node agent, and CLI versions; pre-release resource migrations are not supported.
+Operator activation uses only `discovery.k8s.io/v1` EndpointSlices and requires
+a Pod `targetRef` with a UID. It does not fall back to v1 Endpoints or accept
+unattributed endpoint addresses.
+
+The baseline includes the Pod/node TokenReview extras used with projected
+Pod-bound service-account tokens. `ServiceAccountTokenPodNodeInfo` is GA and
+locked enabled since Kubernetes 1.32; node UID remains optional upstream when
+unavailable at issuance. See the
+[supported baseline and source verification](../content/reference/networking/configuration.md#supported-kubernetes-baseline)
+for the exact identity fields and Kubernetes v1.34.0 references.
+
+The CLI requires `nodeSummaries` in cluster overview responses. Namespace
+discovery probes only the kubeconfig namespace and `unbounded-system`; explicit
+`--namespace` supports custom installations without historical namespace bans.
+
 ## Runtime Configuration
 
 Both binaries now load runtime settings from a shared YAML file mounted from the `unbounded-net-config` ConfigMap.
@@ -27,7 +46,7 @@ restart of the affected controller or node-agent pods.
 | `controller.statusDetailRequestTimeout` | `--status-detail-request-timeout` | `120s` | Strictly positive duration |
 
 The cache lifetime starts when actual details arrive, not on summary updates or
-reads. Continuous legacy full publications refresh it; on-demand duplicate or
+reads. Continuous full-mode publications refresh it; on-demand duplicate or
 late replies do not. The request timeout covers all delivery attempts together.
 
 Requests are coalesced per node, but simultaneous requests for different nodes
@@ -103,7 +122,6 @@ node:
   bridgeName: cbr0
   wireGuardDir: /host/etc/wireguard
   wireGuardPort: 51820
-  enablePolicyRouting: false    # Deprecated -- PBR replaced by per-interface FORWARD ACCEPT rules
   mtu: 0
   healthPort: 9998
   informerResyncPeriod: 3600s
@@ -114,9 +132,7 @@ node:
   statusWebsocketApiserverStartupDelay: 60s
   statusWebsocketKeepaliveInterval: 10s
   statusWsKeepaliveFailureCount: 2
-  shutdownRemoveWireGuardConfiguration: false
-  cleanupNetlinkOnShutdown: false
-  shutdownRemoveMasqueradeRules: false
+  removeConfigurationOnShutdown: false
   criticalDeltaEvery: 1s
   statsDeltaEvery: 15s
   statusPushEnabled: true
@@ -276,7 +292,7 @@ graph TD
 | `--node-name` | string | - | `NODE_NAME` | Name of this node (required). |
 | `--health-port` | int | `9998` | - | Port for health check server (0 to disable). |
 | `--informer-resync-period` | duration | `3600s` | - | Informer resync period. |
-| `--route-table-id` | int | `252` | - | Custom routing table ID for policy routing. **Deprecated** -- PBR is replaced by per-interface FORWARD ACCEPT rules; see `--enable-policy-routing`. |
+| `--route-table-id` | int | `252` | - | Current managed route table ID, independent of the removed gateway connmark PBR mode. |
 | `--kube-proxy-health-interval` | duration | `30s` | - | Interval between kube-proxy health checks. 0s disables. |
 | `--preferred-private-encap` | string | `GENEVE` | - | Preferred encapsulation for internal (private IP) links. |
 | `--preferred-public-encap` | string | `WireGuard` | - | Preferred encapsulation for external (public IP) links. |
@@ -470,7 +486,7 @@ logging both the kept and ignored peering/profile details.
 
 The node agent uses configurable API server mode for websocket and push behavior:
 
-1. WebSocket transport (`/status/nodews` and aggregated API path) with protobuf full+delta messages and compression. The controller also accepts JSON messages for compatibility.
+1. WebSocket transport (`/status/nodews` and aggregated API path) with protobuf full+delta messages and compression. JSON envelopes are also supported; bare top-level full-status JSON is not.
 2. Periodic HTTP push (`/status/push` and aggregated API path) when websocket is unavailable or configured for periodic reconciliation.
 3. Controller pull fallback when push data is stale/unavailable.
 
@@ -485,9 +501,11 @@ When critical changes are published, existing peers retain their last published 
 Statistics updates include a timestamp even when measurements are unchanged, so the controller continues to see fresh status.
 Periodic full synchronization and full resynchronization after a rejected delta remain in place.
 
-New nodes use compact protobuf peer-measurement deltas only after the controller positively advertises `peer_measurements` in a successful WebSocket ACK with a nonzero revision.
+Nodes use compact protobuf peer-measurement deltas only after the controller positively advertises `peer_measurements` in a successful WebSocket ACK with a nonzero revision.
 The capability and revision are reset on every connection; the first message and any resynchronization are full snapshots.
-Old controllers receive full peer replacements, and new controllers continue to accept legacy protobuf and JSON full/top-level deltas.
+Without that negotiated capability, nodes send full peer replacements. Explicit
+protobuf and JSON full/delta envelopes remain supported; this is a current
+publication mode, not a pre-release compatibility promise.
 HTTP fallback uses typed top-level deltas without compact measurements and does not rely on a capability learned on a different connection.
 
 Compact measurements carry packed RX/TX/handshake columns and RTT/uptime string columns instead of repeated static peer metadata and nested health objects.
@@ -515,7 +533,6 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 
 - `never`: use direct controller websocket and push endpoints only.
 - `fallback`: use direct controller endpoints first and API server aggregated endpoints as fallback.
-- `preferred`: compatibility alias for `fallback`; direct controller endpoints are preferred, with API server aggregation used only as fallback.
 
 `node.statusWebsocketApiserverURL` and `node.statusPushURL` support `$(KUBERNETES_SERVICE_HOST)` expansion at runtime.
 `node.statusWebsocketApiserverStartupDelay` delays API server fallback attempts during a direct transport outage to allow direct routing to settle first. WebSocket outages are tracked independently of HTTP push, so WebSocket fallback still works when HTTP push is disabled or healthy. A successful handshake alone does not clear an outage or advertise a usable transport: the initial full status write must also succeed. Initial-write failures retain outage timing and retry backoff so an unusable direct endpoint cannot suppress fallback. Failure of an established direct WebSocket starts a new outage and applies retry backoff; normal node shutdown does not. Fallback eligibility is checked when the outage delay expires, without waiting for the next direct retry. A recovered HTTP push prompts a direct WebSocket probe rather than closing a working fallback without confirming WebSocket recovery. A direct WebSocket 401, including during recovery probing, invalidates its HMAC credential for a fresh exchange.
@@ -528,17 +545,14 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 | `--status-push-apiserver-interval` | duration | `30s` | Minimum interval for API server aggregated push attempts (load-control knob). |
 | `--status-ws-enabled` | bool | `true` | Enable websocket status push transport. |
 | `--status-ws-url` | string | - | Explicit websocket URL to controller. If set, this overrides automatic endpoint selection. |
-| `--status-ws-apiserver-mode` | string | `fallback` | Websocket/push endpoint selection: `never` disables API server endpoints; `fallback` prefers direct controller endpoints with API server fallback; `preferred` is a compatibility alias for `fallback`. |
+| `--status-ws-apiserver-mode` | string | `fallback` | Websocket/push endpoint selection: `never` disables API server endpoints; `fallback` prefers direct controller endpoints with API server fallback. |
 | `--status-ws-apiserver-url` | string | `wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews` | Aggregated API websocket URL (also used to derive aggregated push URL). |
 | `--status-ws-apiserver-startup-delay` | duration | `60s` | Delay from the start of a direct transport outage before API server websocket/push fallback is allowed (`0s` disables delay). |
 | `--status-ws-keepalive-interval` | duration | `10s` | Interval between node websocket keepalive pings (`0s` disables pings). |
 | `--status-ws-keepalive-failure-count` | int | `2` | Sequential websocket keepalive ping failures before the node reconnects. |
 | `--status-critical-interval` | duration | `1s` | Maximum critical-delta publish frequency; changed fields are batched and sent at most once per interval. |
 | `--status-stats-interval` | duration | `15s` | Statistics refresh interval; includes a freshness timestamp even when measurements are unchanged. |
-| `--shutdown-remove-wireguard-configuration` | bool | `false` | Remove WireGuard interfaces on node-agent shutdown. |
-| `--shutdown-cleanup-netlink` | bool | `false` | Remove managed netlink routes and policy routing rules on node-agent shutdown. |
-| `--enable-policy-routing` | bool | `false` | **Deprecated.** Enable connmark/fwmark/ip-rule policy-based routing on gateway WireGuard interfaces. Replaced by per-interface iptables FORWARD ACCEPT rules that are added when tunnel/WG gateway interfaces are created and removed on deletion. Set to `true` only for backward compatibility with pre-1.0.2 deployments. |
-| `--shutdown-remove-masquerade-rules` | bool | `false` | Remove managed masquerade iptables rules on node-agent shutdown. |
+| `--remove-configuration-on-shutdown` | bool | `false` | Remove managed network configuration on node-agent shutdown. Replaces the removed per-subsystem cleanup flags. |
 | `--healthcheck-port` | int | `9997` | UDP port for health check probe listener (0 to disable). |
 | `--base-metric` | int | `1` | Base metric for programmed routes. |
 

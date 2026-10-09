@@ -33,7 +33,7 @@ that scope before submission.
 | Governance | [GOVERNANCE.md](GOVERNANCE.md) | Published; maintainer approval required |
 | Security reporting | [SECURITY.md](SECURITY.md) | Published through the Microsoft security response process |
 | Contribution process | [CONTRIBUTING.md](CONTRIBUTING.md) | Published |
-| Dependency notices | [NOTICE](NOTICE) | Generated from direct Go, npm, and Cargo dependencies plus pinned native dependencies |
+| Dependency notices | [NOTICE](NOTICE) | Generated from direct Go and npm dependencies |
 | Adopters | GitHub issue #555 | Optional; no claims without adopter approval |
 | Application worksheet | [GitHub issue #555](https://github.com/Azure/unbounded/issues/555) | Proposed technical wording awaits maintainer approval |
 

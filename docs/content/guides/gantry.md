@@ -157,20 +157,44 @@ registry, the flow is:
 Requester-delegated private-registry authentication requires an HTTPS origin.
 Private plaintext HTTP registries are not supported by this mode.
 
-#### Shared-Identity Authentication
+Gantry does not mount shared registry identities or read credential files.
+Public registries that require an anonymous Bearer token remain supported.
+Private pulls use the requester's delegated credentials without identity fallback.
 
-Shared identity is a compatibility mode for environments where kubelet or CRI
-cannot provide a usable request credential. It gives every Gantry agent the
-same registry identity.
+#### Configuration Contract
 
-To enable it, create `Secret/gantry-registry-credentials` in the release
-namespace and set the matching registry's `credentialsPath` chart value.
-The file contains a `username:password` pair keyed by the registry `name`.
+The default backend remains containerd; `GANTRY_RACER_ENABLED` selects Racer.
+There is no `storage_mode` selector. The default backend requires a containerd
+socket and positive lease TTL and cleanup intervals.
 
-Gantry reads configured credential files eagerly during startup. A missing
-file causes the pod to fail, so do not add `credentials_path` unless the Secret
-is present. Prefer requester-delegated authentication when possible because it
-avoids distributing a shared registry credential to every node.
+Chair API access uses `chair_kubeconfig`, `GANTRY_CHAIR_KUBECONFIG`, or
+`--chair-kubeconfig`; an empty value selects in-cluster credentials. The former
+membership-named kubeconfig setting has no alias. `node_name` remains supported
+and identifies the node in layer-completion metrics, not chair selection.
+
+Removed cache, membership, HRW, prefetch, chair-percentage, and coordination
+compatibility settings are not accepted in YAML or as flags. Use
+`chair_count` and `chair_seed_count` to size the chair pool and replicas.
+`chair_holder_count` remains a deprecated alias for `chair_count`.
+
+The Racer origin adapter requires bounded range reads. Resumed mirror responses
+must match the selected size, digest, and exact MIME type, including whether the
+MIME type is absent. A metadata mismatch fails before serving the response body.
+
+Live mirror responses always stream directly to containerd. Gantry does not open
+a competing containerd writer for these requests or advertise their bytes before
+containerd commits them. Background chair pulls still ingest and lease content.
+
+Content coordination uses the HTTPS chair endpoint, with a required assignment
+and explicit content kind. Libp2p coordination carries only chair-rotation offers;
+there is no pull-intent or content-pull RPC on that transport. Peer identities
+are libp2p identities, not Kubernetes node-name aliases.
+
+Owned chair HTTPS clients and servers require TLS 1.3 and authenticate the expected
+peer identity. The node-local mirror and peer content-transfer endpoints retain
+their existing HTTP/h2c network-isolation requirements. External registries,
+Bearer token realms, and the Kubernetes API retain their secure client defaults
+and configured trust policy; they are not blindly restricted to TLS 1.3.
 
 ### 5. Verify Distribution
 
@@ -209,3 +233,69 @@ metrics:
 | `p2p_origin_fallback_total` | Remains near zero during healthy operation. |
 | `gantry_advertise_reconcile_total` | Continues increasing as Gantry reconciles containerd content with the DHT. |
 | `gantry_containerd_lease_created_total` | Increases when coordinated background pulls ingest new content. |
+
+## Use Racer as the Backend
+
+The installation and distribution flow above describe Gantry's default containerd
+backend. Racer mode instead uses Racer for object caching and peer reads, with
+Gantry supplying the registry origin adapter. First follow
+[Cache Objects with Racer]({{< relref "guides/racer" >}}) to install Racer, and
+separately create this cluster-scoped Cache volume:
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterVolume
+metadata:
+  name: gantry
+spec:
+  type: Cache
+```
+
+The required `spec.type` is immutable. Creating any ClusterVolume triggers
+operator-managed Racer installation; only Cache volumes enter the cache catalog.
+For an existing ClusterCache deployment, follow the [breaking-change upgrade steps]({{< relref "guides/racer" >}}#upgrade-from-clustercache).
+
+Racer must run on the same nodes as Gantry. Run one Gantry origin owner on every
+eligible node that can supply origin reads for this volume, with consistent
+upstream registry configuration. Match placement and tolerations; installing
+Gantry on only the requesting nodes is not sufficient.
+
+### Helm-Managed Gantry
+
+Add `--set racer.enabled=true` to the OCI chart installation command above,
+retaining its release version, image digest, upstream registries, and your other
+settings. For upgrades, keep those settings in your existing values file:
+
+```bash
+helm upgrade --install gantry oci://ghcr.io/azure/charts/gantry \
+  --version "$GANTRY_VERSION" --namespace gantry-system \
+  -f gantry-values.yaml --set racer.enabled=true --wait --timeout 5m
+```
+
+Here `gantry-values.yaml` contains the existing image and registry settings. The
+chart configures **Gantry only**; it does not deploy Racer or create the volume.
+The setting runs Gantry as UID/GID 0 and mounts `/run/racer/gantry` read-write for
+its client and origin sockets. Authorize that hostPath and root workload narrowly.
+
+### Operator-Managed Gantry
+
+Do not install a competing Helm release. Merge the `data.gantry-racer.yaml` entry
+from [racer-operator-overrides.yaml](https://github.com/Azure/unbounded/blob/main/deploy/gantry/examples/racer-operator-overrides.yaml)
+into your existing `unbounded-component-overrides` ConfigMap in the operator
+namespace. Preserve all other keys and reconcile any existing Gantry patches;
+do not replace the ConfigMap with the example. If no override ConfigMap exists,
+use the example to create it. See
+[workload overrides]({{< relref "reference/workload-overrides" >}}).
+
+The example enables `GANTRY_RACER_ENABLED`, selects UID/GID 0, and mounts
+`/run/racer/gantry` read-write. It does not provision Racer. Keep existing
+`GANTRY_RACER_*` tuning and registry configuration as appropriate for your release.
+
+### Verify Racer Mode
+
+Check Gantry's rollout with `kubectl -n NAMESPACE rollout status daemonset/gantry --timeout=5m`,
+then its `/readyz` endpoint and actual image pulls. Inspect
+`gantry_racer_mirror_requests_total`, `gantry_racer_origin_bytes_total`, and Racer
+diagnostics instead of expecting the default backend's DHT/containerd metrics.
+Gantry does not fall back to its legacy backend or bypass Racer directly on Racer
+failure. This does not remove containerd's independently configured registry routes.

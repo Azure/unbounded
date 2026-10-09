@@ -8,7 +8,7 @@ This guide covers deployment, monitoring, troubleshooting, and operational proce
 
 ### Prerequisites
 
-1. **Kubernetes cluster** (1.24+)
+1. **Kubernetes cluster** (1.34+)
 2. **eBPF/TC** kernel support on all nodes
 3. **WireGuard** kernel module on nodes that use encrypted tunnels
 4. **Container runtime** with CNI support
@@ -745,7 +745,7 @@ Node Agent --> Controller (direct push / WebSocket)
    - `WebSocket wss://.../apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews`
 
 The relay mode is controlled by `--status-ws-apiserver-mode` on the node agent, which
-accepts `never`, `fallback` (default), or `preferred`.
+accepts `never` or `fallback` (default). The old `preferred` alias is rejected.
 
 The controller caches received status and supports delta updates -- nodes send only
 changed fields after the initial full push. If the controller detects drift, it replies
@@ -989,15 +989,12 @@ netstat -tlnp | grep 9998
 # Check controller service endpoints (should be a single EndpointSlice)
 kubectl -n unbounded-system get endpointslices -l kubernetes.io/service-name=unbounded-net-controller
 
-# Verify no stale v1/Endpoints resource exists
-kubectl -n unbounded-system get endpoints unbounded-net-controller 2>&1
-
 # Check push connectivity from a node agent pod
 kubectl -n unbounded-system exec <node-agent-pod> -- wget -q -O - http://<controller-service-ip>:80/healthz
 ```
 
 **Common Causes:**
-- Stale `v1/Endpoints` resource from a previous controller version causing kube-proxy to load-balance pushes to a dead pod IP. The controller automatically cleans these up on leader election, but this can happen during upgrades.
+- Missing or stale EndpointSlice addresses or Pod target references. Check leader readiness and API write permissions; the leader periodically repairs its slice. v1 Endpoints and pre-release layout migrations are not supported.
 - Controller not the leader (push requests return 503)
 - Service account token authentication failures
 

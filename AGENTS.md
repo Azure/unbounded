@@ -81,7 +81,28 @@ unbounded-kube is organized into several directories:
 
 ## Testing Standards
 
+- Move quickly in larger coherent implementation batches. Use compile checks and focused tests for changed behavior during development; run broad suites once at phase completion and then parent integration. Repeat only when failures or new changes justify it. Do not revalidate unchanged phases or repeat benchmarks without a concrete unresolved question. This instruction applies to future agents and handoffs.
+- Every test command must use an external `timeout --signal=TERM --kill-after=10s 300s ...` (shorter bounds are allowed), with tool timeouts no greater than 320000 ms. Go tests must also use `-timeout=5m`. Split suites into bounded groups. A timeout is a failure to investigate, never a reason to retry unbounded. Ensure child process cleanup. This also applies to scripts, benchmarks, and `make fmt` if it invokes tests.
 - Add tests for new behavior. Cover success, failure, and edge cases.
+
+## Operational Delegation and Progress
+
+- Use `Build Smarter` for every subagent and pass these rules, the assigned worktree, and the exact checkpoint
+  to each handoff. Subagents must follow the same delegation rules.
+- Persist a timestamped checkpoint before and after each mutating phase, including the exact command, last
+  successful state, next action, and any error (or explicitly none). Keep it accessible to the parent and successor.
+- Apply the external timeout and cleanup requirements in Testing Standards to every command, not just tests.
+  Bound each phase as well: declare its deadline, heartbeat interval, and success condition before starting.
+  Heartbeats must report the current command and checkpoint, not merely that the agent is still running.
+- Resume an interrupted agent's exact checkpoint only after inspecting live state and checking idempotency.
+  Do not replay completed drains, builds, guards, or tests unless evidence shows their results are invalid.
+- After one declared polling budget with no checkpoint advancement, diagnose the exact blocking command,
+  record evidence and the next action, and return control to the parent instead of starting another unchanged loop.
+- The parent owns progress and recovery. Do not delegate long operations as opaque end-to-end tasks; use
+  phase-sized, bounded handoffs. While load is paused or C0 recovery is pending, the parent must retain explicit
+  responsibility for restoring a safe state and resuming load only after the required checks pass.
+- Distinguish Task cancellation from command timeout or deadlock. Cancellation without checkpoint advancement
+  is an observation, not proof of a hung command; do not assert a root cause without supporting evidence.
 
 ## Sources of Truth
 

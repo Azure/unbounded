@@ -25,7 +25,7 @@ for command usage, exit behavior, and the current check list.
   "Cluster": {
     "CaCertBase64": "<base64-encoded CA certificate>",
     "ClusterDNS": "10.0.0.10",
-    "Version": "1.33.1"
+    "Version": "1.34.1"
   },
   "Kubelet": {
     "ApiServer": "https://api.example.com:6443",
@@ -56,7 +56,7 @@ for command usage, exit behavior, and the current check list.
 | `MachineName` | *(optional)* Name of the Kubernetes `Machine` and node. When omitted, the agent resolves it at startup from the `AGENT_MACHINE_NAME` environment variable, falling back to the host hostname. |
 | `Cluster.CaCertBase64` | Base64-encoded cluster CA certificate. |
 | `Cluster.ClusterDNS` | ClusterIP of the kube-dns Service. |
-| `Cluster.Version` | Kubernetes version to install (e.g. `1.33.1`). |
+| `Cluster.Version` | Kubernetes version to install (e.g. `1.34.1`; supported baseline is 1.34+). |
 | `Kubelet.ApiServer` | Address of the Kubernetes API server. |
 | `Kubelet.Auth.BootstrapToken` | Token used for TLS bootstrapping (omit when using TPM attestation). |
 | `Kubelet.Labels` | Key-value labels applied to the Node on registration. |

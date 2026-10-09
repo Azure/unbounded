@@ -106,7 +106,7 @@ Represents a host and drives its lifecycle.
 | Spec field            | Description |
 |-----------------------|-------------|
 | `spec.ssh`            | SSH connectivity (host, port, user, privateKeyRef) and optional bastion config. |
-| `spec.pxe`            | PXE config: machine image reference, optional netboot image override, dhcpLeases, redfish settings. |
+| `spec.host.netboot`   | PXE config: machine image reference, optional netboot image override, dhcpLeases, redfish settings. |
 | `spec.kubernetes`     | Kubernetes version, bootstrapTokenRef, nodeRef, nodeLabels. |
 
 Status includes phase, message, conditions, SSH fingerprint, Redfish cert
@@ -117,10 +117,10 @@ fingerprint, and TPM info. The API defines condition type constants including
 
 ### Netboot OCI Images
 
-Metalman uses two OCI images for PXE repaves. `Machine.spec.pxe.image` references
-the machine image containing `/disk/disk.img.gz`. `Machine.spec.pxe.netbootImage`
+Metalman uses two OCI images for PXE repaves. `Machine.spec.host.netboot.image` references
+the machine image containing `/disk/disk.img.gz`. `Machine.spec.host.netboot.netbootImage`
 optionally references the reusable PXE boot environment; when omitted, Metalman
-uses its configured default `netboot` image. `Machine.spec.pxe.architecture`
+uses its configured default `netboot` image. `Machine.spec.host.netboot.architecture`
 selects the OCI platform manifest for both images and defaults to `amd64`.
 
 Netboot images contain all files needed for PXE booting under `/disk/`. Files
@@ -167,7 +167,7 @@ For a walkthrough, see the [SSH Provisioning Guide]({{< ref "guides/ssh" >}}).
 
 ### PXE Path (metalman)
 
-1. `Machine` CR created with `spec.pxe`.
+1. `Machine` CR created with `spec.host.netboot`.
 2. A `HostReplace` `MachineOperation` requests a repave; metalman sets the PXE or HTTP boot override and force-restarts the host through Redfish.
 3. Host PXE-boots: DHCP (IP + boot filename) -> TFTP (bootloader) -> HTTP
    (kernel, initrd, configs).
@@ -220,7 +220,9 @@ Resource defaults for both controllers: 100m CPU / 128Mi memory requests,
 Container images are multi-stage builds on Azure Linux 3.0, built with
 `podman`. CRDs are generated with `controller-gen` v0.20.1.
 
-**Build toolchain:** Go 1.25.7, controller-runtime v0.23.3.
+**Build toolchain:** See the checked-in `go.mod` for the Go version and
+controller-runtime dependency. The supported Kubernetes deployment baseline
+is 1.34+, independently of the client library version used to build the tools.
 
 ## See Also
 

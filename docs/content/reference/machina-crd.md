@@ -47,8 +47,8 @@ SSH connection details. When `ssh` is nil, the machina controller skips the Mach
 
 ### spec.host.netboot
 
-Network boot configuration consumed by the Metalman controller. The released
-top-level `spec.pxe` remains a deprecated fallback for existing Machines.
+Network boot configuration consumed by the Metalman controller. `host.netboot`
+uses the `PXESpec` type; there is no top-level `spec.pxe` field.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -89,7 +89,7 @@ Kubernetes join configuration.
 
 ### spec.host
 
-`host` groups host ownership and the desired host image. New Machines select at
+`host` groups host ownership and the desired host image. Machines select at
 most one of `netboot`, `azure`, or `external`. This keeps built-in host identity
 on the Machine while preserving `external.machineRef` as an escape hatch for
 providers whose own CRD has meaningful schema, status, or reconciliation.
@@ -97,6 +97,7 @@ providers whose own CRD has meaningful schema, status, or reconciliation.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `host.image` | string | No | Preserve current image | Opaque image identifier interpreted by the selected provider. |
+| `host.provisioningFormat` | string | For explicit replacement images | No implicit default | `CloudInit` or `Ignition`. Current-image reuse may use the installed observation. Controller-driven replacement currently generates cloud-init only. |
 | `host.netboot` | PXESpec | For new Metalman Machines | -- | Network boot image, DHCP, Redfish, and cloud-init settings owned by Metalman. |
 | `host.azure.resourceID` | string | For Azure VMs | -- | Immutable full Azure Resource Manager VM ID. The provider is inferred as `AzureVM`. |
 | `host.external.provider` | string | For external hosts | -- | Registered provider controller and credential key, such as `OCIInstance`, `ANS`, or a private provider. |
@@ -123,9 +124,11 @@ spec:
       resourceID: /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Compute/virtualMachines/worker-01
 ```
 
-The released top-level `spec.pxe`, `spec.provider`, and `spec.providerID` fields
-remain readable as deprecated fallbacks. New host ownership cannot be mixed
-with those legacy fields. Migration tooling is intentionally separate.
+The top-level `spec.pxe`, `spec.provider`, and `spec.providerID` fields are not
+supported. Declare ownership under `spec.host`; host operations require an owner.
+Older installation and operation snapshot compatibility is not provided.
+See [Host provisioning format]({{< relref "/reference/agent/provisioning-format" >}})
+for image/format selection and the required frozen replacement format.
 
 Machine operation credentials are selected by the Machine site label. Providers that support OIDC/workload identity use `WorkloadIdentity`; providers or sites that need provider-specific credential material use `ExternalPlugin` with a referenced Secret.
 Custom Go controllers register the operations they support with
@@ -139,8 +142,7 @@ idempotent for `OperationRequest.OperationUID` because the controller may call
 them again until their operation handle has been persisted. `OperationRequest`
 contains the exact external machine resource UID and generation, resolved host
 image, and observed Machine generation frozen in target status. Providers
-receive the canonical `host.external.providerID` or Azure resource ID; legacy
-Machines continue to supply `Machine.spec.providerID`. Host operations targeting
+receive `host.external.providerID` or the Azure resource ID. Host operations targeting
 the same Machine are serialized.
 
 ```yaml
@@ -222,10 +224,10 @@ The OCI instance provider handles:
 
 `HostReplace` for `OCIInstance` creates a replacement instance because OCI launch `user_data` is immutable after instance creation. The controller stops the old instance, launches a new instance in the same availability domain, subnet, shape, and fault domain, requests a public IP for bootstrap egress, patches `Machine.spec.host.external.providerID` to the new instance OCID after the replacement reaches `RUNNING`, and then terminates the old instance. The replacement reuses the original `Machine` name as the kubelet node name so it rejoins through the existing Kubernetes `Node` object. Operation completion means the replacement is running, provider ID handoff succeeded, and old-instance cleanup succeeded; it does not wait for the Kubernetes `Node` to become Ready.
 
-The OCI replacement flow copies display name, defined tags, freeform tags, selected agent/availability/shape settings, and primary VNIC subnet/NSG/source-destination-check settings. It adds Unbounded freeform tags for idempotent retry lookup. It does not preserve the exact private IP, boot volume, or attached data volumes; active attached data volumes fail the operation before the old instance is stopped. An omitted host image preserves the source instance image. `spec.parameters.imageID` remains as a temporary compatibility override, while new callers should use the Machine or MachineConfiguration host image. Set `spec.parameters.sshAuthorizedKeys` to append SSH authorized keys to replacement metadata for break-glass debugging.
+The OCI replacement flow copies display name, defined tags, freeform tags, selected agent/availability/shape settings, and primary VNIC subnet/NSG/source-destination-check settings. It adds Unbounded freeform tags for idempotent retry lookup. It does not preserve the exact private IP, boot volume, or attached data volumes; active attached data volumes fail the operation before the old instance is stopped. An omitted host image preserves the source instance image. Set the Machine or MachineConfiguration host image to select a different image; `spec.parameters.imageID` is not used. Set `spec.parameters.sshAuthorizedKeys` to append SSH authorized keys to replacement metadata for break-glass debugging.
 
 Metalman handles bare-metal host operations for Machines with
-`spec.host.netboot.redfish` (or deprecated `spec.pxe.redfish`) and no external
+`spec.host.netboot.redfish` and no external
 host owner. Bare-metal host operations may
 target one Machine with `spec.machineRef` or a site-scoped set of Machines with
 `spec.machineSelector`. Selector-based bare-metal host operations must select a

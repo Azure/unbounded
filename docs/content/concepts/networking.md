@@ -58,6 +58,14 @@ edge deployment. Each site is defined by:
 When a node joins the cluster, the controller matches its internal IP against
 all Site `nodeCidrs` and labels it with `unbounded-cloud.io/site=<name>`.
 
+#### Racer RDMA boundaries
+
+Racer uses the canonical Node label `unbounded-cloud.io/site` as an RDMA boundary:
+each communicating pair needs the same nonempty Site, a compatible selected rail,
+and usable local hardware. Different or missing Sites retain HTTP, and a multi-hop
+route can mix transports. See the [Racer RDMA reference]({{< relref "reference/racer#rdma" >}})
+for NIC policy, discovery, deployment requirements, and coordinated upgrades.
+
 ### Gateway Pools
 
 A **GatewayPool** defines a set of nodes that act as routers between sites.

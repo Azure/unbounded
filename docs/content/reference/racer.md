@@ -1,0 +1,560 @@
+---
+title: "Racer Reference"
+weight: 7
+description: "Racer resources, configuration, diagnostics, Go SDK, and RDMA requirements."
+---
+
+See [Racer concepts]({{< relref "concepts/racer" >}}) and the [deployment/integration guide]({{< relref "guides/racer" >}}).
+
+## ClusterVolume
+
+| Property | Contract |
+|----------|----------|
+| API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterVolume` |
+| Resource / short name | `clustervolumes` / `cvol` |
+| Scope | Cluster-scoped |
+| Fields | Kubernetes metadata and required `spec`; no `status` |
+| `spec.type` | Required, immutable string; the only supported value is `Cache` (no default) |
+| Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
+| Identity | Kubernetes UID, not name; deleting and recreating a volume creates a new identity |
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterVolume
+metadata:
+  name: artifacts
+spec:
+  type: Cache
+```
+
+Any ClusterVolume triggers installation by the Unbounded operator, not a Site
+component flag. Only volumes with `spec.type: Cache` enter the Racer cache catalog.
+This resource is not a Kubernetes PersistentVolume or PersistentVolumeClaim (PVC),
+does not configure an origin or capacity, and makes no durability promise. Cached
+data is disposable. See the [breaking-change upgrade steps]({{< relref "guides/racer" >}}#upgrade-from-clustercache).
+
+Wire names such as `CacheID` and `CacheDefinition`, runtime caching terms, and socket
+paths are unchanged. A volume's Kubernetes UID remains its wire cache identity.
+
+| Path on the node | Owner and purpose |
+|------------------|-------------------|
+| `/run/racer/<name>/client/socket` | Dataplane; SDK clients connect here |
+| `/run/racer/<name>/origin/socket` | Application origin adapter; dataplane calls it for upstream reads |
+
+Pod mounts grant access: expose only the needed volume/role. Origins need existing trusted
+parent directories. Clients do not automatically bypass Racer to connect directly to origins.
+
+## Node labels and annotations
+
+Keys below use the `racer.unbounded-cloud.io/` prefix unless shown in full.
+
+| Key | Meaning |
+|-----|---------|
+| Label `exclude` | Presence excludes the node from membership and dataplane placement, regardless of value |
+| Label `unbounded-cloud.io/site` | Canonical Site boundary for RDMA; absent or empty means HTTP-only |
+| Annotation `shares` | Positive decimal `uint32` placement weight; overrides enrolled shares; default 4 |
+| Annotation `rdma-nics` | Administrator NIC/rail policy; see [RDMA](#rdma); explicit `[]` disables eligibility |
+| Annotation `block-devices` | Startup-only regex selecting raw cache devices by `disk/by-id` basename; see [raw-device storage](#raw-device-storage) |
+| Annotations `enrolled-shares`, `enrolled-rdma-nics` | Controller-managed authenticated dataplane reports; do not edit |
+| Annotation `last-admitted-member` | Controller-managed, Node-UID-bound retained membership; do not edit |
+| Annotations `rails`, `aligned-rails` | Obsolete; ignored with diagnostics |
+
+Malformed membership annotations retain admitted attributes; invalid new nodes are omitted.
+Site uses current labels. Invalid `block-devices` selectors instead fall back to slab files.
+
+## Dataplane configuration
+
+Tune `racer-dataplane-config` in the installation namespace (normally `unbounded-system`).
+The operator preserves administrator data and hashes edits into managed rollouts.
+Explicit workload environment wiring takes precedence over ConfigMap imports.
+Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
+
+| Setting | Default | Scope / constraint |
+|---------|---------|--------------------|
+| `RACER_MAX_THREADS` | Unset (automatic) | Total userspace I/O and crypto threads; explicit value at least 2 |
+| `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
+| `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
+| `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
+| `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Each `268435456` (256 MiB) | Independent node-wide plaintext/ciphertext admission budgets |
+| `RACER_DIRTY_BYTES` | `134217728` (128 MiB) | Node-wide dirty-data budget |
+| `RACER_REGISTERED_BYTES` | `134217728` (128 MiB) | Node-wide native RDMA memory budget when enabled |
+| `RACER_REQUEST_CONTEXT_BYTES` | `67108864` (64 MiB) | Node-wide request-context budget |
+| `RACER_METADATA_ENTRIES` | `4096` | Node-wide catalog entries; at most 1,048,576 |
+| `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget in file mode; configured value at most 1,048,576; device mode can raise it as described below |
+| `RACER_ADMISSION_MODE` | `second-sight` | Disk retention policy: `disabled` or `second-sight`; does not disable request resource admission |
+| `RACER_ADMISSION_HISTORY_BYTES` | `4194304` (4 MiB) | Node-wide Bloom history budget; 32 bytes..512 MiB, divided among final I/O workers, requiring at least 32 bytes per worker |
+| `RACER_ADMISSION_PERIOD_SECS` | `60` | History rotation period; 1..86,400 seconds |
+| `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
+| `RACER_PLACEMENT_CACHE_BYTES` | `16777216` (16 MiB) | Node-wide placement capacity estimate, divided among I/O workers; 1,024 bytes..512 MiB, with at least 1,024 bytes per worker |
+| `RACER_CACHED_PATHS` | `128` | Node-wide retained path-query entry budget, divided among I/O workers; 1..1,048,576 |
+| `RACER_PATH_CACHE_BYTES` | `8388608` (8 MiB) | Node-wide accounted path-cache allocation budget, divided among I/O workers; 1 byte..512 MiB, independent of entry count |
+| `RACER_ACTIVE_PATH_SEARCHES` | `8` | **Per I/O worker** distinct unfinished path-search limit; 1..64, independent of cache size |
+| `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** file-backed slab geometry; positive multiple of segment size; does not limit device-mode capacity |
+| `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead |
+| `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments |
+| `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
+| `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
+| `RACER_CLIENT_CONNECTIONS` | `128` | Node-wide connection admission budget, partitioned among workers |
+| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024 |
+| `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `8` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections, further clamped to the worker's connection budget |
+| `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps |
+| `RACER_REQUEST_TIMEOUT_MS` / `RACER_PEER_ATTEMPT_TIMEOUT_MS` | Each `30000` | Independent request / local peer-exchange deadlines; 1..86,400,000 ms |
+| `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
+| `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1..3,600,000 ms |
+
+Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
+Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets
+can reduce workers. File-backed storage grows with I/O workers; raw-device capacity is
+divided among them. Admission budgets are not RSS limits:
+allocator, TLS, and filesystem cache are additional. Invalid combinations fail validation.
+
+### Raw-device storage
+
+Set the Node annotation `racer.unbounded-cloud.io/block-devices` to a regex over
+basenames in `/host/dev/disk/by-id`, not full paths. The controller accepts at most
+1 KiB (1,024 bytes) and validates with Go's `regexp.Compile`. Invalid or oversized
+values are ignored with a warning. The dataplane compiles the selector with Rust's
+`regex` crate; use syntax accepted by both engines. Matching is **unanchored**:
+use `^` and `$` to avoid unintended substring and partition matches.
+
+Discovery runs once after startup enrollment. Changing or removing the annotation
+does not change a running layout or trigger a rollout; restart the affected
+dataplane to apply it. An absent/empty selector, Rust compile failure, discovery
+failure, no usable matches, or too few segments for all workers' reserves falls
+back to file-backed slabs. Rejected candidates are skipped with diagnostics;
+remaining usable devices can still be selected. Aliases for one device are
+deduplicated.
+
+**Selected devices are overwritten except for reserved guards. There is no
+general filesystem or data-signature check, formatting step, or preservation of
+cache-area contents.** Racer skips
+devices with child partitions, active holders, read-only state, or visible mounts.
+It opens devices with `O_RDWR | O_DIRECT | O_EXCL`; busy devices are skipped.
+These checks are not proof that a device is safe to erase. A partition itself is
+allowed: a broad selector can overwrite an unmounted OS or data partition.
+Select only dedicated disposable cache devices after checking each match.
+
+The first and last **1 MiB (1,048,576 bytes)** of each device are reserved and must
+already be entirely zero. Startup reads each full guard through the same held
+exclusive `O_DIRECT` descriptor, using one aligned 1 MiB buffer. Nonzero bytes,
+short reads, I/O errors, or unsupported alignment reject that device. Racer never
+zeros the guards or bypasses partition, holder, or mount checks. Clearing old
+contents is a separate operator-approved operation, not an automatic repair.
+Keeping cache records out of these ends addresses the observed first-sector
+partition-signature collision; it is not proof against every partition parser.
+
+The managed privileged container mounts host `/dev` read-only at `/host/dev`.
+This protects directory entries, **not device contents**: raw writes are
+intentional. `RACER_SLAB_DIRECTORY` still holds `checkpoint.0` and `checkpoint.1`
+and must remain writable and available.
+
+Device mode uses `floor((device_bytes - 2 MiB) / segment_bytes)` segments per
+device, at offsets `1 MiB + k * segment_bytes`. These are split among
+the final I/O workers with remainder segments assigned to workers. Each device's
+subsegment tail is unusable. `RACER_SLAB_BYTES` is ignored for device capacity,
+but still must pass configuration validation for fallback. The normal per-worker
+free-segment reserve, record headers, AEAD tags, alignment padding, and record
+packing reduce payload capacity. Hard limits can reduce it further:
+
+- At most 1,000,000 segments per worker, also bounded by signed 64-bit byte offsets.
+- Each worker's page index grows to the larger of its estimated full-page capacity
+  after reserves and its configured share of `RACER_DISK_PAGE_ENTRIES`, capped at
+  1,000,000 entries. The estimate includes the largest record header, AEAD tag,
+  and direct-I/O alignment. Small objects can exhaust the index before disk bytes.
+- Checkpoint working memory grows from a conservative estimate of page entries,
+  metadata entries, and segments, never below `RACER_CHECKPOINT_BYTES`, and is
+  capped at 512 MiB node-wide. Encoded checkpoint files still have a 64 MiB cap.
+  Oversized snapshots are skipped; recovery rejects snapshots over its budget.
+
+Plan memory for the larger index, resident heat tracking, segment tables, and
+checkpoint scratch, not just the configured admission budgets. The automatic
+checkpoint budget is not an RSS limit or a guarantee that a full cache can be
+checkpointed. Limit warnings explain discarded capacity and checkpoint pressure.
+
+Checkpoint **v3** binds each worker to file mode or its raw-device IDs, sizes, and
+segment offsets. The raw-layout **v2** digest also includes both guard sizes;
+this is separate from the checkpoint format version. The prior offset-zero raw
+layout cannot recover into the guarded layout. Each checkpoint candidate is
+validated for the whole node: one mismatched worker rejects the entire candidate.
+If both saved candidates use the old layout, the whole node starts cold. File-mode
+layout identity is unchanged by this migration.
+Older checkpoint versions are discarded, including in file
+mode. A changed device layout, storage mode, worker count, or incompatible
+geometry rejects recovery and starts cold when no compatible checkpoint remains.
+Racer does not scan payloads to rebuild the index or migrate cached data. Preserve
+cluster and node identity state; it is separate from disposable cache checkpoints.
+
+### Second-sight disk retention
+
+The default policy allows a currently owned page to persist on its first logical
+read. A non-owned page becomes eligible after an independent reader observes it
+within the recent history window. Retries and copy-only probes do not create
+independent demand. Eligibility is determined before inserting the observation;
+concurrent followers can qualify without promoting the first reader's own attempt.
+Persistence remains best effort and only uses verified ciphertext. A skipped or
+failed optional disk enqueue does not fail an otherwise valid read.
+
+Each I/O worker has four rotating Bloom generations for page history. Reader
+accounting uses exact operation-local interest tokens, retained across retries
+and handoffs, rather than an approximate reader-history filter.
+At the default period, observations remain for approximately 180-240 seconds.
+History allocations round down to 32-byte units and do not exceed the node budget.
+A budget too small for the final worker count fails startup rather than growing
+implicitly. Bloom false positives can retain extra pages but cannot suppress
+independent reader detection; history is never authorization or proof of integrity.
+
+Bounded exact resident heat entries use the worker's disk page-index capacity plus
+its pending-write queue capacity. Heat saturates at three and decays lazily by
+one per 60 seconds, independently of history rotation. Current ownership adds a
+soft eviction preference, not a pin; owned pages remain evictable. History and
+heat are process-local hints, not checkpoint state. `disabled` restores owned-only
+disk admission and neutral eviction scores; resource budgets, integrity checks,
+and authorization still apply. Configuration values are validated even when the
+policy is disabled.
+
+Ownership hints use completed rankings for the current accepted placement.
+Missing or obsolete hints provide no bonus until refreshed. Each worker also
+refreshes indexed residents, including recovered idle pages, without requiring
+foreground reads. A background step visits at most one resident, scores at most
+256 members, and visits at most 64 ranking-cache CLOCK entries. Steps are spaced
+at least 1 ms apart; completed passes and errors retry after 100 ms. Refresh is
+independent of other placement maintenance and stops during shutdown. These
+bounds limit background work, not the time to refresh every resident.
+
+Low-cardinality `racer_retention_*` metrics aggregate all I/O workers without page,
+cache, or reader labels. Counters report logical observations, qualified
+observations, persistence attempts, and accepted persistence attempts. Acceptance
+does not prove a completed disk publication; use `racer_disk_publications_total`
+for that. Gauges report set/total Bloom bits and tracked heat entries. Samples
+refresh on each worker's health tick (normally every 100 ms), so a stalled worker
+leaves its last sample visible. The aggregate is not an atomic node-wide snapshot.
+Storage metrics use the same health-tick snapshots. `classification` has exactly
+two values, `owned` and `nonowned`, sampled from the current cache-only ownership
+hint at each event. Missing or stale rankings classify as `nonowned`; the event
+does not initiate a ranking. This is an event-time classification, not the class
+at insertion, proof of nonownership, or an exact current resident-class aggregate.
+Ownership refresh affects subsequent events only, never rewrites old counters.
+
+| Metric | Meaning |
+| --- | --- |
+| `racer_disk_class_publications_total{classification}` | Completed writer publications; excludes checkpoint restoration and deduplicated enqueue |
+| `racer_disk_class_published_payload_bytes_total{classification}` | Logical page payload bytes in those publications |
+| `racer_disk_class_index_evicted_pages_total{classification}` | Victim mappings removed to reserve page-index capacity |
+| `racer_disk_class_index_evicted_payload_bytes_total{classification}` | Logical payload bytes of those index victims |
+| `racer_disk_class_segment_evicted_pages_total{classification}` | Victim mappings removed by bounded segment reclamation, including index-only segment reclamation |
+| `racer_disk_class_segment_evicted_payload_bytes_total{classification}` | Logical payload bytes of those segment victims, not physical reclaimed disk space |
+| `racer_disk_class_read_payload_bytes_total{classification}` | Logical page payload bytes returned successfully by StoreReader after framing and mapping checks |
+| `racer_disk_pending_payload_bytes` | Total logical payload bytes owned by pending writes, including submitted writes until cleanup |
+| `racer_disk_indexed_payload_bytes` | Total logical payload bytes in retained index mappings, including restored mappings |
+
+All payload byte metrics exclude AEAD tags, record headers, and alignment padding.
+Victim counters exclude invalidation, replacement, cache removal, and pending-write
+discards. A mapping is counted only by the removal path that actually evicts it.
+Read bytes count repeated full-page reads, including internal/copy-only consumers;
+CRC and AEAD validation happen later in fill. They measure disk-to-reader payload,
+not authenticated client-delivered bytes, requested-range bytes, or device I/O.
+Use their rates to compare disk reuse in benchmarks, not as client throughput.
+The two byte gauges are exact unclassified worker totals at sampling time, maintained
+on lifecycle events without scanning all pages. A page can briefly count in both
+while a published write is still pending cleanup. They are not physical allocation
+or unique resident-byte totals, nor ownership-split gauges. Tracked heat entries
+remain a separate measurement; persistence acceptance does not measure eviction.
+
+### Topology capacity and version compatibility
+
+Placement capacity uses a conservative 1,024-byte structural estimate per cached
+ranking, rounding each worker's byte share down to whole entries. It is not an
+allocator hard bound. Path-cache accounting includes retained buffer capacities
+and reference-count headers, but excludes active search scratch, caller-held
+results, membership graphs, and allocator overhead. A result larger than the
+worker's path-cache budget is returned without retention. Cache entry and byte
+limits do not determine search concurrency: identical canonical queries share
+one active search, while distinct searches can report overload. The node's total
+distinct-search concurrency can reach I/O worker count times
+`RACER_ACTIVE_PATH_SEARCHES`.
+
+The overlay is now the symmetric union of 32 independently hashed rings over
+stable node IDs, replacing the position-based radix overlay. It has at most 64
+neighbors per member and is independent of shares. Building a new graph costs
+O(32 N log N) for bounded-size IDs and retains approximately 64N adjacency
+`usize` slots plus N vector headers. On a 64-bit target at 100,000 members,
+adjacency slots alone are about 48.8 MiB, in addition to membership records,
+construction scratch, and any retained old snapshots. These allocations are
+not covered by the path-cache byte limit.
+
+Publications with unchanged validated membership version and content reuse the
+whole membership. New versions with identical node IDs share immutable graph
+storage, including shares-only or metadata-only updates; changed IDs rebuild
+the graph. Membership byte estimates are cached at construction and read in
+constant time, but each snapshot's estimate includes the full shared graph.
+Summing them, as the publication grace budget does, is conservative rather than
+deduplicated allocation accounting.
+
+Live control updates prepare membership off the I/O polling thread. The
+publication store admits one unfinished preparation job with no queued backlog;
+additional preparation is rejected as overloaded until it finishes. Canceling
+the waiter or reaching its deadline does not interrupt a running CPU job or
+free its admission slot. Preparation does not publish by itself. Shutdown joins
+the owned job rather than detaching it, so cleanup may wait beyond the request
+deadline: the join has no independent timeout. Bounded input and job count are
+not a hard wall-clock shutdown guarantee.
+
+Routing selection uses `/next-hop/v5`, which independently length-prefixes the
+seed, source ID, and destination ID. Both ring edges and next-hop selection
+change routing compatibility. **Coordinate the cluster version transition and
+quiesce traffic until all participating dataplanes use the same routing
+implementation.** Matching membership version numbers do not negotiate the
+algorithm, and no automatic safe mixed-version routing is assumed. The
+placement slot, weighted rendezvous algorithm, and placement hash compatibility
+are unchanged for identical application keys, node IDs, and shares; that does
+not make mixed routing safe.
+
+Remove obsolete `RACER_ROUTING_ALGORITHM` and `RACER_CACHED_RANKINGS` settings:
+even empty values fail startup. Use the independent cache settings above, not
+an algorithm selector or the old ranking-entry setting.
+
+## Controller and workload wiring
+
+`racer-config` holds controller settings and operator workload inputs. Listener changes
+also require matching Services, probes, network policy, and monitoring configuration.
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `RACER_CONTROL_ADDRESS` | `:8443` | Controller HTTPS listener |
+| `RACER_HANDSHAKE_TIMEOUT` | `5s` | Controller TLS handshake deadline; positive duration |
+| `RACER_METRICS_ADDRESS` / `RACER_PROBE_ADDRESS` | `:8080` / `:8081` | Controller metrics / health and readiness listeners |
+| `RACER_PEER_PORT` | `8082` | Managed dataplane peer listener and membership publication; 1024..65535 |
+| `RACER_DIAGNOSTICS_PORT` | Unset | Managed dataplane defaults to 9090, or 9091 if peer port is 9090; explicit port must be 1024..65535 and distinct |
+| `RACER_HOST_NETWORK` | `false` | Explicit Racer host-network opt-in; not implied by RDMA |
+| `RACER_POD_NETWORK_NODES` | Unset | JSON array of node names kept on pod networking when host networking is enabled; operator drains before moving between workloads |
+| `RACER_SNAPSHOT_MAX_AGE` | `30s` | Maximum replicated snapshot age |
+| `RACER_CERTIFICATE_LIFETIME` | `24h` | Dataplane leaf lifetime; 2 minutes..24 hours |
+| `RACER_ROTATION_INTERVAL` / `RACER_ROTATION_PREPARE_FOR` / `RACER_ROTATION_RETAIN_FOR` | `24h` / `1h` / `48h` | Issuer/key rotation policy; interval must cover preparation and retention must cover leaf lifetime |
+
+Duration settings use Go syntax and positive whole seconds. Quiesce traffic for peer-port
+transitions; do not independently override the dataplane listener and published port.
+
+Controller HTTPS admission is per process, including replication traffic. The Go
+`Config.Limits` defaults allow `2 * wire.MaxMembers + 128` open connections (room
+for independent snapshot and keyring polls), 32 concurrent TLS handshakes, 32
+concurrent bearer-authenticated operations, and 128 concurrent response writes.
+These concurrency counts are programmatic limits, not environment tuning keys.
+A connection retains its slot until its socket closes, including silent TCP peers, TLS peers, idle
+keep-alives, and long polls. Handshakes retain a separate slot until success or
+failure and use `RACER_HANDSHAKE_TIMEOUT` (default `5s`). Excess connections or
+handshakes are closed before HTTP without a queued waiter or overload response. Completed TLS
+connections do not retain handshake slots. Request authentication and poll
+admission remain independent; shutdown forcibly closes all admitted sockets.
+Readiness also requires the cached serving certificate's DNS SANs to match the
+configured replication server name. A valid certificate for another service is
+not ready; reloading a correctly named certificate restores this readiness gate.
+
+Restrict HTTPS ingress to required clients, dataplanes, and controller replicas;
+replication also needs direct controller Pod-to-Pod access. Preserve kubelet probe,
+monitoring, DNS, and Kubernetes API access. NetworkPolicy enforcement depends on
+the CNI, especially for host-network Pods and external clients. Use host or upstream
+network controls where Pod policy cannot enforce the boundary. The deployment
+does not impose a policy that would block these installation-specific paths.
+
+Standalone rendering creates an installation marker only with
+`InitializationState=fresh` and an explicit new `ClusterID` UUID. Initialization
+requires `staged-v1`. Later renders omit the marker: preserve the actual immutable
+controller-finalized object and its UID commitments, not a regenerated consumed
+manifest. Exclude it from pruning. Never recreate committed authority under the
+same UUID.
+
+Go wire codec byte limits (64 KiB for bootstrap, 512 KiB for keyring bundles,
+and 64 MiB for publications) bound encoded documents, not total heap usage.
+The decoder buffers the bounded document, validates tokens against the schema,
+then decodes typed state. It rejects unknown or duplicate fields and wrong shapes
+without traversing their contents, and rejects excess members or RDMA NICs before
+consuming the next element. Validation does not retain a generic JSON tree.
+Buffers, individual tokens, base64 validation, typed collections, and subsequent
+semantic validation still allocate memory; the byte cap is not a process memory
+budget or a substitute for concurrency limits.
+
+The operator owns identity/wiring: cluster UUID, URL, images, service accounts, trust,
+replication identity, and durable resource names. These are not tuning keys. Node identity
+comes from verified enrollment/local recovery, not a supplied Node name/UID. Do not reset
+markers, credentials, or version counters to repair an existing identity.
+
+Before any manager runnable starts, controller startup recovery has a 30-second
+total deadline covering authoritative installation reads, initialization writes,
+and final version validation. Caller cancellation or an earlier caller deadline
+still applies. The competing-installer wait retains its own five-second limit
+within that total budget. Recovery failure aborts startup without granting serving
+authority; a timeout does not authorize resetting durable state.
+
+The **bare binary** defaults `RACER_PEER_LISTEN` to `0.0.0.0:7443` and
+`RACER_DIAGNOSTICS_LISTEN` to `127.0.0.1:9090`. Managed workloads bind both to the Pod IP
+with the ports above. The operator also wires trust/token paths and
+`/var/lib/racer/identity/private`; standalone defaults do not replace managed wiring.
+
+### Membership and credential reconciliation
+
+Endpoint selection uses the newest eligible Pod controlled by the current managed
+DaemonSet, breaking creation-time ties by Pod UID. Failed, Succeeded, terminating,
+and IP-less Pods are not eligible. Readiness does not gate membership. Pod phase
+changes trigger reconciliation; readiness-only changes do not. A previously admitted
+Node retains its last endpoint across discovery gaps, while a never-admitted Node
+with no eligible endpoint is omitted.
+
+A custom `RACER_DAEMONSET_NAME` must be a valid DNS subdomain and fit a Kubernetes
+label value (at most 63 characters), because it also identifies the workload's
+immutable instance selector.
+
+Issued leaves start validity one minute before issuance to tolerate modest clock
+skew, matching issuer roots. Expiration remains issuance time plus
+`RACER_CERTIFICATE_LIFETIME`; the skew allowance does not extend expiration or grant
+server-auth usage. Clocks must still be synchronized. A staged issuer must cover
+its actual activation, the full interval until its replacement activates, and the
+last issued leaf's lifetime. If that horizon no longer fits, the controller stages
+a fresh issuer and waits a complete preparation period instead of activating the
+stale issuer.
+
+Topology and keyring reconciliation retry dependency-local timeouts or cancellation
+errors while their reconcile context remains live. Cancellation or expiration of
+the reconcile context itself is terminal for that operation.
+
+## Diagnostics and metrics
+
+| Dataplane HTTP path | Use |
+|---------------------|-----|
+| `/healthz` | Process liveness |
+| `/readyz` | Serving readiness, including usable admission |
+| `/metrics` | Prometheus metrics, including `racer_ready` and `racer_live` |
+| `/debug/membership` | Applied membership state |
+| `/debug/failures` | Bounded failure diagnostics |
+| `/debug/pprof/profile?seconds=30` | Opt-in native CPU profile |
+
+CPU profiling is disabled by default. Set the dataplane environment variable
+`RACER_PPROF_ENABLED=true` to enable it; only the exact values `true` and `false`
+are accepted. Use `GET /debug/pprof/profile` on the existing diagnostics listener.
+The optional `seconds` parameter defaults to 30 and must be an integer from 1 to 60.
+Duplicate or unknown parameters return 400. Other methods return 405. Disabled
+profiling returns 404, a concurrent capture or download returns 409, and unavailable
+native sampling or denied perf permissions return 503 with a fixed error code.
+
+The response is a raw pprof protobuf download, capped at 16 MiB. Capture and download
+share a deadline of the requested duration plus 15 seconds, at most 75 seconds.
+Headers still have a two-second deadline. One helper performs CPU sampling and
+encoding; metrics and health remain available during capture. Profiling uses one
+process-wide diagnostic memory reservation (192 MiB, including the output), not a
+16 MiB charge on every worker's request-context quota. This reservation is not a
+strict process RSS limit. Two extra diagnostic reactor slots and their bookkeeping
+are reserved. The enabled per-worker queue floor is nine slots instead of seven;
+small configured budgets can reduce worker count or fail startup. Profiling does
+not increase configured request or queue budgets automatically.
+Shutdown stops new captures, requests cancellation early, and waits for helper cleanup.
+Socket resets and full hangups cancel capture. A TCP FIN alone cannot distinguish a
+disconnected client from a client that closed only its write side, so capture can
+continue until completion or the bounded deadline in that case.
+
+Profiles can contain process addresses and executable paths. This endpoint has no
+authentication and uses the existing listener: localhost for the bare binary, but
+the Pod IP in managed workloads. Restrict network access before opting in. Do not
+expose profiles publicly or grant broad container privileges just to bypass a perf
+permission error.
+
+This endpoint captures native CPU samples only, not heap or goroutine profiles.
+For a standalone listener, save and inspect a profile with the matching binary:
+
+```sh
+curl --fail --max-time 75 'http://127.0.0.1:9090/debug/pprof/profile?seconds=30' -o profile.pb
+go tool pprof -top ./racer-dataplane profile.pb
+```
+
+Keep the exact binary and its debug information for symbol resolution. Userspace
+frames outside the recorded executable mappings keep their raw address with an
+unknown mapping. They do not discard the profile or receive an invented mapping.
+Profile comments count unknown locations, frame references, and affected
+aggregated samples; these are not CPU-time or lost-sample counts. A changed
+executable mapping snapshot still rejects capture with `mapping_changed`.
+
+Native capture requires kernel perf access; the endpoint does not change host perf
+settings, container capabilities, or seccomp policy. Release builds retain frame
+pointers even when profiling is disabled. That compiler change can affect CPU
+performance, so comparisons with older binaries are not profiling-only comparisons.
+
+Monitor `racer_requests_total`, `racer_request_errors_total`, `racer_overloads_total`,
+and per-tier `racer_*_lookup_hits_total` / `racer_*_lookup_misses_total`. Page-source events
+are not request counts or byte rates. A scrape is not readiness. Restrict diagnostics
+network access, especially with host networking.
+
+The [Racer Performance dashboard and provisioning notes](https://github.com/Azure/unbounded/blob/main/deploy/racer/grafana-README.md)
+describe Prometheus labels and Grafana setup. The example port `19090` is installation-specific.
+Persist scrape configuration on workload templates or supported overrides, not only live Pods.
+
+## Go SDK
+
+The Go SDK is `github.com/Azure/unbounded/pkg/racersdk`. Its
+[package documentation](https://pkg.go.dev/github.com/Azure/unbounded/pkg/racersdk)
+is the complete SDK reference, including configuration, the copy and no-copy read
+paths, the origin contract, and error handling. The SDK does not provision volumes
+or origins.
+
+| Socket | Path |
+|--------|------|
+| Client | `/run/racer/<volume>/client/socket` |
+| Origin | `/run/racer/<volume>/origin/socket`, mode `0600` |
+
+For tests, `github.com/Azure/unbounded/pkg/racersdk/racersdktest` runs a
+noncaching fake Racer. It does not test distributed or RDMA behavior.
+
+## RDMA
+
+RDMA is optional per hop. Peers need the same **nonempty Site**, the page's selected rail
+in both published NIC lists, enabled native resources, and compatible local devices.
+Different/missing Sites or unavailable rails retain HTTP, without remapping the page.
+Site uses only `unbounded-cloud.io/site`, not `net.unbounded-cloud.io/site`. It does not
+change placement; in-flight snapshots mean label changes are not immediate revocation.
+
+| `RACER_ENABLE_RDMA` | Behavior |
+|---------------------|----------|
+| `auto` (default) | Reserve native resources only with usable startup hardware; otherwise HTTP-only until restart |
+| `true` | Reserve native capacity even without startup hardware, allowing later discovery to activate devices |
+| `false` | Disable native RDMA |
+
+Release images include native verbs support; discovery/provider failures retain HTTP.
+The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
+
+```json
+[{"device":"mlx5_0","port":1,"rail":0}]
+```
+
+`port` is 1..255; `rail` is 0..65535. Optional `gid` is 32 lowercase hex digits;
+optional `numa_node` is `uint32`. Device/port pairs must be unique; NICs may share a rail.
+Workers prefer same-rail local, then unknown, then remote NUMA, spreading within the best tier.
+
+Absent administrator policy uses active MW2B-capable ports in PCI BDF/port order, reported
+during authenticated enrollment/renewal and published from `enrolled-rdma-nics`. Explicit
+`[]` disables eligibility; a list overrides automatic rails. Discovery cannot infer cabling
+or correct asymmetric initial inventories: use explicit mappings when ordinals do not match.
+
+The private identity directory's `rdma-rails.json` preserves physical-port reservations
+across renewal/restart: missing ports retain rails; new ports append. Do not delete it
+independently of coordinated topology changes. Corruption fails enrollment instead of renumbering rails.
+
+Dataplanes run privileged as root with escalation allowed and a read-only root filesystem.
+HostPaths `/var/lib/racer/identity`, `/var/lib/racer/slabs`, and `/run/racer` are writable;
+host `/dev` at `/host/dev` and `/dev/infiniband` are read-only for directory entries,
+not device-I/O isolation. Raw cache writes through `/host/dev` are intentional. This is
+hostPath access, not device-plugin/CDI allocation or a host security boundary. Kubelet may
+create an empty device directory on HTTP-only nodes; Racer does not provision drivers/devices.
+
+Verify from the actual Pod namespaces:
+
+- Compatible drivers/firmware/providers, active MW2B ports, and sufficient pinned-memory/resources.
+- Visible `/sys/class/infiniband`, `/sys/class/infiniband_verbs`, and `/sys/devices`
+  targets; no host `/sys` mount is automatically added.
+- RDMA namespace mode allows device access. Privilege/mounts do not override exclusive
+  namespace ownership; explicitly enable host networking if needed, reviewing port exposure/conflicts.
+- RoCE has the correct namespace-local Ethernet device, address, routing, and GID.
+  The adapter uses **GID index 0**. Annotation `gid` is a matching constraint, not an index
+  selector or RoCE configuration; retain HTTP when another index is required.
+
+Coordinate controller/dataplane upgrades and quiesce traffic. The `rails`/`alignment_enabled`
+to `rdma_nics` change breaks compatibility despite wire schema version 1; rolling updates
+do not make mixed versions safe. Remove `RACER_RAILS`, `RACER_ALIGNED_RAILS`,
+`RACER_FABRIC_PORTS`, and `RACER_FABRIC_PORTS_FILE`: even empty values fail startup.
+Validate transfers, HTTP fallback, and recovery on target hardware before relying on RDMA.

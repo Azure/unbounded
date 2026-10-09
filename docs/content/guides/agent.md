@@ -116,7 +116,7 @@ hand. A minimal example:
   "Cluster": {
     "CaCertBase64": "<base64-encoded CA certificate>",
     "ClusterDNS": "10.0.0.10",
-    "Version": "1.33.1"
+    "Version": "1.34.1"
   },
   "Kubelet": {
     "ApiServer": "https://api.example.com:6443",
@@ -404,7 +404,7 @@ kubectl get nodes -o wide
 
 ```
 NAME       STATUS   ROLES    AGE   VERSION   INTERNAL-IP      EXTERNAL-IP   OS-IMAGE               KERNEL-VERSION      CONTAINER-RUNTIME
-my-node    Ready    <none>   20s   v1.33.1   192.168.100.10   <none>        Ubuntu 24.04.4 LTS     6.8.0-106-generic   containerd://2.0.4
+my-node    Ready    <none>   20s   v1.34.1   192.168.100.10   <none>        Ubuntu 24.04.4 LTS     6.8.0-106-generic   containerd://2.0.4
 ```
 
 ## GPU Support
