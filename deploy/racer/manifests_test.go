@@ -20,7 +20,7 @@ import (
 func TestEmbeddedInventoryIsControllerOnly(t *testing.T) {
 	files, err := fs.Glob(manifests.Manifests, "*")
 	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"config.yaml", "controller.yaml", "controller-pdb.yaml", "create-restriction.yaml", "node-restriction.yaml", "rbac.yaml"}, files)
+	require.ElementsMatch(t, []string{"config.yaml", "controller.yaml", "controller-pdb.yaml", "node-restriction.yaml", "rbac.yaml"}, files)
 
 	for _, namespace := range []string{"unbounded-system", "custom-system"} {
 		t.Run(namespace, func(t *testing.T) {
@@ -82,7 +82,6 @@ func TestEmbeddedInventoryIsControllerOnly(t *testing.T) {
 			require.ElementsMatch(t, []string{
 				"ConfigMap/racer-config", "Deployment/racer-controller", "Service/racer-controller", "PodDisruptionBudget/racer-controller",
 				"ServiceAccount/racer-controller", "Role/racer-controller", "RoleBinding/racer-controller", "ClusterRole/racer-controller", "ClusterRoleBinding/racer-controller",
-				"ValidatingAdmissionPolicy/racer-runtime-write-restriction", "ValidatingAdmissionPolicyBinding/racer-runtime-write-restriction",
 				"ValidatingAdmissionPolicy/racer-node-write-restriction", "ValidatingAdmissionPolicyBinding/racer-node-write-restriction",
 			}, inventory)
 		})

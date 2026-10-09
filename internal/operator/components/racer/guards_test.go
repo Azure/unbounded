@@ -25,6 +25,30 @@ import (
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
+const retiredRuntimeGuard = "racer-runtime-write-restriction"
+
+var testedGuardNames = []string{retiredRuntimeGuard, "racer-node-write-restriction"}
+
+// Stand in for policies left by an older installation. Their contents no longer
+// matter to the operator, which must neither repair nor delete them.
+func seedRetiredGuard(t *testing.T, env *component.Env) {
+	t.Helper()
+
+	for _, obj := range []client.Object{&admissionv1.ValidatingAdmissionPolicy{}, &admissionv1.ValidatingAdmissionPolicyBinding{}} {
+		require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: guardNames[0]}, obj))
+		obj.SetName(retiredRuntimeGuard)
+		obj.SetUID("")
+		obj.SetResourceVersion("")
+		obj.SetManagedFields(nil)
+
+		if binding, ok := obj.(*admissionv1.ValidatingAdmissionPolicyBinding); ok {
+			binding.Spec.PolicyName = retiredRuntimeGuard
+		}
+
+		require.NoError(t, env.Client.Create(t.Context(), obj))
+	}
+}
+
 func assertControllerBindings(t *testing.T, env *component.Env, present bool) {
 	t.Helper()
 
@@ -42,21 +66,28 @@ func assertControllerBindings(t *testing.T, env *component.Env, present bool) {
 }
 
 func TestGuardContainmentRetainedInstallation(t *testing.T) {
-	for _, name := range guardNames {
+	for _, name := range testedGuardNames {
 		for _, guard := range []client.Object{&admissionv1.ValidatingAdmissionPolicy{}, &admissionv1.ValidatingAdmissionPolicyBinding{}} {
 			t.Run(fmt.Sprintf("%s/%T", name, guard), func(t *testing.T) {
 				env := testEnv(t, cacheObject("cache"))
 				initialize(t, env)
+				seedRetiredGuard(t, env)
 
 				before := &corev1.Secret{}
 				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), before))
 				guard.SetName(name)
 				require.NoError(t, env.Client.Delete(t.Context(), guard))
 				require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
+
 				plan := planPass(t, env)
-				require.Len(t, plan.Operations, 2)
+				if name == retiredRuntimeGuard {
+					require.Zero(t, plan.Len())
+				} else {
+					require.Len(t, plan.Operations, 2)
+				}
+
 				persist(t, env, plan)
-				assertControllerBindings(t, env, false)
+				assertControllerBindings(t, env, name == retiredRuntimeGuard)
 				require.Zero(t, planPass(t, env).Len())
 
 				for _, obj := range []client.Object{
@@ -92,7 +123,7 @@ func TestGuardContainmentReaderFailures(t *testing.T) {
 
 			env.APIReader = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
 				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if key.Name == guardNames[1] {
+					if _, binding := obj.(*admissionv1.ValidatingAdmissionPolicyBinding); binding && key.Name == guardNames[0] {
 						return errors.New("guard read unavailable")
 					}
 
@@ -153,9 +184,9 @@ func TestGuardContainmentRetriesFailedDeletion(t *testing.T) {
 func TestGuardWatch(t *testing.T) {
 	p := guardPredicate()
 
-	for _, name := range append([]string{"unrelated"}, guardNames...) {
+	for _, name := range append([]string{"unrelated"}, testedGuardNames...) {
 		obj := &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: name}}
-		want := name != "unrelated"
+		want := name == guardNames[0]
 		require.Equal(t, want, p.Create(event.CreateEvent{Object: obj}))
 		require.Equal(t, want, p.Delete(event.DeleteEvent{Object: obj}))
 		require.Equal(t, want, p.Update(event.UpdateEvent{ObjectOld: obj, ObjectNew: obj.DeepCopy()}))
@@ -216,7 +247,7 @@ func TestGuardContainmentRevokesBindingsIndependently(t *testing.T) {
 						require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
 					}
 
-					guard := &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: guardNames[1]}}
+					guard := &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: guardNames[0]}}
 					require.NoError(t, env.Client.Delete(t.Context(), guard))
 
 					var blocked, owned client.Object = &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: controllerName, Namespace: env.Namespace}}, &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: controllerName}}
@@ -348,11 +379,12 @@ func TestGuardContainmentSpecTampering(t *testing.T) {
 		}},
 	}
 	for _, retained := range []bool{false, true} {
-		for _, name := range guardNames {
+		for _, name := range testedGuardNames {
 			for _, tc := range cases {
 				t.Run(fmt.Sprintf("retained=%t/%s/%s", retained, name, tc.name), func(t *testing.T) {
 					env := testEnv(t, cacheObject("cache"))
 					initialize(t, env)
+					seedRetiredGuard(t, env)
 
 					guard := tc.object()
 					require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: name}, guard))
@@ -365,6 +397,18 @@ func TestGuardContainmentSpecTampering(t *testing.T) {
 					}
 
 					plan := planPass(t, env)
+
+					if name == retiredRuntimeGuard {
+						before := guard.DeepCopyObject()
+
+						persist(t, env, plan)
+						assertControllerBindings(t, env, true)
+						require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: name}, guard))
+						require.Equal(t, before, guard)
+
+						return
+					}
+
 					require.Len(t, plan.Operations, 2)
 
 					for _, op := range plan.Operations {
@@ -454,8 +498,9 @@ func TestGuardContainmentFailedSpecRepair(t *testing.T) {
 func TestGuardContainmentManifestDefaults(t *testing.T) {
 	env := testEnv(t, cacheObject("cache"))
 	initialize(t, env)
+	seedRetiredGuard(t, env)
 
-	for _, name := range guardNames {
+	for _, name := range testedGuardNames {
 		policy := &admissionv1.ValidatingAdmissionPolicy{}
 		require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: name}, policy))
 		require.Contains(t, policy.Spec.MatchConditions[0].Expression, ":custom-system:")

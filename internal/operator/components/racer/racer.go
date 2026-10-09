@@ -193,7 +193,7 @@ func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*com
 }
 
 func decodeRuntimeManifests(env *component.Env) ([]*unstructured.Unstructured, error) {
-	return env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml"}, nil)
+	return env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml"}, nil)
 }
 
 func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) error {

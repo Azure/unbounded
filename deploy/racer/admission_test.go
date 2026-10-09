@@ -43,7 +43,7 @@ func TestEnvtestControllerAdmission(t *testing.T) {
 			ctx := t.Context()
 			require.NoError(t, admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}))
 			env := &component.Env{Namespace: namespace}
-			objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "node-restriction.yaml", "rbac.yaml"}, nil)
+			objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml"}, nil)
 			require.NoError(t, err)
 
 			for _, obj := range objects {
@@ -74,9 +74,9 @@ func TestEnvtestControllerAdmission(t *testing.T) {
 				require.NoError(c, controller.Update(ctx, credentials.DeepCopy(), client.DryRunAll))
 				require.NoError(c, patch(`{"metadata":{"annotations":{"racer.unbounded-cloud.io/enrolled-shares":"1"}}}`))
 
-				invalid := credentials.DeepCopy()
-				invalid.Annotations = map[string]string{corev1.ServiceAccountNameKey: "racer-controller"}
-				require.ErrorContains(c, controller.Update(ctx, invalid, client.DryRunAll), "racer-runtime-write-restriction")
+				annotated := credentials.DeepCopy()
+				annotated.Annotations = map[string]string{corev1.ServiceAccountNameKey: "racer-controller"}
+				require.NoError(c, controller.Update(ctx, annotated, client.DryRunAll))
 				require.ErrorContains(c, patch(`{"spec":{"unschedulable":true}}`), "racer-node-write-restriction")
 			}, 15*time.Second, 100*time.Millisecond)
 
@@ -92,7 +92,8 @@ func TestEnvtestControllerAdmission(t *testing.T) {
 			for _, key := range []string{corev1.ServiceAccountNameKey, corev1.ServiceAccountUIDKey} {
 				obj := credentials.DeepCopy()
 				obj.Annotations = map[string]string{key: ""}
-				require.ErrorContains(t, controller.Update(ctx, obj, client.DryRunAll), "racer-runtime-write-restriction")
+				// Annotations cannot turn an Opaque Secret into a token Secret.
+				require.NoError(t, controller.Update(ctx, obj, client.DryRunAll))
 			}
 
 			obj := credentials.DeepCopy()
