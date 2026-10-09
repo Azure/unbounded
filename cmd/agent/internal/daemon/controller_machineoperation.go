@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -29,6 +30,9 @@ type machineOperationTarget struct {
 	machineName          string
 	nodeOperator         nodeOperator
 	agentUpgradeLockPath string
+	// restartScheduled is set once this daemon has staged an AgentUpgrade and
+	// scheduled its own restart; see reconcileAgentUpgrade.
+	restartScheduled atomic.Bool
 }
 
 func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
@@ -70,6 +74,21 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 }
 
 func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+	// The restart this daemon scheduled runs a moment after it returns, from
+	// the binary it staged. Until then the operation it staged is InProgress
+	// but not finished, so it can be reconciled again, and staging again would
+	// switch the slots back. The restarted daemon reports that operation from
+	// the pending signal, and picks up any other that is still Pending when it
+	// starts watching, so this daemon takes no further AgentUpgrade. It goes by
+	// what this process did rather than by the signal file, which a daemon that
+	// failed to report it at startup can leave behind.
+	if t.restartScheduled.Load() {
+		t.log.Info("not starting an AgentUpgrade: this daemon is about to be restarted for one it staged",
+			"operation", op.Name)
+
+		return ctrl.Result{}, nil
+	}
+
 	installationLock, err := t.installation.AcquireMutationLock()
 	if errors.Is(err, installstate.ErrLockHeld) {
 		return ctrl.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
@@ -138,6 +157,8 @@ func (t *machineOperationTarget) reconcileAgentUpgrade(ctx context.Context, stor
 
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
+
+	t.restartScheduled.Store(true)
 
 	return ctrl.Result{}, nil
 }
