@@ -6,7 +6,9 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 // The move itself is tested in internal/hostroot.
@@ -133,5 +136,72 @@ func TestAwaitReplacement(t *testing.T) {
 
 		err := awaitReplacement(ctx, discardLogger(), time.Hour)
 		require.ErrorIs(t, err, context.Canceled)
+	})
+}
+
+// TestRestartFromHostRoot: the move's planned restart must not be refused for
+// the unit's start limit, so the limit is cleared first, on this unit alone,
+// and a denied reset does not stop the restart.
+func TestRestartFromHostRoot(t *testing.T) {
+	t.Parallel()
+
+	// fakeSystemctl records its arguments, one per line, and exits with code.
+	fakeSystemctl := func(t *testing.T, code int) (func(context.Context) *exec.Cmd, string) {
+		t.Helper()
+
+		dir := t.TempDir()
+		calls := filepath.Join(dir, "calls")
+		script := filepath.Join(dir, "systemctl")
+		require.NoError(t, os.WriteFile(script,
+			fmt.Appendf(nil, "#!/bin/sh\nprintf '%%s\\n' \"$@\" >> %q\nexit %d\n", calls, code), 0o755))
+
+		return func(ctx context.Context) *exec.Cmd { return exec.CommandContext(ctx, script) }, calls
+	}
+
+	t.Run("clears this unit's start limit before restarting", func(t *testing.T) {
+		t.Parallel()
+
+		systemctl, calls := fakeSystemctl(t, 0)
+
+		var atRestart []byte
+
+		err := restartFromHostRoot(t.Context(), discardLogger(), systemctl, func(context.Context) error {
+			var err error
+
+			atRestart, err = os.ReadFile(calls)
+
+			return err
+		})
+		require.NoError(t, err)
+		// Named, so systemd resets this unit and not every unit on the host.
+		assert.Equal(t, "reset-failed\n"+goalstates.DaemonUnit+"\n", string(atRestart))
+	})
+
+	t.Run("restarts when the reset is denied", func(t *testing.T) {
+		t.Parallel()
+
+		systemctl, calls := fakeSystemctl(t, 1)
+		restarted := false
+
+		err := restartFromHostRoot(t.Context(), discardLogger(), systemctl, func(context.Context) error {
+			restarted = true
+
+			return nil
+		})
+		require.NoError(t, err)
+		assert.True(t, restarted)
+		assert.FileExists(t, calls)
+	})
+
+	t.Run("reports a failed restart", func(t *testing.T) {
+		t.Parallel()
+
+		systemctl, _ := fakeSystemctl(t, 0)
+		restartErr := errors.New("restart failed")
+
+		err := restartFromHostRoot(t.Context(), discardLogger(), systemctl, func(context.Context) error {
+			return restartErr
+		})
+		require.ErrorIs(t, err, restartErr)
 	})
 }

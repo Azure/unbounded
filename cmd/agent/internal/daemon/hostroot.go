@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
@@ -112,9 +114,44 @@ func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOpera
 		},
 		Verify: verifyMovedDaemon,
 		Restart: func(ctx context.Context) error {
-			return operator.RestartAgentDaemon(ctx, log)
+			return restartFromHostRoot(ctx, log, executil.Systemctl(), func(ctx context.Context) error {
+				return operator.RestartAgentDaemon(ctx, log)
+			})
 		},
 	})
+}
+
+// restartFromHostRoot clears the daemon unit's start limit, then restarts it
+// from the rewritten units.
+//
+// The move's restart is planned, but systemd counts it against the unit's
+// StartLimitBurst like any other start. Right after a burst of starts, such as
+// AgentUpgrades in quick succession, it can be the one that exceeds the limit.
+// systemd then refuses it and runs OnFailure, and the recovery script rolls the
+// daemon back to last-good. No AgentUpgrade is pending by then, so nothing
+// records that it happened.
+//
+// systemctl reset-failed on this unit zeroes its start counter and leaves every
+// other unit alone. It must name the unit: with no name it resets every unit on
+// the host. Before systemd v255 the daemon-reload that rewriting the units runs
+// zeroes the counter too, but from v255 the counter survives a reload. An
+// AgentUpgrade's own restart does not need this: if systemd refuses it,
+// recovery finds the upgrade pending and reports it.
+//
+// It is best-effort, as in the recovery script: SELinux can deny it, and the
+// restart is worth trying either way.
+func restartFromHostRoot(
+	ctx context.Context,
+	log *slog.Logger,
+	systemctl func(context.Context) *exec.Cmd,
+	restart func(context.Context) error,
+) error {
+	if err := executil.RunCmd(ctx, log, systemctl, "reset-failed", goalstates.DaemonUnit); err != nil {
+		log.Warn("could not clear the daemon unit's start limit; restarting it from the host root anyway",
+			"unit", goalstates.DaemonUnit, "error", err)
+	}
+
+	return restart(ctx)
 }
 
 // verifyMovedDaemon runs the current daemon binary from a copy of the layout

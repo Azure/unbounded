@@ -56,7 +56,10 @@ type MoveOptions struct {
 	Verify func(ctx context.Context, root string) error
 	// Restart restarts the daemon from the rewritten units, so it runs from
 	// the root. It may only queue the restart; the caller must not carry on
-	// as the running daemon when ReconcileMove reports it.
+	// as the running daemon when ReconcileMove reports it. systemd counts
+	// this planned restart against the unit's start limit, so a caller should
+	// clear the unit's start limit first, with systemctl reset-failed <unit>,
+	// or a refused restart strands the move.
 	Restart func(context.Context) error
 }
 

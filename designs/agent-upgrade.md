@@ -78,9 +78,12 @@ nothing is removed while the daemon still runs from it:
    start tries the move again.
 5. Rewrite the daemon and recovery units, the recovery script, the LocalDNS
    network unit and the nspawn lifecycle hooks, and reload systemd.
-6. Restart the daemon, which is still running from `/usr/local`. It releases
-   the installation lock, takes no work, and waits to be replaced, exiting with
-   an error after two minutes so the unit's `Restart=` starts it instead.
+6. Restart the daemon, which is still running from `/usr/local`. It first runs
+   `systemctl reset-failed` on the daemon unit, so this planned restart is not
+   refused for a start limit that earlier starts used up; from systemd v255 a
+   `daemon-reload` no longer clears it. It releases the installation lock, takes
+   no work, and waits to be replaced, exiting with an error after two minutes so
+   the unit's `Restart=` starts it instead.
 7. The restarted daemon, running from `/opt/unbounded/agent`, finds the marker
    and repeats steps 3 and 5, then removes the layout from `/usr/local`, the
    digest record and the `.moving` marker. It does not restart again. Running
