@@ -104,6 +104,12 @@ func TestState(t *testing.T) {
 			got, err := state(l.root, l.legacy)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
+
+			// Only a finished installation under the root counts: on every
+			// other host the legacy files may still be in use.
+			done, err := installed(l.root, l.legacy)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want == StateInstalled, done, "installed")
 		})
 	}
 }

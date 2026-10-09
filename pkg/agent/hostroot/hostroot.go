@@ -91,6 +91,15 @@ func Prepare(ctx context.Context, log *slog.Logger, subdirs ...string) error {
 	return impl.Prepare(ctx, log, subdirs...)
 }
 
+// Installed reports whether Path is a real directory holding a finished
+// installation: not missing, not a link to LegacyPath or anywhere else, and not
+// partway through a move by ReconcileMove. Until it is, files under LegacyPath
+// may still be in use, even ones the install scripts leave there for older
+// releases, so an agent removes nothing there before it reports true.
+func Installed() (bool, error) {
+	return impl.Installed()
+}
+
 // MoveOptions describes what ReconcileMove moves and how the agent follows it:
 // the agent's files and directories under the root, where binaries that know
 // the host root are recorded, the AgentUpgrade signal and blue-green links that

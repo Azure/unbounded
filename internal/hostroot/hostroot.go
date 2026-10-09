@@ -69,6 +69,17 @@ func CurrentState() (State, error) {
 	return state(Path, LegacyPath)
 }
 
+// Installed is documented in pkg/agent/hostroot.
+func Installed() (bool, error) {
+	return installed(Path, LegacyPath)
+}
+
+func installed(root, legacy string) (bool, error) {
+	current, err := state(root, legacy)
+
+	return current == StateInstalled, err
+}
+
 func state(root, legacy string) (State, error) {
 	info, err := os.Lstat(root)
 
