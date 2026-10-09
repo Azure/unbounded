@@ -23,6 +23,7 @@ GO_PACKAGE_DIRS=$(shell $(GOCMD) list -tags e2e -f '{{.Dir}}' $(GO_PACKAGE_PATTE
 
 CONTAINER_ENGINE ?= podman
 CONTAINER_REGISTRY ?= ghcr.io/azure
+RACER_OBJECT_IMAGE ?= $(CONTAINER_REGISTRY)/racer-object:$(VERSION_TAG)
 
 # Unified install namespace for all unbounded components. Each component's
 # *_NAMESPACE var derives from this by default, so overriding UNBOUNDED_NAMESPACE
@@ -237,7 +238,7 @@ REACT_DEV ?= false
 
 ##@ General
 
-all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry ## Build all binaries (default)
+all: kubectl-unbounded forge relctl machina machine-ops-controller token-refresher unbounded-operator unbounded-net-controller unbounded-net-node unbounded-net-routeplan-debug unping unroute gantry racer-object ## Build all binaries (default)
 
 help: ## Show this help
 	@echo ""
@@ -295,6 +296,9 @@ help: ## Show this help
 	@echo "  unbounded-net-routeplan-debug    Build net routeplan debug tool"
 	@echo "  unping                           Build unping health-check utility"
 	@echo "  unroute                          Build unroute eBPF inspection utility"
+	@echo "  racer-object                     Test and build the S3 read adapter"
+	@echo "  racer-object-build               Build the S3 read adapter without tests"
+	@echo "  racer-object-test                Test the S3 read adapter"
 	@echo ""
 	@echo "Container Images (local, single-arch):"
 	@echo "  image-inventory-all-local        Build all local inventory container images"
@@ -312,6 +316,7 @@ help: ## Show this help
 	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
 	@echo "  image-unbounded-operator-push    Build and push unbounded-operator image"
 	@echo "  image-playpen-local              Build playpen image"
+	@echo "  image-racer-object-local         Build the S3 read adapter image locally"
 	@echo "  image-net-controller-local       Build unbounded-net-controller image"
 	@echo "  image-net-controller-push        Build and push unbounded-net-controller image"
 	@echo "  image-net-node-local             Build unbounded-net-node image"
@@ -794,6 +799,26 @@ unroute-build: ## Build the unroute utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
 
 unroute: test unroute-build ## Build the unroute utility (implies test)
+
+##@ Racer Object (S3 read adapter)
+
+.PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
+racer-object: racer-object-test racer-object-build ## Test and build the S3 read adapter
+
+racer-object-build: ## Build the S3 read adapter without lint/test
+	@mkdir -p bin
+	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-object ./cmd/racer-object
+
+racer-object-test: ## Test the S3 read adapter
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m ./cmd/racer-object/... ./internal/racer/object/...
+
+image-racer-object-local: ## Build the S3 read adapter image locally (single-arch)
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t racer-object:$(VERSION_TAG) -t $(RACER_OBJECT_IMAGE) \
+		-f ./images/racer-object/Containerfile .
 
 ##@ Gantry (peer-to-peer OCI distribution)
 
