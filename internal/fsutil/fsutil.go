@@ -164,3 +164,14 @@ func FileSHA256(path string) ([sha256.Size]byte, error) {
 
 	return digest, nil
 }
+
+// MountedNoexec reports whether the filesystem holding path is mounted without
+// permission to run programs from it, so a binary placed there cannot run.
+func MountedNoexec(path string) (bool, error) {
+	var fs unix.Statfs_t
+	if err := unix.Statfs(path, &fs); err != nil {
+		return false, fmt.Errorf("inspect the filesystem of %s: %w", path, err)
+	}
+
+	return fs.Flags&unix.ST_NOEXEC != 0, nil
+}

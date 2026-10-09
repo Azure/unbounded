@@ -16,7 +16,6 @@ import (
 	"strings"
 
 	"github.com/google/renameio/v2"
-	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/internal/fsutil"
 )
@@ -103,7 +102,7 @@ func ReconcileMove(ctx context.Context, log *slog.Logger, opts MoveOptions) (boo
 	return reconcileMove(ctx, log, Path, LegacyPath, opts, moveHost{
 		executable: os.Executable,
 		relabel:    restoreLabels,
-		noexec:     mountedNoexec,
+		noexec:     fsutil.MountedNoexec,
 	})
 }
 
@@ -158,7 +157,7 @@ func reconcileMove(
 	// Verify would catch it too, but only after a full copy, at every start.
 	parent := filepath.Dir(root)
 	if noexec, err := host.noexec(parent); err != nil {
-		return false, fmt.Errorf("inspect the filesystem of %s: %w", parent, err)
+		return false, err
 	} else if noexec {
 		log.Warn("keeping the agent's files under the legacy root: the host root's filesystem is mounted noexec",
 			"path", parent, "legacy", legacy)
@@ -313,17 +312,6 @@ func relink(root, legacy string) error {
 	}
 
 	return nil
-}
-
-// mountedNoexec reports whether the filesystem holding path is mounted
-// without permission to run programs from it.
-func mountedNoexec(path string) (bool, error) {
-	var fs unix.Statfs_t
-	if err := unix.Statfs(path, &fs); err != nil {
-		return false, err
-	}
-
-	return fs.Flags&unix.ST_NOEXEC != 0, nil
 }
 
 // atOrUnder reports whether path is the legacy root or under it, as given or
