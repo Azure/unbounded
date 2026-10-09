@@ -97,8 +97,8 @@ class OverlayTest(unittest.TestCase):
         self.assertEqual(dp["template"]["spec"]["nodeSelector"], {"agentpool": "ddsv6"})
         self.assertEqual(dp["updateStrategy"]["rollingUpdate"]["maxSurge"], 0)
         env = {e["name"]: e["value"] for e in dp["template"]["spec"]["containers"][0]["env"]}
-        for key, value in {"RACER_PLAINTEXT_BYTES": "4294967296",
-                           "RACER_CIPHERTEXT_BYTES": "8589934592",
+        for key, value in {"RACER_PLAINTEXT_BYTES": "8589934592",
+                           "RACER_CIPHERTEXT_BYTES": "17179869184",
                            "RACER_DIRTY_BYTES": "2147483648",
                            "RACER_REGISTERED_BYTES": "2147483648",
                            "RACER_REQUEST_CONTEXT_BYTES": "268435456",
@@ -112,7 +112,7 @@ class OverlayTest(unittest.TestCase):
         dashboard = json.loads((ROOT.parent.parent / "racer/grafana-direct-zipf.json").read_text())
         description = dashboard["description"]
         for value in ("512 x 2147483648-byte", "zipf-balanced-v1", "exponent 0.5",
-                      "4 GiB plaintext", "8 GiB ciphertext",
+                      "8 GiB plaintext", "16 GiB ciphertext",
                       "2 GiB each for dirty and registered", "owned-only"):
             self.assertIn(value, description)
         for panel in dashboard["panels"][:2]:

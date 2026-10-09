@@ -2,10 +2,10 @@
   "id": null,
   "uid": "racer-direct-zipf",
   "title": "Racer Direct Zipf | 512 x 2 GiB | 1 TiB catalog",
-  "description": "Balanced-config experiment: 512 x 2147483648-byte blobs (1 TiB catalog), seed zipf-balanced-v1, Zipf exponent 0.5, owned-only disk retention (admission disabled), 4 GiB plaintext, 8 GiB ciphertext, and 2 GiB each for dirty and registered buffers. Balanced describes the configuration goal, not measured hit shares. Throughput excludes processes started before 2026-10-09 20:05:50 UTC, the 2 GiB rollout boundary. Wait a full five-minute new-pod window after readiness. Successful payload is not wire traffic or verified goodput. Cache-hit event shares are not client attribution. Disk capacity and usage are physical segment bytes, not effective payload capacity.",
+  "description": "Balanced-config experiment: 512 x 2147483648-byte blobs (1 TiB catalog), seed zipf-balanced-v1, Zipf exponent 0.5, owned-only disk retention (admission disabled), 8 GiB plaintext, 16 GiB ciphertext, and 2 GiB each for dirty and registered buffers. Balanced describes the configuration goal, not measured hit shares. Throughput excludes processes started before 2026-10-09 20:05:50 UTC, the 2 GiB rollout boundary. Wait a full five-minute new-pod window after readiness. Successful payload is not wire traffic or verified goodput. Cache-hit event shares are not client attribution. Disk capacity and usage are physical segment bytes, not effective payload capacity.",
   "tags": ["racer", "zipf"],
   "schemaVersion": 39,
-  "version": 3,
+  "version": 4,
   "editable": false,
   "timezone": "browser",
   "refresh": "1m",
@@ -62,14 +62,14 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Average Racer-host CPU (non-idle)",
-      "description": "Mean non-idle fraction per host, then an equal-weight mean across discovered Racer hosts with CPU samples. Includes all host workloads and I/O wait, not just Racer. Missing host CPU series are not zero. System-only nodes are excluded by the Racer node join.",
+      "title": "Average busy logical cores per Racer node",
+      "description": "Sum of per-CPU non-idle fractions per host, then an equal-weight mean across discovered Racer hosts with CPU samples. Logical cores, not a percentage or total cluster cores. Includes all host workloads and I/O wait, not just Racer. Missing host CPU series are not zero. System-only nodes are excluded by the Racer node join.",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "gridPos": {"h": 9, "w": 12, "x": 12, "y": 9},
-      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "decimals": 1, "noValue": "No data"}, "overrides": []},
+      "fieldConfig": {"defaults": {"unit": "suffix:cores", "min": 0, "decimals": 1, "noValue": "No data"}, "overrides": []},
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
       "targets": [
-        {"refId": "A", "legendFormat": "Mean host non-idle CPU", "expr": "avg((1 - avg by (node) (rate(node_cpu_seconds_total{job=\"node-exporter\",mode=\"idle\"}[5m]))) and on (node) group by (node) (up{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}))"}
+        {"refId": "A", "legendFormat": "Mean busy logical cores per node", "expr": "avg(sum by (node) (1 - rate(node_cpu_seconds_total{job=\"node-exporter\",mode=\"idle\"}[5m])) and on (node) group by (node) (up{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"}))"}
       ]
     },
     {

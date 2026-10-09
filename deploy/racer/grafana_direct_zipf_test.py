@@ -11,6 +11,7 @@ DASHBOARD = json.loads((ROOT / "grafana-direct-zipf.json").read_text())
 
 class DashboardTest(unittest.TestCase):
     def test_five_basic_panels_and_eight_queries(self):
+        self.assertEqual(DASHBOARD["uid"], "racer-direct-zipf")
         panels = DASHBOARD["panels"]
         self.assertEqual([p["id"] for p in panels], [1, 2, 3, 4, 5])
         self.assertEqual(sum(len(p["targets"]) for p in panels), 8)
@@ -35,6 +36,35 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("not indexed payload or effective payload capacity", panel["description"])
         self.assertIn("Missing disk scrapes", panel["description"])
         self.assertEqual(panel["gridPos"], {"h": 9, "w": 24, "x": 0, "y": 18})
+
+    def test_cpu_is_average_busy_logical_cores_per_racer_host(self):
+        panel = DASHBOARD["panels"][3]
+        self.assertEqual(panel["title"], "Average busy logical cores per Racer node")
+        defaults = panel["fieldConfig"]["defaults"]
+        self.assertEqual(defaults["unit"], "suffix:cores")
+        self.assertEqual(defaults["min"], 0)
+        self.assertNotIn("max", defaults)
+        self.assertEqual(panel["targets"][0]["expr"],
+                         'avg(sum by (node) (1 - rate(node_cpu_seconds_total'
+                         '{job="node-exporter",mode="idle"}[5m])) '
+                         'and on (node) group by (node) '
+                         '(up{job="kubernetes-pods",namespace="${namespace}",'
+                         'app_kubernetes_io_name="racer-dataplane"}))')
+        for text in ("not a percentage or total cluster cores",
+                     "Missing host CPU series are not zero",
+                     "System-only nodes are excluded", "I/O wait"):
+            self.assertIn(text, panel["description"])
+        # Only CPU changes units; cache-hit shares remain fractions.
+        self.assertEqual(DASHBOARD["panels"][2]["fieldConfig"]["defaults"]["unit"],
+                         "percentunit")
+
+    def test_experiment_buffer_descriptions(self):
+        readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
+        for text in (DASHBOARD["description"], readme):
+            self.assertIn("8 GiB plaintext, 16 GiB ciphertext", text)
+            self.assertIn("2 GiB each for dirty and", text)
+            self.assertNotIn("4 GiB plaintext", text)
+            self.assertNotIn("8 GiB ciphertext", text)
 
     def test_rollout_gate_excludes_old_size_and_missing_process_metrics(self):
         boundary = int(datetime.datetime(2026, 10, 9, 20, 5, 50,

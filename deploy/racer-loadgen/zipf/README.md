@@ -11,13 +11,29 @@ This is an owned-only disk-retention comparison, not the default retention polic
 admission and integrity checks remain active. The seed stays `zipf-balanced-v1`;
 larger blobs change content digests. Do not erase existing disk data.
 
-Node budgets are plaintext 4 GiB, ciphertext 8 GiB, dirty 2 GiB, registered 2 GiB,
+Node budgets are plaintext 8 GiB, ciphertext 16 GiB, dirty 2 GiB, registered 2 GiB,
 and request contexts 256 MiB. Counts are flights 512, queue entries 4096, client
 connections 1024, pipes 256, and relay transfers 256. Worker sizing stays automatic;
 the target nodes select 21 I/O and 11 crypto workers. No Kubernetes limits are set.
-The smaller resident budgets exercise disk reads while preserving about 195 MiB
-plaintext and 390 MiB ciphertext per I/O worker. Apply buffer-only changes to the
-dataplane alone; leave loadgens running to avoid hashing the catalog again.
+These resident budgets preserve about 390 MiB plaintext and 780 MiB ciphertext
+per I/O worker. The authorized experiment doubles only plaintext and ciphertext
+from 4/8 GiB to 8/16 GiB. Keep automatic threads, all other budgets, no CPU or
+memory limits, and three approved NVMe devices per node unchanged. Patch only
+the two explicit dataplane env values, matching their names and old values.
+Keep the existing 100% rollout and zero grace. Leave loadgens running with their
+current template, including the user's live `--blob-concurrency=4`, to avoid
+hashing the catalog again. Do not apply the loadgen overlay for this experiment.
+
+Change live request concurrency through `racer-loadgen-control`, not the Pod
+template. Each generic operation contains one blob, so `--blob-concurrency=4`
+does not increase parallel reads for this workload. Changing the Pod template
+restarts catalog hashing. Leave loadgen running when the experiment ends.
+
+With 8/16 GiB budgets, the October 9 tests rejected C12 and C16: failed pulls
+were about 36% and 83%, respectively. Peer overloads exhausted candidate budgets
+and truncated reads; the resource causing the first overload was not proven.
+Retain C8 until that failure is addressed. A fresh C8 recovery window delivered
+1,494 Gbit/s with 0.165% failed pulls; larger caches did not remove all errors.
 
 Each loadgen hashes the full catalog before origin readiness. Health and metrics
 start first; readiness remains false during hashing. Startup is bounded by

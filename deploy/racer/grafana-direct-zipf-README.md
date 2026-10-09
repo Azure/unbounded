@@ -9,7 +9,7 @@ Run only the intended `racer-loadgen` workload in the selected namespace:
 direct UDS, `--catalog-blobs=512`, `--blob-bytes=2147483648`,
 `--seed=zipf-balanced-v1`, `--profile=zipf`, and `--zipf-exponent=0.5`.
 The balanced-config experiment uses owned-only disk retention (admission
-disabled), 4 GiB plaintext, 8 GiB ciphertext, and 2 GiB each for dirty and
+disabled), 8 GiB plaintext, 16 GiB ciphertext, and 2 GiB each for dirty and
 registered buffers. This is a workload description, not a claim
 that measured memory, disk, and peer event shares are balanced.
 Successful payload is completed successful operations times that exact size.
@@ -30,9 +30,18 @@ dashboard for another size, change both multipliers and the rollout boundary.
 
 The cache panel shows shares of memory, disk, and peer **hit events**, excluding
 origin fills. It is not a client cache-hit ratio or byte breakdown. A peer page
-can also count as a memory or disk hit on its serving node. Host CPU includes
-all workloads and I/O wait, with equal weight per sampled Racer host. Missing
-data and idle ratios stay undefined.
+can also count as a memory or disk hit on its serving node. Missing data and
+idle cache-hit ratios stay undefined.
+
+Host CPU is **average busy logical cores per Racer node**, not a percentage
+or total cluster cores. The query sums `1 - rate(idle[5m])` across logical CPUs
+by node, then averages those sums across discovered Racer hosts with CPU samples.
+It includes all host workloads and I/O wait, with equal weight per sampled
+Racer host. System-only nodes are excluded; missing CPU samples are not zero.
+On 64-logical-CPU hosts, this equals the previous non-idle fraction times 64
+(or the displayed percentage divided by 100, then times 64). The number of
+Racer nodes does not multiply the result. Mixed CPU counts still use each
+host's own core sum, not a fixed 64-core multiplier.
 
 The disk panel uses IEC byte units. It sums `racer_disk_size_bytes` for total
 assigned physical segment capacity and `racer_disk_used_bytes` for reserved

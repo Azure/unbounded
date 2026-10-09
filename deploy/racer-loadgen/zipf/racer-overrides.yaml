@@ -35,9 +35,9 @@ overrides:
                 image: ghcr.io/azure/racer-dataplane:f9a088a22a29cf8549e1945af833f508a14199d1
                 env:
                   - name: RACER_PLAINTEXT_BYTES
-                    value: "4294967296"
-                  - name: RACER_CIPHERTEXT_BYTES
                     value: "8589934592"
+                  - name: RACER_CIPHERTEXT_BYTES
+                    value: "17179869184"
                   - name: RACER_DIRTY_BYTES
                     value: "2147483648"
                   - name: RACER_REGISTERED_BYTES
