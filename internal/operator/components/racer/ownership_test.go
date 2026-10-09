@@ -4,6 +4,7 @@
 package racer
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -11,9 +12,11 @@ import (
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	"github.com/Azure/unbounded/internal/operator/component"
 )
@@ -116,9 +119,21 @@ func TestRuntimeCreateRaceAndReplacement(t *testing.T) {
 				result, err := env.Execute(t.Context(), plan)
 				require.NoError(t, err)
 
-				if phase == "create-race" {
+				switch phase {
+				case "create-race":
 					require.Len(t, result.Stale, 1)
-				} else {
+				case "ownership-edit":
+					// UID-only SSA can restore ownership edited after the live read.
+					require.Len(t, result.Results, 1)
+					require.Equal(t, component.OpSucceeded, result.Results[0].Status)
+					require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(standalone), standalone))
+					require.Equal(t, before.GetUID(), standalone.GetUID())
+					require.NoError(t, validateRuntimeOwner(standalone, "installation"))
+					// An ownership edit seen before planning still blocks adoption.
+					standalone.SetAnnotations(nil)
+					require.NoError(t, env.Client.Update(t.Context(), standalone))
+					before = standalone.DeepCopy()
+				default:
 					require.Len(t, result.Deferred, 1)
 				}
 
@@ -128,6 +143,100 @@ func TestRuntimeCreateRaceAndReplacement(t *testing.T) {
 				require.ErrorContains(t, err, "refusing adoption")
 			})
 		}
+	}
+}
+
+func TestRuntimeStatusWriteBeforeApply(t *testing.T) {
+	testRuntimeStatusWriteBeforeApply(t, testEnv(t))
+}
+
+func TestEnvtestRuntimeStatusWriteBeforeApply(t *testing.T) {
+	assets := os.Getenv("KUBEBUILDER_ASSETS")
+	if assets == "" {
+		t.Skip("set KUBEBUILDER_ASSETS for real API ownership tests")
+	}
+
+	environment := &envtest.Environment{BinaryAssetsDirectory: assets}
+	config, err := environment.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, environment.Stop()) })
+
+	env := testEnv(t)
+	env.Client, err = client.New(config, client.Options{Scheme: env.Scheme})
+	require.NoError(t, err)
+
+	env.APIReader = env.Client
+	require.NoError(t, env.Client.Create(t.Context(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: env.Namespace}}))
+	testRuntimeStatusWriteBeforeApply(t, env)
+}
+
+func testRuntimeStatusWriteBeforeApply(t *testing.T, env *component.Env) {
+	t.Helper()
+
+	for _, candidate := range runtimeCandidates(t) {
+		statusField := ""
+
+		switch candidate.GetKind() {
+		case "Deployment":
+			statusField = "replicas"
+		case "PodDisruptionBudget":
+			statusField = "currentHealthy"
+		default:
+			continue
+		}
+
+		t.Run(candidate.GetKind(), func(t *testing.T) {
+			first, err := ownedRuntimeOperation(t.Context(), env, component.Operation{Kind: component.OpApply, Component: name, Object: candidate.DeepCopy()}, "installation")
+			require.NoError(t, err)
+			require.Equal(t, component.OpCreateIfAbsent, first.Kind)
+
+			plan := component.NewPlan()
+			plan.Add(first)
+			persist(t, env, plan)
+
+			current := candidate.DeepCopy()
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(current), current))
+
+			desired := candidate.DeepCopy()
+			desired.SetLabels(map[string]string{"ownership-test": "updated"})
+			desired.SetResourceVersion(current.GetResourceVersion())
+			op, err := ownedRuntimeOperation(t.Context(), env, component.Operation{Kind: component.OpApply, Component: name, Object: desired}, "installation")
+			require.NoError(t, err)
+			require.Equal(t, component.OpApply, op.Kind)
+			require.Equal(t, current.GetUID(), op.Object.GetUID())
+
+			observedRevision := current.GetResourceVersion()
+			require.NoError(t, unstructured.SetNestedField(current.Object, int64(2), "status", statusField))
+			require.NoError(t, env.Client.Status().Update(t.Context(), current))
+			require.NotEqual(t, observedRevision, current.GetResourceVersion())
+
+			plan = component.NewPlan()
+			plan.Add(op)
+			persist(t, env, plan)
+			require.Empty(t, op.Object.GetResourceVersion())
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(current), current))
+			require.Equal(t, "updated", current.GetLabels()["ownership-test"])
+			status, found, err := unstructured.NestedInt64(current.Object, "status", statusField)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, int64(2), status)
+
+			require.NoError(t, env.Client.Delete(t.Context(), current))
+
+			replacement := candidate.DeepCopy()
+			require.NoError(t, env.Client.Create(t.Context(), replacement))
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(replacement), replacement))
+			require.NotEqual(t, op.Object.GetUID(), replacement.GetUID())
+			before := replacement.DeepCopy()
+			result, err := env.Execute(t.Context(), plan)
+			require.NoError(t, err)
+			require.Len(t, result.Results, 1)
+			require.NotEqual(t, component.OpSucceeded, result.Results[0].Status)
+			require.True(t, apierrors.IsConflict(result.Results[0].Err) || apierrors.IsInvalid(result.Results[0].Err), "%v", result.Results[0].Err)
+			t.Logf("replacement rejected: %v", result.Results[0].Err)
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(replacement), replacement))
+			require.Equal(t, before, replacement)
+		})
 	}
 }
 

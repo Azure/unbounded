@@ -33,8 +33,9 @@ func validateRuntimeOwner(obj client.Object, installation types.UID) error {
 	return nil
 }
 
-// Create wins ownership atomically. Later applies carry the observed UID and
-// revision so a replacement or ownership edit cannot win between read and write.
+// Create wins ownership atomically. Later applies pin the UID to reject a
+// replacement without racing status writes. Ownership edits after the live read
+// can be overwritten; resourceVersion CAS is reserved for read-dependent patches.
 func ownedRuntimeOperation(ctx context.Context, env *component.Env, op component.Operation, installation types.UID) (component.Operation, error) {
 	bindRuntime(op.Object, installation)
 	current := op.Object.DeepCopy()
@@ -54,7 +55,7 @@ func ownedRuntimeOperation(ctx context.Context, env *component.Env, op component
 	}
 
 	op.Object.SetUID(current.GetUID())
-	op.Object.SetResourceVersion(current.GetResourceVersion())
+	op.Object.SetResourceVersion("")
 
 	return op, nil
 }
