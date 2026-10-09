@@ -19,5 +19,5 @@ COPY --from=builder /out/client /usr/local/bin/racer-demo
 COPY --from=builder /out/origin /usr/local/bin/racer-demo-origin
 COPY LICENSE NOTICE /usr/share/licenses/racer-demo/
 USER 65532:65532
-# Override the pod command with ["racer-demo-origin"] to serve, or exec racer-demo get/bench.
+# Override the pod command with ["racer-demo-origin"] to serve, or exec racer-demo to read.
 CMD ["sleep", "infinity"]

@@ -15,14 +15,7 @@ import (
 const cacheName = "racer-demo"
 
 func main() {
-	var err error
-	if len(os.Args) > 2 && os.Args[1] != "bench" {
-		err = runBench()
-	} else {
-		err = runGet()
-	}
-
-	if err != nil {
+	if err := runGet(); err != nil {
 		panic(err)
 	}
 }
