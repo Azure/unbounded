@@ -23,7 +23,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	publicmachineops "github.com/Azure/unbounded/pkg/machineops"
 )
 
@@ -33,8 +32,6 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Generation = 3
-	machine.Spec.Provider = ""
-	machine.Spec.ProviderID = ""
 	machine.Spec.Host = &unboundedv1alpha3.HostSpec{Azure: &unboundedv1alpha3.AzureHostSpec{
 		ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1",
 	}}
@@ -76,10 +73,9 @@ func TestMachineOperationReconciler_SnapshotsProviderRefAndHostImage(t *testing.
 	machine := newExternalMachine("machine-1", "ExampleCloud")
 	machine.UID = "machine-uid"
 	machine.Generation = 7
-	machine.Spec.Provider = ""
-	machine.Spec.ProviderID = ""
 	machine.Spec.Host = &unboundedv1alpha3.HostSpec{
-		Image: "image-v2",
+		Image:              "image-v2",
+		ProvisioningFormat: unboundedv1alpha3.ProvisioningFormatCloudInit,
 		External: &unboundedv1alpha3.ExternalHostSpec{
 			Provider: "ExampleCloud",
 			MachineRef: &unboundedv1alpha3.ProviderMachineReference{
@@ -169,8 +165,6 @@ func TestMachineOperationReconciler_RejectsMismatchedProviderRefKind(t *testing.
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", "ExampleCloud")
-	machine.Spec.Provider = ""
-	machine.Spec.ProviderID = ""
 	machine.Spec.Host = &unboundedv1alpha3.HostSpec{
 		External: &unboundedv1alpha3.ExternalHostSpec{
 			Provider: "ExampleCloud",
@@ -303,17 +297,17 @@ func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
 	require.Equal(t, "secret", provider.authData[0]["clientSecret"])
 }
 
-func TestOperationAuthTargetForUsesNetSiteLabel(t *testing.T) {
+func TestOperationAuthTargetForRejectsNetSiteLabelOnly(t *testing.T) {
 	t.Parallel()
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Labels = map[string]string{netv1alpha1.SiteLabelKey: "site-a"}
+	machine.Labels = map[string]string{"net.unbounded-cloud.io/site": "site-a"}
 
 	target, failure := operationAuthTargetFor(machine)
 
-	require.Nil(t, failure)
-	require.Equal(t, "site-a", target.SiteName)
-	require.Equal(t, unboundedv1alpha3.ExternalProviderAzureVM, target.Provider)
+	require.NotNil(t, failure)
+	require.Equal(t, authReasonInvalid, failure.Reason)
+	require.Empty(t, target)
 }
 
 func TestOperationAuthTargetForAcceptsMatchingSiteLabels(t *testing.T) {
@@ -322,7 +316,7 @@ func TestOperationAuthTargetForAcceptsMatchingSiteLabels(t *testing.T) {
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Labels = map[string]string{
 		unboundedv1alpha3.MachineSiteLabelKey: "site-a",
-		netv1alpha1.SiteLabelKey:              "site-a",
+		"net.unbounded-cloud.io/site":         "site-a",
 	}
 
 	target, failure := operationAuthTargetFor(machine)
@@ -331,20 +325,19 @@ func TestOperationAuthTargetForAcceptsMatchingSiteLabels(t *testing.T) {
 	require.Equal(t, "site-a", target.SiteName)
 }
 
-func TestOperationAuthTargetForRejectsConflictingSiteLabels(t *testing.T) {
+func TestOperationAuthTargetForIgnoresConflictingRetiredSiteLabel(t *testing.T) {
 	t.Parallel()
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Labels = map[string]string{
 		unboundedv1alpha3.MachineSiteLabelKey: "site-a",
-		netv1alpha1.SiteLabelKey:              "site-b",
+		"net.unbounded-cloud.io/site":         "site-b",
 	}
 
-	_, failure := operationAuthTargetFor(machine)
+	target, failure := operationAuthTargetFor(machine)
 
-	require.NotNil(t, failure)
-	require.Equal(t, authReasonInvalid, failure.Reason)
-	require.Contains(t, failure.Message, "conflicting site labels")
+	require.Nil(t, failure)
+	require.Equal(t, "site-a", target.SiteName)
 }
 
 func TestMachineOperationReconciler_FailsMachineWithoutSiteLabel(t *testing.T) {
@@ -702,8 +695,6 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
-	machine.Spec.Provider = ""
-	machine.Spec.ProviderID = ""
 	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{
 		Provider:   unboundedv1alpha3.ExternalProviderOCIInstance,
 		ProviderID: "oci://old-instance",
@@ -782,7 +773,7 @@ func TestMachineOperationReconciler_FailsUnsupportedExternalOperation(t *testing
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
-	machine.Spec.ProviderID = "oci://ocid1.instance.oc1.test"
+	machine.Spec.Host.External.ProviderID = "oci://ocid1.instance.oc1.test"
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderOCIInstance, supported: map[unboundedv1alpha3.OperationKind]bool{}}
 
@@ -1051,9 +1042,12 @@ func newExternalMachine(name, provider string) *unboundedv1alpha3.Machine {
 			Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "site-a"},
 		},
 		Spec: unboundedv1alpha3.MachineSpec{
-			Provider:   provider,
-			ProviderID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/" + name,
+			Host: &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{
+				Provider:   provider,
+				ProviderID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/" + name,
+			}},
 		},
+		Status: unboundedv1alpha3.MachineStatus{ObservedProvisioningFormat: unboundedv1alpha3.ProvisioningFormatCloudInit},
 	}
 }
 

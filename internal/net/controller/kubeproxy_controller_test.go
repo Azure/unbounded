@@ -143,9 +143,7 @@ func nodeWithLabels(labels map[string]string) *corev1.Node {
 	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: labels}}
 }
 
-// TestEnsureDaemonSetRecreatesOnSelectorChange guards the automated migration of
-// the managed kube-proxy DaemonSet from the deprecated site label in its
-// (immutable) selector to the canonical one.
+// TestEnsureDaemonSetRecreatesOnSelectorChange guards immutable selector repair.
 func TestEnsureDaemonSetRecreatesOnSelectorChange(t *testing.T) {
 	site := unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{Name: "test"},
@@ -154,14 +152,13 @@ func TestEnsureDaemonSetRecreatesOnSelectorChange(t *testing.T) {
 		}},
 	}
 
-	// Seed an existing DaemonSet built with the deprecated site label in its
-	// selector (as a pre-rename controller would have created it).
-	deprecatedSelector := map[string]string{"app.kubernetes.io/name": managedKubeProxyAppName, unboundednetv1alpha1.SiteLabelKey: "test"}
+	// Seed a DaemonSet with drift in its immutable selector.
+	driftedSelector := map[string]string{"app.kubernetes.io/name": managedKubeProxyAppName, canonicalSiteLabelKey: "wrong-site"}
 	old := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{Name: managedKubeProxyDaemonSetName("test"), Namespace: "unbounded-net"},
 		Spec: appsv1.DaemonSetSpec{
-			Selector: &metav1.LabelSelector{MatchLabels: deprecatedSelector},
-			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: deprecatedSelector}},
+			Selector: &metav1.LabelSelector{MatchLabels: driftedSelector},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: driftedSelector}},
 		},
 	}
 
@@ -178,10 +175,10 @@ func TestEnsureDaemonSetRecreatesOnSelectorChange(t *testing.T) {
 	}
 
 	if got.Spec.Selector.MatchLabels[canonicalSiteLabelKey] != "test" {
-		t.Fatalf("selector not migrated to canonical label: %#v", got.Spec.Selector.MatchLabels)
+		t.Fatalf("selector not repaired: %#v", got.Spec.Selector.MatchLabels)
 	}
 
-	if _, ok := got.Spec.Selector.MatchLabels[unboundednetv1alpha1.SiteLabelKey]; ok {
-		t.Fatalf("selector still carries deprecated label: %#v", got.Spec.Selector.MatchLabels)
+	if got.Spec.Template.Labels[canonicalSiteLabelKey] != "test" {
+		t.Fatalf("template label not repaired: %#v", got.Spec.Template.Labels)
 	}
 }

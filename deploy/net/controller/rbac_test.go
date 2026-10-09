@@ -44,6 +44,10 @@ func TestBoundObjectCacheRBAC(t *testing.T) {
 				}
 
 				for _, rule := range role.Rules {
+					if slices.Contains(rule.Resources, "endpoints") {
+						t.Fatal("retired Endpoints permission remains")
+					}
+
 					if slices.Contains(rule.Resources, "serviceaccounts") || slices.Contains(rule.Resources, "*") {
 						if role.Kind != "Role" || role.Namespace != namespace ||
 							!slices.Equal(rule.APIGroups, []string{""}) ||

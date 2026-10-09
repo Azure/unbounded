@@ -783,7 +783,7 @@ func testMachine(name, url string) *v1alpha3.Machine {
 	return &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image: "ghcr.io/test/image:v1",
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         url,
@@ -791,7 +791,7 @@ func testMachine(name, url string) *v1alpha3.Machine {
 					DeviceID:    "System.Embedded.1",
 					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
 				},
-			},
+			}},
 		},
 	}
 }

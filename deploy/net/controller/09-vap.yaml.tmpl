@@ -5,7 +5,7 @@
 # Restrict what resources the unbounded-net controller service account may create.
 # RBAC cannot scope the "create" verb by resourceNames, so this VAP ensures the
 # controller can only create resources with the expected names. This prevents the
-# SA from creating arbitrary Secrets, ConfigMaps, Endpoints, or EndpointSlices.
+# SA from creating arbitrary Secrets, ConfigMaps, or EndpointSlices.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -20,7 +20,7 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE"]
-        resources: ["secrets", "configmaps", "endpoints"]
+        resources: ["secrets", "configmaps"]
       - apiGroups: ["discovery.k8s.io"]
         apiVersions: ["v1"]
         operations: ["CREATE"]
@@ -39,11 +39,6 @@ spec:
         request.resource.resource != 'configmaps' ||
         object.metadata.name == 'unbounded-net-serving-ca'
       message: "unbounded-net controller may only create the unbounded-net-serving-ca configmap"
-    # Endpoints: only unbounded-net-controller
-    - expression: >-
-        request.resource.resource != 'endpoints' ||
-        object.metadata.name == 'unbounded-net-controller'
-      message: "unbounded-net controller may only create the unbounded-net-controller endpoints"
     # EndpointSlices: only unbounded-net-controller
     - expression: >-
         request.resource.resource != 'endpointslices' ||
@@ -108,10 +103,16 @@ spec:
           'net.unbounded-cloud.io/wireguard-port' in oldObject.metadata.annotations &&
           object.metadata.annotations['net.unbounded-cloud.io/wireguard-port'] == oldObject.metadata.annotations['net.unbounded-cloud.io/wireguard-port']))
       message: "unbounded-net-node may not modify the controller-owned WireGuard port annotation"
-    # Labels: only net.unbounded-cloud.io/ prefix labels and the canonical
-    # unbounded-cloud.io/site label may be added, changed, or removed. The
-    # canonical site label is dual-written alongside the deprecated
-    # net.unbounded-cloud.io/site during the label deprecation window.
+    # Labels: current net-prefixed labels and canonical Site membership may change.
+    # The retired net.unbounded-cloud.io/site label is not controller-owned.
+    - expression: >-
+        ((!has(object.metadata.labels) || !('net.unbounded-cloud.io/site' in object.metadata.labels)) &&
+         (!has(oldObject.metadata.labels) || !('net.unbounded-cloud.io/site' in oldObject.metadata.labels))) ||
+        (has(object.metadata.labels) && has(oldObject.metadata.labels) &&
+         'net.unbounded-cloud.io/site' in object.metadata.labels &&
+         'net.unbounded-cloud.io/site' in oldObject.metadata.labels &&
+         object.metadata.labels['net.unbounded-cloud.io/site'] == oldObject.metadata.labels['net.unbounded-cloud.io/site'])
+      message: "unbounded-net may not modify the retired Site label"
     - expression: >-
         (!has(object.metadata.labels) && !has(oldObject.metadata.labels)) ||
         (!has(oldObject.metadata.labels) && object.metadata.labels.all(k, k.startsWith('net.unbounded-cloud.io/') || k == 'unbounded-cloud.io/site')) ||

@@ -17,9 +17,6 @@ const (
 	forwardChain = "UNBOUNDED-FORWARD"
 	// forwardComment identifies rules created by this manager.
 	forwardComment = "unbounded-net: forward between managed tunnels"
-	// legacyForwardComment identifies old per-interface FORWARD ACCEPT rules
-	// from previous agent versions that should be cleaned up.
-	legacyForwardComment = "unbounded-net: accept tunnel traffic"
 )
 
 // ForwardManager manages iptables FORWARD rules that restrict forwarded
@@ -38,8 +35,7 @@ type ForwardManager struct {
 }
 
 // NewForwardManager creates a ForwardManager, ensures the UNBOUNDED-FORWARD
-// chain exists, and cleans up any legacy per-interface FORWARD ACCEPT rules
-// left by previous agent versions.
+// chain exists.
 func NewForwardManager() (*ForwardManager, error) {
 	ipt4, err := iptables.New()
 	if err != nil {
@@ -63,12 +59,6 @@ func NewForwardManager() (*ForwardManager, error) {
 		if err := m.ensureChain(ipt6, "IPv6"); err != nil {
 			klog.Warningf("Failed to create IPv6 forward chain: %v", err)
 		}
-	}
-
-	m.cleanupLegacyRules(ipt4, "IPv4")
-
-	if ipt6 != nil {
-		m.cleanupLegacyRules(ipt6, "IPv6")
 	}
 
 	return m, nil
@@ -236,36 +226,6 @@ func (m *ForwardManager) cleanupFamily(ipt *iptables.IPTables, family string) {
 
 		if err := ipt.DeleteChain("filter", forwardChain); err != nil {
 			klog.Warningf("ForwardManager: failed to delete %s chain during cleanup: %v", family, err)
-		}
-	}
-}
-
-// cleanupLegacyRules removes old-style per-interface FORWARD ACCEPT rules
-// from previous agent versions. These rules have the comment
-// "unbounded-net: accept tunnel traffic".
-func (m *ForwardManager) cleanupLegacyRules(ipt *iptables.IPTables, family string) {
-	rules, err := ipt.List("filter", "FORWARD")
-	if err != nil {
-		klog.V(4).Infof("ForwardManager: failed to list %s FORWARD rules for legacy cleanup: %v", family, err)
-
-		return
-	}
-
-	for _, rule := range rules {
-		if !strings.Contains(rule, legacyForwardComment) {
-			continue
-		}
-
-		ifName := parseInterfaceFromRule(rule, "-i")
-		if ifName == "" {
-			continue
-		}
-
-		legacyRule := []string{"-i", ifName, "-j", "ACCEPT", "-m", "comment", "--comment", legacyForwardComment}
-		if err := ipt.DeleteIfExists("filter", "FORWARD", legacyRule...); err != nil {
-			klog.V(4).Infof("ForwardManager: failed to remove legacy %s FORWARD rule for %s: %v", family, ifName, err)
-		} else {
-			klog.V(2).Infof("ForwardManager: removed legacy %s FORWARD ACCEPT rule for %s", family, ifName)
 		}
 	}
 }

@@ -100,15 +100,20 @@ func consoleStreamURL(redfish map[string]string) (string, error) {
 func redfishWebSocketHTTPClient(redfish map[string]string) *http.Client {
 	transport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
-		return http.DefaultClient
+		transport = &http.Transport{Proxy: http.ProxyFromEnvironment}
 	}
 
 	clonedTransport := transport.Clone()
+	if clonedTransport.TLSClientConfig == nil {
+		clonedTransport.TLSClientConfig = &tls.Config{}
+	}
+
+	clonedTransport.TLSClientConfig.MinVersion = tls.VersionTLS13
 
 	if certPEM := strings.TrimSpace(redfish["certPEM"]); certPEM != "" {
 		roots := x509.NewCertPool()
 		if roots.AppendCertsFromPEM([]byte(certPEM)) {
-			clonedTransport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+			clonedTransport.TLSClientConfig.RootCAs = roots
 		}
 	}
 

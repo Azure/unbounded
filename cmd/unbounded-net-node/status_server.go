@@ -561,16 +561,12 @@ func startHealthServer(port int, healthState *nodeHealthState) {
 }
 
 const (
-	statusWSAPIServerModeNever    = "never"
-	statusWSAPIServerModeFallback = "fallback"
-	// Preferred is a compatibility alias for direct-first fallback behavior.
-	statusWSAPIServerModePreferred     = "preferred"
+	statusWSAPIServerModeNever         = "never"
+	statusWSAPIServerModeFallback      = "fallback"
 	defaultAggregatedNodeStatusWSURL   = "wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews"
 	defaultAggregatedNodeStatusPushURL = "https://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
 	directRecoveryProbeMultiplier      = 3
 	serviceAccountCACertPath           = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	legacyAggregatedStatusAPIPath      = "/apis/net.unbounded-cloud.io/v1alpha1/status/"
-	currentAggregatedStatusAPIPath     = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/"
 	statusWSModeNone                   = int32(0)
 	statusWSModeDirect                 = int32(1)
 	statusWSModeFallback               = int32(2)
@@ -610,7 +606,7 @@ func startStatusPublishers(ctx context.Context, cfg *config, healthState *nodeHe
 func newStatusPushHTTPClient(timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone() //nolint:errcheck
 	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS13,
 	}
 
 	pool := x509.NewCertPool()
@@ -669,20 +665,11 @@ func parseStatusWSAPIServerMode(mode string) (string, error) {
 	}
 
 	switch normalized {
-	case statusWSAPIServerModeNever, statusWSAPIServerModeFallback, statusWSAPIServerModePreferred:
+	case statusWSAPIServerModeNever, statusWSAPIServerModeFallback:
 		return normalized, nil
 	default:
-		return "", fmt.Errorf("invalid status websocket API server mode %q (expected never, fallback, preferred)", mode)
+		return "", fmt.Errorf("invalid status websocket API server mode %q (expected never, fallback)", mode)
 	}
-}
-
-// normalizeAggregatedStatusAPIURL rewrites legacy aggregated API group URLs to the current status group.
-func normalizeAggregatedStatusAPIURL(rawURL string) string {
-	if strings.Contains(rawURL, legacyAggregatedStatusAPIPath) {
-		return strings.Replace(rawURL, legacyAggregatedStatusAPIPath, currentAggregatedStatusAPIPath, 1)
-	}
-
-	return rawURL
 }
 
 func setAggregatedNodeTokenHeaders(headers http.Header, token string) {
@@ -696,12 +683,7 @@ func setAggregatedNodeTokenHeaders(headers http.Header, token string) {
 
 func resolveStatusPushAPIServerURL(cfg *config) string {
 	if cfg.StatusWSAPIServerURL != "" {
-		normalizedWSURL := normalizeAggregatedStatusAPIURL(cfg.StatusWSAPIServerURL)
-		if normalizedWSURL != cfg.StatusWSAPIServerURL {
-			klog.V(2).Infof("Status push: rewrote legacy aggregated API URL from %q to %q", cfg.StatusWSAPIServerURL, normalizedWSURL)
-		}
-
-		pushURL := strings.Replace(normalizedWSURL, "/status/nodews", "/status/push", 1)
+		pushURL := strings.Replace(cfg.StatusWSAPIServerURL, "/status/nodews", "/status/push", 1)
 		if strings.HasPrefix(pushURL, "wss://") {
 			pushURL = "https://" + strings.TrimPrefix(pushURL, "wss://")
 		} else if strings.HasPrefix(pushURL, "ws://") {
@@ -811,7 +793,6 @@ func resolveStatusWebSocketURLs(cfg *config, allowAPIServerFallback bool) []stri
 		apiserverURL = defaultAggregatedNodeStatusWSURL
 	}
 
-	apiserverURL = normalizeAggregatedStatusAPIURL(apiserverURL)
 	apiserverURL = expandKubernetesServiceHost(apiserverURL)
 
 	switch mode {
@@ -2426,9 +2407,13 @@ func startStatusPusher(
 
 					details.receive(ack)
 
-					legacyEmptyACK := ack.Status == "" && ack.DetailRequestID == "" && ack.DetailRequest == nil
+					if delivery == nil && !ack.IsPublicationAck() {
+						appendNodeError(healthState, "status-publication", "controller did not acknowledge the publication")
+						return false, false
+					}
+
 					if delivery == nil && cfg.StatusDetailMode == "summary" &&
-						(ack.IsPublicationAck() || legacyEmptyACK) && !ack.SummarySupported {
+						ack.IsPublicationAck() && !ack.SummarySupported {
 						appendNodeError(healthState, nodeErrorSummaryUnsupported, "controller does not advertise summary support; full publication is disabled in summary mode")
 						return false, true
 					}
@@ -2441,7 +2426,7 @@ func startStatusPusher(
 
 					pushStateMu.Lock()
 
-					if delivery == nil && (ack.IsPublicationAck() || legacyEmptyACK) {
+					if delivery == nil && ack.IsPublicationAck() {
 						if ack.Revision > 0 {
 							lastAckRevision = ack.Revision
 						}

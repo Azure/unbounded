@@ -173,6 +173,15 @@ type NetworkResponse struct {
 	DNS         []string `json:"dns"`
 }
 
+func (o *Operator) servingTLSConfig(cert tls.Certificate) *tls.Config {
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequestClientCert,
+		ClientCAs:    o.aggregatedClientCAs,
+	}
+}
+
 func (o *Operator) Run(ctx context.Context) error {
 	cert, err := o.EnsureTLSSecret(ctx)
 	if err != nil {
@@ -194,12 +203,7 @@ func (o *Operator) Run(ctx context.Context) error {
 		Addr:              o.Config.ListenAddr,
 		Handler:           o.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
-		TLSConfig: &tls.Config{
-			MinVersion:   tls.VersionTLS12,
-			Certificates: []tls.Certificate{cert},
-			ClientAuth:   tls.RequestClientCert,
-			ClientCAs:    o.aggregatedClientCAs,
-		},
+		TLSConfig:         o.servingTLSConfig(cert),
 	}
 
 	errCh := make(chan error, 1)

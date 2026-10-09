@@ -50,7 +50,6 @@ data:
       bridgeName: "{{ default "cbr0" .NodeBridgeName }}"
       wireGuardDir: "{{ default "/host/etc/wireguard" .NodeWireGuardDir }}"
       wireGuardPort: {{ default "51820" .NodeWireGuardPort }}
-      enablePolicyRouting: {{ default "false" .NodeEnablePolicyRouting }}
       mtu: {{ default "0" .NodeMTU }}
       healthPort: {{ default "9998" .NodeHealthPort }}
       informerResyncPeriod: "{{ default "3600s" .NodeInformerResyncPeriod }}"
@@ -62,9 +61,6 @@ data:
       statusWebsocketKeepaliveInterval: "{{ default "10s" .NodeStatusWebsocketKeepaliveInterval }}"
       statusWsKeepaliveFailureCount: {{ default "2" .NodeStatusWsKeepaliveFailureCount }}
       removeConfigurationOnShutdown: {{ default "false" .NodeRemoveConfigurationOnShutdown }}
-      shutdownRemoveWireGuardConfiguration: {{ default "false" .NodeShutdownRemoveWireGuardConfiguration }}
-      cleanupNetlinkOnShutdown: {{ default "false" .NodeShutdownRemoveIPRoutes }}
-      shutdownRemoveMasqueradeRules: {{ default "false" .NodeShutdownRemoveMasqueradeRules }}
       criticalDeltaEvery: "{{ default "15s" .NodeCriticalDeltaEvery }}"
       statsDeltaEvery: "{{ default "60s" .NodeStatsDeltaEvery }}"
       statusPushEnabled: {{ default "true" .NodeStatusPushEnabled }}

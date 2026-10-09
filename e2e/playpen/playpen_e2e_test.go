@@ -761,7 +761,7 @@ func TestPlaypenRedfishReadyProbe(t *testing.T) {
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots}
 	client := &http.Client{Timeout: 5 * time.Second, Transport: transport}
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, readyURL, http.NoBody)

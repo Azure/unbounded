@@ -318,22 +318,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		state.gatewayPodCIDRs = make(map[string][]string)
 	}
 
-	// Initialize gateway policy manager if unavailable.
-	if state.gatewayPolicyManager == nil {
-		var err error
-
-		state.gatewayPolicyManager, err = unboundednetnetlink.NewGatewayPolicyManager(cfg.WireGuardPort)
-		if err != nil {
-			klog.Errorf("Failed to create gateway policy manager: %v", err)
-			// Continue without policy routing - it's not fatal
-		} else {
-			klog.V(2).Info("Initialized gateway policy manager for policy routing")
-		}
-	}
-
 	// Track which gateway interfaces we're using this round
 	desiredGatewayIfaces := make(map[string]bool)
-	desiredGatewayPolicyTables := make(map[string]int)
 
 	var gatewayCIDRs []string
 
@@ -352,7 +338,6 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 
 		gwIfaceName := wireGuardInterfaceName(cfg, gwPort)
 		desiredGatewayIfaces[gwIfaceName] = true
-		desiredGatewayPolicyTables[gwIfaceName] = gwPort
 
 		// Collect all routed CIDRs (they're the same for all gateways)
 		if len(gatewayCIDRs) == 0 {
@@ -486,15 +471,6 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			state.notrackManager.EnsureInterface(gwIfaceName)
 		}
 
-		// Configure policy routing for this gateway interface
-		// This ensures return traffic leaves via the same interface it arrived on
-		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
-			if err := state.gatewayPolicyManager.ConfigureInterface(gwIfaceName, gwPort); err != nil {
-				klog.Warningf("Failed to configure policy routing for %s: %v", gwIfaceName, err)
-				// Continue - policy routing is not critical
-			}
-		}
-
 		prevName, hadPrevName := state.gatewayNames[gwIfaceName]
 		prevSiteName := state.gatewaySiteNames[gwIfaceName]
 		prevRoutedCIDRs := state.gatewaySiteCIDRs[gwIfaceName]
@@ -559,12 +535,6 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	for ifaceName, linkManager := range staleGatewayIfaces {
 		klog.Infof("Removing unused gateway interface %s", ifaceName)
 
-		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
-			if err := state.gatewayPolicyManager.RemoveInterface(ifaceName); err != nil {
-				klog.Warningf("Failed to remove policy routing for %s: %v", ifaceName, err)
-			}
-		}
-
 		if err := linkManager.DeleteLink(); err != nil {
 			klog.Warningf("Failed to delete gateway interface %s: %v", ifaceName, err)
 		}
@@ -575,12 +545,6 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 
 		if state.notrackManager != nil {
 			state.notrackManager.RemoveInterface(ifaceName)
-		}
-	}
-
-	if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
-		if err := state.gatewayPolicyManager.ReconcileExpectedInterfaces(desiredGatewayPolicyTables); err != nil {
-			klog.Warningf("Failed to reconcile gateway policy routing chains: %v", err)
 		}
 	}
 

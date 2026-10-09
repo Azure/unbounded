@@ -28,7 +28,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
 
 // TestIsTrustedAggregatedRequest tests is trusted aggregated request.
@@ -275,10 +274,8 @@ func TestGetClientCAs(t *testing.T) {
 	}
 }
 
-// TestBuildNodeAdmissionPatchDualWritesSiteLabels verifies the mutating webhook
-// stamps both the canonical (unbounded-cloud.io/site) and deprecated
-// (net.unbounded-cloud.io/site) site labels during the deprecation window.
-func TestBuildNodeAdmissionPatchDualWritesSiteLabels(t *testing.T) {
+// The mutating webhook stamps only the canonical site label.
+func TestBuildNodeAdmissionPatchCanonicalSiteLabel(t *testing.T) {
 	patch, err := buildNodeAdmissionPatch(&corev1.Node{}, "site-a")
 	if err != nil {
 		t.Fatalf("build patch: %v", err)
@@ -303,14 +300,13 @@ func TestBuildNodeAdmissionPatchDualWritesSiteLabels(t *testing.T) {
 	}
 
 	canonical := "/metadata/labels/" + escapeJSONPointer(unboundedv1alpha3.MachineSiteLabelKey)
-	deprecated := "/metadata/labels/" + escapeJSONPointer(unboundednetv1alpha1.SiteLabelKey)
 
 	if labelValues[canonical] != "site-a" {
 		t.Fatalf("canonical site label not set: %#v", labelValues)
 	}
 
-	if labelValues[deprecated] != "site-a" {
-		t.Fatalf("deprecated site label not set: %#v", labelValues)
+	if len(labelValues) != 1 {
+		t.Fatalf("unexpected site labels: %#v", labelValues)
 	}
 }
 

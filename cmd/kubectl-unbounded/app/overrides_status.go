@@ -176,10 +176,7 @@ func runOverridesStatus(ctx context.Context, c client.Client, out io.Writer) err
 // desired hash on that path, no desired hash either, so the failure rendered as
 // "no override", the exact opposite of the truth.
 //
-// The hash comparison remains as a fallback for a status written by an operator
-// that predates the state field, or one a lagging CRD pruned it from. Both
-// hashes are computed over the same contributor set for the same workload, so
-// they stay directly comparable.
+// Missing or unknown state is reported as unknown, never inferred from hashes.
 func describeApplied(workload v1alpha3.OverriddenWorkload) string {
 	switch workload.State {
 	case v1alpha3.OverrideStateApplied:
@@ -190,17 +187,8 @@ func describeApplied(workload v1alpha3.OverriddenWorkload) string {
 		return "withheld"
 	case v1alpha3.OverrideStateFailed:
 		return "failed"
-	}
-
-	switch {
-	case workload.DesiredHash == "":
-		return "no override"
-	case workload.AppliedHash == "":
-		return "not applied"
-	case workload.AppliedHash == workload.DesiredHash:
-		return "yes"
 	default:
-		return "stale"
+		return "unknown"
 	}
 }
 

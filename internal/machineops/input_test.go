@@ -35,7 +35,7 @@ func TestResolveHostImage(t *testing.T) {
 		Spec: unboundedv1alpha3.MachineConfigurationVersionSpec{
 			Version: version,
 			Template: unboundedv1alpha3.MachineConfigurationTemplate{
-				Host: &unboundedv1alpha3.MachineConfigurationHostSpec{Image: "configuration-image"},
+				Host: &unboundedv1alpha3.MachineConfigurationHostSpec{Image: "configuration-image", ProvisioningFormat: unboundedv1alpha3.ProvisioningFormatCloudInit},
 			},
 		},
 	}
@@ -54,7 +54,7 @@ func TestResolveHostImage(t *testing.T) {
 		{
 			name: "Machine override wins",
 			machine: &unboundedv1alpha3.Machine{Spec: unboundedv1alpha3.MachineSpec{
-				Host:             &unboundedv1alpha3.HostSpec{Image: "machine-image"},
+				Host:             &unboundedv1alpha3.HostSpec{Image: "machine-image", ProvisioningFormat: unboundedv1alpha3.ProvisioningFormatCloudInit},
 				ConfigurationRef: &unboundedv1alpha3.MachineConfigurationRef{Name: "worker", Version: &version},
 			}},
 			want: "machine-image",
@@ -68,7 +68,7 @@ func TestResolveHostImage(t *testing.T) {
 		},
 		{
 			name:    "omitted image preserves current image",
-			machine: &unboundedv1alpha3.Machine{},
+			machine: &unboundedv1alpha3.Machine{Status: unboundedv1alpha3.MachineStatus{ObservedProvisioningFormat: unboundedv1alpha3.ProvisioningFormatCloudInit}},
 			want:    "",
 		},
 	}

@@ -259,12 +259,9 @@ func TestReconcilerSnapshotsSiteScopedSelectorTargets(t *testing.T) {
 
 	s := testScheme(t)
 	machineA := testBareMetalMachine("machine-a", "rack-a")
-	machineA.Spec.Host = &v1alpha3.HostSpec{Netboot: machineA.Spec.PXE}
-	machineA.Spec.PXE = nil
 	machineB := testBareMetalMachine("machine-b", "rack-a")
 	machineOtherSite := testBareMetalMachine("machine-c", "rack-b")
 	external := testBareMetalMachine("machine-d", "rack-a")
-	external.Spec.PXE = nil
 	external.Spec.Host = &v1alpha3.HostSpec{Azure: &v1alpha3.AzureHostSpec{
 		ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-d",
 	}}
@@ -471,8 +468,8 @@ func TestReconcilerFallsBackToBIOSHTTPBootURIForHostReplace(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
-	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
+	machine.Spec.Host.Netboot.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.Host.Netboot.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 
@@ -512,8 +509,8 @@ func TestReconcilerUsesBIOSHTTPBootURIWhenStandardURIAbsent(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
-	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
+	machine.Spec.Host.Netboot.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.Host.Netboot.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-bios", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 
@@ -553,8 +550,8 @@ func TestReconcilerFallsBackToBIOSWhenStaticInterfaceIsReadOnly(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
-	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
+	machine.Spec.Host.Netboot.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.Host.Netboot.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-read-only-nic", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 
@@ -631,7 +628,7 @@ func TestReconcilerRetriesHTTPHostReplaceWithoutStaticLease(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.Host.Netboot.BootProtocol = v1alpha3.PXEBootProtocolHTTP
 	op := testOperation("op-replace-http-no-lease", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 
@@ -664,8 +661,8 @@ func TestReconcilerWaitsForHTTPBootImage(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolHTTP
-	machine.Spec.PXE.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
+	machine.Spec.Host.Netboot.BootProtocol = v1alpha3.PXEBootProtocolHTTP
+	machine.Spec.Host.Netboot.DHCPLeases = []v1alpha3.DHCPLease{httpBootLease()}
 	op := testOperation("op-replace-http-wait-image", v1alpha3.OperationHostReplace)
 	op.Spec.MachineRef = machine.Name
 
@@ -1014,9 +1011,9 @@ func TestReconcilerStartsDisjointHostReplaceWhileOlderReplaceInProgress(t *testi
 
 	s := testScheme(t)
 	machineA := testBareMetalMachine("machine-a", "rack-a")
-	machineA.Spec.PXE.Redfish.URL = "https://bmc-a.example.com"
+	machineA.Spec.Host.Netboot.Redfish.URL = "https://bmc-a.example.com"
 	machineB := testBareMetalMachine("machine-b", "rack-a")
-	machineB.Spec.PXE.Redfish.URL = "https://bmc-b.example.com"
+	machineB.Spec.Host.Netboot.Redfish.URL = "https://bmc-b.example.com"
 	older := testOperation("op-a", v1alpha3.OperationHostReplace)
 	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
 	older.Spec.MachineRef = machineA.Name
@@ -1052,9 +1049,9 @@ func TestReconcilerWaitsForOlderHostReplaceSelectorOverlap(t *testing.T) {
 
 	s := testScheme(t)
 	machineA := testBareMetalMachine("machine-a", "rack-a")
-	machineA.Spec.PXE.Redfish.URL = "https://bmc-a.example.com"
+	machineA.Spec.Host.Netboot.Redfish.URL = "https://bmc-a.example.com"
 	machineB := testBareMetalMachine("machine-b", "rack-a")
-	machineB.Spec.PXE.Redfish.URL = "https://bmc-b.example.com"
+	machineB.Spec.Host.Netboot.Redfish.URL = "https://bmc-b.example.com"
 	older := testOperation("op-a", v1alpha3.OperationHostReplace)
 	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
 	older.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
@@ -1081,10 +1078,10 @@ func TestReconcilerStartsDisjointHostReplaceSelector(t *testing.T) {
 	s := testScheme(t)
 	machineA := testBareMetalMachine("machine-a", "rack-a")
 	machineA.Labels["pool"] = "a"
-	machineA.Spec.PXE.Redfish.URL = "https://bmc-a.example.com"
+	machineA.Spec.Host.Netboot.Redfish.URL = "https://bmc-a.example.com"
 	machineB := testBareMetalMachine("machine-b", "rack-a")
 	machineB.Labels["pool"] = "b"
-	machineB.Spec.PXE.Redfish.URL = "https://bmc-b.example.com"
+	machineB.Spec.Host.Netboot.Redfish.URL = "https://bmc-b.example.com"
 	older := testOperation("op-a", v1alpha3.OperationHostReplace)
 	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
 	older.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a", "pool": "a"}}
@@ -1115,9 +1112,9 @@ func TestReconcilerWaitsForOlderHostReplaceSharedRedfishEndpoint(t *testing.T) {
 
 	s := testScheme(t)
 	machineA := testBareMetalMachine("machine-a", "rack-a")
-	machineA.Spec.PXE.Redfish.URL = "https://bmc.example.com/"
+	machineA.Spec.Host.Netboot.Redfish.URL = "https://bmc.example.com/"
 	machineB := testBareMetalMachine("machine-b", "rack-a")
-	machineB.Spec.PXE.Redfish.URL = "https://bmc.example.com"
+	machineB.Spec.Host.Netboot.Redfish.URL = "https://bmc.example.com"
 	older := testOperation("op-a", v1alpha3.OperationHostReplace)
 	older.CreationTimestamp = metav1.NewTime(fixedNow().Add(-time.Minute))
 	older.Spec.MachineRef = machineA.Name
@@ -1325,7 +1322,7 @@ func testBareMetalMachine(name, site string) *v1alpha3.Machine {
 	return &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{siteLabel: site}},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image: "ghcr.io/test/host:v1",
 				Redfish: &v1alpha3.RedfishSpec{
 					URL:         "https://bmc.example.com",
@@ -1333,7 +1330,7 @@ func testBareMetalMachine(name, site string) *v1alpha3.Machine {
 					DeviceID:    "1",
 					PasswordRef: v1alpha3.SecretKeySelector{Name: "redfish", Namespace: "unbounded-system", Key: "password"},
 				},
-			},
+			}},
 		},
 		Status: v1alpha3.MachineStatus{Redfish: &v1alpha3.RedfishStatus{CertFingerprint: "fp"}},
 	}

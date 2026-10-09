@@ -783,12 +783,6 @@ func removeUnmanagedWireGuardInterfaces(cfg *config, state *wireGuardState, desi
 			continue
 		}
 
-		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
-			if err := state.gatewayPolicyManager.RemoveInterface(name); err != nil {
-				klog.V(3).Infof("Policy cleanup skipped for unmanaged interface %s: %v", name, err)
-			}
-		}
-
 		if err := netlink.LinkDel(link); err != nil {
 			klog.Warningf("Failed to delete unmanaged WireGuard interface %s: %v", name, err)
 			continue

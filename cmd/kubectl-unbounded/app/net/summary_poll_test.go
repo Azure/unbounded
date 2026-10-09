@@ -14,22 +14,20 @@ import (
 	"testing"
 )
 
-const legacyOverviewFixture = `{
+const summaryOverviewFixture = `{
 	"seq":7,"pullEnabled":false,"leaderInfo":{"podName":"leader"},
 	"sites":[{"name":"site","manageCniPlugin":true}],
 	"gatewayPools":[{"name":"pool","gateways":["node-a"]}],
 	"warnings":["controller warning"],
-	"nodes":[{
-		"nodeInfo":{"name":"node-a","siteName":"site","isGateway":true,"k8sReady":"Ready"},
-		"statusSource":"ws","nodeErrors":[{"type":"cni","message":"not ready"}],
-		"peers":[{"name":"peer","healthCheck":{"enabled":true,"status":"up"}},{"name":"down"}],
-		"routingTable":{"routes":[{"nextHops":[{"expected":true,"present":false}]}]},
-		"bpfEntries":[{"cidr":"10.0.0.0/24","node":"secret-detail"}]
+	"nodeCount":1,"nodeSummaries":[{
+		"name":"node-a","siteName":"site","isGateway":true,"k8sReady":"Ready",
+		"statusSource":"ws","errorCount":1,"firstError":"not ready",
+		"peerCount":2,"healthyPeers":1,"routeCount":1,"routeMismatch":true
 	}]
 }`
 
-func TestDecodeClusterSummaryCompatibility(t *testing.T) {
-	summary, err := decodeClusterSummary([]byte(legacyOverviewFixture))
+func TestDecodeClusterSummary(t *testing.T) {
+	summary, err := decodeClusterSummary([]byte(summaryOverviewFixture))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +58,7 @@ func TestDecodeClusterSummaryCompatibility(t *testing.T) {
 		t.Fatalf("summary round trip changed: %+v, %v", got, err)
 	}
 
-	for _, raw := range []string{`{`, `{}`, `null`, `{"nodeSummaries":"bad"}`, `{"nodes":"bad"}`} {
+	for _, raw := range []string{`{`, `{}`, `null`, `{"nodeSummaries":"bad"}`, `{"nodes":"bad"}`, `{"nodes":[]}`} {
 		if _, err := decodeClusterSummary([]byte(raw)); err == nil {
 			t.Errorf("accepted malformed response %s", raw)
 		}
@@ -130,7 +128,7 @@ func TestMergeClusterSummaryDelta(t *testing.T) {
 
 func TestNodeListUsesOnlyOverview(t *testing.T) {
 	for _, fixture := range []string{
-		legacyOverviewFixture,
+		summaryOverviewFixture,
 		`{"nodeSummaries":[{"name":"node-a","peerCount":2,"healthyPeers":1}],"sites":[],"gatewayPools":[]}`,
 	} {
 		for _, output := range []string{"json", "table", "wide"} {

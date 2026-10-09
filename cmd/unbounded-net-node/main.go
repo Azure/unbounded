@@ -84,7 +84,6 @@ type config struct {
 	BridgeName                    string
 	WireGuardDir                  string
 	WireGuardPort                 int
-	EnablePolicyRouting           bool
 	MTU                           int
 	HealthPort                    int
 	InformerResyncPeriod          time.Duration
@@ -96,15 +95,12 @@ type config struct {
 	StatusDetailMode              string        // Startup-loaded routine publication mode.
 	StatusWSEnabled               bool          // Whether websocket push is enabled
 	StatusWSURL                   string        // Controller websocket URL for status push
-	StatusWSAPIServerMode         string        // API server fallback mode: never, fallback, preferred (alias for fallback)
+	StatusWSAPIServerMode         string        // API server fallback mode: never, fallback
 	StatusWSAPIServerURL          string        // API server websocket URL for status push fallback
 	StatusWSAPIServerStartupDelay time.Duration // Delay before API server fallback is allowed during a direct transport outage
 	StatusWSKeepaliveInterval     time.Duration // Interval between websocket keepalive pings (0 disables keepalive)
 	StatusWSKeepaliveFailureCount int           // Sequential websocket keepalive ping failures before reconnect
 	RemoveConfigurationOnShutdown bool          // Remove all managed configuration (WireGuard, routes, masquerade, etc.) on shutdown
-	RemoveWireGuardOnShutdown     bool          // Deprecated: use RemoveConfigurationOnShutdown
-	CleanupNetlinkOnShutdown      bool          // Deprecated: use RemoveConfigurationOnShutdown
-	RemoveMasqueradeOnShutdown    bool          // Deprecated: use RemoveConfigurationOnShutdown
 	HealthCheckPort               int           // UDP port for health check probes (default 9997)
 	BaseMetric                    int           // Base metric for programmed routes (default 1)
 	RouteTableID                  int           // Route table ID for managed routes (default 252)
@@ -223,7 +219,6 @@ func main() {
 		BridgeName:                    "cbr0",
 		WireGuardDir:                  "/etc/wireguard",
 		WireGuardPort:                 51820,
-		EnablePolicyRouting:           false,
 		MTU:                           0,
 		HealthPort:                    9998,
 		InformerResyncPeriod:          600 * time.Second,
@@ -306,7 +301,6 @@ then annotates the node with the public key.`,
 	// WireGuard configuration flags
 	flags.StringVar(&cfg.WireGuardDir, "wireguard-dir", "/etc/wireguard", "Directory to store WireGuard keys")
 	flags.IntVar(&cfg.WireGuardPort, "wireguard-port", 51820, "WireGuard listen port")
-	flags.BoolVar(&cfg.EnablePolicyRouting, "enable-policy-routing", false, "Enable policy-based routing on gateway interfaces (deprecated, UNBOUNDED-FORWARD chain rules replace PBR)")
 
 	// Tunnel-interface configuration flags. All three shared tunnel device
 	// names must be non-empty, distinct, and must not collide with
@@ -333,15 +327,12 @@ then annotates the node with the public key.`,
 	flags.StringVar(&cfg.StatusDetailMode, "status-detail-mode", configpkg.DefaultStatusDetailMode, "Routine status detail mode: summary or full")
 	flags.BoolVar(&cfg.StatusWSEnabled, "status-ws-enabled", true, "Enable websocket status push to controller")
 	flags.StringVar(&cfg.StatusWSURL, "status-ws-url", "", "Controller websocket URL for status push (default: ws://service/status/nodews)")
-	flags.StringVar(&cfg.StatusWSAPIServerMode, "status-ws-apiserver-mode", statusWSAPIServerModeFallback, "API server fallback mode: never, fallback, preferred (alias for fallback); direct controller endpoints are tried first")
+	flags.StringVar(&cfg.StatusWSAPIServerMode, "status-ws-apiserver-mode", statusWSAPIServerModeFallback, "API server fallback mode: never, fallback; direct controller endpoints are tried first")
 	flags.StringVar(&cfg.StatusWSAPIServerURL, "status-ws-apiserver-url", "", "API server websocket URL for status push fallback (default: wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews)")
 	flags.DurationVar(&cfg.StatusWSAPIServerStartupDelay, "status-ws-apiserver-startup-delay", 60*time.Second, "Delay from the start of a direct transport outage before API server websocket/push fallback is allowed (0 to disable delay)")
 	flags.DurationVar(&cfg.StatusWSKeepaliveInterval, "status-ws-keepalive-interval", 10*time.Second, "Interval between websocket keepalive pings (0 to disable)")
 	flags.IntVar(&cfg.StatusWSKeepaliveFailureCount, "status-ws-keepalive-failure-count", 2, "Sequential websocket keepalive ping failures before reconnect")
 	flags.BoolVar(&cfg.RemoveConfigurationOnShutdown, "remove-configuration-on-shutdown", false, "Remove all managed configuration (WireGuard, routes, masquerade, tunnel interfaces) on shutdown")
-	flags.BoolVar(&cfg.RemoveWireGuardOnShutdown, "shutdown-remove-wireguard-configuration", false, "Remove WireGuard interfaces/configuration on shutdown (deprecated: use --remove-configuration-on-shutdown)")
-	flags.BoolVar(&cfg.CleanupNetlinkOnShutdown, "shutdown-cleanup-netlink", false, "Remove managed netlink routes/policy rules on shutdown (deprecated: use --remove-configuration-on-shutdown)")
-	flags.BoolVar(&cfg.RemoveMasqueradeOnShutdown, "shutdown-remove-masquerade-rules", false, "Remove managed masquerade rules on shutdown (deprecated: use --remove-configuration-on-shutdown)")
 	flags.IntVar(&cfg.HealthCheckPort, "healthcheck-port", 9997, "UDP port for health check probes")
 	flags.IntVar(&cfg.BaseMetric, "base-metric", 1, "Base metric for programmed routes")
 	flags.IntVar(&cfg.RouteTableID, "route-table-id", 252, "Route table ID for managed routes (default 252, set to 254 for main table)")
@@ -429,10 +420,6 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 		cfg.WireGuardPort = *nodeCfg.WireGuardPort
 	}
 
-	if !flags.Changed("enable-policy-routing") && nodeCfg.EnablePolicyRouting != nil { //nolint:staticcheck // intentional use of deprecated field for backward compat
-		cfg.EnablePolicyRouting = *nodeCfg.EnablePolicyRouting //nolint:staticcheck // intentional use of deprecated field
-	}
-
 	if !flags.Changed("mtu") && nodeCfg.MTU != nil {
 		cfg.MTU = *nodeCfg.MTU
 	}
@@ -513,22 +500,6 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 	// New consolidated shutdown cleanup flag.
 	if !flags.Changed("remove-configuration-on-shutdown") && nodeCfg.RemoveConfigurationOnShutdown != nil {
 		cfg.RemoveConfigurationOnShutdown = *nodeCfg.RemoveConfigurationOnShutdown
-	}
-	// Deprecated individual shutdown cleanup flags (kept for backward compatibility).
-	if !flags.Changed("shutdown-remove-wireguard-configuration") && nodeCfg.ShutdownRemoveWireGuardConfiguration != nil {
-		cfg.RemoveWireGuardOnShutdown = *nodeCfg.ShutdownRemoveWireGuardConfiguration
-	}
-
-	if !flags.Changed("shutdown-cleanup-netlink") && nodeCfg.ShutdownRemoveIPRoutes != nil {
-		cfg.CleanupNetlinkOnShutdown = *nodeCfg.ShutdownRemoveIPRoutes
-	}
-
-	if !flags.Changed("shutdown-remove-masquerade-rules") && nodeCfg.ShutdownRemoveMasqueradeRules != nil {
-		cfg.RemoveMasqueradeOnShutdown = *nodeCfg.ShutdownRemoveMasqueradeRules
-	}
-	// If any deprecated flag is true, activate the consolidated flag.
-	if cfg.RemoveWireGuardOnShutdown || cfg.CleanupNetlinkOnShutdown || cfg.RemoveMasqueradeOnShutdown {
-		cfg.RemoveConfigurationOnShutdown = true
 	}
 
 	if _, err := parseStatusWSAPIServerMode(cfg.StatusWSAPIServerMode); err != nil {
@@ -698,12 +669,6 @@ func run(cfg *config) error {
 	}
 
 	klog.Infof("Running on node: %s", cfg.NodeName)
-
-	if cfg.EnablePolicyRouting {
-		klog.Info("Policy-based routing on gateway interfaces is enabled")
-	} else {
-		klog.Info("Policy-based routing on gateway interfaces is disabled")
-	}
 
 	// Build Kubernetes client
 	var (

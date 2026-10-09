@@ -17,7 +17,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -124,16 +123,6 @@ func (h *installHandler) execute(ctx context.Context) error {
 
 	if h.namespace == "" {
 		h.namespace = unbounded.SystemNamespace()
-	}
-
-	// Refuse to install into a legacy namespace: the operator's migration reaper
-	// drains and deletes these namespaces, so installing into one would delete
-	// the components we just bootstrapped.
-	if unbounded.IsLegacyNamespace(h.namespace) {
-		return fmt.Errorf(
-			"refusing to install into legacy namespace %q: the operator's migration reaper drains and deletes this namespace; choose a different --namespace (default %q)",
-			h.namespace, unbounded.SystemNamespace(),
-		)
 	}
 
 	if h.timeout == 0 {
@@ -298,7 +287,7 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	// The operator auto-discovers the API server endpoint from
 	// kube-public/cluster-info at runtime, so the endpoint is only stored when
 	// explicitly overridden via --api-server-endpoint. A previously stored
-	// override is preserved across reinstalls (like the reaper flag) rather than
+	// override is preserved across reinstalls rather than
 	// being cleared or replaced with the kubeconfig host.
 	endpoint := ""
 	// The operator image and the component registry must stay in lockstep (the
@@ -316,7 +305,6 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 
 	h.resolvedOperatorImage = resolvedOperatorImage
 
-	reapLegacyResources := true
 	previousImageRegistry := ""
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
@@ -333,19 +321,10 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 			return fmt.Errorf("get existing unbounded-operator-config data: %w", err)
 		}
 
-		// The endpoint and reaper flag are cluster policy and are preserved across
-		// reinstalls; the image registry is a build-artifact locator and is not.
+		// The endpoint is cluster policy and is preserved across reinstalls;
+		// the image registry is a build-artifact locator and is not.
 		endpoint = data["UNBOUNDED_API_SERVER_ENDPOINT"]
 		previousImageRegistry = data["UNBOUNDED_IMAGE_REGISTRY"]
-
-		if value, found := data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; found {
-			parsed, err := strconv.ParseBool(value)
-			if err != nil {
-				return fmt.Errorf("parse existing UNBOUNDED_REAP_LEGACY_RESOURCES value %q: %w", value, err)
-			}
-
-			reapLegacyResources = parsed
-		}
 	}
 
 	if h.apiServerEndpoint != "" {
@@ -361,9 +340,8 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	}
 
 	h.operatorConfigData = map[string]string{
-		"UNBOUNDED_API_SERVER_ENDPOINT":   endpoint,
-		"UNBOUNDED_IMAGE_REGISTRY":        imageRegistry,
-		"UNBOUNDED_REAP_LEGACY_RESOURCES": strconv.FormatBool(reapLegacyResources),
+		"UNBOUNDED_API_SERVER_ENDPOINT": endpoint,
+		"UNBOUNDED_IMAGE_REGISTRY":      imageRegistry,
 	}
 
 	return nil

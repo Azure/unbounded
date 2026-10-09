@@ -323,6 +323,10 @@ func TestAssignPodCIDRsWithLabelPatchesWithResourceVersion(t *testing.T) {
 		}
 	}
 
+	if len(labels) != 1 || labels[canonicalSiteLabelKey] != "site-a" {
+		t.Fatalf("patch must set only the canonical site label: %v", labels)
+	}
+
 	if got := patch["spec"]["podCIDR"]; got != "10.244.0.0/24" {
 		t.Fatalf("patch podCIDR = %v, want 10.244.0.0/24", got)
 	}

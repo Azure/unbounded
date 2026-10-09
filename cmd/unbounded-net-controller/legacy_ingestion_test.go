@@ -64,6 +64,11 @@ func TestLegacyIngestionPropagatesStorageFailure(t *testing.T) {
 					switch transport {
 					case "raw-http":
 						ack, code, pushErr = handleStatusPushRequest(health, []byte(`{"nodeInfo":{"name":"node"},"peers":[{"name":"peer"}]}`))
+						if code != http.StatusBadRequest || pushErr == nil || cache.Len() != 0 {
+							t.Fatalf("retired bare payload accepted: code=%d err=%v", code, pushErr)
+						}
+
+						return
 					case "json-http":
 						ack, code, pushErr = handleStatusPushRequest(health, []byte(`{"mode":"full","nodeName":"node","status":{"nodeInfo":{"name":"node"},"peers":[{"name":"peer"}]}}`))
 					case "protobuf-http":

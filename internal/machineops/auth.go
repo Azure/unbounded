@@ -13,10 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 )
-
-var machineSiteLabelKeys = []string{unboundedv1alpha3.MachineSiteLabelKey, netv1alpha1.SiteLabelKey}
 
 const (
 	authReasonAmbiguous       = "AuthAmbiguous"
@@ -58,13 +55,6 @@ func (r *MachineOperationReconciler) resolveOperationAuth(ctx context.Context, m
 }
 
 func operationAuthTargetFor(machine *unboundedv1alpha3.Machine) (operationAuthTarget, *authResolutionFailure) {
-	if canonical, legacy, conflict := conflictingSiteLabels(machine.Labels); conflict {
-		return operationAuthTarget{}, &authResolutionFailure{
-			Reason:  authReasonInvalid,
-			Message: fmt.Sprintf("Machine %s has conflicting site labels %q=%q and %q=%q", machine.Name, unboundedv1alpha3.MachineSiteLabelKey, canonical, netv1alpha1.SiteLabelKey, legacy),
-		}
-	}
-
 	host, err := resolveMachineHost(machine)
 	if err != nil {
 		return operationAuthTarget{}, &authResolutionFailure{
@@ -125,20 +115,7 @@ func (r *MachineOperationReconciler) machineOperationCredentialFor(
 }
 
 func siteNameFromLabels(labels map[string]string) string {
-	for _, key := range machineSiteLabelKeys {
-		if value := strings.TrimSpace(labels[key]); value != "" {
-			return value
-		}
-	}
-
-	return ""
-}
-
-func conflictingSiteLabels(labels map[string]string) (string, string, bool) {
-	canonical := strings.TrimSpace(labels[unboundedv1alpha3.MachineSiteLabelKey])
-	legacy := strings.TrimSpace(labels[netv1alpha1.SiteLabelKey])
-
-	return canonical, legacy, canonical != "" && legacy != "" && canonical != legacy
+	return strings.TrimSpace(labels[unboundedv1alpha3.MachineSiteLabelKey])
 }
 
 func (r *MachineOperationReconciler) authFromCredential(

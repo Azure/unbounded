@@ -1059,14 +1059,11 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 	existing := existingObj.(*unstructured.Unstructured)                                    //nolint:errcheck
 	previousPool, _, _ := unstructured.NestedString(existing.Object, "spec", "gatewayPool") //nolint:errcheck
 
-	// Carry the canonical labels forward and actively clear the deprecated site
-	// label key so GatewayPoolNodes created before the rename are migrated.
+	// Repair the desired labels without changing unrelated labels.
 	patchLabels := map[string]interface{}{}
 	for k, v := range obj.GetLabels() {
 		patchLabels[k] = v
 	}
-
-	patchLabels[deprecatedSiteLabelKey] = nil
 
 	existingLabels := existing.GetLabels()
 	labelsMatch := true
@@ -1079,9 +1076,7 @@ func (gc *GatewayPoolController) ensureGatewayPoolNode(ctx context.Context, pool
 		}
 	}
 
-	_, hasDeprecatedSiteLabel := existingLabels[deprecatedSiteLabelKey]
-
-	if labelsMatch && !hasDeprecatedSiteLabel &&
+	if labelsMatch &&
 		reflect.DeepEqual(existing.GetOwnerReferences(), obj.GetOwnerReferences()) &&
 		reflect.DeepEqual(existing.Object["spec"], obj.Object["spec"]) {
 		return nil
