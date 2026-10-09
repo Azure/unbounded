@@ -1,9 +1,11 @@
-# Unbounded Certification Controller
+# Project Signal: Certification Controller
 
 **Status:** Engineering design review draft
 
 **Scope:** Certification of newly provisioned, repaired, stale, or suspect
 compute capacity before production admission.
+
+**Project name:** Project Signal
 
 ## Decision summary
 
