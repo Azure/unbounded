@@ -11,8 +11,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -523,6 +526,41 @@ func TestRunBindFailure(t *testing.T) {
 				t.Fatal("bind failure did not stop run")
 			}
 		})
+	}
+}
+
+func TestMainMalformedTargetRedaction(t *testing.T) {
+	if os.Getenv("RACER_LOADGEN_TEST_MALFORMED_TARGET") == "1" {
+		os.Args = []string{"racer-loadgen", "--target=https://user:password@private.invalid:bad/payload?token=secret"}
+
+		main()
+
+		return
+	}
+
+	executable, err := os.Executable()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestMainMalformedTargetRedaction$", "-test.timeout=5m")
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = 10 * time.Second
+
+	cmd.Env = append(os.Environ(), "RACER_LOADGEN_TEST_MALFORMED_TARGET=1")
+	output, err := cmd.CombinedOutput()
+
+	require.NoError(t, ctx.Err())
+
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr)
+	require.Equal(t, 1, exitErr.ExitCode())
+	require.Contains(t, string(output), "racer-loadgen stopped")
+	require.Contains(t, string(output), "invalid pull target URL")
+
+	for _, secret := range []string{"user", "password", "private.invalid", "payload", "token", "secret"} {
+		require.NotContains(t, string(output), secret)
 	}
 }
 

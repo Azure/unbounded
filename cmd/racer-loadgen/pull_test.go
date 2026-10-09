@@ -644,6 +644,26 @@ func TestPullTargetPort(t *testing.T) {
 	}
 }
 
+func TestPullTargetParseErrorRedaction(t *testing.T) {
+	for name, target := range map[string]string{
+		"invalid port":     "https://user:password@private.invalid:bad/payload?token=secret",
+		"invalid path":     "https://user:password@private.invalid/%zz?token=secret",
+		"invalid userinfo": "https://user:pass%zz@private.invalid/payload?token=secret",
+		"control byte":     "https://user:password@private.invalid/payload?token=secret\nforged",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, err := newPuller("test/image", pullTestOptions(target), pullTestMetrics())
+			if p != nil {
+				t.Cleanup(p.close)
+			}
+
+			require.Nil(t, p)
+			require.EqualError(t, err, "invalid pull target URL")
+			require.Nil(t, errors.Unwrap(err))
+		})
+	}
+}
+
 func TestPullOptions(t *testing.T) {
 	img := pullTestImage(t)
 	for _, target := range []string{

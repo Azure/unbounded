@@ -118,7 +118,7 @@ func newPuller(repository string, opts pullOptions, metrics *loadMetrics) (*pull
 
 	target, err := url.Parse(opts.Target)
 	if err != nil {
-		return nil, fmt.Errorf("parse pull target: %w", err)
+		return nil, errors.New("invalid pull target URL")
 	}
 
 	if (target.Scheme != "http" && target.Scheme != "https") || target.Hostname() == "" || target.User != nil ||
