@@ -7,7 +7,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -39,17 +38,14 @@ func TestEnvtestGuardContainmentDefaults(t *testing.T) {
 	ctx := t.Context()
 	require.NoError(t, admin.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: env.Namespace}}))
 
-	claim := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: claimName, Namespace: env.Namespace, Annotations: map[string]string{managerAnnotation: component.FieldOwner}},
-		Data:       map[string]string{"cluster": uuid.NewString(), "state": "consumed"},
-		Immutable:  ptr.To(true),
-	}
-	require.NoError(t, admin.Create(ctx, claim))
-	marker := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: markerName, Namespace: env.Namespace, Annotations: map[string]string{managerAnnotation: component.FieldOwner, claimAnnotation: string(claim.UID)}},
-		Data:       map[string]string{"cluster": claim.Data["cluster"], "version_configmap": versionName},
-	}
-	require.NoError(t, admin.Create(ctx, marker))
+	marker := finishIdentity(t, env)
+	claim := &corev1.ConfigMap{}
+	require.NoError(t, admin.Get(ctx, objectKey(env, claimName), claim))
+	require.Equal(t, operatorStaged, claim.Data[operatorInitialization])
+	require.Equal(t, "consumed", claim.Data["state"])
+	require.Equal(t, ptr.To(true), claim.Immutable)
+	require.NotEmpty(t, marker.UID)
+	require.Equal(t, string(marker.UID), claim.Data[operatorMarkerUID])
 
 	objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml"}, nil)
 	require.NoError(t, err)
