@@ -64,22 +64,6 @@ const (
 	StateOther State = "other"
 )
 
-// CurrentState reports what the root is on this host.
-func CurrentState() (State, error) {
-	return state(Path, LegacyPath)
-}
-
-// Installed is documented in pkg/agent/hostroot.
-func Installed() (bool, error) {
-	return installed(Path, LegacyPath)
-}
-
-func installed(root, legacy string) (bool, error) {
-	current, err := state(root, legacy)
-
-	return current == StateInstalled, err
-}
-
 // LegacyReleased is documented in pkg/agent/hostroot.
 func LegacyReleased() (bool, error) {
 	return legacyReleased(Path, LegacyPath)

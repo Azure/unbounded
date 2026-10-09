@@ -91,13 +91,6 @@ func Prepare(ctx context.Context, log *slog.Logger, subdirs ...string) error {
 	return impl.Prepare(ctx, log, subdirs...)
 }
 
-// Installed reports whether Path is a real directory holding a finished
-// installation: not missing, not a link to LegacyPath or anywhere else, and not
-// partway through a move by ReconcileMove.
-func Installed() (bool, error) {
-	return impl.Installed()
-}
-
 // LegacyReleased reports whether nothing an agent runs is under LegacyPath any
 // more: Path is a real directory holding a finished installation, or a link an
 // operator made that leads to a directory outside LegacyPath. Until it is,
