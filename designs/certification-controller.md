@@ -547,370 +547,318 @@ Acceptance requires:
 - Initial scheduler and failure-domain lock implementation.
 - Policy for promotion from advisory to required gates.
 
-## Appendix A: Flex Node Day 0, Day 1, and Day 2 lifecycle
+## Appendix A: Flex Node lifecycle grounded in current Unbounded operations
 
-This appendix follows one Flex Node from initial cluster join through normal
-operation and a later repair. It shows how the control plane, execution plane,
-and evidence plane cooperate without merging their ownership boundaries.
+This appendix separates the lifecycle that Unbounded implements today from the
+Project Signal integration proposed by this design. Current-state claims cite
+the code that enforces them.
 
-### Component map
+### What exists today
 
-```text
-                         KUBERNETES CONTROL PLANE
-+-----------------------------------------------------------------------------+
-|                                                                             |
-|  Infrastructure       Machine / Node      Project Signal       Workflow      |
-|  controller           controllers         Controller           engine        |
-|       |                     |                   |                   |         |
-|       | create/repair       |                   |                   |         |
-|       +-------------------->|                   |                   |         |
-|       |                     | Machine + Node    |                   |         |
-|       |                     +------------------>|                   |         |
-|       |                     |                   | select profile    |         |
-|       |                     |                   | block scheduling  |         |
-|       |                     |                   | create run        |         |
-|       |                     |                   +------------------>|         |
-|       |                     |                   |                   |         |
-|  +----v---------------------v-------------------v-------------------v------+  |
-|  | Kubernetes API                                                      |  |
-|  | Machine, Node, profiles, runs, workflows, Conditions, labels, taints |  |
-|  +---------------------------------------------------------------------+  |
-+-----------------------------------------------------------------------------+
-                                         |
-                                         | schedule suite
-                                         v
-                               FLEX NODE EXECUTION PLANE
-+-----------------------------------------------------------------------------+
-|                                                                             |
-|  Node agent              Network and device setup       Suite runner        |
-|       |                            |                          |              |
-|       +-- joins Node ------------>|                          |              |
-|       |                            +-- exposes resources ---->|              |
-|       |                            |                          |              |
-|       |                            |       discovery and preflight           |
-|       |                            |       observers and active stages       |
-|       |                            |       cooldown and evaluation           |
-|       |                            |       cleanup                           |
-|       |                            |                          |              |
-+-------+----------------------------+--------------------------+--------------+
-        |                            |                          |
-        | telemetry                  | topology                 | results
-        v                            v                          v
-+-----------------------------------------------------------------------------+
-|                         EVIDENCE AND OPERATIONS                             |
-|                                                                             |
-|  Kubernetes status       Logs, metrics, and traces       Immutable evidence |
-|  current run state       operational debugging           results and proof  |
-|                                                                             |
-|                    Append-only audit journal                                |
-|       requested -> resolved -> executed -> decided -> published             |
-+-----------------------------------------------------------------------------+
-                                         |
-                                         v
-                              PROJECT SIGNAL DECISION
-
-                 +--------------+-----------------+----------------+
-                 | PASS         | INCONCLUSIVE    | FAIL           |
-                 v              v                 v
-             Admit Node     Retry or inspect   Keep blocked
-             to canary or   without declaring  and request
-             production     hardware failure   remediation
-```
-
-### Day 0: join and establish trust
-
-Day 0 begins when new capacity is created and ends when the Node is admitted or
-kept out of production.
-
-```text
-Provision
-   |
-   v
-Machine exists
-   |
-   v
-Agent joins Kubernetes
-   |
-   v
-Node becomes Ready
-   |
-   v
-Networking and devices become available
-   |
-   v
-Project Signal observes Node
-   |
-   +-- Bind Node to durable asset identity
-   +-- Record lifecycle and repair generation
-   +-- Resolve exactly one CertificationProfile
-   +-- Add blocked/testing scheduling protection
-   +-- Create CertificationRun
-             |
-             v
-       Wait for capacity,
-       quota, and domain lease
-             |
-             v
-       Submit workflow
-             |
-             v
-  +---------------------------+
-  | Certification suite       |
-  |                           |
-  | 1. Discover hardware      |
-  | 2. Validate inventory     |
-  | 3. Start observers        |
-  | 4. Run active stages      |
-  | 5. Observe cooldown       |
-  | 6. Evaluate thresholds    |
-  | 7. Stop and clean up      |
-  | 8. Publish evidence       |
-  +---------------------------+
-             |
-             v
-       Controller evaluates
-       all required gates
-```
-
-Day 0 ownership:
-
-| Component | Responsibility |
+| Area | Implemented behavior |
 |---|---|
-| Infrastructure controller | Creates or repairs the machine and reports durable asset identity |
-| Machine controller | Tracks provisioning, readiness, and lifecycle generation |
-| Node agent | Registers the Node and reports node-local state |
-| Network and device operators | Make networking, accelerators, storage, and device resources available |
-| Project Signal Controller | Selects policy, blocks scheduling, creates the run, and owns admission |
-| Workflow engine | Executes the selected suite graph |
-| Suite runner | Performs discovery, testing, observation, evaluation, and cleanup |
-| Evidence service | Stores immutable results and artifacts |
-| Audit pipeline | Records decisions and state mutations |
-| Scheduler | Keeps the Node out of production until eligibility advances |
+| Machine lifecycle | `Machine.status.phase` uses `Pending`, `Provisioning`, `Joining`, `Ready`, and `Failed`, with `Rebooting` also defined for lifecycle work (`api/machina/v1alpha3/machine_types.go:744-751`) |
+| Provisioning conditions | Machines expose `Provisioning`, `Provisioned`, `AgentBootstrapped`, `NodeUpdated`, `ConfigurationPending`, and `RepavePending` conditions (`api/machina/v1alpha3/machine_types.go:54-91`) |
+| Node binding | `Machine.spec.kubernetes.nodeRef` records the corresponding Node; when absent, Machine and Node names are matched by convention (`api/machina/v1alpha3/machine_types.go:516-518`, `cmd/machina/machina/controller/machine_controller.go:793-809`) |
+| Initial Node taints | `Machine.spec.kubernetes.registerWithTaints` is passed to kubelet registration (`api/machina/v1alpha3/machine_types.go:524-527`, `pkg/agent/phases/nodestart/kubelet.go:227-250`) |
+| Agent bootstrap | The agent runs host preparation, rootfs preparation, node start, and daemon installation in order (`cmd/agent/internal/bootstrap/coordinator.go:21-40`, `cmd/agent/internal/bootstrap/coordinator.go:122-145`) |
+| Node join | After provisioning succeeds, Machina enters `Joining`, waits for the Node object, records `nodeRef` when needed, and enters `Ready` (`cmd/machina/machina/controller/machine_controller.go:394-419`, `cmd/machina/machina/controller/machine_controller.go:793-843`) |
+| Lifecycle operations | `MachineOperation` supports `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostReboot`, `HostPowerOff`, `HostPowerOn`, and `HostReplace` (`api/machina/v1alpha3/machineoperation_types.go:51-85`) |
+| Operation status | Operations move through `Pending`, `InProgress`, `Complete`, or `Failed` (`api/machina/v1alpha3/machineoperation_types.go:88-95`) |
 
-Day 0 result handling:
+### Day 0: current Machine and Node join path
+
+The existing controllers already own host provisioning and cluster join. Project
+Signal must integrate after or alongside those states rather than inventing a
+second provisioning workflow.
 
 ```text
-PASS
-  execution = Completed
-  verdict = Pass
-  evidence = Complete
-  cleanup = Complete
-      |
-      v
-  eligibility = canary or production
-
-INTERRUPTION
-  execution = Interrupted
-  verdict = Inconclusive
-      |
-      +-- preserve partial evidence
-      +-- keep Node blocked
-      +-- retry under infrastructure policy
-
-FAILURE
-  execution = Completed
-  verdict = Fail
-      |
-      +-- preserve complete evidence
-      +-- keep Node blocked
-      +-- classify failure
-      +-- request remediation when policy allows
+Machine created
+   |
+   v
+Machina reconciliation
+   |
+   +-- host unreachable -------------------------------> Machine Pending
+   |
+   +-- host reachable and Kubernetes config present
+           |
+           v
+     Machine Provisioning
+     Provisioning=True
+           |
+           v
+     Provisioner installs/configures the agent
+           |
+           v
+     Agent bootstrap coordinator
+           |
+           +-- EnsureHostClean
+           +-- ResolveInputs
+           +-- PrepareHost
+           +-- PrepareRootFS
+           +-- EnsureNodeStarted
+           |      |
+           |      +-- start node services
+           |      +-- wait for kubelet bootstrap
+           |      +-- persist applied configuration
+           |
+           +-- EnsureDaemonInstalled
+           |
+           v
+     Provisioned=True
+     Provisioning=False
+     Machine Joining
+           |
+           v
+     Machina waits for Node object
+           |
+           +-- Node absent --> remain Joining
+           |
+           +-- Node found
+                  |
+                  +-- write spec.kubernetes.nodeRef if absent
+                  |
+                  v
+              Machine Ready
 ```
 
-### Day 1: operate and maintain trust
+Code references for this path:
 
-Day 1 is the normal lifecycle after admission.
+- Machina checks reachability, enters provisioning only from allowed phases,
+  requires the bootstrap token, and sets `Provisioning=True` before invoking the
+  provisioner (`cmd/machina/machina/controller/machine_controller.go:255-360`).
+- Successful provisioning sets `Provisioned=True` and changes the phase to
+  `Joining` (`cmd/machina/machina/controller/machine_controller.go:394-419`).
+- The agent bootstrap coordinator executes all bootstrap stages in order and
+  records completion locally (`cmd/agent/internal/bootstrap/coordinator.go:62-145`).
+- Node start starts the node and waits for kubelet bootstrap before persisting
+  applied configuration (`cmd/agent/internal/cmd/bootstrap.go:183-225`).
+- Machina changes `Joining` to `Ready` when the Node object appears
+  (`cmd/machina/machina/controller/machine_controller.go:819-843`).
+
+`MachinePhaseReady` currently means that the expected Node object exists. The
+join reconciler does not check the Node's `Ready` Condition before changing the
+Machine phase (`cmd/machina/machina/controller/machine_controller.go:819-843`).
+Project Signal therefore needs its own entry guard for the Node conditions and
+resources required by the selected certification profile.
+
+### Project Signal handoff on Day 0
+
+Project Signal adds certification after the existing join path. It does not
+replace provisioning or agent bootstrap.
 
 ```text
-                 +----------------------+
-                 | Production Node      |
-                 | eligibility=prod     |
-                 +----------+-----------+
-                            |
-           +----------------+------------------+
-           |                |                  |
-           v                v                  v
-    Runtime signals    Evidence aging     Explicit request
-    and Conditions     policy             or maintenance
-           |                |                  |
-           +----------------+------------------+
-                            v
-                  Project Signal evaluates
-                            |
-               +------------+-------------+
-               |            |             |
-               v            v             v
-           No action   Idle revalidation  Immediate block
+IMPLEMENTED TODAY                         PROJECT SIGNAL ADDITION
+
+Machine Pending
+      |
+Machine Provisioning
+      |
+Agent bootstrap
+      |
+Machine Joining
+      |
+Node object appears
+      |
+Machine Ready --------------------------> Certification entry guard
+                                               |
+                                               +-- Machine phase is Ready
+                                               +-- Machine has NodeRef
+                                               +-- Node object exists
+                                               +-- required Node Conditions pass
+                                               +-- required resources are visible
+                                               |
+                                               v
+                                         Resolve one profile
+                                               |
+                                               v
+                                         Create CertificationRun
+                                               |
+                                               v
+                                         Execute required suites
+                                               |
+                                               v
+                                         Project eligibility
 ```
 
-Lightweight runtime observation can report device, kernel, network, storage,
-temperature, clock, error-counter, and service signals. These signals do not
-rewrite prior certification history. They produce new evidence or a reason to
-recertify.
+To avoid a scheduling race, capacity that always requires certification should
+join with a blocking taint through the existing
+`Machine.spec.kubernetes.registerWithTaints` field. Project Signal can later
+remove or replace that taint after required gates pass. Whether Project Signal
+owns that initial Machine field or another controller supplies it remains an
+API ownership decision.
 
-Idle revalidation:
+The Day 0 boundary is:
 
 ```text
-Evidence becomes stale
+Machina owns:        Pending -> Provisioning -> Joining -> Ready
+Agent owns:          host -> rootfs -> node start -> daemon bootstrap
+Project Signal owns: certification due -> testing -> evidence -> eligibility
+```
+
+### Day 1: current steady state and proposed revalidation
+
+Machina's current steady-state behavior is deliberately small:
+
+- While the Machine is `Ready` and the Node object still exists, it remains
+  `Ready` (`cmd/machina/machina/controller/machine_controller.go:845-848`).
+- If the Node object disappears, the Machine returns to `Joining` and waits for
+  it to reappear (`cmd/machina/machina/controller/machine_controller.go:850-857`).
+- Agent and configuration changes are represented through existing Machine
+  conditions such as `NodeUpdated` and `RepavePending`
+  (`api/machina/v1alpha3/machine_types.go:72-91`).
+
+Project Signal adds trust maintenance without redefining those states:
+
+```text
+Machine Ready and Node present
+        |
+        +-- certification evidence current --> no action
+        |
+        +-- evidence stale
+        |       |
+        |       +-- Node busy --> defer
+        |       |
+        |       +-- Node idle --> acquire certification lease
+        |                           |
+        |                           v
+        |                     run revalidation profile
+        |                           |
+        |                +----------+----------+
+        |                |                     |
+        |                v                     v
+        |            gates pass            gates fail
+        |                |                     |
+        |                v                     v
+        |        refresh evidence       block eligibility
+        |
+        +-- Node disappears --> Machina returns Machine to Joining
+```
+
+Project Signal should watch both the Machine and its referenced Node. It should
+not treat Machine `Ready` as proof that certification prerequisites are still
+present.
+
+### Day 2: use existing MachineOperation kinds
+
+Project Signal should request an existing `MachineOperation` kind rather than a
+generic `repair` action. The selected kind depends on policy and evidence.
+
+| Operation | Existing meaning | Expected certification response |
+|---|---|---|
+| `NodeReboot` | Restart the node in place without rebuilding its rootfs | Keep blocked during the operation, then run the configured post-reboot profile |
+| `AgentUpgrade` | Upgrade the host-side agent | Revalidate agent and Node readiness; run deeper certification only when profile policy requires it |
+| `AgentReset` | Remove the agent and associated resources | Expect the Node to disappear; wait for bootstrap and join before recertification |
+| `HostReboot` | Power-cycle the host | Wait for operation completion and Node rejoin, then run the post-reboot profile |
+| `HostPowerOff` | Power off the host | Keep blocked; no certification can run until a later power-on operation completes |
+| `HostPowerOn` | Power on the host | Wait for join prerequisites, then determine whether current evidence is still valid |
+| `HostReplace` | Replace the host VM and reinstall the agent so the Node can rejoin | Invalidate prior admission evidence and require the full replacement profile |
+
+The current operation flow is:
+
+```text
+MachineOperation created
         |
         v
-Check Node eligibility
+phase = Pending
         |
-        +-- active workload --> defer
+        v
+operation executor accepts work
         |
-        +-- idle
-             |
-             v
-       Acquire disruption lease
-             |
-             v
-       Temporarily block scheduling
-             |
-             v
-       Run bounded active suite
-             |
-             v
-       Cooldown and evaluate
-             |
-       +-----+---------------+
-       |                     |
-       v                     v
-   Evidence fresh        New failure
-   return to service     block Node
+        v
+phase = InProgress
+        |
+        +-- operation succeeds --> phase = Complete
+        |
+        +-- operation fails ----> phase = Failed
 ```
 
-A Day 1 profile may be less disruptive than the Day 0 profile. The profile
-explicitly identifies required, advisory, and shadow gates.
-
-### Day 2: fault, repair, and return to service
-
-Day 2 represents a later operational incident requiring intervention.
+Project Signal integration:
 
 ```text
-Production Node
-      |
-      v
-Runtime fault or repeated degradation
-      |
-      v
-Project Signal correlates:
-  - current signal
-  - certification history
-  - previous failures
-  - repair generation
-  - workload state
-  - fleet safety limits
-      |
-      v
-Keep eligible, degrade, or block
-      |
-      v
-Remediation requested
-      |
-      v
-Lifecycle controller performs action
-      |
-      +-- reboot
-      +-- reconfigure
-      +-- repair
-      +-- replace
-      |
-      v
-Machine reports new repair generation
-      |
-      v
-VerificationRequired
-      |
-      v
-Run post-repair CertificationProfile
-      |
-      +-- Pass ---------> restore eligibility
-      +-- Inconclusive -> retry while blocked
-      +-- Fail ---------> remediate again or quarantine
+Certification evidence fails
+        |
+        v
+Policy selects one existing OperationKind
+        |
+        v
+Project Signal creates MachineOperation
+        |
+        v
+Project Signal watches operation phase
+        |
+        +-- Pending/InProgress --> remain blocked
+        |
+        +-- Failed ------------> record operation failure; remain blocked
+        |
+        +-- Complete
+                |
+                v
+        wait for Machine and Node prerequisites
+                |
+                v
+        create a new CertificationRun
+                |
+         +------+-------+
+         |              |
+         v              v
+       Pass            Fail
+         |              |
+         v              v
+   restore policy   another operation
+   eligibility      or quarantine
 ```
 
-Repair generation prevents stale trust:
+There is no generic repair-generation field in the current API. Project Signal
+should correlate verification with the completed `MachineOperation` UID, the
+current Machine UID/generation, the Node identity, and the new
+`CertificationRun`. If a stronger lifecycle generation is needed, this design
+must add it explicitly rather than describing it as existing behavior.
+
+### Combined current and proposed state story
 
 ```text
-certified generation 7 + repaired generation 8
-                  !=
-       production-eligible generation 8
+CURRENT MACHINE LIFECYCLE                PROJECT SIGNAL LIFECYCLE
+
+Pending
+   |
+Provisioning
+   |
+Joining
+   |
+Ready ---------------------------------> CertificationDue
+   |                                            |
+   |                                      WaitingForLease
+   |                                            |
+   |                                         Running
+   |                                            |
+   |                                        Evaluating
+   |                                  +---------+---------+
+   |                                  |                   |
+   |                                  v                   v
+   |                               Eligible            Failed
+   |                                  |                   |
+Node disappears                        |                   v
+   |                                  |          MachineOperation
+   v                                  |          Pending/InProgress
+Joining                               |                   |
+   |                                  |          +--------+--------+
+Node rejoins                          |          |                 |
+   |                                  |          v                 v
+Ready --------------------------------+       Complete           Failed
+                                                  |
+                                                  v
+                                           Machine/Node ready
+                                                  |
+                                                  v
+                                           CertificationDue
 ```
 
-A successful result from generation 7 cannot admit generation 8. Repair
-invalidates the relevant trust evidence and requires a new verification run.
-
-Repeated-failure path:
+The integration rule is:
 
 ```text
-Failure
-   |
-   v
-Repair
-   |
-   v
-Verification failure
-   |
-   v
-Repeat count or policy threshold
-   |
-   +-- below threshold --> another controlled repair
-   |
-   +-- threshold reached
-              |
-              v
-          Quarantined
-              |
-              +-- no automatic admission
-              +-- preserve complete history
-              +-- require explicit recovery or replacement policy
-```
-
-### Combined lifecycle state story
-
-```text
-DAY 0                         DAY 1                         DAY 2
-Establish trust               Maintain trust               Restore trust
-
-Observed                      Eligible                     RuntimeFault
-   |                             |                             |
-IdentityResolved                +-- healthy -------------------+
-   |                             |
-ProfileResolved                 +-- evidence stale
-   |                             |        |
-Blocked                         |        v
-   |                             |   Revalidation
-WaitingForLease                 |        |
-   |                             |        +-- pass --> Eligible
-WorkflowPending                 |        |
-   |                             |        +-- fail --> Blocked
-Running                         |
-   |                             |
-Evaluating                      |
-   |                             |
-   +-- pass ---------> Eligible-+
-   +-- interrupted --> Retry
-   +-- fail ---------> RemediationRequested
-                                |
-                                v
-                            Repairing
-                                |
-                                v
-                       VerificationRequired
-                                |
-                                v
-                         CertificationDue
-                                |
-                 +--------------+---------------+
-                 |              |               |
-                 v              v               v
-             Eligible       Retry blocked   Quarantined
-```
-
-The durable trust loop is:
-
-```text
-Provision -> Certify -> Admit -> Observe -> Revalidate
-                ^                     |
-                +-- Verify <- Repair <- Fault
+Existing controllers establish Machine and Node readiness.
+Project Signal establishes production trust.
+MachineOperation performs the selected lifecycle action.
+A completed lifecycle action does not restore trust by itself.
 ```
