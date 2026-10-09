@@ -850,10 +850,25 @@ impl Drop for WriteFence {
         self.0.count.set(remaining);
         if remaining == 0 {
             let waiters = std::mem::take(&mut *self.0.waiters.borrow_mut());
+            let mut panic = None;
             for waiter in waiters {
-                // Snapshot ownership without invoking the raw waker's clone callback.
-                let waker = waiter.borrow().clone();
-                waker.wake_by_ref();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    // Snapshot ownership without invoking the raw waker's clone callback.
+                    let waker = waiter.borrow().clone();
+                    waker.wake_by_ref();
+                }));
+                if let Err(payload) = result {
+                    if panic.is_none() && !std::thread::panicking() {
+                        panic = Some(payload);
+                    } else {
+                        // A suppressed payload's destructor could also panic.
+                        std::mem::forget(payload);
+                    }
+                }
+            }
+            // Notify the whole batch, but never start a second unwind from Drop.
+            if let Some(payload) = panic {
+                std::panic::resume_unwind(payload);
             }
         }
     }
@@ -2125,6 +2140,87 @@ mod tests {
         );
         assert!(state.waiters.borrow().is_empty());
         assert!(waiter.borrow().registration.is_none());
+    }
+
+    /// A failed wake must not discard later notifications or replace the first panic.
+    #[test]
+    fn fence_completion_notifies_remaining_waiters_after_panic() {
+        check_fence_wake_panic(false);
+    }
+
+    /// Wake failures during cleanup preserve the outer panic and notify all waiters.
+    #[test]
+    fn fence_completion_notifies_remaining_waiters_during_unwind() {
+        check_fence_wake_panic(true);
+    }
+
+    /// Exercise wake failures with an optional panic already in flight.
+    fn check_fence_wake_panic(unwinding: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Wake;
+
+        /// Count every notification before optionally failing it.
+        struct WakeProbe {
+            wakes: AtomicUsize,
+            panic: Option<&'static str>,
+        }
+
+        impl Wake for WakeProbe {
+            fn wake(self: Arc<Self>) {
+                self.wakes.fetch_add(1, Ordering::Relaxed);
+                if let Some(message) = self.panic {
+                    std::panic::panic_any(message);
+                }
+            }
+        }
+
+        let slab = Slab::<()>::new(PathBuf::new(), 4096, 4096, 512);
+        let write = slab.writes.acquire().unwrap();
+        let probes = [Some("first wake panic"), Some("second wake panic"), None].map(|panic| {
+            Arc::new(WakeProbe {
+                wakes: AtomicUsize::new(0),
+                panic,
+            })
+        });
+        let mut waiters = probes.each_ref().map(|probe| {
+            let mut waiter = slab.fence_writes();
+            let waker = Waker::from(probe.clone());
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            waiter
+        });
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _write = write;
+            if unwinding {
+                panic!("outer panic");
+            }
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>().copied(),
+            Some(if unwinding {
+                "outer panic"
+            } else {
+                "first wake panic"
+            })
+        );
+        assert_eq!(slab.writes_in_flight(), 0);
+        assert!(slab.writes.waiters.borrow().is_empty());
+        for probe in &probes {
+            assert_eq!(probe.wakes.load(Ordering::Relaxed), 1);
+        }
+        for waiter in &mut waiters {
+            assert_eq!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Ok(()))
+            );
+        }
     }
 
     /// Waiters sleep, replace wakers, unregister on cancellation, and register again.
