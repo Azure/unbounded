@@ -97,12 +97,19 @@ type MoveOptions = impl.MoveOptions
 // into a real directory at Path, once neither the current nor the last-good
 // binary predates Path, and finishes a move that was interrupted. Call it from
 // the daemon after Migrate, while holding what keeps an upgrade or a reset from
-// changing the layout. It reports whether it restarted the daemon.
+// changing the layout.
 //
 // Each call on a linked host records the running binary's digest in
 // MoveOptions.Record, which is how a binary that predates Path is told apart:
-// it never records itself. The files under LegacyPath stay until
-// MoveOptions.RewriteUnits has pointed the units at the new ones.
+// it never records itself.
+//
+// A move spans two daemon starts. The first copies the files into Path,
+// restores their SELinux labels, calls MoveOptions.RewriteUnits and then
+// MoveOptions.Restart, and reports true. The daemon must then stop taking work
+// and wait to be replaced. The second start, running from Path, rewrites the
+// units again and removes the files under LegacyPath. Nothing is removed while
+// the daemon still runs from LegacyPath, so a restart that fails leaves every
+// file in place and the next start tries again.
 func ReconcileMove(ctx context.Context, log *slog.Logger, opts MoveOptions) (bool, error) {
 	return impl.ReconcileMove(ctx, log, opts)
 }

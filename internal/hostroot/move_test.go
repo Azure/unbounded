@@ -4,8 +4,6 @@
 package hostroot
 
 import (
-	"context"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -48,8 +46,6 @@ func legacyHost(t *testing.T) layout {
 
 	return l
 }
-
-func noRelabel(context.Context, *slog.Logger, string) {}
 
 func readLinked(t *testing.T, path string) string {
 	t.Helper()
@@ -215,6 +211,8 @@ func TestRebase(t *testing.T) {
 	}
 }
 
+// TestMove covers the copy and the swap. completeMove lays the copy out and
+// labels it; see TestReconcileMoveResumes.
 func TestMove(t *testing.T) {
 	t.Parallel()
 
@@ -222,17 +220,12 @@ func TestMove(t *testing.T) {
 	// LocalDNS was never enabled, so there is nothing under libexec.
 	require.NoError(t, os.RemoveAll(filepath.Join(l.legacy, "libexec")))
 
-	relabeled := ""
-
-	require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, Layout(), []string{"bin", "libexec"},
-		func(_ context.Context, _ *slog.Logger, root string) { relabeled = root }))
+	require.NoError(t, move(discard(), l.root, l.legacy, Layout()))
 
 	got, err := state(l.root, l.legacy)
 	require.NoError(t, err)
 	assert.Equal(t, StateMoving, got)
-	assert.Equal(t, l.root, relabeled, "copied files take their new parent's SELinux label until restored")
-	assert.DirExists(t, filepath.Join(l.root, "libexec"), "a moved host is laid out like a fresh one")
-	assert.NoFileExists(t, filepath.Join(l.root, "libexec/unbounded-localdns-network"), "a missing file is skipped")
+	assert.NoDirExists(t, filepath.Join(l.root, "libexec"), "a missing file is skipped, and nothing is made for it")
 
 	_, err = os.Lstat(l.root + stagingSuffix)
 	assert.ErrorIs(t, err, os.ErrNotExist)
@@ -241,7 +234,30 @@ func TestMove(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(canonical(l.root), "bin/unbounded-agent-green"), current,
 		"the current link leads to the copy, and compares equal to a slot built from the resolved root")
+	assert.Equal(t, "green", readLinked(t, filepath.Join(l.legacy, "bin/unbounded-agent-current")), "the legacy layout is untouched")
 	assertArtifactsKept(t, l)
+}
+
+func TestUnder(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	real := filepath.Join(dir, "var", "usrlocal")
+	legacy := filepath.Join(dir, "usr", "local")
+
+	require.NoError(t, os.MkdirAll(real, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacy), 0o755))
+	require.NoError(t, os.Symlink(real, legacy))
+
+	for path, want := range map[string]bool{
+		filepath.Join(legacy, "bin/unbounded-agent-green"): true,
+		// /proc/self/exe names the resolved path.
+		filepath.Join(real, "bin/unbounded-agent-green"):                    true,
+		filepath.Join(dir, "opt/unbounded/agent/bin/unbounded-agent-green"): false,
+		legacy + "other/bin/unbounded-agent-green":                          false,
+	} {
+		assert.Equal(t, want, under(path, legacy), path)
+	}
 }
 
 func TestRemoveSeed(t *testing.T) {

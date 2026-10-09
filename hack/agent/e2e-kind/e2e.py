@@ -5167,9 +5167,11 @@ def _daemon_executable() -> str:
 def validate_host_root_moved() -> None:
     """Assert a host an older agent installed has been moved to the host root.
 
-    The daemon moves it at the first start after the AgentUpgrade that follows
-    the last older agent out of the slots, then restarts from the host root.
-    The reboot that follows in the suite runs the rewritten units.
+    The daemon copies the files at the first start after the AgentUpgrade that
+    follows the last older agent out of the slots, points the units at the copy
+    and restarts from it, and the restarted daemon removes the legacy files. The
+    root is "moving" in between. The reboot that follows in the suite runs the
+    rewritten units.
     """
 
     log(f"Waiting for the agent's files to move to {HOST_ROOT}...")

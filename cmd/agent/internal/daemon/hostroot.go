@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/fsutil"
@@ -30,48 +31,72 @@ func MigrateHostRoot(log *slog.Logger) error {
 // It is under the agent config directory, which reset removes.
 var hostRootAgentsPath = filepath.Join(goalstates.AgentConfigDir, "host-root-agents")
 
+// hostRootRestartWait bounds how long a daemon that queued its own restart
+// waits for systemd to replace it.
+const hostRootRestartWait = 2 * time.Minute
+
 // reconcileHostRootUnderLock runs the operator's ReconcileHostRoot for the
 // active machine while holding installation ownership, which keeps an
-// agent-upgrade or a reset from changing the layout under it.
+// agent-upgrade or a reset from changing the layout under it. It reports
+// whether the daemon's restart was queued; the lock is released either way.
 //
 // A failure is logged, never returned. The daemon is healthy either way, and
-// failing its start would count towards the unit's start limit and could roll
+// failing its start would count toward the unit's start limit and could roll
 // the binary back for a problem it does not have. The next start retries.
-func reconcileHostRootUnderLock(ctx context.Context, log *slog.Logger, store *installstate.Store, operator nodeOperator, active *ActiveMachine) {
+func reconcileHostRootUnderLock(ctx context.Context, log *slog.Logger, store *installstate.Store, operator nodeOperator, active *ActiveMachine) bool {
 	lock, err := store.AcquireMutationLock()
 	if err != nil {
 		log.Warn("not reconciling the host root: installation ownership is not available", "error", err)
 
-		return
+		return false
 	}
 
 	defer releaseInstallationLock(log, lock)
 
-	if err := operator.ReconcileHostRoot(ctx, log, active); err != nil {
+	restarted, err := operator.ReconcileHostRoot(ctx, log, active)
+	if err != nil {
 		log.Warn("could not move the agent's files to the host root; the next daemon start retries", "error", err)
+	}
+
+	return restarted
+}
+
+// awaitReplacement waits for systemd to replace a daemon that queued its own
+// restart from the host root. It takes no work in the meantime: the restart
+// stops it at any point. It returns an error if ctx ends or the restart has
+// not come within wait, so the unit's Restart= starts the daemon from the
+// rewritten units instead.
+func awaitReplacement(ctx context.Context, log *slog.Logger, wait time.Duration) error {
+	log.Info("waiting to be restarted from the host root", "timeout", wait)
+
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("stopped while waiting to be restarted from the host root: %w", ctx.Err())
+	case <-time.After(wait):
+		return fmt.Errorf("not restarted from the host root within %s", wait)
 	}
 }
 
 // reconcileHostRoot moves a host an older agent installed to the host root
 // once that cannot strand a rollback, and on a host installed under the host
 // root removes the binary install scripts seed under the legacy root for older
-// agents.
-func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOperator, active *ActiveMachine) error {
+// agents. It reports whether it queued the daemon's restart.
+func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOperator, active *ActiveMachine) (bool, error) {
 	state, err := hostroot.CurrentState()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if state == hostroot.StateInstalled {
-		return hostroot.RemoveSeed(log)
+		return false, hostroot.RemoveSeed(log)
 	}
 
 	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	_, err = hostroot.ReconcileMove(ctx, log, hostroot.MoveOptions{
+	return hostroot.ReconcileMove(ctx, log, hostroot.MoveOptions{
 		Files: hostroot.Layout(),
 		// The directories a fresh installation's PrepareHost creates.
 		Subdirs:      []string{"bin", "libexec"},
@@ -86,8 +111,6 @@ func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOpera
 			return operator.RestartAgentDaemon(ctx, log)
 		},
 	})
-
-	return err
 }
 
 // rewriteHostRootUnits points every unit and script that names the agent's

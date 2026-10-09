@@ -358,27 +358,20 @@ func removeIfExists(path string) error {
 }
 
 // move copies files, given relative to the root, from legacy into a staging
-// directory beside root, puts the copy in place of the link at root, then
-// creates any of subdirs the copy lacks and restores SELinux labels, as
-// Prepare does for a new installation. The copy carries a marker that keeps
-// the host in StateMoving until completeMove removes it. Files that are not
-// there are skipped.
+// directory beside root and puts the copy in place of the link at root. The
+// copy carries a marker that keeps the host in StateMoving until completeMove,
+// which lays it out and labels it, removes the marker. Files that are not there
+// are skipped.
 //
 // Symlinks are recreated rather than copied, and a target under LegacyPath is
 // rewritten to the same file under Path, so the blue-green links in the copy
 // lead to the copy. The target names Path as it will resolve once the copy is
 // in place, because that is how the agent writes and compares them.
 //
-// Nothing that is in use changes before the swap: the units, the blue-green
-// links and the recovery script all name LegacyPath, whose files stay. A staging
-// directory left by an earlier attempt is replaced.
-func move(
-	ctx context.Context,
-	log *slog.Logger,
-	root, legacy string,
-	files, subdirs []string,
-	relabel func(context.Context, *slog.Logger, string),
-) error {
+// Nothing that is in use changes: the units, the blue-green links and the
+// recovery script all name LegacyPath, whose files stay. A staging directory
+// left by an earlier attempt is replaced.
+func move(log *slog.Logger, root, legacy string, files []string) error {
 	if err := stage(root, legacy, files); err != nil {
 		return err
 	}
@@ -401,9 +394,9 @@ func move(
 		return err
 	}
 
-	log.Info("moved the agent's files into the host root", "path", root, "from", legacy)
+	log.Info("copied the agent's files into the host root", "path", root, "from", legacy)
 
-	return prepare(ctx, log, root, subdirs, relabel)
+	return nil
 }
 
 func stage(root, legacy string, files []string) error {

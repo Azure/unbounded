@@ -225,12 +225,12 @@ by one of them moves to `/opt/unbounded/agent` in two stages:
    AgentUpgrade back to it works.
 2. **Moved.** Once neither the current nor the last-good binary is from v0.10.0
    or earlier, the daemon copies the files into a real `/opt/unbounded/agent`,
-   rewrites the units to use them, removes them from `/usr/local`, and restarts
-   itself. That is at the first daemon start after the AgentUpgrade that
-   follows the older release out of the last-good slot. To move a host that is
-   not due another upgrade, apply the release it already runs as an
-   AgentUpgrade. A move that is interrupted is finished or started over at the
-   next daemon start.
+   rewrites the units to use them, and restarts itself from there. The
+   restarted daemon then removes the files from `/usr/local`. That is at the
+   first daemon start after the AgentUpgrade that follows the older release out
+   of the last-good slot. To move a host that is not due another upgrade, apply
+   the release it already runs as an AgentUpgrade. A move that is interrupted is
+   finished or started over at the next daemon start.
 
 `unbounded-agent reset` removes the agent's files from both locations, and the
 link or the directory at `/opt/unbounded/agent`, at any stage.

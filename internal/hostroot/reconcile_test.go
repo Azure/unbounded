@@ -6,6 +6,7 @@ package hostroot
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,12 +18,14 @@ import (
 
 // moveRun records what ReconcileMove asked of the agent.
 type moveRun struct {
-	rewrites, restarts int
-	rewriteErr         error
+	rewrites, restarts     int
+	rewriteErr, restartErr error
 	// What RewriteUnits saw: the units are rewritten while the legacy files
 	// are still in place and the host is marked as moving.
 	legacyDuringRewrite string
 	stateDuringRewrite  State
+	// The root whose SELinux labels were restored, if any.
+	relabeled string
 }
 
 func moveOptions(t *testing.T, l layout, run *moveRun) MoveOptions {
@@ -48,23 +51,56 @@ func moveOptions(t *testing.T, l layout, run *moveRun) MoveOptions {
 		Restart: func(context.Context) error {
 			run.restarts++
 
-			return nil
+			return run.restartErr
 		},
 	}
 }
 
-// reconcile runs what the daemon of the green agent runs on the legacy host.
-func reconcile(t *testing.T, l layout, opts MoveOptions) (bool, error) {
+// fromLegacy and fromRoot are where the green daemon runs from: the legacy
+// root until the move restarts it, and the root after.
+func fromLegacy(l layout) string { return filepath.Join(l.legacy, "bin", BinaryGreenName) }
+
+func fromRoot(l layout) string { return filepath.Join(l.root, "bin", BinaryGreenName) }
+
+// reconcile runs what the green daemon runs on the legacy host, as the daemon
+// running from self.
+func reconcile(t *testing.T, l layout, opts MoveOptions, run *moveRun, self string) (bool, error) {
 	t.Helper()
 
-	self := func() (string, error) { return filepath.Join(l.legacy, "bin", BinaryGreenName), nil }
+	executable := func() (string, error) { return self, nil }
+	relabel := func(_ context.Context, _ *slog.Logger, root string) { run.relabeled = root }
 
-	return reconcileMove(t.Context(), discard(), l.root, l.legacy, opts, self, noRelabel)
+	return reconcileMove(t.Context(), discard(), l.root, l.legacy, opts, executable, relabel)
 }
 
 func recordBlue(t *testing.T, l layout, opts MoveOptions) {
 	t.Helper()
 	require.NoError(t, recordDigest(opts.Record, filepath.Join(l.legacy, "bin", BinaryBlueName)))
+}
+
+// assertRestarting checks the first pass of a move left the host moving, laid
+// out and labeled, with the daemon restarted and the legacy files all in
+// place for the units the restart may not have reached.
+func assertRestarting(t *testing.T, l layout, opts MoveOptions, run *moveRun, restarted bool, err error) {
+	t.Helper()
+
+	require.NoError(t, err)
+	assert.True(t, restarted, "the daemon runs from the legacy files until it is restarted")
+	assert.Equal(t, 1, run.restarts)
+
+	got, err := state(l.root, l.legacy)
+	require.NoError(t, err)
+	assert.Equal(t, StateMoving, got)
+	assert.Equal(t, l.root, run.relabeled, "copied files take their new parent's SELinux label until restored")
+	assert.DirExists(t, filepath.Join(l.root, "libexec"), "a moved host is laid out like a fresh one")
+	assert.Equal(t, "green", readLinked(t, filepath.Join(l.root, "bin", BinaryCurrentName)))
+
+	for _, path := range LayoutUnder(l.legacy) {
+		_, err := os.Lstat(path)
+		assert.NoError(t, err, "%s is removed before the daemon restarts from the root", path)
+	}
+
+	assert.FileExists(t, opts.Record, "the record stays until the move is finished")
 }
 
 // assertMoved checks the host ended up a plain installation under the root,
@@ -90,6 +126,20 @@ func assertMoved(t *testing.T, l layout, opts MoveOptions) {
 	require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()), "a moved host is a plain installation")
 }
 
+// finish runs the daemon restarted from the root and checks it finishes the
+// move without restarting again.
+func finish(t *testing.T, l layout, opts MoveOptions, run *moveRun) {
+	t.Helper()
+
+	restarts := run.restarts
+
+	restarted, err := reconcile(t, l, opts, run, fromRoot(l))
+	require.NoError(t, err)
+	assert.False(t, restarted, "a daemon running from the root has nothing to restart for")
+	assert.Equal(t, restarts, run.restarts)
+	assertMoved(t, l, opts)
+}
+
 func TestReconcileMove(t *testing.T) {
 	t.Parallel()
 
@@ -100,7 +150,7 @@ func TestReconcileMove(t *testing.T) {
 		run := &moveRun{}
 		opts := moveOptions(t, l, run)
 
-		restarted, err := reconcile(t, l, opts)
+		restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
 		require.NoError(t, err)
 		assert.False(t, restarted)
 		assert.Zero(t, run.rewrites)
@@ -125,13 +175,13 @@ func TestReconcileMove(t *testing.T) {
 		recordBlue(t, l, opts)
 		require.NoError(t, os.WriteFile(opts.SignalPath, []byte("{}"), 0o600))
 
-		restarted, err := reconcile(t, l, opts)
+		restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
 		require.NoError(t, err)
 		assert.False(t, restarted)
 		assert.Zero(t, run.rewrites)
 	})
 
-	t.Run("a host whose slots are both recorded is moved", func(t *testing.T) {
+	t.Run("a host whose slots are both recorded is moved over two starts", func(t *testing.T) {
 		t.Parallel()
 
 		l := legacyHost(t)
@@ -139,14 +189,14 @@ func TestReconcileMove(t *testing.T) {
 		opts := moveOptions(t, l, run)
 		recordBlue(t, l, opts)
 
-		restarted, err := reconcile(t, l, opts)
-		require.NoError(t, err)
-		assert.True(t, restarted)
+		restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
+		assertRestarting(t, l, opts, run, restarted, err)
 		assert.Equal(t, 1, run.rewrites)
-		assert.Equal(t, 1, run.restarts, "the running daemon's binary is gone")
 		assert.Equal(t, StateMoving, run.stateDuringRewrite)
 		assert.Equal(t, "green", run.legacyDuringRewrite, "the legacy files stay until the units name the new ones")
-		assertMoved(t, l, opts)
+
+		finish(t, l, opts, run)
+		assert.Equal(t, 2, run.rewrites, "the units are rewritten again before the legacy files go")
 	})
 
 	t.Run("other hosts are left alone", func(t *testing.T) {
@@ -155,16 +205,25 @@ func TestReconcileMove(t *testing.T) {
 		for name, setup := range map[string]func(t *testing.T, l layout){
 			"no root":   func(*testing.T, layout) {},
 			"installed": func(t *testing.T, l layout) { touch(t, filepath.Join(l.root, "bin", BinaryBlueName)) },
+			"a link someone else made": func(t *testing.T, l layout) {
+				require.NoError(t, os.MkdirAll(filepath.Dir(l.root), 0o755))
+				require.NoError(t, os.Symlink(t.TempDir(), l.root))
+			},
 		} {
-			l := newLayout(t)
-			setup(t, l)
+			t.Run(name, func(t *testing.T) {
+				l := newLayout(t)
+				setup(t, l)
 
-			run := &moveRun{}
+				run := &moveRun{}
+				opts := moveOptions(t, l, run)
 
-			restarted, err := reconcile(t, l, moveOptions(t, l, run))
-			require.NoError(t, err, name)
-			assert.False(t, restarted, name)
-			assert.Zero(t, run.rewrites, name)
+				restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
+				require.NoError(t, err)
+				assert.False(t, restarted)
+				assert.Zero(t, run.rewrites)
+				assert.Empty(t, run.relabeled)
+				assert.NoFileExists(t, opts.Record, "only a linked host records its binary")
+			})
 		}
 	})
 }
@@ -180,7 +239,7 @@ func TestReconcileMoveKeepsTheLegacyFilesUntilTheUnitsAreRewritten(t *testing.T)
 	opts := moveOptions(t, l, run)
 	recordBlue(t, l, opts)
 
-	restarted, err := reconcile(t, l, opts)
+	restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
 	require.ErrorContains(t, err, "systemd is busy")
 	assert.False(t, restarted)
 	assert.Zero(t, run.restarts)
@@ -191,10 +250,40 @@ func TestReconcileMoveKeepsTheLegacyFilesUntilTheUnitsAreRewritten(t *testing.T)
 	assert.Equal(t, StateMoving, got)
 
 	run.rewriteErr = nil
-	restarted, err = reconcile(t, l, opts)
+	restarted, err = reconcile(t, l, opts, run, fromLegacy(l))
+	assertRestarting(t, l, opts, run, restarted, err)
+	finish(t, l, opts, run)
+}
+
+// TestReconcileMoveRetriesAFailedRestart covers a restart that fails: nothing
+// has been removed, so the daemon keeps running from files that are still
+// there, and the next start restarts it again.
+func TestReconcileMoveRetriesAFailedRestart(t *testing.T) {
+	t.Parallel()
+
+	l := legacyHost(t)
+	run := &moveRun{restartErr: errors.New("restart refused")}
+	opts := moveOptions(t, l, run)
+	recordBlue(t, l, opts)
+
+	restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
+	require.ErrorContains(t, err, "restart refused")
+	assert.False(t, restarted)
+
+	got, err := state(l.root, l.legacy)
 	require.NoError(t, err)
-	assert.True(t, restarted)
-	assertMoved(t, l, opts)
+	assert.Equal(t, StateMoving, got, "the marker stays, so the next start finishes the move")
+
+	for _, path := range LayoutUnder(l.legacy) {
+		_, err := os.Lstat(path)
+		assert.NoError(t, err, "%s is removed although the daemon still runs from the legacy root", path)
+	}
+
+	run.restartErr = nil
+	run.restarts = 0
+	restarted, err = reconcile(t, l, opts, run, fromLegacy(l))
+	assertRestarting(t, l, opts, run, restarted, err)
+	finish(t, l, opts, run)
 }
 
 // TestReconcileMoveRemovesTheAgentsDirectories checks the directories that hold
@@ -203,7 +292,7 @@ func TestReconcileMoveRemovesTheAgentsDirectories(t *testing.T) {
 	t.Parallel()
 
 	l := legacyHost(t)
-	run := &moveRun{rewriteErr: errors.New("systemd is busy")}
+	run := &moveRun{}
 	opts := moveOptions(t, l, run)
 	recordBlue(t, l, opts)
 
@@ -216,15 +305,12 @@ func TestReconcileMoveRemovesTheAgentsDirectories(t *testing.T) {
 	elsewhere := t.TempDir()
 	require.NoError(t, os.Symlink(elsewhere, filepath.Join(l.legacy, "lib/linked")))
 
-	_, err := reconcile(t, l, opts)
-	require.ErrorContains(t, err, "systemd is busy")
+	restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
+	assertRestarting(t, l, opts, run, restarted, err)
 	assert.DirExists(t, filepath.Join(l.legacy, "libexec"), "the directories stay while the files in them do")
+	assert.DirExists(t, filepath.Join(l.legacy, "lib/agent/nested"))
 
-	run.rewriteErr = nil
-	restarted, err := reconcile(t, l, opts)
-	require.NoError(t, err)
-	assert.True(t, restarted)
-	assertMoved(t, l, opts)
+	finish(t, l, opts, run)
 
 	for _, rel := range []string{"lib/agent", "libexec"} {
 		assert.NoDirExists(t, filepath.Join(l.legacy, rel))
@@ -246,21 +332,34 @@ func TestReconcileMoveResumes(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		interrupt func(t *testing.T, l layout)
+		interrupt func(t *testing.T, l layout, opts MoveOptions)
+		// The interrupted daemon was already running from the root.
+		fromRoot bool
 	}{
 		{
 			// The window in which the root does not exist.
 			name: "after removing the link",
-			interrupt: func(t *testing.T, l layout) {
+			interrupt: func(t *testing.T, l layout, _ MoveOptions) {
 				require.NoError(t, stage(l.root, l.legacy, Layout()))
 				require.NoError(t, os.Remove(l.root))
 			},
 		},
 		{
-			name: "after the swap",
-			interrupt: func(t *testing.T, l layout) {
-				require.NoError(t, move(t.Context(), discard(), l.root, l.legacy, Layout(), nil, noRelabel))
+			// The copy is in place but not yet laid out or labeled.
+			name: "after the rename",
+			interrupt: func(t *testing.T, l layout, _ MoveOptions) {
+				require.NoError(t, move(discard(), l.root, l.legacy, Layout()))
 			},
+		},
+		{
+			// The restarted daemon died while it removed the legacy files.
+			name: "partway through removing the legacy files",
+			interrupt: func(t *testing.T, l layout, _ MoveOptions) {
+				require.NoError(t, move(discard(), l.root, l.legacy, Layout()))
+				require.NoError(t, os.Remove(filepath.Join(l.legacy, "bin", BinaryBlueName)))
+				require.NoError(t, os.Remove(filepath.Join(l.legacy, "bin", BinaryCurrentName)))
+			},
+			fromRoot: true,
 		},
 	}
 
@@ -272,14 +371,17 @@ func TestReconcileMoveResumes(t *testing.T) {
 			run := &moveRun{}
 			opts := moveOptions(t, l, run)
 			recordBlue(t, l, opts)
-			tt.interrupt(t, l)
+			tt.interrupt(t, l, opts)
 
 			require.NoError(t, migrate(discard(), l.root, l.legacy, Markers()))
 
-			restarted, err := reconcile(t, l, opts)
-			require.NoError(t, err)
-			assert.True(t, restarted)
-			assertMoved(t, l, opts)
+			if !tt.fromRoot {
+				restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
+				assertRestarting(t, l, opts, run, restarted, err)
+			}
+
+			finish(t, l, opts, run)
+			assert.Equal(t, l.root, run.relabeled, "a resumed move restores the labels too")
 		})
 	}
 }

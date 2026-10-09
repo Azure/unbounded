@@ -66,8 +66,10 @@ type nodeOperator interface {
 	RestartAgentDaemon(context.Context, *slog.Logger) error
 	// ReconcileHostRoot moves the agent's files to the host root on a host an
 	// older agent installed, once that cannot strand a rollback, and finishes
-	// an interrupted move. The caller holds installation ownership.
-	ReconcileHostRoot(context.Context, *slog.Logger, *ActiveMachine) error
+	// an interrupted move. The caller holds installation ownership. It reports
+	// whether it queued the daemon's restart, after which the daemon must not
+	// take any work.
+	ReconcileHostRoot(context.Context, *slog.Logger, *ActiveMachine) (bool, error)
 }
 
 type nspawnNodeOperator struct{}
@@ -309,6 +311,6 @@ func (nspawnNodeOperator) RestartAgentDaemon(ctx context.Context, log *slog.Logg
 	return nil
 }
 
-func (op nspawnNodeOperator) ReconcileHostRoot(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+func (op nspawnNodeOperator) ReconcileHostRoot(ctx context.Context, log *slog.Logger, active *ActiveMachine) (bool, error) {
 	return reconcileHostRoot(ctx, log, op, active)
 }

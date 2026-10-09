@@ -105,11 +105,11 @@ the link, the move and reset. An AgentUpgrade to this build must link
 as they were, because the older release is now last-good and a rollback needs
 them. The host then reboots, returns to the older release, and upgrades to this
 build again, staying linked throughout. The next upgrade leaves no older release
-in either slot, and the daemon it starts must move the files into a real
-`/opt/unbounded/agent`, point the units at them, remove them from `/usr/local`,
-and restart itself from there. The moved host reboots, then resets, which must
-leave neither root behind. The older release cannot be installed on an immutable
-host, so the suite needs a cloud-init host:
+in either slot, and the daemon it starts must copy the files into a real
+`/opt/unbounded/agent`, point the units at them, and restart itself from there,
+and the restarted daemon must remove them from `/usr/local`. The moved host
+reboots, then resets, which must leave neither root behind. The older release
+cannot be installed on an immutable host, so the suite needs a cloud-init host:
 
 ```sh
 HOST_BASE_OS=ubuntu2404 E2E_SUITE=migration KEEP_ENV=1 \

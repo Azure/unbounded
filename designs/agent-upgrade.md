@@ -57,24 +57,30 @@ start on a linked host records the SHA-256 of its own binary in
 `/etc/unbounded/agent/host-root-agents`; older releases never do. Once the
 current and last-good targets are both recorded, and no AgentUpgrade signal is
 pending, the daemon moves the files into a real `/opt/unbounded/agent` under
-installation ownership:
+installation ownership. The move spans two daemon starts, so nothing is removed
+while the daemon still runs from it:
 
 1. Copy the layout from `/usr/local` into `/opt/unbounded/agent.staging`,
    recreating the slot links with targets under `/opt/unbounded/agent`, and
    write a `.moving` marker into the copy last. The copy is beside the root, so
    the rename below stays on one filesystem even when `/opt/unbounded` is a
    mount.
-2. Remove the link and rename the copy into place, then restore SELinux labels.
-3. Rewrite the nspawn lifecycle hooks, the daemon and recovery units, the
-   recovery script and the LocalDNS network unit, and reload systemd.
-4. Remove the layout from `/usr/local`, then the `.moving` marker and the
-   digest record.
-5. Restart the daemon, whose running binary was removed.
+2. Remove the link and rename the copy into place.
+3. Create the root's missing subdirectories and restore its SELinux labels.
+4. Rewrite the daemon and recovery units, the recovery script, the LocalDNS
+   network unit and the nspawn lifecycle hooks, and reload systemd.
+5. Restart the daemon, which is still running from `/usr/local`. It releases
+   the installation lock, takes no work, and waits to be replaced, exiting with
+   an error after two minutes so the unit's `Restart=` starts it instead.
+6. The restarted daemon, running from `/opt/unbounded/agent`, finds the marker
+   and repeats steps 3 and 4, then removes the layout from `/usr/local`, the
+   digest record and the `.moving` marker. It does not restart again.
 
-A start that finds the `.moving` marker resumes at step 3. One that finds a
-staging copy beside a link discards it and starts over. The files under
-`/usr/local` stay in place until the units stop naming them, so the daemon unit
-can start at every step.
+A start that finds the `.moving` marker resumes at step 3, and restarts the
+daemon only if it is still running from `/usr/local`. One that finds a staging
+copy beside a link discards it and starts over. The files under `/usr/local`
+stay in place until the daemon runs from the copy, so a restart that fails
+strands nothing, and the daemon unit can start at every step.
 
 After the move, the last-good binary is a release that knows the host root, so
 automatic rollback is unaffected. An AgentUpgrade to a release up to v0.10.0 is
