@@ -6,7 +6,7 @@ metadata:
   name: racer-controller
   namespace: unbounded-system
 spec:
-  minAvailable: 2
+  maxUnavailable: 1
   selector:
     matchLabels:
       app: racer-controller

@@ -6,6 +6,7 @@ package racer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -28,6 +30,7 @@ import (
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/override"
 	racercore "github.com/Azure/unbounded/internal/racer"
 )
 
@@ -194,7 +197,9 @@ func TestControllerOnlyLifecycleWithoutSites(t *testing.T) {
 
 	budget := &policyv1.PodDisruptionBudget{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), budget))
-	require.Equal(t, 2, budget.Spec.MinAvailable.IntValue())
+	require.Nil(t, budget.Spec.MinAvailable)
+	require.NotNil(t, budget.Spec.MaxUnavailable)
+	require.Equal(t, intstr.FromInt32(1), *budget.Spec.MaxUnavailable)
 	require.Equal(t, deployment.Spec.Selector, budget.Spec.Selector)
 
 	service := &corev1.Service{}
@@ -220,6 +225,43 @@ func TestControllerOnlyLifecycleWithoutSites(t *testing.T) {
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, versionName), after))
 	require.Equal(t, before, after)
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+}
+
+func TestControllerPDBReplicaOverrides(t *testing.T) {
+	for _, replicas := range []int64{0, 1, 2, 3, 5} {
+		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
+			env := testEnv(t, cacheObject("cache"))
+			initialize(t, env)
+			plan := planPass(t, env)
+			entries := []override.SourcedEntry{{
+				Source: override.Source{Key: "racer.yaml", Index: 0},
+				Entry: override.Entry{
+					Component: "racer", Kind: "Deployment",
+					Patch: map[string]any{"spec": map[string]any{"replicas": replicas}},
+				},
+			}}
+			require.NoError(t, override.ValidateErr(entries))
+
+			report := override.Apply(plan, entries, nil)
+			require.NoError(t, report.Err())
+			require.Empty(t, report.Withheld)
+			require.Len(t, report.Workloads, 1)
+			persist(t, env, plan)
+
+			deployment := &appsv1.Deployment{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+			require.EqualValues(t, replicas, *deployment.Spec.Replicas)
+			require.Equal(t, intstr.FromInt32(0), *deployment.Spec.Strategy.RollingUpdate.MaxUnavailable)
+			require.Equal(t, intstr.FromInt32(1), *deployment.Spec.Strategy.RollingUpdate.MaxSurge)
+
+			budget := &policyv1.PodDisruptionBudget{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), budget))
+			require.Nil(t, budget.Spec.MinAvailable)
+			require.NotNil(t, budget.Spec.MaxUnavailable)
+			require.Equal(t, intstr.FromInt32(1), *budget.Spec.MaxUnavailable)
+			require.Equal(t, deployment.Spec.Selector, budget.Spec.Selector)
+		})
+	}
 }
 
 func TestDamagedStateFailsClosed(t *testing.T) {

@@ -121,6 +121,15 @@ Each component emits one kind, except `net`:
 | `racer` | `Deployment` | no |
 | `metalman` | `Deployment` | yes |
 
+### Racer replicas and voluntary disruptions
+
+The Racer controller defaults to three replicas. You can change `spec.replicas`
+with a `racer`/`Deployment` override. Its PodDisruptionBudget uses
+`maxUnavailable: 1`, so one healthy pod can be evicted when all desired replicas
+are healthy, including at one or two replicas. With one replica, eviction leaves
+the controller unavailable until a replacement is ready. Overrides do not change
+the PodDisruptionBudget.
+
 ### Always use `extraArgs` to add arguments
 
 `args` and `command` carry no strategic merge key, so a patch that sets `args`
