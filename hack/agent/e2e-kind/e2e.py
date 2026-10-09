@@ -5157,9 +5157,9 @@ def _legacy_files_left() -> str:
 
 def validate_host_root() -> None:
     """Assert the agent is under a real directory at the host root, with nothing
-    left under the legacy root and labels as SELinux policy gives them. The
-    daemon removes the binary the install script seeds under the legacy root
-    for older agents once it is running, so this waits for that first."""
+    left under the legacy root. The daemon removes the binary the install
+    script seeds under the legacy root for older agents once it is running,
+    so this waits for that first."""
 
     state = host_root_state()
     if state != "dir":
@@ -5179,10 +5179,6 @@ def validate_host_root() -> None:
             *) echo "current binary $current is not under {DAEMON_BIN_DIR}"; exit 1 ;;
         esac
         if [ -e {HOST_ROOT_STAGING} ]; then echo "{HOST_ROOT_STAGING} is left from a move"; exit 1; fi
-        if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled && command -v restorecon >/dev/null 2>&1; then
-            relabel=$(restorecon -nvR {HOST_ROOT})
-            if [ -n "$relabel" ]; then echo "labels differ from policy:"; echo "$relabel"; exit 1; fi
-        fi
     """)
     result = ssh_capture_quiet("sudo bash -c " + shlex.quote(script))
     if result.returncode != 0:

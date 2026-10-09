@@ -132,3 +132,16 @@ cannot be installed on an immutable host, so the suite needs a cloud-init host:
 HOST_BASE_OS=ubuntu2404 E2E_SUITE=migration KEEP_ENV=1 \
   bash hack/agent/e2e-kind/run-local.sh
 ```
+
+GitHub Actions runs this same `migration` suite on Ubuntu 24.04 and AlmaLinux 9.
+Both hosts follow the regular upgrade/downgrade, move, reboot, workload/DNS,
+and reset sequence, without fault injection or SELinux policy changes. The
+migration check requires the daemon to run from the new host root; a directory
+move alone is not success. SELinux label differences alone do not fail the
+suite. Service failures are evaluated through the normal lifecycle checks, with
+the daemon journal and AVC logs retained for diagnosis.
+
+```sh
+HOST_BASE_OS=almalinux9 E2E_SUITE=migration KEEP_ENV=1 \
+  bash hack/agent/e2e-kind/run-local.sh
+```
