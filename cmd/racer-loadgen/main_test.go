@@ -30,6 +30,7 @@ func TestParseOptionsDefaults(t *testing.T) {
 	require.Empty(t, output.String())
 	require.Equal(t, options{
 		listen: ":8080", metricsListen: ":9090", startDelay: 10 * time.Second, catalogImages: 1, blobBytes: 64 << 20,
+		metricsShutdownGrace: 30 * time.Second,
 		image: imageOptions{
 			Repository: "benchmark/image", Layers: 8, LayerBytes: 64 << 20,
 			Jitter: 0.2, Seed: "benchmark-v1",
@@ -53,11 +54,13 @@ func TestParseOptionsOverrides(t *testing.T) {
 		"--retry-delay=20ms", "--interval=30ms", "--verify=false", "--start-delay=0", "--duration=1m",
 		"--catalog-images=512", "--startup-timeout=4m",
 		"--profile=zipf", "--zipf-exponent=0.8",
+		"--metrics-shutdown-grace=45s",
 	}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, options{
 		listen: "127.0.0.1:8001", metricsListen: "127.0.0.1:9001", duration: time.Minute, catalogImages: 512, startupTimeout: 4 * time.Minute, blobBytes: 64 << 20,
-		image: imageOptions{Repository: "custom/image", Layers: 2, LayerBytes: 4096, Seed: "custom"},
+		metricsShutdownGrace: 45 * time.Second,
+		image:                imageOptions{Repository: "custom/image", Layers: 2, LayerBytes: 4096, Seed: "custom"},
 		pull: pullOptions{
 			Backend: "gantry",
 			Profile: profileZipf, ZipfExponent: 0.8,
@@ -83,6 +86,8 @@ func TestParseOptionsInvalid(t *testing.T) {
 		{"bad float", []string{"--jitter=some"}, "invalid value"},
 		{"negative start delay", []string{"--start-delay=-1ns"}, "must be nonnegative"},
 		{"negative duration", []string{"--duration=-1ns"}, "must be nonnegative"},
+		{"negative metrics grace", []string{"--metrics-shutdown-grace=-1ns"}, "metrics-shutdown-grace must be nonnegative"},
+		{"invalid metrics grace", []string{"--metrics-shutdown-grace=forever"}, "invalid value"},
 		{"empty catalog", []string{"--catalog-images=0"}, "catalog-images must be"},
 		{"negative catalog", []string{"--catalog-images=-1"}, "catalog-images must be"},
 		{"oversized catalog", []string{"--catalog-images=513"}, "catalog-images must be"},
@@ -118,6 +123,7 @@ func TestParseOptionsHelp(t *testing.T) {
 				"-concurrency", "zero serves only the origin", "-layer-concurrency",
 				"-pull-timeout", "-retry-delay", "-interval", "-verify", "-start-delay", "-duration",
 				"-catalog-images", "-startup-timeout", "-profile", "-zipf-exponent",
+				"-metrics-shutdown-grace",
 			} {
 				require.Contains(t, output.String(), text)
 			}
@@ -137,6 +143,7 @@ func loadgenTestOptions(t *testing.T) options {
 	opts.pull.Concurrency = 1
 	opts.pull.Interval = time.Hour
 	opts.startDelay = 0
+	opts.metricsShutdownGrace = 100 * time.Millisecond
 
 	return opts
 }
@@ -341,6 +348,106 @@ func TestRunInitializingHealthAndReadiness(t *testing.T) {
 	assertLoadgenStopped(t, client, opts)
 }
 
+func TestRunMetricsShutdownGrace(t *testing.T) {
+	for _, interrupt := range []bool{false, true} {
+		t.Run(map[bool]string{false: "expires", true: "cancel during grace"}[interrupt], func(t *testing.T) {
+			var requests atomic.Int64
+
+			target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				<-r.Context().Done()
+			}))
+			t.Cleanup(target.Close)
+
+			opts := loadgenTestOptions(t)
+			loadgenTestAddresses(t, &opts)
+			opts.pull.Target = target.URL
+			opts.duration = 200 * time.Millisecond
+
+			opts.metricsShutdownGrace = 2 * time.Second
+			if interrupt {
+				opts.metricsShutdownGrace = time.Hour
+			}
+
+			client := loadgenTestClient(t)
+			started := time.Now()
+			running := startLoadgenTest(t, opts)
+			require.Eventually(t, func() bool {
+				_, body, err := loadgenTestGet(client, "http://"+opts.metricsListen+"/metrics")
+
+				return err == nil && strings.Contains(body, `racer_loadgen_pulls_total{result="error"} 1`) &&
+					strings.Contains(body, "racer_loadgen_applied_concurrency 0")
+			}, 5*time.Second, 5*time.Millisecond, "final worker metrics must remain available after duration")
+
+			awaitLoadgenStatus(t, client, "http://"+opts.metricsListen+"/readyz", http.StatusOK)
+			awaitLoadgenStatus(t, client, "http://"+opts.listen+"/v2/", http.StatusOK)
+
+			for range 2 {
+				families := loadgenTestScrape(t, client, opts.metricsListen)
+				require.Zero(t, metricWithLabels(t, families["racer_loadgen_in_flight"], nil).GetGauge().GetValue())
+				require.Equal(t, float64(1), metricWithLabels(t, families["racer_loadgen_pulls_total"], map[string]string{"result": "error"}).GetCounter().GetValue())
+				require.Equal(t, int64(1), requests.Load(), "grace must not start more work")
+				time.Sleep(25 * time.Millisecond)
+			}
+
+			if interrupt {
+				running.cancel()
+			}
+
+			running.wait(t)
+
+			if !interrupt {
+				require.GreaterOrEqual(t, time.Since(started), opts.duration+opts.metricsShutdownGrace)
+			}
+
+			assertLoadgenStopped(t, client, opts)
+		})
+	}
+}
+
+func TestRunMetricsShutdownGraceEdges(t *testing.T) {
+	for _, mode := range []string{"zero grace", "origin only", "cancel during load", "cancel during start delay"} {
+		t.Run(mode, func(t *testing.T) {
+			opts := loadgenTestOptions(t)
+			loadgenTestAddresses(t, &opts)
+			opts.pull.Concurrency = 0
+			opts.duration = 100 * time.Millisecond
+			opts.metricsShutdownGrace = time.Hour
+
+			switch mode {
+			case "zero grace":
+				parsed, err := parseOptions([]string{"--metrics-shutdown-grace=0"}, io.Discard)
+				require.NoError(t, err)
+				require.Zero(t, parsed.metricsShutdownGrace)
+				opts.metricsShutdownGrace = parsed.metricsShutdownGrace
+			case "origin only":
+				opts.metricsShutdownGrace = 100 * time.Millisecond
+			case "cancel during load":
+				opts.duration = time.Hour
+			case "cancel during start delay":
+				opts.startDelay = time.Hour
+			}
+
+			client := loadgenTestClient(t)
+			started := time.Now()
+			running := startLoadgenTest(t, opts)
+			awaitLoadgenStatus(t, client, "http://"+opts.metricsListen+"/readyz", http.StatusOK)
+
+			if strings.HasPrefix(mode, "cancel") {
+				running.cancel()
+			}
+
+			running.wait(t)
+
+			if mode == "origin only" {
+				require.GreaterOrEqual(t, time.Since(started), opts.duration+opts.metricsShutdownGrace)
+			}
+
+			assertLoadgenStopped(t, client, opts)
+		})
+	}
+}
+
 func TestRunOriginOnlyAndStartDelay(t *testing.T) {
 	for _, mode := range []string{"origin only", "start delay"} {
 		t.Run(mode, func(t *testing.T) {
@@ -391,6 +498,8 @@ func TestRunBindFailure(t *testing.T) {
 			t.Cleanup(func() { _ = listener.Close() })
 
 			opts := loadgenTestOptions(t)
+
+			opts.metricsShutdownGrace = time.Hour
 			if address == "origin" {
 				opts.listen = listener.Addr().String()
 			} else {

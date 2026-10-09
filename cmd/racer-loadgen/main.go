@@ -28,17 +28,18 @@ import (
 )
 
 type options struct {
-	s3             s3Options
-	image          imageOptions
-	pull           pullOptions
-	listen         string
-	metricsListen  string
-	startDelay     time.Duration
-	duration       time.Duration
-	catalogImages  int
-	catalogBlobs   int
-	blobBytes      int64
-	startupTimeout time.Duration
+	s3                   s3Options
+	image                imageOptions
+	pull                 pullOptions
+	listen               string
+	metricsListen        string
+	metricsShutdownGrace time.Duration
+	startDelay           time.Duration
+	duration             time.Duration
+	catalogImages        int
+	catalogBlobs         int
+	blobBytes            int64
+	startupTimeout       time.Duration
 }
 
 func parseOptions(args []string, output io.Writer) (options, error) {
@@ -55,6 +56,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.BoolVar(&opts.s3.Origin, "s3-origin", false, "Serve synthetic S3 on listen; requires backend=s3, use concurrency=0 for origin only")
 	f.StringVar(&opts.listen, "listen", ":8080", "Synthetic registry listen address")
 	f.StringVar(&opts.metricsListen, "metrics-listen", ":9090", "Metrics and health listen address")
+	f.DurationVar(&opts.metricsShutdownGrace, "metrics-shutdown-grace", 30*time.Second, "Keep metrics and origins available after timed load completion; zero disables, signals interrupt")
 	f.StringVar(&opts.image.Repository, "repository", "benchmark/image", "Synthetic image repository (tag: latest)")
 	f.IntVar(&opts.image.Layers, "layers", 8, "Number of synthetic layers")
 	f.Int64Var(&opts.image.LayerBytes, "layer-bytes", 64<<20, "Payload bytes per layer, before jitter and tar overhead")
@@ -133,6 +135,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	if opts.startDelay < 0 || opts.duration < 0 {
 		return opts, errors.New("start-delay and duration must be nonnegative")
+	}
+
+	if opts.metricsShutdownGrace < 0 {
+		return opts, errors.New("metrics-shutdown-grace must be nonnegative")
 	}
 
 	if opts.catalogImages < 1 || opts.catalogImages > maxCatalogImages {
@@ -358,6 +364,11 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 			}
 
 			p.run(loadCtx)
+
+			if opts.duration > 0 && opts.metricsShutdownGrace > 0 && ctx.Err() == nil {
+				slog.Info("load complete; waiting for final metrics scrapes", "metrics_shutdown_grace", opts.metricsShutdownGrace)
+				waitPullDelay(ctx, opts.metricsShutdownGrace)
+			}
 		}
 	}
 
