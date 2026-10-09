@@ -7,20 +7,25 @@
 //! again, whatever the allocator's generations say. Restore, append, reclaim,
 //! and I/O results are also checked against small executable specifications.
 //!
-//! Replay one random case with `DST_SEED=<seed>`; tune with `DST_SEEDS` and
-//! `DST_STEPS`. A failure prints the case, step, and operation.
+//! Replay one random case with `DST_SEED=<seed>`; otherwise run `DST_SEEDS`
+//! consecutive seeds from `DST_START_SEED` (default zero). Tune with `DST_STEPS`.
+//! A failure prints the case, step, and operation.
 
 #![cfg(feature = "simulation")]
 
 use page_alloc::{
-    AlignedBuffer, Charge, Error, Extent, FreezeGuard, Generation, SegmentClock, SegmentEntries,
-    SegmentId, SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
+    AlignedBuffer, Alignment, Charge, Error, Extent, FreezeGuard, Generation, SegmentClock,
+    SegmentEntries, SegmentId, SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
 };
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
     rc::Rc,
-    task::{Context, Poll, Waker},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll, Wake, Waker},
 };
 use uring_runtime::{
     Operation, Scope,
@@ -138,19 +143,19 @@ impl Rng {
     }
 }
 
-/// How an appended reservation is used.
+/// How a read or appended reservation is used.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Io {
-    /// Write and drive to completion.
+    /// Drive the I/O to completion.
     Complete,
 
-    /// Write, poll once, and keep the future.
+    /// Poll once and keep the future.
     Pending,
 
-    /// Write, poll once, and drop the future if it has not completed.
+    /// Poll once and drop the future if it has not completed.
     Abandon,
 
-    /// Create the write future without polling it; it still owns the lease.
+    /// Create the future without polling it; it still owns the lease.
     Unpolled,
 
     /// Keep the append lease without writing.
@@ -247,6 +252,20 @@ enum Image {
 /// The single operation vocabulary shared by every DST case.
 #[derive(Clone, Debug)]
 enum Op {
+    Geometry {
+        slots: usize,
+        pages: u64,
+        unequal: bool,
+        partial: bool,
+    },
+    GeometryStep {
+        action: u8,
+        pick: u8,
+    },
+    Invalid(u8),
+    Fence,
+    PollFence(u8),
+    DropFence(u8),
     Append {
         pages: u8,
         io: Io,
@@ -255,10 +274,11 @@ enum Op {
     Read {
         pick: u8,
         fault: Option<FaultKind>,
-        abandon: bool,
+        io: Io,
     },
     ReadAll,
     Turn(u8),
+    Poll(u8),
     Abandon(u8),
     Lease(u8),
     Release(u8),
@@ -268,6 +288,9 @@ enum Op {
         quiesce: bool,
     },
     ExpectRestore(Result<(), Error>),
+    ExpectRecycle(Result<(), Error>),
+    ExpectHeldWrite,
+    ExpectHeldRead,
     Freeze,
     Thaw,
     Reclaim {
@@ -324,6 +347,20 @@ fn reclaim_all() -> Op {
 /// Transitions reached across a set of runs; zero means a case did not test it.
 #[derive(Clone, Copy, Debug, Default)]
 struct Coverage {
+    fence_pending: usize,
+    fence_multiple: usize,
+    fence_repoll: usize,
+    fence_drop: usize,
+    fence_wake: usize,
+    fence_ready: usize,
+    invalid: [usize; 9],
+    geometry: [usize; 7],
+    unequal: usize,
+    partial: usize,
+    large_segments: usize,
+    scored_cap: usize,
+    overreport: [usize; 3],
+    empty_clock: usize,
     restores_ok: usize,
     restore_bumps: usize,
     restore_stale: usize,
@@ -335,6 +372,11 @@ struct Coverage {
     partial_evictions: usize,
     write_failures: usize,
     read_failures: usize,
+    pending_reads: usize,
+    unpolled_reads: usize,
+    retained_read_completions: usize,
+    abandoned_reads: usize,
+    reads_after_eviction: usize,
     abandoned: usize,
     recoveries: usize,
     data_checks: usize,
@@ -344,6 +386,26 @@ struct Coverage {
 impl Coverage {
     /// Accumulate counters from another run.
     fn add(&mut self, other: Self) {
+        self.fence_pending += other.fence_pending;
+        self.fence_multiple += other.fence_multiple;
+        self.fence_repoll += other.fence_repoll;
+        self.fence_drop += other.fence_drop;
+        self.fence_wake += other.fence_wake;
+        self.fence_ready += other.fence_ready;
+        for (a, b) in self.invalid.iter_mut().zip(other.invalid) {
+            *a += b;
+        }
+        for (a, b) in self.geometry.iter_mut().zip(other.geometry) {
+            *a += b;
+        }
+        for (a, b) in self.overreport.iter_mut().zip(other.overreport) {
+            *a += b;
+        }
+        self.unequal += other.unequal;
+        self.partial += other.partial;
+        self.large_segments += other.large_segments;
+        self.scored_cap += other.scored_cap;
+        self.empty_clock += other.empty_clock;
         self.restores_ok += other.restores_ok;
         self.publishes += other.publishes;
         self.restore_bumps += other.restore_bumps;
@@ -356,6 +418,11 @@ impl Coverage {
         self.partial_evictions += other.partial_evictions;
         self.write_failures += other.write_failures;
         self.read_failures += other.read_failures;
+        self.pending_reads += other.pending_reads;
+        self.unpolled_reads += other.unpolled_reads;
+        self.retained_read_completions += other.retained_read_completions;
+        self.abandoned_reads += other.abandoned_reads;
+        self.reads_after_eviction += other.reads_after_eviction;
         self.abandoned += other.abandoned;
         self.recoveries += other.recoveries;
         self.data_checks += other.data_checks;
@@ -438,6 +505,7 @@ impl SegmentEntries for Index {
 
 /// State that survives table recovery.
 struct World {
+    geometry: Option<GeometryModel>,
     records: Vec<Record>,
 
     index: Index,
@@ -451,6 +519,8 @@ struct World {
     coverage: Coverage,
 
     last_restore: Option<Result<(), Error>>,
+
+    last_recycle: Option<Result<(), Error>>,
 
     fill: u8,
 }
@@ -494,6 +564,8 @@ struct Pending<'t> {
     fails: Option<bool>,
 
     polled: bool,
+
+    retained_read: bool,
 
     operation: Operation<'t, AlignedBuffer<Counted>, TestError>,
 }
@@ -647,7 +719,327 @@ fn newest(len: usize, pick: u8) -> Option<usize> {
 }
 
 /// Runner state for one table incarnation.
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl WakeCount {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct Fence<'t> {
+    operation: Operation<'t, (), Error>,
+    waker: Arc<WakeCount>,
+    registered: bool,
+}
+
+/// A second table keeps geometry and hostile-index transitions in the seeded model.
+struct GeometryModel {
+    segments: Rc<Segments>,
+    expected: Vec<SegmentSnapshot>,
+    alignment: Alignment,
+    bytes: u64,
+    counts: RefCell<Vec<usize>>,
+}
+
+struct BadIndex<'a> {
+    counts: &'a RefCell<Vec<usize>>,
+    bad: bool,
+    target: usize,
+}
+
+/// Admission can be withdrawn between the slab check and idle-buffer rebinding.
+struct RebindCharge {
+    remaining: Cell<usize>,
+}
+
+impl Charge for RebindCharge {
+    fn covers(&self, _: usize) -> bool {
+        let remaining = self.remaining.get();
+        self.remaining.set(remaining.saturating_sub(1));
+        remaining != 0
+    }
+}
+
+impl SegmentEntries for BadIndex<'_> {
+    fn can_evict(&self, id: SegmentId) -> bool {
+        id.0 as usize == self.target
+    }
+    fn remove_bounded(&self, id: SegmentId, budget: usize) -> usize {
+        if self.bad {
+            return budget + 1;
+        }
+        let mut counts = self.counts.borrow_mut();
+        let count = &mut counts[id.0 as usize];
+        let removed = (*count).min(budget);
+        *count -= removed;
+        removed
+    }
+    fn is_empty(&self, id: SegmentId) -> bool {
+        self.counts.borrow()[id.0 as usize] == 0
+    }
+}
+
+impl GeometryModel {
+    fn new(slots: usize, pages: u64, unequal: bool, partial: bool, c: &mut Coverage) -> Self {
+        let alignment = Alignment::new(
+            PAGE as usize,
+            PAGE,
+            if unequal { 512 } else { PAGE as usize },
+        )
+        .unwrap();
+        let bytes = PAGE * pages;
+        let segments = Rc::new(Segments::new(bytes));
+        let category = [0, 1, 2, 3, 63, 64, 65]
+            .iter()
+            .position(|n| *n == slots)
+            .unwrap();
+        c.geometry[category] += 1;
+        c.unequal += usize::from(unequal);
+        c.partial += usize::from(partial);
+        c.large_segments += usize::from(pages > 2);
+        if slots != 0 {
+            segments
+                .configure(
+                    bytes * (slots + usize::from(partial)) as u64,
+                    slots,
+                    alignment,
+                )
+                .unwrap();
+        } else {
+            assert_eq!(
+                segments.configure(bytes, 0, alignment),
+                Err(Error::InvalidConfiguration)
+            );
+            assert!(!segments.is_configured());
+        }
+        let mut expected = Vec::new();
+        for id in 0..slots {
+            let (lease, extent) = segments.append(bytes as usize).unwrap();
+            assert_eq!(
+                extent,
+                Extent::new(id as u64 * bytes, bytes as usize).unwrap()
+            );
+            drop(lease);
+            expected.push(SegmentSnapshot {
+                id: SegmentId(id as u64),
+                generation: Generation(1),
+                state: SegmentState::Sealed,
+                used_bytes: bytes,
+            });
+        }
+        assert_eq!(segments.snapshot(), expected);
+        let mut model = Self {
+            segments,
+            expected,
+            alignment,
+            bytes,
+            counts: RefCell::new(vec![1; slots]),
+        };
+        if slots == 65 {
+            let clock = SegmentClock::new(model.segments.clone());
+            let index = BadIndex {
+                counts: &model.counts,
+                bad: false,
+                target: 64,
+            };
+            let mut scored = Vec::new();
+            assert_eq!(
+                clock.reclaim_scored(&index, 65, 255, 1, |id| {
+                    scored.push(id);
+                    0
+                }),
+                Err(Error::Busy)
+            );
+            assert!(
+                scored.is_empty(),
+                "eligible slot 64 must be outside the first sample"
+            );
+            assert_eq!(model.segments.snapshot(), model.expected);
+            assert_eq!(
+                clock.reclaim_scored(&index, 65, 255, 1, |id| {
+                    scored.push(id);
+                    0
+                }),
+                Err(Error::Busy)
+            );
+            assert_eq!(scored, vec![SegmentId(64)]);
+            model.expected[64].state = SegmentState::Free;
+            model.expected[64].used_bytes = 0;
+            model.expected[64].generation = Generation(2);
+            assert_eq!(model.segments.snapshot(), model.expected);
+            c.scored_cap += 1;
+        }
+        model
+    }
+
+    fn step(&mut self, action: u8, pick: u8, c: &mut Coverage) {
+        let slots = self.expected.len();
+        let clock = SegmentClock::new(self.segments.clone());
+        if slots == 0 {
+            let index = BadIndex {
+                counts: &self.counts,
+                bad: false,
+                target: 0,
+            };
+            assert_eq!(clock.reclaim(&index, 1, 255, 1), Err(Error::Unavailable));
+            assert_eq!(
+                clock.reclaim_scored(&index, 1, 255, 1, |_| 0),
+                Err(Error::Unavailable)
+            );
+            assert_eq!(clock.reclaim_index(&index, 255, || false), Err(Error::Busy));
+            assert!(self.segments.snapshot().is_empty());
+            c.empty_clock += 1;
+            return;
+        }
+        let target = pick as usize % slots;
+        let action = action % 6;
+        match action {
+            0..=2 => {
+                // An index error preserves generation and occupancy, not lifecycle:
+                // physical reclamation already entered eviction before the callback.
+                let target = if action == 0 {
+                    target
+                } else {
+                    let Some(target) = self
+                        .expected
+                        .iter()
+                        .position(|s| s.state == SegmentState::Evicting)
+                        .or_else(|| {
+                            self.expected
+                                .iter()
+                                .position(|s| s.state == SegmentState::Sealed)
+                        })
+                    else {
+                        return;
+                    };
+                    target
+                };
+                self.counts.borrow_mut()[target] = 1;
+                let index = BadIndex {
+                    counts: &self.counts,
+                    bad: true,
+                    target,
+                };
+                let result = match action {
+                    0 => clock.reclaim_index(&index, 255, || false),
+                    1 => clock.reclaim(&index, slots, 255, 1),
+                    _ => clock.reclaim_scored(&index, slots, 255, 1, |_| 0),
+                };
+                if action == 2 && target >= 64 {
+                    assert_eq!(result, Err(Error::Busy));
+                } else {
+                    assert_eq!(result, Err(Error::InvalidConfiguration));
+                    if action != 0 {
+                        self.expected[target].state = SegmentState::Evicting;
+                    }
+                    c.overreport[action as usize] += 1;
+                }
+            }
+            3 => {
+                let before = self.expected.clone();
+                let length = if pick.is_multiple_of(2) {
+                    PAGE
+                } else {
+                    self.bytes
+                };
+                let open = before.iter().position(|s| s.state == SegmentState::Open);
+                let slot = open
+                    .filter(|i| before[*i].used_bytes + length <= self.bytes)
+                    .or_else(|| before.iter().position(|s| s.state == SegmentState::Free));
+                if let Some(i) = open.filter(|i| Some(*i) != slot) {
+                    self.expected[i].state = SegmentState::Sealed;
+                }
+                match slot {
+                    None => assert_eq!(
+                        self.segments.append(length as usize).err(),
+                        Some(Error::Busy)
+                    ),
+                    Some(i) => {
+                        let (lease, extent) = self.segments.append(length as usize).unwrap();
+                        assert_eq!(
+                            extent,
+                            self.alignment
+                                .extent(
+                                    i as u64 * self.bytes + before[i].used_bytes,
+                                    length as usize
+                                )
+                                .unwrap()
+                        );
+                        assert_eq!(lease.generation(), before[i].generation);
+                        drop(lease);
+                        self.expected[i].used_bytes += length;
+                        self.expected[i].state = if self.expected[i].used_bytes == self.bytes {
+                            SegmentState::Sealed
+                        } else {
+                            SegmentState::Open
+                        };
+                    }
+                }
+            }
+            4 => {
+                let s = &mut self.expected[target];
+                let result = self.segments.begin_evict(s.id);
+                if matches!(s.state, SegmentState::Sealed | SegmentState::Evicting) {
+                    assert_eq!(result, Ok(()));
+                    s.state = SegmentState::Evicting;
+                    self.counts.borrow_mut()[target] = 0;
+                    assert_eq!(self.segments.recycle(s.id), Ok(()));
+                    s.state = SegmentState::Free;
+                    s.generation.0 += 1;
+                    s.used_bytes = 0;
+                } else {
+                    assert_eq!(result, Err(Error::Busy));
+                }
+            }
+            _ => {
+                assert_eq!(
+                    self.segments.append(0).err(),
+                    Some(Error::InvalidConfiguration)
+                );
+                assert_eq!(
+                    self.segments.append(PAGE as usize - 1).err(),
+                    Some(Error::InvalidConfiguration)
+                );
+                assert_eq!(
+                    self.segments
+                        .append(self.bytes as usize + PAGE as usize)
+                        .err(),
+                    Some(Error::InvalidConfiguration)
+                );
+            }
+        }
+        assert_eq!(self.segments.snapshot(), self.expected);
+        assert_eq!(
+            self.segments.free_count(),
+            self.expected
+                .iter()
+                .filter(|s| s.state == SegmentState::Free)
+                .count()
+        );
+        for s in &self.expected {
+            let result = self.segments.lease(s.id, s.generation);
+            assert_eq!(
+                result.is_ok(),
+                matches!(s.state, SegmentState::Open | SegmentState::Sealed)
+            );
+        }
+    }
+}
+
 struct Phase<'t, 'w> {
+    fences: Vec<Fence<'t>>,
+    retired_wakers: Vec<(Arc<WakeCount>, usize)>,
     sim: &'w Simulation,
 
     t: &'t Table,
@@ -669,9 +1061,303 @@ struct Phase<'t, 'w> {
 }
 
 impl<'t, 'w> Phase<'t, 'w> {
+    fn check_fences(&mut self) {
+        for (waker, expected) in &self.retired_wakers {
+            assert_eq!(waker.count(), *expected, "retired waker notified");
+        }
+        for fence in &mut self.fences {
+            if fence.registered {
+                let zero = self.t.slab.writes_in_flight() == 0;
+                assert_eq!(
+                    fence.waker.count(),
+                    usize::from(zero),
+                    "fence notification before final write release"
+                );
+                if zero {
+                    fence.registered = false;
+                    self.w.coverage.fence_wake += 1;
+                }
+            }
+        }
+    }
+
+    fn poll_fence(&mut self, pick: u8) {
+        self.check_fences();
+        let Some(i) = newest(self.fences.len(), pick) else {
+            return;
+        };
+        let active = self.fences.iter().filter(|f| f.registered).count();
+        let fence = &mut self.fences[i];
+        if fence.registered {
+            self.w.coverage.fence_repoll += 1;
+        }
+        self.retired_wakers
+            .push((fence.waker.clone(), fence.waker.count()));
+        fence.waker = Arc::new(WakeCount::default());
+        let waker = Waker::from(fence.waker.clone());
+        let result = fence
+            .operation
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker));
+        if self.t.slab.writes_in_flight() == 0 {
+            assert_eq!(result, Poll::Ready(Ok(())));
+            self.fences.remove(i);
+            self.w.coverage.fence_ready += 1;
+        } else {
+            assert_eq!(result, Poll::Pending);
+            fence.registered = true;
+            self.w.coverage.fence_pending += 1;
+            self.w.coverage.fence_multiple += usize::from(active > 0);
+        }
+    }
+
+    fn invalid(&mut self, kind: u8) {
+        let kind = kind as usize % 9;
+        let before = self.snap();
+        let a = self.t.slab.alignment().unwrap();
+        let charge = self.w.charge.get();
+        let idle = self.t.slab.idle_bytes();
+        match kind {
+            0 => {
+                for length in [0, PAGE as usize - 1, SEGMENT as usize + PAGE as usize] {
+                    assert_eq!(
+                        self.t.segments.append(length).err(),
+                        Some(if self.frozen.is_some() {
+                            Error::Busy
+                        } else {
+                            Error::InvalidConfiguration
+                        })
+                    );
+                }
+            }
+            1 => {
+                assert_eq!(a.memory(), PAGE as usize);
+                assert_eq!(
+                    Alignment::new(3, PAGE, PAGE as usize),
+                    Err(Error::Unsupported)
+                );
+                let free = Segments::from_geometry(self.t.segments.geometry().unwrap()).unwrap();
+                assert_eq!(free.capacity_bytes(), CAPACITY);
+                let pre = free.snapshot();
+                assert_eq!(
+                    free.configure(CAPACITY, SLOTS, a),
+                    Err(Error::InvalidConfiguration)
+                );
+                let frozen = free.freeze().unwrap();
+                assert_eq!(free.configure(CAPACITY, SLOTS, a), Err(Error::Busy));
+                assert_eq!(free.snapshot(), pre);
+                drop(frozen);
+                for (offset, length) in [
+                    (0, 0),
+                    (u64::MAX, 1),
+                    (0, Alignment::MAX_TRANSFER_LENGTH + 1),
+                ] {
+                    assert_eq!(Extent::new(offset, length), Err(Error::Corrupt));
+                }
+                for (offset, length) in [(1, 1), (0, 0), (0, Alignment::MAX_TRANSFER_LENGTH + 1)] {
+                    assert_eq!(a.extent(offset, length), Err(Error::InvalidConfiguration));
+                }
+                let odd = Alignment::new(8, 3, 3).unwrap();
+                assert_eq!(
+                    odd.extent(0, Alignment::MAX_TRANSFER_LENGTH),
+                    Err(Error::InvalidConfiguration)
+                );
+            }
+            2 => {
+                for length in [0, PAGE as usize - 1, Alignment::MAX_TRANSFER_LENGTH + 1] {
+                    assert_eq!(
+                        a.allocate(length, Counted::new(&self.w.charge, length))
+                            .err(),
+                        Some(Error::InvalidConfiguration)
+                    );
+                }
+                assert_eq!(
+                    a.allocate(PAGE as usize, Counted::new(&self.w.charge, 0))
+                        .err(),
+                    Some(Error::InvalidConfiguration)
+                );
+                assert_eq!(
+                    self.t
+                        .slab
+                        .allocate(PAGE as usize, Counted::new(&self.w.charge, 0))
+                        .err(),
+                    Some(Error::InvalidConfiguration)
+                );
+                let buffer = a
+                    .allocate(PAGE as usize, Counted::new(&self.w.charge, PAGE as usize))
+                    .unwrap();
+                for extent in [
+                    Extent::new(1, PAGE as usize).unwrap(),
+                    Extent::new(0, 2 * PAGE as usize).unwrap(),
+                ] {
+                    assert_eq!(a.check(extent, &buffer), Err(Error::InvalidConfiguration));
+                }
+            }
+            3 | 4 => {
+                let Some(s) = before
+                    .iter()
+                    .find(|s| matches!(s.state, SegmentState::Open | SegmentState::Sealed))
+                else {
+                    return;
+                };
+                let lease = self.t.segments.lease(s.id, s.generation).unwrap();
+                let start = s.id.0 * SEGMENT;
+                let valid = Extent::new(start, PAGE as usize).unwrap();
+                assert_eq!(self.t.segments.validate_lease(&lease, &valid), Ok(()));
+                for extent in [
+                    Extent::new(start, 1).unwrap(),
+                    Extent::new(start + 1, 1).unwrap(),
+                    Extent::new(start + s.used_bytes, PAGE as usize).unwrap(),
+                ] {
+                    assert_eq!(
+                        self.t.segments.validate_lease(&lease, &extent),
+                        Err(Error::Corrupt)
+                    );
+                    assert_eq!(
+                        self.t.segments.validate(s.id, s.generation, &extent),
+                        Err(Error::Corrupt)
+                    );
+                }
+                let foreign = Segments::new(SEGMENT);
+                foreign.configure(CAPACITY, SLOTS, a).unwrap();
+                assert_eq!(foreign.validate_lease(&lease, &valid), Err(Error::Stale));
+                if kind == 4 {
+                    let (foreign_lease, extent) = foreign.append(PAGE as usize).unwrap();
+                    let buffer = a
+                        .allocate(PAGE as usize, Counted::new(&self.w.charge, PAGE as usize))
+                        .unwrap();
+                    let mut operation =
+                        self.t
+                            .slab
+                            .write(&self.t.reactor, extent, buffer, foreign_lease, &SCOPE);
+                    assert!(matches!(
+                        operation
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Ready(Err(TestError::Alloc(Error::Stale)))
+                    ));
+                }
+            }
+            5 => {
+                let other = Segments::new(SEGMENT);
+                assert_eq!(
+                    self.t.slab.configure_segments(&other),
+                    Err(Error::InvalidConfiguration)
+                );
+                assert!(other.snapshot().is_empty());
+                assert!(!other.is_configured());
+                let huge = Slab::<Counted>::new(
+                    "/dst/huge".into(),
+                    SEGMENT * (page_alloc::MAX_SEGMENTS + 1),
+                    SEGMENT,
+                    PAGE as usize,
+                );
+                assert_eq!(
+                    huge.open_configured(&other),
+                    Err(Error::InvalidConfiguration)
+                );
+            }
+            6 => {
+                let slab =
+                    Slab::<Counted>::new("/dst/config".into(), CAPACITY, SEGMENT, PAGE as usize);
+                let _ = slab.open_now().unwrap();
+                let wrong = Segments::new(PAGE);
+                assert_eq!(
+                    slab.configure_segments(&wrong),
+                    Err(Error::InvalidConfiguration)
+                );
+                for (capacity, alignment) in [
+                    (CAPACITY + SEGMENT, a),
+                    (CAPACITY, Alignment::new(512, 512, 512).unwrap()),
+                ] {
+                    let wrong = Segments::new(SEGMENT);
+                    wrong.configure(capacity, 1, alignment).unwrap();
+                    let pre = wrong.snapshot();
+                    assert_eq!(
+                        slab.configure_segments(&wrong),
+                        Err(Error::InvalidConfiguration)
+                    );
+                    assert_eq!(wrong.snapshot(), pre);
+                }
+                let partial = Segments::new(SEGMENT);
+                partial.configure(CAPACITY, 1, a).unwrap();
+                assert_eq!(slab.configure_segments(&partial), Ok(()));
+                assert_eq!(partial.count(), 1);
+            }
+            7 => {
+                {
+                    let slab =
+                        Slab::<Counted>::new("/dst/size".into(), CAPACITY, SEGMENT, PAGE as usize);
+                    let _ = slab.open_now().unwrap();
+                }
+                let slab = Slab::<Counted>::new(
+                    "/dst/size".into(),
+                    CAPACITY + SEGMENT,
+                    SEGMENT,
+                    PAGE as usize,
+                );
+                assert_eq!(slab.open_now(), Err(Error::InvalidConfiguration));
+            }
+            _ => {
+                let charge = RebindCharge {
+                    remaining: Cell::new(usize::MAX),
+                };
+                let slab = Slab::<RebindCharge>::new(
+                    "/dst/rebind-pool".into(),
+                    CAPACITY,
+                    SEGMENT,
+                    PAGE as usize,
+                );
+                let _ = slab.open_now().unwrap();
+                drop(slab.allocate(PAGE as usize, charge).unwrap());
+                let idle = slab.idle_bytes();
+                assert_eq!(idle, PAGE as usize);
+                assert_eq!(
+                    slab.allocate(
+                        PAGE as usize,
+                        RebindCharge {
+                            remaining: Cell::new(0)
+                        }
+                    )
+                    .err(),
+                    Some(Error::InvalidConfiguration)
+                );
+                assert_eq!(slab.idle_bytes(), idle);
+                assert_eq!(
+                    slab.allocate(
+                        PAGE as usize,
+                        RebindCharge {
+                            remaining: Cell::new(1)
+                        }
+                    )
+                    .err(),
+                    Some(Error::InvalidConfiguration)
+                );
+                // A withdrawn charge rejects rebinding after the idle owner was
+                // taken. Idle owners have no return pool, so storage is released.
+                assert_eq!(slab.idle_bytes(), 0);
+                let buffer = slab
+                    .allocate(
+                        PAGE as usize,
+                        RebindCharge {
+                            remaining: Cell::new(usize::MAX),
+                        },
+                    )
+                    .unwrap();
+                assert!(buffer.as_slice().iter().all(|b| *b == 0));
+            }
+        }
+        assert_eq!(self.snap(), before);
+        assert_eq!(self.w.charge.get(), charge);
+        assert_eq!(self.t.slab.idle_bytes(), idle);
+        self.w.coverage.invalid[kind] += 1;
+    }
+
     /// Start a phase with no caller-owned resources.
     fn new(sim: &'w Simulation, t: &'t Table, w: &'w mut World) -> Self {
         Self {
+            fences: Vec::new(),
+            retired_wakers: Vec::new(),
             sim,
             t,
             w,
@@ -725,14 +1411,57 @@ impl<'t, 'w> Phase<'t, 'w> {
     /// Execute one operation and check its specific contract.
     fn step(&mut self, op: &Op) {
         match op {
+            Op::Geometry {
+                slots,
+                pages,
+                unequal,
+                partial,
+            } => {
+                self.w.geometry = Some(GeometryModel::new(
+                    *slots,
+                    *pages,
+                    *unequal,
+                    *partial,
+                    &mut self.w.coverage,
+                ));
+            }
+            Op::GeometryStep { action, pick } => {
+                if let Some(model) = &mut self.w.geometry {
+                    model.step(*action, *pick, &mut self.w.coverage);
+                }
+            }
+            Op::Invalid(kind) => self.invalid(*kind),
+            Op::Fence => {
+                if self.fences.len() < 8 {
+                    self.fences.push(Fence {
+                        operation: self.t.slab.fence_writes(),
+                        waker: Arc::new(WakeCount::default()),
+                        registered: false,
+                    });
+                    self.poll_fence(0);
+                }
+            }
+            Op::PollFence(pick) => self.poll_fence(*pick),
+            Op::DropFence(pick) => {
+                if let Some(i) = newest(self.fences.len(), *pick) {
+                    let fence = self.fences.remove(i);
+                    if fence.registered {
+                        self.w.coverage.fence_drop += 1;
+                    }
+                    self.retired_wakers
+                        .push((fence.waker.clone(), fence.waker.count()));
+                    drop(fence);
+                }
+            }
             Op::Append { pages, io, fault } => self.append(*pages, *io, *fault),
-            Op::Read {
-                pick,
-                fault,
-                abandon,
-            } => self.read(*pick, *fault, *abandon),
+            Op::Read { pick, fault, io } => self.read(*pick, *fault, *io),
             Op::ReadAll => self.read_all(),
             Op::Turn(turns) => self.turn(*turns),
+            Op::Poll(pick) => {
+                if let Some(i) = newest(self.pending.len(), *pick) {
+                    self.poll_id(self.pending[i].id);
+                }
+            }
             Op::Abandon(pick) => self.abandon(*pick),
             Op::Lease(pick) => self.lease(*pick),
             Op::Release(pick) => {
@@ -749,6 +1478,29 @@ impl<'t, 'w> Phase<'t, 'w> {
             }
             Op::Restore { image, quiesce } => self.restore(image, *quiesce),
             Op::ExpectRestore(expected) => assert_eq!(self.w.last_restore, Some(*expected)),
+            Op::ExpectRecycle(expected) => assert_eq!(self.w.last_recycle, Some(*expected)),
+            Op::ExpectHeldWrite => {
+                assert_eq!(self.pending.len(), 1);
+                let pending = &self.pending[0];
+                assert!(pending.write && pending.polled);
+                assert!(self.sim.trace().iter().any(|event| {
+                    event.operation == "complete:write"
+                        && event.result == self.w.records[pending.record].extent.length() as i64
+                }));
+                assert_eq!(self.t.reactor.in_flight(), 1);
+                assert_eq!(self.t.slab.writes_in_flight(), 1);
+            }
+            Op::ExpectHeldRead => {
+                assert_eq!(self.pending.len(), 1);
+                let pending = &self.pending[0];
+                assert!(!pending.write && pending.polled);
+                assert!(self.sim.trace().iter().any(|event| {
+                    event.operation == "complete:read"
+                        && event.result == self.w.records[pending.record].extent.length() as i64
+                }));
+                assert_eq!(self.t.reactor.in_flight(), 1);
+                assert_eq!(self.t.slab.writes_in_flight(), 0);
+            }
             Op::Freeze => {
                 let result = self.t.segments.freeze();
                 if self.frozen.is_some() {
@@ -931,6 +1683,7 @@ impl<'t, 'w> Phase<'t, 'w> {
             write,
             fails: fault.map_or(Some(false), FaultKind::fails),
             polled: false,
+            retained_read: false,
             operation,
         });
         id
@@ -963,11 +1716,12 @@ impl<'t, 'w> Phase<'t, 'w> {
         };
         let pending = &mut self.pending[i];
         pending.polled = true;
-        let ready = match pending
+        let result = pending
             .operation
             .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-        {
+            .poll(&mut Context::from_waker(Waker::noop()));
+        self.check_fences();
+        let ready = match result {
             Poll::Ready(result) => result,
             Poll::Pending => return false,
         };
@@ -983,6 +1737,8 @@ impl<'t, 'w> Phase<'t, 'w> {
                 return;
             }
             self.t.reactor.poll_budgeted(64).unwrap();
+            self.check_fences();
+            self.poll_submitted();
         }
         panic!("operation {id} did not complete in {TURNS} turns");
     }
@@ -993,11 +1749,15 @@ impl<'t, 'w> Phase<'t, 'w> {
         if pending.write {
             self.w.records[pending.record].status = Status::Unknown;
             self.w.index.unpublished.borrow_mut()[self.w.records[pending.record].seg] -= 1;
+        } else {
+            self.w.coverage.abandoned_reads += 1;
         }
         if pending.polled {
             self.maybe_held = true;
         }
         self.w.coverage.abandoned += 1;
+        drop(pending);
+        self.check_fences();
     }
 
     /// Check a completion against its fault and publish successful writes.
@@ -1041,11 +1801,19 @@ impl<'t, 'w> Phase<'t, 'w> {
                         self.w.coverage.publishes += 1;
                     }
                 } else {
-                    let fill = self.w.records[record].fill;
+                    let r = &self.w.records[record];
+                    assert!(!r.superseded, "read completed from reissued bytes");
+                    let fill = r.fill;
                     assert!(
                         buffer.as_slice().iter().all(|b| *b == fill),
                         "record {record} read back foreign bytes"
                     );
+                    if expect_validate(r, &self.snap()).is_err() {
+                        self.w.coverage.reads_after_eviction += 1;
+                    }
+                    if pending.retained_read {
+                        self.w.coverage.retained_read_completions += 1;
+                    }
                     self.w.coverage.data_checks += 1;
                 }
             }
@@ -1076,20 +1844,28 @@ impl<'t, 'w> Phase<'t, 'w> {
             .collect()
     }
 
-    /// Read one readable record, optionally abandoning it after submission.
-    fn read(&mut self, pick: u8, fault: Option<FaultKind>, abandon: bool) {
+    /// Read known bytes using the same polling modes as writes.
+    fn read(&mut self, pick: u8, fault: Option<FaultKind>, io: Io) {
+        assert!(matches!(
+            io,
+            Io::Complete | Io::Pending | Io::Abandon | Io::Unpolled
+        ));
         let readable = self.readable();
         let Some(i) = newest(readable.len(), pick) else {
             return;
         };
+        // Faults are consumed on submission, not future creation. Do not leave a
+        // fault queued for an unrelated read while this future stays unpolled.
+        let fault = if io == Io::Unpolled { None } else { fault };
         let id = self.submit_read(readable[i], fault);
-        if abandon {
-            if !self.poll_id(id) {
-                let i = self.find(id).unwrap();
-                self.drop_pending(i);
+        self.after_submit(id, io);
+        if let Some(i) = self.find(id) {
+            self.pending[i].retained_read = true;
+            match io {
+                Io::Pending => self.w.coverage.pending_reads += 1,
+                Io::Unpolled => self.w.coverage.unpolled_reads += 1,
+                _ => unreachable!("only retained reads remain"),
             }
-        } else {
-            self.drive(id);
         }
     }
 
@@ -1128,15 +1904,21 @@ impl<'t, 'w> Phase<'t, 'w> {
     fn turn(&mut self, turns: u8) {
         for _ in 0..=turns % 8 {
             self.t.reactor.poll_budgeted(64).unwrap();
-            let polled: Vec<u64> = self
-                .pending
-                .iter()
-                .filter(|p| p.polled)
-                .map(|p| p.id)
-                .collect();
-            for id in polled {
-                self.poll_id(id);
-            }
+            self.check_fences();
+            self.poll_submitted();
+        }
+    }
+
+    /// Retire terminal results before the model checks which futures hold leases.
+    fn poll_submitted(&mut self) {
+        let polled: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|p| p.polled)
+            .map(|p| p.id)
+            .collect();
+        for id in polled {
+            self.poll_id(id);
         }
     }
 
@@ -1382,6 +2164,7 @@ impl<'t, 'w> Phase<'t, 'w> {
                 .remove_bounded(SegmentId(seg as u64), usize::MAX);
         }
         let result = self.t.segments.recycle(SegmentId(seg as u64));
+        self.w.last_recycle = Some(result);
         let post = self.snap();
         if self.frozen.is_some() || pre[seg].state != SegmentState::Evicting || self.held(seg) {
             assert_eq!(result, Err(Error::Busy));
@@ -1428,6 +2211,7 @@ impl<'t, 'w> Phase<'t, 'w> {
                 self.poll_id(id);
             }
             self.t.reactor.poll_budgeted(64).unwrap();
+            self.check_fences();
         }
         assert!(self.pending.is_empty(), "I/O did not finish");
         assert_eq!(self.t.reactor.in_flight(), 0);
@@ -1446,6 +2230,9 @@ impl<'t, 'w> Phase<'t, 'w> {
         assert!(done, "write fence did not finish");
         drop(fence);
         assert_eq!(self.t.slab.writes_in_flight(), 0);
+        while !self.fences.is_empty() {
+            self.poll_fence(0);
+        }
         self.maybe_held = false;
         let live: usize = self.buffers.iter().map(AlignedBuffer::len).sum();
         assert_eq!(self.w.charge.get(), live + self.t.slab.idle_bytes());
@@ -1466,6 +2253,7 @@ impl<'t, 'w> Phase<'t, 'w> {
 
     /// Table-wide invariants checked after every operation.
     fn invariants(&mut self) {
+        self.check_fences();
         let snap = self.snap();
         assert_eq!(snap.len(), SLOTS);
         assert!(
@@ -1518,6 +2306,7 @@ fn run(case: &str, cancel_first: bool, ops: &[Op]) -> Coverage {
     let _environment = sim.enter();
     sim.set_cancel_first(cancel_first);
     let mut world = World {
+        geometry: None,
         records: Vec::new(),
         index: Index::default(),
         history: Vec::new(),
@@ -1525,6 +2314,7 @@ fn run(case: &str, cancel_first: bool, ops: &[Op]) -> Coverage {
         charge: Rc::new(Cell::new(0)),
         coverage: Coverage::default(),
         last_restore: None,
+        last_recycle: None,
         fill: 0,
     };
     let mut start = 0;
@@ -1616,8 +2406,15 @@ fn generate(seed: u64, steps: usize) -> (bool, Vec<Op>) {
     let mut rng = Rng(seed);
     let cancel_first = rng.chance(50);
     let mut ops = Vec::with_capacity(steps);
+    let slots = [0, 1, 2, 3, 3, 3, 3, 3, 63, 64, 65][rng.below(11) as usize];
+    ops.push(Op::Geometry {
+        slots,
+        pages: 2 + rng.below(4),
+        unequal: rng.chance(50),
+        partial: rng.chance(50),
+    });
     while ops.len() < steps {
-        let roll = rng.below(100);
+        let roll = rng.below(130);
         let op = match roll {
             0..=24 => Op::Append {
                 pages: rng.byte(2) + 1,
@@ -1666,9 +2463,15 @@ fn generate(seed: u64, steps: usize) -> (bool, Vec<Op>) {
             73..=78 => Op::Read {
                 pick: rng.byte(8),
                 fault: random_fault(&mut rng),
-                abandon: rng.chance(30),
+                io: match rng.below(10) {
+                    0..=3 => Io::Complete,
+                    4..=6 => Io::Pending,
+                    7 => Io::Unpolled,
+                    _ => Io::Abandon,
+                },
             },
-            79..=83 => Op::Turn(rng.byte(8)),
+            79..=82 => Op::Turn(rng.byte(8)),
+            83 => Op::Poll(rng.byte(8)),
             84..=86 => Op::Abandon(rng.byte(8)),
             87..=88 => Op::Freeze,
             89..=91 => Op::Thaw,
@@ -1677,7 +2480,15 @@ fn generate(seed: u64, steps: usize) -> (bool, Vec<Op>) {
             95 => Op::DropBuffer(rng.byte(4)),
             96 => Op::ReclaimIdle,
             97..=98 => Op::Quiesce,
-            _ => Op::Recover,
+            99 => Op::Recover,
+            100..=109 => Op::GeometryStep {
+                action: rng.byte(6),
+                pick: rng.byte(256),
+            },
+            110..=117 => Op::Invalid(rng.byte(9)),
+            118..=122 => Op::Fence,
+            123..=126 => Op::PollFence(rng.byte(8)),
+            _ => Op::DropFence(rng.byte(8)),
         };
         ops.push(op);
     }
@@ -1689,22 +2500,81 @@ fn env(name: &str) -> Option<u64> {
     std::env::var(name).ok().map(|v| v.parse().unwrap())
 }
 
+/// Select a replay or a checked contiguous campaign without storing its seeds.
+fn seed_range(mut setting: impl FnMut(&str) -> Option<u64>) -> (u64, u64) {
+    if let Some(seed) = setting("DST_SEED") {
+        return (seed, 1);
+    }
+    let start = setting("DST_START_SEED").unwrap_or(0);
+    let count = setting("DST_SEEDS").unwrap_or(256);
+    start
+        .checked_add(count.saturating_sub(1))
+        .expect("DST_START_SEED + DST_SEEDS - 1 overflows u64");
+    (start, count)
+}
+
+#[test]
+fn seed_ranges_are_disjoint_and_checked() {
+    assert_eq!(seed_range(|_| None), (0, 256));
+    for start in [0, 256, 512] {
+        assert_eq!(
+            seed_range(|name| (name == "DST_START_SEED").then_some(start)),
+            (start, 256)
+        );
+    }
+    for count in [0, 1] {
+        assert_eq!(
+            seed_range(|name| match name {
+                "DST_START_SEED" => Some(u64::MAX),
+                "DST_SEEDS" => Some(count),
+                _ => None,
+            }),
+            (u64::MAX, count)
+        );
+    }
+    assert_eq!(
+        seed_range(|name| match name {
+            "DST_SEED" => Some(u64::MAX),
+            _ => panic!("replay must ignore {name}"),
+        }),
+        (u64::MAX, 1)
+    );
+}
+
+#[test]
+#[should_panic(expected = "DST_START_SEED + DST_SEEDS - 1 overflows u64")]
+fn seed_range_rejects_overflow() {
+    seed_range(|name| match name {
+        "DST_START_SEED" => Some(u64::MAX),
+        "DST_SEEDS" => Some(2),
+        _ => None,
+    });
+}
+
 /// Seeded random sequences through the shared runner, with coverage floors.
 #[test]
 fn seeded_sequences_preserve_allocator_invariants() {
     let steps = env("DST_STEPS").unwrap_or(400) as usize;
-    let seeds: Vec<u64> = match env("DST_SEED") {
-        Some(seed) => vec![seed],
-        None => (0..env("DST_SEEDS").unwrap_or(256)).collect(),
-    };
+    let (start, count) = seed_range(env);
     let mut coverage = Coverage::default();
-    for seed in &seeds {
-        let (cancel_first, ops) = generate(*seed, steps);
+    for seed in (0..count).map(|offset| start.checked_add(offset).unwrap()) {
+        let (cancel_first, ops) = generate(seed, steps);
         coverage.add(run(&format!("seed {seed}"), cancel_first, &ops));
     }
-    if seeds.len() > 1 {
+    if count > 1 {
         let c = coverage;
         for (name, count) in [
+            ("fence_pending", c.fence_pending),
+            ("fence_multiple", c.fence_multiple),
+            ("fence_repoll", c.fence_repoll),
+            ("fence_drop", c.fence_drop),
+            ("fence_wake", c.fence_wake),
+            ("fence_ready", c.fence_ready),
+            ("unequal", c.unequal),
+            ("partial", c.partial),
+            ("large_segments", c.large_segments),
+            ("scored_cap", c.scored_cap),
+            ("empty_clock", c.empty_clock),
             ("restores_ok", c.restores_ok),
             ("restore_bumps", c.restore_bumps),
             ("restore_stale", c.restore_stale),
@@ -1715,6 +2585,11 @@ fn seeded_sequences_preserve_allocator_invariants() {
             ("partial_evictions", c.partial_evictions),
             ("write_failures", c.write_failures),
             ("read_failures", c.read_failures),
+            ("pending_reads", c.pending_reads),
+            ("unpolled_reads", c.unpolled_reads),
+            ("retained_read_completions", c.retained_read_completions),
+            ("abandoned_reads", c.abandoned_reads),
+            ("reads_after_eviction", c.reads_after_eviction),
             ("abandoned", c.abandoned),
             ("recoveries", c.recoveries),
             ("data_checks", c.data_checks),
@@ -1722,8 +2597,206 @@ fn seeded_sequences_preserve_allocator_invariants() {
         ] {
             assert!(count > 0, "seeded DST never reached {name}: {c:?}");
         }
+        for (name, counts) in [
+            ("invalid", c.invalid.as_slice()),
+            ("geometry", c.geometry.as_slice()),
+            ("overreport", c.overreport.as_slice()),
+        ] {
+            for (category, count) in counts.iter().enumerate() {
+                assert!(
+                    *count > 0,
+                    "seeded DST never reached {name}[{category}]: {c:?}"
+                );
+            }
+        }
         if std::env::var_os("DST_COVERAGE").is_some() {
             eprintln!("{c:?}");
+        }
+    }
+}
+
+/// Several waiters follow the final write, not the first completion or cancellation.
+#[test]
+fn fence_waiters_follow_final_completion() {
+    for cancel_first in [false, true] {
+        let ops = [
+            Op::Append {
+                pages: 1,
+                io: Io::Pending,
+                fault: Some(FaultKind::Hold(7)),
+            },
+            Op::Append {
+                pages: 1,
+                io: Io::Pending,
+                fault: Some(FaultKind::Hold(3)),
+            },
+            Op::Fence,
+            Op::Fence,
+            Op::Fence,
+            Op::PollFence(1),
+            Op::DropFence(0),
+            Op::Turn(0),
+            Op::Abandon(0),
+            Op::PollFence(0),
+            Op::Quiesce,
+        ];
+        let c = run("fence final completion", cancel_first, &ops);
+        assert!(c.fence_pending >= 3);
+        assert!(c.fence_multiple >= 2);
+        assert!(c.fence_repoll >= 1);
+        assert_eq!(c.fence_drop, 1);
+        assert_eq!(c.fence_wake, 2);
+        assert_eq!(c.fence_ready, 2);
+    }
+}
+
+/// Executed writes retain their lease after abandonment until the held CQE arrives.
+#[test]
+fn post_execution_write_abandonment() {
+    let ops = [
+        Op::Append {
+            pages: 2,
+            io: Io::Pending,
+            fault: Some(FaultKind::Hold(7)),
+        },
+        Op::Turn(0),
+        Op::ExpectHeldWrite,
+        Op::Abandon(0),
+        Op::Evict(0),
+        Op::Recycle(0),
+        Op::ExpectRecycle(Err(Error::Busy)),
+        Op::Restore {
+            image: Image::Current,
+            quiesce: false,
+        },
+        Op::ExpectRestore(Err(Error::Busy)),
+        Op::Quiesce,
+        Op::Recycle(0),
+        Op::ExpectRecycle(Ok(())),
+        write(2),
+    ];
+    for cancel_first in [false, true] {
+        let c = run("post-execution write abandonment", cancel_first, &ops);
+        assert_eq!(c.abandoned, 1, "{c:?}");
+        assert_eq!(c.restore_busy, 1, "{c:?}");
+        assert_eq!(c.recycles, 1, "{c:?}");
+        assert_eq!(c.reissues, 1, "{c:?}");
+        assert_eq!(c.data_checks, 1, "{c:?}");
+    }
+}
+
+/// Held reads keep their bytes and leases after reclaim removes their mappings.
+#[test]
+fn post_execution_read_reclaim_and_cancellation() {
+    for cancel_first in [false, true] {
+        for abandon in [false, true] {
+            let mut ops = vec![
+                write(2),
+                Op::Read {
+                    pick: 0,
+                    fault: Some(FaultKind::Hold(7)),
+                    io: Io::Pending,
+                },
+                Op::Turn(0),
+                Op::ExpectHeldRead,
+                reclaim_all(),
+                Op::Recycle(0),
+                Op::ExpectRecycle(Err(Error::Busy)),
+                Op::Restore {
+                    image: Image::Current,
+                    quiesce: false,
+                },
+                Op::ExpectRestore(Err(Error::Busy)),
+            ];
+            if abandon {
+                ops.extend([
+                    Op::Abandon(0),
+                    Op::Turn(0),
+                    Op::Recycle(0),
+                    Op::ExpectRecycle(Err(Error::Busy)),
+                    Op::Restore {
+                        image: Image::Current,
+                        quiesce: false,
+                    },
+                    Op::ExpectRestore(Err(Error::Busy)),
+                ]);
+            }
+            ops.extend([
+                Op::Quiesce,
+                Op::Recycle(0),
+                Op::ExpectRecycle(Ok(())),
+                write(2),
+            ]);
+            let case = format!("held read reclaim cancel_first={cancel_first} abandon={abandon}");
+            let c = run(&case, cancel_first, &ops);
+            assert_eq!(c.pending_reads, 1, "{c:?}");
+            assert_eq!(c.abandoned_reads, usize::from(abandon), "{c:?}");
+            assert_eq!(c.retained_read_completions, usize::from(!abandon), "{c:?}");
+            assert_eq!(c.reads_after_eviction, usize::from(!abandon), "{c:?}");
+            assert_eq!(c.data_checks, 1 + usize::from(!abandon), "{c:?}");
+            assert_eq!(c.recycles, 1, "{c:?}");
+            assert_eq!(c.reissues, 1, "{c:?}");
+        }
+    }
+}
+
+/// An unpolled read keeps its captured lease through eviction or drops it unused.
+#[test]
+fn unpolled_read_reclaim_and_cancellation() {
+    for cancel_first in [false, true] {
+        for abandon in [false, true] {
+            let ops = [
+                write(2),
+                Op::Read {
+                    pick: 0,
+                    fault: None,
+                    io: Io::Unpolled,
+                },
+                reclaim_all(),
+                Op::Recycle(0),
+                Op::ExpectRecycle(Err(Error::Busy)),
+                if abandon { Op::Abandon(0) } else { Op::Poll(0) },
+                Op::Quiesce,
+                Op::Recycle(0),
+                Op::ExpectRecycle(Ok(())),
+                write(2),
+            ];
+            let case =
+                format!("unpolled read reclaim cancel_first={cancel_first} abandon={abandon}");
+            let c = run(&case, cancel_first, &ops);
+            assert_eq!(c.unpolled_reads, 1, "{c:?}");
+            assert_eq!(c.abandoned_reads, usize::from(abandon), "{c:?}");
+            assert_eq!(c.retained_read_completions, usize::from(!abandon), "{c:?}");
+            assert_eq!(c.reads_after_eviction, usize::from(!abandon), "{c:?}");
+            assert_eq!(c.recycles, 1, "{c:?}");
+            assert_eq!(c.reissues, 1, "{c:?}");
+        }
+    }
+}
+
+/// Driving another operation retires read errors before checking lease ownership.
+#[test]
+fn pending_read_terminal_results_during_write() {
+    for fault in [FaultKind::Errno, FaultKind::Short, FaultKind::Reject] {
+        for cancel_first in [false, true] {
+            let ops = [
+                write(2),
+                Op::Read {
+                    pick: 0,
+                    fault: Some(fault),
+                    io: Io::Pending,
+                },
+                Op::Evict(0),
+                write(2),
+                Op::Recycle(0),
+                Op::ExpectRecycle(Ok(())),
+                write(2),
+            ];
+            let case = format!("terminal read {fault:?} cancel_first={cancel_first}");
+            let c = run(&case, cancel_first, &ops);
+            assert_eq!(c.read_failures, 1, "{c:?}");
+            assert_eq!(c.recycles, 1, "{c:?}");
+            assert_eq!(c.reissues, 1, "{c:?}");
         }
     }
 }
@@ -1933,7 +3006,7 @@ fn restore_cross_product() {
             vec![Op::Read {
                 pick: 0,
                 fault: Some(FaultKind::Hold(7)),
-                abandon: true,
+                io: Io::Abandon,
             }],
         ),
     ];
