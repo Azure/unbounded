@@ -291,6 +291,26 @@ class TestSuites(unittest.TestCase):
             self.assertTrue(any(check > change for check in checks), f"no check after {steps[change]}")
 
 
+class TestWarn(unittest.TestCase):
+    """warn() carries remote output, such as a refused reset-failed's stderr."""
+
+    def test_remote_output_cannot_start_a_workflow_command(self):
+        """GitHub reads every log line for workflow commands, so no raw line of
+        the message may reach the log there."""
+        message = "refused\n::add-mask::x\r\n100%"
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), patch("builtins.print") as printed:
+            e2e.warn(message)
+
+        lines = [call.args[0] for call in printed.call_args_list]
+        self.assertEqual(lines, ["::warning::refused%0A::add-mask::x%0D%0A100%25"])
+
+    def test_outside_actions_it_is_printed_as_is(self):
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": ""}), patch("builtins.print") as printed:
+            e2e.warn("refused")
+
+        printed.assert_called_once_with("[WARN]  refused", flush=True)
+
+
 class TestStagedFiles(unittest.TestCase):
     def test_staged_files_must_be_unchanged(self):
         for stdout, returncode, ok in ((e2e.HOST_STAGED_CONTENT, 0, True), ("changed", 0, False), ("", 1, False)):

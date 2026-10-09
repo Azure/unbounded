@@ -186,12 +186,15 @@ def log(msg: str) -> None:
 
 
 def warn(msg: str) -> None:
-    print(f"[WARN]  {msg}", flush=True)
+    """Report a problem that does not fail the run. msg may hold remote
+    output. In GitHub Actions every line of the log is read for workflow
+    commands, so it is printed once, escaped, as a warning, and never as raw
+    lines, where a line break in it could start a command of its own."""
     if os.environ.get("GITHUB_ACTIONS") == "true":
-        # Escaped, so a line break in remote output cannot start a workflow
-        # command of its own.
         escaped = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
         print(f"::warning::{escaped}", flush=True)
+    else:
+        print(f"[WARN]  {msg}", flush=True)
 
 
 def die(msg: str) -> None:
