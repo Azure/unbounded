@@ -379,3 +379,92 @@ func TestBootstrapExpiredIssuerAllowsRuntimeRepairWithoutRotation(t *testing.T) 
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, credentialsName), after))
 	require.Equal(t, before, after)
 }
+
+func TestBootstrapConfigPassValidatesDurableState(t *testing.T) {
+	for _, configState := range []string{"unchanged", "missing", "drifted"} {
+		for _, damage := range []string{"none", "version", "credentials", "commitment"} {
+			t.Run(configState+"/"+damage, func(t *testing.T) {
+				env := testEnv(t, cacheObject("cache"))
+				initialize(t, env)
+
+				cm := &corev1.ConfigMap{}
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+
+				switch configState {
+				case "missing":
+					require.NoError(t, env.Client.Delete(t.Context(), cm))
+				case "drifted":
+					cm.Data["RACER_CREDENTIALS_SECRET_NAME"] = "wrong"
+					require.NoError(t, env.Client.Update(t.Context(), cm))
+				}
+
+				switch damage {
+				case "version", "commitment":
+					version := &corev1.ConfigMap{}
+					require.NoError(t, env.Client.Get(t.Context(), objectKey(env, versionName), version))
+
+					if damage == "version" {
+						version.Data["sequence"] = "0"
+					} else {
+						delete(version.Annotations, credentialsUID)
+					}
+
+					require.NoError(t, env.Client.Update(t.Context(), version))
+				case "credentials":
+					secret := &corev1.Secret{}
+					require.NoError(t, env.Client.Get(t.Context(), objectKey(env, credentialsName), secret))
+					delete(secret.Data, "issuer.json")
+					require.NoError(t, env.Client.Update(t.Context(), secret))
+				}
+
+				versionReads := 0
+				env.APIReader = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if key == objectKey(env, versionName) {
+							versionReads++
+						}
+
+						return c.Get(ctx, key, obj, opts...)
+					},
+				})
+				env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+					Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+						t.Fatal("bootstrap planning created state")
+						return nil
+					},
+					Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+						t.Fatal("bootstrap planning updated state")
+						return nil
+					},
+					Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+						t.Fatal("bootstrap planning patched state")
+						return nil
+					},
+				})
+
+				plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+				if damage != "none" {
+					require.Error(t, err)
+					require.Nil(t, plan)
+
+					return
+				}
+
+				require.NoError(t, err)
+				// Recover reads twice, commitment once, persisted credentials once.
+				require.Equal(t, 4, versionReads, "planning must not repeat authority recovery")
+
+				if configState != "unchanged" {
+					require.Len(t, plan.Operations, 1)
+					require.Equal(t, configName, plan.Operations[0].Object.GetName())
+				} else {
+					require.Contains(t, plan.Summary(), "Deployment/")
+				}
+
+				for _, op := range plan.Operations {
+					require.NotEqual(t, component.OpRun, op.Kind)
+				}
+			})
+		}
+	}
+}

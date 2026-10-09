@@ -75,24 +75,26 @@ func validateBootstrapConfig(cfg authority.Config, env *component.Env, marker *c
 
 func planBootstrap(ctx context.Context, env *component.Env, runtime *component.Plan, marker *corev1.ConfigMap) (*component.Plan, bool, error) {
 	plan := component.NewPlan()
+	cm := &corev1.ConfigMap{}
 	// Persist canonical configuration in its own pass before any authority write.
 	for _, op := range runtime.Operations {
 		if op.Object.GetKind() == "ConfigMap" && op.Object.GetName() == configName {
+			if err := env.Scheme.Convert(op.Object, cm, nil); err != nil {
+				return nil, false, err
+			}
+
 			plan.Add(op)
 		}
 	}
 
-	if plan.Len() != 0 {
-		return plan, true, nil
-	}
+	if plan.Len() == 0 {
+		if err := env.LiveReader().Get(ctx, objectKey(env, configName), cm); err != nil {
+			return nil, false, err
+		}
 
-	cm := &corev1.ConfigMap{}
-	if err := env.LiveReader().Get(ctx, objectKey(env, configName), cm); err != nil {
-		return nil, false, err
-	}
-
-	if cm.UID == "" || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil {
-		return nil, false, fmt.Errorf("racer bootstrap configuration is not durable")
+		if cm.UID == "" || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil {
+			return nil, false, fmt.Errorf("racer bootstrap configuration is not durable")
+		}
 	}
 
 	cfg, err := configAuthority(env, cm)
@@ -104,20 +106,33 @@ func planBootstrap(ctx context.Context, env *component.Env, runtime *component.P
 		return nil, false, err
 	}
 
+	committed := false
+
 	if marker.Data["state"] == "consumed" {
+		// Validate even config-only passes, using the canonical runtime settings.
 		owner := authority.New(cfg, authority.Dependencies{Reader: env.LiveReader()})
 		if err := owner.Recover(ctx, planningWriter{}); err != nil {
-			return nil, false, err
+			return nil, false, fmt.Errorf("racer durable state: %w", err)
 		}
 
-		committed, err := credentialsCommitted(ctx, env)
+		committed, err = credentialsCommitted(ctx, env)
 		if err != nil {
 			return nil, false, err
 		}
 
 		if committed {
-			return nil, false, owner.ValidatePersistedCredentials(ctx)
+			if err := owner.ValidatePersistedCredentials(ctx); err != nil {
+				return nil, false, err
+			}
 		}
+	}
+
+	if plan.Len() != 0 {
+		return plan, true, nil
+	}
+
+	if committed {
+		return nil, false, nil
 	}
 
 	expectedMarker, expectedConfig := marker.DeepCopy(), cm.DeepCopy()
