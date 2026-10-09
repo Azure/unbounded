@@ -1,85 +1,152 @@
 ---
 title: "Racer Distributed Cache"
 weight: 4
-description: "How Racer shares immutable object data across Kubernetes nodes."
+description: "How Racer lets nodes share cached object data so each object is read from its source once."
 ---
 
-## What Is Racer?
+## Why Racer?
 
-Racer is a distributed object cache for Kubernetes workloads. Applications read
-through a local Unix socket; Racer retrieves data from memory, local disk, peers,
-or an application-provided origin. Use it to share repeatedly read objects
-without making every consumer download them from the upstream service.
+Many workloads read the same large files on many nodes at once: container image
+layers, model weights, datasets. Without a shared cache, every node downloads
+its own copy from the same registry or object store. This:
 
-Racer is **not durable object storage**. Keep an authoritative origin: cached
-bytes can be evicted or lost. It is also not a filesystem or a registry by itself.
-[Gantry]({{< relref "guides/gantry#use-racer-as-the-backend" >}}) supplies the
-container-registry integration; other applications use the Go SDK.
+- Multiplies egress cost.
+- Overloads the source when a large job starts.
+- Makes scale-out as slow as the slowest download.
 
-## Components
+**Racer** is a read-through cache that runs on every node. Nodes share cached
+data with each other, so the cluster normally reads each piece of an object from
+its source only once. Apps read through a local Unix socket. When no node has
+the data yet, Racer asks an **origin**, a small program you write that fetches
+objects from your own storage.
 
-| Component | Responsibility |
-|-----------|----------------|
-| **ClusterVolume** | Names a cluster-wide volume and its local socket directories; required immutable `spec.type: Cache` selects caching. |
-| **Controller** | Manages authenticated membership, cache keys, and replicated control state. |
-| **Dataplane** | Runs on eligible Linux nodes, stores object pages, and serves client and peer reads. |
-| **Origin adapter** | Application code that resolves keys and returns immutable versions from the authoritative source. |
-| **Go SDK** | Connects consumers to the local dataplane and serves origin callbacks. |
+## Architecture
 
-The Unbounded operator deploys Racer when any ClusterVolume is created. Only
-volumes with `spec.type: Cache` enter the cache catalog; `Cache` is currently the
-only supported type. The short name is `cvol`.
-Creating the resource does not deploy an origin adapter or populate the cache.
-Consumers need a local dataplane; adapters must cover every eligible node that
-can supply origin reads, with one origin owner per volume per node.
+Racer runs two components:
 
-A ClusterVolume is not a Kubernetes PersistentVolume or PersistentVolumeClaim
-(PVC), a filesystem mount, or a durability promise. Its Kubernetes UID is its
-identity; recreating the same name does not reuse the old identity. The socket
-paths remain `/run/racer/<name>/client/socket` and `/run/racer/<name>/origin/socket`.
+**Controller** (`racer-controller`) -- A Deployment with three replicas and one
+elected leader:
 
-## Objects and Versions
+- Builds the member list from Nodes and dataplane pods, and publishes it to
+  every node.
+- Enrolls each dataplane pod and issues it a short-lived certificate.
+- Creates and rotates the encryption keys for each cache.
 
-An object has a **32-byte key**, an immutable version identified by a strong
-quoted **ETag**, a size, and a metadata expiration time. Your adapter defines the
-key mapping and must return the same bytes for the same key/version everywhere.
-Keys are opaque bytes, not arbitrary URLs or filenames.
+**Dataplane** (`racer-dataplane`) -- A DaemonSet on every node:
 
-Racer transfers objects in **16 MiB pages**, with a shorter final page. Consumers
-can request byte ranges without downloading the entire object. A read stays on
-one admitted immutable version; a pinned read requests a particular ETag.
+- Serves app reads on per-cache Unix sockets under `/run/racer/<cache>/`.
+- Keeps pages in memory and on local disk.
+- Fetches pages from other nodes over TCP, or over RDMA where both nodes
+  support it.
+- Calls the local origin when this node is responsible for a page that no
+  node has yet.
 
-Fresh reads may reuse unexpired metadata, so "fresh" does not guarantee an origin
-round-trip. Expiration controls admission of fresh reads, not the lifetime of an
-already admitted stream. Choose expiration deliberately when implementing an
-adapter for names whose current version can change.
+Apps and origins use the Go SDK (`pkg/racersdk`). It provides a `Client` for
+reads and `ServeOrigin` for origins.
 
-## Placement and Transport
+You do not install Racer directly. `unbounded-operator` deploys the controller
+and dataplane when the first `ClusterCache` is created.
 
-Racer chooses cache locations from its membership and node placement weights.
-The `shares` annotation changes relative weight, not a node's memory or disk
-limit. Local storage and memory budgets are configured separately.
+## Core Concepts
 
-Peers use HTTP, with optional RDMA on eligible hops. RDMA requires the same
-nonempty Site and a compatible selected rail at both ends; other hops retain
-HTTP. A Site is an RDMA boundary, not a cache-placement boundary. See the
-[RDMA reference]({{< relref "reference/racer#rdma" >}}) for hardware and deployment
-requirements.
+### API
 
-## Access and Failure Behavior
+A **ClusterCache** represents a logical cache namespace:
 
-Applications receive access through mounts of a volume's socket directories.
-Mount only the client directory for consumers and the origin directory for
-trusted adapters. Ordinary clients do not need a Racer-specific ServiceAccount
-or token. Upstream authorization, when needed, is passed to the origin adapter
-as request context; it is not a replacement for controlling socket access.
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: models
+```
 
-The SDK does not bypass Racer to read directly from an origin when the dataplane
-is unavailable. Handle read errors, close values, and treat partial output as
-incomplete. Cache bytes are disposable, but cluster identity, credentials, and
-version counters are durable installation state and must be preserved.
+Each cache gets two sockets on every node:
 
-## Next Steps
+- `/run/racer/<name>/client/socket` -- Apps read objects here.
+- `/run/racer/<name>/origin/socket` -- The origin listens here.
 
-- [Cache Objects with Racer]({{< relref "guides/racer" >}}): create a Cache volume and connect an application.
-- [Racer Reference]({{< relref "reference/racer" >}}): configuration, SDK APIs, diagnostics, and RDMA.
+There is no access list on the volume. A pod can use a volume only if it mounts
+that volume's socket directory. The volume's Kubernetes UID is its identity, so
+deleting and recreating a volume starts a new, empty cache. Racer also accepts
+the `ClusterCache` kind for the same purpose. One name cannot be used by both
+kinds.
+
+### Objects, Keys, and Versions
+
+- **Key** -- 32 bytes chosen by the app, often a content digest such as a
+  SHA-256.
+- **Version** -- One fixed set of bytes for a key, named by an **ETag** that the
+  origin returns. The bytes of a version must never change. Every page of a read
+  comes from the same version.
+- **Expiry** -- The origin can optionally set `ExpiresAt` for each version. After that time,
+  Racer asks the origin again before serving a fresh read. A read pinned to a
+  specific ETag can still use the older version.
+
+### Pages
+
+Racer splits every object into **16 MiB pages**. A page is the unit for caching,
+transfer between nodes, placement, and origin reads.
+
+### Origins
+
+An origin answers two kinds of requests:
+
+- **HEAD** -- Returns the size, ETag, and expiry for a key.
+- **GET** -- Returns one page-aligned range of a version.
+
+Origins do not push data into Racer. Any node can own a page, so run the origin
+on every node, usually as a DaemonSet that mounts the volume's origin socket.
+
+The client can pass `Metadata` and `Authorization` headers with each read. Racer sends
+them to the origin unchanged and never caches them. Use them to tell the origin
+where to find the object and to securely pass the caller's credentials.
+
+### Owners and Shares
+
+Each page has up to **three owner nodes**. Racer picks them with weighted
+rendezvous hashing over node IDs. Each node has a weight called **shares**
+(default `4`). A node with more shares owns more pages. Set it with the Node
+annotation `racer.unbounded-cloud.io/shares`.
+
+Owners do not depend on the version, so a new version of an object lands on the
+same nodes as the old one. Only owners call the origin. Every other node gets
+the page from an owner.
+
+To keep a node out of Racer, label it `racer.unbounded-cloud.io/exclude`.
+
+## How a Read Works
+
+1. The app calls `Get` on the volume's client socket.
+2. The local dataplane checks memory, then local disk.
+3. On a miss, it asks the page's owners in rank order. Nodes connect only to a
+   limited set of neighbors, so a request may pass through a few other nodes on
+   the way.
+4. If no owner has the page, an owner calls its local origin, encrypts the
+   page, and keeps it.
+5. The page streams back to the app. The SDK holds back the last byte until
+   Racer confirms the whole range arrived intact.
+
+If many readers on one node want the same page at the same time, the node makes
+one request and shares the result.
+
+### What Stays on Disk
+
+Owners keep a page on disk the first time it is read. Other nodes keep a page on
+disk only after it is read a second time. This stops one-off reads from pushing
+out useful data. This policy is called **second-sight**.
+
+By default, disk data lives in slab files under `/var/lib/racer/slabs`. You can
+give Racer whole raw block devices instead. On restart, a node reloads its
+checkpoint and keeps its cached pages.
+
+## Security
+
+- **Enrollment** -- Each dataplane pod proves its identity to the controller
+  with a projected ServiceAccount token. The controller checks that the pod
+  belongs to the Racer DaemonSet, then issues a certificate valid for 24 hours.
+- **Encryption** -- Pages are encrypted with a per-volume key, both between
+  nodes and on disk. The controller rotates keys every 24 hours by default.
+- **Signed requests** -- Every node signs each request it sends or forwards to
+  another node.
+- **Credentials** -- `Authorization` and `Metadata` are sealed when they cross
+  nodes, and are never written to disk.
