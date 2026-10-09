@@ -146,7 +146,7 @@ func TestDiagnosticFiniteTarget(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); img.handler().ServeHTTP(w, r) }))
 	defer server.Close()
 
-	cfg := diagnosticTargetConfig{Target: server.URL, Image: opts, ImageIndices: []int{2}, Iterations: 2, LayerConcurrency: 1, StartupTimeout: "2s", PullTimeout: "2s", TotalTimeout: "5s"}
+	cfg := diagnosticTargetConfig{Target: server.URL, Image: opts, ImageIndices: []int{2}, Iterations: 2, BlobConcurrency: 1, StartupTimeout: "2s", PullTimeout: "2s", TotalTimeout: "5s"}
 	require.NoError(t, runDiagnosticTarget(t.Context(), cfg))
 	require.Equal(t, int64(2*(2+opts.Layers)), requests.Load())
 
@@ -317,7 +317,7 @@ func TestDiagnosticTargetDeadline(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
 	defer server.Close()
 
-	cfg := diagnosticTargetConfig{Target: server.URL, Image: testImageOptions(), ImageIndices: []int{0}, Iterations: 2, LayerConcurrency: 1, StartupTimeout: "1s", PullTimeout: "1s", TotalTimeout: "20ms"}
+	cfg := diagnosticTargetConfig{Target: server.URL, Image: testImageOptions(), ImageIndices: []int{0}, Iterations: 2, BlobConcurrency: 1, StartupTimeout: "1s", PullTimeout: "1s", TotalTimeout: "20ms"}
 	require.ErrorIs(t, runDiagnosticTarget(t.Context(), cfg), context.DeadlineExceeded)
 
 	for _, indices := range [][]int{nil, {-1}, {512}} {

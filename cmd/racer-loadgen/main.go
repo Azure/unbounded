@@ -48,7 +48,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
 	f.SetOutput(output)
 	f.StringVar(&opts.pull.Backend, "backend", "gantry", "Acquisition and origin transport: gantry (OCI HTTP), uds (direct Racer SDK), or s3 (S3 GetObject)")
-	f.StringVar(&opts.pull.Volume, "volume", "", "Racer cache name (compatibility flag); required for uds, using /run/racer/<cache>/{client,origin}/socket")
+	f.StringVar(&opts.pull.Volume, "volume", "", "Racer cache name; required for uds, using /run/racer/<cache>/{client,origin}/socket")
 	f.StringVar(&opts.s3.Endpoint, "endpoint", "", "S3 endpoint for the standard S3 client: racer-object sidecar or synthetic origin (default http://127.0.0.1:8080)")
 	f.StringVar(&opts.s3.Bucket, "bucket", "", "Synthetic S3 bucket (default benchmark; requires backend=s3)")
 	f.IntVar(&opts.s3.Count, "object-count", 0, "Synthetic S3 object count, 1-512 (default 128)")
@@ -74,8 +74,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.StringVar(&opts.pull.ConcurrencyFile, "concurrency-file", "", "Optional regular file containing concurrency 0-256; polled every second without restarting the origin")
 	f.StringVar(&opts.pull.NodeCapsFile, "node-concurrency-caps-file", "", "Optional versioned node-cap JSON key in the same projected ConfigMap as concurrency-file")
 	f.StringVar(&opts.pull.NodeName, "node-name", "", "Exact Kubernetes node name for optional node concurrency caps")
-	f.IntVar(&opts.pull.LayerConcurrency, "blob-concurrency", 4, "Concurrent blob requests per batch (generic single-blob operations use one)")
-	f.IntVar(&opts.pull.LayerConcurrency, "layer-concurrency", 4, "Compatibility alias for blob-concurrency")
+	f.IntVar(&opts.pull.BlobConcurrency, "blob-concurrency", 4, "Concurrent blob requests per batch (generic single-blob operations use one)")
 	f.DurationVar(&opts.pull.Timeout, "pull-timeout", 2*time.Minute, "Deadline for one complete blob-batch operation")
 	f.DurationVar(&opts.pull.RetryDelay, "retry-delay", time.Second, "Per-worker delay after failed pulls")
 	f.DurationVar(&opts.pull.Interval, "interval", 0, "Per-worker delay after successful pulls")
@@ -113,10 +112,6 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		if err := client.Close(); err != nil {
 			return opts, err
 		}
-	}
-
-	if seen["blob-concurrency"] && seen["layer-concurrency"] {
-		return opts, errors.New("specify only one of blob-concurrency and layer-concurrency")
 	}
 
 	if seen["catalog-blobs"] {

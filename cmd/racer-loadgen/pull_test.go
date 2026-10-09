@@ -40,7 +40,7 @@ func pullTestOptions(target string) pullOptions {
 	return pullOptions{
 		ZipfExponent: defaultZipfExponent,
 		Target:       target, Namespace: "registry.example:5000/a b&c", Concurrency: 1,
-		LayerConcurrency: 2, Timeout: 5 * time.Second, RetryDelay: 200 * time.Millisecond,
+		BlobConcurrency: 2, Timeout: 5 * time.Second, RetryDelay: 200 * time.Millisecond,
 		Verify: true,
 	}
 }
@@ -102,7 +102,7 @@ func TestPullCompleteImage(t *testing.T) {
 	var connections atomic.Int64
 
 	opts := pullTestOptions("")
-	opts.LayerConcurrency = 1
+	opts.BlobConcurrency = 1
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Query().Get("ns") != opts.Namespace || len(r.URL.Query()) != 1 {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
@@ -211,7 +211,7 @@ func TestPullResponseFailures(t *testing.T) {
 				}))
 				t.Cleanup(server.Close)
 				opts := pullTestOptions(server.URL)
-				opts.LayerConcurrency = 1
+				opts.BlobConcurrency = 1
 				opts.Verify = mode != "unverified"
 				p, metrics := pullTestNew(t, img, opts)
 				err := p.pull(t.Context())
@@ -307,7 +307,7 @@ func TestPullTimeoutAndCancellation(t *testing.T) {
 				t.Cleanup(server.Close)
 				opts := pullTestOptions(server.URL)
 
-				opts.LayerConcurrency = 1
+				opts.BlobConcurrency = 1
 				if !canceled {
 					opts.Timeout = 150 * time.Millisecond
 				}
@@ -444,7 +444,7 @@ func TestPullRunConcurrencyAndJoin(t *testing.T) {
 				close(done)
 			}()
 
-			expected := int64(concurrency * opts.LayerConcurrency)
+			expected := int64(concurrency * opts.BlobConcurrency)
 
 			require.Eventually(t, func() bool { return layers.Load() >= expected }, time.Second, time.Millisecond)
 			require.Never(t, func() bool { return layers.Load() > expected }, 50*time.Millisecond, time.Millisecond)
@@ -497,7 +497,7 @@ func TestPullRunPacing(t *testing.T) {
 			server.Start()
 			t.Cleanup(server.Close)
 			opts := pullTestOptions(server.URL)
-			opts.LayerConcurrency = 1
+			opts.BlobConcurrency = 1
 			opts.Interval = opts.RetryDelay
 			p, metrics := pullTestNew(t, img, opts)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -650,8 +650,8 @@ func TestPullOptions(t *testing.T) {
 	for name, mutate := range map[string]func(*pullOptions){
 		"negative concurrency":       func(o *pullOptions) { o.Concurrency = -1 },
 		"concurrency overflow":       func(o *pullOptions) { o.Concurrency = int(^uint(0) >> 1) },
-		"zero layer concurrency":     func(o *pullOptions) { o.LayerConcurrency = 0 },
-		"negative layer concurrency": func(o *pullOptions) { o.LayerConcurrency = -1 },
+		"zero layer concurrency":     func(o *pullOptions) { o.BlobConcurrency = 0 },
+		"negative layer concurrency": func(o *pullOptions) { o.BlobConcurrency = -1 },
 		"zero timeout":               func(o *pullOptions) { o.Timeout = 0 },
 		"negative timeout":           func(o *pullOptions) { o.Timeout = -1 },
 		"zero retry":                 func(o *pullOptions) { o.RetryDelay = 0 },

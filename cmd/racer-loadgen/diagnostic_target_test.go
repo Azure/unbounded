@@ -24,7 +24,7 @@ type diagnosticTargetConfig struct {
 	Target, Namespace                         string
 	Image                                     imageOptions
 	ImageIndices                              []int
-	Iterations, LayerConcurrency              int
+	Iterations, BlobConcurrency               int
 	StartupTimeout, PullTimeout, TotalTimeout string
 }
 
@@ -44,8 +44,8 @@ func runDiagnosticTarget(ctx context.Context, cfg diagnosticTargetConfig) error 
 		return errors.New("positive total timeout required")
 	}
 
-	if cfg.Iterations < 1 || cfg.LayerConcurrency < 1 || len(cfg.ImageIndices) == 0 || len(cfg.ImageIndices) > maxCatalogImages {
-		return errors.New("positive iterations, layer concurrency, and selected images required")
+	if cfg.Iterations < 1 || cfg.BlobConcurrency < 1 || len(cfg.ImageIndices) == 0 || len(cfg.ImageIndices) > maxCatalogImages {
+		return errors.New("positive iterations, blob concurrency, and selected images required")
 	}
 
 	for _, index := range cfg.ImageIndices {
@@ -59,7 +59,7 @@ func runDiagnosticTarget(ctx context.Context, cfg diagnosticTargetConfig) error 
 
 	opts := pullOptions{
 		Target: cfg.Target, Namespace: cfg.Namespace, Concurrency: 1,
-		LayerConcurrency: cfg.LayerConcurrency, Timeout: pull, RetryDelay: time.Second,
+		BlobConcurrency: cfg.BlobConcurrency, Timeout: pull, RetryDelay: time.Second,
 		Verify: true, DiagnoseIntegrity: true, ZipfExponent: defaultZipfExponent,
 	}
 

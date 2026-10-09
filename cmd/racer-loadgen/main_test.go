@@ -39,7 +39,7 @@ func TestParseOptionsDefaults(t *testing.T) {
 			Backend: "gantry",
 			Profile: profileShuffle, ZipfExponent: defaultZipfExponent,
 			Target: "http://127.0.0.1:5000", Namespace: "loadgen.invalid",
-			Concurrency: 64, LayerConcurrency: 4, Timeout: 2 * time.Minute,
+			Concurrency: 64, BlobConcurrency: 4, Timeout: 2 * time.Minute,
 			RetryDelay: time.Second, Verify: false,
 		},
 	}, opts)
@@ -50,7 +50,7 @@ func TestParseOptionsOverrides(t *testing.T) {
 		"--listen=127.0.0.1:8001", "--metrics-listen=127.0.0.1:9001",
 		"--repository=custom/image", "--layers=2", "--layer-bytes=4096", "--jitter=0", "--seed=custom",
 		"--target=https://mirror.example/base", "--namespace=registry.example:5000",
-		"--concurrency=0", "--layer-concurrency=3", "--pull-timeout=9s",
+		"--concurrency=0", "--blob-concurrency=3", "--pull-timeout=9s",
 		"--retry-delay=20ms", "--interval=30ms", "--verify=false", "--start-delay=0", "--duration=1m",
 		"--catalog-images=512", "--startup-timeout=4m",
 		"--profile=zipf", "--zipf-exponent=0.8",
@@ -65,7 +65,7 @@ func TestParseOptionsOverrides(t *testing.T) {
 			Backend: "gantry",
 			Profile: profileZipf, ZipfExponent: 0.8,
 			Target: "https://mirror.example/base", Namespace: "registry.example:5000",
-			Concurrency: 0, LayerConcurrency: 3, Timeout: 9 * time.Second,
+			Concurrency: 0, BlobConcurrency: 3, Timeout: 9 * time.Second,
 			RetryDelay: 20 * time.Millisecond, Interval: 30 * time.Millisecond,
 		},
 	}, opts)
@@ -78,6 +78,7 @@ func TestParseOptionsInvalid(t *testing.T) {
 		want string
 	}{
 		{"unknown flag", []string{"--unknown"}, "flag provided but not defined"},
+		{"removed layer concurrency alias", []string{"--layer-concurrency=3"}, "flag provided but not defined: -layer-concurrency"},
 		{"missing value", []string{"--layers"}, "flag needs an argument"},
 		{"bad integer", []string{"--concurrency=many"}, "invalid value"},
 		{"integer overflow", []string{"--layer-bytes=9223372036854775808"}, "invalid value"},
@@ -120,13 +121,15 @@ func TestParseOptionsHelp(t *testing.T) {
 			for _, text := range []string{
 				"Usage of racer-loadgen:", "-listen", "-metrics-listen", "-repository",
 				"-layers", "-layer-bytes", "-jitter", "-seed", "-target", "-namespace",
-				"-concurrency", "zero serves only the origin", "-layer-concurrency",
+				"-concurrency", "zero serves only the origin", "-blob-concurrency",
 				"-pull-timeout", "-retry-delay", "-interval", "-verify", "-start-delay", "-duration",
 				"-catalog-images", "-startup-timeout", "-profile", "-zipf-exponent",
 				"-metrics-shutdown-grace",
 			} {
 				require.Contains(t, output.String(), text)
 			}
+
+			require.NotContains(t, output.String(), "-layer-concurrency")
 		})
 	}
 }
@@ -526,7 +529,7 @@ func TestRunBindFailure(t *testing.T) {
 func TestRunInvalidOptions(t *testing.T) {
 	for _, arg := range []string{
 		"--layers=0", "--layer-bytes=0", "--jitter=1", "--jitter=NaN", "--repository=UPPER/image",
-		"--concurrency=-1", "--layer-concurrency=0", "--pull-timeout=0", "--retry-delay=0",
+		"--concurrency=-1", "--layer-concurrency=0", "--blob-concurrency=0", "--pull-timeout=0", "--retry-delay=0",
 		"--interval=-1s", "--target=ftp://example.com", "--target=http://user:pass@example.com",
 		"--target=http://example.com?query=value", "--target=http://example.com#fragment",
 		"--target=http://example.com:0", "--target=http://example.com:65536",
@@ -535,6 +538,11 @@ func TestRunInvalidOptions(t *testing.T) {
 			opts, err := parseOptions([]string{
 				"--listen=127.0.0.1:0", "--metrics-listen=127.0.0.1:0", "--layers=1", "--layer-bytes=1", arg,
 			}, io.Discard)
+			if arg == "--layer-concurrency=0" {
+				require.ErrorContains(t, err, "flag provided but not defined: -layer-concurrency")
+				return
+			}
+
 			require.NoError(t, err)
 
 			running := startLoadgenTest(t, opts)

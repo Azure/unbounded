@@ -24,7 +24,7 @@ func TestS3Options(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, s3Options{Endpoint: "http://127.0.0.1:8080", Bucket: "benchmark", Count: 128, Bytes: 64 << 20}, opts.s3)
 	require.Equal(t, opts.s3.Endpoint, opts.pull.Target)
-	require.Equal(t, 1, opts.pull.LayerConcurrency)
+	require.Equal(t, 1, opts.pull.BlobConcurrency)
 	opts, err = parseOptions([]string{"--backend=s3", "--endpoint=https://origin:443/", "--bucket=my-bucket", "--object-count=3", "--object-bytes=123", "--s3-origin", "--concurrency=0", "--profile=zipf"}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, s3Options{Endpoint: "https://origin:443/", Bucket: "my-bucket", Count: 3, Bytes: 123, Origin: true}, opts.s3)
@@ -61,7 +61,7 @@ func s3TestPuller(t *testing.T, c *blobCatalog, endpoint string) (*puller, *load
 
 	opts := pullTestOptions(endpoint)
 	opts.Backend = "s3"
-	opts.LayerConcurrency = 1
+	opts.BlobConcurrency = 1
 	p, m := pullTestNew(t, &syntheticImage{}, opts)
 	p.batches = c.batches
 	p.configureS3(c, "benchmark")

@@ -36,7 +36,7 @@ func TestBlobOptions(t *testing.T) {
 	require.Equal(t, "blob-test", opts.pull.Volume)
 	require.Equal(t, 3, opts.catalogBlobs)
 	require.Equal(t, int64(123), opts.blobBytes)
-	require.Equal(t, 7, opts.pull.LayerConcurrency)
+	require.Equal(t, 7, opts.pull.BlobConcurrency)
 
 	for _, args := range [][]string{
 		{"--backend=other"},
@@ -83,6 +83,8 @@ func TestVolumeFlag(t *testing.T) {
 	_, err := parseOptions([]string{"--help"}, &output)
 	require.ErrorIs(t, err, flag.ErrHelp)
 	require.Contains(t, output.String(), "-volume")
+	require.Contains(t, output.String(), "Racer cache name; required for uds")
+	require.NotContains(t, output.String(), "compatibility flag")
 	require.NotContains(t, output.String(), "-cache")
 }
 
@@ -303,7 +305,7 @@ func (b *blobTestBody) Close() error { b.closed.Add(1); return b.closeErr }
 
 func TestSDKAdmissionAndIndependentTarget(t *testing.T) {
 	opts := pullTestOptions("not a URL")
-	opts.Backend, opts.Volume, opts.Concurrency, opts.LayerConcurrency = "uds", "test", 100, 8
+	opts.Backend, opts.Volume, opts.Concurrency, opts.BlobConcurrency = "uds", "test", 100, 8
 	config := sdkClientConfig(opts, opts.Concurrency)
 	require.Equal(t, 800, config.MaxConnections)
 	config = sdkClientConfig(opts, maxLiveConcurrency)

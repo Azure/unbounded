@@ -39,7 +39,6 @@ type pullOptions struct {
 	ConcurrencyFile   string
 	NodeCapsFile      string
 	NodeName          string
-	LayerConcurrency  int // Compatibility input; normalized into BlobConcurrency.
 	BlobConcurrency   int
 	Timeout           time.Duration
 	RetryDelay        time.Duration
@@ -74,10 +73,6 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 
 	if opts.Backend != "gantry" && opts.Backend != "uds" && opts.Backend != "s3" {
 		return nil, errors.New("backend must be gantry, uds, or s3")
-	}
-
-	if opts.BlobConcurrency == 0 {
-		opts.BlobConcurrency = opts.LayerConcurrency
 	}
 
 	if opts.DiagnoseIntegrity && !opts.Verify {

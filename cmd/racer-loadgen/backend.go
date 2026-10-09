@@ -56,12 +56,7 @@ func (p *puller) acquireHTTP(ctx context.Context, kind string, desc ocispec.Desc
 
 func sdkClientConfig(opts pullOptions, capacity int) racersdk.ClientConfig {
 	// Never let the SDK's zero/default 64 silently cap the configured workload.
-	blobConcurrency := opts.BlobConcurrency
-	if blobConcurrency == 0 {
-		blobConcurrency = opts.LayerConcurrency
-	}
-
-	limit := max(1, capacity*blobConcurrency)
+	limit := max(1, capacity*opts.BlobConcurrency)
 
 	return racersdk.ClientConfig{Cache: opts.Volume, MaxConnections: limit}
 }
