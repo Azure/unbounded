@@ -43,7 +43,7 @@ func TestCatalogIdenticalOriginsAndCompatibility(t *testing.T) {
 		}
 	}
 
-	for _, catalog := range []*imageCatalog{first, second} {
+	for _, catalog := range []*blobCatalog{first, second} {
 		handler := catalog.handler()
 		prefix := "/v2/" + opts.Repository
 

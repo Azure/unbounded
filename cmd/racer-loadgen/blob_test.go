@@ -259,7 +259,7 @@ func TestBlobStreamMustFinishAndMatchMetadata(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/diagnostic=%v", mode, diagnostic), func(t *testing.T) {
 				p, metrics := pullTestNew(t, &syntheticImage{}, pullTestOptions("http://unused"))
 				p.opts.DiagnoseIntegrity = diagnostic
-				p.expected = map[digest.Digest]imageBlob{desc.Digest: {descriptor: desc, data: bytes.NewReader(data)}}
+				p.expected = map[digest.Digest]blobSource{desc.Digest: {descriptor: desc, data: bytes.NewReader(data)}}
 
 				var closed atomic.Int32
 

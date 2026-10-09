@@ -55,7 +55,7 @@ func TestDiagnosticReader(t *testing.T) {
 			actual[offset] ^= 1
 		}
 
-		n, hash, e, err := p.readBodyDiagnostic(&diagnosticChunks{actual, 32749, io.EOF}, imageBlob{desc, bytes.NewReader(data)})
+		n, hash, e, err := p.readBodyDiagnostic(&diagnosticChunks{actual, 32749, io.EOF}, blobSource{desc, bytes.NewReader(data)})
 		require.NoError(t, err)
 		require.Equal(t, int64(len(data)), n)
 		require.Equal(t, digest.FromBytes(actual).String(), hash)
@@ -73,9 +73,9 @@ func TestDiagnosticReader(t *testing.T) {
 		require.Equal(t, sha256.Sum256(data[r.Offset:r.Offset+r.Length]), r.Expected)
 	}
 
-	_, _, _, err := p.readBodyDiagnostic(&diagnosticChunks{[]byte{1}, 1, io.ErrUnexpectedEOF}, imageBlob{desc, bytes.NewReader(data)})
+	_, _, _, err := p.readBodyDiagnostic(&diagnosticChunks{[]byte{1}, 1, io.ErrUnexpectedEOF}, blobSource{desc, bytes.NewReader(data)})
 	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
-	_, _, _, err = p.readBodyDiagnostic(bytes.NewReader(data), imageBlob{desc, bytes.NewReader(nil)})
+	_, _, _, err = p.readBodyDiagnostic(bytes.NewReader(data), blobSource{desc, bytes.NewReader(nil)})
 	require.ErrorContains(t, err, "oracle")
 }
 
@@ -184,7 +184,7 @@ func TestDiagnosticPageCapAndLogging(t *testing.T) {
 	p, _ := pullTestNew(t, pullTestImage(t), pullTestOptions("http://localhost"))
 	desc := byteDescriptor("test", nil)
 	desc.Size = 9 * diagnosticPageSize
-	_, _, evidence, err := p.readBodyDiagnostic(io.NewSectionReader(diagnosticPattern{true}, 0, desc.Size), imageBlob{desc, diagnosticPattern{}})
+	_, _, evidence, err := p.readBodyDiagnostic(io.NewSectionReader(diagnosticPattern{true}, 0, desc.Size), blobSource{desc, diagnosticPattern{}})
 	require.NoError(t, err)
 	require.Equal(t, int64(9), evidence.examined)
 	require.Equal(t, int64(9), evidence.mismatching)
@@ -293,7 +293,7 @@ func TestDiagnosticTruncatedAndEmpty(t *testing.T) {
 	for _, size := range []int64{0, diagnosticPageSize} {
 		desc := byteDescriptor("test", nil)
 		desc.Size = size
-		n, _, e, err := p.readBodyDiagnostic(io.NewSectionReader(diagnosticPattern{}, 0, size), imageBlob{desc, diagnosticPattern{}})
+		n, _, e, err := p.readBodyDiagnostic(io.NewSectionReader(diagnosticPattern{}, 0, size), blobSource{desc, diagnosticPattern{}})
 		require.NoError(t, err)
 		require.Equal(t, size, n)
 		require.Equal(t, size/diagnosticPageSize, e.examined)
@@ -301,7 +301,7 @@ func TestDiagnosticTruncatedAndEmpty(t *testing.T) {
 	}
 
 	desc := byteDescriptor("test", []byte{0, 0})
-	n, _, e, err := p.readBodyDiagnostic(&diagnosticChunks{[]byte{1}, 1, io.EOF}, imageBlob{desc, diagnosticPattern{}})
+	n, _, e, err := p.readBodyDiagnostic(&diagnosticChunks{[]byte{1}, 1, io.EOF}, blobSource{desc, diagnosticPattern{}})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), n)
 	require.Zero(t, e.examined, "short final page must not be finalized")
