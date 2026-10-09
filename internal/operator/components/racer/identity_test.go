@@ -244,10 +244,78 @@ func TestIdentityRejectsManifestCollisions(t *testing.T) {
 				require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(existing), before))
 
 				plan, _, err := (Component{}).Plan(t.Context(), env, nil)
-				require.ErrorContains(t, err, "standalone installations are not adopted")
+				if phase == "legacy" {
+					require.ErrorContains(t, err, "unsupported Racer operator initialization protocol")
+				} else {
+					require.ErrorContains(t, err, "standalone installations are not adopted")
+				}
+
 				require.Nil(t, plan)
 				require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(existing), existing))
 				require.Equal(t, before, existing)
+			})
+		}
+	}
+}
+
+func TestIdentityRequiresStagedProtocol(t *testing.T) {
+	for _, state := range []string{"reserved", "consumed"} {
+		for _, protocol := range []string{"", "unknown", operatorStaged} {
+			t.Run(state+"/"+protocol, func(t *testing.T) {
+				env := testEnv(t)
+				if state == "consumed" {
+					finishIdentity(t, env)
+				} else {
+					plan, _ := identityPlan(t, env)
+					persist(t, env, plan)
+				}
+
+				claim := &corev1.ConfigMap{}
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, claimName), claim))
+
+				if protocol == "" {
+					delete(claim.Data, operatorInitialization)
+				} else {
+					claim.Data[operatorInitialization] = protocol
+				}
+				// Seed unsupported persisted input; the fake permits immutable data changes.
+				require.NoError(t, env.Client.Update(t.Context(), claim))
+				before := claim.DeepCopy()
+				env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+					Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+						t.Fatal("identity planning created state")
+						return nil
+					},
+					Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+						t.Fatal("identity planning updated state")
+						return nil
+					},
+					Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+						t.Fatal("identity planning patched state")
+						return nil
+					},
+				})
+				plan := component.NewPlan()
+
+				_, err := planIdentity(t.Context(), env, plan)
+				if protocol == operatorStaged {
+					require.NoError(t, err)
+				} else {
+					require.ErrorContains(t, err, "unsupported Racer operator initialization protocol")
+					require.Zero(t, plan.Len())
+				}
+
+				if state == "consumed" {
+					_, err = claimedMarker(t.Context(), env, claim)
+					if protocol == operatorStaged {
+						require.NoError(t, err)
+					} else {
+						require.ErrorContains(t, err, "unsupported Racer operator initialization protocol")
+					}
+				}
+
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, claimName), claim))
+				require.Equal(t, before, claim)
 			})
 		}
 	}

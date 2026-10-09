@@ -26,7 +26,7 @@ const (
 )
 
 // Stage a non-startable marker before permanently binding its UID. Never reset
-// either permanent object. Legacy claims retain their one-shot Create contract.
+// either permanent object. Only staged-v1 claims are supported.
 func planIdentity(ctx context.Context, env *component.Env, plan *component.Plan) (*corev1.ConfigMap, error) {
 	claim := &corev1.ConfigMap{}
 
@@ -53,45 +53,19 @@ func planIdentity(ctx context.Context, env *component.Env, plan *component.Plan)
 		return nil, fmt.Errorf("invalid Racer operator claim; restore consistent installation state")
 	}
 
-	if protocol := claim.Data[operatorInitialization]; protocol != "" {
-		if protocol != operatorStaged {
-			return nil, fmt.Errorf("unknown Racer operator initialization protocol")
-		}
-
-		return planStagedIdentity(ctx, env, plan, claim)
+	if claim.Data[operatorInitialization] != operatorStaged {
+		return nil, fmt.Errorf("unsupported Racer operator initialization protocol")
 	}
 
-	if claim.Data["state"] == "reserved" && !ptr.Deref(claim.Immutable, false) {
-		if err := checkNewInstallation(ctx, env); err != nil {
-			return nil, err
-		}
-
-		claim.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
-		committed := claim.DeepCopy()
-		committed.Data["state"] = "consumed"
-		committed.Immutable = ptr.To(true)
-		cas := component.Operation{Kind: component.OpMergePatch, Component: name, Base: component.ToUnstructured(claim), Object: component.ToUnstructured(committed)}
-		plan.Add(cas)
-
-		marker := &corev1.ConfigMap{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-			ObjectMeta: metav1.ObjectMeta{Name: markerName, Namespace: env.Namespace, Annotations: map[string]string{managerAnnotation: component.FieldOwner, claimAnnotation: string(claim.UID)}},
-			Data:       map[string]string{"cluster": claim.Data["cluster"], "version_configmap": versionName, "state": "fresh", operatorInitialization: operatorStaged},
-		}
-		plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Component: name, Object: component.ToUnstructured(marker), DependsOn: []component.ObjectRef{cas.Ref()}})
-
-		return nil, nil
-	}
-
-	if claim.Data["state"] != "consumed" || !ptr.Deref(claim.Immutable, false) {
-		return nil, fmt.Errorf("invalid Racer operator claim state")
-	}
-
-	return claimedMarker(ctx, env, claim)
+	return planStagedIdentity(ctx, env, plan, claim)
 }
 
 // Read-only validation cannot consume a claim or recreate a marker.
 func claimedMarker(ctx context.Context, env *component.Env, claim *corev1.ConfigMap) (*corev1.ConfigMap, error) {
+	if claim.Data[operatorInitialization] != operatorStaged {
+		return nil, fmt.Errorf("unsupported Racer operator initialization protocol")
+	}
+
 	if claim.Annotations[managerAnnotation] != component.FieldOwner || claim.UID == "" || claim.ResourceVersion == "" || claim.DeletionTimestamp != nil || !wire.ValidUUID(claim.Data["cluster"]) || claim.Data["state"] != "consumed" || !ptr.Deref(claim.Immutable, false) {
 		return nil, fmt.Errorf("invalid established Racer operator claim")
 	}
@@ -105,7 +79,7 @@ func claimedMarker(ctx context.Context, env *component.Env, claim *corev1.Config
 		return nil, fmt.Errorf("racer marker does not match the permanent operator claim")
 	}
 
-	if protocol := claim.Data[operatorInitialization]; protocol != "" && (protocol != operatorStaged || claim.Data[operatorMarkerUID] != string(marker.UID) || marker.Data[operatorInitialization] != operatorStaged) {
+	if claim.Data[operatorMarkerUID] != string(marker.UID) || marker.Data[operatorInitialization] != operatorStaged {
 		return nil, fmt.Errorf("racer marker UID does not match the permanent operator claim")
 	}
 
@@ -128,7 +102,7 @@ func checkInstallationResources(ctx context.Context, env *component.Env, stagedM
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tlsName, Namespace: env.Namespace}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "racer-credentials", Namespace: env.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: credentialsName, Namespace: env.Namespace}},
 	}
 	if !stagedMarker {
 		objects = append(objects, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: markerName, Namespace: env.Namespace}})
