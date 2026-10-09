@@ -239,6 +239,84 @@ func TestExecuteGatingIsPerSite(t *testing.T) {
 	})
 }
 
+func TestExecuteFailureDomainsPreserveAttribution(t *testing.T) {
+	env, attempted := applyEnv(t, map[string]error{
+		"delete ServiceAccount/revoke": errors.New("delete denied"),
+		"ConfigMap/tls":                errors.New("TLS denied"),
+	})
+	plan := NewPlan()
+	plan.Add(
+		Operation{Kind: OpDelete, Object: serviceAccountObject("revoke"), Component: "a", Site: "east"},
+		Operation{Kind: OpApply, Object: configMapObject("blocked"), Component: "a", Site: "east"},
+		Operation{Kind: OpApply, Object: configMapObject("tls"), Component: "a", Site: "east", FailureDomain: "tls"},
+		Operation{Kind: OpApply, Object: daemonSetObject("tls-consumer"), Component: "a", Site: "east", FailureDomain: "tls"},
+		Operation{Kind: OpApply, Object: daemonSetObject("independent"), Component: "a", Site: "east", FailureDomain: "other"},
+	)
+
+	result, err := env.Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertCalls(t, *attempted, []string{"delete ServiceAccount/revoke", "ConfigMap/tls", "DaemonSet/independent"})
+
+	if len(result.Failed()) != 2 || len(result.Skipped()) != 2 {
+		t.Fatalf("unexpected outcomes: %+v", result.Results)
+	}
+
+	for _, outcome := range result.Results {
+		if outcome.Component != "a" || outcome.Site != "east" {
+			t.Fatalf("lost attribution: %+v", outcome)
+		}
+	}
+
+	combined := CombineResult("a", "east", Result{}, result)
+	if combined.Err == nil || !strings.Contains(combined.Err.Error(), "delete denied") || !strings.Contains(combined.Err.Error(), "TLS denied") {
+		t.Fatalf("lost failure attribution: %+v", combined)
+	}
+}
+
+func TestExecuteFailureDomainsKeepSafetyGates(t *testing.T) {
+	for _, gate := range []string{"namespace", "same-object", "dependency", "shared-alias"} {
+		t.Run(gate, func(t *testing.T) {
+			first := Operation{Kind: OpApply, Object: configMapObject("broken"), Component: "a"}
+			later := Operation{Kind: OpApply, Object: daemonSetObject("blocked"), Component: "a", FailureDomain: "tls"}
+			plan := NewPlan()
+
+			switch gate {
+			case "namespace":
+				first.Object = namespaceObject(DefaultNamespace)
+			case "same-object":
+				later.Object = first.Object.DeepCopy()
+			case "dependency":
+				later.DependsOn = []ObjectRef{first.Ref()}
+			case "shared-alias":
+				first.SharedKey = "shared"
+				alias := first
+				first.FailureDomain = "tls"
+
+				plan.Add(alias)
+			}
+
+			failedCall := first.Object.GetKind() + "/" + first.Object.GetName()
+			env, attempted := applyEnv(t, map[string]error{failedCall: errors.New("denied")})
+
+			plan.Add(first, later)
+
+			result, err := env.Execute(t.Context(), plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			assertCalls(t, *attempted, []string{failedCall})
+
+			if len(result.Skipped()) != 1 || result.Skipped()[0].Ref != later.Ref() {
+				t.Fatalf("safety gate bypassed: %+v", result.Results)
+			}
+		})
+	}
+}
+
 // TestExecuteSkipsLaterOperationsOnAFailedObject covers the third gate. A plan
 // legitimately holds more than one operation on the same object, and patching
 // one whose creation failed produces only a second, more confusing error.

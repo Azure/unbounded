@@ -80,6 +80,7 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 		// have no dependencies on each other and never grant new permissions.
 		if tlsErr == nil {
 			for _, op := range tlsPlan.Operations {
+				op.FailureDomain = "retained-tls"
 				guardPlan.Add(op)
 			}
 		}

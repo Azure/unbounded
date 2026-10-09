@@ -22,6 +22,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -717,4 +718,74 @@ func TestTLSWriteFailureDoesNotDelayGuardContainment(t *testing.T) {
 	stored := &corev1.Secret{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
 	require.Equal(t, secret.Data, stored.Data)
+}
+
+func TestGuardContainmentFailureDoesNotDelayTLSMaintenance(t *testing.T) {
+	for _, deniedKind := range []string{"RoleBinding", "ClusterRoleBinding"} {
+		for _, missingTrust := range []bool{false, true} {
+			t.Run(deniedKind+map[bool]string{false: "/existing-trust", true: "/missing-trust"}[missingTrust], func(t *testing.T) {
+				env := testEnv(t, cacheObject("cache"))
+				initialize(t, env)
+
+				old := &corev1.Secret{}
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), old))
+				at := stateOf(t, old).CreatedAt.Add(caLifetime)
+				guard := &admissionv1.ValidatingAdmissionPolicy{}
+				require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: guardNames[0]}, guard))
+				guard.Spec.Validations = nil
+				require.NoError(t, env.Client.Update(t.Context(), guard))
+
+				if missingTrust {
+					require.NoError(t, env.Client.Delete(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace}}))
+				}
+
+				env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if obj.GetObjectKind().GroupVersionKind().Kind == deniedKind {
+							return apierrors.NewForbidden(schema.GroupResource{Group: rbacv1.GroupName, Resource: deniedKind}, obj.GetName(), errors.New("containment denied"))
+						}
+
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+				for pass, target := range []string{tlsName, trustName} {
+					plan, planned, err := planAt(t.Context(), env, at)
+					require.NoError(t, err)
+					require.Len(t, plan.Operations, 3-pass)
+
+					for _, op := range plan.Operations {
+						require.True(t, op.Kind == component.OpDelete || op.Object.GetName() == target)
+					}
+
+					result, err := env.Execute(t.Context(), plan)
+					require.NoError(t, err)
+					require.ErrorContains(t, result.Err(), "containment denied")
+					require.Len(t, result.Failed(), 1)
+					require.True(t, apierrors.IsForbidden(result.Failed()[0].Err))
+					require.Empty(t, result.Skipped())
+					require.ErrorContains(t, component.CombineResult(name, "", planned, result).Err, "containment denied")
+
+					for _, outcome := range result.Results {
+						require.Equal(t, name, outcome.Component)
+						require.Empty(t, outcome.Site)
+
+						if outcome.Ref.Name == target {
+							require.Equal(t, component.OpSucceeded, outcome.Status)
+						}
+					}
+				}
+
+				stored := &corev1.Secret{}
+				trust := &corev1.ConfigMap{}
+
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, trustName), trust))
+				require.NotEqual(t, old.Data["ca.crt"], stored.Data["ca.crt"])
+				require.Equal(t, string(servingRoots(stored)), trust.Data["ca.crt"])
+				require.NoError(t, verifyServing(t, stored, []byte(trust.Data["ca.crt"]), at))
+				require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: guardNames[0]}, guard))
+				require.Empty(t, guard.Spec.Validations)
+			})
+		}
+	}
 }
