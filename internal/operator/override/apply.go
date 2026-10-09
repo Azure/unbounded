@@ -6,7 +6,6 @@ package override
 import (
 	"errors"
 	"fmt"
-	"reflect"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -202,8 +201,8 @@ func applyTarget(plan *component.Plan, target Target) WorkloadResult {
 		return result
 	}
 
-	if op := plan.Operations[target.Index]; op.Component == "racer" && op.Site == "" && original.GetKind() == "Deployment" {
-		if err := checkRacerEnvironment(original, candidate); err != nil {
+	if validate := plan.Operations[target.Index].ValidateOverride; validate != nil {
+		if err := validate(original, candidate); err != nil {
 			result.Err = fmt.Errorf("%s: %w", contributorSources(target.Contributors), err)
 
 			return result
@@ -217,41 +216,6 @@ func applyTarget(plan *component.Plan, target Target) WorkloadResult {
 	plan.Operations[target.Index].Object = candidate
 
 	return result
-}
-
-func checkRacerEnvironment(original, candidate *unstructured.Unstructured) error {
-	controller := func(workload *unstructured.Unstructured) (map[string]any, int) {
-		var found map[string]any
-
-		count := 0
-
-		for _, container := range patchedContainers(workload.Object, "containers") {
-			if container["name"] == "controller" {
-				found = container
-				count++
-			}
-		}
-
-		return found, count
-	}
-
-	before, beforeCount := controller(original)
-	after, afterCount := controller(candidate)
-
-	if beforeCount != 1 || afterCount != 1 {
-		return errors.New("racer Deployment must retain exactly one canonical controller container; use ConfigMap racer-config for configuration tuning")
-	}
-
-	for _, field := range []string{"env", "envFrom"} {
-		beforeValue, beforePresent := before[field]
-		afterValue, afterPresent := after[field]
-
-		if beforePresent != afterPresent || !reflect.DeepEqual(beforeValue, afterValue) {
-			return fmt.Errorf("racer Deployment container controller %s must match the canonical configuration exactly for trusted bootstrap parity; use ConfigMap racer-config for configuration tuning", field)
-		}
-	}
-
-	return nil
 }
 
 func stampAnnotations(workload *unstructured.Unstructured, hash, sources, drift string) {
