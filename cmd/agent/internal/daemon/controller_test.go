@@ -313,6 +313,79 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 	assert.NoFileExists(t, signalPath)
 }
 
+// agentUpgradeOperation returns a Pending AgentUpgrade for test-machine.
+func agentUpgradeOperation(name string) *v1alpha3.MachineOperation {
+	return &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+			Parameters: map[string]string{
+				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
+				agentUpgradeSHA256Parameter:      testAgentUpgradeSHA256,
+			},
+		},
+	}
+}
+
+// TestReconcileAgentUpgrade_NothingMoreOnceRestartScheduled covers the moment
+// between scheduling the daemon's restart and the restart: staging again would
+// switch the slots back, so this daemon takes no further AgentUpgrade, and the
+// restarted one reports the staged operation and picks up the rest.
+func TestReconcileAgentUpgrade_NothingMoreOnceRestartScheduled(t *testing.T) {
+	signalPath := setAgentUpgradeSignalPath(t)
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
+	op := &fakeNodeOperator{}
+	c := fakeStatusClient(machine, agentUpgradeOperation("op-1"), agentUpgradeOperation("op-2"))
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+	_, err := reconciler.ReconcileMachineOperation(t.Context(), "op-1")
+	require.NoError(t, err)
+	require.True(t, op.stageUpgradeCalled)
+	require.True(t, op.restartAgentCalled)
+
+	for _, name := range []string{"op-1", "op-2"} {
+		op.stageUpgradeCalled, op.restartAgentCalled = false, false
+
+		result, err := reconciler.ReconcileMachineOperation(t.Context(), name)
+		require.NoError(t, err)
+		assert.Zero(t, result, "%s: the restarted daemon handles it, so nothing is requeued here", name)
+		assert.False(t, op.stageUpgradeCalled, "%s must not be staged before the restart", name)
+		assert.False(t, op.restartAgentCalled, "%s must not schedule another restart", name)
+	}
+
+	var second v1alpha3.MachineOperation
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "op-2"}, &second))
+	assert.Empty(t, second.Status.Phase, "op-2 stays Pending, so the restarted daemon enqueues it")
+
+	data, err := os.ReadFile(signalPath)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"operationName":"op-1","observedMachineGeneration":9}`, string(data))
+}
+
+// TestReconcileAgentUpgrade_RetriesAfterFailedRestart: only a restart that was
+// scheduled stops this daemon taking AgentUpgrades; one that failed to schedule
+// fails its operation and leaves the next one to run here.
+func TestReconcileAgentUpgrade_RetriesAfterFailedRestart(t *testing.T) {
+	setAgentUpgradeSignalPath(t)
+
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
+	op := &fakeNodeOperator{restartAgentErr: errors.New("restart failed")}
+	c := fakeStatusClient(machine, agentUpgradeOperation("op-1"), agentUpgradeOperation("op-2"))
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+	_, err := reconciler.ReconcileMachineOperation(t.Context(), "op-1")
+	require.NoError(t, err)
+
+	op.restartAgentErr = nil
+	op.stageUpgradeCalled, op.restartAgentCalled = false, false
+
+	_, err = reconciler.ReconcileMachineOperation(t.Context(), "op-2")
+	require.NoError(t, err)
+	assert.True(t, op.stageUpgradeCalled)
+	assert.True(t, op.restartAgentCalled)
+}
+
 func TestReconcileAgentUpgrade_WaitsForActivationLock(t *testing.T) {
 	lockPath := filepath.Join(t.TempDir(), "agent-upgrade.lock")
 	lock, err := agentbinary.AcquireHostActivationLock(lockPath)

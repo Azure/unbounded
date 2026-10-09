@@ -199,6 +199,8 @@ locking, and rollback behavior.
 ```text
 Pending MachineOperation
         |
+        +-- this daemon already scheduled its restart ---> Left for the restarted daemon
+        |
         v
 Acquire shared host activation lock
         |
@@ -249,12 +251,17 @@ it. The pending signal prevents a direct host activation from entering the
 window between the lock's release and the restarted daemon's startup.
 
 The daemon does not run the restart itself. A `systemctl` it runs is in the
-daemon's cgroup, which stopping the daemon kills, and when the kill lands
-before `systemctl` exits the daemon would fail the operation and clear its
-signal for a restart already under way. It schedules the restart with
+daemon's cgroup, which stopping the daemon kills, and when the kill lands before
+`systemctl` exits the daemon would fail the operation and clear its signal for a
+restart already under way. It schedules the restart with
 `systemd-run --on-active=1s` instead, which runs `systemctl restart` from a
 transient unit outside that cgroup once the daemon has returned. Only a failure
-to schedule it fails the operation.
+to schedule it fails the operation. Until the restart, an operation this daemon
+staged is InProgress but not finished, so it can be reconciled again. Once the
+daemon has scheduled its restart it takes no further AgentUpgrade: staging again
+would switch the slots back. The restarted daemon reports the staged operation
+from the pending signal, and enqueues any other that is still Pending when it
+starts watching.
 
 The daemon reads `spec.parameters["downloadURL"]` and the optional
 `spec.parameters["sha256"]` from the `MachineOperation`, resolves the current
