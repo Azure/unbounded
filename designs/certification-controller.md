@@ -67,7 +67,31 @@ The system must:
 
 ## Architecture
 
-![Certification system architecture](images/certification-controller/system-architecture.png)
+```mermaid
+flowchart TB
+    subgraph Control["Project Signal control plane"]
+        Controller["Certification Controller"]
+        API["Profiles and Run API"]
+        Workflow["Argo Workflows"]
+    end
+    subgraph Execution["Execution plane"]
+        Catalog["Runner catalog"]
+        Suites["Suite runners"]
+        Targets["Target capacity"]
+    end
+    subgraph Evidence["Evidence plane"]
+        Store["Immutable evidence"]
+        Observe["Audit, logs, metrics, traces"]
+        State["Eligibility and remediation"]
+    end
+    Controller --> API --> Workflow
+    Workflow --> Catalog --> Suites --> Targets
+    Suites --> Store
+    Suites --> Observe
+    Controller --> State
+    Store --> Controller
+    Observe --> Controller
+```
 
 ### Ownership
 
@@ -83,7 +107,23 @@ The system must:
 
 ## End-to-end lifecycle
 
-![Certification lifecycle](images/certification-controller/run-lifecycle.png)
+```mermaid
+stateDiagram-v2
+    [*] --> Observed
+    Observed --> ProfileResolved
+    ProfileResolved --> Blocked
+    Blocked --> WaitingForLease
+    WaitingForLease --> Running
+    Running --> Evaluating
+    Evaluating --> Eligible: required gates pass
+    Evaluating --> Failed: required evidence fails
+    Evaluating --> Inconclusive: interrupted or incomplete
+    Inconclusive --> WaitingForLease: retry permitted
+    Failed --> RemediationRequested
+    RemediationRequested --> VerificationRequired: repair completes
+    VerificationRequired --> Blocked
+    Eligible --> Blocked: evidence stale or fault observed
+```
 
 1. The controller observes capacity that requires certification.
 2. It binds the Kubernetes Node to durable asset identity and current repair
@@ -103,7 +143,22 @@ not substitute a smaller suite merely because resources are unavailable.
 
 ## Suite execution contract
 
-![Suite contract](images/certification-controller/suite-contract.png)
+```mermaid
+flowchart LR
+    Inputs["Run identity<br/>Profile and suite version<br/>Runner digest<br/>Participants and topology<br/>Deadline and configuration"]
+    subgraph Runner["Suite runner"]
+        Discover["Discovery and preflight"]
+        Observe["Collectors and monitors"]
+        Stages["Parallel or sequential stages"]
+        Cooldown["Cooldown"]
+        Evaluate["Deferred evaluation"]
+        Cleanup["Cancellation and cleanup"]
+        Discover --> Observe --> Stages --> Cooldown --> Evaluate --> Cleanup
+    end
+    Outputs["Execution state<br/>Hardware verdict<br/>Measurements<br/>Evidence manifest<br/>Cleanup result<br/>Audit events"]
+    Inputs --> Discover
+    Cleanup --> Outputs
+```
 
 A suite is a complete gate-level procedure. It may internally implement:
 
@@ -159,7 +214,20 @@ what the completed evidence says about the target.
 
 ## Profiles and gate graphs
 
-![Profile resolution and gates](images/certification-controller/profile-gates.png)
+```mermaid
+flowchart LR
+    Capabilities["Hardware class<br/>Topology class<br/>Lifecycle generation<br/>Certification class"]
+    Resolve{"Exactly one<br/>profile match?"}
+    Blocked["Remain blocked"]
+    Node["Node gate"]
+    Rack["Rack or fabric gate"]
+    Environment["Environment gate"]
+    Admission["Admission policy"]
+    Capabilities --> Resolve
+    Resolve -->|No or multiple| Blocked
+    Resolve -->|Yes| Node
+    Node --> Rack --> Environment --> Admission
+```
 
 A profile selects suites based on declared capabilities and certification
 class. Different environments may select different profiles while using the
@@ -233,7 +301,24 @@ gate.
 
 ## Evidence and data flow
 
-![Evidence and audit data flow](images/certification-controller/evidence-audit.png)
+```mermaid
+flowchart TB
+    Run["CertificationRun UID"]
+    Kubernetes["Kubernetes state<br/>current status and links"]
+    Workflow["Workflow status<br/>tasks and attempts"]
+    Logs["Logs and traces<br/>execution debugging"]
+    Metrics["Metrics<br/>fleet operations"]
+    Evidence["Immutable evidence<br/>results and artifacts"]
+    Audit["Audit journal<br/>decisions and mutations"]
+    Run --> Kubernetes
+    Run --> Workflow
+    Run --> Logs
+    Run --> Metrics
+    Run --> Evidence
+    Run --> Audit
+    Evidence --> Run
+    Audit --> Run
+```
 
 Each run writes an immutable prefix:
 
@@ -283,7 +368,24 @@ correlation.
 | Distributed traces | One-run path across controller, workflow engine, runners, stores, publishers, and lifecycle APIs |
 | Evidence manifest | Reproducible inputs and outputs that anchor the verdict |
 
-![Audit event sequence](images/certification-controller/audit-sequence.png)
+```mermaid
+sequenceDiagram
+    participant Requester
+    participant Controller
+    participant Workflow
+    participant Runner
+    participant Evidence
+    participant Audit
+    Requester->>Controller: RunRequested
+    Controller->>Audit: ProfileResolved and EligibilityBlocked
+    Controller->>Workflow: WorkflowSubmitted
+    Workflow->>Runner: SuiteStarted
+    Runner->>Evidence: Result and artifacts
+    Runner->>Audit: SuiteCompleted or SuiteInterrupted
+    Evidence-->>Controller: EvidencePublished
+    Controller->>Audit: VerdictRecorded
+    Controller->>Audit: EligibilityChanged or RemediationRequested
+```
 
 Minimum audit sequence:
 
@@ -308,7 +410,14 @@ unrestricted environment dumps must not enter logs or evidence.
 
 ## Compatibility mode
 
-![Compatibility migration](images/certification-controller/compatibility-migration.png)
+```mermaid
+flowchart LR
+    Wrap["1. Wrap<br/>Current-equivalent suite<br/>New result and evidence contracts"]
+    Shadow["2. Shadow<br/>Compare targeting, measurements,<br/>verdict, outputs, and cleanup"]
+    Cutover["3. Cut over<br/>Controller becomes<br/>sole eligibility writer"]
+    Expand["4. Expand<br/>Add advisory gates<br/>Promote by profile version"]
+    Wrap --> Shadow --> Cutover --> Expand
+```
 
 Compatibility mode brings an existing certification procedure into the new
 control plane without translating every internal operation into a separate
