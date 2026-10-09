@@ -479,7 +479,7 @@ func TestRustSubscriptionInterop(t *testing.T) {
 		defer closeQuietly(object)
 
 		_, err = object.WriteTo(writeFunc(func([]byte) (int, error) { return 0, sentinel }))
-		if !errors.Is(err, sentinel) {
+		if !errors.Is(err, sentinel) || !errors.Is(err, ErrDestination) || errors.Is(err, ErrUnavailable) {
 			t.Fatal(err)
 		}
 
