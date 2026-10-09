@@ -89,10 +89,9 @@ and recreating it gives it a new cache identity.
 - **Version** -- One fixed set of bytes for a key, named by a strong **ETag**
   that the origin returns. The bytes of a version must never change. Every page
   of a read comes from the same version.
-- **Expiry** -- The origin must set `ExpiresAt`. It limits how long Racer can
-  reuse its current-version selection for unpinned reads. A read pinned to an
-  ETag may still use that cached version after expiry, but pinning does not
-  guarantee the version remains available.
+- **Expiry** -- The origin must set `ExpiresAt` to define freshness. Pinning a
+  read to an ETag selects that exact version but does not guarantee the version
+  remains available.
 
 ### Pages
 
