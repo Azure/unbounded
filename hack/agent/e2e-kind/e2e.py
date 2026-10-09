@@ -2422,11 +2422,13 @@ def acquire_host_image(image: HostImage) -> Path:
 # The gallery export's temporary disks carry this tag, and only disks with it
 # are ever swept.
 ACL_EXPORT_DISK_TAG = "unbounded-acl-e2e"
-# A disk older than this was left by a job that is gone: a cancelled job does
+# A disk older than this was left by a job that is gone: a canceled job does
 # not run its cleanup. It is far longer than any job, so a running export is
 # never touched.
 ACL_EXPORT_STALE_AFTER = 6 * 3600
-ACL_EXPORT_SAS_SECONDS = 3600
+# The download takes seconds in CI and under a minute locally, and the SAS is
+# revoked as soon as it ends; this only bounds a SAS that outlives a dead job.
+ACL_EXPORT_SAS_SECONDS = 600
 ACL_EXPORT_CHUNK = 8 << 20
 ACL_EXPORT_WORKERS = 16
 VHD_FOOTER_SIZE = 512
@@ -2513,7 +2515,10 @@ def _grant_export_sas(disk: str) -> str:
     if not sas.startswith("https://"):
         die(f"grant-access on disk {disk} returned no SAS")
     if os.environ.get("GITHUB_ACTIONS") == "true":
-        print(f"::add-mask::{sas}", flush=True)
+        # The signature on its own too, which is all an error that prints only
+        # part of the URL, or the URL decoded, would need to leak.
+        for secret in [sas, *urllib.parse.parse_qs(urllib.parse.urlsplit(sas).query).get("sig", [])]:
+            print(f"::add-mask::{secret}", flush=True)
 
     return sas
 
@@ -2524,9 +2529,9 @@ def _acl_az_best_effort(args: list[str], what: str) -> str | None:
     try:
         return capture(_acl_az_command(args))
     except subprocess.CalledProcessError as exc:
-        warning = f"could not {what}: {(exc.stderr or '').strip()[-500:]}"
-        print(f"::warning::{warning}" if os.environ.get("GITHUB_ACTIONS") == "true" else f"[WARN]  {warning}",
-              flush=True)
+        # Through warn(), which escapes it: az's stderr is not ours, and a line
+        # break in it would otherwise start a workflow command.
+        warn(f"could not {what}: {(exc.stderr or '').strip()[-500:]}")
         return None
 
 
@@ -2542,7 +2547,15 @@ def sweep_stale_export_disks(now: float | None = None) -> None:
 
     cutoff = (time.time() if now is None else now) - ACL_EXPORT_STALE_AFTER
     for disk in json.loads(listed or "[]"):
-        if _azure_timestamp(disk["created"]) > cutoff:
+        # A disk whose age is unknown is left alone: it could be a running
+        # export's. The sweep is cleanup, and must not fail the export.
+        try:
+            created = _azure_timestamp(disk["created"])
+        except (KeyError, TypeError, ValueError):
+            warn(f"not sweeping export disk {disk.get('name')!r}: its creation time {disk.get('created')!r} "
+                 "cannot be read")
+            continue
+        if created > cutoff:
             continue
         log(f"Deleting export disk {disk['name']}, created {disk['created']} by an earlier job")
         if disk.get("state") == "ActiveSAS":

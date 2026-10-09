@@ -12,6 +12,7 @@ that will not boot or an assertion against a path nothing ever wrote to.
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -535,10 +536,22 @@ class TestGalleryExport(unittest.TestCase):
 
         self.assertFalse([args for args in az.calls if any("SECRET" in arg for arg in args)])
         printed.assert_any_call(f"::add-mask::{FakeAz.SAS}", flush=True)
+        # The signature on its own, decoded as parse_qs decodes it.
+        printed.assert_any_call("::add-mask::SECRET=", flush=True)
+
+    def test_the_sas_is_short_lived(self):
+        """It is revoked when the download ends; the duration only bounds one
+        a dead job never revoked."""
+        az = FakeAz()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._export(tmp, az)
+
+        grant = next(args for args in az.calls if az.verb(args) == "disk grant-access")
+        self.assertLessEqual(int(grant[grant.index("--duration-in-seconds") + 1]), 900)
 
 
 class TestExportSweep(unittest.TestCase):
-    """Cancelled jobs leave disks behind. Only old ones carrying the export's
+    """Canceled jobs leave disks behind. Only old ones carrying the export's
     tag are deleted, so a running export elsewhere is never touched."""
 
     NOW = 1_800_000_000.0
@@ -573,6 +586,36 @@ class TestExportSweep(unittest.TestCase):
         az = FakeAz(fail={"disk list"})
         self._sweep(az)
         self.assertEqual(az.verbs(), ["disk list"])
+
+    def test_a_disk_of_unknown_age_is_left_alone(self):
+        """It could be a running export's, and the sweep must not fail the
+        export it runs before."""
+        az = FakeAz(disks=[
+            {"name": "no-time", "state": "Unattached"},
+            {"name": "null-time", "created": None, "state": "Unattached"},
+            {"name": "odd-time", "created": "yesterday", "state": "Unattached"},
+            {"name": "old", "created": self._iso(7 * 3600), "state": "Unattached"},
+        ])
+        self._sweep(az)
+
+        touched = [(az.verb(args), args[args.index("-n") + 1]) for args in az.calls[1:]]
+        self.assertEqual(touched, [("disk delete", "old")])
+
+    def test_az_output_cannot_start_a_workflow_command(self):
+        """az's stderr is not ours; a line break in it must not reach the log
+        as a command of its own."""
+        error = subprocess.CalledProcessError(1, ["az"], stderr="failed\n::add-mask::x\r\n100%")
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(e2e, "ACL_IMAGE_SUBSCRIPTION", ""), \
+                patch.object(e2e, "capture", side_effect=error), \
+                patch("builtins.print") as printed:
+            self.assertIsNone(e2e._acl_az_best_effort(["disk", "list"], "list disks"))
+
+        lines = [call.args[0] for call in printed.call_args_list]
+        for line in lines:
+            self.assertNotIn("\n", line)
+            self.assertNotIn("\r", line)
+        self.assertTrue(any(line.startswith("::warning::") and "%0A::add-mask::x" in line for line in lines))
 
 
 def _fixed_vhd(data: bytes) -> bytes:
