@@ -272,6 +272,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 		op := component.Operation{Kind: component.OpApply, Object: obj, Component: name, Overridable: obj.GetKind() == "Deployment"}
 		if obj.GetKind() == "Deployment" {
+			op.ValidateOverride = ValidateOverride
 			// Security and configuration must succeed before startup consumes identity.
 			for _, dependency := range plan.Operations {
 				op.DependsOn = append(op.DependsOn, dependency.Ref())

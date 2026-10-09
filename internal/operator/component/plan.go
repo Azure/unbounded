@@ -121,6 +121,10 @@ type Operation struct {
 	// or ConfigMaps from reconciling.
 	Overridable bool
 
+	// ValidateOverride optionally checks the merged workload before assignment.
+	// It must not mutate either input. An error withholds this operation.
+	ValidateOverride func(original, candidate *unstructured.Unstructured) error
+
 	// SharedKey, when non-empty, identifies an operation that is identical
 	// across Sites and must execute once per pass. Per-Site planning otherwise
 	// re-applies shared support objects once per Site.

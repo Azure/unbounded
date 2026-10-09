@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/components/racer"
 )
 
 func TestApplyRacerEnvironmentParity(t *testing.T) {
@@ -60,7 +61,13 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 			}
 
 			plan := component.NewPlan()
-			plan.Add(component.Operation{Kind: component.OpApply, Object: workload, Component: componentName, Overridable: true})
+
+			op := component.Operation{Kind: component.OpApply, Object: workload, Component: componentName, Overridable: true}
+			if componentName == "racer" {
+				op.ValidateOverride = racer.ValidateOverride
+			}
+
+			plan.Add(op)
 
 			unrelated := testWorkload("unrelated")
 			plan.Add(component.Operation{Kind: component.OpApply, Object: unrelated, Component: "metalman", Site: "unrelated", Overridable: true})
@@ -152,7 +159,7 @@ func TestApplyRacerManifestEnvironmentParity(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			plan := component.NewPlan()
-			plan.Add(component.Operation{Kind: component.OpApply, Component: "racer", Object: canonical.DeepCopy(), Overridable: true})
+			plan.Add(component.Operation{Kind: component.OpApply, Component: "racer", Object: canonical.DeepCopy(), Overridable: true, ValidateOverride: racer.ValidateOverride})
 
 			patch := map[string]any{}
 			if err := setNestedSlice(patch, []any{map[string]any{"name": "controller", tt.field: tt.value}}, "spec", "template", "spec", "containers"); err != nil {
