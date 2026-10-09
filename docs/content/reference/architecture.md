@@ -230,6 +230,8 @@ is 1.34+, independently of the client library version used to build the tools.
   introduction to the system components.
 - **[Networking Concepts]({{< relref "concepts/networking" >}})** -- How
   unbounded-net provides cross-site pod connectivity.
+- **[Racer Distributed Cache]({{< relref "concepts/racer" >}})** -- Planned
+  shared object caching, origins, and access boundaries.
 - **[Networking Reference]({{< relref "reference/networking" >}})** -- Full
   unbounded-net CRDs, configuration, routing flows, and operations.
 - **[Bare Metal Concepts]({{< relref "concepts/bare-metal" >}})** -- PXE boot,
