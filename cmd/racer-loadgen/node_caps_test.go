@@ -216,7 +216,7 @@ func TestNodeCapOptions(t *testing.T) {
 	require.Equal(t, "node-a", parsed.pull.NodeName)
 	require.NoError(t, validateNodeCapsOptions(parsed.pull))
 	parsed.pull.ConcurrencyFile = ""
-	_, err = newPuller(pullTestImage(t), parsed.pull, pullTestMetrics())
+	_, err = newPuller(pullTestImage(t).repository, parsed.pull, pullTestMetrics())
 	require.Error(t, err)
 
 	opts := pullOptions{ConcurrencyFile: "/control/concurrency", NodeCapsFile: "/control/caps", NodeName: "node-a"}

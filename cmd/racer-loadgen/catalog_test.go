@@ -170,7 +170,7 @@ func TestCatalogWorkerTraversalAndVerifiedBytes(t *testing.T) {
 			opts := pullTestOptions(server.URL)
 			opts.Interval, opts.RetryDelay = time.Millisecond, time.Millisecond
 			p, metrics := pullTestNew(t, catalog.images[0], opts)
-			p.images = catalog.images
+			p.batches = catalog.batches
 			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan struct{})
 

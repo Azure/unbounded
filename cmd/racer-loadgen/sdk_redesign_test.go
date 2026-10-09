@@ -70,7 +70,7 @@ func TestReadBodyVerifiedUsesRead(t *testing.T) {
 }
 
 func TestPullerClosesDrainDestination(t *testing.T) {
-	p, err := newPuller(&syntheticImage{}, pullTestOptions("http://unused"), pullTestMetrics())
+	p, err := newPuller("test/image", pullTestOptions("http://unused"), pullTestMetrics())
 	require.NoError(t, err)
 	p.close()
 	_, err = p.devNull.Write([]byte("x"))

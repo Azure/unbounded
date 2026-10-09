@@ -63,7 +63,7 @@ func runDiagnosticTarget(ctx context.Context, cfg diagnosticTargetConfig) error 
 		Verify: true, DiagnoseIntegrity: true, ZipfExponent: defaultZipfExponent,
 	}
 
-	p, err := newPuller(&syntheticImage{}, opts, pullTestMetrics())
+	p, err := newPuller(cfg.Image.Repository, opts, pullTestMetrics())
 	if err != nil {
 		return err
 	}
@@ -84,7 +84,6 @@ func runDiagnosticTarget(ctx context.Context, cfg diagnosticTargetConfig) error 
 
 	stop()
 
-	p.img = images[0]
 	if err := p.configureDiagnostics(catalogFromImages(images)); err != nil {
 		return err
 	}

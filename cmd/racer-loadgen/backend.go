@@ -32,7 +32,7 @@ func (p *puller) acquireHTTP(ctx context.Context, kind string, desc ocispec.Desc
 		resource = "manifests"
 	}
 
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v2/" + p.img.repository + "/" + resource + "/" + desc.Digest.String()
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v2/" + p.repository + "/" + resource + "/" + desc.Digest.String()
 
 	endpoint.RawPath = ""
 	if p.opts.Namespace != "" {

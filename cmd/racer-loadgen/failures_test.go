@@ -112,13 +112,14 @@ func TestPullFailureLogsUnderlyingCause(t *testing.T) {
 func TestFailureDiagnosticHTTPAcquisition(t *testing.T) {
 	opts := pullTestOptions("http://private.invalid")
 	opts.Namespace = "token=secret"
-	p, _ := pullTestNew(t, pullTestImage(t), opts)
+	img := pullTestImage(t)
+	p, _ := pullTestNew(t, img, opts)
 	p.transport.Proxy = nil
 	p.transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
 		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}
 	}
 
-	err := p.fetch(t.Context(), "manifest", p.img.Manifest)
+	err := p.fetch(t.Context(), "manifest", img.Manifest)
 	require.ErrorIs(t, err, syscall.ECONNREFUSED)
 	require.Contains(t, err.Error(), "secret", "the original HTTP error contains the namespace URL query")
 	require.Equal(t, "connection refused", failureDiagnostic(err))

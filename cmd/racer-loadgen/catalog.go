@@ -143,14 +143,10 @@ type catalogTraversal struct {
 func (p *puller) newTraversal() catalogTraversal {
 	traversal := catalogTraversal{randomFloat64: p.randomFloat64}
 	if p.opts.Profile == profileZipf {
-		traversal.zipfCDF = newZipfCDF(p.batchCount(), p.opts.ZipfExponent)
+		traversal.zipfCDF = newZipfCDF(len(p.batches), p.opts.ZipfExponent)
 	}
 
 	return traversal
-}
-
-func (t *catalogTraversal) nextImage(images []*syntheticImage) *syntheticImage {
-	return images[t.nextIndex(len(images))]
 }
 
 func (t *catalogTraversal) nextIndex(count int) int {

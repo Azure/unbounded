@@ -51,8 +51,7 @@ type puller struct {
 	batches      []blobBatch
 	acquire      func(context.Context, string, ocispec.Descriptor) (blobResponse, error)
 	closeBackend func() error
-	img          *syntheticImage
-	images       []*syntheticImage
+	repository   string
 	opts         pullOptions
 	target       *url.URL
 	metrics      *loadMetrics
@@ -66,7 +65,7 @@ type puller struct {
 	randomFloat64 func() float64
 }
 
-func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*puller, error) {
+func newPuller(repository string, opts pullOptions, metrics *loadMetrics) (*puller, error) {
 	if opts.Backend == "" {
 		opts.Backend = "gantry"
 	}
@@ -79,8 +78,8 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 		return nil, errors.New("diagnose-integrity requires verify")
 	}
 
-	if img == nil || metrics == nil {
-		return nil, errors.New("image and metrics are required")
+	if repository == "" || metrics == nil {
+		return nil, errors.New("repository and metrics are required")
 	}
 
 	if opts.Profile == "" {
@@ -145,7 +144,7 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 	transport.MaxIdleConns = transport.MaxIdleConnsPerHost
 	p := &puller{
 		randomFloat64: rand.Float64,
-		img:           img, images: []*syntheticImage{img}, opts: opts, target: target, metrics: metrics, transport: transport,
+		repository:    repository, opts: opts, target: target, metrics: metrics, transport: transport,
 		client: &http.Client{
 			Transport: transport,
 			// Read redirect responses as failures so every received body is accounted for.
@@ -241,14 +240,6 @@ func waitPullDelay(ctx context.Context, delay time.Duration) bool {
 	case <-timer.C:
 		return ctx.Err() == nil
 	}
-}
-
-func (p *puller) pull(ctx context.Context) error {
-	return p.pullImage(ctx, p.img)
-}
-
-func (p *puller) pullImage(ctx context.Context, img *syntheticImage) error {
-	return p.pullBatch(ctx, imageBatch(img))
 }
 
 func (p *puller) pullBatch(ctx context.Context, batch blobBatch) (err error) {

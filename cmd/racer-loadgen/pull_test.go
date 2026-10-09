@@ -68,12 +68,26 @@ func pullTestMetrics() *loadMetrics {
 func pullTestNew(t *testing.T, img *syntheticImage, opts pullOptions) (*puller, *loadMetrics) {
 	t.Helper()
 
+	repository := img.repository
+	if repository == "" {
+		repository = "test/image"
+	}
+
 	metrics := pullTestMetrics()
-	p, err := newPuller(img, opts, metrics)
+	p, err := newPuller(repository, opts, metrics)
 	require.NoError(t, err)
 	t.Cleanup(p.close)
+	p.batches = []blobBatch{imageBatch(img)}
 
 	return p, metrics
+}
+
+func (p *puller) pull(ctx context.Context) error {
+	return p.pullBatch(ctx, p.batches[0])
+}
+
+func (p *puller) pullImage(ctx context.Context, img *syntheticImage) error {
+	return p.pullBatch(ctx, imageBatch(img))
 }
 
 func pullTestHistogramCount(t *testing.T, vec *prometheus.HistogramVec, labels ...string) uint64 {
@@ -612,7 +626,7 @@ func TestPullTargetPort(t *testing.T) {
 		{target: "https://[::1]:65536", wantErr: true},
 	} {
 		t.Run(tc.target, func(t *testing.T) {
-			p, err := newPuller(img, pullTestOptions(tc.target), pullTestMetrics())
+			p, err := newPuller(img.repository, pullTestOptions(tc.target), pullTestMetrics())
 			if p != nil {
 				t.Cleanup(p.close)
 			}
@@ -623,6 +637,8 @@ func TestPullTargetPort(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				require.Equal(t, tc.target, p.target.String())
+				require.Equal(t, img.repository, p.repository)
+				require.Empty(t, p.batches, "the caller supplies batches after catalog startup")
 			}
 		})
 	}
@@ -636,7 +652,7 @@ func TestPullOptions(t *testing.T) {
 		"http://host#fragment", "http://host#", "http://host/%zz",
 	} {
 		t.Run(target, func(t *testing.T) {
-			_, err := newPuller(img, pullTestOptions(target), pullTestMetrics())
+			_, err := newPuller(img.repository, pullTestOptions(target), pullTestMetrics())
 			require.Error(t, err)
 		})
 	}
@@ -661,13 +677,13 @@ func TestPullOptions(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			opts := pullTestOptions("http://host")
 			mutate(&opts)
-			_, err := newPuller(img, opts, pullTestMetrics())
+			_, err := newPuller(img.repository, opts, pullTestMetrics())
 			require.Error(t, err)
 		})
 	}
 
-	_, err := newPuller(nil, pullTestOptions("http://host"), pullTestMetrics())
-	require.Error(t, err)
-	_, err = newPuller(img, pullTestOptions("http://host"), nil)
+	_, err := newPuller("", pullTestOptions("http://host"), pullTestMetrics())
+	require.ErrorContains(t, err, "repository and metrics are required")
+	_, err = newPuller(img.repository, pullTestOptions("http://host"), nil)
 	require.Error(t, err)
 }

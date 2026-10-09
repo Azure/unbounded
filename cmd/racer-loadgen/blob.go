@@ -39,21 +39,8 @@ func imageBatch(img *syntheticImage) blobBatch {
 	return batch
 }
 
-func (p *puller) batchCount() int {
-	if len(p.batches) != 0 {
-		return len(p.batches)
-	}
-
-	return len(p.images)
-}
-
 func (p *puller) nextBatch(t *catalogTraversal) blobBatch {
-	index := t.nextIndex(p.batchCount())
-	if len(p.batches) != 0 {
-		return p.batches[index]
-	}
-
-	return imageBatch(p.images[index])
+	return p.batches[t.nextIndex(len(p.batches))]
 }
 
 // newBlobCatalog creates exactly count objects of exactly size bytes, without tar

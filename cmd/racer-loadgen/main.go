@@ -183,7 +183,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	reg := prometheus.NewRegistry()
 	metrics := newMetrics(reg)
 
-	p, err := newPuller(&syntheticImage{}, opts.pull, metrics)
+	p, err := newPuller(opts.image.Repository, opts.pull, metrics)
 	if err != nil {
 		return err
 	}
@@ -286,16 +286,11 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	}
 
 	if err == nil {
-		p.img = &syntheticImage{repository: catalog.repository}
-		if len(catalog.images) != 0 {
-			p.img = catalog.images[0]
-		}
+		p.repository = catalog.repository
 
 		if err := p.configureDiagnostics(catalog); err != nil {
 			return err
 		}
-
-		p.images = catalog.images
 
 		p.batches = catalog.batches
 		if p.opts.Backend == "s3" {

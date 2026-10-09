@@ -311,7 +311,7 @@ func TestSDKAdmissionAndIndependentTarget(t *testing.T) {
 	config = sdkClientConfig(opts, maxLiveConcurrency)
 	require.Equal(t, 2048, config.MaxConnections)
 
-	p, err := newPuller(&syntheticImage{}, opts, pullTestMetrics())
+	p, err := newPuller("test/blobs", opts, pullTestMetrics())
 	require.NoError(t, err, "NewClient is valid without dialing a Racer or Gantry endpoint")
 	p.close()
 }

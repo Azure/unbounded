@@ -159,7 +159,7 @@ func TestDiagnosticFiniteTarget(t *testing.T) {
 
 	op := pullTestOptions(server.URL)
 	op.DiagnoseIntegrity, op.Verify = true, false
-	_, err = newPuller(img, op, pullTestMetrics())
+	_, err = newPuller(img.repository, op, pullTestMetrics())
 	require.Error(t, err)
 	require.False(t, errors.Is(err, io.EOF))
 }

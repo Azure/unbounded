@@ -109,7 +109,7 @@ func TestPullProfileValidation(t *testing.T) {
 			opts := pullTestOptions("http://localhost")
 			opts.Profile, opts.ZipfExponent = profile, exponent
 
-			p, err := newPuller(&syntheticImage{}, opts, pullTestMetrics())
+			p, err := newPuller("test/image", opts, pullTestMetrics())
 			if profile == "unknown" || math.IsNaN(exponent) || math.IsInf(exponent, 0) || exponent <= 0 {
 				require.Error(t, err)
 				require.Nil(t, p)
@@ -195,7 +195,7 @@ func TestZipfWorkerDrawsAfterSuccessAndFailure(t *testing.T) {
 					}
 
 					p, metrics := pullTestNew(t, catalog.images[0], opts)
-					p.images = catalog.images
+					p.batches = catalog.batches
 
 					ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 					defer cancel()
