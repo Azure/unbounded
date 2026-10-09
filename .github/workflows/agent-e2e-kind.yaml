@@ -13,6 +13,9 @@ on:
       - internal/provision/**
       - internal/agentartifacts/**
       - internal/kube/**
+      - internal/hostroot/**
+      - internal/fsutil/**
+      - internal/executil/**
       - hack/agent/e2e-kind/**
       - hack/cmd/agent-artifacts-builder/**
       - deploy/machina/crd/**
@@ -25,6 +28,7 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
+      - .github/actions/agent-e2e-*/**
   push:
     # release-* included so a cherry-pick onto a release branch gets the same
     # post-merge validation as main. The pull_request trigger above is
@@ -38,6 +42,9 @@ on:
       - internal/provision/**
       - internal/agentartifacts/**
       - internal/kube/**
+      - internal/hostroot/**
+      - internal/fsutil/**
+      - internal/executil/**
       - hack/agent/e2e-kind/**
       - hack/cmd/agent-artifacts-builder/**
       - deploy/machina/crd/**
@@ -50,6 +57,7 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
+      - .github/actions/agent-e2e-*/**
   workflow_dispatch:
 
 permissions:

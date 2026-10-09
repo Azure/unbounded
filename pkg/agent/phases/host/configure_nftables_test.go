@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -70,4 +71,48 @@ func TestNFTablesFlushUnitDoesNotOrderTheMachines(t *testing.T) {
 	var buf bytes.Buffer
 	require.NoError(t, nftablesFlushServiceTemplate.Execute(&buf, map[string]string{"NFTablesClearPath": nftablesClearPath}))
 	assert.NotContains(t, buf.String(), "Before=systemd-nspawn@.service")
+}
+
+// TestNFTablesFlushUnitOutranksTheImageFirewall pins the boot ordering that
+// makes the flush mean anything on an image with a firewall of its own.
+//
+// The flush hands a clean ruleset to a node that has not started yet. That only
+// holds if nothing reinstalls rules after it. Azure Container Linux enables
+// iptables.service, which loads an INPUT policy of DROP, and it was starting
+// after the flush: the flush ran, iptables.service put the policy back, and the
+// node came up with kubelet unreachable from the control plane on every boot.
+// Nothing fails at install time and the node still reaches Ready, so only this
+// test keeps a later edit to the unit from quietly dropping the ordering. The
+// machines order themselves after the flush in their service override; see
+// TestNFTablesFlushUnitDoesNotOrderTheMachines.
+func TestNFTablesFlushUnitOutranksTheImageFirewall(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	require.NoError(t, nftablesFlushServiceTemplate.Execute(&buf, map[string]string{
+		"NFTablesClearPath": nftablesClearPath,
+	}))
+
+	unit := buf.String()
+
+	after := ""
+
+	for line := range strings.SplitSeq(unit, "\n") {
+		if strings.HasPrefix(line, "After=") {
+			after = line
+		}
+	}
+
+	require.NotEmpty(t, after, "the unit must order itself after the image's firewall units")
+
+	for _, other := range []string{"iptables.service", "ip6tables.service", "nftables.service"} {
+		assert.Contains(t, after, other,
+			"a firewall unit starting after the flush undoes it")
+	}
+
+	// Ordering only, never a dependency: pulling these in would start a
+	// firewall on a host that had deliberately disabled one.
+	for _, dependency := range []string{"Wants=", "Requires=", "BindsTo="} {
+		assert.NotContains(t, unit, dependency+"iptables.service")
+	}
 }

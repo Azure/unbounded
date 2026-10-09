@@ -109,7 +109,20 @@ func TestAgentInstallDirsProbeIsCreatable(t *testing.T) {
 }
 
 // TestAgentInstallDirsTracksTheBinaryPath keeps the checked directory tied to
-// where the agent actually installs, so the two cannot drift apart.
+// where the agent actually installs, so the two cannot drift apart. Preflight
+// does not migrate the host root, so it checks where the binary will go once
+// bootstrap has: under the host root on a fresh host, and under the legacy root
+// on a host an older release installed.
+//
+// Not parallel: it clears the binary path override for this process.
+func TestAgentInstallDirsTracksTheBinaryPath(t *testing.T) {
+	t.Setenv(goalstates.EnvDaemonBinary, "")
+
+	paths, err := goalstates.PlannedAgentUpgradePaths()
+	require.NoError(t, err)
+	assert.Equal(t, []string{filepath.Dir(paths.BinaryPath)}, agentInstallDirs())
+}
+
 func TestCheckExistingDeploymentCleanHost(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.stat = statNotExist()
