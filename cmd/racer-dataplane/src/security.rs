@@ -414,7 +414,15 @@ impl PageCryptoEngine {
             sample.facts = Some(capture_aead_failure(ciphertext, &aad, scope.request));
         }
         let outcome = match prepared {
-            Err(error) => CryptoOutcome::Failed { input, error },
+            Err(error) => {
+                if permit.measurement.decrypt {
+                    permit.measurement.failure = Some(DecryptFailureMeta {
+                        request: scope.request,
+                        engine_ms: Failure::new(Stage::PeerDecode, error).unix_millis,
+                    });
+                }
+                CryptoOutcome::Failed { input, error }
+            }
             Ok((envelope, bytes)) => Self::complete(input, envelope, bytes),
         };
         permit.executed(measurement_start);
@@ -432,7 +440,9 @@ impl PageCryptoEngine {
         scope: &RequestScope,
         permit: &mut CryptoPermit,
     ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
-        scope.check()?;
+        scope.check().inspect_err(|error| {
+            permit.measurement.scope_failure = crate::telemetry::DecryptScopeFailure::Entry(*error);
+        })?;
         if let CryptoInput::Checksum { ciphertext } = input {
             if let Some(sample) = &mut permit.send_sample {
                 sample.cached = ciphertext.cached_checksum().is_some();
@@ -534,7 +544,9 @@ impl PageCryptoEngine {
                 (envelope.clone(), bytes)
             }
         };
-        scope.check()?;
+        scope.check().inspect_err(|error| {
+            permit.measurement.scope_failure = crate::telemetry::DecryptScopeFailure::Final(*error);
+        })?;
         Ok((envelope, std::mem::take(&mut bytes)))
     }
 
@@ -1021,6 +1033,14 @@ struct Measurement {
     execution_ns: Option<u64>,
 
     rejection: Option<IntegrityRejection>,
+
+    failure: Option<DecryptFailureMeta>,
+
+    scope_failure: crate::telemetry::DecryptScopeFailure,
+}
+struct DecryptFailureMeta {
+    request: RequestId,
+    engine_ms: u64,
 }
 /// Exact failed integrity check, not a diagnosis of where bytes became invalid.
 #[derive(Clone, Copy)]
@@ -1117,6 +1137,14 @@ impl CryptoCompletion {
         for (event, amount) in events.into_iter().zip(amounts) {
             metrics.record(event, amount);
         }
+        if m.decrypt
+            && let CryptoOutcome::Failed { error, .. } = self.outcome
+        {
+            metrics.record(
+                crate::telemetry::DecryptReason::new(error, m.rejection).event(),
+                1,
+            );
+        }
         if let Some(rejection) = m.rejection {
             metrics.record(
                 match rejection {
@@ -1180,6 +1208,33 @@ pub struct CryptoCompletion {
     pub(crate) _key: KeyLease,
 }
 impl CryptoCompletion {
+    fn decrypt_failure(&self) -> Option<crate::telemetry::DecryptFailure> {
+        let m = &self.permit.measurement;
+        if !m.decrypt || m.checksum_only || m.execution_ns.is_none() {
+            return None;
+        }
+        let CryptoOutcome::Failed { input, error } = &self.outcome else {
+            return None;
+        };
+        Some(crate::telemetry::DecryptFailure {
+            id: self.id(),
+            error: *error,
+            reason: crate::telemetry::DecryptReason::new(*error, m.rejection),
+            request: m.failure.as_ref().map(|f| f.request),
+            page: match input {
+                CryptoInput::Decrypt { ciphertext, .. } => {
+                    Some(ciphertext.envelope().page.number.0)
+                }
+                _ => None,
+            },
+            engine_ms: m.failure.as_ref().map(|f| f.engine_ms),
+            reap_ms: Failure::new(Stage::PeerDecode, *error).unix_millis,
+            scope_failure: m.scope_failure,
+            queue_ns: m.queue_ns,
+            execution_ns: m.execution_ns,
+        })
+    }
+
     pub fn id(&self) -> CryptoId {
         self.permit.reservation.id()
     }
@@ -1369,6 +1424,9 @@ impl CryptoClient {
     fn observe(&self, completion: &CryptoCompletion) {
         if let Some(metrics) = self.metrics.borrow().as_ref() {
             completion.record(metrics);
+        }
+        if let Some(failure) = completion.decrypt_failure() {
+            self.observer.borrow().record_decrypt(failure);
         }
         let id = completion.id();
         if let Some(sample) = &completion.permit.send_sample {
@@ -2021,6 +2079,53 @@ mod tests {
             }
 
             #[test]
+            fn decrypt_submission_rejection_is_not_an_executed_failure() {
+                use std::time::Duration;
+                use uring_runtime::environment::{SimulationClock, now};
+                let clock = SimulationClock::new(849);
+                let _environment = clock.environment(0).enter();
+                for closed in [false, true] {
+                    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    )));
+                    let keys = keyring();
+                    let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
+                    let lease = || keys.active(&cache, KeyPurpose::Page).unwrap();
+                    let scope =
+                        RequestScope::new(RequestId([7; 16]), now() + Duration::from_secs(10))
+                            .unwrap();
+                    let data = measurement_input(&admission, &cache, lease(), &scope, true, false);
+                    let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+                    let client = CryptoClient::new(io);
+                    let metrics = Metrics::default();
+                    let failures = crate::telemetry::Failures::default();
+                    client.set_metrics(metrics.clone());
+                    client.set_failure_observer(failures.observer(WorkerId(0)));
+                    if closed {
+                        client.close_submissions().unwrap();
+                    } else {
+                        scope.cancel().unwrap();
+                    }
+                    let mut future = client.execute(data, lease(), &scope);
+                    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+                    assert!(!matches!(
+                        engine.poll_job(&mut cx),
+                        Poll::Ready(Ok(Some(_)))
+                    ));
+                    client.poll_budgeted(1).unwrap();
+                    assert_eq!(client.outstanding(), 0);
+                    assert_eq!(metrics.count(CryptoDecryptStarted), 0);
+                    for reason in crate::telemetry::DecryptReason::ALL {
+                        assert_eq!(metrics.count(reason.event()), 0);
+                    }
+                    let mut text = String::new();
+                    failures.write_decrypt(&mut text).unwrap();
+                    assert!(text.contains("total=0 retained=0"));
+                }
+            }
+
+            #[test]
             fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
                 use std::time::Duration;
                 use uring_runtime::environment;
@@ -2044,6 +2149,12 @@ mod tests {
                         "short_body",
                         "abandon_crc",
                         "abandon_aead",
+                        "deadline",
+                        "missing_key",
+                        "invalid_configuration",
+                        "late_cancel",
+                        "failure_late_cancel",
+                        "no_metrics",
                     ] {
                         if !decrypt
                             && matches!(
@@ -2053,6 +2164,12 @@ mod tests {
                                     | "short_body"
                                     | "abandon_crc"
                                     | "abandon_aead"
+                                    | "deadline"
+                                    | "missing_key"
+                                    | "invalid_configuration"
+                                    | "late_cancel"
+                                    | "failure_late_cancel"
+                                    | "no_metrics"
                             )
                         {
                             continue;
@@ -2060,7 +2177,9 @@ mod tests {
                         let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
                         let client = CryptoClient::new(io);
                         let metrics = Metrics::default();
-                        client.set_metrics(metrics.clone());
+                        if mode != "no_metrics" {
+                            client.set_metrics(metrics.clone());
+                        }
                         let failures = crate::telemetry::Failures::default();
                         client.set_failure_observer(failures.observer(WorkerId(0)));
                         let scope = RequestScope::new(
@@ -2082,9 +2201,30 @@ mod tests {
                             lease(),
                             &scope,
                             decrypt,
-                            matches!(mode, "failure" | "aead" | "abandon_crc" | "abandon_aead"),
+                            matches!(
+                                mode,
+                                "failure"
+                                    | "aead"
+                                    | "abandon_crc"
+                                    | "abandon_aead"
+                                    | "failure_late_cancel"
+                                    | "no_metrics"
+                            ),
                         );
-                        if let CryptoInput::Decrypt { ciphertext, .. } = &mut data {
+                        if let CryptoInput::Decrypt {
+                            ciphertext,
+                            plaintext,
+                        } = &mut data
+                        {
+                            if mode == "missing_key" {
+                                Arc::get_mut(&mut ciphertext.inner).unwrap().envelope.key_id =
+                                    KeyId([99; 16]);
+                            }
+                            if mode == "invalid_configuration" {
+                                *plaintext = admission
+                                    .reserve(Some(&cache), ResourceClass::Ciphertext, 1)
+                                    .unwrap();
+                            }
                             if matches!(mode, "aead" | "abandon_aead") {
                                 // Peer bytes without a persisted CRC must still fail AEAD.
                                 Arc::get_mut(&mut ciphertext.inner).unwrap().checksum =
@@ -2111,11 +2251,63 @@ mod tests {
                         if mode == "cancel" {
                             scope.cancel().unwrap();
                         }
+                        if mode == "deadline" {
+                            clock.advance(Duration::from_secs(11));
+                        }
                         clock.advance(Duration::from_millis(3));
                         let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
                             panic!("job")
                         };
+                        let expected_page = match &job.input {
+                            CryptoInput::Decrypt { ciphertext, .. } => {
+                                Some(ciphertext.envelope().page.number.0)
+                            }
+                            _ => None,
+                        };
                         let mut completion = crate::security::PageCryptoEngine::process(job);
+                        let engine_ms = completion
+                            .permit
+                            .measurement
+                            .failure
+                            .as_ref()
+                            .map(|f| f.engine_ms);
+                        let expected_error = match mode {
+                            "success" | "abandon" | "late_cancel" => None,
+                            "cancel" => Some(Error::Cancelled),
+                            "deadline" => Some(Error::DeadlineExceeded),
+                            "missing_key" => Some(Error::MissingKey),
+                            "invalid_configuration" => Some(Error::InvalidConfiguration),
+                            _ if !decrypt => Some(Error::MissingKey),
+                            _ => Some(Error::CorruptRecord),
+                        };
+                        if decrypt {
+                            let facts = completion.decrypt_failure();
+                            assert_eq!(facts.map(|f| f.error), expected_error, "{mode}");
+                            if let Some(f) = facts {
+                                assert_eq!(f.request, Some(scope.request));
+                                assert_eq!(f.page, expected_page);
+                                assert_eq!(f.id, completion.id());
+                                assert_eq!(
+                                    f.scope_failure,
+                                    match mode {
+                                        "cancel" => crate::telemetry::DecryptScopeFailure::Entry(
+                                            Error::Cancelled
+                                        ),
+                                        "deadline" => crate::telemetry::DecryptScopeFailure::Entry(
+                                            Error::DeadlineExceeded
+                                        ),
+                                        _ => crate::telemetry::DecryptScopeFailure::Unknown,
+                                    }
+                                );
+                            }
+                            let execution = completion.permit.measurement.execution_ns.take();
+                            assert!(completion.decrypt_failure().is_none());
+                            completion.permit.measurement.execution_ns = execution;
+                        }
+                        if matches!(mode, "late_cancel" | "failure_late_cancel") {
+                            clock.advance(Duration::from_millis(1));
+                            scope.cancel().unwrap();
+                        }
                         // The engine uses virtual time (zero cost in DST). Explicitly
                         // advance a measured interval to exercise the exact sum separately.
                         assert_eq!(completion.permit.measurement.execution_ns, Some(0));
@@ -2129,6 +2321,9 @@ mod tests {
                         assert_eq!(metrics.count(events[0]), 0);
                         assert_eq!(metrics.count(CryptoDecryptCrcRejected), 0);
                         assert_eq!(metrics.count(CryptoDecryptAeadRejected), 0);
+                        let mut before_reap = String::new();
+                        failures.write_decrypt(&mut before_reap).unwrap();
+                        assert!(before_reap.contains("total=0 retained=0"));
                         if matches!(mode, "abandon" | "abandon_crc" | "abandon_aead") {
                             drop(future);
                         } else {
@@ -2137,12 +2332,13 @@ mod tests {
                                 Poll::Ready(Ok(_)) => assert_eq!(mode, "success"),
                                 Poll::Ready(Err(error)) => assert_eq!(
                                     error,
-                                    if mode == "cancel" {
+                                    if matches!(
+                                        mode,
+                                        "cancel" | "late_cancel" | "failure_late_cancel"
+                                    ) {
                                         Error::Cancelled
-                                    } else if !decrypt {
-                                        Error::MissingKey
                                     } else {
-                                        Error::CorruptRecord
+                                        expected_error.unwrap()
                                     }
                                 ),
                                 Poll::Pending => panic!("completion not returned"),
@@ -2150,7 +2346,50 @@ mod tests {
                         }
                         client.poll_budgeted(1).unwrap();
                         client.poll_budgeted(1).unwrap();
-                        let success = u64::from(mode == "success" || mode == "abandon");
+                        let mut records = String::new();
+                        failures.write_decrypt(&mut records).unwrap();
+                        let failed = decrypt && expected_error.is_some();
+                        assert_eq!(records.lines().count(), 1 + usize::from(failed), "{mode}");
+                        if failed {
+                            assert!(
+                                records.contains(&format!("error={:?}", expected_error.unwrap())),
+                                "{mode} {records}"
+                            );
+                            assert!(records.contains("scope_at_reap=unknown"));
+                            assert!(records.contains("worker=0 crypto=0:1"));
+                            assert!(records.contains(&format!(
+                                "engine_failure_observed_ms={}",
+                                engine_ms.unwrap()
+                            )));
+                            let reap_ms = Failure::new(Stage::PeerDecode, expected_error.unwrap())
+                                .unix_millis;
+                            assert!(records.contains(&format!("reap_ms={reap_ms} ")));
+                            assert!(reap_ms > engine_ms.unwrap());
+                            let reason = match mode {
+                                "cancel" => "cancelled",
+                                "deadline" => "deadline_exceeded",
+                                "missing_key" => "missing_key",
+                                "invalid_configuration" => "invalid_configuration",
+                                "malformed" | "short_body" => "corrupt_unclassified",
+                                "aead" | "abandon_aead" => "corrupt_aead",
+                                _ => "corrupt_crc",
+                            };
+                            assert!(
+                                records.contains(&format!("reason={reason} ")),
+                                "{mode} {records}"
+                            );
+                        }
+                        if mode == "no_metrics" {
+                            assert_eq!(metrics.count(CryptoDecryptFailure), 0);
+                            assert_eq!(client.outstanding(), 0);
+                            continue;
+                        }
+                        let reason_sum: u64 = crate::telemetry::DecryptReason::ALL
+                            .iter()
+                            .map(|r| metrics.count(r.event()))
+                            .sum();
+                        assert_eq!(reason_sum, metrics.count(CryptoDecryptFailure), "{mode}");
+                        let success = u64::from(expected_error.is_none());
                         for (event, expected) in events.into_iter().zip([
                             1,
                             success,
@@ -2159,14 +2398,24 @@ mod tests {
                             1,
                             2_000_000,
                             1,
-                            3_000_000,
+                            if mode == "deadline" {
+                                11_003_000_000
+                            } else {
+                                3_000_000
+                            },
                         ]) {
                             assert_eq!(metrics.count(event), expected, "{mode} {event:?}");
                         }
                         assert_eq!(client.outstanding(), 0);
                         assert_eq!(
                             metrics.count(CryptoDecryptCrcRejected),
-                            u64::from(decrypt && matches!(mode, "failure" | "abandon_crc")),
+                            u64::from(
+                                decrypt
+                                    && matches!(
+                                        mode,
+                                        "failure" | "abandon_crc" | "failure_late_cancel"
+                                    )
+                            ),
                             "{mode}"
                         );
                         assert_eq!(

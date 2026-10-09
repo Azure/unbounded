@@ -403,6 +403,7 @@ fn get(
         "/debug/membership" => (Response::Text, "", Event::DiagnosticMetrics),
         "/debug/failures"
         | "/debug/aead"
+        | "/debug/decrypt-failures"
         | "/debug/send-crc"
         | "/debug/terminal"
         | "/debug/gate-events"
@@ -429,6 +430,8 @@ fn get(
         telemetry.send_crc.write(&mut output)?;
     } else if path == "/debug/aead" {
         telemetry.failures.write_aead(&mut output)?;
+    } else if path == "/debug/decrypt-failures" {
+        telemetry.failures.write_decrypt(&mut output)?;
     } else if path == "/debug/candidate-final" {
         telemetry.failures.write_candidate_final(&mut output)?;
     } else if path == "/debug/gate-events" {
@@ -1022,6 +1025,108 @@ impl AeadFailure {
 
 type AeadRing = SharedRing<(crate::security::CryptoId, AeadFailure), AEAD_CAPACITY>;
 
+const DECRYPT_FAILURE_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DecryptScopeFailure {
+    #[default]
+    Unknown,
+    Entry(Error),
+    Final(Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DecryptReason {
+    Cancelled,
+    DeadlineExceeded,
+    MissingKey,
+    InvalidConfiguration,
+    InvalidRequest,
+    Overloaded,
+    CorruptCrc,
+    CorruptAead,
+    CorruptUnclassified,
+    Other,
+}
+impl DecryptReason {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Cancelled,
+        Self::DeadlineExceeded,
+        Self::MissingKey,
+        Self::InvalidConfiguration,
+        Self::InvalidRequest,
+        Self::Overloaded,
+        Self::CorruptCrc,
+        Self::CorruptAead,
+        Self::CorruptUnclassified,
+        Self::Other,
+    ];
+    pub(crate) fn new(
+        error: Error,
+        rejection: Option<crate::security::IntegrityRejection>,
+    ) -> Self {
+        use crate::security::IntegrityRejection;
+        match error {
+            Error::Cancelled => Self::Cancelled,
+            Error::DeadlineExceeded => Self::DeadlineExceeded,
+            Error::MissingKey => Self::MissingKey,
+            Error::InvalidConfiguration => Self::InvalidConfiguration,
+            Error::InvalidRequest => Self::InvalidRequest,
+            Error::Overloaded => Self::Overloaded,
+            Error::CorruptRecord => match rejection {
+                Some(IntegrityRejection::Crc) => Self::CorruptCrc,
+                Some(IntegrityRejection::Aead) => Self::CorruptAead,
+                None => Self::CorruptUnclassified,
+            },
+            _ => Self::Other,
+        }
+    }
+    pub(crate) fn event(self) -> Event {
+        match self {
+            Self::Cancelled => Event::CryptoDecryptFailureCancelled,
+            Self::DeadlineExceeded => Event::CryptoDecryptFailureDeadlineExceeded,
+            Self::MissingKey => Event::CryptoDecryptFailureMissingKey,
+            Self::InvalidConfiguration => Event::CryptoDecryptFailureInvalidConfiguration,
+            Self::InvalidRequest => Event::CryptoDecryptFailureInvalidRequest,
+            Self::Overloaded => Event::CryptoDecryptFailureOverloaded,
+            Self::CorruptCrc => Event::CryptoDecryptFailureCorruptCrc,
+            Self::CorruptAead => Event::CryptoDecryptFailureCorruptAead,
+            Self::CorruptUnclassified => Event::CryptoDecryptFailureCorruptUnclassified,
+            Self::Other => Event::CryptoDecryptFailureOther,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::MissingKey => "missing_key",
+            Self::InvalidConfiguration => "invalid_configuration",
+            Self::InvalidRequest => "invalid_request",
+            Self::Overloaded => "overloaded",
+            Self::CorruptCrc => "corrupt_crc",
+            Self::CorruptAead => "corrupt_aead",
+            Self::CorruptUnclassified => "corrupt_unclassified",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Failure-only facts. Page is a numeric envelope page, not an object identity.
+#[derive(Clone, Copy)]
+pub(crate) struct DecryptFailure {
+    pub id: crate::security::CryptoId,
+    pub error: Error,
+    pub reason: DecryptReason,
+    pub request: Option<RequestId>,
+    pub page: Option<u64>,
+    pub engine_ms: Option<u64>,
+    pub reap_ms: u64,
+    pub scope_failure: DecryptScopeFailure,
+    pub queue_ns: Option<u64>,
+    pub execution_ns: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Stage {
     Admission,
@@ -1266,6 +1371,7 @@ pub struct Failures(
     SharedRing<(WorkerId, CandidateFinal), 16>,
     std::sync::Arc<GateEvents>,
     SharedRing<(WorkerId, RequestId, u64, FlightExpiry), 16>,
+    SharedRing<DecryptFailure, DECRYPT_FAILURE_CAPACITY>,
 );
 
 /// One sampled entry, with no object identity or owned resources.
@@ -1728,6 +1834,52 @@ impl Failures {
         }
         Ok(())
     }
+    pub fn write_decrypt(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        let ring = self.7.snapshot();
+        let (total, len) = (ring.total(), ring.len());
+        writeln!(
+            out,
+            "schema_version=1 coverage=executed_decrypt_failure_at_reap total={total} retained={len} overwritten={} capacity={DECRYPT_FAILURE_CAPACITY} page_kind=envelope_number_not_object_identity scope_at_reap=unknown",
+            total.saturating_sub(len as u64)
+        )?;
+        fn optional(out: &mut impl std::fmt::Write, value: Option<u64>) -> std::fmt::Result {
+            match value {
+                Some(value) => write!(out, "{value}"),
+                None => write!(out, "unknown"),
+            }
+        }
+        for (sequence, f) in ring.iter() {
+            write!(
+                out,
+                "seq={sequence} worker={} crypto={}:{} error={:?} reason={} request=",
+                f.id.worker.0,
+                f.id.generation,
+                f.id.sequence,
+                f.error,
+                f.reason.name()
+            )?;
+            match f.request {
+                Some(request) => hex(out, &request.0)?,
+                None => write!(out, "unknown")?,
+            }
+            write!(out, " page=")?;
+            optional(out, f.page)?;
+            write!(out, " engine_failure_observed_ms=")?;
+            optional(out, f.engine_ms)?;
+            write!(out, " reap_ms={} scope_at_failure=", f.reap_ms)?;
+            match f.scope_failure {
+                DecryptScopeFailure::Unknown => write!(out, "unknown")?,
+                DecryptScopeFailure::Entry(error) => write!(out, "entry_check:{error:?}")?,
+                DecryptScopeFailure::Final(error) => write!(out, "final_check:{error:?}")?,
+            }
+            write!(out, " scope_at_reap=unknown queue_ns=")?;
+            optional(out, f.queue_ns)?;
+            write!(out, " execution_ns=")?;
+            optional(out, f.execution_ns)?;
+            writeln!(out)?;
+        }
+        Ok(())
+    }
     pub fn observer(&self, worker: WorkerId) -> Observer {
         Observer(Some((self.clone(), worker)))
     }
@@ -1836,6 +1988,11 @@ impl Observer {
             return;
         };
         failures.1.push((id, failure));
+    }
+    pub(crate) fn record_decrypt(&self, failure: DecryptFailure) {
+        if let Some((failures, _)) = &self.0 {
+            failures.7.push(failure);
+        }
     }
     pub fn record(&self, failure: Failure) {
         let Some((failures, worker)) = &self.0 else {
@@ -2394,6 +2551,16 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::OpaqueRelayBodyCompleted => "racer_opaque_relay_body_completed_total",
             Self::OpaqueRelayBodyBytes => "racer_opaque_relay_body_completed_bytes_total",
             Self::OpaqueRelayBodyFailed => "racer_opaque_relay_body_failed_total",
+            Self::CryptoDecryptFailureCancelled => "racer_crypto_decrypt_failure_cancelled_total",
+            Self::CryptoDecryptFailureDeadlineExceeded => "racer_crypto_decrypt_failure_deadline_exceeded_total",
+            Self::CryptoDecryptFailureMissingKey => "racer_crypto_decrypt_failure_missing_key_total",
+            Self::CryptoDecryptFailureInvalidConfiguration => "racer_crypto_decrypt_failure_invalid_configuration_total",
+            Self::CryptoDecryptFailureInvalidRequest => "racer_crypto_decrypt_failure_invalid_request_total",
+            Self::CryptoDecryptFailureOverloaded => "racer_crypto_decrypt_failure_overloaded_total",
+            Self::CryptoDecryptFailureCorruptCrc => "racer_crypto_decrypt_failure_corrupt_crc_total",
+            Self::CryptoDecryptFailureCorruptAead => "racer_crypto_decrypt_failure_corrupt_aead_total",
+            Self::CryptoDecryptFailureCorruptUnclassified => "racer_crypto_decrypt_failure_corrupt_unclassified_total",
+            Self::CryptoDecryptFailureOther => "racer_crypto_decrypt_failure_other_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::PeerReceiveActive => "racer_peer_receive_active",
@@ -4024,6 +4191,143 @@ pub(crate) mod tests {
 
     pub(crate) mod failures_tests {
         use super::*;
+
+        #[test]
+        fn decrypt_failure_classification_is_fixed_and_preserves_unknown_causes() {
+            use crate::security::IntegrityRejection::{Aead, Crc};
+            // Classification only: this does not exercise the allocator failure path.
+            let cases = [
+                (Error::Cancelled, None, "cancelled"),
+                (Error::DeadlineExceeded, None, "deadline_exceeded"),
+                (Error::MissingKey, None, "missing_key"),
+                (Error::InvalidConfiguration, None, "invalid_configuration"),
+                (Error::InvalidRequest, None, "invalid_request"),
+                (Error::Overloaded, None, "overloaded"),
+                (Error::CorruptRecord, Some(Crc), "corrupt_crc"),
+                (Error::CorruptRecord, Some(Aead), "corrupt_aead"),
+                (Error::CorruptRecord, None, "corrupt_unclassified"),
+                (Error::Os(-123), None, "other"),
+            ];
+            for ((error, rejection, name), reason) in cases.into_iter().zip(DecryptReason::ALL) {
+                assert_eq!(DecryptReason::new(error, rejection), reason);
+                assert_eq!(reason.name(), name);
+            }
+            assert_eq!(
+                DecryptReason::new(Error::Overloaded, Some(Aead)),
+                DecryptReason::Overloaded
+            );
+        }
+
+        #[test]
+        fn decrypt_failure_ring_is_bounded_independent_redacted_and_nonconsuming() {
+            let telemetry = Telemetry::default();
+            let failures = &telemetry.failures;
+            let observer = failures.observer(WorkerId(7));
+            let mut record = DecryptFailure {
+                id: crate::security::CryptoId {
+                    worker: WorkerId(u16::MAX),
+                    generation: u64::MAX,
+                    sequence: u64::MAX,
+                },
+                error: Error::Os(i32::MIN),
+                reason: DecryptReason::Other,
+                request: Some(RequestId([255; 16])),
+                page: Some(u64::MAX),
+                engine_ms: Some(u64::MAX),
+                reap_ms: u64::MAX,
+                scope_failure: DecryptScopeFailure::Final(Error::DeadlineExceeded),
+                queue_ns: Some(u64::MAX),
+                execution_ns: Some(u64::MAX),
+            };
+            observer.record_decrypt(record);
+            for _ in 0..4096 {
+                observer.record(Failure::new(Stage::Admission, Error::Overloaded));
+                observer.record_aead(record.id, test_aead_failure());
+            }
+            struct Output<'a> {
+                failures: &'a Failures,
+                text: String,
+                fail: bool,
+            }
+            impl std::fmt::Write for Output<'_> {
+                fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                    assert!(self.failures.7.try_snapshot().is_some());
+                    if self.fail {
+                        return Err(std::fmt::Error);
+                    }
+                    self.text.push_str(text);
+                    Ok(())
+                }
+            }
+            let mut out = Output {
+                failures,
+                text: String::new(),
+                fail: true,
+            };
+            assert!(get(&telemetry, "/debug/decrypt-failures", true, &mut out).is_err());
+            out.fail = false;
+            get(&telemetry, "/debug/decrypt-failures", true, &mut out).unwrap();
+            assert!(out.text.contains("coverage=executed_decrypt_failure_at_reap total=1 retained=1 overwritten=0 capacity=64"));
+            assert!(out.text.contains("error=Os(-2147483648) reason=other"));
+            assert!(
+                out.text
+                    .contains("scope_at_failure=final_check:DeadlineExceeded")
+            );
+            assert!(
+                out.text
+                    .contains("worker=65535 crypto=18446744073709551615:18446744073709551615")
+            );
+            for _ in 0..64 {
+                record.error = Error::PublishedNotDurable(
+                    crate::error::PublicationCause::UnsatisfiableRangeWithLength(u64::MAX),
+                );
+                record.reason = DecryptReason::CorruptUnclassified;
+                record.scope_failure = DecryptScopeFailure::Final(record.error);
+                observer.record_decrypt(record);
+            }
+            out.text.clear();
+            get(&telemetry, "/debug/decrypt-failures", true, &mut out).unwrap();
+            assert!(
+                out.text
+                    .contains("total=65 retained=64 overwritten=1 capacity=64")
+            );
+            assert_eq!(out.text.lines().count(), 65);
+            assert!(out.text.contains("\nseq=2 "));
+            assert!(out.text.len() + 512 < MAX_RESPONSE_BYTES);
+            assert!(MAX_RESPONSE_BYTES <= 64 * 1024);
+            for forbidden in [
+                " key=",
+                " nonce=",
+                " cache=",
+                " etag=",
+                " object=",
+                "payload",
+                "supplier=",
+            ] {
+                assert!(!out.text.contains(forbidden));
+            }
+            record.request = None;
+            record.page = None;
+            record.engine_ms = None;
+            record.scope_failure = DecryptScopeFailure::Unknown;
+            record.queue_ns = None;
+            record.execution_ns = None;
+            observer.record_decrypt(record);
+            out.text.clear();
+            failures.write_decrypt(&mut out).unwrap();
+            let last = out.text.lines().last().unwrap();
+            for unknown in [
+                "request=unknown",
+                "page=unknown",
+                "engine_failure_observed_ms=unknown",
+                "scope_at_failure=unknown",
+                "scope_at_reap=unknown",
+                "queue_ns=unknown",
+                "execution_ns=unknown",
+            ] {
+                assert!(last.contains(unknown), "{last}");
+            }
+        }
 
         #[test]
         fn exact_output_and_formatting_outside_both_locks() {
