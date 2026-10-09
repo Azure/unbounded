@@ -1,0 +1,167 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package racer
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	authv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/racer/authority"
+	"github.com/Azure/unbounded/internal/racer/wire"
+)
+
+func TestRacerNetworkConfiguration(t *testing.T) {
+	env := testEnv(t, volume("cache"))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	cm := &corev1.ConfigMap{}
+	ds := &appsv1.DaemonSet{}
+	deployment := &appsv1.Deployment{}
+
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
+	require.False(t, ds.Spec.Template.Spec.HostNetwork)
+	require.Equal(t, corev1.DNSClusterFirst, ds.Spec.Template.Spec.DNSPolicy)
+	require.Equal(t, int32(8082), ds.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort)
+	require.Equal(t, int32(9090), ds.Spec.Template.Spec.Containers[0].Ports[1].ContainerPort)
+	baseline := ds.Spec.Template.Spec.DeepCopy()
+
+	cm.Data["RACER_HOST_NETWORK"] = "true"
+	cm.Data["RACER_PEER_PORT"] = "18082"
+	cm.Data["RACER_DIAGNOSTICS_PORT"] = "19090"
+	require.NoError(t, env.Client.Update(t.Context(), cm))
+	persist(t, env, planPass(t, env))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+	require.Equal(t, component.ConfigMapPayloadHash(cm), deployment.Spec.Template.Annotations["unbounded-cloud.io/racer-config-hash"])
+	require.Equal(t, configName, deployment.Spec.Template.Spec.Containers[0].EnvFrom[0].ConfigMapRef.Name)
+	require.False(t, deployment.Spec.Template.Spec.HostNetwork)
+
+	pod := ds.Spec.Template.Spec
+	require.True(t, pod.HostNetwork)
+	require.Equal(t, corev1.DNSClusterFirstWithHostNet, pod.DNSPolicy)
+	require.False(t, pod.HostPID)
+	require.False(t, pod.HostIPC)
+	require.Equal(t, baseline.Containers[0].SecurityContext, pod.Containers[0].SecurityContext)
+	require.Equal(t, baseline.Volumes, pod.Volumes)
+	require.Equal(t, baseline.ServiceAccountName, pod.ServiceAccountName)
+	require.Zero(t, ds.Spec.UpdateStrategy.RollingUpdate.MaxSurge.IntValue())
+	require.Equal(t, "diagnostics", pod.Containers[0].ReadinessProbe.HTTPGet.Port.StrVal)
+
+	values := map[string]corev1.EnvVar{}
+	for _, variable := range pod.Containers[0].Env {
+		values[variable.Name] = variable
+	}
+
+	require.Equal(t, "status.podIP", values["RACER_POD_IP"].ValueFrom.FieldRef.FieldPath)
+	require.Equal(t, "[$(RACER_POD_IP)]:18082", values["RACER_PEER_LISTEN"].Value)
+	require.Equal(t, "[$(RACER_POD_IP)]:19090", values["RACER_DIAGNOSTICS_LISTEN"].Value)
+	require.Equal(t, int32(18082), pod.Containers[0].Ports[0].ContainerPort)
+	require.Equal(t, int32(19090), pod.Containers[0].Ports[1].ContainerPort)
+
+	// The existing controller parser ignores workload-only keys and publishes
+	// the same port. Ownership remains mandatory even on the host network.
+	cfg := configuration(t, env)
+	require.Equal(t, uint16(18082), cfg.PeerPort)
+	// The fake SSA persistence path does not allocate API server UIDs.
+	ds.UID = "managed-daemonset"
+	require.NoError(t, env.Client.Update(t.Context(), ds))
+
+	sa := &corev1.ServiceAccount{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, cfg.DataplaneServiceAccount), sa))
+	sa.UID = "managed-sa"
+	require.NoError(t, env.Client.Update(t.Context(), sa))
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: "00000000-0000-0000-0000-000000000001"}}
+	require.NoError(t, env.Client.Create(t.Context(), node))
+	reviewer := interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
+		review := obj.(*authv1.TokenReview)
+		review.Status = authv1.TokenReviewStatus{Authenticated: true, Audiences: []string{wire.TokenAudience}, User: authv1.UserInfo{
+			Username: "system:serviceaccount:" + env.Namespace + ":" + sa.Name, UID: string(sa.UID),
+			Extra: map[string]authv1.ExtraValue{
+				"authentication.kubernetes.io/pod-name": {"managed"}, "authentication.kubernetes.io/pod-uid": {"pod"},
+				"authentication.kubernetes.io/node-name": {node.Name}, "authentication.kubernetes.io/node-uid": {string(node.UID)},
+			},
+		}}
+
+		return nil
+	}})
+	bootstrap := authority.New(authority.Config{Cluster: cfg.Cluster, Namespace: cfg.Namespace, DaemonSetName: cfg.DaemonSetName, DataplaneServiceAccount: cfg.DataplaneServiceAccount, MaxTokenBytes: cfg.Limits.HeaderBytes}, authority.Dependencies{Writer: reviewer, Reader: env.Client})
+	token := "e30." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(time.Hour).Unix()))) + ".signature"
+	request := httptest.NewRequest("POST", wire.BootstrapPath, nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+
+	for _, ip := range []string{"10.0.0.12", "fd00::12"} {
+		managed := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "managed", Namespace: env.Namespace, UID: "pod", OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID, Controller: ptr.To(true)}}},
+			Spec:       pod, Status: corev1.PodStatus{PodIP: ip},
+		}
+		managed.Spec.NodeName = "node"
+		require.NoError(t, env.Client.Create(t.Context(), &managed))
+		managed.UID = "pod"
+		require.NoError(t, env.Client.Update(t.Context(), &managed))
+		identity, err := bootstrap.Authenticate(t.Context(), request)
+		require.NoError(t, err)
+		require.Equal(t, wire.NodeID(node.UID), identity.Node())
+
+		managed.OwnerReferences = nil
+		require.NoError(t, env.Client.Update(t.Context(), &managed))
+		_, err = bootstrap.Authenticate(t.Context(), request)
+		require.ErrorIs(t, err, wire.Forbidden)
+		require.NoError(t, env.Client.Delete(t.Context(), &managed))
+	}
+
+	// Removing the opt-in restores ordinary Pod networking and legacy ports.
+	for _, key := range []string{"RACER_HOST_NETWORK", "RACER_PEER_PORT", "RACER_DIAGNOSTICS_PORT"} {
+		delete(cm.Data, key)
+	}
+
+	require.NoError(t, env.Client.Update(t.Context(), cm))
+	persist(t, env, planPass(t, env))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
+	require.Equal(t, *baseline, ds.Spec.Template.Spec)
+}
+
+func TestRacerNetworkRejectsInvalidConfiguration(t *testing.T) {
+	env := testEnv(t, volume("cache"))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	for key, invalid := range map[string][]string{
+		"RACER_HOST_NETWORK":     {"", "TRUE", "1", "yes"},
+		"RACER_PEER_PORT":        {"", "0", "1023", "65536", "-1", "18082x"},
+		"RACER_DIAGNOSTICS_PORT": {"", "0", "1023", "65536", "-1", "8082"},
+	} {
+		for _, value := range invalid {
+			t.Run(key+"="+value, func(t *testing.T) {
+				cm := &corev1.ConfigMap{}
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
+				before := cm.DeepCopy()
+				cm.Data[key] = value
+				require.NoError(t, env.Client.Update(t.Context(), cm))
+				plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+				require.Error(t, err)
+				require.Nil(t, plan, "invalid network configuration must not apply a partial plan")
+
+				cm.Data = before.Data
+				require.NoError(t, env.Client.Update(t.Context(), cm))
+			})
+		}
+	}
+}

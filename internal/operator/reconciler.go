@@ -33,6 +33,7 @@ import (
 	"github.com/Azure/unbounded/internal/operator/components/machina"
 	"github.com/Azure/unbounded/internal/operator/components/metalman"
 	netcomponent "github.com/Azure/unbounded/internal/operator/components/net"
+	"github.com/Azure/unbounded/internal/operator/components/racer"
 	"github.com/Azure/unbounded/internal/operator/components/tokenrefresher"
 	"github.com/Azure/unbounded/internal/operator/override"
 )
@@ -97,6 +98,7 @@ func DefaultRegistry() *component.Registry {
 			machina.New(),
 			gantry.New(),
 			tokenrefresher.New(),
+			racer.New(),
 		},
 		Site: []component.SiteComponent{
 			metalman.New(),
@@ -665,8 +667,7 @@ func setComponentResult(logger logr.Logger, site *unboundedv1alpha3.Site, name, 
 }
 
 func (r *SiteReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// A nil APIReader is refused rather than tolerated, for the same reason the
-	// legacy reaper refuses one. Env.LiveReader falls back to the cached
+	// A nil APIReader is refused rather than tolerated. Env.LiveReader falls back to the cached
 	// client, which is fine for a unit test constructing the reconciler
 	// directly and is not fine under a manager: a readiness gate reading a
 	// lagging cache reports a stale rollout as the current one, and every kind

@@ -770,8 +770,8 @@ func TestApplyPreservesPodAntiAffinity(t *testing.T) {
 
 	// The Site constraint must be untouched by an unrelated affinity section.
 	terms := spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
-	if len(terms) != 2 {
-		t.Fatalf("node affinity terms = %d, want the operator's two", len(terms))
+	if len(terms) != 1 {
+		t.Fatalf("node affinity terms = %d, want the operator's canonical term", len(terms))
 	}
 }
 

@@ -10,32 +10,24 @@ metadata:
     app.kubernetes.io/name: unbounded-operator
     app.kubernetes.io/component: controller
 rules:
+  - apiGroups: ["racer.unbounded-cloud.io"]
+    resources: ["clustercaches", "clustervolumes"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites"]
-    verbs: ["get", "list", "watch", "create"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites/status"]
     verbs: ["get", "patch", "update"]
-  # Legacy net-group Sites are read during migration and translated into the
-  # machina-group Sites above; their finalizers are cleared (update/patch) so the
-  # CRD can be deleted once drained.
-  - apiGroups: ["net.unbounded-cloud.io"]
-    resources: ["sites"]
-    verbs: ["get", "list", "watch", "update", "patch"]
-  - apiGroups: ["net.unbounded-cloud.io"]
-    resources: ["sitenodeslices"]
-    verbs: ["get", "list", "watch"]
-  # Cluster-scoped custom resources whose embedded secret references are
-  # repointed from the legacy namespaces to unbounded-system.
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["machines", "machineoperationcredentials"]
-    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
-    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: [""]
-    resources: ["namespaces", "serviceaccounts", "configmaps", "services", "secrets"]
-    verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]
+    resources: ["namespaces", "services", "secrets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
@@ -44,27 +36,27 @@ rules:
     verbs: ["get", "list", "watch"]
   # Read-only, and only ever read: a component that registers admission
   # webhooks or an aggregated API points them at a Service, and a registration
-  # whose backend is not serving is worse than none. Endpoints answer whether
+  # whose backend is not serving is worse than none. EndpointSlices answer whether
   # anything is actually behind that Service. The net controller Service has no
   # selector - its leader pod writes these itself - so there is no other way to
   # tell a running backend from a Deployment that merely exists.
   #
   # The verbs are exactly what the reads need and no more. These go through
-  # Env.LiveReader, which bypasses the manager cache. Both endpoint objects use
-  # the Service's own name, so get suffices. Neither is watched, which is the
+  # Env.LiveReader, which bypasses the manager cache. The EndpointSlice uses
+  # the Service's own name, so get suffices. It is not watched, which is the
   # point of reading them live.
-  - apiGroups: [""]
-    resources: ["endpoints"]
-    verbs: ["get"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get"]
   - apiGroups: ["apps"]
     resources: ["deployments", "daemonsets"]
-    verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["statefulsets", "replicasets"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
     verbs: ["get", "list", "watch"]
@@ -78,9 +70,8 @@ rules:
     # escalate + bind let the operator install the component RBAC (net,
     # machina, metalman, storage) whose Roles/ClusterRoles grant permissions
     # the operator itself does not hold; without them the apiserver rejects the
-    # role creation as a privilege escalation. deletecollection lets the reaper
-    # DeleteAllOf the legacy component RBAC by label.
-    verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection", "escalate", "bind"]
+    # role creation as a privilege escalation.
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "escalate", "bind"]
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["validatingwebhookconfigurations", "mutatingwebhookconfigurations", "validatingadmissionpolicies", "validatingadmissionpolicybindings"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]

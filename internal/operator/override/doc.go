@@ -52,10 +52,12 @@ type Entry struct {
 	// gantry or metalman.
 	Component string `yaml:"component"`
 
-	// Kind is Deployment or DaemonSet. Together with Component it identifies
-	// every workload the operator emits today, so users never have to
-	// reconstruct a derived per-Site name.
+	// Kind is Deployment or DaemonSet.
 	Kind string `yaml:"kind"`
+
+	// Name selects an exact workload. It is required for Racer DaemonSet entries
+	// to distinguish racer-dataplane from the pod-network workload.
+	Name string `json:"Name,omitempty" yaml:"name,omitempty"`
 
 	// Sites selects which Sites to affect, for per-Site components only.
 	//

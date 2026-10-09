@@ -468,10 +468,8 @@ func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site)
 // plans.
 //
 // The metalman RBAC that also ships in the machina manifest set must not appear
-// here: the metalman component owns and applies it. The reaper gates its
-// migration on the controller Deployment's config-hash annotation
-// (internal/operator/migrate.go), so an object or annotation silently
-// appearing, disappearing or being renamed here breaks the upgrade path.
+// here: the metalman component owns and applies it. The controller Deployment's
+// config-hash annotation ensures that config changes trigger a rollout.
 func TestPlanGolden(t *testing.T) {
 	env := &component.Env{
 		Client:    fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),

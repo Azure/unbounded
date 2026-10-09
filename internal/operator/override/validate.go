@@ -32,6 +32,7 @@ var knownComponents = map[string]struct {
 	"net":             {perSite: false, kinds: []string{"DaemonSet", "Deployment"}},
 	"machina":         {perSite: false, kinds: []string{"Deployment"}},
 	"gantry":          {perSite: false, kinds: []string{"DaemonSet"}},
+	"racer":           {perSite: false, kinds: []string{"Deployment", "DaemonSet"}},
 	"token-refresher": {perSite: false, kinds: []string{"Deployment"}},
 	"metalman":        {perSite: true, kinds: []string{"Deployment"}},
 }
@@ -122,6 +123,10 @@ func validateEntry(sourced SourcedEntry) []string {
 
 	problems = append(problems, validateSites(entry, known, component.perSite)...)
 
+	if entry.Component == "racer" && entry.Kind == "DaemonSet" && entry.Name == "" {
+		problems = append(problems, "name is required for Racer DaemonSet overrides; select racer-dataplane or racer-dataplane-podnet explicitly")
+	}
+
 	if !entry.HasWork() {
 		problems = append(problems, "entry changes nothing; set patch, extraArgs, or both")
 	}
@@ -140,6 +145,7 @@ func validateEntry(sourced SourcedEntry) []string {
 	problems = append(problems, validateAddNames("addInitContainers", entry.AddInitContainers)...)
 	problems = append(problems, reportAddedContainers(entry)...)
 	problems = append(problems, validatePatch(entry.Patch)...)
+	problems = append(problems, validateDaemonSetStrategy(entry)...)
 	problems = append(problems, reportTypedFieldConflicts(entry)...)
 
 	return problems
@@ -641,8 +647,8 @@ func reportShape(value any, path string, report func(string)) bool {
 
 // reportReservedKeys rejects label or annotation keys under the operator's own
 // prefix. Those carry component config hashes, Site scoping and override
-// visibility, so a patch able to write them could forge a hash the reaper gates
-// on, or hide the fact that an override is in effect.
+// visibility, so a patch able to write them could suppress a config rollout or
+// hide the fact that an override is in effect.
 func reportReservedKeys(value any, path string, report func(string)) {
 	labels, ok := value.(map[string]any)
 	if !ok {

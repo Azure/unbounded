@@ -48,12 +48,6 @@ const (
 	// (unbounded-cloud.io/site). Per-site components node-select on it.
 	SiteLabelKey = unboundedv1alpha3.MachineSiteLabelKey
 
-	// DeprecatedSiteLabelKey is the node site-membership label used by released
-	// net controllers before the switch to unbounded-cloud.io/site. Per-site
-	// workloads target either key during the deprecation window so they schedule
-	// before the upgraded net has converged all Nodes to the canonical label.
-	DeprecatedSiteLabelKey = "net.unbounded-cloud.io/site"
-
 	// AppliedHashLabel records the exact SSA payload last submitted by the
 	// operator. A matching cached object can skip an identical apply without
 	// confusing API defaulting or server-managed fields with desired drift.
@@ -190,7 +184,7 @@ type Env struct {
 	// takes to arrive, and a gate reading a stale Deployment reports the
 	// outgoing revision's availability as the current one's. And every kind
 	// read through it establishes an informer, so answering whether one
-	// Service has a backend would cache every Endpoints, EndpointSlice, Pod
+	// Service has a backend would cache every EndpointSlice, Pod
 	// and ReplicaSet in the namespace for the life of the process.
 	//
 	// It may be nil in unit tests that do not need it; LiveReader falls back to
@@ -417,6 +411,8 @@ func AppliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
 
 	sum := sha256.Sum256(data)
 
+	// Unpadded base32 keeps all 256 bits in 52 alphanumeric characters. Unlike
+	// URL-base64, it cannot begin or end with punctuation forbidden in labels.
 	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:]), nil
 }
 
@@ -653,46 +649,13 @@ func SiteOwnerReference(site *unboundedv1alpha3.Site) metav1.OwnerReference {
 	}
 }
 
-// UpsertOwnerReference adds or updates owner in refs, returning whether the slice
-// changed. An existing reference to the same owner (matched by UID, Kind, and
-// APIVersion) is rewritten when its Name or Controller flag differs, so a
-// resource adopted before Controller ownership was introduced converges to a
-// controller reference on the next reconcile.
-func UpsertOwnerReference(refs []metav1.OwnerReference, owner metav1.OwnerReference) ([]metav1.OwnerReference, bool) {
-	for i := range refs {
-		if refs[i].UID == owner.UID && refs[i].Kind == owner.Kind && refs[i].APIVersion == owner.APIVersion {
-			if refs[i].Name == owner.Name && controllerEqual(refs[i].Controller, owner.Controller) {
-				return refs, false
-			}
-
-			out := append([]metav1.OwnerReference(nil), refs...)
-			out[i] = owner
-
-			return out, true
-		}
-	}
-
-	out := append([]metav1.OwnerReference(nil), refs...)
-	out = append(out, owner)
-
-	return out, true
-}
-
-// controllerEqual compares two owner-reference Controller pointers, treating a
-// nil pointer as false.
-func controllerEqual(a, b *bool) bool {
-	return ptr.Deref(a, false) == ptr.Deref(b, false)
-}
-
-// SiteNodeAffinity matches Nodes carrying either the canonical site label or the
-// deprecated net-prefixed site label. The OR is required during migration.
+// SiteNodeAffinity matches Nodes carrying the canonical site label.
 func SiteNodeAffinity(siteName string) *corev1.Affinity {
 	return &corev1.Affinity{
 		NodeAffinity: &corev1.NodeAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
 				NodeSelectorTerms: []corev1.NodeSelectorTerm{
 					siteNodeSelectorTerm(SiteLabelKey, siteName),
-					siteNodeSelectorTerm(DeprecatedSiteLabelKey, siteName),
 				},
 			},
 		},

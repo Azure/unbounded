@@ -20,10 +20,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,15 +53,6 @@ const (
 	// container carries the operator-managed image; the DaemonSet's busybox
 	// init container keeps its pinned public image.
 	agentContainerName = "gantry"
-
-	// legacyNodeConfigName and legacyNodeConfigDaemonSetName were installed by
-	// older operator versions. The unbounded agent owns this host configuration.
-	legacyNodeConfigName          = "gantry-containerd-hosts"
-	legacyNodeConfigDaemonSetName = "gantry-containerd-config"
-
-	// legacyAgentClusterRoleName granted the agent list/watch on Nodes for the
-	// membership informer that the Lease-chair design removed.
-	legacyAgentClusterRoleName = "gantry-agent"
 
 	configHashAnnotation = "unbounded-cloud.io/gantry-config-hash"
 )
@@ -131,17 +120,6 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		return plan, component.NotReady(reasonInstallationConflict, message), nil
 	}
 
-	// The legacy node config is removed before anything else is applied, and
-	// the applies depend on those deletes, so a failure to remove the legacy
-	// DaemonSet does not race the replacement into the cluster alongside it.
-	legacy := legacyCleanupOperations(c.Name(), env.Namespace)
-	plan.Add(legacy...)
-
-	legacyRefs := make([]component.ObjectRef, 0, len(legacy))
-	for _, op := range legacy {
-		legacyRefs = append(legacyRefs, op.Ref())
-	}
-
 	if !enabled {
 		// Keep gantry installed once the operator has taken ownership; automatic
 		// singleton removal is surprising. A future explicit uninstall flow
@@ -161,7 +139,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		return nil, component.Result{}, err
 	}
 
-	dependsOn := legacyRefs
+	var dependsOn []component.ObjectRef
 
 	if configOp != nil {
 		plan.Add(*configOp)
@@ -197,16 +175,15 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	return plan, component.Reconciled(), nil
 }
 
-// SetupWatches reconciles Gantry on changes to its active resources and when
-// legacy node-config resources appear so they can be removed.
+// SetupWatches reconciles Gantry on changes to its active resources.
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	// The singleton request already fans out to every Site, so enqueuing
 	// the Sites as well would run one redundant pass per Site for a single
 	// ConfigMap edit.
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName))))
+		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName))))
+		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName))))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
 	b.Watches(&schedulingv1.PriorityClass{}, env.RequestSingleton(),
@@ -304,29 +281,6 @@ func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {
 	}
 
 	return false, nil
-}
-
-func legacyCleanupOperations(componentName, namespace string) []component.Operation {
-	return []component.Operation{
-		component.DeleteOperation(&appsv1.DaemonSet{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: legacyNodeConfigDaemonSetName},
-		}, componentName, ""),
-		component.DeleteOperation(&corev1.ConfigMap{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: legacyNodeConfigName},
-		}, componentName, ""),
-		// The agent no longer runs Pod/Node informers, so the cluster-scoped
-		// Nodes grant is removed rather than left behind on upgraded clusters.
-		component.DeleteOperation(&rbacv1.ClusterRoleBinding{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
-			ObjectMeta: metav1.ObjectMeta{Name: legacyAgentClusterRoleName},
-		}, componentName, ""),
-		component.DeleteOperation(&rbacv1.ClusterRole{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
-			ObjectMeta: metav1.ObjectMeta{Name: legacyAgentClusterRoleName},
-		}, componentName, ""),
-	}
 }
 
 // applyMutator skips CRDs and the separately reconciled gantry-config ConfigMap,

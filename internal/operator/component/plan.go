@@ -204,9 +204,7 @@ func (p *Plan) ExecutionOrder() (string, error) {
 // Summary renders the plan as one line per operation, in plan order.
 //
 // It exists so tests can pin exactly what a component intends to write, and so
-// a plan can be logged or displayed without dumping whole objects. The reaper
-// gates its migration on the objects and annotations components produce, so an
-// object silently appearing, disappearing or being renamed is a real hazard.
+// a plan can be logged or displayed without dumping whole objects.
 func (p *Plan) Summary() string {
 	if p.Len() == 0 {
 		return ""
