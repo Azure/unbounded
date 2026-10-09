@@ -1,0 +1,12 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: racer-controller
+  namespace: unbounded-system
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: racer-controller

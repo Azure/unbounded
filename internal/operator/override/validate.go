@@ -33,6 +33,7 @@ var knownComponents = map[string]struct {
 	"machina":         {perSite: false, kinds: []string{"Deployment"}},
 	"gantry":          {perSite: false, kinds: []string{"DaemonSet"}},
 	"token-refresher": {perSite: false, kinds: []string{"Deployment"}},
+	"racer":           {perSite: false, kinds: []string{"Deployment"}},
 	"metalman":        {perSite: true, kinds: []string{"Deployment"}},
 }
 
@@ -640,9 +641,7 @@ func reportShape(value any, path string, report func(string)) bool {
 }
 
 // reportReservedKeys rejects label or annotation keys under the operator's own
-// prefix. Those carry component config hashes, Site scoping and override
-// visibility, so a patch able to write them could forge a hash the reaper gates
-// on, or hide the fact that an override is in effect.
+// prefix. These keep ownership, reconciliation and override visibility intact.
 func reportReservedKeys(value any, path string, report func(string)) {
 	labels, ok := value.(map[string]any)
 	if !ok {

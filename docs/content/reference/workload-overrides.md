@@ -100,9 +100,9 @@ data:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `component` | yes | `net`, `machina`, `gantry`, `token-refresher` or `metalman`. |
+| `component` | yes | `net`, `machina`, `gantry`, `token-refresher`, `racer` or `metalman`. |
 | `kind` | yes | The kind that component emits. With `component` this identifies every workload the operator emits, so you never write a derived per-Site name. A pair the component cannot produce, such as `machina`/`DaemonSet`, is rejected rather than left to match nothing. |
-| `sites` | no | **Per-Site components only**, meaning `metalman`. Naming it on `net`, `machina`, `gantry` or `token-refresher` is an error, because those are cluster singletons and there is one of each for the whole cluster. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
+| `sites` | no | **Per-Site components only**, meaning `metalman`. Naming it on `net`, `machina`, `gantry`, `token-refresher` or `racer` is an error, because those are cluster singletons and there is one of each for the whole cluster. **Omit it to match every Site.** An empty list is an error, since it is far likelier to be a mistake than an intent to match nothing. |
 | `patch` | no | A strategic merge patch against the whole workload object, so `metadata.labels`, `metadata.annotations`, `spec.replicas` and the pod template are all reachable. |
 | `extraArgs` | no | Arguments to append, keyed by container name. See below. |
 | `addContainers` | no | Names of containers this entry intends to create rather than modify. |
@@ -118,7 +118,17 @@ Each component emits one kind, except `net`:
 | `machina` | `Deployment` | no |
 | `gantry` | `DaemonSet` | no |
 | `token-refresher` | `Deployment` | no |
+| `racer` | `Deployment` | no |
 | `metalman` | `Deployment` | yes |
+
+### Racer replicas and voluntary disruptions
+
+The Racer controller defaults to three replicas. You can change `spec.replicas`
+with a `racer`/`Deployment` override. Its PodDisruptionBudget uses
+`maxUnavailable: 1`, so one healthy pod can be evicted when all desired replicas
+are healthy, including at one or two replicas. With one replica, eviction leaves
+the controller unavailable until a replacement is ready. Overrides do not change
+the PodDisruptionBudget.
 
 ### Always use `extraArgs` to add arguments
 
@@ -223,13 +233,21 @@ does not depend on the check being exhaustive:
 | `status` | Owned by the workload controller, not by the operator. Also easy to paste in by accident. |
 | `spec.template.spec.serviceAccountName` | Retargeting borrows another identity's API permissions. |
 | `hostNetwork`, `hostPID`, `hostIPC` | Deliberate per-component decisions. |
-| Labels and annotations under `unbounded-cloud.io/` | They carry config hashes, Site scoping and override visibility. |
+| Labels and annotations under `unbounded-cloud.io/` | They carry installation ownership, config hashes, Site scoping and override visibility. |
 | `spec.replicas` on `metalman` | The Site owns it: set `spec.components.metalman.replicas`. See below. |
 | Repointing an operator-declared mount | Mount identity is `(container, mountPath)`, because `volumeMounts` merge on `mountPath` rather than on name, so protecting them by name would be bypassable. Mounting a *different* volume at a path the operator already mounts is refused; adjusting the same mount, for example `readOnly`, is not. |
 | Operator-declared volumes | `volumes` merge on `name`, so redefining one repoints every mount that uses it without naming a `mountPath` anywhere. Adding volumes under new names is fine. |
 
 Strategic merge directives (any `$`-prefixed key) and explicit `null` values are
 rejected everywhere, because both can delete operator-managed content.
+
+For the `racer` Deployment, the merged `controller` container must keep
+the operator's `env` and `envFrom` exactly, including source order and prefixes.
+Use ConfigMap `racer-config` for configuration tuning so the controller and
+trusted bootstrap use the same settings. This check runs against the rendered
+workload, not during offline validation. A mismatch withholds the Deployment
+rather than applying it without the override. Other permitted pod tuning,
+security settings, resources, and sidecars remain available.
 
 **An override cannot delete a field.** Explicit `null` is refused everywhere,
 because that is how strategic merge removes operator-managed content. Replacing

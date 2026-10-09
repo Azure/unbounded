@@ -5,6 +5,7 @@ package override
 
 import (
 	"errors"
+	"fmt"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -198,6 +199,14 @@ func applyTarget(plan *component.Plan, target Target) WorkloadResult {
 		result.Err = err
 
 		return result
+	}
+
+	if validate := plan.Operations[target.Index].ValidateOverride; validate != nil {
+		if err := validate(original, candidate); err != nil {
+			result.Err = fmt.Errorf("%s: %w", contributorSources(target.Contributors), err)
+
+			return result
+		}
 	}
 
 	result.VersionDrift = imageDrift(original, candidate)

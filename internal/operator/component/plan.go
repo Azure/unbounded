@@ -4,6 +4,7 @@
 package component
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -43,6 +44,9 @@ const (
 
 	// OpDelete removes the object, treating absence as success.
 	OpDelete
+
+	// OpRun calls Run. Object anchors ordering and results but is not written.
+	OpRun
 )
 
 // String renders an OpKind for error messages and test failures.
@@ -56,6 +60,8 @@ func (k OpKind) String() string {
 		return "MergePatch"
 	case OpDelete:
 		return "Delete"
+	case OpRun:
+		return "Run"
 	default:
 		return fmt.Sprintf("OpKind(%d)", int(k))
 	}
@@ -93,6 +99,15 @@ type Operation struct {
 	Kind   OpKind
 	Object *unstructured.Unstructured
 
+	// Run is required only for OpRun and runs after validation and dependencies.
+	// It must be idempotent and honor context cancellation. It may capture a
+	// client; the executor does not write Object or set its owner references.
+	// OpRun cannot use SharedKey or Overridable.
+	// Racer uses it for trusted bootstrap: RBAC cannot scope Secret create by
+	// name, so the runtime controller must not initialize its own credentials.
+	// Bootstrap limits its writes and keeps planning read-only.
+	Run func(context.Context) error
+
 	// Base is the observed state for OpMergePatch, and is ignored otherwise.
 	// The executor computes the patch from Base to Object.
 	Base *unstructured.Unstructured
@@ -103,11 +118,23 @@ type Operation struct {
 	Component string
 	Site      string
 
+	// FailureDomain scopes inferred tier failure gating within a Component and
+	// Site. Operations with the same value, including the empty default, share
+	// that gate: an earlier-tier failure skips later tiers in that domain.
+	// Different values bypass only this inferred gate; explicit DependsOn,
+	// same-object, and namespace failure gates still apply. Result attribution
+	// remains by Component and Site.
+	FailureDomain string
+
 	// Overridable marks the workloads user-supplied overrides may target. Only
 	// these are merge candidates, and only these are dropped when an override
 	// document fails preflight, so an override typo cannot stop RBAC, Services
 	// or ConfigMaps from reconciling.
 	Overridable bool
+
+	// ValidateOverride optionally checks the merged workload before assignment.
+	// It must not mutate either input. An error withholds this operation.
+	ValidateOverride func(original, candidate *unstructured.Unstructured) error
 
 	// SharedKey, when non-empty, identifies an operation that is identical
 	// across Sites and must execute once per pass. Per-Site planning otherwise
