@@ -641,8 +641,7 @@ func reportShape(value any, path string, report func(string)) bool {
 }
 
 // reportReservedKeys rejects label or annotation keys under the operator's own
-// prefix, plus the Racer ownership keys. These keep reconciliation and override
-// visibility intact.
+// prefix. These keep ownership, reconciliation and override visibility intact.
 func reportReservedKeys(value any, path string, report func(string)) {
 	labels, ok := value.(map[string]any)
 	if !ok {
@@ -658,10 +657,6 @@ func reportReservedKeys(value any, path string, report func(string)) {
 	sort.Strings(keys)
 
 	for _, key := range keys {
-		if slices.Contains(ownershipAnnotationKeys, key) {
-			report(fmt.Sprintf("%s is reserved for operator installation ownership", joinPath(path, key)))
-		}
-
 		if strings.HasPrefix(key, ReservedPrefix) {
 			report(fmt.Sprintf("%s is reserved; the %s prefix carries operator config hashes, Site scoping and override visibility",
 				joinPath(path, key), ReservedPrefix))

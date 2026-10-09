@@ -31,16 +31,17 @@ import (
 )
 
 const (
-	name                   = "racer"
-	controllerName         = "racer-controller"
-	claimName              = "racer-operator-installation"
-	markerName             = "racer-installation"
-	versionName            = "racer-version"
-	configName             = "racer-config"
-	tlsName                = "racer-controller-tls"
-	trustName              = "racer-bootstrap-trust"
-	managerAnnotation      = "racer.unbounded-cloud.io/manager"
-	claimAnnotation        = "racer.unbounded-cloud.io/operator-claim-uid"
+	name              = "racer"
+	controllerName    = "racer-controller"
+	claimName         = "racer-operator-installation"
+	markerName        = "racer-installation"
+	versionName       = "racer-version"
+	configName        = "racer-config"
+	tlsName           = "racer-controller-tls"
+	trustName         = "racer-bootstrap-trust"
+	managerAnnotation = "unbounded-cloud.io/racer-manager"
+	claimAnnotation   = "unbounded-cloud.io/racer-operator-claim-uid"
+	// Authority protocol key, not operator ownership metadata.
 	installationAnnotation = "racer.unbounded-cloud.io/installation-uid"
 )
 

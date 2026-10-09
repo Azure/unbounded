@@ -31,7 +31,7 @@ func preservedConfig(ctx context.Context, env *component.Env, plan *component.Pl
 		return nil, err
 	}
 
-	if err := validateRuntimeOwner(current, types.UID(defaults.Annotations[installationAnnotation])); err != nil {
+	if err := validateRuntimeOwner(current, types.UID(defaults.Annotations[runtimeInstallationAnnotation])); err != nil {
 		return nil, err
 	}
 
