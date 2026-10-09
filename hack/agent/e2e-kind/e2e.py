@@ -110,8 +110,8 @@ OFFLINE_ARTIFACTS_DIR = "/opt/unbounded/artifacts"
 
 # A release before the host root. The migration suite installs it, and returns
 # to it after moving to this build. The default is the latest published one,
-# which is what hosts being moved most likely run; releases before the host
-# root have laid the host out the same way since v0.1.4.
+# which is what hosts being moved most likely run. Its layout under /usr/local
+# is the one v0.8.0, the earlier default, has.
 LEGACY_AGENT_VERSION = os.environ.get("LEGACY_AGENT_VERSION", "v0.12.0")
 LEGACY_AGENT_RELEASE_URL = f"https://github.com/Azure/unbounded/releases/download/{LEGACY_AGENT_VERSION}"
 LEGACY_AGENT_TARBALL = "unbounded-agent-linux-amd64.tar.gz"
