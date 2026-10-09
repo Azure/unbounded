@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: racer-loadgen
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+        runAsGroup: 0
+      containers:
+        - name: racer-loadgen
+          # Replace all OCI arguments: generic blobs exclude image sizing flags.
+          args:
+            - --backend=uds
+            - --volume=racer-loadgen
+            - --metrics-listen=:9090
+            - --catalog-blobs=128
+            - --blob-bytes=67108864
+            - --seed=benchmark-v1
+            - --profile=shuffle
+            - --concurrency=8
+            - --blob-concurrency=1
+            - --pull-timeout=2m
+            - --retry-delay=1s
+            - --interval=0s
+            - --verify=true
+            - --start-delay=10s
+          ports:
+            - name: origin
+              containerPort: 8080
+              $patch: delete
+          resources:
+            requests:
+              memory: 256Mi
+          volumeMounts:
+            - name: racer-sockets
+              mountPath: /run/racer/racer-loadgen
+      volumes:
+        - name: racer-sockets
+          hostPath:
+            path: /run/racer/racer-loadgen
+            type: DirectoryOrCreate

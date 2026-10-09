@@ -1,0 +1,6 @@
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterVolume
+metadata:
+  name: racer-object
+spec:
+  type: Cache
