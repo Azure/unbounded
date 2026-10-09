@@ -237,6 +237,8 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 
 | Metric | Meaning |
 | --- | --- |
+| `racer_disk_size_bytes{disk}` | Gauge of segment capacity assigned to Racer on this backing disk, including reserve segments |
+| `racer_disk_used_bytes{disk}` | Gauge of reserved record bytes on this backing disk, including headers, tags, and alignment padding, until segment recycling |
 | `racer_disk_class_publications_total{classification}` | Completed writer publications; excludes checkpoint restoration and deduplicated enqueue |
 | `racer_disk_class_published_payload_bytes_total{classification}` | Logical page payload bytes in those publications |
 | `racer_disk_class_index_evicted_pages_total{classification}` | Victim mappings removed to reserve page-index capacity |
@@ -247,6 +249,22 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 | `racer_disk_pending_payload_bytes` | Total logical payload bytes owned by pending writes, including submitted writes until cleanup |
 | `racer_disk_indexed_payload_bytes` | Total logical payload bytes in retained index mappings, including restored mappings |
 
+For per-disk utilization as a percentage, use:
+
+```promql
+100 * racer_disk_used_bytes / racer_disk_size_bytes
+```
+
+The `disk` label is `device:<by-id basename>` for raw devices and
+`file:worker-<id>-slab-0.dat` for file-backed slabs. Workers sharing a device
+contribute only their assigned segments. Size excludes device guards, unused
+tails outside assigned segments, and unassigned capacity. Used bytes include
+failed-write reservations and records whose index mappings were removed, until
+their segments are recycled. These gauges measure Racer's reserved record space,
+not filesystem allocation or whole-device fullness. Sealed segment tails and
+free-segment reserves can require reclamation before utilization reaches 100%.
+They are sampled after recovery and on each worker's health tick.
+
 All payload byte metrics exclude AEAD tags, record headers, and alignment padding.
 Victim counters exclude invalidation, replacement, cache removal, and pending-write
 discards. A mapping is counted only by the removal path that actually evicts it.
@@ -254,7 +272,7 @@ Read bytes count repeated full-page reads, including internal/copy-only consumer
 CRC and AEAD validation happen later in fill. They measure disk-to-reader payload,
 not authenticated client-delivered bytes, requested-range bytes, or device I/O.
 Use their rates to compare disk reuse in benchmarks, not as client throughput.
-The two byte gauges are exact unclassified worker totals at sampling time, maintained
+The pending and indexed payload gauges are exact unclassified worker totals at sampling time, maintained
 on lifecycle events without scanning all pages. A page can briefly count in both
 while a published write is still pending cleanup. They are not physical allocation
 or unique resident-byte totals, nor ownership-split gauges. Tracked heat entries
