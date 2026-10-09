@@ -32,7 +32,8 @@ func runGet() error {
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+
+	defer func() { _ = client.Close() }() //nolint:errcheck
 
 	obj, err := client.Get(context.TODO(), racersdk.Request{
 		Key: sha256.Sum256([]byte("0")),
@@ -40,7 +41,8 @@ func runGet() error {
 	if err != nil {
 		return err
 	}
-	defer obj.Close()
+
+	defer func() { _ = obj.Close() }() //nolint:errcheck
 
 	_, err = io.Copy(os.Stdout, obj)
 

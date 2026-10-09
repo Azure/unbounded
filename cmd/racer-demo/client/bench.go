@@ -38,7 +38,8 @@ func runBench() error {
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+
+	defer func() { _ = client.Close() }() //nolint:errcheck
 
 	// Separate files avoid sharing a destination lock between workers.
 	var sinks [concurrency]*os.File
@@ -48,7 +49,7 @@ func runBench() error {
 			return err
 		}
 
-		defer client.Close()
+		defer func() { _ = client.Close() }() //nolint:errcheck
 	}
 
 	var (
