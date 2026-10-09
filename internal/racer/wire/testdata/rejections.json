@@ -397,5 +397,12 @@
     "old": "\"port\":1",
     "new": "\"port\":1,\"gid\":\"ABCDEF0123456789abcdef0123456789\"",
     "code": "invalid_request"
+  },
+  {
+    "name": "duplicate key material",
+    "file": "bundle.json",
+    "old": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+    "new": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "code": "invalid_request"
   }
 ]
