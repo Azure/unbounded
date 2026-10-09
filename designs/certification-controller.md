@@ -2,15 +2,36 @@
 
 **Status:** Engineering design review draft
 
-**Scope:** Certification of newly provisioned, repaired, stale, or suspect
-compute capacity before production admission.
+**Scope:** Certification and policy-controlled Day 1 and Day 2 operations for
+newly provisioned, repaired, stale, or suspect compute capacity.
 
 **Project name:** Project Signal
 
+## Primary requirement
+
+Project Signal must provide a common control and evidence plane for operating
+Nodes after they join the cluster:
+
+- **Day 1 operations maintain trust** through certification, evidence
+  freshness, revalidation, scheduling protection, eligibility changes, and
+  fault classification.
+- **Day 2 operations restore trust** when a Node requires a lifecycle action
+  such as an agent reset, reboot, power operation, or host replacement.
+
+Project Signal owns the policy decision, request, audit trail, and mandatory
+post-operation certification. Existing Unbounded controllers continue to
+provision Nodes and execute approved lifecycle actions through their existing
+APIs. A completed Day 2 action does not restore production eligibility until a
+new certification run passes.
+
 ## Decision summary
 
+- Project Signal is the policy and evidence layer for both Day 1 trust
+  maintenance and Day 2 lifecycle intervention on Nodes.
 - A Certification Controller owns certification lifecycle, profile selection,
   participant selection, evidence policy, eligibility, and remediation requests.
+- Day 2 execution uses existing Unbounded lifecycle operation APIs rather than
+  introducing a second repair executor.
 - Argo Workflows owns execution of suite graphs, including retries, deadlines,
   synchronization, fan-out, cancellation, and cleanup sequencing.
 - A certification suite is the stable execution boundary. A suite may contain
@@ -30,18 +51,21 @@ compute capacity before production admission.
 
 The system must:
 
-1. Keep capacity blocked until its required profile produces current evidence.
-2. Bind certification history to durable infrastructure asset identity while
+1. Provide an auditable path from Day 1 observation and revalidation to a
+   policy-approved Day 2 lifecycle operation and mandatory recertification.
+2. Keep capacity blocked until its required profile produces current evidence.
+3. Bind certification history to durable infrastructure asset identity while
    projecting current state onto the active Kubernetes Node.
-3. Support initial burn-in, post-repair verification, idle revalidation,
+4. Support initial burn-in, post-repair verification, idle revalidation,
    continuous fault response, and authorized on-demand runs.
-4. Support node-local and coordinated multi-node suites without forcing every
+5. Support node-local and coordinated multi-node suites without forcing every
    diagnostic operation into a separate pod.
-5. Produce reproducible results tied to immutable profile, configuration,
+6. Produce reproducible results tied to immutable profile, configuration,
    runner image, participant, topology, and artifact identity.
-6. Preserve one writer for eligibility and one requester for remediation.
-7. Apply fleet and failure-domain concurrency limits to disruptive testing.
-8. Allow compatibility behavior and new certification gates to coexist without
+7. Preserve one writer for eligibility and one requester for remediation.
+8. Apply fleet and failure-domain concurrency limits to disruptive testing and
+   lifecycle operations.
+9. Allow compatibility behavior and new certification gates to coexist without
    silently changing each other's verdicts.
 
 ## Non-goals
