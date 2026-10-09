@@ -92,6 +92,10 @@ func TestUnboundedAgentInstallScriptSeed(t *testing.T) {
 	require.Positive(t, length)
 
 	block := strings.ReplaceAll(script[start:start+length+len(end)], "/usr/local/bin", filepath.Join(t.TempDir(), "missing"))
+	// The block runs rm and install. Anything left naming /usr/local would
+	// reach the host's when the tests run as root.
+	require.NotContains(t, block, "/usr/local", "the block must only touch the temporary directory")
+
 	agent := filepath.Join(t.TempDir(), "unbounded-agent")
 	require.NoError(t, os.WriteFile(agent, []byte("#!/bin/sh\n"), 0o755))
 

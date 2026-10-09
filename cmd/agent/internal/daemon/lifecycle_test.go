@@ -257,11 +257,18 @@ func TestRemoveAgentArtifactsRemovesTheRootLast(t *testing.T) {
 	configDir := filepath.Join(root, "etc", "unbounded", "agent")
 	require.NoError(t, os.MkdirAll(configDir, 0o755))
 
+	// The temporary configs are matched in a temporary directory, so the test
+	// never removes the host's.
+	tempConfig := filepath.Join(root, "tmp", "unbounded-agent-config.1234.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(tempConfig), 0o755))
+	require.NoError(t, os.WriteFile(tempConfig, []byte("{}"), 0o600))
+
 	rootRemovals := 0
 	task := &removeAgentArtifacts{
-		log:   discardLogger(),
-		files: files,
-		dirs:  []string{configDir},
+		log:         discardLogger(),
+		files:       files,
+		dirs:        []string{configDir},
+		tempConfigs: filepath.Join(root, "tmp", "unbounded-agent-config.*.json"),
 		removeRoot: func() error {
 			rootRemovals++
 
@@ -279,6 +286,7 @@ func TestRemoveAgentArtifactsRemovesTheRootLast(t *testing.T) {
 
 	_, err := os.Stat(configDir)
 	assert.ErrorIs(t, err, os.ErrNotExist, "config directory must be removed")
+	assert.NoFileExists(t, tempConfig, "temporary configs must be removed")
 
 	// Removing an already-absent file is the ordinary case on a partially
 	// provisioned host, so a second pass has to succeed.

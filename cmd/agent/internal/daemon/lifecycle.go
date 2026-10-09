@@ -329,9 +329,11 @@ func (t *removeFirstBootUnit) Do(ctx context.Context) error {
 type removeAgentArtifacts struct {
 	log *slog.Logger
 	// Set at construction so tests can run the task against a temporary tree.
-	files      []string
-	dirs       []string
-	removeRoot func() error
+	files []string
+	dirs  []string
+	// tempConfigs matches the config files earlier installs left in /tmp.
+	tempConfigs string
+	removeRoot  func() error
 }
 
 // RemoveAgentArtifacts returns a task that removes the agent binary, install
@@ -340,10 +342,11 @@ type removeAgentArtifacts struct {
 // migrated host.
 func RemoveAgentArtifacts(log *slog.Logger) phases.Task {
 	return &removeAgentArtifacts{
-		log:        log,
-		files:      hostroot.OwnedFiles(),
-		dirs:       []string{goalstates.AgentConfigDir, "/tmp/unbounded-agent"},
-		removeRoot: func() error { return hostroot.Remove(log) },
+		log:         log,
+		files:       hostroot.OwnedFiles(),
+		dirs:        []string{goalstates.AgentConfigDir, "/tmp/unbounded-agent"},
+		tempConfigs: "/tmp/unbounded-agent-config.*.json",
+		removeRoot:  func() error { return hostroot.Remove(log) },
 	}
 }
 
@@ -366,8 +369,8 @@ func (t *removeAgentArtifacts) Do(_ context.Context) error {
 		}
 	}
 
-	// Remove temp config files matching /tmp/unbounded-agent-config.*.json.
-	matches, _ := filepath.Glob("/tmp/unbounded-agent-config.*.json") //nolint:errcheck // Pattern is valid; only errors on malformed globs.
+	// Remove the temporary config files earlier installs left.
+	matches, _ := filepath.Glob(t.tempConfigs) //nolint:errcheck // Pattern is valid; only errors on malformed globs.
 	for _, m := range matches {
 		if err := removeOwnedFile(m); err != nil {
 			return err

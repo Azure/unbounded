@@ -1256,6 +1256,12 @@ func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
 	require.Contains(t, unit.Contents, " "+goalstates.DaemonUnit+"\n", "a reboot must not repair a daemon that is still starting")
 	require.Contains(t, unit.Contents, "ExecStartPre=/opt/unbounded/agent/bin/unbounded-agent preflight\n")
 	require.Contains(t, unit.Contents, "ExecStart=/opt/unbounded/agent/bin/unbounded-agent start\n")
+	// The agent reads its config from this variable, set in cmd/agent's
+	// config.go. Without it start falls back to the environment and fails.
+	require.Contains(t, unit.Contents, "Environment=UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json\n")
+	require.Contains(t, unit.Contents, "WantedBy=multi-user.target\n", "enabling the unit must make it run at boot")
+	require.Contains(t, unit.Contents, "Restart=on-failure\n", "a first boot has no later chance to bootstrap")
+	require.Contains(t, unit.Contents, "StartLimitIntervalSec=0\n", "retries must not hit the start limit")
 }
 
 // TestValidateRejectsIgnitionInputBeforeContactingTheCluster: validate runs
