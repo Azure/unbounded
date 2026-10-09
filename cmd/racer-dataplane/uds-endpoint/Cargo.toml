@@ -1,0 +1,14 @@
+[package]
+name = "uds-endpoint"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Linux Unix socket filesystem ownership and crash recovery"
+
+[features]
+test-util = []
+simulation = ["dep:uring-runtime", "uring-runtime/simulation"]
+
+[dependencies]
+libc = "0.2"
+uring-runtime = { path = "../runtime", optional = true }

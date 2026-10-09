@@ -3,6 +3,7 @@
 //! The caller owns execution, payloads, scope policy and result classification.
 //! Dropping a waiter abandons delivery, not the accepted job or its credit.
 
+use crate::Scope;
 use crate::channel::{self, Receiver, Sender};
 use futures::task::AtomicWaker;
 use std::{
@@ -16,6 +17,229 @@ use std::{
     },
     task::{Context, Poll, Waker},
 };
+
+/// Worker-local client state. Accepted operations wait for completion, not cancellation.
+pub struct Client<I: Identity, C, S: Scope> {
+    waiters: Waiters<I, C>,
+
+    pending: AdmissionQueue<S>,
+
+    drain_waiter: RefCell<Option<(S, Waker)>>,
+}
+
+impl<I: Identity + 'static, C: Reserved<I> + 'static, S: Scope> Client<I, C, S>
+where
+    S::Error: From<Error>,
+{
+    /// Allocate bounded admission waiters independently of application payloads.
+    pub fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            waiters: Waiters::default(),
+            pending: AdmissionQueue::new(capacity),
+            drain_waiter: RefCell::new(None),
+        }
+    }
+
+    /// Reserve, publish, and await the exact completion while retaining accepted owners.
+    pub async fn execute<J: Reserved<I>>(
+        &self,
+        port: &ClientPort<I, J, C>,
+        scope: &S,
+        identify: impl FnOnce(u64) -> I,
+        build: impl FnOnce(Permit<I>) -> J,
+        submitted: impl FnOnce(&mut J),
+    ) -> crate::Result<C, S::Error> {
+        scope.check()?;
+        let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+        let capacity_waiter =
+            std::future::poll_fn(|cx| Poll::Ready(self.pending.enter(scope.clone(), cx))).await?;
+        let id = identify(capacity_waiter.sequence());
+        let permit = std::future::poll_fn(|cx| {
+            if let Some(cancellation) = &cancellation {
+                cancellation.register(cx.waker());
+            }
+            scope.check()?;
+            capacity_waiter.poll(cx, |cx| port.poll_reserve(cx, id).map_err(S::Error::from))
+        })
+        .await?;
+        drop(capacity_waiter);
+        let job = build(permit);
+        let registration =
+            std::future::poll_fn(|cx| Poll::Ready(self.waiters.register_guard(id, cx.waker())))
+                .await;
+        if let Err(failure) = port.try_submit(job, submitted) {
+            self.waiters.remove(id);
+            return Err(failure.error.into());
+        }
+        let result = std::future::poll_fn(|cx| match self.waiters.poll_result(id, cx) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
+            Poll::Ready(Ok(completion)) => {
+                scope.check()?;
+                Poll::Ready(Ok(completion))
+            }
+            Poll::Pending if port.completions_closed() && port.outstanding() == 0 => {
+                Poll::Ready(Err(crate::Error::Unavailable.into()))
+            }
+            Poll::Pending => Poll::Pending,
+        })
+        .await;
+        drop(registration);
+        result
+    }
+
+    /// Reap independently of delivery futures; observation remains application policy.
+    pub fn poll_budgeted<J: Reserved<I>>(
+        &self,
+        port: &ClientPort<I, J, C>,
+        budget: usize,
+        mut observe: impl FnMut(&C),
+    ) -> crate::Result<(), S::Error> {
+        for _ in 0..budget {
+            let Some(completion) = port.receive()? else {
+                break;
+            };
+            observe(&completion);
+            let id = completion.permit().id();
+            self.waiters.deliver(id, completion);
+        }
+        if port.completions_closed() {
+            port.discard_closed();
+            self.waiters.worker_closed(budget, port.outstanding() == 0);
+        }
+        self.pending.wake_if(budget, |scope| {
+            scope.check().is_err() || port.submissions_closed()
+        });
+        let wake = self
+            .drain_waiter
+            .borrow()
+            .as_ref()
+            .filter(|(scope, _)| scope.check().is_err())
+            .map(|(_, waker)| waker.clone());
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    /// Cancel delivery on scope expiry but fence all accepted work before returning.
+    pub async fn drain<J: Reserved<I>>(
+        &self,
+        port: &ClientPort<I, J, C>,
+        scope: &S,
+        mut observe: impl FnMut(&C),
+    ) -> crate::Result<(), S::Error> {
+        let cancellation = scope.cancellation().map(|c| c.subscribe()).transpose()?;
+        /// Clear stale driver wake registrations even when the drain future is dropped.
+        struct Guard<'a, S>(&'a RefCell<Option<(S, Waker)>>);
+        impl<S> Drop for Guard<'_, S> {
+            /// Detach the drain wake without changing accepted ownership.
+            fn drop(&mut self) {
+                self.0.borrow_mut().take();
+            }
+        }
+        let _guard = Guard(&self.drain_waiter);
+        std::future::poll_fn(|cx| {
+            if scope.check().is_ok()
+                && let Some(cancellation) = &cancellation
+            {
+                cancellation.register(cx.waker());
+            }
+            *self.drain_waiter.borrow_mut() = Some((scope.clone(), cx.waker().clone()));
+            port.register_driver(cx.waker());
+            port.register_capacity(cx.waker());
+            self.poll_budgeted(port, port.capacity(), &mut observe)?;
+            if scope.check().is_err() {
+                self.waiters.abandon_all();
+            }
+            if port.outstanding() == 0 {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    /// Whether all delivery registrations have been consumed or detached.
+    pub fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
+    }
+
+    /// Inspect bounded admission and delivery registrations in integration tests.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn waiter_counts(&self) -> (usize, usize) {
+        (self.pending.len(), self.waiters.len())
+    }
+}
+
+/// Bounded synchronous worker loop retaining rejected completion publication.
+pub struct Worker<C> {
+    pending: Option<C>,
+
+    closed: bool,
+}
+
+impl<C> Default for Worker<C> {
+    /// Start without a pending completion or an observed end of stream.
+    fn default() -> Self {
+        Self {
+            pending: None,
+            closed: false,
+        }
+    }
+}
+
+impl<C> Worker<C> {
+    /// Publish the previous completion before processing another job, including the last turn.
+    pub fn poll<I: Identity, J: Reserved<I>>(
+        &mut self,
+        port: &mut WorkerPort<I, J, C>,
+        cx: &mut Context<'_>,
+        budget: usize,
+        mut process: impl FnMut(J) -> C,
+    ) -> Result<(), Error>
+    where
+        C: Reserved<I>,
+    {
+        let mut exhausted = budget != 0;
+        for _ in 0..budget {
+            if let Some(completion) = self.pending.take()
+                && let Err(failure) = port.complete(completion)
+            {
+                self.pending = Some(failure.command);
+                return Err(failure.error);
+            }
+            match port.poll_job(cx) {
+                Poll::Pending => {
+                    exhausted = false;
+                    break;
+                }
+                Poll::Ready(Err(error)) => return Err(error.into()),
+                Poll::Ready(Ok(None)) => {
+                    self.closed = true;
+                    exhausted = false;
+                    break;
+                }
+                Poll::Ready(Ok(Some(job))) => self.pending = Some(process(job)),
+            }
+        }
+        if let Some(completion) = self.pending.take()
+            && let Err(failure) = port.complete(completion)
+        {
+            self.pending = Some(failure.command);
+            return Err(failure.error);
+        }
+        if exhausted {
+            cx.waker().wake_by_ref();
+        }
+        Ok(())
+    }
+
+    /// Closure is a fence only once no unpublished completion remains.
+    pub fn is_drained(&self) -> bool {
+        self.closed && self.pending.is_none()
+    }
+}
 
 /// Caller-defined ticket identity. Sequences must increase within a generation.
 pub trait Identity: Copy + Ord {
@@ -331,7 +555,37 @@ pub struct AdmissionQueue<S> {
     cursor: Cell<usize>,
 }
 
+/// Scalar queue facts captured without touching scopes or wake callbacks.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionSnapshot {
+    pub queued: usize,
+
+    pub capacity: usize,
+
+    pub head: Option<u64>,
+
+    pub head_age_us: Option<u64>,
+
+    pub tail_age_us: Option<u64>,
+}
+
 impl<S> AdmissionQueue<S> {
+    /// Inspect only the FIFO endpoints, without scanning or invoking callbacks.
+    pub fn snapshot(&self, now: std::time::Instant) -> AdmissionSnapshot {
+        let pending = self.pending.borrow();
+        let age = |entry: &Pending<S>| {
+            u64::try_from(now.saturating_duration_since(entry.entered).as_micros())
+                .unwrap_or(u64::MAX)
+        };
+        AdmissionSnapshot {
+            queued: pending.len(),
+            capacity: self.capacity.get(),
+            head: pending.front().map(|entry| entry.sequence),
+            head_age_us: pending.front().map(age),
+            tail_age_us: pending.back().map(age),
+        }
+    }
+
     /// Bound the number of waiting futures independently of accepted work.
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
@@ -360,6 +614,7 @@ impl<S> AdmissionQueue<S> {
         // borrowing, then validate capacity/sequence after any reentrant clone.
         let waker = Rc::new(cx.waker().clone());
         let scope = Rc::new(scope);
+        let entered = crate::environment::now();
         let mut pending = self.pending.borrow_mut();
         if pending.len() >= self.capacity.get() {
             return Err(crate::Error::Overloaded);
@@ -372,12 +627,14 @@ impl<S> AdmissionQueue<S> {
         self.sequence.set(sequence);
         pending.push_back(Pending {
             sequence,
+            entered,
             waker,
             scope,
         });
         Ok(CapacityWaiter {
             queue: self,
             sequence,
+            entered,
         })
     }
 
@@ -409,9 +666,16 @@ pub struct CapacityWaiter<'a, S> {
     queue: &'a AdmissionQueue<S>,
 
     sequence: u64,
+
+    entered: std::time::Instant,
 }
 
 impl<S> CapacityWaiter<'_, S> {
+    /// Return the fixed admission timestamp, not the latest poll time.
+    pub fn entered(&self) -> std::time::Instant {
+        self.entered
+    }
+
     /// Return this admission attempt's unique sequence, never reused on drop.
     pub fn sequence(&self) -> u64 {
         self.sequence
@@ -458,6 +722,40 @@ impl<S> Drop for CapacityWaiter<'_, S> {
         if let Some(wake) = wake {
             wake.wake_by_ref();
         }
+    }
+}
+
+#[cfg(test)]
+mod expiry_snapshot_tests {
+    use super::*;
+
+    /// Reading endpoint ages leaves tickets and wake ownership unchanged.
+    #[test]
+    fn expiry_snapshot_queue_endpoint_ages() {
+        let clock = crate::environment::SimulationClock::new(918);
+        let _environment = clock.environment(0).enter();
+        let queue = AdmissionQueue::new(NonZeroUsize::new(3).unwrap());
+        let cx = Context::from_waker(Waker::noop());
+        let head = queue.enter((), &cx).unwrap();
+        clock.advance(std::time::Duration::from_millis(30));
+        let tail = queue.enter((), &cx).unwrap();
+        clock.advance(std::time::Duration::from_millis(20));
+        let snapshot = queue.snapshot(crate::environment::now());
+        assert_eq!(snapshot.queued, 2);
+        assert_eq!(snapshot.head, Some(head.sequence()));
+        assert_eq!(snapshot.head_age_us, Some(50_000));
+        assert_eq!(snapshot.tail_age_us, Some(20_000));
+        assert_ne!(snapshot.head, Some(tail.sequence()));
+        drop(head);
+        assert_eq!(
+            queue.snapshot(crate::environment::now()).head,
+            Some(tail.sequence())
+        );
+        drop(tail);
+        let snapshot = queue.snapshot(crate::environment::now());
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.head_age_us, None);
+        assert_eq!(snapshot.tail_age_us, None);
     }
 }
 
@@ -716,6 +1014,8 @@ struct Handoff<I> {
 struct Pending<S> {
     sequence: u64,
 
+    entered: std::time::Instant,
+
     waker: Rc<Waker>,
 
     scope: Rc<S>,
@@ -735,6 +1035,106 @@ struct Waiter<C> {
 /// Admission, delivery, reentry, and owner-lifetime state-space regressions.
 #[cfg(test)]
 mod tests {
+    /// Cancellation policy for the generic client lifecycle tests.
+    #[derive(Clone)]
+    struct ClientScope(crate::environment::Cancellation);
+    impl crate::Scope for ClientScope {
+        /// Preserve offload identity errors alongside portable runtime failures.
+        type Error = super::Error;
+
+        /// Reject canceled admission without ending accepted work.
+        fn check(&self) -> Result<(), Self::Error> {
+            if self.0.is_cancelled() {
+                Err(crate::Error::Cancelled.into())
+            } else {
+                Ok(())
+            }
+        }
+
+        /// Register wakes for cancellation independently of completion delivery.
+        fn cancellation(&self) -> Option<&crate::environment::Cancellation> {
+            Some(&self.0)
+        }
+    }
+
+    /// Accepted cancellation and detached delivery both retain payloads until reap.
+    #[test]
+    fn client_and_worker_loops_preserve_completion_fences_and_last_budget_publication() {
+        use std::future::Future;
+        for detach in [false, true] {
+            let (port, mut worker) = pair(7, 1);
+            let client =
+                super::Client::<Id, Message, ClientScope>::new(NonZeroUsize::new(1).unwrap());
+            let scope = ClientScope(crate::environment::Cancellation::new().unwrap());
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut operation = Box::pin(client.execute(
+                &port,
+                &scope,
+                |sequence| Id(1, 7, sequence),
+                |permit| Message {
+                    payload: Payload(drops.clone()),
+                    result: Ok(42),
+                    permit,
+                },
+                |_| {},
+            ));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            scope.0.cancel().unwrap();
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(port.outstanding(), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            let mut operation = Some(operation);
+            if detach {
+                drop(operation.take());
+            }
+            let mut executor = super::Worker::default();
+            executor.poll(&mut worker, &mut cx, 0, |job| job).unwrap();
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            executor.poll(&mut worker, &mut cx, 1, |job| job).unwrap();
+            let mut observations = 0;
+            client
+                .poll_budgeted(&port, 1, |completion| {
+                    assert_eq!(completion.result, Ok(42));
+                    observations += 1;
+                })
+                .unwrap();
+            assert_eq!(observations, 1, "last-budget completion was published");
+            if let Some(mut operation) = operation {
+                assert!(matches!(
+                    operation.as_mut().poll(&mut cx),
+                    Poll::Ready(Err(Error::Runtime(crate::Error::Cancelled)))
+                ));
+            }
+            assert_eq!(port.outstanding(), 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(client.is_empty());
+            port.close_submissions();
+            executor.poll(&mut worker, &mut cx, 1, |job| job).unwrap();
+            assert!(executor.is_drained());
+        }
+    }
+
+    /// Failed completion publication retains its payload rather than dropping ownership.
+    #[test]
+    fn worker_loop_retains_rejected_completion() {
+        let (port, mut worker) = pair(7, 1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        assert!(port.try_submit(message(&port, 1, &drops), |_| {}).is_ok());
+        drop(port);
+        let mut executor = super::Worker::default();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(
+            executor.poll(&mut worker, &mut cx, 1, |job| job),
+            Err(Error::Runtime(crate::Error::Unavailable))
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(!executor.is_drained());
+        assert!(executor.pending.is_some());
+        drop(executor);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
     use super::*;
 
     /// Bulk abandonment detaches every completed owner before any destructor runs.

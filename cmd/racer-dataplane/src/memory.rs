@@ -1,0 +1,2184 @@
+//! Distinct accounting and lifetimes for plaintext, ciphertext, pipes, and kernel I/O.
+//! Cache lookups retain the original encrypted page and immutable version metadata.
+//! Eviction releases idle leases; retirement hides entries without revoking owners.
+
+use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::PAGE_BYTES;
+use crate::model::PageEnvelope;
+use crate::model::PageId;
+use crate::model::VersionMetadata;
+use crate::runtime::HashMap;
+use crate::runtime::HashSet;
+use racer_control_wire::CacheId;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct BufferPool {
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+}
+/// Mutable staging buffer, not proof of authentication and not client-deliverable.
+/// Fixed-size owned backing stays at the same address when this owner moves.
+pub struct PlaintextBuffer(flow_control::ChargedBuffer<AdmissionPolicy>);
+impl PlaintextBuffer {
+    pub(crate) fn into_parts(self) -> (Box<[u8]>, flow_control::Charge<AdmissionPolicy>) {
+        self.0.into_parts()
+    }
+    pub(crate) fn reservation(&self) -> &flow_control::Charge<AdmissionPolicy> {
+        self.0.charge()
+    }
+}
+// SAFETY: private fixed backing and reservation remain exclusively owned.
+unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
+    type Error = Error;
+    fn bytes(&self) -> Result<&[u8]> {
+        Ok(self.0.bytes())
+    }
+    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        Ok(self.0.bytes_mut())
+    }
+}
+/// Only page authentication/origin validation may create this publishable type.
+#[derive(Clone)]
+pub struct VerifiedPage {
+    pub(crate) inner: Arc<VerifiedBytes>,
+}
+/// Authenticated page identity paired with one recyclable payload owner.
+pub(crate) struct VerifiedBytes {
+    pub page: PageId,
+
+    pub storage: flow_control::ChargedBytes<AdmissionPolicy>,
+}
+
+impl std::ops::Deref for VerifiedBytes {
+    type Target = flow_control::ChargedBytes<AdmissionPolicy>;
+
+    /// Borrow allocation and accounting without exposing mutable verified contents.
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for VerifiedBytes {
+    /// Permit malformed fixture construction without exposing mutable verified bytes.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
+    }
+}
+#[derive(Clone)]
+pub struct CiphertextPage {
+    pub(crate) inner: Arc<CiphertextBytes>,
+    pub(crate) provenance: Option<crate::telemetry::PeerProvenance>,
+}
+/// Ciphertext metadata and checksum cache remain separate from allocation ownership.
+pub(crate) struct CiphertextBytes {
+    pub checksum: std::sync::OnceLock<u64>,
+
+    pub envelope: PageEnvelope,
+
+    pub storage: flow_control::ChargedBytes<AdmissionPolicy>,
+}
+
+impl std::ops::Deref for CiphertextBytes {
+    type Target = flow_control::ChargedBytes<AdmissionPolicy>;
+
+    /// Keep existing internal byte and reservation views on the shared owner.
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+impl std::ops::DerefMut for CiphertextBytes {
+    /// Exclusive owners can rehome accounting without copying the allocation.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
+    }
+}
+impl BufferPool {
+    pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
+        Self { admission }
+    }
+    pub fn plaintext(
+        &self,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        length: usize,
+    ) -> Result<PlaintextBuffer> {
+        if length == 0 || length > PAGE_BYTES as usize {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.validate_reservation(
+            &reservation,
+            ResourceClass::Plaintext,
+            length,
+            reservation.key(),
+        )?;
+        Ok(PlaintextBuffer(flow_control::ChargedBuffer::new(
+            reservation,
+            length,
+        )?))
+    }
+    pub fn ciphertext(
+        &self,
+        mut reservation: flow_control::Charge<AdmissionPolicy>,
+        envelope: PageEnvelope,
+        bytes: Vec<u8>,
+    ) -> Result<CiphertextPage> {
+        envelope.validate()?;
+        if bytes.len() != envelope.ciphertext_length as usize {
+            return Err(Error::CorruptRecord);
+        }
+        self.validate_reservation(
+            &reservation,
+            ResourceClass::Ciphertext,
+            bytes.capacity(),
+            Some(&envelope.page.version.object.cache),
+        )?;
+        reservation.shrink(bytes.capacity())?;
+        Ok(CiphertextPage {
+            provenance: None,
+            inner: Arc::new(CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
+                envelope,
+                storage: flow_control::ChargedBytes { bytes, reservation },
+            }),
+        })
+    }
+    fn entry_limit(&self) -> usize {
+        self.admission.policy().limits().metadata_entries.get()
+    }
+    fn reclaim_buffers(&self) {
+        self.admission.reclaim_buffers();
+    }
+    fn validate_reservation(
+        &self,
+        reservation: &flow_control::Charge<AdmissionPolicy>,
+        class: ResourceClass,
+        capacity: usize,
+        cache: Option<&CacheId>,
+    ) -> Result<()> {
+        if !self.admission.owns(reservation) || cache.is_none() || reservation.key() != cache {
+            return Err(Error::InvalidConfiguration);
+        }
+        reservation.validate(class, capacity).map_err(Into::into)
+    }
+    fn validate_page(&self, page: &PageResult) -> Result<()> {
+        page.validate_metadata()?;
+        let cache = Some(&page.plaintext.page().version.object.cache);
+        self.validate_reservation(
+            &page.plaintext.inner.reservation,
+            ResourceClass::Plaintext,
+            page.plaintext.inner.bytes.capacity(),
+            cache,
+        )?;
+        self.validate_reservation(
+            &page.ciphertext.inner.reservation,
+            ResourceClass::Ciphertext,
+            page.ciphertext.inner.bytes.capacity(),
+            cache,
+        )
+    }
+    fn validate_ciphertext(&self, copy: &CiphertextCopy) -> Result<()> {
+        copy.validate_metadata()?;
+        self.validate_reservation(
+            &copy.ciphertext.inner.reservation,
+            ResourceClass::Ciphertext,
+            copy.ciphertext.inner.bytes.capacity(),
+            Some(&copy.metadata.version.object.cache),
+        )
+    }
+}
+impl VerifiedPage {
+    pub fn page(&self) -> &PageId {
+        &self.inner.page
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.inner.bytes
+    }
+}
+impl CiphertextPage {
+    /// Rehome a completed receive before retaining it in another worker's cache.
+    /// Admit the new charge first. Shared transport owners keep their original
+    /// allocation and charge until fenced; only exclusive bytes can move in place.
+    pub(crate) fn rehome(
+        mut self,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+    ) -> Result<Self> {
+        reservation.validate(ResourceClass::Ciphertext, self.inner.bytes.capacity())?;
+        if reservation.key() != Some(&self.envelope().page.version.object.cache) {
+            return Err(Error::InvalidConfiguration);
+        }
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.reservation = reservation;
+            return Ok(self);
+        }
+        let mut bytes = reservation.buffer(self.bytes().len())?;
+        bytes.copy_from_slice(self.bytes());
+        Ok(Self {
+            inner: Arc::new(CiphertextBytes {
+                checksum: self.inner.checksum.clone(),
+                envelope: self.envelope().clone(),
+                storage: flow_control::ChargedBytes { bytes, reservation },
+            }),
+            provenance: self.provenance,
+        })
+    }
+    pub fn checksum(&self) -> u64 {
+        *self
+            .inner
+            .checksum
+            .get_or_init(|| racer_crypto::crc64(self.bytes()))
+    }
+    /// Never initializes a checksum or scans bytes on the I/O thread.
+    pub(crate) fn cached_checksum(&self) -> Option<u64> {
+        self.inner.checksum.get().copied()
+    }
+    pub(crate) fn verify_checksum(&self) -> Result<()> {
+        let actual = racer_crypto::crc64(self.bytes());
+        if self
+            .inner
+            .checksum
+            .get()
+            .is_some_and(|expected| *expected != actual)
+        {
+            return Err(Error::CorruptRecord);
+        }
+        let _ = self.inner.checksum.set(actual);
+        Ok(())
+    }
+    pub(crate) fn expected_checksum(&self, checksum: u64) -> Result<()> {
+        self.inner
+            .checksum
+            .set(checksum)
+            .map_err(|_| Error::CorruptRecord)
+    }
+    pub fn envelope(&self) -> &PageEnvelope {
+        &self.inner.envelope
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.inner.bytes
+    }
+}
+// SAFETY: shared ciphertext backing is immutable and retained by the owner.
+unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
+    type Error = Error;
+    fn send_bytes(&self) -> Result<&[u8]> {
+        Ok(self.bytes())
+    }
+}
+/// Credential-free page results shared by fills, memory, and flight completion.
+/// Retain all three values for the same version until the last reader releases
+/// them. Freshness-pointer eviction must not strand a cached page without length.
+#[derive(Clone)]
+pub struct PageResult {
+    pub metadata: ObjectMetadata,
+    pub plaintext: VerifiedPage,
+    pub ciphertext: CiphertextPage,
+}
+
+/// Pending and completed peer copies retain metadata alongside original ciphertext.
+/// The deadline is historical, not permission to advance the current-version pointer.
+#[derive(Clone)]
+pub struct CiphertextCopy {
+    pub metadata: ObjectMetadata,
+    pub ciphertext: CiphertextPage,
+}
+
+/// Structurally validated acquisition output, not proof of page AEAD. Only a
+/// plaintext consumer may promote this to PageResult after authenticating bytes.
+#[derive(Clone)]
+pub struct UnverifiedPage {
+    pub copy: CiphertextCopy,
+    pub(crate) disk_token: Option<crate::store::ReadToken>,
+}
+
+#[derive(Clone)]
+pub enum AcquiredPage {
+    Ciphertext(UnverifiedPage),
+    Plaintext(PageResult),
+}
+impl AcquiredPage {
+    #[cfg(test)]
+    pub(crate) fn verified(self) -> PageResult {
+        match self {
+            Self::Plaintext(page) => page,
+            Self::Ciphertext(_) => panic!("expected verified page"),
+        }
+    }
+    pub fn copy(&self) -> CiphertextCopy {
+        match self {
+            Self::Ciphertext(page) => page.copy.clone(),
+            Self::Plaintext(page) => page.copy(),
+        }
+    }
+
+    /// Validate the requested identity without cloning retained payload owners.
+    pub fn validate_for(&self, page: &PageId) -> Result<()> {
+        match self {
+            Self::Plaintext(result) => result.validate_for(page),
+            Self::Ciphertext(result) => {
+                let copy = &result.copy;
+                if &copy.ciphertext.envelope().page != page {
+                    return Err(Error::CorruptRecord);
+                }
+                copy.validate_metadata()
+            }
+        }
+    }
+}
+impl From<PageResult> for AcquiredPage {
+    fn from(page: PageResult) -> Self {
+        Self::Plaintext(page)
+    }
+}
+
+impl PageResult {
+    /// An internally consistent bundle still must match the requested flight page.
+    /// This is structural validation, not a substitute for authentication.
+    pub fn validate_for(&self, page: &PageId) -> Result<()> {
+        if self.plaintext.page() != page {
+            return Err(Error::CorruptRecord);
+        }
+        self.validate_metadata()
+    }
+
+    /// Structural agreement only. Authentication remains the fill/crypto boundary.
+    pub fn validate_metadata(&self) -> Result<()> {
+        self.metadata.validate()?;
+        validate_ciphertext_length(&self.ciphertext)?;
+        validate_association(
+            &self.metadata,
+            self.plaintext.page(),
+            self.plaintext.bytes().len() as u64,
+            self.ciphertext.envelope(),
+        )
+    }
+    pub fn copy(&self) -> CiphertextCopy {
+        CiphertextCopy {
+            metadata: self.metadata.clone(),
+            ciphertext: self.ciphertext.clone(),
+        }
+    }
+}
+
+impl CiphertextCopy {
+    pub fn validate_metadata(&self) -> Result<()> {
+        validate_ciphertext(&self.metadata, &self.ciphertext)
+    }
+}
+
+fn validate_ciphertext(metadata: &ObjectMetadata, ciphertext: &CiphertextPage) -> Result<()> {
+    metadata.validate()?;
+    metadata.immutable().validate_page(ciphertext.envelope())?;
+    validate_ciphertext_length(ciphertext)
+}
+fn validate_ciphertext_length(ciphertext: &CiphertextPage) -> Result<()> {
+    if ciphertext.bytes().len() != ciphertext.envelope().ciphertext_length as usize {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(())
+}
+
+fn validate_association(
+    metadata: &ObjectMetadata,
+    plaintext_page: &PageId,
+    plaintext_length: u64,
+    envelope: &PageEnvelope,
+) -> Result<()> {
+    metadata.immutable().validate_page(envelope)?;
+    if plaintext_page != &envelope.page || plaintext_length != u64::from(envelope.plaintext_length)
+    {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Entries {
+    pages: HashMap<PageId, (u64, PageResult)>,
+    lru: BTreeMap<u64, PageId>,
+    versions: HashMap<ObjectVersion, HashSet<PageId>>,
+    clock: u64,
+    reclaim_after: u64,
+}
+impl Entries {
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+    fn remove(&mut self, id: &PageId) -> Option<PageResult> {
+        let (tick, page) = self.pages.remove(id)?;
+        self.lru.remove(&tick);
+        if let Some(pages) = self.versions.get_mut(&id.version) {
+            pages.remove(id);
+            if pages.is_empty() {
+                self.versions.remove(&id.version);
+            }
+        }
+        Some(page)
+    }
+    fn insert(&mut self, page: PageResult) -> Result<()> {
+        self.clock = self.clock.checked_add(1).ok_or(Error::Overloaded)?;
+        let id = page.plaintext.page().clone();
+        self.lru.insert(self.clock, id.clone());
+        self.versions
+            .entry(id.version.clone())
+            .or_default()
+            .insert(id.clone());
+        self.pages.insert(id, (self.clock, page));
+        Ok(())
+    }
+    fn candidates(&self) -> Vec<(u64, PageId)> {
+        self.lru
+            .range((
+                std::ops::Bound::Excluded(self.reclaim_after),
+                std::ops::Bound::Unbounded,
+            ))
+            .chain(self.lru.range(..=self.reclaim_after))
+            .take(256)
+            .map(|(tick, id)| (*tick, id.clone()))
+            .collect()
+    }
+}
+/// Worker-local idle verified pages and original ciphertext; independent of disk clock.
+pub struct MemoryCache {
+    // BufferPool is only an admission handle; do not retain a second Rc layer.
+    pool: BufferPool,
+    entries: RefCell<Entries>,
+    ciphertext_entries: RefCell<BTreeMap<PageId, UnverifiedPage>>,
+    ciphertext_cursor: RefCell<Option<PageId>>,
+    availability: Rc<crate::control::Availability>,
+}
+
+/// One bounded view of the LRU clock. Touches and insertions after this cut are
+/// not chased; another reclaimer cannot move this operation's cursor.
+pub(crate) struct PlaintextReclaim {
+    after: u64,
+    through: u64,
+}
+impl MemoryCache {
+    pub(crate) fn plaintext_reclaim(&self) -> PlaintextReclaim {
+        PlaintextReclaim {
+            after: 0,
+            through: self.entries.borrow().clock,
+        }
+    }
+
+    /// Visit at most 256 entries from the initial clock cut. Return whether that
+    /// cut is exhausted, preserving both plaintext and ciphertext live owners.
+    pub(crate) fn reclaim_plaintext_quantum(
+        &self,
+        cursor: &mut PlaintextReclaim,
+        cache: Option<&CacheId>,
+        bytes: usize,
+        mut release_queued: impl FnMut(&PageResult) -> usize,
+    ) -> bool {
+        let mut entries = self.entries.borrow_mut();
+        let selected: Vec<_> = entries
+            .lru
+            .range((
+                std::ops::Bound::Excluded(cursor.after),
+                std::ops::Bound::Included(cursor.through),
+            ))
+            .take(256)
+            .map(|(tick, id)| (*tick, id.clone()))
+            .collect();
+        let mut released = 0usize;
+        for (tick, id) in selected {
+            cursor.after = tick;
+            let entry = &entries.pages[&id].1;
+            if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache)
+                || Arc::strong_count(&entry.plaintext.inner) != 1
+            {
+                continue;
+            }
+            release_queued(entry);
+            if !idle(entry) {
+                continue;
+            }
+            released = released.saturating_add(entry.plaintext.inner.reservation.amount());
+            entries.remove(&id);
+            if released >= bytes {
+                break;
+            }
+        }
+        entries
+            .lru
+            .range((
+                std::ops::Bound::Excluded(cursor.after),
+                std::ops::Bound::Included(cursor.through),
+            ))
+            .next()
+            .is_none()
+    }
+
+    pub fn new(pool: BufferPool, availability: Rc<crate::control::Availability>) -> Self {
+        Self {
+            pool,
+            entries: RefCell::new(Entries::default()),
+            ciphertext_entries: RefCell::new(BTreeMap::new()),
+            ciphertext_cursor: RefCell::new(None),
+            availability,
+        }
+    }
+    fn available(&self, page: &PageResult) -> bool {
+        self.availability.page(
+            &page.metadata.version.object.cache,
+            page.ciphertext.envelope().key_id,
+        )
+    }
+    pub fn get(&self, page: &PageId) -> Result<Option<PageResult>> {
+        let mut entries = self.entries.borrow_mut();
+        let Some((tick, entry)) = entries.pages.get(page) else {
+            return Ok(None);
+        };
+        if !self.available(entry) {
+            entries.remove(page);
+            return Ok(None);
+        }
+        let old = *tick;
+        let result = entry.clone();
+        entries.clock = entries.clock.checked_add(1).ok_or(Error::Overloaded)?;
+        let tick = entries.clock;
+        entries.lru.remove(&old);
+        entries.lru.insert(tick, page.clone());
+        entries.pages.get_mut(page).unwrap().0 = tick;
+        Ok(Some(result))
+    }
+    pub(crate) fn ciphertext(&self, page: &PageId) -> Result<Option<CiphertextCopy>> {
+        if let Some(entry) = self.get(page)? {
+            return Ok(Some(entry.copy()));
+        }
+        Ok(self.unverified(page)?.map(|entry| entry.copy))
+    }
+    pub(crate) fn unverified(&self, page: &PageId) -> Result<Option<UnverifiedPage>> {
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries.get(page).is_some_and(|entry| {
+            !self.availability.page(
+                &page.version.object.cache,
+                entry.copy.ciphertext.envelope().key_id,
+            )
+        }) {
+            entries.remove(page);
+        }
+        Ok(entries.get(page).cloned())
+    }
+    pub(crate) fn publish_ciphertext(&self, page: UnverifiedPage) -> Result<()> {
+        self.pool.validate_ciphertext(&page.copy)?;
+        let id = &page.copy.ciphertext.envelope().page;
+        if !self.availability.page(
+            &id.version.object.cache,
+            page.copy.ciphertext.envelope().key_id,
+        ) {
+            return Err(Error::MissingKey);
+        }
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries.contains_key(id) {
+            return Ok(());
+        }
+        if entries.len() + self.entries.borrow().len() >= self.pool.entry_limit() {
+            return Err(Error::Overloaded);
+        }
+        entries.insert(id.clone(), page);
+        Ok(())
+    }
+    pub(crate) fn invalidate_ciphertext(&self, page: &UnverifiedPage) {
+        let id = &page.copy.ciphertext.envelope().page;
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries.get(id).is_some_and(|entry| {
+            Arc::ptr_eq(&entry.copy.ciphertext.inner, &page.copy.ciphertext.inner)
+        }) {
+            entries.remove(id);
+        }
+    }
+    /// Validate matching identities and full-page bounds before retaining the bundle.
+    pub fn publish(&self, page: PageResult) -> Result<()> {
+        self.pool.validate_page(&page)?;
+        self.publish_validated(page)
+    }
+    fn publish_validated(&self, page: PageResult) -> Result<()> {
+        let id = page.plaintext.page();
+        self.ciphertext_entries.borrow_mut().remove(id);
+        if !self.availability.cache(&id.version.object.cache) {
+            return Err(Error::Unavailable);
+        }
+        if !self.available(&page) {
+            return Err(Error::MissingKey);
+        }
+        let mut entries = self.entries.borrow_mut();
+        if let Some(known) = entries
+            .versions
+            .get(&page.metadata.version)
+            .and_then(|pages| pages.iter().next())
+            .and_then(|id| entries.pages.get(id))
+            && !known
+                .1
+                .metadata
+                .immutable()
+                .compatible(&page.metadata.immutable())
+        {
+            return Err(Error::CorruptRecord);
+        }
+        if let Some((_, entry)) = entries.pages.get(id) {
+            if entry.plaintext.bytes() != page.plaintext.bytes() {
+                return Err(Error::CorruptRecord);
+            }
+            // A duplicate fill must not replace the original nonce/ciphertext
+            // or turn its historical deadline into renewed freshness.
+            return Ok(());
+        }
+        if entries.len() + self.ciphertext_entries.borrow().len() >= self.pool.entry_limit() {
+            let id = entries
+                .candidates()
+                .into_iter()
+                .find_map(|(tick, id)| {
+                    entries.reclaim_after = tick;
+                    idle(&entries.pages[&id].1).then_some(id)
+                })
+                .ok_or(Error::Overloaded)?;
+            entries.remove(&id);
+        }
+        entries.insert(page)
+    }
+    pub(crate) fn metadata(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
+        let entries = self.entries.borrow();
+        let found = entries
+            .versions
+            .get(version)
+            .and_then(|pages| {
+                pages
+                    .iter()
+                    .filter_map(|id| entries.pages.get(id))
+                    .find(|(_, entry)| self.available(entry))
+            })
+            .map(|(_, entry)| entry.metadata.immutable());
+        if found.is_some() {
+            return Ok(found);
+        }
+        Ok(self
+            .ciphertext_entries
+            .borrow()
+            .values()
+            .find(|entry| {
+                &entry.copy.metadata.version == version
+                    && self.availability.page(
+                        &version.object.cache,
+                        entry.copy.ciphertext.envelope().key_id,
+                    )
+            })
+            .map(|entry| entry.copy.metadata.immutable()))
+    }
+    /// Return released admission bytes, including any reserved final-page slack.
+    /// Busy plaintext OR ciphertext protects the complete retained bundle.
+    pub fn evict_idle(&self, bytes: usize) -> Result<usize> {
+        let mut released = self.reclaim_ciphertext(None, bytes);
+        let mut entries = self.entries.borrow_mut();
+        let candidates = entries.candidates();
+        for (tick, id) in candidates {
+            if released >= bytes {
+                break;
+            }
+            entries.reclaim_after = tick;
+            let entry = &entries.pages[&id].1;
+            if !idle(entry) {
+                continue;
+            }
+            released = released
+                .saturating_add(entry.plaintext.inner.reservation.amount())
+                .saturating_add(entry.ciphertext.inner.reservation.amount());
+            entries.remove(&id);
+        }
+        self.pool.reclaim_buffers();
+        Ok(released)
+    }
+    /// One bounded LRU pass, counting only the exhausted class. The callback may
+    /// release a queued writer's sole extra ciphertext reference, never a reader.
+    pub(crate) fn reclaim_idle(
+        &self,
+        class: ResourceClass,
+        cache: Option<&CacheId>,
+        bytes: usize,
+        mut release_queued: impl FnMut(&PageResult) -> usize,
+    ) -> usize {
+        if !matches!(class, ResourceClass::Plaintext | ResourceClass::Ciphertext) {
+            return 0;
+        }
+        let mut released = if matches!(class, ResourceClass::Ciphertext) {
+            self.reclaim_ciphertext(cache, bytes)
+        } else {
+            0
+        };
+        let mut entries = self.entries.borrow_mut();
+        let candidates = entries.candidates();
+        for (tick, id) in candidates {
+            if released >= bytes {
+                break;
+            }
+            entries.reclaim_after = tick;
+            let entry = &entries.pages[&id].1;
+            if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache)
+                || Arc::strong_count(&entry.plaintext.inner) != 1
+            {
+                continue;
+            }
+            let staging = release_queued(entry);
+            if matches!(class, ResourceClass::Ciphertext) {
+                released = released.saturating_add(staging);
+            }
+            if released >= bytes {
+                break;
+            }
+            if !idle(entry) {
+                continue;
+            }
+            released = released.saturating_add(match class {
+                ResourceClass::Plaintext => entry.plaintext.inner.reservation.amount(),
+                _ => entry.ciphertext.inner.reservation.amount(),
+            });
+            entries.remove(&id);
+        }
+        released
+    }
+    pub(crate) fn remove_cache(&self, cache: &CacheId) -> Result<()> {
+        self.ciphertext_entries
+            .borrow_mut()
+            .retain(|id, _| &id.version.object.cache != cache);
+        let mut entries = self.entries.borrow_mut();
+        let removed: Vec<_> = entries
+            .pages
+            .keys()
+            .filter(|id| &id.version.object.cache == cache)
+            .cloned()
+            .collect();
+        for id in removed {
+            entries.remove(&id);
+        }
+        Ok(())
+    }
+    fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        let cursor = self.ciphertext_cursor.borrow().clone();
+        let selected: Vec<_> = entries
+            .range((
+                cursor
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                std::ops::Bound::Unbounded,
+            ))
+            .chain(
+                entries
+                    .iter()
+                    .take_while(|(id, _)| cursor.as_ref().is_some_and(|cursor| *id <= cursor)),
+            )
+            .take(256)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut released = 0;
+        for id in selected {
+            if released >= bytes {
+                break;
+            }
+            *self.ciphertext_cursor.borrow_mut() = Some(id.clone());
+            if cache.is_some_and(|c| c != &id.version.object.cache)
+                || Arc::strong_count(&entries[&id].copy.ciphertext.inner) != 1
+            {
+                continue;
+            }
+            if let Some(entry) = entries.remove(&id) {
+                released += entry.copy.ciphertext.inner.reservation.amount();
+            }
+        }
+        released
+    }
+}
+fn idle(entry: &PageResult) -> bool {
+    Arc::strong_count(&entry.plaintext.inner) == 1
+        && Arc::strong_count(&entry.ciphertext.inner) == 1
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::model::Nonce;
+    use crate::model::PageNumber;
+    use crate::model::VersionMetadata;
+    use uring_runtime::reactor::IoBuffer;
+    mod cache {
+        use super::*;
+        use crate::model::ExpiresAt;
+
+        #[test]
+        #[ignore = "deterministic cache refill trace experiment"]
+        fn reclaim_trace_experiment() {
+            use sha2::{Digest, Sha256};
+            const WARMUP: usize = 2048;
+            const MEASURE: usize = 20000;
+            let cache_id = CacheId(crate::test_support::security::CACHE.into());
+            let mut cdf = Vec::new();
+            let mut total = 0.0;
+            for rank in 1..=512 {
+                total += (rank as f64).powf(-1.2);
+                cdf.push(total);
+            }
+            for value in &mut cdf {
+                *value /= total;
+            }
+            cdf[511] = 1.0;
+            for workload in ["hot16_churn", "zipf512_1.2", "sequential512"] {
+                let mut limits = crate::test_support::cluster::config(false).limits;
+                limits.plaintext_bytes = std::num::NonZeroUsize::new(51 * 8).unwrap();
+                limits.ciphertext_bytes = std::num::NonZeroUsize::new(51 * 24).unwrap();
+                limits.metadata_entries = std::num::NonZeroUsize::new(512).unwrap();
+                let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+                let pool = BufferPool::new(admission.clone());
+                let cache = MemoryCache::new(pool.clone(), crate::test_support::availability());
+                let mut random = 0x6a09_e667_f3bc_c909u64;
+                let mut hash = Sha256::new();
+                let mut hits = 0;
+                let mut refills = 0;
+                let mut warmup_refills = 0;
+                let mut reclaims = 0;
+                for request in 0..WARMUP + MEASURE {
+                    let rank = match workload {
+                        "hot16_churn" if request % 5 == 4 => 16 + (request / 5) % 496,
+                        "hot16_churn" => (request / 5 * 4 + request % 5) % 16,
+                        "zipf512_1.2" => {
+                            random ^= random << 13;
+                            random ^= random >> 7;
+                            random ^= random << 17;
+                            let draw = (random >> 11) as f64 / (1u64 << 53) as f64;
+                            cdf.partition_point(|value| *value <= draw)
+                        }
+                        _ => request % 512,
+                    };
+                    hash.update((rank as u64).to_le_bytes());
+                    let mut key = [0; 32];
+                    key[..8].copy_from_slice(&(rank as u64).to_le_bytes());
+                    let metadata = VersionMetadata {
+                        content_type: None,
+                        version: ObjectVersion {
+                            object: crate::model::ObjectId {
+                                cache: cache_id.clone(),
+                                key: crate::model::CacheKey(key),
+                            },
+                            etag: crate::model::StrongEtag::test_value("trace-v1"),
+                        },
+                        length: 8,
+                    };
+                    let page = PageId {
+                        version: metadata.version.clone(),
+                        number: PageNumber(0),
+                    };
+                    if let Some(found) = cache.get(&page).unwrap() {
+                        drop(found);
+                        hits += usize::from(request >= WARMUP);
+                    } else {
+                        refills += usize::from(request >= WARMUP);
+                        warmup_refills += usize::from(request < WARMUP);
+                        let mut reserve =
+                            |class, amount| match admission.reserve(Some(&cache_id), class, amount)
+                            {
+                                Ok(charge) => charge,
+                                Err(flow_control::Error::Overloaded) => {
+                                    assert!(
+                                        cache.reclaim_idle(class, Some(&cache_id), amount, |_| 0)
+                                            >= amount
+                                    );
+                                    reclaims += usize::from(request >= WARMUP);
+                                    admission.reserve(Some(&cache_id), class, amount).unwrap()
+                                }
+                                Err(error) => panic!("unexpected admission error: {error:?}"),
+                            };
+                        let cipher_charge = reserve(ResourceClass::Ciphertext, 24);
+                        let plain_charge = reserve(ResourceClass::Plaintext, 8);
+                        let plaintext = VerifiedPage {
+                            inner: Arc::new(VerifiedBytes {
+                                page: page.clone(),
+                                storage: flow_control::ChargedBytes {
+                                    bytes: (rank as u64).to_le_bytes().to_vec(),
+                                    reservation: plain_charge,
+                                },
+                            }),
+                        };
+                        let ciphertext = pool
+                            .ciphertext(
+                                cipher_charge,
+                                PageEnvelope {
+                                    page,
+                                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                                    nonce: Nonce([2; 24]),
+                                    plaintext_length: 8,
+                                    ciphertext_length: 24,
+                                },
+                                vec![2; 24],
+                            )
+                            .unwrap();
+                        cache
+                            .publish(PageResult {
+                                metadata: metadata.for_pin(),
+                                plaintext,
+                                ciphertext,
+                            })
+                            .unwrap();
+                    }
+                    let entries = cache.entries.borrow();
+                    assert!(entries.len() <= 51);
+                    assert_eq!(admission.used(ResourceClass::Plaintext), entries.len() * 8);
+                    assert_eq!(
+                        admission.used(ResourceClass::Ciphertext),
+                        entries.len() * 24
+                    );
+                    assert!(admission.used(ResourceClass::Plaintext) <= 408);
+                    assert!(admission.used(ResourceClass::Ciphertext) <= 1224);
+                }
+                assert_eq!(hits + refills, MEASURE);
+                cache.evict_idle(usize::MAX).unwrap();
+                admission.reclaim_buffers();
+                assert!(cache.entries.borrow().pages.is_empty());
+                assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+                assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+                println!(
+                    "reclaim_trace workload={workload} sha256={:x} warmup={WARMUP} measured={MEASURE} warmup_refills={warmup_refills} hits={hits} refills={refills} reclaims={reclaims} cleanup_plain=0 cleanup_cipher=0",
+                    hash.finalize()
+                );
+            }
+        }
+
+        mod partial_reclaim {
+            use super::*;
+
+            fn publish(
+                cache: &MemoryCache,
+                admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+                name: &str,
+            ) -> PageId {
+                let page = bundle(admission, name);
+                let id = page.plaintext.page().clone();
+                cache.publish(page).unwrap();
+                id
+            }
+
+            fn publish_ciphertext(
+                cache: &MemoryCache,
+                admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+                name: &str,
+            ) -> PageId {
+                let page = bundle(admission, name);
+                let id = page.plaintext.page().clone();
+                cache
+                    .publish_ciphertext(UnverifiedPage {
+                        copy: page.copy(),
+                        disk_token: None,
+                    })
+                    .unwrap();
+                id
+            }
+
+            #[test]
+            fn capacity_and_eviction_resume_after_examined_victim() {
+                for capacity in [false, true] {
+                    let admission = admission(if capacity { 3 } else { 8 });
+                    let cache = MemoryCache::new(
+                        BufferPool::new(admission.clone()),
+                        crate::test_support::availability(),
+                    );
+                    let a = publish(&cache, &admission, "a");
+                    let b = publish(&cache, &admission, "b");
+                    let c = publish(&cache, &admission, "c");
+                    if !capacity {
+                        assert_eq!(cache.evict_idle(1), Ok(22));
+                    }
+                    let d = publish(&cache, &admission, "d");
+                    assert!(!cache.entries.borrow().pages.contains_key(&a));
+                    assert_eq!(cache.entries.borrow().reclaim_after, 1);
+                    if capacity {
+                        publish(&cache, &admission, "e");
+                    } else {
+                        assert_eq!(cache.evict_idle(1), Ok(22));
+                    }
+                    let entries = cache.entries.borrow();
+                    assert!(!entries.pages.contains_key(&b));
+                    assert!(entries.pages.contains_key(&c));
+                    assert!(entries.pages.contains_key(&d));
+                    assert_eq!(entries.reclaim_after, 2);
+                }
+            }
+
+            #[test]
+            fn zero_targets_and_ciphertext_sufficiency_leave_paired_cursor_untouched() {
+                for evict in [false, true] {
+                    let admission = admission(8);
+                    let cache = MemoryCache::new(
+                        BufferPool::new(admission.clone()),
+                        crate::test_support::availability(),
+                    );
+                    let paired = publish(&cache, &admission, "paired");
+                    let cipher = publish_ciphertext(&cache, &admission, "cipher");
+                    assert_eq!(cache.evict_idle(0), Ok(0));
+                    for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
+                        assert_eq!(
+                            cache.reclaim_idle(class, None, 0, |_| panic!("zero target callback")),
+                            0
+                        );
+                    }
+                    assert_eq!(cache.entries.borrow().reclaim_after, 0);
+                    assert_eq!(*cache.ciphertext_cursor.borrow(), None);
+                    if evict {
+                        assert_eq!(cache.evict_idle(1), Ok(19));
+                    } else {
+                        assert_eq!(
+                            cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_| panic!(
+                                "target already met"
+                            )),
+                            19
+                        );
+                    }
+                    assert_eq!(cache.entries.borrow().reclaim_after, 0);
+                    assert!(cache.entries.borrow().pages.contains_key(&paired));
+                    assert_eq!(*cache.ciphertext_cursor.borrow(), Some(cipher));
+                }
+            }
+
+            #[test]
+            fn examined_filters_and_staging_callback_advance_cursor() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let a = publish(&cache, &admission, "a");
+                let b = publish(&cache, &admission, "b");
+                let held = cache.entries.borrow().pages[&a].1.plaintext.clone();
+                assert_eq!(
+                    cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
+                    3
+                );
+                assert_eq!(cache.entries.borrow().reclaim_after, 2);
+                assert!(cache.entries.borrow().pages.contains_key(&a));
+                assert!(!cache.entries.borrow().pages.contains_key(&b));
+                let c = publish(&cache, &admission, "c");
+                let wrong = CacheId("wrong".into());
+                assert_eq!(
+                    cache.reclaim_idle(ResourceClass::Plaintext, Some(&wrong), 1, |_| panic!(
+                        "wrong cache callback"
+                    )),
+                    0
+                );
+                assert_eq!(cache.entries.borrow().reclaim_after, 1);
+                let staging = admission
+                    .reserve(Some(&c.version.object.cache), ResourceClass::Ciphertext, 1)
+                    .unwrap();
+                let mut staging = Some(staging);
+                assert_eq!(
+                    cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |page| {
+                        assert_eq!(page.plaintext.page(), &c);
+                        drop(staging.take().unwrap());
+                        1
+                    }),
+                    1
+                );
+                assert_eq!(cache.entries.borrow().reclaim_after, 3);
+                assert!(cache.entries.borrow().pages.contains_key(&c));
+                drop(held);
+            }
+
+            #[test]
+            fn ciphertext_partial_scan_preserves_unexamined_keys_after_insertion() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let a = publish_ciphertext(&cache, &admission, "a");
+                let b = publish_ciphertext(&cache, &admission, "b");
+                let c = publish_ciphertext(&cache, &admission, "c");
+                assert!(a < b && b < c);
+                assert_eq!(cache.reclaim_ciphertext(None, 1), 19);
+                assert_eq!(*cache.ciphertext_cursor.borrow(), Some(a));
+                let d = publish_ciphertext(&cache, &admission, "d");
+                assert!(c < d);
+                assert_eq!(cache.reclaim_ciphertext(None, 1), 19);
+                assert_eq!(*cache.ciphertext_cursor.borrow(), Some(b.clone()));
+                let entries = cache.ciphertext_entries.borrow();
+                assert!(!entries.contains_key(&b));
+                assert!(entries.contains_key(&c));
+                assert!(entries.contains_key(&d));
+            }
+
+            #[test]
+            fn ciphertext_busy_prefix_and_wrong_cache_advance_bounded_scan() {
+                let admission = admission(300);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                for n in 0..257 {
+                    publish_ciphertext(&cache, &admission, &format!("v{n:03}"));
+                }
+                let ids: Vec<_> = cache.ciphertext_entries.borrow().keys().cloned().collect();
+                let held: Vec<_> = ids[..256]
+                    .iter()
+                    .map(|id| {
+                        cache.ciphertext_entries.borrow()[id]
+                            .copy
+                            .ciphertext
+                            .clone()
+                    })
+                    .collect();
+                assert_eq!(cache.reclaim_ciphertext(None, 1), 0);
+                assert_eq!(*cache.ciphertext_cursor.borrow(), Some(ids[255].clone()));
+                assert_eq!(cache.reclaim_ciphertext(None, 1), 19);
+                assert_eq!(*cache.ciphertext_cursor.borrow(), Some(ids[256].clone()));
+                drop(held);
+                assert_eq!(
+                    cache.reclaim_ciphertext(Some(&CacheId("wrong".into())), 1),
+                    0
+                );
+                assert_eq!(*cache.ciphertext_cursor.borrow(), Some(ids[255].clone()));
+                assert_eq!(cache.ciphertext_entries.borrow().len(), 256);
+                assert_eq!(cache.reclaim_ciphertext(None, 1), 19);
+                assert_eq!(*cache.ciphertext_cursor.borrow(), Some(ids[0].clone()));
+            }
+
+            #[test]
+            fn empty_and_maximum_clock_selection_is_nonmutating_and_wraps() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                cache.entries.borrow_mut().reclaim_after = u64::MAX;
+                assert!(cache.entries.borrow().candidates().is_empty());
+                assert_eq!(cache.evict_idle(1), Ok(0));
+                assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX);
+                cache.entries.borrow_mut().clock = u64::MAX - 2;
+                let a = publish(&cache, &admission, "a");
+                let b = publish(&cache, &admission, "b");
+                assert_eq!(
+                    cache.entries.borrow().candidates(),
+                    vec![(u64::MAX - 1, a.clone()), (u64::MAX, b.clone())]
+                );
+                assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX);
+                assert_eq!(
+                    cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
+                    3
+                );
+                assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX - 1);
+                assert_eq!(
+                    cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
+                    3
+                );
+                assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX);
+                assert_eq!(
+                    cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
+                    0
+                );
+                assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX);
+            }
+
+            enum Change {
+                None,
+                Publish,
+                Touch,
+            }
+
+            fn check(class: ResourceClass, change: Change) {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let mut ids = Vec::new();
+                for name in ["a", "b", "c"] {
+                    let page = bundle(&admission, name);
+                    ids.push(page.plaintext.page().clone());
+                    cache.publish(page).unwrap();
+                }
+                let charge = match class {
+                    ResourceClass::Plaintext => 3,
+                    ResourceClass::Ciphertext => 19,
+                    _ => unreachable!(),
+                };
+                assert!(
+                    cache
+                        .entries
+                        .borrow()
+                        .pages
+                        .values()
+                        .all(|(_, page)| idle(page))
+                );
+                assert_eq!(cache.reclaim_idle(class, None, 1, |_| 0), charge);
+                {
+                    let entries = cache.entries.borrow();
+                    assert!(!entries.pages.contains_key(&ids[0]), "first victim is A");
+                    assert!(entries.pages.contains_key(&ids[1]), "B remains idle");
+                    assert!(entries.pages.contains_key(&ids[2]), "C remains idle");
+                }
+                assert_eq!(admission.used(ResourceClass::Plaintext), 6);
+                assert_eq!(admission.used(ResourceClass::Ciphertext), 38);
+
+                let expected = match change {
+                    Change::None => vec![false, false, true],
+                    Change::Publish => {
+                        let page = bundle(&admission, "d");
+                        ids.push(page.plaintext.page().clone());
+                        cache.publish(page).unwrap();
+                        vec![false, false, true, true]
+                    }
+                    Change::Touch => {
+                        drop(cache.get(&ids[1]).unwrap().unwrap());
+                        vec![false, true, false]
+                    }
+                };
+                assert!(
+                    cache
+                        .entries
+                        .borrow()
+                        .pages
+                        .values()
+                        .all(|(_, page)| idle(page))
+                );
+                assert_eq!(cache.reclaim_idle(class, None, 1, |_| 0), charge);
+                let entries = cache.entries.borrow();
+                let present: Vec<_> = ids
+                    .iter()
+                    .map(|id| entries.pages.contains_key(id))
+                    .collect();
+                assert_eq!(
+                    present, expected,
+                    "{class:?}: resident [A, B, C, optional D]; reclaim older unprocessed idle pages before recent pages"
+                );
+            }
+
+            #[test]
+            fn plaintext_without_new_ticks_reclaims_older_idle_page() {
+                check(ResourceClass::Plaintext, Change::None);
+            }
+
+            #[test]
+            fn ciphertext_without_new_ticks_reclaims_older_idle_page() {
+                check(ResourceClass::Ciphertext, Change::None);
+            }
+
+            #[test]
+            fn plaintext_preserves_newly_published_page() {
+                check(ResourceClass::Plaintext, Change::Publish);
+            }
+
+            #[test]
+            fn ciphertext_preserves_newly_published_page() {
+                check(ResourceClass::Ciphertext, Change::Publish);
+            }
+
+            #[test]
+            fn plaintext_preserves_recently_touched_page() {
+                check(ResourceClass::Plaintext, Change::Touch);
+            }
+
+            #[test]
+            fn ciphertext_preserves_recently_touched_page() {
+                check(ResourceClass::Ciphertext, Change::Touch);
+            }
+        }
+
+        #[test]
+        fn ciphertext_residency_is_distinct_bounded_and_conditionally_invalidated() {
+            let admission = admission(2);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let first = bundle(&admission, "cipher");
+            let id = first.plaintext.page().clone();
+            let unverified = UnverifiedPage {
+                copy: first.copy(),
+                disk_token: None,
+            };
+            cache.publish_ciphertext(unverified.clone()).unwrap();
+            assert!(cache.get(&id).unwrap().is_none());
+            assert_eq!(
+                cache.ciphertext(&id).unwrap().unwrap().ciphertext.bytes(),
+                first.ciphertext.bytes()
+            );
+            let replacement = bundle(&admission, "cipher");
+            cache.invalidate_ciphertext(&UnverifiedPage {
+                copy: replacement.copy(),
+                disk_token: None,
+            });
+            assert!(
+                cache.unverified(&id).unwrap().is_some(),
+                "different allocation must not invalidate"
+            );
+            cache.invalidate_ciphertext(&unverified);
+            assert!(cache.unverified(&id).unwrap().is_none());
+            cache.publish_ciphertext(unverified).unwrap();
+            cache.publish(first).unwrap();
+            assert!(cache.unverified(&id).unwrap().is_none());
+            assert!(cache.get(&id).unwrap().is_some());
+        }
+        #[test]
+        fn bounded_reclamation_advances_past_a_busy_prefix() {
+            let admission = admission(300);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let mut busy = Vec::new();
+            let mut ids = Vec::new();
+            for n in 0..300 {
+                let page = bundle(&admission, &format!("v{n}"));
+                ids.push(page.plaintext.page().clone());
+                if n < 256 {
+                    busy.push(page.clone());
+                }
+                cache.publish(page).unwrap();
+            }
+            assert_eq!(cache.evict_idle(1), Ok(0));
+            assert_eq!(cache.evict_idle(1), Ok(22));
+            assert!(cache.get(&ids[256]).unwrap().is_none());
+            assert!(cache.get(&ids[257]).unwrap().is_some());
+            for reader in &busy {
+                assert_eq!(reader.plaintext.bytes(), &[1; 3]);
+                assert!(cache.get(reader.plaintext.page()).unwrap().is_some());
+            }
+            assert_eq!(admission.used(ResourceClass::Plaintext), 299 * 3);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 299 * 19);
+            drop(busy);
+            for _ in 0..3 {
+                cache.evict_idle(usize::MAX).unwrap();
+            }
+            for id in ids {
+                assert!(cache.get(&id).unwrap().is_none());
+            }
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+        #[test]
+        fn busy_leases_protect_both_allocations_and_eviction_releases_idle_bytes() {
+            let admission = admission(8);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let page = bundle(&admission, "v1");
+            let id = page.plaintext.page().clone();
+            cache.publish(page).unwrap();
+            let copy = cache.ciphertext(&id).unwrap().unwrap();
+            assert_eq!(cache.evict_idle(usize::MAX), Ok(0));
+            drop(copy);
+            let plaintext = cache.get(&id).unwrap().unwrap().plaintext;
+            assert_eq!(cache.evict_idle(usize::MAX), Ok(0));
+            drop(plaintext);
+            assert_eq!(cache.evict_idle(0), Ok(0));
+            assert_eq!(cache.evict_idle(1), Ok(22));
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+            assert!(cache.get(&id).unwrap().is_none());
+            assert!(cache.metadata(&id.version).unwrap().is_none());
+        }
+        #[test]
+        fn duplicate_preserves_original_ciphertext_metadata_and_expired_deadline() {
+            let admission = admission(8);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let page = bundle(&admission, "v1");
+            let id = page.plaintext.page().clone();
+            let original = page.ciphertext.envelope().clone();
+            cache.publish(page).unwrap();
+            let mut duplicate = bundle(&admission, "v1");
+            duplicate.metadata.expires_at = ExpiresAt::from_unix_millis(123456).unwrap();
+            Arc::get_mut(&mut duplicate.ciphertext.inner)
+                .unwrap()
+                .envelope
+                .nonce
+                .0[0] ^= 1;
+            cache.publish(duplicate).unwrap();
+            let copy = cache.ciphertext(&id).unwrap().unwrap();
+            assert_eq!(copy.ciphertext.envelope(), &original);
+            assert_eq!(copy.ciphertext.bytes(), &[2; 19]);
+            assert_eq!(
+                copy.metadata.expires_at,
+                ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap()
+            );
+            assert_eq!(
+                cache.metadata(&id.version).unwrap(),
+                Some(copy.metadata.immutable())
+            );
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        }
+        #[test]
+        fn capacity_evicts_least_recent_idle_entry_and_rejects_all_busy() {
+            let admission = admission(2);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let first = bundle(&admission, "v1");
+            let first_id = first.plaintext.page().clone();
+            let second = bundle(&admission, "v2");
+            let second_id = second.plaintext.page().clone();
+            cache.publish(first).unwrap();
+            cache.publish(second).unwrap();
+            let busy = cache.get(&first_id).unwrap().unwrap();
+            let also_busy = cache.get(&second_id).unwrap().unwrap();
+            assert_eq!(
+                cache.publish(bundle(&admission, "v3")),
+                Err(Error::Overloaded)
+            );
+            drop(also_busy);
+            let third = bundle(&admission, "v3");
+            let third_id = third.plaintext.page().clone();
+            cache.publish(third).unwrap();
+            assert!(cache.get(&second_id).unwrap().is_none());
+            assert!(cache.get(&first_id).unwrap().is_some());
+            drop(busy);
+            let fourth = bundle(&admission, "v4");
+            let fourth_id = fourth.plaintext.page().clone();
+            cache.publish(fourth).unwrap();
+            assert!(cache.get(&first_id).unwrap().is_some());
+            assert!(cache.get(&third_id).unwrap().is_none());
+            assert!(cache.get(&fourth_id).unwrap().is_some());
+            assert_eq!(admission.used(ResourceClass::Plaintext), 6);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 38);
+        }
+        #[test]
+        fn publication_rejects_foreign_undercharged_and_conflicting_bundles() {
+            let admission = admission(8);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            assert_eq!(
+                cache.publish(bundle(&self::admission(8), "v1")),
+                Err(Error::InvalidConfiguration)
+            );
+            let mut malformed = bundle(&admission, "v1");
+            Arc::get_mut(&mut malformed.ciphertext.inner)
+                .unwrap()
+                .bytes
+                .pop();
+            assert_eq!(cache.publish(malformed), Err(Error::CorruptRecord));
+            let mut undercharged = bundle(&admission, "v1");
+            let wrong = admission
+                .reserve(
+                    Some(&undercharged.metadata.version.object.cache),
+                    ResourceClass::Ciphertext,
+                    3,
+                )
+                .unwrap();
+            Arc::get_mut(&mut undercharged.plaintext.inner)
+                .unwrap()
+                .reservation = wrong;
+            assert_eq!(
+                cache.publish(undercharged),
+                Err(Error::InvalidConfiguration)
+            );
+            let original = bundle(&admission, "v1");
+            let id = original.plaintext.page().clone();
+            cache.publish(original).unwrap();
+            let mut conflicting = bundle(&admission, "v1");
+            Arc::get_mut(&mut conflicting.plaintext.inner)
+                .unwrap()
+                .bytes[0] ^= 1;
+            assert_eq!(cache.publish(conflicting), Err(Error::CorruptRecord));
+            let mut inconsistent = bundle(&admission, "v2");
+            let rejected_id = inconsistent.plaintext.page().clone();
+            inconsistent.metadata.version.etag = crate::model::StrongEtag::test_value("v1");
+            assert_eq!(cache.publish(inconsistent), Err(Error::CorruptRecord));
+            assert_eq!(cache.get(&id).unwrap().unwrap().plaintext.bytes(), &[1; 3]);
+            assert!(cache.get(&rejected_id).unwrap().is_none());
+            assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        }
+        #[test]
+        fn eviction_is_cache_scoped_and_preserves_live_leases() {
+            let admission = admission(8);
+            let other_cache = CacheId("44444444-4444-4444-8444-444444444444".into());
+            let availability = crate::test_support::availability_for(vec![
+                CacheId(crate::test_support::security::CACHE.into()),
+                other_cache.clone(),
+            ]);
+            let cache = MemoryCache::new(BufferPool::new(admission.clone()), availability);
+            let page = bundle(&admission, "v1");
+            let id = page.plaintext.page().clone();
+            let mut other_descriptor = page.metadata.immutable();
+            other_descriptor.version.object.cache = other_cache;
+            let other = bundle_for(&admission, other_descriptor.clone());
+            let other_id = other.plaintext.page().clone();
+            cache.publish(page.clone()).unwrap();
+            cache.publish(other).unwrap();
+            cache.remove_cache(&id.version.object.cache).unwrap();
+            assert!(cache.get(&id).unwrap().is_none());
+            assert!(cache.get(&other_id).unwrap().is_some());
+            assert_eq!(page.plaintext.bytes(), &[1; 3]);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 6);
+            drop(page);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+            let lease = cache.ciphertext(&other_id).unwrap().unwrap();
+            cache.remove_cache(&other_id.version.object.cache).unwrap();
+            assert!(cache.get(&other_id).unwrap().is_none());
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            drop(lease);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+        #[test]
+        fn eviction_is_idempotent_and_churn_needs_no_tombstones() {
+            let admission = admission(1);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission),
+                crate::test_support::availability(),
+            );
+            let id = CacheId("cache".into());
+            assert_eq!(cache.remove_cache(&id), Ok(()));
+            assert_eq!(cache.remove_cache(&id), Ok(()));
+            assert_eq!(cache.remove_cache(&CacheId("other".into())), Ok(()));
+            for n in 0..10_000 {
+                cache.remove_cache(&CacheId(n.to_string())).unwrap();
+            }
+        }
+        #[test]
+        fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
+            use crate::control::for_caches;
+            use crate::test_support::security::rotation_bundle;
+            let admission = admission(1024);
+            let keys = Rc::new(crate::test_support::security::keys());
+            let roots = (*keys.peer_trust_roots().unwrap()).clone();
+            let caches: Vec<_> = (0..356)
+                .map(|cache| CacheId(format!("{cache:08x}-0000-4000-8000-000000000000")))
+                .collect();
+            let memory = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                for_caches(keys.clone(), caches.clone()),
+            );
+            use racer_control_wire::CacheKeyPurpose;
+            let mut previous: Vec<racer_control_wire::CacheKeyRef> = Vec::new();
+            for generation in 2u64..=6 {
+                let mut next = rotation_bundle(generation, roots.clone());
+                let templates = std::mem::take(&mut next.cache_keys);
+                for cache in 0u64..356 {
+                    for template in &templates {
+                        let mut key = template.clone();
+                        key.key.cache = CacheId(format!("{cache:08x}-0000-4000-8000-000000000000"));
+                        let (reference, state, mut material) = key.clone().into_installation();
+                        material[8..16].copy_from_slice(&cache.to_be_bytes());
+                        key =
+                            racer_control_wire::CacheEncryptionKey::new(reference, state, material);
+                        next.cache_keys.push(key);
+                    }
+                }
+                keys.install(next.clone()).unwrap();
+                for key in previous {
+                    if key.purpose == CacheKeyPurpose::Page {
+                        assert!(!memory.availability.page(&key.cache, key.id));
+                    }
+                }
+                previous = next.cache_keys.iter().map(|key| key.key.clone()).collect();
+            }
+            assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+    }
+
+    pub(in crate::memory) fn admission(
+        entries: usize,
+    ) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.metadata_entries = std::num::NonZeroUsize::new(entries).unwrap();
+        Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)))
+    }
+    pub(in crate::memory) fn bundle(
+        admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+        version: &str,
+    ) -> PageResult {
+        use crate::model::CacheKey;
+        use crate::model::ObjectId;
+        use crate::model::ObjectVersion;
+        use crate::model::StrongEtag;
+        bundle_for(
+            admission,
+            VersionMetadata {
+                content_type: None,
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: CacheId(crate::test_support::security::CACHE.into()),
+                        key: CacheKey([0; 32]),
+                    },
+                    etag: StrongEtag::test_value(version),
+                },
+                length: 3,
+            },
+        )
+    }
+    pub(crate) fn bundle_for(
+        admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+        metadata: VersionMetadata,
+    ) -> PageResult {
+        let page = PageId {
+            version: metadata.version.clone(),
+            number: PageNumber(0),
+        };
+        let cache = &page.version.object.cache;
+        let plaintext = VerifiedPage {
+            inner: Arc::new(VerifiedBytes {
+                page: page.clone(),
+                storage: flow_control::ChargedBytes {
+                    bytes: vec![1; 3],
+                    reservation: admission
+                        .reserve(Some(cache), ResourceClass::Plaintext, 3)
+                        .unwrap(),
+                },
+            }),
+        };
+        let ciphertext = BufferPool::new(admission.clone())
+            .ciphertext(
+                admission
+                    .reserve(Some(cache), ResourceClass::Ciphertext, 19)
+                    .unwrap(),
+                PageEnvelope {
+                    page,
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                    nonce: Nonce([2; 24]),
+                    plaintext_length: 3,
+                    ciphertext_length: 19,
+                },
+                vec![2; 19],
+            )
+            .unwrap();
+        PageResult {
+            metadata: metadata.for_pin(),
+            plaintext,
+            ciphertext,
+        }
+    }
+    #[test]
+    fn rehome_moves_exclusive_bytes_but_preserves_shared_transport_owners() {
+        for shared in [false, true] {
+            let source = admission(8);
+            let target = admission(8);
+            let mut page = bundle(&source, "rehome");
+            let provenance = crate::telemetry::PeerProvenance {
+                request: crate::model::RequestId([3; 16]),
+                attempt: crate::model::AttemptId([4; 16]),
+                supplier: [b'a'; 36],
+                remote: [b'b'; 36],
+            };
+            page.ciphertext.provenance = Some(provenance);
+            let checksum = page.ciphertext.checksum();
+            let pointer = page.ciphertext.bytes().as_ptr();
+            let retained = shared.then(|| page.ciphertext.clone());
+            let reservation = target
+                .reserve(
+                    Some(&page.metadata.version.object.cache),
+                    ResourceClass::Ciphertext,
+                    19,
+                )
+                .unwrap();
+            let moved = page.ciphertext.rehome(reservation).unwrap();
+            assert_eq!(moved.bytes().as_ptr() == pointer, !shared);
+            assert_eq!(moved.checksum(), checksum);
+            assert_eq!(moved.provenance, Some(provenance));
+            if let Some(retained) = &retained {
+                assert_eq!(retained.provenance, Some(provenance));
+            }
+            assert!(target.owns(&moved.inner.reservation));
+            assert_eq!(
+                source.used(ResourceClass::Ciphertext),
+                if shared { 19 } else { 0 }
+            );
+            assert_eq!(target.used(ResourceClass::Ciphertext), 19);
+            drop(retained);
+            assert_eq!(source.used(ResourceClass::Ciphertext), 0);
+            drop(moved);
+            assert_eq!(target.used(ResourceClass::Ciphertext), 0);
+        }
+    }
+
+    #[test]
+    fn rehome_rejects_wrong_cache_class_and_insufficient_charge() {
+        let source = admission(8);
+        let target = admission(8);
+        let page = bundle(&source, "rehome");
+        let cache = &page.metadata.version.object.cache;
+        let wrong = CacheId("wrong".into());
+        for (cache, class, amount) in [
+            (&wrong, ResourceClass::Ciphertext, 19),
+            (cache, ResourceClass::Plaintext, 19),
+            (cache, ResourceClass::Ciphertext, 18),
+        ] {
+            assert!(matches!(
+                page.ciphertext
+                    .clone()
+                    .rehome(target.reserve(Some(cache), class, amount).unwrap(),),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        assert_eq!(source.used(ResourceClass::Ciphertext), 19);
+        assert_eq!(target.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(target.used(ResourceClass::Plaintext), 0);
+    }
+
+    #[test]
+    fn aead_fingerprints_reuse_crc_and_separate_body_from_identity() {
+        use crate::model::RequestId;
+        use crate::security::capture_aead_failure;
+        let admission = admission(8);
+        let mut page = bundle(&admission, "sensitive-etag");
+        let request = RequestId([9; 16]);
+        let capture = |p: &CiphertextPage| {
+            // Use a small stand-in AAD to isolate diagnostic fingerprinting.
+            // Production passes the already validated canonical page_aad bytes.
+            let mut aad = p.envelope().nonce.0.to_vec();
+            aad.extend_from_slice(p.envelope().page.version.etag.as_bytes());
+            capture_aead_failure(p, &aad, request)
+        };
+        assert_eq!(page.ciphertext.cached_checksum(), None);
+        assert_eq!(capture(&page.ciphertext).crc, None);
+        assert_eq!(capture(&page.ciphertext).peer, None);
+        assert_eq!(
+            page.ciphertext.cached_checksum(),
+            None,
+            "capture must not hash payload"
+        );
+        let provenance = crate::telemetry::PeerProvenance {
+            request: RequestId([3; 16]),
+            attempt: crate::model::AttemptId([4; 16]),
+            supplier: [b'a'; 36],
+            remote: [b'b'; 36],
+        };
+        page.ciphertext.provenance = Some(provenance);
+        page.ciphertext.verify_checksum().unwrap();
+        assert_eq!(page.ciphertext.verify_checksum(), Ok(()));
+        let first = capture(&page.ciphertext);
+        let repeat = capture(&page.ciphertext);
+        // Frozen SHA-256 vectors include the domain, u64 field lengths, exact
+        // quoted ETag and page number. The AAD fingerprint hashes exact bytes.
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            hex(&first.page),
+            "c862fae4132569c58e99bb681cc7e9907ea20a693ea6760bf1ea5fcf7224243e"
+        );
+        assert_eq!(
+            hex(&first.aad),
+            "611dfd441fbad13fcb7e6e98a61a2704e30651ca1f2353acdc32906dd8ae3122"
+        );
+        assert_eq!(first.request, request);
+        assert_eq!(first.peer, Some(provenance));
+        assert_eq!(first.number, 0);
+        assert_eq!(first.key, page.ciphertext.envelope().key_id.0);
+        assert_eq!(first.nonce, [2; 24]);
+        assert_eq!((first.plaintext, first.ciphertext), (3, 19));
+        assert_eq!(
+            first.crc,
+            Some(racer_crypto::crc64(page.ciphertext.bytes()))
+        );
+        assert_eq!(first.page, repeat.page);
+        assert_eq!(first.aad, repeat.aad);
+        assert_eq!(first.crc, repeat.crc);
+        let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
+        inner.bytes[0] ^= 1;
+        assert!(page.validate_metadata().is_ok());
+        assert_eq!(page.ciphertext.verify_checksum(), Err(Error::CorruptRecord));
+        assert_eq!(capture(&page.ciphertext).crc, first.crc);
+        assert_eq!(page.ciphertext.cached_checksum(), first.crc);
+        Arc::get_mut(&mut page.ciphertext.inner).unwrap().checksum = std::sync::OnceLock::new();
+        page.ciphertext.verify_checksum().unwrap();
+        let changed = capture(&page.ciphertext);
+        assert_ne!(first.crc, changed.crc);
+        assert_eq!(first.page, changed.page);
+        assert_eq!(first.aad, changed.aad);
+        Arc::get_mut(&mut page.ciphertext.inner)
+            .unwrap()
+            .envelope
+            .nonce
+            .0[0] ^= 1;
+        let changed_aad = capture(&page.ciphertext);
+        assert_eq!(changed.crc, changed_aad.crc);
+        assert_eq!(changed.page, changed_aad.page);
+        assert_ne!(changed.aad, changed_aad.aad);
+        let failures = crate::telemetry::Failures::default();
+        failures.observer(crate::model::WorkerId(0)).record_aead(
+            crate::security::CryptoId {
+                worker: crate::model::WorkerId(0),
+                generation: 0,
+                sequence: 1,
+            },
+            first,
+        );
+        let mut text = String::new();
+        failures.write_aead(&mut text).unwrap();
+        assert!(!text.contains("sensitive-etag"));
+        assert!(!text.contains(&page.ciphertext.envelope().page.version.object.key.to_hex()));
+        drop(page);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        let mut retained = String::new();
+        failures.write_aead(&mut retained).unwrap();
+        assert_eq!(retained, text, "diagnostic facts do not retain page owners");
+    }
+    #[test]
+    fn plaintext_is_stable_zeroed_and_reservation_backed() {
+        let admission = admission(8);
+        let pool = BufferPool::new(admission.clone());
+        let cache = CacheId("cache".into());
+        let reservation = admission
+            .reserve(Some(&cache), ResourceClass::Plaintext, 8)
+            .unwrap();
+        let mut buffer = pool.plaintext(reservation, 3).unwrap();
+        assert_eq!(buffer.bytes().unwrap(), &[0; 3]);
+        let pointer = buffer.bytes().unwrap().as_ptr();
+        buffer.bytes_mut().unwrap().copy_from_slice(b"abc");
+        let (bytes, reservation) = buffer.into_parts();
+        assert_eq!(bytes.as_ptr(), pointer);
+        assert_eq!(&*bytes, b"abc");
+        assert_eq!(reservation.amount(), 3);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+        drop((bytes, reservation));
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    }
+    #[test]
+    fn allocations_reject_wrong_provenance_class_cache_and_bounds() {
+        let admission = admission(8);
+        let pool = BufferPool::new(admission.clone());
+        let other = self::admission(8);
+        let cache = CacheId("cache".into());
+        for (owner, class, cache, amount, length) in [
+            (&other, ResourceClass::Plaintext, Some(&cache), 3, 3),
+            (&admission, ResourceClass::Ciphertext, Some(&cache), 3, 3),
+            (&admission, ResourceClass::Plaintext, None, 3, 3),
+            (&admission, ResourceClass::Plaintext, Some(&cache), 2, 3),
+            (&admission, ResourceClass::Plaintext, Some(&cache), 3, 0),
+            (
+                &admission,
+                ResourceClass::Plaintext,
+                Some(&cache),
+                3,
+                PAGE_BYTES as usize + 1,
+            ),
+        ] {
+            assert!(matches!(
+                pool.plaintext(owner.reserve(cache, class, amount).unwrap(), length),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        let page = bundle(&admission, "v1");
+        let envelope = page.ciphertext.envelope().clone();
+        let wrong = CacheId("other".into());
+        for (owner, class, cache, amount) in [
+            (&other, ResourceClass::Ciphertext, &cache, 19),
+            (&admission, ResourceClass::Plaintext, &cache, 19),
+            (&admission, ResourceClass::Ciphertext, &wrong, 19),
+            (&admission, ResourceClass::Ciphertext, &cache, 18),
+        ] {
+            assert!(matches!(
+                pool.ciphertext(
+                    owner.reserve(Some(cache), class, amount).unwrap(),
+                    envelope.clone(),
+                    vec![0; 19]
+                ),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        for length in [0, 18, 20] {
+            assert!(matches!(
+                pool.ciphertext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, 20)
+                        .unwrap(),
+                    envelope.clone(),
+                    vec![0; length]
+                ),
+                Err(Error::CorruptRecord)
+            ));
+        }
+        let mut excess_capacity = Vec::with_capacity(100);
+        excess_capacity.resize(19, 0);
+        assert!(matches!(
+            pool.ciphertext(
+                admission
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                    .unwrap(),
+                envelope.clone(),
+                excess_capacity
+            ),
+            Err(Error::InvalidConfiguration)
+        ));
+        let mut invalid = envelope;
+        invalid.plaintext_length = 0;
+        assert!(matches!(
+            pool.ciphertext(
+                admission
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                    .unwrap(),
+                invalid,
+                vec![0; 19]
+            ),
+            Err(Error::CorruptRecord)
+        ));
+    }
+    #[test]
+    fn immutable_clones_charge_once_until_last_cross_thread_owner() {
+        let admission = admission(8);
+        let page = bundle(&admission, "v1");
+        let plain = page.plaintext.clone();
+        let cipher = page.ciphertext.clone();
+        let pointer = cipher.bytes().as_ptr();
+        assert_eq!(page.ciphertext.bytes().as_ptr(), pointer);
+        drop(page);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        std::thread::spawn(move || drop((plain, cipher)))
+            .join()
+            .unwrap();
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+    mod page {
+        use super::*;
+        use crate::error::Error;
+
+        /// Both acquisition forms enforce identity and structure without retaining owners.
+        #[test]
+        fn acquired_validation_preserves_identity_metadata_and_ownership() {
+            let admission = super::admission(8);
+            for plaintext in [false, true] {
+                for malformed in [false, true] {
+                    let mut page = bundle(&admission, "v1");
+                    let id = page.plaintext.page().clone();
+                    if malformed {
+                        page.metadata.length += 1;
+                    }
+                    let acquired = if plaintext {
+                        AcquiredPage::Plaintext(page)
+                    } else {
+                        AcquiredPage::Ciphertext(UnverifiedPage {
+                            copy: page.copy(),
+                            disk_token: None,
+                        })
+                    };
+                    let owner = match &acquired {
+                        AcquiredPage::Plaintext(page) => &page.ciphertext.inner,
+                        AcquiredPage::Ciphertext(page) => &page.copy.ciphertext.inner,
+                    };
+                    let owners = Arc::strong_count(owner);
+                    let expected = if malformed {
+                        Err(Error::CorruptRecord)
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(acquired.validate_for(&id), expected);
+                    let mut wrong = id.clone();
+                    wrong.number.0 += 1;
+                    assert_eq!(acquired.validate_for(&wrong), Err(Error::CorruptRecord));
+                    // This checks net retention, not temporary clones during validation.
+                    assert_eq!(Arc::strong_count(owner), owners);
+                    assert_eq!(acquired.validate_for(&id), expected);
+                }
+            }
+        }
+
+        #[test]
+        fn shared_results_reject_truncated_or_padded_ciphertext() {
+            let admission = crate::memory::tests::admission(8);
+            for length in [0, 18, 19, 20] {
+                let mut page = crate::memory::tests::bundle(&admission, "v1");
+                std::sync::Arc::get_mut(&mut page.ciphertext.inner)
+                    .unwrap()
+                    .bytes
+                    .resize(length, 0);
+                let expected = if length == 19 {
+                    Ok(())
+                } else {
+                    Err(Error::CorruptRecord)
+                };
+                assert_eq!(page.validate_metadata(), expected);
+                assert_eq!(page.copy().validate_metadata(), expected);
+            }
+        }
+        #[test]
+        fn shared_result_rejects_mixed_metadata_plaintext_and_ciphertext() {
+            let admission = crate::memory::tests::admission(8);
+            let bundle = crate::memory::tests::bundle(&admission, "v1");
+            let metadata = &bundle.metadata;
+            let page = bundle.plaintext.page();
+            let envelope = bundle.ciphertext.envelope();
+            assert_eq!(validate_association(metadata, page, 3, envelope), Ok(()));
+            for case in 0..4 {
+                let mut metadata = metadata.clone();
+                let mut page = page.clone();
+                let mut length = 3;
+                match case {
+                    0 => length = 2,
+                    1 => page.version.etag = crate::model::StrongEtag::test_value("v2"),
+                    2 => metadata.version.object.key.0[0] ^= 1,
+                    _ => metadata.length = 4,
+                }
+                assert_eq!(
+                    validate_association(&metadata, &page, length, envelope),
+                    Err(Error::CorruptRecord)
+                );
+            }
+        }
+    }
+    pub(in crate::memory) mod pipe_tests {
+        use super::*;
+        use crate::config::Limits;
+        use crate::error::Error;
+        use crate::http::acquire_wait;
+        use crate::http::new_pipe_pool;
+        use crate::runtime::RequestScope;
+        use flow_control::Quotas;
+        use std::task::Waker;
+
+        pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
+            let small = std::num::NonZeroUsize::new(8).unwrap();
+            let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();
+            Rc::new(Quotas::new(AdmissionPolicy::new(Limits {
+                plaintext_bytes: bytes,
+                ciphertext_bytes: bytes,
+                dirty_bytes: bytes,
+                registered_bytes: bytes,
+                request_context_bytes: bytes,
+                flights: small,
+                waiters_per_flight: small,
+                queue_entries: small,
+                connections_per_neighbor: small,
+                client_connections: small,
+                pipes: std::num::NonZeroUsize::new(pipes).unwrap(),
+                range_window_pages: small,
+                header_bytes: small,
+                placement_cache_bytes: small,
+                path_cache_bytes: small,
+                active_path_searches: small,
+                cached_paths: small,
+                retained_snapshots: small,
+                metadata_entries: small,
+                relay_transfers: small,
+            })))
+        }
+
+        #[test]
+        fn immediate_acquisition_does_not_subscribe_to_cancellation() {
+            use crate::model::RequestId;
+            use std::task::Context;
+            use std::task::Poll;
+            use std::time::Duration;
+            use std::time::Instant;
+            let admission = admission(1);
+            let pool = new_pipe_pool(admission.clone());
+            let scope =
+                RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
+                    .unwrap();
+            let mut registrations = Vec::new();
+            loop {
+                match scope.cancellation.subscribe() {
+                    Ok(registration) => registrations.push(registration),
+                    Err(Error::Overloaded) => break,
+                    Err(error) => panic!("unexpected registration failure: {error:?}"),
+                }
+                assert!(registrations.len() <= 1024);
+            }
+            let mut cx = Context::from_waker(Waker::noop());
+            let Poll::Ready(Ok(held)) = acquire_wait(&pool, &scope).as_mut().poll(&mut cx) else {
+                panic!("immediate acquisition unnecessarily subscribed")
+            };
+            assert!(matches!(
+                acquire_wait(&pool, &scope).as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
+            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+            assert_eq!(admission.used(ResourceClass::Pipe), 1);
+            drop(registrations);
+            let mut wait = acquire_wait(&pool, &scope);
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            drop(held);
+            assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        }
+
+        #[test]
+        fn scheduled_wait_cancellation_deadline_stop_and_abandonment_release_admission() {
+            use crate::model::RequestId;
+            use crate::test_support::WakeCounter;
+            use std::sync::Arc;
+            use std::task::Context;
+            use std::task::Poll;
+            use std::time::Duration;
+            use std::time::Instant;
+            for failure in [
+                Some(Error::Cancelled),
+                Some(Error::DeadlineExceeded),
+                Some(Error::Unavailable),
+                None,
+            ] {
+                let admission = admission(1);
+                let pool = new_pipe_pool(admission.clone());
+                let held = pool.acquire().unwrap();
+                let scope = RequestScope::new(
+                    RequestId([0; 16]),
+                    Instant::now()
+                        + if failure == Some(Error::DeadlineExceeded) {
+                            Duration::from_millis(10)
+                        } else {
+                            Duration::from_secs(5)
+                        },
+                )
+                .unwrap();
+                let count = Arc::new(WakeCounter::default());
+                let waker = Waker::from(count.clone());
+                let mut cx = Context::from_waker(&waker);
+                let mut wait = acquire_wait(&pool, &scope);
+                assert!(wait.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(
+                    admission.used(ResourceClass::RequestContext),
+                    pool.waiter_bytes()
+                );
+                match failure {
+                    Some(Error::Cancelled) => {
+                        scope.cancel().unwrap();
+                        assert!(count.count() > 0);
+                    }
+                    Some(Error::DeadlineExceeded) => std::thread::sleep(Duration::from_millis(20)),
+                    Some(Error::Unavailable) => admission.stop(),
+                    _ => {}
+                }
+                if let Some(expected) = failure {
+                    assert!(
+                        matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error == expected)
+                    );
+                }
+                drop(wait);
+                assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+                assert_eq!(admission.used(ResourceClass::Pipe), 1);
+                drop(held);
+                if failure != Some(Error::Unavailable) {
+                    // No stale FIFO entry may prevent the next caller's progress.
+                    let fresh = RequestScope::new(
+                        RequestId([1; 16]),
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        acquire_wait(&pool, &fresh).as_mut().poll(&mut cx),
+                        Poll::Ready(Ok(_))
+                    ));
+                }
+                drop(pool);
+                assert_eq!(admission.used(ResourceClass::Pipe), 0);
+            }
+        }
+    }
+}

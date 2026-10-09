@@ -1,0 +1,34 @@
+[package]
+name = "racer-crypto"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Cryptographic primitives, certificate identities, and purpose-bound key epochs"
+
+[features]
+default = []
+test-util = []
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+racer-control-wire = { path = "../control-wire" }
+uring-runtime = { path = "../runtime" }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+x509-parser = { version = "0.16", features = ["verify"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+# Wipe the buffered stream cipher wrapper as well as the ChaCha20 core.
+cipher = { version = "0.5", features = ["zeroize"] }
+# chacha20poly1305/zeroize does not forward Poly1305 state wiping.
+poly1305 = { version = "0.9", features = ["zeroize"] }
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+sha2 = "0.10"
+zeroize = "1"
+crc64fast = "1.1.0"
+
+[dev-dependencies]
+futures = "0.3"
+uring-runtime = { path = "../runtime", features = ["simulation"] }

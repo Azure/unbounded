@@ -1,0 +1,1872 @@
+//! Preserve original signatures and bind each signed hop to consumed route state.
+//!
+//! The owned API supports a complete relay round trip without degrading signed
+//! envelopes to logical operations. Each receiver admits only its final envelope;
+//! historical originals and hops are cryptographically verified without readmission.
+//!
+//! ```no_run
+//! use racer_control_wire::NodeId;
+//! use racer_dataplane::{
+//!     error::Result,
+//!     peer::{server::LocalPageService, protocol::PeerRequest},
+//!     runtime::RequestScope,
+//!     peer::forwarding::{Forwarding, VerifiedResponse},
+//!     topology::{Membership, RouteBudget},
+//! };
+//!
+//! async fn round_trip(
+//!     requester: &Forwarding,
+//!     relay: &Forwarding,
+//!     destination: &Forwarding,
+//!     local: &dyn LocalPageService,
+//!     request: PeerRequest,
+//!     next: &NodeId,
+//!     previous: &NodeId,
+//!     budget: RouteBudget,
+//!     membership: std::sync::Arc<Membership>,
+//!     scope: &RequestScope,
+//! ) -> Result<VerifiedResponse> {
+//!     let (outbound, outstanding) = requester.sign_request(request)?;
+//!     let ingress = relay.verify_request(outbound)?;
+//!     let reverse_binding = ingress.binding().clone();
+//!     let forwarded = relay.append_request(ingress, next, budget)?;
+//!     let admitted = destination.verify_request(forwarded)?;
+//!     let reply_binding = admitted.binding().clone();
+//!     let unsigned = local.serve_peer(admitted, membership, scope).await?;
+//!     let response = destination.sign_response(&reply_binding, unsigned)?;
+//!     let verified = relay.verify_response(response, &reverse_binding)?;
+//!     let reverse = relay.append_response(verified, previous)?;
+//!     requester.verify_response(reverse, &outstanding)
+//! }
+//! ```
+use crate::error::Error;
+use crate::error::Result;
+use crate::peer::protocol;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::Signatures;
+use crate::peer::protocol::SignedHead;
+use crate::peer::protocol::SignedRequest;
+use crate::peer::protocol::SignedResponse;
+use crate::peer::protocol::field;
+use crate::peer::protocol::node_field;
+use crate::peer::protocol::number;
+use crate::peer::protocol::push;
+use crate::peer::protocol::receiver;
+use crate::peer::protocol::signed_digest;
+use crate::topology::RouteBudget;
+use http1::MessageHead;
+use http1::StartLine;
+#[cfg(test)]
+use racer_control_wire::CacheId;
+#[cfg(test)]
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
+use racer_crypto::identity::VerifiedPeer;
+use std::rc::Rc;
+use std::sync::Arc;
+
+pub struct Forwarding {
+    signatures: Rc<Signatures>,
+}
+pub use peer_wire::ForwardedHead;
+
+/// Opaque outstanding-request context, minted only by request signing or ingress
+/// verification. Retains the exact original head/signature, not just a request ID.
+/// Cloning retains ownership for response signing after local service consumes the
+/// request. No credentials are decoded or decrypted here.
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::forwarding::RequestBinding;
+/// fn fabricate_binding() -> RequestBinding {
+///     RequestBinding { original: todo!() }
+/// }
+/// ```
+#[derive(Clone)]
+pub struct RequestBinding {
+    original: Arc<SignedHead>,
+    path: Vec<NodeId>,
+    deadline: u64,
+}
+impl RequestBinding {
+    pub(crate) fn retained_proof(&self) -> Result<&SignedHead> {
+        check_request_deadline(self)?;
+        if field(&self.original.head, "racer-kind")? != "request"
+            || self.deadline > number(&self.original.head, "racer-route-deadline")?
+        {
+            return Err(Error::Unauthorized);
+        }
+        Ok(&self.original)
+    }
+}
+
+/// Admitted ingress with its original signature and entire forwarding chain.
+/// Only this module's verifier can construct it. Shared access prevents callers
+/// from modifying signed fields after verification.
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::{protocol::SignedRequest, forwarding::VerifiedRequest};
+/// fn bypass_verification(request: SignedRequest) -> VerifiedRequest {
+///     request.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::forwarding::VerifiedRequest;
+/// fn change_verified_route(request: VerifiedRequest) {
+///     request.request().route.remaining_links = 255;
+/// }
+/// ```
+pub struct VerifiedRequest {
+    signed: SignedRequest,
+    binding: RequestBinding,
+    origin: VerifiedPeer,
+    forwarders: Vec<VerifiedPeer>,
+}
+impl VerifiedRequest {
+    /// A provider may project its authenticated compact demand onto one selected
+    /// page for the existing Fill implementation. This value must never be relayed
+    /// or reverified: its immutable binding still names the full subscription.
+    pub(crate) fn select_page(mut self, page: crate::model::PageId) -> Result<Self> {
+        use crate::peer::protocol::FetchMode;
+        use crate::peer::protocol::Operation;
+        let Operation::Subscribe { subscription, mode } = &self.signed.request.operation else {
+            return Err(Error::InvalidRequest);
+        };
+        if page.version != subscription.version || !subscription.demand.contains(page.number.0) {
+            return Err(Error::Unauthorized);
+        }
+        let mode = match mode {
+            FetchMode::Acquire => FetchMode::Acquire,
+            FetchMode::CopyOnly => FetchMode::CopyOnly,
+        };
+        self.signed.request.operation = Operation::Page { page, mode };
+        Ok(self)
+    }
+    pub fn request(&self) -> &PeerRequest {
+        &self.signed.request
+    }
+    pub fn signed(&self) -> &SignedRequest {
+        &self.signed
+    }
+    pub fn binding(&self) -> &RequestBinding {
+        &self.binding
+    }
+    pub fn origin(&self) -> &VerifiedPeer {
+        &self.origin
+    }
+    pub fn forwarders(&self) -> &[VerifiedPeer] {
+        &self.forwarders
+    }
+    pub fn into_signed(self) -> SignedRequest {
+        self.signed
+    }
+}
+
+/// Verified response bound to one original request, retaining every signature.
+/// This is distinct from both an unsigned local result and unverified wire input.
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::{protocol::SignedResponse, forwarding::VerifiedResponse};
+/// fn bypass_verification(response: SignedResponse) -> VerifiedResponse {
+///     response.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::{protocol::PeerResponse, forwarding::VerifiedResponse};
+/// fn replace_verified_result(mut response: VerifiedResponse) {
+///     *response.response() = PeerResponse::Miss;
+/// }
+/// ```
+pub struct VerifiedResponse {
+    signed: SignedResponse,
+    binding: RequestBinding,
+    origin: VerifiedPeer,
+    forwarders: Vec<VerifiedPeer>,
+}
+impl VerifiedResponse {
+    pub fn response(&self) -> &PeerResponse {
+        &self.signed.response
+    }
+    pub fn signed(&self) -> &SignedResponse {
+        &self.signed
+    }
+    pub fn binding(&self) -> &RequestBinding {
+        &self.binding
+    }
+    pub fn origin(&self) -> &VerifiedPeer {
+        &self.origin
+    }
+    pub fn forwarders(&self) -> &[VerifiedPeer] {
+        &self.forwarders
+    }
+    pub fn into_signed(self) -> SignedResponse {
+        self.signed
+    }
+}
+impl Forwarding {
+    /// Retain the locally emitted route for verification at the transport boundary.
+    /// Response verification still authenticates the original signature and path.
+    pub(crate) fn outbound_binding(&self, request: &SignedRequest) -> Result<RequestBinding> {
+        let route = RouteState::from_budget(&request.request.route)?;
+        if route.visited.last() != Some(self.signatures.node()) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(RequestBinding {
+            original: request.authentication.original.clone(),
+            deadline: route.deadline,
+            path: route.0.visited,
+        })
+    }
+    pub(crate) fn verify_opaque(
+        &self,
+        auth: &ForwardedHead,
+        length: usize,
+        request: &RequestBinding,
+    ) -> Result<()> {
+        let expected = crate::peer::protocol::opaque_response_head(&auth.original.head, length)?;
+        self.verify_response_head(auth, &expected, request)?;
+        Ok(())
+    }
+    pub fn new(signatures: Rc<Signatures>) -> Self {
+        Self { signatures }
+    }
+    /// Encode and sign a fresh local attempt, retaining request-binding context
+    /// for its eventual response. Direct sends target the route destination.
+    pub fn sign_request(&self, request: PeerRequest) -> Result<(SignedRequest, RequestBinding)> {
+        let next = request.route.destination.clone();
+        self.sign_request_to(request, &next)
+    }
+    /// Sign an initial request to an explicitly selected first relay. The route
+    /// starts with exactly the local node in `visited`; links include this send.
+    pub fn sign_request_to(
+        &self,
+        request: PeerRequest,
+        next: &NodeId,
+    ) -> Result<(SignedRequest, RequestBinding)> {
+        let route = RouteState::from_budget(&request.route)?;
+        if route.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+            return Err(Error::DeadlineExceeded);
+        }
+        if route.visited != [self.signatures.node().clone()]
+            || next == self.signatures.node()
+            || route.links == 0
+        {
+            return Err(Error::HopBudgetExhausted);
+        }
+        let mut head = protocol::request_head(&request)?;
+        push(&mut head, "racer-receiver", &next.0);
+        let original = Arc::new(self.signatures.sign(head)?);
+        let binding = RequestBinding {
+            original: original.clone(),
+            deadline: route.deadline,
+            path: route.0.visited,
+        };
+        Ok((
+            SignedRequest {
+                authentication: ForwardedHead {
+                    original,
+                    hops: Vec::new(),
+                },
+                request,
+            },
+            binding,
+        ))
+    }
+    /// Verify original and every historical hop, identity, logical-field agreement,
+    /// and monotonic routing limits. Socket admission must precede this call.
+    pub fn verify_request(&self, request: SignedRequest) -> Result<VerifiedRequest> {
+        let auth = &request.authentication;
+        if auth.hops.len() >= protocol::MAX_HOPS {
+            return Err(Error::HopBudgetExhausted);
+        }
+        let origin = self.signatures.verify_historical(&auth.original)?;
+        protocol::agrees(
+            &auth.original.head,
+            &protocol::request_head(&request.request)?,
+            true,
+        )?;
+        let mut route = RouteState::from_head(&auth.original.head)?;
+        if field(&auth.original.head, "racer-mode")? == "copy" && route.attempts != 0 {
+            return Err(Error::Unauthorized);
+        }
+        if route.visited != [origin.node().clone()] {
+            return Err(Error::Unauthorized);
+        }
+        let mut previous = auth.original.as_ref();
+        let mut forwarders = Vec::new();
+        for hop in &auth.hops {
+            let peer = self.signatures.verify_historical(hop)?;
+            if peer.node() != &receiver(&previous.head)? {
+                return Err(Error::Unauthorized);
+            }
+            let next = RouteState::from_head(&hop.head)?;
+            route.transition(&next, peer.node())?;
+            check_hop(hop, "request-hop", &auth.original, previous, &next)?;
+            route = next;
+            previous = hop;
+            forwarders.push(peer);
+        }
+        if route != RouteState::from_budget(&request.request.route)?
+            || route.visited.contains(&receiver(&previous.head)?)
+        {
+            return Err(Error::Unauthorized);
+        }
+        if route.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+            return Err(Error::DeadlineExceeded);
+        }
+        if receiver(&previous.head)? != *self.signatures.node() {
+            return Err(Error::Unauthorized);
+        }
+        let deadline = route.deadline;
+        let mut path = route.0.visited;
+        path.push(self.signatures.node().clone());
+        let binding = RequestBinding {
+            original: auth.original.clone(),
+            path,
+            deadline,
+        };
+        Ok(VerifiedRequest {
+            signed: request,
+            binding,
+            origin,
+            forwarders,
+        })
+    }
+    /// Sign all local outcomes, including misses/errors, against the exact request.
+    pub fn sign_response(
+        &self,
+        request: &RequestBinding,
+        response: PeerResponse,
+    ) -> Result<SignedResponse> {
+        check_request_deadline(request)?;
+        // A retained subscription must not outlive retired request keys/trust.
+        self.signatures.verify_retained_request(request)?;
+        if request.path.last() != Some(self.signatures.node()) || request.path.len() < 2 {
+            return Err(Error::Unauthorized);
+        }
+        let mut head =
+            protocol::response_head(&response, &signed_digest(&request.original)?, &request.path)?;
+        check_grant_deadline(&head, request)?;
+        response_matches(&head, &request.original.head)?;
+        response_authority(&head, &request.original.head, self.signatures.node())?;
+        push(
+            &mut head,
+            "racer-receiver",
+            &request.path[request.path.len() - 2].0,
+        );
+        let original = Arc::new(self.signatures.sign(head)?);
+        Ok(SignedResponse {
+            authentication: ForwardedHead {
+                original,
+                hops: Vec::new(),
+            },
+            response,
+        })
+    }
+    /// Verify original and every historical hop, identity and signed logical fields,
+    /// then check response correlation against the supplied outstanding attempt.
+    /// A request ID alone is not sufficient; the original signature binds identity,
+    /// operation, membership, attempt, and freshness without hashing page bytes.
+    ///
+    /// ```compile_fail
+    /// use racer_dataplane::{peer::protocol::SignedResponse, peer::forwarding::Forwarding};
+    /// fn unbound_response(auth: &Forwarding, response: SignedResponse) {
+    ///     auth.verify_response(response);
+    /// }
+    /// ```
+    pub fn verify_response(
+        &self,
+        mut response: SignedResponse,
+        request: &RequestBinding,
+    ) -> Result<VerifiedResponse> {
+        let path = protocol::decode_nodes(
+            field(
+                &response.authentication.original.head,
+                "racer-response-path",
+            )?
+            .as_bytes(),
+        )?;
+        let expected = protocol::response_head(
+            &response.response,
+            &signed_digest(&request.original)?,
+            &path,
+        )?;
+        let (origin, forwarders) =
+            self.verify_response_head(&response.authentication, &expected, request)?;
+        // Diagnostic context belongs to this received lease, never its shared bytes.
+        // Extraction cannot change the verified response's delivery behavior.
+        let provenance = (|| {
+            let id = |name| -> Result<[u8; 16]> {
+                protocol::decode_binary(field(&request.original.head, name)?.as_bytes())?
+                    .try_into()
+                    .map_err(|_| Error::InvalidRequest)
+            };
+            Ok::<_, Error>(crate::telemetry::PeerProvenance {
+                request: crate::model::RequestId(id("racer-request")?),
+                attempt: crate::model::AttemptId(id("racer-attempt")?),
+                supplier: origin
+                    .node()
+                    .0
+                    .as_bytes()
+                    .try_into()
+                    .map_err(|_| Error::InvalidRequest)?,
+                remote: forwarders
+                    .last()
+                    .unwrap_or(&origin)
+                    .node()
+                    .0
+                    .as_bytes()
+                    .try_into()
+                    .map_err(|_| Error::InvalidRequest)?,
+            })
+        })()
+        .ok();
+        match &mut response.response {
+            PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. } => {
+                ciphertext.provenance = provenance;
+            }
+            PeerResponse::Bootstrap {
+                page_zero: Some(ciphertext),
+                ..
+            } => {
+                ciphertext.provenance = provenance;
+            }
+            _ => {}
+        }
+        Ok(VerifiedResponse {
+            signed: response,
+            binding: request.clone(),
+            origin,
+            forwarders,
+        })
+    }
+
+    fn verify_response_head(
+        &self,
+        auth: &ForwardedHead,
+        expected: &MessageHead,
+        request: &RequestBinding,
+    ) -> Result<(VerifiedPeer, Vec<VerifiedPeer>)> {
+        check_request_deadline(request)?;
+        self.signatures.verify_retained_request(request)?;
+        check_grant_deadline(&auth.original.head, request)?;
+        if auth.hops.len() >= protocol::MAX_HOPS {
+            return Err(Error::HopBudgetExhausted);
+        }
+        let origin = self.signatures.verify_historical(&auth.original)?;
+        let path =
+            protocol::decode_nodes(field(&auth.original.head, "racer-response-path")?.as_bytes())?;
+        if path.len() < 2
+            || !path.starts_with(&request.path)
+            || path.last() != Some(origin.node())
+            || path[1] != receiver(&request.original.head)?
+            || path.len() > RouteState::from_head(&request.original.head)?.links as usize + 1
+        {
+            return Err(Error::Unauthorized);
+        }
+        protocol::agrees(&auth.original.head, expected, false)?;
+        if protocol::decode_binary(field(&auth.original.head, "racer-request-binding")?.as_bytes())?
+            != signed_digest(&request.original)?
+        {
+            return Err(Error::Unauthorized);
+        }
+        response_matches(&auth.original.head, &request.original.head)?;
+        response_authority(&auth.original.head, &request.original.head, origin.node())?;
+        if receiver(&auth.original.head)? != path[path.len() - 2] {
+            return Err(Error::Unauthorized);
+        }
+        let mut previous = auth.original.as_ref();
+        let mut forwarders = Vec::new();
+        for (i, hop) in auth.hops.iter().enumerate() {
+            let index = path
+                .len()
+                .checked_sub(i + 2)
+                .filter(|n| *n > 0)
+                .ok_or(Error::Unauthorized)?;
+            let peer = self.signatures.verify_historical(hop)?;
+            if peer.node() != &path[index] || receiver(&hop.head)? != path[index - 1] {
+                return Err(Error::Unauthorized);
+            }
+            let expected = response_hop_head(
+                &auth.original,
+                previous,
+                &request.original,
+                &path,
+                index - 1,
+            )?;
+            protocol::agrees(&hop.head, &expected, false)?;
+            previous = hop;
+            forwarders.push(peer);
+        }
+        let index = path
+            .len()
+            .checked_sub(auth.hops.len() + 2)
+            .ok_or(Error::Unauthorized)?;
+        if index + 1 != request.path.len() || request.path.last() != Some(self.signatures.node()) {
+            return Err(Error::Unauthorized);
+        }
+        if receiver(&previous.head)? != *self.signatures.node() {
+            return Err(Error::Unauthorized);
+        }
+        Ok((origin, forwarders))
+    }
+    /// Verify canonical metadata and the complete reverse chain before forwarding
+    /// an opaque fixed-length HTTP body. No ciphertext owner or decryptor is used.
+    pub(crate) fn forward_opaque(
+        &self,
+        mut auth: ForwardedHead,
+        length: usize,
+        request: &RequestBinding,
+        previous: &NodeId,
+    ) -> Result<ForwardedHead> {
+        let expected = crate::peer::protocol::opaque_response_head(&auth.original.head, length)?;
+        self.verify_response_head(&auth, &expected, request)?;
+        self.append_response_head(&mut auth, request, previous)?;
+        Ok(auth)
+    }
+    /// Preserve the original and existing hops; append a separately signed header
+    /// bound to that original signature, prior chain, next hop, and consumed route.
+    /// Only the effective route may change, without extending deadline or budget.
+    pub fn append_request(
+        &self,
+        mut request: VerifiedRequest,
+        next_hop: &NodeId,
+        budget: RouteBudget,
+    ) -> Result<SignedRequest> {
+        check_request_deadline(&request.binding)?;
+        if request.binding.path.last() != Some(self.signatures.node()) {
+            return Err(Error::Unauthorized);
+        }
+        let old = RouteState::from_budget(&request.signed.request.route)?;
+        let next = RouteState::from_budget(&budget)?;
+        if next.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+            return Err(Error::DeadlineExceeded);
+        }
+        old.transition(&next, self.signatures.node())?;
+        if next.visited.contains(next_hop) {
+            return Err(Error::HopBudgetExhausted);
+        }
+        let auth = &mut request.signed.authentication;
+        let previous = auth.hops.last().unwrap_or(&auth.original);
+        let mut head = hop_head("request-hop", &auth.original, previous)?;
+        protocol::route_headers(&mut head, &budget)?;
+        push(&mut head, "racer-receiver", &next_hop.0);
+        auth.hops.push(self.signatures.sign(head)?);
+        request.signed.request.route = budget;
+        Ok(request.signed)
+    }
+    /// Preserve the responder's original signature, prior chain, request binding,
+    /// and ciphertext. Append a separate signed hop for the recorded reverse path.
+    pub fn append_response(
+        &self,
+        mut response: VerifiedResponse,
+        previous_hop: &NodeId,
+    ) -> Result<SignedResponse> {
+        self.append_response_head(
+            &mut response.signed.authentication,
+            &response.binding,
+            previous_hop,
+        )?;
+        Ok(response.signed)
+    }
+    fn append_response_head(
+        &self,
+        auth: &mut ForwardedHead,
+        binding: &RequestBinding,
+        previous_hop: &NodeId,
+    ) -> Result<()> {
+        check_request_deadline(binding)?;
+        let path =
+            protocol::decode_nodes(field(&auth.original.head, "racer-response-path")?.as_bytes())?;
+        let index = path
+            .len()
+            .checked_sub(auth.hops.len() + 2)
+            .filter(|n| *n > 0)
+            .ok_or(Error::Unauthorized)?;
+        if path[index] != *self.signatures.node() || path[index - 1] != *previous_hop {
+            return Err(Error::Unauthorized);
+        }
+        let previous = auth.hops.last().unwrap_or(&auth.original);
+        let mut head = response_hop_head(
+            &auth.original,
+            previous,
+            &binding.original,
+            &path,
+            index - 1,
+        )?;
+        push(&mut head, "racer-receiver", &previous_hop.0);
+        auth.hops.push(self.signatures.sign(head)?);
+        Ok(())
+    }
+}
+#[derive(PartialEq, Eq)]
+struct RouteState(peer_wire::forwarding::RouteState);
+
+impl std::ops::Deref for RouteState {
+    type Target = peer_wire::forwarding::RouteState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl RouteState {
+    fn from_budget(budget: &RouteBudget) -> Result<Self> {
+        let mut head = MessageHead {
+            start: StartLine::Response { status: 200 },
+            headers: Vec::new(),
+        };
+        protocol::route_headers(&mut head, budget)?;
+        Self::from_head(&head)
+    }
+    fn from_head(head: &MessageHead) -> Result<Self> {
+        peer_wire::forwarding::RouteState::from_head(head)
+            .map(Self)
+            .map_err(Into::into)
+    }
+    fn transition(&self, next: &Self, signer: &NodeId) -> Result<()> {
+        self.0.transition(&next.0, signer).map_err(Into::into)
+    }
+}
+fn hop_head(kind: &str, original: &SignedHead, previous: &SignedHead) -> Result<MessageHead> {
+    peer_wire::forwarding::hop_head(kind, original, previous).map_err(Into::into)
+}
+fn check_hop(
+    hop: &SignedHead,
+    kind: &str,
+    original: &SignedHead,
+    previous: &SignedHead,
+    route: &RouteState,
+) -> Result<()> {
+    peer_wire::forwarding::check_hop(hop, kind, original, previous, &route.0).map_err(Into::into)
+}
+fn response_hop_head(
+    original: &SignedHead,
+    previous: &SignedHead,
+    request: &SignedHead,
+    path: &[NodeId],
+    index: usize,
+) -> Result<MessageHead> {
+    peer_wire::forwarding::response_hop_head(original, previous, request, path, index)
+        .map_err(Into::into)
+}
+fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()> {
+    let outcome = field(response, "racer-outcome")?;
+    if outcome == "selected" {
+        if field(request, "racer-operation")? != "subscribe" {
+            return Err(Error::Unauthorized);
+        }
+        for name in [
+            "racer-cache",
+            "racer-key",
+            "racer-etag",
+            "racer-subscription",
+            "racer-subscription-sequence",
+        ] {
+            if field(response, name)? != field(request, name)? {
+                return Err(Error::Unauthorized);
+            }
+        }
+        let receivers = protocol::decode_nodes(field(request, "racer-route-visited")?.as_bytes())?;
+        if !crate::peer::protocol::demand(request)?.contains(number(response, "racer-page")?)
+            || number(response, "racer-grant-membership")?
+                != number(request, "racer-route-membership")?
+            || receivers.first() != Some(&node_field(response, "racer-grant-receiver")?)
+            || number(response, "racer-grant-deadline")? > number(request, "racer-route-deadline")?
+            || number(response, "racer-grant-deadline")?
+                <= protocol::millis(uring_runtime::environment::wall_now())?
+            || number(response, "racer-page-budget")?.checked_add(1)
+                != Some(number(request, "racer-page-budget")?)
+            || number(response, "racer-byte-budget")?
+                .checked_add(number(response, "racer-ciphertext-length")?)
+                != Some(number(request, "racer-byte-budget")?)
+        {
+            return Err(Error::Unauthorized);
+        }
+        return Ok(());
+    }
+    if outcome == "not-found"
+        && (!matches!(
+            field(request, "racer-operation")?.as_str(),
+            "metadata" | "bootstrap"
+        ) || field(request, "racer-mode")? != "acquire"
+            || field(request, "racer-selector")? != "fresh")
+    {
+        return Err(Error::Unauthorized);
+    }
+    if outcome != "page" && outcome != "metadata" && outcome != "bootstrap" {
+        return Ok(());
+    }
+    if field(request, "racer-operation")? != outcome {
+        return Err(Error::Unauthorized);
+    }
+    for name in ["racer-cache", "racer-key"] {
+        if field(response, name)? != field(request, name)? {
+            return Err(Error::Unauthorized);
+        }
+    }
+    if let Some(etag) = request.unique("racer-etag")?
+        && response.unique("racer-etag")? != Some(etag)
+    {
+        return Err(Error::Unauthorized);
+    }
+    if outcome == "page" && field(response, "racer-page")? != field(request, "racer-page")? {
+        return Err(Error::Unauthorized);
+    }
+    if outcome == "bootstrap" {
+        let length = protocol::number(response, "racer-length")?;
+        let present = protocol::number(response, "racer-page-present")?;
+        if present != u64::from(length != 0)
+            || (present == 1 && protocol::number(response, "racer-page")? != 0)
+        {
+            return Err(Error::Unauthorized);
+        }
+    }
+    Ok(())
+}
+/// A relay may report its own failure, but only the requested destination may
+/// assert successful data or authoritative absence, even with a valid shorter path.
+fn response_authority(
+    response: &MessageHead,
+    request: &MessageHead,
+    signer: &NodeId,
+) -> Result<()> {
+    if matches!(
+        field(response, "racer-outcome")?.as_str(),
+        "page" | "metadata" | "bootstrap" | "selected" | "not-found"
+    ) && signer != &node_field(request, "racer-route-destination")?
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+fn check_request_deadline(request: &RequestBinding) -> Result<()> {
+    if request.deadline <= protocol::millis(uring_runtime::environment::wall_now())? {
+        return Err(Error::DeadlineExceeded);
+    }
+    Ok(())
+}
+fn check_grant_deadline(head: &MessageHead, request: &RequestBinding) -> Result<()> {
+    if field(head, "racer-outcome")? == "selected"
+        && number(head, "racer-grant-deadline")? > request.deadline
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admission::AdmissionPolicy;
+    use crate::admission::ResourceClass;
+    use crate::config::Limits;
+    use crate::model::MetadataSelector;
+    use crate::model::Nonce;
+    use crate::model::*;
+    use crate::peer::protocol::FetchMode;
+    use crate::peer::protocol::Operation;
+    use crate::runtime::RequestScope;
+    use crate::security::EncryptedAuthorization;
+    use crate::security::OpaqueMetadata;
+    use crate::security::PeerOriginContext;
+    use crate::test_support::security::clone_head;
+    use crate::test_support::security::network;
+    use crate::test_support::security::node;
+    use racer_control_wire::KeyId;
+    use std::time::Duration;
+    use std::time::Instant;
+    fn wire_ciphertext(envelope: PageEnvelope, length: usize) -> crate::memory::CiphertextPage {
+        crate::memory::CiphertextPage {
+            provenance: None,
+            inner: Arc::new(crate::memory::CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
+                envelope,
+                storage: flow_control::ChargedBytes {
+                    bytes: vec![0; length],
+                    reservation: request(5).origin.reservation,
+                },
+            }),
+        }
+    }
+    fn request(id: u8) -> PeerRequest {
+        let n = std::num::NonZeroUsize::new(1024 * 1024).unwrap();
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(Limits {
+            plaintext_bytes: n,
+            ciphertext_bytes: n,
+            dirty_bytes: n,
+            registered_bytes: n,
+            request_context_bytes: n,
+            flights: n,
+            waiters_per_flight: n,
+            queue_entries: n,
+            connections_per_neighbor: n,
+            client_connections: n,
+            pipes: n,
+            range_window_pages: n,
+            header_bytes: n,
+            placement_cache_bytes: n,
+            path_cache_bytes: n,
+            active_path_searches: n,
+            cached_paths: n,
+            retained_snapshots: n,
+            metadata_entries: n,
+            relay_transfers: n,
+        }));
+        let object = ObjectId {
+            cache: CacheId(node(88).0),
+            key: CacheKey([7; 32]),
+        };
+        let scope = RequestScope::new(
+            RequestId([id; 16]),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        PeerRequest {
+            operation: Operation::Metadata {
+                object: object.clone(),
+                selector: MetadataSelector::Pinned(StrongEtag::parse(b"\"version\"").unwrap()),
+                mode: FetchMode::CopyOnly,
+            },
+            route: RouteBudget {
+                membership: MembershipVersion(1),
+                request: scope.request,
+                attempt: AttemptId([2; 16]),
+                destination: node(2),
+                visited: vec![node(0)],
+                remaining_links: 4,
+                remaining_attempts: 0,
+                deadline: scope.deadline,
+            },
+            origin: PeerOriginContext {
+                object,
+                request: scope.request,
+                attempt: AttemptId([2; 16]),
+                metadata: Some(OpaqueMetadata::from_header(b"opaque\xff").unwrap()),
+                authorization: Some(EncryptedAuthorization {
+                    key_id: KeyId([3; 16]),
+                    nonce: Nonce([4; 24]),
+                    ciphertext: vec![5; 32],
+                }),
+                reservation: admission
+                    .reserve(None, ResourceClass::RequestContext, 1024)
+                    .unwrap(),
+                scope,
+            },
+        }
+    }
+    fn budget(request: &VerifiedRequest) -> RouteBudget {
+        let old = &request.request().route;
+        let mut visited = old.visited.clone();
+        visited.push(node(1));
+        RouteBudget {
+            membership: old.membership,
+            request: old.request,
+            attempt: old.attempt,
+            destination: old.destination.clone(),
+            visited,
+            remaining_links: old.remaining_links - 1,
+            remaining_attempts: old.remaining_attempts,
+            deadline: old.deadline,
+        }
+    }
+    fn copy_response(response: &SignedResponse) -> SignedResponse {
+        SignedResponse {
+            authentication: ForwardedHead {
+                original: Arc::new(clone_head(&response.authentication.original)),
+                hops: response
+                    .authentication
+                    .hops
+                    .iter()
+                    .map(clone_head)
+                    .collect(),
+            },
+            response: PeerResponse::Miss,
+        }
+    }
+    #[test]
+    fn retained_request_survives_fresh_window_but_not_deadline_or_forgery() {
+        let clock = uring_runtime::environment::SimulationClock::new_at(
+            931,
+            Instant::now(),
+            std::time::SystemTime::now(),
+        );
+        let environment = clock.environment(0);
+        let _guard = environment.enter();
+        let signatures = network(3);
+        let sender = Forwarding::new(signatures[0].clone());
+        let receiver = Forwarding::new(signatures[2].clone());
+        let mut logical = request(44);
+        logical.route.deadline.0 = uring_runtime::environment::now() + Duration::from_secs(120);
+        let (signed, binding) = sender.sign_request(logical).unwrap();
+        let admitted = receiver.verify_request(signed).unwrap();
+        clock.advance(Duration::from_secs(61));
+        assert!(matches!(
+            signatures[2].verify_historical(&binding.original),
+            Err(Error::Replay)
+        ));
+        let response = receiver
+            .sign_response(admitted.binding(), PeerResponse::Miss)
+            .unwrap();
+        let mut forged = binding.clone();
+        let mut proof = clone_head(&forged.original);
+        proof.signature[0] ^= 1;
+        forged.original = Arc::new(proof);
+        assert!(
+            sender
+                .verify_response(copy_response(&response), &forged)
+                .is_err()
+        );
+        let mut forged_mac = binding.clone();
+        let mut proof = clone_head(&forged_mac.original);
+        proof
+            .head
+            .headers
+            .iter_mut()
+            .find(|h| h.name == "racer-request-mac")
+            .unwrap()
+            .value[0] ^= 1;
+        forged_mac.original = Arc::new(proof);
+        assert!(
+            sender
+                .verify_response(copy_response(&response), &forged_mac)
+                .is_err()
+        );
+        let wall = uring_runtime::environment::wall_now();
+        clock.set_wall_time(wall - Duration::from_secs(67));
+        assert!(matches!(
+            signatures[2].verify_retained_request(admitted.binding()),
+            Err(Error::Replay)
+        ));
+        clock.set_wall_time(wall);
+        let mut wrong_path = binding.clone();
+        wrong_path.path = vec![node(1)];
+        assert!(
+            sender
+                .verify_response(copy_response(&response), &wrong_path)
+                .is_err()
+        );
+        sender
+            .verify_response(copy_response(&response), &binding)
+            .unwrap();
+        clock.advance(Duration::from_secs(59));
+        assert!(matches!(
+            receiver.sign_response(admitted.binding(), PeerResponse::Miss),
+            Err(Error::DeadlineExceeded)
+        ));
+        assert!(matches!(
+            sender.verify_response(response, &binding),
+            Err(Error::DeadlineExceeded)
+        ));
+    }
+
+    #[test]
+    fn bootstrap_binds_intent_empty_page_zero_length_and_destination() {
+        use crate::memory::tests::bundle_for;
+        use crate::model::ExpiresAt;
+        use crate::model::ObjectMetadata;
+        let mut request = request(90);
+        request.operation = Operation::Bootstrap {
+            object: request.origin.object.clone(),
+            mode: FetchMode::Acquire,
+        };
+        request.route.remaining_attempts = 2;
+        let head = protocol::request_head(&request).unwrap();
+        let mut metadata = ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: request.origin.object.clone(),
+                etag: StrongEtag::test_value("bootstrap"),
+            },
+            length: 0,
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+        };
+        let empty = protocol::response_head(
+            &PeerResponse::Bootstrap {
+                metadata: metadata.clone(),
+                page_zero: None,
+            },
+            &[0; 32],
+            &[node(0), node(2)],
+        )
+        .unwrap();
+        assert_eq!(response_matches(&empty, &head), Ok(()));
+        assert_eq!(
+            response_authority(&empty, &head, &node(1)),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(response_authority(&empty, &head, &node(2)), Ok(()));
+        metadata.length = 3;
+        let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let page = bundle_for(&admission, metadata.immutable());
+        let response = protocol::response_head(
+            &PeerResponse::Bootstrap {
+                metadata: metadata.clone(),
+                page_zero: Some(page.ciphertext),
+            },
+            &[0; 32],
+            &[node(0), node(2)],
+        )
+        .unwrap();
+        assert_eq!(response_matches(&response, &head), Ok(()));
+        for name in [
+            "racer-page",
+            "racer-page-present",
+            "racer-cache",
+            "racer-key",
+        ] {
+            let mut bad = crate::http::Codec::new(65536)
+                .decode_head(
+                    &crate::http::Codec::new(65536)
+                        .encode_head(&response)
+                        .unwrap(),
+                )
+                .unwrap()
+                .unwrap()
+                .0;
+            bad.headers
+                .iter_mut()
+                .find(|h| h.name == name)
+                .unwrap()
+                .value = b"9".to_vec();
+            assert!(response_matches(&bad, &head).is_err(), "{name}");
+        }
+        request.operation = Operation::Metadata {
+            object: request.origin.object.clone(),
+            selector: MetadataSelector::Fresh,
+            mode: FetchMode::Acquire,
+        };
+        assert!(response_matches(&response, &protocol::request_head(&request).unwrap()).is_err());
+        assert!(
+            protocol::response_head(
+                &PeerResponse::Bootstrap {
+                    metadata,
+                    page_zero: None
+                },
+                &[0; 32],
+                &[node(0), node(2)]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn every_signed_request_field_must_agree_with_the_logical_request() {
+        let signatures = network(3);
+        let receiver = Forwarding::new(signatures[1].clone());
+        let fields = protocol::request_head(&request(1)).unwrap().headers;
+        for field in fields {
+            let logical = request(1);
+            let mut head = protocol::request_head(&logical).unwrap();
+            head.headers
+                .iter_mut()
+                .find(|h| h.name == field.name)
+                .unwrap()
+                .value
+                .push(b'x');
+            push(&mut head, "racer-receiver", node(1).0);
+            // Malformed transport fields can be rejected before signing; every
+            // otherwise well-formed, validly signed disagreement must fail ingress.
+            if let Ok(original) = signatures[0].sign(head) {
+                assert!(
+                    receiver
+                        .verify_request(SignedRequest {
+                            authentication: ForwardedHead {
+                                original: Arc::new(original),
+                                hops: Vec::new()
+                            },
+                            request: logical,
+                        })
+                        .is_err(),
+                    "accepted signed logical disagreement {}",
+                    field.name
+                );
+            }
+        }
+    }
+    #[test]
+    fn route_membership_and_identifier_sizes_are_validated_before_admission() {
+        let signatures = network(3);
+        let sender = Forwarding::new(signatures[0].clone());
+        let receiver = Forwarding::new(signatures[1].clone());
+        let mut zero = request(1);
+        zero.route.membership.0 = 0;
+        assert!(sender.sign_request_to(zero, &node(1)).is_err());
+        for (name, value) in [
+            ("racer-route-membership", "0".to_owned()),
+            ("racer-route-request", protocol::binary(&[1; 15])),
+            ("racer-route-attempt", protocol::binary(&[2; 17])),
+        ] {
+            let logical = request(1);
+            let mut head = protocol::request_head(&logical).unwrap();
+            head.headers
+                .iter_mut()
+                .find(|h| h.name == name)
+                .unwrap()
+                .value = value.into_bytes();
+            push(&mut head, "racer-receiver", node(1).0);
+            let original = signatures[0].sign(head).unwrap();
+            assert!(
+                receiver
+                    .verify_request(SignedRequest {
+                        authentication: ForwardedHead {
+                            original: Arc::new(original),
+                            hops: Vec::new()
+                        },
+                        request: logical,
+                    })
+                    .is_err(),
+                "accepted malformed {name}"
+            );
+        }
+    }
+    #[test]
+    fn every_negative_outcome_is_signed_and_bound_to_the_exact_attempt() {
+        let signatures = network(3);
+        let sender = Forwarding::new(signatures[0].clone());
+        let receiver = Forwarding::new(signatures[2].clone());
+        let (signed, binding) = sender.sign_request(request(1)).unwrap();
+        // A distinct attempt has a distinct signed binding. Session ordering
+        // distinguishes repeated transport sends of an identical historical proof.
+        let (_, other) = sender.sign_request(request(2)).unwrap();
+        let admitted = receiver.verify_request(signed).unwrap();
+        for outcome in [
+            PeerResponse::Miss,
+            PeerResponse::VersionUnavailable,
+            PeerResponse::Unavailable,
+            PeerResponse::Overloaded,
+            PeerResponse::OriginRejected,
+            PeerResponse::OriginForbidden,
+        ] {
+            let signed = receiver.sign_response(admitted.binding(), outcome).unwrap();
+            // An authentic response cannot substitute for another signed attempt.
+            let substituted = SignedResponse {
+                authentication: ForwardedHead {
+                    original: signed.authentication.original.clone(),
+                    hops: Vec::new(),
+                },
+                response: match &signed.response {
+                    PeerResponse::Miss => PeerResponse::Miss,
+                    PeerResponse::VersionUnavailable => PeerResponse::VersionUnavailable,
+                    PeerResponse::Unavailable => PeerResponse::Unavailable,
+                    PeerResponse::Overloaded => PeerResponse::Overloaded,
+                    PeerResponse::OriginForbidden => PeerResponse::OriginForbidden,
+                    _ => PeerResponse::OriginRejected,
+                },
+            };
+            assert!(sender.verify_response(substituted, &other).is_err());
+            sender.verify_response(signed, &binding).unwrap();
+        }
+    }
+    #[test]
+    fn signed_attempt_ceiling_survives_decode_and_rejects_tamper_and_hop_refills() {
+        let signatures = network(4);
+        let f: Vec<_> = signatures
+            .iter()
+            .map(|s| Forwarding::new(s.clone()))
+            .collect();
+        let acquire = |id| {
+            let mut logical = request(id);
+            if let Operation::Metadata { mode, .. } = &mut logical.operation {
+                *mode = FetchMode::Acquire;
+            }
+            logical.route.destination = node(3);
+            logical.route.remaining_attempts = 7;
+            logical
+        };
+        for value in ["4294967296", "-1", "01", "+1"] {
+            let mut head = protocol::request_head(&acquire(9)).unwrap();
+            head.headers
+                .iter_mut()
+                .find(|h| h.name == "racer-route-attempts")
+                .unwrap()
+                .value = value.as_bytes().to_vec();
+            assert!(RouteState::from_head(&head).is_err());
+        }
+        let mut maximum = acquire(9);
+        maximum.route.remaining_attempts = u32::MAX;
+        let (maximum, _) = f[0].sign_request_to(maximum, &node(1)).unwrap();
+        assert_eq!(
+            f[1].verify_request(maximum)
+                .unwrap()
+                .request()
+                .route
+                .remaining_attempts,
+            u32::MAX
+        );
+        let (mut tampered, _) = f[0].sign_request_to(acquire(10), &node(1)).unwrap();
+        tampered.request.route.remaining_attempts = 8;
+        assert!(f[1].verify_request(tampered).is_err());
+
+        let (outbound, _) = f[0].sign_request_to(acquire(11), &node(1)).unwrap();
+        let first = f[1].verify_request(outbound).unwrap();
+        let mut route = budget(&first);
+        route.remaining_attempts = 4;
+        let forwarded = f[1].append_request(first, &node(2), route).unwrap();
+        assert_eq!(
+            number(
+                &forwarded.authentication.original.head,
+                "racer-route-attempts"
+            )
+            .unwrap(),
+            7
+        );
+        assert_eq!(
+            number(
+                &forwarded.authentication.hops[0].head,
+                "racer-route-attempts"
+            )
+            .unwrap(),
+            4
+        );
+
+        // Real wire framing and canonical logical decode retain the effective
+        // balance independently of the immutable original signed ceiling.
+        use crate::peer::protocol::SecurityCodec;
+        use crate::peer::protocol::decode_envelope;
+        use crate::peer::protocol::encode_envelope;
+        let scope = forwarded.request.origin.scope().clone();
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let codec =
+            SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
+        let (auth, _) = decode_envelope(
+            encode_envelope(&forwarded.authentication, false, 0).unwrap(),
+            false,
+        )
+        .unwrap();
+        let decoded = codec.request(auth, &scope).unwrap();
+        assert_eq!(decoded.request.route.remaining_attempts, 4);
+        let second = f[2].verify_request(decoded).unwrap();
+        let mut reduced = second.request().route.clone();
+        reduced.visited.push(node(2));
+        reduced.remaining_links -= 1;
+        reduced.remaining_attempts = 2;
+        let mut final_request = f[2].append_request(second, &node(3), reduced).unwrap();
+
+        // Re-sign a malicious hop: cryptographic validity cannot authorize a
+        // refill from 4 to 5 even though it is below the original ceiling of 7.
+        let mut forged = hop_head(
+            "request-hop",
+            &final_request.authentication.original,
+            &final_request.authentication.hops[0],
+        )
+        .unwrap();
+        let mut refill = final_request.request.route.clone();
+        refill.remaining_attempts = 5;
+        protocol::route_headers(&mut forged, &refill).unwrap();
+        push(&mut forged, "racer-receiver", &node(3).0);
+        let bad_hop = signatures[2].sign(forged).unwrap();
+        let genuine_hop = std::mem::replace(&mut final_request.authentication.hops[1], bad_hop);
+        final_request.request.route = refill;
+        let bad = SignedRequest {
+            authentication: ForwardedHead {
+                original: final_request.authentication.original.clone(),
+                hops: final_request
+                    .authentication
+                    .hops
+                    .iter()
+                    .map(clone_head)
+                    .collect(),
+            },
+            request: final_request.request,
+        };
+        assert!(f[3].verify_request(bad).is_err());
+        let mut auth = final_request.authentication;
+        auth.hops[1] = genuine_hop;
+        let decoded = codec.request(auth, &scope).unwrap();
+        let verified = f[3].verify_request(decoded).unwrap();
+        assert_eq!(verified.request().route.remaining_attempts, 2);
+
+        let mut copy = request(12);
+        copy.route.remaining_attempts = 1;
+        assert!(f[0].sign_request_to(copy, &node(1)).is_err());
+        // A forged but correctly signed CopyOnly original cannot hide credits by
+        // lowering them to zero in the effective route at a subsequent relay.
+        let mut copy = request(12);
+        let mut original_head = protocol::request_head(&copy).unwrap();
+        original_head
+            .headers
+            .iter_mut()
+            .find(|h| h.name == "racer-route-attempts")
+            .unwrap()
+            .value = b"7".to_vec();
+        push(&mut original_head, "racer-receiver", &node(1).0);
+        let original = Arc::new(signatures[0].sign(original_head).unwrap());
+        copy.route.visited.push(node(1));
+        copy.route.remaining_links -= 1;
+        let mut hop = hop_head("request-hop", &original, &original).unwrap();
+        protocol::route_headers(&mut hop, &copy.route).unwrap();
+        push(&mut hop, "racer-receiver", &node(2).0);
+        let hop = signatures[1].sign(hop).unwrap();
+        assert!(
+            f[2].verify_request(SignedRequest {
+                authentication: ForwardedHead {
+                    original,
+                    hops: vec![hop]
+                },
+                request: copy
+            })
+            .is_err()
+        );
+        let mut exhausted = acquire(13);
+        exhausted.route.remaining_attempts = 0;
+        let (zero, _) = f[0].sign_request_to(exhausted, &node(1)).unwrap();
+        let zero = f[1].verify_request(zero).unwrap();
+        let mut refill = budget(&zero);
+        refill.remaining_attempts = 1;
+        assert!(f[1].append_request(zero, &node(2), refill).is_err());
+    }
+
+    #[test]
+    fn origin_forbidden_is_signed_403_and_cannot_substitute_rejected_401() {
+        let signatures = network(3);
+        let sender = Forwarding::new(signatures[0].clone());
+        let receiver = Forwarding::new(signatures[2].clone());
+        let (signed, binding) = sender.sign_request(request(14)).unwrap();
+        let admitted = receiver.verify_request(signed).unwrap();
+        for (outcome, status, substitute) in [
+            (
+                PeerResponse::OriginForbidden,
+                403,
+                PeerResponse::OriginRejected,
+            ),
+            (
+                PeerResponse::OriginRejected,
+                401,
+                PeerResponse::OriginForbidden,
+            ),
+        ] {
+            let reply = receiver.sign_response(admitted.binding(), outcome).unwrap();
+            assert!(
+                matches!(reply.authentication.original.head.start,StartLine::Response{status:s} if s==status)
+            );
+            let bad = SignedResponse {
+                authentication: ForwardedHead {
+                    original: reply.authentication.original.clone(),
+                    hops: vec![],
+                },
+                response: substitute,
+            };
+            assert!(sender.verify_response(bad, &binding).is_err());
+            let mut bad_head = clone_head(&reply.authentication.original);
+            bad_head.head.start = StartLine::Response { status: 200 };
+            let bad = SignedResponse {
+                authentication: ForwardedHead {
+                    original: Arc::new(bad_head),
+                    hops: vec![],
+                },
+                response: if status == 403 {
+                    PeerResponse::OriginForbidden
+                } else {
+                    PeerResponse::OriginRejected
+                },
+            };
+            assert!(sender.verify_response(bad, &binding).is_err());
+            sender.verify_response(reply, &binding).unwrap();
+        }
+    }
+    #[test]
+    fn signed_round_trip_reverse_path_response_substitution_and_replay() {
+        let signatures = network(3);
+        let f: Vec<_> = signatures
+            .iter()
+            .map(|s| Forwarding::new(s.clone()))
+            .collect();
+        let (outbound, binding) = f[0].sign_request_to(request(1), &node(1)).unwrap();
+        let admitted = f[1].verify_request(outbound).unwrap();
+        let reverse = admitted.binding().clone();
+        let route = budget(&admitted);
+        let forwarded = f[1].append_request(admitted, &node(2), route).unwrap();
+        let destination = f[2].verify_request(forwarded).unwrap();
+        let response = f[2]
+            .sign_response(destination.binding(), PeerResponse::Miss)
+            .unwrap();
+        let mut substituted = copy_response(&response);
+        substituted.response = PeerResponse::Overloaded;
+        assert!(f[1].verify_response(substituted, &reverse).is_err());
+        let (_, other) = f[0].sign_request_to(request(9), &node(1)).unwrap();
+        assert!(
+            f[1].verify_response(copy_response(&response), &other)
+                .is_err()
+        );
+        let replay = copy_response(&response);
+        let verified = f[1].verify_response(response, &reverse).unwrap();
+        f[1].verify_response(replay, &reverse).unwrap();
+        assert!(f[1].append_response(verified, &node(2)).is_err());
+        // Historical response proofs may be carried by fresh session heads.
+        let response = f[2]
+            .sign_response(destination.binding(), PeerResponse::Miss)
+            .unwrap();
+        let verified = f[1].verify_response(response, &reverse).unwrap();
+        let reverse_response = f[1].append_response(verified, &node(0)).unwrap();
+        for h in &reverse_response.authentication.hops[0].head.headers {
+            let mut tampered = copy_response(&reverse_response);
+            tampered.authentication.hops[0]
+                .head
+                .headers
+                .iter_mut()
+                .find(|v| v.name == h.name)
+                .unwrap()
+                .value
+                .push(b'x');
+            assert!(
+                f[0].verify_response(tampered, &binding).is_err(),
+                "accepted reverse-hop mutation {}",
+                h.name
+            );
+        }
+        let mut stripped = copy_response(&reverse_response);
+        stripped.authentication.hops.clear();
+        assert!(f[0].verify_response(stripped, &binding).is_err());
+        assert!(
+            f[0].verify_response(copy_response(&reverse_response), &other)
+                .is_err()
+        );
+        f[0].verify_response(reverse_response, &binding).unwrap();
+    }
+    #[test]
+    fn page_descriptor_fields_and_successful_response_are_bound_exactly() {
+        let signatures = network(3);
+        let a = Forwarding::new(signatures[0].clone());
+        let b = Forwarding::new(signatures[2].clone());
+        let mut request = request(3);
+        let page = PageId {
+            version: ObjectVersion {
+                object: request.origin.object.clone(),
+                etag: StrongEtag::parse(b"\"version\"").unwrap(),
+            },
+            number: PageNumber(0),
+        };
+        request.operation = Operation::Page {
+            page: page.clone(),
+            mode: FetchMode::Acquire,
+        };
+        let (signed, binding) = a.sign_request(request).unwrap();
+        let admitted = b.verify_request(signed).unwrap();
+        let metadata = ObjectMetadata {
+            content_type: None,
+            version: page.version.clone(),
+            length: 7,
+            expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
+        };
+        let ciphertext = wire_ciphertext(
+            PageEnvelope {
+                page,
+                key_id: KeyId([6; 16]),
+                nonce: Nonce([7; 24]),
+                plaintext_length: 7,
+                ciphertext_length: 23,
+            },
+            23,
+        );
+        let response = b
+            .sign_response(
+                admitted.binding(),
+                PeerResponse::Page {
+                    metadata: metadata.clone(),
+                    ciphertext: ciphertext.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            field(&response.authentication.original.head, "content-range").unwrap(),
+            "bytes 0-6/7"
+        );
+        for change in 0..7 {
+            let mut m = metadata.clone();
+            let mut envelope = ciphertext.envelope().clone();
+            match change {
+                0 => envelope.key_id.0[0] ^= 1,
+                1 => envelope.nonce.0[0] ^= 1,
+                2 => envelope.plaintext_length += 1,
+                3 => envelope.ciphertext_length += 1,
+                4 => m.length += 1,
+                5 => envelope.page.number.0 += 1,
+                _ => {
+                    m.expires_at =
+                        ExpiresAt::from_unix_millis(m.expires_at.to_unix_millis().unwrap() + 1)
+                            .unwrap()
+                }
+            }
+            let body = wire_ciphertext(envelope, 23);
+            let tampered = SignedResponse {
+                authentication: ForwardedHead {
+                    original: response.authentication.original.clone(),
+                    hops: Vec::new(),
+                },
+                response: PeerResponse::Page {
+                    metadata: m,
+                    ciphertext: body,
+                },
+            };
+            assert!(
+                a.verify_response(tampered, &binding).is_err(),
+                "accepted page field {change}"
+            );
+        }
+        let verified = a.verify_response(response, &binding).unwrap();
+        let PeerResponse::Page {
+            ciphertext: direct, ..
+        } = verified.response()
+        else {
+            panic!("page");
+        };
+        let provenance = direct.provenance.unwrap();
+        assert_eq!(&provenance.supplier, node(2).0.as_bytes());
+        assert_eq!(provenance.remote, provenance.supplier);
+        assert_eq!(provenance.request, admitted.request().origin.request);
+        assert_eq!(provenance.attempt, admitted.request().origin.attempt);
+        assert!(
+            ciphertext.provenance.is_none(),
+            "shared bytes must not share acquisition identity"
+        );
+
+        let relay = Forwarding::new(signatures[1].clone());
+        let mut local = self::request(4);
+        local.operation = Operation::Page {
+            page: ciphertext.envelope().page.clone(),
+            mode: FetchMode::Acquire,
+        };
+        let (signed, binding) = a.sign_request_to(local, &node(1)).unwrap();
+        let inbound = relay.verify_request(signed).unwrap();
+        let reverse = inbound.binding().clone();
+        let mut budget = inbound.request().route.clone();
+        budget.visited.push(node(1));
+        budget.remaining_links -= 1;
+        let forwarded = relay.append_request(inbound, &node(2), budget).unwrap();
+        let inbound = b.verify_request(forwarded).unwrap();
+        let reply = b
+            .sign_response(
+                inbound.binding(),
+                PeerResponse::Page {
+                    metadata,
+                    ciphertext,
+                },
+            )
+            .unwrap();
+        let reply = relay.verify_response(reply, &reverse).unwrap();
+        let reply = relay.append_response(reply, &node(0)).unwrap();
+        let reply = a.verify_response(reply, &binding).unwrap();
+        let PeerResponse::Page { ciphertext, .. } = reply.response() else {
+            panic!("page");
+        };
+        let provenance = ciphertext.provenance.unwrap();
+        assert_eq!(&provenance.supplier, node(2).0.as_bytes());
+        assert_eq!(&provenance.remote, node(1).0.as_bytes());
+        assert_eq!(provenance.request, inbound.request().origin.request);
+        assert_eq!(provenance.attempt, inbound.request().origin.attempt);
+    }
+    #[test]
+    fn validly_signed_page_must_match_the_requested_version_and_page() {
+        let signatures = network(3);
+        let sender = Forwarding::new(signatures[0].clone());
+        let mut local = request(1);
+        let requested = PageId {
+            version: ObjectVersion {
+                object: local.origin.object.clone(),
+                etag: StrongEtag::parse(b"\"version\"").unwrap(),
+            },
+            number: PageNumber(0),
+        };
+        local.operation = Operation::Page {
+            page: requested.clone(),
+            mode: FetchMode::CopyOnly,
+        };
+        let (_, binding) = sender.sign_request(local).unwrap();
+        for change in 0..2 {
+            let mut page = requested.clone();
+            if change == 0 {
+                page.version.etag = StrongEtag::parse(b"\"another-version\"").unwrap();
+            } else {
+                page.number = PageNumber(1);
+            }
+            let metadata = ObjectMetadata {
+                content_type: None,
+                version: page.version.clone(),
+                length: page.number.0 * PAGE_BYTES + 3,
+                expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
+            };
+            let ciphertext = wire_ciphertext(
+                PageEnvelope {
+                    page,
+                    key_id: KeyId([3; 16]),
+                    nonce: Nonce([4; 24]),
+                    plaintext_length: 3,
+                    ciphertext_length: 19,
+                },
+                19,
+            );
+            let response = PeerResponse::Page {
+                metadata,
+                ciphertext,
+            };
+            let mut head = protocol::response_head(
+                &response,
+                &signed_digest(&binding.original).unwrap(),
+                &[node(0), node(2)],
+            )
+            .unwrap();
+            push(&mut head, "racer-receiver", node(0).0);
+            let signed = SignedResponse {
+                authentication: ForwardedHead {
+                    original: Arc::new(signatures[2].sign(head).unwrap()),
+                    hops: Vec::new(),
+                },
+                response,
+            };
+            assert!(sender.verify_response(signed, &binding).is_err());
+        }
+    }
+    #[test]
+    fn exact_request_agreement_credentials_mode_identity_and_route() {
+        let signatures = network(3);
+        let f: Vec<_> = signatures
+            .iter()
+            .map(|s| Forwarding::new(s.clone()))
+            .collect();
+        for change in 0..10 {
+            let (mut signed, _) = f[0].sign_request_to(request(1), &node(1)).unwrap();
+            match change {
+                0 => {
+                    if let Operation::Metadata { mode, .. } = &mut signed.request.operation {
+                        *mode = FetchMode::Acquire;
+                    }
+                }
+                1 => signed.request.origin.metadata = None,
+                2 => {
+                    signed
+                        .request
+                        .origin
+                        .authorization
+                        .as_mut()
+                        .unwrap()
+                        .ciphertext[0] ^= 1
+                }
+                3 => {
+                    signed
+                        .request
+                        .origin
+                        .authorization
+                        .as_mut()
+                        .unwrap()
+                        .nonce
+                        .0[0] ^= 1
+                }
+                4 => {
+                    signed
+                        .request
+                        .origin
+                        .authorization
+                        .as_mut()
+                        .unwrap()
+                        .key_id
+                        .0[0] ^= 1
+                }
+                5 => signed.request.route.membership.0 += 1,
+                6 => signed.request.route.remaining_links += 1,
+                7 => signed.request.route.deadline.0 += Duration::from_secs(1),
+                8 => {
+                    if let Operation::Metadata { selector, .. } = &mut signed.request.operation {
+                        *selector = MetadataSelector::Fresh;
+                    }
+                }
+                _ => signed.request.origin.object.key.0[0] ^= 1,
+            }
+            assert!(
+                f[1].verify_request(signed).is_err(),
+                "accepted logical mutation {change}"
+            );
+        }
+    }
+    #[test]
+    fn route_budget_extensions_loops_and_hop_chain_substitution_fail() {
+        let signatures = network(3);
+        let f: Vec<_> = signatures
+            .iter()
+            .map(|s| Forwarding::new(s.clone()))
+            .collect();
+        for change in 0..5 {
+            let (signed, _) = f[0].sign_request_to(request(1), &node(1)).unwrap();
+            let admitted = f[1].verify_request(signed).unwrap();
+            let mut route = budget(&admitted);
+            match change {
+                0 => route.remaining_links += 1,
+                1 => route.deadline.0 += Duration::from_secs(1),
+                2 => route.visited.clear(),
+                3 => route.destination = node(0),
+                _ => route.attempt.0[0] ^= 1,
+            }
+            assert!(f[1].append_request(admitted, &node(2), route).is_err());
+        }
+        let (first, _) = f[0].sign_request_to(request(1), &node(1)).unwrap();
+        let (second, _) = f[0].sign_request_to(request(2), &node(1)).unwrap();
+        let admitted = f[1].verify_request(first).unwrap();
+        let route = budget(&admitted);
+        let mut forwarded = f[1].append_request(admitted, &node(2), route).unwrap();
+        for h in &forwarded.authentication.hops[0].head.headers {
+            let mut logical = request(1);
+            logical.route = RouteBudget {
+                membership: forwarded.request.route.membership,
+                request: forwarded.request.route.request,
+                attempt: forwarded.request.route.attempt,
+                destination: forwarded.request.route.destination.clone(),
+                visited: forwarded.request.route.visited.clone(),
+                remaining_links: forwarded.request.route.remaining_links,
+                remaining_attempts: forwarded.request.route.remaining_attempts,
+                deadline: forwarded.request.route.deadline,
+            };
+            let mut hop = clone_head(&forwarded.authentication.hops[0]);
+            hop.head
+                .headers
+                .iter_mut()
+                .find(|v| v.name == h.name)
+                .unwrap()
+                .value
+                .push(b'x');
+            assert!(
+                f[2].verify_request(SignedRequest {
+                    authentication: ForwardedHead {
+                        original: forwarded.authentication.original.clone(),
+                        hops: vec![hop]
+                    },
+                    request: logical,
+                })
+                .is_err(),
+                "accepted forward-hop mutation {}",
+                h.name
+            );
+        }
+        forwarded.authentication.original = second.authentication.original;
+        assert!(f[2].verify_request(forwarded).is_err());
+        let mut exhausted = request(1);
+        exhausted.route.remaining_links = 1;
+        let (signed, _) = f[0].sign_request_to(exhausted, &node(1)).unwrap();
+        let admitted = f[1].verify_request(signed).unwrap();
+        let route = budget(&admitted);
+        assert!(f[1].append_request(admitted, &node(2), route).is_err());
+    }
+    #[test]
+    fn successful_metadata_must_match_original_object_pin_and_operation() {
+        use crate::model::ExpiresAt;
+        use crate::model::ObjectMetadata;
+        let signatures = network(3);
+        let f: Vec<_> = signatures
+            .iter()
+            .map(|s| Forwarding::new(s.clone()))
+            .collect();
+        let (signed, _) = f[0].sign_request(request(1)).unwrap();
+        let admitted = f[2].verify_request(signed).unwrap();
+        let good = ObjectMetadata {
+            content_type: Some(crate::model::ContentType::parse(b"text/plain").unwrap()),
+            version: ObjectVersion {
+                object: admitted.request().origin.object.clone(),
+                etag: StrongEtag::parse(b"\"version\"").unwrap(),
+            },
+            length: 20,
+            expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
+        };
+        f[2].sign_response(admitted.binding(), PeerResponse::Metadata(good.clone()))
+            .unwrap();
+        let (signed, binding) = f[0].sign_request(request(2)).unwrap();
+        let admitted_typed = f[2].verify_request(signed).unwrap();
+        let mut signed = f[2]
+            .sign_response(
+                admitted_typed.binding(),
+                PeerResponse::Metadata(good.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            protocol::field(
+                &signed.authentication.original.head,
+                "racer-metadata-version"
+            )
+            .unwrap(),
+            "2"
+        );
+        assert_eq!(
+            protocol::field(&signed.authentication.original.head, "content-length").unwrap(),
+            "0"
+        );
+        if let PeerResponse::Metadata(metadata) = &mut signed.response {
+            metadata.content_type = Some(crate::model::ContentType::parse(b"text/html").unwrap());
+        }
+        assert!(
+            f[0].verify_response(signed, &binding).is_err(),
+            "MIME metadata is covered by signed agreement"
+        );
+        let mut bad = good.clone();
+        bad.version.etag = StrongEtag::parse(b"\"other\"").unwrap();
+        assert!(
+            f[2].sign_response(admitted.binding(), PeerResponse::Metadata(bad))
+                .is_err()
+        );
+        let mut bad = good;
+        bad.version.object.key.0[0] ^= 1;
+        assert!(
+            f[2].sign_response(admitted.binding(), PeerResponse::Metadata(bad))
+                .is_err()
+        );
+    }
+    #[test]
+    fn relay_cannot_assert_success_but_can_return_request_bound_errors() {
+        use crate::model::ExpiresAt;
+        use crate::model::ObjectMetadata;
+        let signatures = network(3);
+        let requester = Forwarding::new(signatures[0].clone());
+        let relay = Forwarding::new(signatures[1].clone());
+        let (signed, binding) = requester.sign_request_to(request(1), &node(1)).unwrap();
+        let admitted = relay.verify_request(signed).unwrap();
+        let metadata = ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: admitted.request().origin.object.clone(),
+                etag: StrongEtag::parse(b"\"version\"").unwrap(),
+            },
+            length: 20,
+            expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
+        };
+        assert!(
+            relay
+                .sign_response(admitted.binding(), PeerResponse::Metadata(metadata.clone()))
+                .is_err()
+        );
+        // Bypass the honest signer facade to simulate a malicious certified relay.
+        let response = PeerResponse::Metadata(metadata);
+        let mut head = protocol::response_head(
+            &response,
+            &signed_digest(&binding.original).unwrap(),
+            &[node(0), node(1)],
+        )
+        .unwrap();
+        push(&mut head, "racer-receiver", node(0).0);
+        let forged_success = SignedResponse {
+            authentication: ForwardedHead {
+                original: Arc::new(signatures[1].sign(head).unwrap()),
+                hops: Vec::new(),
+            },
+            response,
+        };
+        assert!(requester.verify_response(forged_success, &binding).is_err());
+        let error = relay
+            .sign_response(admitted.binding(), PeerResponse::Unavailable)
+            .unwrap();
+        requester.verify_response(error, &binding).unwrap();
+    }
+    #[test]
+    fn deadline_roundtrip_and_verified_mailbox_ownership() {
+        let deadline =
+            uring_runtime::environment::Deadline(Instant::now() + Duration::from_secs(20));
+        let value = protocol::encode_deadline(deadline).unwrap();
+        let decoded = protocol::decode_deadline(value).unwrap();
+        assert_eq!(protocol::encode_deadline(decoded).unwrap(), value);
+        assert!(decoded.0 <= deadline.0);
+        fn send<T: Send>() {}
+        send::<VerifiedRequest>();
+        send::<VerifiedResponse>();
+        send::<RequestBinding>();
+    }
+}

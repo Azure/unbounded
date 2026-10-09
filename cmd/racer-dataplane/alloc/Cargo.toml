@@ -1,0 +1,16 @@
+[package]
+name = "page-alloc"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Worker-local aligned buffers and lease-fenced sparse slab storage"
+
+[features]
+default = []
+simulation = ["uring-runtime/simulation"]
+
+[dependencies]
+libc = "0.2"
+zeroize = "1"
+uring-runtime = { path = "../runtime" }

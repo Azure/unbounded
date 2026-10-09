@@ -4,6 +4,67 @@
 use super::*;
 use fixtures::{Admission, Limits, Reactor, RequestScope, ResourceClass};
 
+#[cfg(feature = "simulation")]
+#[test]
+fn gate_callback_sq_id_and_bookkeeping_rejections_allow_reentry() {
+    struct BudgetSwitch(Rc<Cell<bool>>);
+    impl Budget for BudgetSwitch {
+        type Charge = ();
+        fn charge(&self, _: usize) -> Result<()> {
+            if self.0.get() {
+                Err(Error::Overloaded)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let sim = simulation::Simulation::new();
+    let _environment = sim.enter();
+    let blocked = Rc::new(Cell::new(false));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let sink = events.clone();
+    let reactor = Rc::new_cyclic(|weak: &Weak<super::Reactor<RequestScope, BudgetSwitch>>| {
+        let weak = weak.clone();
+        super::Reactor::new(2, BudgetSwitch(blocked.clone())).with_rejection_observer(
+            move |_, facts| {
+                let reactor = weak.upgrade().unwrap();
+                assert_eq!(reactor.in_flight(), 0);
+                assert!(reactor.state.try_borrow_mut().is_ok());
+                sink.borrow_mut().push(facts.reason);
+            },
+        )
+    });
+    reactor.init().unwrap();
+    let request = scope();
+    let (fd, _peer) = sim.socket_pair();
+    let fd = Rc::new(fd);
+    blocked.set(true);
+    assert!(matches!(
+        poll(&mut reactor.readiness(fd.clone(), libc::POLLIN as u32, &request)),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    blocked.set(false);
+    reactor.state.borrow_mut().next = CANCEL_BIT;
+    assert!(matches!(
+        poll(&mut reactor.readiness(fd.clone(), libc::POLLIN as u32, &request)),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    reactor.state.borrow_mut().next = 1;
+    sim.reject_submissions(1).unwrap();
+    assert!(matches!(
+        poll(&mut reactor.readiness(fd, libc::POLLIN as u32, &request)),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    assert!(matches!(
+        events.borrow().as_slice(),
+        [
+            RejectionReason::Bookkeeping,
+            RejectionReason::IdExhausted,
+            RejectionReason::SubmissionQueueFull
+        ]
+    ));
+}
+
 pub(super) mod fixtures {
     //! Counting guards and a scoped adapter for raw completion ownership tests.
     use super::*;

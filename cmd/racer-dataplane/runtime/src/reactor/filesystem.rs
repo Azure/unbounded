@@ -4,6 +4,7 @@ use super::*;
 use std::{ffi::CString, num::NonZeroUsize, ops::Deref};
 use zeroize::Zeroize;
 
+pub mod checkpoint;
 pub mod operations;
 
 /// Stable, quota-owning I/O storage with a cursor for partial writes.

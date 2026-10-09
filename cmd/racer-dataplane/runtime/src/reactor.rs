@@ -62,6 +62,8 @@ use std::{
 /// Worker-local I/O owner, explicitly driven by [`Self::poll_budgeted`].
 /// Dropping a waiting operation abandons delivery, never its kernel-owned resources.
 pub struct Reactor<S: Scope, B: Budget> {
+    rejection_observer: Option<Box<RejectionObserver<S>>>,
+
     environment: super::environment::Environment,
 
     budget: B,
@@ -73,6 +75,44 @@ pub struct Reactor<S: Scope, B: Budget> {
     ordinary: Rc<Cell<usize>>,
 
     reserved: RefCell<Weak<SubmissionCapacity>>,
+}
+
+/// Caller-owned event sink, invoked only when admission fails.
+type RejectionObserver<S> = dyn Fn(&S, SubmissionRejection);
+
+/// Submission events describe rejected operations, not final client outcomes.
+#[derive(Clone, Copy, Debug)]
+pub enum RejectionReason {
+    Initialization,
+    ReservedFull,
+    OrdinaryFull,
+    Bookkeeping,
+    EntriesFull,
+    PartitionFull,
+    IdExhausted,
+    SubmissionQueueFull,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SubmissionKind {
+    OtherIo,
+    Readiness,
+    Timeout,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SubmissionRejection {
+    pub reason: RejectionReason,
+
+    pub kind: SubmissionKind,
+
+    pub reserved: bool,
+
+    pub used: Option<usize>,
+
+    pub limit: Option<usize>,
+
+    pub requested: usize,
 }
 
 /// Startup-owned partition of the existing entry and bookkeeping ceilings.
@@ -661,6 +701,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// Create an uninitialized reactor; kernel resources are acquired by [`Self::init`].
     pub fn new(queue_entries: usize, budget: Q) -> Self {
         Self {
+            rejection_observer: None,
             environment: super::environment::Environment::current(),
             budget,
             queue_entries,
@@ -688,7 +729,22 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         }
     }
 
-    /// Explicit, idempotent kernel resource acquisition. Also called lazily on I/O.
+    /// Observe rejected submissions only, without changing the returned error.
+    pub fn with_rejection_observer(
+        mut self,
+        observer: impl Fn(&S, SubmissionRejection) + 'static,
+    ) -> Self {
+        self.rejection_observer = Some(Box::new(observer));
+        self
+    }
+
+    fn rejected(&self, scope: &S, facts: SubmissionRejection) {
+        if let Some(observer) = &self.rejection_observer {
+            observer(scope, facts);
+        }
+    }
+
+    /// Initialize the selected backend once.
     pub fn init(&self) -> Result<()> {
         let state = self.state.borrow();
         if state.stopped {
@@ -811,8 +867,45 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         capacity: Option<Rc<SubmissionCapacity>>,
         finish: impl FnOnce(Result<KernelResult, S::Error>) -> Result<T, S::Error> + 'static,
     ) -> Result<Waiting<T, S::Error>, S::Error> {
+        self.submit_reserved_kind(
+            sqe,
+            scope,
+            accept,
+            capacity,
+            SubmissionKind::OtherIo,
+            finish,
+        )
+    }
+
+    fn submit_reserved_kind<T: 'static>(
+        &self,
+        sqe: Submission,
+        scope: &S,
+        accept: bool,
+        capacity: Option<Rc<SubmissionCapacity>>,
+        kind: SubmissionKind,
+        finish: impl FnOnce(Result<KernelResult, S::Error>) -> Result<T, S::Error> + 'static,
+    ) -> Result<Waiting<T, S::Error>, S::Error> {
         scope.check()?;
-        self.init()?;
+        let reserved_partition = capacity.is_some();
+        let reject = |reason, used, limit, requested| {
+            self.rejected(
+                scope,
+                SubmissionRejection {
+                    reason,
+                    kind,
+                    reserved: reserved_partition,
+                    used,
+                    limit,
+                    requested,
+                },
+            );
+        };
+        self.init().inspect_err(|error| {
+            if *error == Error::Overloaded {
+                reject(RejectionReason::Initialization, None, None, 1);
+            }
+        })?;
         let scope = Rc::new(scope.clone());
         let bytes = std::mem::size_of::<Entry<S>>()
             + std::mem::size_of::<S>()
@@ -832,6 +925,12 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 return Err(Error::InvalidConfiguration.into());
             }
             if pool.active.get() >= pool.capacity {
+                reject(
+                    RejectionReason::ReservedFull,
+                    Some(pool.active.get()),
+                    Some(pool.capacity),
+                    1,
+                );
                 return Err(Error::Overloaded.into());
             }
             (pool.memory.clone(), pool.active.clone())
@@ -842,9 +941,20 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 .upgrade()
                 .map_or(0, |pool| pool.capacity);
             if self.ordinary.get() >= self.queue_entries - reserved {
+                reject(
+                    RejectionReason::OrdinaryFull,
+                    Some(self.ordinary.get()),
+                    Some(self.queue_entries - reserved),
+                    1,
+                );
                 return Err(Error::Overloaded.into());
             }
-            (Rc::new(self.charge(bytes)?), self.ordinary.clone())
+            let charge = self.charge(bytes).inspect_err(|error| {
+                if *error == Error::Overloaded {
+                    reject(RejectionReason::Bookkeeping, None, None, bytes);
+                }
+            })?;
+            (Rc::new(charge), self.ordinary.clone())
         };
         let mut state = self.state.borrow_mut();
         if state.stopped {
@@ -856,12 +966,23 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             |pool| pool.capacity,
         );
         if state.entries.len() >= self.queue_entries || active.get() >= available {
+            let (reason, used, limit) = if state.entries.len() >= self.queue_entries {
+                (
+                    RejectionReason::EntriesFull,
+                    state.entries.len(),
+                    self.queue_entries,
+                )
+            } else {
+                (RejectionReason::PartitionFull, active.get(), available)
+            };
             drop(state);
+            reject(reason, Some(used), Some(limit), 1);
             return Err(Error::Overloaded.into());
         }
         let id = IoId(state.next);
         if id.0 >= CANCEL_BIT {
             drop(state);
+            reject(RejectionReason::IdExhausted, None, None, 1);
             return Err(Error::Overloaded.into());
         }
         state.next += 1;
@@ -936,6 +1057,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             let entry = state.entries.remove(&id);
             drop(state);
             drop(entry);
+            reject(RejectionReason::SubmissionQueueFull, None, None, 1);
             return Err(Error::Overloaded.into());
         }
         // Kernel submission is driven by poll_budgeted and by wait before sleeping,
@@ -980,11 +1102,18 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 // readiness SQE is pending. Abandonment must retain them too.
                 let retained_fd = fd.clone();
                 owned = self
-                    .submit_reserved(sqe, scope, false, capacity.clone(), move |result| {
-                        drop(retained_fd);
-                        result?.value()?;
-                        Ok(owned)
-                    })?
+                    .submit_reserved_kind(
+                        sqe,
+                        scope,
+                        false,
+                        capacity.clone(),
+                        SubmissionKind::Readiness,
+                        move |result| {
+                            drop(retained_fd);
+                            result?.value()?;
+                            Ok(owned)
+                        },
+                    )?
                     .await?;
             }
         }
@@ -1284,6 +1413,29 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, u32, S::Error> {
+        self.readiness_capacity(fd, interest, lease, None, scope)
+    }
+
+    /// Wait with prepaid capacity and retain the descriptor and lease until fenced.
+    pub fn readiness_reserved<'a, L: 'static>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        interest: u32,
+        lease: L,
+        capacity: Rc<SubmissionCapacity>,
+        scope: &'a S,
+    ) -> Operation<'a, u32, S::Error> {
+        self.readiness_capacity(fd, interest, lease, Some(capacity), scope)
+    }
+
+    fn readiness_capacity<'a, L: 'static>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        interest: u32,
+        lease: L,
+        capacity: Option<Rc<SubmissionCapacity>>,
+        scope: &'a S,
+    ) -> Operation<'a, u32, S::Error> {
         Box::pin(async move {
             if interest == 0
                 || interest
@@ -1297,11 +1449,18 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 return Err(Error::InvalidInput.into());
             }
             let sqe = self.readiness_submission(&fd, interest);
-            self.submit(sqe, scope, false, move |result| {
-                drop(fd);
-                drop(lease);
-                Ok(result?.value()? as u32)
-            })?
+            self.submit_reserved_kind(
+                sqe,
+                scope,
+                false,
+                capacity,
+                SubmissionKind::Readiness,
+                move |result| {
+                    drop(fd);
+                    drop(lease);
+                    Ok(result?.value()? as u32)
+                },
+            )?
             .await
         })
     }
@@ -2001,16 +2160,23 @@ pub mod timer {
                 }
                 let timeout = SyscallArg::new(types::Timespec::from(duration));
                 let sqe = opcode::Timeout::new(timeout.as_ptr()).build();
-                self.submit(Submission::Real(sqe), scope, false, move |result| {
-                    drop(timeout);
-                    match result? {
-                        KernelResult::Value(value) if value == -libc::ETIME => Ok(()),
-                        other => {
-                            other.value()?;
-                            Ok(())
+                self.submit_reserved_kind(
+                    Submission::Real(sqe),
+                    scope,
+                    false,
+                    None,
+                    SubmissionKind::Timeout,
+                    move |result| {
+                        drop(timeout);
+                        match result? {
+                            KernelResult::Value(value) if value == -libc::ETIME => Ok(()),
+                            other => {
+                                other.value()?;
+                                Ok(())
+                            }
                         }
-                    }
-                })?
+                    },
+                )?
                 .await?;
                 scope.check()
             })

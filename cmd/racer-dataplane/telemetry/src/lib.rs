@@ -18,6 +18,109 @@ pub mod server;
 
 pub use metrics::{Lease, Metric, Metrics};
 
+/// Fixed writer shards for caller-defined diagnostic snapshots.
+/// Each read clones one shard under its lock; aggregation never holds a writer lock.
+pub struct SnapshotShards<T>(Arc<[Mutex<T>]>);
+
+impl<T> Clone for SnapshotShards<T> {
+    /// Share the fixed shard collection without copying snapshots.
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: Default + Clone> SnapshotShards<T> {
+    /// Allocate a fixed number of default-valued shards, including zero if desired.
+    pub fn new(count: usize) -> Self {
+        Self((0..count).map(|_| Mutex::new(T::default())).collect())
+    }
+
+    /// Replace one writer's complete observation; panic on an invalid shard index.
+    pub fn replace(&self, shard: usize, value: T) {
+        *self.0[shard].lock().unwrap_or_else(|e| e.into_inner()) = value;
+    }
+
+    /// Copy each observation independently, recovering retained poisoned state.
+    pub fn snapshots(&self) -> impl ExactSizeIterator<Item = T> + '_ {
+        self.0
+            .iter()
+            .map(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+}
+
+/// Shared sampling admission and bounded retention under one lock.
+/// Callers decide eligibility before acquisition and own the record schema.
+pub struct Sampler<T, const N: usize>(Arc<Mutex<SamplerState<T, N>>>);
+
+/// Admission and publication are serialized so snapshots see matching totals.
+struct SamplerState<T, const N: usize> {
+    budget: SampleBudget,
+
+    entries: Ring<Arc<T>, N>,
+}
+
+/// Exclusive sample work ownership. Drop releases admission, never refunds it.
+/// Retained records and reader snapshots may outlive this lease.
+pub struct SampleLease<T, const N: usize>(Sampler<T, N>);
+
+impl<T, const N: usize> Clone for Sampler<T, N> {
+    /// Share admission and retention without copying records or limits.
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T, const N: usize> Sampler<T, N> {
+    /// Create an empty sampler with caller-selected limits and positive retention.
+    pub fn new(limits: SampleLimits) -> Self {
+        Self(Arc::new(Mutex::new(SamplerState {
+            budget: SampleBudget::new(limits),
+            entries: Ring::default(),
+        })))
+    }
+
+    /// Admit and publish one record. The constructor runs under the sampler lock
+    /// and must not reenter this sampler. Rejected attempts do not construct data.
+    pub fn acquire(
+        &self,
+        now: Instant,
+        record: impl FnOnce(u64) -> T,
+    ) -> Option<(Arc<T>, SampleLease<T, N>)> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = state.budget.acquire(now)?;
+        let record = Arc::new(record(sequence));
+        state.entries.push(record.clone());
+        Some((record, SampleLease(self.clone())))
+    }
+
+    /// Copy counters without changing admission or retention.
+    pub fn counts(&self) -> SampleCounts {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .budget
+            .counts()
+    }
+
+    /// Clone retention and its matching counts, releasing the lock before formatting.
+    pub fn snapshot(&self) -> (Ring<Arc<T>, N>, SampleCounts) {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (state.entries.clone(), state.budget.counts())
+    }
+}
+
+impl<T, const N: usize> Drop for SampleLease<T, N> {
+    /// Release the single busy slot even when sampled work is abandoned.
+    fn drop(&mut self) {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .budget
+            .release();
+    }
+}
+
 /// Shared bounded diagnostics with snapshots that never expose the writer lock.
 ///
 /// Cloning shares the writer; snapshotting clones retention under the lock.
@@ -285,6 +388,45 @@ pub mod metrics {
         label: &'static str,
     }
 
+    /// A fixed exposition schema. Identifiers, kinds, and optional labels must be
+    /// trusted static text; no dynamic registration or unbounded label input exists.
+    pub struct Exposition<const N: usize> {
+        series: [(&'static str, &'static str); N],
+    }
+
+    impl<const N: usize> Exposition<N> {
+        /// Define ordered metric names and Prometheus kinds at compile time.
+        pub const fn new(series: [(&'static str, &'static str); N]) -> Self {
+            Self { series }
+        }
+
+        /// Write one unlabeled observation per metric, preserving schema order.
+        pub fn write(&self, out: &mut impl fmt::Write, values: [u64; N]) -> fmt::Result {
+            for ((name, kind), value) in self.series.into_iter().zip(values) {
+                writeln!(out, "# TYPE {name} {kind}\n{name} {value}")?;
+            }
+            Ok(())
+        }
+
+        /// Write fixed-cardinality labeled observations in metric-major order.
+        /// Labels must be trusted static strings without quotes or backslashes.
+        pub fn write_labeled<const L: usize>(
+            &self,
+            out: &mut impl fmt::Write,
+            label: &'static str,
+            labels: [&'static str; L],
+            values: [[u64; N]; L],
+        ) -> fmt::Result {
+            for (index, (name, kind)) in self.series.into_iter().enumerate() {
+                writeln!(out, "# TYPE {name} {kind}")?;
+                for (label_value, values) in labels.into_iter().zip(values) {
+                    writeln!(out, "{name}{{{label}=\"{label_value}\"}} {}", values[index])?;
+                }
+            }
+            Ok(())
+        }
+    }
+
     impl<C: Metric, G: Metric> Metrics<C, G> {
         /// Allocate a fixed registry. Panics if `n` is zero or capacity overflows.
         pub fn shards(n: usize) -> Vec<Self> {
@@ -364,22 +506,10 @@ pub mod metrics {
         /// Writes directly to the caller's sink and propagates capacity errors.
         pub fn write_prometheus(&self, out: &mut impl fmt::Write) -> fmt::Result {
             for &metric in C::ALL {
-                writeln!(
-                    out,
-                    "# TYPE {} counter\n{} {}",
-                    metric.name(),
-                    metric.name(),
-                    self.count(metric)
-                )?;
+                Exposition::new([(metric.name(), "counter")]).write(out, [self.count(metric)])?;
             }
             for &metric in G::ALL {
-                writeln!(
-                    out,
-                    "# TYPE {} gauge\n{} {}",
-                    metric.name(),
-                    metric.name(),
-                    self.gauge(metric)
-                )?;
+                Exposition::new([(metric.name(), "gauge")]).write(out, [self.gauge(metric)])?;
             }
             Ok(())
         }
@@ -497,6 +627,33 @@ pub mod metrics {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Fixed schemas preserve exact order, maxima, empty sets and sink errors.
+        #[test]
+        fn fixed_exposition_preserves_metric_major_layout_and_errors() {
+            let schema = Exposition::new([("requests", "counter"), ("active", "gauge")]);
+            let mut text = String::new();
+            schema.write(&mut text, [u64::MAX, 0]).unwrap();
+            assert_eq!(
+                text,
+                "# TYPE requests counter\nrequests 18446744073709551615\n# TYPE active gauge\nactive 0\n"
+            );
+            text.clear();
+            schema
+                .write_labeled(&mut text, "class", ["a", "b"], [[1, 2], [3, 4]])
+                .unwrap();
+            assert_eq!(
+                text,
+                "# TYPE requests counter\nrequests{class=\"a\"} 1\nrequests{class=\"b\"} 3\n# TYPE active gauge\nactive{class=\"a\"} 2\nactive{class=\"b\"} 4\n"
+            );
+            assert!(schema.write(&mut Full, [0, 0]).is_err());
+            assert!(
+                schema
+                    .write_labeled(&mut Full, "class", ["a"], [[0, 0]])
+                    .is_err()
+            );
+            Exposition::new([]).write(&mut Full, []).unwrap();
+        }
 
         /// Exercise ordered numeric labels, maximum values, and empty schemas.
         #[test]
@@ -970,6 +1127,9 @@ mod ring_tests {
         assert!(ring.try_snapshot().unwrap().is_empty());
         ring.push(1);
         ring.push(2);
+        let guard = ring.0.lock().unwrap();
+        assert!(ring.try_snapshot().is_none());
+        drop(guard);
         let snapshot = ring.try_snapshot().unwrap();
         assert_eq!(snapshot.total(), 2);
         assert_eq!(snapshot.iter().collect::<Vec<_>>(), [(1, 1), (2, 2)]);
@@ -1168,6 +1328,72 @@ mod ring_tests {
 #[cfg(test)]
 mod sampling_tests {
     use super::*;
+
+    /// Snapshot readers never retain writer locks or observe mutable borrowed data.
+    #[test]
+    fn snapshot_shards_replace_and_release_each_writer_lock() {
+        let shards = SnapshotShards::<Vec<u64>>::new(2);
+        shards.replace(0, vec![1]);
+        shards.replace(1, vec![2]);
+        let other = shards.clone();
+        let mut snapshots = shards.snapshots();
+        let first = snapshots.next().unwrap();
+        other.replace(0, vec![3]);
+        other.replace(1, vec![4]);
+        assert_eq!(first, vec![1]);
+        assert_eq!(snapshots.next(), Some(vec![4]));
+        assert_eq!(snapshots.next(), None);
+        assert_eq!(
+            shards.snapshots().collect::<Vec<_>>(),
+            vec![vec![3], vec![4]]
+        );
+        assert_eq!(SnapshotShards::<u64>::new(0).snapshots().len(), 0);
+    }
+
+    /// Admission is shared across threads, while snapshots outlive overwritten records.
+    #[test]
+    fn shared_sampler_releases_abandoned_work_without_refunding_admission() {
+        let now = Instant::now();
+        let sampler = Sampler::<u64, 1>::new(SampleLimits {
+            total: 2,
+            duration: Duration::from_secs(10),
+            interval: Duration::ZERO,
+        });
+        let (first, lease) = sampler.acquire(now, |sequence| sequence).unwrap();
+        let other = sampler.clone();
+        assert!(
+            std::thread::spawn(move || other
+                .acquire(now, |_| panic!("busy constructor"))
+                .is_none())
+            .join()
+            .unwrap()
+        );
+        let (snapshot, counts) = sampler.snapshot();
+        assert_eq!(
+            (counts.eligible, counts.sampled, counts.skipped, counts.busy),
+            (2, 1, 1, true)
+        );
+        drop(lease);
+        assert!(!sampler.counts().busy);
+        let (second, lease) = sampler.acquire(now, |sequence| sequence).unwrap();
+        assert_eq!((*first, *second), (1, 2));
+        assert_eq!(*snapshot.iter_refs().next().unwrap().1.as_ref(), 1);
+        assert_eq!(
+            *sampler.snapshot().0.iter_refs().next().unwrap().1.as_ref(),
+            2
+        );
+        drop(lease);
+        assert!(
+            sampler
+                .acquire(now, |_| panic!("exhausted constructor"))
+                .is_none()
+        );
+        let counts = sampler.counts();
+        assert_eq!(
+            (counts.eligible, counts.sampled, counts.skipped, counts.busy),
+            (4, 2, 2, false)
+        );
+    }
 
     /// Independent count, window, and interval limits for boundary tests.
     fn limits() -> SampleLimits {
