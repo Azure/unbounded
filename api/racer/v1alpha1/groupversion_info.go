@@ -7,3 +7,4 @@ package v1alpha1
 
 //go:generate go tool controller-gen object:headerFile=../../../hack/boilerplate.go.txt paths=.
 //go:generate go tool controller-gen crd:headerFile=../../../hack/boilerplate.yaml.txt paths=. output:crd:dir=crd
+//go:generate go tool controller-gen crd:headerFile=../../../hack/boilerplate.yaml.txt paths=. output:crd:dir=../../../deploy/racer/crd

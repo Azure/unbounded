@@ -608,12 +608,7 @@ func (r *TopologyReconciler) observeTopology(ctx context.Context) (authority.Top
 		return authority.TopologyObservation{}, err
 	}
 
-	var caches racerv1.ClusterCacheList
-	if err := r.APIReader.List(ctx, &caches); err != nil {
-		return authority.TopologyObservation{}, err
-	}
-
-	catalog, err := members.BuildCatalog(caches.Items)
+	catalog, err := members.ReadCatalog(ctx, r.APIReader)
 	if err != nil {
 		return authority.TopologyObservation{}, err
 	}
@@ -761,7 +756,7 @@ func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		Named("racer-topology").
 		WatchesRawSource(installation).
 		WatchesRawSource(source.Func(func(_ context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request]) error {
@@ -772,11 +767,14 @@ func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(nodeChanges())).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(managedPodChanges(cfg))).
 		Watches(&appsv1.DaemonSet{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, cfg.DaemonSetName))).
-		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, cfg.CredentialsSecretName))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(cfg))).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(r)
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
+	if err := watchCatalog(mgr, b); err != nil {
+		return err
+	}
+
+	return b.Complete(r)
 }
 
 // singleton coalesces input changes without introducing a singleton CR.
@@ -816,14 +814,18 @@ func (r *KeyringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		Named("racer-credentials").
 		WatchesRawSource(installation).
 		WatchesRawSource(initialEnqueue()).
-		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, cfg.CredentialsSecretName))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(cfg))).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).Complete(r)
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
+	if err := watchCatalog(mgr, b); err != nil {
+		return err
+	}
+
+	return b.Complete(r)
 }
 
 // Kubernetes field selectors cannot OR two names. Each controller watches the

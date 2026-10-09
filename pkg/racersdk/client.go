@@ -25,11 +25,13 @@ func init() {
 	sdkhook.ServeOriginAt = serveOrigin
 }
 
-// ClientConfig configures a [Client]. Only Cache is required.
+// ClientConfig configures a [Client]. Set Cache or Volume.
 type ClientConfig struct {
 	// Cache names the Racer cache, a DNS subdomain such as "blobs". The
 	// client connects to /run/racer/<Cache>/client/socket.
 	Cache string
+	// Volume is an alternate name for Cache. If both are set, they must match.
+	Volume string
 	// MaxConnections bounds concurrent [Client.Get] transfers without
 	// [ReadOptions.SmallObject]. Zero means 64. SmallObject transfers and
 	// [Client.Stat] calls each have a separate four-slot lane. Each lane has a
@@ -98,11 +100,16 @@ func newLane(slots, queue int) lane {
 // NewClient returns a client for config.Cache. It does not connect until the
 // first request, so Racer need not be running yet.
 func NewClient(config ClientConfig) (*Client, error) {
-	return newClient(config, "/run/racer/"+config.Cache+"/client/socket")
+	name, err := cacheName(config.Cache, config.Volume)
+	if err != nil {
+		return nil, err
+	}
+
+	return newClient(config, "/run/racer/"+name+"/client/socket")
 }
 
 func newClient(config ClientConfig, path string) (*Client, error) {
-	if err := validateCache(config.Cache); err != nil {
+	if _, err := cacheName(config.Cache, config.Volume); err != nil {
 		return nil, err
 	}
 
@@ -125,6 +132,22 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		ctx:    ctx,
 		cancel: cancel,
 	}, nil
+}
+
+func cacheName(cache, volume string) (string, error) {
+	if cache != "" && volume != "" && cache != volume {
+		return "", invalid("config", errors.New("cache and volume must match"))
+	}
+
+	if cache == "" && volume != "" {
+		if err := validateCache(volume); err != nil {
+			return "", invalid("volume", errors.New("invalid volume name"))
+		}
+
+		return volume, nil
+	}
+
+	return cache, validateCache(cache)
 }
 
 func validateCache(s string) error {

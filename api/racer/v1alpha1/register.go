@@ -15,6 +15,7 @@ var (
 	GroupVersion  = schema.GroupVersion{Group: GroupName, Version: "v1alpha1"}
 	SchemeBuilder = runtime.NewSchemeBuilder(func(s *runtime.Scheme) error {
 		s.AddKnownTypes(GroupVersion, &ClusterCache{}, &ClusterCacheList{})
+		s.AddKnownTypes(GroupVersion, &ClusterVolume{}, &ClusterVolumeList{})
 		metav1.AddToGroupVersion(s, GroupVersion)
 
 		return nil

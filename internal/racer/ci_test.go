@@ -28,7 +28,7 @@ func TestRacerEnvtestCIContract(t *testing.T) {
 	}
 
 	run := target("racer-envtest")
-	for _, pkg := range []string{"./internal/racer", "./internal/racer/authority"} {
+	for _, pkg := range []string{"./internal/racer", "./internal/racer/authority", "./deploy/racer"} {
 		require.Contains(t, strings.Fields(run), pkg)
 	}
 

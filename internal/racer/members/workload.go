@@ -1,8 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package testutil provides workload fixtures for controller tests.
-package testutil
+package members
 
 import "github.com/Azure/unbounded/internal/racer/workload"
 
