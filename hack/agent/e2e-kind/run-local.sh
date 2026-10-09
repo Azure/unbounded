@@ -183,7 +183,11 @@ if kind get clusters 2>/dev/null | grep -qx "${KIND_CLUSTER_NAME}"; then
     info "Kind cluster '${KIND_CLUSTER_NAME}' already exists, reusing"
 else
     info "Creating Kind cluster '${KIND_CLUSTER_NAME}'..."
-    kind create cluster --name "${KIND_CLUSTER_NAME}"
+    # Wait for the node to be Ready, as CI's kind-action does. The bridge is
+    # attached and kindnet patched next; doing that before kindnet has written
+    # its CNI config can leave the node without one, and setup then times out
+    # waiting for controllers that cannot be scheduled.
+    kind create cluster --name "${KIND_CLUSTER_NAME}" --wait 2m
 fi
 
 # ---------------------------------------------------------------------------

@@ -64,13 +64,23 @@ permissions:
   contents: read
   packages: read
 
+env:
+  # Where the Azure Container Linux image comes from; see
+  # hack/agent/e2e-kind/README.md. The gallery export creates its temporary
+  # disk in this resource group, in the gallery image's region, and its
+  # identity can delete disks there from any pull request in this repository,
+  # so the group should hold nothing but export disks. "manifest" switches back
+  # to the storage-account image and its read-only identity.
+  ACL_IMAGE_SOURCE: gallery
+  ACL_IMAGE_RESOURCE_GROUP: unbounded-dev-infra-westus2
+
 jobs:
   # The Azure Container Linux image needs a federated Azure login, which forks
   # do not get, and a static matrix cannot drop one entry conditionally. The ACL
   # entry is left out rather than failed; see hack/agent/e2e-kind/README.md.
   select-hosts:
     name: select host matrix
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -80,10 +90,13 @@ jobs:
         env:
           # Absent for non-pull_request events, where secrets are available.
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          # Checked for presence only; the Azure login needs all three.
-          ACL_CLIENT_ID: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
-          ACL_TENANT_ID: ${{ secrets.ACL_IMAGE_TENANT_ID }}
-          ACL_SUBSCRIPTION_ID: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
+          # Checked for presence only; the selected source's Azure login needs
+          # all three. The prefix is a literal either way, so a secret missing
+          # from one set never falls through to the other set's identity.
+          ACL_SECRET_PREFIX: ${{ env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY' }}
+          ACL_CLIENT_ID: ${{ secrets[format('{0}_CLIENT_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
+          ACL_TENANT_ID: ${{ secrets[format('{0}_TENANT_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
+          ACL_SUBSCRIPTION_ID: ${{ secrets[format('{0}_SUBSCRIPTION_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
         run: |
           set -euo pipefail
 
@@ -98,14 +111,16 @@ jobs:
             {"host-base-os":"ubuntu2604","nspawn-base-os":"ubuntu2604","timeout":60}
           ]'
 
-          # Azure Container Linux gets longer: it downloads a 630 MiB image and
-          # boots a 31 GiB sparse overlay through OVMF.
+          # Azure Container Linux gets longer: every run exports its image from
+          # the gallery (about 850 MiB downloaded through a temporary managed
+          # disk, about two minutes), and it boots a 32.5 GiB sparse overlay
+          # through OVMF.
           acl='{"host-base-os":"acl","nspawn-base-os":"azlinux3","timeout":75}'
 
           if [ -n "${HEAD_REPO}" ] && [ "${HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]; then
             echo "::notice::Azure Container Linux is skipped for forks: its image needs Azure credentials"
           elif [ -z "${ACL_CLIENT_ID}" ] || [ -z "${ACL_TENANT_ID}" ] || [ -z "${ACL_SUBSCRIPTION_ID}" ]; then
-            echo "::notice::Azure Container Linux is skipped: ACL_IMAGE_CLIENT_ID, ACL_IMAGE_TENANT_ID and ACL_IMAGE_SUBSCRIPTION_ID are not all configured"
+            echo "::notice::Azure Container Linux is skipped: ${ACL_SECRET_PREFIX}_CLIENT_ID, ${ACL_SECRET_PREFIX}_TENANT_ID and ${ACL_SECRET_PREFIX}_SUBSCRIPTION_ID are not all configured"
           else
             hosts="$(printf '%s' "${hosts}" | jq -c ". + [${acl}]")"
           fi
@@ -115,7 +130,7 @@ jobs:
   agent-e2e:
     name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
     needs: select-hosts
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
@@ -139,16 +154,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The gallery export's identity can create and delete disks in one
+      # resource group; the manifest's can only read the image container.
       - name: Azure login
         if: matrix.host-base-os == 'acl'
         uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
-          client-id: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
-          tenant-id: ${{ secrets.ACL_IMAGE_TENANT_ID }}
-          subscription-id: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
+          # Indexed by a literal prefix, not `cond && a || b`, which falls
+          # through to the other identity when the selected secret is empty.
+          client-id: ${{ secrets[format('{0}_CLIENT_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
+          tenant-id: ${{ secrets[format('{0}_TENANT_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
+          subscription-id: ${{ secrets[format('{0}_SUBSCRIPTION_ID', env.ACL_IMAGE_SOURCE == 'manifest' && 'ACL_IMAGE' || 'ACL_GALLERY')] }}
 
       # Exported for later e2e.py processes, so the job uses one build. The
-      # image is downloaded and verified on every run, never put in the Actions
+      # image is exported or downloaded on every run, never put in the Actions
       # cache: a pull request from a fork can restore the base branch's caches,
       # and the image is only readable with the Azure login above.
       - name: Resolve the Azure Container Linux build
@@ -185,7 +204,7 @@ jobs:
 
   agent-bootstrap-recovery:
     name: agent ${{ matrix.title }} (Ubuntu)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -233,7 +252,7 @@ jobs:
 
   agent-config-e2e:
     name: agent config e2e
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       KIND_CLUSTER_NAME: agent-config-e2e
