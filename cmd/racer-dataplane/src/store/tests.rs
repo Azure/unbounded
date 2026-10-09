@@ -390,6 +390,8 @@ fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
     assert_eq!(retention.snapshot().pending_payload_bytes, 0);
     assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
     assert_eq!(retention.snapshot().disk[0].published_pages, 0);
+    let reserved = f.segments.usage()[0].1;
+    assert!(reserved > 3, "failed I/O still owns aligned record space");
     let copy = f.copy(2, 7);
     let id = copy.ciphertext.envelope().page.clone();
     f.enqueue(copy).unwrap();
@@ -405,6 +407,10 @@ fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
     assert_eq!(retention.snapshot().indexed_payload_bytes, 0);
     assert_eq!(retention.snapshot().disk[0].index_evicted_pages, 0);
     assert_eq!(retention.snapshot().disk[0].segment_evicted_pages, 0);
+    assert!(
+        f.segments.usage()[0].1 > reserved,
+        "invalidation does not recycle record space"
+    );
 }
 #[test]
 fn second_sight_queue_owned_bias_hot_nonowned_and_pressure_discard() {

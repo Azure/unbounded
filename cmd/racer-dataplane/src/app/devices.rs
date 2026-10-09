@@ -35,6 +35,7 @@ pub struct Placement {
 
 pub struct WorkerDevices {
     pub placements: Vec<Placement>,
+    pub disk_groups: Vec<(Arc<str>, usize)>,
     pub alignment: Alignment,
     pub digest: [u8; 32],
     pub page_entries: usize,
@@ -324,6 +325,8 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
         hash.update(GUARD_BYTES.to_le_bytes());
         hash.update(GUARD_BYTES.to_le_bytes());
         let mut placements = Vec::with_capacity(count as usize);
+        let mut disk_groups: Vec<(Arc<str>, usize)> = Vec::new();
+        let mut last_device = None;
         for _ in 0..count {
             while offset
                 .checked_add(config.segment_bytes)
@@ -334,6 +337,12 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
                 offset = GUARD_BYTES;
             }
             let device = &devices[device_index];
+            if last_device == Some(device_index) {
+                disk_groups.last_mut().unwrap().1 += 1;
+            } else {
+                disk_groups.push((format!("device:{}", device.id).into(), 1));
+                last_device = Some(device_index);
+            }
             hash.update((device.id.len() as u64).to_le_bytes());
             hash.update(device.id.as_bytes());
             hash.update(device.bytes.to_le_bytes());
@@ -355,6 +364,7 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
         max_snapshot = max_snapshot.max(snapshot);
         plans.push(WorkerDevices {
             placements,
+            disk_groups,
             alignment,
             digest: hash.finalize().into(),
             page_entries: pages,
@@ -461,6 +471,12 @@ mod tests {
         );
         assert_eq!(p.workers[1].placements[0].offset, GUARD_BYTES + 4 * s);
         assert_eq!(p.workers[1].placements[1].offset, GUARD_BYTES);
+        assert_eq!(p.workers[0].disk_groups, vec![(Arc::from("device:a"), 4)]);
+        assert_eq!(
+            p.workers[1].disk_groups,
+            vec![(Arc::from("device:a"), 1), (Arc::from("device:z"), 3)]
+        );
+        assert_eq!(p.workers[2].disk_groups, vec![(Arc::from("device:z"), 3)]);
         assert!(Arc::ptr_eq(
             &p.workers[0].placements[0].file,
             &p.workers[1].placements[0].file
@@ -468,6 +484,56 @@ mod tests {
         assert_ne!(p.workers[0].digest, p.workers[1].digest);
         let q = plan(vec![device("a", 5, s), device("z", 6, s)], &c, 3).unwrap();
         assert_eq!(p.workers[0].digest, q.workers[0].digest);
+    }
+
+    #[test]
+    fn disk_usage_shared_device_plan_exports_each_assigned_segment_once() {
+        let c = config();
+        let s = c.segment_bytes;
+        let p = plan(vec![device("z", 6, s), device("a", 5, s)], &c, 3).unwrap();
+        let metrics = crate::telemetry::Metrics::for_workers(3).unwrap();
+        for (worker, metric) in p.workers.iter().zip(&metrics) {
+            let segments = page_alloc::Segments::new(s);
+            segments
+                .configure(
+                    worker.placements.len() as u64 * s,
+                    worker.placements.len(),
+                    worker.alignment,
+                )
+                .unwrap();
+            segments
+                .configure_usage_groups(
+                    &worker
+                        .disk_groups
+                        .iter()
+                        .map(|(_, count)| *count)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            drop(segments.append(4096).unwrap());
+            metric.observe_disks(
+                worker
+                    .disk_groups
+                    .iter()
+                    .zip(segments.usage())
+                    .map(|((disk, _), (size, used))| crate::telemetry::DiskUsage {
+                        disk: disk.clone(),
+                        size,
+                        used,
+                    })
+                    .collect(),
+            );
+        }
+        let mut output = String::new();
+        metrics[0].write_prometheus(&mut output).unwrap();
+        for (disk, size, used) in [("a", 5 * s, 8192), ("z", 6 * s, 4096)] {
+            assert!(output.contains(&format!(
+                "racer_disk_size_bytes{{disk=\"device:{disk}\"}} {size}\n"
+            )));
+            assert!(output.contains(&format!(
+                "racer_disk_used_bytes{{disk=\"device:{disk}\"}} {used}\n"
+            )));
+        }
     }
 
     #[test]

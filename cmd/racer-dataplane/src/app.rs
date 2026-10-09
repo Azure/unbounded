@@ -1255,7 +1255,16 @@ impl WorkerApplication {
                 runtime.reactor.clone(),
                 availability,
             )
-            .with_metrics(metrics.clone()),
+            .with_metrics(metrics.clone())
+            .with_disk_groups(devices.map_or_else(
+                || {
+                    vec![(
+                        format!("file:worker-{}-slab-0.dat", worker.0).into(),
+                        (config.slab_bytes / config.segment_bytes) as usize,
+                    )]
+                },
+                |devices| devices.disk_groups.clone(),
+            )),
         );
         let disk_page_entries = devices
             .map_or((config.disk_page_entries.get() / node.count).max(1), |d| {
@@ -2181,6 +2190,7 @@ impl WorkerApplication {
     /// Report this worker's current resources and credential lifetime.
     fn observe_health(&self) -> Result<()> {
         let node = &self.node;
+        self.store.writer.observe_disks();
         self.telemetry
             .metrics
             .observe_retention(self.store.writer.retention().snapshot());

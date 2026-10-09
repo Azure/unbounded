@@ -136,6 +136,8 @@ impl Drop for SegmentLease {
 struct Slot {
     image: SegmentSnapshot,
 
+    usage_group: usize,
+
     leases: Rc<Cell<usize>>,
 }
 
@@ -183,6 +185,8 @@ pub struct Segments {
     free: RefCell<BTreeSet<usize>>,
 
     evicting: Cell<usize>,
+
+    usage: RefCell<Vec<(u64, u64)>>,
 }
 
 impl Segments {
@@ -198,6 +202,7 @@ impl Segments {
             open: Cell::new(None),
             free: RefCell::new(BTreeSet::new()),
             evicting: Cell::new(0),
+            usage: RefCell::new(Vec::new()),
         }
     }
 
@@ -209,6 +214,37 @@ impl Segments {
     /// Configured physical capacity, or zero before configuration.
     pub fn capacity_bytes(&self) -> u64 {
         self.geometry.get().map_or(0, SegmentGeometry::slab_bytes)
+    }
+
+    /// Group consecutive slots for storage metrics. Counts must cover every slot.
+    /// Call at startup; regrouping scans the table once.
+    pub fn configure_usage_groups(&self, counts: &[usize]) -> Result<()> {
+        let mut slots = self.slots.borrow_mut();
+        if !self.is_configured()
+            || counts.is_empty()
+            || counts.contains(&0)
+            || counts.iter().try_fold(0usize, |n, c| n.checked_add(*c)) != Some(slots.len())
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut usage = Vec::with_capacity(counts.len());
+        let mut start = 0;
+        for (group, &count) in counts.iter().enumerate() {
+            let mut used = 0;
+            for slot in &mut slots[start..start + count] {
+                slot.usage_group = group;
+                used += slot.image.used_bytes;
+            }
+            usage.push((count as u64 * self.segment_bytes, used));
+            start += count;
+        }
+        *self.usage.borrow_mut() = usage;
+        Ok(())
+    }
+
+    /// Assigned capacity and reserved bytes per group, without scanning slots.
+    pub fn usage(&self) -> Vec<(u64, u64)> {
+        self.usage.borrow().clone()
     }
 
     /// Build an entirely free table, rejecting geometry above the retained slot limit.
@@ -266,6 +302,7 @@ impl Segments {
         self.geometry.set(Some(geometry));
         *self.slots.borrow_mut() = (0..count)
             .map(|id| Slot {
+                usage_group: 0,
                 image: SegmentSnapshot {
                     id: SegmentId(id as u64),
                     generation: Generation(1),
@@ -276,6 +313,7 @@ impl Segments {
             })
             .collect();
         *self.free.borrow_mut() = (0..count).collect();
+        *self.usage.borrow_mut() = vec![(count as u64 * self.segment_bytes, 0)];
         Ok(())
     }
 
@@ -338,6 +376,7 @@ impl Segments {
         let slot = &mut slots[position];
         slot.image.state = SegmentState::Open;
         slot.image.used_bytes = used_bytes;
+        self.usage.borrow_mut()[slot.usage_group].1 += length as u64;
         if slot.image.used_bytes == self.segment_bytes {
             slot.image.state = SegmentState::Sealed;
             self.open.set(None);
@@ -438,6 +477,7 @@ impl Segments {
         );
         slot.image.state = SegmentState::Free;
         self.evicting.set(self.evicting.get() - 1);
+        self.usage.borrow_mut()[slot.usage_group].1 -= slot.image.used_bytes;
         slot.image.used_bytes = 0;
         self.free.borrow_mut().insert(Self::position(id)?);
         Ok(())
@@ -512,6 +552,10 @@ impl Segments {
         self.open.set(None);
         self.free.borrow_mut().clear();
         self.evicting.set(0);
+        let mut usage = self.usage.borrow_mut();
+        for (_, used) in usage.iter_mut() {
+            *used = 0;
+        }
         for (slot, mut image) in slots.iter_mut().zip(images) {
             if image.state == SegmentState::Open {
                 image.state = SegmentState::Sealed;
@@ -522,6 +566,7 @@ impl Segments {
             if image.state == SegmentState::Evicting {
                 self.evicting.set(self.evicting.get() + 1);
             }
+            usage[slot.usage_group].1 += image.used_bytes;
             slot.image = image;
         }
         self.restore_epoch.set(epoch);
@@ -981,6 +1026,57 @@ mod tests {
         assert_eq!(s.free_count(), 0);
         assert!(s.snapshot().is_empty());
         s.configure(1024, 1, a).unwrap();
+    }
+
+    #[test]
+    fn disk_usage_tracks_reservations_recycle_and_restore() {
+        let s = segments(1024, 3);
+        assert_eq!(s.usage(), [(3072, 0)]);
+        s.configure_usage_groups(&[1, 2]).unwrap();
+        assert_eq!(s.usage(), [(1024, 0), (2048, 0)]);
+        let (held, _) = s.append(1024).unwrap();
+        drop(s.append(512).unwrap());
+        assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        let image = s.snapshot();
+        assert!(s.append(513).is_err());
+        assert!(s.restore(image.clone()).is_err());
+        for counts in [vec![], vec![0, 3], vec![2], vec![usize::MAX, 1]] {
+            assert!(s.configure_usage_groups(&counts).is_err());
+            assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        }
+        s.begin_evict(SegmentId(0)).unwrap();
+        assert!(s.recycle(SegmentId(0)).is_err());
+        assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        drop(held);
+        s.recycle(SegmentId(0)).unwrap();
+        assert_eq!(s.usage(), [(1024, 0), (2048, 512)]);
+        s.restore(image.clone()).unwrap();
+        assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        let mut invalid = image;
+        invalid[0].used_bytes = 1025;
+        assert!(s.restore(invalid).is_err());
+        assert_eq!(s.usage(), [(1024, 1024), (2048, 512)]);
+        s.configure_usage_groups(&[3]).unwrap();
+        assert_eq!(s.usage(), [(3072, 1536)]);
+        let fresh = segments(1024, 3).snapshot();
+        s.restore(fresh).unwrap();
+        assert_eq!(s.usage(), [(3072, 0)]);
+    }
+
+    #[test]
+    fn disk_usage_counts_assigned_slots_not_unassigned_capacity() {
+        let s = Segments::new(1024);
+        assert!(s.usage().is_empty());
+        assert!(s.configure_usage_groups(&[1]).is_err());
+        s.configure(8192, 2, Alignment::new(512, 512, 512).unwrap())
+            .unwrap();
+        assert_eq!(s.capacity_bytes(), 8192);
+        assert_eq!(s.usage(), [(2048, 0)]);
+        s.configure_usage_groups(&[1, 1]).unwrap();
+        drop(s.append(1024).unwrap());
+        drop(s.append(1024).unwrap());
+        assert!(s.append(512).is_err());
+        assert_eq!(s.usage(), [(1024, 1024), (1024, 1024)]);
     }
 
     /// Malformed append and synthetic saturation cannot consume or seal slots.

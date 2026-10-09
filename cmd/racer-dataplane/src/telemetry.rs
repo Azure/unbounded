@@ -452,6 +452,73 @@ mod retention_metric_tests {
     use super::*;
 
     #[test]
+    fn disk_usage_aggregates_shared_disks_replaces_and_escapes_labels() {
+        let workers = Metrics::for_workers(2).unwrap();
+        let mut output = String::new();
+        workers[0].write_disks(&mut output).unwrap();
+        assert!(output.is_empty());
+        let sample = |disk: &str, size, used| DiskUsage {
+            disk: disk.into(),
+            size,
+            used,
+        };
+        workers[0].observe_disks(vec![
+            sample("device:a", 1024, 512),
+            sample("file:worker-0-slab-0.dat", 4096, 0),
+        ]);
+        workers[1].observe_disks(vec![
+            sample("device:a", 2048, 1024),
+            sample("device:b\\\"\n", 512, 512),
+        ]);
+        workers[0].write_disks(&mut output).unwrap();
+        assert!(output.contains("# TYPE racer_disk_size_bytes gauge\n"));
+        assert!(output.contains("# TYPE racer_disk_used_bytes gauge\n"));
+        assert!(output.contains("racer_disk_size_bytes{disk=\"device:a\"} 3072\n"));
+        assert!(output.contains("racer_disk_used_bytes{disk=\"device:a\"} 1536\n"));
+        assert!(output.contains("racer_disk_used_bytes{disk=\"device:b\\\\\\\"\\n\"} 512\n"));
+        assert!(output.contains("racer_disk_used_bytes{disk=\"file:worker-0-slab-0.dat\"} 0\n"));
+        workers[1].observe_disks(vec![sample("device:a", 2048, 0)]);
+        workers[1].observe_disks(vec![sample("device:a", 2048, 0)]);
+        output.clear();
+        workers[0].write_disks(&mut output).unwrap();
+        assert!(output.contains("racer_disk_size_bytes{disk=\"device:a\"} 3072\n"));
+        assert!(output.contains("racer_disk_used_bytes{disk=\"device:a\"} 512\n"));
+        assert!(!output.contains("device:b"));
+        workers[0].observe_disks(vec![]);
+        workers[1].observe_disks(vec![]);
+        output.clear();
+        workers[0].write_disks(&mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn disk_usage_export_saturates_and_keeps_samples_on_output_failure() {
+        struct Full;
+        impl Write for Full {
+            fn write_str(&mut self, _: &str) -> std::fmt::Result {
+                Err(std::fmt::Error)
+            }
+        }
+        let workers = Metrics::for_workers(2).unwrap();
+        for worker in &workers {
+            worker.observe_disks(vec![DiskUsage {
+                disk: "device:a".into(),
+                size: u64::MAX,
+                used: u64::MAX,
+            }]);
+        }
+        assert!(workers[0].write_disks(&mut Full).is_err());
+        let mut output = String::new();
+        workers[1].write_disks(&mut output).unwrap();
+        for name in ["size", "used"] {
+            assert!(output.contains(&format!(
+                "racer_disk_{name}_bytes{{disk=\"device:a\"}} {}\n",
+                u64::MAX
+            )));
+        }
+    }
+
+    #[test]
     fn disk_observability_aggregates_fixed_classes_and_replaces_gauges() {
         let workers = Metrics::for_workers(2).unwrap();
         for (i, worker) in workers.iter().enumerate() {
@@ -2189,7 +2256,29 @@ pub struct Metrics {
 
     retention: ::telemetry::SnapshotShards<crate::retention::Snapshot>,
 
+    disks: ::telemetry::SnapshotShards<Vec<DiskUsage>>,
+
     shard: usize,
+}
+
+#[derive(Clone)]
+/// One worker's assigned capacity and reserved record bytes on a backing disk.
+pub(crate) struct DiskUsage {
+    pub disk: Arc<str>,
+    pub size: u64,
+    pub used: u64,
+}
+
+fn write_disk_label(out: &mut impl Write, disk: &str) -> std::fmt::Result {
+    for ch in disk.chars() {
+        match ch {
+            '\\' => out.write_str("\\\\")?,
+            '"' => out.write_str("\\\"")?,
+            '\n' => out.write_str("\\n")?,
+            _ => out.write_char(ch)?,
+        }
+    }
+    Ok(())
 }
 const RETENTION_METRICS: [(&str, &str); 9] = [
     ("racer_retention_observations_total", "counter"),
@@ -2376,6 +2465,37 @@ impl Drop for RequestMetrics {
     }
 }
 impl Metrics {
+    pub(crate) fn observe_disks(&self, samples: Vec<DiskUsage>) {
+        self.disks.replace(self.shard, samples);
+    }
+
+    fn write_disks(&self, out: &mut impl Write) -> std::fmt::Result {
+        let mut totals = std::collections::BTreeMap::<Arc<str>, (u64, u64)>::new();
+        for shard in self.disks.snapshots() {
+            for sample in shard {
+                let total = totals.entry(sample.disk).or_default();
+                total.0 = total.0.saturating_add(sample.size);
+                total.1 = total.1.saturating_add(sample.used);
+            }
+        }
+        if !totals.is_empty() {
+            for metric in ["racer_disk_size_bytes", "racer_disk_used_bytes"] {
+                writeln!(out, "# TYPE {metric} gauge")?;
+            }
+        }
+        for (disk, (size, used)) in totals {
+            for (metric, value) in [
+                ("racer_disk_size_bytes", size),
+                ("racer_disk_used_bytes", used),
+            ] {
+                write!(out, "{metric}{{disk=\"")?;
+                write_disk_label(out, &disk)?;
+                writeln!(out, "\"}} {value}")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Sample on the owning worker's health tick, never on a request hot path.
     /// Diagnostics aggregate fixed-size copies without accessing worker-local Rc.
     pub(crate) fn observe_retention(&self, snapshot: crate::retention::Snapshot) {
@@ -2479,6 +2599,7 @@ impl Metrics {
         }
         let admission: Arc<[_]> = (0..count).map(|_| OnceLock::new()).collect();
         let retention = ::telemetry::SnapshotShards::new(count);
+        let disks = ::telemetry::SnapshotShards::new(count);
         Ok(::telemetry::Metrics::shards(count)
             .into_iter()
             .enumerate()
@@ -2486,6 +2607,7 @@ impl Metrics {
                 core,
                 admission: admission.clone(),
                 retention: retention.clone(),
+                disks: disks.clone(),
                 shard,
             })
             .collect())
@@ -2528,7 +2650,8 @@ impl Metrics {
     pub fn write_prometheus(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         self.core.write_prometheus(out)?;
         self.write_retention(out)?;
-        // Only runtime worker IDs are labels. Read the authority's actual charge,
+        self.write_disks(out)?;
+        // Quota labels use runtime worker IDs. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
         const QUOTAS: ::telemetry::metrics::LabeledGauges<4> =

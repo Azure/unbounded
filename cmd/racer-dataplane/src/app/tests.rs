@@ -1058,6 +1058,42 @@ fn assembled_worker_exports_live_quota_gauges() {
 }
 
 #[test]
+fn disk_usage_worker_samples_recovery_and_reset() {
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let worker = wake_test_worker();
+    let geometry = futures::executor::block_on(worker.prepare_storage()).unwrap();
+    let mut image = futures::executor::block_on(worker.store.checkpoint.snapshot_shard()).unwrap();
+    worker.store.checkpoint.finish_snapshot();
+    image.segments[0].state = page_alloc::SegmentState::Sealed;
+    image.segments[0].used_bytes = geometry.alignment().unwrap().length() as u64;
+    let used = image.segments[0].used_bytes;
+    futures::executor::block_on(worker.store.recovery.install_shard(Some(image))).unwrap();
+    worker.observe_health().unwrap();
+    let scrape = || {
+        let mut output = String::new();
+        worker
+            .telemetry
+            .metrics
+            .write_prometheus(&mut output)
+            .unwrap();
+        output
+    };
+    let output = scrape();
+    assert!(output.contains(&format!(
+        "racer_disk_size_bytes{{disk=\"file:worker-0-slab-0.dat\"}} {}\n",
+        geometry.slab_bytes
+    )));
+    assert!(output.contains(&format!(
+        "racer_disk_used_bytes{{disk=\"file:worker-0-slab-0.dat\"}} {used}\n"
+    )));
+    futures::executor::block_on(worker.store.recovery.install_shard(None)).unwrap();
+    assert_eq!(scrape(), output, "samples change only on observation");
+    worker.observe_health().unwrap();
+    assert!(scrape().contains("racer_disk_used_bytes{disk=\"file:worker-0-slab-0.dat\"} 0\n"));
+}
+
+#[test]
 fn application_budget_poll_preserves_cooperative_and_completion_wakes() {
     let mut worker = wake_test_worker();
     // Exercise the production runtime Service entry point with side-effect-free

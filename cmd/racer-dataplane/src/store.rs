@@ -324,6 +324,7 @@ fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
 /// Bounded dirty copies persist asynchronously, with publication after full I/O.
 pub struct StoreWriter {
     metrics: crate::telemetry::Metrics,
+    disk_groups: Vec<(std::sync::Arc<str>, usize)>,
     index: Rc<Index>,
     segments: Rc<Segments>,
     slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
@@ -358,6 +359,7 @@ impl StoreWriter {
     ) -> Self {
         Self {
             metrics: crate::telemetry::Metrics::default(),
+            disk_groups: Vec::new(),
             index,
             segments,
             slabs,
@@ -400,8 +402,35 @@ impl StoreWriter {
     pub fn open(&self) -> Operation<'_, Alignment> {
         Box::pin(async move {
             // Slab discovery is blocking startup work, not asynchronous request I/O.
-            Ok(self.slabs.open_configured(&self.segments)?)
+            let alignment = self.slabs.open_configured(&self.segments)?;
+            if !self.disk_groups.is_empty() {
+                self.segments.configure_usage_groups(
+                    &self
+                        .disk_groups
+                        .iter()
+                        .map(|(_, count)| *count)
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+            Ok(alignment)
         })
+    }
+    pub(crate) fn with_disk_groups(mut self, groups: Vec<(std::sync::Arc<str>, usize)>) -> Self {
+        self.disk_groups = groups;
+        self
+    }
+    pub(crate) fn observe_disks(&self) {
+        let samples = self
+            .disk_groups
+            .iter()
+            .zip(self.segments.usage())
+            .map(|((disk, _), (size, used))| crate::telemetry::DiskUsage {
+                disk: disk.clone(),
+                size,
+                used,
+            })
+            .collect();
+        self.metrics.observe_disks(samples);
     }
     pub fn slabs(&self) -> &Rc<Slab<flow_control::Charge<AdmissionPolicy>>> {
         &self.slabs
