@@ -739,6 +739,86 @@ Project Signal should watch both the Machine and its referenced Node. It should
 not treat Machine `Ready` as proof that certification prerequisites are still
 present.
 
+### The Day 1 and Day 2 boundary
+
+Project Signal divides Day 1 from Day 2 by the kind of action required, not by
+the age of the Machine.
+
+- **Day 1 is trust maintenance.** Project Signal observes the Machine and Node,
+  checks evidence freshness, schedules non-disruptive or explicitly permitted
+  revalidation, and changes certification eligibility. It does not request a
+  host lifecycle mutation.
+- **Day 2 is lifecycle intervention.** It begins when policy decides that
+  restoring trust requires an existing `MachineOperation`, such as resetting an
+  agent, rebooting a host, or replacing a host. Project Signal selects and
+  requests the operation; the existing Unbounded operation executor performs
+  it.
+
+The same signal can remain in Day 1 or escalate to Day 2 depending on policy,
+history, and evidence:
+
+| Observation | Day 1 response | Day 2 threshold |
+|---|---|---|
+| Evidence is stale | Revalidate when the Node is eligible for testing | Repeated inability to complete revalidation indicates a lifecycle fault |
+| A required gate is inconclusive | Retry or collect more evidence while keeping eligibility blocked as required | Retry budget is exhausted and policy maps the failure mode to an operation |
+| A required gate fails | Block eligibility and classify the failure | The classified failure has an approved `MachineOperation` response |
+| Node disappears | Invalidate Node-level trust and wait while Machina returns the Machine to `Joining` | An operation is required to recover or replace the host |
+| Agent or configuration drifts | Revalidate affected gates after the existing controller converges | Convergence requires `AgentUpgrade`, `AgentReset`, or another operation |
+
+```text
+DAY 1: TRUST MAINTENANCE
+
+Eligible
+   |
+   +-- evidence current ------------------------------> remain eligible
+   |
+   +-- evidence stale / new signal
+            |
+            v
+       revalidate and classify
+            |
+       +----+-------------------+
+       |                        |
+       v                        v
+  trust restored       block or limit eligibility
+                                |
+                                +-- observation/retry is sufficient --> stay Day 1
+                                |
+                                +-- lifecycle mutation required
+                                             |
+                                             v
+                                    DAY 2: INTERVENTION
+                                             |
+                                             v
+                                  create MachineOperation
+                                             |
+                                      +------+------+
+                                      |             |
+                                      v             v
+                                   Failed        Complete
+                                      |             |
+                                 stay blocked       v
+                                             wait for Machine
+                                             and Node readiness
+                                                   |
+                                                   v
+                                           mandatory recertification
+                                                   |
+                                              +----+----+
+                                              |         |
+                                              v         v
+                                            Pass       Fail
+                                              |         |
+                                              v         v
+                                      return to Day 1  remain Day 2
+```
+
+Day 2 therefore does not replace Day 1. It is a controlled excursion from
+normal trust maintenance into an Unbounded lifecycle action. The Machine
+returns to Day 1 only after the operation completes, Machine and Node
+prerequisites return, and a new `CertificationRun` passes. Operation completion
+alone never restores eligibility.
+
 ### Day 2: use existing MachineOperation kinds
 
 Project Signal should request an existing `MachineOperation` kind rather than a
