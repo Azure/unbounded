@@ -115,6 +115,24 @@ class TestCmdlineRoom(unittest.TestCase):
                 self.assertEqual(ukiboot.cmdline_room(_pe(sections, size_of_image=size_of_image)), want)
 
 
+class TestExtendCmdline(unittest.TestCase):
+    """The first-boot addon is extended within cmdline_room, not its raw
+    size."""
+
+    def test_the_next_section_bounds_the_extension(self):
+        roomy = _pe([(".cmdline", 0x10, 0x2000, 0x1000, 0x400), (".linux", 0x10, 0x3000, 0x200, 0x1400)])
+        tight = _pe([(".cmdline", 0x10, 0x2000, 0x1000, 0x400), (".linux", 0x10, 0x2020, 0x200, 0x1400)])
+        extra = "ignition.config.url=http://192.168.100.1:8199/config.ign"
+
+        merged, room = ukiboot.extend_cmdline(roomy, "flatcar.first_boot=detected", extra)
+        self.assertEqual(merged, f"flatcar.first_boot=detected {extra}".encode())
+        self.assertEqual(room, 0x1000)
+
+        merged, room = ukiboot.extend_cmdline(tight, "flatcar.first_boot=detected", extra)
+        self.assertIsNone(merged, "the raw size has room, but the grown section would reach .linux")
+        self.assertEqual(room, 0x20)
+
+
 class TestSingleUKI(unittest.TestCase):
     def test_exactly_one_uki_is_required(self):
         """With more than one, the one patched may not be the one that boots."""
