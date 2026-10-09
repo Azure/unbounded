@@ -317,7 +317,6 @@ func (h *installHandler) prepareOperatorConfig(ctx context.Context) error {
 	h.resolvedOperatorImage = resolvedOperatorImage
 
 	reapLegacyResources := true
-
 	previousImageRegistry := ""
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
