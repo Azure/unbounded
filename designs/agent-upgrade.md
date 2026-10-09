@@ -57,8 +57,10 @@ start on a linked host records the SHA-256 of its own binary in
 `/etc/unbounded/agent/host-root-agents`; older releases never do. Once the
 current and last-good targets are both recorded, and no AgentUpgrade signal is
 pending, the daemon moves the files into a real `/opt/unbounded/agent` under
-installation ownership. The move spans two daemon starts, so nothing is removed
-while the daemon still runs from it:
+installation ownership. It makes no copy where the filesystem the copy would
+be made on is mounted `noexec`; it logs why, and the host stays linked until a
+later start finds it mounted otherwise. The move spans two daemon starts, so
+nothing is removed while the daemon still runs from it:
 
 1. Copy the layout from `/usr/local` into `/opt/unbounded/agent.staging`,
    recreating the slot links with targets under `/opt/unbounded/agent`, and
@@ -67,14 +69,22 @@ while the daemon still runs from it:
    mount.
 2. Remove the link and rename the copy into place.
 3. Create the root's missing subdirectories and restore its SELinux labels.
-4. Rewrite the daemon and recovery units, the recovery script, the LocalDNS
+4. Run the current binary's `version` command from the copy. Once a unit
+   names the copy, a daemon that cannot run from it does not start again, and
+   the recovery unit only acts on an AgentUpgrade, so nothing would roll it
+   back. If it fails, put the link back in place of the copy, rewrite what
+   step 5 rewrites so it names `/usr/local` again, and keep the digest record.
+   The daemon logs the failure and carries on from `/usr/local`, and the next
+   start tries the move again.
+5. Rewrite the daemon and recovery units, the recovery script, the LocalDNS
    network unit and the nspawn lifecycle hooks, and reload systemd.
-5. Restart the daemon, which is still running from `/usr/local`. It releases
+6. Restart the daemon, which is still running from `/usr/local`. It releases
    the installation lock, takes no work, and waits to be replaced, exiting with
    an error after two minutes so the unit's `Restart=` starts it instead.
-6. The restarted daemon, running from `/opt/unbounded/agent`, finds the marker
-   and repeats steps 3 and 4, then removes the layout from `/usr/local`, the
-   digest record and the `.moving` marker. It does not restart again.
+7. The restarted daemon, running from `/opt/unbounded/agent`, finds the marker
+   and repeats steps 3 and 5, then removes the layout from `/usr/local`, the
+   digest record and the `.moving` marker. It does not restart again. Running
+   from the copy shows it runs there, so it skips step 4.
 
 A start that finds the `.moving` marker resumes at step 3, and restarts the
 daemon only if it is still running from `/usr/local`. One that finds a staging
@@ -82,9 +92,16 @@ copy beside a link discards it and starts over. The files under `/usr/local`
 stay in place until the daemon runs from the copy, so a restart that fails
 strands nothing, and the daemon unit can start at every step.
 
+Install scripts also place the agent binary at `/usr/local/bin/unbounded-agent`
+for releases before the host root, which look for it there. The move removes it
+with the rest of the layout. On a host installed under the host root, or whose
+root an operator linked to a directory outside `/usr/local`, nothing the agent
+runs is under `/usr/local`; `hostroot.LegacyReleased` reports that, and each
+daemon start then removes the binary if the install script left it.
+
 After the move, the last-good binary is a release that knows the host root, so
-automatic rollback is unaffected. An AgentUpgrade to a release up to v0.10.0 is
-not supported and not refused: that release looks for its files under
+automatic rollback is unaffected. An AgentUpgrade to a release before the host
+root is not supported and not refused: that release looks for its files under
 `/usr/local`, so its own next upgrade fails to resolve the current binary.
 
 `NextTargetPath()` chooses the inactive slot:

@@ -12,9 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// legacyHost lays out what an agent up to v0.10.0 leaves under the legacy root
-// after an upgrade to green, with the root linked to it as a newer agent
-// leaves it. The links name the legacy root the way that agent wrote them. The
+// legacyHost lays out what an agent released before Path leaves under the
+// legacy root after an upgrade to green, with the root linked to it as a newer
+// agent leaves it. The links name the legacy root the way that agent wrote them. The
 // root's parent holds files staged for the agent, which a move and a reset
 // must leave alone; see assertArtifactsKept.
 func legacyHost(t *testing.T) layout {

@@ -112,12 +112,12 @@ they do not assert resumable bootstrap or introduce new recovery operations.
 ## Host root migration
 
 The `migration` suite starts from a host installed by a release before the host
-root, `LEGACY_AGENT_VERSION` (default `v0.8.0`), fetched from its GitHub release
-by the install script. v0.10.0 is the last such release and lays the host out
-the same way; the default moves to it once it is published. Before installing
-it, the suite stages a file under `/opt/unbounded/images`, as a host keeping a
-local OCI layout beside the host root would, and checks it is untouched after
-the link, the move and reset. An AgentUpgrade to this build must link
+root, `LEGACY_AGENT_VERSION` (default `v0.12.0`, the latest published release),
+fetched from its GitHub release by the install script. Releases before the host
+root have laid the host out the same way since v0.1.4. Before installing it, the
+suite stages a file under `/opt/unbounded/images`, as a host keeping a local OCI
+layout beside the host root would, and checks it is untouched after the link,
+the move and reset. An AgentUpgrade to this build must link
 `/opt/unbounded/agent` to `/usr/local` and leave that release's layout and units
 as they were, because the older release is now last-good and a rollback needs
 them. The host then reboots, returns to the older release, and upgrades to this

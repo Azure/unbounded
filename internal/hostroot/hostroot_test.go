@@ -148,8 +148,8 @@ func TestMigrate(t *testing.T) {
 			setup: func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-install.sh")) },
 		},
 		{
-			// Install scripts seed the plain binary for agents up to v0.10.0
-			// on every host that allows it.
+			// Install scripts seed the plain binary for agents released
+			// before Path on every host that allows it.
 			name:  "a seeded binary on its own is not an installation",
 			setup: func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, "bin/unbounded-agent")) },
 		},

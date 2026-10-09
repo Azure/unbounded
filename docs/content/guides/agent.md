@@ -214,40 +214,44 @@ removes it or anything else in it. Mount a volume at a subdirectory such as
 hide the agent.
 
 The filesystem that holds `/opt/unbounded/agent` must allow running programs,
-so `/opt` must not be mounted `noexec`.
+so `/opt` must not be mounted `noexec`. Preflight fails where it is.
 
-Releases up to v0.10.0 installed these files under `/usr/local`. A host installed
-by one of them moves to `/opt/unbounded/agent` in two stages:
+Releases before `/opt/unbounded/agent` installed these files under
+`/usr/local`. A host installed by one of them moves to `/opt/unbounded/agent` in
+two stages:
 
 1. **Linked.** The first command of a newer agent that changes the host links
    `/opt/unbounded/agent` to `/usr/local`, creating `/opt/unbounded` if needed.
    That happens when the daemon starts after an AgentUpgrade, when `start` or
-   `agent-upgrade` runs, or when an nspawn lifecycle hook runs. The files stay
+   `agent-upgrade` runs, or when the nspawn pre-start hook runs. The files stay
    where they are, and every path the units name is unchanged. The older
    release is still the last-good binary, so the daemon can roll back to it, and
-   an AgentUpgrade back to it works.
-2. **Moved.** Once neither the current nor the last-good binary is from v0.10.0
-   or earlier, the daemon copies the files into a real `/opt/unbounded/agent`,
-   rewrites the units to use them, and restarts itself from there. The
-   restarted daemon then removes the files from `/usr/local`. That is at the
-   first daemon start after the AgentUpgrade that follows the older release out
-   of the last-good slot. To move a host that is not due another upgrade, apply
-   the release it already runs as an AgentUpgrade. A move that is interrupted is
-   finished or started over at the next daemon start.
+   an AgentUpgrade back to it works. If the link cannot be made, the pre-start
+   hook leaves the machine's config as it is and the machine still starts; the
+   daemon refuses to start, and its journal says why.
+2. **Moved.** Once neither the current nor the last-good binary is from a
+   release before `/opt/unbounded/agent`, the daemon copies the files into a
+   real `/opt/unbounded/agent`, rewrites the units to use them, and restarts
+   itself from there. The restarted daemon then removes the files from
+   `/usr/local`. That is at the first daemon start after the AgentUpgrade that
+   follows the older release out of the last-good slot. To move a host that is
+   not due another upgrade, apply the release it already runs as an
+   AgentUpgrade. A move that is interrupted is finished or started over at the
+   next daemon start.
 
    Before any unit names the copy, the daemon runs it. A host whose `/opt` is
    mounted `noexec`, or where the copy does not run for another reason, stays
-   linked: the daemon logs why, removes the copy, points the units back at
-   `/usr/local` if a move that was interrupted had already pointed them at the
-   copy, and tries again at its next start.
+   linked: the daemon logs why, removes any copy it made, points the units back
+   at `/usr/local` if a move that was interrupted had already pointed them at
+   the copy, and tries again at its next start.
 
 `unbounded-agent reset` removes the agent's files from both locations at any
 stage, then `/opt/unbounded/agent` itself: the link the agent made, or the
 directory once nothing else is left in it.
 
-Releases up to v0.10.0 cannot run on a host whose agent is in a real
-`/opt/unbounded/agent`, whether it was installed there or moved there, and an
-AgentUpgrade to one is not supported. Nothing refuses it, and what happens
+Releases before `/opt/unbounded/agent` cannot run on a host whose agent is in a
+real `/opt/unbounded/agent`, whether it was installed there or moved there, and
+an AgentUpgrade to one is not supported. Nothing refuses it, and what happens
 depends on `/usr/local`:
 
 - Where it is read-only, that release's daemon fails at startup, because it
@@ -269,8 +273,8 @@ locations, or an installation under `/usr/local` beside an existing
 Run `unbounded-agent reset` first.
 
 The install script also places the agent binary at
-`/usr/local/bin/unbounded-agent` where it can, because releases up to v0.10.0
-look for it there. Newer releases do not use it, and the daemon removes it once
+`/usr/local/bin/unbounded-agent` where it can, because releases before
+`/opt/unbounded/agent` look for it there. Newer releases do not use it, and the daemon removes it once
 nothing it runs is under `/usr/local`: once the host is installed in a real
 `/opt/unbounded/agent`, or in a directory outside `/usr/local` that you linked
 `/opt/unbounded/agent` to.
@@ -283,8 +287,9 @@ such image. `/opt`, and with it the agent's files under `/opt/unbounded/agent`,
 is on the writable root filesystem there.
 
 For these hosts, generate an Ignition config. The agent has to be a release
-after v0.10.0: earlier releases install under `/usr/local`, which is read-only
-on these hosts. Set `VERSION` to that release's tag:
+that installs under `/opt/unbounded/agent`: earlier releases install under
+`/usr/local`, which is read-only on these hosts. Set `VERSION` to that release's
+tag:
 
 ```bash
 VERSION=vX.Y.Z

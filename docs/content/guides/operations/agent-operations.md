@@ -86,8 +86,9 @@ version crashes on startup.
 After a successful operation, confirm the agent version on the host:
 
 ```bash
-# From the host. On a host installed by v0.10.0 or earlier that no newer agent
-# has run on yet, the binary is /usr/local/bin/unbounded-agent instead.
+# From the host. On a host installed by a release before /opt/unbounded/agent
+# that no newer agent has run on yet, the binary is
+# /usr/local/bin/unbounded-agent instead.
 /opt/unbounded/agent/bin/unbounded-agent version
 
 # From the cluster, check the machine status
@@ -136,8 +137,8 @@ If you have SSH or console access to the host, you can reset directly:
 sudo /opt/unbounded/agent/bin/unbounded-agent reset
 ```
 
-On a host installed by v0.10.0 or earlier that no newer agent has run on yet,
-run `sudo /usr/local/bin/unbounded-agent reset` instead.
+On a host installed by a release before `/opt/unbounded/agent` that no newer
+agent has run on yet, run `sudo /usr/local/bin/unbounded-agent reset` instead.
 
 This is the inverse of `unbounded-agent start` and performs the same cleanup as
 the MachineOperation path.

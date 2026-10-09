@@ -23,8 +23,9 @@ const (
 	uninstallScriptName = "unbounded-agent-uninstall.sh"
 
 	// SeedFile is where install scripts place the agent binary, relative to
-	// LegacyPath, for agents up to v0.10.0. Current agents do not use it, and
-	// remove it from a host installed under Path.
+	// LegacyPath, for agents released before Path. Current agents do not use
+	// it, and remove it once LegacyReleased reports nothing runs from
+	// LegacyPath.
 	SeedFile = "bin/" + BinaryName
 )
 
