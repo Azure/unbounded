@@ -149,7 +149,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pinned Rust
-        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
 
       - name: Enable io_uring
         run: timeout --signal=TERM --kill-after=10s 300s sudo sysctl -w kernel.io_uring_disabled=0
@@ -179,6 +179,134 @@ jobs:
 
       - name: Test all features
         run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --all-features
+
+      - name: Strict runtime Clippy
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --all-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --no-default-features -- -D warnings
+
+      - name: Runtime production real I/O (no simulation)
+        env:
+          RUNTIME_REQUIRE_IO_URING: "1"
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --no-default-features
+
+  racer-verbs:
+    name: Racer Verbs (${{ matrix.configuration }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: no-default-features
+            features: ""
+            native: false
+          - configuration: simulation
+            features: simulation
+            native: false
+          - configuration: native
+            features: native
+            native: true
+          - configuration: native-and-simulation
+            features: native,simulation
+            native: true
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-verbs-cargo
+      CARGO_BUILD_JOBS: "2"
+      RUST_TEST_THREADS: "1"
+      VERBS_FEATURES: ${{ matrix.features }}
+      LD_LIBRARY_PATH: ${{ github.workspace }}/bin/racer-verbs-native
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned Rust
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+
+      - name: Install native adapter build dependencies
+        if: matrix.native
+        run: |
+          # Ubuntu runner sources share this list; bypass the stalled Azure mirror.
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | timeout --signal=TERM --kill-after=10s 300s sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          apt_options=(-o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=2)
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" update
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" install -y --no-install-recommends build-essential pkg-config libibverbs-dev
+
+      # Rust loads the adapter dynamically, so Cargo cannot compile-check its C ABI.
+      - name: Compile native C adapter (not hardware validation)
+        if: matrix.native
+        run: timeout --signal=TERM --kill-after=10s 300s sh images/racer-dataplane/build-native.sh cmd/racer-dataplane/verbs/native/verbs.c bin/racer-verbs-native/librdma_verbs.so.1
+
+      - name: Require native adapter ABI and symbols (no hardware)
+        if: matrix.native
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::tests::required_native_adapter_loads_abi_and_symbols -- --exact --ignored
+
+      - name: Test C discovery and open cleanup faults (no hardware)
+        if: matrix.native
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s sh images/racer-dataplane/build-native.sh cmd/racer-dataplane/verbs/native/discovery_faults.c bin/racer-verbs-faults/librdma_verbs.so.1
+          timeout --signal=TERM --kill-after=10s 300s env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-faults" cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::discovery_fault_tests::internal_close_failures_keep_admission_and_adapter -- --exact --ignored
+          timeout --signal=TERM --kill-after=10s 300s env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-faults" cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::discovery_fault_tests::open_cleanup_failures_keep_admission_and_adapter -- --exact --ignored
+
+      - name: Check verbs formatting
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --check
+
+      - name: Check verbs feature configuration
+        run: |
+          features=()
+          if [ -n "$VERBS_FEATURES" ]; then features=(--features "$VERBS_FEATURES"); fi
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --all-targets --no-default-features "${features[@]}"
+
+      - name: Strict verbs Clippy
+        run: |
+          features=()
+          if [ -n "$VERBS_FEATURES" ]; then features=(--features "$VERBS_FEATURES"); fi
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --all-targets --no-default-features "${features[@]}" -- -D warnings
+
+      # Explicit zero-port and active-provider tests remain ignored. A hosted
+      # runner does not establish RDMA hardware or DMA/fencing correctness.
+      - name: Test verbs without requiring RDMA hardware
+        run: |
+          features=()
+          if [ -n "$VERBS_FEATURES" ]; then features=(--features "$VERBS_FEATURES"); fi
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --no-default-features "${features[@]}"
+
+  runtime-miri:
+    name: Runtime Miri (${{ matrix.group }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [channel, offload, scheduler, memory]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Miri
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install nightly-2025-11-21 --profile minimal --component miri,rust-src
+
+      - name: Prepare Miri sysroot
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +nightly-2025-11-21 miri setup
+
+      - name: Validate exact pure runtime test group
+        run: timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/runtime-miri.py ${{ matrix.group }}
+  racer-envtest:
+    name: Racer API Server Integration Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Provision envtest and run controller API-server race tests
+        run: timeout --signal=TERM --kill-after=10s 300s make racer-envtest-ci
 
   # ---------- Orca Integration Tests ----------
   # Spins up Garage and Azurite via testcontainers-go and runs the

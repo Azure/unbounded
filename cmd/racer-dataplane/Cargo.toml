@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "topology"]
+members = [".", "topology", "runtime", "telemetry", "verbs"]
 resolver = "3"
 
 [package]

@@ -1,6 +1,6 @@
 module github.com/Azure/unbounded
 
-go 1.26.8
+go 1.26.9
 
 tool (
 	golang.org/x/vuln/cmd/govulncheck
@@ -54,6 +54,7 @@ require (
 	github.com/google/go-tpm-tools v0.4.10
 	github.com/google/licensecheck v0.3.1
 	github.com/google/renameio/v2 v2.0.2
+	github.com/google/uuid v1.6.0
 	github.com/insomniacslk/dhcp v0.0.0-20260220084031-5adc3eb26f91
 	github.com/ipfs/go-cid v0.6.2
 	github.com/lib/pq v1.12.3
@@ -183,7 +184,6 @@ require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
@@ -327,7 +327,7 @@ require (
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/exp v0.0.0-20260824195058-e88cd73687aa // indirect
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260902144106-3ef544be8421 // indirect
 	golang.org/x/text v0.42.0 // indirect
