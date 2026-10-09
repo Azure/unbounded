@@ -51,13 +51,15 @@ func TestEnvtestGuardContainmentDefaults(t *testing.T) {
 	}
 	require.NoError(t, admin.Create(ctx, marker))
 
-	objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "node-restriction.yaml", "rbac.yaml"}, nil)
+	objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml"}, nil)
 	require.NoError(t, err)
 
 	for _, obj := range objects {
 		bindRuntime(obj, marker.UID)
 		require.NoError(t, admin.Create(ctx, obj.DeepCopy()))
 	}
+
+	seedRetiredGuard(t, env)
 
 	assertHealthy := func(t *testing.T) {
 		t.Helper()
@@ -72,7 +74,7 @@ func TestEnvtestGuardContainmentDefaults(t *testing.T) {
 	}
 
 	t.Run("persisted-defaults", func(t *testing.T) {
-		for _, name := range guardNames {
+		for _, name := range testedGuardNames {
 			policy := &admissionv1.ValidatingAdmissionPolicy{}
 			require.NoError(t, admin.Get(ctx, client.ObjectKey{Name: name}, policy))
 			require.Equal(t, ptr.To(admissionv1.Fail), policy.Spec.FailurePolicy)
@@ -90,7 +92,7 @@ func TestEnvtestGuardContainmentDefaults(t *testing.T) {
 		assertHealthy(t)
 	})
 
-	for _, name := range guardNames {
+	for _, name := range testedGuardNames {
 		for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
 			t.Run(name+"/"+kind+"-drift", func(t *testing.T) {
 				var guard client.Object = &admissionv1.ValidatingAdmissionPolicyBinding{}
@@ -109,6 +111,18 @@ func TestEnvtestGuardContainmentDefaults(t *testing.T) {
 				}
 
 				require.NoError(t, admin.Update(ctx, guard))
+
+				if name == retiredRuntimeGuard {
+					assertHealthy(t)
+
+					current := guard.DeepCopyObject().(client.Object)
+					require.NoError(t, admin.Get(ctx, client.ObjectKeyFromObject(guard), current))
+					require.Equal(t, guard, current)
+					require.NoError(t, admin.Delete(ctx, guard))
+					assertHealthy(t)
+
+					return
+				}
 
 				plan, stop, err := planGuardContainment(t.Context(), env)
 				require.NoError(t, err)

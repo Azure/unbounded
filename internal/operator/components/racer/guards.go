@@ -22,7 +22,7 @@ import (
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-var guardNames = []string{"racer-runtime-write-restriction", "racer-node-write-restriction"}
+var guardNames = []string{"racer-node-write-restriction"}
 
 func guardPredicate() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
@@ -40,6 +40,7 @@ func guardPredicate() predicate.Predicate {
 // writers remain trusted. Revoke both grants in a separate pass before any
 // repair, even without caches. Keep workloads and durable identity intact;
 // removing these bindings contains their API writes without destroying state.
+// Secret and ConfigMap writes are bounded by RBAC, not an admission guard.
 func planGuardContainment(ctx context.Context, env *component.Env) (*component.Plan, bool, error) {
 	claim := &corev1.ConfigMap{}
 	if err := env.LiveReader().Get(ctx, objectKey(env, claimName), claim); err != nil {
@@ -59,7 +60,7 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 		return nil, false, err
 	}
 
-	guards, err := env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "node-restriction.yaml"}, nil)
+	guards, err := env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml"}, nil)
 	if err != nil {
 		return nil, false, err
 	}

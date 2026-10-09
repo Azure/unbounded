@@ -374,7 +374,7 @@ func TestPoliciesGateControllerPermissions(t *testing.T) {
 		}
 	}
 
-	require.Len(t, policies, 4)
+	require.Len(t, policies, 2)
 
 	for _, op := range plan.Operations {
 		switch op.Object.GetKind() {
@@ -412,6 +412,16 @@ func TestPolicyFailuresSkipBindingsAndStartup(t *testing.T) {
 				obj.SetAPIVersion("admissionregistration.k8s.io/v1")
 				obj.SetKind(kind)
 				obj.SetName(policyName)
+
+				if policyName == retiredRuntimeGuard {
+					require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), client.ObjectKeyFromObject(obj), obj)))
+					persist(t, env, planPass(t, env))
+					assertControllerBindings(t, env, true)
+					require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), &appsv1.Deployment{}))
+
+					return
+				}
+
 				require.NoError(t, env.Client.Delete(t.Context(), obj))
 				containment := planPass(t, env)
 				require.Len(t, containment.Operations, 2)
