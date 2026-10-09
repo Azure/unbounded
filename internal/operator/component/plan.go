@@ -118,6 +118,12 @@ type Operation struct {
 	Component string
 	Site      string
 
+	// FailureDomain scopes inferred tier failure gating within a Component and
+	// Site. Operations with the same value, including the empty default, share
+	// that gate: an earlier-tier failure skips later tiers in that domain.
+	// Different values bypass only this inferred gate; explicit DependsOn,
+	// same-object, and namespace failure gates still apply. Result attribution
+	// remains by Component and Site.
 	FailureDomain string
 
 	// Overridable marks the workloads user-supplied overrides may target. Only
