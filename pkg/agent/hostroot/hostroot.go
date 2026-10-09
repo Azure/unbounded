@@ -71,14 +71,6 @@ func Planned(markers ...string) string {
 // fresh installation gets a real directory. A link to anywhere else is an
 // operator's, and is kept.
 //
-// On every host, it also refuses one where a user other than root could
-// replace the files under Path: where a directory on the way to Path, such as
-// /opt or /opt/unbounded, or Path itself, is owned by another user or can be
-// written to by group or others. Links are followed, so a link an operator
-// made is checked where it leads. A Path linked to LegacyPath is checked up to
-// the link; LegacyPath is trusted as it is, as every earlier release trusted
-// it.
-//
 // Commands that change the host call it first, before any path is resolved: a
 // path resolved on an unmigrated legacy host names Path, where nothing is
 // installed.
@@ -90,8 +82,7 @@ func Migrate(log *slog.Logger, markers ...string) error {
 // a new installation needs them, with mode 0755 regardless of the umask, and
 // restores the SELinux labels under Path where the policy tools are present.
 // An existing parent keeps its mode. On a migrated host Path is the existing
-// installation and is left as it is. It refuses a host where a user other than
-// root could replace the files under Path, as Migrate does.
+// installation and is left as it is.
 //
 // The labels matter because a directory takes its parent's label when it is
 // created. Under /opt that is usr_t, while the policy expects bin_t under
@@ -149,9 +140,6 @@ type MoveOptions = impl.MoveOptions
 // is mounted noexec, nothing is copied. Where Verify fails, the copy is
 // replaced with the link again, RewriteUnits is called to point the units back
 // at LegacyPath, and the error is returned. The next start tries again.
-//
-// It refuses a host where a user other than root could replace the files
-// under Path, as Migrate does.
 func ReconcileMove(ctx context.Context, log *slog.Logger, opts MoveOptions) (bool, error) {
 	return impl.ReconcileMove(ctx, log, opts)
 }

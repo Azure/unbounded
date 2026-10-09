@@ -553,31 +553,6 @@ func TestReconcileMoveRequiresVerify(t *testing.T) {
 	assertStillLinked(t, l, opts)
 }
 
-// TestReconcileMoveRefusesARootOthersCanReplace covers a root's parent that
-// others can write to: the copy would go where they could replace it.
-func TestReconcileMoveRefusesARootOthersCanReplace(t *testing.T) {
-	t.Parallel()
-
-	l := legacyHost(t)
-	run := &moveRun{}
-	opts := moveOptions(t, l, run)
-	recordBlue(t, l, opts)
-	require.NoError(t, os.Chmod(filepath.Dir(l.root), 0o777))
-
-	restarted, err := reconcile(t, l, opts, run, fromLegacy(l))
-	require.ErrorIs(t, err, errUntrusted)
-	assert.False(t, restarted)
-	assert.Zero(t, run.verifies)
-	assert.Zero(t, run.rewrites)
-
-	got, err := state(l.root, l.legacy)
-	require.NoError(t, err)
-	assert.Equal(t, StateLinked, got)
-
-	_, err = os.Lstat(l.root + stagingSuffix)
-	assert.ErrorIs(t, err, os.ErrNotExist, "nothing is copied")
-}
-
 func TestRecordDigest(t *testing.T) {
 	t.Parallel()
 

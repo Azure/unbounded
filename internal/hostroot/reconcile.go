@@ -97,9 +97,6 @@ type moveHost struct {
 // replaced with the link again and the units pointed back at LegacyPath. The
 // host stays linked either way, and the next start tries again.
 //
-// It refuses a host where someone other than root could replace the files
-// under the root, as Migrate does.
-//
 // It reports whether it restarted the daemon, which it may only have queued.
 // The caller must then wait to be replaced rather than carry on.
 func ReconcileMove(ctx context.Context, log *slog.Logger, opts MoveOptions) (bool, error) {
@@ -130,11 +127,6 @@ func reconcileMove(
 
 	if opts.Verify == nil {
 		return false, errors.New("hostroot: MoveOptions.Verify is required")
-	}
-
-	// The copy goes beside the root, and then in its place.
-	if err := checkRoot(root, legacy); err != nil {
-		return false, err
 	}
 
 	self, err := host.executable()
@@ -196,7 +188,7 @@ func completeMove(
 	// Laid out and labeled as a fresh installation is, before any unit runs
 	// from it. A move interrupted after the rename has not done it yet, and
 	// doing it again is harmless.
-	if err := prepare(ctx, log, root, legacy, opts.Subdirs, host.relabel); err != nil {
+	if err := prepare(ctx, log, root, opts.Subdirs, host.relabel); err != nil {
 		return false, err
 	}
 

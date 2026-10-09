@@ -326,7 +326,7 @@ func TestPrepareIgnoresTheUmask(t *testing.T) {
 	l := newLayout(t)
 	relabeled := ""
 
-	require.NoError(t, prepare(t.Context(), discard(), l.root, l.legacy, []string{"bin", "libexec"},
+	require.NoError(t, prepare(t.Context(), discard(), l.root, []string{"bin", "libexec"},
 		func(_ context.Context, _ *slog.Logger, root string) { relabeled = root }))
 
 	for _, dir := range []string{filepath.Dir(l.root), l.root, filepath.Join(l.root, "bin"), filepath.Join(l.root, "libexec")} {
@@ -348,7 +348,7 @@ func TestPrepareLeavesTheParentAlone(t *testing.T) {
 
 	relabeled := ""
 
-	require.NoError(t, prepare(t.Context(), discard(), l.root, l.legacy, []string{"bin"},
+	require.NoError(t, prepare(t.Context(), discard(), l.root, []string{"bin"},
 		func(_ context.Context, _ *slog.Logger, root string) { relabeled = root }))
 
 	assert.DirExists(t, filepath.Join(l.root, "bin"))
@@ -365,7 +365,7 @@ func TestPrepareLeavesAMigratedHostAlone(t *testing.T) {
 
 	relabeled := false
 
-	require.NoError(t, prepare(t.Context(), discard(), l.root, l.legacy, []string{"libexec"},
+	require.NoError(t, prepare(t.Context(), discard(), l.root, []string{"libexec"},
 		func(context.Context, *slog.Logger, string) { relabeled = true }))
 
 	_, err := os.Stat(filepath.Join(l.legacy, "libexec"))

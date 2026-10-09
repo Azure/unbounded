@@ -213,14 +213,8 @@ removes it or anything else in it. Mount a volume at a subdirectory such as
 `/opt/unbounded/artifacts` rather than over `/opt/unbounded`, so it does not
 hide the agent.
 
-Systemd runs the agent's files as root, so the agent refuses to run where a user
-other than root could replace them. `/opt`, `/opt/unbounded`, and
-`/opt/unbounded/agent` must be owned by root and not writable by group or
-others, and so must every directory that a link along the way leads to. If an
-account other than root stages files for the agent, give it a subdirectory of
-its own, such as `/opt/unbounded/artifacts`, rather than `/opt/unbounded`
-itself. The filesystem that holds `/opt/unbounded/agent` must also allow running
-programs, so `/opt` must not be mounted `noexec`.
+The filesystem that holds `/opt/unbounded/agent` must allow running programs,
+so `/opt` must not be mounted `noexec`.
 
 Releases up to v0.10.0 installed these files under `/usr/local`. A host installed
 by one of them moves to `/opt/unbounded/agent` in two stages:

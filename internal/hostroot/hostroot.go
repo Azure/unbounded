@@ -216,12 +216,6 @@ func Migrate(log *slog.Logger, markers ...string) error {
 }
 
 func migrate(log *slog.Logger, root, legacy string, markers []string) error {
-	// On every host, fresh ones included: commands call this first, before
-	// they install anything under the root.
-	if err := checkRoot(root, legacy); err != nil {
-		return err
-	}
-
 	current, err := state(root, legacy)
 	if err != nil {
 		return err
@@ -295,20 +289,16 @@ func holdsAny(root string, markers []string) bool {
 
 // Prepare is documented in pkg/agent/hostroot.
 func Prepare(ctx context.Context, log *slog.Logger, subdirs ...string) error {
-	return prepare(ctx, log, Path, LegacyPath, subdirs, restoreLabels)
+	return prepare(ctx, log, Path, subdirs, restoreLabels)
 }
 
 func prepare(
 	ctx context.Context,
 	log *slog.Logger,
-	root, legacy string,
+	root string,
 	subdirs []string,
 	relabel func(context.Context, *slog.Logger, string),
 ) error {
-	if err := checkRoot(root, legacy); err != nil {
-		return err
-	}
-
 	if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil
 	}
