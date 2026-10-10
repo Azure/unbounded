@@ -43,7 +43,7 @@ func TestBlobOptions(t *testing.T) {
 		{"--backend=uds"},
 		{"--backend=uds", "--volume=../bad"},
 		{"--catalog-blobs=0"},
-		{"--catalog-blobs=513"},
+		{fmt.Sprintf("--catalog-blobs=%d", maxCatalogBlobs+1)},
 		{"--catalog-blobs=1", "--blob-bytes=0"},
 		{"--blob-bytes=12"},
 		{"--catalog-blobs=1", "--jitter=0"},
@@ -113,7 +113,7 @@ func TestBlobCatalogExactDeterministic(t *testing.T) {
 	_, err = newBlobCatalog(ctx, "test/blobs", "seed", 1, 1)
 	require.ErrorIs(t, err, context.Canceled)
 
-	for _, count := range []int{0, 513} {
+	for _, count := range []int{0, maxCatalogBlobs + 1} {
 		_, err := newBlobCatalog(t.Context(), "test/blobs", "seed", count, 1)
 		require.Error(t, err)
 	}

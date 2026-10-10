@@ -37,6 +37,7 @@ type options struct {
 	duration       time.Duration
 	catalogImages  int
 	catalogBlobs   int
+	catalogWorkers int
 	blobBytes      int64
 	startupTimeout time.Duration
 }
@@ -61,7 +62,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.Float64Var(&opts.image.Jitter, "jitter", 0.2, "Deterministic per-layer size jitter fraction in [0,1)")
 	f.StringVar(&opts.image.Seed, "seed", "benchmark-v1", "Content seed; keep identical on all nodes")
 	f.IntVar(&opts.catalogImages, "catalog-images", 1, "Number of deterministic images, 1-512; keep identical on all origins")
-	f.IntVar(&opts.catalogBlobs, "catalog-blobs", 0, "Select generic workload: 1-512 independent raw blobs, one blob per operation; excludes image sizing flags")
+	f.IntVar(&opts.catalogBlobs, "catalog-blobs", 0, fmt.Sprintf("Select generic workload: 1-%d independent raw blobs, one blob per operation; excludes image sizing flags", maxCatalogBlobs))
+	f.IntVar(&opts.catalogWorkers, "catalog-workers", 1, "Parallel catalog hashing workers, 1-64; requires catalog-blobs")
 	f.Int64Var(&opts.blobBytes, "blob-bytes", 64<<20, "Exact bytes per generic blob (no jitter or tar framing); requires catalog-blobs")
 	f.StringVar(&opts.pull.Profile, "profile", profileShuffle, "Catalog selection profile: shuffle or zipf")
 	f.Float64Var(&opts.pull.ZipfExponent, "zipf-exponent", defaultZipfExponent, "Finite positive Zipf exponent; larger values increase skew (zipf profile only)")
@@ -122,8 +124,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 
 	if seen["catalog-blobs"] {
-		if opts.catalogBlobs < 1 || opts.catalogBlobs > maxCatalogImages || opts.blobBytes < 1 {
-			return opts, errors.New("catalog-blobs must be in [1, 512] and blob-bytes must be positive")
+		if opts.catalogBlobs < 1 || opts.catalogBlobs > maxCatalogBlobs || opts.blobBytes < 1 {
+			return opts, fmt.Errorf("catalog-blobs must be in [1, %d] and blob-bytes must be positive", maxCatalogBlobs)
 		}
 
 		for _, name := range []string{"catalog-images", "layers", "layer-bytes", "jitter"} {
@@ -133,6 +135,14 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		}
 	} else if seen["blob-bytes"] {
 		return opts, errors.New("blob-bytes requires catalog-blobs")
+	}
+
+	if seen["catalog-workers"] && !seen["catalog-blobs"] {
+		return opts, errors.New("catalog-workers requires catalog-blobs")
+	}
+
+	if opts.catalogWorkers < 1 || opts.catalogWorkers > maxCatalogWorkers {
+		return opts, fmt.Errorf("catalog-workers must be in [1, %d]", maxCatalogWorkers)
 	}
 
 	if opts.startDelay < 0 || opts.duration < 0 {
@@ -268,7 +278,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 		})
 	}
 
-	slog.Info("generating synthetic catalog", "catalog_images", opts.catalogImages, "catalog_blobs", opts.catalogBlobs, "blob_bytes", opts.blobBytes, "seed", opts.image.Seed)
+	slog.Info("generating synthetic catalog", "catalog_images", opts.catalogImages, "catalog_blobs", opts.catalogBlobs, "catalog_workers", opts.catalogWorkers, "blob_bytes", opts.blobBytes, "seed", opts.image.Seed)
 
 	startupCtx := ctx
 
@@ -283,7 +293,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	if opts.pull.Backend == "s3" {
 		catalog, err = newBlobCatalog(startupCtx, "benchmark/s3", opts.image.Seed, opts.s3.Count, opts.s3.Bytes)
 	} else if opts.catalogBlobs > 0 {
-		catalog, err = newBlobCatalog(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes)
+		catalog, err = newBlobCatalogWithWorkers(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes, opts.catalogWorkers)
 	} else {
 		catalog, err = newCatalog(startupCtx, opts.image, opts.catalogImages)
 	}

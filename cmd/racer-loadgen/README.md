@@ -162,15 +162,28 @@ expected digest and size.
 
 ### Catalog and operation units
 
-- `--catalog-blobs=N` creates 1-512 independent raw objects. Each is exactly
+- `--catalog-blobs=N` creates 1-32768 independent raw objects. Each is exactly
   `--blob-bytes` bytes (default 64 MiB), without tar framing or jitter. One worker
   operation reads one blob. Very small objects can produce duplicate content;
   startup rejects duplicate catalogs rather than reporting a false distinct count.
+- `--catalog-workers=N` uses 1-64 startup hashing workers (default 1). It requires
+  `--catalog-blobs`; OCI and S3 invocations reject the explicit flag. Each worker
+  reuses a 128 KiB buffer. Catalog metadata grows with object count, not payload
+  size. All workers stop before a failed or canceled build returns. Worker count
+  does not change bytes, SHA-256 keys, or catalog rank. Completed object and byte
+  counts are logged at most once per five seconds as objects finish, plus a final
+  completion log.
+  For example, `--catalog-blobs=16384 --blob-bytes=67108864 --catalog-workers=32`
+  creates a 1 TiB working set with 4 MiB of hashing scratch space. Every origin
+  hashes the full working set before readiness. Size the startup deadline and
+  CPU budget accordingly. Choose catalog size and Zipf skew from measured cache
+  hit rates; a larger catalog alone does not guarantee a balanced cache mix.
 - Without `--catalog-blobs`, existing OCI invocations remain compatible. Each
   catalog entry becomes a blob batch: ordered manifest and config, then concurrent
   layer blobs. This workload also works directly over UDS.
 - `--catalog-images`, `--layers`, `--layer-bytes`, and `--jitter` retain their OCI
-  meanings and cannot be explicitly combined with `--catalog-blobs`.
+  meanings and cannot be explicitly combined with `--catalog-blobs`. The OCI
+  catalog limit remains 512 images; the S3 limit remains 512 objects.
   `--blob-bytes` requires `--catalog-blobs`.
 - `--concurrency` counts admitted operations, not individual requests.
   `--blob-concurrency` bounds parallel blobs within a batch (default 4).
