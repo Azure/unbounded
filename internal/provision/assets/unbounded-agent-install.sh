@@ -85,23 +85,27 @@ curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
 AGENT_BIN="${tmp_dir}/unbounded-agent"
 chmod 0755 "${AGENT_BIN}"
 
-# Seed the daemon binary path when nothing usable is there yet. The agent
-# version is selected independently of this script - by AGENT_VERSION, by
-# AGENT_URL, or by the default of tracking the latest published release - so an
-# installer that relied on the agent to install its own binary would silently
-# break every agent released before that behavior existed. Such an agent never
-# writes the binary, and bootstrap then fails at daemon setup with no indication
-# that the installer and the agent disagree.
+# Seed the daemon binary path used by agents released before
+# /opt/unbounded/agent. The agent version is selected independently of this
+# script - by AGENT_VERSION, by AGENT_URL, or by the default of tracking the
+# latest published release - so it may be one that never writes its own binary
+# and looks for it here. Newer agents install under
+# /opt/unbounded/agent and remove a lone seed, and a read-only /usr/local/bin
+# only means the host cannot run the older agents.
 #
-# The test follows symlinks on purpose. On a host this installation already owns
-# the path resolves through the compatibility symlink to a live blue-green slot,
-# so it is left untouched and admission still runs from the staged executable
-# above. A dangling link resolves to nothing and is replaced, because install
-# would otherwise write through it to a stale location.
+# The test follows symlinks on purpose. On a host an older agent installed, or
+# one linked to it, the path resolves through the compatibility symlink to a
+# live blue-green slot, so it is left untouched and admission still runs from
+# the staged executable above. A dangling link resolves to nothing and is
+# replaced, because install would otherwise write through it to a stale
+# location. On a host installed under /opt/unbounded/agent the daemon has
+# removed the seed, so running this again seeds it again, and the daemon
+# removes it again.
 AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"
 if [ ! -x "${AGENT_BIN_TARGET}" ]; then
-    rm -f "${AGENT_BIN_TARGET}"
-    install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"
+    if ! { rm -f "${AGENT_BIN_TARGET}" && install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"; } 2>/dev/null; then
+        echo "Not seeding ${AGENT_BIN_TARGET}: it is not writable. Only agents released before /opt/unbounded/agent use it."
+    fi
 fi
 
 _START_ARGS=""

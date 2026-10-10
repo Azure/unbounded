@@ -13,6 +13,9 @@ on:
       - internal/provision/**
       - internal/agentartifacts/**
       - internal/kube/**
+      - internal/hostroot/**
+      - internal/fsutil/**
+      - internal/executil/**
       - hack/agent/e2e-kind/**
       - hack/cmd/agent-artifacts-builder/**
       - deploy/machina/crd/**
@@ -25,6 +28,7 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
+      - .github/actions/agent-e2e-*/**
   push:
     # release-* included so a cherry-pick onto a release branch gets the same
     # post-merge validation as main. The pull_request trigger above is
@@ -38,6 +42,9 @@ on:
       - internal/provision/**
       - internal/agentartifacts/**
       - internal/kube/**
+      - internal/hostroot/**
+      - internal/fsutil/**
+      - internal/executil/**
       - hack/agent/e2e-kind/**
       - hack/cmd/agent-artifacts-builder/**
       - deploy/machina/crd/**
@@ -50,6 +57,7 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
+      - .github/actions/agent-e2e-*/**
   workflow_dispatch:
 
 permissions:
@@ -57,27 +65,69 @@ permissions:
   packages: read
 
 jobs:
-  agent-e2e:
-    name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
+  # The Azure Container Linux image needs a federated Azure login, which forks
+  # do not get, and a static matrix cannot drop one entry conditionally. The ACL
+  # entry is left out rather than failed; see hack/agent/e2e-kind/README.md.
+  select-hosts:
+    name: select host matrix
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - host-base-os: ubuntu2404
-            nspawn-base-os: ubuntu2404
-          # Fedora, AlmaLinux, and CentOS Stream cover RPM hosts with Azure Linux nspawn.
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select hosts
+        id: select
+        env:
+          # Absent for non-pull_request events, where secrets are available.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          # Checked for presence only; the Azure login needs all three.
+          ACL_CLIENT_ID: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
+          ACL_TENANT_ID: ${{ secrets.ACL_IMAGE_TENANT_ID }}
+          ACL_SUBSCRIPTION_ID: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+
+          # Fedora and AlmaLinux cover RPM hosts with Azure Linux nspawn.
           # Azure Linux 3 does not currently publish a QEMU-ready VHD that this
           # e2e can boot directly as the host VM.
-          - host-base-os: fedora
-            nspawn-base-os: azlinux3
-          - host-base-os: almalinux9
-            nspawn-base-os: azlinux3
-          - host-base-os: almalinux10
-            nspawn-base-os: azlinux3
-          - host-base-os: ubuntu2604
-            nspawn-base-os: ubuntu2604
+          hosts='[
+            {"host-base-os":"ubuntu2404","nspawn-base-os":"ubuntu2404","timeout":60},
+            {"host-base-os":"fedora","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"almalinux9","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"almalinux10","nspawn-base-os":"azlinux3","timeout":60},
+            {"host-base-os":"ubuntu2604","nspawn-base-os":"ubuntu2604","timeout":60}
+          ]'
+
+          # Azure Container Linux gets longer: it downloads a 630 MiB image and
+          # boots a 31 GiB sparse overlay through OVMF.
+          acl='{"host-base-os":"acl","nspawn-base-os":"azlinux3","timeout":75}'
+
+          if [ -n "${HEAD_REPO}" ] && [ "${HEAD_REPO}" != "${GITHUB_REPOSITORY}" ]; then
+            echo "::notice::Azure Container Linux is skipped for forks: its image needs Azure credentials"
+          elif [ -z "${ACL_CLIENT_ID}" ] || [ -z "${ACL_TENANT_ID}" ] || [ -z "${ACL_SUBSCRIPTION_ID}" ]; then
+            echo "::notice::Azure Container Linux is skipped: ACL_IMAGE_CLIENT_ID, ACL_IMAGE_TENANT_ID and ACL_IMAGE_SUBSCRIPTION_ID are not all configured"
+          else
+            hosts="$(printf '%s' "${hosts}" | jq -c ". + [${acl}]")"
+          fi
+
+          printf 'matrix=%s\n' "$(printf '%s' "${hosts}" | jq -c '{include: .}')" >> "${GITHUB_OUTPUT}"
+
+  agent-e2e:
+    name: agent e2e (host ${{ matrix.host-base-os }}, nspawn ${{ matrix.nspawn-base-os }})
+    needs: select-hosts
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: read
+      packages: read
+      # The federated login for the Azure Container Linux image. Permissions
+      # cannot vary by matrix entry, so every entry gets it, and only the ACL
+      # entry's Azure login step uses it. Pull requests from forks never get
+      # an OIDC token, whatever this says.
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select-hosts.outputs.matrix) }}
     env:
       KIND_CLUSTER_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
       VM_NAME: agent-e2e-${{ matrix.host-base-os }}-${{ matrix.nspawn-base-os }}
@@ -88,6 +138,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Azure login
+        if: matrix.host-base-os == 'acl'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.ACL_IMAGE_CLIENT_ID }}
+          tenant-id: ${{ secrets.ACL_IMAGE_TENANT_ID }}
+          subscription-id: ${{ secrets.ACL_IMAGE_SUBSCRIPTION_ID }}
+
+      # Exported for later e2e.py processes, so the job uses one build. The
+      # image is downloaded and verified on every run, never put in the Actions
+      # cache: a pull request from a fork can restore the base branch's caches,
+      # and the image is only readable with the Azure login above.
+      - name: Resolve the Azure Container Linux build
+        if: matrix.host-base-os == 'acl'
+        run: python3 ./hack/agent/e2e-kind/e2e.py resolve-host-image
 
       - name: Set up test control plane
         uses: ./.github/actions/agent-e2e-kind-control-plane
@@ -118,15 +184,28 @@ jobs:
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup
 
   agent-bootstrap-recovery:
-    name: agent bootstrap recovery (Ubuntu)
+    name: agent ${{ matrix.title }} (Ubuntu)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: bootstrap-recovery
+            title: bootstrap recovery
+            suite: bootstrap-recovery
+          # A host installed by the last release before the host root, linked
+          # and then moved. That release cannot be installed on an immutable
+          # host, so one conventional host covers it.
+          - id: host-root-migration
+            title: host root migration
+            suite: migration
     env:
-      KIND_CLUSTER_NAME: agent-bootstrap-recovery
-      VM_NAME: agent-bootstrap-recovery
+      KIND_CLUSTER_NAME: agent-${{ matrix.id }}
+      VM_NAME: agent-${{ matrix.id }}
       VM_SUBNET: "192.168.100"
       VM_IP: "192.168.100.10"
-      AGENT_MACHINE_NAME: agent-bootstrap-recovery
+      AGENT_MACHINE_NAME: agent-${{ matrix.id }}
       HOST_BASE_OS: ubuntu2404
     steps:
       - name: Checkout
@@ -138,15 +217,16 @@ jobs:
           vm-subnet: ${{ env.VM_SUBNET }}
       - name: Set up machina resources
         uses: ./.github/actions/agent-e2e-machina-setup
-      - name: Retry late bootstrap and repair after ordinary repave
-        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite bootstrap-recovery
+      - name: Run the ${{ matrix.title }} suite
+        run: python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite ${{ matrix.suite }}
       - name: Verify strict reset
+        if: matrix.suite == 'bootstrap-recovery'
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose reset-agent
       - name: Collect logs
         if: always()
         uses: ./.github/actions/agent-e2e-kind-logs
         with:
-          artifact-name: agent-bootstrap-recovery-logs
+          artifact-name: agent-${{ matrix.id }}-logs
       - name: Cleanup
         if: always()
         run: python3 ./hack/agent/e2e-kind/e2e.py --verbose cleanup

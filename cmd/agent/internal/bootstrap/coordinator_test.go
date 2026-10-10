@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -22,7 +24,10 @@ type fakeStages struct {
 	verifyErr error
 }
 
-var errInjected = errors.New("injected stage failure")
+var (
+	errInjected     = errors.New("injected stage failure")
+	errRepairFailed = errors.New("injected repair failure")
+)
 
 func (f *fakeStages) run(name string) error {
 	f.calls = append(f.calls, name)
@@ -33,6 +38,10 @@ func (f *fakeStages) run(name string) error {
 	}
 
 	if name == f.fail {
+		if name == "repair" {
+			return errRepairFailed
+		}
+
 		return errInjected
 	}
 
@@ -110,6 +119,9 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 		r.Phase = installstate.Complete
 		require.NoError(t, store.Save(r))
 
+		before, err := os.Stat(filepath.Join(store.Root(), "install-state.json"))
+		require.NoError(t, err)
+
 		stages := &fakeStages{store: store, fail: "resolve"}
 		if repair {
 			stages.verifyErr = errInjected
@@ -127,9 +139,11 @@ func TestCompletedRecoveryDoesNotResolveRetiredBootstrapInputs(t *testing.T) {
 
 		require.Equal(t, want, stages.calls)
 
-		complete, err := store.Load()
+		// The Ignition unit reaches this on every boot; a completed record
+		// is never rewritten, repaired or not.
+		after, err := os.Stat(filepath.Join(store.Root(), "install-state.json"))
 		require.NoError(t, err)
-		require.Equal(t, installstate.Complete, complete.Phase)
+		require.True(t, os.SameFile(before, after), "the record must not be rewritten")
 	}
 }
 
@@ -161,7 +175,10 @@ func TestAdmissionFailurePreventsAllStageWork(t *testing.T) {
 			}
 
 			stages := &fakeStages{store: store}
-			_, err = New(slog.New(slog.DiscardHandler), store, stages, nil).Run(t.Context(), id)
+			c := New(slog.New(slog.DiscardHandler), store, stages, nil)
+			c.lockWait = 0 // waiting is covered by TestRunWaitsForTheInstallationLock
+
+			_, err = c.Run(t.Context(), id)
 			require.Error(t, err)
 			require.Empty(t, stages.calls)
 		})
@@ -177,7 +194,8 @@ func TestInterruptedRepairRemainsCompleteAndRetries(t *testing.T) {
 	c := New(slog.New(slog.DiscardHandler), store, stages, nil)
 	id := Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint}
 	_, err = c.Run(t.Context(), id)
-	require.ErrorIs(t, err, errInjected)
+	require.ErrorIs(t, err, errInjected, "the fault that triggered the repair is reported")
+	require.ErrorIs(t, err, errRepairFailed, "and so is the repair's own failure")
 	loaded, err := store.Load()
 	require.NoError(t, err)
 	require.Equal(t, installstate.Complete, loaded.Phase)
@@ -188,4 +206,82 @@ func TestInterruptedRepairRemainsCompleteAndRetries(t *testing.T) {
 	_, err = c.Run(t.Context(), id)
 	require.NoError(t, err)
 	require.Equal(t, []string{"verify", "repair", "verify"}, stages.calls)
+}
+
+// TestRunWaitsForTheInstallationLock covers a reboot, where the daemon holds
+// the lock while it migrates the host and the first-boot unit runs start at
+// the same time.
+func TestRunWaitsForTheInstallationLock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		releaseIn time.Duration
+		lockWait  time.Duration
+		cancel    bool
+		wantErr   error
+		wantCalls []string
+	}{
+		{
+			name:      "released within the wait",
+			releaseIn: 100 * time.Millisecond,
+			lockWait:  10 * time.Second,
+			wantCalls: []string{"verify"},
+		},
+		{
+			name:      "still held at the deadline",
+			releaseIn: time.Hour,
+			lockWait:  100 * time.Millisecond,
+			wantErr:   installstate.ErrLockHeld,
+		},
+		{
+			name:      "canceled while waiting",
+			releaseIn: time.Hour,
+			lockWait:  10 * time.Second,
+			cancel:    true,
+			wantErr:   context.Canceled,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
+			r, err := installstate.NewRecord("machine", "fingerprint")
+			require.NoError(t, err)
+			require.NoError(t, store.MarkComplete(r))
+
+			held, err := store.AcquireLock()
+			require.NoError(t, err)
+
+			release := time.AfterFunc(tt.releaseIn, func() { _ = held.Release() })
+
+			t.Cleanup(func() {
+				release.Stop()
+
+				_ = held.Release()
+			})
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			if tt.cancel {
+				time.AfterFunc(100*time.Millisecond, cancel)
+			}
+
+			stages := &fakeStages{store: store}
+			c := New(slog.New(slog.DiscardHandler), store, stages, nil)
+			c.lockWait = tt.lockWait
+
+			_, err = c.Run(ctx, Identity{MachineName: r.MachineName, ConfigFingerprint: r.ConfigFingerprint})
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, tt.wantCalls, stages.calls)
+		})
+	}
 }

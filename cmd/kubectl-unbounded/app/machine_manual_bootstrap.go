@@ -47,6 +47,10 @@ const (
 
 	// variantCloudInit produces a cloud-init user-data document.
 	variantCloudInit bootstrapVariant = "cloud-init"
+
+	// variantIgnition produces an Ignition config, for image-based hosts such
+	// as Azure Container Linux that ship no cloud-init.
+	variantIgnition bootstrapVariant = "ignition"
 )
 
 func parseBootstrapVariant(s string) (bootstrapVariant, error) {
@@ -55,8 +59,10 @@ func parseBootstrapVariant(s string) (bootstrapVariant, error) {
 		return variantScript, nil
 	case variantCloudInit:
 		return variantCloudInit, nil
+	case variantIgnition:
+		return variantIgnition, nil
 	default:
-		return "", fmt.Errorf("unknown variant %q (valid: script, cloud-init)", s)
+		return "", fmt.Errorf("unknown variant %q (valid: script, cloud-init, ignition)", s)
 	}
 }
 
@@ -103,7 +109,12 @@ type manualBootstrapHandler struct {
 
 	// agentURL is a fully qualified override for the unbounded-agent download
 	// URL. When set it takes precedence over agentVersion and agentBaseURL.
+	// The ignition variant requires it to name the bare binary.
 	agentURL string
+
+	// agentSHA256 is the expected digest of the agent binary, required by the
+	// ignition variant.
+	agentSHA256 string
 
 	// agentBaseURL overrides the base URL used to construct the download URL
 	// for the unbounded-agent. Useful for self-hosted release mirrors. Must
@@ -186,6 +197,8 @@ func (h *manualBootstrapHandler) execute(ctx context.Context) error {
 	switch bootstrapVariant(h.variant) {
 	case variantCloudInit:
 		output, err = h.renderCloudInit(cfg)
+	case variantIgnition:
+		output, err = h.renderIgnition(cfg)
 	default:
 		output, err = h.renderScript(cfg)
 	}
@@ -367,8 +380,15 @@ func (h *manualBootstrapHandler) validate() error {
 		h.variant = string(variantScript)
 	}
 
-	if _, err := parseBootstrapVariant(h.variant); err != nil {
+	variant, err := parseBootstrapVariant(h.variant)
+	if err != nil {
 		return err
+	}
+
+	if variant == variantIgnition {
+		if err := h.validateIgnitionInput(); err != nil {
+			return err
+		}
 	}
 
 	if err := validateOfflineArtifactsSource(h.offlineArtifactsSource); err != nil {
@@ -649,7 +669,7 @@ func (h *manualBootstrapHandler) renderCloudInit(cfg *provision.UnboundedAgentCo
 func newMachineManualBootstrapCommand(handler *manualBootstrapHandler) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "manual-bootstrap [NAME]",
-		Short: "Generate a bootstrap script or cloud-init config for provisioning a machine",
+		Short: "Generate a bootstrap script, cloud-init config, or Ignition config for provisioning a machine",
 		Long: `Generate a self-contained bootstrap payload that provisions a bare-metal or VM
 host as an unbounded worker node. The payload embeds the agent JSON
 configuration inline and the install script for the target architecture.
@@ -665,6 +685,9 @@ Use --variant to choose the output format:
 
   script      (default) A bash script that can be piped directly to a host.
   cloud-init  A cloud-init user-data document for VM provisioning APIs.
+  ignition    An Ignition config for image-based hosts such as Azure Container
+              Linux. Requires --agent-url naming the bare binary, and
+              --agent-sha256.
 
 Examples:
 
@@ -710,9 +733,10 @@ Examples:
 	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)
 	cmd.Flags().StringArrayVar(&handler.additionalHostDevices, "additional-host-device", nil, `Extra host device node or systemd device group specifier to expose in the nspawn machine (can be repeated). Accepts absolute /dev/* paths and systemd device group specifiers like char-input or block-*`)
 	cmd.Flags().StringVar(&handler.kubernetesVersion, "kubernetes-version", "", "Override the Kubernetes version (default: auto-detected from API server)")
-	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script or cloud-init")
+	cmd.Flags().StringVar(&handler.variant, "variant", "script", "Output format: script, cloud-init, or ignition")
 	cmd.Flags().StringVar(&handler.agentVersion, "agent-version", "", "Pin the unbounded-agent release tag to download on the host (default: latest GitHub release)")
-	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url)")
+	cmd.Flags().StringVar(&handler.agentURL, "agent-url", "", "Fully qualified download URL for the unbounded-agent tarball (overrides --agent-version and --agent-base-url). With --variant ignition this must name the bare binary, not the tarball")
+	cmd.Flags().StringVar(&handler.agentSHA256, "agent-sha256", "", "SHA-256 digest of the agent binary, published in checksums.txt. Required with --variant ignition")
 	cmd.Flags().StringVar(&handler.agentBaseURL, "agent-base-url", "", "Base URL for unbounded-agent release downloads (default: https://github.com/Azure/unbounded/releases). Use this to self-host or mirror release assets")
 
 	// Rootfs binary download overrides. See `kubectl unbounded machine register --help`

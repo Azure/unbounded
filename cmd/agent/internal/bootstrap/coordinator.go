@@ -12,9 +12,17 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 )
+
+// defaultLockWait bounds how long Run waits for another lifecycle operation to
+// release the installation lock. On every boot the daemon holds it while it
+// reconciles the nspawn hooks, and the Ignition bootstrap unit, ordered after
+// the daemon unit, runs start then. On a host an older release installed the
+// daemon also holds it while it moves the files to the host root.
+const defaultLockWait = 30 * time.Second
 
 type Identity struct{ MachineName, ConfigFingerprint string }
 
@@ -51,16 +59,17 @@ type Coordinator struct {
 	store    *installstate.Store
 	stages   Stages
 	reporter Reporter
+	lockWait time.Duration
 }
 
 func New(log *slog.Logger, store *installstate.Store, stages Stages, reporter Reporter) *Coordinator {
-	return &Coordinator{log: log, store: store, stages: stages, reporter: reporter}
+	return &Coordinator{log: log, store: store, stages: stages, reporter: reporter, lockWait: defaultLockWait}
 }
 
 type Outcome struct{ AlreadyComplete bool }
 
 func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
-	lock, err := c.store.AcquireLock()
+	lock, err := installstate.AcquireWithin(ctx, c.lockWait, c.store.AcquireLock)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -92,18 +101,15 @@ func (c *Coordinator) Run(ctx context.Context, id Identity) (Outcome, error) {
 	}
 
 	if disposition == installstate.AlreadyComplete {
-		if err := c.stages.VerifyInstalled(ctx); err != nil {
+		verifyErr := c.stages.VerifyInstalled(ctx)
+		if verifyErr != nil {
 			if err := c.stages.RepairDaemon(ctx); err != nil {
-				return Outcome{}, err
+				return Outcome{}, fmt.Errorf("repair daemon after %w: %w", verifyErr, err)
 			}
 
 			if err := c.stages.VerifyInstalled(ctx); err != nil {
 				return Outcome{}, err
 			}
-		}
-
-		if err := c.store.MarkComplete(r); err != nil {
-			return Outcome{}, err
 		}
 
 		return Outcome{AlreadyComplete: true}, nil

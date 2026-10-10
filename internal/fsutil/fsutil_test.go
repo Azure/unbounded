@@ -4,8 +4,11 @@
 package fsutil_test
 
 import (
+	"crypto/sha256"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -80,4 +83,54 @@ func TestSyncOpenFilesystemsDeduplicatesByDevice(t *testing.T) {
 func TestSyncFilesystemsReportsMissingPath(t *testing.T) {
 	t.Parallel()
 	require.Error(t, fsutil.SyncFilesystems(filepath.Join(t.TempDir(), "absent")))
+}
+
+func TestFileSHA256(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(path, []byte("content"), 0o600))
+
+	digest, err := fsutil.FileSHA256(path)
+	require.NoError(t, err)
+	require.Equal(t, sha256.Sum256([]byte("content")), digest)
+
+	_, err = fsutil.FileSHA256(filepath.Join(t.TempDir(), "absent"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// TestMountedNoexec checks the answer against the kernel's mount table, for a
+// mount that runs programs and for /proc, which systemd and container
+// runtimes mount noexec.
+func TestMountedNoexec(t *testing.T) {
+	t.Parallel()
+
+	mountinfo, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		t.Skipf("no mount table to check against: %v", err)
+	}
+
+	// The fifth field is the mount point, the sixth its options; the last
+	// line for a mount point is the one on top.
+	options := map[string][]string{}
+
+	for line := range strings.SplitSeq(string(mountinfo), "\n") {
+		if fields := strings.Fields(line); len(fields) > 5 {
+			options[fields[4]] = strings.Split(fields[5], ",")
+		}
+	}
+
+	for _, mountPoint := range []string{"/", "/proc"} {
+		opts, ok := options[mountPoint]
+		if !ok {
+			continue
+		}
+
+		got, err := fsutil.MountedNoexec(mountPoint)
+		require.NoError(t, err)
+		require.Equal(t, slices.Contains(opts, "noexec"), got, "%s is mounted %s", mountPoint, strings.Join(opts, ","))
+	}
+
+	_, err = fsutil.MountedNoexec(filepath.Join(t.TempDir(), "missing"))
+	require.ErrorContains(t, err, "inspect the filesystem of")
 }

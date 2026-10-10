@@ -35,6 +35,7 @@ Both possible nspawn machine names (kube1 and kube2) are stopped and removed.`,
 				"commit", version.GitCommit,
 			)
 
+			// No host root migration; see hostroot.Migrate.
 			return resetAgent(cmdCtx.Logger).Do(ctx)
 		},
 	}

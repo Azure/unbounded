@@ -30,8 +30,10 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
+        # ovmf is the UEFI firmware an Ignition host boots through; qemu-utils
+        # also provides the qemu-nbd used to patch its boot command line.
         sudo apt-get install -y --no-install-recommends \
-          qemu-system-x86 qemu-utils genisoimage \
+          qemu-system-x86 qemu-utils genisoimage ovmf \
           iptables
 
     - name: Create Kind cluster

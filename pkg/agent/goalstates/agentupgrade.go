@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Azure/unbounded/internal/hostroot"
 )
 
 const AgentUpgradeBinaryName = "unbounded-agent"
@@ -22,15 +24,31 @@ type AgentUpgradePaths struct {
 	CurrentTargetPath string
 }
 
-// ResolvedAgentUpgradePaths returns the host-side agent binary paths after
-// applying environment overrides.
+// ResolvedAgentUpgradePaths returns the host-side agent binary paths under the
+// resolved host root, after applying environment overrides. Overrides name a
+// specific file and so take precedence over the root.
+//
+// The AgentUpgrade signal path is not under the host root. It is state about
+// an upgrade rather than part of the installed layout, and lives in the agent
+// config directory.
 func ResolvedAgentUpgradePaths() (AgentUpgradePaths, error) {
+	return agentUpgradePathsIn(ResolveHostPaths().BinDir)
+}
+
+// PlannedAgentUpgradePaths returns the paths ResolvedAgentUpgradePaths will
+// return once the host root is migrated, without migrating it; see
+// PlannedHostPaths.
+func PlannedAgentUpgradePaths() (AgentUpgradePaths, error) {
+	return agentUpgradePathsIn(PlannedHostPaths().BinDir)
+}
+
+func agentUpgradePathsIn(binDir string) (AgentUpgradePaths, error) {
 	paths := AgentUpgradePaths{
-		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, DaemonBinaryPath),
-		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, DaemonBinaryBluePath),
-		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, DaemonBinaryGreenPath),
-		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, DaemonBinaryCurrentPath),
-		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, DaemonBinaryLastGoodPath),
+		BinaryPath:   resolveDaemonBinaryPath(EnvDaemonBinary, filepath.Join(binDir, hostroot.BinaryName)),
+		BluePath:     resolveDaemonBinaryPath(EnvDaemonBinaryBlue, filepath.Join(binDir, hostroot.BinaryBlueName)),
+		GreenPath:    resolveDaemonBinaryPath(EnvDaemonBinaryGreen, filepath.Join(binDir, hostroot.BinaryGreenName)),
+		CurrentPath:  resolveDaemonBinaryPath(EnvDaemonBinaryCurrent, filepath.Join(binDir, hostroot.BinaryCurrentName)),
+		LastGoodPath: resolveDaemonBinaryPath(EnvDaemonBinaryLastGood, filepath.Join(binDir, hostroot.BinaryLastGoodName)),
 		SignalPath:   resolveDaemonBinaryPath(EnvDaemonAgentUpgradeSignalPath, DaemonAgentUpgradeSignalPath),
 	}
 

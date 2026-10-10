@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
@@ -62,6 +63,8 @@ func TestCheckHostPackagesBlocksMissingPackagesWhenOfflineArtifactsConfigured(t 
 func TestCheckHostOSConfiguration(t *testing.T) {
 	deps := defaultHostCheckDeps()
 	deps.writeProbe = func(string) error { return nil }
+	// Not the test host's mounts.
+	deps.noexec = func(string) (bool, error) { return false, nil }
 
 	results := checkHostOSConfiguration(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
@@ -94,6 +97,7 @@ func TestAgentInstallDirsProbeIsCreatable(t *testing.T) {
 		probed = append(probed, dir)
 		return nil
 	}
+	deps.noexec = func(string) (bool, error) { return false, nil }
 
 	results := installDirResults(slog.New(slog.DiscardHandler), []string{target}, deps)
 	assert.Empty(t, results, "an absent directory under a writable parent is fine")
@@ -107,14 +111,97 @@ func TestAgentInstallDirsProbeIsCreatable(t *testing.T) {
 	assert.Contains(t, results[0].Message, root)
 }
 
-// TestAgentInstallDirsTracksTheBinaryPath keeps the checked directory tied to
-// where the agent actually installs, so the two cannot drift apart.
-func TestAgentInstallDirsTracksTheBinaryPath(t *testing.T) {
+// TestAgentInstallDirsMustRunPrograms covers an install directory on a
+// filesystem mounted noexec: systemd could not start the daemon from it, so
+// preflight fails there rather than bootstrap failing late. The filesystem
+// asked about is the one the directory will be created on.
+func TestAgentInstallDirsMustRunPrograms(t *testing.T) {
 	t.Parallel()
 
-	dirs := agentInstallDirs()
-	assert.Len(t, dirs, 1)
-	assert.Equal(t, filepath.Dir(goalstates.DaemonBinaryPath), dirs[0])
+	root := t.TempDir()
+	target := filepath.Join(root, "agent", "bin")
+
+	tests := []struct {
+		name         string
+		writeErr     error
+		noexec       bool
+		noexecErr    error
+		wantSeverity preflight.Severity
+		wantMessage  string
+		wantChecked  bool
+	}{
+		{name: "a filesystem that runs programs", wantChecked: true},
+		{
+			name:         "a filesystem mounted noexec",
+			noexec:       true,
+			wantSeverity: preflight.SeverityError,
+			wantMessage:  "mounted noexec",
+			wantChecked:  true,
+		},
+		{
+			name:         "a filesystem that cannot be inspected",
+			noexecErr:    errors.New("statfs failed"),
+			wantSeverity: preflight.SeverityWarning,
+			wantMessage:  "statfs failed",
+			wantChecked:  true,
+		},
+		{
+			// One error, for the write: whether it could run there is moot.
+			name:         "a directory that cannot be written",
+			writeErr:     errors.New("read-only file system"),
+			noexec:       true,
+			wantSeverity: preflight.SeverityError,
+			wantMessage:  "cannot be created",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var checked []string
+
+			deps := defaultHostCheckDeps()
+			deps.writeProbe = func(string) error { return tt.writeErr }
+			deps.noexec = func(path string) (bool, error) {
+				checked = append(checked, path)
+
+				return tt.noexec, tt.noexecErr
+			}
+
+			results := installDirResults(slog.New(slog.DiscardHandler), []string{target}, deps)
+
+			if tt.wantMessage == "" {
+				assert.Empty(t, results)
+			} else {
+				require.Len(t, results, 1)
+				assert.Equal(t, tt.wantSeverity, results[0].Severity)
+				assert.Contains(t, results[0].Message, tt.wantMessage)
+				assert.Contains(t, results[0].Message, target)
+			}
+
+			if tt.wantChecked {
+				assert.Equal(t, []string{root}, checked, "the nearest existing ancestor's filesystem is checked")
+			} else {
+				assert.Empty(t, checked)
+			}
+		})
+	}
+}
+
+// TestAgentInstallDirsTracksTheBinaryPath keeps the checked directory tied to
+// where the agent actually installs, so the two cannot drift apart. Preflight
+// does not migrate the host root, so it checks where the binary will go once
+// bootstrap has: under the host root on a fresh host, and under the legacy root
+// on a host an older release installed.
+//
+// Not parallel: it clears the binary path override for this process.
+func TestAgentInstallDirsTracksTheBinaryPath(t *testing.T) {
+	t.Setenv(goalstates.EnvDaemonBinary, "")
+
+	paths, err := goalstates.PlannedAgentUpgradePaths()
+	require.NoError(t, err)
+	assert.Equal(t, []string{filepath.Dir(paths.BinaryPath)}, agentInstallDirs())
 }
 
 func TestCheckExistingDeploymentCleanHost(t *testing.T) {
@@ -125,6 +212,24 @@ func TestCheckExistingDeploymentCleanHost(t *testing.T) {
 	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+}
+
+// TestCheckExistingDeploymentFindsTheRecoveryScript looks where the host root
+// will lead, because preflight does not migrate it: on a host installed by an
+// older release that is still the legacy root.
+func TestCheckExistingDeploymentFindsTheRecoveryScript(t *testing.T) {
+	t.Parallel()
+
+	script := goalstates.PlannedHostPaths().DaemonRecoveryScript
+	deps := defaultHostCheckDeps()
+	deps.stat = statOnlyExists(script)
+	deps.outputCmd = outputWith("", errors.New("not found"))
+
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+
+	require.Len(t, results, 1)
+	assert.Equal(t, preflight.SeverityError, results[0].Severity)
+	assert.Contains(t, results[0].Message, script)
 }
 
 func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {

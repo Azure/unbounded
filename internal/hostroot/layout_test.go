@@ -1,0 +1,53 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package hostroot
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+// TestMarkersAreTheBinaryLayout keeps files that a fresh host also has under
+// the legacy root out of the markers: the plain binary install scripts seed,
+// the install script cloud-init writes, and a helper an older reset can leave
+// behind. Counting one would link a fresh host's root to the legacy root and
+// install the agent there.
+func TestMarkersAreTheBinaryLayout(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, []string{
+		"bin/unbounded-agent-blue",
+		"bin/unbounded-agent-green",
+		"bin/unbounded-agent-current",
+		"bin/unbounded-agent-last-good",
+	}, Markers())
+}
+
+func TestOwnedFiles(t *testing.T) {
+	t.Parallel()
+
+	layout := func(root string) []string {
+		return []string{
+			root + "/bin/unbounded-agent",
+			root + "/bin/unbounded-agent-blue",
+			root + "/bin/unbounded-agent-green",
+			root + "/bin/unbounded-agent-current",
+			root + "/bin/unbounded-agent-last-good",
+			root + "/bin/unbounded-agent-nspawn-lifecycle",
+			root + "/bin/unbounded-agent-daemon-recovery.sh",
+			root + "/libexec/unbounded-localdns-network",
+		}
+	}
+	// Reset does not migrate, so on a host the migration refused the
+	// installation is under the legacy root while the root is a real
+	// directory. The installer scripts are written under the legacy root by
+	// cloud-init and netboot on every host. Nothing else under /opt/unbounded
+	// is the agent's.
+	want := append(append(layout("/opt/unbounded/agent"), layout("/usr/local")...),
+		"/usr/local/bin/unbounded-agent-install.sh",
+		"/usr/local/bin/unbounded-agent-uninstall.sh",
+	)
+	assert.ElementsMatch(t, want, OwnedFiles())
+}

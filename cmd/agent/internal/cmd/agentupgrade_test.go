@@ -6,6 +6,8 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -48,14 +50,24 @@ func TestHostAgentUpgradePreflight(t *testing.T) {
 
 	var output bytes.Buffer
 
+	// On a legacy host the resolved paths are not where the installation is
+	// until the migration has run, so preflight plans against where it will
+	// put things instead, and leaves the host root alone.
 	handler := &hostAgentUpgradeHandler{
-		cmdCtx:       &CommandContext{LogFormat: "text"},
-		preflight:    true,
-		writer:       &output,
-		executable:   func() (string, error) { return candidatePath, nil },
-		resolvedPath: func() (goalstates.AgentUpgradePaths, error) { return paths, nil },
-		newService:   func(goalstates.AgentUpgradePaths) agentbinary.DaemonService { return preflightOnlyDaemonService{} },
-		geteuid:      func() int { return 1000 },
+		cmdCtx:     &CommandContext{LogFormat: "text"},
+		preflight:  true,
+		writer:     &output,
+		executable: func() (string, error) { return candidatePath, nil },
+		resolvedPath: func() (goalstates.AgentUpgradePaths, error) {
+			return goalstates.AgentUpgradePaths{}, errors.New("preflight must not use the resolved paths")
+		},
+		plannedPath: func() (goalstates.AgentUpgradePaths, error) { return paths, nil },
+		newService:  func(goalstates.AgentUpgradePaths) agentbinary.DaemonService { return preflightOnlyDaemonService{} },
+		geteuid:     func() int { return 1000 },
+		migrate: func(*slog.Logger) error {
+			t.Error("preflight must not migrate the host root")
+			return nil
+		},
 	}
 
 	require.NoError(t, handler.execute(context.Background()))
@@ -96,8 +108,51 @@ func TestHostAgentUpgradeTakesInstallationLockBeforeActivation(t *testing.T) {
 		resolvedPath: func() (goalstates.AgentUpgradePaths, error) { return goalstates.AgentUpgradePaths{}, nil },
 		newService:   func(goalstates.AgentUpgradePaths) agentbinary.DaemonService { return preflightOnlyDaemonService{} },
 		geteuid:      func() int { return 0 },
+		migrate:      func(*slog.Logger) error { return nil },
 	}
 	require.ErrorIs(t, handler.execute(t.Context()), installstate.ErrLockHeld)
+}
+
+// TestHostAgentUpgradeMigratesBeforeResolvingPaths pins the order the rest of
+// the upgrade depends on: paths resolved before the migration name the new
+// root on a legacy host, where the running daemon's slots are not. Root is
+// checked first, because without it the migration fails less plainly. Not
+// parallel: execute sets up the process-wide logger.
+func TestHostAgentUpgradeMigratesBeforeResolvingPaths(t *testing.T) {
+	tests := []struct {
+		name       string
+		euid       int
+		migrateErr error
+		wantErr    string
+		wantCalls  []string
+	}{
+		{name: "migrates, then resolves", wantErr: "stop here", wantCalls: []string{"migrate", "resolve"}},
+		{name: "a failed migration stops", migrateErr: errors.New("installed under both"), wantErr: "installed under both", wantCalls: []string{"migrate"}},
+		{name: "root is required first", euid: 1000, wantErr: "requires root privileges"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []string
+
+			handler := &hostAgentUpgradeHandler{
+				cmdCtx:     &CommandContext{LogFormat: "text"},
+				executable: func() (string, error) { return filepath.Join(t.TempDir(), "candidate"), nil },
+				resolvedPath: func() (goalstates.AgentUpgradePaths, error) {
+					calls = append(calls, "resolve")
+					return goalstates.AgentUpgradePaths{}, errors.New("stop here")
+				},
+				geteuid: func() int { return tt.euid },
+				migrate: func(*slog.Logger) error {
+					calls = append(calls, "migrate")
+					return tt.migrateErr
+				},
+			}
+
+			require.ErrorContains(t, handler.execute(t.Context()), tt.wantErr)
+			assert.Equal(t, tt.wantCalls, calls)
+		})
+	}
 }
 
 func TestRecordAgentUpgradeFailureSignalCommand(t *testing.T) {

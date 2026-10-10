@@ -58,6 +58,13 @@ type fakeNodeOperator struct {
 
 	restartAgentCalled bool
 	restartAgentErr    error
+
+	hostRootCalls     int
+	hostRootActive    *ActiveMachine
+	hostRootRestarted bool
+	hostRootErr       error
+	// hostRootDuring runs inside ReconcileHostRoot, to see what holds then.
+	hostRootDuring func()
 }
 
 func (op *fakeNodeOperator) FindActiveMachine(*slog.Logger) (*ActiveMachine, error) {
@@ -123,6 +130,17 @@ func (op *fakeNodeOperator) RestartAgentDaemon(_ context.Context, _ *slog.Logger
 	op.restartAgentCalled = true
 
 	return op.restartAgentErr
+}
+
+func (op *fakeNodeOperator) ReconcileHostRoot(_ context.Context, _ *slog.Logger, active *ActiveMachine) (bool, error) {
+	op.hostRootCalls++
+	op.hostRootActive = active
+
+	if op.hostRootDuring != nil {
+		op.hostRootDuring()
+	}
+
+	return op.hostRootRestarted, op.hostRootErr
 }
 
 func fakeStatusClient(objs ...client.Object) client.Client {

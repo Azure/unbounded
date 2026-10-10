@@ -139,7 +139,7 @@ func existingDeploymentHostArtifacts() []existingDeploymentArtifact {
 		},
 		{
 			description: "agent daemon recovery script",
-			path:        goalstates.DaemonRecoveryScriptPath,
+			path:        goalstates.PlannedHostPaths().DaemonRecoveryScript,
 		},
 	}
 }

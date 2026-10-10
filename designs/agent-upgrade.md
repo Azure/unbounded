@@ -24,7 +24,7 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 
 | Field | Purpose |
 |-------|---------|
-| `BinaryPath` | Compatibility path, normally `/usr/local/bin/unbounded-agent`. |
+| `BinaryPath` | Compatibility path, normally `/opt/unbounded/agent/bin/unbounded-agent`. |
 | `BluePath` | First blue-green binary slot. |
 | `GreenPath` | Second blue-green binary slot. |
 | `CurrentPath` | Symlink used by the systemd daemon unit. |
@@ -32,10 +32,82 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 | `SignalPath` | Single JSON signal file for pending and failure state. |
 | `CurrentTargetPath` | Resolved current binary target for one operation. |
 
-`goalstates.ResolvedAgentUpgradePaths()` resolves environment overrides and
-stores the resolved `CurrentPath` target in `CurrentTargetPath`. If
-`CurrentPath` does not exist, the compatibility `BinaryPath` is used as the
-current target. `NextTargetPath()` then chooses the inactive slot:
+`goalstates.ResolvedAgentUpgradePaths()` resolves the slots under the host
+root, applies environment overrides, and stores the resolved `CurrentPath`
+target in `CurrentTargetPath`. If `CurrentPath` does not exist, the
+compatibility `BinaryPath` is used as the current target.
+
+The host root is `/opt/unbounded/agent`, resolved through symlinks before any
+path is built from it. On a host installed by a release before the host root,
+the agent links `/opt/unbounded/agent` to `/usr/local`, where that release put
+its files, before it resolves anything. The slots then resolve to the paths that
+release wrote, so the resolved current target still compares equal to one of
+them, and the units that release wrote stay valid.
+
+The root's parent, `/opt/unbounded`, is not the agent's. Hosts stage files
+there, such as offline artifacts and OCI layouts, as the agent docs suggest,
+so a host installed by an older release may already have it as a directory or a
+mount. The link and the move only create, replace or remove
+`/opt/unbounded/agent` and its staging copy inside it. The agent creates the
+parent with mode 0755 when it is missing, and otherwise never changes it; reset
+never removes it.
+
+The link lasts while the older release can still be rolled back to. Each daemon
+start on a linked host records the SHA-256 of its own binary in
+`/etc/unbounded/agent/host-root-agents`; older releases never do. Once the
+current and last-good targets are both recorded, and no AgentUpgrade signal is
+pending, the daemon moves the files into a real `/opt/unbounded/agent` under
+installation ownership. It makes no copy where the filesystem the copy would
+be made on is mounted `noexec`; it logs why, and the host stays linked until a
+later start finds it mounted otherwise. The move spans two daemon starts, so
+nothing is removed while the daemon still runs from it:
+
+1. Copy the layout from `/usr/local` into `/opt/unbounded/agent.staging`,
+   recreating the slot links with targets under `/opt/unbounded/agent`, and
+   write a `.moving` marker into the copy last. The copy is beside the root, so
+   the rename below stays on one filesystem even when `/opt/unbounded` is a
+   mount.
+2. Remove the link and rename the copy into place.
+3. Create the root's missing subdirectories and restore its SELinux labels.
+4. Run the current binary's `version` command from the copy. Once a unit
+   names the copy, a daemon that cannot run from it does not start again, and
+   the recovery unit only acts on an AgentUpgrade, so nothing would roll it
+   back. If it fails, put the link back in place of the copy, rewrite what
+   step 5 rewrites so it names `/usr/local` again, and keep the digest record.
+   The daemon logs the failure and carries on from `/usr/local`, and the next
+   start tries the move again.
+5. Rewrite the daemon and recovery units, the recovery script, the LocalDNS
+   network unit and the nspawn lifecycle hooks, and reload systemd.
+6. Restart the daemon, which is still running from `/usr/local`. It first runs
+   `systemctl reset-failed` on the daemon unit, so this planned restart is not
+   refused for a start limit that earlier starts used up; from systemd v255 a
+   `daemon-reload` no longer clears it. It releases the installation lock, takes
+   no work, and waits to be replaced, exiting with an error after two minutes so
+   the unit's `Restart=` starts it instead.
+7. The restarted daemon, running from `/opt/unbounded/agent`, finds the marker
+   and repeats steps 3 and 5, then removes the layout from `/usr/local`, the
+   digest record and the `.moving` marker. It does not restart again. Running
+   from the copy shows it runs there, so it skips step 4.
+
+A start that finds the `.moving` marker resumes at step 3, and restarts the
+daemon only if it is still running from `/usr/local`. One that finds a staging
+copy beside a link discards it and starts over. The files under `/usr/local`
+stay in place until the daemon runs from the copy, so a restart that fails
+strands nothing, and the daemon unit can start at every step.
+
+Install scripts also place the agent binary at `/usr/local/bin/unbounded-agent`
+for releases before the host root, which look for it there. The move removes it
+with the rest of the layout. On a host installed under the host root, or whose
+root an operator linked to a directory outside `/usr/local`, nothing the agent
+runs is under `/usr/local`; `hostroot.LegacyReleased` reports that, and each
+daemon start then removes the binary if the install script left it.
+
+After the move, the last-good binary is a release that knows the host root, so
+automatic rollback is unaffected. An AgentUpgrade to a release before the host
+root is not supported and not refused: that release looks for its files under
+`/usr/local`, so its own next upgrade fails to resolve the current binary.
+
+`NextTargetPath()` chooses the inactive slot:
 
 ```text
 current target == BluePath  -> next target = GreenPath
@@ -105,8 +177,10 @@ version ordering and may also be used for reinstall, repair, or downgrade.
 
 Without `--preflight`, the command performs one transactional activation:
 
-1. Require sufficient host privileges and acquire an exclusive activation
-   lock.
+1. Require sufficient host privileges, link the host root to `/usr/local` on a
+   host an older release installed (see Host paths), and acquire an exclusive
+   activation lock. The link is made before the lock, as every command that
+   changes the host makes it before it resolves a path.
 2. Open the executing candidate once and copy that inode into a private,
    root-owned snapshot so later path replacement cannot change the bytes being
    activated.
@@ -157,6 +231,10 @@ service status. It must not:
 - Write service units or drop-ins.
 - Reload, start, stop, or restart a service.
 - Create an AgentUpgrade signal.
+
+Preflight does not link the host root either. It resolves the paths the host
+will have once linked, so on a host an older release installed it plans against
+`/usr/local`.
 
 Preflight exits nonzero when it finds a condition that would block activation.
 Because host state can change after preflight, the applying command repeats all

@@ -5,12 +5,12 @@ package agentbinary
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/Azure/unbounded/internal/fsutil"
 )
 
 // PreflightHostDaemonActivation validates and plans a host-driven activation
@@ -267,34 +267,15 @@ func readSymlinkState(path string) (bool, string, error) {
 }
 
 func filesDiffer(firstPath, secondPath string) (bool, error) {
-	first, err := fileSHA256(firstPath)
+	first, err := fsutil.FileSHA256(firstPath)
 	if err != nil {
 		return false, err
 	}
 
-	second, err := fileSHA256(secondPath)
+	second, err := fsutil.FileSHA256(secondPath)
 	if err != nil {
 		return false, err
 	}
 
 	return first != second, nil
-}
-
-func fileSHA256(path string) ([sha256.Size]byte, error) {
-	var digest [sha256.Size]byte
-
-	file, err := os.Open(path)
-	if err != nil {
-		return digest, err
-	}
-	defer file.Close() //nolint:errcheck // read error is authoritative
-
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return digest, err
-	}
-
-	copy(digest[:], hasher.Sum(nil))
-
-	return digest, nil
 }
