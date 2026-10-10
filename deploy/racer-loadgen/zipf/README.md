@@ -6,10 +6,19 @@ hash verification. Loadgen and dataplane select `agentpool=ddsv6`. The overlay
 pins all three images to source tag `f9a088a22a29cf8549e1945af833f508a14199d1`.
 Confirm builds and image digests before deployment. SHA tags are not digest pins.
 
-This is an owned-only disk-retention comparison, not the default retention policy.
-`RACER_ADMISSION_MODE=disabled` disables second-sight disk admission only; resource
-admission and integrity checks remain active. The seed stays `zipf-balanced-v1`;
-larger blobs change content digests. Do not erase existing disk data.
+`RACER_ADMISSION_MODE=second-sight` enables bounded disk retention for nonowned
+pages seen by a second logical reader. Owned pages remain eligible on first sight.
+Resource admission and integrity checks remain active; dirty-buffer pressure can
+skip optional persistence without failing the read. This changes only retention,
+not buffers, quotas, worker sizing, or the shared 1 TiB catalog. The seed stays
+`zipf-balanced-v1`. Do not erase existing disk data.
+
+For this disk-hit experiment, patch only the admission-mode env value, guarded by
+the current DaemonSet resourceVersion, full spec, and old value. Capture all device
+identities and dataplane/loadgen specs and Pod UIDs first. Keep C16 running; do not
+pause or roll loadgens. After the authorized dataplane rollout, verify all 300 raw
+devices. If old processes still hold devices, wait for read-only exclusive-open
+checks to pass and retry only affected dataplane Pods. Never erase device data.
 
 Node budgets are plaintext 32 GiB, ciphertext 64 GiB, dirty 2 GiB, registered 2 GiB,
 and request contexts 1 GiB. Counts are flights 2048, queue entries 16384, client
@@ -161,7 +170,8 @@ or memory limits are injected. Do not alter unrelated overrides to fix this.
 Both benchmark DaemonSets request 100% unavailability and zero termination grace.
 This can interrupt all reads and lose recent checkpoints. Normally pause and drain
 load before changing dataplanes; zero grace is not a safe drain mechanism. For this
-authorized disposable-cache experiment, the parent permits rollouts with C8 active.
+authorized disposable-cache experiment, the parent permits rollouts with C16 active
+and requires loadgens to stay running without a rollout or pause.
 Exclude rollout and catalog startup from cache-balance measurements.
 
 ## NVMe gate

@@ -60,13 +60,28 @@ class DashboardTest(unittest.TestCase):
 
     def test_experiment_buffer_descriptions(self):
         readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
-        self.assertEqual(DASHBOARD["version"], 5)
+        self.assertEqual(DASHBOARD["version"], 6)
         for text in (DASHBOARD["description"], readme):
             self.assertIn("32 GiB plaintext, 64 GiB ciphertext", text)
             self.assertIn("2 GiB each for dirty and", text)
             for stale in ("4 GiB plaintext", "8 GiB plaintext",
                           "8 GiB ciphertext", "16 GiB ciphertext"):
                 self.assertNotIn(stale, text)
+
+    def test_second_sight_retention_descriptions(self):
+        readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
+        for text in (DASHBOARD["description"], readme):
+            with self.subTest(source="dashboard" if text == DASHBOARD["description"] else "readme"):
+                normalized = " ".join(text.lower().split())
+                for required in ("second-sight local disk retention", "c16",
+                                 "racer_admission_mode=second-sight", "runtime default",
+                                 "repeated nonowner reads can admit verified ciphertext",
+                                 "subject to resource limits", "warm-up, not steady state"):
+                    self.assertIn(required, normalized)
+                for stale in ("owned-only", "admission disabled", "balanced-config"):
+                    self.assertNotIn(stale, normalized)
+        self.assertIn("same logical read is not a second sight", readme)
+        self.assertIn("does not bypass dirty-buffer limits", readme)
 
     def test_rollout_gate_excludes_old_size_and_missing_process_metrics(self):
         boundary = int(datetime.datetime(2026, 10, 9, 20, 5, 50,

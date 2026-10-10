@@ -63,4 +63,4 @@ overrides:
                   - name: RACER_ACTIVE_PATH_SEARCHES
                     value: "64"
                   - name: RACER_ADMISSION_MODE
-                    value: disabled
+                    value: second-sight

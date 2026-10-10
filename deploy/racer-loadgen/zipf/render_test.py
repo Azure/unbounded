@@ -113,7 +113,7 @@ class OverlayTest(unittest.TestCase):
                            "RACER_PEER_INFLIGHT_MAX": "1024",
                            "RACER_PEER_PER_NEIGHBOR_MAX": "128",
                            "RACER_ACTIVE_PATH_SEARCHES": "64",
-                           "RACER_ADMISSION_MODE": "disabled"}.items():
+                           "RACER_ADMISSION_MODE": "second-sight"}.items():
             self.assertEqual(env[key], value)
         self.assertNotIn("RACER_MAX_THREADS", env)
         self.assertEqual(int(env["RACER_PLAINTEXT_BYTES"]) // 21, 1636178017)
@@ -128,7 +128,7 @@ class OverlayTest(unittest.TestCase):
         description = dashboard["description"]
         for value in ("512 x 2147483648-byte", "zipf-balanced-v1", "exponent 0.5",
                       "32 GiB plaintext", "64 GiB ciphertext",
-                      "2 GiB each for dirty and registered", "owned-only"):
+                      "2 GiB each for dirty and registered"):
             self.assertIn(value, description)
         for panel in dashboard["panels"][:2]:
             expression = panel["targets"][0]["expr"]

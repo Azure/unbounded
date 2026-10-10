@@ -8,10 +8,22 @@ Use datasource UID `prometheus`, 60-second scrapes, and the existing
 Run only the intended `racer-loadgen` workload in the selected namespace:
 direct UDS, `--catalog-blobs=512`, `--blob-bytes=2147483648`,
 `--seed=zipf-balanced-v1`, `--profile=zipf`, and `--zipf-exponent=0.5`.
-The balanced-config experiment uses owned-only disk retention (admission
-disabled), 32 GiB plaintext, 64 GiB ciphertext, and 2 GiB each for dirty and
-registered buffers. This is a workload description, not a claim
-that measured memory, disk, and peer event shares are balanced.
+The second-sight local disk retention experiment keeps C16,
+32 GiB plaintext, 64 GiB ciphertext, and 2 GiB each for dirty and registered
+buffers. `RACER_ADMISSION_MODE=second-sight` is the runtime default. Repeated
+nonowner reads can admit verified ciphertext to local disk, subject to resource
+limits. A retry within the same logical read is not a second sight. Resource
+admission remains enforced; disk retention does not bypass dirty-buffer limits.
+This configuration does not imply balanced hit shares. Treat post-rollout
+observations as warm-up, not steady state; a full query window alone does not
+prove steady state.
+
+The mode default is in `cmd/racer-dataplane/src/config.rs`; `app.rs` wires it to
+the shared retention policy. The tests in `src/read/tests/fill.rs`
+(`second_sight_memory_hit_persists_original_ciphertext_and_retry_does_not` and
+`second_sight_selected_and_optional_pressure_preserve_read_success`) cover
+repeated nonowner reads and resource pressure.
+
 Successful payload is completed successful operations times that exact size.
 It works without client hashing but is not verified goodput or wire traffic.
 The node average divides by distinct discovered `racer-dataplane` nodes,
@@ -62,7 +74,8 @@ are summed once by disk label before scrape export.
 Run the dashboard checks with:
 
 ```sh
-timeout --signal=TERM --kill-after=10s 300s python3 deploy/racer/grafana_direct_zipf_test.py
+timeout --signal=TERM --kill-after=10s 300s python3 -B deploy/racer/grafana_direct_zipf_test.py
+timeout --signal=TERM --kill-after=10s 300s python3 -B deploy/racer-loadgen/zipf/render_test.py
 ```
 
 Merge only the `racer-direct-zipf.json` data key into the existing
@@ -72,7 +85,7 @@ is needed. See [the provisioning guide](grafana-README.md#provision-through-the-
 Open `/d/racer-direct-zipf` through the existing Grafana access path.
 
 If Grafana says the datasource is missing, check its datasource health API and
-run a panel query through Grafana, not just Prometheus. The UID can exist while
+run all eight panel queries through Grafana, not just Prometheus. The UID can exist while
 the Prometheus plugin is not registered. See the
 [startup recovery note](grafana-README.md#grafana-startup-troubleshooting).
 Preserve Grafana's database and plugin files before replacing a pod that uses
