@@ -5627,6 +5627,63 @@ def _daemon_executable() -> str:
     ).stdout.strip()
 
 
+def _daemon_process() -> tuple[str, str]:
+    """Return the daemon unit's main PID and its resolved executable, or "" for
+    each that cannot be read."""
+
+    out = ssh_capture_quiet(
+        "sudo sh -c 'pid=$(systemctl show -p MainPID --value unbounded-agent-daemon.service); "
+        'echo "$pid"; [ "${pid:-0}" -gt 0 ] && readlink -f /proc/$pid/exe\''
+    ).stdout.split()
+    pid = out[0] if out and out[0] != "0" else ""
+    return pid, out[1] if len(out) > 1 else ""
+
+
+def restarted_in_place_problem(pid_before: str, pid_after: str, exe_after: str, current: str) -> str:
+    """Why a daemon an AgentUpgrade staged a binary for did not restart in
+    place, or "" if it did: it must keep its PID and run the new current slot.
+    The daemon re-executes itself rather than letting systemd restart it, so a
+    new PID means it fell back to exiting, or systemd restarted it for another
+    reason. Slots are compared by name: on a linked host, the daemon the
+    upgrade starts may move the files to the host root, and the same slot then
+    has a new path."""
+    if not pid_before or pid_after != pid_before:
+        return (f"the daemon's PID went from {pid_before or 'none'} to {pid_after or 'none'}; "
+                "it did not restart in place")
+    if not exe_after or os.path.basename(exe_after) != os.path.basename(current):
+        return f"the daemon runs {exe_after!r}, not the current slot {current!r}"
+    return ""
+
+
+# Logged by the daemon command when it re-executes, and when it falls back to
+# exiting for systemd to restart it; see cmd/agent/internal/cmd/daemon.go.
+DAEMON_REEXEC_LOG = "re-executing the daemon in place"
+DAEMON_REEXEC_FALLBACK_LOGS = ("could not re-execute the daemon", "could not resolve the daemon unit's binary")
+
+
+def reexec_journal_problem(journal: str, binary_dir: str) -> str:
+    """Why the daemon's current systemd invocation does not show it re-executing
+    in place into *binary_dir*, or "" if it does. A restart by systemd starts a
+    new invocation, so a re-execution logged in the current one happened in
+    place."""
+    for fallback in DAEMON_REEXEC_FALLBACK_LOGS:
+        if fallback in journal:
+            return f"the daemon fell back to a systemd restart: {fallback!r} in its journal"
+    for line in journal.splitlines():
+        if DAEMON_REEXEC_LOG in line and f"path={binary_dir}/" in line:
+            return ""
+    return f"the daemon's current invocation has no {DAEMON_REEXEC_LOG!r} into {binary_dir}"
+
+
+def _daemon_invocation_journal() -> str:
+    """Return the journal of the daemon unit's current systemd invocation."""
+
+    return ssh_capture_quiet(
+        "sudo sh -c 'id=$(systemctl show -p InvocationID --value unbounded-agent-daemon.service); "
+        '[ -n "$id" ] && journalctl --no-pager -o cat _SYSTEMD_INVOCATION_ID="$id"\''
+    ).stdout
+
+
 def validate_host_root_moved() -> None:
     """Assert a host an older agent installed has been moved to the host root.
 
@@ -5644,6 +5701,10 @@ def validate_host_root_moved() -> None:
     log("Waiting for the daemon to run from the host root...")
     _wait_until(lambda: "" if (executable := _daemon_executable()).startswith(f"{DAEMON_BIN_DIR}/")
                 else f"daemon runs {executable!r}, not a binary under {DAEMON_BIN_DIR}", 180)
+
+    # The move's restart, like an AgentUpgrade's, re-executes in place.
+    if problem := reexec_journal_problem(_daemon_invocation_journal(), DAEMON_BIN_DIR):
+        die(problem)
 
     validate_host_root()
     log(f"The agent's files moved from {LEGACY_HOST_ROOT} to {HOST_ROOT}")
@@ -5740,8 +5801,13 @@ def validate_agent_downgrade_to_legacy() -> None:
 # ---------------------------------------------------------------------------
 # validate-agent-upgrade-operation
 # ---------------------------------------------------------------------------
-def validate_agent_upgrade_operation() -> None:
-    """Validate AgentUpgrade stages a new daemon binary and updates symlinks."""
+def validate_agent_upgrade_operation(in_place: bool = True) -> None:
+    """Validate AgentUpgrade stages a new daemon binary and updates symlinks.
+
+    With *in_place*, the daemon that performs the upgrade must also restart in
+    place: the same process, running the new binary. An agent released before
+    that asks systemd to restart it instead, so the migration suite turns it off
+    for the upgrades such an agent performs."""
 
     operation_name = f"e2e-agent-upgrade-{int(time.time())}"
     root_before = host_root_state()
@@ -5749,6 +5815,7 @@ def validate_agent_upgrade_operation() -> None:
     if not before_current:
         die("daemon current binary symlink target was empty")
     log(f"Current daemon binary before upgrade: {before_current}")
+    pid_before = _daemon_process()[0] if in_place else ""
 
     tarball = VM_DIR / "unbounded-agent-upgrade-good.tar.gz"
     _build_agent_upgrade_tarball(tarball)
@@ -5778,6 +5845,12 @@ def validate_agent_upgrade_operation() -> None:
         die(f"AgentUpgrade did not switch the daemon current symlink (still points to {after_current})")
     if slot(last_good) != slot(before_current):
         die(f"last-good symlink mismatch: got {last_good!r}, expected {before_current!r}")
+
+    if in_place:
+        pid_after, exe_after = _daemon_process()
+        if problem := restarted_in_place_problem(pid_before, pid_after, exe_after, after_current):
+            die(problem)
+        log(f"The daemon restarted in place as PID {pid_after}, running {exe_after}")
 
     log("============================================")
     log("  AgentUpgrade operation validation PASSED")
@@ -6376,10 +6449,10 @@ SUITES: dict[str, list[str]] = {
     # A host installed before the host root, linked and then moved; see README.
     # Files staged beside the host root before the install must survive each
     # change to it.
-    "migration": ["stage-host-files", "run-legacy-agent", "wait-for-node", "validate-agent-upgrade-operation",
+    "migration": ["stage-host-files", "run-legacy-agent", "wait-for-node", "validate-agent-upgrade-from-legacy",
                   "validate-host-root-linked", "validate-host-staged-files", "validate-host-reboot",
                   "validate-host-root-linked", "validate-agent-downgrade-to-legacy",
-                  "validate-agent-upgrade-operation", "validate-host-root-linked",
+                  "validate-agent-upgrade-from-legacy", "validate-host-root-linked",
                   "validate-agent-upgrade-operation", "validate-host-root-moved", "validate-host-staged-files",
                   "validate-host-reboot", "validate-host-root", "reset-agent", "validate-host-staged-files"],
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
@@ -6458,6 +6531,8 @@ COMMANDS: dict[str, Command] = {
     "validate-node-reboot-operation": _without_node_config(validate_node_reboot_operation),
     "validate-host-agent-upgrade": _without_node_config(validate_host_agent_upgrade),
     "validate-agent-upgrade-operation": _without_node_config(validate_agent_upgrade_operation),
+    # An agent released before the in-place restart performs this upgrade.
+    "validate-agent-upgrade-from-legacy": _without_node_config(lambda: validate_agent_upgrade_operation(in_place=False)),
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),

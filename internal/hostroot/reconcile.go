@@ -55,11 +55,12 @@ type MoveOptions struct {
 	// then undone. It is required.
 	Verify func(ctx context.Context, root string) error
 	// Restart restarts the daemon from the rewritten units, so it runs from
-	// the root. It may only queue the restart; the caller must not carry on
-	// as the running daemon when ReconcileMove reports it. systemd counts
-	// this planned restart against the unit's start limit, so a caller should
-	// clear the unit's start limit first, with systemctl reset-failed <unit>,
-	// or a refused restart strands the move.
+	// the root. It may only queue the restart, or leave it to the caller
+	// replacing itself in place or exiting under the unit's Restart=; the
+	// caller must not carry on as the running daemon when ReconcileMove
+	// reports it. systemd counts a restart it makes against the unit's start
+	// limit, so a caller should clear the unit's start limit first, with
+	// systemctl reset-failed <unit>, or a refused restart strands the move.
 	Restart func(context.Context) error
 }
 
@@ -99,8 +100,10 @@ type moveHost struct {
 // replaced with the link again and the units pointed back at LegacyPath. The
 // host stays linked either way, and the next start tries again.
 //
-// It reports whether it restarted the daemon, which it may only have queued.
-// The caller must then wait to be replaced rather than carry on.
+// It reports whether the daemon has to be restarted from the root, which
+// Restart may only have queued, or left to the caller. The caller must then
+// stop taking work, and wait to be replaced, replace itself in place, or exit
+// for the unit's Restart= to start it again, rather than carry on.
 func ReconcileMove(ctx context.Context, log *slog.Logger, opts MoveOptions) (bool, error) {
 	return reconcileMove(ctx, log, Path, LegacyPath, opts, moveHost{
 		executable: os.Executable,

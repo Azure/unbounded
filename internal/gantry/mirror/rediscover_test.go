@@ -188,6 +188,17 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 		t.Fatalf("peer calls before advertise = %d, want 0", got)
 	}
 
+	// Headers are flushed before round 0. Wait for cold-start so the late
+	// provider cannot satisfy the initial lookup and skip the exhausted path.
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(&coldStart.calls) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("cold-start was not called before provider advertisement")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
 	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
 
 	got, err := io.ReadAll(resp.Body)

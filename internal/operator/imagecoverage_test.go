@@ -64,6 +64,7 @@ var componentImages = map[string][]string{
 	"gantry":          {"gantry"},
 	"metalman":        {"metalman"},
 	"token-refresher": {"token-refresher"},
+	"racer":           {"racer-controller"},
 }
 
 // releaseBOMSource is the tool whose hardcoded image list feeds the signed

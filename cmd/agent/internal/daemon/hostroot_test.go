@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -59,7 +58,7 @@ func TestReconcileHostRootUnderLock(t *testing.T) {
 		requireReleased(t, store)
 	})
 
-	t.Run("reports a queued restart and releases the lock", func(t *testing.T) {
+	t.Run("reports a restart and releases the lock", func(t *testing.T) {
 		t.Parallel()
 
 		store := newStore(t)
@@ -115,34 +114,10 @@ func TestVerifyMovedDaemon(t *testing.T) {
 	require.Error(t, verifyMovedDaemon(t.Context(), root), "a binary that cannot run fails")
 }
 
-// TestAwaitReplacement: a daemon that queued its own restart does nothing until
-// systemd stops it, and fails if that does not come, so Restart= starts it from
-// the rewritten units.
-func TestAwaitReplacement(t *testing.T) {
-	t.Parallel()
-
-	t.Run("fails when the restart does not come", func(t *testing.T) {
-		t.Parallel()
-
-		err := awaitReplacement(t.Context(), discardLogger(), time.Millisecond)
-		require.ErrorContains(t, err, "not restarted from the host root")
-	})
-
-	t.Run("stops with its context", func(t *testing.T) {
-		t.Parallel()
-
-		ctx, cancel := context.WithCancel(t.Context())
-		cancel()
-
-		err := awaitReplacement(ctx, discardLogger(), time.Hour)
-		require.ErrorIs(t, err, context.Canceled)
-	})
-}
-
-// TestRestartFromHostRoot: the move's planned restart must not be refused for
-// the unit's start limit, so the limit is cleared first, on this unit alone,
-// and a denied reset does not stop the restart.
-func TestRestartFromHostRoot(t *testing.T) {
+// TestClearDaemonStartLimit: the move's planned restart must not be refused
+// for the unit's start limit, so the limit is cleared before the daemon exits,
+// on this unit alone, and a denied reset does not stop the move.
+func TestClearDaemonStartLimit(t *testing.T) {
 	t.Parallel()
 
 	// fakeSystemctl records its arguments, one per line, and exits with code.
@@ -158,50 +133,18 @@ func TestRestartFromHostRoot(t *testing.T) {
 		return func(ctx context.Context) *exec.Cmd { return exec.CommandContext(ctx, script) }, calls
 	}
 
-	t.Run("clears this unit's start limit before restarting", func(t *testing.T) {
-		t.Parallel()
+	for name, code := range map[string]int{"cleared": 0, "denied": 1} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-		systemctl, calls := fakeSystemctl(t, 0)
+			systemctl, calls := fakeSystemctl(t, code)
 
-		var atRestart []byte
+			clearDaemonStartLimit(t.Context(), discardLogger(), systemctl)
 
-		err := restartFromHostRoot(t.Context(), discardLogger(), systemctl, func(context.Context) error {
-			var err error
-
-			atRestart, err = os.ReadFile(calls)
-
-			return err
+			recorded, err := os.ReadFile(calls)
+			require.NoError(t, err)
+			// Named, so systemd resets this unit and not every unit on the host.
+			assert.Equal(t, "reset-failed\n"+goalstates.DaemonUnit+"\n", string(recorded))
 		})
-		require.NoError(t, err)
-		// Named, so systemd resets this unit and not every unit on the host.
-		assert.Equal(t, "reset-failed\n"+goalstates.DaemonUnit+"\n", string(atRestart))
-	})
-
-	t.Run("restarts when the reset is denied", func(t *testing.T) {
-		t.Parallel()
-
-		systemctl, calls := fakeSystemctl(t, 1)
-		restarted := false
-
-		err := restartFromHostRoot(t.Context(), discardLogger(), systemctl, func(context.Context) error {
-			restarted = true
-
-			return nil
-		})
-		require.NoError(t, err)
-		assert.True(t, restarted)
-		assert.FileExists(t, calls)
-	})
-
-	t.Run("reports a failed restart", func(t *testing.T) {
-		t.Parallel()
-
-		systemctl, _ := fakeSystemctl(t, 0)
-		restartErr := errors.New("restart failed")
-
-		err := restartFromHostRoot(t.Context(), discardLogger(), systemctl, func(context.Context) error {
-			return restartErr
-		})
-		require.ErrorIs(t, err, restartErr)
-	})
+	}
 }

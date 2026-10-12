@@ -12,7 +12,57 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 )
+
+func TestObsoleteRacerEnvironmentIgnored(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		unset bool
+	}{
+		{name: "unset", unset: true},
+		{name: "true", value: "true"},
+		{name: "false", value: "false"},
+		{name: "empty"},
+		{name: "invalid", value: "yes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unsetenv(t, "UNBOUNDED_REAP_LEGACY_RESOURCES")
+
+			if tc.unset {
+				unsetenv(t, "ENABLE_RACER")
+			} else {
+				t.Setenv("ENABLE_RACER", tc.value)
+			}
+
+			called := false
+			cmd := newCommand(func(_ context.Context, _ config) error {
+				called = true
+
+				return nil
+			})
+			cmd.SetArgs(nil)
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+
+			err := cmd.Execute()
+			if err != nil || !called {
+				t.Fatalf("error = %v, called = %v", err, called)
+			}
+		})
+	}
+}
+
+func TestRuntimeSchemeIncludesClusterCache(t *testing.T) {
+	scheme := runtimeScheme()
+	for _, kind := range []string{"ClusterCache", "ClusterCacheList"} {
+		if _, err := scheme.New(racerv1.GroupVersion.WithKind(kind)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func TestReapLegacyResourcesConfiguration(t *testing.T) {
 	cases := []struct {

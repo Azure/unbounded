@@ -5,6 +5,8 @@
 `e2e.py list-suite --suite lifecycle` to inspect the exact sequence.
 The host lifecycle includes existing upgrade/rollback, reset/reinstall, and repave
 operations plus an unassisted host reboot with fresh node identity and workload/DNS.
+An AgentUpgrade must restart the daemon in place: the same process, running the
+new binary.
 Persistent DNS failure is fatal after bounded convergence retries.
 
 ```sh
@@ -174,10 +176,11 @@ as they were, because the older release is now last-good and a rollback needs
 them. The host then reboots, returns to the older release, and upgrades to this
 build again, staying linked throughout. The next upgrade leaves no older release
 in either slot, and the daemon it starts must copy the files into a real
-`/opt/unbounded/agent`, point the units at them, and restart itself from there,
-and the restarted daemon must remove them from `/usr/local`. The moved host
-reboots, then resets, which must leave neither root behind. The older release
-cannot be installed on an immutable host, so the suite needs a cloud-init host:
+`/opt/unbounded/agent`, point the units at them, and restart itself from there
+in place, and the restarted daemon must remove them from `/usr/local`. The
+moved host reboots, then resets, which must leave neither root behind. The
+older release cannot be installed on an immutable host, so the suite needs a
+cloud-init host:
 
 ```sh
 HOST_BASE_OS=ubuntu2404 E2E_SUITE=migration KEEP_ENV=1 \
