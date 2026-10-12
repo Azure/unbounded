@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
@@ -208,13 +209,24 @@ func testSDKClient(t *testing.T, origin racersdk.Origin) *racersdk.Client {
 }
 
 // testS3Client returns a real, signing AWS S3 client that talks to server
-// with path-style addressing and no retries.
-func testS3Client(server *httptest.Server) *s3.Client {
-	return s3.New(s3.Options{
-		Region: "us-east-1", BaseEndpoint: aws.String(server.URL), UsePathStyle: true,
-		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
-		Credentials:                credentials.NewStaticCredentialsProvider("placeholder", "placeholder", ""),
-		RetryMaxAttempts:           1, HTTPClient: server.Client(),
+// with default checksum settings, path-style addressing, and no retries.
+func testS3Client(t *testing.T, server *httptest.Server) *s3.Client {
+	t.Helper()
+	t.Setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "")
+
+	cfg, err := config.LoadDefaultConfig(t.Context(),
+		config.WithRegion("us-east-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("placeholder", "placeholder", "")),
+		config.WithSharedConfigFiles([]string{}), config.WithSharedCredentialsFiles([]string{}),
+		config.WithHTTPClient(server.Client()), config.WithRetryMaxAttempts(1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(server.URL)
+		o.UsePathStyle = true
 	})
 }
 
@@ -793,7 +805,7 @@ func TestOriginAWSClientBridge(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := originClient(t, testS3Client(server), OriginConfig{Namespace: "store", Buckets: []string{"bucket"}})
+	client := originClient(t, testS3Client(t, server), OriginConfig{Namespace: "store", Buckets: []string{"bucket"}})
 
 	got, err := originReadValue(t, client, objectRequest(t, "v+/="))
 	if err != nil || string(got) != "hello" || heads.Load() != 1 || gets.Load() != 1 {

@@ -31,8 +31,9 @@ type sidecar struct {
 // NewSidecar serves a read-only, trusted pod endpoint. The caller owns the client
 // and must bind the server to loopback. SigV4 headers are ignored, not verified or
 // forwarded. Presigned query parameters and unsupported S3 operations are rejected.
-// Only known auth/plumbing x-amz headers are accepted. Owner checks, SSE-C,
-// requester-pays, and checksum requests are unsupported and return NotImplemented.
+// Known auth/plumbing x-amz headers and optional checksum mode ENABLED are
+// accepted, but no checksum metadata is returned. Owner checks, SSE-C, and
+// requester-pays are unsupported and return NotImplemented.
 // Install this handler directly: a path-cleaning mux changes object identities.
 func NewSidecar(client *racersdk.Client, config SidecarConfig) (http.Handler, error) {
 	if client == nil {
@@ -313,11 +314,21 @@ func sidecarSDKFailure(err error) sidecarFailure {
 }
 
 func sidecarSupportedHeaders(h http.Header) bool {
-	for name := range h {
+	var checksumMode bool
+
+	for name, values := range h {
 		name = strings.ToLower(name)
 		switch name {
 		case "if-modified-since", "if-unmodified-since", "if-range":
 			return false
+		case "x-amz-checksum-mode":
+			if checksumMode || len(values) != 1 || strings.Trim(values[0], " \t") != "ENABLED" {
+				return false
+			}
+			// ENABLED asks for available checksums; it does not require one.
+			checksumMode = true
+
+			continue
 		case "x-amz-date", "x-amz-content-sha256", "x-amz-security-token", "x-amz-region-set", "x-amz-s3session-token", "x-amz-user-agent":
 			// These only carry ignored credentials, signing data, or SDK telemetry.
 			continue

@@ -559,7 +559,7 @@ func TestSidecarAWSClient(t *testing.T) {
 		h.ServeHTTP(w, r)
 	}))
 	t.Cleanup(server.Close)
-	client := testS3Client(server)
+	client := testS3Client(t, server)
 
 	res, err := client.GetObject(t.Context(), &s3.GetObjectInput{Bucket: aws.String("bucket"), Key: aws.String("a//b/../c"), Range: aws.String("bytes=2-4"), IfMatch: aws.String(`"v"`)})
 	if err != nil {
@@ -588,9 +588,128 @@ func TestSidecarAWSClient(t *testing.T) {
 		t.Fatalf("SDK error mapping: %v", err)
 	}
 
-	_, err = client.GetObject(t.Context(), &s3.GetObjectInput{Bucket: aws.String("bucket"), Key: aws.String("key"), ChecksumMode: "ENABLED"})
-	if !errors.As(err, &apiError) || apiError.ErrorCode() != "NotImplemented" {
-		t.Fatalf("SDK checksum request was not rejected: %v", err)
+	res, err = client.GetObject(t.Context(), &s3.GetObjectInput{Bucket: aws.String("bucket"), Key: aws.String("key"), ChecksumMode: "ENABLED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	data, err = io.ReadAll(res.Body)
+	if err != nil || string(data) != "0123456789" {
+		t.Fatalf("SDK explicit checksum response %q %v", data, err)
+	}
+}
+
+func TestSidecarAWSDefaultChecksum(t *testing.T) {
+	for _, tc := range []struct {
+		name, data, rangeValue, want string
+	}{
+		{"full", "data", "", "data"},
+		{"range", "data", "bytes=1-2", "at"},
+		{"empty", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := sidecarTestHandler(t, sidecarTestOrigin(t, tc.data, `"v"`, nil))
+
+			var requests atomic.Int32
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+
+				if got := r.Header.Values("X-Amz-Checksum-Mode"); len(got) != 1 || got[0] != "ENABLED" {
+					t.Errorf("SDK checksum mode = %q, want ENABLED", got)
+				}
+
+				h.ServeHTTP(w, r)
+			}))
+			t.Cleanup(server.Close)
+			client := testS3Client(t, server)
+
+			input := &s3.GetObjectInput{Bucket: aws.String("bucket"), Key: aws.String("key")}
+			if tc.rangeValue != "" {
+				input.Range = aws.String(tc.rangeValue)
+			}
+
+			res, err := client.GetObject(t.Context(), input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+
+			data, err := io.ReadAll(res.Body)
+			if err != nil || string(data) != tc.want || requests.Load() != 1 {
+				t.Fatalf("SDK read = %q, error = %v, requests = %d", data, err, requests.Load())
+			}
+
+			if res.ChecksumCRC32 != nil || res.ChecksumCRC32C != nil || res.ChecksumCRC64NVME != nil || res.ChecksumSHA1 != nil || res.ChecksumSHA256 != nil || res.ChecksumType != "" {
+				t.Fatal("invented checksum metadata")
+			}
+		})
+	}
+}
+
+func TestSidecarChecksumMode(t *testing.T) {
+	var calls atomic.Int32
+
+	h, _ := sidecarTestHandler(t, sidecarTestOrigin(t, "data", `"v"`, &calls))
+
+	for _, tc := range []struct {
+		name   string
+		values []string
+		status int
+	}{
+		{"enabled", []string{"ENABLED"}, 200},
+		{"whitespace", []string{" \tENABLED\t "}, 200},
+		{"empty", []string{""}, 501},
+		{"no values", nil, 501},
+		{"lowercase", []string{"enabled"}, 501},
+		{"disabled", []string{"DISABLED"}, 501},
+		{"unknown", []string{"private-mode"}, 501},
+		{"repeated", []string{"ENABLED", "ENABLED"}, 501},
+		{"conflicting", []string{"ENABLED", "DISABLED"}, 501},
+		{"combined", []string{"ENABLED, ENABLED"}, 501},
+	} {
+		for _, method := range []string{"GET", "HEAD"} {
+			t.Run(tc.name+method, func(t *testing.T) {
+				for _, name := range []string{"x-amz-checksum-mode", "X-Amz-Checksum-Mode", "X-AMZ-CHECKSUM-MODE"} {
+					before := calls.Load()
+
+					w := sidecarTestRequest(h, method, "/bucket/key", http.Header{name: tc.values})
+					if w.Code != tc.status {
+						t.Fatalf("status = %d, want %d", w.Code, tc.status)
+					}
+
+					if tc.status != 200 && calls.Load() != before {
+						t.Fatal("invalid checksum mode reached Racer")
+					}
+
+					if method == "HEAD" && w.Body.Len() != 0 {
+						t.Fatal("HEAD returned a body")
+					}
+
+					for header := range w.Header() {
+						if strings.HasPrefix(strings.ToLower(header), "x-amz-checksum-") {
+							t.Fatalf("invented checksum header %s", header)
+						}
+					}
+				}
+			})
+		}
+	}
+
+	for _, extra := range []string{"x-amz-checksum-mode", "x-amz-expected-bucket-owner", "x-amz-server-side-encryption-customer-key", "x-amz-request-payer", "x-amz-unknown-operation"} {
+		for _, method := range []string{"GET", "HEAD"} {
+			t.Run("enabled with "+extra+method, func(t *testing.T) {
+				before := calls.Load()
+
+				w := sidecarTestRequest(h, method, "/bucket/key", http.Header{
+					"X-Amz-Checksum-Mode": {"ENABLED"}, extra: {"ENABLED"},
+				})
+				if w.Code != 501 || calls.Load() != before {
+					t.Fatalf("unsupported header accepted: status=%d calls=%d", w.Code, calls.Load()-before)
+				}
+			})
+		}
 	}
 }
 

@@ -114,11 +114,14 @@ reach it.
 - Query: only `versionId` and `x-id` (`GetObject` or `HeadObject`). Anything
   else returns 501.
 - Headers: `If-Match`, `If-None-Match`, and a single byte `Range` are
-  supported. `If-Modified-Since`, `If-Unmodified-Since`, `If-Range`, and
-  unknown `x-amz-*` headers return 501, so the client never gets a full body
-  when it asked for something the sidecar cannot do. Signing headers such as
-  `x-amz-date` and `x-amz-content-sha256` are ignored, so standard S3 SDKs
-  work unchanged.
+  supported. A single `x-amz-checksum-mode: ENABLED` is accepted for GET and
+  HEAD as a request for available checksums. The sidecar has no S3 checksum
+  metadata, so it returns no checksum headers, including for ranges and empty
+  objects. The default AWS SDK accepts this response without checksum
+  validation. Empty, repeated, or unknown checksum modes return 501.
+  `If-Modified-Since`, `If-Unmodified-Since`, `If-Range`, and unknown `x-amz-*`
+  headers still return 501, including owner checks, SSE-C, and requester-pays.
+  Signing headers such as `x-amz-date` and `x-amz-content-sha256` are ignored.
 
 **Flow.**
 
