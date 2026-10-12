@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -70,6 +71,11 @@ func runController(
 		return fmt.Errorf("create daemon manager: %w", err)
 	}
 
+	// An AgentUpgrade stops the manager with ErrRestartRequested as the cause
+	// once it has staged the new binary; see managerExit.
+	mgrCtx, stopManager := context.WithCancelCause(ctx)
+	defer stopManager(nil)
+
 	c := mgr.GetClient()
 	machineOperations := &machineOperationTarget{
 		installation:         installation,
@@ -78,6 +84,7 @@ func runController(
 		machineName:          machineName,
 		nodeOperator:         nodeOperator,
 		agentUpgradeLockPath: goalstates.DaemonAgentUpgradeLockPath,
+		requestRestart:       func() { stopManager(ErrRestartRequested) },
 	}
 
 	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconcilerWithReader(
@@ -113,9 +120,21 @@ func runController(
 		return fmt.Errorf("setup daemon controller: %w", err)
 	}
 
-	err = mgr.Start(ctx)
+	err = mgr.Start(mgrCtx)
 
 	log.Info("daemon shutting down")
+
+	return managerExit(mgrCtx, err)
+}
+
+// managerExit returns why the daemon's manager stopped, given the context it
+// ran on and what Start returned: ErrRestartRequested when the daemon stopped
+// it to be restarted, and otherwise err. A manager that failed returns its
+// error even then, which systemd also restarts.
+func managerExit(mgrCtx context.Context, err error) error {
+	if err == nil && errors.Is(context.Cause(mgrCtx), ErrRestartRequested) {
+		return ErrRestartRequested
+	}
 
 	return err
 }
