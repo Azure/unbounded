@@ -387,7 +387,7 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
         } else if let Some(body) = &state.body {
             body[first as usize..(first + length) as usize].to_vec()
         } else if metadata.length == 3 {
-            b"abc".to_vec()
+            b"abc"[first as usize..(first + length) as usize].to_vec()
         } else {
             vec![call.page as u8; length as usize]
         }

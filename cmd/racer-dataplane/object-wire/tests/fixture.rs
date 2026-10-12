@@ -43,6 +43,35 @@ fn exchange(fixture: &AdapterOrigin, method: &str, first: u64) -> (MessageHead, 
 }
 
 #[test]
+fn fixture_default_body_matches_range_headers() {
+    let fixture = AdapterOrigin::new("cache", metadata(3, "v1"));
+    for (first, expected_body, expected_range) in [
+        (0, b"abc".as_slice(), "bytes 0-2/3"),
+        (1, b"bc".as_slice(), "bytes 1-2/3"),
+        (2, b"c".as_slice(), "bytes 2-2/3"),
+        (3, b"".as_slice(), "bytes */3"),
+    ] {
+        let (head, body) = exchange(&fixture, "GET", first);
+        assert_eq!(body, expected_body, "offset {first}");
+        assert_eq!(
+            head.unique("Content-Length").unwrap(),
+            Some(body.len().to_string().as_bytes()),
+            "offset {first}"
+        );
+        assert_eq!(
+            head.unique("Content-Range").unwrap(),
+            Some(expected_range.as_bytes()),
+            "offset {first}"
+        );
+        assert!(matches!(
+            head.start,
+            http1::StartLine::Response { status, .. }
+                if status == if first == 3 { 416 } else { 206 }
+        ));
+    }
+}
+
+#[test]
 fn fixture_errors_include_required_origin_headers() {
     for length in [0, 3, MAX_WIRE_INTEGER] {
         let fixture = AdapterOrigin::new("cache", metadata(length, "v1"));
