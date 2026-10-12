@@ -12,7 +12,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
@@ -153,7 +152,7 @@ func (l *gatewayInformerLifecycle) start(ctx context.Context) (gatewayInformerSn
 	onEvent := l.onEvent
 	l.mu.Unlock()
 
-	factory := dynamicinformer.NewDynamicSharedInformerFactory(l.client, l.resync)
+	factory := newNodeDynamicInformerFactory(l.client, l.resync)
 	pools := factory.ForResource(gatewayPoolGVR).Informer()
 	nodes := factory.ForResource(gatewayNodeGVR).Informer()
 	poolPeerings := factory.ForResource(gatewayPoolPeeringGVR).Informer()
