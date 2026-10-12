@@ -53,3 +53,13 @@ timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manife
 The production gate requires real io_uring and direct-I/O support: capability
 skips fail when `PAGE_ALLOC_REQUIRE_REAL_IO=1`. CI also checks all targets and
 runs strict Clippy for each allocator mode.
+
+The [`uds-endpoint`](uds-endpoint/README.md) library owns Linux Unix socket names,
+crash recovery, and a worker-local publication journal. Production uses only
+`libc`; its optional `simulation` feature adds the runtime's simulated filesystem.
+CI checks, tests, and runs strict Clippy separately for production and all features:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uds-endpoint --no-default-features -j 2
+timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uds-endpoint --all-features -j 2
+```
