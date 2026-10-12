@@ -107,7 +107,7 @@ fn signature_base_preserves_order_case_and_rejects_invalid_components() {
             "duplicate-signature",
             "leading",
             "trailing",
-            "non-ascii",
+            "control",
             "newline",
             "bad-name",
             "timestamp",
@@ -126,7 +126,7 @@ fn signature_base_preserves_order_case_and_rejects_invalid_components() {
                     let (name, value) = match fault {
                         "leading" => ("x-fixture-00", b" leading".to_vec()),
                         "trailing" => ("x-fixture-00", b"trailing\t".to_vec()),
-                        "non-ascii" => ("x-fixture-00", vec![0xff]),
+                        "control" => ("x-fixture-00", vec![0x7f]),
                         "newline" => ("x-fixture-00", b"x\r\ny".to_vec()),
                         "timestamp" => ("racer-timestamp", b"01700000000123".to_vec()),
                         "signer" => ("racer-signer", b"not-a-uuid".to_vec()),
@@ -147,6 +147,94 @@ fn signature_base_preserves_order_case_and_rejects_invalid_components() {
                 "response={response} fault={fault}"
             );
         }
+    }
+}
+
+#[test]
+fn signature_base_preserves_obs_text_and_rejects_controls() {
+    for response in [false, true] {
+        for byte in 0..=u8::MAX {
+            let mut head = canonical_fixture(response, 1, 1);
+            head.headers
+                .iter_mut()
+                .find(|h| h.name == "x-fixture-00")
+                .unwrap()
+                .value = vec![b'a', byte, b'z'];
+            let base = signature_base(&head);
+            if byte.is_ascii_control() {
+                assert!(base.is_err(), "response={response} byte={byte}");
+            } else {
+                let expected = [b"\"x-fixture-00\": a".as_slice(), &[byte], b"z\n"].concat();
+                assert!(
+                    base.unwrap().windows(expected.len()).any(|v| v == expected),
+                    "response={response} byte={byte}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
+    use racer_object_wire::{CacheKey, client::RequestParser, origin};
+
+    let metadata = b"a,\\b\x80";
+    let authorization = b"Bearer \xff";
+    let mut head = origin::request(
+        &CacheKey([0xab; 32]),
+        "GET",
+        Some(metadata),
+        Some(authorization),
+    )
+    .unwrap();
+    let encoded = Codec::new(MAX_HEAD).encode_head(&head).unwrap();
+    let (mut decoded, consumed) = Codec::new(MAX_HEAD).decode_head(&encoded).unwrap().unwrap();
+    assert_eq!(consumed, encoded.len());
+    decoded.start = StartLine::Request {
+        method: "HEAD".into(),
+        target: format!("/v2/objects/{}", CacheKey([0xab; 32]).to_hex()),
+    };
+    let parsed = RequestParser::new(MAX_HEAD).parse(&decoded).unwrap();
+    assert_eq!(parsed.metadata, Some(metadata.as_slice()));
+    assert_eq!(parsed.authorization, Some(authorization.as_slice()));
+
+    push(&mut head, "racer-timestamp", "1700000000123");
+    push(&mut head, "racer-signer", node(0).0);
+    let params = "(\"@method\" \"@request-target\" \"authorization\" \"content-length\" \"host\" \"racer-metadata\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v5\"";
+    push(&mut head, "signature-input", format!("racer={params}"));
+    let mut expected = b"\"@method\": GET\n\"@request-target\": /v1/objects/abababababababababababababababababababababababababababababababab\n\"authorization\": Bearer \xff\n\"content-length\": 0\n\"host\": racer\n\"racer-metadata\": a,\\b\x80\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": ".to_vec();
+    expected.extend_from_slice(params.as_bytes());
+    assert_eq!(signature_base(&head).unwrap(), expected);
+
+    head.headers.retain(|h| !is_auth_field(&h.name));
+    push(&mut head, "racer-receiver", node(1).0);
+    let n = network(2);
+    let signed = n[0].sign(head).unwrap();
+    let digest = signed_digest(&signed).unwrap();
+    let encoded = encode_signed(&signed).unwrap();
+    let decoded = decode_signed(&encoded).unwrap();
+    assert_eq!(signed_digest(&decoded).unwrap(), digest);
+    let verified = n[1].verify_proof(decoded).unwrap();
+    assert_eq!(
+        verified.signed().head.unique("racer-metadata").unwrap(),
+        Some(metadata.as_slice())
+    );
+    assert_eq!(
+        verified.signed().head.unique("authorization").unwrap(),
+        Some(authorization.as_slice())
+    );
+    for name in ["racer-metadata", "authorization"] {
+        let mut tampered = decode_signed(&encoded).unwrap();
+        let value = &mut tampered
+            .head
+            .headers
+            .iter_mut()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .unwrap()
+            .value;
+        *value.last_mut().unwrap() ^= 1;
+        assert_ne!(signed_digest(&tampered).unwrap(), digest);
+        assert!(n[1].verify_proof(tampered).is_err());
     }
 }
 
