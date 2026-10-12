@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
@@ -95,5 +96,33 @@ func TestExampleMemoryOriginRanges4210611540(t *testing.T) {
 				t.Fatalf("body=%q err=%v, want %q", got, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestExampleMemoryOriginExpiresPerRequest(t *testing.T) {
+	origin := exampleMemoryOrigin([]byte("hello, racer"))
+
+	// Make sure the request starts strictly after the origin was created.
+	time.Sleep(2 * time.Millisecond)
+
+	for _, head := range []bool{true, false} {
+		start := time.Now()
+
+		metadata, body, err := origin(t.Context(), racersdk.OriginRequest{
+			Request: racersdk.Request{Key: key},
+			Length:  racersdk.PageSize,
+			Head:    head,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if body != nil {
+			_ = body.Close()
+		}
+
+		if metadata.ExpiresAt.Before(start.Add(time.Hour)) {
+			t.Fatalf("head=%v: ExpiresAt %v precedes request start plus one hour %v", head, metadata.ExpiresAt, start.Add(time.Hour))
+		}
 	}
 }

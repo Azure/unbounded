@@ -81,9 +81,19 @@ type OriginConfig struct {
 	MaxConcurrentRequests int
 	// RecoverStaleSocket lets ServeOrigin replace a socket left behind by an
 	// earlier ServeOrigin with this option that exited without cleanup, such
-	// as after a crash. The directory must be owned by this user and must
-	// not be writable by group or others. Without it, an existing socket
-	// path is an error.
+	// as after a crash or SIGKILL. Enable it when a supervisor restarts the
+	// origin. The directory must be owned by this process's effective user
+	// and must not be writable by group or others. ServeOrigin keeps
+	// .racer-origin.lock and .racer-origin.socket in the directory to
+	// recognize its own sockets, and it never replaces a socket that is
+	// still accepting connections or that it did not create with this
+	// option. Turning the option on after a crash with it off therefore
+	// does not remove the old socket.
+	//
+	// Without it, an existing socket path is an error. ServeOrigin removes
+	// its socket only when it returns, so if the process exits without
+	// returning, later calls fail until the socket is removed by hand or by
+	// a startup step that knows no other origin is serving.
 	RecoverStaleSocket bool
 }
 
@@ -136,9 +146,16 @@ func (c OriginConfig) limits() (originLimits, error) {
 
 // ServeOrigin serves origin to Racer until ctx is canceled, then closes all
 // connections and bodies and returns ctx.Err(). It does not wait for
-// callbacks that ignore cancellation. The socket is created with mode 0600,
-// so the origin must run as the same user as the Racer dataplane, usually
-// root. On return it removes the socket it created.
+// callbacks that ignore cancellation. On return it removes the socket it
+// created. A process that exits without returning leaves the socket behind;
+// see [OriginConfig.RecoverStaleSocket].
+//
+// ServeOrigin does not need root. It needs write and search permission on
+// the socket directory, where it creates the socket with mode 0600, owned by
+// its effective user. Only a process with that user, or one allowed to
+// bypass file permissions such as root with CAP_DAC_OVERRIDE, can connect to
+// it, so the Racer dataplane must run as the same user as the origin or with
+// that capability.
 func ServeOrigin(ctx context.Context, config OriginConfig, origin Origin) error {
 	return serveOrigin(ctx, config, origin, "/run/racer/"+config.Cache+"/origin/socket")
 }

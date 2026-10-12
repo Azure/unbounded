@@ -6,6 +6,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 // ---------------------------------------------------------------------------
@@ -1188,4 +1190,136 @@ func TestManualBootstrapHandler_BuildAgentConfig_AdditionalHostDevices(t *testin
 	require.NoError(t, err)
 
 	require.Equal(t, []string{"/dev/uinput", "char-input"}, cfg.AdditionalHostDevices)
+}
+
+const ignitionTestDigest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+
+// TestRenderIgnitionPlacesEverythingBeforeFirstBoot covers the property the
+// whole variant exists for: on a host with no shell and no operator, every file
+// the agent needs is already present, under the host root, when the unit
+// starts.
+func TestRenderIgnitionPlacesEverythingBeforeFirstBoot(t *testing.T) {
+	t.Parallel()
+
+	h := &manualBootstrapHandler{
+		logger:      discardLogger(),
+		agentURL:    "https://example.test/unbounded-agent-linux-amd64",
+		agentSHA256: ignitionTestDigest,
+	}
+
+	out, err := h.renderIgnition(&provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{MachineName: "test-node"}})
+	require.NoError(t, err)
+	require.NotContains(t, out, "/usr/local", "nothing may be written or run from the read-only legacy root")
+
+	var cfg ignitionConfig
+	require.NoError(t, json.Unmarshal([]byte(out), &cfg), "emitted document must be valid JSON")
+	require.Equal(t, "3.4.0", cfg.Ignition.Version)
+	require.NotNil(t, cfg.Storage)
+
+	paths := map[string]ignitionFile{}
+	for _, f := range cfg.Storage.Files {
+		paths[f.Path] = f
+	}
+
+	agentConfig, ok := paths["/etc/unbounded/agent/config.json"]
+	require.True(t, ok, "the agent config must be written, got %v", paths)
+	require.Equal(t, 0o600, agentConfig.Mode, "the agent config carries a bootstrap token")
+
+	encoded, ok := strings.CutPrefix(agentConfig.Contents.Source, "data:;base64,")
+	require.True(t, ok, agentConfig.Contents.Source)
+
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	require.NoError(t, err)
+
+	var written provision.UnboundedAgentConfig
+	require.NoError(t, json.Unmarshal(decoded, &written))
+	require.Equal(t, "test-node", written.MachineName)
+
+	binary, ok := paths["/opt/unbounded/agent/bin/unbounded-agent"]
+	require.True(t, ok, "the agent binary must land under the host root, got %v", paths)
+	require.Equal(t, 0o755, binary.Mode)
+	require.Equal(t, "https://example.test/unbounded-agent-linux-amd64", binary.Contents.Source)
+	require.NotNil(t, binary.Contents.Verification, "an unattended host must not accept whatever the URL returns")
+	require.Equal(t, "sha256-"+ignitionTestDigest, binary.Contents.Verification.Hash)
+
+	require.NotNil(t, cfg.Systemd)
+	require.Len(t, cfg.Systemd.Units, 1)
+
+	unit := cfg.Systemd.Units[0]
+	require.Equal(t, provision.FirstBootBootstrapUnit, unit.Name)
+	require.NotNil(t, unit.Enabled)
+	require.True(t, *unit.Enabled, "an unenabled unit never runs and nothing reports it")
+
+	// See ignitionBootstrapUnit for why each of these is there.
+	require.NotContains(t, unit.Contents, "Condition", "the unit runs every boot, and a missing binary must fail visibly")
+	require.Contains(t, unit.Contents, "AssertPathExists=/opt/unbounded/agent/bin/unbounded-agent\n")
+	require.Contains(t, unit.Contents, " "+goalstates.DaemonUnit+"\n", "a reboot must not repair a daemon that is still starting")
+	require.Contains(t, unit.Contents, "ExecStartPre=/opt/unbounded/agent/bin/unbounded-agent preflight\n")
+	require.Contains(t, unit.Contents, "ExecStart=/opt/unbounded/agent/bin/unbounded-agent start\n")
+	// The agent reads its config from this variable, set in cmd/agent's
+	// config.go. Without it start falls back to the environment and fails.
+	require.Contains(t, unit.Contents, "Environment=UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent/config.json\n")
+	require.Contains(t, unit.Contents, "WantedBy=multi-user.target\n", "enabling the unit must make it run at boot")
+	require.Contains(t, unit.Contents, "Restart=on-failure\n", "a first boot has no later chance to bootstrap")
+	require.Contains(t, unit.Contents, "StartLimitIntervalSec=0\n", "retries must not hit the start limit")
+}
+
+// TestValidateRejectsIgnitionInputBeforeContactingTheCluster: validate runs
+// before any Kubernetes client is built, and the flag errors come before the
+// kubeconfig is even read.
+func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
+	t.Parallel()
+
+	base := func() *manualBootstrapHandler {
+		return &manualBootstrapHandler{
+			siteName:       "site-a",
+			variant:        string(variantIgnition),
+			agentURL:       " https://example.test/unbounded-agent ",
+			agentSHA256:    strings.ToUpper(ignitionTestDigest) + "  unbounded-agent-linux-amd64",
+			kubeconfigPath: "/nonexistent",
+		}
+	}
+
+	valid := base()
+	valid.kubeconfigPath = writeTempKubeconfig(t)
+	require.NoError(t, valid.validate(), "a complete ignition invocation must pass")
+	require.Equal(t, "https://example.test/unbounded-agent", valid.agentURL)
+	require.Equal(t, ignitionTestDigest, valid.agentSHA256, "a checksums.txt line is reduced to its digest")
+
+	for name, tc := range map[string]struct {
+		mutate  func(*manualBootstrapHandler)
+		wantErr string
+	}{
+		"no agent url": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentURL = "" },
+			wantErr: "--agent-url is required",
+		},
+		"unfetchable agent url": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentURL = "oci://ghcr.io/azure/agent:v1" },
+			wantErr: "cannot be fetched by Ignition",
+		},
+		"no digest": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = " " },
+			wantErr: "--agent-sha256 is required",
+		},
+		"not hex": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = strings.Repeat("g", 64) },
+			wantErr: "invalid --agent-sha256",
+		},
+		"too short": {
+			mutate:  func(h *manualBootstrapHandler) { h.agentSHA256 = "abcd" },
+			wantErr: "invalid --agent-sha256",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			h := base()
+			tc.mutate(h)
+
+			err := h.validate()
+			require.ErrorContains(t, err, tc.wantErr)
+			require.NotContains(t, err.Error(), "kubeconfig")
+		})
+	}
 }

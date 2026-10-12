@@ -1024,8 +1024,14 @@ jobs:
 
           CHART_VERSION="${TAG#v}"
           CHART="build/charts/gantry-${CHART_VERSION}.tgz"
-          OUTPUT="$(bin/helm push "$CHART" "oci://${REGISTRY}/charts")"
-          printf '%s\n' "$OUTPUT"
+          # Helm writes push confirmation and the manifest digest to stderr.
+          if OUTPUT="$(bin/helm push "$CHART" "oci://${REGISTRY}/charts" 2>&1)"; then
+            printf '%s\n' "$OUTPUT"
+          else
+            STATUS=$?
+            printf '%s\n' "$OUTPUT" >&2
+            exit "$STATUS"
+          fi
 
           DIGEST="$(awk '$1 == "Digest:" {print $2}' <<<"$OUTPUT")"
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -1156,12 +1162,15 @@ jobs:
 
       - name: Render krew manifest
         run: |
+          set -euo pipefail
+
           export VERSION="${{ needs.version.outputs.tag }}"
           export REPO="${{ github.repository }}"
-          export SHA_LINUX_AMD64=$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')
-          export SHA_LINUX_ARM64=$(sha256sum dist/kubectl-unbounded-linux-arm64.tar.gz | awk '{print $1}')
-          export SHA_DARWIN_AMD64=$(sha256sum dist/kubectl-unbounded-darwin-amd64.tar.gz | awk '{print $1}')
-          export SHA_DARWIN_ARM64=$(sha256sum dist/kubectl-unbounded-darwin-arm64.tar.gz | awk '{print $1}')
+          SHA_LINUX_AMD64="$(sha256sum dist/kubectl-unbounded-linux-amd64.tar.gz | awk '{print $1}')"
+          SHA_LINUX_ARM64="$(sha256sum dist/kubectl-unbounded-linux-arm64.tar.gz | awk '{print $1}')"
+          SHA_DARWIN_AMD64="$(sha256sum dist/kubectl-unbounded-darwin-amd64.tar.gz | awk '{print $1}')"
+          SHA_DARWIN_ARM64="$(sha256sum dist/kubectl-unbounded-darwin-arm64.tar.gz | awk '{print $1}')"
+          export SHA_LINUX_AMD64 SHA_LINUX_ARM64 SHA_DARWIN_AMD64 SHA_DARWIN_ARM64
           envsubst < hack/krew-manifest.yaml > dist/unbounded.yaml
 
       - name: Generate and sign release BOM

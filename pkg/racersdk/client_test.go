@@ -331,7 +331,7 @@ func assertNoSentinel(t *testing.T, err error) {
 		t.Fatal("no error")
 	}
 
-	for _, target := range []error{ErrInvalidRequest, ErrUnauthorized, ErrForbidden, ErrNotFound, ErrVersionMismatch, ErrRangeNotSatisfiable, ErrUnavailable, context.Canceled, net.ErrClosed} {
+	for _, target := range []error{ErrInvalidRequest, ErrUnauthorized, ErrForbidden, ErrNotFound, ErrVersionMismatch, ErrRangeNotSatisfiable, ErrUnavailable, ErrDestination, context.Canceled, net.ErrClosed} {
 		if errors.Is(err, target) {
 			t.Fatalf("error %v matches %v", err, target)
 		}
@@ -518,6 +518,11 @@ func TestObjectWriteToErrors(t *testing.T) {
 
 	_, err = o.WriteTo(shortWriter{})
 	assertIs(t, err, io.ErrShortWrite)
+	assertIs(t, err, ErrDestination)
+
+	if errors.Is(err, ErrUnavailable) {
+		t.Fatalf("short write reported as Racer unavailable: %v", err)
+	}
 
 	o, err = c.Get(t.Context(), Request{})
 	if err != nil {

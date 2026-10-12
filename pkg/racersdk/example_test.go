@@ -116,13 +116,15 @@ func ExampleServeOrigin() { //nolint:testableexamples // Requires a provisioned 
 }
 
 func exampleMemoryOrigin(content []byte) racersdk.Origin {
-	metadata := racersdk.Metadata{
-		Size:      int64(len(content)),
-		ETag:      `"v1"`,
-		ExpiresAt: time.Now().Add(time.Hour),
-	}
-
 	return func(_ context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		// Compute the expiry for each request so a long-running origin
+		// never returns metadata that has already expired.
+		metadata := racersdk.Metadata{
+			Size:      int64(len(content)),
+			ETag:      `"v1"`,
+			ExpiresAt: time.Now().Add(time.Hour),
+		}
+
 		if r.Key != key {
 			return racersdk.Metadata{}, nil, racersdk.ErrNotFound
 		}
