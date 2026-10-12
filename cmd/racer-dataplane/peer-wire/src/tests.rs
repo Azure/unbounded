@@ -91,6 +91,66 @@ fn canonical_fixture(response: bool, fields: usize, value_bytes: usize) -> Messa
 }
 
 #[test]
+fn auth_field_recognizes_reserved_names_in_any_ascii_case() {
+    for name in [
+        "signature-input",
+        "signature",
+        "racer-profile",
+        "racer-cluster",
+        "racer-signer",
+        "racer-receiver",
+        "racer-certificates",
+        "racer-session",
+        "racer-direction",
+        "racer-sequence",
+        "racer-timestamp",
+        "racer-mac-key",
+        "racer-request-mac",
+    ] {
+        let mixed: String = name
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        for spelling in [name.to_owned(), name.to_ascii_uppercase(), mixed] {
+            assert!(is_auth_field(&spelling), "{spelling}");
+            for unknown in [
+                format!("x-{spelling}"),
+                format!("{spelling}-extra"),
+                format!(" {spelling}"),
+                format!("{spelling} "),
+            ] {
+                assert!(!is_auth_field(&unknown), "{unknown:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn auth_field_leaves_other_names_unrecognized() {
+    for name in [
+        "",
+        "authorization",
+        "content-length",
+        "host",
+        "racer-kind",
+        "racer-metadata",
+        "racer-route-deadline",
+        "racer-unknown",
+        "ſignature",
+    ] {
+        assert!(!is_auth_field(name), "{name:?}");
+        assert!(!is_auth_field(&name.to_ascii_uppercase()), "{name:?}");
+    }
+}
+
+#[test]
 fn signature_base_preserves_order_case_and_rejects_invalid_components() {
     for response in [false, true] {
         let mut head = canonical_fixture(response, 8, 16);

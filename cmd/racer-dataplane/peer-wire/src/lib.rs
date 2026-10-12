@@ -317,22 +317,23 @@ impl Signatures {
 
 /// Fields reserved exclusively to the authentication layer.
 pub fn is_auth_field(name: &str) -> bool {
-    matches!(
-        name,
-        "signature-input"
-            | "signature"
-            | "racer-profile"
-            | "racer-cluster"
-            | "racer-signer"
-            | "racer-receiver"
-            | "racer-certificates"
-            | "racer-session"
-            | "racer-direction"
-            | "racer-sequence"
-            | "racer-timestamp"
-            | "racer-mac-key"
-            | "racer-request-mac"
-    )
+    [
+        "signature-input",
+        "signature",
+        "racer-profile",
+        "racer-cluster",
+        "racer-signer",
+        "racer-receiver",
+        "racer-certificates",
+        "racer-session",
+        "racer-direction",
+        "racer-sequence",
+        "racer-timestamp",
+        "racer-mac-key",
+        "racer-request-mac",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 /// Canonical domain-separated request-MAC message, excluding the MAC itself.
