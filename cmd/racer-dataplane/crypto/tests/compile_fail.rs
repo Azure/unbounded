@@ -92,8 +92,11 @@ fn certificates_are_not_send() {
 
 #[test]
 fn verified_peer_cannot_be_constructed() {
+    // Infer NodeId from crypto so separately built control-wire rlibs cannot conflict.
     rejects(
-        "let peer = racer_crypto::identity::VerifiedPeer { node: racer_control_wire::NodeId(\"forged\".into()) };",
+        "fn forge(identity: &racer_crypto::identity::SigningIdentity) {
+            let peer = racer_crypto::identity::VerifiedPeer { node: identity.node().clone() };
+        }",
         "E0451",
         "private",
     );
