@@ -4,6 +4,7 @@
 package racersdk
 
 import (
+	"errors"
 	"io"
 	"testing"
 )
@@ -51,7 +52,11 @@ func TestObjectWriteToWriterEOF(t *testing.T) {
 			}
 
 			assertIs(t, err, io.EOF)
-			assertIs(t, err, ErrUnavailable)
+			assertIs(t, err, ErrDestination)
+
+			if errors.Is(err, ErrUnavailable) {
+				t.Fatalf("writer EOF reported as Racer unavailable: %v", err)
+			}
 
 			if n, repeatedErr := o.WriteTo(io.Discard); n != 0 || repeatedErr != err {
 				t.Fatalf("repeated WriteTo = %d, %v; want 0, %v", n, repeatedErr, err)

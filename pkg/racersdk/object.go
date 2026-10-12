@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
@@ -91,16 +93,25 @@ func (o *Object) Read(p []byte) (int, error) {
 
 // WriteTo writes the rest of the object to w and returns the number of bytes
 // written. [io.Copy] calls it automatically. A nil error means the whole
-// selected range was written and Racer confirmed it complete.
+// selected range was written and Racer confirmed it complete. A failure from
+// w.Write, including a short write or a write timeout, matches [ErrDestination]
+// and wraps w's error. A timeout from w.ReadFrom cannot be attributed to either
+// endpoint: it wraps [os.ErrDeadlineExceeded] and matches neither
+// [ErrDestination] nor [ErrUnavailable].
 //
 // If w implements [io.ReaderFrom] and is backed by a file descriptor, such as
-// a [net.Conn], an [*os.File], or an HTTP/1 [http.ResponseWriter], data moves
+// a [*net.TCPConn], an [*os.File], or an HTTP/1 [http.ResponseWriter], data moves
 // from Racer's socket to w inside the kernel with splice(2), with no copy into
 // process memory. Other writers receive data through a reused 256 KiB buffer.
 //
 // When w supports SetWriteDeadline, directly or through an HTTP response
-// controller, WriteTo bounds each write and interrupts it if the Get context
-// ends. It clears its deadlines before returning and never closes w. Set HTTP
+// controller, WriteTo takes over w's write deadline for the whole call. It
+// replaces any deadline already set on w, including one derived from
+// [http.Server.WriteTimeout], with a fixed timeout for each write, and moves
+// it to the present to interrupt a blocked write if the Get context ends.
+// Before returning, it clears the deadline, so w has no write deadline
+// afterward. To keep an overall write budget, bound the Get context and set
+// the deadline again after WriteTo returns. WriteTo never closes w. Set HTTP
 // response headers, including Content-Length, before calling WriteTo.
 // Without supported write deadlines, neither context cancellation nor
 // [Object.Close] can interrupt an already-blocked write to w; that write must
@@ -336,14 +347,18 @@ func (o *Object) splice(dst *destination, raw *net.UnixConn) (int64, error) {
 	}
 
 	if err := dst.arm(); err != nil {
-		return 0, err
+		return 0, destinationFailure(err)
 	}
 
 	limited := &io.LimitedReader{R: raw, N: batch}
+
 	n, err := dst.rf.ReadFrom(limited)
+	if err != nil {
+		err = spliceFailure(raw, err)
+	}
 
 	if clearErr := dst.disarm(); err == nil {
-		err = clearErr
+		err = destinationFailure(clearErr)
 	}
 
 	_ = o.conn.SetReadDeadline(time.Time{}) //nolint:errcheck // Preserve bytes received before a peer close.
@@ -354,19 +369,93 @@ func (o *Object) splice(dst *destination, raw *net.UnixConn) (int64, error) {
 		n = 0
 
 		if err == nil {
-			err = io.ErrShortWrite
+			err = destinationFailure(io.ErrShortWrite)
 		}
 	}
 
 	if err == nil && limited.N != 0 {
-		err = io.ErrUnexpectedEOF
+		if sourceOpen(raw) {
+			// The destination stopped reading while Racer still had bytes
+			// to send, the splice equivalent of a short write.
+			err = destinationFailure(io.ErrShortWrite)
+		} else {
+			// The destination took everything the socket delivered before
+			// EOF.
+			err = io.ErrUnexpectedEOF
+		}
 	}
 
 	if err == nil && n != batch {
-		err = io.ErrShortWrite
+		err = destinationFailure(io.ErrShortWrite)
 	}
 
-	return n, truncation(err)
+	return n, err
+}
+
+// spliceFailure attributes an error from a destination's ReadFrom. Splice
+// reports source and destination failures alike, so the Racer connection is
+// checked: a broken pipe can only come from writing, and an error while the
+// connection is still open came from the destination. A closed or failed
+// connection means Racer cut the transfer short. A timeout stays ambiguous:
+// source bytes may arrive after a read timeout but before we check the socket.
+func spliceFailure(raw *net.UnixConn, err error) error {
+	switch {
+	case errors.Is(err, unix.EPIPE):
+		return destinationFailure(err)
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return failure(wire.ErrorDeadline, "write", err)
+	case sourceOpen(raw):
+		return destinationFailure(err)
+	default:
+		return fmt.Errorf("%w: %w", io.ErrUnexpectedEOF, err)
+	}
+}
+
+// sourceOpen reports whether the Racer connection is still open, without
+// consuming any data from it.
+func sourceOpen(raw *net.UnixConn) bool {
+	n, err := peekSource(raw)
+
+	switch {
+	case err == unix.EAGAIN:
+		return true
+	case err != nil:
+		return false
+	default:
+		// Zero bytes is an orderly close; anything more is unread data.
+		return n > 0
+	}
+}
+
+// peekSource checks for unread bytes without consuming data or waiting.
+func peekSource(raw *net.UnixConn) (int, error) {
+	rc, err := raw.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+
+	var (
+		n       int
+		peekErr error
+	)
+
+	// Control ignores the read deadline, which may have expired even when
+	// splice returned a non-timeout error.
+	// MSG_DONTWAIT keeps the receive nonblocking.
+	if err := rc.Control(func(fd uintptr) {
+		var b [1]byte
+
+		for {
+			n, _, peekErr = unix.Recvfrom(int(fd), b[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
+			if peekErr != unix.EINTR {
+				return
+			}
+		}
+	}); err != nil {
+		return 0, err
+	}
+
+	return n, peekErr
 }
 
 // copy moves one batch through buffer. It reads once rather than filling the
@@ -668,7 +757,7 @@ func (d *destination) write(p []byte) (int64, error) {
 	}
 
 	if err := d.arm(); err != nil {
-		return 0, err
+		return 0, destinationFailure(err)
 	}
 
 	n, err := d.w.Write(p)
@@ -688,5 +777,5 @@ func (d *destination) write(p []byte) (int64, error) {
 		err = io.ErrShortWrite
 	}
 
-	return int64(n), err
+	return int64(n), destinationFailure(err)
 }

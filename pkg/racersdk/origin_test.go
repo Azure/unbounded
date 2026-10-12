@@ -1393,6 +1393,36 @@ func TestOwnedOriginUnsafePathsAndForeignEndpoints(t *testing.T) {
 	}
 }
 
+func TestOriginDefaultModeStaleSocketNeedsManualRemoval(t *testing.T) {
+	dir := ownedSocketTestDir(t)
+	path := filepath.Join(dir, "socket")
+
+	l, _, err := listenOrigin(path, 0o600)
+	require.NoError(t, err)
+	// Closing without cleanup leaves the socket behind, as a crash would.
+	closeQuietly(l)
+
+	stale, err := os.Lstat(path)
+	require.NoError(t, err)
+
+	_, _, err = listenOrigin(path, 0o600)
+	require.ErrorIs(t, err, os.ErrExist, "default mode reused a stale socket")
+
+	// Recovery cannot prove a default-mode socket is ours, so it refuses too.
+	_, _, err = listenOwnedOrigin(path, 0o600)
+	require.ErrorIs(t, err, os.ErrExist, "recovery adopted a default-mode socket")
+
+	current, err := os.Lstat(path)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(stale, current), "stale socket changed")
+
+	require.NoError(t, os.Remove(path))
+
+	_, cleanup, err := listenOwnedOrigin(path, 0o600)
+	require.NoError(t, err)
+	cleanup()
+}
+
 func TestOwnedOriginPreservesReplacementAndLiveWitness(t *testing.T) {
 	dir := ownedSocketTestDir(t)
 	path := filepath.Join(dir, "socket")
