@@ -5,6 +5,115 @@ use racer_control_wire::CacheId;
 use racer_object_wire::client::{self, ReadKind, RequestParser};
 use racer_object_wire::origin;
 use racer_object_wire::*;
+use std::time::{Duration, UNIX_EPOCH};
+
+#[test]
+fn head_retention_accepts_http_lists_and_quoted_delta_seconds() {
+    let parser = RequestParser::new(usize::MAX);
+    for (fields, expected) in [
+        (vec![], None),
+        (vec!["no-cache, extension=ignored"], None),
+        (vec!["max-age=0"], None),
+        (vec!["MAX-age = \"00012\""], Some(12)),
+        (vec!["private, max-age=42, immutable"], Some(42)),
+        (vec!["extension=\"a, max-age=99\"", "max-age=7"], Some(7)),
+        (vec!["max-age=18446744073709551615"], Some(u64::MAX)),
+    ] {
+        for pin in [false, true] {
+            let mut head = request();
+            if let StartLine::Request { method, .. } = &mut head.start {
+                *method = "HEAD".into();
+            }
+            if pin {
+                head.headers.push(Header::new("If-Match", "\"v1\""));
+            }
+            for field in &fields {
+                head.headers.push(Header::new("Cache-Control", field));
+            }
+            let parsed = parser.parse(&head).unwrap();
+            assert!(parsed.kind.is_head());
+            assert_eq!(parsed.kind.pin().is_some(), pin);
+            assert_eq!(parsed.retain, expected.map(Duration::from_secs));
+        }
+    }
+}
+
+#[test]
+fn head_retention_rejects_bad_max_age_but_post_ignores_it() {
+    let parser = RequestParser::new(usize::MAX);
+    for fields in [
+        vec!["max-age"],
+        vec!["max-age="],
+        vec!["max-age=-1"],
+        vec!["max-age=+1"],
+        vec!["max-age=1.0"],
+        vec!["max-age=1 2"],
+        vec!["max-age=18446744073709551616"],
+        vec!["max-age=\"\""],
+        vec!["max-age=\"1"],
+        vec!["max-age=\"1\\2\""],
+        vec!["max-age=1;"],
+        vec!["max-age=0, MAX-AGE=0"],
+        vec!["max-age=1", "max-age=2"],
+    ] {
+        let mut head = request();
+        for field in &fields {
+            head.headers.push(Header::new("Cache-Control", field));
+        }
+        assert_eq!(parser.parse(&head).unwrap().retain, None);
+        if let StartLine::Request { method, .. } = &mut head.start {
+            *method = "HEAD".into();
+        }
+        assert!(
+            matches!(parser.parse(&head), Err(Error::InvalidRequest)),
+            "{fields:?}"
+        );
+    }
+}
+
+#[test]
+fn retained_head_deadline_is_optional_bounded_unix_milliseconds() {
+    let m = metadata(123);
+    for head in [
+        client::success_head(&m, None).unwrap(),
+        client::success_head_retained(&m, None, None).unwrap(),
+    ] {
+        assert!(head.unique("Racer-Retain-Until").unwrap().is_none());
+        assert_eq!(
+            head.unique("Content-Length").unwrap(),
+            Some(b"123".as_slice())
+        );
+    }
+    for millis in [0, 1234, i64::MAX as u64] {
+        let deadline = UNIX_EPOCH + Duration::from_millis(millis);
+        let head = client::success_head_retained(&m, None, Some(deadline)).unwrap();
+        assert_eq!(
+            head.unique("Racer-Retain-Until").unwrap(),
+            Some(millis.to_string().as_bytes())
+        );
+        assert_eq!(
+            head.unique("Content-Length").unwrap(),
+            Some(b"123".as_slice())
+        );
+    }
+    let fractional = UNIX_EPOCH + Duration::from_nanos(1_999_999);
+    assert_eq!(
+        client::success_head_retained(&m, None, Some(fractional))
+            .unwrap()
+            .unique("Racer-Retain-Until")
+            .unwrap(),
+        Some(b"1".as_slice())
+    );
+    for deadline in [
+        UNIX_EPOCH - Duration::from_nanos(1),
+        UNIX_EPOCH + Duration::from_millis(i64::MAX as u64 + 1),
+    ] {
+        assert!(matches!(
+            client::success_head_retained(&m, None, Some(deadline)),
+            Err(Error::BadGateway)
+        ));
+    }
+}
 
 /// An object descriptor shared by response and fixture scenarios.
 fn metadata(length: u64) -> ObjectMetadata {

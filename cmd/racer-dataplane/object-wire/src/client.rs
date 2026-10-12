@@ -6,7 +6,7 @@ use crate::model::{
 use crate::{Error, Result};
 use http1::{Header, MessageHead, StartLine, is_token, trim_ows};
 use std::collections::HashSet;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Maximum client request head size, including raw HTTP framing.
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
@@ -52,6 +52,9 @@ impl ReadKind {
 pub struct ClientRequest<'a> {
     pub kind: ReadKind,
 
+    /// Requested HEAD retention. Zero max-age and subscriptions do not warm.
+    pub retain: Option<Duration>,
+
     pub key: CacheKey,
 
     pub metadata: Option<&'a [u8]>,
@@ -94,6 +97,7 @@ impl RequestParser {
         let mut page_credits = 2;
         let mut byte_credits = 2 * PAGE_BYTES;
         let mut ordered = false;
+        let mut max_age = None;
         for header in &head.headers {
             decoded_bytes = decoded_bytes
                 .saturating_add(header.name.len())
@@ -133,6 +137,7 @@ impl RequestParser {
                 return Err(Error::InvalidRequest);
             }
             match name.as_str() {
+                "cache-control" if method == "HEAD" => parse_max_age(value, &mut max_age)?,
                 "host" => host = Some(value == b"racer"),
                 "content-length" if value == b"0" => content_length = true,
                 "content-length"
@@ -213,11 +218,68 @@ impl RequestParser {
         };
         Ok(ClientRequest {
             kind,
+            retain: max_age
+                .filter(|&seconds| seconds != 0)
+                .map(Duration::from_secs),
             key,
             metadata,
             authorization,
         })
     }
+}
+
+/// Read delta-seconds, including quoted digits, without splitting quoted commas.
+fn parse_max_age(value: &[u8], max_age: &mut Option<u64>) -> Result<()> {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, &byte) in value.iter().chain(std::iter::once(&b',')).enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if byte == b',' && !quoted {
+            let directive = trim_ows(&value[start..i]);
+            start = i + 1;
+            let end = directive
+                .iter()
+                .position(|&b| !is_token(b))
+                .unwrap_or(directive.len());
+            if !directive[..end].eq_ignore_ascii_case(b"max-age") {
+                continue;
+            }
+            if max_age.is_some() {
+                return Err(Error::InvalidRequest);
+            }
+            let argument = trim_ows(&directive[end..])
+                .strip_prefix(b"=")
+                .ok_or(Error::InvalidRequest)?;
+            let mut digits = trim_ows(argument);
+            if digits.starts_with(b"\"") {
+                digits = digits
+                    .strip_prefix(b"\"")
+                    .and_then(|s| s.strip_suffix(b"\""))
+                    .ok_or(Error::InvalidRequest)?;
+            }
+            if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+                return Err(Error::InvalidRequest);
+            }
+            *max_age = Some(
+                digits
+                    .iter()
+                    .try_fold(0u64, |n, digit| {
+                        n.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+                    })
+                    .ok_or(Error::InvalidRequest)?,
+            );
+        }
+    }
+    if quoted || escaped {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(())
 }
 
 /// Parse a nonzero canonical credit value inside its protocol bounds.
@@ -300,6 +362,15 @@ pub fn success_head(
     metadata: &ObjectMetadata,
     range: Option<ResolvedRange>,
 ) -> Result<MessageHead> {
+    success_head_retained(metadata, range, None)
+}
+
+/// Add an accepted retention deadline, rounded down to Unix milliseconds.
+pub fn success_head_retained(
+    metadata: &ObjectMetadata,
+    range: Option<ResolvedRange>,
+    retain_until: Option<SystemTime>,
+) -> Result<MessageHead> {
     let expiry = metadata
         .expires_at
         .as_system_time()
@@ -315,6 +386,16 @@ pub fn success_head(
         header("ETag", metadata.version.etag.as_bytes()),
         header("Racer-Expires-At", expiry.as_millis().to_string()),
     ];
+    if let Some(until) = retain_until {
+        let millis = until
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::BadGateway)?
+            .as_millis();
+        if millis > i64::MAX as u128 {
+            return Err(Error::BadGateway);
+        }
+        headers.push(header("Racer-Retain-Until", millis.to_string()));
+    }
     if let Some(content_type) = &metadata.content_type {
         headers.push(header("Racer-Content-Type", content_type.as_bytes()));
     }
