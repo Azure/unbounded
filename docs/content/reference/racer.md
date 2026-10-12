@@ -84,6 +84,11 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_ADMISSION_MODE` | `second-sight` | Disk retention policy: `disabled` or `second-sight`; does not disable request resource admission |
 | `RACER_ADMISSION_HISTORY_BYTES` | `4194304` (4 MiB) | Node-wide Bloom history budget; 32 bytes..512 MiB, divided among final I/O workers, requiring at least 32 bytes per worker |
 | `RACER_ADMISSION_PERIOD_SECS` | `60` | History rotation period; 1..86,400 seconds |
+| `RACER_WARM_MAX_TTL_SECS` | `3600` | Maximum admitted warm TTL; 1..86,400 seconds |
+| `RACER_WARM_FILL_TIMEOUT_SECS` | `600` | Independent background fill deadline; 1..86,400 seconds |
+| `RACER_WARM_MAX_JOBS` | `16` | Node-wide tracked warm versions, including completed jobs until expiry; 1..1024 |
+| `RACER_WARM_WINDOW_PAGES` | `2` | Maximum in-flight pages per warm job; 1..64 |
+| `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per-worker hard-hold cap as a percentage of segment count and page-index capacity; 1..100; free-segment reserve still applies |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
 | `RACER_PLACEMENT_CACHE_BYTES` | `16777216` (16 MiB) | Node-wide placement capacity estimate, divided among I/O workers; 1,024 bytes..512 MiB, with at least 1,024 bytes per worker |
 | `RACER_CACHED_PATHS` | `128` | Node-wide retained path-query entry budget, divided among I/O workers; 1..1,048,576 |
@@ -171,9 +176,10 @@ checkpoint scratch, not just the configured admission budgets. The automatic
 checkpoint budget is not an RSS limit or a guarantee that a full cache can be
 checkpointed. Limit warnings explain discarded capacity and checkpoint pressure.
 
-Checkpoint **v3** binds each worker to file mode or its raw-device IDs, sizes, and
-segment offsets. The raw-layout **v2** digest also includes both guard sizes;
-this is separate from the checkpoint format version. The prior offset-zero raw
+Checkpoint **v4** stores completed-page hold deadlines and binds each worker to
+file mode or its raw-device IDs, sizes, and segment offsets. The raw-layout **v2**
+digest also includes both guard sizes; this is separate from the checkpoint
+format version. The prior offset-zero raw
 layout cannot recover into the guarded layout. Each checkpoint candidate is
 validated for the whole node: one mismatched worker rejects the entire candidate.
 If both saved candidates use the old layout, the whole node starts cold. File-mode
@@ -183,6 +189,71 @@ mode. A changed device layout, storage mode, worker count, or incompatible
 geometry rejects recovery and starts cold when no compatible checkpoint remains.
 Racer does not scan payloads to rebuild the index or migrate cached data. Preserve
 cluster and node identity state; it is separate from disposable cache checkpoints.
+
+### Warm and hard retention
+
+Send `HEAD` on the client socket with `Cache-Control: max-age=<seconds>` to request
+warming of the whole selected version. The value is a positive integer TTL in
+seconds, clamped to `RACER_WARM_MAX_TTL_SECS`. No `max-age`, or `max-age=0`, is an
+ordinary metadata request. Duplicate, malformed, negative, or overflowing
+`max-age` values are rejected. `If-Match` selects one strong ETag; without it,
+Racer resolves the current version. The retention hint applies only to HEAD,
+not to reads or origin requests.
+
+| HEAD result | Meaning |
+|-------------|---------|
+| `200` with `Racer-Retain-Until` | Retention admitted; the header is an absolute Unix timestamp in milliseconds, not a TTL or completion signal |
+| `200` without `Racer-Retain-Until` | Metadata succeeded but retention was refused; do not assume warming started |
+| Non-success status | Metadata, version selection, or request processing failed |
+
+Admission reserves local capacity before returning the header. Filling continues
+asynchronously with a separate cancellation scope. The TTL starts at HEAD
+admission and runs during the fill, so a short TTL can expire before all pages
+load. Repeated requests for the same cache, key, and ETag share the job and can
+extend, but never shorten, its hold. Admission can be refused because of job,
+storage, index, or request-context limits, shutdown, or a conflicting active
+read selection. A successful metadata response does not make these limits optional.
+
+Warm uses the normal page acquisition path, placement, and routing. Only the
+requesting node reserves hard holds; warm does not pin every owner or peer.
+Pages start in ascending order within a bounded pipeline. Both ordered and
+unordered local reads of that exact version follow the disk-publication frontier,
+including pages the warm job has not started. Reads remain pipelined: they need
+not wait for the whole object, but cannot move a later page ahead of the warm
+window or launch a competing acquisition. Their own deadlines and credits still
+apply. If the warm job fails or expires, waiting reads can use the normal fill
+path. A different ETag never joins the old job.
+
+Retention is separate from freshness. An unpinned request still refreshes expired
+current-version metadata. Pin `Get` to the returned ETag to read the warmed version;
+retention does not force later unpinned reads to select it.
+
+Hard holds bypass second-sight and veto both page-index eviction and reclamation
+of a segment containing a held record. Admission charges **one whole segment per
+page**, including short pages and existing local copies. This is conservative
+capacity accounting, not a dedicated warm tail or one-page physical layout.
+Existing local copies stay where they are and are not rewritten. The charge
+leaves room for the eviction veto even when records are fragmented across segments.
+It can reject a request well before the disk's payload-byte capacity is full.
+Each worker must fit its pages within the retained percentage of both segments
+and index entries, while preserving the free-segment reserve and unused index
+reservations. Worker imbalance can also cause refusal.
+
+Progress means verified ciphertext has been published on disk, not merely queued
+for writing. If a later page fails, completed disk pages keep their admitted
+deadlines; unused reservation capacity is released after outstanding persistence
+finishes. Retention is not a guarantee against corruption, key loss, cache removal,
+or storage failure.
+
+The background job owns a charged, zeroizing copy of `Authorization` and `Metadata`
+in memory only. It uses the fill timeout (600 seconds by default), separate from
+the HEAD deadline and retention TTL. Credentials are never checkpointed. On
+restart, jobs, waiters, and unused reservations are gone. Checkpoint v4 restores
+only unexpired holds for completed disk records. Live hold expiry waits for both
+wall and monotonic deadlines; restart has only the saved wall-clock deadline.
+Neither payload nor checkpoint publication adds `fsync`, so process or host
+failure can lose pages or holds. Older checkpoint formats are rejected and start
+cold when no compatible checkpoint remains, including in file mode.
 
 ### Second-sight disk retention
 
@@ -510,6 +581,40 @@ The Go SDK is `github.com/Azure/unbounded/pkg/racersdk`. Its
 is the complete SDK reference, including configuration, the copy and no-copy read
 paths, the origin contract, and error handling. The SDK does not provision volumes
 or origins.
+
+### Warm an exact version
+
+The method signature is:
+
+```go
+func (c *Client) Warm(ctx context.Context, request Request, ttl time.Duration, opts WarmOptions) (WarmResult, error)
+```
+
+`WarmOptions{}` selects the current version; `WarmOptions{ETag: tag}` pins a strong
+ETag. `ttl` must be positive; the SDK rounds it up to whole seconds and rejects
+rounding overflow. `WarmResult` contains `Metadata` and `RetainUntil`. A zero
+`RetainUntil` means refusal, not a metadata error. A nonzero value is admission,
+not fill completion. `Warm` shares the SDK's bounded Stat lane; `Stat` itself does
+not request warming.
+
+With an existing `client`, `ctx`, and `request`:
+
+```go
+warmed, err := client.Warm(ctx, request, 10*time.Minute, racersdk.WarmOptions{})
+if err != nil {
+    return err
+}
+// A zero RetainUntil means this Get may need a normal cache fill.
+object, err := client.Get(ctx, request, racersdk.ReadOptions{ETag: warmed.Metadata.ETag})
+if err != nil {
+    return err
+}
+defer object.Close()
+```
+
+Read and close `object` as usual. Pinning the ETag, rather than calling an unpinned
+`Get`, selects the version admitted by `Warm`. See [warm and hard retention](#warm-and-hard-retention)
+for server limits, partial failures, and restart behavior.
 
 | Socket | Path |
 |--------|------|
