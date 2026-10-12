@@ -48,12 +48,15 @@ impl BoundSocket {
         &self.directory
     }
 
-    /// Set the current entry's permissions using the simulated filesystem.
+    /// Set the owned socket's permissions, rejecting a missing or replaced entry.
     pub fn set_mode(&self, mode: u32) -> io::Result<()> {
-        self.sim.chmod(
-            &self.directory.join(self.basename.borrow().as_str()),
-            mode as _,
-        )
+        let basename = self.basename.borrow();
+        if !self.owns(&basename) {
+            return Err(Self::ownership_error());
+        }
+        // These synchronous calls cannot yield to another worker-local simulation task.
+        self.sim
+            .chmod(&self.directory.join(basename.as_str()), mode as _)
     }
 }
 
@@ -115,6 +118,67 @@ impl Drop for BoundSocket {
 mod tests {
     use super::*;
 
+    #[test]
+    fn set_mode_preserves_foreign_socket() {
+        let sim = Simulation::new();
+        let directory = PathBuf::from("/sockets");
+        let path = directory.join("socket");
+        let original = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
+        sim.unlink(&path).unwrap();
+        let replacement = BoundSocket::bind(sim.clone(), directory, "socket").unwrap();
+        replacement.set_mode(0o640).unwrap();
+        let before = sim.metadata(&path).unwrap();
+        assert_ne!(before.0, original.inode);
+
+        let result = original.set_mode(0o666);
+        assert_eq!(sim.metadata(&path).unwrap(), before);
+        assert_eq!(
+            result.unwrap_err().get_ref().unwrap().downcast_ref(),
+            Some(&crate::Error::OwnershipChanged)
+        );
+    }
+
+    #[test]
+    fn set_mode_preserves_replacement_file() {
+        let sim = Simulation::new();
+        let directory = PathBuf::from("/sockets");
+        let path = directory.join("socket");
+        let original = BoundSocket::bind(sim.clone(), directory, "socket").unwrap();
+        sim.unlink(&path).unwrap();
+        sim.write_file(&path, b"foreign").unwrap();
+        sim.chmod(&path, 0o640).unwrap();
+        let before = sim.metadata(&path).unwrap();
+        assert_ne!(before.0, original.inode);
+        assert_eq!(before.1 as u32 & libc::S_IFMT, libc::S_IFREG);
+
+        let result = original.set_mode(0o666);
+        assert_eq!(sim.metadata(&path).unwrap(), before);
+        assert_eq!(sim.read_file(&path).unwrap(), b"foreign");
+        assert_eq!(
+            result.unwrap_err().get_ref().unwrap().downcast_ref(),
+            Some(&crate::Error::OwnershipChanged)
+        );
+    }
+
+    #[test]
+    fn set_mode_rejects_missing_entry() {
+        let sim = Simulation::new();
+        let directory = PathBuf::from("/sockets");
+        let original = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
+        sim.unlink(&directory.join("socket")).unwrap();
+
+        assert_eq!(
+            original
+                .set_mode(0o666)
+                .unwrap_err()
+                .get_ref()
+                .unwrap()
+                .downcast_ref(),
+            Some(&crate::Error::OwnershipChanged)
+        );
+        assert!(original.absent("socket"));
+    }
+
     /// Publication bookkeeping follows renames and cleanup preserves replacement inodes.
     #[test]
     fn rename_and_drop_preserve_exact_inode_ownership() {
@@ -127,9 +191,10 @@ mod tests {
         first.rename("first", "second", Rename::NoReplace).unwrap();
         first.set_basename("second".into());
         assert!(first.owns("second"));
+        first.set_mode(0o640).unwrap();
         assert_eq!(
             sim.metadata(&directory.join("second")).unwrap().1 as u32 & 0o777,
-            0o666
+            0o640
         );
         sim.unlink(&directory.join("second")).unwrap();
         let second = BoundSocket::bind(sim.clone(), directory.clone(), "second").unwrap();
