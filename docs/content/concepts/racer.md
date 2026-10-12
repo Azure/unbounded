@@ -44,21 +44,16 @@ Racer's planned deployment has two components:
 
 **Dataplane** (`racer-dataplane`) -- A DaemonSet on participating nodes:
 
-- Listens on each cache's client socket for app reads.
+- Serves app reads on per-cache Unix sockets under `/run/racer/<cache>/`.
 - Keeps pages in memory and on local disk.
 - Fetches pages from other nodes over TCP, or over RDMA within the same Site
   when both nodes have compatible RDMA devices and rails (network paths).
   RDMA is not a cross-Site transport.
-- Connects to the cache's origin socket on its own node when this node owns a
-  page that no node has yet.
+- Calls the local origin when this node is responsible for a page that no
+  node has yet.
 
-You provide the other two parts, both built with the Go SDK (`pkg/racersdk`):
-
-- **App** -- Reads objects with `racersdk.Client`.
-- **Origin** -- Fetches objects from your storage. It runs
-  `racersdk.ServeOrigin`.
-
-See [Sockets](#sockets) for how these parts connect.
+Apps and origins use the Go SDK (`pkg/racersdk`). It provides a `Client` for
+reads and `ServeOrigin` for origins.
 
 The planned operator integration will deploy the controller and dataplane
 when the first `ClusterCache` is created. Creating a `ClusterCache` on `main`
@@ -77,49 +72,15 @@ metadata:
   name: models
 ```
 
-The name (`models`) is the cache name. Apps and origins pass it to the SDK, and
-it is part of the socket paths below. The `ClusterCache`'s Kubernetes UID is its
-identity, so deleting and recreating it gives it a new cache identity.
+Each cache uses two sockets on every participating node:
 
-### Sockets
+- `/run/racer/<name>/client/socket` -- Apps read objects here.
+- `/run/racer/<name>/origin/socket` -- The origin listens here.
 
-Each cache has two Unix sockets on every participating node. They point in
-opposite directions:
-
-```text
-             client socket                    origin socket
-   app  ------------------->  dataplane  ------------------->  origin  --->  your storage
-```
-
-| Socket | Path | Listens | Connects | Used for |
-|--------|------|---------|----------|----------|
-| Client | `/run/racer/<name>/client/socket` | Dataplane | App (`racersdk.Client`) | Reading objects (`Get`, `Stat`) |
-| Origin | `/run/racer/<name>/origin/socket` | Origin (`racersdk.ServeOrigin`) | Dataplane | Fetching missing data from your storage |
-
-- **Client socket** -- The app's only way into the cache. The app never talks
-  to the origin or to other nodes. Racer answers from its cache, or gets the
-  data from another node or an origin.
-- **Origin socket** -- Racer's way out to your storage. The dataplane uses it
-  only when its node owns a page that no node has yet. Apps do not use it.
-
-One process can use both sockets. Gantry, for example, reads through the client
-socket and serves the origin socket from the same process.
-
-Access rules:
-
-- There is no access list on the `ClusterCache`. A pod gets access by mounting
-  the socket directory from the host. Mount only the directory the pod needs:
-  `client/` for apps, `origin/` for origins.
-- Anyone who can connect to the client socket can read all cached objects.
-- `ServeOrigin` does not create the `origin/` directory; it must already exist.
-  The origin does not need root, but it needs write and search permission on
-  the directory.
-- `ServeOrigin` creates the socket with mode `0600`, owned by the origin's
-  user. The dataplane must run as the same user, or have `CAP_DAC_OVERRIDE`.
-- If the origin restarts and finds an old socket file, `ServeOrigin` fails.
-  Set `RecoverStaleSocket` to replace the old socket instead. This requires the
-  directory to be owned by the origin's user and not writable by group or
-  others.
+There is no access list on the `ClusterCache`. A pod needs access to the
+cache's socket directory, normally through a mount, and the required filesystem
+permissions. The `ClusterCache`'s Kubernetes UID is its identity, so deleting
+and recreating it gives it a new cache identity.
 
 ### Objects, Keys, and Versions
 
@@ -172,35 +133,17 @@ To keep a node out of Racer, label it `racer.unbounded-cloud.io/exclude`.
 
 ## How a Read Works
 
-The planned read path, for an app on node A and a page owned by node B:
+The planned dataplane read path is:
 
-```text
-Node A                                 Node B (owns the page)
-
-app                                    origin  --->  your storage
- |                                       ^
- | Get (client socket)                   | HEAD / GET (origin socket)
- v                                       |
-dataplane  <---- TCP or RDMA ---->  dataplane
-```
-
-1. The app calls `Get`. The SDK sends it through the client socket to the
-   dataplane on node A.
-2. The dataplane on node A checks memory, then local disk. On a hit, it sends
-   the page to the app. The origin is not called.
-3. On a miss, node A asks the page's owners in rank order. Nodes connect only
-   to a limited set of neighbors, so a request may pass through a few other
-   nodes on the way. If an owner has the page, it sends it back.
-4. If no owner has the page, an owner (node B) sends the request through its
-   own origin socket to its own origin. The origin gets the app's `Key`,
-   `Metadata`, and `Authorization`. Node B encrypts the page it gets back and
-   makes it available to readers.
+1. The app calls `Get` on the cache's client socket.
+2. The local dataplane checks memory, then local disk.
+3. On a miss, it asks the page's owners in rank order. Nodes connect only to a
+   limited set of neighbors, so a request may pass through a few other nodes on
+   the way.
+4. If no owner has the page, an owner calls its local origin, encrypts the
+   page, and makes it available to readers.
 5. The page streams back to the app. The SDK holds back the last byte until
    Racer confirms the whole range arrived intact.
-
-The origin that runs is usually not on the app's node. So every origin must be
-able to reach your storage, and the `Metadata` and `Authorization` the app
-sends must work from any node.
 
 If many readers on one node want the same page at the same time, the dataplane
 is designed to combine their requests and share the result.
@@ -217,208 +160,6 @@ The planned default storage is slab files under `/var/lib/racer/slabs`, with
 raw block devices as an alternative. Checkpoints are intended to let a node
 recover cached pages after a restart. The cache is not durable storage; keep
 the source available to refill missing pages.
-
-## Using Racer from an App
-
-These steps show the planned workflow. The SDK and `racersdktest` work on
-`main` today; the dataplane that serves the sockets is still pending.
-
-### 1. Create the Cache
-
-```yaml
-apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: ClusterCache
-metadata:
-  name: models
-```
-
-Use `models` as `Cache` in the SDK configs below.
-
-### 2. Decide What the App Sends
-
-Each `Get` carries a `racersdk.Request`:
-
-- `Key` -- Names the object. Use the same key for the same object everywhere,
-  for example the SHA-256 of its content or of its URL.
-- `Metadata` -- Tells the origin where the object is, for example a URL or a
-  bucket and path. Up to 8 KiB.
-- `Authorization` -- A credential the origin uses with your storage. Up to
-  8 KiB.
-
-Racer does not read `Metadata` or `Authorization`. It passes them to the origin
-on a miss.
-
-### 3. Write the Origin
-
-The origin is a function that reads from your storage. `ServeOrigin` listens on
-the origin socket and calls it for each request.
-
-```go
-func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
-	defer stop()
-
-	err := racersdk.ServeOrigin(ctx, racersdk.OriginConfig{Cache: "models"}, fetch)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-// store stands for your storage client.
-func fetch(ctx context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-	obj, err := store.Lookup(ctx, r.Metadata, r.Authorization)
-	if err != nil {
-		// Wrap an SDK error, such as ErrNotFound or ErrForbidden.
-		return racersdk.Metadata{}, nil, fmt.Errorf("%w: %w", racersdk.ErrNotFound, err)
-	}
-
-	md := racersdk.Metadata{
-		Size:      obj.Size,
-		ETag:      obj.ETag, // Must change when the bytes change.
-		ExpiresAt: time.Now().Add(time.Hour),
-	}
-
-	if r.ETag != "" && r.ETag != md.ETag {
-		return racersdk.Metadata{}, nil, racersdk.ErrVersionMismatch
-	}
-
-	if r.Head {
-		return md, nil, nil
-	}
-
-	// Return at most one page, starting at r.Offset.
-	start := min(r.Offset, md.Size)
-
-	length := min(r.Length, md.Size-start)
-	if length == 0 {
-		return md, nil, nil
-	}
-
-	body, err := obj.ReadRange(ctx, start, length)
-
-	return md, body, err
-}
-```
-
-Rules for the origin:
-
-- Answer `Head` with metadata only.
-- Otherwise return exactly the bytes asked for, from the version you report.
-- Set `ExpiresAt` on every answer. Racer stops serving the version from cache
-  after this time.
-
-### 4. Run the Origin on Every Node
-
-Any Racer node can own a page, so run the origin as a DaemonSet on the same
-nodes as the dataplane. Mount only the cache's `origin/` directory, at the same
-path as on the host:
-
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: models-origin
-spec:
-  selector:
-    matchLabels:
-      app: models-origin
-  template:
-    metadata:
-      labels:
-        app: models-origin
-    spec:
-      containers:
-        - name: origin
-          image: example.com/models-origin:latest
-          volumeMounts:
-            - name: racer-origin
-              mountPath: /run/racer/models/origin
-      volumes:
-        - name: racer-origin
-          hostPath:
-            path: /run/racer/models/origin
-            type: Directory
-```
-
-Each origin must be able to reach your storage. Run it as the same user as the
-dataplane, unless the dataplane has `CAP_DAC_OVERRIDE`.
-
-### 5. Read from the App
-
-Mount the cache's `client/` directory at the same path as on the host. The SDK
-always uses `/run/racer/<name>/client/socket`.
-
-```yaml
-      containers:
-        - name: app
-          volumeMounts:
-            - name: racer-client
-              mountPath: /run/racer/models/client
-      volumes:
-        - name: racer-client
-          hostPath:
-            path: /run/racer/models/client
-            type: Directory
-```
-
-Create one `Client` per cache and share it. It is safe for concurrent use. It
-does not connect until the first request, so the app can start before the
-dataplane is ready.
-
-```go
-client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: "models"})
-if err != nil {
-	return err
-}
-defer client.Close()
-
-url := "https://store.example.com/models/weights.bin"
-
-object, err := client.Get(ctx, racersdk.Request{
-	Key:           racersdk.Key(sha256.Sum256([]byte(url))),
-	Metadata:      url,
-	Authorization: "Bearer " + token,
-})
-if err != nil {
-	return err
-}
-defer object.Close()
-
-// io.Copy to a file or socket moves data without copying it through the app.
-_, err = io.Copy(file, object)
-```
-
-Tips:
-
-- `object.Metadata()` gives the size and ETag. `client.Stat` returns only
-  metadata.
-- To read part of an object, pass `racersdk.ReadOptions` with `Offset` and
-  `Length`. Set `ETag` to keep reading the same version across calls.
-- For objects of 16 MiB or less, set `SmallObject` so they do not wait behind
-  large reads.
-- Check errors with `errors.Is`. Check `ErrDestination` first: it means your
-  writer failed, so do not retry Racer. `ErrUnavailable` is temporary and a
-  retry may work.
-- A read that stops early always returns an error, so a nil error means the
-  app got every byte.
-
-### 6. Test Without a Cluster
-
-`racersdktest.NewClient` runs an in-process fake Racer that calls your origin
-directly. It does not cache, but it uses the same request checks as
-`ServeOrigin`.
-
-```go
-func TestRead(t *testing.T) {
-	client := racersdktest.NewClient(t, fetch)
-
-	object, err := client.Get(t.Context(), racersdk.Request{Key: key, Metadata: url})
-	// ...
-}
-```
-
-For a complete integration, see Gantry (`cmd/gantry/agent_racer.go`). It reads
-image content through Racer and serves a registry origin from the same process.
 
 ## Security
 
