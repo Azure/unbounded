@@ -72,10 +72,13 @@ metadata:
   name: models
 ```
 
-Each cache uses two sockets on every participating node:
+Each cache uses two Unix domain sockets (UDS) on every participating node:
 
-- `/run/racer/<name>/client/socket` -- Apps read objects here.
-- `/run/racer/<name>/origin/socket` -- The origin listens here.
+- `/run/racer/<name>/client/socket` -- The dataplane listens here. Apps connect
+  with `racersdk.Client` to read objects.
+- `/run/racer/<name>/origin/socket` -- The origin listens here with
+  `racersdk.ServeOrigin`. The local dataplane connects to fetch missing data
+  from your storage.
 
 There is no access list on the `ClusterCache`. A pod needs access to the
 cache's socket directory, normally through a mount, and the required filesystem
