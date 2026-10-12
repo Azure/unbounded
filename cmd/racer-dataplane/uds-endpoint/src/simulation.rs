@@ -55,7 +55,11 @@ impl BoundSocket {
     }
 
     /// Set the owned socket's permissions, rejecting a missing or replaced entry.
+    /// Reject bits outside 0777 with `InvalidMode` before checking ownership.
     pub fn set_mode(&self, mode: u32) -> io::Result<()> {
+        if mode & !0o777 != 0 {
+            return Err(crate::error(crate::Error::InvalidMode));
+        }
         let basename = self.basename.borrow();
         if !self.owns(&basename) {
             return Err(Self::ownership_error());
@@ -356,6 +360,79 @@ mod tests {
             first.same_directory(&second).unwrap_err().raw_os_error(),
             Some(libc::EIO)
         );
+    }
+
+    #[test]
+    fn set_mode_accepts_all_permission_bits() {
+        let sim = Simulation::new();
+        let directory = PathBuf::from("/sockets");
+        let socket = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
+        let path = directory.join("socket");
+        let before = sim.metadata(&path).unwrap();
+
+        for mode in 0..=0o777 {
+            socket.set_mode(mode).unwrap();
+            assert_eq!(
+                sim.metadata(&path).unwrap(),
+                (before.0, (libc::S_IFSOCK | mode) as u16)
+            );
+        }
+    }
+
+    #[test]
+    fn set_mode_rejects_every_non_permission_bit_without_mutation() {
+        let sim = Simulation::new();
+        let directory = PathBuf::from("/sockets");
+        let socket = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
+        let path = directory.join("socket");
+        socket.set_mode(0o640).unwrap();
+        let before = sim.metadata(&path).unwrap();
+
+        for mode in (9..u32::BITS)
+            .flat_map(|bit| [1u32 << bit, (1u32 << bit) | 0o600])
+            .chain([libc::S_IFSOCK | 0o600, libc::S_IFREG | 0o777, u32::MAX])
+        {
+            let error = socket.set_mode(mode).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{mode:#o}");
+            assert_eq!(
+                error.get_ref().unwrap().downcast_ref(),
+                Some(&crate::Error::InvalidMode),
+                "{mode:#o}"
+            );
+            assert_eq!(sim.metadata(&path).unwrap(), before, "{mode:#o}");
+        }
+    }
+
+    #[test]
+    fn set_mode_validates_mode_before_ownership() {
+        let sim = Simulation::new();
+        let directory = PathBuf::from("/sockets");
+        let path = directory.join("socket");
+        let socket = BoundSocket::bind(sim.clone(), directory, "socket").unwrap();
+        sim.unlink(&path).unwrap();
+        sim.write_file(&path, b"foreign").unwrap();
+        sim.chmod(&path, 0o640).unwrap();
+        let before = sim.metadata(&path).unwrap();
+
+        for mode in [0o1000, 0o2600, 0o4600, libc::S_IFSOCK | 0o600, u32::MAX] {
+            let error = socket.set_mode(mode).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.get_ref().unwrap().downcast_ref(),
+                Some(&crate::Error::InvalidMode)
+            );
+            assert_eq!(sim.metadata(&path).unwrap(), before);
+            assert_eq!(sim.read_file(&path).unwrap(), b"foreign");
+        }
+
+        sim.unlink(&path).unwrap();
+        let error = socket.set_mode(u32::MAX).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.get_ref().unwrap().downcast_ref(),
+            Some(&crate::Error::InvalidMode)
+        );
+        assert!(socket.absent("socket"));
     }
 
     #[test]
