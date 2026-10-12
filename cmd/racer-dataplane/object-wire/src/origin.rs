@@ -134,7 +134,6 @@ fn field<'a>(head: &'a MessageHead, name: &str) -> Result<Option<&'a [u8]>> {
         if name.eq_ignore_ascii_case("Authorization")
             || name.eq_ignore_ascii_case("Racer-Metadata")
             || name.eq_ignore_ascii_case("Racer-Expires-At")
-            || name.eq_ignore_ascii_case("Racer-Content-Type")
             || name.eq_ignore_ascii_case("Content-Length")
             || name.eq_ignore_ascii_case("Content-Range")
         {
