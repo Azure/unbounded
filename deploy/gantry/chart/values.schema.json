@@ -127,7 +127,8 @@
       "required": [
         "enabled",
         "hostPath",
-        "reconcileIntervalSeconds"
+        "reconcileIntervalSeconds",
+        "legacySelector"
       ],
       "properties": {
         "enabled": {
@@ -140,6 +141,9 @@
         "reconcileIntervalSeconds": {
           "type": "integer",
           "minimum": 1
+        },
+        "legacySelector": {
+          "type": "boolean"
         }
       }
     },

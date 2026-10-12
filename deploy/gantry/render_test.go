@@ -157,6 +157,90 @@ func TestRendersFixedChairLeaseSet(t *testing.T) {
 	}
 }
 
+func TestRendersNodeConfigSelector(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want map[string]string
+	}{
+		{
+			name: "default",
+			want: map[string]string{
+				"app.kubernetes.io/name":      "gantry-containerd-config",
+				"app.kubernetes.io/component": "node-config",
+			},
+		},
+		{
+			name: "legacy",
+			args: []string{"--set", "nodeConfig.legacySelector=true"},
+			want: map[string]string{"app.kubernetes.io/name": "gantry-containerd-config"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := os.ReadFile(filepath.Join(renderChart(t, false, tc.args...), "node-config.yaml"))
+			if err != nil {
+				t.Fatalf("read rendered node config: %v", err)
+			}
+
+			decoder := yaml.NewDecoder(bytes.NewReader(raw))
+			found := false
+
+			for {
+				var object struct {
+					Kind string `yaml:"kind"`
+					Spec struct {
+						Selector struct {
+							MatchLabels map[string]string `yaml:"matchLabels"`
+						} `yaml:"selector"`
+						Template struct {
+							Metadata struct {
+								Labels map[string]string `yaml:"labels"`
+							} `yaml:"metadata"`
+						} `yaml:"template"`
+					} `yaml:"spec"`
+				}
+
+				err := decoder.Decode(&object)
+				if err == io.EOF {
+					break
+				}
+
+				if err != nil {
+					t.Fatalf("decode rendered node config: %v", err)
+				}
+
+				if object.Kind != "DaemonSet" {
+					continue
+				}
+
+				found = true
+
+				if !reflect.DeepEqual(object.Spec.Selector.MatchLabels, tc.want) {
+					t.Fatalf("node-config selector = %v, want %v", object.Spec.Selector.MatchLabels, tc.want)
+				}
+
+				for key, value := range tc.want {
+					if object.Spec.Template.Metadata.Labels[key] != value {
+						t.Fatalf("node-config pod labels %v do not match selector %v", object.Spec.Template.Metadata.Labels, tc.want)
+					}
+				}
+
+				if object.Spec.Template.Metadata.Labels["app.kubernetes.io/component"] != "node-config" {
+					t.Fatal("node-config pods lost the component label")
+				}
+			}
+
+			if !found {
+				t.Fatal("node-config DaemonSet not rendered")
+			}
+		})
+	}
+}
+
 func TestRendersConfiguredChairAndSeedCounts(t *testing.T) {
 	t.Parallel()
 

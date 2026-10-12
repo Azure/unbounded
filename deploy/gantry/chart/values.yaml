@@ -27,6 +27,12 @@ nodeConfig:
   enabled: true
   hostPath: /etc/containerd/certs.d
   reconcileIntervalSeconds: 5
+  # Select node-config pods by app.kubernetes.io/name only, matching the
+  # pre-chart deploy/gantry/node-config.yaml manifests. A DaemonSet's selector
+  # is immutable, so set this when adopting an existing DaemonSet installed
+  # from those manifests; otherwise the upgrade fails with "field is
+  # immutable". Do not change it on an existing chart installation.
+  legacySelector: false
 
 registryCredentials:
   secretName: gantry-registry-credentials

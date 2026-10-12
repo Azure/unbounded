@@ -26,7 +26,9 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: gantry-containerd-config
+      {{- if not .Values.nodeConfig.legacySelector }}
       app.kubernetes.io/component: node-config
+      {{- end }}
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:

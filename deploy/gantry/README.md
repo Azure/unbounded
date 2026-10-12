@@ -90,6 +90,16 @@ Do not combine these stages in one Helm upgrade. A new pod can create a
 higher-numbered Lease while old pods are still running, which makes the old
 pods reject their next chair snapshot.
 
+## Migrating from the pre-chart manifests
+
+Before the Helm chart, `deploy/gantry/node-config.yaml` created
+`DaemonSet/gantry-containerd-config` with the selector
+`app.kubernetes.io/name: gantry-containerd-config`. The chart also selects on
+`app.kubernetes.io/component: node-config`, and Kubernetes rejects selector
+changes on an existing DaemonSet (`field is immutable`). When adopting such a
+DaemonSet, set `nodeConfig.legacySelector=true` to keep its original selector.
+The pods still carry both labels.
+
 ## Operator Profile
 
 ```sh
