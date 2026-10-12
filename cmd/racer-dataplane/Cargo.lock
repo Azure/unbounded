@@ -659,6 +659,7 @@ dependencies = [
  "http1",
  "racer-control-wire",
  "racer-crypto",
+ "racer-object-wire",
  "sha2",
  "uring-runtime",
 ]

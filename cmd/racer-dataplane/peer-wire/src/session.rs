@@ -181,8 +181,12 @@ where
 {
     parent.check()?;
     if let Some(session) = C::session(connection.state()) {
-        session.check()?;
+        if let Err(error) = session.check() {
+            connection.poison();
+            return Err(error.into());
+        }
         if session.peer() != peer {
+            connection.poison();
             return Err(Error::Unauthorized.into());
         }
         return Ok(connection);
@@ -198,7 +202,8 @@ where
         )
         .await?;
     let (_, echoed, b) =
-        verify_session(&signatures, response.value, Some(peer), "challenge", true)?;
+        verify_session(&signatures, &response.value, Some(peer), "challenge", true)?;
+    drop(response.value);
     if echoed != a || b == [0; 32] {
         return Err(Error::Unauthorized.into());
     }
@@ -212,7 +217,8 @@ where
         )
         .await?;
     let (_, echoed, remote) =
-        verify_session(&signatures, response.value, Some(peer), "ready", true)?;
+        verify_session(&signatures, &response.value, Some(peer), "ready", true)?;
+    drop(response.value);
     if echoed != a || remote != b {
         return Err(Error::Unauthorized.into());
     }
@@ -243,14 +249,18 @@ where
 {
     parent.check()?;
     if let Some(session) = C::session(connection.state()) {
-        session.check()?;
+        if let Err(error) = session.check() {
+            connection.poison();
+            return Err(error.into());
+        }
         return Ok(connection);
     }
     let scope = C::handshake_scope(parent)?;
     let io = &io.capped(65536);
     let incoming = io.receive_head(connection, &scope).await?;
     scope.check()?;
-    let (peer, a, zero) = verify_session(&signatures, incoming.value, None, "hello", false)?;
+    let (peer, a, zero) = verify_session(&signatures, &incoming.value, None, "hello", false)?;
+    drop(incoming.value);
     if a == [0; 32] || zero != [0; 32] {
         return Err(Error::Unauthorized.into());
     }
@@ -268,7 +278,8 @@ where
     let incoming = io.receive_head(connection, &scope).await?;
     scope.check()?;
     let (_, echoed, remote) =
-        verify_session(&signatures, incoming.value, Some(&peer), "finish", false)?;
+        verify_session(&signatures, &incoming.value, Some(&peer), "finish", false)?;
+    drop(incoming.value);
     if echoed != a || remote != b {
         return Err(Error::Unauthorized.into());
     }
@@ -295,15 +306,19 @@ fn session_array<const N: usize>(head: &MessageHead, name: &str) -> Result<[u8; 
 }
 
 fn signed(head: MessageHead) -> Result<SignedHead> {
-    let value = field(&head, "signature")?;
+    Ok(SignedHead {
+        signature: signature(&head)?,
+        head,
+    })
+}
+
+fn signature(head: &MessageHead) -> Result<Vec<u8>> {
+    let value = field(head, "signature")?;
     let value = value
         .strip_prefix("racer=:")
         .and_then(|v| v.strip_suffix(':'))
         .ok_or(Error::Unauthorized)?;
-    Ok(SignedHead {
-        signature: decode_binary(value.as_bytes())?,
-        head,
-    })
+    decode_binary(value.as_bytes())
 }
 
 fn random() -> Result<[u8; 32]> {
@@ -341,6 +356,9 @@ fn session_head(
         },
         headers: vec![],
     };
+    if !response {
+        push(&mut h, "host", "");
+    }
     push(&mut h, "content-length", 0);
     push(&mut h, "racer-receiver", &peer.0);
     push(&mut h, "racer-handshake", phase);
@@ -351,13 +369,15 @@ fn session_head(
 
 fn verify_session(
     signatures: &Signatures,
-    head: MessageHead,
+    h: &MessageHead,
     peer: Option<&NodeId>,
     phase: &str,
     response: bool,
 ) -> Result<(NodeId, [u8; 32], [u8; 32])> {
-    let verified = signatures.verify_proof(signed(head)?)?;
-    let h = &verified.signed.head;
+    let verified = signatures.verify_signed_age(h, &signature(h)?, true)?;
+    if receiver(h)? != *signatures.node() {
+        return Err(Error::Unauthorized);
+    }
     let start = if response {
         matches!(h.start, StartLine::Response { status: 200 })
     } else {
@@ -366,15 +386,17 @@ fn verify_session(
     if !start
         || h.content_length()? != Some(0)
         || field(h, "racer-handshake")? != phase
-        || peer.is_some_and(|p| p != verified.peer.node())
+        || peer.is_some_and(|p| p != verified.node())
     {
         return Err(Error::Unauthorized);
     }
     for field in &h.headers {
-        if !is_auth_field(&field.name)
+        let name = field.name.to_ascii_lowercase();
+        if !is_auth_field(&name)
             && !matches!(
-                field.name.as_str(),
-                "content-length"
+                name.as_str(),
+                "host"
+                    | "content-length"
                     | "racer-handshake"
                     | "racer-client-challenge"
                     | "racer-server-challenge"
@@ -384,7 +406,7 @@ fn verify_session(
         }
     }
     Ok((
-        verified.peer.node().clone(),
+        verified.node().clone(),
         session_array(h, "racer-client-challenge")?,
         session_array(h, "racer-server-challenge")?,
     ))
@@ -434,9 +456,12 @@ pub mod test_util {
         phase: &str,
         response: bool,
     ) -> Result<(NodeId, [u8; 32], [u8; 32])> {
-        super::verify_session(signatures, head, peer, phase, response)
+        super::verify_session(signatures, &head, peer, phase, response)
     }
 }
+
+#[cfg(test)]
+mod handshake_tests;
 
 #[cfg(test)]
 mod tests {
@@ -448,7 +473,10 @@ mod tests {
                 method: "POST".into(),
                 target: REQUEST_TARGET.into(),
             },
-            headers: vec![Header::new("content-length", b"0")],
+            headers: vec![
+                Header::new("host", b""),
+                Header::new("content-length", b"0"),
+            ],
         }
     }
 
@@ -459,6 +487,97 @@ mod tests {
             .unwrap()
             .unwrap()
             .0
+    }
+
+    #[test]
+    fn handshake_verification_borrows_original_head_without_consuming_it() {
+        struct BorrowedMac {
+            expected: std::cell::Cell<*const MessageHead>,
+            calls: std::cell::Cell<usize>,
+        }
+
+        impl RequestMac for BorrowedMac {
+            fn sign(&self, _: &Keyring, _: &mut MessageHead) -> Result<()> {
+                Ok(())
+            }
+
+            fn verify(&self, _: &Keyring, head: &MessageHead) -> Result<()> {
+                assert!(std::ptr::eq(head, self.expected.get()));
+                self.calls.set(self.calls.get() + 1);
+                Ok(())
+            }
+        }
+
+        let n = crate::tests::network(3);
+        let policy = Rc::new(BorrowedMac {
+            expected: std::cell::Cell::new(std::ptr::null()),
+            calls: std::cell::Cell::new(0),
+        });
+        let verifier =
+            Signatures::new(n[1].keys.clone(), n[1].certificates.clone(), policy.clone());
+        for response in [false, true] {
+            let phase = if response { "challenge" } else { "hello" };
+            let mut head =
+                session_head(&n[0], n[1].node(), phase, &[1; 32], &[2; 32], response).unwrap();
+            policy.expected.set(&head);
+            let before = Codec::new(MAX_HEAD).encode_head(&head).unwrap();
+            let (peer, a, b) =
+                verify_session(&verifier, &head, Some(n[0].node()), phase, response).unwrap();
+            assert_eq!(&peer, n[0].node());
+            assert_eq!(a, [1; 32]);
+            assert_eq!(b, [2; 32]);
+            assert_eq!(Codec::new(MAX_HEAD).encode_head(&head).unwrap(), before);
+
+            head.headers
+                .iter_mut()
+                .find(|h| h.name == "racer-client-challenge")
+                .unwrap()
+                .value = binary(&[3; 32]).into_bytes();
+            assert!(verify_session(&verifier, &head, Some(n[0].node()), phase, response).is_err());
+            assert_eq!(
+                session_array::<32>(&head, "racer-client-challenge").unwrap(),
+                [3; 32]
+            );
+
+            let wrong =
+                session_head(&n[0], n[2].node(), phase, &[1; 32], &[2; 32], response).unwrap();
+            policy.expected.set(&wrong);
+            assert!(matches!(
+                verify_session(&verifier, &wrong, Some(n[0].node()), phase, response),
+                Err(Error::Unauthorized)
+            ));
+            assert_eq!(receiver(&wrong).unwrap(), *n[2].node());
+        }
+        assert_eq!(policy.calls.get(), 6);
+    }
+
+    #[test]
+    fn handshake_accepts_header_case_but_rejects_unknown_fields() {
+        let n = crate::tests::network(2);
+        for response in [false, true] {
+            let phase = if response { "challenge" } else { "hello" };
+            let mut head =
+                session_head(&n[0], n[1].node(), phase, &[1; 32], &[2; 32], response).unwrap();
+            for field in &mut head.headers {
+                field.name = field.name.to_ascii_uppercase();
+            }
+            let (peer, a, b) =
+                verify_session(&n[1], &head, Some(n[0].node()), phase, response).unwrap();
+            assert_eq!(&peer, n[0].node());
+            assert_eq!(a, [1; 32]);
+            assert_eq!(b, [2; 32]);
+
+            head.headers.retain(|h| {
+                !is_auth_field(&h.name.to_ascii_lowercase())
+                    || h.name.eq_ignore_ascii_case("racer-receiver")
+            });
+            push(&mut head, "x-unknown", "value");
+            let signed = n[0].sign(head).unwrap();
+            assert!(matches!(
+                verify_session(&n[1], &signed.head, Some(n[0].node()), phase, response),
+                Err(Error::Unauthorized)
+            ));
+        }
     }
 
     #[test]

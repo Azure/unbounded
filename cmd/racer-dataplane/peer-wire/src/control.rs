@@ -125,6 +125,9 @@ impl Binding {
             },
             headers: vec![],
         };
+        if !phase.response() {
+            push(&mut h, "host", "");
+        }
         push(&mut h, "content-length", length);
         push(&mut h, "racer-kind", format!("payload-v1-{}", phase.name()));
         for (n, b) in [

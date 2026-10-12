@@ -63,6 +63,7 @@ fn head() -> MessageHead {
         },
         headers: vec![],
     };
+    push(&mut head, "host", "");
     push(&mut head, "racer-receiver", node(1).0);
     push(&mut head, "content-length", 0);
     push(&mut head, "racer-kind", "test");
@@ -106,7 +107,7 @@ fn signature_base_preserves_order_case_and_rejects_invalid_components() {
             "duplicate-signature",
             "leading",
             "trailing",
-            "non-ascii",
+            "control",
             "newline",
             "bad-name",
             "timestamp",
@@ -125,7 +126,7 @@ fn signature_base_preserves_order_case_and_rejects_invalid_components() {
                     let (name, value) = match fault {
                         "leading" => ("x-fixture-00", b" leading".to_vec()),
                         "trailing" => ("x-fixture-00", b"trailing\t".to_vec()),
-                        "non-ascii" => ("x-fixture-00", vec![0xff]),
+                        "control" => ("x-fixture-00", vec![0x7f]),
                         "newline" => ("x-fixture-00", b"x\r\ny".to_vec()),
                         "timestamp" => ("racer-timestamp", b"01700000000123".to_vec()),
                         "signer" => ("racer-signer", b"not-a-uuid".to_vec()),
@@ -150,6 +151,94 @@ fn signature_base_preserves_order_case_and_rejects_invalid_components() {
 }
 
 #[test]
+fn signature_base_preserves_obs_text_and_rejects_controls() {
+    for response in [false, true] {
+        for byte in 0..=u8::MAX {
+            let mut head = canonical_fixture(response, 1, 1);
+            head.headers
+                .iter_mut()
+                .find(|h| h.name == "x-fixture-00")
+                .unwrap()
+                .value = vec![b'a', byte, b'z'];
+            let base = signature_base(&head);
+            if byte.is_ascii_control() {
+                assert!(base.is_err(), "response={response} byte={byte}");
+            } else {
+                let expected = [b"\"x-fixture-00\": a".as_slice(), &[byte], b"z\n"].concat();
+                assert!(
+                    base.unwrap().windows(expected.len()).any(|v| v == expected),
+                    "response={response} byte={byte}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
+    use racer_object_wire::{CacheKey, client::RequestParser, origin};
+
+    let metadata = b"a,\\b\x80";
+    let authorization = b"Bearer \xff";
+    let mut head = origin::request(
+        &CacheKey([0xab; 32]),
+        "GET",
+        Some(metadata),
+        Some(authorization),
+    )
+    .unwrap();
+    let encoded = Codec::new(MAX_HEAD).encode_head(&head).unwrap();
+    let (mut decoded, consumed) = Codec::new(MAX_HEAD).decode_head(&encoded).unwrap().unwrap();
+    assert_eq!(consumed, encoded.len());
+    decoded.start = StartLine::Request {
+        method: "HEAD".into(),
+        target: format!("/v2/objects/{}", CacheKey([0xab; 32]).to_hex()),
+    };
+    let parsed = RequestParser::new(MAX_HEAD).parse(&decoded).unwrap();
+    assert_eq!(parsed.metadata, Some(metadata.as_slice()));
+    assert_eq!(parsed.authorization, Some(authorization.as_slice()));
+
+    push(&mut head, "racer-timestamp", "1700000000123");
+    push(&mut head, "racer-signer", node(0).0);
+    let params = "(\"@method\" \"@request-target\" \"authorization\" \"content-length\" \"host\" \"racer-metadata\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v5\"";
+    push(&mut head, "signature-input", format!("racer={params}"));
+    let mut expected = b"\"@method\": GET\n\"@request-target\": /v1/objects/abababababababababababababababababababababababababababababababab\n\"authorization\": Bearer \xff\n\"content-length\": 0\n\"host\": racer\n\"racer-metadata\": a,\\b\x80\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": ".to_vec();
+    expected.extend_from_slice(params.as_bytes());
+    assert_eq!(signature_base(&head).unwrap(), expected);
+
+    head.headers.retain(|h| !is_auth_field(&h.name));
+    push(&mut head, "racer-receiver", node(1).0);
+    let n = network(2);
+    let signed = n[0].sign(head).unwrap();
+    let digest = signed_digest(&signed).unwrap();
+    let encoded = encode_signed(&signed).unwrap();
+    let decoded = decode_signed(&encoded).unwrap();
+    assert_eq!(signed_digest(&decoded).unwrap(), digest);
+    let verified = n[1].verify_proof(decoded).unwrap();
+    assert_eq!(
+        verified.signed().head.unique("racer-metadata").unwrap(),
+        Some(metadata.as_slice())
+    );
+    assert_eq!(
+        verified.signed().head.unique("authorization").unwrap(),
+        Some(authorization.as_slice())
+    );
+    for name in ["racer-metadata", "authorization"] {
+        let mut tampered = decode_signed(&encoded).unwrap();
+        let value = &mut tampered
+            .head
+            .headers
+            .iter_mut()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .unwrap()
+            .value;
+        *value.last_mut().unwrap() ^= 1;
+        assert_ne!(signed_digest(&tampered).unwrap(), digest);
+        assert!(n[1].verify_proof(tampered).is_err());
+    }
+}
+
+#[test]
 fn rfc9421_exact_request_and_response_signature_base_vectors() {
     let mut request = MessageHead {
         start: StartLine::Request {
@@ -158,14 +247,17 @@ fn rfc9421_exact_request_and_response_signature_base_vectors() {
         },
         headers: vec![],
     };
+    push(&mut request, "host", "");
     push(&mut request, "racer-timestamp", "1700000000123");
     push(&mut request, "racer-signer", node(0).0);
     push(&mut request, "content-length", "0");
-    let params = "(\"@method\" \"@request-target\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v5\"";
+    let params = "(\"@method\" \"@request-target\" \"content-length\" \"host\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v5\"";
     push(&mut request, "signature-input", format!("racer={params}"));
-    assert_eq!(signature_base(&request).unwrap(), format!("\"@method\": POST\n\"@request-target\": /racer/peer/v1?attempt=1\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}").as_bytes());
+    assert_eq!(signature_base(&request).unwrap(), format!("\"@method\": POST\n\"@request-target\": /racer/peer/v1?attempt=1\n\"content-length\": 0\n\"host\": \n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}").as_bytes());
     request.start = StartLine::Response { status: 200 };
-    request.headers.retain(|h| h.name != "signature-input");
+    request
+        .headers
+        .retain(|h| h.name != "signature-input" && h.name != "host");
     let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v5\"";
     push(&mut request, "signature-input", format!("racer={params}"));
     assert_eq!(signature_base(&request).unwrap(), format!("\"@status\": 200\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}").as_bytes());
@@ -278,7 +370,42 @@ fn envelope_limits_and_canonical_fields_preserve_exact_bytes() {
         assert_eq!(decode_binary(value), Err(Error::Unauthorized));
     }
     assert_eq!(binary(&[0, 1, 255]), "AAH/");
-    assert!(decode_nodes(nodes(&[node(1), node(1)]).unwrap().as_bytes()).is_err());
+    let duplicate_nodes = b"\x00\x00\x00\x2400000001-1111-4111-8111-111111111111".repeat(2);
+    assert_eq!(
+        decode_nodes(binary(&duplicate_nodes).as_bytes()),
+        Err(Error::Unauthorized)
+    );
+}
+
+#[test]
+fn unique_node_lists_roundtrip_preserving_order_and_framing() {
+    for length in [0, 1, 3, MAX_HOPS + 1] {
+        let input: Vec<_> = (0..length).rev().map(node).collect();
+        let encoded = nodes(&input).unwrap();
+        let mut expected = Vec::new();
+        for node in &input {
+            expected.extend_from_slice(&36u32.to_be_bytes());
+            expected.extend_from_slice(node.0.as_bytes());
+        }
+        assert_eq!(encoded, binary(&expected));
+        assert_eq!(decode_nodes(encoded.as_bytes()).unwrap(), input);
+    }
+}
+
+#[test]
+fn node_list_encoding_rejects_duplicates_invalid_ids_and_excess_hops() {
+    let mut maximum_duplicate: Vec<_> = (0..=MAX_HOPS).map(node).collect();
+    maximum_duplicate[MAX_HOPS] = node(0);
+    for input in [
+        vec![node(1), node(1)],
+        vec![node(1), node(2), node(1)],
+        maximum_duplicate,
+        vec![NodeId("not-a-uuid".into())],
+    ] {
+        assert_eq!(nodes(&input), Err(Error::InvalidRequest));
+    }
+    let too_many: Vec<_> = (0..MAX_HOPS + 2).map(node).collect();
+    assert_eq!(nodes(&too_many), Err(Error::HopBudgetExhausted));
 }
 
 #[test]
@@ -364,6 +491,44 @@ fn route_transition_consumes_one_link_without_refilling_authority() {
             Err(Error::HopBudgetExhausted)
         );
     }
+}
+
+#[test]
+fn request_builders_supply_host_for_strict_http_codec() {
+    use crate::control::{Binding, Phase};
+    let n = network(2);
+    let original = n[0].sign(head()).unwrap();
+    let hop = forwarding::hop_head("request-hop", &original, &original).unwrap();
+    assert_eq!(hop.unique("host").unwrap(), Some(b"".as_slice()));
+    Codec::new(MAX_HEAD).encode_head(&hop).unwrap();
+
+    let auth = ForwardedHead {
+        original: Arc::new(original),
+        hops: vec![],
+    };
+    let envelope = encode_envelope(&auth, false, 0).unwrap();
+    assert_eq!(envelope.unique("host").unwrap(), Some(b"".as_slice()));
+    decode_envelope(envelope, false).unwrap();
+    let binding = Binding {
+        request: [1; 32],
+        response: [2; 32],
+        transfer: [3; 16],
+        membership: 1,
+        deadline: 1,
+        rail: racer_control_wire::RailId(1),
+    };
+    for phase in [Phase::Accept, Phase::Fallback, Phase::Done, Phase::Finish] {
+        let head = binding.head(phase, &[0; 32], 0, vec![]).unwrap();
+        assert_eq!(
+            head.unique("host").unwrap(),
+            (!phase.response()).then_some(b"".as_slice())
+        );
+        Codec::new(MAX_HEAD).encode_head(&head).unwrap();
+    }
+
+    let mut duplicate = head();
+    push(&mut duplicate, "Host", "");
+    assert!(n[0].sign(duplicate).is_err());
 }
 
 #[test]

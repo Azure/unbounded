@@ -2,6 +2,7 @@
 name = "peer-wire"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 publish = false
 description = "Signed peer heads, ordered sessions, and forwarding proofs"
 
@@ -17,5 +18,6 @@ base64 = "0.22"
 sha2 = "0.10"
 
 [dev-dependencies]
+racer-object-wire = { path = "../object-wire" }
 racer-crypto = { path = "../crypto", features = ["test-util"] }
 uring-runtime = { path = "../runtime", features = ["simulation", "test-util"] }

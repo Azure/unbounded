@@ -250,7 +250,7 @@ impl Signatures {
 
     /// Verify a historical hop under the fresh-message timestamp window.
     pub fn verify_historical(&self, signed: &SignedHead) -> Result<VerifiedPeer> {
-        self.verify_signed_age(signed, true)
+        self.verify_signed_age(&signed.head, &signed.signature, true)
     }
 
     /// Revalidate retained request authority bounded by its original signed deadline.
@@ -268,11 +268,15 @@ impl Signatures {
         {
             return Err(Error::Unauthorized);
         }
-        self.verify_signed_age(signed, false)
+        self.verify_signed_age(&signed.head, &signed.signature, false)
     }
 
-    fn verify_signed_age(&self, signed: &SignedHead, fresh: bool) -> Result<VerifiedPeer> {
-        let head = &signed.head;
+    fn verify_signed_age(
+        &self,
+        head: &MessageHead,
+        signature: &[u8],
+        fresh: bool,
+    ) -> Result<VerifiedPeer> {
         if field(head, "racer-profile")? != PROFILE
             || field(head, "racer-cluster")? != self.keys.cluster().0
         {
@@ -281,8 +285,8 @@ impl Signatures {
         uuid(&self.keys.cluster().0)?;
         self.request_mac.verify(&self.keys, head)?;
         let base = signature_base(head)?;
-        if signed.signature.len() != 64
-            || field(head, "signature")? != format!("racer=:{}:", binary(&signed.signature))
+        if signature.len() != 64
+            || field(head, "signature")? != format!("racer=:{}:", binary(signature))
         {
             return Err(Error::Unauthorized);
         }
@@ -306,7 +310,7 @@ impl Signatures {
             return Err(Error::Replay);
         }
         self.certificates
-            .verify_signed(&chain, &signer, &base, &signed.signature)
+            .verify_signed(&chain, &signer, &base, signature)
             .map_err(Into::into)
     }
 }
@@ -375,7 +379,7 @@ fn components(head: &MessageHead) -> Result<Vec<String>> {
         if !names.insert(name)
             || h.value.first().is_some_and(|b| b.is_ascii_whitespace())
             || h.value.last().is_some_and(|b| b.is_ascii_whitespace())
-            || !h.value.is_ascii()
+            || h.value.iter().any(u8::is_ascii_control)
         {
             return Err(Error::Unauthorized);
         }
@@ -416,19 +420,25 @@ fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
     if field(head, "signature-input")? != format!("racer={input}") {
         return Err(Error::Unauthorized);
     }
-    let mut lines = Vec::new();
+    let mut base = Vec::new();
     for name in components {
-        let value = match (name.as_str(), &head.start) {
-            ("@method", StartLine::Request { method, .. }) => method.clone(),
-            ("@request-target", StartLine::Request { target, .. }) => target.clone(),
-            ("@status", StartLine::Response { status }) => status.to_string(),
-            _ => String::from_utf8(head.unique(&name)?.ok_or(Error::Unauthorized)?.to_vec())
-                .map_err(|_| Error::Unauthorized)?,
-        };
-        lines.push(format!("\"{name}\": {value}"));
+        base.extend_from_slice(format!("\"{name}\": ").as_bytes());
+        match (name.as_str(), &head.start) {
+            ("@method", StartLine::Request { method, .. }) => {
+                base.extend_from_slice(method.as_bytes());
+            }
+            ("@request-target", StartLine::Request { target, .. }) => {
+                base.extend_from_slice(target.as_bytes());
+            }
+            ("@status", StartLine::Response { status }) => {
+                base.extend_from_slice(status.to_string().as_bytes());
+            }
+            _ => base.extend_from_slice(head.unique(&name)?.ok_or(Error::Unauthorized)?),
+        }
+        base.push(b'\n');
     }
-    lines.push(format!("\"@signature-params\": {input}"));
-    Ok(lines.join("\n").into_bytes())
+    base.extend_from_slice(format!("\"@signature-params\": {input}").as_bytes());
+    Ok(base)
 }
 
 /// Bind the exact signature base and signature without hashing payload bytes.
@@ -570,8 +580,11 @@ pub fn nodes(nodes: &[NodeId]) -> Result<String> {
         return Err(Error::HopBudgetExhausted);
     }
     let mut bytes = Vec::new();
-    for node in nodes {
+    for (index, node) in nodes.iter().enumerate() {
         uuid(&node.0)?;
+        if nodes[..index].contains(node) {
+            return Err(Error::InvalidRequest);
+        }
         bytes.extend_from_slice(&(node.0.len() as u32).to_be_bytes());
         bytes.extend_from_slice(node.0.as_bytes());
     }
@@ -675,6 +688,9 @@ pub fn encode_envelope(
             name: format!("racer-hop-{index}"),
             value: encode_signed(head)?,
         });
+    }
+    if !response {
+        headers.push(Header::new("host", b""));
     }
     let head = MessageHead {
         start: if response {

@@ -88,6 +88,7 @@ pub fn hop_head(kind: &str, original: &SignedHead, previous: &SignedHead) -> Res
         },
         headers: Vec::new(),
     };
+    push(&mut head, "host", "");
     push(&mut head, "racer-kind", kind);
     push(&mut head, "content-length", 0);
     push_binary(&mut head, "racer-original", &signed_digest(original)?);
