@@ -250,100 +250,66 @@ func TestMergeLowestTunnelMTU(t *testing.T) {
 	}
 }
 
-func TestMergeGatewayPoolPeeringTunnelMTU(t *testing.T) {
-	mtu := int32(1280)
-	peering := unboundednetv1alpha1.GatewayPoolPeering{
-		Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{
-			GatewayPools: []string{"pool-a", "pool-b"},
-			TunnelMTU:    &mtu,
-		},
-	}
-	tunnelMTUs := map[string]int{"pool-a": 1400, "pool-b": 1200}
-
-	mergeGatewayPoolPeeringTunnelMTU(tunnelMTUs, peering)
-
-	if got := tunnelMTUs["pool-a"]; got != 1280 {
-		t.Fatalf("pool-a MTU = %d, want 1280", got)
-	}
-
-	if got := tunnelMTUs["pool-b"]; got != 1200 {
-		t.Fatalf("pool-b MTU = %d, want existing lower value 1200", got)
-	}
-}
-
-func TestResolveSiteTopologyTunnelMTU(t *testing.T) {
+func TestForwardingAwareTunnelMTU(t *testing.T) {
 	siteMTUs := map[string]int{
-		"local":        1450,
-		"remote":       1250,
-		"disconnected": 576,
+		"site-a": 1450,
+		"site-b": 1300,
 	}
 	poolMTUs := map[string]int{
-		"local-pool":  1400,
-		"remote-pool": 1350,
+		"pool-g": 1100,
+		"pool-h": 1400,
 	}
 
-	sitePeerings := []unboundednetv1alpha1.SitePeering{{
-		Spec: unboundednetv1alpha1.SitePeeringSpec{
-			Sites:     []string{"local", "remote"},
-			TunnelMTU: ptrInt32(1300),
-		},
-	}}
-	assignments := []unboundednetv1alpha1.SiteGatewayPoolAssignment{
-		{
-			Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
-				Sites:        []string{"local"},
-				GatewayPools: []string{"local-pool"},
-				TunnelMTU:    ptrInt32(1380),
-			},
-		},
-		{
-			Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
-				Sites:        []string{"remote"},
-				GatewayPools: []string{"remote-pool"},
-			},
-		},
+	meshPeer := meshPeerInfo{SiteName: "site-b"}
+	if got := resolveMeshPeerTunnelMTU(0, meshPeer, "site-a", siteMTUs, map[string]int{"site-b": 1350}, nil); got != 1300 {
+		t.Fatalf("A-B mesh MTU = %d, want remote Site minimum 1300", got)
 	}
-	poolPeerings := []unboundednetv1alpha1.GatewayPoolPeering{{
+
+	// Site A meshes Site B, and only Site B is assigned to pool G. Mesh peers
+	// advertise B's PodCIDRs, not transit through B to G, so G must not lower A.
+	if got := resolveCNIConfigMTU(0, siteMTUs["site-a"], []meshPeerInfo{{TunnelMTU: 1300}}, nil, 1500); got != 1300 {
+		t.Fatalf("A-B-G unsupported transit MTU = %d, want 1300", got)
+	}
+
+	gatewayPeer := gatewayPeerInfo{PoolName: "pool-g"}
+	if got := resolveGatewayPeerTunnelMTU(0, "site-a", gatewayPeer, siteMTUs, map[string]int{"pool-g": 1250}, poolMTUs); got != 1100 {
+		t.Fatalf("direct gateway MTU = %d, want pool minimum 1100", got)
+	}
+
+	peering := unboundednetv1alpha1.GatewayPoolPeering{
 		Spec: unboundednetv1alpha1.GatewayPoolPeeringSpec{
-			GatewayPools: []string{"local-pool", "remote-pool"},
-			TunnelMTU:    ptrInt32(1280),
+			GatewayPools: []string{"pool-g", "pool-h"},
+			TunnelMTU:    ptrInt32(1200),
 		},
-	}}
-
-	if got := resolveSiteTopologyTunnelMTU(
-		"local",
-		siteMTUs,
-		poolMTUs,
-		sitePeerings,
-		assignments,
-		poolPeerings,
-		nil,
-	); got != 1250 {
-		t.Fatalf("local topology MTU = %d, want remote site minimum 1250", got)
 	}
 
-	if got := resolveSiteTopologyTunnelMTU(
-		"disconnected",
-		siteMTUs,
-		poolMTUs,
-		sitePeerings,
-		assignments,
-		poolPeerings,
-		nil,
-	); got != 576 {
-		t.Fatalf("disconnected topology MTU = %d, want 576", got)
+	transitMTU := gatewayPoolPeeringTunnelMTU([]string{"pool-g"}, "pool-h", []unboundednetv1alpha1.GatewayPoolPeering{peering})
+	if got := resolveGatewayPeerTunnelMTU(0, "site-a", gatewayPeerInfo{PoolName: "pool-h", TransitTunnelMTU: transitMTU}, siteMTUs, nil, poolMTUs); got != 1200 {
+		t.Fatalf("gateway multi-pool routed path MTU = %d, want peering minimum 1200", got)
 	}
 
-	if got := resolveSiteTopologyTunnelMTU(
-		"local",
-		map[string]int{"local": 1450},
-		map[string]int{"gateway-only": 1200},
-		nil,
-		nil,
-		nil,
-		[]string{"gateway-only"},
-	); got != 1200 {
-		t.Fatalf("gateway pool membership MTU = %d, want 1200", got)
+	learnedRoutes := map[string]unboundednetv1alpha1.GatewayNodeRoute{
+		"10.0.0.0/24": {
+			Paths: [][]unboundednetv1alpha1.GatewayNodePathHop{{
+				{Type: "GatewayPool", Name: "pool-h"},
+				{Type: "GatewayPool", Name: "pool-g"},
+			}},
+		},
+	}
+	if got := learnedGatewayTransitTunnelMTU("pool-g", learnedRoutes, []unboundednetv1alpha1.GatewayPoolPeering{peering}); got != 1200 {
+		t.Fatalf("worker learned gateway transit MTU = %d, want 1200", got)
+	}
+
+	if got := learnedGatewayTransitTunnelMTU("pool-g", nil, []unboundednetv1alpha1.GatewayPoolPeering{peering}); got != 0 {
+		t.Fatalf("gateway peering without a learned forwarding path constrained worker MTU: %d", got)
+	}
+
+	if got := resolveMeshPeerTunnelMTU(1420, meshPeerInfo{SiteName: "missing"}, "site-a", siteMTUs, nil, nil); got != 1420 {
+		t.Fatalf("missing remote resources MTU = %d, want configured default 1420", got)
+	}
+
+	if got := resolveTunnelMTU(0, -1, 0, 1280); got != 1280 {
+		t.Fatalf("invalid non-positive MTUs changed result: %d", got)
 	}
 }
 

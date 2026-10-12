@@ -318,11 +318,11 @@ encapsulation overhead. For example, WireGuard over a 1500-byte route uses
 **Behavior:**
 - Each peer's effective MTU is the lowest applicable configured cap, CRD
   `tunnelMTU`, and route MTU after encapsulation overhead.
-- Sites and GatewayPools form a topology connected by SitePeerings,
-  SiteGatewayPoolAssignments, and GatewayPoolPeerings. The lowest `tunnelMTU`
-  in the local site's connected topology is applied site-wide, including
-  downstream multi-hop gateway paths.
-- The CNI MTU is the lowest effective peer or connected-topology MTU.
+- Only scopes on an actual forwarding path constrain a node. Direct mesh
+  peers use both endpoint Sites and their enabled SitePeering. Gateway paths
+  use assignments targeting the worker's own Site, the selected GatewayPool,
+  and GatewayPoolPeerings present in an advertised transit path.
+- The CNI MTU is the lowest effective MTU among actual mesh and gateway peers.
 - At startup and whenever the effective CNI MTU changes, the node agent updates
   the CNI bridge and both endpoints of existing pod veth pairs.
 - Forwarded TCP SYN packets on every interface are MSS-clamped to the

@@ -197,6 +197,7 @@ type gatewayPeerInfo struct {
 	UnmanagedCNISite       bool     // Gateway's Site has manageCniPlugin=false, so it never gets a podCIDR
 	TunnelProtocol         string   // Resolved tunnel protocol for this peer (WireGuard or GENEVE)
 	TunnelMTU              int      // Effective MTU after route, encapsulation, and CRD limits
+	TransitTunnelMTU       int      // MTU imposed by an actual downstream GatewayPoolPeering path
 }
 
 // meshPeerInfo contains information about a peer on the main mesh interface.
