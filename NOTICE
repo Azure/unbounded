@@ -515,6 +515,20 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/prometheus/client_golang/blob/v1.24.1/LICENSE
+  - dependency: github.com/prometheus/client_model
+    ecosystem: go
+    copyright:
+      - Copyright 2012-2015 The Prometheus Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/prometheus/client_model/blob/v0.6.2/LICENSE
+  - dependency: github.com/prometheus/common
+    ecosystem: go
+    copyright:
+      - Copyright 2015 The Prometheus Authors
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/prometheus/common/blob/v0.70.1/LICENSE
   - dependency: github.com/spf13/cobra
     ecosystem: go
     copyright:
