@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
@@ -25,13 +26,22 @@ import (
 // reach a v1 origin at http://racer. The caller owns transport and server lifetime,
 // including canceling request contexts to close hijacked subscription sockets.
 func NewHandler(transport http.RoundTripper) http.Handler {
+	return NewHandlerWithWarm(transport, nil)
+}
+
+// WarmPolicy scripts retention acceptance after a successful origin HEAD.
+// Zero refuses retention. The fake does not cache or load object pages.
+type WarmPolicy func(context.Context, wire.Request, wire.Metadata) (time.Time, error)
+
+// NewHandlerWithWarm adds a scripted warming policy. Nil refuses all retention.
+func NewHandlerWithWarm(transport http.RoundTripper, warm WarmPolicy) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && strings.HasPrefix(r.RequestURI, wire.ClientObjectPrefix) {
 			serveSubscription(w, r, transport)
 			return
 		}
 
-		serveHead(w, r, transport)
+		serveHead(w, r, transport, warm)
 	})
 }
 
@@ -345,14 +355,14 @@ func fetchPage(ctx context.Context, transport http.RoundTripper, request wire.Re
 	return res, response, err
 }
 
-func serveHead(w http.ResponseWriter, r *http.Request, transport http.RoundTripper) {
+func serveHead(w http.ResponseWriter, r *http.Request, transport http.RoundTripper, warm WarmPolicy) {
 	descriptor, err := wire.ParseClientHead(r)
 	if err != nil {
 		writeError(w, 400)
 		return
 	}
 
-	res, _, err := fetchPage(r.Context(), transport, descriptor, nil)
+	res, response, err := fetchPage(r.Context(), transport, descriptor, nil)
 	if res != nil {
 		defer closeBody(res.Body)
 	}
@@ -363,8 +373,39 @@ func serveHead(w http.ResponseWriter, r *http.Request, transport http.RoundTripp
 		return
 	}
 
+	var retain time.Time
+	if err == nil && descriptor.RetainSeconds != 0 && warm != nil {
+		retain, err = warm(r.Context(), descriptor, response.Metadata)
+		if err != nil {
+			status := 502
+			if errors.As(err, &typed) && typed.Status != 0 {
+				status = typed.Status
+			}
+
+			writeError(w, status)
+
+			return
+		}
+
+		if !retain.IsZero() {
+			check := response.Metadata
+
+			check.ExpiresAt = retain
+			if check.Validate() != nil {
+				writeError(w, 502)
+				return
+			}
+		}
+	}
+
 	for name, values := range res.Header {
 		w.Header()[name] = values
+	}
+	// An origin cannot grant retention on behalf of the cache.
+	w.Header().Del("Racer-Retain-Until")
+
+	if !retain.IsZero() {
+		w.Header().Set("Racer-Retain-Until", strconv.FormatInt(retain.UnixMilli(), 10))
 	}
 
 	w.WriteHeader(res.StatusCode)

@@ -597,7 +597,7 @@ func headerToken(b byte) bool {
 func singletonHeader(name string) bool {
 	switch name {
 	case "host", "content-length", "content-type", "content-range", "etag", "if-match", "range",
-		"racer-expires-at", "racer-content-type", "racer-metadata", "authorization", "racer-object-length",
+		"racer-expires-at", "racer-retain-until", "racer-content-type", "racer-metadata", "authorization", "racer-object-length",
 		"racer-range-start", "racer-range-end", "racer-page-credits", "racer-byte-credits", "racer-ordered":
 		return true
 	default:
@@ -617,7 +617,7 @@ func HeadHeaders(head []byte) http.Header {
 		name, value := string(line[:i]), string(line[i+1:])
 
 		switch strings.ToLower(name) {
-		case "content-length", "content-range", "range", "racer-expires-at",
+		case "content-length", "content-range", "range", "racer-expires-at", "racer-retain-until",
 			"racer-object-length", "racer-range-start", "racer-range-end",
 			"racer-page-credits", "racer-byte-credits", "racer-ordered":
 			value = strings.TrimPrefix(value, " ")
@@ -657,6 +657,7 @@ type Request struct {
 	Key                            [32]byte
 	Operation                      Operation
 	Pin                            string
+	RetainSeconds                  uint64
 	Range                          Range
 	AdapterMetadata, Authorization string `json:"-"`
 }
@@ -904,7 +905,14 @@ func ParseClientHead(r *http.Request) (Request, error) {
 
 	raw.WriteString("\r\n")
 
-	return ParseRequestHead(raw.Bytes(), false)
+	request, err := ParseRequestHead(raw.Bytes(), false)
+	if err != nil {
+		return Request{}, err
+	}
+
+	request.RetainSeconds, err = parseMaxAge(r.Header.Values("Cache-Control"))
+
+	return request, err
 }
 
 func requestHeadAt(r Request, prefix string) ([]byte, error) {
@@ -928,6 +936,10 @@ func requestHeadAt(r Request, prefix string) ([]byte, error) {
 		b.WriteString("If-Match: " + r.Pin + "\r\n")
 	}
 
+	if prefix == ClientObjectPrefix && r.Operation == OperationHead && r.RetainSeconds != 0 {
+		b.WriteString("Cache-Control: max-age=" + strconv.FormatUint(r.RetainSeconds, 10) + "\r\n")
+	}
+
 	if r.AdapterMetadata != "" {
 		b.WriteString("Racer-Metadata: " + r.AdapterMetadata + "\r\n")
 	}
@@ -943,6 +955,7 @@ func requestHeadAt(r Request, prefix string) ([]byte, error) {
 
 type Response struct {
 	Metadata    Metadata
+	RetainUntil time.Time
 	First, Last uint64
 	Length      int64
 	Close       bool
@@ -962,7 +975,21 @@ func ParseClientHeadResponse(head []byte, request Request) (Response, error) {
 		return Response{}, failure(ErrorProtocol, "response", nil)
 	}
 
-	return parseResponseHead(head, request, nil, "HEAD, POST")
+	response, err := parseResponseHead(head, request, nil, "HEAD, POST")
+	if err != nil {
+		return Response{}, err
+	}
+
+	if values, ok := HeadHeaders(head)["Racer-Retain-Until"]; ok {
+		millis, err := Decimal(values[0])
+		if err != nil {
+			return Response{}, failure(ErrorProtocol, "retain until", nil)
+		}
+
+		response.RetainUntil = time.UnixMilli(int64(millis)).UTC()
+	}
+
+	return response, nil
 }
 
 func parseResponseHead(head []byte, request Request, snapshot *Metadata, allow string) (Response, error) {
@@ -1027,6 +1054,9 @@ func parseResponseHead(head []byte, request Request, snapshot *Metadata, allow s
 
 func responseStatusError(h http.Header, status int, length uint64, request Request, snapshot *Metadata, allow string) error {
 	bad := failure(ErrorProtocol, "response", nil)
+	if allow == "HEAD, POST" && hasAnyHeader(h, "Racer-Retain-Until") {
+		return bad
+	}
 
 	statusErr := StatusError(status)
 	if statusErr.Kind == ErrorProtocol || length != 0 || hasAnyHeader(h, "Etag", "Racer-Expires-At", "Racer-Content-Type") {
