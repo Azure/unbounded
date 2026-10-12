@@ -10,11 +10,11 @@ DASHBOARD = json.loads((ROOT / "grafana-direct-zipf.json").read_text())
 
 
 class DashboardTest(unittest.TestCase):
-    def test_five_basic_panels_and_eight_queries(self):
+    def test_six_basic_panels_and_ten_queries(self):
         self.assertEqual(DASHBOARD["uid"], "racer-direct-zipf")
         panels = DASHBOARD["panels"]
-        self.assertEqual([p["id"] for p in panels], [1, 2, 3, 4, 5])
-        self.assertEqual(sum(len(p["targets"]) for p in panels), 8)
+        self.assertEqual([p["id"] for p in panels], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(sum(len(p["targets"]) for p in panels), 10)
         for panel in panels:
             self.assertEqual(panel["type"], "timeseries")
             self.assertEqual(panel["datasource"], {"type": "prometheus", "uid": "prometheus"})
@@ -60,13 +60,58 @@ class DashboardTest(unittest.TestCase):
 
     def test_experiment_buffer_descriptions(self):
         readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
-        self.assertEqual(DASHBOARD["version"], 8)
+        self.assertEqual(DASHBOARD["version"], 9)
         for text in (DASHBOARD["description"], readme):
             self.assertIn("48 GiB plaintext, 64 GiB ciphertext", text)
             self.assertIn("2 GiB each for dirty and", text)
             for stale in ("4 GiB plaintext", "8 GiB plaintext", "32 GiB plaintext",
                           "8 GiB ciphertext", "16 GiB ciphertext"):
                 self.assertNotRegex(text, r"\b" + re.escape(stale))
+
+    def test_network_tx_rx_scope_conversion_and_single_interface(self):
+        panel = DASHBOARD["panels"][5]
+        self.assertEqual(panel["title"], "Total Racer-node network TX/RX (Gbit/s)")
+        self.assertEqual(panel["gridPos"], {"h": 9, "w": 24, "x": 0, "y": 27})
+        self.assertEqual(panel["fieldConfig"]["defaults"]["unit"], "suffix:Gbit/s")
+        self.assertEqual(panel["fieldConfig"]["defaults"]["min"], 0)
+        self.assertEqual([t["legendFormat"] for t in panel["targets"]],
+                         ["TX (ens1)", "RX (ens1)"])
+        join = (' and on (node) group by (node) '
+                '(up{job="kubernetes-pods",namespace="${namespace}",'
+                'app_kubernetes_io_name="racer-dataplane"})')
+        readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
+        for target, direction in zip(panel["targets"], ("transmit", "receive")):
+            with self.subTest(direction=direction):
+                rate = ('rate(node_network_' + direction + '_bytes_total'
+                        '{job="node-exporter",device="ens1"}[5m])')
+                self.assertEqual(target["expr"], 'sum(' + rate + join + ') * 8 / 1e9')
+                # No duplicate interfaces, fleet multiplier, healthy-only gate, or zero fill.
+                for forbidden in ('device=~', 'eth0', 'geneve0', '* 100', '== 1',
+                                  'or vector(0)', 'clamp_min'):
+                    self.assertNotIn(forbidden, target["expr"])
+                if direction == "transmit":
+                    self.assertIn('count(' + rate + join + ')', readme)
+        for text in (panel["description"], " ".join(readme.split())):
+            for required in ("non-Racer and external traffic", "not peer-only",
+                             "node-pair attribution", "do not add them as unique traffic",
+                             "Missing network samples reduce totals"):
+                self.assertIn(required.lower(), text.lower())
+        self.assertIn("all 100 Racer nodes", panel["description"])
+        self.assertIn("down dataplane scrape targets", panel["description"])
+        self.assertIn("100 Racer nodes among 103 node-exporter nodes",
+                      " ".join(readme.split()))
+        self.assertIn("Zero traffic still contributes a series", readme)
+        self.assertIn("absent samples do not", readme)
+
+    def test_cache_queries_remain_event_shares(self):
+        selector = ('{job="kubernetes-pods",namespace="${namespace}",'
+                    'app_kubernetes_io_name="racer-dataplane"}')
+        rates = {tier: 'sum(rate(racer_' + tier + '_hits_total' + selector + '[5m]))'
+                 for tier in ("memory", "disk", "peer")}
+        denominator = '(' + ' + '.join(rates.values()) + ')'
+        self.assertEqual([t["expr"] for t in DASHBOARD["panels"][2]["targets"]],
+                         [rates[tier] + ' / ' + denominator
+                          for tier in ("peer", "disk", "memory")])
 
     def test_second_sight_retention_descriptions(self):
         readme = (ROOT / "grafana-direct-zipf-README.md").read_text()

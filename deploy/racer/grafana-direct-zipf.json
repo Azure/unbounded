@@ -5,7 +5,7 @@
   "description": "Second-sight local disk retention: 16384 x 1073741824-byte blobs (16 TiB catalog), seed zipf-balanced-v2, Zipf exponent 1.1, C16, 32 catalog workers. Buffers: 48 GiB plaintext, 64 GiB ciphertext, and 2 GiB each for dirty and registered buffers. RACER_ADMISSION_MODE=second-sight is the runtime default; repeated nonowner reads can admit verified ciphertext, subject to resource limits. Throughput includes only zipf-16t-v3 loadgens, excluding the prior exponent 1.0 run with the same catalog bytes. During catalog hashing, no data is expected, not zero. Wait a full five-minute window after readiness. Treat initial observations as warm-up, not steady state. Successful payload is not wire traffic or verified goodput. Cache-hit events are nonexclusive, not client attribution. Disk values are physical bytes, not effective payload capacity.",
   "tags": ["racer", "zipf"],
   "schemaVersion": 39,
-  "version": 8,
+  "version": 9,
   "editable": false,
   "timezone": "browser",
   "refresh": "1m",
@@ -84,6 +84,20 @@
       "targets": [
         {"refId": "A", "legendFormat": "Total assigned physical capacity", "expr": "sum(racer_disk_size_bytes{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"})"},
         {"refId": "B", "legendFormat": "Used physical record reservations", "expr": "sum(racer_disk_used_bytes{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"})"}
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Total Racer-node network TX/RX (Gbit/s)",
+      "description": "Cluster sum of five-minute ens1 physical-host byte rates across discovered Racer dataplane nodes, converted to decimal Gbit/s. Includes non-Racer and external traffic; an approximation of inter-node traffic, not peer-only throughput or node-pair attribution. TX and RX are separate: do not add them as unique traffic, since a cross-host transfer appears at both ends. Only ens1 is counted, not eth0 or Geneve. The node join excludes system-only nodes and includes down dataplane scrape targets. Missing network samples reduce totals, not zero-fill them; verify coverage of all 100 Racer nodes.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 27},
+      "fieldConfig": {"defaults": {"unit": "suffix:Gbit/s", "min": 0, "decimals": 2, "noValue": "No data"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"refId": "A", "legendFormat": "TX (ens1)", "expr": "sum(rate(node_network_transmit_bytes_total{job=\"node-exporter\",device=\"ens1\"}[5m]) and on (node) group by (node) (up{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"})) * 8 / 1e9"},
+        {"refId": "B", "legendFormat": "RX (ens1)", "expr": "sum(rate(node_network_receive_bytes_total{job=\"node-exporter\",device=\"ens1\"}[5m]) and on (node) group by (node) (up{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"})) * 8 / 1e9"}
       ]
     }
   ]

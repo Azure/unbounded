@@ -1,6 +1,6 @@
 # Direct Zipf dashboard: 16384 x 1 GiB (16 TiB catalog)
 
-`grafana-direct-zipf.json` has five panels. Its UID is `racer-direct-zipf`.
+`grafana-direct-zipf.json` has six panels and ten queries. Its UID is `racer-direct-zipf`.
 Use datasource UID `prometheus`, 60-second scrapes, and the existing
 `kubernetes-pods` and `node-exporter` jobs. The default namespace is
 `unbounded-system`.
@@ -34,7 +34,7 @@ The node average divides by distinct discovered `racer-dataplane` nodes,
 including down scrape targets, not expected fleet size.
 
 The size multiplier is fixed. The success counter has no blob-size label.
-Both throughput queries select the Pod-template label
+Both successful-payload queries select the Pod-template label
 `racer.unbounded-cloud.io/benchmark=zipf-16t-v3`, scraped as
 `racer_unbounded_cloud_io_benchmark="zipf-16t-v3"`. Keep the namespace, job, and
 `app_kubernetes_io_name="racer-loadgen"` selectors. Old and unlabeled loadgens are
@@ -92,6 +92,39 @@ The source contract is in `cmd/racer-dataplane/alloc/src/segments.rs`
 and `cmd/racer-dataplane/src/telemetry.rs` (`write_disks`). Workers sharing a disk
 are summed once by disk label before scrape export.
 
+## Network throughput
+
+**Total Racer-node network TX/RX (Gbit/s)** sums five-minute byte-counter rates
+on physical interface `ens1`, then converts bytes/s to decimal Gbit/s with
+`* 8 / 1e9`. TX and RX stay separate. Do not add them as unique traffic: a
+cross-host transfer appears in TX at one end and RX at the other.
+
+The `and on (node) group by (node) (up{...racer-dataplane...})` join limits
+each direction to discovered Racer nodes in the selected namespace, including
+down dataplane scrape targets. Live validation found 100 Racer nodes among
+103 node-exporter nodes. System-only nodes are excluded. Discovery is not
+expected inventory; removed targets disappear. Missing network samples reduce
+totals and are not zero-filled.
+
+This is host traffic, including non-Racer and external traffic, not peer-only
+throughput or node-pair attribution. It approximates traffic between nodes in
+this workload; the counters cannot identify each node pair. Count only `ens1`,
+not `eth0` or Geneve as well, to avoid counting traffic at multiple interfaces.
+The shared `geneve0` tunnel is not Racer-exclusive: network routing includes
+peer pod/node IPs and gateway prefixes
+(`cmd/unbounded-net-node/tunnel_config.go:467-504`). This fixed interface choice
+must be checked again if the host network layout changes.
+
+Check coverage for **each** direction, replacing `transmit` with `receive`:
+
+```promql
+count(rate(node_network_transmit_bytes_total{job="node-exporter",device="ens1"}[5m]) and on (node) group by (node) (up{job="kubernetes-pods",namespace="${namespace}",app_kubernetes_io_name="racer-dataplane"}))
+```
+
+Expect 100 contributing series with one exporter target per node. Check distinct
+node labels and recent source-counter timestamps too; a rate window can contain
+old samples. Zero traffic still contributes a series, while absent samples do not.
+
 Run the dashboard checks with:
 
 ```sh
@@ -106,7 +139,7 @@ is needed. See [the provisioning guide](grafana-README.md#provision-through-the-
 Open `/d/racer-direct-zipf` through the existing Grafana access path.
 
 If Grafana says the datasource is missing, check its datasource health API and
-run all eight panel queries through Grafana, not just Prometheus. The UID can exist while
+run all ten panel queries through Grafana, not just Prometheus. The UID can exist while
 the Prometheus plugin is not registered. See the
 [startup recovery note](grafana-README.md#grafana-startup-troubleshooting).
 Preserve Grafana's database and plugin files before replacing a pod that uses
