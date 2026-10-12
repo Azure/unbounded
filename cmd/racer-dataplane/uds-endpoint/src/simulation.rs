@@ -26,7 +26,9 @@ pub struct BoundSocket {
 
 impl BoundSocket {
     /// Create the directory and bind one socket without choosing its permission mode.
+    /// Reject invalid basename components before creating any directory.
     pub fn bind(sim: Simulation, directory: PathBuf, basename: &str) -> io::Result<Self> {
+        crate::directory::component(basename.as_bytes())?;
         sim.create_dir_all(&directory)?;
         let directory_handle = sim.open(None, &directory, libc::O_PATH | libc::O_DIRECTORY)?;
         let path = directory.join(basename);
@@ -144,6 +146,117 @@ mod tests {
     use crate::publication::{Publication, Replacement};
     use std::rc::Rc;
     use uring_runtime::reactor::simulation::Fault;
+
+    #[test]
+    fn bind_rejects_invalid_names_without_mutation() {
+        for basename in [
+            "".into(),
+            ".".into(),
+            "..".into(),
+            "/".into(),
+            "/escaped".into(),
+            "/foreign/file".into(),
+            "/foreign/socket".into(),
+            "../escaped".into(),
+            "../foreign/file".into(),
+            "../foreign/socket".into(),
+            "child/socket".into(),
+            "./socket".into(),
+            "socket/".into(),
+            "a\0b".into(),
+            "x".repeat(256),
+            "é".repeat(128),
+        ] {
+            for directory in ["/new/nested", "/sockets"] {
+                let sim = Simulation::new();
+                let foreign =
+                    BoundSocket::bind(sim.clone(), PathBuf::from("/foreign"), "socket").unwrap();
+                let file = Path::new("/foreign/file");
+                sim.write_file(file, b"foreign").unwrap();
+                sim.create_dir_all(Path::new("/sockets")).unwrap();
+                let paths = [
+                    "/",
+                    "/foreign",
+                    "/foreign/socket",
+                    "/foreign/file",
+                    "/sockets",
+                ];
+                let before = paths.map(|path| sim.metadata(Path::new(path)).unwrap());
+
+                let result = BoundSocket::bind(sim.clone(), PathBuf::from(directory), &basename);
+                let error = result.err().expect("invalid basename must fail");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{basename:?}");
+                assert_eq!(
+                    error.get_ref().unwrap().downcast_ref(),
+                    Some(&crate::Error::InvalidName),
+                    "{basename:?}"
+                );
+                assert_eq!(
+                    paths.map(|path| sim.metadata(Path::new(path)).unwrap()),
+                    before
+                );
+                assert_eq!(sim.read_file(file).unwrap(), b"foreign");
+                assert!(foreign.owns("socket"));
+                for absent in ["/new", "/escaped", "/sockets/child", "/sockets/socket"] {
+                    assert_eq!(
+                        sim.metadata(Path::new(absent)).unwrap_err().kind(),
+                        io::ErrorKind::NotFound,
+                        "{basename:?}: {absent}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bind_accepts_normal_components_and_cleans_up() {
+        for basename in ["socket", ".hidden", "..suffix", "a\\b", "with space", "é"] {
+            let sim = Simulation::new();
+            let directory = PathBuf::from("/new/nested");
+            let socket = BoundSocket::bind(sim.clone(), directory.clone(), basename).unwrap();
+            assert!(socket.owns(basename));
+            let connection = sim
+                .connect(SocketAddress::Unix(directory.join(basename)))
+                .unwrap();
+            let accepted = socket.accept().unwrap();
+            drop((connection, accepted, socket));
+            assert_eq!(
+                sim.metadata(&directory.join(basename)).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            assert!(sim.metadata(&directory).is_ok());
+        }
+    }
+
+    #[test]
+    fn bind_accepts_component_byte_limit_before_filesystem_errors() {
+        for basename in ["x".repeat(255), format!("{}x", "é".repeat(127))] {
+            let sim = Simulation::new();
+            sim.inject("open", Fault::Errno(libc::EIO)).unwrap();
+            let error = BoundSocket::bind(sim, PathBuf::from("/sockets"), &basename)
+                .err()
+                .expect("directory open must fail");
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        }
+    }
+
+    #[test]
+    fn bind_preserves_occupied_foreign_paths() {
+        let sim = Simulation::new();
+        let directory = PathBuf::from("/sockets");
+        let foreign = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
+        sim.write_file(&directory.join("file"), b"foreign").unwrap();
+        for basename in ["socket", "file"] {
+            let before = sim.metadata(&directory.join(basename)).unwrap();
+            let error = BoundSocket::bind(sim.clone(), directory.clone(), basename)
+                .err()
+                .expect("occupied basename must fail");
+            assert_eq!(error.raw_os_error(), Some(libc::EADDRINUSE));
+            assert_eq!(sim.metadata(&directory.join(basename)).unwrap(), before);
+        }
+        assert_eq!(sim.read_file(&directory.join("file")).unwrap(), b"foreign");
+        assert!(foreign.owns("socket"));
+    }
 
     #[test]
     fn publication_rejects_independent_simulations() {
