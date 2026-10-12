@@ -2191,6 +2191,9 @@ impl WorkerApplication {
     /// Report this worker's current resources and credential lifetime.
     fn observe_health(&self) -> Result<()> {
         let node = &self.node;
+        self.telemetry
+            .metrics
+            .observe_warm(node.workers.warm.snapshot());
         self.store.writer.observe_disks();
         self.telemetry
             .metrics

@@ -451,6 +451,91 @@ fn get(
 }
 
 #[cfg(test)]
+mod warm_metric_tests {
+    use super::*;
+
+    #[test]
+    fn node_registry_gauges_replace_without_multiplying_by_workers() {
+        let workers = Metrics::for_workers(3).unwrap();
+        let mut output = String::new();
+        workers[0].write_prometheus(&mut output).unwrap();
+        assert!(output.contains("racer_warm_tracked_jobs 0\n"));
+        assert!(output.contains("racer_warm_waiters 0\n"));
+        for worker in &workers {
+            worker.observe_warm((7, 11));
+        }
+        output.clear();
+        workers[2].write_prometheus(&mut output).unwrap();
+        assert!(
+            output.contains("# TYPE racer_warm_tracked_jobs gauge\nracer_warm_tracked_jobs 7\n")
+        );
+        assert!(output.contains("# TYPE racer_warm_waiters gauge\nracer_warm_waiters 11\n"));
+        workers[1].clone().observe_warm((2, 0));
+        assert_eq!(workers[0].gauge(Gauge::WarmTrackedJobs), 2);
+        assert_eq!(workers[0].gauge(Gauge::WarmWaiters), 0);
+        workers[0].observe_warm((0, 0));
+        assert_eq!(workers[2].gauge(Gauge::WarmTrackedJobs), 0);
+    }
+
+    #[test]
+    fn warm_event_hooks_export_fixed_saturating_node_counters() {
+        let workers = Metrics::for_workers(2).unwrap();
+        for (event, name) in [
+            (WarmEvent::Accepted, "racer_warm_accepted_total"),
+            (WarmEvent::Refused, "racer_warm_refused_total"),
+            (WarmEvent::Completed, "racer_warm_completed_total"),
+            (WarmEvent::Failed, "racer_warm_failed_total"),
+            (WarmEvent::WaitStarted, "racer_warm_wait_started_total"),
+            (WarmEvent::WaitCompleted, "racer_warm_wait_completed_total"),
+            (WarmEvent::WaitFallback, "racer_warm_wait_fallback_total"),
+            (WarmEvent::WaitFailed, "racer_warm_wait_failed_total"),
+        ] {
+            workers[0].warm_event(event);
+            workers[1].warm_event(event);
+            workers[1].clone().warm_event(event);
+            let mut output = String::new();
+            workers[0].write_prometheus(&mut output).unwrap();
+            assert!(output.contains(&format!("# TYPE {name} counter\n{name} 3\n")));
+            workers[0].record(event.event(), u64::MAX);
+            workers[0].warm_event(event);
+            output.clear();
+            workers[1].write_prometheus(&mut output).unwrap();
+            assert!(output.contains(&format!("{name} {}\n", u64::MAX)));
+            assert!(
+                !output
+                    .lines()
+                    .any(|line| line.starts_with("racer_warm_") && line.contains('{'))
+            );
+        }
+    }
+
+    #[test]
+    fn warm_endpoint_preserves_samples_across_scrapes_and_output_failure() {
+        struct Full;
+        impl Write for Full {
+            fn write_str(&mut self, _: &str) -> std::fmt::Result {
+                Err(std::fmt::Error)
+            }
+        }
+        let telemetry = Telemetry::default();
+        telemetry.metrics.observe_warm((3, 5));
+        telemetry.metrics.warm_event(WarmEvent::Refused);
+        assert!(get(&telemetry, "/metrics", true, &mut Full).is_err());
+        for usable in [true, false, true] {
+            let mut output = String::new();
+            assert!(matches!(
+                get(&telemetry, "/metrics", usable, &mut output),
+                Ok(Response::Metrics)
+            ));
+            assert!(output.contains("racer_warm_tracked_jobs 3\n"));
+            assert!(output.contains("racer_warm_waiters 5\n"));
+            assert!(output.contains("racer_warm_refused_total 1\n"));
+            assert!(output.len() < MAX_RESPONSE_BYTES);
+        }
+    }
+}
+
+#[cfg(test)]
 mod retention_metric_tests {
     use super::*;
 
@@ -2402,6 +2487,32 @@ pub(crate) enum LookupTier {
     Pending,
     DiskIndex,
 }
+/// Fixed warm lifecycle events; callers record each transition once, not each poll.
+#[derive(Clone, Copy, Debug)]
+pub enum WarmEvent {
+    Accepted,
+    Refused,
+    Completed,
+    Failed,
+    WaitStarted,
+    WaitCompleted,
+    WaitFallback,
+    WaitFailed,
+}
+impl WarmEvent {
+    fn event(self) -> Event {
+        match self {
+            Self::Accepted => Event::WarmAccepted,
+            Self::Refused => Event::WarmRefused,
+            Self::Completed => Event::WarmCompleted,
+            Self::Failed => Event::WarmFailed,
+            Self::WaitStarted => Event::WarmWaitStarted,
+            Self::WaitCompleted => Event::WarmWaitCompleted,
+            Self::WaitFallback => Event::WarmWaitFallback,
+            Self::WaitFailed => Event::WarmWaitFailed,
+        }
+    }
+}
 /// Clones retain their writer shard; reads aggregate the fixed node registry.
 #[derive(Clone)]
 pub struct Metrics {
@@ -2468,6 +2579,14 @@ impl Default for Metrics {
 }
 // Declaration order is the counter index; names are the exported wire contract.
 metrics! { Event, EVENTS, EVENT_COUNT;
+            Self::WarmAccepted => "racer_warm_accepted_total",
+            Self::WarmRefused => "racer_warm_refused_total",
+            Self::WarmCompleted => "racer_warm_completed_total",
+            Self::WarmFailed => "racer_warm_failed_total",
+            Self::WarmWaitStarted => "racer_warm_wait_started_total",
+            Self::WarmWaitCompleted => "racer_warm_wait_completed_total",
+            Self::WarmWaitFallback => "racer_warm_wait_fallback_total",
+            Self::WarmWaitFailed => "racer_warm_wait_failed_total",
             Self::PeerReceiveAdmitted => "racer_peer_receive_admitted_total",
             Self::PeerReceiveFull => "racer_peer_receive_full_total",
             Self::PeerReceiveTimeout => "racer_peer_receive_timeout_total",
@@ -2563,6 +2682,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::CryptoDecryptFailureOther => "racer_crypto_decrypt_failure_other_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
+            Self::WarmTrackedJobs => "racer_warm_tracked_jobs",
+            Self::WarmWaiters => "racer_warm_waiters",
             Self::PeerReceiveActive => "racer_peer_receive_active",
             Self::PeerReceiveQueued => "racer_peer_receive_queued",
             Self::PeerAdmissionLimit => "racer_peer_admission_limit",
@@ -2632,6 +2753,22 @@ impl Drop for RequestMetrics {
     }
 }
 impl Metrics {
+    /// Record a HEAD admission, job outcome, or GET wait transition once.
+    /// Accepted includes coalesced admissions; completed/failed count job outcomes.
+    /// WaitStarted counts registered waits, not registry misses or repeated polls.
+    /// WaitCompleted means publication; fallback means normal Fill may proceed.
+    /// WaitFailed includes cancellation, deadline, and abandoned registered waits.
+    pub fn warm_event(&self, event: WarmEvent) {
+        self.record(event.event(), 1);
+    }
+
+    /// Replace node-wide registry counts, never sum the same registry per worker.
+    /// Tracked jobs include completed versions retained until expiry or removal.
+    pub(crate) fn observe_warm(&self, (jobs, waiters): (usize, usize)) {
+        self.set_gauge(Gauge::WarmTrackedJobs, jobs as u64);
+        self.set_gauge(Gauge::WarmWaiters, waiters as u64);
+    }
+
     pub(crate) fn observe_disks(&self, samples: Vec<DiskUsage>) {
         self.disks.replace(self.shard, samples);
     }
@@ -4294,7 +4431,7 @@ pub(crate) mod tests {
             assert_eq!(out.text.lines().count(), 65);
             assert!(out.text.contains("\nseq=2 "));
             assert!(out.text.len() + 512 < MAX_RESPONSE_BYTES);
-            assert!(MAX_RESPONSE_BYTES <= 64 * 1024);
+            const { assert!(MAX_RESPONSE_BYTES <= 64 * 1024) };
             for forbidden in [
                 " key=",
                 " nonce=",
