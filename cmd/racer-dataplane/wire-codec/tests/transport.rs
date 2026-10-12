@@ -1,9 +1,3 @@
-//! Socket-level transport contracts exercised through the public client API.
-//!
-//! This cohesive integration suite intentionally stays below 1000 lines. Its
-//! loopback fixtures are shared with private library tests rather than duplicated
-//! or exposed through the production API merely to meet a file-size target.
-
 use std::{
     io::{Read, Write},
     rc::Rc,
@@ -13,28 +7,22 @@ use std::{
 use wire_codec::rest::{Error as RestError, Method, Operation, Transport};
 
 #[path = "support/mod.rs"]
-/// Loopback I/O, identities, and join-on-drop servers shared with private tests.
 mod testing;
 
 use testing::{Error, RotationServer, TestTransport as _, WeeklyCertificates, rotation_request};
 use testing::{FixtureIo, TestIdentity};
 
-/// Concrete transport used by loopback fixtures.
 type ControlTransport = Transport<FixtureIo>;
 
-/// Full-publication path used by fixture requests.
 const SNAPSHOT_PATH: &str = "/snapshot";
 
-/// Enrollment path used by bootstrap fixture requests.
 const BOOTSTRAP_PATH: &str = "/enroll";
 
-/// Bootstrap and mutual authentication both deliver bounded chunked JSON.
 #[test]
 fn real_server_auth_and_mutual_tls_chunked_response() {
     tls_fixture(false);
 }
 
-/// Cross-signed serving chains accept exactly the retained trust anchors.
 #[test]
 fn weekly_cross_signed_chains_accept_retained_anchors_only() {
     let certs = WeeklyCertificates::new();
@@ -92,13 +80,11 @@ fn weekly_cross_signed_chains_accept_retained_anchors_only() {
     assert!(rotation_request(&transport, None).is_ok());
 }
 
-/// Trailing plaintext is rejected even when it remains in the TLS reader.
 #[test]
 fn rejects_trailing_tls_plaintext_before_connection_reuse() {
     tls_fixture(true);
 }
 
-/// Exercise bootstrap and mutual TLS, with optional plaintext past the frame.
 fn tls_fixture(trailing: bool) {
     let d = testing::Directory::new();
     let (ca, ca_key) = testing::ca();

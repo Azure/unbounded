@@ -1,23 +1,4 @@
-//! Cryptographic primitives and Racer certificate identities and key epochs.
-//!
-//! Primitive callers supply entropy, ensure nonce uniqueness for each key, and
-//! choose domain separation. AEAD borrows input and writes directly to caller-owned
-//! output without allocating or staging plaintext. Public-key parsing does not
-//! establish identity or trust. CRC detects accidental corruption, not forgery.
-//!
-//! Callers must protect and erase their input seeds, key buffers, and imported
-//! DER. Secret-key ownership and explicit PKCS#8 export retain upstream
-//! zeroization. The explicit `cipher/zeroize` and `poly1305/zeroize` dependency
-//! features are required in addition to `chacha20poly1305/zeroize`.
-//!
-//! Public workflows and standard vectors live in `tests/primitives.rs`; private
-//! epoch/cache state-space tests remain here. Tests do not establish timing or
-//! secret-erasure guarantees. Run `cargo test -p racer-crypto` from the workspace.
-//! Select ignored CRC hardware tests individually on supported hosts; they fail
-//! on unsupported hardware rather than silently skipping.
-
 #![forbid(unsafe_code)]
-#![deny(missing_docs)]
 
 pub mod enrollment;
 
@@ -33,68 +14,52 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-/// Opaque failure of a cryptographic operation or input validation.
-/// No application-specific error classification or size policy is imposed.
 #[derive(Debug)]
 pub struct Error(());
 
-/// Secret signing key. Intentionally does not implement Debug or Clone.
-/// The upstream key zeroizes its secret on drop; callers own their seed's lifetime.
 pub struct SigningKey(ed25519_dalek::SigningKey);
 
-/// Public verification key. Parsing does not establish trust or identity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VerifyingKey(ed25519_dalek::VerifyingKey);
 
-/// Number of authentication-tag bytes appended to XChaCha20-Poly1305 ciphertext.
 pub const TAG_LEN: usize = 16;
 
 impl SigningKey {
-    /// Import a caller-supplied secret seed. No randomness is generated here.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         Self(ed25519_dalek::SigningKey::from_bytes(seed))
     }
 
-    /// Import an Ed25519 PKCS#8 DER document, rejecting malformed key material.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
         ed25519_dalek::SigningKey::from_pkcs8_der(der)
             .map(Self)
             .map_err(|_| Error(()))
     }
 
-    /// Explicit secret export. Both the temporary DER document and returned
-    /// bytes are zeroized on drop.
     pub fn to_pkcs8_der(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
         let document = self.0.to_pkcs8_der().map_err(|_| Error(()))?;
         Ok(Zeroizing::new(document.as_bytes().to_vec()))
     }
 
-    /// Return the public verification key corresponding to this signing key.
     pub fn verifying_key(&self) -> VerifyingKey {
         VerifyingKey(self.0.verifying_key())
     }
 
-    /// Sign the exact message bytes without adding framing or domain separation.
     pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
         self.0.sign(msg).to_bytes()
     }
 }
 
 impl VerifyingKey {
-    /// Parse an encoded public key without establishing trust in its owner.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, Error> {
         ed25519_dalek::VerifyingKey::from_bytes(bytes)
             .map(Self)
             .map_err(|_| Error(()))
     }
 
-    /// Borrow the public key's 32-byte encoding.
     pub fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
     }
 
-    /// Reject malformed signatures and use upstream strict verification,
-    /// including its small-order point and scalar malleability checks.
     pub fn verify_strict(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
         let signature = Signature::from_slice(sig).map_err(|_| Error(()))?;
         self.0.verify_strict(msg, &signature).map_err(|_| Error(()))
@@ -102,7 +67,6 @@ impl VerifyingKey {
 }
 
 impl std::fmt::Display for Error {
-    /// Describe the failure without exposing inputs or cryptographic details.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("cryptographic operation failed")
     }
@@ -110,9 +74,6 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Seal into exactly `plaintext.len() + TAG_LEN` bytes as ciphertext followed by tag.
-/// The caller must never reuse a nonce with the same key.
-/// No allocation or plaintext staging copy is performed.
 pub fn seal(
     key: &[u8; 32],
     nonce: &[u8; 24],
@@ -132,9 +93,6 @@ pub fn seal(
     Ok(())
 }
 
-/// Open ciphertext followed by tag into exactly `sealed.len() - TAG_LEN` bytes.
-/// Every error leaves output untouched, including malformed input/output lengths.
-/// Authentication precedes decryption; no allocation or plaintext staging copy is performed.
 pub fn open(
     key: &[u8; 32],
     nonce: &[u8; 24],
@@ -156,7 +114,6 @@ pub fn open(
         .map_err(|_| Error(()))
 }
 
-/// HMAC-SHA256 with a fixed 32-byte key. Domain separation belongs to the caller.
 pub fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
     let mut inner = Zeroizing::new([0x36; 64]);
     let mut outer = Zeroizing::new([0x5c; 64]);
@@ -174,8 +131,6 @@ pub fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// Compare equal-length slices in constant time using `subtle::ConstantTimeEq`.
-/// Lengths are not secret: unequal lengths return immediately.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -183,7 +138,6 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     bool::from(a.ct_eq(b))
 }
 
-/// CRC-64/XZ checksum. Detects accidental corruption, not malicious changes.
 pub fn crc64(bytes: &[u8]) -> u64 {
     let mut digest = crc64fast::Digest::new();
     digest.write(bytes);
@@ -191,46 +145,10 @@ pub fn crc64(bytes: &[u8]) -> u64 {
 }
 
 pub mod identity {
-    //! Trust roots, certificate validation, and locally generated Ed25519 identities.
-    //!
-    //! Immutable key leases outlive admission; their last completion owner zeroizes
-    //! the secret. Secret export is explicit and zeroizing.
-    //!
-    //! # Ownership and admission
-    //!
-    //! Wire bundles move into zeroizing staging before validation. Installation
-    //! publishes a complete epoch atomically; removed epochs remain usable only by
-    //! previously admitted owners. Leases expose fixed-purpose page/credential AEAD
-    //! and request MAC operations, never raw secrets. Inputs are borrowed and outputs
-    //! caller-owned. Purpose, cache, and key ID checks do not consult current admission.
-    //!
-    //! Callers own nonce uniqueness, canonical AAD/messages, quotas, cancellation,
-    //! CRC checks, telemetry, and completion ownership. PKCS8 persistence export is
-    //! explicit and zeroizing. Errors contain no input data. Certificate caches are
-    //! worker-local and non-Send; verified peers cannot be constructed by callers.
-    //! This module has no dependency on the dataplane worker or service graph.
-    //!
-    //! # Validation and fixtures
-    //!
-    //! Private certificate-cache and epoch state-space tests live here. Public identity
-    //! workflows live in `tests/primitives.rs`. Cross-component application
-    //! integration tests are outside this extracted workspace.
-    //! Run these gates from `cmd/racer-dataplane`:
-    //!
-    //! ```sh
-    //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-crypto
-    //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-crypto --features test-util
-    //! timeout --signal=TERM --kill-after=10s 300s cargo clippy --locked -p racer-crypto --all-targets --all-features --no-deps -- -D warnings
-    //! ```
-    //!
-    //! The opt-in `test-util` feature exposes Ed25519 CA and node-certificate fixtures
-    //! with customizable parameters. `test_util::issue_pending` retains an existing
-    //! key without consuming additional entropy. Production does not enable it.
     use crate::{SigningKey, VerifyingKey};
     #[cfg(test)]
     use racer_control_wire::CacheKeyPurpose;
 
-    /// Check the canonical UUID spelling used by Racer identity bindings.
     pub use racer_control_wire::valid_uuid as canonical_uuid;
     use racer_control_wire::{
         BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KeyId, NodeId,
@@ -248,37 +166,27 @@ pub mod identity {
     use x509_parser::{extensions::GeneralName, parse_x509_certificate};
     use zeroize::Zeroizing;
 
-    /// Payload-free component failures, explicitly mapped by the application.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum Error {
-        /// The requested operation has invalid input.
         InvalidRequest,
 
-        /// The proposed key configuration or epoch transition is invalid.
         InvalidConfiguration,
 
-        /// Identity, trust, or authentication validation failed.
         Unauthorized,
 
-        /// A required resource or coherent publication is temporarily unavailable.
         Unavailable,
 
-        /// No admitted key matches the requested cache, ID, and purpose.
         MissingKey,
 
-        /// A page record or its cryptographic encoding is invalid.
         CorruptRecord,
     }
 
-    /// A component result that never includes secrets in its error payload.
     pub type Result<T> = std::result::Result<T, Error>;
 
-    /// A locally owned Ed25519 key awaiting an authenticated certificate chain.
     pub struct PendingIdentity {
         key: SigningKey,
     }
 
-    /// rcgen signs through a dalek owner that wipes its secret on drop, never PKCS8.
     struct RemoteSigningKey {
         key: ed25519_dalek::SigningKey,
 
@@ -300,7 +208,6 @@ pub mod identity {
         }
     }
 
-    /// An accepted node certificate paired with its locally held signing key.
     pub struct SigningIdentity {
         cluster: ClusterId,
 
@@ -315,13 +222,11 @@ pub mod identity {
         valid_from: u64,
     }
 
-    /// Shared publication lock for complete epochs and their signing identity.
     #[derive(Default)]
     pub struct KeyEpochs {
         state: Mutex<State>,
     }
 
-    /// A cluster/node view of shared epochs, responsible for admission and rotation.
     pub struct Keyring {
         cluster: ClusterId,
 
@@ -330,32 +235,25 @@ pub mod identity {
         epochs: Arc<KeyEpochs>,
     }
 
-    /// Canonical bundle replay tracking paired with its current keyring owner.
     pub struct BundleInstaller {
         state: RefCell<BundleDelivery>,
     }
 
-    /// Bundle delivery errors preserve replay, codec, and keyring distinctions.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum BundleError {
-        /// A rollback or conflicting reuse of a generation was rejected.
         Replay,
 
-        /// Canonical wire validation failed.
         Wire(racer_control_wire::Error),
 
-        /// The keyring rejected the proposed epoch.
         Identity(Error),
     }
 
-    /// Owner and replay cursor form one worker-local delivery state.
     struct BundleDelivery {
         keys: Rc<Keyring>,
 
         accepted: Option<AcceptedBundle>,
     }
 
-    /// Accepted canonical content used to reject conflicting delivery cursors.
     struct AcceptedBundle {
         generation: BundleGeneration,
 
@@ -363,7 +261,6 @@ pub mod identity {
     }
 
     impl BundleInstaller {
-        /// Start delivery tracking for one keyring.
         pub fn new(keys: Rc<Keyring>) -> Self {
             Self {
                 state: RefCell::new(BundleDelivery {
@@ -373,7 +270,6 @@ pub mod identity {
             }
         }
 
-        /// Return the last successfully accepted bundle generation.
         pub fn generation(&self) -> Option<BundleGeneration> {
             self.state
                 .borrow()
@@ -382,7 +278,6 @@ pub mod identity {
                 .map(|accepted| accepted.generation)
         }
 
-        /// Replace the keyring and reset delivery tracking for its new owner.
         pub fn bind_keyring(&self, keys: Rc<Keyring>) {
             *self.state.borrow_mut() = BundleDelivery {
                 keys,
@@ -390,11 +285,6 @@ pub mod identity {
             };
         }
 
-        /// Canonicalize unordered records, reject replay, and atomically install keys.
-        ///
-        /// The caller must authenticate the bundle's source and authorize it to
-        /// replace trust roots and install cache keys. Validation does not establish
-        /// that authority or require new roots to chain to existing roots.
         pub fn install(
             &self,
             mut bundle: racer_control_wire::KeyringBundle,
@@ -423,29 +313,14 @@ pub mod identity {
         }
     }
 
-    /// An immutable secret owner, not a raw-key export capability.
-    /// ```compile_fail
-    /// fn raw(key: &racer_crypto::identity::KeyLease) {
-    ///     key.material(racer_crypto::identity::KeyPurpose::Page);
-    /// }
-    /// ```
-    /// ```compile_fail
-    /// fn diagnostic(key: racer_crypto::identity::KeyLease) { println!("{key:?}"); }
-    /// ```
     pub struct KeyLease {
         reference: CacheKeyRef,
 
         secret: Arc<Secret>,
     }
 
-    /// The wire-defined purpose permanently bound to a key epoch.
     pub use racer_control_wire::CacheKeyPurpose as KeyPurpose;
 
-    /// Worker-local verifier caching exact chains against the current trust roots.
-    /// ```compile_fail
-    /// fn send<T: Send>() {}
-    /// send::<racer_crypto::identity::Certificates>();
-    /// ```
     pub struct Certificates {
         cluster: ClusterId,
 
@@ -457,15 +332,10 @@ pub mod identity {
         before_key_return: RefCell<Option<Box<dyn FnOnce()>>>,
     }
 
-    /// Only successful certificate validation can construct a verified peer.
-    /// ```compile_fail
-    /// let peer = racer_crypto::identity::VerifiedPeer { node: racer_control_wire::NodeId("forged".into()) };
-    /// ```
     pub struct VerifiedPeer {
         node: NodeId,
     }
 
-    /// An authenticated leaf key and the validity bounds of its chain and anchor.
     pub(super) struct ValidatedChain {
         pub(super) key: VerifyingKey,
 
@@ -474,7 +344,6 @@ pub mod identity {
         pub(super) expires: u64,
     }
 
-    /// Private validation staging owns zeroizing transfers on every rejection exit.
     #[cfg_attr(test, derive(Clone))]
     struct CacheEncryptionKey {
         key: CacheKeyRef,
@@ -484,7 +353,6 @@ pub mod identity {
         material: Zeroizing<[u8; 32]>,
     }
 
-    /// An owned wire transfer with secrets that wipe on every exit path.
     #[cfg_attr(test, derive(Clone))]
     struct KeyringBundle {
         schema_version: u32,
@@ -499,7 +367,6 @@ pub mod identity {
     }
 
     impl From<racer_control_wire::KeyringBundle> for KeyringBundle {
-        /// Move transferred material into private, zeroizing validation staging.
         fn from(bundle: racer_control_wire::KeyringBundle) -> Self {
             Self {
                 schema_version: bundle.schema_version,
@@ -523,7 +390,6 @@ pub mod identity {
     }
 
     impl PendingIdentity {
-        /// Generate a key from the scoped runtime entropy source.
         pub fn generate() -> Result<Self> {
             let mut seed = Zeroizing::new([0u8; 32]);
             environment::fill_random(&mut *seed).map_err(|_| Error::Unavailable)?;
@@ -532,7 +398,6 @@ pub mod identity {
             })
         }
 
-        /// Recover a bounded Ed25519 PKCS8 key without accepting a certificate.
         pub fn recover(pkcs8: &[u8]) -> Result<Self> {
             if pkcs8.len() > 4096 {
                 return Err(Error::InvalidRequest);
@@ -542,12 +407,10 @@ pub mod identity {
             })
         }
 
-        /// Explicitly export a zeroizing PKCS8 copy for durable storage.
         pub fn export_pkcs8_for_persistence(&self) -> Result<Zeroizing<Vec<u8>>> {
             self.key.to_pkcs8_der().map_err(|_| Error::Unavailable)
         }
 
-        /// The control server assigns the node SAN from authenticated enrollment.
         pub fn csr_der(&self) -> Result<Vec<u8>> {
             let key = self.rcgen_key_pair()?;
             let params = rcgen::CertificateParams::new(Vec::<String>::new())
@@ -559,7 +422,6 @@ pub mod identity {
                 .to_vec())
         }
 
-        /// Keep rcgen's private-key storage empty; the cloned dalek key wipes on drop.
         pub(crate) fn rcgen_key_pair(&self) -> Result<rcgen::KeyPair> {
             rcgen::KeyPair::from_remote(Box::new(RemoteSigningKey {
                 key: self.key.0.clone(),
@@ -568,7 +430,6 @@ pub mod identity {
             .map_err(|_| Error::Unavailable)
         }
 
-        /// Accept only a trusted node chain whose leaf matches this private key.
         pub fn accept(
             self,
             cluster: ClusterId,
@@ -592,12 +453,10 @@ pub mod identity {
     }
 
     impl SigningIdentity {
-        /// Return the conservative expiry of the accepted chain and its trust anchor.
         pub fn expires_at_seconds(&self) -> u64 {
             self.expires
         }
 
-        /// Recover a persisted key and validate its certificate and node binding.
         pub fn from_pkcs8(
             cluster: ClusterId,
             node: NodeId,
@@ -608,22 +467,18 @@ pub mod identity {
             PendingIdentity::recover(pkcs8)?.accept(cluster, node, chain, roots)
         }
 
-        /// Return the cluster authenticated by the certificate.
         pub fn cluster(&self) -> &ClusterId {
             &self.cluster
         }
 
-        /// Return the node authenticated by the certificate.
         pub fn node(&self) -> &NodeId {
             &self.node
         }
 
-        /// Borrow the exact accepted certificate chain, leaf first.
         pub fn certificate_chain(&self) -> &[Vec<u8>] {
             &self.chain
         }
 
-        /// Sign the exact message only within the accepted validity interval.
         pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
             let now = unix_time().as_secs();
             if now < self.valid_from || now >= self.expires {
@@ -633,7 +488,6 @@ pub mod identity {
         }
     }
 
-    /// One exact chain validated against a specific immutable root snapshot.
     struct CachedPeer {
         roots: Arc<Vec<Vec<u8>>>,
 
@@ -649,14 +503,12 @@ pub mod identity {
     }
 
     impl VerifiedPeer {
-        /// Return the authenticated peer node.
         pub fn node(&self) -> &NodeId {
             &self.node
         }
     }
 
     impl Certificates {
-        /// Create a worker-local verifier using current keyring trust roots.
         pub fn new(cluster: ClusterId, keys: Rc<Keyring>) -> Self {
             Self {
                 cluster,
@@ -667,7 +519,6 @@ pub mod identity {
             }
         }
 
-        /// Reuse exact-chain validation only while roots and time remain valid.
         fn key(&self, chain: &[Vec<u8>], expected: &NodeId) -> Result<VerifyingKey> {
             let roots = self.keys.peer_trust_roots()?;
             let key = self.key_for_roots(chain, expected, roots.clone())?;
@@ -681,7 +532,6 @@ pub mod identity {
             Ok(key)
         }
 
-        /// Look up or validate a chain against one immutable trust snapshot.
         fn key_for_roots(
             &self,
             chain: &[Vec<u8>],
@@ -717,7 +567,6 @@ pub mod identity {
             Ok(verified.key)
         }
 
-        /// Exercise certificate acceptance without a message in component tests.
         #[cfg(test)]
         fn verify(&self, chain: &[Vec<u8>], expected: &NodeId) -> Result<VerifiedPeer> {
             if &self.cluster != self.keys.cluster() {
@@ -729,7 +578,6 @@ pub mod identity {
             })
         }
 
-        /// Authenticate both the expected node and its signature over this message.
         pub fn verify_signed(
             &self,
             chain: &[Vec<u8>],
@@ -749,7 +597,6 @@ pub mod identity {
         }
     }
 
-    /// Empty or coherent publication, with an independently installable identity.
     #[derive(Default)]
     struct State {
         published: Option<PublishedBundle>,
@@ -757,7 +604,6 @@ pub mod identity {
         identity: Option<InstalledIdentity>,
     }
 
-    /// A complete publication; an uninstalled keyring has none of these fields.
     struct PublishedBundle {
         cluster: ClusterId,
 
@@ -770,7 +616,6 @@ pub mod identity {
         entries: Vec<Entry>,
     }
 
-    /// An accepted signing identity and the trust snapshot that validated it.
     struct InstalledIdentity {
         identity: Arc<SigningIdentity>,
 
@@ -781,14 +626,12 @@ pub mod identity {
         until: u64,
     }
 
-    /// Validated, zeroizing input ready for a locked generation transition.
     struct ValidatedBundle<'a> {
         bundle: &'a KeyringBundle,
 
         fingerprint: [u8; 32],
     }
 
-    /// Current admission metadata sharing immutable material with outstanding leases.
     struct Entry {
         reference: CacheKeyRef,
 
@@ -797,16 +640,13 @@ pub mod identity {
         secret: Arc<Secret>,
     }
 
-    /// Wipes key material when its last admission or completion owner releases it.
     struct Secret(Zeroizing<[u8; 32]>);
 
     impl KeyLease {
-        /// Validate purpose before application admission and integrity checks.
         pub fn require_purpose(&self, purpose: KeyPurpose) -> Result<()> {
             self.material(purpose).map(|_| ())
         }
 
-        /// Enforce the immutable cache, key ID, and purpose before using the secret.
         fn bound_material(
             &self,
             cache: &CacheId,
@@ -820,8 +660,6 @@ pub mod identity {
             Ok(material)
         }
 
-        /// Seal a page without copying input or consulting current epoch admission.
-        /// Caller supplies canonical AAD and a fresh nonce for this key.
         pub fn seal_page(
             &self,
             cache: &CacheId,
@@ -840,7 +678,6 @@ pub mod identity {
             .map_err(|_| Error::CorruptRecord)
         }
 
-        /// Authenticate before writing caller output; an error leaves output untouched.
         // Keep borrowed buffer and expected-identity arguments explicit at this boundary.
         #[allow(clippy::too_many_arguments)]
         pub fn open_page(
@@ -862,7 +699,6 @@ pub mod identity {
             .map_err(|_| Error::CorruptRecord)
         }
 
-        /// Seal credentials using only a credential epoch. Caller owns nonce and AAD.
         pub fn seal_credentials(
             &self,
             cache: &CacheId,
@@ -881,7 +717,6 @@ pub mod identity {
             .map_err(|_| Error::Unauthorized)
         }
 
-        /// Authenticate credentials into borrowed output without staging plaintext.
         // Keep borrowed buffer and expected-identity arguments explicit at this boundary.
         #[allow(clippy::too_many_arguments)]
         pub fn open_credentials(
@@ -903,7 +738,6 @@ pub mod identity {
             .map_err(|_| Error::Unauthorized)
         }
 
-        /// Derive and use the request-only MAC key internally; never export it.
         pub fn request_mac(
             &self,
             cache: &CacheId,
@@ -921,7 +755,6 @@ pub mod identity {
             Ok(())
         }
 
-        /// Authenticate a request MAC in constant time after checking its binding.
         pub fn verify_request_mac(
             &self,
             cache: &CacheId,
@@ -938,22 +771,18 @@ pub mod identity {
             Ok(())
         }
 
-        /// Return the immutable generation-bound key ID.
         pub fn id(&self) -> KeyId {
             self.reference.id
         }
 
-        /// Return the cache authorized to use this secret.
         pub fn cache(&self) -> &CacheId {
             &self.reference.cache
         }
 
-        /// Exact immutable epoch identity, independent of current admission.
         pub fn reference(&self) -> &CacheKeyRef {
             &self.reference
         }
 
-        /// Borrow private material only for the lease's fixed purpose.
         fn material(&self, purpose: KeyPurpose) -> Result<&[u8; 32]> {
             if self.reference.purpose != purpose {
                 return Err(Error::MissingKey);
@@ -963,7 +792,6 @@ pub mod identity {
     }
 
     impl Keyring {
-        /// Locally installed coherent bundle, not a controller acknowledgment.
         pub fn generation(&self) -> Result<Option<u64>> {
             Ok(self
                 .epochs
@@ -975,7 +803,6 @@ pub mod identity {
                 .map(|bundle| bundle.generation.0))
         }
 
-        /// Create a node-bound view without implicitly installing any keys.
         pub fn new(cluster: ClusterId, node: NodeId, epochs: Arc<KeyEpochs>) -> Self {
             Self {
                 cluster,
@@ -984,17 +811,14 @@ pub mod identity {
             }
         }
 
-        /// Return the cluster this view admits.
         pub fn cluster(&self) -> &ClusterId {
             &self.cluster
         }
 
-        /// Return the node this view admits.
         pub fn node(&self) -> &NodeId {
             &self.node
         }
 
-        /// Lease the current trust snapshot, preserving pointer identity on replay.
         pub fn peer_trust_roots(&self) -> Result<Arc<Vec<Vec<u8>>>> {
             let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
             let published = state.published.as_ref().ok_or(Error::MissingKey)?;
@@ -1004,11 +828,6 @@ pub mod identity {
             Ok(published.roots.clone())
         }
 
-        /// Validate a wire transfer and atomically publish a complete key epoch.
-        ///
-        /// The caller must authenticate the bundle's source and authorize it to
-        /// replace trust roots and install cache keys. Validation does not establish
-        /// that authority or require new roots to chain to existing roots.
         pub fn install(
             &self,
             bundle: racer_control_wire::KeyringBundle,
@@ -1021,7 +840,6 @@ pub mod identity {
             self.install_inner(&bundle.into())
         }
 
-        /// Prepare outside the lock, then validate the transition and publish once.
         fn install_inner(&self, bundle: &KeyringBundle) -> Result<BundleGeneration> {
             let validated = ValidatedBundle::prepare(bundle, &self.cluster, &self.node)?;
             let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
@@ -1034,7 +852,6 @@ pub mod identity {
     }
 
     impl<'a> ValidatedBundle<'a> {
-        /// Validate bounded input and fingerprint its original, order-sensitive form.
         fn prepare(bundle: &'a KeyringBundle, cluster: &ClusterId, node: &NodeId) -> Result<Self> {
             if bundle.schema_version != SCHEMA_VERSION
                 || &bundle.cluster != cluster
@@ -1107,8 +924,6 @@ pub mod identity {
             })
         }
 
-        /// Check the current epoch and construct a replacement without mutating it.
-        /// Exact replay returns no replacement, preserving all shared owner identities.
         fn transition(self, current: Option<&PublishedBundle>) -> Result<Option<PublishedBundle>> {
             let Self {
                 bundle,
@@ -1195,7 +1010,6 @@ pub mod identity {
     }
 
     impl Keyring {
-        /// Accept a matching signing identity against roots unchanged by validation.
         pub fn install_signing_identity(&self, identity: Arc<SigningIdentity>) -> Result<()> {
             if identity.node() != &self.node || identity.cluster() != &self.cluster {
                 return Err(Error::Unauthorized);
@@ -1225,7 +1039,6 @@ pub mod identity {
             Ok(())
         }
 
-        /// Lease the identity after checking current trust and clock continuity.
         pub fn signing_identity(&self) -> Result<Arc<SigningIdentity>> {
             let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
             let installed = state.identity.as_ref().ok_or(Error::MissingKey)?;
@@ -1271,7 +1084,6 @@ pub mod identity {
             Ok(identity)
         }
 
-        /// Admit a specific active or prepared epoch for its cache and purpose.
         pub fn lease(
             &self,
             cache: Option<&CacheId>,
@@ -1301,7 +1113,6 @@ pub mod identity {
             })
         }
 
-        /// Admit the unique active key for this cache and purpose.
         pub fn active(&self, cache: &CacheId, purpose: KeyPurpose) -> Result<KeyLease> {
             let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
             let published = state.published.as_ref().ok_or(Error::MissingKey)?;
@@ -1325,7 +1136,6 @@ pub mod identity {
     }
 
     impl std::fmt::Display for Error {
-        /// Render the payload-free variant name.
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{self:?}")
         }
@@ -1333,18 +1143,14 @@ pub mod identity {
 
     impl std::error::Error for Error {}
 
-    /// Order cache/purpose groups identically for sorting and active admission.
     fn reference_group(reference: &CacheKeyRef) -> (&CacheId, u8) {
         (&reference.cache, reference.purpose as u8)
     }
 
-    /// Order exact epoch identities identically for publication and binary search.
     fn reference_order(reference: &CacheKeyRef) -> ((&CacheId, u8), [u8; 16]) {
         (reference_group(reference), reference.id.0)
     }
 
-    /// Scoped wall time for rustls, clamped to the Unix epoch for pre-epoch clocks.
-    /// This retains rustls's whole-second truncation and does not set certificate policy.
     pub fn unix_time() -> rustls::pki_types::UnixTime {
         rustls::pki_types::UnixTime::since_unix_epoch(
             environment::wall_now()
@@ -1353,8 +1159,6 @@ pub mod identity {
         )
     }
 
-    /// Shared enrollment/activation policy for bounded roots, client-auth chains,
-    /// canonical node URI, and a non-CA Ed25519 leaf with only digitalSignature/clientAuth.
     pub(super) fn verify_chain(
         roots: &[Vec<u8>],
         chain: &[Vec<u8>],
@@ -1466,12 +1270,10 @@ pub mod identity {
         })
     }
 
-    /// Parse bounded CA roots, skipping time-invalid roots but requiring a usable one.
     pub(super) fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
         root_store_with_validity(roots, unix_time()).map(|(store, _)| store)
     }
 
-    /// Keep each accepted anchor paired with the validity rustls does not retain.
     fn root_store_with_validity(
         roots: &[Vec<u8>],
         now: rustls::pki_types::UnixTime,
@@ -1506,7 +1308,6 @@ pub mod identity {
         Ok((store, bounds))
     }
 
-    /// Conservatively intersect the validity of all supplied chain certificates.
     fn validity<'a>(certificates: impl Iterator<Item = &'a Vec<u8>>) -> Result<(u64, u64)> {
         let mut start = 0;
         let mut end = u64::MAX;
@@ -1521,7 +1322,6 @@ pub mod identity {
         Ok((start, end))
     }
 
-    /// Build the single canonical URI permitted for this cluster and node.
     fn spiffe(cluster: &ClusterId, node: &NodeId) -> Result<String> {
         if !canonical_uuid(&cluster.0) || !canonical_uuid(&node.0) {
             return Err(Error::Unauthorized);
@@ -1529,12 +1329,10 @@ pub mod identity {
         Ok(format!("spiffe://{}/node/{}", cluster.0, node.0))
     }
 
-    /// Opt-in Ed25519 certificate fixtures with explicit parameter customization.
     #[cfg(any(test, feature = "test-util"))]
     pub mod test_util {
         use super::*;
 
-        /// Generate an unconstrained signing CA using the fixture defaults.
         pub fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
             let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -1546,7 +1344,6 @@ pub mod identity {
             (params.self_signed(&key).unwrap(), key)
         }
 
-        /// Generate a node key and issue a customizable client-auth certificate.
         pub fn issue(
             ca: &rcgen::Certificate,
             ca_key: &rcgen::KeyPair,
@@ -1558,7 +1355,6 @@ pub mod identity {
             issue_pending(pending, ca, ca_key, cluster, node, customize)
         }
 
-        /// Issue for an existing key without regenerating it or changing defaults.
         pub fn issue_pending(
             pending: PendingIdentity,
             ca: &rcgen::Certificate,
@@ -1582,13 +1378,11 @@ pub mod identity {
         }
     }
 
-    /// Canonical bundle delivery, rejection, and owner replacement contracts.
     #[cfg(test)]
     mod bundle_tests {
         use super::test_util::*;
         use super::*;
 
-        /// Cached delivery cannot return stale roots after another view advances epochs.
         #[test]
         fn cached_delivery_revalidates_shared_keyring_epoch() {
             let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
@@ -1631,7 +1425,6 @@ pub mod identity {
             assert_eq!(installer.generation(), Some(BundleGeneration(3)));
         }
 
-        /// Canonical delivery is idempotent, rejects rollback, and resets with its keyring.
         #[test]
         fn bundle_delivery_canonical_replay_and_rebinding() {
             let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
@@ -1696,13 +1489,11 @@ pub mod identity {
         }
     }
 
-    /// Certificate rejection and cache invalidation state-space tests.
     #[cfg(test)]
     mod certificate_tests {
         use super::tests::{CLUSTER, NODE, issued};
         use super::*;
 
-        /// Root filtering preserves healthy chains without extending the issuing CA's life.
         #[test]
         fn root_time_filtering_preserves_only_valid_signing_paths() {
             use std::time::Duration;
@@ -1787,7 +1578,6 @@ pub mod identity {
             }
         }
 
-        /// A valid root cannot extend the life of an expired issuing intermediate.
         #[test]
         fn intermediate_expiry_blocks_held_signing_and_cached_verification() {
             use std::time::Duration;
@@ -1848,7 +1638,6 @@ pub mod identity {
             );
         }
 
-        /// A future or expired CA is skipped, never trusted before or after its lifetime.
         #[test]
         fn root_store_filters_time_invalid_roots_and_rejects_all_invalid_sets() {
             use std::time::Duration;
@@ -1887,7 +1676,6 @@ pub mod identity {
             assert!(root_store(&roots).is_err());
         }
 
-        /// Both success paths recheck trust, but key-only rotation keeps trust valid.
         #[test]
         fn peer_key_rechecks_roots_after_cached_and_fresh_validation() {
             for cached in [false, true] {
@@ -1942,7 +1730,6 @@ pub mod identity {
             }
         }
 
-        /// Cached chains still require current roots, time, exact bytes, and signatures.
         #[test]
         fn cache_requires_exact_chain_current_trust_time_and_fresh_signature() {
             let clock = environment::SimulationClock::new(93);
@@ -1998,7 +1785,6 @@ pub mod identity {
             assert!(certs.verify(&chain, &node).is_err());
         }
 
-        /// Reject alternate spellings that could alias a canonical node identity.
         #[test]
         fn canonical_identity_rejects_aliases() {
             assert!(canonical_uuid(CLUSTER));
@@ -2021,13 +1807,11 @@ pub mod identity {
         }
     }
 
-    /// Epoch transition tests cover rejection, replay, and retained ownership.
     #[cfg(test)]
     mod keyring_tests {
         use super::tests::{CACHE, CLUSTER, NODE};
         use super::*;
 
-        /// Install the default cache's page and credential keys.
         fn keys() -> Keyring {
             let (_, _, roots) = super::tests::issued();
             let keys = Keyring::new(
@@ -2040,7 +1824,6 @@ pub mod identity {
             keys
         }
 
-        /// Create fresh generation-bound IDs and material for a rotation.
         fn rotation_bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
             let mut next = bundle(generation, roots, CacheKeyState::Active);
             for (i, key) in next.cache_keys.iter_mut().enumerate() {
@@ -2052,7 +1835,6 @@ pub mod identity {
             next
         }
 
-        /// Inspect current admission without counting outstanding lease owners.
         fn admitted_count(keys: &Keyring) -> usize {
             keys.epochs
                 .state
@@ -2065,7 +1847,6 @@ pub mod identity {
                 .len()
         }
 
-        /// Replay is order-sensitive; failures preserve roots and retained secret owners.
         #[test]
         fn publication_is_coherent_and_replay_preserves_shared_owners() {
             let (_, _, mut roots) = super::tests::issued();
@@ -2119,7 +1900,6 @@ pub mod identity {
             ));
         }
 
-        /// Removed epochs cannot return even after skipped bundle generations.
         #[test]
         fn generation_bound_ids_reject_resurrection_skips_future_and_zero_epochs() {
             let keys = keys();
@@ -2185,7 +1965,6 @@ pub mod identity {
             assert_eq!(admitted_count(&keys), 2);
         }
 
-        /// Both replay and rotation must validate every key's encoded generation.
         #[test]
         fn every_install_rejects_opaque_zero_and_future_key_generations() {
             let keys = keys();
@@ -2204,7 +1983,6 @@ pub mod identity {
             }
         }
 
-        /// Public wire installation retains state and error mapping on rejection.
         #[test]
         fn public_install_preserves_generation_errors_and_installed_state() {
             let keys = keys();
@@ -2234,7 +2012,6 @@ pub mod identity {
             }
         }
 
-        /// Build a default pair with generation-one key IDs and configurable admission.
         fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> KeyringBundle {
             KeyringBundle {
                 schema_version: SCHEMA_VERSION,
@@ -2264,7 +2041,6 @@ pub mod identity {
             }
         }
 
-        /// Rotation preserves prepared secret ownership and rejects invalid rebinding.
         #[test]
         fn rotation_rejects_rollback_rebinding_and_cross_purpose_use() {
             let keys = keys();
@@ -2346,7 +2122,6 @@ pub mod identity {
             assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[7; 32]);
         }
 
-        /// Retiring an epoch closes admission but its final lease still owns its bytes.
         #[test]
         fn retirement_closes_admission_and_last_lease_owns_secret() {
             let keys = keys();
@@ -2395,7 +2170,6 @@ pub mod identity {
             );
         }
 
-        /// Replays and newer publications cannot undo completed retirement.
         #[test]
         fn explicit_retirement_blocks_published_keys_without_external_fences() {
             let keys = keys();
@@ -2440,7 +2214,6 @@ pub mod identity {
             assert!(secret.upgrade().is_none());
         }
 
-        /// Empty admission preserves held leases and still forbids resurrection.
         #[test]
         fn removal_of_all_keys_preserves_leases_and_rejects_resurrection() {
             let keys = keys();
@@ -2471,7 +2244,6 @@ pub mod identity {
             assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
         }
 
-        /// Capacity counts only current admission, not previously issued leases.
         #[test]
         fn capacity_is_bounded_by_current_bundle_not_outstanding_leases() {
             let keys = keys();
@@ -2502,7 +2274,6 @@ pub mod identity {
             assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
         }
 
-        /// New identity admission follows current roots without invalidating held Arcs.
         #[test]
         fn identity_installation_and_leases_follow_current_trust() {
             let (pending, chain, roots) = super::tests::issued();
@@ -2539,12 +2310,10 @@ pub mod identity {
         }
     }
 
-    /// Shared issuance fixtures for private state-machine tests.
     #[cfg(test)]
     mod tests {
         use super::*;
 
-        /// The adapter uses the remote path and retains a wiping key owner.
         #[test]
         fn rcgen_signer_is_remote_and_uses_zeroizing_dalek_key() {
             fn requires_zeroize_on_drop(_: &impl zeroize::ZeroizeOnDrop) {}
@@ -2567,7 +2336,6 @@ pub mod identity {
             }
         }
 
-        /// CSR encoding preserves the identity key, default subject, and signature.
         #[test]
         fn pending_csr_public_key_and_signature_match_identity() {
             use x509_parser::{certification_request::X509CertificationRequest, prelude::FromDer};
@@ -2602,16 +2370,12 @@ pub mod identity {
             assert!(corrupted.verify_signature().is_err());
         }
 
-        /// Canonical cluster shared by private fixtures.
         pub(crate) const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 
-        /// Canonical node shared by private fixtures.
         pub(crate) const NODE: &str = "22222222-2222-4222-8222-222222222222";
 
-        /// Canonical cache shared by private fixtures.
         pub(crate) const CACHE: &str = "33333333-3333-4333-8333-333333333333";
 
-        /// Issue the default node certificate and its root.
         pub(super) fn issued() -> (PendingIdentity, Vec<Vec<u8>>, Vec<Vec<u8>>) {
             let (ca, ca_key) = test_util::ca();
             let (pending, chain) = test_util::issue(

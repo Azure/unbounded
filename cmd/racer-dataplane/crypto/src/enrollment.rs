@@ -1,13 +1,3 @@
-//! Durable node-private enrollment, independent of transport and hardware inventory.
-//! The caller persists NIC reservations before preparing a request, supplies current
-//! NICs and shares, and exclusively owns this identity directory. Attempt fencing
-//! must remain bound to the same serving reactor for the lifetime of this owner.
-//!
-//! Prepare persists a retry-stable key before exposing its CSR. Accept validates
-//! the response before durable replacement, and recovery revalidates trust before
-//! returning an identity. Cancellation and abandoned writes are fenced through
-//! the caller's host; transport retries and inventory remain application policy.
-
 use crate::identity;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use racer_control_wire::{
@@ -32,36 +22,27 @@ use uring_runtime::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-/// Enrollment validation failures, separate from caller-owned filesystem errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
-    /// Trust replacement overlaps identity acceptance or recovery. Retry when idle.
     Busy,
 
-    /// Identity correlation, certificate, token, or key pairing failed.
     Unauthorized,
 
-    /// Persisted JSON or private key material is corrupt.
     CorruptRecord,
 
-    /// The configured cluster is not a canonical UUID.
     InvalidConfiguration,
 
-    /// Entropy, serialization, or local key generation failed.
     Io,
 
-    /// Preserve the wire codec's exact failure classification.
     Wire(wire::Error),
 }
 
 impl From<wire::Error> for Error {
-    /// Retain the wire failure category without including rejected record bytes.
     fn from(error: wire::Error) -> Self {
         Self::Wire(error)
     }
 }
 
-/// Node-bound key and certificate persistence on a caller-owned filesystem host.
 pub struct Enrollment<H: Host> {
     cluster: ClusterId,
 
@@ -78,7 +59,6 @@ pub struct Enrollment<H: Host> {
     attempts: Attempts<H::Scope>,
 }
 
-/// A validated local key. Secret storage is private and zeroizes on final drop.
 #[derive(Clone)]
 pub struct LocalSigningIdentity {
     cluster: ClusterId,
@@ -98,7 +78,6 @@ pub struct LocalSigningIdentity {
     not_after: u64,
 }
 
-/// Retry-stable persisted CSR and private key, never included in diagnostics.
 #[derive(Serialize, Deserialize)]
 struct PendingIdentity {
     cluster: String,
@@ -110,30 +89,24 @@ struct PendingIdentity {
     csr: String,
 }
 
-/// Own secret text before serde has constructed the surrounding record.
 struct EncodedPrivateKey(Zeroizing<String>);
 
 impl Serialize for EncodedPrivateKey {
-    /// Preserve the persisted base64 string schema.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)
     }
 }
 
 impl<'de> Deserialize<'de> for EncodedPrivateKey {
-    /// Protect a decoded field immediately, even if a later field is missing.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
     }
 }
 
-/// Clear all JSON strings, including values not consumed by a failing DTO decode.
 struct PrivateJson(serde_json::Value);
 
 impl Drop for PrivateJson {
-    /// Erase temporary copies while their allocations are still owned.
     fn drop(&mut self) {
-        /// Visit every string in a private record's JSON tree.
         fn clear(value: &mut serde_json::Value) {
             match value {
                 serde_json::Value::String(text) => text.zeroize(),
@@ -146,7 +119,6 @@ impl Drop for PrivateJson {
     }
 }
 
-/// Exact pending request paired with the accepted wire response for recovery.
 #[derive(Serialize, Deserialize)]
 struct PersistedIdentity {
     pending: PendingIdentity,
@@ -155,13 +127,11 @@ struct PersistedIdentity {
 }
 
 impl PersistedIdentity {
-    /// Reject duplicate fields and oversized records before deserializing.
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES * 3)?);
         Self::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
     }
 
-    /// Decode the saved response through the same wire validation as live traffic.
     fn response(&self) -> Result<EnrollmentResponse, Error> {
         Ok(wire::decode_enrollment_response(
             &STANDARD
@@ -170,14 +140,12 @@ impl PersistedIdentity {
         )?)
     }
 
-    /// Keep serialized private material in zeroizing storage until submission.
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
         encode_private(self, wire::MAX_ENROLLMENT_BYTES * 3)
     }
 }
 
 impl<H: Host> Enrollment<H> {
-    /// Configure a namespace owner without performing I/O or generating keys.
     pub fn new(
         cluster: ClusterId,
         token_path: PathBuf,
@@ -195,17 +163,10 @@ impl<H: Host> Enrollment<H> {
         }
     }
 
-    /// Return the configured cluster binding.
     pub fn cluster(&self) -> &ClusterId {
         &self.cluster
     }
 
-    /// Validate all roots before atomically replacing the enrollment trust snapshot.
-    /// Return Busy while acceptance or recovery holds trust across filesystem awaits.
-    ///
-    /// The caller must authenticate the source and authorize trust-root replacement.
-    /// Parsing and validity checks do not establish that authority or require new
-    /// roots to chain to existing roots.
     pub fn set_peer_trust_roots(&self, roots: Vec<Vec<u8>>) -> Result<(), Error> {
         let _guard = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
         identity::root_store(&roots).map_err(|_| Error::Unauthorized)?;
@@ -213,7 +174,6 @@ impl<H: Host> Enrollment<H> {
         Ok(())
     }
 
-    /// Generate a local Ed25519 key and a retry-stable random enrollment UUID.
     fn generate(&self) -> Result<PendingIdentity, Error> {
         if !wire::valid_uuid(&self.cluster.0) {
             return Err(Error::InvalidConfiguration);
@@ -245,7 +205,6 @@ impl<H: Host> Enrollment<H> {
         })
     }
 
-    /// Bind caller inventory to a checked, retry-stable CSR without owning hardware.
     fn request(
         &self,
         p: &PendingIdentity,
@@ -268,7 +227,6 @@ impl<H: Host> Enrollment<H> {
         Ok(request)
     }
 
-    /// Validate request correlation and certificate policy before any publication.
     fn accept_pending(
         &self,
         bytes: &[u8],
@@ -288,7 +246,6 @@ impl<H: Host> Enrollment<H> {
         Ok((identity, persisted.encode()?))
     }
 
-    /// Validate the exact enrollment certificate contract, including leaf lifetime.
     fn validate(
         &self,
         p: &PendingIdentity,
@@ -355,8 +312,6 @@ where
         + From<secure::AccessError>
         + From<ReplacementError<<H::Scope as Scope>::Error>>,
 {
-    /// Persist the private key before returning a request. The caller must durably
-    /// persist its NIC reservations before calling this method, including retries.
     pub fn prepare<'a>(
         &'a self,
         nics: Vec<RailMapping>,
@@ -407,7 +362,6 @@ where
         })
     }
 
-    /// Read the current projected token without caching rotations or rejecting symlinks.
     pub fn read_token<'a>(
         &'a self,
         scope: &'a H::Scope,
@@ -424,13 +378,6 @@ where
         })
     }
 
-    /// Validate, durably publish identity, then durably remove the pending request.
-    /// Publication errors are converted by the caller without discarding their phase.
-    ///
-    /// The caller must authenticate and authorize the source of the whole response.
-    /// Structural, certificate, correlation, and key-pair checks do not authenticate
-    /// the whole response: the certificate does not cover `schema_version`,
-    /// `enrollment`, or `block_devices`. The selector is copied, not authorized here.
     pub fn accept_response<'a>(
         &'a self,
         response: EnrollmentResponse,
@@ -486,8 +433,6 @@ where
         })
     }
 
-    /// Recover and revalidate a published identity, fencing uncertain publication
-    /// and removing only a pending request already represented by that identity.
     pub fn load_identity<'a>(
         &'a self,
         parent: &'a H::Scope,
@@ -552,33 +497,26 @@ where
 }
 
 impl LocalSigningIdentity {
-    /// Borrow the accepted block-device selector, with empty selectors treated as absent.
     pub fn block_devices(&self) -> Option<&str> {
         self.block_devices.as_deref()
     }
 
-    /// Return the authenticated node UID.
     pub fn node(&self) -> &NodeId {
         &self.node
     }
 
-    /// Return the authenticated cluster UID.
     pub fn cluster(&self) -> &ClusterId {
         &self.cluster
     }
 
-    /// Borrow the exact accepted leaf-first certificate chain for REST/TLS.
     pub fn certificate_chain(&self) -> &[Vec<u8>] {
         &self.certificate_chain
     }
 
-    /// Explicitly borrow PKCS8 material for the REST client's TLS identity adapter.
-    /// The borrower must not persist, log, or share this key through cluster Secrets.
     pub fn private_key_der(&self) -> &[u8] {
         &self.private_material
     }
 
-    /// Revalidate this identity against the signing subsystem's current peer trust.
     pub fn signing_identity(
         &self,
         roots: &[Vec<u8>],
@@ -593,18 +531,15 @@ impl LocalSigningIdentity {
         .map(Arc::new)
     }
 
-    /// Return the chain and trust roots' earliest expiry for REST lifetime checks.
     pub fn expires_at(&self) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(self.not_after)
     }
 
-    /// Check the chain and trust roots' validity bounds against the scoped wall clock.
     pub fn valid_now(&self) -> bool {
         let now = uring_runtime::environment::wall_now();
         now >= UNIX_EPOCH + Duration::from_secs(self.not_before) && now < self.expires_at()
     }
 
-    /// Renew after two thirds of the trusted lifetime, capped by wire policy.
     pub fn renewal_due(&self) -> bool {
         let lifetime = Duration::from_secs(self.not_after - self.not_before);
         uring_runtime::environment::wall_now()
@@ -614,7 +549,6 @@ impl LocalSigningIdentity {
     }
 }
 
-/// Fixed-capacity output that cannot reallocate after receiving secret bytes.
 struct PrivateOutput {
     bytes: Zeroizing<Vec<u8>>,
 
@@ -622,7 +556,6 @@ struct PrivateOutput {
 }
 
 impl std::io::Write for PrivateOutput {
-    /// Reject an oversized write before copying any bytes or growing the allocation.
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > self.limit - self.bytes.len() {
             return Err(std::io::ErrorKind::FileTooLarge.into());
@@ -631,13 +564,11 @@ impl std::io::Write for PrivateOutput {
         Ok(bytes.len())
     }
 
-    /// Serialization writes directly to memory, so there is nothing to flush.
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
 
-/// Serialize directly into wiping storage sized before any secrets are copied.
 fn encode_private(value: &impl Serialize, limit: usize) -> Result<Zeroizing<Vec<u8>>, Error> {
     let mut output = PrivateOutput {
         bytes: Zeroizing::new(Vec::with_capacity(limit)),
@@ -647,7 +578,6 @@ fn encode_private(value: &impl Serialize, limit: usize) -> Result<Zeroizing<Vec<
     Ok(output.bytes)
 }
 
-/// Parse a projected bearer credential without retaining leading/trailing whitespace.
 fn token(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
     let token = Zeroizing::new(
         std::str::from_utf8(bytes)
@@ -665,13 +595,11 @@ fn token(bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
     Ok(token)
 }
 
-/// Decode bounded, duplicate-free pending JSON without changing its on-disk schema.
 fn decode_pending(bytes: &[u8]) -> Result<PendingIdentity, Error> {
     let scratch = PrivateJson(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES)?);
     PendingIdentity::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
 }
 
-/// Own bounded wiping output before base64 can write even a partial private key.
 fn decode_private_key(encoded: &EncodedPrivateKey) -> Result<Zeroizing<Vec<u8>>, Error> {
     if encoded.0.len() > wire::MAX_ENROLLMENT_BYTES {
         return Err(Error::CorruptRecord);
@@ -686,7 +614,6 @@ fn decode_private_key(encoded: &EncodedPrivateKey) -> Result<Zeroizing<Vec<u8>>,
     Ok(secret)
 }
 
-/// Reject a corrupt or mismatched pending key before submitting its CSR.
 fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error> {
     use x509_parser::prelude::FromDer;
     let secret = decode_private_key(&pending.private_key)?;
@@ -708,7 +635,6 @@ fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error>
 
 #[cfg(test)]
 mod tests {
-    //! Real enrollment state transitions over deterministic reactor completions.
     use super::*;
     use std::{
         cell::Cell,
@@ -726,18 +652,15 @@ mod tests {
     };
 
     std::thread_local! {
-        /// Observe secret-field destruction without reading deallocated memory.
         static PRIVATE_KEY_DROPS: Cell<usize> = const { Cell::new(0) };
     }
 
     impl Drop for EncodedPrivateKey {
-        /// The zeroizing field is erased after this test-only observer runs.
         fn drop(&mut self) {
             PRIVATE_KEY_DROPS.with(|drops| drops.set(drops.get() + 1));
         }
     }
 
-    /// Partial pending and nested persisted records retain zeroizing field ownership.
     #[test]
     fn private_fields_drop_on_missing_and_late_invalid_record_fields() {
         for pending in [
@@ -775,7 +698,6 @@ mod tests {
         }
     }
 
-    /// Fixed storage bounds both record families, including late serializer errors.
     #[test]
     fn private_serialization_is_bounded_non_reallocating_and_round_trips() {
         use std::io::Write;
@@ -831,10 +753,8 @@ mod tests {
         assert_eq!(output.bytes.as_ptr(), pointer);
         assert_eq!(output.bytes.capacity(), capacity);
 
-        /// Fail after the serializer has already emitted a secret-bearing field.
         struct FailsLate;
         impl Serialize for FailsLate {
-            /// Exercise cleanup after a non-capacity serialization failure.
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 use serde::ser::SerializeStruct;
                 let mut record = serializer.serialize_struct("record", 2)?;
@@ -845,7 +765,6 @@ mod tests {
         assert!(matches!(encode_private(&FailsLate, 128), Err(Error::Io)));
     }
 
-    /// Flat cause and publication phase keep test adapter errors lossless.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Failure {
         cause: Cause,
@@ -853,7 +772,6 @@ mod tests {
         phase: u8,
     }
 
-    /// Independent component errors crossing the test host boundary.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Cause {
         Runtime(uring_runtime::Error),
@@ -864,7 +782,6 @@ mod tests {
     }
 
     impl From<uring_runtime::Error> for Failure {
-        /// Retain the runtime cause before any replacement phase is attached.
         fn from(e: uring_runtime::Error) -> Self {
             Self {
                 cause: Cause::Runtime(e),
@@ -874,7 +791,6 @@ mod tests {
     }
 
     impl From<Error> for Failure {
-        /// Retain enrollment validation failures independently of filesystem causes.
         fn from(e: Error) -> Self {
             Self {
                 cause: Cause::Enrollment(e),
@@ -884,7 +800,6 @@ mod tests {
     }
 
     impl From<secure::AccessError> for Failure {
-        /// Preserve secure access policy failures without flattening their category.
         fn from(e: secure::AccessError) -> Self {
             Self {
                 cause: Cause::Access(e),
@@ -894,7 +809,6 @@ mod tests {
     }
 
     impl From<ReplacementError<Failure>> for Failure {
-        /// Preserve whether replacement failed before, during, or after publication.
         fn from(e: ReplacementError<Failure>) -> Self {
             match e {
                 ReplacementError::BeforeRename(e) => e,
@@ -904,7 +818,6 @@ mod tests {
         }
     }
 
-    /// Fresh IDs retain parent cancellation but identify only one attempt's I/O.
     #[derive(Clone)]
     struct Request {
         id: u64,
@@ -915,7 +828,6 @@ mod tests {
     impl Scope for Request {
         type Error = Failure;
 
-        /// Stop cancelled requests before admitting more simulated I/O.
         fn check(&self) -> Result<(), Failure> {
             if self.cancellation.is_cancelled() {
                 Err(uring_runtime::Error::Cancelled.into())
@@ -924,13 +836,11 @@ mod tests {
             }
         }
 
-        /// Share parent cancellation with the fresh attempt scope.
         fn cancellation(&self) -> Option<&Cancellation> {
             Some(&self.cancellation)
         }
     }
 
-    /// Deterministic worker hosting no dataplane state or hardware inventory.
     struct Files {
         reactor: Reactor<Request, ()>,
 
@@ -942,12 +852,10 @@ mod tests {
 
         type Budget = ();
 
-        /// Keep every attempt bound to this serving reactor.
         fn reactor(&self) -> &Reactor<Request, ()> {
             &self.reactor
         }
 
-        /// Assign a distinct I/O identity while retaining parent cancellation.
         fn fresh_scope(&self, parent: &Request) -> Result<Request, Failure> {
             self.next.set(self.next.get() + 1);
             Ok(Request {
@@ -956,25 +864,20 @@ mod tests {
             })
         }
 
-        /// Drain only the abandoned attempt before a successor can access its files.
         fn fence<'a>(&'a self, previous: &'a Request) -> Operation<'a, (), Failure> {
             self.reactor
                 .fence_matching(move |scope| scope.id == previous.id)
         }
 
-        /// Distinguish absent records from other filesystem and policy failures.
         fn is_missing(error: Failure) -> bool {
             error == uring_runtime::Error::NotFound.into()
         }
     }
 
-    /// Canonical authority used for enrollment correlation in simulation.
     const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 
-    /// Node identity assigned by the simulated certificate issuer.
     const NODE: &str = "22222222-2222-4222-8222-222222222222";
 
-    /// Construct one namespace owner on the active simulation backend.
     fn fixture() -> (Rc<Files>, Enrollment<Rc<Files>>, Request) {
         let files = Rc::new(Files {
             reactor: Reactor::new(64, ()),
@@ -996,7 +899,6 @@ mod tests {
         )
     }
 
-    /// Explicitly advance completions with a short bounded progress assertion.
     fn drive<T>(files: &Files, mut operation: Operation<'_, T, Failure>) -> Result<T, Failure> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1012,7 +914,6 @@ mod tests {
         }
     }
 
-    /// Issue a bounded client certificate for the exact CSR, with optional policy mutations.
     fn issue(
         request: &EnrollmentRequest,
         ca: &rcgen::Certificate,
@@ -1042,7 +943,6 @@ mod tests {
         }
     }
 
-    /// Re-enrollment replaces unusable state without discarding corrupt records.
     mod reenrollment {
         use super::*;
 
@@ -1364,7 +1264,6 @@ mod tests {
         }
     }
 
-    /// Enrollment keeps an empty subject and signs with the persisted identity key.
     #[test]
     fn generated_csr_public_key_and_signature_match_persisted_identity() {
         use x509_parser::{certification_request::X509CertificationRequest, prelude::FromDer};
@@ -1391,7 +1290,6 @@ mod tests {
         csr.verify_signature().unwrap();
     }
 
-    /// Retry persistence, inventory refresh, token rotation and recovery share one path.
     #[test]
     fn durable_enrollment_retries_rotation_and_recovery() {
         let sim = Simulation::new();
@@ -1521,7 +1419,6 @@ mod tests {
         }
     }
 
-    /// Live acceptance and a fresh owner recover the same optional selector.
     #[test]
     fn block_device_selector_survives_acceptance_and_recovery() {
         for selector in [Some(r"^nvme-eui\.[0-9a-f]+$"), None, Some("")] {
@@ -1553,7 +1450,6 @@ mod tests {
         }
     }
 
-    /// Rejected renewals retain the selector; accepted renewals replace or clear it.
     #[test]
     fn block_device_selector_changes_only_after_accepted_renewal() {
         for selector in [Some("new-device.*"), None, Some("")] {
@@ -1608,7 +1504,6 @@ mod tests {
         }
     }
 
-    /// Late base64 failures preserve pending work and never publish or recover a key.
     #[test]
     fn late_private_key_base64_errors_preserve_identity_records() {
         let sim = Simulation::new();
@@ -1689,7 +1584,6 @@ mod tests {
         assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
     }
 
-    /// Invalid certificates and pending material never publish an identity.
     #[test]
     fn certificate_correlation_key_pairing_and_pending_corruption_fail_closed() {
         let sim = Simulation::new();
@@ -1748,7 +1642,6 @@ mod tests {
         }
     }
 
-    /// Activation policy rejects renewals before replacing a usable identity or CSR.
     #[test]
     fn rejected_renewal_preserves_prior_identity_and_pending_request() {
         let sim = Simulation::new();
@@ -1867,7 +1760,6 @@ mod tests {
         assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
     }
 
-    /// A valid renewal cannot move a durable identity to another node UID.
     #[test]
     fn renewal_requires_node_continuity_before_durable_publication() {
         let sim = Simulation::new();
@@ -1941,7 +1833,6 @@ mod tests {
         assert_eq!(recovered.private_key_der(), renewed.private_key_der());
     }
 
-    /// Malformed or entirely time-invalid roots cannot replace the last good trust.
     #[test]
     fn invalid_root_snapshots_preserve_last_good_identity_and_trust() {
         let sim = Simulation::new();
@@ -2039,7 +1930,6 @@ mod tests {
         }
     }
 
-    /// Trust cannot change after validation while publication or cleanup awaits I/O.
     #[test]
     fn trust_rotation_is_excluded_until_acceptance_or_recovery_releases() {
         for recovering in [false, true] {
@@ -2137,7 +2027,6 @@ mod tests {
         }
     }
 
-    /// Trust validity must be rechecked when a previously accepted anchor expires.
     #[test]
     fn root_expiring_after_installation_blocks_persistence_and_recovery() {
         let sim = Simulation::new();
@@ -2200,7 +2089,6 @@ mod tests {
         );
     }
 
-    /// An unrelated retiring root cannot expire held or persisted enrollment identities.
     #[test]
     fn unrelated_root_expiry_preserves_enrollment_identities() {
         let sim = Simulation::new();
@@ -2255,7 +2143,6 @@ mod tests {
         );
     }
 
-    /// Held accepted and recovered identities must stay within the root's lifetime.
     #[test]
     fn held_enrollment_identity_uses_root_validity_bounds() {
         let sim = Simulation::new();
@@ -2309,7 +2196,6 @@ mod tests {
         assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
     }
 
-    /// Abandoned writes are fenced before retry and publication phases stay exact.
     #[test]
     fn persistence_faults_abandonment_and_reconciliation_preserve_errors() {
         for case in ["write", "rename", "sync", "abandon", "cancel-rename"] {
@@ -2391,7 +2277,6 @@ mod tests {
         }
     }
 
-    /// Overlap cannot steal serialization; cancellation before admission causes no I/O.
     #[test]
     fn attempts_reject_overlap_and_fence_abandoned_work_before_fresh_scope() {
         let sim = Simulation::new();
@@ -2428,7 +2313,6 @@ mod tests {
         assert_eq!(files.next.get(), 2);
     }
 
-    /// Lifetime-based renewal and recovery treat expired authentication as absent.
     #[test]
     fn renewal_and_expired_recovery_follow_scoped_time() {
         let sim = Simulation::new();
@@ -2462,7 +2346,6 @@ mod tests {
         assert!(!identity.valid_now());
     }
 
-    /// Shared secure helpers keep symlink policy, permissions and size errors intact.
     #[test]
     fn secure_helpers_reject_private_links_modes_and_oversized_reads() {
         let sim = Simulation::new();
