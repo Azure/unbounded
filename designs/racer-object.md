@@ -77,6 +77,8 @@ found".
 
 **Errors.** S3 error codes and HTTP status codes are mapped to `racersdk`
 errors (not found, forbidden, unauthorized, version mismatch, unavailable).
+Network operation and DNS failures map to unavailable when no API or HTTP
+status classification applies. Cancellation and deadlines take precedence.
 The error message is a fixed "S3 request failed". The upstream error is kept
 as the wrapped cause, so `errors.Is` still works, but its text is not shown.
 

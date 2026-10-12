@@ -10,11 +10,14 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -649,6 +652,12 @@ func TestOriginErrorClassificationPrecedence(t *testing.T) {
 		{"known-api", errors.Join(&smithy.GenericAPIError{Code: "AccessDenied"}, originStatusError{404}), racersdk.ErrForbidden},
 		{"unknown-api", errors.Join(&smithy.GenericAPIError{Code: "Unknown"}, originStatusError{404}), racersdk.ErrNotFound},
 		{"unknown-api-and-status", errors.Join(&smithy.GenericAPIError{Code: "Unknown"}, originStatusError{416}), errInvalidS3Response},
+		{"transport-cancellation", &net.OpError{Op: "dial", Net: "tcp", Err: context.Canceled}, context.Canceled},
+		{"transport-deadline", &net.OpError{Op: "dial", Net: "tcp", Err: context.DeadlineExceeded}, context.DeadlineExceeded},
+		{"transport-known-api", errors.Join(&net.OpError{Err: syscall.ECONNRESET}, &smithy.GenericAPIError{Code: "AccessDenied"}), racersdk.ErrForbidden},
+		{"transport-status", errors.Join(&net.OpError{Err: syscall.ECONNRESET}, originStatusError{404}), racersdk.ErrNotFound},
+		{"transport-invalid-status", errors.Join(&net.OpError{Err: syscall.ECONNRESET}, originStatusError{416}), errInvalidS3Response},
+		{"transport-unknown-api", errors.Join(&net.OpError{Err: syscall.ECONNRESET}, &smithy.GenericAPIError{Code: "Unknown"}), racersdk.ErrUnavailable},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, pinned := range []bool{false, true} {
@@ -662,6 +671,42 @@ func TestOriginErrorClassificationPrecedence(t *testing.T) {
 
 				if !errors.Is(err, tt.err) || strings.Contains(err.Error(), "private") {
 					t.Fatal("unsafe or lost cause", err)
+				}
+			}
+		})
+	}
+}
+
+func TestOriginTransportErrorClassification(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		want error
+	}{
+		{"dns", &net.DNSError{Err: "no such host", Name: "private.invalid", IsNotFound: true}, racersdk.ErrUnavailable},
+		{"dial-dns", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "private.invalid", IsNotFound: true}}, racersdk.ErrUnavailable},
+		{"refused", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}, racersdk.ErrUnavailable},
+		{"reset", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}, racersdk.ErrUnavailable},
+		{"timeout", &net.OpError{Op: "read", Net: "tcp", Err: context.DeadlineExceeded}, context.DeadlineExceeded},
+		{"non-transport", errors.New("private request configuration failure"), errInvalidS3Response},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, pinned := range []bool{false, true} {
+				wrapped := &smithy.OperationError{ServiceID: "S3", OperationName: "GetObject", Err: &url.Error{Op: "Get", URL: "https://private.invalid/secret", Err: tt.err}}
+				err := classifyS3Error(wrapped, pinned)
+				originAssertError(t, err, tt.want)
+
+				if !errors.Is(err, wrapped) || !errors.Is(err, tt.err) || strings.Contains(err.Error(), "private") || strings.Contains(err.Error(), "secret") {
+					t.Fatal("unsafe or lost cause", err)
+				}
+
+				wantStatus := http.StatusServiceUnavailable
+				if tt.want == errInvalidS3Response {
+					wantStatus = http.StatusBadGateway
+				}
+
+				if got := int(sidecarSDKFailure(err)); got != wantStatus {
+					t.Fatalf("sidecar status = %d, want %d", got, wantStatus)
 				}
 			}
 		})

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"reflect"
 	"strings"
 	"time"
@@ -384,6 +385,15 @@ func s3Error(err error) error {
 
 	if errors.As(err, &status) {
 		return s3HTTPError(status.HTTPStatusCode())
+	}
+
+	var (
+		op  *net.OpError
+		dns *net.DNSError
+	)
+
+	if errors.As(err, &op) || errors.As(err, &dns) {
+		return racersdk.ErrUnavailable
 	}
 
 	return errInvalidS3Response
