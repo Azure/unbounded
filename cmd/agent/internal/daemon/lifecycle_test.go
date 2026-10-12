@@ -156,6 +156,42 @@ func TestDaemonUnitDeclaresDeferredExitCode(t *testing.T) {
 	require.Contains(t, unit, "OnFailure="+goalstates.DaemonRecoveryUnit)
 }
 
+// TestDaemonUnitRestartsAfterACleanExit pins what ErrRestartRequested falls
+// back on: a daemon that stopped after staging an AgentUpgrade or moving to the
+// host root, and could not re-execute in place, exits 0, and only the unit's
+// Restart= starts it again. Restart=always restarts after any exit, 0 included,
+// unless the code is in RestartPreventExitStatus. A unit that restarts only on
+// failure, or that names 0 there, would leave the host without a daemon and the
+// AgentUpgrade InProgress for good.
+func TestDaemonUnitRestartsAfterACleanExit(t *testing.T) {
+	t.Parallel()
+
+	rendered, err := renderDaemonAssetForPaths("daemon-service", daemonServiceContent, goalstates.AgentUpgradePaths{
+		CurrentPath:  "/opt/unbounded/agent/bin/unbounded-agent-current",
+		LastGoodPath: "/opt/unbounded/agent/bin/unbounded-agent-last-good",
+		BinaryPath:   "/opt/unbounded/agent/bin/unbounded-agent",
+		SignalPath:   "/var/lib/unbounded/agent/upgrade-signal",
+	})
+	require.NoError(t, err)
+
+	values := map[string][]string{}
+
+	for line := range strings.SplitSeq(string(rendered), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok && !strings.HasPrefix(key, "#") {
+			values[key] = append(values[key], value)
+		}
+	}
+
+	require.Equal(t, []string{"always"}, values["Restart"], "only Restart=always restarts a daemon that exits 0")
+
+	for _, prevent := range values["RestartPreventExitStatus"] {
+		require.NotContains(t, strings.Fields(prevent), "0", "a clean exit must not prevent the restart")
+	}
+
+	require.NotEmpty(t, values["RestartSec"], "RestartSec delays the fallback's restart; keep it explicit")
+}
+
 // TestActivateDaemonUnitClearsFailureBeforeStarting pins the order that lets a
 // retry recover a host this bug already broke.
 //

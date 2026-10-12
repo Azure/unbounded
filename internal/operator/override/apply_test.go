@@ -4,13 +4,203 @@
 package override
 
 import (
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/components/racer"
 )
+
+func TestApplyRacerEnvironmentParity(t *testing.T) {
+	env := []any{map[string]any{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.namespace"}}}}
+	envFrom := []any{
+		map[string]any{"configMapRef": map[string]any{"name": "racer-config"}},
+		map[string]any{"configMapRef": map[string]any{"name": "defaults"}, "prefix": "DEFAULT_"},
+	}
+
+	for _, tt := range []struct {
+		name           string
+		container      map[string]any
+		component      string
+		bypassValidate bool
+		wantError      string
+	}{
+		{name: "resources and security", container: map[string]any{"resources": map[string]any{"limits": map[string]any{"memory": "512Mi"}}, "securityContext": map[string]any{"runAsNonRoot": true}}},
+		{name: "identical environment", container: map[string]any{"env": env, "envFrom": envFrom}},
+		{name: "explicit env", container: map[string]any{"env": []any{map[string]any{"name": "RACER_CLUSTER", "value": "other"}}}, wantError: "env"},
+		{name: "env field source", container: map[string]any{"env": []any{map[string]any{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.name"}}}}}, wantError: "env"},
+		{name: "envFrom source", container: map[string]any{"envFrom": []any{map[string]any{"secretRef": map[string]any{"name": "other"}}}}, wantError: "envFrom"},
+		{name: "envFrom configMap name", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "other"}}, envFrom[1]}}, wantError: "envFrom"},
+		{name: "envFrom optional", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-config", "optional": true}}, envFrom[1]}}, wantError: "envFrom"},
+		{name: "envFrom order", container: map[string]any{"envFrom": []any{envFrom[1], envFrom[0]}}, wantError: "envFrom"},
+		{name: "envFrom prefix", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-config"}, "prefix": "OTHER_"}, envFrom[1]}}, wantError: "envFrom"},
+		{name: "envFrom removal", container: map[string]any{"envFrom": []any{}}, wantError: "envFrom"},
+		{name: "container replacement removes env", container: map[string]any{"image": "racer:test"}, bypassValidate: true, wantError: "env"},
+		{name: "controller removal", container: map[string]any{"$patch": "delete"}, bypassValidate: true, wantError: "exactly one"},
+		{name: "other component env", component: "machina", container: map[string]any{"env": []any{map[string]any{"name": "RACER_CLUSTER", "value": "other"}}}},
+		{name: "other component envFrom", component: "machina", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "other"}}}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			workload := testWorkload("racer")
+			workload.SetName("racer-controller")
+
+			if err := setNestedSlice(workload.Object, []any{map[string]any{"name": "controller", "image": "racer:test", "env": env, "envFrom": envFrom}}, "spec", "template", "spec", "containers"); err != nil {
+				t.Fatal(err)
+			}
+
+			original := workload.DeepCopy()
+
+			componentName := tt.component
+			if componentName == "" {
+				componentName = "racer"
+			}
+
+			plan := component.NewPlan()
+
+			op := component.Operation{Kind: component.OpApply, Object: workload, Component: componentName, Overridable: true}
+			if componentName == "racer" {
+				op.ValidateOverride = racer.ValidateOverride
+			}
+
+			plan.Add(op)
+
+			unrelated := testWorkload("unrelated")
+			plan.Add(component.Operation{Kind: component.OpApply, Object: unrelated, Component: "metalman", Site: "unrelated", Overridable: true})
+
+			container := deepCopyMap(tt.container)
+			container["name"] = "controller"
+
+			patch := map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+				"priorityClassName": "high-priority",
+				"containers":        []any{container, map[string]any{"name": "sidecar", "image": "sidecar:test", "env": []any{map[string]any{"name": "SIDECAR_SETTING", "value": "allowed"}}}},
+			}}}}
+			if tt.name == "container replacement removes env" {
+				if err := setNestedSlice(patch, []any{map[string]any{"$patch": "replace"}, container}, "spec", "template", "spec", "containers"); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			entries := []SourcedEntry{{Source: Source{Key: "racer.yaml", Index: 0}, Entry: Entry{Component: componentName, Kind: "Deployment", Patch: patch, AddContainers: []string{"sidecar"}}}}
+
+			if !tt.bypassValidate {
+				if err := ValidateErr(entries); err != nil {
+					t.Fatalf("preflight: %v", err)
+				}
+			}
+
+			report := Apply(plan, entries, nil)
+			if tt.wantError != "" {
+				if !report.Failed() || !strings.Contains(report.Err().Error(), tt.wantError) || !strings.Contains(report.Err().Error(), "ConfigMap racer-config") {
+					t.Fatalf("error = %v, want %q and tuning interface", report.Err(), tt.wantError)
+				}
+
+				if len(plan.Operations) != 1 || plan.Operations[0].Object != unrelated {
+					t.Fatal("failed racer Deployment must be withheld without dropping unrelated operations")
+				}
+
+				if len(report.Withheld) != 1 || report.Withheld[0].Component != "racer" || report.Withheld[0].Ref.Name != "racer-controller" || report.Workloads[0].Hash == "" {
+					t.Fatalf("failure attribution = %+v", report)
+				}
+			} else {
+				if report.Failed() || len(plan.Operations) != 2 || len(report.Withheld) != 0 {
+					t.Fatalf("valid tuning failed: %+v", report)
+				}
+
+				pod := podSpec(t, plan.Operations[0].Object)
+				if pod.PriorityClassName != "high-priority" || len(pod.Containers) != 2 {
+					t.Fatalf("pod tuning or sidecar lost: %+v", pod)
+				}
+
+				if tt.name == "resources and security" {
+					for _, controller := range pod.Containers {
+						if controller.Name == "controller" && (controller.Resources.Limits.Memory().String() != "512Mi" || controller.SecurityContext == nil || controller.SecurityContext.RunAsNonRoot == nil || !*controller.SecurityContext.RunAsNonRoot) {
+							t.Fatalf("controller resources or security settings lost: %+v", controller)
+						}
+					}
+				}
+			}
+
+			if !reflect.DeepEqual(workload.Object, original.Object) {
+				t.Fatal("override mutated the original workload")
+			}
+		})
+	}
+}
+
+func TestApplyRacerManifestEnvironmentParity(t *testing.T) {
+	manifest, err := os.ReadFile("../../../deploy/racer/controller.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canonical := &unstructured.Unstructured{}
+	if err := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(manifest)), 4096).Decode(canonical); err != nil {
+		t.Fatal(err)
+	}
+
+	if canonical.GetKind() != "Deployment" || canonical.GetName() != "racer-controller" {
+		t.Fatalf("unexpected first Racer manifest: %s %s", canonical.GetKind(), canonical.GetName())
+	}
+
+	for _, tt := range []struct {
+		name      string
+		field     string
+		value     any
+		wantError bool
+	}{
+		{name: "valid resources", field: "resources", value: map[string]any{"limits": map[string]any{"memory": "512Mi"}}},
+		{name: "explicit env override", field: "env", value: []any{map[string]any{"name": "RACER_CLUSTER", "value": "other"}}, wantError: true},
+		{name: "envFrom override", field: "envFrom", value: []any{map[string]any{"configMapRef": map[string]any{"name": "other"}}}, wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := component.NewPlan()
+			plan.Add(component.Operation{Kind: component.OpApply, Component: "racer", Object: canonical.DeepCopy(), Overridable: true, ValidateOverride: racer.ValidateOverride})
+
+			patch := map[string]any{}
+			if err := setNestedSlice(patch, []any{map[string]any{"name": "controller", tt.field: tt.value}}, "spec", "template", "spec", "containers"); err != nil {
+				t.Fatal(err)
+			}
+
+			entries := []SourcedEntry{{Source: Source{Key: "racer.yaml", Index: 0}, Entry: Entry{Component: "racer", Kind: "Deployment", Patch: patch}}}
+			if err := ValidateErr(entries); err != nil {
+				t.Fatal(err)
+			}
+
+			report := Apply(plan, entries, nil)
+			if report.Failed() != tt.wantError {
+				t.Fatalf("error = %v, want failure %v", report.Err(), tt.wantError)
+			}
+
+			if tt.wantError {
+				if len(plan.Operations) != 0 || len(report.Withheld) != 1 || !strings.Contains(report.Err().Error(), "ConfigMap racer-config") {
+					t.Fatalf("invalid manifest override was not withheld: %+v", report)
+				}
+
+				return
+			}
+
+			if len(plan.Operations) != 1 {
+				t.Fatal("valid manifest override was withheld")
+			}
+
+			before := podSpec(t, canonical)
+
+			after := podSpec(t, plan.Operations[0].Object)
+			if len(after.Containers) != 1 || after.Containers[0].Name != "controller" || after.Containers[0].Resources.Limits.Memory().String() != "512Mi" {
+				t.Fatalf("valid resource override did not apply: %+v", after.Containers)
+			}
+
+			if !reflect.DeepEqual(before.Containers[0].Env, after.Containers[0].Env) || !reflect.DeepEqual(before.Containers[0].EnvFrom, after.Containers[0].EnvFrom) {
+				t.Fatal("canonical manifest environment changed")
+			}
+		})
+	}
+}
 
 // multiSitePlan builds a plan with one metalman Deployment per Site plus a
 // cluster-singleton net DaemonSet, so Site selection can be exercised.
