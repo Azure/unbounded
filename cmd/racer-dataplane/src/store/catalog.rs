@@ -239,6 +239,7 @@ impl Index {
             return Err(Error::Overloaded);
         }
         let inflight = old.map_or_else(|| Rc::new(Cell::new(0)), |hold| hold.inflight.clone());
+        let active = old.map_or_else(|| Rc::new(Cell::new(0)), |hold| hold.active.clone());
         let unused = holds.unused() - old.map_or(0, super::holds::Hold::unused)
             + count.saturating_sub(locations.len() + inflight.get());
         if state.pages.len() + self.reserved.get() + unused > self.page_capacity.get() {
@@ -253,6 +254,7 @@ impl Index {
                 monotonic,
                 pages: count,
                 inflight,
+                active,
                 locations,
             },
         );
@@ -283,11 +285,11 @@ impl Index {
     }
 
     /// Release only unused capacity after a partial failure. Completed pages stay held.
-    /// Call after this version's persistence futures have finished.
+    /// Call after this version's persistence futures and pending writes have finished.
     pub fn release_hold(&self, version: &ObjectVersion) -> Result<()> {
         let mut holds = self.holds.borrow_mut();
         if let Some(hold) = holds.entries.get_mut(version) {
-            if hold.inflight.get() != 0 {
+            if hold.inflight.get() != 0 || hold.active.get() != 0 {
                 return Err(Error::Overloaded);
             }
             hold.pages = hold.locations.len();
@@ -300,6 +302,18 @@ impl Index {
 
     pub fn is_held(&self, page: &PageId) -> bool {
         self.hold_expiry(&page.version).is_some()
+    }
+
+    pub(super) fn protect_hold(&self, version: &ObjectVersion) -> Result<super::holds::HoldGuard> {
+        let holds = self.holds.borrow();
+        let hold = holds
+            .entries
+            .get(version)
+            .filter(|hold| hold.live())
+            .ok_or(Error::Unavailable)?;
+        hold.active
+            .set(hold.active.get().checked_add(1).ok_or(Error::Overloaded)?);
+        Ok(super::holds::HoldGuard(hold.active.clone()))
     }
 
     /// Deadline of a published held page. A HEAD reservation alone returns None.
@@ -396,6 +410,7 @@ impl Index {
                             monotonic,
                             pages: 0,
                             inflight: Rc::new(Cell::new(0)),
+                            active: Rc::new(Cell::new(0)),
                             locations: HashMap::default(),
                         });
                 hold.until = hold.until.max(*until);

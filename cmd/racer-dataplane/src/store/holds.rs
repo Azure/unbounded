@@ -18,6 +18,7 @@ pub(super) struct Hold {
     pub monotonic: Instant,
     pub pages: usize,
     pub inflight: Rc<Cell<usize>>,
+    pub active: Rc<Cell<usize>>,
     pub locations: HashMap<PageNumber, RecordLocation>,
 }
 
@@ -54,7 +55,7 @@ impl Default for Holds {
 impl Holds {
     pub fn expire(&mut self) {
         self.entries
-            .retain(|_, hold| hold.live() || hold.inflight.get() != 0);
+            .retain(|_, hold| hold.live() || hold.inflight.get() != 0 || hold.active.get() != 0);
     }
 
     pub fn unused(&self) -> usize {
@@ -81,5 +82,13 @@ impl Holds {
         uring_runtime::environment::now()
             .checked_add(ttl)
             .ok_or(Error::InvalidConfiguration)
+    }
+}
+
+pub(super) struct HoldGuard(pub Rc<Cell<usize>>);
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
     }
 }

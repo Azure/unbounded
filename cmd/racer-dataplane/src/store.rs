@@ -286,6 +286,7 @@ impl StoreReader {
 }
 
 struct Dirty {
+    hold: Option<holds::HoldGuard>,
     _resident: catalog::Resident,
 
     _payload: crate::retention::Payload,
@@ -337,6 +338,8 @@ pub struct StoreWriter {
     next: Cell<u64>,
     capacity: Cell<usize>,
     busy: Cell<bool>,
+    waiters: RefCell<HashMap<u64, Option<std::task::Waker>>>,
+    next_waiter: Cell<u64>,
     active_scope: RefCell<Option<RequestScope>>,
     availability: Rc<crate::control::Availability>,
     discarded: Cell<u64>,
@@ -372,6 +375,8 @@ impl StoreWriter {
             next: Cell::new(1),
             capacity: Cell::new(64),
             busy: Cell::new(false),
+            waiters: RefCell::new(HashMap::default()),
+            next_waiter: Cell::new(0),
             active_scope: RefCell::new(None),
             availability,
             discarded: Cell::new(0),
@@ -461,6 +466,8 @@ impl StoreWriter {
     /// Force an encrypted copy to disk, regardless of ownership or second sight.
     /// Reserve the version first. Success means a completed, published disk write,
     /// not queue acceptance or fsync durability. Poll with the worker reactor.
+    /// Cancellation waits for accepted disk work to finish. Keep polling this
+    /// future and the background writer until completion, even after canceling.
     pub fn persist_held<'a>(
         &'a self,
         page: CiphertextCopy,
@@ -470,6 +477,7 @@ impl StoreWriter {
             scope.check()?;
             logical_length(&page)?;
             let id = page.ciphertext.envelope().page.clone();
+            let _hold = self.index.protect_hold(&id.version)?;
             if !self.index.is_held(&id) {
                 return Err(Error::Unavailable);
             }
@@ -487,25 +495,36 @@ impl StoreWriter {
                 )?;
                 return Ok(());
             }
+            let waiter = WriterWaiter::new(self)?;
             let dirty = self.admission.reserve_completion(
                 Some(&id.version.object.cache),
                 ResourceClass::DirtyCiphertext,
                 page.ciphertext.bytes().len(),
             )?;
             let ticket = self.enqueue(page, dirty)?;
-            while self
-                .pending
-                .borrow()
-                .get(&id)
-                .is_some_and(|dirty| dirty.ticket == ticket)
-            {
-                scope.check()?;
-                if self.busy.get() {
-                    uring_runtime::drivers::yield_now().await;
-                } else {
-                    self.progress(8, scope).await?;
+            loop {
+                waiter.idle().await;
+                if let Err(error) = scope.check() {
+                    self.remove_queued_ticket(&id, ticket);
+                    self.slabs.fence_writes().await?;
+                    return Err(error);
+                }
+                if self
+                    .pending
+                    .borrow()
+                    .get(&id)
+                    .is_none_or(|dirty| dirty.ticket != ticket)
+                {
+                    break;
+                }
+                if let Err(error) = self.progress(8, scope).await {
+                    self.remove_queued_ticket(&id, ticket);
+                    self.slabs.fence_writes().await?;
+                    return Err(error);
                 }
             }
+            self.slabs.fence_writes().await?;
+            scope.check()?;
             let entry = self.index.lookup(&id)?.ok_or(Error::Io)?;
             self.segments.validate(
                 entry.location.segment,
@@ -517,6 +536,30 @@ impl StoreWriter {
             }
             Ok(())
         })
+    }
+
+    fn remove_queued_ticket(&self, page: &PageId, ticket: u64) {
+        let position = self.queue.borrow().iter().position(|queued| queued == page);
+        if self
+            .pending
+            .borrow()
+            .get(page)
+            .is_some_and(|dirty| dirty.ticket == ticket)
+            && let Some(position) = position
+        {
+            self.queue.borrow_mut().remove(position);
+            self.pending.borrow_mut().remove(page);
+            self.note_discard(1);
+        }
+    }
+
+    fn protected_pending(&self, page: &PageId) -> bool {
+        self.index.is_held(page)
+            || self
+                .pending
+                .borrow()
+                .get(page)
+                .is_some_and(|dirty| dirty.hold.is_some())
     }
     /// Accepted fills may complete after request admission closes, within quota.
     fn reserve_staging(
@@ -581,8 +624,11 @@ impl StoreWriter {
         if self.index.lookup(&id)?.is_some() {
             return Ok(0);
         }
-        let pending = self.pending.borrow();
-        if let Some(existing) = pending.get(&id) {
+        let mut pending = self.pending.borrow_mut();
+        if let Some(existing) = pending.get_mut(&id) {
+            if existing.hold.is_none() && self.index.is_held(&id) {
+                existing.hold = Some(self.index.protect_hold(&id.version)?);
+            }
             return Ok(existing.ticket);
         }
         let full = pending.len() >= self.capacity.get();
@@ -595,7 +641,7 @@ impl StoreWriter {
                 .iter()
                 .enumerate()
                 .take(QUEUE_RECLAIM_CANDIDATES)
-                .filter(|(_, page)| !self.index.is_held(page))
+                .filter(|(_, page)| !self.protected_pending(page))
                 .min_by_key(|(_, page)| retention.score(page))
                 .map(|(position, page)| (position, page.clone(), retention.score(page)));
             let Some((position, victim, score)) = victim else {
@@ -622,6 +668,11 @@ impl StoreWriter {
         self.pending.borrow_mut().insert(
             id.clone(),
             Dirty {
+                hold: if self.index.is_held(&id) {
+                    Some(self.index.protect_hold(&id.version)?)
+                } else {
+                    None
+                },
                 _resident: self.index.track(&id)?,
                 _payload: self.retention().payload(
                     u64::from(page.ciphertext.envelope().plaintext_length),
@@ -693,7 +744,9 @@ impl StoreWriter {
         let mut pending = self.pending.borrow_mut();
         let mut removed = 0;
         for page in queued {
-            if self.index.is_held(&page) {
+            if self.index.is_held(&page)
+                || pending.get(&page).is_some_and(|dirty| dirty.hold.is_some())
+            {
                 self.queue.borrow_mut().push_back(page);
                 continue;
             }
@@ -706,7 +759,7 @@ impl StoreWriter {
     /// must be that bundle and this queued write, not a submitted operation/reader.
     pub(crate) fn discard_idle_copy(&self, page: &crate::memory::PageResult) -> usize {
         let id = page.plaintext.page();
-        if self.index.is_held(id) {
+        if self.protected_pending(id) {
             return 0;
         }
         let mut queue = self.queue.borrow_mut();
@@ -747,6 +800,7 @@ impl StoreWriter {
                 cache.is_none_or(|cache| cache == &id.version.object.cache)
                     && !retention.is_owned(id)
                     && !self.index.is_held(id)
+                    && pending.get(*id).is_none_or(|dirty| dirty.hold.is_none())
             })
             .cloned()
             .collect();
@@ -784,6 +838,7 @@ impl StoreWriter {
             .take(QUEUE_RECLAIM_CANDIDATES)
             .filter(|id| cache.is_none_or(|cache| cache == &id.version.object.cache))
             .filter(|id| !self.index.is_held(id))
+            .filter(|id| pending.get(*id).is_none_or(|dirty| dirty.hold.is_none()))
             .map(|id| (retention.score(id), id.clone()))
             .collect();
         candidates.sort_by_key(|(score, _)| *score);
@@ -1042,6 +1097,62 @@ impl Drop for Busy<'_> {
     fn drop(&mut self) {
         self.0.busy.set(false);
         self.0.active_scope.borrow_mut().take();
+        let wakes: Vec<_> = self
+            .0
+            .waiters
+            .borrow_mut()
+            .values_mut()
+            .filter_map(Option::take)
+            .collect();
+        for wake in wakes {
+            wake.wake();
+        }
+    }
+}
+
+struct WriterWaiter<'a> {
+    writer: &'a StoreWriter,
+    id: u64,
+}
+
+impl<'a> WriterWaiter<'a> {
+    fn new(writer: &'a StoreWriter) -> Result<Self> {
+        let mut waiters = writer.waiters.borrow_mut();
+        if waiters.len() >= writer.capacity.get() {
+            return Err(Error::Overloaded);
+        }
+        let id = writer.next_waiter.get();
+        writer
+            .next_waiter
+            .set(id.checked_add(1).ok_or(Error::Unavailable)?);
+        waiters.insert(id, None);
+        Ok(Self { writer, id })
+    }
+
+    async fn idle(&self) {
+        std::future::poll_fn(|cx| {
+            if !self.writer.busy.get() {
+                return std::task::Poll::Ready(());
+            }
+            let wake = cx.waker().clone();
+            let old = self
+                .writer
+                .waiters
+                .borrow_mut()
+                .get_mut(&self.id)
+                .expect("registered writer waiter")
+                .replace(wake);
+            drop(old);
+            std::task::Poll::Pending
+        })
+        .await;
+    }
+}
+
+impl Drop for WriterWaiter<'_> {
+    fn drop(&mut self) {
+        let removed = self.writer.waiters.borrow_mut().remove(&self.id);
+        drop(removed);
     }
 }
 struct DirtyCleanup<'a> {

@@ -435,6 +435,153 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     assert!(index.lookup(&id).unwrap().is_some());
 }
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    struct Wakes(std::sync::atomic::AtomicUsize);
+    impl futures::task::ArcWake for Wakes {
+        fn wake_by_ref(this: &std::sync::Arc<Self>) {
+            this.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let index = f.store.writer.index();
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    index.reserve_hold(&id.version, 1, until).unwrap();
+    f.enqueue(copy.clone()).unwrap();
+    assert_eq!(index.release_hold(&id.version), Err(Error::Overloaded));
+    simulation.inject("write", Fault::Delay(6)).unwrap();
+    let background_scope = scope();
+    let mut background = f.store.writer.progress(1, &background_scope);
+    assert!(
+        background
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            .is_pending()
+    );
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    let request = scope();
+    let mut held = f.store.writer.persist_held(copy.clone(), &request);
+    let wakes = std::sync::Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = futures::task::waker(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(held.as_mut().poll(&mut cx).is_pending());
+    request.cancel().unwrap();
+    for _ in 0..4 {
+        assert!(held.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    assert_eq!(index.release_hold(&id.version), Err(Error::Overloaded));
+    assert_eq!(f.store.writer.waiters.borrow().len(), 1);
+
+    // Dropped followers unregister, and excess followers are bounded.
+    let follower_scope = scope();
+    let mut follower = f.store.writer.persist_held(copy.clone(), &follower_scope);
+    assert!(follower.as_mut().poll(&mut cx).is_pending());
+    let excess_scope = scope();
+    let mut excess = f.store.writer.persist_held(copy, &excess_scope);
+    assert_eq!(
+        excess.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Overloaded))
+    );
+    drop(excess);
+    drop(follower);
+    assert_eq!(f.store.writer.waiters.borrow().len(), 1);
+
+    drive(&f.reactor, background).unwrap();
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+    assert_eq!(f.store.writer.writes_in_flight(), 0);
+    assert_eq!(
+        held.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    );
+    assert!(f.store.writer.waiters.borrow().is_empty());
+    index.release_hold(&id.version).unwrap();
+    assert_eq!(index.held_page_expiry(&id), Some(until));
+}
+
+#[test]
+fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let index = f.store.writer.index();
+    index
+        .reserve_hold(
+            &id.version,
+            1,
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+        )
+        .unwrap();
+    f.store.writer.busy.set(true);
+    let busy = Busy(&f.store.writer);
+    let request = scope();
+    let mut held = f.store.writer.persist_held(copy, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(held.as_mut().poll(&mut cx).is_pending());
+    request.cancel().unwrap();
+    assert!(held.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.discard_unsubmitted(), 0);
+    drop(busy);
+    assert_eq!(
+        held.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    );
+    assert_eq!(f.store.writer.pending_count(), 0);
+    index.release_hold(&id.version).unwrap();
+    assert_eq!(index.hold_expiry(&id.version), None);
+}
+
+#[test]
+fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let index = f.store.writer.index();
+    index
+        .reserve_hold(
+            &id.version,
+            1,
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+        )
+        .unwrap();
+    f.enqueue(copy.clone()).unwrap();
+    simulation.inject("write", Fault::Delay(6)).unwrap();
+    let background_scope = scope();
+    let mut background = f.store.writer.progress(1, &background_scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(background.as_mut().poll(&mut cx).is_pending());
+    let request = scope();
+    let mut held = f.store.writer.persist_held(copy, &request);
+    assert!(held.as_mut().poll(&mut cx).is_pending());
+    request.cancel().unwrap();
+    drop(background);
+    assert_eq!(f.store.writer.pending_count(), 0);
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    assert!(held.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(index.release_hold(&id.version), Err(Error::Overloaded));
+    assert_eq!(drive(&f.reactor, held), Err(Error::Cancelled));
+    assert_eq!(f.store.writer.writes_in_flight(), 0);
+    index.release_hold(&id.version).unwrap();
+    assert_eq!(index.hold_expiry(&id.version), None);
+    assert!(f.store.writer.waiters.borrow().is_empty());
+}
 #[test]
 fn disk_observability_publication_read_and_pending_cleanup() {
     let f = Fixture::new();
