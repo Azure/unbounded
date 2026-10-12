@@ -102,7 +102,7 @@ func TestCollectorRejectsCargoFilesystemErrors(t *testing.T) {
 var workspaceMembers = []string{
 	"runtime", "alloc", "crypto", "verbs", "http", "topology",
 	"telemetry", "flow", "control-wire", "controlplane",
-	"uds-endpoint", "wire-codec", "peer-wire", "object-wire", "env-config",
+	"uds-endpoint", "wire-codec", "peer-wire", "object-wire",
 }
 
 // Discover actual manifests independently so two stale explicit lists cannot agree.
@@ -771,7 +771,6 @@ uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec" }
 peer-wire = { path = "peer-wire" }
 racer-object-wire = { path = "object-wire" }
-env-config = { path = "env-config" }
 `,
 		"cmd/racer-dataplane/Cargo.lock": "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n",
 	})
