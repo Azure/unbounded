@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "topology", "runtime", "alloc", "flow", "http", "telemetry", "verbs"]
+members = [".", "topology", "runtime", "telemetry", "verbs", "alloc", "control-wire", "wire-codec", "crypto", "flow", "http"]
 resolver = "3"
 
 [package]

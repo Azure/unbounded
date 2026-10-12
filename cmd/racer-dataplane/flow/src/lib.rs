@@ -75,7 +75,7 @@ impl std::fmt::Display for Error {
         f.write_str(match self {
             Self::InvalidInput => "invalid flow-control input",
             Self::Overloaded => "flow-control quota exhausted",
-            Self::Unavailable => "flow control stopped",
+            Self::Unavailable => "flow control unavailable",
             Self::Io => "flow-control I/O failed",
         })
     }
@@ -332,7 +332,8 @@ impl<P: Policy> Charge<P> {
         if amount == 0 || amount >= self.amount {
             return Err(Error::InvalidInput);
         }
-        Ok(self.transfer(amount, self.buffers.clone()))
+        let key = self.key.clone();
+        Ok(self.transfer(amount, self.buffers.clone(), key))
     }
 
     /// Caller must retain at least the capacity of every live backing allocation.
@@ -387,6 +388,9 @@ impl<P: Policy> Charge<P> {
         let Some(pool) = self.buffers.upgrade() else {
             return;
         };
+        // Application cloning may reenter stop or fill the pool. Clone unlocked,
+        // then check retention again before transferring any admission.
+        let key = self.key.clone();
         let mut pool = match pool.try_lock() {
             Ok(pool) => pool,
             Err(std::sync::TryLockError::WouldBlock) => return,
@@ -397,14 +401,12 @@ impl<P: Policy> Charge<P> {
         }
         // SAFETY: wipe_payload initialized the entire capacity above.
         unsafe { bytes.set_len(bytes.capacity()) };
-        let charge = self.transfer(self.amount, Weak::new());
+        let charge = self.transfer(self.amount, Weak::new(), key);
         pool.push((bytes, charge));
     }
 
-    /// Move admission to a new owner without touching either usage counter.
-    fn transfer(&mut self, amount: usize, buffers: Weak<Buffers<P>>) -> Self {
-        // Clone the application key before mutating ownership: its Clone may panic.
-        let key = self.key.clone();
+    /// Move admission with a precloned key without touching either usage counter.
+    fn transfer(&mut self, amount: usize, buffers: Weak<Buffers<P>>, key: Option<P::Key>) -> Self {
         self.amount -= amount;
         Self {
             class: self.class,
@@ -432,6 +434,8 @@ impl<P: Policy> Drop for Charge<P> {
     /// Release exactly this charge's remaining amount and apply wake policy.
     fn drop(&mut self) {
         self.release_to(0);
+        // Retire the final key owner before a wake callback retries admission.
+        drop(self.local.take());
         if P::wakes(self.class) {
             self.totals.wake.wake();
         }
@@ -505,8 +509,8 @@ impl<P: Policy> Quotas<P> {
         class: P::Class,
         amount: usize,
     ) -> Option<(Option<P::Key>, usize)> {
-        let keys = self.keys.borrow();
-        let local = keys.get(key).and_then(Weak::upgrade);
+        // Keep the counters alive, but release the lookup borrow before callbacks.
+        let local = self.keys.borrow().get(key).and_then(Weak::upgrade);
         let fair = self.fair_limit(
             class,
             self.active_keys.load(Ordering::Acquire) + usize::from(local.is_none()),
@@ -521,7 +525,8 @@ impl<P: Policy> Quotas<P> {
         if local_deficit != 0 {
             return Some((Some(key.clone()), local_deficit));
         }
-        let deficit = self.used(class).saturating_sub(self.limit(class) - amount);
+        let headroom = self.limit(class).checked_sub(amount)?;
+        let deficit = self.used(class).saturating_sub(headroom);
         (deficit != 0).then_some((None, deficit))
     }
 
@@ -621,8 +626,11 @@ impl<P: Policy> Quotas<P> {
         if amount == 0 {
             return Err(Error::InvalidInput);
         }
-        let limit = self.limit(class);
         let local = key.map(|key| self.key_counters(key)).transpose()?;
+        // Clone before checking limits: application code may admit more work,
+        // change policy, stop admission, or panic without owning a charge yet.
+        let key = key.cloned();
+        let limit = self.limit(class);
         if let Some(local) = local.as_ref().filter(|_| mode == AdmissionMode::Ordinary) {
             let fair = self.fair_limit(class, self.active_keys.load(Ordering::Acquire).max(1));
             let used = local.counter(class).used();
@@ -631,9 +639,6 @@ impl<P: Policy> Quotas<P> {
                 return Err(Error::Overloaded);
             }
         }
-        // Application cloning may panic. Finish it before committing admission
-        // so every counter increment is paired with a fully constructed owner.
-        let key = key.cloned();
         self.totals
             .counter(class)
             .reserve(amount, limit)
@@ -687,13 +692,28 @@ impl<P: Policy> Quotas<P> {
         if let Some(counts) = keys.get(key).and_then(Weak::upgrade) {
             return Ok(counts);
         }
+        drop(keys);
+        let retirement_key = key.clone();
+        let map_key = key.clone();
+        let limit = self.policy.max_keys();
+        let mut keys = self.keys.borrow_mut();
+        // Either clone may have installed this key or filled the table.
+        if let Some(counts) = keys.get(key).and_then(Weak::upgrade) {
+            return Ok(counts);
+        }
+        if !keys.contains_key(key) && keys.len() >= limit {
+            let used = keys.len();
+            drop(keys);
+            self.policy.rejected(Rejection::Keys { used, limit });
+            return Err(Error::Overloaded);
+        }
         let counts = Arc::new(Counters::keyed(
             P::Class::COUNT,
-            key.clone(),
+            retirement_key,
             self.active_keys.clone(),
             self.retired_keys.clone(),
         ));
-        keys.insert(key.clone(), Arc::downgrade(&counts));
+        keys.insert(map_key, Arc::downgrade(&counts));
         Ok(counts)
     }
 
@@ -1013,6 +1033,12 @@ fn wipe_payload(bytes: &mut Vec<u8>) {
 mod quota_tests {
     use super::*;
 
+    /// Unavailability does not imply that flow control has stopped.
+    #[test]
+    fn unavailable_display_is_state_neutral() {
+        assert_eq!(Error::Unavailable.to_string(), "flow control unavailable");
+    }
+
     /// Distinct payload, wake-enabled, and drain-progress fixture classes.
     #[derive(Clone, Copy, Debug)]
     enum Resource {
@@ -1033,7 +1059,7 @@ mod quota_tests {
         }
     }
 
-    /// Fixed limits and a shared rejection log for assertions.
+    /// Optional limit samples and a shared rejection log for assertions.
     #[derive(Clone)]
     struct TestPolicy {
         limit: usize,
@@ -1043,6 +1069,8 @@ mod quota_tests {
         rejected: Arc<Mutex<Vec<Rejection<Resource>>>>,
 
         limit_gate: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
+
+        limit_samples: Arc<Mutex<VecDeque<usize>>>,
     }
 
     impl TestPolicy {
@@ -1053,6 +1081,7 @@ mod quota_tests {
                 max_keys,
                 rejected: Arc::default(),
                 limit_gate: None,
+                limit_samples: Arc::default(),
             }
         }
     }
@@ -1070,7 +1099,11 @@ mod quota_tests {
                 gate.0.wait();
                 gate.1.wait();
             }
-            self.limit
+            self.limit_samples
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(self.limit)
         }
 
         /// Return the fixture's key-record bound.
@@ -1247,6 +1280,551 @@ mod quota_tests {
         assert_eq!(quotas.used(Resource::Payload), 0);
     }
 
+    /// A lower second limit must not wrap or suggest an impossible byte remedy.
+    #[test]
+    fn dynamic_limits_reclamation_revalidates_aggregate_headroom() {
+        for shared_usage in [false, true] {
+            for existing_key in [false, true] {
+                for (first, second, amount, expected) in [
+                    (10, 0, 5, None),
+                    (10, 4, 5, None),
+                    (10, 5, 5, Some((None, 3))),
+                    (10, 7, 5, Some((None, 1))),
+                    (10, 8, 5, None),
+                    (10, 20, 5, None),
+                    (usize::MAX, usize::MAX, usize::MAX, Some((None, 3))),
+                    (4, 0, 5, None),
+                ] {
+                    let quotas = Quotas::new(TestPolicy::new(100, 1));
+                    let shared = quotas.shared();
+                    let key = "a".to_owned();
+                    let owner = existing_key
+                        .then(|| quotas.reserve(Some(&key), Resource::Other, 1).unwrap());
+                    let held = if shared_usage {
+                        shared.reserve(Resource::Payload, 3).unwrap()
+                    } else {
+                        quotas.reserve(None, Resource::Payload, 3).unwrap()
+                    };
+                    quotas
+                        .policy
+                        .limit_samples
+                        .lock()
+                        .unwrap()
+                        .extend([first, second]);
+                    assert_eq!(
+                        quotas.reclamation(&key, Resource::Payload, amount),
+                        expected
+                    );
+                    assert_eq!(held.amount(), 3);
+                    assert_eq!(quotas.used(Resource::Payload), 3);
+                    assert_eq!(shared.used(Resource::Payload), 3);
+                    assert_eq!(
+                        quotas.active_keys.load(Ordering::Acquire),
+                        usize::from(existing_key)
+                    );
+                    assert!(quotas.policy.rejected.lock().unwrap().is_empty());
+                    drop((held, owner));
+                    assert_eq!(shared.used(Resource::Payload), 0);
+                    assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+                }
+            }
+        }
+    }
+
+    /// Reclamation callbacks may admit keyed work without borrowing the lookup table.
+    mod reclamation_callbacks {
+        use super::*;
+
+        /// Application callback selected for one synchronous admission.
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum Callback {
+            Limit,
+
+            Floor,
+
+            Clone,
+        }
+
+        /// A one-shot callback, optionally delayed past the first limit sample.
+        struct Hook {
+            callback: Callback,
+
+            skip: usize,
+
+            action: Box<dyn FnOnce()>,
+        }
+
+        thread_local! {
+            static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
+
+        /// Take the selected callback before running it so nested calls are inert.
+        fn invoke(callback: Callback) {
+            let hook = HOOK.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let hook = slot.as_mut()?;
+                if hook.callback != callback {
+                    return None;
+                }
+                if hook.skip != 0 {
+                    hook.skip -= 1;
+                    return None;
+                }
+                slot.take()
+            });
+            if let Some(hook) = hook {
+                (hook.action)();
+            }
+        }
+
+        /// A transferable identity with a worker-local clone callback.
+        #[derive(Debug, Eq, PartialEq, Hash)]
+        struct Key(u8);
+
+        impl Clone for Key {
+            /// Exercise application code when reclamation returns a keyed deficit.
+            fn clone(&self) -> Self {
+                invoke(Callback::Clone);
+                Self(self.0)
+            }
+        }
+
+        /// Fixed limits with one-shot application callbacks.
+        struct ReentrantPolicy;
+
+        impl Policy for ReentrantPolicy {
+            type Class = Resource;
+
+            type Key = Key;
+
+            /// Permit both the initial charges and the nested admission.
+            fn limit(&self, _: Resource) -> usize {
+                invoke(Callback::Limit);
+                100
+            }
+
+            /// Exercise callback reentry during fair-share calculation.
+            fn floor(&self, _: Resource) -> usize {
+                invoke(Callback::Floor);
+                1
+            }
+
+            /// Leave room for nested creation as well as live-key reuse.
+            fn max_keys(&self) -> usize {
+                3
+            }
+
+            /// No waiter is needed for this synchronous regression.
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            /// The fixture does not allocate page backing.
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            /// Every nested admission must succeed without a retry.
+            fn rejected(&self, _: Rejection<Resource>) {
+                panic!("unexpected rejection");
+            }
+        }
+
+        /// Check deficit results and accounting after new-key and live-key reentry.
+        fn check(callback: Callback, skip: usize) {
+            for nested_key in [0, 2] {
+                for (keyed, unkeyed, amount, expected) in [
+                    (40, 0, 11, Some((Some(Key(0)), 1))),
+                    (0, 90, 11, Some((None, 1))),
+                    (0, 0, 11, None),
+                    (0, 0, 51, None),
+                ] {
+                    let local_deficit = keyed != 0;
+                    if (callback == Callback::Clone && !local_deficit)
+                        || (skip != 0 && (local_deficit || amount > 50))
+                    {
+                        continue;
+                    }
+                    let quotas = Rc::new(Quotas::new(ReentrantPolicy));
+                    let first = quotas.reserve(Some(&Key(0)), Resource::Other, 1).unwrap();
+                    let second = quotas.reserve(Some(&Key(1)), Resource::Other, 1).unwrap();
+                    let payload = (keyed + unkeyed != 0).then(|| {
+                        quotas
+                            .reserve(
+                                (keyed != 0).then_some(&Key(0)),
+                                Resource::Payload,
+                                keyed + unkeyed,
+                            )
+                            .unwrap()
+                    });
+                    let nested = quotas.clone();
+                    HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Hook {
+                            callback,
+                            skip,
+                            action: Box::new(move || {
+                                let charge = nested
+                                    .reserve(Some(&Key(nested_key)), Resource::Progress, 1)
+                                    .unwrap();
+                                assert_eq!(nested.used(Resource::Progress), 1);
+                                drop(charge);
+                                assert_eq!(nested.used(Resource::Progress), 0);
+                            }),
+                        });
+                    });
+                    assert_eq!(
+                        quotas.reclamation(&Key(0), Resource::Payload, amount),
+                        expected
+                    );
+                    assert!(HOOK.with(|slot| slot.borrow().is_none()));
+                    assert_eq!(quotas.used(Resource::Payload), keyed + unkeyed);
+                    assert_eq!(quotas.active_keys.load(Ordering::Acquire), 2);
+                    drop((payload, first, second));
+                    assert_eq!(quotas.used(Resource::Payload), 0);
+                    assert_eq!(quotas.used(Resource::Other), 0);
+                    assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+                }
+            }
+        }
+
+        /// The first aggregate sample runs without a key-table borrow.
+        #[test]
+        fn fair_limit_allows_keyed_reentry() {
+            check(Callback::Limit, 0);
+        }
+
+        /// The later aggregate headroom sample also permits keyed reentry.
+        #[test]
+        fn aggregate_limit_allows_keyed_reentry() {
+            check(Callback::Limit, 1);
+        }
+
+        /// The per-key floor callback may admit work synchronously.
+        #[test]
+        fn floor_allows_keyed_reentry() {
+            check(Callback::Floor, 0);
+        }
+
+        /// Cloning the returned identity may admit work synchronously.
+        #[test]
+        fn key_clone_allows_keyed_reentry() {
+            check(Callback::Clone, 0);
+        }
+    }
+
+    /// Lower ceilings reject without losing old charges; higher ceilings admit exactly.
+    #[test]
+    fn dynamic_limits_admission_preserves_failure_accounting_and_success_edges() {
+        let quotas = Quotas::new(TestPolicy::new(4, 1));
+        let shared = quotas.shared();
+        let key = "a".to_owned();
+        quotas.policy.limit_samples.lock().unwrap().extend([10, 10]);
+        let held = quotas.reserve(Some(&key), Resource::Payload, 6).unwrap();
+        assert!(matches!(
+            shared.reserve(Resource::Payload, 1),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            quotas.reserve(None, Resource::Payload, 1),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            quotas.reserve(Some(&key), Resource::Payload, 1),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            quotas.reserve_completion(Some(&key), Resource::Payload, 1),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            shared.reserve(Resource::Payload, 0),
+            Err(Error::InvalidInput)
+        ));
+        assert!(matches!(
+            quotas.reserve(Some(&key), Resource::Payload, 0),
+            Err(Error::InvalidInput)
+        ));
+        assert_eq!(quotas.used(Resource::Payload), 6);
+        assert_eq!(shared.used(Resource::Payload), 6);
+        assert_eq!(
+            held.local
+                .as_ref()
+                .unwrap()
+                .counter(Resource::Payload)
+                .used(),
+            6
+        );
+        assert_eq!(quotas.active_keys.load(Ordering::Acquire), 1);
+        {
+            let rejected = quotas.policy.rejected.lock().unwrap();
+            assert_eq!(
+                rejected.len(),
+                7,
+                "local retries once; shared does not retry"
+            );
+            for (index, rejection) in rejected.iter().enumerate() {
+                let (key_used, key_limit) = if matches!(index, 3 | 4) {
+                    (Some(6), Some(4))
+                } else {
+                    (None, None)
+                };
+                assert!(matches!(rejection, Rejection::Resource {
+                    class: Resource::Payload, used: 6, limit: 4, requested: 1,
+                    key_used: actual_used, key_limit: actual_limit,
+                } if *actual_used == key_used && *actual_limit == key_limit));
+            }
+        }
+        quotas.policy.limit_samples.lock().unwrap().extend([10, 10]);
+        let refill = quotas.reserve(Some(&key), Resource::Payload, 4).unwrap();
+        assert_eq!(shared.used(Resource::Payload), 10);
+        assert_eq!(
+            held.local
+                .as_ref()
+                .unwrap()
+                .counter(Resource::Payload)
+                .used(),
+            10
+        );
+        drop((refill, held));
+        assert_eq!(shared.used(Resource::Payload), 0);
+        assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+        let exact = shared.reserve(Resource::Payload, 4).unwrap();
+        assert_eq!(quotas.used(Resource::Payload), 4);
+        drop(exact);
+        assert_eq!(quotas.used(Resource::Payload), 0);
+        assert_eq!(quotas.policy.rejected.lock().unwrap().len(), 7);
+    }
+
+    /// Check nested admission at each key clone and preserve all owned counters.
+    fn check_quota_key_clone(skip: usize) {
+        use std::cell::Cell;
+
+        /// Select one clone callback without affecting nested admission.
+        struct Hook {
+            skip: usize,
+
+            action: Box<dyn FnOnce()>,
+        }
+
+        thread_local! {
+            static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
+
+        /// A transferable key with a worker-local clone hook.
+        #[derive(Debug, Eq, PartialEq, Hash)]
+        struct Key(u8);
+
+        impl Clone for Key {
+            /// Release the hook borrow before running application code.
+            fn clone(&self) -> Self {
+                let hook = HOOK.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let hook = slot.as_mut()?;
+                    if hook.skip != 0 {
+                        hook.skip -= 1;
+                        return None;
+                    }
+                    slot.take()
+                });
+                if let Some(hook) = hook {
+                    (hook.action)();
+                }
+                Self(self.0)
+            }
+        }
+
+        /// Mutable ceilings and observed rejection facts.
+        struct ClonePolicy {
+            limit: Cell<usize>,
+
+            max_keys: Cell<usize>,
+
+            rejected: RefCell<Vec<Rejection<Resource>>>,
+        }
+
+        impl Policy for ClonePolicy {
+            type Class = Resource;
+
+            type Key = Key;
+
+            /// Read the current aggregate ceiling.
+            fn limit(&self, _: Resource) -> usize {
+                self.limit.get()
+            }
+
+            /// Read the current record ceiling.
+            fn max_keys(&self) -> usize {
+                self.max_keys.get()
+            }
+
+            /// This fixture has no admission waiter.
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            /// This fixture allocates no page backing.
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            /// Retain the rejection facts for assertions.
+            fn rejected(&self, rejection: Rejection<Resource>) {
+                self.rejected.borrow_mut().push(rejection);
+            }
+        }
+
+        for action in [
+            "same",
+            "keys",
+            "fair",
+            "global",
+            "limit",
+            "key_limit",
+            "stop",
+            "panic",
+        ] {
+            for completion in [false, true] {
+                let quotas = Rc::new(Quotas::new(ClonePolicy {
+                    limit: Cell::new(10),
+                    max_keys: Cell::new(2),
+                    rejected: RefCell::default(),
+                }));
+                let held = Rc::new(RefCell::new(Vec::new()));
+                let nested = quotas.clone();
+                let nested_held = held.clone();
+                HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Hook {
+                        skip,
+                        action: Box::new(move || match action {
+                            "same" => nested_held
+                                .borrow_mut()
+                                .push(nested.reserve(Some(&Key(0)), Resource::Payload, 3).unwrap()),
+                            "keys" => {
+                                for key in [1, 2] {
+                                    let result =
+                                        nested.reserve(Some(&Key(key)), Resource::Other, 1);
+                                    if let Ok(charge) = result {
+                                        nested_held.borrow_mut().push(charge);
+                                    } else {
+                                        assert_eq!(nested.keys.borrow().len(), 2);
+                                    }
+                                }
+                            }
+                            "fair" => nested_held
+                                .borrow_mut()
+                                .push(nested.reserve(Some(&Key(1)), Resource::Other, 1).unwrap()),
+                            "global" => nested_held
+                                .borrow_mut()
+                                .push(nested.reserve(None, Resource::Payload, 4).unwrap()),
+                            "limit" => nested.policy.limit.set(6),
+                            "key_limit" => nested.policy.max_keys.set(0),
+                            "stop" => nested.stop(),
+                            "panic" => panic!("key clone failed"),
+                            _ => unreachable!(),
+                        }),
+                    });
+                });
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if completion {
+                        quotas.reserve_completion(Some(&Key(0)), Resource::Payload, 7)
+                    } else {
+                        quotas.reserve(Some(&Key(0)), Resource::Payload, 7)
+                    }
+                }));
+                assert!(HOOK.with(|slot| slot.borrow().is_none()));
+                if action == "panic" {
+                    assert!(result.is_err());
+                } else {
+                    let result = result.unwrap();
+                    let expected = match action {
+                        "keys" if skip < 2 || !completion => Some(Error::Overloaded),
+                        "key_limit" if skip < 2 => Some(Error::Overloaded),
+                        "fair" if !completion => Some(Error::Overloaded),
+                        "global" | "limit" => Some(Error::Overloaded),
+                        "stop" if !completion => Some(Error::Unavailable),
+                        _ => None,
+                    };
+                    if let Some(expected) = expected {
+                        assert!(
+                            matches!(result, Err(error) if error == expected),
+                            "{action}"
+                        );
+                    } else {
+                        let charge = result.unwrap();
+                        assert_eq!(charge.key(), Some(&Key(0)));
+                        if action == "same" {
+                            assert!(Arc::ptr_eq(
+                                charge.local.as_ref().unwrap(),
+                                held.borrow()[0].local.as_ref().unwrap(),
+                            ));
+                        }
+                        held.borrow_mut().push(charge);
+                    }
+                }
+                if action == "keys" && skip < 2 {
+                    assert!(matches!(
+                        quotas.policy.rejected.borrow().as_slice(),
+                        [
+                            Rejection::Keys { used: 2, limit: 2 },
+                            Rejection::Keys { used: 2, limit: 2 }
+                        ]
+                    ));
+                }
+                assert!(quotas.keys.borrow().len() <= 2);
+                let owners = held.borrow();
+                for class in [Resource::Payload, Resource::Other] {
+                    let total: usize = owners
+                        .iter()
+                        .filter(|charge| charge.class.index() == class.index())
+                        .map(Charge::amount)
+                        .sum();
+                    assert_eq!(quotas.used(class), total, "{action}");
+                    assert!(total <= quotas.limit(class));
+                    for charge in owners.iter().filter(|charge| charge.local.is_some()) {
+                        let local = charge.local.as_ref().unwrap();
+                        let keyed: usize = owners
+                            .iter()
+                            .filter(|other| {
+                                other.key() == charge.key() && other.class.index() == class.index()
+                            })
+                            .map(Charge::amount)
+                            .sum();
+                        assert_eq!(local.counter(class).used(), keyed);
+                    }
+                }
+                let active = owners
+                    .iter()
+                    .filter_map(Charge::key)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                assert_eq!(quotas.active_keys.load(Ordering::Acquire), active);
+                drop(owners);
+                held.borrow_mut().clear();
+                assert_eq!(quotas.used(Resource::Payload), 0);
+                assert_eq!(quotas.used(Resource::Other), 0);
+                assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+            }
+        }
+    }
+
+    /// The retirement-key clone may recursively reserve keyed work.
+    #[test]
+    fn quota_key_clone_first_reentry() {
+        check_quota_key_clone(0);
+    }
+
+    /// The map-key clone must also run without holding the map borrow.
+    #[test]
+    fn quota_key_clone_second_reentry() {
+        check_quota_key_clone(1);
+    }
+
+    /// The final charge-key clone must precede admission checks.
+    #[test]
+    fn quota_key_clone_charge_reentry() {
+        check_quota_key_clone(2);
+    }
+
     /// Idle backing retains two live charges and reports pressure before retry.
     #[test]
     fn recycler_retains_two_live_charges_and_reports_pressure_before_retry() {
@@ -1331,6 +1909,109 @@ mod quota_tests {
         assert!(quotas.reserve(Some(&key), Resource::Other, 1).is_ok());
         assert!(unlocked.load(Ordering::SeqCst));
         assert_eq!(quotas.retained_buffer_bytes(), 0);
+    }
+
+    /// Key cloning runs unlocked, and callback changes are checked before retention.
+    #[test]
+    fn recycler_key_clone_runs_before_retention_checks() {
+        thread_local! {
+            static CLONE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        }
+
+        #[derive(Eq, PartialEq, Hash)]
+        struct Key;
+
+        impl Clone for Key {
+            fn clone(&self) -> Self {
+                let hook = CLONE_HOOK.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook();
+                }
+                Self
+            }
+        }
+
+        struct ClonePolicy;
+
+        impl Policy for ClonePolicy {
+            type Class = Resource;
+            type Key = Key;
+
+            fn limit(&self, _: Resource) -> usize {
+                4 << 20
+            }
+
+            fn max_keys(&self) -> usize {
+                1
+            }
+
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            fn rejected(&self, _: Rejection<Resource>) {
+                panic!("unexpected rejection");
+            }
+        }
+
+        let size = 1 << 20;
+        for action in ["retain", "stop", "fill"] {
+            let quotas = Rc::new(Quotas::new(ClonePolicy));
+            let mut idle = quotas.reserve(None, Resource::Payload, size).unwrap();
+            idle.recycle(vec![0xa7; size]);
+            let mut donor = quotas
+                .reserve(Some(&Key), Resource::Payload, 2 * size)
+                .unwrap();
+            let nested = quotas.clone();
+            CLONE_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Fail before reentry can block on the same mutex.
+                    assert!(
+                        nested.buffers.try_lock().is_ok(),
+                        "key cloned under recycler lock"
+                    );
+                    match action {
+                        "stop" => nested.stop(),
+                        "fill" => {
+                            let mut extra = nested.reserve(None, Resource::Payload, size).unwrap();
+                            extra.recycle(vec![0xa7; size]);
+                        }
+                        _ => {}
+                    }
+                }));
+            });
+
+            donor.recycle(vec![0xa7; size]);
+            assert!(CLONE_HOOK.with(|slot| slot.borrow().is_none()));
+            assert_eq!(quotas.is_stopped(), action == "stop");
+            let retained = match action {
+                "retain" => 3 * size,
+                "fill" => 2 * size,
+                _ => 0,
+            };
+            let owned = if action == "retain" { 0 } else { 2 * size };
+            assert_eq!(donor.amount(), owned);
+            assert!(donor.key().is_some());
+            assert_eq!(
+                donor
+                    .local
+                    .as_ref()
+                    .unwrap()
+                    .counter(Resource::Payload)
+                    .used(),
+                2 * size
+            );
+            assert_eq!(quotas.retained_buffer_bytes(), retained);
+            assert_eq!(quotas.used(Resource::Payload), retained + owned);
+            drop(donor);
+            quotas.reclaim_buffers();
+            assert_eq!(quotas.used(Resource::Payload), 0);
+            assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+        }
     }
 
     /// A poisoned recycler remains usable after a prior operation panicked.
@@ -1454,6 +2135,97 @@ mod quota_tests {
         drop(replacement);
         assert_eq!(quotas.used(Resource::Payload), 0);
         assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+    }
+
+    /// A final keyed release frees its record before synchronous waiter reentry.
+    #[test]
+    fn keyed_release_retires_before_reentrant_wake() {
+        thread_local! {
+            static ON_WAKE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        }
+
+        struct ReentrantWake(AtomicUsize);
+
+        impl std::task::Wake for ReentrantWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                let callback = ON_WAKE.with(|slot| slot.borrow_mut().take());
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
+        }
+
+        let quotas = Rc::new(Quotas::new(TestPolicy::new(10, 1)));
+        let old = "old".to_owned();
+        let mut charge = quotas.reserve(Some(&old), Resource::Other, 10).unwrap();
+        let split = charge.split(4).unwrap();
+        let wake = Arc::new(ReentrantWake(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(wake.clone());
+
+        let nested = quotas.clone();
+        ON_WAKE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(nested.used(Resource::Other), 6);
+                assert_eq!(nested.active_keys.load(Ordering::Acquire), 1);
+                let local = nested.keys.borrow()["old"].upgrade().unwrap();
+                assert_eq!(local.counter(Resource::Other).used(), 6);
+                assert!(nested.retired_keys.lock().unwrap().is_empty());
+                assert!(matches!(
+                    nested.reserve(Some(&"new".to_owned()), Resource::Other, 10),
+                    Err(Error::Overloaded)
+                ));
+            }));
+        });
+        quotas.shared().register(&waker);
+        drop(split);
+        assert_eq!(wake.0.load(Ordering::Relaxed), 1);
+        assert_eq!(charge.amount(), 6);
+        assert_eq!(quotas.used(Resource::Other), 6);
+
+        quotas.policy.rejected.lock().unwrap().clear();
+        let nested = quotas.clone();
+        ON_WAKE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(nested.used(Resource::Other), 0);
+                let replacement = nested
+                    .reserve(Some(&"new".to_owned()), Resource::Other, 10)
+                    .expect("the final release must free the key slot before waking");
+                assert_eq!(nested.used(Resource::Other), 10);
+                assert_eq!(nested.active_keys.load(Ordering::Acquire), 1);
+                assert_eq!(
+                    replacement
+                        .local
+                        .as_ref()
+                        .unwrap()
+                        .counter(Resource::Other)
+                        .used(),
+                    10
+                );
+                assert!(!nested.keys.borrow().contains_key("old"));
+                assert_eq!(nested.keys.borrow().len(), 1);
+                assert!(nested.retired_keys.lock().unwrap().is_empty());
+                drop(replacement);
+                assert_eq!(nested.used(Resource::Other), 0);
+                assert_eq!(nested.active_keys.load(Ordering::Acquire), 0);
+                assert_eq!(
+                    nested
+                        .retired_keys
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    vec!["new"]
+                );
+            }));
+        });
+        quotas.shared().register(&waker);
+        drop(charge);
+        assert_eq!(wake.0.load(Ordering::Relaxed), 2);
+        assert_eq!(quotas.used(Resource::Other), 0);
+        assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+        assert!(quotas.policy.rejected.lock().unwrap().is_empty());
+        assert!(ON_WAKE.with(|slot| slot.borrow().is_none()));
     }
 
     /// Charges and shared handles retain exact accounting across threads.

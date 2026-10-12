@@ -10,3 +10,4 @@
 self-hosted-runner:
   labels:
     - pve
+    - ubuntu-26.04

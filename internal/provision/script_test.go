@@ -4,6 +4,9 @@
 package provision
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -70,6 +73,38 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 
 	// Whatever is staged must still be cleaned up.
 	require.Contains(t, script, `trap 'rm -rf "${tmp_dir}"' EXIT`)
+}
+
+// TestUnboundedAgentInstallScriptSeed runs the block that seeds
+// /usr/local/bin against a directory that is missing, which stands in for a
+// read-only one: it fails the same way for root, which a permission bit would
+// not. The seed must not fail the install.
+func TestUnboundedAgentInstallScriptSeed(t *testing.T) {
+	t.Parallel()
+
+	script := UnboundedAgentInstallScript()
+	start := strings.Index(script, `AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"`)
+	require.GreaterOrEqual(t, start, 0)
+
+	const end = "\n    fi\nfi\n"
+
+	length := strings.Index(script[start:], end)
+	require.Positive(t, length)
+
+	block := strings.ReplaceAll(script[start:start+length+len(end)], "/usr/local/bin", filepath.Join(t.TempDir(), "missing"))
+	// The block runs rm and install. Anything left naming /usr/local would
+	// reach the host's when the tests run as root.
+	require.NotContains(t, block, "/usr/local", "the block must only touch the temporary directory")
+
+	agent := filepath.Join(t.TempDir(), "unbounded-agent")
+	require.NoError(t, os.WriteFile(agent, []byte("#!/bin/sh\n"), 0o755))
+
+	cmd := exec.Command("bash", "-eo", "pipefail", "-c", block)
+
+	cmd.Env = append(os.Environ(), "AGENT_BIN="+agent)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "%s", out)
+	require.Contains(t, string(out), "Not seeding")
 }
 
 func TestUnboundedAgentUninstallScript(t *testing.T) {

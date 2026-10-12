@@ -1,4 +1,4 @@
-//! Public allocator workflows across restart, cancellation, accounting, and real I/O.
+//! Public allocator workflows across cancellation, accounting, and real I/O.
 
 use page_alloc::{Alignment, DevicePlacement, Error, Generation, SegmentId, Segments, Slab};
 #[cfg(feature = "simulation")]
@@ -109,133 +109,6 @@ impl Drop for CountingCharge {
     fn drop(&mut self) {
         self.used.set(self.used.get() - self.bytes);
     }
-}
-
-/// Restored records remain readable and the sealed recovery tail is not overwritten.
-#[cfg(feature = "simulation")]
-#[test]
-fn reopen_snapshot_reads_old_record_and_appends_without_overwriting_it() {
-    let simulation = Simulation::new();
-    let _environment = simulation.enter();
-    let reactor = Reactor::<TestScope, ()>::new(16, ());
-    let make_slab = || Slab::<()>::new("/alloc-workflows/restart".into(), 16384, 8192, 1024);
-    let slab = make_slab();
-    let segments = Segments::new(slab.segment_bytes());
-    let alignment = slab.open_configured(&segments).unwrap();
-    let payload = b"a caller-owned record, not a cache entry";
-    let padded = alignment.extent(0, payload.len()).unwrap().length();
-    let (lease, extent) = segments.append(padded).unwrap();
-    let (id, generation) = (lease.id(), lease.generation());
-    let mut buffer = slab.allocate(padded, ()).unwrap();
-    buffer.as_mut_slice()[..payload.len()].copy_from_slice(payload);
-    drop(
-        drive(
-            &reactor,
-            slab.write(&reactor, extent, buffer, lease, &TestScope),
-        )
-        .unwrap(),
-    );
-    drive(&reactor, slab.fence_writes()).unwrap();
-    let frozen = segments.freeze().unwrap();
-    let snapshot = segments.snapshot();
-    assert_eq!(snapshot[0].state, SegmentState::Open);
-    assert_eq!(snapshot[0].used_bytes, padded as u64);
-    assert_eq!(snapshot[1].state, SegmentState::Free);
-    assert_eq!(segments.restore(snapshot.clone()), Err(Error::Busy));
-    drop(frozen);
-    drop(slab);
-    drop(segments);
-
-    let slab = make_slab();
-    let segments = Segments::new(slab.segment_bytes());
-    let alignment = slab.open_configured(&segments).unwrap();
-    // Restore validates the entire image before changing any slot or free list.
-    for (invalid, label) in [
-        "duplicate segment ID",
-        "zero generation",
-        "oversized sealed segment",
-        "misaligned sealed segment",
-        "nonempty free segment",
-        "missing segment",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut damaged = snapshot.clone();
-        match invalid {
-            0 => damaged[1].id = SegmentId(0),
-            1 => damaged[1].generation = Generation(0),
-            2 => {
-                damaged[1].state = SegmentState::Sealed;
-                damaged[1].used_bytes = slab.segment_bytes() + alignment.length() as u64;
-            }
-            3 => {
-                damaged[1].state = SegmentState::Sealed;
-                damaged[1].used_bytes = 513;
-            }
-            4 => damaged[1].used_bytes = alignment.length() as u64,
-            _ => {
-                damaged.pop();
-            }
-        }
-        assert_eq!(segments.restore(damaged), Err(Error::Corrupt), "{label}");
-        assert_eq!(segments.free_count(), 2, "{label}");
-        assert!(
-            segments
-                .snapshot()
-                .iter()
-                .all(|s| s.state == SegmentState::Free && s.used_bytes == 0),
-            "{label}"
-        );
-    }
-    segments.validate_restore(&snapshot).unwrap();
-    segments.restore(snapshot).unwrap();
-    assert_eq!(segments.state(id), Ok(SegmentState::Sealed));
-    assert_eq!(segments.free_count(), 1);
-    segments.validate(id, generation, &extent).unwrap();
-    let buffer = drive(
-        &reactor,
-        slab.read(
-            &reactor,
-            extent,
-            slab.allocate(padded, ()).unwrap(),
-            segments.lease(id, generation).unwrap(),
-            &TestScope,
-        ),
-    )
-    .unwrap();
-    assert_eq!(&buffer.as_slice()[..payload.len()], payload);
-    assert!(buffer.as_slice()[payload.len()..].iter().all(|b| *b == 0));
-    drop(buffer);
-
-    let (next, next_extent) = segments.append(padded).unwrap();
-    assert_eq!(next.id(), SegmentId(1));
-    assert_eq!(next_extent.offset(), slab.segment_bytes());
-    assert_eq!(segments.free_count(), 0);
-    let mut buffer = slab.allocate(padded, ()).unwrap();
-    buffer.as_mut_slice().fill(99);
-    drop(
-        drive(
-            &reactor,
-            slab.write(&reactor, next_extent, buffer, next, &TestScope),
-        )
-        .unwrap(),
-    );
-    let buffer = drive(
-        &reactor,
-        slab.read(
-            &reactor,
-            extent,
-            slab.allocate(padded, ()).unwrap(),
-            segments.lease(id, generation).unwrap(),
-            &TestScope,
-        ),
-    )
-    .unwrap();
-    assert_eq!(&buffer.as_slice()[..payload.len()], payload);
-    assert!(buffer.as_slice()[payload.len()..].iter().all(|b| *b == 0));
-    assert_eq!(slab.writes_in_flight(), 0);
-    assert_eq!(reactor.in_flight(), 0);
 }
 
 /// Public pooling enforces admission, zeroization, exact-size reuse, and bounded retention.
@@ -400,56 +273,6 @@ fn bound_io_rejects_foreign_tables_and_ranges_appended_after_lease_acquisition()
     assert!(written.as_slice().iter().all(|byte| *byte == 73));
     assert_eq!(reactor.in_flight(), 0);
     assert_eq!(slab.writes_in_flight(), 0);
-}
-
-/// Thawing and write completion are independent prerequisites for recovery.
-#[cfg(feature = "simulation")]
-#[test]
-fn restore_waits_for_freeze_guard_and_abandoned_write_completion_independently() {
-    for cancel_first in [false, true] {
-        let simulation = Simulation::new();
-        simulation.set_cancel_first(cancel_first);
-        let _environment = simulation.enter();
-        let reactor = Reactor::<TestScope, ()>::new(16, ());
-        let slab = Slab::<()>::new("/alloc-workflows/freeze".into(), 8192, 4096, 512);
-        let segments = Segments::new(slab.segment_bytes());
-        let alignment = slab.open_configured(&segments).unwrap();
-        let size = alignment.extent(0, 31).unwrap().length();
-        let (lease, extent) = segments.append(size).unwrap();
-        simulation
-            .inject("write", Fault::HoldCompletion(8))
-            .unwrap();
-        let mut write = slab.write(
-            &reactor,
-            extent,
-            slab.allocate(size, ()).unwrap(),
-            lease,
-            &TestScope,
-        );
-        assert!(poll(&mut write).is_pending());
-        reactor.poll_budgeted(1).unwrap();
-        drop(write);
-        assert_eq!(slab.writes_in_flight(), 1);
-
-        let frozen = segments.freeze().unwrap();
-        let snapshot = segments.snapshot();
-        assert!(matches!(segments.append(size), Err(Error::Busy)));
-        assert_eq!(segments.restore(snapshot.clone()), Err(Error::Busy));
-        drop(frozen);
-        // Thawing is not a kernel completion fence; the abandoned write owns a lease.
-        assert_eq!(segments.restore(snapshot.clone()), Err(Error::Busy));
-        assert_eq!(segments.snapshot(), snapshot);
-        let frozen = segments.freeze().unwrap();
-        drive(&reactor, slab.fence_writes()).unwrap();
-        assert_eq!(slab.writes_in_flight(), 0);
-        assert_eq!(reactor.in_flight(), 0);
-        // Conversely, completion does not release a caller's freeze guard.
-        assert_eq!(segments.restore(snapshot.clone()), Err(Error::Busy));
-        drop(frozen);
-        segments.restore(snapshot).unwrap();
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
-        assert_eq!(segments.append(size).unwrap().0.id(), SegmentId(1));
-    }
 }
 
 /// Build and bind a deterministic simulated slab with two segments.
@@ -746,6 +569,57 @@ fn real_alignment(result: page_alloc::Result<Alignment>) -> Option<Alignment> {
     }
 }
 
+/// Discover alignment before choosing any slab dimensions.
+fn probe_alignment(directory: &Directory) -> Option<Alignment> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+    let result = (|| {
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_DIRECT)
+            .open(directory.0.join("alignment-probe"))
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS) => Error::Unsupported,
+                errno => Error::SystemIo {
+                    operation: "open",
+                    errno,
+                },
+            })?;
+        // SAFETY: stat is initialized and the file and empty path remain live.
+        let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                libc::STATX_DIOALIGN,
+                &mut stat,
+            )
+        } != 0
+        {
+            return Err(match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENOSYS | libc::EOPNOTSUPP) => Error::Unsupported,
+                errno => Error::SystemIo {
+                    operation: "statx",
+                    errno,
+                },
+            });
+        }
+        if stat.stx_mask & libc::STATX_DIOALIGN == 0 {
+            return Err(Error::Unsupported);
+        }
+        Alignment::new(
+            stat.stx_dio_mem_align as usize,
+            stat.stx_dio_offset_align as u64,
+            stat.stx_dio_offset_align as usize,
+        )
+    })();
+    real_alignment(result)
+}
+
 /// Probe baseline io_uring support without hiding unexpected runtime setup failures.
 fn kernel_available() -> bool {
     let mut params = [0u64; 15];
@@ -793,14 +667,21 @@ fn io_uring_roundtrip_and_completion_fence() {
         return;
     }
     let directory = Directory::new();
-    let slab = Slab::<()>::new(directory.0.join("uring.dat"), 8192, 4096, 512);
-    let segments = Segments::new(4096);
-    if real_alignment(slab.open_configured(&segments)).is_none() {
+    let Some(alignment) = probe_alignment(&directory) else {
         return;
-    }
+    };
+    let (_, segment_bytes) = device_placement_sizes(alignment);
+    let slab = Slab::<()>::new(
+        directory.0.join("uring.dat"),
+        2 * segment_bytes,
+        segment_bytes,
+        segment_bytes as usize,
+    );
+    let segments = Segments::new(segment_bytes);
+    assert_eq!(slab.open_configured(&segments), Ok(alignment));
     let reactor = Reactor::<TestScope, ()>::new(16, ());
     reactor.init().unwrap();
-    let (lease, extent) = segments.append(4096).unwrap();
+    let (lease, extent) = segments.append(segment_bytes as usize).unwrap();
     let mut buffer = slab.allocate(extent.length(), ()).unwrap();
     buffer.as_mut_slice().fill(73);
     drop(
@@ -861,6 +742,10 @@ fn device_placement_sizes_support_4096_and_arbitrary_units() {
         (4096, 4096, 4096),
         (4096, 512, 4096),
         (512, 4096, 4096),
+        (8192, 8192, 8192),
+        (8192, 512, 8192),
+        (512, 8192, 8192),
+        (65536, 65536, 65536),
         (768, 512, 3072),
         (3, 5, 2055),
     ] {
@@ -899,6 +784,14 @@ fn device_placement_sizes_support_4096_and_arbitrary_units() {
             }
         }
         assert_eq!(segments.free_count(), 0);
+        let whole_segments = Segments::from_geometry(geometry).unwrap();
+        let buffer = alignment.allocate(segment_bytes as usize, ()).unwrap();
+        for id in 0..3 {
+            let (lease, extent) = whole_segments.append(segment_bytes as usize).unwrap();
+            assert_eq!(lease.id(), SegmentId(id));
+            assert_eq!(extent.offset(), id * segment_bytes);
+            alignment.check(extent, &buffer).unwrap();
+        }
     }
 }
 
@@ -911,8 +804,7 @@ fn device_placements_route_real_io_and_reject_short_reads() {
         return;
     }
     let directory = Directory::new();
-    let probe = Slab::<()>::new(directory.0.join("probe"), 16384, 4096, 4096);
-    let Some(alignment) = real_alignment(probe.open_configured(&Segments::new(4096))) else {
+    let Some(alignment) = probe_alignment(&directory) else {
         return;
     };
     let (half_bytes, segment_bytes) = device_placement_sizes(alignment);
@@ -1034,44 +926,43 @@ fn device_placements_route_real_io_and_reject_short_reads() {
 #[test]
 fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission() {
     let directory = Directory::new();
+    let Some(alignment) = probe_alignment(&directory) else {
+        return;
+    };
+    let (_, segment_bytes) = device_placement_sizes(alignment);
     #[cfg(feature = "simulation")]
     let failures = ["unbound", "wrong-geometry", "frozen-table"].as_slice();
     #[cfg(not(feature = "simulation"))]
     let failures = ["wrong-geometry", "frozen-table"].as_slice();
     for &failure in failures {
-        let slab = Slab::<()>::new(directory.0.join(failure), 8192, 4096, 512);
-        let correct = Segments::new(4096);
+        let slab = Slab::<()>::new(
+            directory.0.join(failure),
+            2 * segment_bytes,
+            segment_bytes,
+            segment_bytes as usize,
+        );
+        let correct = Segments::new(segment_bytes);
         match failure {
             #[cfg(feature = "simulation")]
             "unbound" => {
-                if real_alignment(slab.open_now()).is_none() {
-                    return;
-                }
+                assert_eq!(slab.open_now(), Ok(alignment));
             }
             "wrong-geometry" => {
-                let result = slab.open_configured(&Segments::new(8192));
-                if result == Err(Error::Unsupported) {
-                    let _ = real_alignment(result);
-                    return;
-                }
+                let result = slab.open_configured(&Segments::new(2 * segment_bytes));
                 assert_eq!(result, Err(Error::InvalidConfiguration));
             }
             "frozen-table" => {
                 let frozen = correct.freeze().unwrap();
                 let result = slab.open_configured(&correct);
-                if result == Err(Error::Unsupported) {
-                    let _ = real_alignment(result);
-                    return;
-                }
                 assert_eq!(result, Err(Error::Busy));
                 drop(frozen);
             }
             _ => unreachable!(),
         }
-        let alignment = slab.alignment().unwrap();
+        assert_eq!(slab.alignment(), Ok(alignment));
         let correct = Segments::from_geometry(slab.geometry().unwrap()).unwrap();
-        let (lease, extent) = correct.append(4096).unwrap();
-        let buffer = slab.allocate(4096, ()).unwrap();
+        let (lease, extent) = correct.append(segment_bytes as usize).unwrap();
+        let buffer = slab.allocate(extent.length(), ()).unwrap();
         let reactor = Reactor::<TestScope, ()>::new(16, ());
         let mut read = slab.read(&reactor, extent, buffer, lease, &TestScope);
         assert!(matches!(
@@ -1082,7 +973,7 @@ fn unbound_and_failed_binding_reject_reads_and_writes_before_reactor_admission()
         let mut write = slab.write(
             &reactor,
             extent,
-            slab.allocate(4096, ()).unwrap(),
+            slab.allocate(extent.length(), ()).unwrap(),
             correct.lease(SegmentId(0), Generation(1)).unwrap(),
             &TestScope,
         );

@@ -27,7 +27,6 @@ package mirror
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -50,6 +49,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/digestpipe"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/manifest"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/internal/gantry/streamcopy"
@@ -68,14 +68,26 @@ type AuthenticationChallenger interface {
 	AuthenticationChallenge(ctx context.Context, registry string) (challenge string, required bool, err error)
 }
 
+// ContentBackend serves content after reference validation and authentication
+// preflight. It replaces the local store, peer, and origin paths without fallback.
+type ContentBackend interface {
+	ServeContent(http.ResponseWriter, *http.Request, ifaces.OriginRef)
+}
+
+// WithContentBackend replaces the mirror's content paths with backend.
+func WithContentBackend(backend ContentBackend) Option {
+	return func(s *Server) { s.contentBackend = backend }
+}
+
 // Server is the mirror HTTP handler.
 type Server struct {
-	cfg     *config.Config
-	store   ifaces.LocalContentStore
-	origin  ifaces.OriginPuller
-	auth    AuthenticationChallenger
-	logger  *slog.Logger
-	metrics metricsHooks
+	contentBackend ContentBackend
+	cfg            *config.Config
+	store          ifaces.LocalContentStore
+	origin         ifaces.OriginPuller
+	auth           AuthenticationChallenger
+	logger         *slog.Logger
+	metrics        metricsHooks
 
 	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.
@@ -819,6 +831,24 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.contentBackend != nil {
+		contentRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+		if kind == ifaces.KindBlob {
+			contentRef.Offset, _ = parseOriginRetryRange(r.Header.Get("Range"))
+		}
+
+		s.contentBackend.ServeContent(w, r, contentRef)
+
+		return
+	}
+
+	if s.cfg.RacerEnabled {
+		s.logger.Error("mirror: Racer enabled without a content backend")
+		http.Error(w, "Racer unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
 	s.serveDigest(w, r, upstream, repo, d, kind)
 }
 
@@ -1042,6 +1072,8 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 		defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
 
 		s.bumpCacheHit()
+		setStoredManifestContentType(w, rc, size, kind)
+
 		// Sniff the first bytes so writeBlobHeaders can label content
 		// with its real mediaType for two cases (see
 		// writeBlobHeadersWithPrefix for the full story):
@@ -2417,6 +2449,8 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 	s.bumpPeerFetch("hit")
 	s.bumpPeerFetchLatency("hit", fetchStart)
+	setStoredManifestContentType(w, rcLocal, size, kind)
+
 	// Sniff the cached body's prefix so writeBlobHeaders can label
 	// content with the right Content-Type for blobs that hold manifest
 	// bytes AND for manifests that hold a manifest list/index body
@@ -3037,6 +3071,21 @@ func writeBlobHeaders(w http.ResponseWriter, d digest.Digest, size int64, kind i
 	writeBlobHeadersWithPrefix(w, d, size, kind, nil)
 }
 
+func setStoredManifestContentType(w http.ResponseWriter, reader io.Reader, size int64, kind ifaces.OriginRefKind) {
+	if kind != ifaces.KindManifest || w.Header().Get("Content-Type") != "" || size < 0 {
+		return
+	}
+
+	readerAt, ok := reader.(io.ReaderAt)
+	if !ok {
+		return
+	}
+
+	if contentType := manifest.DetectContentTypeFromReader(io.NewSectionReader(readerAt, 0, size)); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+}
+
 func writeBlobHeadersWithPrefix(w http.ResponseWriter, d digest.Digest, size int64, kind ifaces.OriginRefKind, sniffPrefix []byte) {
 	w.Header().Set("Docker-Content-Digest", d.String())
 
@@ -3059,7 +3108,7 @@ func writeBlobHeadersWithPrefix(w http.ResponseWriter, d digest.Digest, size int
 			// body prefix first to pick the matching content type;
 			// only when sniffing yields nothing do we fall back to the
 			// safe OCI manifest default.
-			if ct := sniffManifestContentType(sniffPrefix); ct != "" {
+			if ct := manifest.DetectContentType(sniffPrefix); ct != "" {
 				w.Header().Set("Content-Type", ct)
 			} else {
 				w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
@@ -3071,7 +3120,7 @@ func writeBlobHeadersWithPrefix(w http.ResponseWriter, d digest.Digest, size int
 			// the difference; if it looks like a manifest envelope use
 			// the matching manifest content type, otherwise the
 			// distribution-spec default.
-			if ct := sniffManifestContentType(sniffPrefix); ct != "" {
+			if ct := manifest.DetectContentType(sniffPrefix); ct != "" {
 				w.Header().Set("Content-Type", ct)
 			} else {
 				w.Header().Set("Content-Type", "application/octet-stream")
@@ -3082,42 +3131,6 @@ func writeBlobHeadersWithPrefix(w http.ResponseWriter, d digest.Digest, size int
 	if size >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	}
-}
-
-// sniffManifestContentType returns an OCI/Docker manifest Content-Type
-// when the prefix bytes look like a manifest JSON envelope, otherwise
-// an empty string. Used by writeBlobHeadersWithPrefix to label content
-// retrieved via origin's /blobs/->/manifests/ fallback so containerd's
-// CRI plugin can unpack it. We inspect mediaType because the same
-// schemaVersion=2 envelope is used by both image-manifest, image-index,
-// docker-manifest, and docker-manifest-list and the client needs the
-// right one to dispatch unpacking.
-func sniffManifestContentType(prefix []byte) string {
-	if len(prefix) < 2 || prefix[0] != '{' {
-		return ""
-	}
-	// Try to find a mediaType field. We don't fully parse JSON here
-	// because the prefix may not contain a complete value; a substring
-	// match against the well-known media types is sufficient for the
-	// types Gantry ever sees on the /blobs/ fallback path.
-	switch {
-	case bytes.Contains(prefix, []byte("application/vnd.oci.image.index.v1+json")):
-		return "application/vnd.oci.image.index.v1+json"
-	case bytes.Contains(prefix, []byte("application/vnd.oci.image.manifest.v1+json")):
-		return "application/vnd.oci.image.manifest.v1+json"
-	case bytes.Contains(prefix, []byte("application/vnd.docker.distribution.manifest.list.v2+json")):
-		return "application/vnd.docker.distribution.manifest.list.v2+json"
-	case bytes.Contains(prefix, []byte("application/vnd.docker.distribution.manifest.v2+json")):
-		return "application/vnd.docker.distribution.manifest.v2+json"
-	}
-	// Schema-version-2 envelope without a recognizable mediaType: use
-	// the OCI manifest content type as a safe default (containerd's
-	// unpacker will pick the right schema from the envelope itself).
-	if bytes.Contains(prefix, []byte("\"schemaVersion\"")) || bytes.Contains(prefix, []byte("\"schemaVersion\":")) {
-		return "application/vnd.oci.image.manifest.v1+json"
-	}
-
-	return ""
 }
 
 // writeOriginError maps an *ifaces.OriginError to an HTTP status code that

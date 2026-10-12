@@ -1,0 +1,9 @@
+[
+  {"name":"absent","fields":"","pattern":"","code":""},
+  {"name":"empty","fields":",\"block_devices\":\"\"","pattern":"","code":""},
+  {"name":"valid","fields":",\"block_devices\":\"^nvme-eui\\\\.[0-9a-f]+$\"","pattern":"^nvme-eui\\.[0-9a-f]+$","code":""},
+  {"name":"null","fields":",\"block_devices\":null","pattern":"","code":"invalid_request"},
+  {"name":"array","fields":",\"block_devices\":[]","pattern":"","code":"invalid_request"},
+  {"name":"duplicate","fields":",\"block_devices\":\"a\",\"block_devices\":\"b\"","pattern":"","code":"invalid_request"},
+  {"name":"wrong case","fields":",\"BlockDevices\":\"a\"","pattern":"","code":"invalid_request"}
+]

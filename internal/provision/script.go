@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+// FirstBootBootstrapUnit is the unit an Ignition config installs to bootstrap
+// the agent on every boot. kubectl-unbounded writes it and reset removes it.
+const FirstBootBootstrapUnit = "unbounded-agent-bootstrap.service"
+
 //go:embed assets/unbounded-agent-install.sh
 var unboundedAgentInstallScript string
 

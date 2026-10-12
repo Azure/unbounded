@@ -46,6 +46,26 @@ type fixture struct {
 	originHits *int32
 }
 
+type readerAtCache struct {
+	*fakes.Cache
+	digest digest.Digest
+	body   []byte
+}
+
+func (c *readerAtCache) Open(ctx context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
+	if d != c.digest {
+		return c.Cache.Open(ctx, d)
+	}
+
+	return &readerAtCacheReadCloser{Reader: bytes.NewReader(c.body)}, int64(len(c.body)), nil
+}
+
+type readerAtCacheReadCloser struct {
+	*bytes.Reader
+}
+
+func (r *readerAtCacheReadCloser) Close() error { return nil }
+
 func newFixture(t *testing.T, blobs map[digest.Digest][]byte) *fixture {
 	t.Helper()
 
@@ -104,6 +124,76 @@ func newFixture(t *testing.T, blobs map[digest.Digest][]byte) *fixture {
 	t.Cleanup(srv.Close)
 
 	return &fixture{cfg: cfg, cache: c, upstream: up, server: srv, originHits: &originHits}
+}
+
+func TestMirrorLocalIndexDetectsContentTypeBeyondPrefix(t *testing.T) {
+	body := []byte(`{"schemaVersion":2,"padding":"` + strings.Repeat("x", 8*1024) + `","manifests":[]}`)
+	d := digestOf(body)
+	cache := fakes.NewCache()
+	cache.Put(d, body)
+	store := &readerAtCache{Cache: cache, digest: d, body: body}
+	cfg := &config.Config{
+		UpstreamRegistries: []config.UpstreamRegistry{
+			{Name: "reg.example.com", Endpoint: "https://reg.example.com"},
+		},
+	}
+
+	srv := httptest.NewServer(mirror.New(cfg, store, fakes.NewOriginPuller()).Handler())
+	t.Cleanup(srv.Close)
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v2/repo/manifests/"+d.String(), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("Content-Type"); got != "application/vnd.oci.image.index.v1+json" {
+		t.Fatalf("Content-Type = %q, want OCI index", got)
+	}
+
+	gotBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("body length = %d, want %d", len(gotBody), len(body))
+	}
+}
+
+func TestMirrorLocalImageConfigUsesBlobContentType(t *testing.T) {
+	body := []byte(`{"architecture":"amd64","config":{"Env":["PATH=/usr/bin"]},"os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`)
+	d := digestOf(body)
+	fixture := newFixture(t, nil)
+	fixture.cache.Put(d, body)
+
+	req, err := http.NewRequest(http.MethodGet, fixture.server.URL+"/v2/repo/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("Content-Type"); got != "application/octet-stream" {
+		t.Fatalf("Content-Type = %q, want application/octet-stream", got)
+	}
 }
 
 type writerSpyCache struct {
