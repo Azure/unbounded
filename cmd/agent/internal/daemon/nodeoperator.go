@@ -63,8 +63,9 @@ type nodeOperator interface {
 	RepaveNode(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig) error
 	// StageAgentUpgrade stages a new host-side agent binary.
 	StageAgentUpgrade(context.Context, *slog.Logger, agentUpgradeRequest) error
-	// RestartAgentDaemon schedules a restart of the host-side agent daemon
-	// once an upgrade is staged and its pending signal recorded. It returns
+	// RestartAgentDaemon schedules a restart of the host-side agent daemon:
+	// once an AgentUpgrade is staged and its pending signal recorded, and once
+	// a host root move has pointed the units at the moved files. It returns
 	// before the restart begins, and fails only if it could not schedule it.
 	RestartAgentDaemon(context.Context, *slog.Logger) error
 	// ReconcileHostRoot moves the agent's files to the host root on a host an

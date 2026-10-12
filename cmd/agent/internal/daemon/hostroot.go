@@ -121,8 +121,9 @@ func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOpera
 	})
 }
 
-// restartFromHostRoot clears the daemon unit's start limit, then restarts it
-// from the rewritten units.
+// restartFromHostRoot clears the daemon unit's start limit, then schedules its
+// restart from the rewritten units, as an AgentUpgrade does; see
+// nspawnNodeOperator.RestartAgentDaemon.
 //
 // The move's restart is planned, but systemd counts it against the unit's
 // StartLimitBurst like any other start. Right after a burst of starts, such as
