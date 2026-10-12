@@ -11,6 +11,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -104,12 +105,6 @@ func NewManagedKubeProxyController(
 		),
 	}
 
-	enqueueAllHandler := cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(any) { c.enqueueAll() },
-		UpdateFunc: func(any, any) { c.enqueueAll() },
-		DeleteFunc: func(any) { c.enqueueAll() },
-	}
-
 	nodeHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(any) { c.enqueueAll() },
 		UpdateFunc: func(oldObj, newObj any) {
@@ -120,15 +115,43 @@ func NewManagedKubeProxyController(
 		DeleteFunc: func(any) { c.enqueueAll() },
 	}
 
+	daemonSetHandler := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			if managedKubeProxyDaemonSetEventRelevant(c.options.Namespace, obj) {
+				c.enqueueAll()
+			}
+		},
+		UpdateFunc: func(oldObj, newObj any) {
+			if managedKubeProxyDaemonSetUpdateAffectsReconcile(c.options.Namespace, oldObj, newObj) {
+				c.enqueueAll()
+			}
+		},
+		DeleteFunc: func(obj any) {
+			if managedKubeProxyDaemonSetEventRelevant(c.options.Namespace, obj) {
+				c.enqueueAll()
+			}
+		},
+	}
+
+	siteHandler := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(any) { c.enqueueAll() },
+		UpdateFunc: func(oldObj, newObj any) {
+			if managedKubeProxySiteUpdateAffectsReconcile(oldObj, newObj) {
+				c.enqueueAll()
+			}
+		},
+		DeleteFunc: func(any) { c.enqueueAll() },
+	}
+
 	if _, err := nodeInformer.Informer().AddEventHandler(nodeHandler); err != nil {
 		return nil, fmt.Errorf("add node event handler: %w", err)
 	}
 
-	if _, err := dsInformer.Informer().AddEventHandler(enqueueAllHandler); err != nil {
+	if _, err := dsInformer.Informer().AddEventHandler(daemonSetHandler); err != nil {
 		return nil, fmt.Errorf("add daemonset event handler: %w", err)
 	}
 
-	if _, err := siteInformer.AddEventHandler(enqueueAllHandler); err != nil {
+	if _, err := siteInformer.AddEventHandler(siteHandler); err != nil {
 		return nil, fmt.Errorf("add site event handler: %w", err)
 	}
 
@@ -140,6 +163,88 @@ func managedKubeProxyNodeUpdateAffectsReconcile(oldObj, newObj any) bool {
 	newNode, newOK := newObj.(*corev1.Node)
 
 	return !oldOK || !newOK || !labels.Equals(labels.Set(oldNode.Labels), labels.Set(newNode.Labels))
+}
+
+type kubeProxyDaemonSetClass int
+
+const (
+	kubeProxyDaemonSetUnrelated kubeProxyDaemonSetClass = iota
+	kubeProxyDaemonSetManaged
+	kubeProxyDaemonSetProvider
+)
+
+func managedKubeProxyDaemonSetEventRelevant(namespace string, obj any) bool {
+	ds, ok := daemonSetFromEvent(obj)
+
+	return ok && classifyKubeProxyDaemonSet(namespace, ds) != kubeProxyDaemonSetUnrelated
+}
+
+func managedKubeProxyDaemonSetUpdateAffectsReconcile(namespace string, oldObj, newObj any) bool {
+	oldDS, oldOK := daemonSetFromEvent(oldObj)
+
+	newDS, newOK := daemonSetFromEvent(newObj)
+	if !oldOK || !newOK {
+		return true
+	}
+
+	oldClass := classifyKubeProxyDaemonSet(namespace, oldDS)
+
+	newClass := classifyKubeProxyDaemonSet(namespace, newDS)
+	if oldClass != newClass {
+		return oldClass != kubeProxyDaemonSetUnrelated || newClass != kubeProxyDaemonSetUnrelated
+	}
+
+	switch newClass {
+	case kubeProxyDaemonSetManaged:
+		return oldDS.Generation != newDS.Generation ||
+			!labels.Equals(labels.Set(oldDS.Labels), labels.Set(newDS.Labels))
+	case kubeProxyDaemonSetProvider:
+		return oldDS.Generation != newDS.Generation
+	default:
+		return false
+	}
+}
+
+func managedKubeProxySiteUpdateAffectsReconcile(oldObj, newObj any) bool {
+	oldSite, oldOK := oldObj.(*unstructured.Unstructured)
+
+	newSite, newOK := newObj.(*unstructured.Unstructured)
+	if !oldOK || !newOK {
+		return true
+	}
+
+	oldSpec, _, oldErr := unstructured.NestedFieldNoCopy(oldSite.Object, "spec")
+	newSpec, _, newErr := unstructured.NestedFieldNoCopy(newSite.Object, "spec")
+
+	return oldErr != nil || newErr != nil || !apiequality.Semantic.DeepEqual(oldSpec, newSpec)
+}
+
+func daemonSetFromEvent(obj any) (*appsv1.DaemonSet, bool) {
+	if ds, ok := obj.(*appsv1.DaemonSet); ok {
+		return ds, true
+	}
+
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil, false
+	}
+
+	ds, ok := tombstone.Obj.(*appsv1.DaemonSet)
+
+	return ds, ok
+}
+
+func classifyKubeProxyDaemonSet(namespace string, ds *appsv1.DaemonSet) kubeProxyDaemonSetClass {
+	if ds.Namespace == namespace &&
+		(ds.Labels["app.kubernetes.io/name"] == managedKubeProxyAppName || strings.HasPrefix(ds.Name, managedKubeProxyNamePrefix)) {
+		return kubeProxyDaemonSetManaged
+	}
+
+	if isProviderKubeProxyDaemonSet(ds) {
+		return kubeProxyDaemonSetProvider
+	}
+
+	return kubeProxyDaemonSetUnrelated
 }
 
 // Run starts the managed kube-proxy controller.
@@ -317,19 +422,26 @@ func providerKubeProxyDaemonSets(dsList []*appsv1.DaemonSet) []*appsv1.DaemonSet
 	var out []*appsv1.DaemonSet
 
 	for _, ds := range dsList {
-		if ds.Labels["app.kubernetes.io/name"] == managedKubeProxyAppName || strings.HasPrefix(ds.Name, managedKubeProxyNamePrefix) {
-			continue
-		}
-
-		for _, c := range ds.Spec.Template.Spec.Containers {
-			if c.Name == "kube-proxy" || strings.Contains(c.Image, "kube-proxy") {
-				out = append(out, ds)
-				break
-			}
+		if isProviderKubeProxyDaemonSet(ds) {
+			out = append(out, ds)
 		}
 	}
 
 	return out
+}
+
+func isProviderKubeProxyDaemonSet(ds *appsv1.DaemonSet) bool {
+	if ds.Labels["app.kubernetes.io/name"] == managedKubeProxyAppName || strings.HasPrefix(ds.Name, managedKubeProxyNamePrefix) {
+		return false
+	}
+
+	for _, container := range ds.Spec.Template.Spec.Containers {
+		if container.Name == "kube-proxy" || strings.Contains(container.Image, "kube-proxy") {
+			return true
+		}
+	}
+
+	return false
 }
 
 func daemonSetCouldScheduleOnNode(ds *appsv1.DaemonSet, node *corev1.Node) bool {
@@ -404,14 +516,28 @@ func (c *ManagedKubeProxyController) ensureDaemonSet(ctx context.Context, site u
 
 	want := c.daemonSetForSite(site, clusterCIDR)
 
+	cached, err := c.dsLister.DaemonSets(c.options.Namespace).Get(want.Name)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	if err == nil && managedKubeProxyDaemonSetOwnedFieldsEqual(cached, want) {
+		return nil
+	}
+
 	existing, err := c.clientset.AppsV1().DaemonSets(c.options.Namespace).Get(ctx, want.Name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Create(ctx, want, metav1.CreateOptions{})
+
 		return err
 	}
 
 	if err != nil {
 		return err
+	}
+
+	if managedKubeProxyDaemonSetOwnedFieldsEqual(existing, want) {
+		return nil
 	}
 
 	// spec.selector is immutable. When it differs (e.g. the site label moved
@@ -428,11 +554,110 @@ func (c *ManagedKubeProxyController) ensureDaemonSet(ctx context.Context, site u
 		return err
 	}
 
-	existing.Spec.Template = want.Spec.Template
-	existing.Spec.UpdateStrategy = want.Spec.UpdateStrategy
-	_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Update(ctx, existing, metav1.UpdateOptions{})
+	updated := existing.DeepCopy()
+	if updated.Labels == nil {
+		updated.Labels = map[string]string{}
+	}
+
+	for key, value := range want.Labels {
+		updated.Labels[key] = value
+	}
+
+	updated.Spec.Template = want.Spec.Template
+	updated.Spec.UpdateStrategy = want.Spec.UpdateStrategy
+	_, err = c.clientset.AppsV1().DaemonSets(c.options.Namespace).Update(ctx, updated, metav1.UpdateOptions{})
 
 	return err
+}
+
+func managedKubeProxyDaemonSetOwnedFieldsEqual(existing, want *appsv1.DaemonSet) bool {
+	existing = existing.DeepCopy()
+	want = want.DeepCopy()
+
+	normalizeManagedKubeProxyDaemonSetDefaults(existing)
+	normalizeManagedKubeProxyDaemonSetDefaults(want)
+
+	return containsLabels(existing.Labels, want.Labels) &&
+		equalLabelSelector(existing.Spec.Selector, want.Spec.Selector) &&
+		apiequality.Semantic.DeepEqual(existing.Spec.Template, want.Spec.Template) &&
+		apiequality.Semantic.DeepEqual(existing.Spec.UpdateStrategy, want.Spec.UpdateStrategy)
+}
+
+func normalizeManagedKubeProxyDaemonSetDefaults(ds *appsv1.DaemonSet) {
+	// client-go's scheme does not install kube-apiserver defaulting functions.
+	// Normalize the server-defaulted fields present in the owned fields above.
+	strategy := &ds.Spec.UpdateStrategy
+	if strategy.Type == "" {
+		strategy.Type = appsv1.RollingUpdateDaemonSetStrategyType
+	}
+
+	if strategy.Type == appsv1.RollingUpdateDaemonSetStrategyType {
+		if strategy.RollingUpdate == nil {
+			strategy.RollingUpdate = &appsv1.RollingUpdateDaemonSet{}
+		}
+
+		if strategy.RollingUpdate.MaxUnavailable == nil {
+			maxUnavailable := intstr.FromInt32(1)
+			strategy.RollingUpdate.MaxUnavailable = &maxUnavailable
+		}
+
+		if strategy.RollingUpdate.MaxSurge == nil {
+			maxSurge := intstr.FromInt32(0)
+			strategy.RollingUpdate.MaxSurge = &maxSurge
+		}
+	}
+
+	podSpec := &ds.Spec.Template.Spec
+	if podSpec.ServiceAccountName == "" {
+		podSpec.ServiceAccountName = podSpec.DeprecatedServiceAccount
+	}
+
+	podSpec.DeprecatedServiceAccount = podSpec.ServiceAccountName
+	if podSpec.DNSPolicy == "" {
+		podSpec.DNSPolicy = corev1.DNSClusterFirst
+	}
+
+	if podSpec.RestartPolicy == "" {
+		podSpec.RestartPolicy = corev1.RestartPolicyAlways
+	}
+
+	if podSpec.SecurityContext == nil {
+		podSpec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+
+	if podSpec.TerminationGracePeriodSeconds == nil {
+		terminationGracePeriodSeconds := int64(corev1.DefaultTerminationGracePeriodSeconds)
+		podSpec.TerminationGracePeriodSeconds = &terminationGracePeriodSeconds
+	}
+
+	if podSpec.SchedulerName == "" {
+		podSpec.SchedulerName = corev1.DefaultSchedulerName
+	}
+
+	normalizeContainerDefaults(podSpec.InitContainers)
+	normalizeContainerDefaults(podSpec.Containers)
+}
+
+func normalizeContainerDefaults(containers []corev1.Container) {
+	for i := range containers {
+		if containers[i].TerminationMessagePath == "" {
+			containers[i].TerminationMessagePath = corev1.TerminationMessagePathDefault
+		}
+
+		if containers[i].TerminationMessagePolicy == "" {
+			containers[i].TerminationMessagePolicy = corev1.TerminationMessageReadFile
+		}
+	}
+}
+
+func containsLabels(existing, want map[string]string) bool {
+	for key, value := range want {
+		if existing[key] != value {
+			return false
+		}
+	}
+
+	return true
 }
 
 // equalLabelSelector reports whether two label selectors have the same
