@@ -1574,6 +1574,7 @@ impl WorkerApplication {
             .is_ok_and(|cut| cut.blocks_writer());
         if !checkpoint_waiting
             && self.writer_task.is_none()
+            && self.store.writer.can_start_progress()
             && self.store.writer.pending_count() != 0
         {
             let writer = self.store.writer.clone();

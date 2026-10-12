@@ -60,6 +60,7 @@ impl Store {
         queue_entries: usize,
         page_entries: usize,
     ) -> Result<()> {
+        self.checkpoint.bind_writer(&self.writer);
         self.writer.configure(
             admission,
             self.eviction.clone(),
@@ -71,6 +72,7 @@ impl Store {
     /// Open slabs and configure the actual live shard and checkpoint geometry.
     pub fn open(&self) -> Operation<'_, Alignment> {
         Box::pin(async move {
+            self.checkpoint.bind_writer(&self.writer);
             let alignment = self.writer.open().await?;
             let geometry = checkpoint::CheckpointGeometry::from(self.writer.slabs().geometry()?);
             self.checkpoint.configure_geometry(geometry)?;
@@ -338,6 +340,7 @@ pub struct StoreWriter {
     next: Cell<u64>,
     capacity: Cell<usize>,
     busy: Cell<bool>,
+    paused: Cell<bool>,
     waiters: RefCell<HashMap<u64, Option<std::task::Waker>>>,
     next_waiter: Cell<u64>,
     active_scope: RefCell<Option<RequestScope>>,
@@ -375,6 +378,7 @@ impl StoreWriter {
             next: Cell::new(1),
             capacity: Cell::new(64),
             busy: Cell::new(false),
+            paused: Cell::new(false),
             waiters: RefCell::new(HashMap::default()),
             next_waiter: Cell::new(0),
             active_scope: RefCell::new(None),
@@ -503,7 +507,7 @@ impl StoreWriter {
             )?;
             let ticket = self.enqueue(page, dirty)?;
             loop {
-                waiter.idle().await;
+                waiter.ready(true).await;
                 if let Err(error) = scope.check() {
                     self.remove_queued_ticket(&id, ticket);
                     self.slabs.fence_writes().await?;
@@ -517,6 +521,7 @@ impl StoreWriter {
                 {
                     break;
                 }
+                waiter.ready(false).await;
                 if let Err(error) = self.progress(8, scope).await {
                     self.remove_queued_ticket(&id, ticket);
                     self.slabs.fence_writes().await?;
@@ -709,6 +714,9 @@ impl StoreWriter {
     pub fn pending_count(&self) -> usize {
         self.pending.borrow().len()
     }
+    pub(crate) fn can_start_progress(&self) -> bool {
+        !self.paused.get() && !self.busy.get()
+    }
     pub fn queued_count(&self) -> usize {
         self.queue.borrow().len()
     }
@@ -866,6 +874,9 @@ impl StoreWriter {
     /// Drive at most `budget` writes. Keep polling this future through reactor completion.
     pub fn progress<'a>(&'a self, budget: usize, scope: &'a RequestScope) -> Operation<'a, usize> {
         Box::pin(async move {
+            if self.paused.get() {
+                WriterWaiter::new(self)?.ready(false).await;
+            }
             if self.busy.replace(true) {
                 return Err(Error::Overloaded);
             }
@@ -1091,14 +1102,9 @@ impl StoreWriter {
     fn reclaim_idle_buffer(&self) -> usize {
         self.slabs.reclaim_idle()
     }
-}
-struct Busy<'a>(&'a StoreWriter);
-impl Drop for Busy<'_> {
-    fn drop(&mut self) {
-        self.0.busy.set(false);
-        self.0.active_scope.borrow_mut().take();
+
+    fn notify_waiters(&self) {
         let wakes: Vec<_> = self
-            .0
             .waiters
             .borrow_mut()
             .values_mut()
@@ -1107,6 +1113,35 @@ impl Drop for Busy<'_> {
         for wake in wakes {
             wake.wake();
         }
+    }
+
+    async fn pause_for_checkpoint(self: &Rc<Self>) -> Result<WriterPause> {
+        if self.paused.replace(true) {
+            return Err(Error::Overloaded);
+        }
+        let guard = WriterPause(self.clone());
+        // One checkpoint waiter has its own slot beyond the foreground bound.
+        let waiter = WriterWaiter::with_limit(self, self.capacity.get().saturating_add(1))?;
+        waiter.ready(true).await;
+        self.slabs.fence_writes().await?;
+        Ok(guard)
+    }
+}
+
+struct WriterPause(Rc<StoreWriter>);
+
+impl Drop for WriterPause {
+    fn drop(&mut self) {
+        self.0.paused.set(false);
+        self.0.notify_waiters();
+    }
+}
+struct Busy<'a>(&'a StoreWriter);
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.busy.set(false);
+        self.0.active_scope.borrow_mut().take();
+        self.0.notify_waiters();
     }
 }
 
@@ -1117,8 +1152,12 @@ struct WriterWaiter<'a> {
 
 impl<'a> WriterWaiter<'a> {
     fn new(writer: &'a StoreWriter) -> Result<Self> {
+        Self::with_limit(writer, writer.capacity.get())
+    }
+
+    fn with_limit(writer: &'a StoreWriter, limit: usize) -> Result<Self> {
         let mut waiters = writer.waiters.borrow_mut();
-        if waiters.len() >= writer.capacity.get() {
+        if waiters.len() >= limit {
             return Err(Error::Overloaded);
         }
         let id = writer.next_waiter.get();
@@ -1129,9 +1168,9 @@ impl<'a> WriterWaiter<'a> {
         Ok(Self { writer, id })
     }
 
-    async fn idle(&self) {
+    async fn ready(&self, checkpoint: bool) {
         std::future::poll_fn(|cx| {
-            if !self.writer.busy.get() {
+            if !self.writer.busy.get() && (checkpoint || !self.writer.paused.get()) {
                 return std::task::Poll::Ready(());
             }
             let wake = cx.waker().clone();

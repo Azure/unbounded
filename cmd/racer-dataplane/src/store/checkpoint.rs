@@ -55,6 +55,8 @@ pub struct Checkpointer {
     segments: Rc<Segments>,
     geometry: Cell<Option<CheckpointGeometry>>,
     frozen: RefCell<Option<FreezeGuard>>,
+    writer: RefCell<std::rc::Weak<super::StoreWriter>>,
+    paused: RefCell<Option<super::WriterPause>>,
 }
 
 impl Checkpointer {
@@ -66,6 +68,20 @@ impl Checkpointer {
             segments,
             geometry: Cell::new(None),
             frozen: RefCell::new(None),
+            writer: RefCell::new(std::rc::Weak::new()),
+            paused: RefCell::new(None),
+        }
+    }
+
+    pub(super) fn bind_writer(&self, writer: &Rc<super::StoreWriter>) {
+        *self.writer.borrow_mut() = Rc::downgrade(writer);
+    }
+
+    async fn pause_writer(&self) -> Result<Option<super::WriterPause>> {
+        let writer = self.writer.borrow().upgrade();
+        match writer {
+            Some(writer) => writer.pause_for_checkpoint().await.map(Some),
+            None => Ok(None),
         }
     }
 
@@ -108,6 +124,7 @@ impl Checkpointer {
             if self.frozen.borrow().is_some() {
                 return Err(Error::Overloaded);
             }
+            let paused = self.pause_writer().await?;
             let frozen = self.segments.freeze()?;
             let snapshot = (|| {
                 let mut segments = self.segments.snapshot();
@@ -124,6 +141,7 @@ impl Checkpointer {
             })();
             if snapshot.is_ok() {
                 *self.frozen.borrow_mut() = Some(frozen);
+                *self.paused.borrow_mut() = paused;
             }
             snapshot
         })
@@ -140,6 +158,7 @@ impl Checkpointer {
                 return Err(Error::Overloaded);
             }
             // Keep ownership in the future until success so cancellation also thaws.
+            let paused = owner.pause_writer().await?;
             let frozen = owner.segments.freeze()?;
             let result = async {
                 let segment_bytes = owner
@@ -150,7 +169,6 @@ impl Checkpointer {
                 let mut remaining = budget.checked_sub(segment_bytes).ok_or(Error::Overloaded)?;
                 let metadata = owner.index.snapshot_metadata_budgeted(&mut remaining)?;
                 let mut segments = owner.segments.snapshot();
-                owner.index.snapshot_holds(&mut segments, &mut remaining)?;
                 let mut entries = Vec::new();
                 let mut cursor = 0;
                 loop {
@@ -168,6 +186,9 @@ impl Checkpointer {
                     cursor = next;
                     yield_now().await;
                 }
+                // Publications are fenced. Capture deadlines after traversal so
+                // holds acquired or extended during its yields are included.
+                owner.index.snapshot_holds(&mut segments, &mut remaining)?;
                 let mut shard = ShardImage {
                     worker: owner.index.worker(),
                     geometry,
@@ -180,6 +201,7 @@ impl Checkpointer {
             .await;
             if result.is_ok() {
                 *owner.frozen.borrow_mut() = Some(frozen);
+                *owner.paused.borrow_mut() = paused;
             }
             result
         })
@@ -189,6 +211,8 @@ impl Checkpointer {
     /// Images are Send values, deliberately containing no worker-local lease/Rc.
     pub fn finish_snapshot(&self) {
         self.frozen.borrow_mut().take();
+        let paused = self.paused.borrow_mut().take();
+        drop(paused);
     }
 
     /// One coordinator calls this after all owner-worker snapshots have succeeded.

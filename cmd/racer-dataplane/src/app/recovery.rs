@@ -318,6 +318,7 @@ impl WorkerApplication {
         if self.checkpoint_generation != generation {
             // Stop starting batches while existing SQEs drain, then freeze only
             // this shard. No queue-idle requirement can starve a busy checkpoint.
+            // The storage snapshot also pauses and fences warm-owned progress.
             if self.writer_task.is_some() {
                 return Ok(());
             }

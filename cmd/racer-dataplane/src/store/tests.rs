@@ -437,6 +437,183 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
+    struct Wakes(std::sync::atomic::AtomicUsize);
+    impl futures::task::ArcWake for Wakes {
+        fn wake_by_ref(this: &std::sync::Arc<Self>) {
+            this.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let cut = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
+    assert!(cut.index.entries.is_empty());
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    f.store
+        .writer
+        .index()
+        .reserve_hold(&id.version, 1, until)
+        .unwrap();
+    let request = scope();
+    let mut held = f.store.writer.persist_held(copy, &request);
+    let wakes = std::sync::Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = futures::task::waker(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    for _ in 0..4 {
+        assert!(held.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    assert_eq!(f.store.writer.pending_count(), 1);
+    assert_eq!(f.store.writer.writes_in_flight(), 0);
+    assert_eq!(f.store.writer.discarded_count(), 0);
+    // Direct progress callers must also obey the pause, not just warming.
+    let background_scope = scope();
+    let mut background = f.store.writer.progress(1, &background_scope);
+    assert!(background.as_mut().poll(&mut cx).is_pending());
+    drop(background);
+    f.store.checkpoint.finish_snapshot();
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+    drive(&f.reactor, held).unwrap();
+    assert_eq!(f.store.writer.index().held_page_expiry(&id), Some(until));
+    assert_eq!(f.store.writer.discarded_count(), 0);
+}
+
+#[test]
+fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let index = f.store.writer.index();
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    index.reserve_hold(&id.version, 1, until).unwrap();
+    simulation.inject("write", Fault::Delay(6)).unwrap();
+    let request = scope();
+    let mut held = f.store.writer.persist_held(copy, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(held.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    let mut snapshot = f.store.checkpoint.snapshot_incremental(1024 * 1024);
+    assert!(snapshot.as_mut().poll(&mut cx).is_pending());
+    assert!(f.store.writer.paused.get());
+    drive(&f.reactor, held).unwrap();
+    let shard = drive(&f.reactor, snapshot).unwrap();
+    assert_eq!(shard.index.entries.len(), 1);
+    assert_eq!(
+        shard
+            .segments
+            .iter()
+            .map(|s| s.retained_records.len())
+            .sum::<usize>(),
+        1
+    );
+    f.store.checkpoint.finish_snapshot();
+    let encoded = crate::store::checkpoint::encode(&crate::store::checkpoint::CheckpointImage {
+        version: crate::store::checkpoint::CHECKPOINT_VERSION,
+        sequence: 1,
+        shards: vec![shard],
+    })
+    .unwrap();
+    let restored = crate::store::checkpoint::decode(&encoded).unwrap();
+    futures::executor::block_on(
+        f.store
+            .recovery
+            .install_shard(restored.shards.into_iter().next()),
+    )
+    .unwrap();
+    assert_eq!(index.held_page_expiry(&id), Some(until));
+    let segment = index.lookup(&id).unwrap().unwrap().location.segment;
+    assert!(!page_alloc::SegmentEntries::can_reclaim(&**index, segment));
+    drop(f.segments.append(32 * 1024 * 1024).unwrap());
+    f.store.eviction.reclaim_now().unwrap();
+    assert!(index.lookup(&id).unwrap().is_some());
+}
+
+#[test]
+fn hard_hold_checkpoint_abandoned_pause_reopens_writer() {
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.store.writer.busy.set(true);
+    let busy = Busy(&f.store.writer);
+    let mut snapshot = f.store.checkpoint.snapshot_incremental(1024 * 1024);
+    assert!(
+        snapshot
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            .is_pending()
+    );
+    assert!(f.store.writer.paused.get());
+    drop(snapshot);
+    assert!(!f.store.writer.paused.get());
+    assert!(f.store.writer.waiters.borrow().is_empty());
+    drop(busy);
+}
+
+#[test]
+fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    let index = f.store.writer.index();
+    index.set_page_capacity(256).unwrap();
+    let mut first = None;
+    for number in 0..129 {
+        let copy = f.copy(number, 113);
+        let id = copy.ciphertext.envelope().page.clone();
+        let (lease, extent) = f.segments.append(4096).unwrap();
+        index
+            .publish(
+                id.clone(),
+                catalog::IndexedPage {
+                    location: catalog::RecordLocation {
+                        segment: lease.id(),
+                        generation: lease.generation(),
+                        extent,
+                    },
+                    metadata: copy.metadata.immutable(),
+                    key_id: copy.ciphertext.envelope().key_id,
+                },
+            )
+            .unwrap();
+        first.get_or_insert(id);
+    }
+    let id = first.unwrap();
+    let mut snapshot = f.store.checkpoint.snapshot_incremental(1024 * 1024);
+    assert!(
+        snapshot
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            .is_pending()
+    );
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    index.reserve_hold(&id.version, 1, until).unwrap();
+    let shard = futures::executor::block_on(snapshot).unwrap();
+    assert_eq!(
+        shard
+            .segments
+            .iter()
+            .map(|s| s.retained_records.len())
+            .sum::<usize>(),
+        1
+    );
+    f.store.checkpoint.finish_snapshot();
+    futures::executor::block_on(f.store.recovery.install_shard(Some(shard))).unwrap();
+    assert_eq!(index.held_page_expiry(&id), Some(until));
+}
+
+#[test]
 fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
     use uring_runtime::reactor::simulation::{Fault, Simulation};
     struct Wakes(std::sync::atomic::AtomicUsize);
