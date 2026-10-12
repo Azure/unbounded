@@ -204,6 +204,8 @@
         "pprofListen",
         "chairCount",
         "chairSeedCount",
+        "peerFetchTimeout",
+        "transferMaxConcurrentServes",
         "upstreamRegistries"
       ],
       "properties": {
@@ -220,6 +222,14 @@
         "chairSeedCount": {
           "type": "integer",
           "minimum": 1
+        },
+        "peerFetchTimeout": {
+          "type": "string",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+        },
+        "transferMaxConcurrentServes": {
+          "type": "integer",
+          "minimum": 0
         },
         "upstreamRegistries": {
           "type": "array",
