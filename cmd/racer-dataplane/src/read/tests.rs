@@ -25,6 +25,7 @@ pub(super) fn admission_coordinator() -> (Rc<Coordinator>, impl Sized) {
 mod hot_reads;
 mod peer_copies;
 mod remote;
+mod warming;
 
 pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
     use crate::memory::CiphertextBytes;

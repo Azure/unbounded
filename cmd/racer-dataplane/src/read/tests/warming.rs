@@ -1,0 +1,547 @@
+//! Real read, Fill, crypto, and disk paths with a gated authenticated peer.
+use super::fill::*;
+use super::hot_reads::coordinator;
+use crate::client::{ClientRequest, ReadKind};
+use crate::peer::forwarding::{Forwarding, VerifiedResponse};
+use crate::peer::protocol::PeerRequest;
+use crate::read::ReadPayload;
+use crate::test_support::security::{network, node};
+
+struct Peer {
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    sender: Forwarding,
+    receiver: Forwarding,
+    pages: Vec<PageResult>,
+    blocked: Cell<bool>,
+    wake: RefCell<Option<std::task::Waker>>,
+    calls: RefCell<Vec<u64>>,
+}
+impl Peer {
+    fn available(&self, _: &Arc<Membership>, _: &racer_control_wire::NodeId) -> bool {
+        false
+    }
+    fn direct<'a>(
+        &'a self,
+        _: PeerRequest,
+        _: Arc<Membership>,
+        _: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        Box::pin(async { panic!("unexpected hedge") })
+    }
+    fn request<'a>(
+        &'a self,
+        request: PeerRequest,
+        _: Arc<Membership>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        Box::pin(async move {
+            let PeerOperation::Page { page, .. } = &request.operation else {
+                panic!("GET bypassed warm gate with provider selection");
+            };
+            let number = page.number.0;
+            self.calls.borrow_mut().push(number);
+            let cancellation = scope.cancellation.subscribe()?;
+            std::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                scope.check()?;
+                *self.wake.borrow_mut() = Some(cx.waker().clone());
+                if self.blocked.get() {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok::<(), Error>(()))
+                }
+            })
+            .await?;
+            let (signed, binding) = self.sender.sign_request(request)?;
+            let verified = self.receiver.verify_request(signed)?;
+            let page = &self.pages[number as usize];
+            let ciphertext = page.ciphertext.clone().rehome(self.admission.reserve(
+                Some(&page.metadata.version.object.cache),
+                crate::admission::ResourceClass::Ciphertext,
+                page.ciphertext.bytes().len(),
+            )?)?;
+            self.sender.verify_response(
+                self.receiver.sign_response(
+                    verified.binding(),
+                    PeerResponse::Page {
+                        metadata: page.metadata.clone(),
+                        ciphertext,
+                    },
+                )?,
+                &binding,
+            )
+        })
+    }
+    fn unblock(&self) {
+        self.blocked.set(false);
+        if let Some(wake) = self.wake.borrow_mut().take() {
+            wake.wake();
+        }
+    }
+}
+
+#[test]
+fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_frontier() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(2);
+    let mut source = fixture_with(2 * PAGE_BYTES + 7, None);
+    let mut pages = Vec::new();
+    for number in 0..3 {
+        let mut budget = AcquisitionBudget::new(source.scope.deadline.0, 8, 16);
+        pages.push(
+            drive(
+                source.fill.acquire(
+                    PageId {
+                        version: source.page.version.clone(),
+                        number: PageNumber(number),
+                    },
+                    source.membership.clone(),
+                    &source.context,
+                    &source.scope,
+                    &mut budget,
+                ),
+                &mut source.engine,
+                &source.crypto,
+            )
+            .unwrap(),
+        );
+    }
+    let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let membership = Arc::new(
+        Membership::validate(
+            racer_control_wire::MembershipVersion(1),
+            (0..2)
+                .map(|i| Member {
+                    node: node(i),
+                    shares: NonZeroU32::new(if i == 1 { 1_000_000 } else { 1 }).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 8200 + i),
+                    rails: vec![],
+                    site: String::new(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let peer = Rc::new(Peer {
+        admission: f.fill.dependencies.admission.clone(),
+        sender: Forwarding::new(signers[0].clone()),
+        receiver: Forwarding::new(signers[1].clone()),
+        pages,
+        blocked: Cell::new(true),
+        wake: RefCell::new(None),
+        calls: RefCell::new(Vec::new()),
+    });
+    let requester = Requester::scripted(peer.clone(), Peer::available, Peer::request, Peer::direct);
+    let (local, mut endpoint, _publication) = coordinator(&f, &signers[0], &membership, requester);
+    let owners = f.fill.dependencies.metadata_owner.clone();
+    owners
+        .warm
+        .configure(crate::read::warm::Config {
+            window: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let origin = || OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let head_scope = RequestScope::new(RequestId([81; 16]), f.scope.deadline.0).unwrap();
+    let mut head = local.read(
+        ClientRequest {
+            kind: ReadKind::HeadPinned {
+                etag: f.page.version.etag.clone(),
+            },
+            retain: Some(Duration::from_secs(60)),
+            origin: origin(),
+        },
+        &head_scope,
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut response = None;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = head.as_mut().poll(&mut cx) {
+            response = Some(result.unwrap());
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    let until = response
+        .expect("HEAD must not wait for peer payload")
+        .retain_until
+        .expect("hold accepted");
+    drop(head);
+    head_scope.cancel().unwrap();
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .lookup(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    let mut duplicate = local.read(
+        ClientRequest {
+            kind: ReadKind::HeadPinned {
+                etag: f.page.version.etag.clone(),
+            },
+            retain: Some(Duration::from_secs(1)),
+            origin: origin(),
+        },
+        &f.scope,
+    );
+    let mut repeated = None;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = duplicate.as_mut().poll(&mut cx) {
+            repeated = Some(result.unwrap());
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert_eq!(repeated.unwrap().retain_until, Some(until));
+    drop(duplicate);
+    let mut streams = Vec::new();
+    for ordered in [true, false] {
+        let read = futures::executor::block_on(
+            local.read(
+                ClientRequest {
+                    retain: None,
+                    origin: origin(),
+                    kind: ReadKind::Subscription {
+                        pin: Some(f.page.version.etag.clone()),
+                        range: Some(crate::model::ByteRange::From(2 * PAGE_BYTES)),
+                        page_credits: 1,
+                        byte_credits: PAGE_BYTES,
+                        ordered,
+                    },
+                },
+                &RequestScope::new(RequestId([82 + u8::from(ordered); 16]), f.scope.deadline.0)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let ReadPayload::Stream(stream) = read.payload else {
+            panic!("body expected");
+        };
+        streams.push(stream);
+    }
+    for _ in 0..64 {
+        for stream in &mut streams {
+            assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert_eq!(
+        &*peer.calls.borrow(),
+        &[0],
+        "neither GET requests its unstarted tail page"
+    );
+    peer.unblock();
+    let mut delivered = [false; 2];
+    for _ in 0..8192 {
+        for (i, stream) in streams.iter_mut().enumerate() {
+            if !delivered[i]
+                && let Poll::Ready(result) = stream.next_slice().as_mut().poll(&mut cx)
+            {
+                let lease = result.unwrap().unwrap();
+                assert_eq!(lease.slice().page, PageNumber(2));
+                assert_eq!(lease.slice().length, 7);
+                delivered[i] = true;
+            }
+        }
+        if delivered == [true; 2] {
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    assert_eq!(
+        delivered,
+        [true; 2],
+        "calls={:?}, warm={:?}, drivers={}, pending={}, io={}",
+        peer.calls.borrow(),
+        owners.warm.snapshot(),
+        queue.pending(),
+        f.fill.dependencies.writer.pending_count(),
+        f.reactor.in_flight()
+    );
+    assert_eq!(
+        &*peer.calls.borrow(),
+        &[0, 1, 2],
+        "one outbound acquisition per page across both GET modes"
+    );
+    assert_eq!(
+        f.origin.calls.get(),
+        0,
+        "normal topology uses peer, not direct origin"
+    );
+    for number in 0..3 {
+        let page = PageId {
+            version: f.page.version.clone(),
+            number: PageNumber(number),
+        };
+        assert!(
+            f.fill
+                .dependencies
+                .writer
+                .index()
+                .lookup(&page)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            f.fill.dependencies.writer.index().held_page_expiry(&page),
+            Some(until)
+        );
+    }
+    drop(streams);
+    for _ in 0..32 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    endpoint.uninstall().unwrap();
+}
+
+#[test]
+fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(1);
+    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let membership = Arc::new(
+        Membership::validate(
+            racer_control_wire::MembershipVersion(1),
+            vec![Member {
+                node: node(0),
+                shares: NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:8200".into(),
+                rails: vec![],
+                site: String::new(),
+            }],
+        )
+        .unwrap(),
+    );
+    let (local, mut endpoint, _) = coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    let owners = f.fill.dependencies.metadata_owner.clone();
+    owners
+        .warm
+        .configure(crate::read::warm::Config {
+            window: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let request = || ClientRequest {
+        retain: Some(Duration::from_secs(60)),
+        kind: ReadKind::HeadPinned {
+            etag: f.page.version.etag.clone(),
+        },
+        origin: OriginContext {
+            object: f.context.object.clone(),
+            metadata: None,
+            authorization: None,
+        },
+    };
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    f.origin.blocked_pages.borrow_mut().insert(1);
+    let mut head = local.read(request(), &f.scope);
+    let mut accepted = None;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = head.as_mut().poll(&mut cx) {
+            accepted = Some(result.unwrap());
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert!(accepted.unwrap().retain_until.is_some());
+    drop(head);
+    for _ in 0..8192 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        if f.origin.started_pages.borrow().contains(&1) {
+            break;
+        }
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .held_page_expiry(&f.page)
+            .is_some()
+    );
+    f.origin.version_unavailable.set(true);
+    f.origin.blocked_pages.borrow_mut().clear();
+    for _ in 0..1024 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        if owners.warm.snapshot().0 == 0 {
+            break;
+        }
+    }
+    assert_eq!(owners.warm.snapshot(), (0, 0));
+    pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .held_page_expiry(&f.page)
+            .is_some(),
+        "partial failure preserves promised disk page"
+    );
+    f.origin.version_unavailable.set(false);
+    for ordered in [true, false] {
+        let caller =
+            RequestScope::new(RequestId([90 + u8::from(ordered); 16]), f.scope.deadline.0).unwrap();
+        let response = futures::executor::block_on(local.read(
+            ClientRequest {
+                retain: None,
+                kind: ReadKind::Subscription {
+                    pin: Some(f.page.version.etag.clone()),
+                    range: Some(crate::model::ByteRange::From(PAGE_BYTES)),
+                    page_credits: 1,
+                    byte_credits: PAGE_BYTES,
+                    ordered,
+                },
+                origin: OriginContext {
+                    object: f.context.object.clone(),
+                    metadata: None,
+                    authorization: None,
+                },
+            },
+            &caller,
+        ))
+        .unwrap();
+        let ReadPayload::Stream(mut stream) = response.payload else {
+            panic!("body expected")
+        };
+        let mut delivered = false;
+        for _ in 0..1024 {
+            if let Poll::Ready(result) = stream.next_slice().as_mut().poll(&mut cx) {
+                assert_eq!(result.unwrap().unwrap().slice().page, PageNumber(1));
+                delivered = true;
+                break;
+            }
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        }
+        assert!(delivered, "GET falls back only after failed warm finishes");
+    }
+    let mut retry = local.read(request(), &f.scope);
+    let mut accepted = None;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = retry.as_mut().poll(&mut cx) {
+            accepted = Some(result.unwrap());
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert!(
+        accepted.unwrap().retain_until.is_some(),
+        "same-version retry admits after rollback"
+    );
+    drop(retry);
+    let tail = PageId {
+        version: f.page.version.clone(),
+        number: PageNumber(1),
+    };
+    for _ in 0..8192 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        if f.fill
+            .dependencies
+            .writer
+            .index()
+            .held_page_expiry(&tail)
+            .is_some()
+            && queue.pending() == 0
+        {
+            break;
+        }
+        f.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .held_page_expiry(&tail)
+            .is_some()
+    );
+    assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1, 1]);
+    endpoint.uninstall().unwrap();
+}
+
+#[test]
+fn warm_drain_cancels_detached_job_and_refused_head_keeps_metadata_success() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(1);
+    for length in [3, 9 * PAGE_BYTES] {
+        let mut f = fixture_with(length, None);
+        f.reactor.init().unwrap();
+        let membership = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                vec![Member {
+                    node: node(0),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:8200".into(),
+                    rails: vec![],
+                    site: String::new(),
+                }],
+            )
+            .unwrap(),
+        );
+        let (local, mut endpoint, _) =
+            coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        f.origin.blocked_pages.borrow_mut().insert(0);
+        let mut head = local.read(
+            ClientRequest {
+                retain: Some(Duration::from_secs(60)),
+                kind: ReadKind::HeadPinned {
+                    etag: f.page.version.etag.clone(),
+                },
+                origin: OriginContext {
+                    object: f.context.object.clone(),
+                    metadata: None,
+                    authorization: None,
+                },
+            },
+            &f.scope,
+        );
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut response = None;
+        for _ in 0..1024 {
+            if let Poll::Ready(result) = head.as_mut().poll(&mut cx) {
+                response = Some(result.unwrap());
+                break;
+            }
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        }
+        let response = response.unwrap();
+        assert_eq!(response.metadata.length, length);
+        assert_eq!(response.retain_until.is_some(), length == 3);
+        drop(head);
+        endpoint.stop_admission();
+        f.origin.blocked_pages.borrow_mut().clear();
+        for _ in 0..1024 {
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+            if endpoint.is_drained() && queue.pending() == 0 {
+                break;
+            }
+        }
+        assert!(endpoint.is_drained());
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(f.fill.dependencies.metadata_owner.warm.snapshot(), (0, 0));
+        assert!(
+            f.fill
+                .dependencies
+                .writer
+                .index()
+                .hold_expiry(&f.page.version)
+                .is_none()
+        );
+        endpoint.uninstall().unwrap();
+    }
+}
