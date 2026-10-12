@@ -95,6 +95,7 @@ impl Binding {
         length: usize,
         extensions: Vec<Header>,
     ) -> Result<MessageHead> {
+        decode_deadline(self.deadline)?;
         if self.membership == 0
             || self.transfer == [0; 16]
             || extensions.len() != phase.fields().len()
