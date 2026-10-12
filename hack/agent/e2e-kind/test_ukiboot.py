@@ -115,6 +115,24 @@ class TestCmdlineRoom(unittest.TestCase):
                 self.assertEqual(ukiboot.cmdline_room(_pe(sections, size_of_image=size_of_image)), want)
 
 
+class TestExtendCmdline(unittest.TestCase):
+    """The first-boot addon is extended within cmdline_room, not its raw
+    size."""
+
+    def test_the_next_section_bounds_the_extension(self):
+        roomy = _pe([(".cmdline", 0x10, 0x2000, 0x1000, 0x400), (".linux", 0x10, 0x3000, 0x200, 0x1400)])
+        tight = _pe([(".cmdline", 0x10, 0x2000, 0x1000, 0x400), (".linux", 0x10, 0x2020, 0x200, 0x1400)])
+        extra = "ignition.config.url=http://192.168.100.1:8199/config.ign"
+
+        merged, room = ukiboot.extend_cmdline(roomy, "flatcar.first_boot=detected", extra)
+        self.assertEqual(merged, f"flatcar.first_boot=detected {extra}".encode())
+        self.assertEqual(room, 0x1000)
+
+        merged, room = ukiboot.extend_cmdline(tight, "flatcar.first_boot=detected", extra)
+        self.assertIsNone(merged, "the raw size has room, but the grown section would reach .linux")
+        self.assertEqual(room, 0x20)
+
+
 class TestSingleUKI(unittest.TestCase):
     def test_exactly_one_uki_is_required(self):
         """With more than one, the one patched may not be the one that boots."""
@@ -123,6 +141,27 @@ class TestSingleUKI(unittest.TestCase):
             with self.subTest(names=names):
                 with self.assertRaises(RuntimeError):
                     ukiboot.single_uki(names, Path("d"))
+
+
+class TestFirstbootAddon(unittest.TestCase):
+    """The harness's additions go only into the addon that is deleted after the
+    first boot, never into the one every boot reads."""
+
+    def test_the_first_boot_addon_is_chosen_among_the_others(self):
+        names = ["vmlinuz-6.6.157.1-1.azl3.addon.efi", "firstboot.addon.efi"]
+        self.assertEqual(ukiboot.find_firstboot_addon(names, "d"), "firstboot.addon.efi")
+
+    def test_the_name_is_matched_as_fat_does(self):
+        """FAT ignores case, and the patch has to read the file under the name
+        the directory gives it."""
+        self.assertEqual(ukiboot.find_firstboot_addon(["FIRSTBOOT.ADDON.EFI"], "d"), "FIRSTBOOT.ADDON.EFI")
+
+    def test_a_disk_that_has_booted_is_refused(self):
+        """ignition-quench has deleted the addon, and Ignition does not run on
+        a later boot, so a config appended anywhere else would never be read.
+        Failing here beats a VM that waits for a bootstrap that never comes."""
+        with self.assertRaisesRegex(RuntimeError, "already booted"):
+            ukiboot.find_firstboot_addon(["vmlinuz.addon.efi"], "d")
 
 
 class TestNbdServerStartup(unittest.TestCase):
