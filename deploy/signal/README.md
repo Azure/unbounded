@@ -108,7 +108,8 @@ or kubeconfig. Its ServiceAccount can read:
 
 - CertificationRuns and approved CertificationProfiles;
 - Argo Workflows and MPIJobs in the Project Signal namespace;
-- pod readiness in that namespace for controller and Argo health;
+- pod readiness in that namespace for controller and Argo health, plus bounded
+  `pods/log` reads used only to parse exact `PROJECT_SIGNAL_STAGE` records;
 - individual Nodes referenced by a profile or run. The dashboard never lists
   the fleet and uses deterministic aliases in participant and Node columns.
 
@@ -125,10 +126,15 @@ kubectl -n project-signal port-forward service/project-signal-dashboard 8080:808
 ```
 
 Then open `http://127.0.0.1:8080`. The page refreshes every seven seconds and
-shows summary counts, approved-node state, typed hardware verdicts, Argo task
-nodes, MPIJob conditions, cleanup status, and plain-language policy reasons.
+separates active/current health from retained history and classifies diagnostic
+and superseded attempts explicitly. Run details show admission policy, the
+immutable declared stage plan, observed script stages, finalization, typed
+hardware verdicts, Argo task nodes, MPIJob conditions, cleanup status, and
+plain-language policy reasons. Profiles may declare `purpose` and an ordered
+`stagePlan`; both are snapshotted onto each admitted run.
 Kubernetes reason and message fields are rendered as text, truncated to a safe
-bound, and GPU UUIDs are redacted.
+bound, and GPU UUIDs are redacted. Arbitrary raw pod logs and script bodies are
+never returned by dashboard endpoints.
 
 Stable JSON endpoints:
 
@@ -137,8 +143,8 @@ Stable JSON endpoints:
 | `GET /healthz` | Process liveness. |
 | `GET /readyz` | Required Signal and Argo API readability. |
 | `GET /api/summary` | Run counts, approved-node counts, component health, and reason glossary. |
-| `GET /api/runs?phase=&verdict=&profile=&hardware=&offset=&limit=` | Bounded active/recent run list. The maximum page size is 100. |
-| `GET /api/runs/{name}` | Correlated run, Workflow DAG nodes, MPIJob status, typed outputs, participants, and cleanup. |
+| `GET /api/runs?phase=&verdict=&profile=&hardware=&view=&offset=&limit=` | Bounded run list. `view` accepts `Current`, `Historical`, `Diagnostics`, or `Superseded`; the maximum page size is 100. |
+| `GET /api/runs/{name}` | Correlated admission, immutable execution plan, normalized stage events, Workflow DAG nodes, MPIJob status, typed outputs, finalization, participants, and cleanup. |
 | `GET /api/nodes` | Approved-node projection only. |
 
 Responses contain `partial` and `errors` fields when a noncritical Kubernetes
@@ -253,11 +259,15 @@ kubectl -n project-signal logs deployment/project-signal-dashboard
 kubectl auth can-i --as=system:serviceaccount:project-signal:project-signal-dashboard \
   list workflows.argoproj.io -n project-signal
 kubectl auth can-i --as=system:serviceaccount:project-signal:project-signal-dashboard \
+  get pods/log -n project-signal
+kubectl auth can-i --as=system:serviceaccount:project-signal:project-signal-dashboard \
   list nodes
 ```
 
-The last command should print `no`; the dashboard is intentionally limited to
-individual `get` requests for approved Nodes.
+The log read should print `yes`; it is bounded in bytes, lines, and time and
+only normalized stage records are returned. The last command should print `no`;
+the dashboard is intentionally limited to individual `get` requests for
+approved Nodes.
 
 ## Cancellation and cleanup
 

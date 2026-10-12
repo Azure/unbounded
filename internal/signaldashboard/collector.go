@@ -38,8 +38,13 @@ type Reader interface {
 	List(context.Context, client.ObjectList, ...client.ListOption) error
 }
 
+type PodLogReader interface {
+	ReadPodLog(context.Context, string, string, string, int64, int64) ([]byte, error)
+}
+
 type Collector struct {
 	Reader    Reader
+	PodLogs   PodLogReader
 	Namespace string
 	Now       func() time.Time
 }
@@ -125,28 +130,37 @@ func (c *Collector) Collect(ctx context.Context) collected {
 }
 
 func (c *Collector) Summary(snapshot collected) Summary {
-	counts := RunCounts{}
+	active := ActiveCounts{}
+	history := RunCounts{}
 
 	for i := range snapshot.runs {
 		switch snapshot.runs[i].Status.Phase {
 		case signalv1.RunPhasePending:
-			counts.Pending++
+			active.Pending++
 		case signalv1.RunPhaseRunning:
-			counts.Running++
+			active.Running++
 		case signalv1.RunPhaseSucceeded:
+			if diagnosticRun(&snapshot.runs[i]) {
+				continue
+			}
 			if strings.EqualFold(snapshot.runs[i].Status.Verdict, "Pass") {
-				counts.Passed++
+				history.Passed++
 			} else {
-				counts.Inconclusive++
+				history.Inconclusive++
 			}
 		case signalv1.RunPhaseFailed:
-			counts.Failed++
+			if !diagnosticRun(&snapshot.runs[i]) {
+				history.Failed++
+			}
 		case signalv1.RunPhaseInconclusive, signalv1.RunPhaseCancelled:
-			counts.Inconclusive++
+			if !diagnosticRun(&snapshot.runs[i]) {
+				history.Inconclusive++
+			}
 		}
 	}
 
 	nodeCounts := map[string]int{}
+	currentNodes := CurrentNodeCounts{}
 
 	for _, node := range snapshot.nodes {
 		key := node.Labels[signal.StateLabel] + "/" + node.Labels[signal.EligibilityLabel]
@@ -155,17 +169,28 @@ func (c *Collector) Summary(snapshot collected) Summary {
 		}
 
 		nodeCounts[key]++
+		switch node.Labels[signal.EligibilityLabel] {
+		case "production":
+			currentNodes.Healthy++
+		case "blocked":
+			currentNodes.Blocked++
+		default:
+			currentNodes.Unknown++
+		}
 	}
 
 	return Summary{
-		Counts:      counts,
-		NodeCounts:  nodeCounts,
-		Controller:  componentHealth(snapshot.pods, "project-signal-controller", snapshot.errors, "CertificationRun"),
-		Argo:        componentHealth(snapshot.pods, "workflow-controller", snapshot.errors, "Workflow"),
-		Reasons:     reasonExplanations,
-		LastRefresh: snapshot.refreshed,
-		Partial:     len(snapshot.errors) > 0,
-		Errors:      snapshot.errors,
+		Active:          active,
+		CurrentNodes:    currentNodes,
+		RetainedHistory: history,
+		LatestOutcomes:  latestOutcomes(snapshot),
+		NodeCounts:      nodeCounts,
+		Controller:      componentHealth(snapshot.pods, "project-signal-controller", snapshot.errors, "CertificationRun"),
+		Argo:            componentHealth(snapshot.pods, "workflow-controller", snapshot.errors, "Workflow"),
+		Reasons:         reasonExplanations,
+		LastRefresh:     snapshot.refreshed,
+		Partial:         len(snapshot.errors) > 0,
+		Errors:          snapshot.errors,
 	}
 }
 
@@ -241,13 +266,13 @@ func (c *Collector) Nodes(snapshot collected) NodeList {
 	}
 }
 
-func (c *Collector) Run(snapshot collected, name string) (RunDetail, error) {
+func (c *Collector) Run(ctx context.Context, snapshot collected, name string) (RunDetail, error) {
 	for i := range snapshot.runs {
 		if snapshot.runs[i].Name != name {
 			continue
 		}
 
-		return buildRunDetail(&snapshot.runs[i], snapshot), nil
+		return c.buildRunDetail(ctx, &snapshot.runs[i], snapshot), nil
 	}
 
 	return RunDetail{}, apierrors.NewNotFound(signalv1.GroupVersion.WithResource("certificationruns").GroupResource(), name)
@@ -381,33 +406,44 @@ func buildRunSummary(run *signalv1.CertificationRun, snapshot collected) RunSumm
 
 	started := metaTime(run.Status.StartedAt)
 	finished := metaTime(run.Status.FinishedAt)
+	purpose, scope := runPurpose(run)
+	classification, superseded := runClassification(run, snapshot.runs)
+	timingLabel := "elapsed"
+	if run.Status.Phase.Terminal() {
+		timingLabel = "completed in"
+	}
 
 	return RunSummary{
-		Name:          run.Name,
-		Profile:       run.Spec.Profile.Name,
-		HardwareClass: hardware,
-		NodeAliases:   aliases,
-		Phase:         string(run.Status.Phase),
-		Execution:     run.Status.ExecutionState,
-		Verdict:       run.Status.Verdict,
-		Reason:        sanitizeDisplay(run.Status.Reason),
-		Explanation:   explainReason(run.Status.Reason),
-		OutcomeType:   outcomeType(run.Status.Phase, run.Status.ExecutionState, run.Status.Verdict),
-		StartedAt:     optionalTime(started),
-		FinishedAt:    optionalTime(finished),
-		Duration:      runDuration(started, finished, snapshot.refreshed),
-		NextDueAt:     optionalTime(nextDue),
-		WorkflowName:  objectName(workflow),
-		WorkflowPhase: nestedString(workflow, "status", "phase"),
-		MPIJobName:    objectName(mpiJob),
-		MPIJobPhase:   mpiPhase(mpiJob),
-		ScriptDigest:  shortDigest(run.Spec.Script.Digest),
-		Trigger:       runTrigger(run, snapshot.profiles),
-		Attempt:       run.Status.Workflow.Attempt,
+		Name:           run.Name,
+		Profile:        run.Spec.Profile.Name,
+		HardwareClass:  hardware,
+		NodeAliases:    aliases,
+		Phase:          string(run.Status.Phase),
+		Execution:      run.Status.ExecutionState,
+		Verdict:        run.Status.Verdict,
+		Reason:         sanitizeDisplay(run.Status.Reason),
+		Explanation:    explainReason(run.Status.Reason),
+		OutcomeType:    outcomeType(run.Status.Phase, run.Status.ExecutionState, run.Status.Verdict),
+		StartedAt:      optionalTime(started),
+		FinishedAt:     optionalTime(finished),
+		Duration:       runDuration(started, finished, snapshot.refreshed),
+		NextDueAt:      optionalTime(nextDue),
+		WorkflowName:   objectName(workflow),
+		WorkflowPhase:  nestedString(workflow, "status", "phase"),
+		MPIJobName:     objectName(mpiJob),
+		MPIJobPhase:    mpiPhase(mpiJob),
+		ScriptDigest:   shortDigest(run.Spec.Script.Digest),
+		Purpose:        purpose,
+		Scope:          scope,
+		Classification: classification,
+		Superseded:     superseded,
+		TimingLabel:    timingLabel,
+		Trigger:        runTrigger(run, snapshot.profiles),
+		Attempt:        run.Status.Workflow.Attempt,
 	}
 }
 
-func buildRunDetail(run *signalv1.CertificationRun, snapshot collected) RunDetail {
+func (c *Collector) buildRunDetail(ctx context.Context, run *signalv1.CertificationRun, snapshot collected) RunDetail {
 	workflow := workflowForRun(run, snapshot.workflows)
 	mpiJob := mpiJobForRun(run, workflow, snapshot.mpiJobs)
 	summary := buildRunSummary(run, snapshot)
@@ -427,10 +463,34 @@ func buildRunDetail(run *signalv1.CertificationRun, snapshot collected) RunDetai
 	}
 
 	workflowNodes := extractWorkflowNodes(workflow)
+	plan, planIssues := declaredStagePlan(run)
+	events := []stageEvent{}
+	logError := ""
+	pod := workflowPod(workflow, snapshot.pods)
+	if pod != nil && c.PodLogs != nil {
+		content, err := c.PodLogs.ReadPodLog(ctx, c.Namespace, pod.Name, "main", maxStageLogLines, maxStageLogBytes)
+		if err != nil {
+			logError = "Structured stage events are temporarily unavailable."
+		} else {
+			events = parseStageEvents(content)
+		}
+	}
+	executionPlan, eventIssues, currentStage := reconcileStagePlan(plan, events, run.Status.Phase.Terminal(), snapshot.refreshed)
+	planIssues = append(planIssues, eventIssues...)
+	if logError != "" {
+		planIssues = append(planIssues, logError)
+	}
+	argoTask := argoTaskStatus(workflowNodes)
 
 	return RunDetail{
 		RunSummary:    summary,
-		Stages:        buildStages(run, workflowNodes),
+		Admission:     admissionStages(run),
+		ExecutionPlan: executionPlan,
+		Finalization:  finalizationStages(run),
+		PlanIssues:    planIssues,
+		CurrentStage:  currentStage,
+		Script:        scriptStatus(run, pod),
+		ArgoTask:      argoTask,
 		WorkflowNodes: workflowNodes,
 		Outputs:       workflowOutputs(workflow),
 		MPIJob:        extractMPIJobStatus(mpiJob),
@@ -643,50 +703,6 @@ func mpiPhase(job *unstructured.Unstructured) string {
 	return ""
 }
 
-func buildStages(run *signalv1.CertificationRun, nodes []WorkflowNode) []StageStatus {
-	stages := []StageStatus{
-		{Name: "snapshot", Phase: "Succeeded", Message: "Immutable script snapshot and digest pinned before execution.", Source: "Project Signal"},
-		{Name: "node-health", Phase: "Pending", Source: "Argo"},
-		{Name: "mpi-backend", Phase: "Pending", Source: "Argo"},
-		{Name: "result", Phase: "Pending", Source: "Project Signal"},
-		{Name: "cleanup", Phase: "Pending", Source: "Project Signal"},
-	}
-
-	for _, node := range nodes {
-		name := strings.ToLower(firstNonempty(node.DisplayName, node.Template))
-		for i := range stages {
-			if stages[i].Name == "node-health" && strings.Contains(name, "node-health") ||
-				stages[i].Name == "mpi-backend" && strings.Contains(name, "mpi-backend") {
-				stages[i].Phase = firstNonempty(node.Phase, "Pending")
-				stages[i].Reason = node.Reason
-				stages[i].Message = node.Message
-				stages[i].StartedAt = node.StartedAt
-				stages[i].FinishedAt = node.FinishedAt
-			}
-		}
-	}
-
-	if run.Status.Verdict != "" {
-		stages[3].Phase = "Succeeded"
-		stages[3].Reason = run.Status.Reason
-		stages[3].Message = "Typed execution and hardware verdict collected."
-	} else if run.Status.Phase.Terminal() {
-		stages[3].Phase = "Failed"
-		stages[3].Reason = run.Status.Reason
-		stages[3].Message = "The run ended without a complete typed hardware verdict."
-	}
-
-	if run.Status.Cleanup.ReservationsReleased && run.Status.Cleanup.SnapshotDeleted {
-		stages[4].Phase = "Succeeded"
-		stages[4].Message = "Reservations and the per-run script snapshot were released."
-	} else if run.Status.Phase.Terminal() {
-		stages[4].Phase = "Running"
-		stages[4].Message = "Terminal cleanup is still reconciling."
-	}
-
-	return stages
-}
-
 func componentHealth(pods []corev1.Pod, component string, apiErrors []APIError, resource string) HealthStatus {
 	for _, apiErr := range apiErrors {
 		if apiErr.Resource == resource || apiErr.Resource == "Pod" {
@@ -746,6 +762,9 @@ func latestRunByNode(runs []signalv1.CertificationRun) map[string]*signalv1.Cert
 	result := map[string]*signalv1.CertificationRun{}
 
 	for i := range runs {
+		if !runs[i].Status.Phase.Terminal() || !certificationRun(&runs[i]) {
+			continue
+		}
 		for _, participant := range runs[i].Spec.Participants {
 			current := result[participant.NodeName]
 			if current == nil || current.CreationTimestamp.Before(&runs[i].CreationTimestamp) {

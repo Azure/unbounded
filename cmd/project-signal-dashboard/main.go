@@ -14,7 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,10 +53,16 @@ func main() {
 		logger.Error("create Kubernetes client", "error", err)
 		os.Exit(1)
 	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		logger.Error("create Kubernetes log client", "error", err)
+		os.Exit(1)
+	}
 
 	dashboard := &signaldashboard.Server{
 		Collector: &signaldashboard.Collector{
 			Reader:    kube,
+			PodLogs:   podLogs{client: clientset},
 			Namespace: namespace,
 		},
 		Logger: logger,
@@ -73,6 +81,7 @@ func main() {
 		if err := server.Shutdown(shutdownContext); err != nil {
 			logger.Error("shut down dashboard", "error", err)
 		}
+
 	}()
 
 	logger.Info("starting Project Signal dashboard", "address", address, "namespace", namespace)
@@ -88,4 +97,23 @@ func mustAddToScheme(logger *slog.Logger, err error) {
 		logger.Error("register Kubernetes scheme", "error", err)
 		os.Exit(1)
 	}
+}
+
+type podLogs struct {
+	client kubernetes.Interface
+}
+
+func (p podLogs) ReadPodLog(
+	ctx context.Context,
+	namespace, pod, container string,
+	tailLines, limitBytes int64,
+) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	return p.client.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{
+		Container:  container,
+		TailLines:  &tailLines,
+		LimitBytes: &limitBytes,
+	}).DoRaw(ctx)
 }

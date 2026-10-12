@@ -26,6 +26,7 @@ func TestDashboardRBACIsReadOnlyAndNodeListIsNotGranted(t *testing.T) {
 	assert.NotContains(t, dashboardRBAC, `verbs: ["delete"`)
 	assert.Contains(t, dashboardRBAC, `resources: ["nodes"]`+"\n"+`    verbs: ["get"]`)
 	assert.NotContains(t, dashboardRBAC, `resources: ["nodes"]`+"\n"+`    verbs: ["get", "list"`)
+	assert.Contains(t, dashboardRBAC, `resources: ["pods/log"]`+"\n"+`    verbs: ["get"]`)
 }
 
 func TestDashboardServiceIsInternalAndImageFailsClosed(t *testing.T) {

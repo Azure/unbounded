@@ -64,6 +64,12 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	if run.Spec.Script.Digest != digestString(payload) {
 		t.Fatalf("script digest = %q", run.Spec.Script.Digest)
 	}
+	if len(run.Spec.StagePlan) != 1 || run.Spec.StagePlan[0].ID != "workload" {
+		t.Fatalf("stage plan = %#v, want immutable profile plan", run.Spec.StagePlan)
+	}
+	if run.Spec.Purpose != signalv1.PurposeQuickCertification {
+		t.Fatalf("purpose = %q, want %q", run.Spec.Purpose, signalv1.PurposeQuickCertification)
+	}
 
 	if run.Annotations[RunTriggerAnnotation] != "manual" {
 		t.Fatalf("trigger = %q, want manual", run.Annotations[RunTriggerAnnotation])
@@ -313,6 +319,20 @@ func TestWorkflowParameterFallsBackToEntrypointNodeOutputs(t *testing.T) {
 	}
 }
 
+func TestValidateStagePlanRejectsInvalidAndDuplicateStages(t *testing.T) {
+	t.Parallel()
+
+	if err := validateStagePlan([]signalv1.CertificationStage{{DisplayName: "Missing ID"}}); err == nil {
+		t.Fatal("expected empty stage ID to fail validation")
+	}
+	if err := validateStagePlan([]signalv1.CertificationStage{
+		{ID: "workload", DisplayName: "First"},
+		{ID: "workload", DisplayName: "Duplicate"},
+	}); err == nil {
+		t.Fatal("expected duplicate stage IDs to fail validation")
+	}
+}
+
 func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 	t.Parallel()
 
@@ -527,6 +547,8 @@ func testProfile(name, sku string) *signalv1.CertificationProfile {
 			Workflow:     signalv1.WorkflowReference{Name: "gpu-cert"},
 			Backend:      signalv1.ExecutionBackend{APIVersion: "kubeflow.org/v2beta1", Kind: "MPIJob"},
 			RunnerImage:  "runner@sha256:abc",
+			Purpose:      signalv1.PurposeQuickCertification,
+			StagePlan:    []signalv1.CertificationStage{{ID: "workload", DisplayName: "Workload", Category: "compute", Required: true}},
 			EvidencePath: "signal/" + sku,
 			Deadline:     metav1.Duration{Duration: 10 * time.Minute},
 			MaxAttempts:  2,

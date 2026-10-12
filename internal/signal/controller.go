@@ -130,6 +130,9 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 	if err := r.Get(ctx, client.ObjectKey{Name: profileName}, &profile); err != nil {
 		return fmt.Errorf("get CertificationProfile %s: %w", profileName, err)
 	}
+	if err := validateStagePlan(profile.Spec.StagePlan); err != nil {
+		return fmt.Errorf("profile %s stage plan: %w", profile.Name, err)
+	}
 
 	participants, err := r.selectParticipants(ctx, node, &profile)
 	if err != nil {
@@ -185,6 +188,8 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 			Workflow:        profile.Spec.Workflow,
 			Backend:         profile.Spec.Backend,
 			RunnerImage:     profile.Spec.RunnerImage,
+			Purpose:         profile.Spec.Purpose,
+			StagePlan:       append([]signalv1.CertificationStage(nil), profile.Spec.StagePlan...),
 			Parameters:      profile.Spec.Parameters,
 			EvidencePath:    strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
 			Deadline:        profile.Spec.Deadline,
@@ -193,6 +198,7 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 			RequestNodeName: node.Name,
 		},
 	}
+
 	if err := r.Create(ctx, run); err != nil {
 		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
 
@@ -693,6 +699,8 @@ func (r *RunReconciler) evidenceDocument(
 		"workflow":       run.Status.Workflow,
 		"backend":        run.Spec.Backend,
 		"runnerImage":    run.Spec.RunnerImage,
+		"purpose":        run.Spec.Purpose,
+		"stagePlan":      run.Spec.StagePlan,
 		"parameters":     run.Spec.Parameters,
 		"scriptSnapshot": run.Spec.Script,
 		"scriptContent":  snapshot.Data[run.Spec.Script.Key],
@@ -964,6 +972,25 @@ func removeString(values []string, remove string) []string {
 	}
 
 	return result
+}
+
+func validateStagePlan(plan []signalv1.CertificationStage) error {
+	seen := map[string]struct{}{}
+	for i := range plan {
+		stage := &plan[i]
+		if stage.ID == "" {
+			return fmt.Errorf("stage %d has an empty ID", i)
+		}
+		if stage.DisplayName == "" {
+			return fmt.Errorf("stage %q has an empty display name", stage.ID)
+		}
+		if _, ok := seen[stage.ID]; ok {
+			return fmt.Errorf("duplicate stage ID %q", stage.ID)
+		}
+		seen[stage.ID] = struct{}{}
+	}
+
+	return nil
 }
 
 func AddToScheme(scheme *runtime.Scheme) error {

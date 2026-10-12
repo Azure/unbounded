@@ -116,6 +116,17 @@ spec:
                 - name
                 - uid
                 type: object
+              purpose:
+                enum:
+                - FullCertification
+                - QuickCertification
+                - Preflight
+                - TargetedVerification
+                - Diagnostic
+                type: string
+                x-kubernetes-validations:
+                - message: purpose is immutable
+                  rule: self == oldSelf
               requestNodeName:
                 type: string
               runnerImage:
@@ -133,6 +144,33 @@ spec:
                 - digest
                 - key
                 type: object
+              stagePlan:
+                items:
+                  properties:
+                    category:
+                      type: string
+                    conditional:
+                      type: boolean
+                    description:
+                      type: string
+                    displayName:
+                      type: string
+                    expectedDuration:
+                      type: string
+                    id:
+                      type: string
+                    required:
+                      type: boolean
+                  required:
+                  - category
+                  - displayName
+                  - id
+                  - required
+                  type: object
+                type: array
+                x-kubernetes-validations:
+                - message: stagePlan is immutable
+                  rule: self == oldSelf
               tolerations:
                 items:
                   description: |-

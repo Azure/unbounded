@@ -144,6 +144,14 @@ spec:
                 - count
                 - selector
                 type: object
+              purpose:
+                enum:
+                - FullCertification
+                - QuickCertification
+                - Preflight
+                - TargetedVerification
+                - Diagnostic
+                type: string
               recurring:
                 properties:
                   enabled:
@@ -203,6 +211,30 @@ spec:
                 - key
                 - name
                 type: object
+              stagePlan:
+                items:
+                  properties:
+                    category:
+                      type: string
+                    conditional:
+                      type: boolean
+                    description:
+                      type: string
+                    displayName:
+                      type: string
+                    expectedDuration:
+                      type: string
+                    id:
+                      type: string
+                    required:
+                      type: boolean
+                  required:
+                  - category
+                  - displayName
+                  - id
+                  - required
+                  type: object
+                type: array
               tolerations:
                 items:
                   description: |-

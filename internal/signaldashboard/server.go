@@ -91,7 +91,7 @@ func (s *Server) run(response http.ResponseWriter, request *http.Request) {
 
 	snapshot := s.Collector.Collect(request.Context())
 
-	detail, err := s.Collector.Run(snapshot, name)
+	detail, err := s.Collector.Run(request.Context(), snapshot, name)
 	if err != nil {
 		if IsNotFound(err) {
 			writeJSON(response, http.StatusNotFound, map[string]string{"error": "run not found"})
@@ -127,7 +127,8 @@ func filterRuns(snapshot collected, request *http.Request) collected {
 	profile := strings.ToLower(request.URL.Query().Get("profile"))
 
 	hardware := strings.ToLower(request.URL.Query().Get("hardware"))
-	if phase == "" && verdict == "" && profile == "" && hardware == "" {
+	view := strings.ToLower(request.URL.Query().Get("view"))
+	if phase == "" && verdict == "" && profile == "" && hardware == "" && view == "" {
 		return snapshot
 	}
 
@@ -146,6 +147,13 @@ func filterRuns(snapshot collected, request *http.Request) collected {
 
 		if profile != "" && !strings.Contains(strings.ToLower(run.Spec.Profile.Name), profile) {
 			continue
+		}
+
+		if view != "" {
+			classification, _ := runClassification(run, snapshot.runs)
+			if strings.ToLower(classification) != view {
+				continue
+			}
 		}
 
 		if hardware != "" {

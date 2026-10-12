@@ -16,22 +16,42 @@ type HealthStatus struct {
 }
 
 type Summary struct {
-	Counts      RunCounts         `json:"counts"`
-	NodeCounts  map[string]int    `json:"nodeCounts"`
-	Controller  HealthStatus      `json:"controller"`
-	Argo        HealthStatus      `json:"argo"`
-	Reasons     map[string]string `json:"reasonExplanations"`
-	LastRefresh time.Time         `json:"lastRefresh"`
-	Partial     bool              `json:"partial"`
-	Errors      []APIError        `json:"errors,omitempty"`
+	Active          ActiveCounts      `json:"active"`
+	CurrentNodes    CurrentNodeCounts `json:"currentNodes"`
+	RetainedHistory RunCounts         `json:"retainedHistory"`
+	LatestOutcomes  []LatestOutcome   `json:"latestOutcomes"`
+	NodeCounts      map[string]int    `json:"nodeCounts"`
+	Controller      HealthStatus      `json:"controller"`
+	Argo            HealthStatus      `json:"argo"`
+	Reasons         map[string]string `json:"reasonExplanations"`
+	LastRefresh     time.Time         `json:"lastRefresh"`
+	Partial         bool              `json:"partial"`
+	Errors          []APIError        `json:"errors,omitempty"`
 }
 
 type RunCounts struct {
-	Running      int `json:"running"`
-	Pending      int `json:"pending"`
 	Passed       int `json:"passed"`
 	Failed       int `json:"failed"`
 	Inconclusive int `json:"inconclusive"`
+}
+
+type ActiveCounts struct {
+	Running int `json:"running"`
+	Pending int `json:"pending"`
+}
+
+type CurrentNodeCounts struct {
+	Healthy int `json:"healthy"`
+	Blocked int `json:"blocked"`
+	Unknown int `json:"unknown"`
+}
+
+type LatestOutcome struct {
+	NodeAlias string     `json:"nodeAlias"`
+	Profile   string     `json:"profile"`
+	Verdict   string     `json:"verdict"`
+	Reason    string     `json:"reason"`
+	At        *time.Time `json:"at,omitempty"`
 }
 
 type RunList struct {
@@ -45,32 +65,43 @@ type RunList struct {
 }
 
 type RunSummary struct {
-	Name          string     `json:"name"`
-	Profile       string     `json:"profile"`
-	HardwareClass string     `json:"hardwareClass"`
-	NodeAliases   []string   `json:"nodeAliases"`
-	Phase         string     `json:"phase"`
-	Execution     string     `json:"execution"`
-	Verdict       string     `json:"verdict"`
-	Reason        string     `json:"reason"`
-	Explanation   string     `json:"explanation"`
-	OutcomeType   string     `json:"outcomeType"`
-	StartedAt     *time.Time `json:"startedAt,omitempty"`
-	FinishedAt    *time.Time `json:"finishedAt,omitempty"`
-	Duration      string     `json:"duration"`
-	NextDueAt     *time.Time `json:"nextDueAt,omitempty"`
-	WorkflowName  string     `json:"workflowName,omitempty"`
-	WorkflowPhase string     `json:"workflowPhase,omitempty"`
-	MPIJobName    string     `json:"mpiJobName,omitempty"`
-	MPIJobPhase   string     `json:"mpiJobPhase,omitempty"`
-	ScriptDigest  string     `json:"scriptDigest,omitempty"`
-	Trigger       string     `json:"trigger"`
-	Attempt       int32      `json:"attempt"`
+	Name           string     `json:"name"`
+	Profile        string     `json:"profile"`
+	HardwareClass  string     `json:"hardwareClass"`
+	NodeAliases    []string   `json:"nodeAliases"`
+	Phase          string     `json:"phase"`
+	Execution      string     `json:"execution"`
+	Verdict        string     `json:"verdict"`
+	Reason         string     `json:"reason"`
+	Explanation    string     `json:"explanation"`
+	OutcomeType    string     `json:"outcomeType"`
+	StartedAt      *time.Time `json:"startedAt,omitempty"`
+	FinishedAt     *time.Time `json:"finishedAt,omitempty"`
+	Duration       string     `json:"duration"`
+	NextDueAt      *time.Time `json:"nextDueAt,omitempty"`
+	WorkflowName   string     `json:"workflowName,omitempty"`
+	WorkflowPhase  string     `json:"workflowPhase,omitempty"`
+	MPIJobName     string     `json:"mpiJobName,omitempty"`
+	MPIJobPhase    string     `json:"mpiJobPhase,omitempty"`
+	ScriptDigest   string     `json:"scriptDigest,omitempty"`
+	Purpose        string     `json:"purpose"`
+	Scope          string     `json:"scope"`
+	Classification string     `json:"classification"`
+	Superseded     bool       `json:"superseded"`
+	TimingLabel    string     `json:"timingLabel"`
+	Trigger        string     `json:"trigger"`
+	Attempt        int32      `json:"attempt"`
 }
 
 type RunDetail struct {
 	RunSummary
-	Stages        []StageStatus       `json:"stages"`
+	Admission     []StageStatus       `json:"admission"`
+	ExecutionPlan []StageStatus       `json:"executionPlan"`
+	Finalization  []StageStatus       `json:"finalization"`
+	PlanIssues    []string            `json:"planIssues,omitempty"`
+	CurrentStage  string              `json:"currentStage,omitempty"`
+	Script        ScriptStatus        `json:"script"`
+	ArgoTask      StageStatus         `json:"argoTask"`
 	WorkflowNodes []WorkflowNode      `json:"workflowNodes"`
 	Outputs       map[string]string   `json:"outputs,omitempty"`
 	MPIJob        *MPIJobStatus       `json:"mpiJob,omitempty"`
@@ -81,13 +112,28 @@ type RunDetail struct {
 }
 
 type StageStatus struct {
-	Name       string     `json:"name"`
-	Phase      string     `json:"phase"`
-	Reason     string     `json:"reason,omitempty"`
-	Message    string     `json:"message,omitempty"`
-	StartedAt  *time.Time `json:"startedAt,omitempty"`
-	FinishedAt *time.Time `json:"finishedAt,omitempty"`
-	Source     string     `json:"source"`
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	Category         string     `json:"category,omitempty"`
+	Description      string     `json:"description,omitempty"`
+	ExpectedDuration string     `json:"expectedDuration,omitempty"`
+	Required         bool       `json:"required"`
+	Conditional      bool       `json:"conditional,omitempty"`
+	Phase            string     `json:"phase"`
+	Reason           string     `json:"reason,omitempty"`
+	Message          string     `json:"message,omitempty"`
+	StartedAt        *time.Time `json:"startedAt,omitempty"`
+	FinishedAt       *time.Time `json:"finishedAt,omitempty"`
+	Duration         string     `json:"duration,omitempty"`
+	Source           string     `json:"source"`
+}
+
+type ScriptStatus struct {
+	Key               string   `json:"key"`
+	SnapshotConfigMap string   `json:"snapshotConfigMap"`
+	Digest            string   `json:"digest"`
+	RunnerImageDigest string   `json:"runnerImageDigest,omitempty"`
+	Command           []string `json:"command,omitempty"`
 }
 
 type WorkflowNode struct {

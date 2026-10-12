@@ -47,15 +47,37 @@ function renderSummary(summary) {
   const cards = byId("cards");
   clear(cards);
   [
-    ["Running", summary.counts.running],
-    ["Pending", summary.counts.pending],
-    ["Passed", summary.counts.passed],
-    ["Failed", summary.counts.failed],
-    ["Inconclusive", summary.counts.inconclusive],
+    ["Active Running", summary.active.running],
+    ["Active Pending", summary.active.pending],
+    ["Approved Nodes Healthy", summary.currentNodes.healthy],
+    ["Approved Nodes Blocked", summary.currentNodes.blocked],
   ].forEach(([label, value]) => {
     const card = text("article", "", "card");
     card.append(text("span", label), text("strong", String(value)));
     cards.append(card);
+  });
+  const history = byId("history-cards");
+  clear(history);
+  [
+    ["Passed attempts", summary.retainedHistory.passed],
+    ["Failed attempts", summary.retainedHistory.failed],
+    ["Inconclusive attempts", summary.retainedHistory.inconclusive],
+  ].forEach(([label, value]) => {
+    const card = text("article", "", "card retained");
+    card.append(text("span", label), text("strong", String(value)));
+    history.append(card);
+  });
+  const outcomes = byId("latest-outcomes");
+  clear(outcomes);
+  outcomes.append(text("h3", "Latest certification outcome per approved node/profile"));
+  if (!summary.latestOutcomes.length) {
+    outcomes.append(text("p", "No terminal certification outcome is retained yet."));
+  }
+  summary.latestOutcomes.forEach((item) => {
+    const article = text("article", "", "outcome");
+    article.append(text("div", `${item.nodeAlias} · ${item.profile}`, "primary"), badge(item.verdict || "unknown"),
+      text("p", `${item.reason || "No reason"} · ${formatTime(item.at)}`));
+    outcomes.append(article);
   });
 
   const health = byId("health");
@@ -88,6 +110,7 @@ function renderRuns(runs) {
     row.setAttribute("aria-label", `Open details for ${run.name}`);
     row.append(
       cell(shortName(run.name), run.profile, "mono"),
+      cell(run.purpose, `${run.scope} · ${run.classification}${run.superseded ? " · superseded" : ""}`),
       cell(run.nodeAliases.join(", ") || "approved-node", run.hardwareClass),
     );
 
@@ -103,7 +126,7 @@ function renderRuns(runs) {
 
     row.append(
       cell(shortName(run.workflowName), `${run.workflowPhase || "not created"} · ${shortName(run.mpiJobName)} ${run.mpiJobPhase || ""}`, "mono"),
-      cell(run.duration || "n/a", `Started ${formatTime(run.startedAt)} | next due ${formatTime(run.nextDueAt)}`),
+      cell(`${run.timingLabel} ${run.duration || "n/a"}`, `Started ${formatTime(run.startedAt)} | next due ${formatTime(run.nextDueAt)}`),
       cell(run.trigger, `Attempt ${run.attempt || 1} | script ${run.scriptDigest || "n/a"}`),
     );
     row.addEventListener("click", () => openRun(run.name));
@@ -145,6 +168,7 @@ function filterQuery() {
     ["verdict", "verdict-filter"],
     ["profile", "profile-filter"],
     ["hardware", "hardware-filter"],
+    ["view", "view-filter"],
   ].forEach(([name, id]) => {
     const value = byId(id).value.trim();
     if (value) params.set(name, value);
@@ -178,7 +202,7 @@ async function refresh() {
 }
 
 function renderStages(stages) {
-  const list = byId("stage-list");
+  const list = arguments.length > 1 ? byId(arguments[1]) : byId("stage-list");
   clear(list);
   stages.forEach((stage) => {
     const article = text("article", "", "stage");
@@ -186,7 +210,9 @@ function renderStages(stages) {
     const fallback = stage.phase === "Succeeded" ? "Stage completed." :
       stage.phase === "Running" ? "Stage is running." : "Waiting for this stage.";
     article.append(text("p", stage.message || stage.reason || fallback));
-    article.append(text("p", stage.source, "mono"));
+    const timing = [stage.duration, stage.expectedDuration ? `expected ${stage.expectedDuration}` : ""].filter(Boolean).join(" · ");
+    if (timing) article.append(text("p", timing));
+    article.append(text("p", `${stage.category || "orchestration"} · ${stage.source}`, "mono"));
     list.append(article);
   });
 }
@@ -212,8 +238,31 @@ function renderWorkflowNodes(nodes) {
 function renderRunDetail(detail) {
   byId("detail-title").textContent = detail.name;
   byId("detail-subtitle").textContent = `${detail.profile} · ${detail.nodeAliases.join(", ")} · ${detail.hardwareClass}`;
-  renderStages(detail.stages);
+  renderStages(detail.admission, "admission-list");
+  renderStages(detail.executionPlan, "stage-list");
+  renderStages(detail.finalization, "finalization-list");
   renderWorkflowNodes(detail.workflowNodes);
+  const issues = byId("plan-issues");
+  if (detail.planIssues?.length) {
+    issues.textContent = detail.planIssues.join(" ");
+    issues.classList.remove("hidden");
+  } else {
+    issues.classList.add("hidden");
+  }
+  const argoTask = byId("argo-task");
+  clear(argoTask);
+  argoTask.append(text("div", `Argo task: ${detail.argoTask.name} (${detail.argoTask.phase})`, "primary"),
+    text("p", detail.argoTask.message || detail.argoTask.reason || "Outer workflow task status."));
+  const script = byId("script-status");
+  clear(script);
+  script.append(
+    text("div", `Script: ${detail.script.key || "unknown"}`, "primary"),
+    text("p", `Snapshot: ${detail.script.snapshotConfigMap || "unknown"}`, "mono"),
+    text("p", `Digest: ${detail.script.digest || "unknown"}`, "mono"),
+    text("p", `Runner: ${detail.script.runnerImageDigest || "digest unavailable"}`, "mono"),
+    text("p", `Command: ${(detail.script.command || []).join(" ") || "unavailable"}`, "mono"),
+    text("p", `Current suite stage: ${detail.currentStage || "none observed"}`, "primary"),
+  );
 
   const typed = byId("typed-result");
   clear(typed);
@@ -276,7 +325,7 @@ async function openRun(name) {
 
 byId("refresh-now").addEventListener("click", refresh);
 byId("close-detail").addEventListener("click", () => byId("run-dialog").close());
-["phase-filter", "verdict-filter"].forEach((id) => byId(id).addEventListener("change", refresh));
+["phase-filter", "verdict-filter", "view-filter"].forEach((id) => byId(id).addEventListener("change", refresh));
 ["profile-filter", "hardware-filter"].forEach((id) => byId(id).addEventListener("input", () => {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(refresh, 350);

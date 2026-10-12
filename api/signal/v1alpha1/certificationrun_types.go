@@ -47,19 +47,24 @@ type ScriptSnapshot struct {
 }
 
 type CertificationRunSpec struct {
-	Profile         PinnedProfile       `json:"profile"`
-	Participants    []Participant       `json:"participants"`
-	Script          ScriptSnapshot      `json:"script"`
-	Workflow        WorkflowReference   `json:"workflow"`
-	Backend         ExecutionBackend    `json:"backend"`
-	RunnerImage     string              `json:"runnerImage"`
-	Parameters      map[string]string   `json:"parameters,omitempty"`
-	EvidencePath    string              `json:"evidencePath"`
-	Deadline        metav1.Duration     `json:"deadline"`
-	MaxAttempts     int32               `json:"maxAttempts"`
-	Tolerations     []corev1.Toleration `json:"tolerations,omitempty"`
-	RequestNodeName string              `json:"requestNodeName"`
-	Cancel          bool                `json:"cancel,omitempty"`
+	Profile      PinnedProfile     `json:"profile"`
+	Participants []Participant     `json:"participants"`
+	Script       ScriptSnapshot    `json:"script"`
+	Workflow     WorkflowReference `json:"workflow"`
+	Backend      ExecutionBackend  `json:"backend"`
+	RunnerImage  string            `json:"runnerImage"`
+	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="purpose is immutable"
+	Purpose CertificationPurpose `json:"purpose,omitempty"`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="stagePlan is immutable"
+	StagePlan       []CertificationStage `json:"stagePlan,omitempty"`
+	Parameters      map[string]string    `json:"parameters,omitempty"`
+	EvidencePath    string               `json:"evidencePath"`
+	Deadline        metav1.Duration      `json:"deadline"`
+	MaxAttempts     int32                `json:"maxAttempts"`
+	Tolerations     []corev1.Toleration  `json:"tolerations,omitempty"`
+	RequestNodeName string               `json:"requestNodeName"`
+	Cancel          bool                 `json:"cancel,omitempty"`
 }
 
 type WorkflowStatus struct {

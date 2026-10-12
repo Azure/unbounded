@@ -22,6 +22,24 @@ spec:
     apiVersion: kubeflow.org/v2beta1
     kind: MPIJob
   runnerImage: {{ default "example.invalid/gpu-runner:replace-me" .RunnerImage }}
+  purpose: QuickCertification
+  stagePlan:
+    - id: preflight
+      displayName: Preflight health
+      category: health
+      description: Verify the approved hardware identity and baseline health.
+      required: true
+    - id: workload
+      displayName: Certification workload
+      category: compute
+      description: Run the profile-specific hardware workload.
+      expectedDuration: 5m
+      required: true
+    - id: health-after
+      displayName: Final health
+      category: health
+      description: Verify that the workload introduced no new hardware errors.
+      required: true
   parameters:
     expected-gpu-product-regex: ^REPLACE_WITH_VERIFIED_NVIDIA_SMI_PRODUCT$
     expected-gpu-count: "REPLACE_WITH_VERIFIED_GPU_COUNT"

@@ -34,7 +34,15 @@ main { padding-bottom: 70px; }
 section { margin-top: 28px; }
 .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 13px; }
 .section-heading > p { margin-bottom: 2px; }
-.cards { display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr)); gap: 12px; }
+.cards { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 12px; }
+.history-heading { margin-top: 22px; }
+.history-cards { grid-template-columns: repeat(3, minmax(130px, 1fr)); }
+.card.retained { opacity: .86; }
+.latest-outcomes { margin-top: 18px; display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 10px; }
+.latest-outcomes > h3 { grid-column: 1 / -1; }
+.outcome { background: var(--surface); border: 1px solid var(--border); border-radius: 11px; padding: 12px; }
+.outcome .badge { margin-top: 8px; }
+.outcome p { margin: 8px 0 0; font-size: .8rem; }
 .card, .panel, .reason-grid article { background: linear-gradient(145deg, rgba(22,37,52,.96), rgba(13,25,36,.96)); border: 1px solid var(--border); border-radius: 13px; padding: 16px; }
 .card strong { display: block; margin-top: 8px; font-size: 2rem; }
 .card span { color: var(--muted); }
@@ -68,7 +76,8 @@ dialog { width: min(1180px, calc(100% - 32px)); max-height: calc(100vh - 40px); 
 dialog::backdrop { background: rgba(0,0,0,.72); backdrop-filter: blur(4px); }
 .dialog-heading { display: flex; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--border); padding-bottom: 15px; }
 .detail-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: 18px; }
-.stage-list { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+.stage-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 8px; }
+.stage-list.compact { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 .stage { position: relative; min-height: 120px; padding: 13px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); }
 .stage:not(:last-child)::after { content: "→"; position: absolute; right: -10px; top: 42%; z-index: 2; color: var(--muted); }
 .stage p { font-size: .78rem; margin: 8px 0 0; }

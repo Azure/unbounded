@@ -17,6 +17,26 @@ type WorkflowReference struct {
 	Name string `json:"name"`
 }
 
+type CertificationPurpose string
+
+const (
+	PurposeFullCertification    CertificationPurpose = "FullCertification"
+	PurposeQuickCertification   CertificationPurpose = "QuickCertification"
+	PurposePreflight            CertificationPurpose = "Preflight"
+	PurposeTargetedVerification CertificationPurpose = "TargetedVerification"
+	PurposeDiagnostic           CertificationPurpose = "Diagnostic"
+)
+
+type CertificationStage struct {
+	ID               string          `json:"id"`
+	DisplayName      string          `json:"displayName"`
+	Category         string          `json:"category"`
+	Description      string          `json:"description,omitempty"`
+	ExpectedDuration metav1.Duration `json:"expectedDuration,omitempty"`
+	Required         bool            `json:"required"`
+	Conditional      bool            `json:"conditional,omitempty"`
+}
+
 type ExecutionBackend struct {
 	APIVersion string `json:"apiVersion"`
 	Kind       string `json:"kind"`
@@ -34,17 +54,20 @@ type ParticipantPolicy struct {
 }
 
 type CertificationProfileSpec struct {
-	Participants ParticipantPolicy   `json:"participants"`
-	Script       ScriptReference     `json:"script"`
-	Workflow     WorkflowReference   `json:"workflow"`
-	Backend      ExecutionBackend    `json:"backend"`
-	RunnerImage  string              `json:"runnerImage"`
-	Parameters   map[string]string   `json:"parameters,omitempty"`
-	EvidencePath string              `json:"evidencePath"`
-	Deadline     metav1.Duration     `json:"deadline"`
-	MaxAttempts  int32               `json:"maxAttempts,omitempty"`
-	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
-	Recurring    *RecurringPolicy    `json:"recurring,omitempty"`
+	Participants ParticipantPolicy `json:"participants"`
+	Script       ScriptReference   `json:"script"`
+	Workflow     WorkflowReference `json:"workflow"`
+	Backend      ExecutionBackend  `json:"backend"`
+	RunnerImage  string            `json:"runnerImage"`
+	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
+	Purpose      CertificationPurpose `json:"purpose,omitempty"`
+	StagePlan    []CertificationStage `json:"stagePlan,omitempty"`
+	Parameters   map[string]string    `json:"parameters,omitempty"`
+	EvidencePath string               `json:"evidencePath"`
+	Deadline     metav1.Duration      `json:"deadline"`
+	MaxAttempts  int32                `json:"maxAttempts,omitempty"`
+	Tolerations  []corev1.Toleration  `json:"tolerations,omitempty"`
+	Recurring    *RecurringPolicy     `json:"recurring,omitempty"`
 }
 
 type RecurringPolicy struct {

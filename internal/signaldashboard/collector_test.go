@@ -99,7 +99,7 @@ func TestCollectorCorrelatesWorkflowAndMPIJobByOwnership(t *testing.T) {
 	reader := fixtureReader()
 	collector := fixtureCollector(reader)
 	snapshot := collector.Collect(context.Background())
-	detail, err := collector.Run(snapshot, "run-example")
+	detail, err := collector.Run(context.Background(), snapshot, "run-example")
 	require.NoError(t, err)
 
 	assert.Equal(t, "workflow-example", detail.WorkflowName)
@@ -201,6 +201,75 @@ func TestNodeSummaryUsesStatusForProjectedProfile(t *testing.T) {
 	require.NotNil(t, nodes.Items[0].NextDueAt)
 	assert.Equal(t, fixedTime.Add(time.Hour), *nodes.Items[0].NextDueAt)
 	assert.Equal(t, "NotDue", nodes.Items[0].RecurringReason)
+}
+
+func TestSummarySeparatesCurrentHealthFromRetainedHistory(t *testing.T) {
+	t.Parallel()
+
+	reader := fixtureReader()
+	active := reader.runs[0]
+	active.Name = "active-full"
+	active.Spec.Profile.Name = "a100-full"
+	active.Spec.Script.Key = "full.sh"
+	active.Status = signalv1.CertificationRunStatus{Phase: signalv1.RunPhaseRunning, StartedAt: ptrMetaTime(metav1.NewTime(fixedTime.Add(-time.Hour)))}
+
+	failed := reader.runs[0]
+	failed.Name = "old-failure"
+	failed.CreationTimestamp = metav1.NewTime(fixedTime.Add(-2 * time.Hour))
+	failed.Status = signalv1.CertificationRunStatus{Phase: signalv1.RunPhaseFailed, ExecutionState: "Completed", Verdict: "Fail"}
+
+	diagnostic := failed
+	diagnostic.Name = "storage-diagnostic"
+	diagnostic.Spec.Profile.Name = "storage-diagnostic"
+	diagnostic.Status.Reason = "StorageDiagnosticOnly"
+	reader.runs = []signalv1.CertificationRun{active, failed, diagnostic}
+	node := reader.nodes["approved-a100"]
+	node.Labels[signal.StateLabel] = "testing"
+	node.Labels[signal.EligibilityLabel] = "blocked"
+	reader.nodes["approved-a100"] = node
+
+	collector := fixtureCollector(reader)
+	summary := collector.Summary(collector.Collect(context.Background()))
+	assert.Equal(t, 1, summary.Active.Running)
+	assert.Equal(t, 1, summary.CurrentNodes.Blocked)
+	assert.Equal(t, 1, summary.RetainedHistory.Failed)
+}
+
+func TestViewFilterSeparatesCurrentHistoricalDiagnosticsAndSuperseded(t *testing.T) {
+	t.Parallel()
+
+	reader := fixtureReader()
+	active := reader.runs[0]
+	active.Name = "active"
+	active.Status.Phase = signalv1.RunPhaseRunning
+
+	old := reader.runs[0]
+	old.Name = "old"
+	old.CreationTimestamp = metav1.NewTime(fixedTime.Add(-time.Hour))
+	old.Status = signalv1.CertificationRunStatus{Phase: signalv1.RunPhaseFailed, Verdict: "Fail"}
+
+	passed := old
+	passed.Name = "passed"
+	passed.CreationTimestamp = metav1.NewTime(fixedTime)
+	passed.Status = signalv1.CertificationRunStatus{Phase: signalv1.RunPhaseSucceeded, Verdict: "Pass"}
+
+	diagnostic := old
+	diagnostic.Name = "diagnostic"
+	diagnostic.Spec.Purpose = signalv1.PurposeDiagnostic
+
+	snapshot := collected{runs: []signalv1.CertificationRun{active, old, passed, diagnostic}}
+	cases := map[string]string{
+		"Current":     "active",
+		"Historical":  "passed",
+		"Diagnostics": "diagnostic",
+		"Superseded":  "old",
+	}
+	for view, want := range cases {
+		request := httptest.NewRequest(http.MethodGet, "/api/runs?view="+view, nil)
+		filtered := filterRuns(snapshot, request)
+		require.Len(t, filtered.runs, 1, view)
+		assert.Equal(t, want, filtered.runs[0].Name, view)
+	}
 }
 
 func TestSanitizeDisplayRedactsUUIDsAndBoundsMessages(t *testing.T) {
