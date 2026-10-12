@@ -39,6 +39,8 @@ const maxOriginRequestTimeout = time.Minute
 // send a timeout response after the handler's context expires.
 const sidecarWriteGrace = 5 * time.Second
 
+const sidecarMaxHeaderBytes = 32 << 10
+
 type bucketsFlag []string
 
 func (b *bucketsFlag) String() string { return strings.Join(*b, ",") }
@@ -411,9 +413,14 @@ func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handl
 	server := &http.Server{
 		ReadHeaderTimeout: min(5*time.Second, requestTimeout),
 		ReadTimeout:       requestTimeout, WriteTimeout: requestTimeout + sidecarWriteGrace, IdleTimeout: 30 * time.Second,
-		MaxHeaderBytes: 32 << 10, ErrorLog: log.New(io.Discard, "", 0),
+		MaxHeaderBytes: sidecarMaxHeaderBytes, ErrorLog: log.New(io.Discard, "", 0),
 		BaseContext: func(net.Listener) context.Context { return lifetime },
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if sidecarRequestHeaderBytes(r) > sidecarMaxHeaderBytes {
+				http.Error(w, http.StatusText(http.StatusRequestHeaderFieldsTooLarge), http.StatusRequestHeaderFieldsTooLarge)
+				return
+			}
+
 			requestCtx, done := context.WithTimeout(r.Context(), requestTimeout)
 			defer done()
 
@@ -452,4 +459,17 @@ func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handl
 
 		return nil
 	}
+}
+
+// net/http allows parser slop above MaxHeaderBytes. Match Racer's parsed-field
+// accounting to enforce the application bound before calling the sidecar.
+func sidecarRequestHeaderBytes(r *http.Request) int {
+	size := len(r.RequestURI) + len(r.Host)
+	for key, values := range r.Header {
+		for _, value := range values {
+			size += len(key) + len(value) + 4
+		}
+	}
+
+	return size
 }
