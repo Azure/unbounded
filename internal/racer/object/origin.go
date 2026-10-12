@@ -283,7 +283,7 @@ func (o *objectOrigin) headMetadata(head *s3.HeadObjectOutput, object Object) (r
 	}
 
 	// SDK metadata cannot carry Content-Encoding to the reader.
-	if encoding := aws.ToString(head.ContentEncoding); encoding != "" && encoding != "identity" {
+	if encoding := aws.ToString(head.ContentEncoding); encoding != "" && !strings.EqualFold(encoding, "identity") {
 		return racersdk.Metadata{}, errInvalidS3Response
 	}
 
@@ -341,7 +341,7 @@ func validateObjectPage(output *s3.GetObjectOutput, head *s3.HeadObjectOutput, m
 	if output.Body == nil || output.ContentLength == nil || *output.ContentLength != int64(last-first+1) ||
 		aws.ToString(output.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", first, last, metadata.Size) ||
 		aws.ToString(output.ContentType) != metadata.ContentType || aws.ToString(output.VersionId) != aws.ToString(head.VersionId) ||
-		aws.ToString(output.ContentEncoding) != aws.ToString(head.ContentEncoding) || aws.ToBool(output.DeleteMarker) {
+		!strings.EqualFold(aws.ToString(output.ContentEncoding), aws.ToString(head.ContentEncoding)) || aws.ToBool(output.DeleteMarker) {
 		return errInvalidS3Response
 	}
 

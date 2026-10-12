@@ -1136,7 +1136,7 @@ func TestOriginRangeResolvedAgainstPinnedHead(t *testing.T) {
 }
 
 func TestOriginContentEncoding(t *testing.T) {
-	for _, encoding := range []string{"", "identity", "gzip", "br", "gzip, identity"} {
+	for _, encoding := range []string{"", "identity", "Identity", "IDENTITY", "iDeNtItY", "gzip", "br", "gzip, identity"} {
 		for _, operation := range []string{"HEAD", "bootstrap"} {
 			t.Run(operation+"/"+encoding, func(t *testing.T) {
 				var gets atomic.Int32
@@ -1171,7 +1171,7 @@ func TestOriginContentEncoding(t *testing.T) {
 					got, err = originReadValue(t, client, request)
 				}
 
-				if encoding != "" && encoding != "identity" {
+				if encoding == "gzip" || encoding == "br" || encoding == "gzip, identity" {
 					originAssertError(t, err, errInvalidS3Response)
 
 					if gets.Load() != 0 || len(got) != 0 {
@@ -1194,5 +1194,61 @@ func TestOriginContentEncoding(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestOriginGetContentEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		head, get string
+		accepted  bool
+	}{
+		{"identity", "Identity", true},
+		{"Identity", "identity", true},
+		{"IDENTITY", "iDeNtItY", true},
+		{"Identity", "gzip", false},
+		{"identity", "GZIP", false},
+		{"Identity", "br", false},
+		{"Identity", "identity, gzip", false},
+		{"", "Identity", false},
+		{"Identity", "", false},
+	} {
+		t.Run(tc.head+"/"+tc.get, func(t *testing.T) {
+			var gets atomic.Int32
+
+			stub := &originS3Stub{
+				head: func(context.Context, *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+					head := originHead(5)
+					head.ContentEncoding = aws.String(tc.head)
+
+					return head, nil
+				},
+				get: func(context.Context, *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+					gets.Add(1)
+
+					output := originPage(io.NopCloser(strings.NewReader("hello")), 0, 4, 5)
+					output.ContentEncoding = aws.String(tc.get)
+
+					return output, nil
+				},
+			}
+			client := originClient(t, stub, OriginConfig{Namespace: "store"})
+
+			got, err := originReadValue(t, client, objectRequest(t, ""))
+			if tc.accepted {
+				if err != nil || string(got) != "hello" {
+					t.Fatalf("GET = %q, error = %v", got, err)
+				}
+			} else {
+				originAssertError(t, err, errInvalidS3Response)
+
+				if len(got) != 0 {
+					t.Fatal("rejected encoding exposed bytes")
+				}
+			}
+
+			if gets.Load() != 1 {
+				t.Fatal("expected one GET", gets.Load())
+			}
+		})
 	}
 }
