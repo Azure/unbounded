@@ -5,7 +5,7 @@
   "description": "Second-sight local disk retention: 16384 x 1073741824-byte blobs (16 TiB catalog), seed zipf-balanced-v2, Zipf exponent 1.1, C16, 32 catalog workers. Buffers: 48 GiB plaintext, 64 GiB ciphertext, and 2 GiB each for dirty and registered buffers. RACER_ADMISSION_MODE=second-sight is the runtime default; repeated nonowner reads can admit verified ciphertext, subject to resource limits. Throughput includes only zipf-16t-v3 loadgens, excluding the prior exponent 1.0 run with the same catalog bytes. During catalog hashing, no data is expected, not zero. Wait a full five-minute window after readiness. Treat initial observations as warm-up, not steady state. Successful payload is not wire traffic or verified goodput. Cache-hit events are nonexclusive, not client attribution. Disk values are physical bytes, not effective payload capacity.",
   "tags": ["racer", "zipf"],
   "schemaVersion": 39,
-  "version": 9,
+  "version": 10,
   "editable": false,
   "timezone": "browser",
   "refresh": "1m",
@@ -98,6 +98,65 @@
       "targets": [
         {"refId": "A", "legendFormat": "TX (ens1)", "expr": "sum(rate(node_network_transmit_bytes_total{job=\"node-exporter\",device=\"ens1\"}[5m]) and on (node) group by (node) (up{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"})) * 8 / 1e9"},
         {"refId": "B", "legendFormat": "RX (ens1)", "expr": "sum(rate(node_network_receive_bytes_total{job=\"node-exporter\",device=\"ens1\"}[5m]) and on (node) group by (node) (up{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-dataplane\"})) * 8 / 1e9"}
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Successful whole-blob read latency | p50 / p95 / p99 / p99.9",
+      "description": "Client-visible completed 1 GiB blob operations, including SDK admission, metadata, body consumption, and close. Not 16 MiB page latency or time to first byte; client hashing is disabled in this workload. Fleet percentiles pool histogram buckets before quantile calculation. Linear interpolation within coarse buckets limits precision, especially p99.9; the largest finite bucket is 300 seconds. Failed, canceled, and still-running reads are excluded. Read with outcome, threshold, and progress panels; no completions leave percentiles undefined.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 36},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "decimals": 3, "noValue": "No data"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"refId": "A", "legendFormat": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m])))"},
+        {"refId": "B", "legendFormat": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m])))"},
+        {"refId": "C", "legendFormat": "p99", "expr": "histogram_quantile(0.99, sum by (le) (rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m])))"},
+        {"refId": "D", "legendFormat": "p99.9", "expr": "histogram_quantile(0.999, sum by (le) (rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m])))"}
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Successful whole-blob reads exceeding 5s / 10s / 30s",
+      "description": "Fraction of completed successful 1 GiB operations strictly above each fixed bucket boundary: (count - bucket) / count over five minutes. Uses live le labels 5.0, 10.0, and 30.0. No within-bucket interpolation; these are success-only fractions, not failure rates or fractions of in-flight reads. Zero completions remain undefined; missing buckets remain No data.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 36},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "decimals": 2, "noValue": "No data"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"refId": "A", "legendFormat": ">5s", "expr": "(sum(rate(racer_loadgen_pull_duration_seconds_count{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m])) - sum(rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\",le=\"5.0\"}[5m]))) / sum(rate(racer_loadgen_pull_duration_seconds_count{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m]))"},
+        {"refId": "B", "legendFormat": ">10s", "expr": "(sum(rate(racer_loadgen_pull_duration_seconds_count{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m])) - sum(rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\",le=\"10.0\"}[5m]))) / sum(rate(racer_loadgen_pull_duration_seconds_count{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m]))"},
+        {"refId": "C", "legendFormat": ">30s", "expr": "(sum(rate(racer_loadgen_pull_duration_seconds_count{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m])) - sum(rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\",le=\"30.0\"}[5m]))) / sum(rate(racer_loadgen_pull_duration_seconds_count{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m]))"}
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Completed blob operations by outcome (operations/s)",
+      "description": "All completed attempts, split into success, error, and canceled. Timeouts count as error. Failed and canceled operations are absent from successful latency panels. A result series may not exist until its first event; an absent error series alone does not prove health. Missing scrapes are not zero-filled. Check progress and contributing loadgens too.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 45},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0, "noValue": "No data"}, "overrides": [{"matcher": {"id": "byRegexp", "options": "^(error|canceled)$"}, "properties": [{"id": "custom.axisPlacement", "value": "right"}, {"id": "custom.axisLabel", "value": "Errors / cancellations per second"}]}]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"refId": "A", "legendFormat": "{{result}}", "expr": "sum by (result) (rate(racer_loadgen_pulls_total{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\"}[5m]))"}
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Read progress and successful-histogram coverage (counts)",
+      "description": "Current in-flight operations, estimated successful completions in the last five minutes, and loadgens contributing successful histogram count rates. Still-running reads have no latency observation; a falling completion count or coverage can make success-only tails misleading. Expect 100 contributing loadgens for this fleet after readiness and enough scrapes. Zero rates still contribute a series; absent samples do not. Windowed rates can retain old samples, so check scrape health separately. Missing telemetry stays No data, not zero.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 45},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "noValue": "No data"}, "overrides": [{"matcher": {"id": "byName", "options": "Successful completions / 5m"}, "properties": [{"id": "custom.axisPlacement", "value": "right"}, {"id": "custom.axisLabel", "value": "Successful completions / 5m"}]}]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"refId": "A", "legendFormat": "In-flight operations now", "expr": "sum(racer_loadgen_in_flight{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\"})"},
+        {"refId": "B", "legendFormat": "Successful completions / 5m", "expr": "sum(increase(racer_loadgen_pull_duration_seconds_count{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m]))"},
+        {"refId": "C", "legendFormat": "Contributing loadgens", "expr": "count(rate(racer_loadgen_pull_duration_seconds_count{job=\"kubernetes-pods\",namespace=\"${namespace}\",app_kubernetes_io_name=\"racer-loadgen\",racer_unbounded_cloud_io_benchmark=\"zipf-16t-v3\",result=\"success\"}[5m]))"}
       ]
     }
   ]

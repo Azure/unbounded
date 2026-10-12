@@ -1,6 +1,6 @@
 # Direct Zipf dashboard: 16384 x 1 GiB (16 TiB catalog)
 
-`grafana-direct-zipf.json` has six panels and ten queries. Its UID is `racer-direct-zipf`.
+`grafana-direct-zipf.json` has ten panels and 21 queries. Its UID is `racer-direct-zipf`.
 Use datasource UID `prometheus`, 60-second scrapes, and the existing
 `kubernetes-pods` and `node-exporter` jobs. The default namespace is
 `unbounded-system`.
@@ -92,6 +92,37 @@ The source contract is in `cmd/racer-dataplane/alloc/src/segments.rs`
 and `cmd/racer-dataplane/src/telemetry.rs` (`write_disks`). Workers sharing a disk
 are summed once by disk label before scrape export.
 
+## Client read tails
+
+The four added panels keep the same namespace and `zipf-16t-v3` workload filter:
+
+- **Successful whole-blob latency:** p50, p95, p99, and p99.9 for completed
+  1 GiB blob operations, from SDK admission through metadata, body consumption,
+  and close. This is not 16 MiB page latency or time to first byte. Client hashing
+  is disabled in this workload. Fleet quantiles pool buckets, not node percentiles.
+- **Slow-read fractions:** successful reads strictly above 5s, 10s, and 30s,
+  using the live bucket labels `le="5.0"`, `le="10.0"`, and `le="30.0"`.
+  Each fraction is `(count - bucket) / count`; it needs no interpolation.
+- **Outcomes:** completed operations/s by success, error, and canceled.
+  Errors and cancellations use the right axis so success traffic does not hide them.
+  Timeouts count as error. An outcome series may be absent until its first event;
+  absence alone does not prove health.
+- **Progress and coverage:** current in-flight operations, estimated successful
+  completions over five minutes, and contributing loadgens with enough successful
+  histogram samples for a rate. Expect 100 contributing loadgens after readiness
+  and enough scrapes. Zero rates still count; absent samples do not. Windowed
+  rates can retain old samples, so check scrape health separately. Completions use
+  the right axis; in-flight operations and coverage use the left.
+
+Quantiles use linear interpolation in coarse classic histogram buckets. The
+largest finite bucket is 300 seconds, so tails beyond it cannot be resolved.
+p99.9 is especially sensitive to bucket width and low completion counts. Failed,
+canceled, and still-running reads do not enter the successful latency or fraction
+panels. Read all four panels together: fewer completions can hide stalled reads.
+Zero completions leave quantiles and fractions undefined; missing telemetry stays
+No data, not zero. Definitions are in `cmd/racer-loadgen/metrics.go:33-43` and
+`cmd/racer-loadgen/pull.go:251-343`.
+
 ## Network throughput
 
 **Total Racer-node network TX/RX (Gbit/s)** sums five-minute byte-counter rates
@@ -139,7 +170,7 @@ is needed. See [the provisioning guide](grafana-README.md#provision-through-the-
 Open `/d/racer-direct-zipf` through the existing Grafana access path.
 
 If Grafana says the datasource is missing, check its datasource health API and
-run all ten panel queries through Grafana, not just Prometheus. The UID can exist while
+run all 21 panel queries through Grafana, not just Prometheus. The UID can exist while
 the Prometheus plugin is not registered. See the
 [startup recovery note](grafana-README.md#grafana-startup-troubleshooting).
 Preserve Grafana's database and plugin files before replacing a pod that uses

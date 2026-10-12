@@ -10,11 +10,11 @@ DASHBOARD = json.loads((ROOT / "grafana-direct-zipf.json").read_text())
 
 
 class DashboardTest(unittest.TestCase):
-    def test_six_basic_panels_and_ten_queries(self):
+    def test_ten_panels_and_twenty_one_queries(self):
         self.assertEqual(DASHBOARD["uid"], "racer-direct-zipf")
         panels = DASHBOARD["panels"]
-        self.assertEqual([p["id"] for p in panels], [1, 2, 3, 4, 5, 6])
-        self.assertEqual(sum(len(p["targets"]) for p in panels), 10)
+        self.assertEqual([p["id"] for p in panels], list(range(1, 11)))
+        self.assertEqual(sum(len(p["targets"]) for p in panels), 21)
         for panel in panels:
             self.assertEqual(panel["type"], "timeseries")
             self.assertEqual(panel["datasource"], {"type": "prometheus", "uid": "prometheus"})
@@ -22,6 +22,71 @@ class DashboardTest(unittest.TestCase):
             for target in panel["targets"]:
                 self.assertNotIn("or vector(0)", target["expr"])
                 self.assertIn('job="', target["expr"])
+
+    def test_tail_queries_and_safeguards(self):
+        base = ('job="kubernetes-pods",namespace="${namespace}",'
+                'app_kubernetes_io_name="racer-loadgen",'
+                'racer_unbounded_cloud_io_benchmark="zipf-16t-v3"')
+        success = base + ',result="success"'
+        count_rate = ('rate(racer_loadgen_pull_duration_seconds_count{'
+                      + success + '}[5m])')
+        total = 'sum(' + count_rate + ')'
+        latency, thresholds, outcomes, progress = DASHBOARD["panels"][6:]
+        self.assertEqual(latency["fieldConfig"]["defaults"]["unit"], "s")
+        self.assertEqual([t["legendFormat"] for t in latency["targets"]],
+                         ["p50", "p95", "p99", "p99.9"])
+        for target, quantile in zip(latency["targets"], ("0.50", "0.95", "0.99", "0.999")):
+            self.assertEqual(target["expr"],
+                             'histogram_quantile(' + quantile + ', sum by (le) '
+                             '(rate(racer_loadgen_pull_duration_seconds_bucket{'
+                             + success + '}[5m])))')
+        self.assertEqual(thresholds["fieldConfig"]["defaults"]["unit"], "percentunit")
+        for target, boundary in zip(thresholds["targets"], ("5.0", "10.0", "30.0")):
+            bucket = ('sum(rate(racer_loadgen_pull_duration_seconds_bucket{'
+                      + success + ',le="' + boundary + '"}[5m]))')
+            self.assertEqual(target["expr"], '(' + total + ' - ' + bucket + ') / ' + total)
+            self.assertEqual(target["legendFormat"], '>' + boundary[:-2] + 's')
+        self.assertEqual(outcomes["targets"][0]["expr"],
+                         'sum by (result) (rate(racer_loadgen_pulls_total{' + base + '}[5m]))')
+        self.assertEqual(outcomes["targets"][0]["legendFormat"], "{{result}}")
+        for panel, matcher in ((outcomes, {"id": "byRegexp", "options": "^(error|canceled)$"}),
+                               (progress, {"id": "byName", "options": "Successful completions / 5m"})):
+            override, = panel["fieldConfig"]["overrides"]
+            self.assertEqual(override["matcher"], matcher)
+            self.assertIn({"id": "custom.axisPlacement", "value": "right"},
+                          override["properties"])
+        self.assertEqual([t["expr"] for t in progress["targets"]], [
+            'sum(racer_loadgen_in_flight{' + base + '})',
+            'sum(increase(racer_loadgen_pull_duration_seconds_count{' + success + '}[5m]))',
+            'count(' + count_rate + ')',
+        ])
+        for panel, x, y in ((latency, 0, 36), (thresholds, 12, 36),
+                            (outcomes, 0, 45), (progress, 12, 45)):
+            self.assertEqual(panel["gridPos"], {"h": 9, "w": 12, "x": x, "y": y})
+            for target in panel["targets"]:
+                for forbidden in ("or vector(0)", "clamp_min", "gantry_racer_",
+                                  "request_duration_seconds", "avg("):
+                    self.assertNotIn(forbidden, target["expr"])
+
+    def test_tail_scope_and_missing_data_descriptions(self):
+        latency, thresholds, outcomes, progress = DASHBOARD["panels"][6:]
+        for text in ("completed 1 GiB", "Not 16 MiB page latency", "interpolation",
+                     "300 seconds", "Failed, canceled, and still-running reads",
+                     "undefined"):
+            self.assertIn(text, latency["description"])
+        for text in ("strictly above", "5.0, 10.0, and 30.0", "Zero completions",
+                     "undefined", "missing buckets"):
+            self.assertIn(text.lower(), thresholds["description"].lower())
+        for text in ("Timeouts count as error", "first event", "does not prove health"):
+            self.assertIn(text, outcomes["description"])
+        for text in ("Still-running reads", "100 contributing loadgens",
+                     "absent samples do not", "old samples", "scrape health"):
+            self.assertIn(text, progress["description"])
+        readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
+        for text in ("ten panels and 21 queries", "p99.9", "interpolation",
+                     "1 GiB", "300 seconds", "5.0", "10.0", "30.0",
+                     "still-running", "Timeouts", "contributing loadgens"):
+            self.assertIn(text, readme)
 
     def test_physical_disk_pair_and_units(self):
         panel = DASHBOARD["panels"][4]
@@ -60,7 +125,7 @@ class DashboardTest(unittest.TestCase):
 
     def test_experiment_buffer_descriptions(self):
         readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
-        self.assertEqual(DASHBOARD["version"], 9)
+        self.assertEqual(DASHBOARD["version"], 10)
         for text in (DASHBOARD["description"], readme):
             self.assertIn("48 GiB plaintext, 64 GiB ciphertext", text)
             self.assertIn("2 GiB each for dirty and", text)
