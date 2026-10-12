@@ -69,8 +69,9 @@ pub struct WarmRegistry {
     jobs: Mutex<BTreeMap<ObjectVersion, Arc<Job>>>,
     waiter_limit: usize,
     draining: std::sync::atomic::AtomicBool,
-    releases: Mutex<BTreeMap<u16, (Option<Waker>, std::collections::BTreeSet<ObjectVersion>)>>,
+    releases: Mutex<BTreeMap<u16, ReleaseQueue>>,
 }
+type ReleaseQueue = (Option<Waker>, std::collections::BTreeSet<ObjectVersion>);
 
 impl WarmRegistry {
     pub(crate) fn new(waiter_limit: usize) -> Self {
@@ -176,7 +177,7 @@ impl WarmRegistry {
         });
         if let Some(job) = jobs.get(version) {
             let mut progress = job.progress.lock().unwrap();
-            if progress.admissions >= self.waiter_limit {
+            if progress.stopped || progress.admissions >= self.waiter_limit {
                 return Err(Error::Overloaded);
             }
             progress.admissions += 1;
@@ -386,6 +387,11 @@ impl Drop for JobGuard {
         if !self.complete {
             let _ = self.job.scope.cancel();
             self.job.stop();
+        }
+        let progress = self.job.progress.lock().unwrap();
+        let remove = progress.stopped && progress.admissions == 0;
+        drop(progress);
+        if remove {
             self.directory.warm.remove(&self.job);
         }
         self.directory.warm.wake_workers();
@@ -511,6 +517,64 @@ pub(crate) async fn admit(
     .await
 }
 
+async fn run(
+    directory: &Arc<WorkerDirectory>,
+    job: &Arc<Job>,
+    metadata: &ObjectMetadata,
+    membership: Arc<crate::topology::Membership>,
+    context: &ChargedOriginContext,
+    window: usize,
+) -> Result<()> {
+    use futures::{StreamExt, stream::FuturesOrdered};
+    let count = metadata.length.div_ceil(PAGE_BYTES);
+    let mut pending = FuturesOrdered::new();
+    let mut next = 0;
+    let mut failure = None;
+    loop {
+        while failure.is_none() && next < count && pending.len() < window {
+            if let Err(error) = job.scope.check() {
+                failure = Some(error);
+                break;
+            }
+            if job
+                .progress
+                .lock()
+                .unwrap()
+                .until
+                .is_none_or(|until| until <= uring_runtime::environment::wall_now())
+            {
+                failure = Some(Error::DeadlineExceeded);
+                break;
+            }
+            let page = PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(next),
+            };
+            pending.push_back(directory.warm_page(
+                page,
+                metadata.immutable(),
+                membership.clone(),
+                context,
+                &job.scope,
+            ));
+            next += 1;
+        }
+        if failure.is_some() {
+            let _ = job.scope.cancel();
+        }
+        let Some(result) = pending.next().await else {
+            return failure.map_or(Ok(()), Err);
+        };
+        match result {
+            Ok(()) if failure.is_none() => job.update(|progress| progress.frontier += 1),
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +595,44 @@ mod tests {
             uring_runtime::environment::now() + Duration::from_secs(30),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn failed_job_keeps_queued_admissions_visible_until_their_guards_drop() {
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(
+                    super::super::dispatch::WorkerMap::new(vec![crate::model::WorkerId(0)])
+                        .unwrap(),
+                ),
+                vec![crate::model::WorkerId(0)],
+                4,
+            )
+            .unwrap(),
+        );
+        let version = version("a");
+        let (job, _) = directory.warm.begin(&version).unwrap();
+        directory.warm.begin(&version).unwrap();
+        let owner = JobGuard {
+            directory: directory.clone(),
+            job: job.clone(),
+            complete: false,
+        };
+        let extension = JobGuard {
+            directory: directory.clone(),
+            job: job.clone(),
+            complete: true,
+        };
+        drop(owner);
+        assert_eq!(directory.warm.snapshot().0, 1);
+        assert!(!directory.warm.drained(crate::model::WorkerId(0)));
+        assert!(matches!(
+            directory.warm.begin(&version),
+            Err(Error::Overloaded)
+        ));
+        drop(extension);
+        assert_eq!(directory.warm.snapshot().0, 0);
+        assert!(directory.warm.drained(crate::model::WorkerId(0)));
     }
 
     #[test]
@@ -678,63 +780,5 @@ mod tests {
             assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
         }
         Config::default().validate().unwrap();
-    }
-}
-
-async fn run(
-    directory: &Arc<WorkerDirectory>,
-    job: &Arc<Job>,
-    metadata: &ObjectMetadata,
-    membership: Arc<crate::topology::Membership>,
-    context: &ChargedOriginContext,
-    window: usize,
-) -> Result<()> {
-    use futures::{StreamExt, stream::FuturesOrdered};
-    let count = metadata.length.div_ceil(PAGE_BYTES);
-    let mut pending = FuturesOrdered::new();
-    let mut next = 0;
-    let mut failure = None;
-    loop {
-        while failure.is_none() && next < count && pending.len() < window {
-            if let Err(error) = job.scope.check() {
-                failure = Some(error);
-                break;
-            }
-            if job
-                .progress
-                .lock()
-                .unwrap()
-                .until
-                .is_none_or(|until| until <= uring_runtime::environment::wall_now())
-            {
-                failure = Some(Error::DeadlineExceeded);
-                break;
-            }
-            let page = PageId {
-                version: metadata.version.clone(),
-                number: PageNumber(next),
-            };
-            pending.push_back(directory.warm_page(
-                page,
-                metadata.immutable(),
-                membership.clone(),
-                context,
-                &job.scope,
-            ));
-            next += 1;
-        }
-        if failure.is_some() {
-            let _ = job.scope.cancel();
-        }
-        let Some(result) = pending.next().await else {
-            return failure.map_or(Ok(()), Err);
-        };
-        match result {
-            Ok(()) if failure.is_none() => job.update(|progress| progress.frontier += 1),
-            Err(error) => {
-                failure.get_or_insert(error);
-            }
-            _ => {}
-        }
     }
 }

@@ -760,6 +760,7 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
                 .unwrap();
             assert_eq!(parsed.kind, kind);
             let response = ReadResponse {
+                retain_until: None,
                 metadata: ObjectMetadata {
                     content_type: None,
                     version: ObjectVersion {
@@ -1592,6 +1593,7 @@ fn raw_uds_sequential_requests_do_not_inherit_opaque_context() {
             assert_eq!(parsed.origin.metadata.is_some(), present);
             drop(parsed);
             let response = ReadResponse {
+                retain_until: None,
                 metadata: ObjectMetadata {
                     content_type: None,
                     version: ObjectVersion {

@@ -336,6 +336,12 @@ impl WorkerDirectory {
         worker: WorkerId,
         local: Rc<Coordinator>,
     ) -> Result<WorkerEndpoint> {
+        local
+            .fill
+            .dependencies
+            .writer
+            .index()
+            .set_hold_capacity_percent(self.warm.config().retained_percent)?;
         let mailbox = self.mailbox(worker)?.clone();
         let key = Arc::as_ptr(self) as usize;
         LOCALS.with(|locals| {
@@ -438,10 +444,8 @@ impl WorkerDirectory {
                 .await?
                 .value?
             {
-                Value::Held(created, expiry) => {
-                    if created {
-                        fresh.push(mailbox.worker);
-                    }
+                Value::Held(_created, expiry) => {
+                    fresh.push(mailbox.worker);
                     accepted = accepted.max(expiry);
                 }
                 _ => return Err(Error::StaleFlight),
@@ -861,18 +865,7 @@ async fn execute(
     scope.check()?;
     match work {
         Work::Hold(version, pages, until) => {
-            local
-                .fill
-                .dependencies
-                .writer
-                .index()
-                .configure_holds(local.streams.directory().warm.config().retained_percent)?;
-            let previous = local
-                .fill
-                .dependencies
-                .writer
-                .index()
-                .hold_until(&version)?;
+            let previous = local.fill.dependencies.writer.index().hold_expiry(&version);
             local
                 .fill
                 .dependencies
