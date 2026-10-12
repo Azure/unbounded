@@ -574,8 +574,11 @@ pub fn nodes(nodes: &[NodeId]) -> Result<String> {
         return Err(Error::HopBudgetExhausted);
     }
     let mut bytes = Vec::new();
-    for node in nodes {
+    for (index, node) in nodes.iter().enumerate() {
         uuid(&node.0)?;
+        if nodes[..index].contains(node) {
+            return Err(Error::InvalidRequest);
+        }
         bytes.extend_from_slice(&(node.0.len() as u32).to_be_bytes());
         bytes.extend_from_slice(node.0.as_bytes());
     }

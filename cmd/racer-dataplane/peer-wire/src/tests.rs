@@ -282,7 +282,42 @@ fn envelope_limits_and_canonical_fields_preserve_exact_bytes() {
         assert_eq!(decode_binary(value), Err(Error::Unauthorized));
     }
     assert_eq!(binary(&[0, 1, 255]), "AAH/");
-    assert!(decode_nodes(nodes(&[node(1), node(1)]).unwrap().as_bytes()).is_err());
+    let duplicate_nodes = b"\x00\x00\x00\x2400000001-1111-4111-8111-111111111111".repeat(2);
+    assert_eq!(
+        decode_nodes(binary(&duplicate_nodes).as_bytes()),
+        Err(Error::Unauthorized)
+    );
+}
+
+#[test]
+fn unique_node_lists_roundtrip_preserving_order_and_framing() {
+    for length in [0, 1, 3, MAX_HOPS + 1] {
+        let input: Vec<_> = (0..length).rev().map(node).collect();
+        let encoded = nodes(&input).unwrap();
+        let mut expected = Vec::new();
+        for node in &input {
+            expected.extend_from_slice(&36u32.to_be_bytes());
+            expected.extend_from_slice(node.0.as_bytes());
+        }
+        assert_eq!(encoded, binary(&expected));
+        assert_eq!(decode_nodes(encoded.as_bytes()).unwrap(), input);
+    }
+}
+
+#[test]
+fn node_list_encoding_rejects_duplicates_invalid_ids_and_excess_hops() {
+    let mut maximum_duplicate: Vec<_> = (0..=MAX_HOPS).map(node).collect();
+    maximum_duplicate[MAX_HOPS] = node(0);
+    for input in [
+        vec![node(1), node(1)],
+        vec![node(1), node(2), node(1)],
+        maximum_duplicate,
+        vec![NodeId("not-a-uuid".into())],
+    ] {
+        assert_eq!(nodes(&input), Err(Error::InvalidRequest));
+    }
+    let too_many: Vec<_> = (0..MAX_HOPS + 2).map(node).collect();
+    assert_eq!(nodes(&too_many), Err(Error::HopBudgetExhausted));
 }
 
 #[test]
