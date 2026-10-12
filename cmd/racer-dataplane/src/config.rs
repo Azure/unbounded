@@ -60,6 +60,7 @@ pub struct Limits {
 }
 
 pub struct Config {
+    pub warm: crate::read::warm::Config,
     pub send_crc_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::candidates::HedgeConfig,
     pub peer_admission: crate::peer::Config,
@@ -184,6 +185,13 @@ impl Config {
             env_config::unsigned(&value).map_err(|_| Error::InvalidConfiguration)
         };
         let max_threads = to_usize(number("RACER_MAX_THREADS", DEFAULT_MAX_THREADS as u64)?)?;
+        let warm = crate::read::warm::Config {
+            max_ttl: Duration::from_secs(number("RACER_WARM_MAX_TTL_SECS", 3600)?),
+            fill_timeout: Duration::from_secs(number("RACER_WARM_FILL_TIMEOUT_SECS", 600)?),
+            max_jobs: to_usize(number("RACER_WARM_MAX_JOBS", 16)?)?,
+            window: to_usize(number("RACER_WARM_WINDOW_PAGES", 2)?)?,
+            retained_percent: to_usize(number("RACER_RETAINED_SEGMENT_PERCENT", 50)?)?,
+        };
         let page_hedge = crate::read::candidates::HedgeConfig {
             delay: Duration::from_millis(number("RACER_PAGE_HEDGE_DELAY_MS", 100)?),
             slots: to_usize(number("RACER_PAGE_HEDGE_SLOTS", 0)?)?,
@@ -247,6 +255,7 @@ impl Config {
             .map(|value| crate::telemetry::Pair::parse(&value))
             .transpose()?;
         let config = Self {
+            warm,
             send_crc_pair,
             page_hedge,
             peer_admission,
@@ -290,6 +299,7 @@ impl Config {
     /// Check arithmetic and progress reserves; filesystem alignment is additionally
     /// discovered and checked when opening the slabs, not guessed from this config.
     pub fn validate(&self) -> Result<()> {
+        self.warm.validate()?;
         if let Some(pair) = &self.send_crc_pair {
             pair.validate()?;
         }
@@ -747,6 +757,33 @@ mod tests {
                 }))
         })
     }
+    #[test]
+    fn warm_defaults_and_environment_limits_are_bounded() {
+        let warm = parse(&[]).unwrap().warm;
+        assert_eq!(warm.max_ttl, Duration::from_secs(3600));
+        assert_eq!(warm.fill_timeout, Duration::from_secs(600));
+        assert_eq!(
+            (warm.max_jobs, warm.window, warm.retained_percent),
+            (16, 2, 50)
+        );
+        let warm = parse(&[
+            ("RACER_WARM_MAX_JOBS", "8"),
+            ("RACER_WARM_WINDOW_PAGES", "4"),
+        ])
+        .unwrap()
+        .warm;
+        assert_eq!((warm.max_jobs, warm.window), (8, 4));
+        for (name, value) in [
+            ("RACER_WARM_MAX_TTL_SECS", "0"),
+            ("RACER_WARM_FILL_TIMEOUT_SECS", "0"),
+            ("RACER_WARM_MAX_JOBS", "0"),
+            ("RACER_WARM_WINDOW_PAGES", "65"),
+            ("RACER_RETAINED_SEGMENT_PERCENT", "101"),
+        ] {
+            assert!(parse(&[(name, value)]).is_err());
+        }
+    }
+
     #[test]
     fn send_crc_pair_is_opt_in_and_validated() {
         assert!(parse(&[]).unwrap().send_crc_pair.is_none());

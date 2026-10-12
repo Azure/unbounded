@@ -259,6 +259,7 @@ impl Application {
             self.limits.queue_entries.get(),
             self.config.peer_admission,
         )?);
+        self.node.workers.warm.configure(self.config.warm)?;
         Arc::get_mut(&mut self.node)
             .ok_or(Error::Internal)?
             .publications = Arc::new(Published::new(Snapshot::retention(
