@@ -1,7 +1,8 @@
 //! Validate origin response framing, status, metadata, and whole-page boundaries.
 
 use crate::model::{
-    ContentType, ExpiresAt, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES, PageId, StrongEtag,
+    ContentType, ExpiresAt, MAX_FIELD_BYTES, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES,
+    PageId, StrongEtag,
 };
 use crate::{Error, Result};
 use http1::{MessageHead, StartLine};
@@ -41,8 +42,10 @@ pub fn request(
 
 /// Validate opaque origin context without interpreting credentials or normalizing bytes.
 pub fn opaque(bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_FIELD_BYTES {
+        return Err(Error::HeaderTooLarge);
+    }
     if bytes.is_empty()
-        || bytes.len() > 8192
         || bytes.first() == Some(&b' ')
         || bytes.last() == Some(&b' ')
         || bytes.iter().any(|b| *b < 0x20 || *b == 0x7f)

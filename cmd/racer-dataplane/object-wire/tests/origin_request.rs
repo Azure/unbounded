@@ -55,7 +55,6 @@ fn unsupported_and_malformed_methods_are_rejected() {
 #[test]
 fn allowed_methods_still_validate_opaque_context() {
     let key = CacheKey([0xab; 32]);
-    let oversized = vec![b'x'; 8193];
     for method in ["HEAD", "GET"] {
         for value in [
             b"".as_slice(),
@@ -65,8 +64,8 @@ fn allowed_methods_still_validate_opaque_context() {
             b"line\r\nbreak",
             b"nul\0value",
             b"del\x7fvalue",
-            oversized.as_slice(),
         ] {
+            assert_eq!(origin::opaque(value), Err(Error::InvalidRequest));
             for (metadata, authorization) in [(Some(value), None), (None, Some(value))] {
                 assert!(matches!(
                     origin::request(&key, method, metadata, authorization),
@@ -75,6 +74,7 @@ fn allowed_methods_still_validate_opaque_context() {
             }
         }
         let boundary = vec![b'x'; 8192];
+        assert_eq!(origin::opaque(&boundary), Ok(()));
         let head = origin::request(&key, method, Some(&boundary), Some(&boundary)).unwrap();
         assert_eq!(
             head.unique("Racer-Metadata").unwrap(),
@@ -84,5 +84,50 @@ fn allowed_methods_still_validate_opaque_context() {
             head.unique("Authorization").unwrap(),
             Some(boundary.as_slice())
         );
+    }
+}
+
+#[test]
+fn oversized_opaque_context_is_header_too_large() {
+    let key = CacheKey([0xab; 32]);
+    for method in ["HEAD", "GET"] {
+        for byte in [b'x', b' ', b'\t', b'\r', b'\n', 0, 0x7f] {
+            let mut value = vec![b'x'; 8193];
+            value[0] = byte;
+            assert_eq!(origin::opaque(&value), Err(Error::HeaderTooLarge));
+            for (metadata, authorization) in [
+                (Some(value.as_slice()), None),
+                (None, Some(value.as_slice())),
+                (Some(value.as_slice()), Some(value.as_slice())),
+            ] {
+                assert!(matches!(
+                    origin::request(&key, method, metadata, authorization),
+                    Err(Error::HeaderTooLarge)
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_opaque_context_at_limit_is_invalid_request() {
+    let key = CacheKey([0xab; 32]);
+    for byte in (0..=0x20).chain([0x7f]) {
+        for position in [0, 8191] {
+            let mut value = vec![b'x'; 8192];
+            value[position] = byte;
+            assert_eq!(origin::opaque(&value), Err(Error::InvalidRequest));
+            for method in ["HEAD", "GET"] {
+                for (metadata, authorization) in [
+                    (Some(value.as_slice()), None),
+                    (None, Some(value.as_slice())),
+                ] {
+                    assert!(matches!(
+                        origin::request(&key, method, metadata, authorization),
+                        Err(Error::InvalidRequest)
+                    ));
+                }
+            }
+        }
     }
 }
