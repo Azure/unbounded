@@ -15,6 +15,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -714,6 +715,193 @@ func TestCreateOrUpdateSliceRepairsOwnerReferenceWithoutNodeChanges(t *testing.T
 	}
 }
 
+func TestUnchangedCachedSiteSliceReconcileUsesNoLiveAPIReads(t *testing.T) {
+	site := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "site-a",
+			UID:        "site-a-uid",
+			Finalizers: []string{ProtectionFinalizer},
+		},
+		Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.0.0.0/24"}},
+		Status: unboundedv1alpha3.SiteStatus{
+			NodeCount:  1,
+			SliceCount: 1,
+		},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "node-a",
+			Annotations: map[string]string{WireGuardPubKeyAnnotation: "key-a"},
+		},
+		Spec: corev1.NodeSpec{PodCIDRs: []string{"10.244.0.0/24"}},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+			Type:    corev1.NodeInternalIP,
+			Address: "10.0.0.10",
+		}}},
+	}
+
+	sc := &SiteController{}
+	slice := sc.buildSliceObject(site, "site-a-0", 0, []interface{}{map[string]interface{}{
+		"name":               node.Name,
+		"wireGuardPublicKey": "key-a",
+		"internalIPs":        []interface{}{"10.0.0.10"},
+		"podCIDRs":           []interface{}{"10.244.0.0/24"},
+	}})
+	slice.SetResourceVersion("slice-rv")
+
+	sliceStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := sliceStore.Add(slice.DeepCopy()); err != nil {
+		t.Fatalf("add slice to cache: %v", err)
+	}
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := nodeIndexer.Add(node); err != nil {
+		t.Fatalf("add node to cache: %v", err)
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, site),
+		slice.DeepCopy(),
+	)
+	sc.dynamicClient = dynamicClient
+	sc.nodeLister = corev1listers.NewNodeLister(nodeIndexer)
+	sc.sliceInformer = &fakeInformer{store: sliceStore}
+	sc.sitesCache = []unboundedv1alpha3.Site{site}
+
+	sc.markSiteSlicesDirty(site.Name)
+
+	if err := sc.updateSiteSlicesIfDirty(context.Background()); err != nil {
+		t.Fatalf("updateSiteSlicesIfDirty: %v", err)
+	}
+
+	if actions := dynamicClient.Actions(); len(actions) != 0 {
+		t.Fatalf("unchanged cache-synchronized reconcile made live API requests: %#v", actions)
+	}
+}
+
+func TestTargetedSiteSliceReconcileDoesNotReadOtherSite(t *testing.T) {
+	siteA := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "site-a-uid", Finalizers: []string{ProtectionFinalizer}},
+		Spec:       unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.0.0.0/24"}},
+		Status:     unboundedv1alpha3.SiteStatus{NodeCount: 1, SliceCount: 1},
+	}
+	siteB := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-b", UID: "site-b-uid", Finalizers: []string{ProtectionFinalizer}},
+		Spec:       unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.1.0.0/24"}},
+		Status:     unboundedv1alpha3.SiteStatus{NodeCount: 1, SliceCount: 1},
+	}
+
+	nodeA := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a", Annotations: map[string]string{WireGuardPubKeyAnnotation: "new-key"}},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+			Type: corev1.NodeInternalIP, Address: "10.0.0.10",
+		}}},
+	}
+	nodeB := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-b"},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+			Type: corev1.NodeInternalIP, Address: "10.1.0.10",
+		}}},
+	}
+
+	builder := &SiteController{}
+	sliceA := builder.buildSliceObject(siteA, "site-a-0", 0, []interface{}{map[string]interface{}{
+		"name":               "node-a",
+		"wireGuardPublicKey": "old-key",
+		"internalIPs":        []interface{}{"10.0.0.10"},
+	}})
+	sliceA.SetResourceVersion("a-rv")
+
+	sliceB := builder.buildSliceObject(siteB, "site-b-0", 0, []interface{}{map[string]interface{}{
+		"name":        "node-b",
+		"internalIPs": []interface{}{"10.1.0.10"},
+	}})
+	sliceB.SetResourceVersion("b-rv")
+
+	sliceStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	for _, slice := range []*unstructured.Unstructured{sliceA, sliceB} {
+		if err := sliceStore.Add(slice.DeepCopy()); err != nil {
+			t.Fatalf("add slice %s to cache: %v", slice.GetName(), err)
+		}
+	}
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, node := range []*corev1.Node{nodeA, nodeB} {
+		if err := nodeIndexer.Add(node); err != nil {
+			t.Fatalf("add node %s to cache: %v", node.Name, err)
+		}
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, siteA),
+		siteUnstructured(t, siteB),
+		sliceA.DeepCopy(),
+		sliceB.DeepCopy(),
+	)
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		nodeLister:    corev1listers.NewNodeLister(nodeIndexer),
+		sliceInformer: &fakeInformer{store: sliceStore},
+		sitesCache:    []unboundedv1alpha3.Site{siteA, siteB},
+	}
+
+	sc.markSiteSlicesDirty(siteA.Name)
+
+	if err := sc.updateSiteSlicesIfDirty(context.Background()); err != nil {
+		t.Fatalf("updateSiteSlicesIfDirty: %v", err)
+	}
+
+	for _, action := range dynamicClient.Actions() {
+		if action.GetVerb() == "list" {
+			t.Fatalf("targeted reconcile made cluster-wide list request: %#v", action)
+		}
+
+		switch typed := action.(type) {
+		case clienttesting.UpdateAction:
+			accessor, err := meta.Accessor(typed.GetObject())
+			if err != nil {
+				t.Fatalf("access updated object metadata: %v", err)
+			}
+
+			if accessor.GetName() == siteB.Name || accessor.GetName() == sliceB.GetName() {
+				t.Fatalf("targeted reconcile updated site-b: %#v", action)
+			}
+		case clienttesting.PatchAction:
+			if typed.GetName() == siteB.Name {
+				t.Fatalf("targeted reconcile patched site-b: %#v", action)
+			}
+		case clienttesting.GetAction:
+			if typed.GetName() == siteB.Name || typed.GetName() == sliceB.GetName() {
+				t.Fatalf("targeted reconcile read site-b: %#v", action)
+			}
+		}
+	}
+
+	gotB, err := dynamicClient.Tracker().Get(siteNodeSliceGVR, "", sliceB.GetName())
+	if err != nil {
+		t.Fatalf("get site-b slice from tracker: %v", err)
+	}
+
+	accessor, err := meta.Accessor(gotB)
+	if err != nil {
+		t.Fatalf("access site-b slice metadata: %v", err)
+	}
+
+	if accessor.GetResourceVersion() != "b-rv" {
+		t.Fatalf("site-b slice changed during site-a reconcile")
+	}
+}
+
 func TestCreateOrUpdateSliceGetsLiveObjectAfterConflict(t *testing.T) {
 	site := unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "current-uid"}}
 	desired := (&SiteController{}).buildSliceObject(site, "site-a-0", 0, []interface{}{map[string]interface{}{"name": "node-a"}})
@@ -1242,6 +1430,82 @@ func TestCleanupOrphanSiteNodeSlicesRevalidatesSitesAndDeletePreconditions(t *te
 
 	if deleteActions != len(wantPreconditions) {
 		t.Fatalf("delete actions = %d, want %d", deleteActions, len(wantPreconditions))
+	}
+}
+
+func TestTopologyReconcileDefersOrphanRepair(t *testing.T) {
+	site := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "site-uid"},
+		Status:     unboundedv1alpha3.SiteStatus{},
+	}
+	orphan := (&SiteController{}).buildSliceObject(site, "orphan-0", 0, nil)
+	orphan.Object["siteName"] = ""
+	orphan.SetUID("orphan-uid")
+	orphan.SetResourceVersion("orphan-rv")
+
+	sliceStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := sliceStore.Add(orphan.DeepCopy()); err != nil {
+		t.Fatalf("add orphan to cache: %v", err)
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			legacySiteGVR:    "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, site),
+		orphan.DeepCopy(),
+	)
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		nodeLister:    corev1listers.NewNodeLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
+		sliceInformer: &fakeInformer{store: sliceStore},
+		sitesCache:    []unboundedv1alpha3.Site{site},
+	}
+
+	sc.markSlicesDirty()
+
+	if err := sc.updateSiteSlicesIfDirty(context.Background()); err != nil {
+		t.Fatalf("topology reconcile: %v", err)
+	}
+
+	if _, err := dynamicClient.Tracker().Get(siteNodeSliceGVR, "", orphan.GetName()); err != nil {
+		t.Fatalf("topology reconcile deleted orphan before periodic repair: %v", err)
+	}
+
+	for _, action := range dynamicClient.Actions() {
+		if action.GetVerb() == "list" {
+			t.Fatalf("topology reconcile performed cluster-wide orphan list: %#v", action)
+		}
+	}
+
+	dynamicClient.ClearActions()
+
+	if err := sc.repairOrphanSiteNodeSlices(context.Background()); err != nil {
+		t.Fatalf("periodic orphan repair: %v", err)
+	}
+
+	if _, err := dynamicClient.Tracker().Get(siteNodeSliceGVR, "", orphan.GetName()); !apierrors.IsNotFound(err) {
+		t.Fatalf("periodic orphan repair left orphan present: %v", err)
+	}
+
+	sawSiteList := false
+	sawDelete := false
+
+	for _, action := range dynamicClient.Actions() {
+		if action.GetVerb() == "list" && action.GetResource() == siteGVR {
+			sawSiteList = true
+		}
+
+		if action.GetVerb() == "delete" && action.GetResource() == siteNodeSliceGVR {
+			sawDelete = true
+		}
+	}
+
+	if !sawSiteList || !sawDelete {
+		t.Fatalf("periodic orphan repair actions = %#v, want Site LIST and slice DELETE", dynamicClient.Actions())
 	}
 }
 
