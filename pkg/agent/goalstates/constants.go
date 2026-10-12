@@ -26,13 +26,25 @@ const (
 	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
 	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
 
-	DaemonBinaryPath             = "/usr/local/bin/unbounded-agent"
-	DaemonBinaryBluePath         = "/usr/local/bin/unbounded-agent-blue"
-	DaemonBinaryGreenPath        = "/usr/local/bin/unbounded-agent-green"
-	DaemonBinaryCurrentPath      = "/usr/local/bin/unbounded-agent-current"
-	DaemonBinaryLastGoodPath     = "/usr/local/bin/unbounded-agent-last-good"
-	NSpawnLifecycleBinaryPath    = "/usr/local/bin/unbounded-agent-nspawn-lifecycle"
-	DaemonRecoveryScriptPath     = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+	// The agent's host-side files under hostroot.LegacyPath, where agents
+	// released before hostroot.Path installed them.
+	//
+	// Deprecated: on hosts installed since, these files are elsewhere. Use
+	// ResolvedAgentUpgradePaths and ResolveHostPaths, which follow the host root.
+	DaemonBinaryPath = "/usr/local/bin/unbounded-agent"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryBluePath = "/usr/local/bin/unbounded-agent-blue"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryGreenPath = "/usr/local/bin/unbounded-agent-green"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryCurrentPath = "/usr/local/bin/unbounded-agent-current"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryLastGoodPath = "/usr/local/bin/unbounded-agent-last-good"
+	// Deprecated: use ResolveHostPaths.
+	NSpawnLifecycleBinaryPath = "/usr/local/bin/unbounded-agent-nspawn-lifecycle"
+	// Deprecated: use ResolveHostPaths.
+	DaemonRecoveryScriptPath = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
 	DaemonAgentUpgradeLockPath   = "/run/unbounded-agent-upgrade.lock"
 

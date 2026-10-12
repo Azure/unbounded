@@ -72,6 +72,11 @@ type runOptions struct {
 
 	// NodeOperator performs host-local nspawn operations. Defaults to nspawnNodeOperator.
 	NodeOperator nodeOperator
+
+	// hostRootRestartWait bounds the wait for systemd to replace the daemon
+	// after it queued its restart from the host root. Defaults to
+	// hostRootRestartWait.
+	hostRootRestartWait time.Duration
 }
 
 func (o *runOptions) validate() error {
@@ -95,6 +100,10 @@ func (o *runOptions) validate() error {
 		o.DaemonCredentialDir = filepath.Join(goalstates.AgentConfigDir, "daemon-controller")
 	}
 
+	if o.hostRootRestartWait == 0 {
+		o.hostRootRestartWait = hostRootRestartWait
+	}
+
 	return nil
 }
 
@@ -102,6 +111,12 @@ func (o *runOptions) validate() error {
 // machine, builds a Kubernetes client, registers the Machine CR if needed,
 // and blocks until the context is canceled.
 func Run(ctx context.Context, log *slog.Logger) error {
+	// After an AgentUpgrade from a release that predates the host root, this is
+	// the first time the new agent runs on the host.
+	if err := MigrateHostRoot(log); err != nil {
+		return err
+	}
+
 	return run(ctx, log, runOptions{})
 }
 
@@ -149,6 +164,13 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 
 	if err := publishAndClearAgentUpgradeSignals(ctx, log, kubeClient); err != nil {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
+	}
+
+	// After the upgrade is reported, so a move never runs before this binary
+	// has shown it can start, and so the signal it waits for is gone.
+	if reconcileHostRootUnderLock(ctx, log, runOpts.installation, runOpts.NodeOperator, active) {
+		// The daemon that systemd starts in its place runs the controller.
+		return awaitReplacement(ctx, log, runOpts.hostRootRestartWait)
 	}
 
 	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation)
