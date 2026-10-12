@@ -123,7 +123,8 @@ type MoveOptions = impl.MoveOptions
 // A move spans two daemon starts. The first copies the files into Path,
 // restores their SELinux labels, calls MoveOptions.Verify, then
 // MoveOptions.RewriteUnits and MoveOptions.Restart, and reports true. The
-// daemon must then stop taking work and wait to be replaced. The second start,
+// daemon must then stop taking work, and wait to be replaced, replace itself
+// in place, or exit for the unit's Restart= to start it again. The second start,
 // running from Path, rewrites the units again and removes the files under
 // LegacyPath. Nothing is removed while the daemon still runs from LegacyPath,
 // so a restart that fails leaves every file in place and the next start tries

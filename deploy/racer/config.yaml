@@ -1,0 +1,29 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: racer-config
+  namespace: unbounded-system
+data:
+  # The operator binds this to the permanent installation claim.
+  RACER_CLUSTER_ID: ""
+  RACER_CONTROL_ADDRESS: ":8443"
+  RACER_HANDSHAKE_TIMEOUT: "5s"
+  RACER_METRICS_ADDRESS: ":8080"
+  RACER_PROBE_ADDRESS: ":8081"
+  RACER_PEER_PORT: "8082"
+  RACER_TLS_CERTIFICATE_FILE: "/etc/racer/tls/tls.crt"
+  RACER_TLS_PRIVATE_KEY_FILE: "/etc/racer/tls/tls.key"
+  RACER_CONTROLLER_SERVICE_ACCOUNT: "racer-controller"
+  RACER_REPLICATION_TOKEN_FILE: "/var/run/secrets/racer-controller/token"
+  RACER_REPLICATION_TRUST_FILE: "/etc/racer/tls/ca.crt"
+  RACER_REPLICATION_SERVER_NAME: "racer-controller.unbounded-system.svc"
+  RACER_REPLICATION_PORT: "8443"
+  RACER_SNAPSHOT_MAX_AGE: "30s"
+  # Read-only discovery and authentication of externally managed workloads.
+  RACER_DATAPLANE_SERVICE_ACCOUNT: "racer-dataplane"
+  RACER_DAEMONSET_NAME: "racer-dataplane"
+  RACER_CREDENTIALS_SECRET_NAME: "racer-credentials"
+  RACER_VERSION_CONFIGMAP_NAME: "racer-version"
+  RACER_INSTALLATION_CONFIGMAP_NAME: "racer-installation"

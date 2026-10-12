@@ -5,8 +5,9 @@
 //! [`Codec`] limits the wire size of a message head, not its body. It accepts
 //! HTTP/1.1 requests and responses, rejects transfer coding and duplicate
 //! Content-Length or Host fields, and leaves body limits to [`connection`].
+//! The codec also rejects `Connection: upgrade`.
 //! Response codes from 100 to 599 are valid at the codec boundary; the connection
-//! exchange layer rejects informational responses, upgrades, and CONNECT requests.
+//! exchange layer rejects informational responses and CONNECT requests.
 //! Requests require one Host with URI host and optional port syntax. Empty Host
 //! values remain valid for targets without authority; callers enforce routing.
 //!
@@ -86,7 +87,7 @@ pub enum StartLine {
         /// The nonempty HTTP token naming the method.
         method: String,
 
-        /// The nonempty visible-ASCII request target.
+        /// The original URI request target, including any percent escapes.
         target: String,
     },
 
@@ -288,13 +289,10 @@ impl<O: Opaque> Codec<O> {
     fn validate(&self, head: &MessageHead) -> Result<()> {
         match &head.start {
             StartLine::Request { method, target } => {
-                if method.is_empty()
-                    || !method.bytes().all(is_token)
-                    || target.is_empty()
-                    || !target.bytes().all(|b| b > 32 && b < 127)
-                {
+                if method.is_empty() || !method.bytes().all(is_token) {
                     return Err(Error::Malformed);
                 }
+                validate_request_target(method, target)?;
             }
             StartLine::Response { status } if !(100..=599).contains(status) => {
                 return Err(Error::Malformed);
@@ -323,6 +321,77 @@ impl<O: Opaque> Codec<O> {
         }
         Ok(())
     }
+}
+
+/// Check the four request-target forms without decoding or normalizing bytes.
+fn validate_request_target(method: &str, target: &str) -> Result<()> {
+    if target.is_empty() || !target.bytes().all(|b| b > 32 && b < 127) {
+        return Err(Error::Malformed);
+    }
+    if method == "CONNECT" {
+        let (host, port) = target.rsplit_once(':').ok_or(Error::Malformed)?;
+        if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::Malformed);
+        }
+        return validate_host(target.as_bytes());
+    }
+    if target == "*" {
+        return if method == "OPTIONS" {
+            Ok(())
+        } else {
+            Err(Error::Malformed)
+        };
+    }
+    let mut path = target;
+    if !target.starts_with('/') {
+        let (scheme, rest) = target.split_once(':').ok_or(Error::Malformed)?;
+        if !scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            || !scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        {
+            return Err(Error::Malformed);
+        }
+        let http = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+        path = rest;
+        if let Some(rest) = rest.strip_prefix("//") {
+            let end = rest.find(['/', '?']).unwrap_or(rest.len());
+            let authority = &rest[..end];
+            let host = if let Some((user, host)) = authority.split_once('@') {
+                validate_uri_component(user.as_bytes(), |b| is_host_char(b) || b == b':')?;
+                host
+            } else {
+                authority
+            };
+            if http && (host.is_empty() || host.starts_with(':')) {
+                return Err(Error::Malformed);
+            }
+            validate_host(host.as_bytes())?;
+            path = &rest[end..];
+        } else if http {
+            return Err(Error::Malformed);
+        }
+    }
+    validate_uri_component(path.as_bytes(), |b| {
+        is_host_char(b) || matches!(b, b':' | b'@' | b'/' | b'?')
+    })
+}
+
+/// Check a URI component's literal bytes and complete percent-encoded octets.
+fn validate_uri_component(mut bytes: &[u8], literal: impl Fn(u8) -> bool) -> Result<()> {
+    while let Some((&byte, rest)) = bytes.split_first() {
+        bytes = if byte == b'%' {
+            if rest.len() < 2 || !rest[..2].iter().all(u8::is_ascii_hexdigit) {
+                return Err(Error::Malformed);
+            }
+            &rest[2..]
+        } else if literal(byte) {
+            rest
+        } else {
+            return Err(Error::Malformed);
+        };
+    }
+    Ok(())
 }
 
 /// Check RFC 9110 Host syntax without changing stored bytes or routing policy.
@@ -792,6 +861,117 @@ mod tests {
 
     /// A codec using the test opaque policy.
     type TestCodec = Codec<Fields>;
+
+    /// Target forms and escapes are checked on both sides without normalization.
+    #[test]
+    fn request_target_forms_and_escapes() {
+        let codec = TestCodec::new(1024);
+        for (method, target, valid) in [
+            ("GET", "/", true),
+            ("GET", "/?", true),
+            ("GET", "//a///b?x=/?:@!$&'()*+,;=", true),
+            ("GET", "/a-._~!$&'()*+,;=:@/%00%2f%FF?q=%23%25", true),
+            ("GET", "http://example.test", true),
+            ("GET", "HTTP://example.test:80/a%2Fb?x=%ff", true),
+            ("GET", "https://[::1]:443/?", true),
+            ("GET", "http://[vF.a:b]/", true),
+            ("GET", "http://a%20b:/", true),
+            ("GET", "urn:example:a%20b?x/y?z", true),
+            ("GET", "foo+bar-1.2://user:pass@example/a", true),
+            ("GET", "file:///a", true),
+            ("GET", "custom:", true),
+            ("OPTIONS", "*", true),
+            ("CONNECT", "example.com:443", true),
+            ("CONNECT", "[::1]:443", true),
+            ("CONNECT", "a%20b:00080", true),
+            ("GET", "", false),
+            ("GET", "relative/path", false),
+            ("GET", "?query", false),
+            ("GET", "*", false),
+            ("options", "*", false),
+            ("OPTIONS", "**", false),
+            ("GET", "/a#fragment", false),
+            ("GET", "/?q=#fragment", false),
+            ("GET", "/%zz", false),
+            ("GET", "/%", false),
+            ("GET", "/%0", false),
+            ("GET", "/%0g", false),
+            ("GET", "/%g0", false),
+            ("GET", "/%00%", false),
+            ("GET", "/?q=%2", false),
+            ("GET", "/a\\b", false),
+            ("GET", "/{}", false),
+            ("GET", "/[]", false),
+            ("GET", "/<>\"^`|", false),
+            ("GET", "/a b", false),
+            ("GET", "/a\tb", false),
+            ("GET", "/a\0b", false),
+            ("GET", "/a\u{7f}b", false),
+            ("GET", "/café", false),
+            ("GET", ":/a", false),
+            ("GET", "1http://example/a", false),
+            ("GET", "ht_tp://example/a", false),
+            ("GET", "http:", false),
+            ("GET", "http:/a", false),
+            ("GET", "https:///a", false),
+            ("GET", "http://:80/a", false),
+            ("GET", "http://example:abc/a", false),
+            ("GET", "http://[not-ip]/a", false),
+            ("GET", "http://example/%zz", false),
+            ("GET", "http://example?q=%", false),
+            ("GET", "http://example/#fragment", false),
+            ("GET", "http://exam%ple/a", false),
+            ("GET", "custom://user%zz@example/a", false),
+            ("GET", "custom://user@@example/a", false),
+            ("CONNECT", "example.com", false),
+            ("CONNECT", "example.com:", false),
+            ("CONNECT", ":443", false),
+            ("CONNECT", "[::1]", false),
+            ("CONNECT", "::1:443", false),
+            ("CONNECT", "example.com:abc", false),
+            ("CONNECT", "example.com:443/a", false),
+            ("CONNECT", "example.com:443?x", false),
+            ("CONNECT", "example.com:443#x", false),
+            ("CONNECT", "user@example.com:443", false),
+            ("CONNECT", "/", false),
+            ("CONNECT", "*", false),
+            ("CONNECT", "https://example.com:443", false),
+        ] {
+            let head = MessageHead {
+                start: StartLine::Request {
+                    method: method.into(),
+                    target: target.into(),
+                },
+                headers: vec![Header::new("Host", "example.test")],
+            };
+            let wire = format!("{method} {target} HTTP/1.1\r\nHost: example.test\r\n\r\n");
+            let encoded = codec.encode_head(&head);
+            let decoded = codec.decode_head(wire.as_bytes());
+            if valid {
+                assert_eq!(encoded.unwrap(), wire.as_bytes(), "{method} {target:?}");
+                let (head, used) = decoded.unwrap().unwrap();
+                assert_eq!(used, wire.len());
+                assert!(
+                    matches!(head.start, StartLine::Request { method: m, target: t }
+                    if m == method && t == target)
+                );
+                for end in 0..wire.len() {
+                    assert!(
+                        codec
+                            .decode_head(&wire.as_bytes()[..end])
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            } else {
+                assert_eq!(encoded, Err(Error::Malformed), "{method} {target:?}");
+                assert!(
+                    matches!(decoded, Err(Error::Malformed)),
+                    "{method} {target:?}"
+                );
+            }
+        }
+    }
 
     /// Host presence and URI grammar apply to both wire and owned request heads.
     #[test]

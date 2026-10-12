@@ -56,8 +56,9 @@ type fakeNodeOperator struct {
 	stageUpgradeSHA256 string
 	stageUpgradeErr    error
 
-	restartAgentCalled bool
-	restartAgentErr    error
+	// restartRequests counts the target's restart requests; the test
+	// reconciler wires them here.
+	restartRequests int
 
 	hostRootCalls     int
 	hostRootActive    *ActiveMachine
@@ -126,12 +127,6 @@ func (op *fakeNodeOperator) StageAgentUpgrade(_ context.Context, _ *slog.Logger,
 	return op.stageUpgradeErr
 }
 
-func (op *fakeNodeOperator) RestartAgentDaemon(_ context.Context, _ *slog.Logger) error {
-	op.restartAgentCalled = true
-
-	return op.restartAgentErr
-}
-
 func (op *fakeNodeOperator) ReconcileHostRoot(_ context.Context, _ *slog.Logger, active *ActiveMachine) (bool, error) {
 	op.hostRootCalls++
 	op.hostRootActive = active
@@ -178,6 +173,11 @@ func newTestMachinaMachineOperationReconcilerWithLockPath(
 		machineName:          "test-machine",
 		nodeOperator:         op,
 		agentUpgradeLockPath: lockPath,
+		requestRestart: func() {
+			if fake, ok := op.(*fakeNodeOperator); ok {
+				fake.restartRequests++
+			}
+		},
 	}
 
 	reconciler, err := daemon.NewMachinaMachineOperationReconciler(
@@ -309,7 +309,7 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 	assert.True(t, op.stageUpgradeCalled)
 	assert.Equal(t, "https://example.com/unbounded-agent.tar.gz", op.stageUpgradeURL)
 	assert.Equal(t, testAgentUpgradeSHA256, op.stageUpgradeSHA256)
-	assert.True(t, op.restartAgentCalled)
+	assert.Equal(t, 1, op.restartRequests, "the daemon stops once, to be restarted from the staged binary")
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -329,6 +329,57 @@ func TestReconcileAgentUpgrade_Complete(t *testing.T) {
 	require.NotNil(t, updated.Status.StartedAt)
 	require.NotNil(t, updated.Status.CompletedAt)
 	assert.NoFileExists(t, signalPath)
+}
+
+// agentUpgradeOperation returns a Pending AgentUpgrade for test-machine.
+func agentUpgradeOperation(name string) *v1alpha3.MachineOperation {
+	return &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationAgentUpgrade,
+			Parameters: map[string]string{
+				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
+				agentUpgradeSHA256Parameter:      testAgentUpgradeSHA256,
+			},
+		},
+	}
+}
+
+// TestReconcileAgentUpgrade_NothingMoreOnceRestartRequested covers the moment
+// between asking to be restarted and stopping: staging again would switch the
+// slots back, so this daemon takes no further AgentUpgrade, and the restarted
+// one reports the staged operation and picks up the rest.
+func TestReconcileAgentUpgrade_NothingMoreOnceRestartRequested(t *testing.T) {
+	signalPath := setAgentUpgradeSignalPath(t)
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
+	op := &fakeNodeOperator{}
+	c := fakeStatusClient(machine, agentUpgradeOperation("op-1"), agentUpgradeOperation("op-2"))
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+	_, err := reconciler.ReconcileMachineOperation(t.Context(), "op-1")
+	require.NoError(t, err)
+	require.True(t, op.stageUpgradeCalled)
+	require.Equal(t, 1, op.restartRequests)
+
+	for _, name := range []string{"op-1", "op-2"} {
+		op.stageUpgradeCalled = false
+
+		result, err := reconciler.ReconcileMachineOperation(t.Context(), name)
+		require.NoError(t, err)
+		assert.Zero(t, result, "%s: the restarted daemon handles it, so nothing is requeued here", name)
+		assert.False(t, op.stageUpgradeCalled, "%s must not be staged before the daemon stops", name)
+	}
+
+	assert.Equal(t, 1, op.restartRequests, "no further restart is requested")
+
+	var second v1alpha3.MachineOperation
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "op-2"}, &second))
+	assert.Empty(t, second.Status.Phase, "op-2 stays Pending, so the restarted daemon enqueues it")
+
+	data, err := os.ReadFile(signalPath)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"operationName":"op-1","observedMachineGeneration":9}`, string(data))
 }
 
 func TestReconcileAgentUpgrade_WaitsForActivationLock(t *testing.T) {
@@ -358,7 +409,7 @@ func TestReconcileAgentUpgrade_WaitsForActivationLock(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, agentUpgradeLockRetryDelay, result.RequeueAfter)
 	assert.False(t, op.stageUpgradeCalled)
-	assert.False(t, op.restartAgentCalled)
+	assert.Zero(t, op.restartRequests)
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -382,7 +433,7 @@ func TestReconcileAgentUpgrade_MissingDownloadURL(t *testing.T) {
 	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
 	require.NoError(t, err)
 	assert.False(t, op.stageUpgradeCalled)
-	assert.False(t, op.restartAgentCalled)
+	assert.Zero(t, op.restartRequests)
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
@@ -416,39 +467,71 @@ func TestReconcileAgentUpgrade_Failed(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 	assert.Equal(t, "upgrade failed", updated.Status.Message)
-	assert.False(t, op.restartAgentCalled)
+	assert.Zero(t, op.restartRequests)
 	assert.NoFileExists(t, signalPath)
 }
 
-func TestReconcileAgentUpgrade_RestartFailureFailsOperation(t *testing.T) {
-	signalPath := setAgentUpgradeSignalPath(t)
-	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 9}}
-	machineOp := &v1alpha3.MachineOperation{
-		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
-		Spec: v1alpha3.MachineOperationSpec{
-			MachineRef:    "test-machine",
-			OperationKind: v1alpha3.OperationAgentUpgrade,
-			Parameters: map[string]string{
-				agentUpgradeDownloadURLParameter: "https://example.com/unbounded-agent.tar.gz",
-				agentUpgradeSHA256Parameter:      testAgentUpgradeSHA256,
-			},
+// TestManagerExit: a daemon whose manager it stopped to be restarted exits for
+// that reason, so the command layer exits cleanly and systemd restarts it.
+// Anything else stops it as before.
+func TestManagerExit(t *testing.T) {
+	t.Parallel()
+
+	managerErr := errors.New("manager failed")
+
+	tests := []struct {
+		name string
+		// stop stops the manager's context, given it and its parent's cancel.
+		stop func(stopManager context.CancelCauseFunc, cancelParent context.CancelFunc)
+		err  error
+		want error
+	}{
+		{
+			name: "restart requested",
+			stop: func(stopManager context.CancelCauseFunc, _ context.CancelFunc) { stopManager(ErrRestartRequested) },
+			want: ErrRestartRequested,
+		},
+		{
+			name: "stopped by its parent",
+			stop: func(_ context.CancelCauseFunc, cancelParent context.CancelFunc) { cancelParent() },
+		},
+		{
+			name: "the manager failed",
+			stop: func(context.CancelCauseFunc, context.CancelFunc) {},
+			err:  managerErr,
+			want: managerErr,
+		},
+		{
+			// It failed while stopping; systemd restarts a failed daemon too.
+			name: "the manager failed after a restart was requested",
+			stop: func(stopManager context.CancelCauseFunc, _ context.CancelFunc) { stopManager(ErrRestartRequested) },
+			err:  managerErr,
+			want: managerErr,
 		},
 	}
 
-	op := &fakeNodeOperator{restartAgentErr: errors.New("restart failed")}
-	c := fakeStatusClient(machine, machineOp)
-	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
-	require.NoError(t, err)
-	assert.True(t, op.stageUpgradeCalled)
-	assert.True(t, op.restartAgentCalled)
+			parent, cancelParent := context.WithCancel(t.Context())
+			defer cancelParent()
 
-	var updated v1alpha3.MachineOperation
-	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
-	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
-	assert.Equal(t, "restart failed", updated.Status.Message)
-	assert.NoFileExists(t, signalPath)
+			mgrCtx, stopManager := context.WithCancelCause(parent)
+			defer stopManager(nil)
+
+			tt.stop(stopManager, cancelParent)
+
+			err := managerExit(mgrCtx, tt.err)
+			if tt.want == nil {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.ErrorIs(t, err, tt.want)
+		})
+	}
 }
 
 func TestPublishAndClearAgentUpgradeSignals_NoSignal(t *testing.T) {

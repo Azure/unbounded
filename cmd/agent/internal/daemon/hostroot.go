@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"time"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/executil"
@@ -34,14 +33,11 @@ func MigrateHostRoot(log *slog.Logger) error {
 // It is under the agent config directory, which reset removes.
 var hostRootAgentsPath = filepath.Join(goalstates.AgentConfigDir, "host-root-agents")
 
-// hostRootRestartWait bounds how long a daemon that queued its own restart
-// waits for systemd to replace it.
-const hostRootRestartWait = 2 * time.Minute
-
 // reconcileHostRootUnderLock runs the operator's ReconcileHostRoot for the
 // active machine while holding installation ownership, which keeps an
 // agent-upgrade or a reset from changing the layout under it. It reports
-// whether the daemon's restart was queued; the lock is released either way.
+// whether the daemon has to be restarted from the moved files; the lock is
+// released either way.
 //
 // A failure is logged, never returned. The daemon is healthy either way, and
 // failing its start would count toward the unit's start limit and could roll
@@ -56,34 +52,19 @@ func reconcileHostRootUnderLock(ctx context.Context, log *slog.Logger, store *in
 
 	defer releaseInstallationLock(log, lock)
 
-	restarted, err := operator.ReconcileHostRoot(ctx, log, active)
+	restart, err := operator.ReconcileHostRoot(ctx, log, active)
 	if err != nil {
 		log.Warn("could not move the agent's files to the host root; the next daemon start retries", "error", err)
 	}
 
-	return restarted
-}
-
-// awaitReplacement waits for systemd to replace a daemon that queued its own
-// restart from the host root. It takes no work in the meantime: the restart
-// stops it at any point. It returns an error if ctx ends or the restart has
-// not come within wait, so the unit's Restart= starts the daemon from the
-// rewritten units instead.
-func awaitReplacement(ctx context.Context, log *slog.Logger, wait time.Duration) error {
-	log.Info("waiting to be restarted from the host root", "timeout", wait)
-
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("stopped while waiting to be restarted from the host root: %w", ctx.Err())
-	case <-time.After(wait):
-		return fmt.Errorf("not restarted from the host root within %s", wait)
-	}
+	return restart
 }
 
 // reconcileHostRoot moves a host an older agent installed to the host root
 // once that cannot strand a rollback, and, once nothing the agent runs is under
 // the legacy root, removes the binary install scripts seed there for older
-// agents. It reports whether it queued the daemon's restart.
+// agents. It reports whether the daemon has to be restarted from the moved
+// files, which it is by stopping; see ErrRestartRequested.
 func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOperator, active *ActiveMachine) (bool, error) {
 	released, err := hostroot.LegacyReleased()
 	if err != nil {
@@ -113,20 +94,23 @@ func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOpera
 			return rewriteHostRootUnits(ctx, log, operator, active)
 		},
 		Verify: verifyMovedDaemon,
+		// The restart itself is the daemon stopping, once this returns.
 		Restart: func(ctx context.Context) error {
-			return restartFromHostRoot(ctx, log, executil.Systemctl(), func(ctx context.Context) error {
-				return operator.RestartAgentDaemon(ctx, log)
-			})
+			clearDaemonStartLimit(ctx, log, executil.Systemctl())
+
+			return nil
 		},
 	})
 }
 
-// restartFromHostRoot clears the daemon unit's start limit, then restarts it
-// from the rewritten units.
+// clearDaemonStartLimit clears the daemon unit's start limit before the daemon
+// stops to be restarted from the moved files.
 //
-// The move's restart is planned, but systemd counts it against the unit's
-// StartLimitBurst like any other start. Right after a burst of starts, such as
-// AgentUpgrades in quick succession, it can be the one that exceeds the limit.
+// The daemon restarts by re-executing in place, which systemd does not count
+// as a start. If that fails, it exits and systemd restarts it, and systemd
+// counts that planned restart against the unit's StartLimitBurst like any
+// other start. Right after a burst of starts, it can be the one that exceeds
+// the limit.
 // systemd then refuses it and runs OnFailure, and the recovery script rolls the
 // daemon back to last-good. No AgentUpgrade is pending by then, so nothing
 // records that it happened.
@@ -135,23 +119,16 @@ func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOpera
 // other unit alone. It must name the unit: with no name it resets every unit on
 // the host. Before systemd v255 the daemon-reload that rewriting the units runs
 // zeroes the counter too, but from v255 the counter survives a reload. An
-// AgentUpgrade's own restart does not need this: if systemd refuses it,
-// recovery finds the upgrade pending and reports it.
+// AgentUpgrade's own restart does not need this: if it falls back to systemd
+// and systemd refuses it, recovery finds the upgrade pending and reports it.
 //
 // It is best-effort, as in the recovery script: SELinux can deny it, and the
 // restart is worth trying either way.
-func restartFromHostRoot(
-	ctx context.Context,
-	log *slog.Logger,
-	systemctl func(context.Context) *exec.Cmd,
-	restart func(context.Context) error,
-) error {
+func clearDaemonStartLimit(ctx context.Context, log *slog.Logger, systemctl func(context.Context) *exec.Cmd) {
 	if err := executil.RunCmd(ctx, log, systemctl, "reset-failed", goalstates.DaemonUnit); err != nil {
 		log.Warn("could not clear the daemon unit's start limit; restarting it from the host root anyway",
 			"unit", goalstates.DaemonUnit, "error", err)
 	}
-
-	return restart(ctx)
 }
 
 // verifyMovedDaemon runs the current daemon binary from a copy of the layout
