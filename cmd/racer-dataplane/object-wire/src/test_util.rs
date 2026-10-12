@@ -337,7 +337,10 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
             .is_some_and(|etag| etag != metadata.version.etag.as_bytes())
         {
             412
-        } else if !head && first >= metadata.length && metadata.length != 0 {
+        } else if !head
+            && first >= metadata.length
+            && (metadata.length != 0 || call.if_match.is_some())
+        {
             416
         } else if head || metadata.length == 0 {
             200

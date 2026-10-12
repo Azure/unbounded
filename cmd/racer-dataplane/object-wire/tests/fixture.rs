@@ -25,6 +25,15 @@ fn metadata(length: u64, etag: &str) -> ObjectMetadata {
 }
 
 fn exchange(fixture: &AdapterOrigin, method: &str, first: u64) -> (MessageHead, Vec<u8>) {
+    exchange_with_pin(fixture, method, first, None)
+}
+
+fn exchange_with_pin(
+    fixture: &AdapterOrigin,
+    method: &str,
+    first: u64,
+    if_match: Option<&str>,
+) -> (MessageHead, Vec<u8>) {
     let mut stream = UnixStream::connect(fixture.root.join("cache/origin/socket")).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -32,7 +41,11 @@ fn exchange(fixture: &AdapterOrigin, method: &str, first: u64) -> (MessageHead, 
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    write!(stream, "{method} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRange: bytes={first}-\r\n\r\n", CacheKey([0; 32]).to_hex()).unwrap();
+    write!(stream, "{method} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRange: bytes={first}-\r\n", CacheKey([0; 32]).to_hex()).unwrap();
+    if let Some(etag) = if_match {
+        write!(stream, "If-Match: {etag}\r\n").unwrap();
+    }
+    stream.write_all(b"\r\n").unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();
     let (head, used) = http1::Codec::<()>::new(32768)
@@ -242,4 +255,67 @@ fn fixture_empty_explicit_body_does_not_slice_past_its_end() {
         origin::validate_bootstrap(&head, &current.version.object),
         Ok((current, 0))
     );
+}
+
+#[test]
+fn fixture_empty_pinned_get_rejects_ranges_after_checking_version() {
+    let fixture = AdapterOrigin::new("cache", metadata(0, "empty"));
+    fixture.set_body(vec![]);
+    for first in [0, PAGE_BYTES] {
+        for (pin, status, expected_range) in [
+            ("\"empty\"", 416, Some(b"bytes */0".as_slice())),
+            ("\"other\"", 412, None),
+        ] {
+            let (head, body) = exchange_with_pin(&fixture, "GET", first, Some(pin));
+            assert!(body.is_empty());
+            assert!(matches!(
+                head.start,
+                http1::StartLine::Response { status: actual, .. } if actual == status
+            ));
+            assert_eq!(
+                head.unique("Content-Length").unwrap(),
+                Some(b"0".as_slice())
+            );
+            assert_eq!(head.unique("Content-Range").unwrap(), expected_range);
+            assert_eq!(
+                origin::validate_response(&head, true),
+                Err(if status == 416 {
+                    Error::UnsatisfiableRangeWithLength(0)
+                } else {
+                    Error::VersionUnavailable
+                })
+            );
+        }
+    }
+    assert_eq!(fixture.count(RequestKind::PinnedGet), 4);
+}
+
+#[test]
+fn fixture_empty_bootstrap_and_head_remain_successful() {
+    let current = metadata(0, "empty");
+    let fixture = AdapterOrigin::new("cache", current.clone());
+    for (method, pin) in [("GET", None), ("HEAD", None), ("HEAD", Some("\"empty\""))] {
+        let (head, body) = exchange_with_pin(&fixture, method, 0, pin);
+        assert!(body.is_empty());
+        assert!(matches!(
+            head.start,
+            http1::StartLine::Response { status: 200, .. }
+        ));
+        assert_eq!(
+            head.unique("Content-Length").unwrap(),
+            Some(b"0".as_slice())
+        );
+        assert_eq!(head.unique("Content-Range").unwrap(), None);
+        if method == "GET" {
+            assert_eq!(
+                origin::validate_bootstrap(&head, &current.version.object),
+                Ok((current.clone(), 0))
+            );
+        } else {
+            assert_eq!(
+                origin::validate_metadata(&head, &current.version.object),
+                Ok(current.clone())
+            );
+        }
+    }
 }
