@@ -51,7 +51,7 @@ const (
 	statConnections       = 4
 	statQueue             = 16
 	// pageCredits is the number of pages Racer may send ahead of the reader.
-	pageCredits = 2
+	pageCredits = 1
 )
 
 type clientLimits struct {
