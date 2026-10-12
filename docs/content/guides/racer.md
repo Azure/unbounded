@@ -278,7 +278,7 @@ state. Deleting and recreating a ClusterVolume creates a new cache identity, eve
 with the same name. Follow release-specific recovery instructions rather than
 resetting durable state independently.
 
-Checkpoint v3 discards older checkpoint formats in both file and device modes.
+Checkpoint v4 discards older checkpoint formats in both file and device modes.
 Expect a cold cache when upgrading from an older format or changing to an
 incompatible device layout, worker count, or storage geometry. Recovery does not
 scan payloads to rebuild the cache. Ensure origins can serve the resulting misses;

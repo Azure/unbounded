@@ -255,6 +255,30 @@ Neither payload nor checkpoint publication adds `fsync`, so process or host
 failure can lose pages or holds. Older checkpoint formats are rejected and start
 cold when no compatible checkpoint remains, including in file mode.
 
+Warm gauges refresh on worker health ticks (normally every 100 ms). They report
+the shared node registry once, without worker, object, or version labels. A
+stalled worker can leave an older sample visible; samples are not atomic with
+storage or request state.
+
+| Metric | Meaning |
+| --- | --- |
+| `racer_warm_tracked_jobs` | Tracked versions, including completed jobs until expiry or removal; not just running fills |
+| `racer_warm_waiters` | Registered GET page waits for warm progress; excludes HEAD admissions and unregistered reads |
+
+The exporter also provides fixed counter hooks for warm admissions, job outcomes,
+and GET waits. Until their call sites are wired, these counters remain zero:
+
+| Counter | Meaning when recorded |
+| --- | --- |
+| `racer_warm_accepted_total` | Accepted HEAD retention admissions, including coalesced requests |
+| `racer_warm_refused_total` | Refused HEAD retention admissions |
+| `racer_warm_completed_total` | Jobs that finished publishing their pages |
+| `racer_warm_failed_total` | Jobs that stopped before completion |
+| `racer_warm_wait_started_total` | Registered GET waits, counted once rather than on each poll |
+| `racer_warm_wait_completed_total` | Registered waits satisfied by warm publication |
+| `racer_warm_wait_fallback_total` | Registered waits released to normal Fill after warm stopped |
+| `racer_warm_wait_failed_total` | Registered waits ended by error, cancellation, deadline, or abandonment |
+
 ### Second-sight disk retention
 
 The default policy allows a currently owned page to persist on its first logical
