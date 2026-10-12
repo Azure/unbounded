@@ -2516,12 +2516,22 @@ def _grant_export_sas(disk: str) -> str:
     if not sas.startswith("https://"):
         die(f"grant-access on disk {disk} returned no SAS")
     if os.environ.get("GITHUB_ACTIONS") == "true":
-        # The signature on its own too, which is all an error that prints only
-        # part of the URL, or the URL decoded, would need to leak.
-        for secret in [sas, *urllib.parse.parse_qs(urllib.parse.urlsplit(sas).query).get("sig", [])]:
+        for secret in sas_secrets(sas):
             print(f"::add-mask::{secret}", flush=True)
 
     return sas
+
+
+def sas_secrets(sas: str) -> list[str]:
+    """Return what to mask for a SAS: the whole URL, and its signature on its
+    own, both as the URL carries it, percent-encoded, and decoded. Either form
+    of the signature is all an error that prints part of the URL, or the URL
+    decoded, would need to leak; GitHub masks only exact matches."""
+    query = urllib.parse.urlsplit(sas).query
+    encoded = [value for key, _, value in (part.partition("=") for part in query.split("&")) if key == "sig"]
+    decoded = urllib.parse.parse_qs(query).get("sig", [])
+
+    return list(dict.fromkeys(secret for secret in [sas, *encoded, *decoded] if secret))
 
 
 def _acl_az_best_effort(args: list[str], what: str) -> str | None:

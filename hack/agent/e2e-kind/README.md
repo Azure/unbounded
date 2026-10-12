@@ -78,14 +78,23 @@ a job, the fresh-bootstrap suite reuses the file the lifecycle suite made.
 runs it once per job. Settings that belong to the other source fail the run
 rather than being ignored.
 
-The gallery export needs, for the identity az is logged in as, on the resource
-group: `Microsoft.Compute/disks/read`, `write`, `delete`,
-`beginGetAccess/action` and `endGetAccess/action`, and read access to the
-shared gallery image. The identity has to be in a tenant the gallery is shared
-with. Grant no more than that: any pull request from this repository can log in
-as it. A resource group that holds only the export disks, with a custom role
-carrying exactly those actions, keeps a pull request from reading or deleting
-any other disk.
+The gallery export needs, for the identity az is logged in as:
+
+- on the resource group: `Microsoft.Compute/disks/read`, `write`, `delete`,
+  `beginGetAccess/action` and `endGetAccess/action`, and
+  `Microsoft.Resources/subscriptions/resourceGroups/read`;
+- on the subscription: `Microsoft.Compute/locations/sharedGalleries/read`,
+  `.../images/read` and `.../images/versions/read`, which resolve the version
+  and let a disk be made from it. They read only galleries shared with the
+  subscription, not any resource in it.
+
+Reader on the subscription is not needed, nor are the built-in disk and
+snapshot roles, which also grant storage accounts, snapshots and virtual
+machines. The identity has to be in a tenant the gallery is shared with. Grant
+no more than that: any pull request from this repository can log in as it. Two
+custom roles carrying exactly those actions, the first assigned on a resource
+group that holds only the export disks, keep a pull request from reading or
+deleting any other disk.
 
 `HOST_IMAGE_PATH` boots a local file with no Azure login at all, whichever the
 source:

@@ -588,8 +588,40 @@ class TestGalleryExport(unittest.TestCase):
 
         self.assertFalse([args for args in az.calls if any("SECRET" in arg for arg in args)])
         printed.assert_any_call(f"::add-mask::{FakeAz.SAS}", flush=True)
-        # The signature on its own, decoded as parse_qs decodes it.
+        # The signature on its own, both as the URL carries it and decoded as
+        # parse_qs decodes it.
+        printed.assert_any_call("::add-mask::SECRET%3D", flush=True)
         printed.assert_any_call("::add-mask::SECRET=", flush=True)
+
+    def test_the_sas_is_not_masked_outside_github_actions(self):
+        """A workflow command printed locally would only clutter the output."""
+        az = FakeAz()
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"GITHUB_ACTIONS": ""}), \
+                patch("builtins.print") as printed:
+            self._export(tmp, az)
+
+        self.assertFalse([call for call in printed.call_args_list
+                          if call.args and str(call.args[0]).startswith("::add-mask::")])
+
+    def test_sas_secrets(self):
+        """GitHub masks only exact matches, so each form a partial or decoded
+        print could take is masked on its own."""
+        tests = {
+            "an encoded signature": (
+                "https://md-x.blob.core.windows.net/a/b?sv=2018-03-28&sr=b&sig=ab%2Bcd%2Fef%3D",
+                ["ab%2Bcd%2Fef%3D", "ab+cd/ef="],
+            ),
+            "a signature that needs no encoding": (
+                "https://md-x.blob.core.windows.net/a/b?sig=abcdef&sv=2018-03-28",
+                ["abcdef"],
+            ),
+            "no signature": ("https://md-x.blob.core.windows.net/a/b?sv=2018-03-28", []),
+            "an empty signature": ("https://md-x.blob.core.windows.net/a/b?sig=&sv=2018-03-28", []),
+        }
+        for name, (sas, signatures) in tests.items():
+            with self.subTest(name):
+                self.assertEqual(e2e.sas_secrets(sas), [sas, *signatures])
 
     def test_the_sas_is_short_lived(self):
         """It is revoked when the download ends; the duration only bounds one
