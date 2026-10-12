@@ -365,6 +365,91 @@ func TestSidecarExactIdentity(t *testing.T) {
 	}
 }
 
+func TestSidecarVersionRejectsEdgeOWSBeforeLookup(t *testing.T) {
+	// A nil client ensures invalid versions cannot reach Stat or any cache lookup.
+	h := &sidecar{scope: scope{namespace: "test"}}
+
+	for _, version := range []string{"%20v", "v%20", "%20v%20", "%20", "+++", "+v", "v+", "%09v", "v%09", "%20%09v%09%20", "v%09v"} {
+		for _, method := range []string{"GET", "HEAD"} {
+			t.Run(method+version, func(t *testing.T) {
+				w := sidecarTestRequest(h, method, "/bucket/key?versionId="+version, nil)
+				if w.Code != http.StatusBadRequest || w.Header().Get("x-amz-version-id") != "" {
+					t.Fatalf("invalid version response: %d %v", w.Code, w.Header())
+				}
+
+				if method == "HEAD" {
+					if w.Body.Len() != 0 {
+						t.Fatal("HEAD error body")
+					}
+				} else if !strings.Contains(w.Body.String(), "<Code>InvalidArgument</Code>") {
+					t.Fatalf("wrong error: %s", w.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestSidecarVersionExactWireHeader(t *testing.T) {
+	for _, version := range []string{"v", "null", "v  v", "version+/=%", "雪", "\u00a0v\u00a0", ""} {
+		t.Run(version, func(t *testing.T) {
+			want, err := NewRequest("test", "bucket", "key", version)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			origin := sidecarTestOrigin(t, "body", `"v"`, nil)
+			h, _ := sidecarTestHandler(t, func(ctx context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				if r.Key != want.Key || r.Metadata != want.Metadata {
+					t.Error("exact version identity changed")
+				}
+
+				return origin(ctx, r)
+			})
+
+			server := httptest.NewServer(h)
+			defer server.Close()
+
+			target := server.URL + "/bucket/key"
+			if version != "" {
+				target += "?versionId=" + url.QueryEscape(version)
+			}
+
+			for _, method := range []string{"GET", "HEAD"} {
+				t.Run(method, func(t *testing.T) {
+					r, err := http.NewRequestWithContext(t.Context(), method, target, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					response, err := server.Client().Do(r)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer response.Body.Close()
+
+					body, err := io.ReadAll(response.Body)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if response.StatusCode != http.StatusOK || response.Header.Get("x-amz-version-id") != version {
+						t.Fatalf("wire response: %d %v; want version %q", response.StatusCode, response.Header, version)
+					}
+
+					wantBody := "body"
+					if method == "HEAD" {
+						wantBody = ""
+					}
+
+					if string(body) != wantBody {
+						t.Fatalf("body = %q, want %q", body, wantBody)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestSidecarSDKFailures(t *testing.T) {
 	for _, tc := range []struct {
 		err    error

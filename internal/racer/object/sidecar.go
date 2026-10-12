@@ -217,6 +217,11 @@ func sidecarVersion(r *http.Request) (string, sidecarFailure) {
 	}
 
 	version := query.Get("versionId")
+	// net/http trims edge OWS in headers, which would change the echoed version.
+	if strings.Trim(version, " \t") != version {
+		return "", http.StatusBadRequest
+	}
+
 	for _, c := range []byte(version) {
 		if c < 0x20 || c == 0x7f {
 			return "", http.StatusBadRequest
