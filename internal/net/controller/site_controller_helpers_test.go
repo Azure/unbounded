@@ -1433,6 +1433,119 @@ func TestCleanupOrphanSiteNodeSlicesRevalidatesSitesAndDeletePreconditions(t *te
 	}
 }
 
+func TestMalformedSliceEventsDirtyAllSites(t *testing.T) {
+	t.Parallel()
+
+	malformed := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": unboundednetv1alpha1.GroupVersion.String(),
+		"kind":       "SiteNodeSlice",
+		"metadata": map[string]interface{}{
+			"name": "site-a-0",
+		},
+		"siteName": "",
+	}}
+
+	tests := []struct {
+		name string
+		obj  interface{}
+	}{
+		{name: "update", obj: malformed},
+		{name: "delete", obj: cache.DeletedFinalStateUnknown{Key: malformed.GetName(), Obj: malformed}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sc := &SiteController{}
+			sc.markSliceObjectDirty(tt.obj)
+
+			work, ok := sc.takeSliceWork()
+			if !ok || !work.all {
+				t.Fatalf("slice work = %#v, available = %v, want all sites dirty", work, ok)
+			}
+		})
+	}
+}
+
+func TestCleanupMalformedSliceSchedulesReconstruction(t *testing.T) {
+	site := unboundedv1alpha3.Site{
+		TypeMeta: metav1.TypeMeta{APIVersion: unboundedv1alpha3.GroupVersion.String(), Kind: "Site"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "site-a",
+			UID:        "site-uid",
+			Finalizers: []string{ProtectionFinalizer},
+		},
+		Spec: unboundedv1alpha3.SiteSpec{NodeCidrs: []string{"10.0.0.0/24"}},
+	}
+	malformed := (&SiteController{}).buildSliceObject(site, "site-a-0", 0, nil)
+	malformed.Object["siteName"] = ""
+	malformed.SetUID("slice-uid")
+	malformed.SetResourceVersion("slice-rv")
+
+	sliceStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := sliceStore.Add(malformed.DeepCopy()); err != nil {
+		t.Fatalf("add malformed slice to cache: %v", err)
+	}
+
+	dynamicClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			siteGVR:          "SiteList",
+			legacySiteGVR:    "SiteList",
+			siteNodeSliceGVR: "SiteNodeSliceList",
+		},
+		siteUnstructured(t, site),
+		malformed.DeepCopy(),
+	)
+
+	nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := nodeIndexer.Add(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{
+			Type:    corev1.NodeInternalIP,
+			Address: "10.0.0.10",
+		}}},
+	}); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+
+	sc := &SiteController{
+		dynamicClient: dynamicClient,
+		nodeLister:    corev1listers.NewNodeLister(nodeIndexer),
+		sliceInformer: &fakeInformer{store: sliceStore},
+		sitesCache:    []unboundedv1alpha3.Site{site},
+	}
+
+	if err := sc.cleanupOrphanSiteNodeSlices(context.Background()); err != nil {
+		t.Fatalf("cleanup malformed slice: %v", err)
+	}
+
+	if !sc.slicesDirty.Load() {
+		t.Fatalf("cleanup did not schedule slice reconstruction")
+	}
+
+	dynamicClient.ClearActions()
+
+	if err := sc.updateSiteSlicesIfDirty(context.Background()); err != nil {
+		t.Fatalf("reconstruct slices: %v", err)
+	}
+
+	reconstructed, err := dynamicClient.Resource(siteNodeSliceGVR).Get(context.Background(), malformed.GetName(), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get reconstructed slice: %v", err)
+	}
+
+	if got, found, err := unstructured.NestedString(reconstructed.Object, "siteName"); err != nil || !found || got != site.Name {
+		t.Fatalf("reconstructed siteName = %q, found = %v, err = %v", got, found, err)
+	}
+
+	nodes, found, err := unstructured.NestedSlice(reconstructed.Object, "nodes")
+	if err != nil || !found || len(nodes) != 1 {
+		t.Fatalf("reconstructed nodes = %#v, found = %v, err = %v", nodes, found, err)
+	}
+}
+
 func TestTopologyReconcileDefersOrphanRepair(t *testing.T) {
 	site := unboundedv1alpha3.Site{
 		ObjectMeta: metav1.ObjectMeta{Name: "site-a", UID: "site-uid"},
