@@ -4,10 +4,13 @@
 package daemon
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,30 +18,45 @@ import (
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/fsutil"
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
+// TestRenderDaemonAsset checks every path the daemon assets carry comes from
+// the same host root. The recovery unit is the only reference to the recovery
+// script, so a mismatch would go unnoticed until recovery was needed.
 func TestRenderDaemonAsset(t *testing.T) {
 	t.Parallel()
 
-	renderedBytes, err := renderDaemonAsset("daemon-service", daemonServiceContent)
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	require.NoError(t, err)
 
-	rendered := string(renderedBytes)
+	hostPaths := goalstates.ResolveHostPaths()
+	require.Equal(t, hostPaths.BinDir, filepath.Dir(paths.CurrentPath), "the binaries must be under the host root")
+	require.Equal(t, hostPaths.BinDir, filepath.Dir(hostPaths.DaemonRecoveryScript), "the recovery script must be under the host root")
 
-	require.NotContains(t, rendered, "{{")
-	assert.Contains(t, rendered, goalstates.DaemonRecoveryUnit)
-	assert.Contains(t, rendered, goalstates.DaemonBinaryCurrentPath)
+	service := renderAsset(t, "daemon-service", daemonServiceContent)
+	assert.Contains(t, service, goalstates.DaemonRecoveryUnit)
+	assert.Contains(t, service, paths.CurrentPath+" daemon")
 
-	renderedRecoveryBytes, err := renderDaemonAsset("daemon-recovery-script", daemonRecoveryScriptContent)
+	recoveryUnit := renderAsset(t, "daemon-recovery-service", daemonRecoveryServiceContent)
+	assert.Contains(t, recoveryUnit, "ExecStart="+hostPaths.DaemonRecoveryScript)
+
+	script := renderAsset(t, "daemon-recovery-script", daemonRecoveryScriptContent)
+	assert.Contains(t, script, paths.LastGoodPath)
+	assert.Contains(t, script, goalstates.DaemonUnit)
+	assert.Contains(t, script, goalstates.DaemonAgentUpgradeSignalPath)
+	assert.Contains(t, script, "record-agent-upgrade-failure-signal")
+}
+
+func renderAsset(t *testing.T, name string, content []byte) string {
+	t.Helper()
+
+	rendered, err := renderDaemonAsset(name, content)
 	require.NoError(t, err)
+	require.NotContains(t, string(rendered), "{{")
 
-	renderedRecovery := string(renderedRecoveryBytes)
-	require.NotContains(t, renderedRecovery, "{{")
-	assert.Contains(t, renderedRecovery, goalstates.DaemonBinaryLastGoodPath)
-	assert.Contains(t, renderedRecovery, goalstates.DaemonUnit)
-	assert.Contains(t, renderedRecovery, goalstates.DaemonAgentUpgradeSignalPath)
-	assert.Contains(t, renderedRecovery, "record-agent-upgrade-failure-signal")
+	return string(rendered)
 }
 
 func TestInstallBinaryStreamsAndReplacesAtomically(t *testing.T) {
@@ -178,4 +196,144 @@ func TestActivateDaemonUnitToleratesDeniedResetFailed(t *testing.T) {
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 
 	require.NoError(t, activateDaemonUnit(t.Context(), discardLogger(), executil.Systemctl()))
+}
+
+func TestRemoveFirstBootBootstrapUnit(t *testing.T) {
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "systemctl"),
+		[]byte("#!/bin/sh\necho \"$@\" >> \""+calls+"\"\n"), 0o755))
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	task := &removeFirstBootUnit{log: discardLogger(), unitDir: t.TempDir()}
+	unitPath := filepath.Join(task.unitDir, provision.FirstBootBootstrapUnit)
+	require.NoError(t, os.WriteFile(unitPath, []byte("[Unit]\n"), 0o644))
+
+	require.NoError(t, task.Do(t.Context()))
+	require.NoFileExists(t, unitPath, "the unit file must be gone, or systemd can still start it")
+
+	recorded, err := os.ReadFile(calls)
+	require.NoError(t, err)
+	require.Equal(t, "disable --now "+provision.FirstBootBootstrapUnit+"\n", string(recorded),
+		"disabling without stopping leaves the unit active, so a later start is a no-op")
+
+	require.NoError(t, task.Do(t.Context()), "a host without the unit has nothing to remove")
+}
+
+// TestInstallBootstrapBinaryInstallsWhereTheDaemonLooks: the binary has to land
+// at the path the rest of the install resolves, including an environment
+// override, or VerifyDaemonInstalled looks elsewhere.
+func TestInstallBootstrapBinaryInstallsWhereTheDaemonLooks(t *testing.T) {
+	installed := filepath.Join(t.TempDir(), "bin", "unbounded-agent")
+	t.Setenv(goalstates.EnvDaemonBinary, installed)
+
+	require.NoError(t, InstallBootstrapBinary())
+
+	info, err := os.Stat(installed)
+	require.NoError(t, err, "binary must land at the resolved path")
+	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+}
+
+// TestRemoveAgentArtifactsRemovesTheRootLast runs the teardown against a
+// temporary tree. The root goes last, so its directories are empty by then.
+func TestRemoveAgentArtifactsRemovesTheRootLast(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+
+	var files []string
+	for _, name := range []string{"bin/unbounded-agent", "bin/unbounded-agent-current", "libexec/unbounded-localdns-network"} {
+		files = append(files, filepath.Join(root, "opt", "unbounded", "agent", name))
+	}
+
+	files = append(files, filepath.Join(root, "usr", "local", "bin", "unbounded-agent-install.sh"))
+
+	for _, path := range files {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte("installed"), 0o644))
+	}
+
+	configDir := filepath.Join(root, "etc", "unbounded", "agent")
+	require.NoError(t, os.MkdirAll(configDir, 0o755))
+
+	// The temporary configs are matched in a temporary directory, so the test
+	// never removes the host's.
+	tempConfig := filepath.Join(root, "tmp", "unbounded-agent-config.1234.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(tempConfig), 0o755))
+	require.NoError(t, os.WriteFile(tempConfig, []byte("{}"), 0o600))
+
+	rootRemovals := 0
+	task := &removeAgentArtifacts{
+		log:         discardLogger(),
+		files:       files,
+		dirs:        []string{configDir},
+		tempConfigs: filepath.Join(root, "tmp", "unbounded-agent-config.*.json"),
+		removeRoot: func() error {
+			rootRemovals++
+
+			for _, path := range files {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("%s is still present when the root is removed", path)
+				}
+			}
+
+			return nil
+		},
+	}
+	require.NoError(t, task.Do(t.Context()))
+	assert.Equal(t, 1, rootRemovals, "the root must be removed")
+
+	_, err := os.Stat(configDir)
+	assert.ErrorIs(t, err, os.ErrNotExist, "config directory must be removed")
+	assert.NoFileExists(t, tempConfig, "temporary configs must be removed")
+
+	// Removing an already-absent file is the ordinary case on a partially
+	// provisioned host, so a second pass has to succeed.
+	require.NoError(t, task.Do(t.Context()), "teardown must be repeatable")
+}
+
+// TestRemoveOwnedFileSkipsTheUnlinkWhenTheFileIsAbsent covers the failure that
+// stopped a reset on an immutable host; see removeOwnedFile. An unwritable
+// directory is no substitute for a read-only mount: unlink returns ENOENT there.
+func TestRemoveOwnedFileSkipsTheUnlinkWhenTheFileIsAbsent(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	remove := func(string) error {
+		called = true
+
+		return syscall.EROFS
+	}
+	absent := func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+
+	require.NoError(t, removeOwnedFileWith("/usr/local/bin/unbounded-agent", absent, remove))
+	assert.False(t, called, "an absent file must not be unlinked, whatever the filesystem would say")
+}
+
+// TestRemoveOwnedFileReportsAFailedUnlink keeps the tolerance narrow: a file
+// that is present and cannot be removed is still an error.
+func TestRemoveOwnedFileReportsAFailedUnlink(t *testing.T) {
+	t.Parallel()
+
+	present := func(string) (os.FileInfo, error) { return nil, nil } //nolint:nilnil // Only presence is read.
+	remove := func(string) error { return syscall.EROFS }
+
+	err := removeOwnedFileWith("/usr/local/bin/unbounded-agent", present, remove)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "/usr/local/bin/unbounded-agent")
+}
+
+// TestRemoveOwnedFileRemovesADanglingSymlink pins why the check uses Lstat.
+func TestRemoveOwnedFileRemovesADanglingSymlink(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	link := filepath.Join(dir, "unbounded-agent-current")
+	require.NoError(t, os.Symlink(filepath.Join(dir, "gone"), link))
+	require.NoError(t, removeOwnedFile(link))
+
+	_, err := os.Lstat(link)
+	assert.ErrorIs(t, err, os.ErrNotExist, "a dangling link must be removed, not skipped")
 }

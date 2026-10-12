@@ -26,8 +26,11 @@ var _ [PageSize - wire.PageSize]struct{}
 
 var _ [wire.PageSize - PageSize]struct{}
 
-// Key names an immutable object in a Racer cache. It is usually a content
-// digest, for example the SHA-256 of a blob.
+// Key names an object in a Racer cache. The object's content may change
+// over time; each version is identified by the ETag in its [Metadata] and
+// must never change. A key is often a content digest, such as the SHA-256
+// of a blob, in which case the bytes cannot change, but the origin may
+// report a new ETag for the same bytes.
 type Key [32]byte
 
 // ParseKey parses 64 lowercase hexadecimal characters.
@@ -78,7 +81,8 @@ func (r Request) wire(op wire.Operation) (wire.Request, error) {
 	return w, nil
 }
 
-// Metadata describes one immutable version of an object.
+// Metadata describes one version of an object. The bytes of a version,
+// identified by its ETag, must never change.
 type Metadata struct {
 	// Size is the object length in bytes.
 	Size int64
@@ -122,8 +126,10 @@ type ReadOptions struct {
 	// object. A range that extends past the end fails with
 	// [ErrRangeNotSatisfiable].
 	Length int64
-	// ETag pins the read to one version, typically from [Client.Stat]. If the
-	// object has changed, Get fails with [ErrVersionMismatch].
+	// ETag pins the read to one version, typically from [Client.Stat]. Use it
+	// when several reads of a key must see the same bytes, since separate
+	// unpinned reads may see different versions. If that version is no
+	// longer available, Get fails with [ErrVersionMismatch].
 	ETag string
 	// SmallObject declares that the object is at most [PageSize] bytes. Small
 	// reads use a separate admission queue so they are not delayed behind
@@ -132,13 +138,17 @@ type ReadOptions struct {
 	SmallObject bool
 }
 
-// Errors returned by [Client] methods and [Object] reads, and recognized when
-// returned by an [Origin]. Test for them with [errors.Is].
+// Errors returned by [Client] methods and [Object] reads, and, except for
+// [ErrDestination], recognized when returned by an [Origin]. Test for them
+// with [errors.Is].
 //
 // Other failures wrap the cause: [context.Canceled] or
 // [context.DeadlineExceeded] when a context ends, and [net.ErrClosed] after
-// [Client.Close] or [Object.Close]. Anything else is a protocol or origin
-// failure that callers usually report as a bad gateway.
+// [Client.Close] or [Object.Close]. When [Object.WriteTo] times out and
+// cannot tell whether Racer or the destination stalled, the error wraps
+// [os.ErrDeadlineExceeded] and matches neither [ErrUnavailable] nor
+// [ErrDestination]. Anything else is a protocol or origin failure that
+// callers usually report as a bad gateway.
 var (
 	// ErrInvalidRequest reports an invalid key, request value, option, or
 	// configuration.
@@ -158,7 +168,41 @@ var (
 	// overloaded or unreachable, or a transfer was cut short. Retrying may
 	// succeed.
 	ErrUnavailable = errors.New("racersdk: unavailable")
+	// ErrDestination reports that the writer passed to [Object.WriteTo]
+	// failed, for example because a downstream client disconnected, a disk
+	// is full, or a write timed out. Racer and the origin are not at fault,
+	// and retrying the read does not help unless the destination recovers.
+	// Check ErrDestination before other sentinels: the error also wraps the
+	// writer's own error, which may match SDK sentinels from a nested Racer read.
+	// Timeouts from the destination's ReadFrom remain ambiguous and match
+	// neither ErrDestination nor [ErrUnavailable].
+	ErrDestination = errors.New("racersdk: destination failed")
 )
+
+// destinationError marks a failure of the writer passed to WriteTo, so it is
+// never mistaken for a Racer transport failure.
+type destinationError struct{ err error }
+
+func (e *destinationError) Error() string {
+	return "racersdk: write: destination failed: " + e.err.Error()
+}
+
+func (e *destinationError) Unwrap() error { return e.err }
+
+func (e *destinationError) Is(target error) bool { return target == ErrDestination }
+
+// destinationFailure attributes err to the WriteTo destination. Nil and
+// errors already carrying the private marker pass through unchanged. A writer
+// error that merely matches ErrDestination is still wrapped, because only the
+// marker keeps ioFailure from reclassifying it.
+func destinationFailure(err error) error {
+	var dst *destinationError
+	if err == nil || errors.As(err, &dst) {
+		return err
+	}
+
+	return &destinationError{err: err}
+}
 
 // sdkError carries a private classification that maps onto at most one
 // exported sentinel, plus a safe operation name and the underlying cause.
@@ -258,10 +302,15 @@ func closedError(op string) error {
 	return failure(wire.ErrorClosed, op, net.ErrClosed)
 }
 
-// ioFailure classifies a transport error, preserving SDK errors and context
-// errors. Nil and io.EOF pass through unchanged.
+// ioFailure classifies a transport error, preserving SDK errors, destination
+// errors, and context errors. Nil and io.EOF pass through unchanged.
 func ioFailure(op string, err error) error {
 	if err == nil || err == io.EOF {
+		return err
+	}
+
+	var dst *destinationError
+	if errors.As(err, &dst) {
 		return err
 	}
 

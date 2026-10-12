@@ -36,6 +36,7 @@ import (
 const (
 	clusterName       = "gantry-e2e"
 	imageTag          = "docker.io/library/gantry:e2e"
+	kindNodeImage     = "kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a"
 	namespace         = "unbounded-system"
 	dsName            = "gantry"
 	e2eRegistry       = "registry.k8s.io"
@@ -152,7 +153,7 @@ func (h *harness) bootCluster(ctx context.Context) {
 	}
 
 	cfg := filepath.Join(h.repoRoot, "e2e", "gantry", "kind-config.yaml")
-	if err := h.run(ctx, "kind", "create", "cluster", "--config", cfg, "--wait", "120s"); err != nil {
+	if err := h.run(ctx, "kind", "create", "cluster", "--config", cfg, "--image", kindNodeImage, "--wait", "120s"); err != nil {
 		h.t.Fatalf("kind create cluster: %v", err)
 	}
 }
@@ -583,12 +584,34 @@ func (h *harness) fetchPodMetrics(ctx context.Context, pod string) string {
 
 func (h *harness) fetchPodPath(ctx context.Context, pod, path string) (string, error) {
 	h.t.Helper()
+
+	response, err := h.fetchPodHTTP(ctx, pod, 9095, path, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return string(response.body), nil
+}
+
+type podHTTPResponse struct {
+	header http.Header
+	body   []byte
+}
+
+func (h *harness) fetchPodHTTP(
+	ctx context.Context,
+	pod string,
+	remotePort int,
+	path string,
+	headers http.Header,
+) (podHTTPResponse, error) {
+	h.t.Helper()
 	port := freeLocalPort(h.t)
 
 	pfCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cmd := exec.CommandContext(pfCtx, "kubectl", "-n", namespace, "port-forward", "pod/"+pod, fmt.Sprintf("%d:9095", port))
+	cmd := exec.CommandContext(pfCtx, "kubectl", "-n", namespace, "port-forward", "pod/"+pod, fmt.Sprintf("%d:%d", port, remotePort))
 	cmd.Dir = h.repoRoot
 	cmd.Env = os.Environ()
 
@@ -633,7 +656,13 @@ func (h *harness) fetchPodPath(ctx context.Context, pod, path string) (string, e
 		if err != nil {
 			// Dropping this left req nil, and Do(nil) panics rather than
 			// reporting anything about the URL that was wrong.
-			return "", fmt.Errorf("build request for %s: %w", url, err)
+			return podHTTPResponse{}, fmt.Errorf("build request for %s: %w", url, err)
+		}
+
+		for name, values := range headers {
+			for _, value := range values {
+				req.Header.Add(name, value)
+			}
 		}
 
 		resp, err := http.DefaultClient.Do(req)
@@ -642,10 +671,13 @@ func (h *harness) fetchPodPath(ctx context.Context, pod, path string) (string, e
 			closeBody(resp)
 
 			if readErr != nil {
-				return "", readErr
+				return podHTTPResponse{}, readErr
 			}
 
-			return string(body), nil
+			return podHTTPResponse{
+				header: resp.Header.Clone(),
+				body:   body,
+			}, nil
 		}
 
 		if err != nil {
@@ -658,12 +690,12 @@ func (h *harness) fetchPodPath(ctx context.Context, pod, path string) (string, e
 
 		select {
 		case <-done:
-			return "", fmt.Errorf("port-forward for %s exited early (%v): %s", pod, waitErr, buf.String())
+			return podHTTPResponse{}, fmt.Errorf("port-forward for %s exited early (%v): %s", pod, waitErr, buf.String())
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
 
-	return "", fmt.Errorf("%s from %s unavailable: %v (port-forward logs: %s)", path, pod, lastErr, buf.String())
+	return podHTTPResponse{}, fmt.Errorf("%s from %s:%d unavailable: %v (port-forward logs: %s)", path, pod, remotePort, lastErr, buf.String())
 }
 
 func (h *harness) applyDaemonSet(ctx context.Context) error {
