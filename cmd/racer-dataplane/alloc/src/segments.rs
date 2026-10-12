@@ -48,6 +48,10 @@ pub struct SegmentSnapshot {
 
     /// Aligned occupied prefix, including record padding.
     pub used_bytes: u64,
+
+    /// Caller-owned checkpoint hints: record offsets and retention deadlines.
+    /// Allocation ignores these; the caller must restore its own eviction vetoes.
+    pub retained_records: Vec<(u64, std::time::SystemTime)>,
 }
 
 /// Unique worker-local lease that prevents reuse until its completion owner drops.
@@ -308,6 +312,7 @@ impl Segments {
                     generation: Generation(1),
                     state: SegmentState::Free,
                     used_bytes: 0,
+                    retained_records: Vec::new(),
                 },
                 leases: Rc::new(Cell::new(0)),
             })
@@ -557,6 +562,7 @@ impl Segments {
             *used = 0;
         }
         for (slot, mut image) in slots.iter_mut().zip(images) {
+            image.retained_records.clear();
             if image.state == SegmentState::Open {
                 image.state = SegmentState::Sealed;
             }
@@ -655,6 +661,11 @@ impl TableIdentity {
 /// Application-owned mappings; removal must compare current entries first.
 /// Callbacks own metadata and version side effects and must never exceed budget.
 pub trait SegmentEntries {
+    /// Hard retention veto, including index-only removal and eviction in progress.
+    fn can_reclaim(&self, _segment: SegmentId) -> bool {
+        true
+    }
+
     /// Active unpublished writes must not lose publication authority. Read
     /// leases still permit eviction and independently fence physical reuse.
     fn can_evict(&self, _segment: SegmentId) -> bool {
@@ -740,6 +751,9 @@ impl SegmentClock {
             if self.recent.borrow_mut().remove(&id) {
                 continue;
             }
+            if !entries.can_reclaim(id) {
+                continue;
+            }
             if entries.remove_bounded(id, 1) > 1 {
                 return Err(Error::InvalidConfiguration);
             }
@@ -789,7 +803,8 @@ impl SegmentClock {
             if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
                 continue;
             }
-            if state == SegmentState::Sealed && !entries.can_evict(id) {
+            if !entries.can_reclaim(id) || (state == SegmentState::Sealed && !entries.can_evict(id))
+            {
                 continue;
             }
             // Rank before any begin_eviction or index side effects.
@@ -804,6 +819,9 @@ impl SegmentClock {
         let mut entries_left = max_entries;
         for (_, _, _, id) in candidates {
             let state = self.segments.state(id)?;
+            if !entries.can_reclaim(id) {
+                continue;
+            }
             if state == SegmentState::Sealed
                 && (self
                     .segments
@@ -875,7 +893,8 @@ impl SegmentClock {
             if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
                 continue;
             }
-            if state == SegmentState::Sealed && !entries.can_evict(id) {
+            if !entries.can_reclaim(id) || (state == SegmentState::Sealed && !entries.can_evict(id))
+            {
                 continue;
             }
             if self.recent.borrow_mut().remove(&id) {
@@ -1315,6 +1334,7 @@ mod clock_tests {
         calls: RefCell<Vec<(SegmentId, usize)>>,
 
         evictable: Cell<bool>,
+        hard_veto: Cell<bool>,
     }
 
     impl Entries {
@@ -1324,11 +1344,15 @@ mod clock_tests {
                 counts: RefCell::new(counts),
                 calls: RefCell::new(vec![]),
                 evictable: Cell::new(true),
+                hard_veto: Cell::new(false),
             }
         }
     }
 
     impl SegmentEntries for Entries {
+        fn can_reclaim(&self, _: SegmentId) -> bool {
+            !self.hard_veto.get()
+        }
         /// Allow tests to protect unpublished mappings before eviction begins.
         fn can_evict(&self, _: SegmentId) -> bool {
             self.evictable.get()
@@ -1380,6 +1404,32 @@ mod clock_tests {
         let entries = Entries::new(vec![1]);
         assert_eq!(clock.reclaim_index(&entries, 0, || false), Err(Error::Busy));
         assert!(entries.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn hard_veto_applies_to_already_evicting_and_index_only_sweeps() {
+        let segments = segments(2);
+        drop(segments.append(1024).unwrap());
+        segments.begin_evict(SegmentId(0)).unwrap();
+        let entries = Entries::new(vec![1, 0]);
+        entries.evictable.set(false);
+        entries.hard_veto.set(true);
+        let clock = SegmentClock::new(segments.clone());
+        assert_eq!(
+            clock.reclaim_scored(&entries, 2, 64, 256, |_| 0),
+            Err(Error::Busy)
+        );
+        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
+        assert_eq!(
+            clock.reclaim_index(&entries, 64, || false),
+            Err(Error::Busy)
+        );
+        assert!(entries.calls.borrow().is_empty());
+        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
+        entries.evictable.set(true);
+        entries.hard_veto.set(false);
+        clock.reclaim_scored(&entries, 2, 64, 256, |_| 0).unwrap();
+        assert_eq!(segments.free_count(), 2);
     }
 
     /// Index admission can forget open mappings without reclaiming their storage.

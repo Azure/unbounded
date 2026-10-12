@@ -111,6 +111,15 @@ impl<K: Eq + Hash + Clone, V, H: BuildHasher> PageIndex<K, V, H> {
 
     /// Select low value, then oldest age, among at most `budget` candidates.
     pub fn victim(&self, budget: usize, mut score: impl FnMut(&K, &V) -> u64) -> Option<K> {
+        self.victim_if(budget, |key, value| Some(score(key, value)))
+    }
+
+    /// A missing score is a hard veto, even when all candidates are protected.
+    pub fn victim_if(
+        &self,
+        budget: usize,
+        mut score: impl FnMut(&K, &V) -> Option<u64>,
+    ) -> Option<K> {
         let after = self.victim_cursor.get();
         let mut best = None;
         for (age, key) in self
@@ -120,7 +129,9 @@ impl<K: Eq + Hash + Clone, V, H: BuildHasher> PageIndex<K, V, H> {
             .take(budget)
         {
             self.victim_cursor.set(*age);
-            let value = score(key, &self.pages[key]);
+            let Some(value) = score(key, &self.pages[key]) else {
+                continue;
+            };
             if best.as_ref().is_none_or(|(v, a, _)| (value, age) < (*v, a)) {
                 best = Some((value, *age, key.clone()));
             }
@@ -203,5 +214,17 @@ mod tests {
         assert_eq!(index.insert(1, 3, SegmentId(1)), Err((1, 3)));
         assert_eq!(index.get(&1), Some(&2));
         assert!(index.segment_empty(SegmentId(1)));
+    }
+
+    #[test]
+    fn hard_veto_is_not_a_large_soft_score() {
+        let mut index = PageIndex::<u64, u64>::default();
+        index.insert(1, 1, SegmentId(0)).unwrap();
+        index.insert(2, 2, SegmentId(0)).unwrap();
+        assert_eq!(index.victim_if(64, |_, _| None), None);
+        assert_eq!(
+            index.victim_if(64, |key, _| (*key == 2).then_some(u64::MAX)),
+            Some(2)
+        );
     }
 }
