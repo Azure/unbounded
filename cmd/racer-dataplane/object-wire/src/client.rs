@@ -139,7 +139,7 @@ impl RequestParser {
             }
             match name.as_str() {
                 "cache-control" if method == "HEAD" => parse_max_age(value, &mut max_age)?,
-                "host" => host = Some(value == b"racer"),
+                "host" => host = Some(trim_ows(value) == b"racer"),
                 "content-length" if value == b"0" => content_length = true,
                 "content-length"
                 | "content-range"
