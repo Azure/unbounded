@@ -470,6 +470,9 @@ pub mod test_util {
 }
 
 #[cfg(test)]
+mod handshake_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
