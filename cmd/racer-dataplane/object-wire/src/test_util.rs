@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -82,7 +82,13 @@ impl AdapterOrigin {
     /// contain their page number repeated, without allocating the complete object.
     pub fn new(cache_name: &str, metadata: ObjectMetadata) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        assert!(!cache_name.contains('/') && !cache_name.is_empty());
+        let mut components = Path::new(cache_name).components();
+        assert!(
+            matches!(components.next(), Some(Component::Normal(name)) if name == cache_name)
+                && components.next().is_none()
+                && !cache_name.contains('\0'),
+            "cache name must be a single normal path component"
+        );
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join(format!(
