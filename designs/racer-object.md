@@ -85,8 +85,10 @@ as the wrapped cause, so `errors.Is` still works, but its text is not shown.
 **Setup.**
 
 - Credentials and region come from the normal AWS SDK config chain.
-  `--region` is required. `--endpoint` and `--path-style` (default on)
-  support S3-compatible stores.
+  `--region` overrides the configured region. A region must be available
+  through `--region` or AWS configuration, such as `AWS_REGION` or
+  `AWS_DEFAULT_REGION`. `--endpoint` and `--path-style` (default on) support
+  S3-compatible stores.
 - Checksums are sent only when S3 requires them. Some S3-compatible stores
   reject the optional ones.
 - `--request-timeout` is capped at one minute, which is the SDK's own limit
