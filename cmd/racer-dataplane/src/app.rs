@@ -2194,6 +2194,9 @@ impl WorkerApplication {
         self.telemetry
             .metrics
             .observe_warm(node.workers.warm.snapshot());
+        self.telemetry
+            .metrics
+            .observe_held(self.store.writer.index().held_snapshot());
         self.store.writer.observe_disks();
         self.telemetry
             .metrics

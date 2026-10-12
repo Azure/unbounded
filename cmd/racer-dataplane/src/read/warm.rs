@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::model::{ObjectMetadata, ObjectVersion, PAGE_BYTES, PageId, PageNumber, RequestId};
 use crate::runtime::RequestScope;
 use crate::security::ChargedOriginContext;
+use crate::telemetry::{Metrics, WarmEvent};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -58,6 +59,7 @@ struct Progress {
 }
 
 pub(crate) struct Job {
+    metrics: Metrics,
     version: ObjectVersion,
     scope: RequestScope,
     admission: futures::lock::Mutex<()>,
@@ -65,6 +67,7 @@ pub(crate) struct Job {
 }
 
 pub struct WarmRegistry {
+    metrics: std::sync::OnceLock<Metrics>,
     config: Mutex<Config>,
     jobs: Mutex<BTreeMap<ObjectVersion, Arc<Job>>>,
     waiter_limit: usize,
@@ -76,6 +79,7 @@ type ReleaseQueue = (Option<Waker>, std::collections::BTreeSet<ObjectVersion>);
 impl WarmRegistry {
     pub(crate) fn new(waiter_limit: usize) -> Self {
         Self {
+            metrics: std::sync::OnceLock::new(),
             config: Mutex::new(Config::default()),
             jobs: Mutex::new(BTreeMap::new()),
             waiter_limit,
@@ -95,6 +99,14 @@ impl WarmRegistry {
 
     pub fn config(&self) -> Config {
         *self.config.lock().unwrap()
+    }
+
+    pub(super) fn attach_metrics(&self, metrics: &Metrics) {
+        self.metrics.get_or_init(|| metrics.clone());
+    }
+
+    fn metrics(&self) -> Metrics {
+        self.metrics.get().cloned().unwrap_or_default()
     }
 
     pub(crate) fn contains(&self, version: &ObjectVersion) -> bool {
@@ -231,6 +243,7 @@ impl WarmRegistry {
         let mut request = [0; 16];
         uring_runtime::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
         let job = Arc::new(Job {
+            metrics: self.metrics(),
             version: version.clone(),
             scope: RequestScope::new(
                 RequestId(request),
@@ -313,12 +326,18 @@ impl WarmRegistry {
             deadline: scope.deadline.0,
         };
         let cancellation = scope.cancellation.subscribe()?;
-        std::future::poll_fn(|cx| {
+        let result = std::future::poll_fn(|cx| {
             cancellation.register(cx.waker());
             scope.check()?;
             waiter.poll(cx, page.number.0)
         })
-        .await
+        .await;
+        waiter.finish(match result {
+            Ok(true) => WarmEvent::WaitCompleted,
+            Ok(false) => WarmEvent::WaitFallback,
+            Err(_) => WarmEvent::WaitFailed,
+        });
+        result
     }
 
     fn remove(&self, job: &Arc<Job>) {
@@ -372,6 +391,13 @@ struct Waiter {
     deadline: std::time::Instant,
 }
 impl Waiter {
+    fn finish(&mut self, event: WarmEvent) {
+        if let Some(id) = self.id.take() {
+            self.job.progress.lock().unwrap().waiters.remove(&id);
+            self.job.metrics.warm_event(event);
+        }
+    }
+
     fn poll(&mut self, cx: &mut Context<'_>, number: u64) -> Poll<Result<bool>> {
         let mut progress = self.job.progress.lock().unwrap();
         if progress.stopped
@@ -393,6 +419,7 @@ impl Waiter {
                 }
                 progress.sequence = progress.sequence.checked_add(1).ok_or(Error::Overloaded)?;
                 self.id = Some(progress.sequence);
+                self.job.metrics.warm_event(WarmEvent::WaitStarted);
                 progress.sequence
             }
         };
@@ -404,9 +431,18 @@ impl Waiter {
 }
 impl Drop for Waiter {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
-            self.job.progress.lock().unwrap().waiters.remove(&id);
-        }
+        self.finish(WarmEvent::WaitFailed);
+    }
+}
+
+/// A decision survives caller cancellation when moved into the detached driver.
+struct Outcome {
+    metrics: Metrics,
+    event: WarmEvent,
+}
+impl Drop for Outcome {
+    fn drop(&mut self) {
+        self.metrics.warm_event(self.event);
     }
 }
 
@@ -441,6 +477,10 @@ pub(crate) async fn admit(
     ttl: Duration,
     caller: &RequestScope,
 ) -> Result<SystemTime> {
+    let mut admission = Outcome {
+        metrics: directory.warm.metrics(),
+        event: WarmEvent::Refused,
+    };
     caller.check()?;
     let config = directory.warm.config();
     if ttl.is_zero() {
@@ -509,11 +549,17 @@ pub(crate) async fn admit(
             }
         };
         job.update(|progress| progress.until = Some(target));
+        admission.event = WarmEvent::Accepted;
+        drop(admission);
         drop(lock);
         let _ = send.send(Ok(target));
         if !fresh {
             return Ok(());
         }
+        let mut outcome = Outcome {
+            metrics: job.metrics.clone(),
+            event: WarmEvent::Failed,
+        };
         let result = run(
             &directory,
             &job,
@@ -530,6 +576,7 @@ pub(crate) async fn admit(
         } else {
             job.update(|progress| progress.running = false);
             guard.complete = true;
+            outcome.event = WarmEvent::Completed;
         }
         Ok(())
     }));
@@ -609,7 +656,229 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::Event;
     use std::future::Future;
+
+    #[test]
+    fn admission_and_job_metrics_survive_caller_drop_and_count_coalescing_once() {
+        let queue = std::rc::Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let _queue = queue.enter();
+        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(
+                    super::super::dispatch::WorkerMap::new(vec![crate::model::WorkerId(0)])
+                        .unwrap(),
+                ),
+                vec![crate::model::WorkerId(0)],
+                8,
+            )
+            .unwrap(),
+        );
+        let metrics = Metrics::default();
+        directory.warm.attach_metrics(&metrics);
+        let mut endpoint = directory
+            .install(crate::model::WorkerId(0), local.clone())
+            .unwrap();
+        let caller = scope();
+        let origin = crate::security::OriginContext {
+            object: version("metrics").object,
+            metadata: None,
+            authorization: None,
+        };
+        let membership = Arc::new(
+            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
+                .unwrap(),
+        );
+        let metadata = ObjectMetadata {
+            version: version("metrics"),
+            length: 0,
+            content_type: None,
+            expires_at: crate::model::ExpiresAt::from_system_time(SystemTime::UNIX_EPOCH).unwrap(),
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut admission = Box::pin(admit(
+            directory.clone(),
+            metadata.clone(),
+            membership.clone(),
+            local.credentials.local_context(&origin, &caller).unwrap(),
+            Duration::from_secs(60),
+            &caller,
+        ));
+        assert!(admission.as_mut().poll(&mut cx).is_pending());
+        drop(admission);
+        caller.cancel().unwrap();
+        for _ in 0..32 {
+            queue.poll(&mut cx, 64);
+            endpoint.poll(&mut cx, 64).unwrap();
+            if queue.pending() == 0 {
+                break;
+            }
+        }
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(metrics.count(Event::WarmAccepted), 1);
+        assert_eq!(metrics.count(Event::WarmCompleted), 1);
+        assert_eq!(metrics.count(Event::WarmRefused), 0);
+        let caller = scope();
+        for ttl in [Duration::from_secs(60), Duration::ZERO] {
+            let mut admission = Box::pin(admit(
+                directory.clone(),
+                metadata.clone(),
+                membership.clone(),
+                local.credentials.local_context(&origin, &caller).unwrap(),
+                ttl,
+                &caller,
+            ));
+            let mut result = None;
+            for _ in 0..32 {
+                if let Poll::Ready(value) = admission.as_mut().poll(&mut cx) {
+                    result = Some(value);
+                    break;
+                }
+                queue.poll(&mut cx, 64);
+                endpoint.poll(&mut cx, 64).unwrap();
+            }
+            assert_eq!(result.unwrap().is_ok(), !ttl.is_zero());
+        }
+        assert_eq!(metrics.count(Event::WarmAccepted), 2);
+        assert_eq!(metrics.count(Event::WarmCompleted), 1);
+        assert_eq!(metrics.count(Event::WarmRefused), 1);
+        assert_eq!(metrics.count(Event::WarmFailed), 0);
+
+        let mut refused = Box::pin(admit(
+            directory.clone(),
+            ObjectMetadata {
+                version: version("too-large"),
+                length: 100 * PAGE_BYTES,
+                ..metadata.clone()
+            },
+            membership.clone(),
+            local.credentials.local_context(&origin, &caller).unwrap(),
+            Duration::from_secs(60),
+            &caller,
+        ));
+        let mut result = None;
+        for _ in 0..32 {
+            if let Poll::Ready(value) = refused.as_mut().poll(&mut cx) {
+                result = Some(value);
+                break;
+            }
+            queue.poll(&mut cx, 64);
+            endpoint.poll(&mut cx, 64).unwrap();
+        }
+        assert_eq!(result.unwrap(), Err(Error::Overloaded));
+        drop(refused);
+        endpoint.poll(&mut cx, 64).unwrap();
+        assert_eq!(metrics.count(Event::WarmRefused), 2);
+        assert_eq!(
+            metrics.count(Event::WarmFailed),
+            0,
+            "unadmitted jobs are refusals"
+        );
+
+        let metadata = ObjectMetadata {
+            version: version("failed"),
+            length: 3,
+            ..metadata
+        };
+        let mut admission = Box::pin(admit(
+            directory.clone(),
+            metadata,
+            membership,
+            local.credentials.local_context(&origin, &caller).unwrap(),
+            Duration::from_secs(60),
+            &caller,
+        ));
+        assert!(admission.as_mut().poll(&mut cx).is_pending());
+        queue.poll(&mut cx, 64);
+        endpoint.poll(&mut cx, 64).unwrap();
+        queue.poll(&mut cx, 64);
+        assert!(matches!(
+            admission.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        drop(admission);
+        directory.warm.stop();
+        for _ in 0..32 {
+            endpoint.poll(&mut cx, 64).unwrap();
+            queue.poll(&mut cx, 64);
+            if queue.pending() == 0 {
+                break;
+            }
+        }
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(metrics.count(Event::WarmAccepted), 3);
+        assert_eq!(metrics.count(Event::WarmCompleted), 1);
+        assert_eq!(metrics.count(Event::WarmFailed), 1);
+        assert_eq!(metrics.count(Event::WarmRefused), 2);
+    }
+
+    #[test]
+    fn wait_metrics_count_registration_and_one_terminal_outcome() {
+        let registry = WarmRegistry::new(1);
+        let metrics = Metrics::default();
+        registry.attach_metrics(&metrics);
+        let page = PageId {
+            version: version("metrics"),
+            number: PageNumber(0),
+        };
+        let (job, _) = registry.begin(&page.version).unwrap();
+        let scope = scope();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        for _ in 0..3 {
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(metrics.count(Event::WarmWaitStarted), 1);
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &scope)),
+            Err(Error::Overloaded)
+        );
+        job.update(|p| p.frontier = 1);
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(true)));
+        drop(waiting);
+        assert_eq!(metrics.count(Event::WarmWaitCompleted), 1);
+        assert_eq!(metrics.count(Event::WarmWaitFailed), 0);
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &scope)),
+            Ok(true)
+        );
+        let page = PageId {
+            number: PageNumber(1),
+            ..page
+        };
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        drop(waiting);
+        assert_eq!(metrics.count(Event::WarmWaitFailed), 1);
+        let canceled = self::scope();
+        let mut waiting = Box::pin(registry.wait(&page, &canceled));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        canceled.cancel().unwrap();
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        );
+        drop(waiting);
+        assert_eq!(metrics.count(Event::WarmWaitFailed), 2);
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        job.stop();
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Ok(false)));
+        drop(waiting);
+        assert_eq!(metrics.count(Event::WarmWaitFallback), 1);
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &scope)),
+            Ok(false)
+        );
+        registry.remove(&job);
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &scope)),
+            Ok(false)
+        );
+        assert_eq!(metrics.count(Event::WarmWaitStarted), 4);
+        assert_eq!(metrics.count(Event::WarmWaitFailed), 2);
+    }
 
     fn version(etag: &str) -> ObjectVersion {
         ObjectVersion {

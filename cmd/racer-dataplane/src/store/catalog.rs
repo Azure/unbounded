@@ -27,6 +27,14 @@ pub struct RecordLocation {
     pub generation: Generation,
     pub extent: Extent,
 }
+
+/// Published pages under live hard holds on one storage worker.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeldSnapshot {
+    pub pages: u64,
+    pub payload_bytes: u64,
+    pub segments: u64,
+}
 /// One storage shard. The catalog budget is independent of retained page entries;
 /// evicting a catalog item cannot remove a page's attached immutable descriptor.
 pub struct Index {
@@ -269,6 +277,38 @@ impl Index {
             .get(version)
             .filter(|hold| hold.live())
             .map(|hold| hold.until)
+    }
+
+    /// Scan only bounded hold locations, not the full page index or payloads.
+    /// Scratch space contains distinct segment IDs, bounded by held publications.
+    pub fn held_snapshot(&self) -> HeldSnapshot {
+        let holds = self.holds.borrow();
+        let state = self.state.borrow();
+        let mut snapshot = HeldSnapshot::default();
+        let mut segments = HashSet::default();
+        for (version, hold) in holds.entries.iter().filter(|(_, hold)| hold.live()) {
+            let mut page = PageId {
+                version: version.clone(),
+                number: crate::model::PageNumber(0),
+            };
+            for (number, location) in &hold.locations {
+                page.number = *number;
+                let Some(entry) = state.pages.get(&page) else {
+                    continue;
+                };
+                if entry.location != *location {
+                    continue;
+                }
+                let Ok(bytes) = entry.metadata.page_length(&page) else {
+                    continue;
+                };
+                snapshot.pages = snapshot.pages.saturating_add(1);
+                snapshot.payload_bytes = snapshot.payload_bytes.saturating_add(u64::from(bytes));
+                segments.insert(location.segment);
+            }
+        }
+        snapshot.segments = segments.len() as u64;
+        snapshot
     }
 
     /// Extend an existing reservation without adding page capacity.
@@ -1206,6 +1246,73 @@ mod tests {
         assert_eq!(
             index.reserve_hold(&other, usize::MAX, until),
             Err(Error::Overloaded)
+        );
+    }
+
+    #[test]
+    fn held_snapshot_counts_only_live_publications_and_distinct_segments() {
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(8));
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let (first, entry) = indexed(descriptor("first", 17), 0);
+        index.reserve_hold(&first.version, 2, until).unwrap();
+        let pending = index.reserve_page_for(&first, false).unwrap();
+        assert_eq!(index.held_snapshot(), HeldSnapshot::default());
+        drop(segments.append(1024).unwrap());
+        pending.publish(first.clone(), entry).unwrap();
+        let (second, mut entry) = indexed(descriptor("second", 3), 0);
+        entry.location.extent = Extent::new(512, 512).unwrap();
+        index.publish(second.clone(), entry.clone()).unwrap();
+        index.reserve_hold(&second.version, 1, until).unwrap();
+        let expected = HeldSnapshot {
+            pages: 2,
+            payload_bytes: 20,
+            segments: 1,
+        };
+        assert_eq!(index.held_snapshot(), expected);
+        assert_eq!(index.held_snapshot(), expected);
+        index.release_hold(&first.version).unwrap();
+        assert_eq!(index.held_snapshot(), expected);
+        index.remove_if_matches(&second, &entry.location);
+        assert_eq!(
+            index.held_snapshot(),
+            HeldSnapshot {
+                pages: 1,
+                payload_bytes: 17,
+                segments: 1
+            }
+        );
+        let mut snapshots = segments.snapshot();
+        let mut remaining = usize::MAX;
+        index
+            .snapshot_holds(&mut snapshots, &mut remaining)
+            .unwrap();
+        index.holds.borrow_mut().entries.clear();
+        index.restore_holds(&snapshots).unwrap();
+        assert_eq!(
+            index.held_snapshot().payload_bytes,
+            17,
+            "recovered holds have no job"
+        );
+        {
+            let mut holds = index.holds.borrow_mut();
+            let hold = holds.entries.get_mut(&first.version).unwrap();
+            hold.until = std::time::UNIX_EPOCH;
+            assert!(hold.live(), "monotonic deadline still protects pages");
+        }
+        assert_eq!(index.held_snapshot().pages, 1);
+        index
+            .holds
+            .borrow_mut()
+            .entries
+            .get_mut(&first.version)
+            .unwrap()
+            .monotonic = uring_runtime::environment::now() - std::time::Duration::from_secs(1);
+        assert_eq!(index.held_snapshot(), HeldSnapshot::default());
+        assert!(
+            index.lookup(&first).unwrap().is_some(),
+            "expiry need not evict the page"
         );
     }
 

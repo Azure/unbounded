@@ -455,6 +455,48 @@ mod warm_metric_tests {
     use super::*;
 
     #[test]
+    fn held_worker_snapshots_replace_aggregate_saturate_and_survive_failed_output() {
+        use crate::store::catalog::HeldSnapshot;
+        let workers = Metrics::for_workers(2).unwrap();
+        let snapshot = HeldSnapshot {
+            pages: 2,
+            payload_bytes: 17,
+            segments: 1,
+        };
+        workers[0].observe_held(snapshot);
+        workers[0].observe_held(snapshot);
+        workers[1].observe_held(snapshot);
+        let mut output = String::new();
+        workers[1].write_prometheus(&mut output).unwrap();
+        for (name, value) in HELD_METRICS.into_iter().zip([4, 34, 2]) {
+            assert!(output.contains(&format!("# TYPE {} gauge\n{} {value}\n", name.0, name.0)));
+        }
+        workers[0].observe_held(HeldSnapshot::default());
+        output.clear();
+        workers[0].write_held(&mut output).unwrap();
+        assert!(output.contains("racer_warm_held_payload_bytes 17\n"));
+        for worker in &workers {
+            worker.observe_held(HeldSnapshot {
+                pages: u64::MAX,
+                payload_bytes: u64::MAX,
+                segments: u64::MAX,
+            });
+        }
+        struct Full;
+        impl Write for Full {
+            fn write_str(&mut self, _: &str) -> std::fmt::Result {
+                Err(std::fmt::Error)
+            }
+        }
+        assert!(workers[1].write_held(&mut Full).is_err());
+        output.clear();
+        workers[0].write_held(&mut output).unwrap();
+        for (name, _) in HELD_METRICS {
+            assert!(output.contains(&format!("{name} {}\n", u64::MAX)));
+        }
+    }
+
+    #[test]
     fn node_registry_gauges_replace_without_multiplying_by_workers() {
         let workers = Metrics::for_workers(3).unwrap();
         let mut output = String::new();
@@ -2524,6 +2566,8 @@ pub struct Metrics {
 
     retention: ::telemetry::SnapshotShards<crate::retention::Snapshot>,
 
+    held: ::telemetry::SnapshotShards<crate::store::catalog::HeldSnapshot>,
+
     disks: ::telemetry::SnapshotShards<Vec<DiskUsage>>,
 
     shard: usize,
@@ -2558,6 +2602,11 @@ const RETENTION_METRICS: [(&str, &str); 9] = [
     ("racer_retention_heat_entries", "gauge"),
     ("racer_disk_pending_payload_bytes", "gauge"),
     ("racer_disk_indexed_payload_bytes", "gauge"),
+];
+const HELD_METRICS: [(&str, &str); 3] = [
+    ("racer_warm_held_pages", "gauge"),
+    ("racer_warm_held_payload_bytes", "gauge"),
+    ("racer_warm_held_segments", "gauge"),
 ];
 const DISK_CLASS_METRICS: [&str; 7] = [
     "racer_disk_class_publications_total",
@@ -2753,6 +2802,24 @@ impl Drop for RequestMetrics {
     }
 }
 impl Metrics {
+    pub(crate) fn observe_held(&self, snapshot: crate::store::catalog::HeldSnapshot) {
+        self.held.replace(self.shard, snapshot);
+    }
+
+    fn write_held(&self, out: &mut impl Write) -> std::fmt::Result {
+        let mut totals = [0u64; 3];
+        for snapshot in self.held.snapshots() {
+            for (total, value) in
+                totals
+                    .iter_mut()
+                    .zip([snapshot.pages, snapshot.payload_bytes, snapshot.segments])
+            {
+                *total = total.saturating_add(value);
+            }
+        }
+        ::telemetry::metrics::Exposition::new(HELD_METRICS).write(out, totals)
+    }
+
     /// Record a HEAD admission, job outcome, or GET wait transition once.
     /// Accepted includes coalesced admissions; completed/failed count job outcomes.
     /// WaitStarted counts registered waits, not registry misses or repeated polls.
@@ -2903,6 +2970,7 @@ impl Metrics {
         }
         let admission: Arc<[_]> = (0..count).map(|_| OnceLock::new()).collect();
         let retention = ::telemetry::SnapshotShards::new(count);
+        let held = ::telemetry::SnapshotShards::new(count);
         let disks = ::telemetry::SnapshotShards::new(count);
         Ok(::telemetry::Metrics::shards(count)
             .into_iter()
@@ -2911,6 +2979,7 @@ impl Metrics {
                 core,
                 admission: admission.clone(),
                 retention: retention.clone(),
+                held: held.clone(),
                 disks: disks.clone(),
                 shard,
             })
@@ -2954,6 +3023,7 @@ impl Metrics {
     pub fn write_prometheus(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         self.core.write_prometheus(out)?;
         self.write_retention(out)?;
+        self.write_held(out)?;
         self.write_disks(out)?;
         // Quota labels use runtime worker IDs. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
@@ -3805,6 +3875,11 @@ pub(crate) mod tests {
                             read_payload_bytes: u64::MAX,
                         }; 2],
                     });
+                    metrics.observe_held(crate::store::catalog::HeldSnapshot {
+                        pages: u64::MAX,
+                        payload_bytes: u64::MAX,
+                        segments: u64::MAX,
+                    });
                     admission
                 })
                 .collect();
@@ -3830,7 +3905,10 @@ pub(crate) mod tests {
             }
             let text = diagnostic_text(&telemetry, "/metrics");
             assert!(text.len() < MAX_RESPONSE_BYTES);
-            for (name, kind) in crate::telemetry::RETENTION_METRICS {
+            for (name, kind) in crate::telemetry::RETENTION_METRICS
+                .into_iter()
+                .chain(crate::telemetry::HELD_METRICS)
+            {
                 assert!(text.contains(&format!("# TYPE {name} {kind}\n{name} {}\n", u64::MAX)));
                 assert_eq!(
                     text.lines().filter(|line| line.starts_with(name)).count(),
@@ -4932,7 +5010,11 @@ pub(crate) mod tests {
             metrics.write_prometheus(&mut output).unwrap();
             assert_eq!(
                 output.lines().filter(|line| !line.starts_with('#')).count(),
-                EVENT_COUNT + GAUGE_COUNT + RETENTION_METRICS.len() + DISK_CLASS_METRICS.len() * 2
+                EVENT_COUNT
+                    + GAUGE_COUNT
+                    + RETENTION_METRICS.len()
+                    + HELD_METRICS.len()
+                    + DISK_CLASS_METRICS.len() * 2
             );
             assert_only_disk_class_labels(&output);
             assert!(output.len() < 64 * 1024);
@@ -5003,6 +5085,7 @@ pub(crate) mod tests {
                         EVENT_COUNT
                             + GAUGE_COUNT
                             + RETENTION_METRICS.len()
+                            + HELD_METRICS.len()
                             + DISK_CLASS_METRICS.len() * 2
                     );
                     assert_only_disk_class_labels(&output);

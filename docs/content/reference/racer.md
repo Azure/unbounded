@@ -264,16 +264,26 @@ storage or request state.
 | --- | --- |
 | `racer_warm_tracked_jobs` | Tracked versions, including completed jobs until expiry or removal; not just running fills |
 | `racer_warm_waiters` | Registered GET page waits for warm progress; excludes HEAD admissions and unregistered reads |
+| `racer_warm_held_pages` | Published indexed pages under live hard holds; excludes unused reservations and pending writes |
+| `racer_warm_held_payload_bytes` | Logical payload bytes of those pages, excluding tags, headers, and padding |
+| `racer_warm_held_segments` | Distinct segments containing those pages, summed across storage workers |
 
-The exporter also provides fixed counter hooks for warm admissions, job outcomes,
-and GET waits. Until their call sites are wired, these counters remain zero:
+Held gauges use each storage worker's latest health snapshot. Expired holds are
+excluded after both wall and monotonic deadlines pass. Recovered holds count even
+without a live warm job. Repeated samples replace worker values rather than add
+them; the node sum is not an atomic storage snapshot.
 
-| Counter | Meaning when recorded |
+Counters record retention decisions after metadata succeeds, admitted job outcomes,
+and genuine registered GET waits. Immediate warm hits, registry misses, and failed
+waiter registration do not count as waits. Caller disconnection does not change a
+detached admission's decision or count it twice.
+
+| Counter | Meaning |
 | --- | --- |
 | `racer_warm_accepted_total` | Accepted HEAD retention admissions, including coalesced requests |
 | `racer_warm_refused_total` | Refused HEAD retention admissions |
 | `racer_warm_completed_total` | Jobs that finished publishing their pages |
-| `racer_warm_failed_total` | Jobs that stopped before completion |
+| `racer_warm_failed_total` | Admitted jobs that stopped before completion, including abandoned drivers |
 | `racer_warm_wait_started_total` | Registered GET waits, counted once rather than on each poll |
 | `racer_warm_wait_completed_total` | Registered waits satisfied by warm publication |
 | `racer_warm_wait_fallback_total` | Registered waits released to normal Fill after warm stopped |

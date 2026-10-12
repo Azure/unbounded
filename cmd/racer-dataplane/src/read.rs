@@ -125,6 +125,7 @@ impl Coordinator {
         credentials: Rc<CredentialCrypto>,
         availability: Rc<crate::control::Availability>,
     ) -> Self {
+        streams.directory().warm.attach_metrics(&fill.metrics);
         Self {
             snapshots,
             metadata,
@@ -228,7 +229,12 @@ impl Coordinator {
                             )
                             .await
                             .ok(),
-                            Err(_) => None,
+                            Err(_) => {
+                                self.fill
+                                    .metrics
+                                    .warm_event(crate::telemetry::WarmEvent::Refused);
+                                None
+                            }
                         }
                     } else {
                         None
