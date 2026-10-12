@@ -8,4 +8,4 @@ patches:
 images:
   - name: racer-loadgen
     newName: ghcr.io/azure/racer-loadgen
-    newTag: f9a088a22a29cf8549e1945af833f508a14199d1
+    newTag: ee7aa7d2ab336da93106cc0d7f10874f71fb8207

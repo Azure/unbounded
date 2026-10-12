@@ -1,225 +1,150 @@
 # Racer-only Zipf benchmark
 
-Direct UDS, 512 x 2 GiB generic blobs (1 TiB shared), Zipf 0.5,
-seed `zipf-balanced-v1`, concurrency 16, no client
-hash verification. Loadgen and dataplane select `agentpool=ddsv6`. The overlay
-pins all three images to source tag `f9a088a22a29cf8549e1945af833f508a14199d1`.
-Confirm builds and image digests before deployment. SHA tags are not digest pins.
+## Final configuration
 
-`RACER_ADMISSION_MODE=second-sight` enables bounded disk retention for nonowned
-pages seen by a second logical reader. Owned pages remain eligible on first sight.
-Resource admission and integrity checks remain active; dirty-buffer pressure can
-skip optional persistence without failing the read. This changes only retention,
-not buffers, quotas, worker sizing, or the shared 1 TiB catalog. The seed stays
-`zipf-balanced-v1`. Do not erase existing disk data.
+100 loadgens use direct UDS on `agentpool=ddsv6`, sharing a deterministic
+16 TiB catalog: 16384 blobs of exactly 1073741824 bytes (1 GiB) each.
+The final loadgen arguments in `daemonset-patch.yaml` are:
 
-For this disk-hit experiment, patch only the admission-mode env value, guarded by
-the current DaemonSet resourceVersion, full spec, and old value. Capture all device
-identities and dataplane/loadgen specs and Pod UIDs first. Keep C16 running; do not
-pause or roll loadgens. After the authorized dataplane rollout, verify all 300 raw
-devices. If old processes still hold devices, wait for read-only exclusive-open
-checks to pass and retry only affected dataplane Pods. Never erase device data.
-
-Node budgets are plaintext 32 GiB, ciphertext 64 GiB, dirty 2 GiB, registered 2 GiB,
-and request contexts 1 GiB. Counts are flights 2048, queue entries 16384, client
-connections 16384, pipes 1024, and relay transfers 1024. Per-neighbor connections
-are 8, peer inflight maximum 1024, peer per-neighbor maximum 128, and active path
-searches 64. Optional path-cache settings remain unchanged. Worker sizing stays automatic;
-the target nodes select 21 I/O and 11 crypto workers. No Kubernetes limits are set.
-These budgets provide about 1.52 GiB plaintext and 3.05 GiB ciphertext per I/O
-worker. Phase 3 retains phase 2's payload budgets and raises the capacity package
-listed above together. Node quotas are divided by I/O workers, then outbound
-connections get one quarter: 195 slots per worker at 21 workers
-(`cmd/racer-dataplane/src/app.rs:2399-2414`, `admission.rs:134-142`). Total and
-ingress connection capacity also rise. Keep all other budgets, automatic threads,
-no CPU or memory limits, and three approved NVMe devices per node unchanged.
-Require fresh MemAvailable above 128 GiB on every node before changing budgets.
-Patch only the authorized capacity env values with JSON tests for resourceVersion,
-spec, and old env. Env names and defaults are in
-`cmd/racer-dataplane/src/config.rs:195-240`.
-Keep the existing 100% rollout and zero grace. Leave loadgens running with their
-current template, including the user's live `--blob-concurrency=4`, to avoid
-hashing the catalog again. Do not apply the loadgen overlay for this experiment.
-
-Change live request concurrency through `racer-loadgen-control`, not the Pod
-template. Each generic operation contains one blob, so `--blob-concurrency=4`
-does not increase parallel reads for this workload. Changing the Pod template
-restarts catalog hashing. Leave loadgen running when the experiment ends.
-
-October 9 results across all 100 loadgens (C means request concurrency):
-
-| Configuration | Concurrency | Gbit/s | Failed pulls |
-| --- | --- | --- | --- |
-| Connections only: 4096, payload 8/16 GiB | C16 | 945.0 | 83.66% |
-| Payload 32/64 GiB, connections 4096 | C16 | 1,116.6 | 78.05% |
-| Full capacity package above, final window | C16 | 1,668.3 | 0.0135% |
-| Full capacity package | C32 | 1,674.3 | 0.0135% |
-| Full capacity package, sustained 147-second check | C64 | 1,727.8 | 1.183% |
-
-C16 is the final setting. C32 missed the required 5% throughput gain; sustained
-C64 exceeded the 1% failure limit. Final C16 had 7,405 successes and one timeout,
-about 11.7% more throughput than the original 1,494 Gbit/s C8 reference. These
-tests do not isolate which limit helped or prove long-term reliability.
-
-The aggressive dataplane rollout caused NVMe device-busy errors and file-slab
-fallback on 93 nodes. Check raw-device selection after each rollout; recovery
-verified all 300 approved devices across 100 nodes, with 21/11 workers and no
-resource limits. Loadgens did not restart.
-
-`control.yaml` and the source startup fallback select 16. The live startup
-fallback remains 8; its mounted control file selects 16. Live
-`--blob-concurrency=4` and source `--blob-concurrency=1` remain unchanged.
-
-Each loadgen hashes the full catalog before origin readiness. Health and metrics
-start first; readiness remains false during hashing. Startup is bounded by
-`--startup-timeout=60m` and a readiness startup probe with 390 attempts at 10-second
-intervals (65 minutes). The probe leaves room for the application deadline.
-The prior 256 GiB catalog took about six minutes to hash; 1 TiB needs more headroom
-than the prior 25-minute deadline. This is not a workload duration; configured load continues
-after startup. Observe startup in bounded five-minute phases, not a full-length
-rollout wait. Record startup logs and restarts; readiness is false during hashing.
-The flatter exponent changes popularity only, not content. Changing it requires
-a loadgen restart and catalog hashing; existing dataplane cache data is retained.
-
-Use **2147483648 bytes per successful pull** for logical throughput. Do not reuse
-the old 64 MiB dashboard multiplier. Received bytes include failed partial reads;
-logical delivery is not network traffic or client-verified content. Measure fresh
-counter increments after warmup. Memory, disk, and peer counters count acquisition
-events across providers and requesters, not exclusive client-read outcomes.
-
-Only for a separately authorized catalog rollout, patch the loadgen as follows.
-Do not run this on the active C16 test; it restarts catalog hashing:
-
-```sh
-timeout --signal=TERM --kill-after=10s 60s kubectl --context=joolshev-nvme-test -n unbounded-system patch daemonset racer-loadgen --type=strategic --patch-file=deploy/racer-loadgen/zipf/daemonset-patch.yaml
+```text
+--backend=uds --volume=racer-loadgen --metrics-listen=:9090
+--catalog-blobs=16384 --blob-bytes=1073741824 --catalog-workers=32
+--seed=zipf-balanced-v2 --profile=zipf --zipf-exponent=1.1
+--concurrency=16 --concurrency-file=/etc/racer-loadgen-control/concurrency
+--blob-concurrency=1 --pull-timeout=2m --retry-delay=1s --interval=0s
+--verify=false --start-delay=10s --startup-timeout=120m
 ```
 
-First check the live context, control ConfigMap, image, and dataplane Pod UIDs.
-Verify those UIDs are unchanged afterward. This keeps the existing image, buffers,
-dataplane, volume, and control ConfigMap; do not apply the full overlay for this
-change. The 100% rollout restarts all loadgens and interrupts load during hashing.
+The Pod-template benchmark label is `racer.unbounded-cloud.io/benchmark=zipf-16t-v3`.
+`control.yaml` and the overlay startup fallback both select C16. Change live
+concurrency through `racer-loadgen-control`, not the Pod template: restarting a
+loadgen hashes the catalog again. Leave the current loadgens and C16 running.
 
-## Standalone bootstrap for operator v0.8.0
+Image tags:
 
-Read-only checks on 2026-10-09 found operator `v0.8.0` and neither Racer CRD
-on `joolshev-nvme-test`. The existing overrides ConfigMap has net entries.
-Do not apply these overrides to that operator or upgrade it just for this test.
-The published [v0.8.0 registry source](https://github.com/Azure/unbounded/blob/v0.8.0/internal/operator/reconciler.go#L94-L108)
-registers net, machina, gantry, token-refresher, metalman, and storage, not Racer.
-This was checked through the GitHub contents API, not Git history. The live image
-tag matches that release; its exact binary provenance was not checked.
+- Loadgen: `ghcr.io/azure/racer-loadgen:ee7aa7d2ab336da93106cc0d7f10874f71fb8207`.
+- Controller and dataplane: `ghcr.io/azure/racer-{controller,dataplane}:f9a088a22a29cf8549e1945af833f508a14199d1`.
 
-Current source supports Racer workload overrides, but only for workloads it
-already generates (`internal/operator/override/resolve.go:50-76`). The controller
-does not create dataplanes (`internal/racer/workload/workload.go:4-5`). A standalone
-controller alone is therefore not a deployment solution. A separate standalone
-installation needs current CRDs, active admission policies before RBAC, serving
-TLS and bootstrap trust, a new installation identity, and a generated dataplane
-workload. It must not compete with an operator for these resources. That complete
-standalone bootstrap is provided by `hack/cmd/racer-bootstrap`. It calls only the
-existing Racer component planner and executor, including the staged identity and
-TLS protocols and authoritative dataplane builder. It never runs the full Site
-reconciler. Leave the shared overrides ConfigMap untouched: the tool reads this
-directory's local override document instead. Never reset an existing marker.
+The reported loadgen image build, GitHub Actions run `38062921220`, succeeded.
+The loadgen tag matches `kustomization.yaml` and `render_test.py`; SHA tags are
+not digest pins. Confirm resolved image digests before any separately authorized
+deployment. Do not change the current image pins.
 
-For the verified Racer-free v0.8.0 operator, run these bounded phases:
+### Startup bounds and source contract
+
+Every loadgen hashes all 16 TiB before origin readiness. Health and metrics start
+first; readiness stays false during hashing. The application startup deadline is
+120 minutes. The readiness startup probe allows 780 attempts at 10-second
+intervals (130 minutes). This is not a load duration; no `--duration` is set.
+Observe startup in bounded five-minute phases, not one full-length rollout wait.
+
+`--catalog-workers` accepts 1-64 workers and requires `--catalog-blobs`.
+The catalog limit is 32768 blobs. The configured 32 workers bound hashing
+parallelism; each reuses a 128 KiB scratch buffer, and only metadata survives
+hashing. No CPU or memory limits are added for these workers.
+
+Source references, relative to the repository root:
+
+- Flags and validation: `cmd/racer-loadgen/main.go:66-70,140-145`.
+- Catalog limits, worker buffers, and one-blob operations:
+  `cmd/racer-loadgen/blob.go:22-26,95-164`.
+- Health serving, startup deadline, catalog generation, and readiness:
+  `cmd/racer-loadgen/main.go:266-296,335-374`.
+- Unit assertions for worker bounds, stable content, and catalog size:
+  `cmd/racer-loadgen/blob_catalog_workers_test.go:20-88`.
+
+### Dataplane budgets
+
+`racer-overrides.yaml` sets 48 GiB plaintext, 64 GiB ciphertext, 2 GiB each
+for dirty and registered buffers, and 1 GiB for request contexts. Count quotas
+remain flights 2048, queue entries 16384, client connections 16384, pipes 1024,
+and relay transfers 1024. Per-neighbor connections are 8, peer inflight maximum
+1024, peer per-neighbor maximum 128, and active path searches 64.
+Optional path-cache settings and automatic worker sizing remain unchanged.
+The target nodes use 21 I/O and 11 crypto workers, with no Kubernetes CPU or
+memory limits. Check final Pod specs and namespace LimitRanges for injected limits.
+
+Plaintext and ciphertext budgets provide about 2.29 and 3.05 GiB per I/O worker.
+Client connections are divided by I/O workers, then outbound connections get one
+quarter: 195 slots per worker. See `cmd/racer-dataplane/src/app.rs:2399-2418`
+and `cmd/racer-dataplane/src/admission.rs:134-142`.
+
+`RACER_ADMISSION_MODE=second-sight` remains the disk-retention policy, not a new
+memory-admission policy. No second-sight memory admission was added. Repeated
+nonowner reads can retain verified ciphertext; resource admission and integrity
+checks still apply. The mode default is in `cmd/racer-dataplane/src/config.rs:177-181`
+and its retention wiring is in `cmd/racer-dataplane/src/app.rs:1281-1289`.
+Disk data, devices, count quotas, and other buffers remain unchanged.
+
+## Latest reported results
+
+Two fresh windows with the final configuration reported:
+
+| Window | Memory events | Disk events | Peer events | Successful payload |
+| --- | --- | --- | --- | --- |
+| 1 | 29.47% | 42.40% | 28.13% | 3.965 Tbit/s |
+| 2 | 30.18% | 42.50% | 27.32% | 4.069 Tbit/s |
+
+The final drift check counted 60,957 successes and zero errors across all 100 nodes.
+These are warm-up observations, not steady-state balance: indexed disk payload
+was still growing by about 4.5 TB over 130 seconds. Earlier windows had 31-32%
+memory, 34-37% disk, and 32-34% peer events; disk share has since increased.
+All categories remain active, but the ideal 25-40% range no longer holds for disk.
+They do not establish a
+sustained balance improvement from the plaintext budget change.
+
+Use **1073741824 bytes per completed successful operation** for logical
+throughput (`cmd/racer-loadgen/blob.go:149`, `cmd/racer-loadgen/pull.go:251-281,314-324`).
+This is not wire traffic or client-verified goodput. Memory, disk, and peer shares
+are nonexclusive hit events, not client-read outcomes; a peer page can also count
+on its serving node. Exclude rollout and startup from measurement.
+
+The dashboard selects scraped label
+`racer_unbounded_cloud_io_benchmark="zipf-16t-v3"` with namespace, job, and app
+selectors. Do not label old Pods or reuse this label for another size or exponent.
+Missing labeled successful-counter samples mean no data, not zero. Check coverage
+of all 100 loadgens and wait for a full five-minute window after readiness.
+See [the dashboard guide](../../racer/grafana-direct-zipf-README.md) for queries
+and physical-disk accounting limits.
+
+## Rollout and NVMe safety
+
+This configuration is a reproduction reference, not authorization for another
+rollout, load pause, disk reset, or loadgen restart. Both benchmark DaemonSets
+use 100% maximum unavailability and zero termination grace. These settings can
+interrupt all reads and lose recent checkpoints; zero grace is not a safe drain.
+
+**Verify all 300 approved NVMe devices across all 100 nodes after every dataplane
+rollout.** Prior rollouts left devices busy and caused file-slab fallback.
+Readiness alone does not prove raw-device use. Resolve IDs from current node
+annotations, check selected identities and raw-device logs, and confirm all
+100 dataplanes use the expected workers and resource settings.
+
+If fallback occurs, recover only affected Pod UIDs after old processes exit and
+read-only exclusive-open checks pass for all three approved devices on each
+affected node. Preserve loadgen specs, UIDs, restart counts, and C16. Never wipe
+disks, edit guards, change selectors, or retry the whole fleet blindly. Keep each
+recovery phase bounded and record the exact pending checkpoint.
+
+No generic disk selector is supplied. For a new installation, approve explicit
+per-node device IDs, excluding OS disks, partitions, mounts, holders, and protected
+data. Never clear device guards automatically. See the
+[raw-device reference](../../../docs/content/reference/racer.md).
+
+## Reproduction checks
+
+Run from the repository root; these commands are local checks, not deployment:
 
 ```sh
-timeout --signal=TERM --kill-after=10s 60s kubectl --context=joolshev-nvme-test apply -f deploy/racer/crd/
-timeout --signal=TERM --kill-after=10s 300s go build -o bin/racer-bootstrap ./hack/cmd/racer-bootstrap
-timeout --signal=TERM --kill-after=10s 250s bin/racer-bootstrap --context=joolshev-nvme-test --apply
-```
-
-The bootstrap command installs policies and bindings and waits for their type checks
-before granting RBAC. It creates the benchmark volume, installation identity,
-serving TLS, configuration, and controller. It creates the dataplane only after
-the controller commits valid installation state. Restart the command after an
-interrupted phase; it recovers through existing staged state, not a new UUID.
-It refuses another operator version and never updates an existing dataplane.
-The parent owns device annotations, dataplane restarts, and load enablement.
-For an existing standalone dataplane, apply its local override separately; the
-bootstrap command intentionally leaves it unchanged. With the rollout authorized:
-
-```sh
-timeout --signal=TERM --kill-after=10s 60s bash -o pipefail -c 'python3 -c '\''import json,yaml; d=yaml.safe_load(open("deploy/racer-loadgen/zipf/racer-overrides.yaml")); print(json.dumps(next(e["patch"] for e in d["overrides"] if e["kind"] == "DaemonSet" and e["name"] == "racer-dataplane")))'\'' | kubectl --context=joolshev-nvme-test -n unbounded-system patch daemonset racer-dataplane --type=strategic --patch-file=/dev/stdin'
-```
-
-This is a bounded bootstrap tool, not a continuous TLS-maintenance service. Rerun
-it for Racer TLS upkeep well before the 14-day serving leaf expires; it may roll
-controllers. Do not introduce a second manager without reviewing ownership.
-
-Standalone bootstrap is required on v0.8.0; applying the loadgen overlay or the
-shared overrides alone cannot install Racer. After bootstrap and the NVMe gate
-below, deploy loadgen paused, leaving the shared overrides ConfigMap untouched:
-
-```sh
-timeout --signal=TERM --kill-after=10s 60s bash -o pipefail -c 'kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/racer-loadgen/zipf-paused | kubectl --context=joolshev-nvme-test apply -f -'
-```
-
-Confirm every loadgen reports applied concurrency zero and no in-flight reads.
-After checking dataplane raw-device selection and Pod resource limits, enable
-load with the concurrency patch shown below, using `"8"`.
-
-With a verified compatible Racer manager, use `racer-overrides.yaml` for the two
-Racer workloads only. Current dataplane defaults have resource requests and no
-limits (`internal/operator/components/racer/racer.go:276-282`). Overrides reject
-null deletion, so this file deliberately does not claim `limits: {}` removes
-existing limits. Check the final Pod spec and namespace LimitRanges; stop if CPU
-or memory limits are injected. Do not alter unrelated overrides to fix this.
-
-Both benchmark DaemonSets request 100% unavailability and zero termination grace.
-This can interrupt all reads and lose recent checkpoints. Normally pause and drain
-load before changing dataplanes; zero grace is not a safe drain mechanism. For this
-authorized disposable-cache experiment, the parent permits rollouts with C16 active
-and requires loadgens to stay running without a rollout or pause.
-Exclude rollout and catalog startup from cache-balance measurements.
-
-## NVMe gate
-
-No disk selector is shipped. There is no safe generic "all NVMe" selector.
-Inventory each node's by-id targets and approve only disposable local devices,
-excluding OS disks, partitions, mounted devices, holders, and protected data.
-Use an anchored explicit ID allowlist per node. First and last 1 MiB must already
-be zero. Never clear them automatically. Startup may silently use file slabs or
-only a subset of the devices; verify raw-device logs and selected identities on
-every node before enabling load. See `docs/content/reference/racer.md:111-185`.
-
-## Render and validate
-
-Run at repository root. The helper prints a merge patch; it does not call kubectl.
-Its resourceVersion guards against a concurrent edit. It adds only the dedicated
-`racer-zipf.yaml` data key, preserving the existing net entries. A conflicting
-existing key is rejected. Save output only in project-local scratch space.
-
-```sh
-timeout --signal=TERM --kill-after=10s 300s python3 -B deploy/racer-loadgen/zipf/render_test.py
+timeout --signal=TERM --kill-after=10s 280s python3 -B deploy/racer-loadgen/zipf/render_test.py
+timeout --signal=TERM --kill-after=10s 280s python3 -B deploy/racer/grafana_direct_zipf_test.py
 timeout --signal=TERM --kill-after=10s 60s kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/racer-loadgen/zipf
 ```
 
-The following override-ConfigMap path is ONLY for a compatible full operator,
-not the v0.8.0 standalone path above. After all gates pass:
-
-```sh
-timeout --signal=TERM --kill-after=10s 60s bash -o pipefail -c 'kubectl --context=joolshev-nvme-test -n unbounded-system get cm unbounded-component-overrides -o json | python3 -B deploy/racer-loadgen/zipf/override_patch.py > tmp/racer-zipf-overrides.patch.json'
-# Review the patch before this mutation. It must contain only racer-zipf.yaml.
-timeout --signal=TERM --kill-after=10s 60s kubectl --context=joolshev-nvme-test -n unbounded-system patch cm unbounded-component-overrides --type=merge --patch-file=tmp/racer-zipf-overrides.patch.json
-timeout --signal=TERM --kill-after=10s 60s kubectl --context=joolshev-nvme-test apply -f deploy/racer-loadgen/direct/volume.yaml
-# Wait for manager reconciliation, then check both Racer workloads and raw mode.
-timeout --signal=TERM --kill-after=10s 60s bash -o pipefail -c 'kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/racer-loadgen/zipf | kubectl --context=joolshev-nvme-test apply -f -'
-```
-
-The last command starts at C16. For a paused first deployment, use
-`deploy/racer-loadgen/zipf-paused` instead of `deploy/racer-loadgen/zipf` in the
-render/apply command. This changes the control ConfigMap to `"0"`.
-For an existing deployment, the following pauses reads without removing origins:
-
-```sh
-timeout --signal=TERM --kill-after=10s 60s kubectl --context=joolshev-nvme-test -n unbounded-system patch cm racer-loadgen-control --type=merge -p '{"data":{"concurrency":"0"}}'
-```
-
-Wait for projected ConfigMap updates, applied concurrency zero, and in-flight zero
-on every loadgen. For a new deployment, start cautiously at `"8"` and validate
-before raising concurrency. Reapplying the overlay selects C16 and may restart
-loadgens; do not use it to control an active experiment or retain a pause. A readiness
-probe proves origin readiness, not successful cache reads. Inspect acquisition
-errors and received bytes; verify=false does not credit verified-byte metrics.
+Do not reapply the overlay to control the active experiment: it selects C16 and
+may restart loadgens. `zipf-paused` is for a separately authorized new deployment.
+The loadgen overlay alone does not install Racer. On the previously checked
+Racer-free operator v0.8.0 installation, use the separate bootstrap path in
+`hack/cmd/racer-bootstrap`, not shared operator overrides. A compatible manager
+must own Racer workloads before using the local overrides; preserve unrelated
+ConfigMap entries. Never reset installation identity or run competing managers.

@@ -1,4 +1,4 @@
-# Direct Zipf dashboard: 512 x 2 GiB (1 TiB catalog)
+# Direct Zipf dashboard: 16384 x 1 GiB (16 TiB catalog)
 
 `grafana-direct-zipf.json` has five panels. Its UID is `racer-direct-zipf`.
 Use datasource UID `prometheus`, 60-second scrapes, and the existing
@@ -6,10 +6,11 @@ Use datasource UID `prometheus`, 60-second scrapes, and the existing
 `unbounded-system`.
 
 Run only the intended `racer-loadgen` workload in the selected namespace:
-direct UDS, `--catalog-blobs=512`, `--blob-bytes=2147483648`,
-`--seed=zipf-balanced-v1`, `--profile=zipf`, and `--zipf-exponent=0.5`.
+direct UDS, `--catalog-blobs=16384`, `--blob-bytes=1073741824`,
+shared `--seed=zipf-balanced-v2`, `--profile=zipf`, and `--zipf-exponent=1.1`
+(Zipf exponent 1.1), with 32 catalog workers (`--catalog-workers=32`).
 The second-sight local disk retention experiment keeps C16,
-32 GiB plaintext, 64 GiB ciphertext, and 2 GiB each for dirty and registered
+48 GiB plaintext, 64 GiB ciphertext, and 2 GiB each for dirty and registered
 buffers. `RACER_ADMISSION_MODE=second-sight` is the runtime default. Repeated
 nonowner reads can admit verified ciphertext to local disk, subject to resource
 limits. A retry within the same logical read is not a second sight. Resource
@@ -17,6 +18,9 @@ admission remains enforced; disk retention does not bypass dirty-buffer limits.
 This configuration does not imply balanced hit shares. Treat post-rollout
 observations as warm-up, not steady state; a full query window alone does not
 prove steady state.
+
+This dashboard update does not change dataplane quotas, devices, worker sizing,
+or resource limits. Provision only the dashboard ConfigMap key below.
 
 The mode default is in `cmd/racer-dataplane/src/config.rs`; `app.rs` wires it to
 the shared retention policy. The tests in `src/read/tests/fill.rs`
@@ -30,18 +34,35 @@ The node average divides by distinct discovered `racer-dataplane` nodes,
 including down scrape targets, not expected fleet size.
 
 The size multiplier is fixed. The success counter has no blob-size label.
-Both throughput queries join on job, namespace, and pod with
-`process_start_time_seconds >= 1791576350` (2026-10-09 20:05:50 UTC).
-This rollout boundary excludes old 512 MiB and 64 MiB processes, including
-historical windows. All 100 new processes were observed starting after that
-boundary. Missing process metrics or successful new-pod samples leave no data,
-not a zero or an inflated old-size result. Wait for new-pod readiness and a full
-five-minute window before interpreting throughput. The boundary is not a size
-label: do not mix later loadgen sizes in this namespace. When reusing this
-dashboard for another size, change both multipliers and the rollout boundary.
+Both throughput queries select the Pod-template label
+`racer.unbounded-cloud.io/benchmark=zipf-16t-v3`, scraped as
+`racer_unbounded_cloud_io_benchmark="zipf-16t-v3"`. Keep the namespace, job, and
+`app_kubernetes_io_name="racer-loadgen"` selectors. Old and unlabeled loadgens are
+excluded. The prior exponent 1.0 run used `zipf-16t-v2` with the same catalog
+bytes and v2 seed. The v3 label separates popularity changes, not content changes.
+Do not label old Pods or reuse this label for another blob size or exponent.
+Missing labeled successful-pull samples leave no data, not zero, including
+during catalog hashing. Wait for new-pod
+readiness and a full five-minute window before interpreting throughput.
+When changing sizes, change the benchmark label and both multipliers together.
+
+Check the number of labeled loadgens contributing successful-counter samples
+to the five-minute rate, not all discovered Pods or request-counter samples:
+
+```promql
+count(rate(racer_loadgen_pulls_total{job="kubernetes-pods",namespace="${namespace}",app_kubernetes_io_name="racer-loadgen",racer_unbounded_cloud_io_benchmark="zipf-16t-v3",result="success"}[5m]))
+```
+
+This counts eligible series, not successful operations or scrapes. With one
+scrape target per loadgen, expect 100 after rollout and enough samples; verify
+discovery separately. A zero rate can still be counted, and no matching series
+returns no data. The source counter increments once per completed operation
+(`cmd/racer-loadgen/pull.go:251-281`); `result="success"` requires no error
+(`pull.go:314-324`). Generic batches contain one blob
+(`cmd/racer-loadgen/blob.go:149`).
 
 The cache panel shows shares of memory, disk, and peer **hit events**, excluding
-origin fills. It is not a client cache-hit ratio or byte breakdown. A peer page
+origin fills. These events are nonexclusive, not a client cache-hit ratio or byte breakdown. A peer page
 can also count as a memory or disk hit on its serving node. Missing data and
 idle cache-hit ratios stay undefined.
 

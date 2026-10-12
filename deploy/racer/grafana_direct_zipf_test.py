@@ -1,8 +1,8 @@
 """Offline checks for the fixed-config Direct Zipf dashboard."""
 
-import datetime
 import json
 import pathlib
+import re
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -60,13 +60,13 @@ class DashboardTest(unittest.TestCase):
 
     def test_experiment_buffer_descriptions(self):
         readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
-        self.assertEqual(DASHBOARD["version"], 6)
+        self.assertEqual(DASHBOARD["version"], 8)
         for text in (DASHBOARD["description"], readme):
-            self.assertIn("32 GiB plaintext, 64 GiB ciphertext", text)
+            self.assertIn("48 GiB plaintext, 64 GiB ciphertext", text)
             self.assertIn("2 GiB each for dirty and", text)
-            for stale in ("4 GiB plaintext", "8 GiB plaintext",
+            for stale in ("4 GiB plaintext", "8 GiB plaintext", "32 GiB plaintext",
                           "8 GiB ciphertext", "16 GiB ciphertext"):
-                self.assertNotIn(stale, text)
+                self.assertNotRegex(text, r"\b" + re.escape(stale))
 
     def test_second_sight_retention_descriptions(self):
         readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
@@ -83,23 +83,34 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("same logical read is not a second sight", readme)
         self.assertIn("does not bypass dirty-buffer limits", readme)
 
-    def test_rollout_gate_excludes_old_size_and_missing_process_metrics(self):
-        boundary = int(datetime.datetime(2026, 10, 9, 20, 5, 50,
-                                        tzinfo=datetime.timezone.utc).timestamp())
-        self.assertEqual(boundary, 1791576350)
-        gate = ('and on (job, namespace, pod) '
-                '(process_start_time_seconds{job="kubernetes-pods",'
-                'namespace="${namespace}",app_kubernetes_io_name="racer-loadgen"}'
-                f' >= {boundary})')
-        for panel in DASHBOARD["panels"][:2]:
-            expression = panel["targets"][0]["expr"]
-            self.assertIn(gate, expression)
-            self.assertIn('* 2147483648 * 8 / 1e9', expression)
-            self.assertIn('result="success"}[5m]', expression)
-            self.assertNotIn(" bool ", expression)
-            self.assertNotIn("536870912", expression)
-        self.assertIn("1 TiB catalog", DASHBOARD["title"])
-        self.assertIn("512 x 2147483648-byte", DASHBOARD["description"])
+    def test_benchmark_gate_excludes_old_or_unlabeled_loadgens(self):
+        selector = ('{job="kubernetes-pods",namespace="${namespace}",'
+                    'app_kubernetes_io_name="racer-loadgen",'
+                    'racer_unbounded_cloud_io_benchmark="zipf-16t-v3",result="success"}')
+        rate = 'rate(racer_loadgen_pulls_total' + selector + '[5m])'
+        total = 'sum(' + rate + ') * 1073741824 * 8 / 1e9'
+        self.assertEqual(DASHBOARD["panels"][0]["targets"][0]["expr"], total)
+        self.assertEqual(DASHBOARD["panels"][1]["targets"][0]["expr"],
+                         '(' + total + ') / count(group by (node) '
+                         '(up{job="kubernetes-pods",namespace="${namespace}",'
+                         'app_kubernetes_io_name="racer-dataplane"}))')
+        readme = (ROOT / "grafana-direct-zipf-README.md").read_text()
+        # Count only new loadgens with enough successful-counter samples for rate.
+        self.assertIn('count(' + rate + ')', readme)
+        for text in (json.dumps(DASHBOARD), readme):
+            self.assertNotIn("1791576350", text)
+            self.assertNotIn("process_start_time_seconds", text)
+            self.assertNotIn("2147483648", text)
+        self.assertIn("16 TiB catalog", DASHBOARD["title"])
+        self.assertIn("16384 x 1073741824-byte", DASHBOARD["description"])
+        for text in (DASHBOARD["description"], readme):
+            normalized = " ".join(text.split())
+            for required in ("zipf-balanced-v2", "exponent 1.1", "32 catalog workers",
+                             "catalog hashing", "nonexclusive",
+                             "no data", "not zero"):
+                self.assertIn(required, normalized)
+            for stale in ("not known yet", "before rollout", "120 minutes", "130 minutes"):
+                self.assertNotIn(stale, normalized)
 
 
 if __name__ == "__main__":
