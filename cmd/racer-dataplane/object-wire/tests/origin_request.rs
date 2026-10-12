@@ -1,0 +1,88 @@
+use http1::StartLine;
+use racer_object_wire::{CacheKey, Error, origin};
+
+#[test]
+fn head_and_get_preserve_request_fields() {
+    let key = CacheKey([0xab; 32]);
+    for method in ["HEAD", "GET"] {
+        for (metadata, authorization) in [
+            (None, None),
+            (Some(b"a,\\b\x80".as_slice()), None),
+            (None, Some(b"Bearer \xff".as_slice())),
+            (
+                Some(b"a,\\b\x80".as_slice()),
+                Some(b"Bearer \xff".as_slice()),
+            ),
+        ] {
+            let head = origin::request(&key, method, metadata, authorization).unwrap();
+            assert!(matches!(
+                &head.start,
+                StartLine::Request { method: actual, target }
+                    if actual == method && target == &format!("/v1/objects/{}", key.to_hex())
+            ));
+            assert_eq!(head.unique("Host").unwrap(), Some(b"racer".as_slice()));
+            assert_eq!(
+                head.unique("Content-Length").unwrap(),
+                Some(b"0".as_slice())
+            );
+            assert_eq!(head.unique("Racer-Metadata").unwrap(), metadata);
+            assert_eq!(head.unique("Authorization").unwrap(), authorization);
+            assert_eq!(
+                head.headers.len(),
+                2 + usize::from(metadata.is_some()) + usize::from(authorization.is_some())
+            );
+        }
+    }
+}
+
+#[test]
+fn unsupported_and_malformed_methods_are_rejected() {
+    let key = CacheKey([0xab; 32]);
+    for method in [
+        "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE", "CUSTOM", "head", "get",
+        "Head", "Get", "", " GET", "GET ", "HEAD\t", "GET\r\n", "GÉT",
+    ] {
+        assert!(
+            matches!(
+                origin::request(&key, method, None, None),
+                Err(Error::MethodNotAllowed)
+            ),
+            "method: {method:?}"
+        );
+    }
+}
+
+#[test]
+fn allowed_methods_still_validate_opaque_context() {
+    let key = CacheKey([0xab; 32]);
+    let oversized = vec![b'x'; 8193];
+    for method in ["HEAD", "GET"] {
+        for value in [
+            b"".as_slice(),
+            b" padded",
+            b"padded ",
+            b"tab\tvalue",
+            b"line\r\nbreak",
+            b"nul\0value",
+            b"del\x7fvalue",
+            oversized.as_slice(),
+        ] {
+            for (metadata, authorization) in [(Some(value), None), (None, Some(value))] {
+                assert!(matches!(
+                    origin::request(&key, method, metadata, authorization),
+                    Err(Error::InvalidRequest)
+                ));
+            }
+        }
+        let boundary = vec![b'x'; 8192];
+        let head = origin::request(&key, method, Some(&boundary), Some(&boundary)).unwrap();
+        assert_eq!(
+            head.unique("Racer-Metadata").unwrap(),
+            Some(boundary.as_slice())
+        );
+        assert_eq!(
+            head.unique("Authorization").unwrap(),
+            Some(boundary.as_slice())
+        );
+    }
+}

@@ -13,6 +13,9 @@ pub fn request(
     metadata: Option<&[u8]>,
     authorization: Option<&[u8]>,
 ) -> Result<MessageHead> {
+    if !matches!(method, "HEAD" | "GET") {
+        return Err(Error::MethodNotAllowed);
+    }
     let target = format!("/v1/objects/{}", key.to_hex());
     let mut headers = vec![
         http1::Header::new("Host", b"racer"),
