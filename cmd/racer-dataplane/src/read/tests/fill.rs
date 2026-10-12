@@ -44,9 +44,11 @@ fn bounded_admission_prefetched_bootstrap_fails_without_waiting() {
 fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut fixtures = [fixture(), fixture()];
     let clock = uring_runtime::environment::SimulationClock::new(751);
     let _environment = clock.environment(0).enter();
+    // Crypto captures its clock at construction; match the request clock even
+    // when this test runs long after the process-wide simulation anchor.
+    let mut fixtures = [fixture(), fixture()];
     for f in &mut fixtures {
         let admission = f.fill.dependencies.admission.clone();
         let held = admission
