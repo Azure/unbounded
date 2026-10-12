@@ -246,6 +246,25 @@ jobs:
       - name: Test HTTP all features with real I/O
         run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p http1 --all-features
 
+      - name: Check wire libraries without test features
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p peer-wire --lib --no-default-features
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-object-wire --lib --no-default-features
+
+      - name: Test wire libraries separately
+        run: |
+          for package in peer-wire racer-object-wire; do
+            timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p "$package"
+            timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p "$package" --all-features
+          done
+
+      - name: Strict wire library Clippy
+        run: |
+          for package in peer-wire racer-object-wire; do
+            timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p "$package" --all-targets --no-default-features -- -D warnings
+            timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p "$package" --all-targets --all-features -- -D warnings
+          done
+
   racer-verbs:
     name: Racer Verbs (${{ matrix.configuration }})
     runs-on: ubuntu-24.04
