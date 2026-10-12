@@ -634,6 +634,11 @@ func normalizeManagedKubeProxyDaemonSetDefaults(ds *appsv1.DaemonSet) {
 		podSpec.SchedulerName = corev1.DefaultSchedulerName
 	}
 
+	if podSpec.EnableServiceLinks == nil {
+		enableServiceLinks := corev1.DefaultEnableServiceLinks
+		podSpec.EnableServiceLinks = &enableServiceLinks
+	}
+
 	normalizeContainerDefaults(podSpec.InitContainers)
 	normalizeContainerDefaults(podSpec.Containers)
 }

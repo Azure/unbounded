@@ -450,6 +450,30 @@ func TestEnsureDaemonSetUpdatesGenuineDrift(t *testing.T) {
 	}
 }
 
+func TestEnsureDaemonSetRepairsDisabledServiceLinks(t *testing.T) {
+	t.Parallel()
+
+	site := kubeProxyTestSite()
+	c, clientset := newKubeProxyTestController(t, nil, nil)
+	drifted := c.daemonSetForSite(site, "100.125.0.0/16")
+	drifted.Spec.Template.Spec.EnableServiceLinks = boolPtr(false)
+	addDaemonSetToLister(t, c, drifted)
+
+	if _, err := clientset.AppsV1().DaemonSets("unbounded-net").Create(t.Context(), drifted.DeepCopy(), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed live daemonset: %v", err)
+	}
+
+	clientset.ClearActions()
+
+	if err := c.ensureDaemonSet(t.Context(), site); err != nil {
+		t.Fatalf("ensureDaemonSet: %v", err)
+	}
+
+	if got, want := actionVerbs(clientset.Actions()), []string{"get", "update"}; !slices.Equal(got, want) {
+		t.Fatalf("client actions = %v, want %v", got, want)
+	}
+}
+
 func TestEnsureDaemonSetRepairsOwnedLabelDrift(t *testing.T) {
 	t.Parallel()
 
@@ -659,6 +683,7 @@ func applyManagedKubeProxyServerDefaults(ds *appsv1.DaemonSet) {
 	terminationGracePeriodSeconds := int64(corev1.DefaultTerminationGracePeriodSeconds)
 	podSpec.TerminationGracePeriodSeconds = &terminationGracePeriodSeconds
 	podSpec.SchedulerName = corev1.DefaultSchedulerName
+	podSpec.EnableServiceLinks = boolPtr(corev1.DefaultEnableServiceLinks)
 
 	for i := range podSpec.InitContainers {
 		podSpec.InitContainers[i].TerminationMessagePath = corev1.TerminationMessagePathDefault
