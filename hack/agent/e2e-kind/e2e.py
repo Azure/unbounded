@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import functools
 import hashlib
 import json
 import os
@@ -70,11 +71,14 @@ import subprocess
 import sys
 import textwrap
 import time
+import urllib.parse
 from dataclasses import dataclass, field, replace
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from threading import Thread
 from typing import Any, Callable
+
+import ukiboot
 
 # ---------------------------------------------------------------------------
 # Paths and defaults
@@ -89,6 +93,8 @@ VM_SUBNET = os.environ.get("VM_SUBNET", "192.168.100")
 VM_IP = os.environ.get("VM_IP", f"{VM_SUBNET}.10")
 VM_GATEWAY = f"{VM_SUBNET}.1"
 VM_DIR = Path(os.environ.get("VM_DIR", str(REPO_ROOT / ".vm-e2e")))
+# Uploaded by the CI logs action.
+LOGS_DIR = REPO_ROOT / "logs"
 HOST_BASE_OS = os.environ.get("HOST_BASE_OS", "ubuntu2404")
 HOST_IMAGE_URL = os.environ.get("HOST_IMAGE_URL", "")
 VM_SSH_USER = os.environ.get("VM_SSH_USER", "ubuntu")
@@ -99,6 +105,16 @@ KIND_CONTAINER = f"{KIND_CLUSTER_NAME}-control-plane"
 AGENT_MACHINE_NAME = os.environ.get("AGENT_MACHINE_NAME", "agent-e2e")
 AGENT_DEBUG = os.environ.get("AGENT_DEBUG", "")
 OFFLINE_BOOTSTRAP = os.environ.get("OFFLINE_BOOTSTRAP", "").lower() in ("1", "true", "yes")
+# Beside the host root, where the agent docs suggest hosts stage files.
+OFFLINE_ARTIFACTS_DIR = "/opt/unbounded/artifacts"
+
+# A release before the host root. The migration suite installs it, and returns
+# to it after moving to this build. The default is the latest published one,
+# which is what hosts being moved most likely run. Its layout under /usr/local
+# is the one v0.8.0, the earlier default, has.
+LEGACY_AGENT_VERSION = os.environ.get("LEGACY_AGENT_VERSION", "v0.12.0")
+LEGACY_AGENT_RELEASE_URL = f"https://github.com/Azure/unbounded/releases/download/{LEGACY_AGENT_VERSION}"
+LEGACY_AGENT_TARBALL = "unbounded-agent-linux-amd64.tar.gz"
 
 # Site name used when generating the bootstrap script via kubectl-unbounded.
 E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
@@ -145,11 +161,19 @@ TEST_NS = "e2e-workload-test"
 UNBOUNDED_NS = "unbounded-system"
 E2E_WORKLOAD_IMAGE = "docker.io/library/busybox:1.36"
 MACHINE_CONFIG_NAME = f"{AGENT_MACHINE_NAME}-config"
-DAEMON_BINARY = "/usr/local/bin/unbounded-agent"
-DAEMON_BINARY_BLUE = "/usr/local/bin/unbounded-agent-blue"
-DAEMON_BINARY_GREEN = "/usr/local/bin/unbounded-agent-green"
-DAEMON_BINARY_CURRENT = "/usr/local/bin/unbounded-agent-current"
-DAEMON_BINARY_LAST_GOOD = "/usr/local/bin/unbounded-agent-last-good"
+# The agent's host root, and where agents released before it installed their
+# files. A host installed by an older agent keeps its files under the legacy
+# root, and the current agent links the host root to it. The root's parent is
+# not the agent's: hosts stage files there, such as offline artifacts.
+HOST_ROOT_PARENT = "/opt/unbounded"
+HOST_ROOT = f"{HOST_ROOT_PARENT}/agent"
+LEGACY_HOST_ROOT = "/usr/local"
+DAEMON_BIN_DIR = f"{HOST_ROOT}/bin"
+DAEMON_BINARY = f"{DAEMON_BIN_DIR}/unbounded-agent"
+DAEMON_BINARY_BLUE = f"{DAEMON_BIN_DIR}/unbounded-agent-blue"
+DAEMON_BINARY_GREEN = f"{DAEMON_BIN_DIR}/unbounded-agent-green"
+DAEMON_BINARY_CURRENT = f"{DAEMON_BIN_DIR}/unbounded-agent-current"
+DAEMON_BINARY_LAST_GOOD = f"{DAEMON_BIN_DIR}/unbounded-agent-last-good"
 BPFFS_SENTINEL = "unbounded-e2e-bpffs-sentinel"
 DEVICE_REFRESH_PATH = "/dev/infiniband/unbounded-e2e-zero"
 DEVICE_REFRESH_TMPFILES_PATH = "/etc/tmpfiles.d/unbounded-e2e-device.conf"
@@ -160,6 +184,18 @@ DEVICE_REFRESH_TMPFILES_PATH = "/etc/tmpfiles.d/unbounded-e2e-device.conf"
 # ---------------------------------------------------------------------------
 def log(msg: str) -> None:
     print(f"[INFO]  {msg}", flush=True)
+
+
+def warn(msg: str) -> None:
+    """Report a problem that does not fail the run. msg may hold remote
+    output. In GitHub Actions every line of the log is read for workflow
+    commands, so it is printed once, escaped, as a warning, and never as raw
+    lines, where a line break in it could start a command of its own."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        escaped = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::warning::{escaped}", flush=True)
+    else:
+        print(f"[WARN]  {msg}", flush=True)
 
 
 def die(msg: str) -> None:
@@ -206,18 +242,74 @@ def run_quiet(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
     )
 
 
-def download_file(url: str, destination: Path) -> None:
-    run([
-        "curl",
-        "-fsSL",
-        "--connect-timeout", "30",
-        "--retry", "5",
-        "--retry-delay", "5",
-        "--retry-all-errors",
-        "--remove-on-error",
-        "-o", str(destination),
-        url,
+def download_file(url: str, destination: Path, auth: str = "") -> None:
+    config = curl_auth_config(auth)
+    try:
+        run([
+            "curl",
+            "-fsSL",
+            "--connect-timeout", "30",
+            "--retry", "5",
+            "--retry-delay", "5",
+            "--retry-all-errors",
+            "--remove-on-error",
+            *(["--config", "-"] if config else []),
+            "-o", str(destination),
+            url,
+        ], input=config, text=True)
+    except subprocess.CalledProcessError as exc:
+        die(f"downloading {url} failed (curl exit {exc.returncode})")
+
+
+def http_get(url: str, auth: str = "") -> str:
+    config = curl_auth_config(auth)
+    try:
+        return capture([
+            "curl", "-fsSL", "--connect-timeout", "30",
+            "--retry", "3", "--retry-delay", "2", "--retry-all-errors",
+            *(["--config", "-"] if config else []), url,
+        ], input=config)
+    except subprocess.CalledProcessError as exc:
+        die(f"fetching {url} failed (curl exit {exc.returncode})")
+        raise AssertionError("unreachable") from exc
+
+
+def curl_auth_config(auth: str) -> str:
+    """Return a curl config with a bearer token for Azure Blob Storage, whose
+    account disables shared keys and SAS. It goes to curl on stdin, because a
+    failed command prints its arguments, and is masked in GitHub's log."""
+    if not auth:
+        return ""
+
+    if auth != "azure-storage":
+        die(f"unknown auth mode {auth!r}")
+
+    token = capture([
+        "az", "account", "get-access-token",
+        "--resource", "https://storage.azure.com/",
+        "--query", "accessToken", "-o", "tsv",
     ])
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::add-mask::{token}", flush=True)
+
+    return f'header = "Authorization: Bearer {token}"\nheader = "x-ms-version: 2021-12-02"\n'
+
+
+def verify_sha256(path: Path, expected: str) -> None:
+    """Fail, and remove the file, unless a download matches its published digest."""
+    got = file_sha256(path)
+    if got != expected.lower():
+        path.unlink(missing_ok=True)
+        die(f"{path.name} sha256 {got} does not match the published {expected}")
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
 
 
 def capture(args: list[str], **kw: Any) -> str:
@@ -1246,16 +1338,40 @@ def wait_for_node_reboot_event(node_name: str, boot_id: str, timeout_secs: int =
     die(f"Timed out waiting for Node Rebooted event for '{node_name}' boot ID '{boot_id}'")
 
 
+def host_root_state() -> str:
+    """Return what the host root is on the VM: absent, dir, moving (a dir whose
+    move from the legacy root has not finished), link:<target>, or other."""
+
+    return ssh_capture(
+        f"sudo sh -c 'r={HOST_ROOT}; "
+        'if [ -L "$r" ]; then echo "link:$(readlink "$r")"; '
+        'elif [ -e "$r/.moving" ]; then echo moving; '
+        'elif [ -d "$r" ]; then echo dir; '
+        'elif [ -e "$r" ]; then echo other; '
+        "else echo absent; fi'"
+    ).strip()
+
+
+def _resolve_daemon_link(path: str) -> str:
+    """Return a command that resolves *path*, one of the daemon links, under the
+    legacy root on a host installed before the host root that this build has
+    not run on yet. readlink -f fails there, because the host root is missing.
+    """
+
+    legacy = LEGACY_HOST_ROOT + path.removeprefix(HOST_ROOT)
+    return "sudo sh -c " + shlex.quote(f"readlink -f {path} || readlink -f {legacy}")
+
+
 def read_daemon_current_target() -> str:
     """Return the target path of the host daemon current binary symlink."""
 
-    return ssh_capture(f"sudo readlink -f {DAEMON_BINARY_CURRENT}").strip()
+    return ssh_capture(_resolve_daemon_link(DAEMON_BINARY_CURRENT)).strip()
 
 
 def read_daemon_last_good_target() -> str:
     """Return the target path of the host daemon last-good binary symlink."""
 
-    return ssh_capture(f"sudo readlink -f {DAEMON_BINARY_LAST_GOOD}").strip()
+    return ssh_capture(_resolve_daemon_link(DAEMON_BINARY_LAST_GOOD)).strip()
 
 
 def wait_for_daemon_current_target(expected_target: str, timeout_secs: int = 180) -> None:
@@ -1266,8 +1382,7 @@ def wait_for_daemon_current_target(expected_target: str, timeout_secs: int = 180
     last_target = ""
     while elapsed < timeout_secs:
         result = subprocess.run(
-            ["ssh", *SSH_OPTS, SSH_TARGET,
-             f"sudo readlink -f {DAEMON_BINARY_CURRENT}"],
+            ["ssh", *SSH_OPTS, SSH_TARGET, _resolve_daemon_link(DAEMON_BINARY_CURRENT)],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
@@ -1309,6 +1424,20 @@ def wait_for_daemon_active(timeout_secs: int = 180) -> None:
     die(f"Timed out waiting for daemon to become active; last status={last_status!r}")
 
 
+def check_reset_failed() -> None:
+    """Reset the daemon's start-limit budget between upgrade scenarios. Azure
+    Container Linux refuses it for a sudo'd SSH session, which there only risks
+    scenarios sharing a budget."""
+    reset = ssh_capture_quiet("sudo systemctl reset-failed unbounded-agent-daemon.service")
+    if reset.returncode == 0:
+        return
+    if host_image().provisioning != "ignition":
+        die(f"could not reset the daemon start-limit budget: {reset.stderr.strip()}")
+    # Visible in the log, so a failure that only happens once scenarios share
+    # the budget can be traced to it.
+    warn(f"could not reset the daemon start-limit budget; the next scenario shares it: {reset.stderr.strip()}")
+
+
 def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_complete: bool = True) -> dict[str, Any]:
     """Serve *tarball* to the VM, create AgentUpgrade, and wait for it."""
 
@@ -1326,7 +1455,7 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
         # Each scenario intentionally restarts or fails the daemon. Isolate its
         # systemd start-limit budget so the candidate under test gets the
         # configured retries before recovery runs.
-        ssh_cmd("sudo systemctl reset-failed unbounded-agent-daemon.service")
+        check_reset_failed()
         run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
                    "--ignore-not-found"], check=False)
         create_machine_operation(
@@ -1367,7 +1496,11 @@ def _build_failing_agent_tarball(tarball: Path) -> None:
 
 
 def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
-    """Package an executable that passes preflight but fails as the daemon."""
+    """Package an executable that passes verification but fails as the daemon.
+
+    It answers version, which is all verification runs, so the failure comes
+    from the daemon.
+    """
 
     _build_script_agent_tarball(
         tarball,
@@ -1434,8 +1567,33 @@ class HostImage:
     write_files: str = ""
     pre_marker_commands: list[str] | None = None
 
+    # The account the harness connects as. Cloud images conventionally carry a
+    # distro-named user; an image provisioned by Ignition gets whichever user
+    # its own config creates.
+    ssh_user: str = "ubuntu"
+
+    # How the host is configured before it is reachable. "cloud-init" seeds a
+    # NoCloud ISO as a second drive. "ignition" boots the image's own UKI and
+    # seeds an Ignition config, which is the only first-boot mechanism the
+    # immutable Flatcar-derived images implement.
+    provisioning: str = "cloud-init"
+
+    # Published digest of the image, verified after download. Empty for the
+    # public mirrors, which publish no digest alongside the image.
+    sha256: str = ""
+
+    # Credential needed to read the image, for sources that are not public.
+    auth: str = ""
+
 
 def host_image() -> HostImage:
+    """Return the selected host image.
+
+    Deliberately not cached. Tests select a host by patching HOST_BASE_OS, and
+    a cache here silently returns whichever image was resolved first, so they
+    render the wrong distro and fail somewhere unrelated. The expensive part is
+    the manifest lookup, which is cached where it happens.
+    """
     if HOST_BASE_OS == "ubuntu2404":
         return HostImage(
             url=HOST_IMAGE_URL
@@ -1480,11 +1638,149 @@ def host_image() -> HostImage:
             network_interface="eth0",
         )
 
+    if HOST_BASE_OS == "acl":
+        return acl_host_image()
+
     die(
         f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; "
         "expected ubuntu2404, ubuntu2604, fedora, almalinux9, almalinux10, "
-        "centosstream9, or centosstream10"
+        "or acl"
     )
+
+
+# Azure Container Linux publishes no image to a public mirror, so the harness
+# resolves one from a manifest in the storage account that builds it. The
+# manifest names the blob, its size and its sha256, which is what lets the
+# download be verified and named for its build.
+ACL_IMAGE_MANIFEST_URL = os.environ.get(
+    "ACL_IMAGE_MANIFEST_URL",
+    "https://aksflexaclimagestme.blob.core.windows.net/images/latest.json",
+)
+ACL_IMAGE_BUILD_ID = os.environ.get("ACL_IMAGE_BUILD_ID", "")
+# Set together, these name the image directly and the manifest is not read.
+# resolve-host-image exports them, so CI resolves the manifest once per job.
+ACL_IMAGE_URL = os.environ.get("ACL_IMAGE_URL", "")
+ACL_IMAGE_SHA256 = os.environ.get("ACL_IMAGE_SHA256", "")
+ACL_BUILD_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
+# The storage token is sent to the image URL, so it has to be the storage
+# service, and both values are written to $GITHUB_ENV, one per line.
+ACL_IMAGE_HOST_SUFFIX = ".blob.core.windows.net"
+SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def acl_host_image() -> HostImage:
+    """Return the Azure Container Linux host image.
+
+    /usr, /usr/local included, is a read-only dm-verity image with no package
+    manager, so the image carries everything the agent needs, and an agent
+    released before the host root cannot be installed. /opt is writable.
+    """
+    path = os.environ.get("HOST_IMAGE_PATH", "")
+    if path:
+        # A local file wins, so a developer can run against an image that is not
+        # published yet without editing anything.
+        if not Path(path).is_file():
+            die(f"HOST_IMAGE_PATH does not exist: {path}")
+        url, file_name, digest = f"file://{Path(path).resolve()}", Path(path).name, ""
+    else:
+        # Filled in by resolved_host_image: naming the blob needs the manifest,
+        # and host_image is called at import.
+        url, file_name, digest = "", "", ""
+
+    return HostImage(
+        url=url,
+        file_name=file_name,
+        backing_format="qcow2",
+        # The image's own Ignition config creates core and puts it in sudo.
+        sudo_group="sudo",
+        ssh_user="core",
+        packages=[],
+        provisioning="ignition",
+        sha256=digest,
+        auth="" if path else "azure-storage",
+    )
+
+
+@functools.cache
+def acl_image_from_manifest() -> tuple[str, str, str]:
+    """Resolve the image URL, file name, and digest.
+
+    By default the published manifest is followed, so a refreshed image is
+    picked up without a code change. ACL_IMAGE_URL, ACL_IMAGE_SHA256 and
+    ACL_IMAGE_BUILD_ID together pin a build instead and skip the manifest.
+    ACL_IMAGE_BUILD_ID alone only checks that the manifest still publishes that
+    build.
+    """
+    pinned = [ACL_IMAGE_URL, ACL_IMAGE_SHA256]
+    if any(pinned):
+        if not all(pinned) or not ACL_IMAGE_BUILD_ID:
+            die("ACL_IMAGE_URL, ACL_IMAGE_SHA256 and ACL_IMAGE_BUILD_ID must be set together")
+        _check_acl_build_id(ACL_IMAGE_BUILD_ID, "ACL_IMAGE_BUILD_ID")
+        _check_acl_image(ACL_IMAGE_URL, ACL_IMAGE_SHA256, "ACL_IMAGE_URL and ACL_IMAGE_SHA256")
+        return ACL_IMAGE_URL, f"acl-{ACL_IMAGE_BUILD_ID}.qcow2", ACL_IMAGE_SHA256
+
+    manifest = json.loads(http_get(ACL_IMAGE_MANIFEST_URL, auth="azure-storage"))
+    qcow2 = manifest.get("qcow2", {})
+
+    build = manifest.get("build_id")
+    _check_acl_build_id(build, f"{ACL_IMAGE_MANIFEST_URL} build_id")
+    if ACL_IMAGE_BUILD_ID and ACL_IMAGE_BUILD_ID != build:
+        die(f"ACL_IMAGE_BUILD_ID={ACL_IMAGE_BUILD_ID} but the manifest publishes {build!r}; "
+            "pin that build with ACL_IMAGE_URL and ACL_IMAGE_SHA256, or clear the override")
+
+    url = qcow2.get("url", "")
+    digest = qcow2.get("sha256", "")
+    if not url or not digest:
+        die(f"{ACL_IMAGE_MANIFEST_URL} does not name a qcow2 url and sha256")
+    _check_acl_image(url, digest, ACL_IMAGE_MANIFEST_URL)
+
+    # Named for the build so a refreshed image does not reuse a file an earlier
+    # local run left in VM_DIR.
+    log(f"Azure Container Linux build {build} ({qcow2.get('size', 0)} bytes, sha256 {digest[:12]})")
+
+    return url, f"acl-{build}.qcow2", digest
+
+
+def _check_acl_build_id(build: object, source: str) -> None:
+    """The build names the image file, so it has to be a plain name."""
+    if not isinstance(build, str) or not ACL_BUILD_ID_PATTERN.fullmatch(build):
+        die(f"{source} {build!r} is not a build id")
+
+
+def _check_acl_image(url: object, digest: object, source: str) -> None:
+    """The image URL gets the storage token, so it has to be an https URL on
+    Azure Blob Storage, and it and the digest go into $GITHUB_ENV, where a line
+    break would set another variable for every later step."""
+    if not isinstance(url, str) or any(c.isspace() or not c.isprintable() for c in url):
+        die(f"{source} image url {url!r} is not a single printable URL")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not (parsed.hostname or "").endswith(ACL_IMAGE_HOST_SUFFIX):
+        die(f"{source} image url {url!r} is not an https URL on *{ACL_IMAGE_HOST_SUFFIX}")
+    if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
+        die(f"{source} image sha256 {digest!r} is not 64 hex characters")
+
+
+def resolve_host_image() -> None:
+    """Resolve the Azure Container Linux image once and export it.
+
+    In GitHub Actions it is written to $GITHUB_ENV, so every later e2e.py
+    process in the job uses the same build instead of reading the manifest
+    again. CI downloads the image on every run rather than caching it, since a
+    pull request from a fork can restore the base branch's Actions caches.
+    """
+    if HOST_BASE_OS != "acl":
+        die("resolve-host-image only applies to HOST_BASE_OS=acl")
+
+    url, file_name, digest = acl_image_from_manifest()
+    build = file_name.removeprefix("acl-").removesuffix(".qcow2")
+    exports = f"ACL_IMAGE_URL={url}\nACL_IMAGE_SHA256={digest}\nACL_IMAGE_BUILD_ID={build}\n"
+
+    github_env = os.environ.get("GITHUB_ENV", "")
+    if github_env:
+        with open(github_env, "a", encoding="utf-8") as env_file:
+            env_file.write(exports)
+    else:
+        print(exports, end="")
 
 
 def ubuntu_netplan_write_files() -> str:
@@ -1509,6 +1805,27 @@ def ubuntu_netplan_write_files() -> str:
     """)
 
 
+def resolved_host_image() -> HostImage:
+    """Return the host image with its download location filled in, which only
+    the places that fetch or open the image need."""
+    image = host_image()
+    if image.url:
+        return image
+
+    url, file_name, digest = acl_image_from_manifest()
+
+    return replace(image, url=url, file_name=file_name, sha256=digest)
+
+
+# The SSH user is a property of the image, but SSH_TARGET is referenced as a
+# module constant throughout. Rebind it once the image is known, rather than
+# threading an image argument through every call site that needs it.
+#
+# This sits below host_image and everything it calls, because it runs at import.
+VM_SSH_USER = os.environ.get("VM_SSH_USER", "") or host_image().ssh_user
+SSH_TARGET = f"{VM_SSH_USER}@{VM_IP}"
+
+
 def yaml_list(items: list[str], indent: str) -> str:
     return "\n".join(f"{indent}- {item}" for item in items)
 
@@ -1516,7 +1833,7 @@ def yaml_list(items: list[str], indent: str) -> str:
 def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
     packages = yaml_list(image.packages, "  ")
     commands = [*(image.pre_marker_commands or []), "mkdir -p /etc/agent"]
-    if HOST_BASE_OS in ("almalinux10", "centosstream10"):
+    if HOST_BASE_OS == "almalinux10":
         commands.extend(['dnf install -y "kernel-modules-extra-$(uname -r)"',
                          "modprobe nft_compat", "modprobe xt_conntrack", "modprobe xt_comment"])
     preparation = "\n".join(["set -eu", *commands,
@@ -1547,7 +1864,6 @@ def _cloud_init_user_data(image: HostImage, ssh_pub_key: str) -> str:
     )
 
 
-
 def _launch_vm(ssh_pub_key: str) -> None:
     """Create a fresh VM disk, cloud-init ISO, launch QEMU, and wait for SSH.
 
@@ -1555,16 +1871,7 @@ def _launch_vm(ssh_pub_key: str) -> None:
     Networking (bridge, TAP, NAT) must already be configured.
     """
 
-    image = host_image()
-    image_file = VM_DIR / image.file_name
-    if not image_file.exists():
-        die(f"Base cloud image not found: {image_file}. Run create-vm first.")
-
-    # Create VM disk
-    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
-    log(f"Creating snapshot disk: {vm_disk}")
-    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
-         "-F", image.backing_format, str(vm_disk), VM_DISK_SIZE])
+    image, vm_disk = _create_vm_disk()
 
     # cloud-init configuration
     log("Generating cloud-init configuration...")
@@ -1605,27 +1912,76 @@ def _launch_vm(ssh_pub_key: str) -> None:
          "-joliet", "-rock",
          str(user_data), str(meta_data), str(network_config)])
 
-    # Launch QEMU VM
+    _boot_vm(vm_disk, mac_address, {"Memory": f"{VM_MEMORY} MB", "CPUs": VM_CPUS, "Bridge": BRIDGE_NAME},
+             extra_drives=["-drive", f"file={seed_iso},format=raw,if=virtio"])
+
+
+def _create_vm_disk() -> tuple[HostImage, Path]:
+    """Create the overlay the VM boots from, never smaller than its backing file:
+    Azure Container Linux's root partition runs to the end of a 31.4 GiB disk,
+    and the guest cannot find a truncated one. qcow2 is sparse."""
+    image = resolved_host_image()
+    image_file = VM_DIR / image.file_name
+    if not image_file.exists():
+        die(f"Base image not found: {image_file}. Run create-vm first.")
+
+    vm_disk = VM_DIR / f"{VM_NAME}.qcow2"
+    info = json.loads(capture([
+        "qemu-img", "info", "-f", image.backing_format,
+        "--output=json", str(image_file),
+    ]))
+    backing_size = int(info["virtual-size"])
+
+    size = max(_parse_size(VM_DISK_SIZE), backing_size)
+    if size > _parse_size(VM_DISK_SIZE):
+        log(f"Growing overlay to the backing image's {size} bytes")
+
+    log(f"Creating snapshot disk: {vm_disk}")
+    run(["qemu-img", "create", "-f", "qcow2", "-b", str(image_file),
+         "-F", image.backing_format, str(vm_disk), str(size)])
+
+    return image, vm_disk
+
+
+def _parse_size(text: str) -> int:
+    """Parse a qemu-img size such as "20G" into bytes."""
+    units = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+    trimmed = text.strip().upper()
+    if trimmed and trimmed[-1] in units:
+        return int(float(trimmed[:-1]) * units[trimmed[-1]])
+
+    return int(trimmed)
+
+
+def _boot_vm(
+    vm_disk: Path,
+    mac_address: str,
+    details: dict[str, Any],
+    extra_drives: list[str] | None = None,
+    boot_args: list[str] | None = None,
+) -> None:
+    """Start QEMU in the background and wait for SSH.
+
+    boot_args carries the firmware selection for images that need one. The
+    cloud-init hosts boot with the default SeaBIOS; an image whose boot chain is
+    a UKI loaded by shim and systemd-boot needs OVMF and a writable copy of its
+    variables store.
+    """
     pid_file = VM_DIR / f"{VM_NAME}.pid"
     qemu_log = VM_DIR / f"{VM_NAME}.log"
     log("============================================")
-    log(f"  Launching VM: {VM_NAME}")
-    log(f"  Host OS:      {HOST_BASE_OS}")
-    log(f"  Memory:       {VM_MEMORY} MB")
-    log(f"  CPUs:         {VM_CPUS}")
-    log(f"  Disk:         {vm_disk}")
-    log(f"  IP:           {VM_IP}")
-    log(f"  MAC:          {mac_address}")
-    log(f"  Bridge:       {BRIDGE_NAME}")
-    log(f"  Log:          {qemu_log}")
+    for name, value in {"Launching VM": VM_NAME, "Host OS": HOST_BASE_OS, **details, "Disk": vm_disk,
+                        "IP": VM_IP, "MAC": mac_address, "Log": qemu_log}.items():
+        log(f"  {name + ':':<13} {value}")
     log("============================================")
 
     qemu_args = [
         "qemu-system-x86_64",
         "-cpu", "host", "-accel", "kvm",
         "-m", VM_MEMORY, "-smp", VM_CPUS,
+        *(boot_args or []),
         "-drive", f"file={vm_disk},format=qcow2,if=virtio",
-        "-drive", f"file={seed_iso},format=raw,if=virtio",
+        *(extra_drives or []),
         "-netdev", f"tap,id=net0,ifname={TAP_NAME},script=no,downscript=no",
         "-device", f"virtio-net-pci,netdev=net0,mac={mac_address}",
         "-daemonize", "-pidfile", str(pid_file),
@@ -1636,8 +1992,6 @@ def _launch_vm(ssh_pub_key: str) -> None:
 
     qemu_pid = pid_file.read_text().strip()
     log(f"VM started in background (PID: {qemu_pid})")
-
-    # Wait for SSH
     log(f"Waiting for SSH to become available on {VM_IP}...")
     max_attempts = 120
     for attempt in range(1, max_attempts + 1):
@@ -1665,11 +2019,180 @@ def _launch_vm(ssh_pub_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ignition provisioning
+#
+# An Ignition host is configured before it boots, with a config that carries
+# the bootstrap token and the API server address, so run-agent launches it.
+# ---------------------------------------------------------------------------
+IGNITION_BOOTSTRAP_UNIT = "unbounded-agent-bootstrap.service"
+IGNITION_NETWORK_UNIT = "10-e2e-static.network"
+IGNITION_CONFIG_NAME = "config.ign"
+# The name the initramfs gives the virtio NIC. Observed on this image; the
+# real root uses predictable names, which is why that side matches on MAC.
+IGNITION_INITRAMFS_INTERFACE = "eth0"
+
+
+def ignition_data_url(content: str) -> str:
+    return "data:;base64," + base64.b64encode(content.encode()).decode()
+
+
+def _decode_ignition_source(source: str) -> str | None:
+    """Return the content of a base64 data URL, as kubectl-unbounded emits, or
+    None for a remote source."""
+    if not source.startswith("data:"):
+        return None
+    return base64.b64decode(source.partition(",")[2]).decode()
+
+
+def patch_ignition_agent_config(doc: dict, mutate: Callable[[dict], None]) -> None:
+    """Rewrite the agent config in a rendered Ignition config, where it is a
+    data URL that a text substitution over the document would not reach."""
+    for item in doc["storage"]["files"]:
+        if item["path"] == "/etc/unbounded/agent/config.json":
+            agent_config = json.loads(_decode_ignition_source(item["contents"]["source"]))
+            mutate(agent_config)
+            item["contents"]["source"] = ignition_data_url(json.dumps(agent_config, indent=2))
+
+
+def static_network_unit(mac_address: str) -> str:
+    """Return the systemd-networkd unit that gives the VM its static address.
+
+    Matched on MAC alone. Every condition in [Match] has to hold, and the
+    interface name depends on the machine type, so naming it as well would make
+    the unit silently not apply and leave the VM on DHCP.
+    """
+    return textwrap.dedent(f"""\
+        [Match]
+        MACAddress={mac_address}
+
+        [Network]
+        Address={VM_IP}/24
+        Gateway={VM_GATEWAY}
+        DNS=8.8.8.8
+        DNS=8.8.4.4
+    """)
+
+
+def initramfs_ip_karg() -> str:
+    """Return the dracut ip= argument Ignition needs to fetch from the harness.
+
+    The interface has to be named. With the device field empty, bootengine
+    writes Name=*, which matches loopback first, so every fetch fails with
+    connection refused without a packet reaching the wire.
+    """
+    return (f"ip={VM_IP}::{VM_GATEWAY}:24:{VM_NAME}:"
+            f"{IGNITION_INITRAMFS_INTERFACE}:none:8.8.8.8:8.8.4.4")
+
+
+def add_ignition_harness_access(doc: dict, ssh_pub_key: str, mac_address: str) -> dict:
+    """Add what the harness needs to drive the VM, and keep the image's own intent.
+
+    As Ignition's user config this displaces the image's OEM config rather than
+    merging into it, so what the image expected has to be restated: the Azure
+    agent stays masked. The login is specified in full, because a bare name
+    leaves the account with its /sbin/nologin shell.
+    """
+    doc.setdefault("passwd", {}).setdefault("users", []).append({
+        "name": VM_SSH_USER,
+        "shell": "/bin/bash",
+        "groups": ["sudo", "systemd-journal"],
+        "sshAuthorizedKeys": [ssh_pub_key],
+    })
+    doc.setdefault("systemd", {}).setdefault("units", []).append(
+        {"name": "waagent.service", "enabled": False, "mask": True})
+
+    files = doc.setdefault("storage", {}).setdefault("files", [])
+
+    # The node registers under the host's hostname, and this image leaves it as
+    # "localhost": it masks the metadata hostname service and has no cloud-init
+    # to apply NoCloud's local-hostname. The cloud-init hosts get VM_NAME, so
+    # set the same thing here or the node joins under the wrong name.
+    files.append({
+        "path": "/etc/hostname",
+        "mode": 0o644,
+        "overwrite": True,
+        "contents": {"source": ignition_data_url(f"{VM_NAME}\n")},
+    })
+    # The ip= karg only configures the initramfs. The real root gets its address
+    # from this unit, which outranks the DHCP default the image ships.
+    files.append({
+        "path": f"/etc/systemd/network/{IGNITION_NETWORK_UNIT}",
+        "mode": 0o644,
+        "overwrite": True,
+        "contents": {"source": ignition_data_url(static_network_unit(mac_address))},
+    })
+
+    return doc
+
+
+def ovmf_firmware() -> tuple[Path, Path]:
+    """Locate the OVMF code and variables images.
+
+    The non-Secure-Boot build is used deliberately. shim is happy without it,
+    and enabling it would mean enrolling keys for an image the harness patches.
+    """
+    for code, template in (
+        (Path("/usr/share/OVMF/OVMF_CODE.fd"), Path("/usr/share/OVMF/OVMF_VARS.fd")),
+        (Path("/usr/share/OVMF/OVMF_CODE_4M.fd"), Path("/usr/share/OVMF/OVMF_VARS_4M.fd")),
+        (Path("/usr/share/edk2/ovmf/OVMF_CODE.fd"), Path("/usr/share/edk2/ovmf/OVMF_VARS.fd")),
+        (Path("/usr/share/qemu/ovmf-x86_64-code.bin"), Path("/usr/share/qemu/ovmf-x86_64-vars.bin")),
+    ):
+        if code.is_file() and template.is_file():
+            return code, template
+
+    die("OVMF firmware not found. Install the 'ovmf' (or 'edk2-ovmf') package; "
+        "an Ignition host boots through its own UEFI bootloader.")
+    raise AssertionError("unreachable")
+
+
+def launch_ignition_vm(ignition_json: str) -> None:
+    """Boot the VM through its own bootloader with an Ignition config in place.
+    The config source and the initramfs address go on the command line through a
+    patched UKI addon; see ukiboot for why the boot chain is left intact.
+    """
+    _, vm_disk = _create_vm_disk()
+
+    # It carries the bootstrap token, so it is never readable by others, not
+    # even between being written and having its mode set.
+    config_path = VM_DIR / IGNITION_CONFIG_NAME
+    config_path.unlink(missing_ok=True)
+    with os.fdopen(os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as config_file:
+        config_file.write(ignition_json)
+    serve_base = os.environ.get("IGNITION_SERVE_BASE", f"http://{VM_GATEWAY}:{SERVE_PORT}")
+    config_url = f"{serve_base}/{IGNITION_CONFIG_NAME}"
+
+    log(f"Patching the ESP boot command line in {vm_disk}...")
+    patched = ukiboot.patch_uki_cmdline_addon(
+        vm_disk, f"ignition.config.url={config_url} {initramfs_ip_karg()}")
+    log(f"Patched {patched.addon} ({patched.used}/{patched.capacity} bytes)")
+
+    code, vars_template = ovmf_firmware()
+    vars_file = VM_DIR / f"{VM_NAME}-OVMF_VARS.fd"
+    shutil.copyfile(vars_template, vars_file)
+
+    _boot_vm(vm_disk, qemu_mac_address(), {"Config": config_url}, boot_args=[
+        "-machine", "q35",
+        "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
+        "-drive", f"if=pflash,format=raw,file={vars_file}",
+    ])
+
+
+# ---------------------------------------------------------------------------
 # create-vm
 # ---------------------------------------------------------------------------
 def _check_vm_prereqs() -> None:
     # Pre-flight
-    for cmd in ("qemu-system-x86_64", "qemu-img", "genisoimage"):
+    required = ["qemu-system-x86_64", "qemu-img"]
+
+    if host_image().provisioning == "ignition":
+        # The boot command line is patched through NBD rather than a loop
+        # mount, which is what keeps that step unprivileged.
+        required.append("qemu-nbd")
+        ovmf_firmware()
+    else:
+        required.append("genisoimage")
+
+    for cmd in required:
         if shutil.which(cmd) is None:
             die(f"{cmd} is required but not found in PATH")
     if not os.access("/dev/kvm", os.R_OK):
@@ -1721,16 +2244,50 @@ def launch_vm() -> None:
     run(["sudo", "ip", "link", "set", TAP_NAME, "up"])
     _nm_unmanage(TAP_NAME)
 
-    image = host_image()
-    image_file = VM_DIR / image.file_name
-    if not image_file.exists():
-        log(f"Downloading {HOST_BASE_OS} cloud image...")
-        download_file(image.url, image_file)
-    else:
-        log(f"Using existing image: {image_file}")
-    run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
+    image = resolved_host_image()
+    acquire_host_image(image)
+
+    # An Ignition host's config needs the bootstrap token; run-agent launches it.
+    if image.provisioning == "ignition":
+        log("Ignition host: VM launch deferred to run-agent")
+        return
 
     _launch_vm(ssh_pub_key)
+
+
+def acquire_host_image(image: HostImage) -> Path:
+    """Place the base image in VM_DIR, verified, and return its path. A file://
+    source is linked rather than copied; the VM boots from an overlay."""
+    image_file = VM_DIR / image.file_name
+
+    if image.url.startswith("file://"):
+        source = Path(image.url[len("file://"):])
+        if not image_file.exists():
+            image_file.symlink_to(source)
+        log(f"Using local image: {source}")
+        if image.sha256:
+            verify_sha256(image_file, image.sha256)
+    elif image_file.exists() and (not image.sha256 or file_sha256(image_file) == image.sha256.lower()):
+        # Checked again rather than trusted: a build republished under the same
+        # id would otherwise keep booting the earlier image.
+        log(f"Using existing image: {image_file}")
+    else:
+        if image_file.exists():
+            log(f"{image_file} does not match its published sha256; downloading it again")
+            image_file.unlink()
+        log(f"Downloading {HOST_BASE_OS} host image...")
+        # Downloaded under another name and renamed only once verified, so an
+        # interrupted download never sits under the name that is trusted.
+        partial = image_file.with_name(image_file.name + ".part")
+        partial.unlink(missing_ok=True)
+        download_file(image.url, partial, auth=image.auth)
+        if image.sha256:
+            verify_sha256(partial, image.sha256)
+        partial.replace(image_file)
+
+    run(["qemu-img", "info", "-f", image.backing_format, str(image_file)])
+
+    return image_file
 
 
 def create_vm() -> None:
@@ -2022,8 +2579,14 @@ def configure_kind_node_ip() -> None:
 # ---------------------------------------------------------------------------
 # run-agent
 # ---------------------------------------------------------------------------
-def run_agent(node_config: NodeConfig) -> None:
+def run_agent(node_config: NodeConfig, *, reinstall: bool = False) -> None:
     """Build agent, generate bootstrap script, and run it on the VM."""
+
+    # The Ignition path serves the agent binary it stages itself. An agent from
+    # elsewhere, as the configuration scenarios pass, is never staged or served.
+    if os.environ.get("AGENT_URL") and host_image().provisioning == "ignition":
+        die("AGENT_URL is not supported with Ignition, so neither is the configuration suite; "
+            "run E2E_SUITE=lifecycle")
 
     if not SSH_KEY.exists():
         die(f"SSH key not found: {SSH_KEY}. Run create-vm first.")
@@ -2033,7 +2596,7 @@ def run_agent(node_config: NodeConfig) -> None:
 
     agent_url_override = os.environ.get("AGENT_URL", "")
     if agent_url_override:
-        _run_agent_inner(agent_url_override, node_config)
+        _run_agent_inner(agent_url_override, node_config, reinstall=reinstall)
         log("Agent bootstrap completed")
         return
 
@@ -2046,7 +2609,7 @@ def run_agent(node_config: NodeConfig) -> None:
     log(f"Agent download URL: {agent_url}")
 
     try:
-        _run_agent_inner(agent_url, node_config)
+        _run_agent_inner(agent_url, node_config, reinstall=reinstall)
     finally:
         httpd.shutdown()
 
@@ -2090,6 +2653,11 @@ def prepare_agent_artifacts() -> str:
     agent_tarball = VM_DIR / "unbounded-agent-linux-amd64.tar.gz"
     run(["tar", "-czf", str(agent_tarball), "-C", str(REPO_ROOT / "bin"), "unbounded-agent"])
     log(f"Agent tarball: {agent_tarball}")
+
+    # Ignition writes files declaratively and cannot extract an archive, so the
+    # bare binary is served alongside the tarball. It is staged unconditionally
+    # rather than per host, so that the two paths serve the same build.
+    shutil.copy2(agent_bin, VM_DIR / "unbounded-agent")
 
     # Serve the tarball over HTTP
     runner_ip = VM_GATEWAY
@@ -2187,10 +2755,12 @@ def prepare_offline_bootstrap_artifacts(node_config: NodeConfig) -> str:
 
     log("Copying offline artifact bundle to VM...")
     scp_cmd(str(tarball), f"{SSH_TARGET}:/tmp/offline-bootstrap-artifacts.tar.gz")
-    ssh_cmd("sudo rm -rf /opt/unbounded/artifacts && sudo mkdir -p /opt/unbounded/artifacts")
-    ssh_cmd("sudo tar -xzf /tmp/offline-bootstrap-artifacts.tar.gz -C /opt/unbounded/artifacts")
+    # Not under the agent's host root: reset removes that once it is empty, and
+    # files the harness left there would keep it.
+    ssh_cmd(f"sudo rm -rf {OFFLINE_ARTIFACTS_DIR} && sudo mkdir -p {OFFLINE_ARTIFACTS_DIR}")
+    ssh_cmd(f"sudo tar -xzf /tmp/offline-bootstrap-artifacts.tar.gz -C {OFFLINE_ARTIFACTS_DIR}")
 
-    source = f"file:///opt/unbounded/artifacts/{kube_version}"
+    source = f"file://{OFFLINE_ARTIFACTS_DIR}/{kube_version}"
     log(f"Offline artifact source installed on VM: {source}")
     return source
 
@@ -2336,7 +2906,6 @@ def local_rootfs_ref(registry: str, source_ref: str) -> str:
     return f"{registry}/rootfs/{repo}:{tag}"
 
 
-
 def split_tagged_oci_ref(ref: str, label: str) -> tuple[str, str]:
     ref = ref.removeprefix("oci://")
     last = ref.rsplit("/", 1)[-1]
@@ -2443,7 +3012,6 @@ def _crictl_version_for_kubernetes(kube_version: str) -> str:
     return f"{match.group(1)}.{match.group(2)}.0"
 
 
-
 def _make_handler(directory: str) -> type:
     """Create a SimpleHTTPRequestHandler bound to *directory*."""
     class Handler(SimpleHTTPRequestHandler):
@@ -2454,7 +3022,169 @@ def _make_handler(directory: str) -> type:
     return Handler
 
 
-def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
+def agent_binary_url_and_digest() -> tuple[str, str]:
+    """Return the URL and SHA-256 of the bare agent binary served to the VM,
+    which Ignition fetches and verifies, since it cannot extract an archive."""
+    binary = VM_DIR / "unbounded-agent"
+    if not binary.exists():
+        die(f"Agent binary not staged: {binary}. Run prepare_agent_artifacts first.")
+
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    serve_base = os.environ.get("IGNITION_SERVE_BASE", f"http://{VM_GATEWAY}:{SERVE_PORT}")
+
+    return f"{serve_base}/unbounded-agent", digest
+
+
+def _bootstrap_via_ignition(node_config: NodeConfig, api_server: str,
+                            local_api_server: str, *, reinstall: bool = False) -> None:
+    """Render an Ignition config, boot the VM with it, and wait for bootstrap,
+    as an Ignition host does in production: nothing is delivered over SSH."""
+    ssh_pub_key = _ensure_vm_ssh_key()
+    binary_url, binary_digest = agent_binary_url_and_digest()
+
+    args = [
+        KUBECTL_UNBOUNDED, "machine", "manual-bootstrap",
+        AGENT_MACHINE_NAME,
+        "--site", E2E_SITE_NAME,
+        "--variant", "ignition",
+        "--agent-url", binary_url,
+        "--agent-sha256", binary_digest,
+        *node_config_bootstrap_args(node_config),
+    ]
+    if node_config.offline_artifacts_oci_ref:
+        args.extend(["--offline-artifacts-source", node_config.offline_artifacts_oci_ref])
+
+    log("Generating Ignition config with kubectl-unbounded machine manual-bootstrap...")
+    log_active_node_config(node_config)
+    doc = json.loads(capture(args))
+
+    def adjust(agent_config: dict) -> None:
+        # The kubeconfig names a loopback address the VM cannot reach.
+        kubelet = agent_config["Kubelet"]
+        kubelet["ApiServer"] = kubelet["ApiServer"].replace(local_api_server, api_server)
+        if node_config.kubelet_configuration:
+            kubelet["Configuration"] = node_config.kubelet_configuration
+
+    patch_ignition_agent_config(doc, adjust)
+    doc = add_ignition_harness_access(doc, ssh_pub_key, qemu_mac_address())
+
+    previous_invocation = ""
+
+    if reinstall:
+        # Same disk, same boot: reinstall proves a reset host can be provisioned
+        # again, and the caller checks the boot id.
+        previous_invocation = _reinstall_ignition_payload(doc)
+    else:
+        # An Ignition host defers its launch to here, so nothing else has
+        # stopped the previous VM, whose overlay is about to be recreated.
+        _stop_qemu()
+        launch_ignition_vm(json.dumps(doc, indent=2))
+
+    _wait_for_ignition_bootstrap(previous_invocation)
+
+
+def _reinstall_ignition_payload(doc: dict[str, Any]) -> str:
+    """Install the agent's payloads on a reset host without rerunning Ignition,
+    and return the bootstrap unit's invocation id from before it starts.
+
+    Identity, networking and SSH access must survive reset, so only the agent's
+    binary, config and unit are delivered, and the config has to hold exactly
+    those plus the harness's own additions.
+    """
+    agent_files = {
+        DAEMON_BINARY,
+        "/etc/unbounded/agent/config.json",
+    }
+    harness_files = {"/etc/hostname", f"/etc/systemd/network/{IGNITION_NETWORK_UNIT}"}
+    files = {item["path"]: item for item in doc["storage"]["files"]}
+    if set(files) - harness_files != agent_files:
+        die(f"Ignition payload paths {sorted(set(files) - harness_files)} are not the agent's {sorted(agent_files)}")
+    units = {u["name"]: u for u in doc["systemd"]["units"]}
+    if set(units) - {"waagent.service"} != {IGNITION_BOOTSTRAP_UNIT}:
+        die(f"Ignition units {sorted(units)} are not the bootstrap unit and the harness's own")
+
+    for index, destination in enumerate(sorted(agent_files)):
+        item = files[destination]
+        content = _decode_ignition_source(item["contents"]["source"])
+        if content is not None:
+            local = VM_DIR / f"reinstall-{index}"
+            local.write_text(content)
+            local.chmod(0o600)
+        elif destination.endswith("/bin/unbounded-agent"):
+            local = VM_DIR / "unbounded-agent"
+        else:
+            die(f"unsupported reinstall payload source for {destination}")
+        remote = f"/var/tmp/unbounded-reinstall-{index}"
+        scp_cmd(str(local), f"{SSH_TARGET}:{remote}")
+        ssh_cmd(f"sudo install -D -m {item['mode']:o} {remote} {destination} && rm {remote}")
+
+    unit = units[IGNITION_BOOTSTRAP_UNIT]
+    local = VM_DIR / "reinstall-bootstrap.service"
+    local.write_text(unit["contents"])
+
+    # Read before starting. If reset did not stop this unit, starting it does
+    # nothing, and the wait would otherwise accept the previous run.
+    previous = bootstrap_unit_state(time.monotonic() + 30).get("InvocationID", "")
+
+    scp_cmd(str(local), f"{SSH_TARGET}:/var/tmp/unbounded-reinstall.service")
+    ssh_cmd(f"sudo install -m 0644 /var/tmp/unbounded-reinstall.service "
+            f"/etc/systemd/system/{IGNITION_BOOTSTRAP_UNIT} && "
+            "rm /var/tmp/unbounded-reinstall.service && "
+            "sudo systemctl daemon-reload && "
+            f"sudo systemctl enable --now --no-block {IGNITION_BOOTSTRAP_UNIT}")
+
+    return previous
+
+
+def bootstrap_unit_state(deadline: float) -> dict[str, str]:
+    """Return the first-boot unit's ActiveState, InvocationID, Result and
+    NRestarts. systemd gives each start a new InvocationID."""
+    result = bounded_ssh(f"systemctl show {IGNITION_BOOTSTRAP_UNIT} "
+                         "-p ActiveState -p InvocationID -p Result -p NRestarts", deadline)
+    if result.returncode != 0:
+        return {"ActiveState": "unreachable"}
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def settled_bootstrap_unit(deadline: float, previous_invocation: str = "") -> dict[str, str]:
+    """Wait for the first-boot unit to be active or failed in a run other than
+    *previous_invocation*, and return its state.
+
+    The unit is a oneshot with RemainAfterExit=yes, so it stays active after a
+    run, and starting it again does nothing. Waiting for "active" alone accepts
+    the previous run, so the invocation id has to change as well.
+    """
+    state: dict[str, str] = {}
+    while time.monotonic() < deadline:
+        state = bootstrap_unit_state(deadline)
+        if (state.get("ActiveState") in ("active", "failed")
+                and state.get("InvocationID", "") != previous_invocation):
+            break
+        time.sleep(5)
+    return state
+
+
+def _wait_for_ignition_bootstrap(previous_invocation: str = "") -> None:
+    """Wait for the first-boot bootstrap unit to finish, and report if it fails.
+    It retries indefinitely, so a failure is a unit that never leaves
+    activating. Its journal is the only output on this path."""
+    unit = IGNITION_BOOTSTRAP_UNIT
+    log(f"Waiting for {unit} to complete...")
+
+    state = settled_bootstrap_unit(time.monotonic() + 1200, previous_invocation)
+    journal = bounded_ssh(f"sudo journalctl -u {unit} --no-pager -n 80", time.monotonic() + 30).stdout
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    (LOGS_DIR / "ignition-bootstrap.log").write_text(journal)
+
+    active, result = state.get("ActiveState", ""), state.get("Result", "")
+    if active != "active" or result not in ("success", ""):
+        log(journal)
+        die(f"{unit} did not complete: ActiveState={active or 'unknown'} Result={result}")
+
+    log(f"{unit} completed")
+
+
+def _run_agent_inner(agent_url: str, node_config: NodeConfig, *, reinstall: bool = False) -> None:
     """Core logic for run-agent (after HTTP server is up)."""
 
     # Determine the Kind control-plane IP so connectivity checks have the
@@ -2514,6 +3244,10 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
     ])
     if not local_api_server:
         die("Could not determine local API server URL from kubeconfig")
+
+    if host_image().provisioning == "ignition":
+        _bootstrap_via_ignition(node_config, api_server, local_api_server, reinstall=reinstall)
+        return
 
     # Wait for cloud-init and verify connectivity before preparing optional
     # offline artifacts because preparing them copies files to the VM.
@@ -2583,7 +3317,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         inject = (
             "for i in $(seq 1 600); do "
             "if test -f /var/lib/unbounded/agent/install-state.json; then "
-            "mkdir -p /usr/local/bin/unbounded-agent-daemon-recovery.sh; exit 0; fi; "
+            f"mkdir -p {DAEMON_BIN_DIR}/unbounded-agent-daemon-recovery.sh; exit 0; fi; "
             "sleep 1; done; exit 1"
         )
         ssh_cmd("sudo systemd-run --unit=p6-bootstrap-injection --collect /bin/bash -c " + shlex.quote(inject))
@@ -2632,7 +3366,7 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig) -> None:
         scp_cmd(str(retry_script_path), f"{SSH_TARGET}:/tmp/bootstrap-retry.sh")
         ssh_cmd("chmod +x /tmp/bootstrap-retry.sh")
 
-        ssh_cmd("sudo rmdir /usr/local/bin/unbounded-agent-daemon-recovery.sh")
+        ssh_cmd(f"sudo rmdir {DAEMON_BIN_DIR}/unbounded-agent-daemon-recovery.sh")
         run(["timeout", "1200", "ssh", *SSH_OPTS, SSH_TARGET,
              f"sudo {env_prefix} /tmp/bootstrap-retry.sh"])
         after_text = bounded_ssh(
@@ -3309,7 +4043,7 @@ def _validate_node_config_scenario(node_config: NodeConfig, index: int, agent_ur
 
 
 def retire_config_scenario(node_config: NodeConfig, env: dict[str, str]) -> None:
-    logs_dir = REPO_ROOT / "logs"
+    logs_dir = LOGS_DIR
     logs_dir.mkdir(parents=True, exist_ok=True)
     directory = Path(env["VM_DIR"])
     _collect_one_vm_logs(logs_dir, env["VM_NAME"], env["VM_IP"], directory, f"{_safe_name(node_config.name)}-")
@@ -3340,6 +4074,9 @@ def patch_kind_control_plane_node_ip() -> None:
 
 def validate_node_config_scenarios() -> None:
     """Discover node config scenarios and validate them in parallel."""
+    # Refused before any mirroring or VM work; see the same check in run_agent.
+    if host_image().provisioning == "ignition":
+        die("the configuration suite is not supported with Ignition; run E2E_SUITE=lifecycle")
     workers = int(os.environ.get("CONFIG_SCENARIO_WORKERS", "2"))
     if workers < 1:
         die("CONFIG_SCENARIO_WORKERS must be positive")
@@ -3836,9 +4573,57 @@ def reset_agent() -> None:
             die(f"nspawn machine '{nspawn_name}' is still running after reset")
         log(f"nspawn machine '{nspawn_name}' is not running")
 
+    validate_reset_cleanup()
+
     log("============================================")
     log("  Agent reset PASSED")
     log("============================================")
+
+
+def agent_files(root: str) -> list[str]:
+    """Return the agent's own files under *root*, the host root or the legacy root."""
+    names = ["unbounded-agent", "unbounded-agent-blue", "unbounded-agent-green", "unbounded-agent-current",
+             "unbounded-agent-last-good", "unbounded-agent-nspawn-lifecycle", "unbounded-agent-daemon-recovery.sh"]
+    return [f"{root}/bin/{name}" for name in names] + [f"{root}/libexec/unbounded-localdns-network"]
+
+
+def present_on_host(paths: list[str]) -> list[str]:
+    """Return which of *paths* exist on the VM. A dangling link counts: -e
+    follows it, but it is still a file something left behind."""
+    checks = " ; ".join(f'if [ -e "{path}" ] || [ -L "{path}" ]; then echo "{path}"; fi' for path in paths)
+    return ssh_capture(f"sudo sh -c '{checks}'").split()
+
+
+def validate_reset_cleanup() -> None:
+    """Assert reset removed the agent's files under both roots, and the host root
+    itself, since reset does not depend on the host having been migrated. A
+    leftover such as the recovery script makes the next bootstrap's preflight
+    refuse a host the operator was just told is clean."""
+    log(f"Verifying reset removed the agent's files under {HOST_ROOT} and {LEGACY_HOST_ROOT}...")
+
+    must_be_absent = [
+        HOST_ROOT, HOST_ROOT_STAGING, *agent_files(HOST_ROOT), *agent_files(LEGACY_HOST_ROOT),
+        "/etc/systemd/system/unbounded-agent-daemon.service",
+        "/etc/systemd/system/multi-user.target.wants/unbounded-agent-daemon.service",
+        "/etc/systemd/system/unbounded-agent-daemon-recovery.service",
+        "/etc/unbounded/agent",
+        # Ownership left behind would admit the next start as a resumed or
+        # completed installation on a host that has neither.
+        "/var/lib/unbounded/agent/install-state.json",
+    ]
+    # A first-boot unit that survived, or its enablement, would bootstrap the
+    # host again on the next boot.
+    if host_image().provisioning == "ignition":
+        must_be_absent += [f"/etc/systemd/system/{IGNITION_BOOTSTRAP_UNIT}",
+                           f"/etc/systemd/system/multi-user.target.wants/{IGNITION_BOOTSTRAP_UNIT}"]
+
+    remaining = present_on_host(must_be_absent)
+    if remaining:
+        for path in remaining:
+            log(f"  still present: {path}")
+        die(f"reset left {len(remaining)} agent artifacts on the host")
+
+    log(f"Reset removed all {len(must_be_absent)} agent artifacts")
 
 
 # ---------------------------------------------------------------------------
@@ -4305,12 +5090,256 @@ def validate_host_agent_upgrade() -> None:
 
 
 # ---------------------------------------------------------------------------
+# validate-host-root / migration suite
+# ---------------------------------------------------------------------------
+# The copy a move from the legacy root makes beside the host root.
+HOST_ROOT_STAGING = f"{HOST_ROOT}.staging"
+# A file a host staged beside the host root before any agent was installed, as
+# the docs suggest for a local OCI layout. Linking, moving and resetting the
+# host root must leave it alone.
+HOST_STAGED_FILE = f"{HOST_ROOT_PARENT}/images/e2e-staged/oci-layout"
+HOST_STAGED_CONTENT = "staged-before-install"
+
+
+def stage_host_files() -> None:
+    """Stage HOST_STAGED_FILE on a host nothing is installed on yet."""
+
+    if host_image().provisioning == "ignition":
+        die("staging files before install needs a cloud-init host; an Ignition host boots with the agent")
+
+    wait_for_cloud_init()
+    ssh_cmd("sudo sh -c " + shlex.quote(
+        f"mkdir -p {os.path.dirname(HOST_STAGED_FILE)} && printf %s {HOST_STAGED_CONTENT} > {HOST_STAGED_FILE}"
+    ))
+    log(f"Staged {HOST_STAGED_FILE} beside {HOST_ROOT}")
+
+
+def validate_host_staged_files() -> None:
+    """Assert HOST_STAGED_FILE is as stage_host_files left it."""
+
+    result = ssh_capture_quiet(f"sudo cat {HOST_STAGED_FILE}")
+    if result.returncode != 0 or result.stdout != HOST_STAGED_CONTENT:
+        die(f"{HOST_STAGED_FILE}, staged beside {HOST_ROOT}, was changed or removed: "
+            f"{(result.stdout + result.stderr).strip()!r}")
+    log(f"{HOST_STAGED_FILE} is untouched")
+
+
+def _wait_until(check: Callable[[], str], timeout_secs: int) -> None:
+    """Call *check* every five seconds until it returns "", and fail with what it
+    last returned if that takes longer than *timeout_secs*."""
+    deadline = time.monotonic() + timeout_secs
+    while problem := check():
+        if time.monotonic() > deadline:
+            die(problem)
+        time.sleep(5)
+
+
+def _daemon_unit_runs(binary_dir: str) -> None:
+    """Assert the units run the agent's files in *binary_dir*: the daemon unit
+    its current link, the recovery unit its script, and each machine's service
+    override its lifecycle helper."""
+
+    units = ssh_capture(
+        "sudo sh -c 'cat /etc/systemd/system/unbounded-agent-daemon.service "
+        "/etc/systemd/system/unbounded-agent-daemon-recovery.service "
+        "/etc/systemd/system/systemd-nspawn@*.service.d/override.conf'")
+    for want in (f"ExecStart={binary_dir}/unbounded-agent-current daemon",
+                 f"ExecStart={binary_dir}/unbounded-agent-daemon-recovery.sh",
+                 f"={binary_dir}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start"):
+        if want not in units:
+            die(f"the agent's units do not run {want!r}:\n{units}")
+
+
+def _legacy_files_left() -> str:
+    left = present_on_host(agent_files(LEGACY_HOST_ROOT))
+    return f"agent files are still under {LEGACY_HOST_ROOT}: {left}" if left else ""
+
+
+def validate_host_root() -> None:
+    """Assert the agent is under a real directory at the host root, with nothing
+    left under the legacy root and labels as SELinux policy gives them. The
+    daemon removes the binary the install script seeds under the legacy root
+    for older agents once it is running, so this waits for that first."""
+
+    state = host_root_state()
+    if state != "dir":
+        die(f"{HOST_ROOT} is {state!r}; a host installed by this build must have a real directory there")
+
+    _wait_until(_legacy_files_left, 120)
+
+    script = textwrap.dedent(f"""
+        set -eu
+        for d in {HOST_ROOT_PARENT} {HOST_ROOT} {HOST_ROOT}/bin {HOST_ROOT}/libexec; do
+            got=$(stat -c '%a %U' "$d")
+            [ "$got" = "755 root" ] || {{ echo "$d is $got, expected 755 root"; exit 1; }}
+        done
+        current=$(readlink -f {DAEMON_BINARY_CURRENT})
+        case "$current" in
+            {DAEMON_BIN_DIR}/*) ;;
+            *) echo "current binary $current is not under {DAEMON_BIN_DIR}"; exit 1 ;;
+        esac
+        if [ -e {HOST_ROOT_STAGING} ]; then echo "{HOST_ROOT_STAGING} is left from a move"; exit 1; fi
+        if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled && command -v restorecon >/dev/null 2>&1; then
+            relabel=$(restorecon -nvR {HOST_ROOT})
+            if [ -n "$relabel" ]; then echo "labels differ from policy:"; echo "$relabel"; exit 1; fi
+        fi
+    """)
+    result = ssh_capture_quiet("sudo bash -c " + shlex.quote(script))
+    if result.returncode != 0:
+        die(f"host root check failed: {(result.stdout + result.stderr).strip()}")
+
+    _daemon_unit_runs(DAEMON_BIN_DIR)
+    log(f"Agent is installed under {HOST_ROOT}, and nothing under {LEGACY_HOST_ROOT}")
+
+
+def validate_host_root_linked() -> None:
+    """Assert the host root is linked to the legacy root and the layout is unchanged.
+
+    While the current or last-good binary is an agent released before the host
+    root, the host keeps its files under the legacy root and only gains the
+    link. The units keep naming the legacy paths, so an older agent rolled back
+    to still finds its files.
+    """
+
+    state = host_root_state()
+    if state != f"link:{LEGACY_HOST_ROOT}":
+        die(f"{HOST_ROOT} is {state!r}; a host with an older agent in a slot must link it to {LEGACY_HOST_ROOT}")
+
+    current = read_daemon_current_target()
+    if not current.startswith(f"{LEGACY_HOST_ROOT}/bin/"):
+        die(f"current binary resolves to {current!r}, not under {LEGACY_HOST_ROOT}/bin")
+
+    _daemon_unit_runs(f"{LEGACY_HOST_ROOT}/bin")
+    log(f"{HOST_ROOT} links to {LEGACY_HOST_ROOT}, and the legacy layout is unchanged")
+
+
+def _daemon_executable() -> str:
+    """Return the resolved executable of the running daemon, or ''."""
+
+    return ssh_capture_quiet(
+        "sudo sh -c 'pid=$(systemctl show -p MainPID --value unbounded-agent-daemon.service); "
+        '[ "${pid:-0}" -gt 0 ] && readlink -f /proc/$pid/exe\''
+    ).stdout.strip()
+
+
+def validate_host_root_moved() -> None:
+    """Assert a host an older agent installed has been moved to the host root.
+
+    The daemon copies the files at the first start after the AgentUpgrade that
+    follows the last older agent out of the slots, points the units at the copy
+    and restarts from it, and the restarted daemon removes the legacy files. The
+    root is "moving" in between. The reboot that follows in the suite runs the
+    rewritten units.
+    """
+
+    log(f"Waiting for the agent's files to move to {HOST_ROOT}...")
+    _wait_until(lambda: "" if (state := host_root_state()) == "dir"
+                else f"{HOST_ROOT} is {state!r}; the host was not moved to the host root", 300)
+
+    log("Waiting for the daemon to run from the host root...")
+    _wait_until(lambda: "" if (executable := _daemon_executable()).startswith(f"{DAEMON_BIN_DIR}/")
+                else f"daemon runs {executable!r}, not a binary under {DAEMON_BIN_DIR}", 180)
+
+    validate_host_root()
+    log(f"The agent's files moved from {LEGACY_HOST_ROOT} to {HOST_ROOT}")
+
+
+def _check_legacy_agent_version() -> None:
+    """It is interpolated into URLs, file names and a shell command line."""
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", LEGACY_AGENT_VERSION):
+        die(f"LEGACY_AGENT_VERSION must be a release tag such as v0.12.0, got {LEGACY_AGENT_VERSION!r}")
+
+
+def run_legacy_agent(node_config: NodeConfig) -> None:
+    """Install LEGACY_AGENT_VERSION, a release before the host root, as a host
+    installed before the host root got it. This build's kubectl-unbounded
+    renders the bootstrap payload and install script, which download that
+    release's agent from its GitHub release.
+    """
+
+    _check_legacy_agent_version()
+
+    # The bootstrap payload is still rendered by this build's kubectl-unbounded,
+    # and the upgrades that follow serve this build's agent.
+    prepare_agent_artifacts()
+
+    previous = os.environ.get("AGENT_URL")
+    os.environ["AGENT_URL"] = f"{LEGACY_AGENT_RELEASE_URL}/{LEGACY_AGENT_TARBALL}"
+    try:
+        run_agent(node_config)
+    finally:
+        if previous is None:
+            os.environ.pop("AGENT_URL", None)
+        else:
+            os.environ["AGENT_URL"] = previous
+
+
+def _download_legacy_agent_tarball() -> Path:
+    """Return an AgentUpgrade archive holding the legacy release's agent binary
+    alone, as AgentUpgrade requires; the release also ships its license files.
+    """
+
+    _check_legacy_agent_version()
+    tarball = VM_DIR / f"unbounded-agent-{LEGACY_AGENT_VERSION}.tar.gz"
+    checksums = http_get(f"{LEGACY_AGENT_RELEASE_URL}/checksums.txt")
+    want = next((line.split()[0] for line in checksums.splitlines()
+                 if line.split()[1:] == [LEGACY_AGENT_TARBALL]), "")
+    if not want:
+        die(f"{LEGACY_AGENT_VERSION} publishes no checksum for {LEGACY_AGENT_TARBALL}")
+
+    download_file(f"{LEGACY_AGENT_RELEASE_URL}/{LEGACY_AGENT_TARBALL}", tarball)
+    verify_sha256(tarball, want)
+
+    build_dir = VM_DIR / "agent-upgrade-legacy-release"
+    shutil.rmtree(build_dir, ignore_errors=True)
+    build_dir.mkdir(parents=True)
+    run(["tar", "-xzf", str(tarball), "-C", str(build_dir), "unbounded-agent"])
+    upgrade = VM_DIR / f"unbounded-agent-{LEGACY_AGENT_VERSION}-upgrade.tar.gz"
+    run(["tar", "-czf", str(upgrade), "-C", str(build_dir), "unbounded-agent"])
+
+    return upgrade
+
+
+def validate_agent_downgrade_to_legacy() -> None:
+    """Validate AgentUpgrade back to LEGACY_AGENT_VERSION, a release before the
+    host root, while the host is still linked: the link must leave nothing an
+    older agent cannot run with, and the host must not move while that agent is
+    in a slot.
+    """
+
+    before_current = read_daemon_current_target()
+    tarball = _download_legacy_agent_tarball()
+    operation_name = f"e2e-agent-downgrade-{int(time.time())}"
+    _serve_agent_upgrade_tarball(tarball, operation_name)
+
+    wait_for_daemon_active()
+    after_current = read_daemon_current_target()
+    last_good = read_daemon_last_good_target()
+    if after_current == before_current:
+        die(f"downgrade did not switch the daemon current symlink (still points to {after_current})")
+    if last_good != before_current:
+        die(f"last-good symlink mismatch: got {last_good!r}, expected {before_current!r}")
+
+    version_output = ssh_capture(f"sudo {DAEMON_BINARY_CURRENT} version")
+    # A whole word, so v0.8.0 is not found in v10.8.0.
+    if LEGACY_AGENT_VERSION.lstrip("v") not in (word.lstrip("v") for word in version_output.split()):
+        die(f"current daemon is not {LEGACY_AGENT_VERSION}: {version_output!r}")
+
+    validate_host_root_linked()
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+    log("============================================")
+    log(f"  Downgrade to {LEGACY_AGENT_VERSION} validation PASSED")
+    log("============================================")
+
+
+# ---------------------------------------------------------------------------
 # validate-agent-upgrade-operation
 # ---------------------------------------------------------------------------
 def validate_agent_upgrade_operation() -> None:
     """Validate AgentUpgrade stages a new daemon binary and updates symlinks."""
 
     operation_name = f"e2e-agent-upgrade-{int(time.time())}"
+    root_before = host_root_state()
     before_current = read_daemon_current_target()
     if not before_current:
         die("daemon current binary symlink target was empty")
@@ -4330,9 +5359,19 @@ def validate_agent_upgrade_operation() -> None:
     log(f"Current daemon binary after upgrade: {after_current}")
     log(f"Last-good daemon binary after upgrade: {last_good}")
 
-    if after_current == before_current:
+    # On a host an older agent installed, the daemon this upgrade starts may
+    # move the files to the host root, and the same slot then has a new path,
+    # so slots are compared by name. The host root only ever goes from linked
+    # to moving to moved, so an unchanged state means nothing moved in between,
+    # and the paths must match exactly.
+    moved = host_root_state() != root_before
+
+    def slot(path: str) -> str:
+        return os.path.basename(path) if moved else path
+
+    if slot(after_current) == slot(before_current):
         die(f"AgentUpgrade did not switch the daemon current symlink (still points to {after_current})")
-    if last_good != before_current:
+    if slot(last_good) != slot(before_current):
         die(f"last-good symlink mismatch: got {last_good!r}, expected {before_current!r}")
 
     log("============================================")
@@ -4597,9 +5636,17 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         _write_command_log(logs_dir / f"{prefix}{name}", ["ssh", *ssh_opts, ssh_target, command])
 
     ssh_log("vm-journal.log", "sudo journalctl --no-pager -l")
-    ssh_log("vm-cloud-init.log", "sudo cat /var/log/cloud-init.log")
-    ssh_log("vm-cloud-init-output.log", "sudo cat /var/log/cloud-init-output.log")
-    ssh_log("vm-cloud-init-status.json", "sudo cloud-init status --format json")
+
+    if host_image().provisioning == "ignition":
+        # No cloud-init to report on. Ignition records what it did in the
+        # journal, which is already collected above, and asking anyway leaves
+        # three empty files that read as a host where cloud-init failed.
+        ssh_log("vm-ignition.log", "sudo journalctl -u ignition-\\* --no-pager -l")
+    else:
+        ssh_log("vm-cloud-init.log", "sudo cat /var/log/cloud-init.log")
+        ssh_log("vm-cloud-init-output.log", "sudo cat /var/log/cloud-init-output.log")
+        ssh_log("vm-cloud-init-status.json", "sudo cloud-init status --format json")
+
     ssh_log("vm-unbounded-agent.log", "sudo journalctl -u unbounded-agent --no-pager -l")
     ssh_log("vm-unbounded-agent-daemon.log", "sudo journalctl -u unbounded-agent-daemon --no-pager -l")
     ssh_log("vm-systemd-machined.log", "sudo journalctl -u systemd-machined --no-pager -l")
@@ -4623,7 +5670,7 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
 
 def collect_logs() -> None:
     """Collect VM and cluster diagnostics into the logs directory."""
-    logs_dir = REPO_ROOT / "logs"
+    logs_dir = LOGS_DIR
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     if os.environ.get("COLLECT_NODE_CONFIG_LOGS", "").lower() == "true":
@@ -4793,11 +5840,54 @@ def reboot_host_and_wait() -> str:
     die("host did not return with a new boot ID within 300s")
 
 
+INSTALL_RECORD = "/var/lib/unbounded/agent/install-state.json"
+
+
+def install_record_stamp(deadline: float) -> str:
+    """Identify the install record's current contents. Every write replaces the
+    file, so the inode changes even within one second."""
+    return bounded_ssh(f"sudo stat -c '%i %Y' {INSTALL_RECORD}", deadline, check=True).stdout.strip()
+
+
+def ignition_reboot_problems(state: str, restarts: str, journal: str,
+                             record_before: str, record_after: str) -> list[str]:
+    """What the first-boot unit did on a reboot that it should not have.
+
+    The unit runs start on every boot. On a healthy host that only verifies:
+    it must not fail and retry, repair the daemon, or rewrite the record.
+    """
+    problems = []
+    if state != "active":
+        problems.append(f"ActiveState={state or 'unknown'}")
+    if restarts != "0":
+        problems.append(f"NRestarts={restarts or 'unknown'}")
+    # Logged by activateDaemonUnit in cmd/agent/internal/daemon/lifecycle.go.
+    if "daemon unit started" in journal:
+        problems.append("start repaired the daemon")
+    if record_after != record_before:
+        problems.append("the install record was rewritten")
+    return problems
+
+
+def validate_ignition_reboot(record_before: str, deadline: float) -> None:
+    unit = IGNITION_BOOTSTRAP_UNIT
+    state = settled_bootstrap_unit(deadline)
+    journal = bounded_ssh(f"sudo journalctl -b -u {unit} --no-pager", deadline).stdout
+    problems = ignition_reboot_problems(state.get("ActiveState", ""), state.get("NRestarts", ""), journal,
+                                        record_before, install_record_stamp(deadline))
+    if problems:
+        log(journal)
+        die(f"{unit} after a reboot: " + "; ".join(problems))
+    log(f"{unit} verified the host after the reboot without repairing it")
+
+
 def validate_host_reboot() -> None:
     """Require fresh host/node identity and networking without repairing components."""
     previous = node_boot_id(AGENT_MACHINE_NAME)
     if not previous:
         die("node boot identity is absent before host reboot")
+    ignition = host_image().provisioning == "ignition"
+    record_before = install_record_stamp(time.monotonic() + 30) if ignition else ""
     reboot_host_and_wait()
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
@@ -4808,6 +5898,10 @@ def validate_host_reboot() -> None:
             ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in node.get("status", {}).get("conditions", []))
             if boot and boot != previous and ready:
                 bounded_ssh("systemctl is-active unbounded-agent-daemon.service", deadline, check=True)
+                if ignition:
+                    # Its own deadline, rather than what the node's return left
+                    # of the reboot's.
+                    validate_ignition_reboot(record_before, time.monotonic() + 300)
                 validate_workload()
                 log("Host reboot and fresh workload/DNS passed without component repair")
                 return
@@ -4817,7 +5911,7 @@ def validate_host_reboot() -> None:
 
 def reinstall_agent(node_config: NodeConfig) -> None:
     before = bounded_ssh("cat /proc/sys/kernel/random/boot_id", time.monotonic() + 15, check=True).stdout.strip()
-    run_agent(node_config)
+    run_agent(node_config, reinstall=True)
     after = bounded_ssh("cat /proc/sys/kernel/random/boot_id", time.monotonic() + 15, check=True).stdout.strip()
     if not before or after != before:
         die("same-disk reinstall changed host boot identity")
@@ -4832,7 +5926,7 @@ def validate_bootstrap_repair() -> None:
         before=$(sha256sum /etc/unbounded/agent/kube2-applied-config.json)
         node_pid=$(systemctl show systemd-nspawn@kube2.service --property=MainPID --value)
         test "$node_pid" -gt 0
-        cp /usr/local/bin/unbounded-agent-current /tmp/p6-repair-agent
+        cp @DAEMON_BINARY_CURRENT@ /tmp/p6-repair-agent
         chmod 0755 /tmp/p6-repair-agent
         python3 - <<'PY'
         from pathlib import Path
@@ -4855,7 +5949,7 @@ def validate_bootstrap_repair() -> None:
         test "$node_pid" = "$(systemctl show systemd-nspawn@kube2.service --property=MainPID --value)"
         grep -q '"phase": "complete"' /var/lib/unbounded/agent/install-state.json
         systemctl is-active unbounded-agent-daemon.service
-    """)
+    """).replace("@DAEMON_BINARY_CURRENT@", DAEMON_BINARY_CURRENT)
     bounded_ssh("sudo bash -c " + shlex.quote(script), time.monotonic() + 180, check=True)
     validate_workload()
     log("Completed-install repair preserved the repaved slot and workload")
@@ -4864,15 +5958,25 @@ def validate_bootstrap_repair() -> None:
 SUITES: dict[str, list[str]] = {
     "setup": ["configure-kind-kube-proxy", "install-machine-crd", "deploy-unbounded-net-controller",
               "start-machina-controller", "validate-machina-controller", "validate-controllers-healthy"],
-    "lifecycle": ["run-agent", "wait-for-node", "validate-host-nspawn-distro", "validate-controllers-healthy",
+    "lifecycle": ["run-agent", "wait-for-node", "validate-host-root", "validate-host-nspawn-distro", "validate-controllers-healthy",
                   "validate-node-config", "dump-persisted-agent-config", "validate-kube-proxy", "validate-machine-cr-created",
                   "validate-node-reboot-operation", "validate-host-agent-upgrade", "validate-agent-upgrade-operation",
                   "validate-agent-upgrade-rollback", "validate-workload", "validate-host-reboot", "reset-agent",
-                  "delete-machine-cr", "ensure-kind-bridge", "reinstall-agent", "wait-for-node", "validate-host-nspawn-distro",
+                  "delete-machine-cr", "ensure-kind-bridge", "reinstall-agent", "wait-for-node", "validate-host-root",
+                  "validate-host-nspawn-distro",
                   "validate-controllers-healthy", "dump-persisted-agent-config", "validate-kube-proxy", "validate-machine-cr-created",
                   "validate-node-reboot-operation", "validate-workload", "validate-node-repave-upgrade"],
     "configuration": ["validate-node-configs"],
     "fresh-bootstrap": ["run-agent", "wait-for-node", "validate-workload"],
+    # A host installed before the host root, linked and then moved; see README.
+    # Files staged beside the host root before the install must survive each
+    # change to it.
+    "migration": ["stage-host-files", "run-legacy-agent", "wait-for-node", "validate-agent-upgrade-operation",
+                  "validate-host-root-linked", "validate-host-staged-files", "validate-host-reboot",
+                  "validate-host-root-linked", "validate-agent-downgrade-to-legacy",
+                  "validate-agent-upgrade-operation", "validate-host-root-linked",
+                  "validate-agent-upgrade-operation", "validate-host-root-moved", "validate-host-staged-files",
+                  "validate-host-reboot", "validate-host-root", "reset-agent", "validate-host-staged-files"],
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
                            "validate-node-repave-upgrade", "validate-bootstrap-repair"],
 }
@@ -4920,6 +6024,7 @@ COMMANDS: dict[str, Command] = {
     "retire-lifecycle-vm": _without_node_config(retire_lifecycle_vm),
     "collect-logs": _without_node_config(collect_logs),
     "create-vm-bridge": _without_node_config(create_vm_bridge),
+    "resolve-host-image": _without_node_config(resolve_host_image),
     "create-vm": _without_node_config(create_vm),
     "prepare-blocked-network-vm": _without_node_config(prepare_blocked_network_vm),
     "block-external-network": _without_node_config(block_external_network),
@@ -4952,6 +6057,13 @@ COMMANDS: dict[str, Command] = {
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
+    "validate-host-root": _without_node_config(validate_host_root),
+    "validate-host-root-linked": _without_node_config(validate_host_root_linked),
+    "validate-host-root-moved": _without_node_config(validate_host_root_moved),
+    "stage-host-files": _without_node_config(stage_host_files),
+    "validate-host-staged-files": _without_node_config(validate_host_staged_files),
+    "run-legacy-agent": run_legacy_agent,
+    "validate-agent-downgrade-to-legacy": _without_node_config(validate_agent_downgrade_to_legacy),
     "cleanup": _without_node_config(cleanup),
 }
 

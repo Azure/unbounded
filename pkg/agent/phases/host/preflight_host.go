@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/Azure/unbounded/internal/executil"
+	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -45,7 +46,10 @@ type hostCheckDeps struct {
 	readFile             func(string) ([]byte, error)
 	stat                 func(string) (fs.FileInfo, error)
 	writeProbe           func(string) error
-	outputCmd            func(context.Context, *slog.Logger, string, ...string) (string, error)
+	// noexec reports whether the filesystem holding a path is mounted without
+	// permission to run programs from it.
+	noexec    func(string) (bool, error)
+	outputCmd func(context.Context, *slog.Logger, string, ...string) (string, error)
 }
 
 func defaultHostCheckDeps() hostCheckDeps {
@@ -57,6 +61,7 @@ func defaultHostCheckDeps() hostCheckDeps {
 		readFile:             os.ReadFile,
 		stat:                 os.Stat,
 		writeProbe:           utilio.ProbeWritableDir,
+		noexec:               fsutil.MountedNoexec,
 		outputCmd:            executil.OutputCmd,
 	}
 }
@@ -221,22 +226,28 @@ func checkHostOSConfiguration(log *slog.Logger, deps hostCheckDeps) preflight.Ch
 }
 
 // agentInstallDirs returns the host directories the agent writes its own files
-// into. Derived from the binary path rather than restated, so the check cannot
-// drift from where the agent actually installs.
+// into. Derived from the host layout rather than restated, so the check cannot
+// drift from where the agent actually installs. Planned rather than resolved,
+// because preflight does not migrate the host root.
 func agentInstallDirs() []string {
-	return []string{filepath.Dir(goalstates.DaemonBinaryPath)}
+	return []string{goalstates.PlannedHostPaths().BinDir}
 }
 
-// installDirResults verifies the agent can write its own host-side files.
+// installDirResults verifies the agent can write its own host-side files, and
+// run them from there.
 //
 // The agent creates these directories during bootstrap, so on a host that has
 // never been bootstrapped they do not exist yet. Probing the nearest existing
 // ancestor asks the question the check actually means, which is whether the
-// agent can create and write them, not whether they are already there.
+// agent can create and write them, not whether they are already there. The
+// directories it creates are on that ancestor's filesystem, unless something
+// is mounted there later.
 //
-// This fails rather than warns. A directory the agent cannot write is not a
+// Both fail rather than warn. A directory the agent cannot write is not a
 // degraded mode: installing the bootstrap binary is the first thing that
 // happens to the host, and it would fail there anyway with a worse message.
+// Nor is one it cannot run from: systemd could not start the daemon, and
+// bootstrap would fail late, after the node has started.
 func installDirResults(log *slog.Logger, dirs []string, deps hostCheckDeps) []preflight.Result {
 	var results []preflight.Result
 
@@ -244,16 +255,35 @@ func installDirResults(log *slog.Logger, dirs []string, deps hostCheckDeps) []pr
 		log.Debug("checking agent install directory", "path", dir)
 
 		probeDir := utilio.NearestExistingDir(deps.stat, dir)
-		if err := deps.writeProbe(probeDir); err == nil {
+		if err := deps.writeProbe(probeDir); err != nil {
+			results = append(results, preflight.Error(
+				checkHostOSConfigurationName,
+				"host OS configuration",
+				"agent install directory %s cannot be created under %s, which is required to install the agent",
+				dir, probeDir,
+			))
+
 			continue
 		}
 
-		results = append(results, preflight.Error(
-			checkHostOSConfigurationName,
-			"host OS configuration",
-			"agent install directory %s cannot be created under %s, which is required to install the agent",
-			dir, probeDir,
-		))
+		noexec, err := deps.noexec(probeDir)
+
+		switch {
+		case err != nil:
+			results = append(results, preflight.Warning(
+				checkHostOSConfigurationName,
+				"host OS configuration",
+				"could not check whether programs can run from agent install directory %s: %v",
+				dir, err,
+			))
+		case noexec:
+			results = append(results, preflight.Error(
+				checkHostOSConfigurationName,
+				"host OS configuration",
+				"agent install directory %s is on a filesystem mounted noexec at %s, so the agent cannot run from it; remount it without noexec",
+				dir, probeDir,
+			))
+		}
 	}
 
 	return results

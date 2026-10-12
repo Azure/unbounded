@@ -196,6 +196,128 @@ runcmd:
   - export AGENT_MACHINE_NAME=my-custom-node
 ```
 
+### Where the agent installs
+
+The agent keeps its own host-side files under `/opt/unbounded/agent`: the
+daemon binaries and helper scripts in `/opt/unbounded/agent/bin`, and the
+LocalDNS network helper in `/opt/unbounded/agent/libexec`. Paths inside the
+nspawn machine are always relative to the machine directory, and
+`/etc/unbounded/agent` and `/var/lib/unbounded` are separate.
+`/opt/unbounded/agent/bin` is not on the default `PATH`, so run the agent on the
+host as `/opt/unbounded/agent/bin/unbounded-agent`.
+
+`/opt/unbounded/agent` is reserved for the agent. The rest of `/opt/unbounded`
+is yours, for example for offline artifacts or a local OCI layout: the agent
+creates `/opt/unbounded` if it is missing, and otherwise never changes or
+removes it or anything else in it. Mount a volume at a subdirectory such as
+`/opt/unbounded/artifacts` rather than over `/opt/unbounded`, so it does not
+hide the agent.
+
+The filesystem that holds `/opt/unbounded/agent` must allow running programs,
+so `/opt` must not be mounted `noexec`. Preflight fails where it is.
+
+Releases before `/opt/unbounded/agent` installed these files under
+`/usr/local`. A host installed by one of them moves to `/opt/unbounded/agent` in
+two stages:
+
+1. **Linked.** The first command of a newer agent that changes the host links
+   `/opt/unbounded/agent` to `/usr/local`, creating `/opt/unbounded` if needed.
+   That happens when the daemon starts after an AgentUpgrade, when `start` or
+   `agent-upgrade` runs, or when the nspawn pre-start hook runs. The files stay
+   where they are, and every path the units name is unchanged. The older
+   release is still the last-good binary, so the daemon can roll back to it, and
+   an AgentUpgrade back to it works. If the link cannot be made, the pre-start
+   hook leaves the machine's config as it is and the machine still starts; the
+   daemon refuses to start, and its journal says why.
+2. **Moved.** Once neither the current nor the last-good binary is from a
+   release before `/opt/unbounded/agent`, the daemon copies the files into a
+   real `/opt/unbounded/agent`, rewrites the units to use them, and restarts
+   itself from there. The restarted daemon then removes the files from
+   `/usr/local`. That is at the first daemon start after the AgentUpgrade that
+   follows the older release out of the last-good slot. To move a host that is
+   not due another upgrade, apply the release it already runs as an
+   AgentUpgrade. A move that is interrupted is finished or started over at the
+   next daemon start.
+
+   Before any unit names the copy, the daemon runs it. A host whose `/opt` is
+   mounted `noexec`, or where the copy does not run for another reason, stays
+   linked: the daemon logs why, removes any copy it made, points the units back
+   at `/usr/local` if a move that was interrupted had already pointed them at
+   the copy, and tries again at its next start.
+
+`unbounded-agent reset` removes the agent's files from both locations at any
+stage, then `/opt/unbounded/agent` itself: the link the agent made, or the
+directory once nothing else is left in it.
+
+Releases before `/opt/unbounded/agent` cannot run on a host whose agent is in a
+real `/opt/unbounded/agent`, whether it was installed there or moved there, and
+an AgentUpgrade to one is not supported. Nothing refuses it, and what happens
+depends on `/usr/local`:
+
+- Where it is read-only, that release's daemon fails at startup, because it
+  writes its nspawn lifecycle helper there. The agent rolls back to the
+  last-good binary and the operation fails.
+- Where it is writable, the operation reports success, and the next
+  AgentUpgrade fails, because that release looks for its binaries under
+  `/usr/local`.
+
+To recover, copy a newer release's `unbounded-agent` binary to the host and run
+`sudo ./unbounded-agent agent-upgrade` with it. That leaves the older release
+as the last-good binary, so apply the newer release as an AgentUpgrade once
+more to replace it there. Alternatively, run `sudo ./unbounded-agent reset`
+with the newer binary and bootstrap the host again.
+
+The agent refuses to run on a host that has an installation under both
+locations, or an installation under `/usr/local` beside an existing
+`/opt/unbounded/agent` directory, except while a move between them is under way.
+Run `unbounded-agent reset` first.
+
+The install script also places the agent binary at
+`/usr/local/bin/unbounded-agent` where it can, because releases before
+`/opt/unbounded/agent` look for it there. Newer releases do not use it, and the daemon removes it once
+nothing it runs is under `/usr/local`: once the host is installed in a real
+`/opt/unbounded/agent`, or in a directory outside `/usr/local` that you linked
+`/opt/unbounded/agent` to.
+
+### Immutable hosts (read-only /usr)
+
+Some images mount `/usr` read-only and provide no package manager, so there is
+no shell-based provisioning path at first boot. Azure Container Linux is one
+such image. `/opt`, and with it the agent's files under `/opt/unbounded/agent`,
+is on the writable root filesystem there.
+
+For these hosts, generate an Ignition config. The agent has to be a release
+that installs under `/opt/unbounded/agent`: earlier releases install under
+`/usr/local`, which is read-only on these hosts. Set `VERSION` to that release's
+tag:
+
+```bash
+VERSION=vX.Y.Z
+curl -fsSLO "https://github.com/Azure/unbounded/releases/download/${VERSION}/checksums.txt"
+kubectl unbounded machine manual-bootstrap my-node --site mysite \
+    --variant ignition \
+    --agent-url "https://github.com/Azure/unbounded/releases/download/${VERSION}/unbounded-agent-linux-amd64" \
+    --agent-sha256 "$(grep ' unbounded-agent-linux-amd64$' checksums.txt)" \
+    > config.ign
+```
+
+Ignition declares state rather than running commands, so this variant cannot
+resolve a version, detect an architecture, or extract an archive at boot. It
+therefore requires `--agent-url` pointing at the *bare agent binary* rather
+than the release tarball, and `--agent-sha256` to verify it. The digest for
+each release binary is published in `checksums.txt`.
+
+The config writes the agent config and the binary, and enables
+`unbounded-agent-bootstrap.service`, which runs `preflight` and then `start` on
+every boot. On an installed host that does nothing unless the daemon needs
+repair. It retries a failed bootstrap with a delay that grows to five minutes
+on systemd 254 and later, and every 10 seconds on older versions. Follow it on
+the host with `journalctl -u unbounded-agent-bootstrap.service`.
+`unbounded-agent reset` stops, disables, and removes it.
+
+`config.ign` carries the agent config, including the bootstrap token. Treat it
+as a secret, and deliver it only to the host it is for.
+
 ### Customizing the agent download
 
 By default the bootstrap script downloads the latest published
