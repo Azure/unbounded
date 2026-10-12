@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -82,7 +82,13 @@ impl AdapterOrigin {
     /// contain their page number repeated, without allocating the complete object.
     pub fn new(cache_name: &str, metadata: ObjectMetadata) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        assert!(!cache_name.contains('/') && !cache_name.is_empty());
+        let mut components = Path::new(cache_name).components();
+        assert!(
+            matches!(components.next(), Some(Component::Normal(name)) if name == cache_name)
+                && components.next().is_none()
+                && !cache_name.contains('\0'),
+            "cache name must be a single normal path component"
+        );
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join(format!(
@@ -145,8 +151,13 @@ impl AdapterOrigin {
     }
 
     /// Replace the current metadata returned to new requests.
+    /// Keep explicit content only when the immutable descriptor is unchanged.
     pub fn set_version(&self, metadata: ObjectMetadata) {
-        self.state.lock().unwrap().metadata = metadata;
+        let mut state = self.state.lock().unwrap();
+        if !state.metadata.immutable().compatible(&metadata.immutable()) {
+            state.body = None;
+        }
+        state.metadata = metadata;
     }
 
     /// Missing current objects return 404; unsatisfied explicit pins return 412.
@@ -326,7 +337,10 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
             .is_some_and(|etag| etag != metadata.version.etag.as_bytes())
         {
             412
-        } else if !head && first >= metadata.length && metadata.length != 0 {
+        } else if !head
+            && first >= metadata.length
+            && (metadata.length != 0 || call.if_match.is_some())
+        {
             416
         } else if head || metadata.length == 0 {
             200
@@ -341,6 +355,12 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
     };
     let mut response = format!("HTTP/1.1 {status} Fixture\r\nConnection: close\r\n");
     let body = if status >= 400 {
+        if status == 405 {
+            response.push_str("Allow: HEAD, GET\r\n");
+        }
+        if status == 416 {
+            response.push_str(&format!("Content-Range: bytes */{}\r\n", metadata.length));
+        }
         response.push_str("Content-Length: 0\r\n\r\n");
         vec![]
     } else {
@@ -371,12 +391,12 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
             ));
         }
         response.push_str("\r\n");
-        if head {
+        if head || length == 0 {
             vec![]
         } else if let Some(body) = &state.body {
             body[first as usize..(first + length) as usize].to_vec()
         } else if metadata.length == 3 {
-            b"abc".to_vec()
+            b"abc"[first as usize..(first + length) as usize].to_vec()
         } else {
             vec![call.page as u8; length as usize]
         }

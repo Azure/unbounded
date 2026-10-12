@@ -1,7 +1,8 @@
 //! Validate origin response framing, status, metadata, and whole-page boundaries.
 
 use crate::model::{
-    ContentType, ExpiresAt, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES, PageId, StrongEtag,
+    ContentType, ExpiresAt, MAX_FIELD_BYTES, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES,
+    PageId, StrongEtag,
 };
 use crate::{Error, Result};
 use http1::{MessageHead, StartLine};
@@ -13,6 +14,9 @@ pub fn request(
     metadata: Option<&[u8]>,
     authorization: Option<&[u8]>,
 ) -> Result<MessageHead> {
+    if !matches!(method, "HEAD" | "GET") {
+        return Err(Error::MethodNotAllowed);
+    }
     let target = format!("/v1/objects/{}", key.to_hex());
     let mut headers = vec![
         http1::Header::new("Host", b"racer"),
@@ -38,8 +42,10 @@ pub fn request(
 
 /// Validate opaque origin context without interpreting credentials or normalizing bytes.
 pub fn opaque(bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_FIELD_BYTES {
+        return Err(Error::HeaderTooLarge);
+    }
     if bytes.is_empty()
-        || bytes.len() > 8192
         || bytes.first() == Some(&b' ')
         || bytes.last() == Some(&b' ')
         || bytes.iter().any(|b| *b < 0x20 || *b == 0x7f)
@@ -128,7 +134,6 @@ fn field<'a>(head: &'a MessageHead, name: &str) -> Result<Option<&'a [u8]>> {
         if name.eq_ignore_ascii_case("Authorization")
             || name.eq_ignore_ascii_case("Racer-Metadata")
             || name.eq_ignore_ascii_case("Racer-Expires-At")
-            || name.eq_ignore_ascii_case("Racer-Content-Type")
             || name.eq_ignore_ascii_case("Content-Length")
             || name.eq_ignore_ascii_case("Content-Range")
         {
