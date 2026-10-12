@@ -181,8 +181,12 @@ where
 {
     parent.check()?;
     if let Some(session) = C::session(connection.state()) {
-        session.check()?;
+        if let Err(error) = session.check() {
+            connection.poison();
+            return Err(error.into());
+        }
         if session.peer() != peer {
+            connection.poison();
             return Err(Error::Unauthorized.into());
         }
         return Ok(connection);
@@ -255,7 +259,10 @@ where
 {
     parent.check()?;
     if let Some(session) = C::session(connection.state()) {
-        session.check()?;
+        if let Err(error) = session.check() {
+            connection.poison();
+            return Err(error.into());
+        }
         return Ok(connection);
     }
     let scope = C::handshake_scope(parent)?;

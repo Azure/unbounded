@@ -672,52 +672,88 @@ fn cancellation_and_deadlines_abort_each_handshake_wait_and_release_slots() {
 
 #[test]
 fn pooled_sessions_reject_wrong_peer_expiry_and_canceled_parent_without_io() {
-    for fault in ["peer", "expired", "cancel", "deadline"] {
-        simulation(|h, sim, clock| {
-            let (client, server) = h.pair(sim);
-            let (client, server) = h.drive(join(
-                h.connect(client, &h.scope),
-                h.accept(server, &h.scope),
-            ));
-            let (client, server) = h.application_round(client.unwrap(), server.unwrap());
-            let socket = Rc::downgrade(&client.socket());
-            drop(client);
-            let client = h.drive(h.pool.checkout(&Endpoint, &h.scope)).unwrap();
-            assert!(socket.ptr_eq(&Rc::downgrade(&client.socket())));
-            drop(socket);
-            let scope = TestScope::new(Duration::from_secs(7200));
-            match fault {
-                "expired" => clock.advance(Duration::from_secs(3600)),
-                "cancel" => scope.cancellation.cancel().unwrap(),
-                "deadline" => clock.advance(Duration::from_secs(7200)),
-                _ => (),
+    for outbound in [false, true] {
+        for fault in ["peer", "expired", "cancel", "deadline"] {
+            if !outbound && fault == "peer" {
+                continue;
             }
-            let trace = sim.trace();
-            let peer = h.identities[if fault == "peer" { 2 } else { 1 }].node();
-            let result = h.drive(connect(
-                &h.io,
-                client,
-                h.identities[0].clone(),
-                peer,
-                &scope,
-            ));
-            let expected = match fault {
-                "peer" => Error::Unauthorized,
-                "cancel" => Error::Runtime(uring_runtime::Error::Cancelled),
-                _ => Error::DeadlineExceeded,
-            };
-            assert!(matches!(result, Err(error) if error == expected), "{fault}");
-            let new_events = sim.trace();
-            assert!(
-                new_events[trace.len()..]
-                    .iter()
-                    .all(|event| event.operation != "send" && event.operation != "recv")
-            );
-            if fault != "peer" {
+            simulation(|h, sim, _| {
+                let (client, server) = h.pair(sim);
+                let (client, server) = h.drive(join(
+                    h.connect(client, &h.scope),
+                    h.accept(server, &h.scope),
+                ));
+                let (client, server) = h.application_round(client.unwrap(), server.unwrap());
+                let socket = Rc::downgrade(&client.socket());
+                drop(client);
+                let client = h.drive(h.pool.checkout(&Endpoint, &h.scope)).unwrap();
+                assert!(socket.ptr_eq(&Rc::downgrade(&client.socket())));
+                let (mut client, server) = h.application_round(client, server);
+                assert!(client.is_reusable());
+                let mut scope = TestScope::new(Duration::from_secs(30));
+                match fault {
+                    "expired" => client.state_mut().session.as_mut().unwrap().state.expires = now(),
+                    "cancel" => scope.cancellation.cancel().unwrap(),
+                    "deadline" => scope.deadline = now(),
+                    _ => (),
+                }
+                let trace = sim.trace();
+                let peer = h.identities[if fault == "peer" { 2 } else { 1 }].node();
+                let result = if outbound {
+                    h.drive(connect(
+                        &h.io,
+                        client,
+                        h.identities[0].clone(),
+                        peer,
+                        &scope,
+                    ))
+                } else {
+                    h.drive(accept(&h.io, client, h.identities[0].clone(), &scope))
+                };
+                let expected = match fault {
+                    "peer" => Error::Unauthorized,
+                    "cancel" => Error::Runtime(uring_runtime::Error::Cancelled),
+                    _ => Error::DeadlineExceeded,
+                };
                 assert!(
-                    matches!(h.drive(h.accept(server, &scope)), Err(error) if error == expected)
+                    matches!(result, Err(error) if error == expected),
+                    "outbound={outbound} {fault}"
                 );
-            }
-        });
+                let new_events = sim.trace();
+                assert!(
+                    new_events[trace.len()..]
+                        .iter()
+                        .all(|event| event.operation != "send" && event.operation != "recv")
+                );
+                if matches!(fault, "peer" | "expired") {
+                    assert!(
+                        socket.upgrade().is_none(),
+                        "invalid session returned to pool"
+                    );
+                    drop(server);
+                    assert_eq!(h.hooks.slots.get(), 0);
+                    let (client, server) = h.pair(sim);
+                    assert!(!socket.ptr_eq(&Rc::downgrade(&client.socket())));
+                    assert!(client.state().session.is_none());
+                    let (client, server) = h.drive(join(
+                        h.connect(client, &h.scope),
+                        h.accept(server, &h.scope),
+                    ));
+                    let (_client, _server) = h.application_round(client.unwrap(), server.unwrap());
+                    assert_eq!(h.hooks.installations.get(), 4);
+                } else {
+                    let client = h.drive(h.pool.checkout(&Endpoint, &h.scope)).unwrap();
+                    assert!(socket.ptr_eq(&Rc::downgrade(&client.socket())));
+                    let client = if outbound {
+                        h.drive(h.connect(client, &h.scope)).unwrap()
+                    } else {
+                        h.drive(accept(&h.io, client, h.identities[0].clone(), &h.scope))
+                            .unwrap()
+                    };
+                    assert_eq!(h.hooks.installations.get(), 2);
+                    let (_client, _server) = h.application_round(client, server);
+                }
+            });
+        }
     }
 }
