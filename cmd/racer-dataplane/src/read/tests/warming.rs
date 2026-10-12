@@ -391,6 +391,53 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
             .is_some(),
         "partial failure preserves promised disk page"
     );
+    // A new registry job expands this existing partial hold, then fails again.
+    let mut failed_retry = local.read(request(), &f.scope);
+    let mut admitted = false;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = failed_retry.as_mut().poll(&mut cx) {
+            assert!(result.unwrap().retain_until.is_some());
+            admitted = true;
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert!(admitted);
+    drop(failed_retry);
+    for _ in 0..1024 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        if owners.warm.snapshot().0 == 0 {
+            break;
+        }
+    }
+    pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    assert_eq!(owners.warm.snapshot().0, 0);
+    let mut other = f.page.version.clone();
+    other.etag = crate::model::StrongEtag::test_value("other-hold");
+    f.fill
+        .dependencies
+        .writer
+        .index()
+        .reserve_hold(
+            &other,
+            7,
+            uring_runtime::environment::wall_now() + Duration::from_secs(30),
+        )
+        .expect("failed expansion released its unused second page");
+    f.fill
+        .dependencies
+        .writer
+        .index()
+        .release_hold(&other)
+        .unwrap();
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .held_page_expiry(&f.page)
+            .is_some()
+    );
     f.origin.version_unavailable.set(false);
     for ordered in [true, false] {
         let caller =
@@ -468,7 +515,7 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
             .held_page_expiry(&tail)
             .is_some()
     );
-    assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1, 1]);
+    assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1, 1, 1]);
     endpoint.uninstall().unwrap();
 }
 
@@ -544,4 +591,168 @@ fn warm_drain_cancels_detached_job_and_refused_head_keeps_metadata_success() {
         );
         endpoint.uninstall().unwrap();
     }
+}
+
+#[test]
+fn warm_cancel_keeps_get_gate_until_detached_origin_driver_fences() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(1);
+    let mut f = fixture();
+    f.reactor.init().unwrap();
+    let membership = Arc::new(
+        Membership::validate(
+            racer_control_wire::MembershipVersion(1),
+            vec![Member {
+                node: node(0),
+                shares: NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:8200".into(),
+                rails: vec![],
+                site: String::new(),
+            }],
+        )
+        .unwrap(),
+    );
+    let (local, mut endpoint, _) = coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    let owners = f.fill.dependencies.metadata_owner.clone();
+    let origin = || OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    f.origin.blocked_pages.borrow_mut().insert(0);
+    let mut head = local.read(
+        ClientRequest {
+            retain: Some(Duration::from_secs(60)),
+            kind: ReadKind::HeadPinned {
+                etag: f.page.version.etag.clone(),
+            },
+            origin: origin(),
+        },
+        &f.scope,
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut accepted = false;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = head.as_mut().poll(&mut cx) {
+            assert!(result.unwrap().retain_until.is_some());
+            accepted = true;
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert!(accepted);
+    drop(head);
+    for _ in 0..64 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert_eq!(f.origin.calls.get(), 1);
+    let caller = RequestScope::new(RequestId([99; 16]), f.scope.deadline.0).unwrap();
+    let response = futures::executor::block_on(local.read(
+        ClientRequest {
+            retain: None,
+            origin: origin(),
+            kind: ReadKind::Subscription {
+                pin: Some(f.page.version.etag.clone()),
+                range: None,
+                page_credits: 1,
+                byte_credits: PAGE_BYTES,
+                ordered: false,
+            },
+        },
+        &caller,
+    ))
+    .unwrap();
+    let ReadPayload::Stream(mut stream) = response.payload else {
+        panic!("stream");
+    };
+    owners.warm.stop();
+    for _ in 0..64 {
+        assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert_eq!(
+        owners.warm.snapshot().0,
+        1,
+        "canceled driver still owns warm exclusion"
+    );
+    assert_eq!(f.origin.calls.get(), 1, "no unordered outbound overlap");
+    f.origin.blocked_pages.borrow_mut().clear();
+    let mut delivered = false;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = stream.next_slice().as_mut().poll(&mut cx) {
+            assert!(result.unwrap().is_some());
+            delivered = true;
+            break;
+        }
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    assert!(delivered);
+    assert_eq!(owners.warm.snapshot().0, 0);
+    drop(stream);
+    for _ in 0..32 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    endpoint.uninstall().unwrap();
+}
+
+#[test]
+fn warm_follower_cancellation_waits_for_existing_foreground_supplier() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut f = fixture();
+    f.origin.blocked_pages.borrow_mut().insert(0);
+    let foreground_scope = RequestScope::new(RequestId([101; 16]), f.scope.deadline.0).unwrap();
+    let warm_scope = RequestScope::new(RequestId([102; 16]), f.scope.deadline.0).unwrap();
+    let mut foreground_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    let mut warm_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    let mut foreground = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &foreground_scope,
+        &mut foreground_budget,
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for _ in 0..32 {
+        assert!(foreground.as_mut().poll(&mut cx).is_pending());
+        uring_runtime::drivers::poll(&mut cx, 64);
+    }
+    assert_eq!(f.origin.calls.get(), 1);
+    let mut warm = Box::pin(f.fill.acquire_warm(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &warm_scope,
+        &mut warm_budget,
+    ));
+    assert!(warm.as_mut().poll(&mut cx).is_pending());
+    warm_scope.cancel().unwrap();
+    foreground_scope.cancel().unwrap();
+    assert!(matches!(
+        foreground.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    ));
+    drop(foreground);
+    for _ in 0..32 {
+        assert!(
+            warm.as_mut().poll(&mut cx).is_pending(),
+            "follower cancellation is not the supplier fence"
+        );
+        uring_runtime::drivers::poll(&mut cx, 64);
+    }
+    f.origin.blocked_pages.borrow_mut().clear();
+    let mut done = false;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = warm.as_mut().poll(&mut cx) {
+            assert!(matches!(result, Err(Error::Cancelled)));
+            done = true;
+            break;
+        }
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
+    }
+    assert!(done);
+    assert_eq!(f.origin.calls.get(), 1);
 }

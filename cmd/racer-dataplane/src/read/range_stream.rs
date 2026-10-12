@@ -63,19 +63,15 @@ pub(crate) struct Scheduler {
     state: Mutex<State>,
 }
 impl Scheduler {
-    pub(super) fn admit_warm<T>(
+    pub(super) fn admit_warm(
         &self,
         version: &ObjectVersion,
         registry: &super::warm::WarmRegistry,
-        admit: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
+    ) -> Result<(Arc<super::warm::Job>, bool)> {
         let state = self.state.lock().unwrap();
-        if state.selecting.contains(version) && !registry.contains(version) {
-            return Err(Error::Overloaded);
-        }
         // A provider selection may bypass Fill flights. Publish the warm gate
         // while holding its election lock, or refuse this optional HEAD hint.
-        admit()
+        registry.begin_selected(version, state.selecting.contains(version))
     }
     pub(crate) fn contract(
         &self,

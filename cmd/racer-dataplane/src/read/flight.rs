@@ -615,6 +615,30 @@ pub enum FlightState {
 }
 
 impl AcquisitionWaiter<'_> {
+    /// A canceled warm follower must also fence the supplier it joined.
+    pub(super) async fn wait_operations(&mut self) -> Result<()> {
+        poll_fn(|cx| {
+            let flights = self.registration.flights.clone();
+            let mut retired = None;
+            let result = flights.update(|table, _wakes| {
+                let entry = match registered(table, &self.registration) {
+                    Ok(entry) => entry,
+                    Err(Error::StaleFlight) => return Poll::Ready(Ok(())),
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
+                if entry.operations.is_empty() {
+                    return Poll::Ready(Ok(()));
+                }
+                let waiter = entry.state.waiters.get_mut(&self.registration.id).unwrap();
+                retired =
+                    coalesce::flight::state::store_waker(&mut waiter.waker, cx.waker().clone());
+                Poll::Pending
+            });
+            drop(retired);
+            result
+        })
+        .await
+    }
     /// Independent deadline/cancellation. Lead is emitted once per election;
     /// retry elects only a still-live caller with remaining original credits.
     /// A rejected caller receives OriginRejected/OriginForbidden and is ineligible
@@ -1685,6 +1709,7 @@ impl Flights {
                 .complete(id)
                 .map_err(|_| Error::StaleFlight)?;
             refresh(entry, wakes);
+            notify(entry, wakes);
             table.notify_drain(wakes);
             Ok(())
         })?;

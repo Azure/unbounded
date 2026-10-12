@@ -132,14 +132,37 @@ impl WarmRegistry {
         index: &crate::store::catalog::Index,
         cx: &mut Context<'_>,
     ) -> Result<()> {
+        self.poll_releases_with(worker, cx, |version| index.release_hold(version))
+    }
+
+    fn poll_releases_with(
+        &self,
+        worker: crate::model::WorkerId,
+        cx: &mut Context<'_>,
+        mut release: impl FnMut(&ObjectVersion) -> Result<()>,
+    ) -> Result<()> {
         let versions = {
             let mut releases = self.releases.lock().unwrap();
             let (waker, versions) = releases.entry(worker.0).or_default();
             *waker = Some(cx.waker().clone());
-            std::mem::take(versions)
+            versions.iter().cloned().collect::<Vec<_>>()
         };
         for version in versions {
-            index.release_hold(&version)?;
+            if let Err(error) = release(&version) {
+                // Retry on the next worker turn, never self-wake or lose the tail.
+                return if error == Error::Overloaded {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
+            }
+            self.releases
+                .lock()
+                .unwrap()
+                .entry(worker.0)
+                .or_default()
+                .1
+                .remove(&version);
         }
         Ok(())
     }
@@ -161,7 +184,16 @@ impl WarmRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn begin(&self, version: &ObjectVersion) -> Result<(Arc<Job>, bool)> {
+        self.begin_selected(version, false)
+    }
+
+    pub(super) fn begin_selected(
+        &self,
+        version: &ObjectVersion,
+        selecting: bool,
+    ) -> Result<(Arc<Job>, bool)> {
         use std::sync::atomic::Ordering;
         if self.draining.load(Ordering::Acquire) {
             return Err(Error::Unavailable);
@@ -182,6 +214,9 @@ impl WarmRegistry {
             }
             progress.admissions += 1;
             return Ok((job.clone(), false));
+        }
+        if selecting {
+            return Err(Error::Overloaded);
         }
         if jobs.len() >= config.max_jobs
             || self
@@ -234,35 +269,34 @@ impl WarmRegistry {
     pub(crate) fn poll_deadlines(&self) {
         let now = uring_runtime::environment::now();
         let wall = uring_runtime::environment::wall_now();
-        let jobs = self
-            .jobs
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for job in jobs {
-            let progress = job.progress.lock().unwrap();
+        let mut jobs = self.jobs.lock().unwrap();
+        let mut cancel = Vec::new();
+        let mut wake = Vec::new();
+        jobs.retain(|_, job| {
+            let mut progress = job.progress.lock().unwrap();
             let expired = progress.until.is_some_and(|until| until <= wall);
-            let cancel = progress.running && (expired || job.scope.deadline.0 <= now);
+            if progress.running && (expired || job.scope.deadline.0 <= now) {
+                cancel.push(job.clone());
+            }
             let remove = !progress.running && progress.admissions == 0 && expired;
-            let wakes = progress
-                .waiters
-                .values()
-                .filter(|(_, deadline)| *deadline <= now || remove)
-                .map(|(waker, _)| waker.clone())
-                .collect::<Vec<_>>();
-            drop(progress);
-            if cancel {
-                let _ = job.scope.cancel();
-            }
             if remove {
-                job.stop();
-                self.remove(&job);
+                progress.stopped = true;
             }
-            for wake in wakes {
-                wake.wake();
-            }
+            wake.extend(
+                progress
+                    .waiters
+                    .values()
+                    .filter(|(_, deadline)| *deadline <= now || remove)
+                    .map(|(waker, _)| waker.clone()),
+            );
+            !remove
+        });
+        drop(jobs);
+        for job in cancel {
+            let _ = job.scope.cancel();
+        }
+        for waker in wake {
+            waker.wake();
         }
     }
 
@@ -416,12 +450,9 @@ pub(crate) async fn admit(
         .checked_add(ttl.min(config.max_ttl))
         .ok_or(Error::InvalidRequest)?;
     let permit = uring_runtime::drivers::reserve()?;
-    let (job, fresh) =
-        directory
-            .subscriptions
-            .admit_warm(&metadata.version, &directory.warm, || {
-                directory.warm.begin(&metadata.version)
-            })?;
+    let (job, fresh) = directory
+        .subscriptions
+        .admit_warm(&metadata.version, &directory.warm)?;
     let (send, receive) = futures::channel::oneshot::channel();
     permit.submit_detached(Box::pin(async move {
         let mut guard = JobGuard {
@@ -595,6 +626,66 @@ mod tests {
             uring_runtime::environment::now() + Duration::from_secs(30),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn retryable_release_preserves_the_entire_queue_without_self_waking() {
+        let registry = WarmRegistry::new(4);
+        let worker = crate::model::WorkerId(0);
+        registry.release(&version("a"), &[worker]);
+        registry.release(&version("b"), &[worker]);
+        let wakes = Arc::new(crate::test_support::WakeCounter::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut calls = 0;
+        registry
+            .poll_releases_with(worker, &mut cx, |_| {
+                calls += 1;
+                Err(Error::Overloaded)
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(wakes.count(), 0);
+        assert!(!registry.drained(worker));
+        let mut released = Vec::new();
+        registry
+            .poll_releases_with(worker, &mut cx, |version| {
+                released.push(version.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(released, vec![version("a"), version("b")]);
+        assert!(registry.drained(worker));
+    }
+
+    #[test]
+    fn expired_completed_job_cannot_replace_active_provider_selection() {
+        let registry = WarmRegistry::new(4);
+        let version = version("a");
+        let (job, _) = registry.begin(&version).unwrap();
+        job.update(|p| {
+            p.running = false;
+            p.admissions = 0;
+            p.until = Some(SystemTime::UNIX_EPOCH);
+        });
+        let scheduler = super::super::range_stream::Scheduler::new(4);
+        let range = crate::model::ByteRange::From(0).resolve(3).unwrap();
+        let mut demand = scheduler
+            .register(version.clone(), range, 1, PAGE_BYTES, false)
+            .unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Ok(super::super::range_stream::Next::Select(selection))) =
+            demand.poll_next(&mut cx)
+        else {
+            panic!("selection");
+        };
+        assert!(matches!(
+            scheduler.admit_warm(&version, &registry),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(registry.snapshot().0, 0);
+        drop(selection);
+        assert!(scheduler.admit_warm(&version, &registry).unwrap().1);
     }
 
     #[test]

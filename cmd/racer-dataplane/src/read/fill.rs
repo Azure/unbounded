@@ -83,6 +83,7 @@ pub struct Fill {
     pub(super) local_copies: Rc<LocalCopies>,
 
     diagnostic: Option<DriverDiagnostic>,
+    fence_acquisition: bool,
 }
 
 /// Immediate acquisition tier, not the original producer or corruption location.
@@ -560,6 +561,7 @@ impl Fill {
             metrics: Metrics::default(),
             local_copies: Rc::new(LocalCopies::default()),
             diagnostic: None,
+            fence_acquisition: false,
         }
     }
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
@@ -632,6 +634,21 @@ impl Fill {
             AcquiredPage::Plaintext(page) => Ok(page),
             AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
         }
+    }
+
+    /// Warm gates own transfer exclusion until accepted acquisition work is fenced.
+    pub(crate) async fn acquire_warm(
+        &self,
+        page: PageId,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<PageResult> {
+        let mut fill = self.clone();
+        fill.fence_acquisition = true;
+        fill.acquire_unobserved(page, membership, context, scope, budget)
+            .await
     }
 
     pub(crate) async fn acquire_ordered(
@@ -797,7 +814,13 @@ impl Fill {
                 JoinedFlight::Waiter(waiter) => waiter,
             };
             loop {
-                match waiter.wait().await? {
+                let event = waiter.wait().await;
+                if self.fence_acquisition
+                    && matches!(event, Err(_) | Ok(AcquisitionEvent::Failed(_)))
+                {
+                    waiter.wait_operations().await?;
+                }
+                match event? {
                     AcquisitionEvent::Complete(result) => {
                         result.validate_for(&page)?;
                         self.persist_verified(&result, observation);
@@ -985,14 +1008,21 @@ impl Fill {
         }));
         let remaining = std::future::poll_fn(|cx| {
             uring_runtime::drivers::poll(cx, 64);
-            acquisition.cancellation.register(cx.waker());
-            acquisition.scope.check()?;
+            if !self.fence_acquisition || !acquisition.scope.cancellation.is_cancelled() {
+                acquisition.cancellation.register(cx.waker());
+            }
+            if !self.fence_acquisition {
+                acquisition.scope.check()?;
+            }
             std::pin::Pin::new(&mut receive)
                 .poll(cx)
                 .map(|result| result.map_err(|_| Error::Unavailable))
         })
         .await?;
         *acquisition.budget = remaining;
+        if self.fence_acquisition {
+            acquisition.scope.check()?;
+        }
         Ok(())
     }
 

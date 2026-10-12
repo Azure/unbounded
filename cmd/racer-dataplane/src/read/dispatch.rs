@@ -882,7 +882,7 @@ async fn execute(
             let context = local.open_context(envelope)?;
             let result = local
                 .fill
-                .acquire_unobserved(
+                .acquire_warm(
                     page,
                     membership,
                     &context,
