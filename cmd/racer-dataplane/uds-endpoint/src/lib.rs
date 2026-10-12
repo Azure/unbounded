@@ -514,6 +514,44 @@ fn refused(path: &Path) -> io::Result<()> {
     }
 }
 
+fn bind_unlistening(path: &Path) -> io::Result<UnixListener> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    // SAFETY: zero is a valid initial representation for sockaddr_un.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() {
+        return Err(error(Error::InvalidName));
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as _;
+    }
+    // SAFETY: socket has no pointer arguments; OwnedFd takes ownership below.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: socket returned a new descriptor, transferred exactly once.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: address is initialized and its full size is supplied.
+    if unsafe {
+        libc::bind(
+            socket.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of_val(&address) as _,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(UnixListener::from(socket))
+}
+
 /// Nonblocking listener, pinned inode, and inode-checked pathname cleanup. Its
 /// owner survives until cleanup finishes, including failed bind staging.
 #[derive(Debug)]
@@ -530,16 +568,31 @@ pub struct BoundSocket {
 impl BoundSocket {
     /// Derive the witness and directory from the owner. Bind the witness first so
     /// a crash before chmod or linking still leaves recoverable evidence.
+    /// Pin and set mode 0600 before listening, so a permissive umask cannot admit
+    /// clients through the witness before access is restricted.
     ///
     /// # Errors
     /// Returns name/layout/ownership validation errors or the underlying bind,
-    /// pin, chmod, nonblocking, or link error. Failed staging preserves recovery
+    /// socket, pin, chmod, listen, or link error. Failed staging preserves recovery
     /// evidence whenever cleanup cannot prove which inode to remove.
     pub fn bind(owner: Rc<EndpointOwner>, temporary: &str) -> io::Result<Self> {
+        Self::bind_staged(
+            owner,
+            temporary,
+            #[cfg(test)]
+            |_| {},
+        )
+    }
+
+    fn bind_staged(
+        owner: Rc<EndpointOwner>,
+        temporary: &str,
+        #[cfg(test)] before_chmod: impl FnOnce(&Self),
+    ) -> io::Result<Self> {
         owner.validate(&owner.directory)?;
         let witness = owner.layout.witness(temporary)?;
         let basename = RefCell::new(temporary.to_owned());
-        let listener = UnixListener::bind(file_path(&owner.directory).join(&witness))?;
+        let listener = bind_unlistening(&file_path(&owner.directory).join(&witness))?;
         // If pin/stat fails, preserve the witness rather than guessing which inode
         // to unlink. The next owner can recover it after the listener closes.
         let pinned = Dir(&owner.directory).pin(&witness)?;
@@ -556,8 +609,14 @@ impl BoundSocket {
             witness,
             owner,
         };
+        #[cfg(test)]
+        before_chmod(&bound);
         bound.set_mode(0o600)?;
-        bound.listener.set_nonblocking(true)?;
+        // SAFETY: bound retains the socket descriptor. Its pinned inode is now
+        // private, so listening cannot queue clients through a permissive witness.
+        if unsafe { libc::listen(bound.listener.as_raw_fd(), 128) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         Dir(&bound.owner.directory).link(&bound.witness, temporary)?;
         Ok(bound)
     }
@@ -623,5 +682,88 @@ impl Drop for BoundSocket {
             return;
         }
         let _ = dir.unlink_owned(&self.witness, &metadata);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    #[ignore = "invoked by permissions_precede_listen with an isolated umask"]
+    fn permissive_umask_driver() {
+        let root = PathBuf::from(std::env::var_os("UDS_ADMISSION_ROOT").expect("subprocess root"));
+        let directory = open_directory(&root, 0o755).unwrap();
+        let layout =
+            Layout::new("lock", "socket", "owned-", |n| n.starts_with("pending-")).unwrap();
+        let owner = Rc::new(EndpointOwner::acquire(&directory, layout).unwrap());
+        // SAFETY: only this test runs in a dedicated subprocess. No parallel tests
+        // can observe its process-wide umask; process exit discards the change.
+        unsafe { libc::umask(0) };
+        let anchor = file_path(&directory);
+        let witness = anchor.join("owned-pending-a");
+        let bound = BoundSocket::bind_staged(owner.clone(), "pending-a", |bound| {
+            assert_eq!(directory.metadata().unwrap().mode() & 0o777, 0o755);
+            assert_eq!(bound.pinned.metadata().unwrap().mode() & 0o777, 0o777);
+            // Even the owner must be refused until the permissive mode is fixed.
+            assert_eq!(
+                UnixStream::connect(&witness).unwrap_err().raw_os_error(),
+                Some(libc::ECONNREFUSED)
+            );
+        })
+        .unwrap();
+        assert_eq!(fs::metadata(&witness).unwrap().mode() & 0o777, 0o600);
+        assert!(same_inode(
+            &fs::metadata(&witness).unwrap(),
+            &fs::metadata(anchor.join("pending-a")).unwrap()
+        ));
+        assert_eq!(bound.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        let _client = UnixStream::connect(anchor.join("pending-a")).unwrap();
+        let _accepted = bound.accept().unwrap();
+        drop(bound);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
+        let failure = BoundSocket::bind_staged(owner.clone(), "pending-b", |_| {
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o777))
+                .unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(
+            failure.get_ref().unwrap().downcast_ref::<Error>(),
+            Some(&Error::UnsafeDirectory)
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o755))
+            .unwrap();
+        drop(owner);
+        EndpointOwner::acquire(&directory, layout).unwrap();
+    }
+
+    #[test]
+    fn permissions_precede_listen() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("target/tmp")
+            .join(format!("admission-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new("timeout")
+            .args(["--signal=TERM", "--kill-after=10s", "300s"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "admission_tests::permissive_umask_driver",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("UDS_ADMISSION_ROOT", &root)
+            .status()
+            .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(status.success(), "admission subprocess failed: {status}");
     }
 }
