@@ -1438,8 +1438,43 @@ def check_reset_failed() -> None:
     warn(f"could not reset the daemon start-limit budget; the next scenario shares it: {reset.stderr.strip()}")
 
 
-def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_complete: bool = True) -> dict[str, Any]:
-    """Serve *tarball* to the VM, create AgentUpgrade, and wait for it."""
+# TEST ONLY (#890 verification): set by _serve_agent_upgrade_tarball.
+FORCED_START_LIMIT_SINCE = ""
+
+# The daemon unit's StartLimitBurst and StartLimitIntervalSec.
+DAEMON_START_LIMIT_BURST = 3
+DAEMON_START_LIMIT_INTERVAL_SECS = 60
+
+
+def exhaust_daemon_start_limit() -> str:
+    """TEST ONLY (#890 verification): use the daemon unit's whole start-limit
+    budget, so the next start is refused for start-limit-hit, and return the
+    VM's time before the first start, for reading its journal.
+
+    Where reset-failed is denied, as on Azure Container Linux, the window is
+    waited out first, so earlier starts cannot use the budget up early."""
+    reset = ssh_capture_quiet("sudo systemctl reset-failed unbounded-agent-daemon.service")
+    if reset.returncode != 0:
+        wait = DAEMON_START_LIMIT_INTERVAL_SECS + 5
+        log(f"reset-failed is denied ({reset.stderr.strip()}); waiting {wait}s for the start-limit window to empty")
+        time.sleep(wait)
+    since = ssh_capture("date '+%Y-%m-%d %H:%M:%S'").strip()
+    for i in range(DAEMON_START_LIMIT_BURST):
+        log(f"Restarting the daemon to use its start-limit budget ({i + 1}/{DAEMON_START_LIMIT_BURST})")
+        ssh_cmd("sudo systemctl restart unbounded-agent-daemon.service")
+        wait_for_daemon_active(DAEMON_START_LIMIT_INTERVAL_SECS)
+    return since
+
+
+def _serve_agent_upgrade_tarball(
+    tarball: Path,
+    operation_name: str,
+    expect_complete: bool = True,
+    exhaust_start_limit: bool = False,
+) -> dict[str, Any]:
+    """Serve *tarball* to the VM, create AgentUpgrade, and wait for it. With
+    exhaust_start_limit, the daemon's start-limit budget is used up first, so
+    the restart the AgentUpgrade schedules is refused."""
 
     runner_ip = VM_GATEWAY
     agent_url = f"http://{runner_ip}:{SERVE_PORT}/{tarball.name}"
@@ -1456,6 +1491,9 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
         # systemd start-limit budget so the candidate under test gets the
         # configured retries before recovery runs.
         check_reset_failed()
+        if exhaust_start_limit:
+            global FORCED_START_LIMIT_SINCE
+            FORCED_START_LIMIT_SINCE = exhaust_daemon_start_limit()
         run_quiet([KUBECTL, "delete", _machine_operation_resource(), operation_name,
                    "--ignore-not-found"], check=False)
         create_machine_operation(
@@ -5406,13 +5444,30 @@ def validate_agent_upgrade_rollback() -> None:
     operation_name = f"e2e-agent-upgrade-rollback-{int(time.time())}"
     tarball = VM_DIR / "unbounded-agent-upgrade-daemon-bad.tar.gz"
     _build_daemon_failing_agent_tarball(tarball)
-    failed_operation = _serve_agent_upgrade_tarball(tarball, operation_name, expect_complete=False)
+    failed_operation = _serve_agent_upgrade_tarball(
+        tarball, operation_name, expect_complete=False, exhaust_start_limit=True)
     wait_for_daemon_current_target(previous_good)
     wait_for_daemon_active()
     failed_status = failed_operation.get("status", {})
     log(f"Rollback AgentUpgrade failure reason: {failed_status.get('reason')!r}")
+    log(f"Rollback AgentUpgrade failure message: {failed_status.get('message')!r}")
     if AGENT_UPGRADE_ROLLBACK_MESSAGE_FRAGMENT not in failed_status.get("message", ""):
         die(f"unexpected rollback AgentUpgrade failure message: {failed_status.get('message')!r}")
+    # TEST ONLY (#890 verification): the AgentUpgrade's restart must have been
+    # refused for the start limit, or this run did not force the condition,
+    # and it must have come from the transient unit the daemon scheduled.
+    since = FORCED_START_LIMIT_SINCE
+    unit_journal = ssh_capture_quiet(
+        f"sudo journalctl -u unbounded-agent-daemon.service --since '{since}' --no-pager -o short-precise")
+    log(f"Daemon unit journal since {since}:\n{unit_journal.stdout}")
+    if "start-limit-hit" not in unit_journal.stdout:
+        die("the AgentUpgrade's restart was not refused for start-limit-hit; the condition was not forced")
+    restarts = ssh_capture_quiet(
+        f"sudo journalctl --since '{since}' --no-pager -o short-precise | grep -F unbounded-agent-daemon-restart- || true")
+    log(f"Scheduled restart units since {since}:\n{restarts.stdout}")
+    if "unbounded-agent-daemon-restart-" not in restarts.stdout:
+        die("no scheduled restart unit ran; the daemon did not restart through systemd-run")
+    log("Forced start-limit rollback validation PASSED")
 
     log("============================================")
     log("  AgentUpgrade rollback validation PASSED")
