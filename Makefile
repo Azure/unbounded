@@ -842,6 +842,7 @@ image-racer-object-local: ## Build the S3 read adapter image locally (single-arc
 		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		-t racer-object:$(VERSION_TAG) -t $(RACER_OBJECT_IMAGE) \
 		-f ./images/racer-object/Containerfile .
+	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
 
 ##@ Gantry (peer-to-peer OCI distribution)
 
