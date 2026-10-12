@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
@@ -193,4 +194,34 @@ func TestScriptStatusShowsPayloadCommandAndDigestOnly(t *testing.T) {
 	assert.Equal(t, "sha256:aaaaaaaa...", status.RunnerImageDigest)
 	assert.NotContains(t, status.RunnerImageDigest, "private.example")
 	assert.Equal(t, "run-snapshot-[redacted]-scripts", status.SnapshotConfigMap)
+}
+
+func TestWorkflowPodPrefersNodeHealthOverLaterWorkflowTasks(t *testing.T) {
+	t.Parallel()
+
+	workflow := &unstructured.Unstructured{}
+	workflow.SetName("workflow-example")
+
+	pods := []corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "workflow-example-mpi-backend",
+				Labels:      map[string]string{"workflows.argoproj.io/workflow": workflow.GetName()},
+				Annotations: map[string]string{"workflows.argoproj.io/node-name": "workflow-example.mpi-backend"},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main"}}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "workflow-example-node-health",
+				Labels:      map[string]string{"workflows.argoproj.io/workflow": workflow.GetName()},
+				Annotations: map[string]string{"workflows.argoproj.io/node-name": "workflow-example.node-health"},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main"}}},
+		},
+	}
+
+	pod := workflowPod(workflow, pods)
+	require.NotNil(t, pod)
+	assert.Equal(t, "workflow-example-node-health", pod.Name)
 }

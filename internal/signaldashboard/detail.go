@@ -55,19 +55,32 @@ func workflowPod(workflow *unstructured.Unstructured, pods []corev1.Pod) *corev1
 	if workflow == nil {
 		return nil
 	}
+
+	var fallback *corev1.Pod
 	for i := range pods {
 		if pods[i].Labels["workflows.argoproj.io/workflow"] != workflow.GetName() &&
 			!ownedByUID(&pods[i], workflow.GetUID()) {
 			continue
 		}
+
 		for _, container := range pods[i].Spec.Containers {
-			if container.Name == "main" {
+			if container.Name != "main" {
+				continue
+			}
+
+			nodeName := pods[i].Annotations["workflows.argoproj.io/node-name"]
+			if nodeName == "node-health" || strings.HasSuffix(nodeName, ".node-health") {
 				return &pods[i]
 			}
+			if fallback == nil {
+				fallback = &pods[i]
+			}
+
+			break
 		}
 	}
 
-	return nil
+	return fallback
 }
 
 func scriptStatus(run *signalv1.CertificationRun, pod *corev1.Pod) ScriptStatus {
