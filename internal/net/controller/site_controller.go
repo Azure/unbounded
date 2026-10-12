@@ -1476,6 +1476,11 @@ func (sc *SiteController) cleanupOrphanSiteNodeSlices(ctx context.Context) error
 		// source is confirmed healthy and non-empty, so this is a genuine orphan.
 		if err := deleteLiveSiteNodeSlice(ctx, resource, liveSlice); err != nil && !apierrors.IsNotFound(err) {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete orphan slice %s: %w", name, err))
+		} else if !found || siteName == "" {
+			// The malformed object may occupy the deterministic name of a
+			// valid slice. Rebuild all sites after deleting it because there is
+			// no trustworthy siteName with which to scope the work.
+			sc.markSlicesDirty()
 		}
 	}
 
@@ -2718,8 +2723,10 @@ func (sc *SiteController) markSliceObjectDirty(obj interface{}) {
 
 	siteName, found, err := unstructured.NestedString(slice.Object, "siteName")
 	if err != nil || !found || siteName == "" {
-		// Malformed slices are handled by periodic orphan repair. Avoid turning
-		// every controller-authored slice event into a cluster-wide pass.
+		// A malformed object may occupy a valid slice name, and its deletion
+		// may be the only event that allows reconstruction.
+		sc.markSlicesDirty()
+
 		return
 	}
 
