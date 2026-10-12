@@ -49,6 +49,9 @@ impl Config {
 }
 
 struct Progress {
+    runners: BTreeMap<u64, Waker>,
+    next_runner: u64,
+    revision: u64,
     admissions: usize,
     running: bool,
     until: Option<SystemTime>,
@@ -59,6 +62,7 @@ struct Progress {
 }
 
 pub(crate) struct Job {
+    previous_until: Option<SystemTime>,
     metrics: Metrics,
     version: ObjectVersion,
     scope: RequestScope,
@@ -212,6 +216,7 @@ impl WarmRegistry {
         }
         let config = self.config();
         let mut jobs = self.jobs.lock().unwrap();
+        let mut previous_until = None;
         jobs.retain(|_, job| {
             let progress = job.progress.lock().unwrap();
             let expired = progress
@@ -224,13 +229,20 @@ impl WarmRegistry {
             if progress.stopped || progress.admissions >= self.waiter_limit {
                 return Err(Error::Overloaded);
             }
-            progress.admissions += 1;
-            return Ok((job.clone(), false));
+            if progress.running {
+                job.scope.check()?;
+                progress.admissions += 1;
+                return Ok((job.clone(), false));
+            }
+            if progress.admissions != 0 {
+                return Err(Error::Overloaded);
+            }
+            previous_until = progress.until;
         }
         if selecting {
             return Err(Error::Overloaded);
         }
-        if jobs.len() >= config.max_jobs
+        if (!jobs.contains_key(version) && jobs.len() >= config.max_jobs)
             || self
                 .releases
                 .lock()
@@ -243,6 +255,7 @@ impl WarmRegistry {
         let mut request = [0; 16];
         uring_runtime::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
         let job = Arc::new(Job {
+            previous_until,
             metrics: self.metrics(),
             version: version.clone(),
             scope: RequestScope::new(
@@ -251,6 +264,9 @@ impl WarmRegistry {
             )?,
             admission: futures::lock::Mutex::new(()),
             progress: Mutex::new(Progress {
+                runners: BTreeMap::new(),
+                next_runner: 0,
+                revision: 0,
                 admissions: 1,
                 running: true,
                 until: None,
@@ -288,7 +304,9 @@ impl WarmRegistry {
         jobs.retain(|_, job| {
             let mut progress = job.progress.lock().unwrap();
             let expired = progress.until.is_some_and(|until| until <= wall);
-            if progress.running && (expired || job.scope.deadline.0 <= now) {
+            if progress.running
+                && ((expired && progress.admissions <= 1) || job.scope.deadline.0 <= now)
+            {
                 cancel.push(job.clone());
             }
             let remove = !progress.running && progress.admissions == 0 && expired;
@@ -451,9 +469,37 @@ struct JobGuard {
     job: Arc<Job>,
     complete: bool,
 }
+struct Runner {
+    job: Arc<Job>,
+    id: u64,
+}
+impl Runner {
+    fn new(job: Arc<Job>) -> Result<Self> {
+        let mut progress = job.progress.lock().unwrap();
+        progress.next_runner = progress
+            .next_runner
+            .checked_add(1)
+            .ok_or(Error::Overloaded)?;
+        let id = progress.next_runner;
+        drop(progress);
+        Ok(Self { job, id })
+    }
+}
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.job.progress.lock().unwrap().runners.remove(&self.id);
+    }
+}
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        self.job.progress.lock().unwrap().admissions -= 1;
+        let runners = {
+            let mut progress = self.job.progress.lock().unwrap();
+            progress.admissions -= 1;
+            std::mem::take(&mut progress.runners)
+        };
+        for runner in runners.into_values() {
+            runner.wake();
+        }
         if !self.complete {
             let _ = self.job.scope.cancel();
             self.job.stop();
@@ -500,14 +546,42 @@ pub(crate) async fn admit(
             job: job.clone(),
             complete: !fresh,
         };
+        // The first caller owns startup, even if another worker polls its
+        // coalesced admission first. Do not extend a reservation not yet admitted.
+        if !fresh {
+            let runner = Runner::new(job.clone())?;
+            let cancellation = job.scope.cancellation.subscribe()?;
+            std::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                job.scope.check()?;
+                let mut progress = job.progress.lock().unwrap();
+                if progress.stopped {
+                    return Poll::Ready(Err(Error::Unavailable));
+                }
+                if progress.until.is_some() {
+                    return Poll::Ready(Ok(()));
+                }
+                progress.runners.insert(runner.id, cx.waker().clone());
+                Poll::Pending
+            })
+            .await?;
+        }
         let lock = job.admission.lock().await;
         if job.progress.lock().unwrap().stopped {
             let _ = send.send(Err(Error::Unavailable));
             return Ok::<(), Error>(());
         }
-        let old = job.progress.lock().unwrap().until;
+        let old = job.progress.lock().unwrap().until.or(job.previous_until);
         let target = old.map_or(until, |old| old.max(until));
         let pages = metadata.length.div_ceil(PAGE_BYTES);
+        // Every reservation pass can cross expiry on an untouched owner. Hide
+        // the old frontier before yielding and reverify all pages afterward.
+        let revision = {
+            let mut progress = job.progress.lock().unwrap();
+            progress.revision = progress.revision.checked_add(1).ok_or(Error::Overloaded)?;
+            progress.frontier = 0;
+            progress.revision
+        };
         let reservation_scope = if fresh {
             job.scope.clone()
         } else {
@@ -527,6 +601,7 @@ pub(crate) async fn admit(
             )
             .await
             .and_then(|accepted| {
+                job.scope.check()?;
                 if directory
                     .warm
                     .draining
@@ -549,6 +624,10 @@ pub(crate) async fn admit(
             }
         };
         job.update(|progress| progress.until = Some(target));
+        let runners = std::mem::take(&mut job.progress.lock().unwrap().runners);
+        for runner in runners.into_values() {
+            runner.wake();
+        }
         admission.event = WarmEvent::Accepted;
         drop(admission);
         drop(lock);
@@ -567,6 +646,7 @@ pub(crate) async fn admit(
             membership,
             &context,
             config.window,
+            revision,
         )
         .await;
         if result.is_err() {
@@ -574,7 +654,6 @@ pub(crate) async fn admit(
             directory.warm.release(&metadata.version, &fresh_workers);
             job.stop();
         } else {
-            job.update(|progress| progress.running = false);
             guard.complete = true;
             outcome.event = WarmEvent::Completed;
         }
@@ -602,6 +681,7 @@ async fn run(
     membership: Arc<crate::topology::Membership>,
     context: &ChargedOriginContext,
     window: usize,
+    mut revision: u64,
 ) -> Result<()> {
     use futures::{StreamExt, stream::FuturesOrdered};
     let count = metadata.length.div_ceil(PAGE_BYTES);
@@ -621,8 +701,17 @@ async fn run(
                 .until
                 .is_none_or(|until| until <= uring_runtime::environment::wall_now())
             {
-                failure = Some(Error::DeadlineExceeded);
-                break;
+                let _lock = job.admission.lock().await;
+                if job
+                    .progress
+                    .lock()
+                    .unwrap()
+                    .until
+                    .is_none_or(|until| until <= uring_runtime::environment::wall_now())
+                {
+                    failure = Some(Error::DeadlineExceeded);
+                    break;
+                }
             }
             let page = PageId {
                 version: metadata.version.clone(),
@@ -641,10 +730,40 @@ async fn run(
             let _ = job.scope.cancel();
         }
         let Some(result) = pending.next().await else {
-            return failure.map_or(Ok(()), Err);
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            let runner = Runner::new(job.clone())?;
+            std::future::poll_fn(|cx| {
+                let mut progress = job.progress.lock().unwrap();
+                if progress.admissions <= 1 {
+                    Poll::Ready(())
+                } else {
+                    progress.runners.insert(runner.id, cx.waker().clone());
+                    Poll::Pending
+                }
+            })
+            .await;
+            let _lock = job.admission.lock().await;
+            let mut progress = job.progress.lock().unwrap();
+            if progress.admissions > 1 {
+                continue;
+            }
+            if progress.revision != revision {
+                revision = progress.revision;
+                progress.frontier = 0;
+                next = 0;
+                continue;
+            }
+            progress.running = false;
+            return Ok(());
         };
         match result {
-            Ok(()) if failure.is_none() => job.update(|progress| progress.frontier += 1),
+            Ok(()) if failure.is_none() => job.update(|progress| {
+                if progress.revision == revision {
+                    progress.frontier += 1;
+                }
+            }),
             Err(error) => {
                 failure.get_or_insert(error);
             }
@@ -741,7 +860,11 @@ mod tests {
             assert_eq!(result.unwrap().is_ok(), !ttl.is_zero());
         }
         assert_eq!(metrics.count(Event::WarmAccepted), 2);
-        assert_eq!(metrics.count(Event::WarmCompleted), 1);
+        assert_eq!(
+            metrics.count(Event::WarmCompleted),
+            2,
+            "completed HEAD starts one new verification driver"
+        );
         assert_eq!(metrics.count(Event::WarmRefused), 1);
         assert_eq!(metrics.count(Event::WarmFailed), 0);
 
@@ -808,7 +931,7 @@ mod tests {
         }
         assert_eq!(queue.pending(), 0);
         assert_eq!(metrics.count(Event::WarmAccepted), 3);
-        assert_eq!(metrics.count(Event::WarmCompleted), 1);
+        assert_eq!(metrics.count(Event::WarmCompleted), 2);
         assert_eq!(metrics.count(Event::WarmFailed), 1);
         assert_eq!(metrics.count(Event::WarmRefused), 2);
     }

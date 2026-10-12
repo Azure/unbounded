@@ -166,6 +166,30 @@ pub struct WorkerEndpoint {
 
 impl WorkerDirectory {
     #[cfg(test)]
+    pub(crate) fn test_warm_command(
+        &self,
+        worker: WorkerId,
+        local: Rc<Coordinator>,
+    ) -> Option<Operation<'static, ()>> {
+        let command = self.mailbox(worker).unwrap().pop()?;
+        Some(Box::pin(async move {
+            let Command {
+                generation,
+                work,
+                scope,
+                mut budget,
+                reply,
+                permit,
+            } = command;
+            let value = execute(&local, work, &scope, budget.as_mut()).await;
+            reply
+                .complete(generation, Completion { value, budget })
+                .unwrap();
+            drop(permit);
+            Ok(())
+        }))
+    }
+    #[cfg(test)]
     pub(super) fn test_observation_mailbox(&self) -> usize {
         for mailbox in &self.mailboxes {
             if !mailbox.has_queued() && mailbox.outstanding() == 0 {

@@ -7,6 +7,241 @@ use crate::peer::protocol::PeerRequest;
 use crate::read::ReadPayload;
 use crate::test_support::security::{network, node};
 
+#[test]
+fn completed_warm_two_owner_extension_crossing_expiry_revalidates_evicted_pages() {
+    completed_extension(false);
+    completed_extension(true);
+}
+
+fn completed_extension(refuse: bool) {
+    let clock = uring_runtime::environment::SimulationClock::new(197);
+    let _environment = clock.environment(0).enter();
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(1);
+    let mut fixtures = [
+        fixture_with(PAGE_BYTES + 7, None),
+        fixture_with(PAGE_BYTES + 7, None),
+    ];
+    let membership = Arc::new(
+        Membership::validate(
+            racer_control_wire::MembershipVersion(1),
+            vec![Member {
+                node: node(0),
+                shares: NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:8200".into(),
+                rails: vec![],
+                site: String::new(),
+            }],
+        )
+        .unwrap(),
+    );
+    let mut locals = Vec::new();
+    let mut endpoints = Vec::new();
+    for f in &fixtures {
+        f.reactor.init().unwrap();
+        let (local, endpoint, _) = coordinator(f, &signers[0], &membership, NoPeer::requester());
+        locals.push(local);
+        endpoints.push(endpoint);
+    }
+    let workers = vec![WorkerId(0), WorkerId(1)];
+    let directory = Arc::new(
+        crate::read::dispatch::WorkerDirectory::new(
+            Arc::new(crate::read::dispatch::WorkerMap::new(workers.clone()).unwrap()),
+            workers,
+            16,
+        )
+        .unwrap(),
+    );
+    directory.test_observation_mailbox();
+    directory
+        .warm
+        .configure(crate::read::warm::Config {
+            fill_timeout: Duration::from_secs(4),
+            window: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let _local = directory.simulation_scope(Some((WorkerId(0), locals[0].clone())));
+    let metadata = fixtures[0].origin.metadata.clone();
+    let caller = RequestScope::new(
+        RequestId([41; 16]),
+        uring_runtime::environment::now() + Duration::from_secs(60),
+    )
+    .unwrap();
+    let context = OriginContext {
+        object: metadata.version.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let make_head = |ttl| {
+        crate::read::warm::admit(
+            directory.clone(),
+            metadata.clone(),
+            membership.clone(),
+            locals[0]
+                .credentials
+                .local_context(&context, &caller)
+                .unwrap(),
+            ttl,
+            &caller,
+        )
+    };
+    let mut head = Box::pin(make_head(Duration::from_secs(5)));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut commands: Vec<Operation<'static, ()>> = Vec::new();
+    let mut pump = |blocked: Option<WorkerId>| {
+        queue.poll(&mut cx, 64);
+        for (i, local) in locals.iter().enumerate() {
+            if blocked != Some(WorkerId(i as u16))
+                && let Some(command) =
+                    directory.test_warm_command(WorkerId(i as u16), local.clone())
+            {
+                commands.push(command);
+            }
+        }
+        let mut i = 0;
+        while i < commands.len() {
+            if let Poll::Ready(result) = commands[i].as_mut().poll(&mut cx) {
+                result.unwrap();
+                drop(commands.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        for f in &mut fixtures {
+            uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+            f.crypto.poll_budgeted(64).unwrap();
+            f.reactor.poll_budgeted(64).unwrap();
+            f.reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+    };
+    let mut accepted = None;
+    for _ in 0..2048 {
+        if accepted.is_none()
+            && let Poll::Ready(result) = head
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+        {
+            accepted = Some(result.unwrap());
+        }
+        pump(None);
+        if accepted.is_some() && queue.pending() == 0 {
+            break;
+        }
+    }
+    assert!(accepted.is_some());
+    drop(head);
+    let page = (0..2)
+        .map(|number| PageId {
+            version: metadata.version.clone(),
+            number: PageNumber(number),
+        })
+        .find(|page| directory.page_owner(page).unwrap() == WorkerId(1))
+        .expect("fixture covers delayed owner");
+    let delayed_index = locals[1].fill.dependencies.writer.index().clone();
+    assert!(delayed_index.lookup(&page).unwrap().is_some());
+    clock.advance(Duration::from_secs(3));
+    let mut extension = Box::pin(make_head(Duration::from_secs(20)));
+    for _ in 0..8 {
+        assert!(
+            extension
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                .is_pending()
+        );
+        pump(Some(WorkerId(1)));
+    }
+    clock.advance(Duration::from_secs(3));
+    let entry = delayed_index.lookup(&page).unwrap().unwrap();
+    assert!(delayed_index.held_page_expiry(&page).is_none());
+    delayed_index.remove_if_matches(&page, &entry.location);
+    assert!(delayed_index.lookup(&page).unwrap().is_none());
+    let mut pressure = metadata.version.clone();
+    pressure.etag = crate::model::StrongEtag::test_value("pressure");
+    if refuse {
+        delayed_index
+            .reserve_hold(
+                &pressure,
+                8,
+                uring_runtime::environment::wall_now() + Duration::from_secs(30),
+            )
+            .unwrap();
+    }
+    let get_scope = RequestScope::new(
+        RequestId([42; 16]),
+        uring_runtime::environment::now() + Duration::from_secs(20),
+    )
+    .unwrap();
+    let mut get = Box::pin(directory.warm.wait(&page, &get_scope));
+    assert!(
+        get.as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+            .is_pending(),
+        "old frontier must be hidden"
+    );
+    let mut accepted = None;
+    let mut delivered = false;
+    for _ in 0..2048 {
+        if accepted.is_none()
+            && let Poll::Ready(result) = extension
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+        {
+            accepted = Some(result);
+        }
+        if !delivered
+            && let Poll::Ready(result) = get
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+        {
+            assert_eq!(result.unwrap(), !refuse);
+            delivered = true;
+        }
+        pump(None);
+        if delivered && accepted.is_some() && queue.pending() == 0 {
+            break;
+        }
+    }
+    assert!(delivered && accepted.is_some());
+    if refuse {
+        assert_eq!(accepted.unwrap(), Err(Error::Overloaded));
+        assert!(delayed_index.lookup(&page).unwrap().is_none());
+        directory
+            .warm
+            .poll_releases(
+                WorkerId(0),
+                locals[0].fill.dependencies.writer.index(),
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+            )
+            .unwrap();
+        let first = (0..2)
+            .map(|number| PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(number),
+            })
+            .find(|page| directory.page_owner(page).unwrap() == WorkerId(0))
+            .unwrap();
+        assert!(
+            locals[0]
+                .fill
+                .dependencies
+                .writer
+                .index()
+                .held_page_expiry(&first)
+                .unwrap()
+                > uring_runtime::environment::wall_now(),
+            "partial extension failure preserves already-promised pages"
+        );
+    } else {
+        assert!(delayed_index.lookup(&page).unwrap().is_some());
+        assert_eq!(
+            delayed_index.held_page_expiry(&page),
+            Some(accepted.unwrap().unwrap())
+        );
+    }
+}
+
 struct Peer {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     sender: Forwarding,
