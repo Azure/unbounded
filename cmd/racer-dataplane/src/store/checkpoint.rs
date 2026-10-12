@@ -110,11 +110,14 @@ impl Checkpointer {
             }
             let frozen = self.segments.freeze()?;
             let snapshot = (|| {
+                let mut segments = self.segments.snapshot();
+                let mut remaining = MAX_CHECKPOINT_BYTES;
+                self.index.snapshot_holds(&mut segments, &mut remaining)?;
                 let shard = ShardImage {
                     worker: self.index.worker(),
                     geometry,
                     index: self.index.snapshot()?,
-                    segments: self.segments.snapshot(),
+                    segments,
                 };
                 shard.validate()?;
                 Ok(shard)
@@ -146,7 +149,8 @@ impl Checkpointer {
                     .ok_or(Error::Overloaded)?;
                 let mut remaining = budget.checked_sub(segment_bytes).ok_or(Error::Overloaded)?;
                 let metadata = owner.index.snapshot_metadata_budgeted(&mut remaining)?;
-                let segments = owner.segments.snapshot();
+                let mut segments = owner.segments.snapshot();
+                owner.index.snapshot_holds(&mut segments, &mut remaining)?;
                 let mut entries = Vec::new();
                 let mut cursor = 0;
                 loop {
@@ -164,12 +168,14 @@ impl Checkpointer {
                     cursor = next;
                     yield_now().await;
                 }
-                Ok(ShardImage {
+                let mut shard = ShardImage {
                     worker: owner.index.worker(),
                     geometry,
                     index: super::catalog::IndexSnapshot { entries, metadata },
                     segments,
-                })
+                };
+                shard.prune_holds();
+                Ok(shard)
             }
             .await;
             if result.is_ok() {
@@ -234,7 +240,12 @@ impl Checkpointer {
                                 .iter()
                                 .map(snapshot_entry_bytes)
                                 .sum::<usize>()
-                                + shard.segments.len() * 128,
+                                + shard.segments.len() * 128
+                                + shard
+                                    .segments
+                                    .iter()
+                                    .map(|segment| segment.retained_records.len() * 128)
+                                    .sum::<usize>(),
                         )
                     })
             })
@@ -316,6 +327,7 @@ impl Recovery {
                 .index
                 .metadata
                 .retain(|m| metadata_available(&m.version.object.cache));
+            shard.prune_holds();
         }
     }
     pub fn new(_directory: PathBuf, index: Rc<Index>, segments: Rc<Segments>) -> Self {
@@ -361,13 +373,17 @@ impl Recovery {
             image.validate()?;
             self.segments.validate_restore(&image.segments)?;
             self.index.validate_snapshot(&image.index)?;
+            self.index
+                .validate_restored_holds(&image.index, &image.segments)?;
             // Keep both preflights even though restore validates again: a frozen or
             // leased table must reject the cut before the index is mutated.
             // Index::restore checks its own standalone metadata capacity before
             // mutation. There is no await between validation and these installs.
             // The coordinator must fence admission for the complete operation.
             self.index.restore(image.index)?;
+            let deadlines = image.segments.clone();
             self.segments.restore(image.segments)?;
+            self.index.restore_holds(&deadlines)?;
             Ok(())
         })
     }
@@ -411,8 +427,9 @@ pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, Checkpoint
 // and full version/page identity. No freshness or payload bytes are serialized.
 // Version 2 appends a counted ASCII MIME string to every descriptor. Zero length
 // means absent. Version 3 binds each shard to its raw-device layout or file mode.
+// Version 4 adds counted record-offset hold deadlines to each segment.
 // Older versions are discarded as disposable cache hints.
-pub const CHECKPOINT_VERSION: u32 = 3;
+pub const CHECKPOINT_VERSION: u32 = 4;
 pub const FILE_LAYOUT_DIGEST: [u8; 32] = *b"racer-file-layout-v1\0\0\0\0\0\0\0\0\0\0\0\0";
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"RACERCP\0";
@@ -530,6 +547,20 @@ pub struct ShardImage {
     pub segments: Vec<SegmentSnapshot>,
 }
 impl ShardImage {
+    fn prune_holds(&mut self) {
+        let offsets: HashSet<_> = self
+            .index
+            .entries
+            .iter()
+            .map(|(_, entry)| entry.location.extent.offset())
+            .collect();
+        for segment in &mut self.segments {
+            segment
+                .retained_records
+                .retain(|(offset, _)| offsets.contains(offset));
+        }
+    }
+
     /// Validate against an isolated allocation table, without touching live state.
     pub fn validate(&self) -> Result<()> {
         self.geometry.validate()?;
@@ -576,6 +607,23 @@ impl ShardImage {
                     .checked_add(extent.length() as u64)
                     .ok_or(Error::CorruptRecord)?,
             ));
+        }
+        let locations: HashMap<_, _> = self
+            .index
+            .entries
+            .iter()
+            .map(|(_, entry)| (entry.location.extent.offset(), entry.location.segment))
+            .collect();
+        let mut retained = HashSet::default();
+        for segment in &self.segments {
+            for (offset, until) in &segment.retained_records {
+                if !retained.insert(*offset)
+                    || until.duration_since(std::time::UNIX_EPOCH).is_err()
+                    || locations.get(offset) != Some(&segment.id)
+                {
+                    return Err(Error::CorruptRecord);
+                }
+            }
         }
         extents.sort_unstable();
         if extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
@@ -642,6 +690,17 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
                 SegmentState::Evicting => 3,
             }])?;
             out.u64(segment.used_bytes)?;
+            out.count(segment.retained_records.len())?;
+            let mut records = segment.retained_records.clone();
+            records.sort_by_key(|(offset, _)| *offset);
+            for (offset, until) in &records {
+                let duration = until
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| Error::CorruptRecord)?;
+                out.u64(*offset)?;
+                out.u64(duration.as_secs())?;
+                out.u32(duration.subsec_nanos())?;
+            }
         }
         out.count(shard.index.entries.len())?;
         let mut entries: Vec<_> = shard.index.entries.iter().collect();
@@ -728,7 +787,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
             layout_digest: input.array()?,
         };
         geometry.validate()?;
-        let count = input.count(MAX_ITEMS, 25)?;
+        let count = input.count(MAX_ITEMS, 29)?;
         let mut segments = Vec::with_capacity(count);
         for _ in 0..count {
             segments.push(SegmentSnapshot {
@@ -742,6 +801,23 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
                     _ => return Err(Error::CorruptRecord),
                 },
                 used_bytes: input.u64()?,
+                retained_records: {
+                    let count = input.count(MAX_ITEMS, 20)?;
+                    let mut records = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let offset = input.u64()?;
+                        let seconds = input.u64()?;
+                        let nanos = input.u32()?;
+                        if nanos >= 1_000_000_000 {
+                            return Err(Error::CorruptRecord);
+                        }
+                        let until = std::time::UNIX_EPOCH
+                            .checked_add(std::time::Duration::new(seconds, nanos))
+                            .ok_or(Error::CorruptRecord)?;
+                        records.push((offset, until));
+                    }
+                    records
+                },
             });
         }
         let count = input.count(MAX_ITEMS, 112)?;
@@ -827,12 +903,17 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
         let segment_count = input.u64()?;
         input.take(24)?;
         input.take(32)?;
-        let segments = input.count(MAX_ITEMS, 25)?;
+        let segments = input.count(MAX_ITEMS, 29)?;
         if segment_count != segments as u64 {
             return Err(Error::CorruptRecord);
         }
         charge(segments, std::mem::size_of::<SegmentSnapshot>() + 512)?;
-        input.take(segments * 25)?;
+        for _ in 0..segments {
+            input.take(25)?;
+            let count = input.count(MAX_ITEMS, 20)?;
+            charge(count, 128)?;
+            input.take(count * 20)?;
+        }
         let pages = input.count(MAX_ITEMS, 112)?;
         charge(pages, std::mem::size_of::<(PageId, IndexedPage)>() + 512)?;
         for _ in 0..pages {

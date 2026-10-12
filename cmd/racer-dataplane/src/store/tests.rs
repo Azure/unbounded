@@ -322,6 +322,118 @@ mod index_pressure {
         assert_ne!(f.segments.snapshot()[0].generation, location.generation);
     }
 }
+
+#[test]
+fn hard_hold_persist_confirms_publication_and_protects_pending() {
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let index = f.store.writer.index();
+    index.reserve_hold(&id.version, 1, until).unwrap();
+    f.enqueue(copy.clone()).unwrap();
+    assert_eq!(f.store.writer.discard_unsubmitted(), 0);
+    assert_eq!(f.store.writer.reclaim_ciphertext(None, usize::MAX), 0);
+    assert_eq!(f.store.writer.pending_count(), 1);
+    assert!(index.lookup(&id).unwrap().is_none());
+    drive(
+        &f.reactor,
+        f.store.writer.persist_held(copy.clone(), &scope()),
+    )
+    .unwrap();
+    assert!(index.lookup(&id).unwrap().is_some());
+    assert_eq!(f.store.writer.pending_count(), 0);
+    let first = index.lookup(&id).unwrap().unwrap().location;
+    drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
+    assert_eq!(index.lookup(&id).unwrap().unwrap().location, first);
+    index.release_hold(&id.version).unwrap();
+    assert_eq!(index.hold_expiry(&id.version), Some(until));
+}
+
+#[test]
+fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let index = f.store.writer.index();
+    assert_eq!(
+        drive(
+            &f.reactor,
+            f.store.writer.persist_held(copy.clone(), &scope())
+        ),
+        Err(Error::Unavailable)
+    );
+    index
+        .reserve_hold(
+            &id.version,
+            1,
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+        )
+        .unwrap();
+    simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.persist_held(copy, &scope())),
+        Err(Error::Io)
+    );
+    assert!(index.lookup(&id).unwrap().is_none());
+    index.release_hold(&id.version).unwrap();
+    assert_eq!(index.hold_expiry(&id.version), None);
+}
+
+#[test]
+fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
+    use crate::store::checkpoint;
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let index = f.store.writer.index();
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    index.reserve_hold(&id.version, 1, until).unwrap();
+    drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
+    let shard = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
+    f.store.checkpoint.finish_snapshot();
+    let bytes = checkpoint::encode(&checkpoint::CheckpointImage {
+        version: checkpoint::CHECKPOINT_VERSION,
+        sequence: 1,
+        shards: vec![shard],
+    })
+    .unwrap();
+    let image = checkpoint::decode(&bytes).unwrap();
+    futures::executor::block_on(
+        f.store
+            .recovery
+            .install_shard(image.shards.into_iter().next()),
+    )
+    .unwrap();
+    assert_eq!(index.hold_expiry(&id.version), Some(until));
+    let mut image = checkpoint::decode(&bytes).unwrap();
+    for segment in &mut image.shards[0].segments {
+        for (_, deadline) in &mut segment.retained_records {
+            *deadline = std::time::UNIX_EPOCH;
+        }
+    }
+    futures::executor::block_on(
+        f.store
+            .recovery
+            .install_shard(image.shards.into_iter().next()),
+    )
+    .unwrap();
+    assert_eq!(index.hold_expiry(&id.version), None);
+    assert!(index.lookup(&id).unwrap().is_some());
+}
 static NEXT: AtomicU64 = AtomicU64::new(0);
 #[test]
 fn disk_observability_publication_read_and_pending_cleanup() {
@@ -3474,37 +3586,37 @@ mod checkpoint {
             }],
         };
         let bytes = checkpoint_format::encode(&image).unwrap();
-        assert_eq!(bytes.len(), 212);
-        let digest: String = bytes[180..]
+        assert_eq!(bytes.len(), 220);
+        let digest: String = bytes[188..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "0e4e7f9bd03b1ca43e47ca0fad0578248483fefc9ab9f4a84f867ca11aee65ad"
+            "f11edbc0b0013ffecace44dd362a58e6a700accfe1cc3c9ea1b0f06246862e8c"
         );
     }
 
     #[test]
     fn populated_cut_preserves_legacy_slab_wire_field_and_rejects_nonzero() {
         let bytes = checkpoint_format::encode(&image(7)).unwrap();
-        // Literal version-3 image(7) layout, independent of Encoder/Decoder:
+        // Literal version-4 image(7) layout, independent of Encoder/Decoder:
         // header 32 + shard count 4 + worker 2 + geometry 80 + segment count 4
-        // + two segments 50 + page count 4 + descriptor 92 (36-byte cache,
+        // + two segments 58 + page count 4 + descriptor 92 (36-byte cache,
         // 32-byte key, 4-byte quoted ETag, length 8, three string lengths 12)
-        // + page number 8 + key ID 16 + segment 8 + generation 8 = 308.
-        const SLAB_OFFSET: usize = 308;
-        assert_eq!(bytes.len(), 463);
+        // + page number 8 + key ID 16 + segment 8 + generation 8 = 316.
+        const SLAB_OFFSET: usize = 316;
+        assert_eq!(bytes.len(), 471);
         assert_eq!(&bytes[SLAB_OFFSET..SLAB_OFFSET + 8], &[0; 8]);
         // Independently packed legacy single-slab fixture, including its zero slab
-        // u64, extent (0, 4096), and standalone "empty" descriptor, has 431 body bytes.
-        let digest: String = bytes[431..]
+        // u64, extent (0, 4096), and standalone "empty" descriptor, has 439 body bytes.
+        let digest: String = bytes[439..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "5e89a767eae3d5ef366649d1d8bc853a3365c5aa8a5e3ed652d6067b3a8c05e9"
+            "01c3c2ba61feea8045dc5e8090301a6566b8a18a7eb25c827f7b0f6a42188b86"
         );
         let decoded = checkpoint_format::decode(&bytes).unwrap();
         assert_eq!(decoded.shards[0].index.entries.len(), 1);
@@ -3518,7 +3630,7 @@ mod checkpoint {
             let mut malformed = bytes.clone();
             malformed[SLAB_OFFSET..SLAB_OFFSET + 8].copy_from_slice(&slab.to_le_bytes());
             resign(&mut malformed);
-            assert_eq!(&Sha256::digest(&malformed[..431])[..], &malformed[431..]);
+            assert_eq!(&Sha256::digest(&malformed[..439])[..], &malformed[439..]);
             assert!(matches!(
                 checkpoint_format::decode(&malformed),
                 Err(Error::CorruptRecord)
@@ -3529,7 +3641,7 @@ mod checkpoint {
     #[test]
     fn older_checkpoint_versions_are_rejected_and_recover_as_cold_cache() {
         let directory = Directory::new();
-        for version in [0u32, 1, 2, 4] {
+        for version in [0u32, 1, 2, 3, 5] {
             let mut cut = image(9);
             cut.version = version;
             assert!(checkpoint_format::encode(&cut).is_err());
@@ -3647,7 +3759,7 @@ mod checkpoint {
         let mut corrupt = encoded.clone();
         corrupt[20] ^= 1;
         assert!(checkpoint_format::decode(&corrupt).is_err());
-        for (offset, value) in [(8, 4u32), (12, 1), (32, u32::MAX)] {
+        for (offset, value) in [(8, 5u32), (12, 1), (32, u32::MAX)] {
             let mut corrupt = encoded.clone();
             corrupt[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             resign(&mut corrupt);

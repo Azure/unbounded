@@ -42,6 +42,7 @@ use std::rc::Rc;
 
 pub mod catalog;
 pub mod checkpoint;
+pub mod holds;
 
 pub struct Store {
     pub reader: Rc<StoreReader>,
@@ -456,6 +457,67 @@ impl StoreWriter {
         let cache = page.metadata.version.object.cache.clone();
         self.enqueue_reclaiming(page, dirty, |length| self.reserve_staging(length, &cache))
     }
+
+    /// Force an encrypted copy to disk, regardless of ownership or second sight.
+    /// Reserve the version first. Success means a completed, published disk write,
+    /// not queue acceptance or fsync durability. Poll with the worker reactor.
+    pub fn persist_held<'a>(
+        &'a self,
+        page: CiphertextCopy,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            scope.check()?;
+            logical_length(&page)?;
+            let id = page.ciphertext.envelope().page.clone();
+            if !self.index.is_held(&id) {
+                return Err(Error::Unavailable);
+            }
+            if let Some(entry) = self.index.lookup(&id)? {
+                if self.index.held_page_expiry(&id).is_none() {
+                    return Err(Error::Unavailable);
+                }
+                if !entry.metadata.compatible(&page.metadata.immutable()) {
+                    return Err(Error::CorruptRecord);
+                }
+                self.segments.validate(
+                    entry.location.segment,
+                    entry.location.generation,
+                    &entry.location.extent,
+                )?;
+                return Ok(());
+            }
+            let dirty = self.admission.reserve_completion(
+                Some(&id.version.object.cache),
+                ResourceClass::DirtyCiphertext,
+                page.ciphertext.bytes().len(),
+            )?;
+            let ticket = self.enqueue(page, dirty)?;
+            while self
+                .pending
+                .borrow()
+                .get(&id)
+                .is_some_and(|dirty| dirty.ticket == ticket)
+            {
+                scope.check()?;
+                if self.busy.get() {
+                    uring_runtime::drivers::yield_now().await;
+                } else {
+                    self.progress(8, scope).await?;
+                }
+            }
+            let entry = self.index.lookup(&id)?.ok_or(Error::Io)?;
+            self.segments.validate(
+                entry.location.segment,
+                entry.location.generation,
+                &entry.location.extent,
+            )?;
+            if self.index.held_page_expiry(&id).is_none() {
+                return Err(Error::Unavailable);
+            }
+            Ok(())
+        })
+    }
     /// Accepted fills may complete after request admission closes, within quota.
     fn reserve_staging(
         &self,
@@ -533,12 +595,13 @@ impl StoreWriter {
                 .iter()
                 .enumerate()
                 .take(QUEUE_RECLAIM_CANDIDATES)
+                .filter(|(_, page)| !self.index.is_held(page))
                 .min_by_key(|(_, page)| retention.score(page))
                 .map(|(position, page)| (position, page.clone(), retention.score(page)));
             let Some((position, victim, score)) = victim else {
                 return Err(Error::Overloaded);
             };
-            if retention.score(&id) <= score {
+            if !self.index.is_held(&id) && retention.score(&id) <= score {
                 return Err(Error::Overloaded);
             }
             self.queue.borrow_mut().remove(position);
@@ -630,6 +693,10 @@ impl StoreWriter {
         let mut pending = self.pending.borrow_mut();
         let mut removed = 0;
         for page in queued {
+            if self.index.is_held(&page) {
+                self.queue.borrow_mut().push_back(page);
+                continue;
+            }
             removed += usize::from(pending.remove(&page).is_some());
         }
         self.note_discard(removed);
@@ -639,6 +706,9 @@ impl StoreWriter {
     /// must be that bundle and this queued write, not a submitted operation/reader.
     pub(crate) fn discard_idle_copy(&self, page: &crate::memory::PageResult) -> usize {
         let id = page.plaintext.page();
+        if self.index.is_held(id) {
+            return 0;
+        }
         let mut queue = self.queue.borrow_mut();
         let Some(position) = queued_position(&queue, id) else {
             return 0;
@@ -676,6 +746,7 @@ impl StoreWriter {
             .filter(|id| {
                 cache.is_none_or(|cache| cache == &id.version.object.cache)
                     && !retention.is_owned(id)
+                    && !self.index.is_held(id)
             })
             .cloned()
             .collect();
@@ -712,6 +783,7 @@ impl StoreWriter {
             .iter()
             .take(QUEUE_RECLAIM_CANDIDATES)
             .filter(|id| cache.is_none_or(|cache| cache == &id.version.object.cache))
+            .filter(|id| !self.index.is_held(id))
             .map(|id| (retention.score(id), id.clone()))
             .collect();
         candidates.sort_by_key(|(score, _)| *score);
@@ -837,7 +909,9 @@ impl StoreWriter {
             return Ok(());
         }
         // Capacity is owned across the await, including invalidation/replacement.
-        let index_ticket = self.index.reserve_page(self.clock.borrow().is_some())?;
+        let index_ticket = self
+            .index
+            .reserve_page_for(id, self.clock.borrow().is_some())?;
         let alignment = self.slabs.alignment()?;
         let disk_bytes = alignment.extent(0, logical_length(page)?)?.length();
         let (staging, dirty, ticket) = {
@@ -932,6 +1006,7 @@ impl StoreWriter {
             })
             .await?;
             while self.pending_count() != 0 {
+                scope.check()?;
                 self.progress(8, scope).await?;
             }
             self.slabs.fence_writes().await?;
