@@ -76,6 +76,37 @@ func TestRustWireClientFixture(t *testing.T) {
 
 type rustWireSink struct{ offset int64 }
 
+func TestRustWireWarmFixture(t *testing.T) {
+	client, err := newClient(ClientConfig{Cache: "conformance"}, os.Getenv("RACER_CONFORMANCE_SOCKET"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for i := 0; i < 4; i++ {
+		got, err := client.Warm(ctx, Request{}, 1500*time.Millisecond, WarmOptions{ETag: `"v"`})
+		if i == 2 {
+			if !errors.Is(err, ErrVersionMismatch) {
+				t.Fatal("wrong warm pin error", err)
+			}
+			continue
+		}
+		if i == 3 {
+			if err == nil {
+				t.Fatal("accepted duplicate retention deadline")
+			}
+			continue
+		}
+		if err != nil || got.Metadata.Size != 3 || got.Metadata.ETag != `"v"` || got.Metadata.ContentType != "text/plain" {
+			t.Fatal("wrong warm metadata", got, err)
+		}
+		if i == 0 && got.RetainUntil.UnixMilli() != 1234 || i == 1 && !got.RetainUntil.IsZero() {
+			t.Fatal("wrong retention acceptance", got)
+		}
+	}
+}
+
 func TestRustWireRangeFixture(t *testing.T) {
 	size, err := strconv.ParseInt(os.Getenv("RACER_CONFORMANCE_SIZE"), 10, 64)
 	if err != nil {

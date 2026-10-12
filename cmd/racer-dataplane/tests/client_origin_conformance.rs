@@ -992,6 +992,9 @@ mod sdk {
                 thread::sleep(Duration::from_millis(1));
             }
             sdk_range(&binary, &socket, &listener, size);
+            if size == 0 {
+                sdk_warm(&binary, &socket, &listener);
+            }
             drop(listener);
             fs::remove_file(output.join("socket")).unwrap();
         }
@@ -1001,6 +1004,87 @@ mod sdk {
         fs::create_dir(&origin_directory).unwrap();
         let _origin_cleanup = Cleanup(origin_directory.clone());
         sdk_origin(&binary, &origin_directory.join("s"));
+    }
+
+    fn sdk_warm(binary: &std::path::Path, socket: &std::path::Path, listener: &UnixListener) {
+        let mut child = Process(
+            Command::new(binary)
+                .args(["-test.run=^TestRustWireWarmFixture$", "-test.timeout=30s"])
+                .env("RACER_CONFORMANCE_SOCKET", socket)
+                .spawn()
+                .unwrap(),
+        );
+        let rig = Rig::new();
+        rig.reactor.init().unwrap();
+        for case in 0..4 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let accepted = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "warm fixture did not connect");
+                        assert!(child.0.try_wait().unwrap().is_none(), "warm fixture exited");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("warm accept: {error}"),
+                }
+            };
+            rig.drive(async {
+                let scope = scope();
+                let received = rig
+                    .io
+                    .receive_head(rig.lease(accepted), &scope)
+                    .await
+                    .unwrap();
+                let parsed = racer_object_wire::client::RequestParser::new(LIMIT)
+                    .parse(&received.value)
+                    .unwrap();
+                assert_eq!(parsed.retain, Some(Duration::from_secs(2)));
+                assert!(matches!(parsed.kind, ReadKind::HeadPinned { .. }));
+                assert_eq!(parsed.kind.pin().unwrap().as_bytes(), b"\"v\"");
+                let metadata = ObjectMetadata {
+                    content_type: Some(
+                        racer_dataplane::model::ContentType::parse(b"text/plain").unwrap(),
+                    ),
+                    version: ObjectVersion {
+                        object: object(),
+                        etag: StrongEtag::parse(b"\"v\"").unwrap(),
+                    },
+                    length: 3,
+                    expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
+                };
+                let mut head = if case == 2 {
+                    racer_object_wire::client::error_head(412, None).unwrap()
+                } else {
+                    racer_object_wire::client::success_head_retained(
+                        &metadata,
+                        None,
+                        (case != 1).then_some(UNIX_EPOCH + Duration::from_millis(1234)),
+                    )
+                    .unwrap()
+                };
+                if case == 3 {
+                    head.headers.push(Header::new("racer-retain-until", "1234"));
+                }
+                head.headers.push(Header::new("Connection", "close"));
+                let mut connection = rig
+                    .io
+                    .send_head(received.connection, head, &scope)
+                    .await
+                    .unwrap()
+                    .connection;
+                connection.finish_exchange().unwrap();
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "warm fixture failed");
+                break;
+            }
+            assert!(Instant::now() < deadline, "warm fixture stalled");
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn sdk_range(
