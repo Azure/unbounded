@@ -1,7 +1,8 @@
 //! Client request semantics and response heads, independent of I/O and admission.
 
 use crate::model::{
-    ByteRange, CacheKey, MAX_FIELD_BYTES, ObjectMetadata, PAGE_BYTES, ResolvedRange, StrongEtag,
+    ByteRange, CacheKey, MAX_FIELD_BYTES, MAX_WIRE_INTEGER, ObjectMetadata, PAGE_BYTES,
+    ResolvedRange, StrongEtag,
 };
 use crate::{Error, Result};
 use http1::{Header, MessageHead, StartLine, is_token, trim_ows};
@@ -335,6 +336,7 @@ pub fn subscription_head(
         .checked_add(1)
         .and_then(|n| n.checked_mul(21))
         .and_then(|n| n.checked_add(end - start))
+        .filter(|&n| n <= MAX_WIRE_INTEGER)
         .ok_or(Error::BadGateway)?;
     head.start = StartLine::Response { status: 200 };
     head.headers.extend([
