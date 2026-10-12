@@ -6,6 +6,7 @@
     "image",
     "namespace",
     "manager",
+    "updateStrategy",
     "nodeSelector",
     "tolerations",
     "containerd",
@@ -68,6 +69,52 @@
       "enum": [
         "helm"
       ]
+    },
+    "updateStrategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "RollingUpdate",
+            "OnDelete"
+          ]
+        },
+        "rollingUpdate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxUnavailable": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "string",
+                  "pattern": "^([1-9][0-9]?|100)%$"
+                }
+              ]
+            },
+            "maxSurge": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "string",
+                  "pattern": "^([0-9]|[1-9][0-9]|100)%$"
+                }
+              ]
+            }
+          }
+        }
+      }
     },
     "nodeSelector": {
       "type": "object",

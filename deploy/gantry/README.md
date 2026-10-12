@@ -106,6 +106,15 @@ metricsService:
       {"openmetrics": {"init_config": {}, "instances": [{
         "openmetrics_endpoint": "http://%%host%%:9095/metrics",
         "namespace": "gantry", "metrics": [".*"]}]}}
+
+## Agent rollout
+
+`updateStrategy` is the agent DaemonSet's update strategy. The default
+`maxUnavailable: 50%` replaces half of the agents at once; lower it on large
+clusters to bound how many nodes lose their local mirror during a rollout:
+
+```sh
+--set-string updateStrategy.rollingUpdate.maxUnavailable=10%
 ```
 
 ## Operator Profile
