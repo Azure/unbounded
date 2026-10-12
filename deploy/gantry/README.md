@@ -90,6 +90,24 @@ Do not combine these stages in one Helm upgrade. A new pod can create a
 higher-numbered Lease while old pods are still running, which makes the old
 pods reject their next chair snapshot.
 
+## Metrics
+
+Each agent serves Prometheus metrics on port `9095` (`/metrics`). Set
+`metricsService.enabled=true` to render `Service/gantry-metrics`, a headless
+Service over the agents that also lists NotReady agents. Use
+`metricsService.annotations` for annotation-driven scrapers, for example a
+Datadog endpoints check that scrapes every agent from its own node:
+
+```yaml
+metricsService:
+  enabled: true
+  annotations:
+    ad.datadoghq.com/endpoints.checks: |
+      {"openmetrics": {"init_config": {}, "instances": [{
+        "openmetrics_endpoint": "http://%%host%%:9095/metrics",
+        "namespace": "gantry", "metrics": [".*"]}]}}
+```
+
 ## Operator Profile
 
 ```sh

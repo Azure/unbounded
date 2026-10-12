@@ -157,6 +157,63 @@ func TestRendersFixedChairLeaseSet(t *testing.T) {
 	}
 }
 
+func TestRendersOptionalMetricsService(t *testing.T) {
+	t.Parallel()
+
+	if _, err := os.Stat(filepath.Join(renderChart(t, false), "metrics-service.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("metrics Service rendered by default (stat err: %v)", err)
+	}
+
+	outputDir := renderChart(t, false,
+		"--set", "metricsService.enabled=true",
+		"--set-string", "metricsService.annotations.prometheus\\.io/scrape=true",
+	)
+
+	raw, err := os.ReadFile(filepath.Join(outputDir, "metrics-service.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered metrics Service: %v", err)
+	}
+
+	var service struct {
+		Metadata struct {
+			Name        string            `yaml:"name"`
+			Annotations map[string]string `yaml:"annotations"`
+		} `yaml:"metadata"`
+		Spec struct {
+			ClusterIP                string            `yaml:"clusterIP"`
+			PublishNotReadyAddresses bool              `yaml:"publishNotReadyAddresses"`
+			Selector                 map[string]string `yaml:"selector"`
+			Ports                    []struct {
+				Port       int    `yaml:"port"`
+				TargetPort string `yaml:"targetPort"`
+			} `yaml:"ports"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(raw, &service); err != nil {
+		t.Fatalf("decode metrics Service: %v", err)
+	}
+
+	if service.Metadata.Name != "gantry-metrics" {
+		t.Fatalf("metrics Service name = %q", service.Metadata.Name)
+	}
+
+	if service.Metadata.Annotations["prometheus.io/scrape"] != "true" {
+		t.Fatalf("metrics Service annotations = %v", service.Metadata.Annotations)
+	}
+
+	if service.Spec.ClusterIP != "None" || !service.Spec.PublishNotReadyAddresses {
+		t.Fatal("metrics Service must be headless and publish NotReady addresses")
+	}
+
+	if service.Spec.Selector["app.kubernetes.io/name"] != "gantry" || service.Spec.Selector["app.kubernetes.io/component"] != "agent" {
+		t.Fatalf("metrics Service selector = %v", service.Spec.Selector)
+	}
+
+	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 9095 || service.Spec.Ports[0].TargetPort != "metrics" {
+		t.Fatalf("metrics Service ports = %+v", service.Spec.Ports)
+	}
+}
+
 func TestRendersConfiguredChairAndSeedCounts(t *testing.T) {
 	t.Parallel()
 
