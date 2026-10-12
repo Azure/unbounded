@@ -417,7 +417,7 @@ func serveSidecar(ctx context.Context, listener net.Listener, handler http.Handl
 		BaseContext: func(net.Listener) context.Context { return lifetime },
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if sidecarRequestHeaderBytes(r) > sidecarMaxHeaderBytes {
-				http.Error(w, http.StatusText(http.StatusRequestHeaderFieldsTooLarge), http.StatusRequestHeaderFieldsTooLarge)
+				object.WriteSidecarHeaderTooLarge(w, r)
 				return
 			}
 

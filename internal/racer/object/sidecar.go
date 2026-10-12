@@ -279,6 +279,12 @@ var sidecarCodes = map[sidecarFailure]string{
 	http.StatusServiceUnavailable:           "ServiceUnavailable",
 }
 
+// WriteSidecarHeaderTooLarge rejects oversized headers with the sidecar's S3 error format.
+// HEAD returns the same headers as GET without a body.
+func WriteSidecarHeaderTooLarge(w http.ResponseWriter, r *http.Request) {
+	sidecarFailure(http.StatusRequestHeaderFieldsTooLarge).write(w, r)
+}
+
 func (f sidecarFailure) write(w http.ResponseWriter, r *http.Request) {
 	// Both fields are fixed ASCII text without XML metacharacters.
 	body := "<Error><Code>" + sidecarCodes[f] + "</Code><Message>" + http.StatusText(int(f)) + "</Message></Error>"
