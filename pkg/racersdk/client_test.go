@@ -163,16 +163,16 @@ func TestGetRanges(t *testing.T) {
 	}
 }
 
-func TestGetSinglePageCredits(t *testing.T) {
+func TestGetPageCredits(t *testing.T) {
 	const (
 		first = PageSize - 1
 		end   = PageSize + 2
 	)
 
 	c := rawServer(t, func(conn net.Conn, r *bufio.Reader, head []byte) {
-		if !strings.Contains(string(head), "Racer-Page-Credits: 1\r\n") ||
-			!strings.Contains(string(head), fmt.Sprintf("Racer-Byte-Credits: %d\r\n", PageSize)) {
-			t.Errorf("subscription must grant exactly one page and PageSize bytes: %q", head)
+		if !strings.Contains(string(head), "Racer-Page-Credits: 2\r\n") ||
+			!strings.Contains(string(head), fmt.Sprintf("Racer-Byte-Credits: %d\r\n", 2*PageSize)) {
+			t.Errorf("subscription must grant two pages and 2*PageSize bytes: %q", head)
 			return
 		}
 
@@ -191,7 +191,9 @@ func TestGetSinglePageCredits(t *testing.T) {
 			if _, err := io.WriteString(conn, payload); err != nil {
 				return
 			}
+		}
 
+		for number, length := range []uint32{1, 2} {
 			if err := readCredit(r, uint64(number), length); err != nil {
 				t.Error(err)
 				return
