@@ -261,7 +261,7 @@ func TestForwardingAwareTunnelMTU(t *testing.T) {
 	}
 
 	meshPeer := meshPeerInfo{SiteName: "site-b"}
-	if got := resolveMeshPeerTunnelMTU(0, meshPeer, "site-a", siteMTUs, map[string]int{"site-b": 1350}, nil); got != 1300 {
+	if got := resolveMeshPeerTunnelMTU(0, meshPeer, "site-a", siteMTUs, map[string]int{"site-b": 1350}, nil, false); got != 1300 {
 		t.Fatalf("A-B mesh MTU = %d, want remote Site minimum 1300", got)
 	}
 
@@ -304,7 +304,7 @@ func TestForwardingAwareTunnelMTU(t *testing.T) {
 		t.Fatalf("gateway peering without a learned forwarding path constrained worker MTU: %d", got)
 	}
 
-	if got := resolveMeshPeerTunnelMTU(1420, meshPeerInfo{SiteName: "missing"}, "site-a", siteMTUs, nil, nil); got != 1420 {
+	if got := resolveMeshPeerTunnelMTU(1420, meshPeerInfo{SiteName: "missing"}, "site-a", siteMTUs, nil, nil, false); got != 1420 {
 		t.Fatalf("missing remote resources MTU = %d, want configured default 1420", got)
 	}
 
@@ -346,21 +346,36 @@ func TestResolveMeshPeerTunnelMTU(t *testing.T) {
 		map[string]int{"site-a": 1300},
 		map[string]int{"site-b": 1200},
 		map[string]int{"site-b": 1100},
+		false,
 	)
 	if got != 1300 {
 		t.Fatalf("expected 1300 (site MTU), got %d", got)
 	}
 
-	// Cross-site peer: min of site, peering, assignment
+	// An ordinary worker's direct mesh path does not transit the gateway
+	// assignment, so the assignment MTU must not constrain that peer.
 	peer = meshPeerInfo{SiteName: "site-b"}
 
 	got = resolveMeshPeerTunnelMTU(1420, peer, "site-a",
-		map[string]int{"site-a": 1350},
-		map[string]int{"site-b": 1200},
-		map[string]int{"site-b": 1250},
+		map[string]int{"site-a": 1350, "site-b": 1300},
+		map[string]int{"site-b": 1280},
+		map[string]int{"site-b": 1100},
+		false,
 	)
-	if got != 1200 {
-		t.Fatalf("expected 1200 (peering MTU wins), got %d", got)
+	if got != 1280 {
+		t.Fatalf("expected 1280 (peering MTU wins without gateway assignment), got %d", got)
+	}
+
+	// A gateway's mesh link to an assigned Site is part of the assignment
+	// forwarding path, so the assignment MTU applies there.
+	got = resolveMeshPeerTunnelMTU(1420, peer, "site-a",
+		map[string]int{"site-a": 1350, "site-b": 1300},
+		map[string]int{"site-b": 1280},
+		map[string]int{"site-b": 1100},
+		true,
+	)
+	if got != 1100 {
+		t.Fatalf("expected 1100 (gateway assignment MTU wins), got %d", got)
 	}
 
 	// No CRD overrides -- global wins
@@ -370,6 +385,7 @@ func TestResolveMeshPeerTunnelMTU(t *testing.T) {
 		map[string]int{},
 		map[string]int{},
 		map[string]int{},
+		false,
 	)
 	if got != 1420 {
 		t.Fatalf("expected 1420 (global MTU), got %d", got)
