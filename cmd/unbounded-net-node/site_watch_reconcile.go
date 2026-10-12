@@ -2074,7 +2074,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		cfg.PreferredPrivateEncap, cfg.PreferredPublicEncap,
 		siteTunnelProtocols, peeringSiteTunnelProtocols,
 		assignmentPoolTunnelProtocols, poolTunnelProtocols)
-	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, peeredSites, networkPeeredSites,
+	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, isGatewayNode, peeredSites, networkPeeredSites,
 		siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 		assignmentPoolTunnelMTUs, poolTunnelMTUs, state.netlinkCache)
 

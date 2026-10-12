@@ -158,6 +158,7 @@ func resolvePeerTunnelMTUs(
 	meshPeers []meshPeerInfo,
 	gatewayPeers []gatewayPeerInfo,
 	mySiteName string,
+	isGatewayNode bool,
 	peeredSites, networkPeeredSites map[string]bool,
 	siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 	assignmentPoolTunnelMTUs, poolTunnelMTUs map[string]int,
@@ -168,7 +169,7 @@ func resolvePeerTunnelMTUs(
 		autoMTU := detectEncapsulatedRouteMTU(cfg, underlayIP, meshPeers[i].TunnelProtocol, cache)
 		meshPeers[i].TunnelMTU = resolveTunnelMTU(cfg.MTU, autoMTU,
 			resolveMeshPeerTunnelMTU(0, meshPeers[i], mySiteName,
-				siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs))
+				siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, isGatewayNode))
 	}
 
 	for i := range gatewayPeers {
