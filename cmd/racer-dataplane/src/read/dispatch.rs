@@ -70,6 +70,7 @@ impl std::ops::Deref for Mailbox {
 /// The map is immutable for the lifetime of this directory. Construct a replacement
 /// only after all endpoints and completion receipts have drained.
 pub struct WorkerDirectory {
+    pub warm: super::warm::WarmRegistry,
     pub(crate) subscriptions: Arc<super::range_stream::Scheduler>,
     map: Arc<WorkerMap>,
     mailboxes: Vec<Arc<Mailbox>>,
@@ -77,6 +78,14 @@ pub struct WorkerDirectory {
 }
 
 enum Work {
+    Hold(ObjectVersion, usize, std::time::SystemTime),
+    Warm(
+        PageId,
+        crate::model::VersionMetadata,
+        Arc<crate::topology::Membership>,
+        PeerOriginContext,
+    ),
+    WarmLocal(PageId),
     Select(
         ObjectVersion,
         super::range_stream::Selection,
@@ -108,6 +117,7 @@ enum Work {
     Peer(VerifiedRequest, std::sync::Arc<crate::topology::Membership>),
 }
 enum Value {
+    Held(bool, std::time::SystemTime),
     Metadata(ObjectMetadata),
     Page(PageResult),
     Cached(Option<PageResult>),
@@ -303,6 +313,7 @@ impl WorkerDirectory {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
+            warm: super::warm::WarmRegistry::new(capacity.saturating_mul(workers.len())),
             subscriptions: super::range_stream::Scheduler::new(
                 capacity.saturating_mul(workers.len()),
             ),
@@ -388,6 +399,115 @@ impl WorkerDirectory {
     }
     pub fn page_owner(&self, page: &PageId) -> Result<WorkerId> {
         self.map.owner(page)
+    }
+
+    pub(super) async fn reserve_warm(
+        &self,
+        version: &ObjectVersion,
+        pages: u64,
+        until: std::time::SystemTime,
+        scope: &RequestScope,
+        fresh: &mut Vec<WorkerId>,
+    ) -> Result<std::time::SystemTime> {
+        if pages > 1_048_576u64.saturating_mul(self.mailboxes.len() as u64) {
+            return Err(Error::Overloaded);
+        }
+        let mut counts = std::collections::BTreeMap::new();
+        // Bound admission CPU by the configured storage capacity at each owner.
+        for number in 0..pages {
+            scope.check()?;
+            let owner = self.page_owner(&PageId {
+                version: version.clone(),
+                number: crate::model::PageNumber(number),
+            })?;
+            *counts.entry(owner.0).or_insert(0usize) += 1;
+            if number % 1024 == 1023 {
+                uring_runtime::drivers::yield_now().await;
+            }
+        }
+        let mut accepted = until;
+        for mailbox in &self.mailboxes {
+            let count = counts.get(&mailbox.worker.0).copied().unwrap_or(0);
+            let receipt = self.submit(
+                mailbox.worker,
+                Work::Hold(version.clone(), count, until),
+                scope,
+                None,
+            )?;
+            match std::future::poll_fn(|cx| receipt.poll_completion(cx))
+                .await?
+                .value?
+            {
+                Value::Held(created, expiry) => {
+                    if created {
+                        fresh.push(mailbox.worker);
+                    }
+                    accepted = accepted.max(expiry);
+                }
+                _ => return Err(Error::StaleFlight),
+            }
+        }
+        // All workers must honor the same expiry, including recovered longer holds.
+        if accepted > until {
+            for mailbox in &self.mailboxes {
+                let count = counts.get(&mailbox.worker.0).copied().unwrap_or(0);
+                let receipt = self.submit(
+                    mailbox.worker,
+                    Work::Hold(version.clone(), count, accepted),
+                    scope,
+                    None,
+                )?;
+                std::future::poll_fn(|cx| receipt.poll_completion(cx))
+                    .await?
+                    .value?;
+            }
+        }
+        Ok(accepted)
+    }
+
+    pub(super) async fn warm_page(
+        &self,
+        page: PageId,
+        metadata: crate::model::VersionMetadata,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        let owner = self.page_owner(&page)?;
+        let work = Work::Warm(page, metadata, membership, self.seal(context, scope)?);
+        let receipt = self.submit(owner, work, scope, Some(super::default_budget(scope)))?;
+        match std::future::poll_fn(|cx| receipt.poll_completion(cx))
+            .await?
+            .value?
+        {
+            Value::Published => Ok(()),
+            _ => Err(Error::StaleFlight),
+        }
+    }
+
+    pub(super) async fn warmed_page(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<PageResult>> {
+        if !self.warm.wait(page, scope).await? {
+            return Ok(None);
+        }
+        let owner = self.page_owner(page)?;
+        let result = if self.is_local(owner) {
+            self.local()?.fill.warm_local(page, scope).await
+        } else {
+            match self
+                .submit(owner, Work::WarmLocal(page.clone()), scope, None)?
+                .await?
+                .value?
+            {
+                Value::Page(page) => Ok(page),
+                _ => Err(Error::StaleFlight),
+            }
+        };
+        // A lost held copy is an error, not permission to race the active warm job.
+        result.map(Some)
     }
 
     fn submit(
@@ -643,22 +763,43 @@ impl WorkerEndpoint {
         self.active.simulation_crash();
     }
     pub fn stop_admission(&self) {
+        self.directory.warm.stop();
         self.mailbox.stop_admission();
     }
     pub fn is_drained(&self) -> bool {
-        self.mailbox.outstanding() == 0
+        self.mailbox.outstanding() == 0 && self.directory.warm.drained(self.mailbox.worker)
     }
     /// Close admission and continue reaping every accepted command. An expired
     /// shutdown scope requests cancellation but never substitutes for completion.
     pub fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         self.stop_admission();
         Box::pin(std::future::poll_fn(move |cx| {
-            self.active
+            self.directory.warm.poll_releases(
+                self.mailbox.worker,
+                self.local.fill.dependencies.writer.index(),
+                cx,
+            )?;
+            match self
+                .active
                 .poll_drain(&self.mailbox, scope, cx, self.local.clone())
+            {
+                std::task::Poll::Ready(Ok(()))
+                    if !self.directory.warm.drained(self.mailbox.worker) =>
+                {
+                    std::task::Poll::Pending
+                }
+                other => other,
+            }
         }))
     }
     /// Register a reactor waker and execute at most `work_budget` command/poll steps.
     pub fn poll(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
+        self.directory.warm.poll_deadlines();
+        self.directory.warm.poll_releases(
+            self.mailbox.worker,
+            self.local.fill.dependencies.writer.index(),
+            cx,
+        )?;
         self.active
             .poll(&self.mailbox, cx, work_budget, self.local.clone())
     }
@@ -719,6 +860,54 @@ async fn execute(
 ) -> Result<Value> {
     scope.check()?;
     match work {
+        Work::Hold(version, pages, until) => {
+            local
+                .fill
+                .dependencies
+                .writer
+                .index()
+                .configure_holds(local.streams.directory().warm.config().retained_percent)?;
+            let previous = local
+                .fill
+                .dependencies
+                .writer
+                .index()
+                .hold_until(&version)?;
+            local
+                .fill
+                .dependencies
+                .writer
+                .index()
+                .reserve_hold(&version, pages, until)?;
+            Ok(Value::Held(
+                previous.is_none(),
+                previous.map_or(until, |old| old.max(until)),
+            ))
+        }
+        Work::WarmLocal(page) => local.fill.warm_local(&page, scope).await.map(Value::Page),
+        Work::Warm(page, metadata, membership, envelope) => {
+            let context = local.open_context(envelope)?;
+            let result = local
+                .fill
+                .acquire_unobserved(
+                    page,
+                    membership,
+                    &context,
+                    scope,
+                    budget.ok_or(Error::StaleFlight)?,
+                )
+                .await?;
+            if !metadata.compatible(&result.metadata.immutable()) {
+                return Err(Error::CorruptRecord);
+            }
+            local
+                .fill
+                .dependencies
+                .writer
+                .persist_held(result.copy(), scope)
+                .await?;
+            Ok(Value::Published)
+        }
         Work::Observed(page) => {
             local.fill.observe_verified_scoped(&page, scope).await;
             Ok(Value::Published)
@@ -788,6 +977,9 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::Ordered(page, membership, envelope, guard) => {
+            if let Some(result) = local.streams.directory().warmed_page(&page, scope).await? {
+                return Ok(Value::Page(result));
+            }
             let context = local.open_context(envelope)?;
             local
                 .fill
@@ -880,6 +1072,169 @@ mod tests {
     use racer_control_wire::CacheId;
     use std::time::Duration;
     use std::time::Instant;
+    #[test]
+    fn head_admission_returns_before_body_and_survives_caller_cancel() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let _queue = queue.enter();
+        let directory = Arc::new(directory(4));
+        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let _local = directory.simulation_scope(Some((WorkerId(0), local.clone())));
+        let caller = scope();
+        let mut version = version();
+        version.object.cache =
+            racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
+        let origin = OriginContext {
+            object: version.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let context = local.credentials.local_context(&origin, &caller).unwrap();
+        let metadata = ObjectMetadata {
+            version,
+            length: 3,
+            content_type: None,
+            expires_at: crate::model::ExpiresAt::test_time(
+                std::time::SystemTime::now() + Duration::from_secs(60),
+            ),
+        };
+        let membership = Arc::new(
+            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
+                .unwrap(),
+        );
+        let mut head = Box::pin(super::super::warm::admit(
+            directory.clone(),
+            metadata,
+            membership,
+            context,
+            Duration::from_secs(60),
+            &caller,
+        ));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(head.as_mut().poll(&mut cx).is_pending());
+        for mailbox in &directory.mailboxes {
+            queue.poll(&mut cx, 64);
+            let command = mailbox.pop().expect("hold command");
+            assert!(matches!(command.work, Work::Hold(..)));
+            let Work::Hold(_, _, until) = &command.work else {
+                unreachable!()
+            };
+            command
+                .reply
+                .complete(
+                    command.generation,
+                    Completion {
+                        value: Ok(Value::Held(true, *until)),
+                        budget: None,
+                    },
+                )
+                .unwrap();
+        }
+        queue.poll(&mut cx, 64);
+        assert!(matches!(head.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        drop(head);
+        caller.cancel().unwrap();
+        assert_eq!(queue.pending(), 1, "body driver survives HEAD");
+        let command = directory
+            .mailboxes
+            .iter()
+            .find_map(|mailbox| mailbox.pop())
+            .expect("warm body command");
+        assert!(matches!(command.work, Work::Warm(..)));
+        assert!(
+            command.scope.check().is_ok(),
+            "fresh warm cancellation domain"
+        );
+        command
+            .reply
+            .complete(
+                command.generation,
+                Completion {
+                    value: Err(Error::Unavailable),
+                    budget: None,
+                },
+            )
+            .unwrap();
+        drop(command);
+        queue.poll(&mut cx, 64);
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(directory.warm.snapshot(), (0, 0));
+    }
+    #[test]
+    fn ordered_and_unordered_commands_wait_behind_unstarted_warm_pages() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let _queue = queue.enter();
+        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let directory = local.streams.directory();
+        let caller = scope();
+        let mut version = version();
+        version.object.cache =
+            racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
+        let (job, _) = directory.warm.begin(&version).unwrap();
+        let context = OriginContext {
+            object: version.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let membership = Arc::new(
+            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
+                .unwrap(),
+        );
+        let range = crate::model::ByteRange::From(8 * crate::model::PAGE_BYTES)
+            .resolve(10 * crate::model::PAGE_BYTES)
+            .unwrap();
+        for ordered in [true, false] {
+            let mut demand = directory
+                .subscriptions
+                .register(
+                    version.clone(),
+                    range,
+                    2,
+                    2 * crate::model::PAGE_BYTES,
+                    ordered,
+                )
+                .unwrap();
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let envelope = local
+                .credentials
+                .seal(&context, AttemptId([3; 16]), &caller)
+                .unwrap();
+            let work = if ordered {
+                let Poll::Ready(Ok(Some((number, guard)))) = demand.poll_ordered(&mut cx) else {
+                    panic!("ordered credit");
+                };
+                Work::Ordered(
+                    PageId {
+                        version: version.clone(),
+                        number,
+                    },
+                    membership.clone(),
+                    envelope,
+                    Arc::new(guard),
+                )
+            } else {
+                let Poll::Ready(Ok(super::super::range_stream::Next::Select(selection))) =
+                    demand.poll_next(&mut cx)
+                else {
+                    panic!("selection credit");
+                };
+                Work::Select(version.clone(), selection, membership.clone(), envelope)
+            };
+            let mut budget = super::super::default_budget(&caller);
+            let mut command = Box::pin(execute(&local, work, &caller, Some(&mut budget)));
+            for _ in 0..3 {
+                assert!(command.as_mut().poll(&mut cx).is_pending());
+            }
+            assert_eq!(directory.warm.snapshot().1, 1);
+            assert_eq!(
+                queue.pending(),
+                0,
+                "no Fill driver or outbound acquisition may start"
+            );
+            drop(command);
+            assert_eq!(directory.warm.snapshot().1, 0);
+        }
+        job.stop();
+    }
     #[test]
     fn canonical_order_rejects_empty_and_duplicate_identities() {
         assert!(matches!(

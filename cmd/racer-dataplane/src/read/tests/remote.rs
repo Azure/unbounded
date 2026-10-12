@@ -544,6 +544,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 let result = coordinator
                     .read(
                         ClientRequest {
+                            retain: None,
                             origin: context,
                             kind: if matches!(absence, Some(Absence::Subscription)) {
                                 ReadKind::Subscription {

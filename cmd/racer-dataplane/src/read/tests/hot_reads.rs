@@ -46,6 +46,7 @@ mod duplex_release {
                 coordinator(&f, &signers[0], &membership, NoPeer::requester());
             let response = futures::executor::block_on(local.read(
                 ClientRequest {
+                    retain: None,
                     kind: ReadKind::Subscription {
                         pin: Some(f.page.version.etag.clone()),
                         range: None,
@@ -232,6 +233,7 @@ mod duplex_release {
         )
         .unwrap();
         let request = ClientRequest {
+            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(PAGE_BYTES - 1)),
@@ -697,6 +699,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
         coordinator(&f, &signers[0], &membership, NoPeer::requester());
     let open = |ordered, credits, start| {
         let request = ClientRequest {
+            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(start)),
@@ -826,6 +829,7 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
         let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
         let mut stream = match futures::executor::block_on(local.read(
             ClientRequest {
+                retain: None,
                 kind: ReadKind::Subscription {
                     pin: Some(f.page.version.etag.clone()),
                     range: Some(ByteRange::From(start)),
@@ -929,6 +933,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             coordinator(&f, &signers[0], &membership, NoPeer::requester());
         let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
         let request = ClientRequest {
+            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: None,
@@ -1268,6 +1273,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     let open = |index: usize, start: u64| {
         let f = &fixtures[index];
         let request = ClientRequest {
+            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(start * PAGE_BYTES)),
@@ -1293,6 +1299,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     let mut a2 = open(0, 0);
     let mut b = open(1, 2);
     let warm_request = ClientRequest {
+        retain: None,
         kind: ReadKind::Subscription {
             pin: Some(fixtures[0].page.version.etag.clone()),
             range: None,

@@ -49,6 +49,7 @@ use racer_object_wire::client::frame;
 
 /// A validated client operation and its byte-preserving origin context.
 pub struct ClientRequest {
+    pub retain: Option<Duration>,
     pub kind: ReadKind,
 
     pub origin: OriginContext,
@@ -80,6 +81,7 @@ impl RequestParser {
     pub fn parse(&self, cache: &CacheId, head: MessageHead) -> Result<ClientRequest> {
         let request = self.wire.parse(&head)?;
         Ok(ClientRequest {
+            retain: request.retain,
             kind: request.kind,
             origin: OriginContext {
                 object: ObjectId {
@@ -687,7 +689,11 @@ impl Responses {
             if !matches!(&response.payload, ReadPayload::Empty) {
                 return Err(Error::BadGateway);
             }
-            let head = success_head(&response.metadata, None)?;
+            let head = racer_object_wire::client::success_head_retained(
+                &response.metadata,
+                None,
+                response.retain_until,
+            )?;
             connection = self.io.send_head(connection, head, scope).await?.connection;
             connection.finish_exchange()?;
             if let Some(observation) = observation.as_mut() {

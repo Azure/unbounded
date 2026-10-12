@@ -111,6 +111,19 @@ impl DecryptSource {
     }
 }
 impl Fill {
+    pub(super) async fn warm_local(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<PageResult> {
+        if let Some(result) = self.cached_page(page, scope)? {
+            return Ok(result);
+        }
+        match self.acquire_local_copy(page, scope, true).await? {
+            Some(AcquiredPage::Plaintext(result)) => Ok(result),
+            _ => Err(Error::Unavailable),
+        }
+    }
     /// Mark this detached driver's call boundary, if it owns a diagnostic generation.
     fn stage(&self, stage: DriverStage) {
         if let Some(diagnostic) = &self.diagnostic {
@@ -168,6 +181,14 @@ impl Fill {
         };
         if version.object != context.object {
             return Err(Error::InvalidRequest);
+        }
+        if let Some(page) = self
+            .dependencies
+            .metadata_owner
+            .warmed_page(&head, scope)
+            .await?
+        {
+            return Ok(page);
         }
         // A new or credit-starved subscriber can lag behind provider completion.
         // Reuse its verified local head before asking for another node transfer.

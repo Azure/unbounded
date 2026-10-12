@@ -733,8 +733,8 @@ pub struct CredentialCrypto {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 }
 impl CredentialCrypto {
-    /// Independently admitted same-worker context. No trust boundary is crossed;
-    /// retain exact fields and zeroization without a credential AEAD round trip.
+    /// Independently charged zeroizing context. Warm admission may transfer this
+    /// owner to a bounded job with its own scope after the HEAD response ends.
     pub(crate) fn local_context(
         &self,
         context: &OriginContext,

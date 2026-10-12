@@ -63,6 +63,20 @@ pub(crate) struct Scheduler {
     state: Mutex<State>,
 }
 impl Scheduler {
+    pub(super) fn admit_warm<T>(
+        &self,
+        version: &ObjectVersion,
+        registry: &super::warm::WarmRegistry,
+        admit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let state = self.state.lock().unwrap();
+        if state.selecting.contains(version) && !registry.contains(version) {
+            return Err(Error::Overloaded);
+        }
+        // A provider selection may bypass Fill flights. Publish the warm gate
+        // while holding its election lock, or refuse this optional HEAD hint.
+        admit()
+    }
     pub(crate) fn contract(
         &self,
         version: ObjectVersion,
@@ -836,6 +850,9 @@ impl RangeStream {
     /// acquiring the first slice. Already admitted pages retain their original deadlines
     /// and retry budgets; only newly admitted, distinct pages get child scopes.
     pub(crate) fn enable_progress(&mut self, timeout: Duration) {
+        if self.directory.warm.contains(&self.metadata.version) {
+            return;
+        }
         if matches!(self.budget, RangeBudget::ClientPages { .. }) {
             self.budget = RangeBudget::ProgressingPages { timeout };
         }
@@ -1811,6 +1828,7 @@ pub(super) mod tests {
                 .configure_subscription(4, 4 * PAGE_BYTES, false)
                 .unwrap();
             let response = ReadResponse {
+                retain_until: None,
                 metadata,
                 payload: crate::read::ReadPayload::Stream(stream),
             };

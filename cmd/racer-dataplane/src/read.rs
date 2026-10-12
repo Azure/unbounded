@@ -36,9 +36,11 @@ pub mod fill;
 pub mod flight;
 pub mod metadata;
 pub mod range_stream;
+pub mod warm;
 
 /// Metadata and its optional stream, with no independent range to disagree with it.
 pub struct ReadResponse {
+    pub retain_until: Option<std::time::SystemTime>,
     pub metadata: ObjectMetadata,
 
     pub payload: ReadPayload,
@@ -160,7 +162,11 @@ impl Coordinator {
             }
             let membership = snapshot.membership.clone();
             let directory = self.streams.directory();
-            let ClientRequest { kind, origin } = request;
+            let ClientRequest {
+                kind,
+                origin,
+                retain,
+            } = request;
             let selector = match &kind {
                 ReadKind::Subscription { pin, .. } => pin
                     .clone()
@@ -188,6 +194,7 @@ impl Coordinator {
                 } => {
                     if metadata.length == 0 && range.is_none() {
                         return Ok(ReadResponse {
+                            retain_until: None,
                             metadata,
                             payload: ReadPayload::Empty,
                         });
@@ -203,14 +210,35 @@ impl Coordinator {
                     )?;
                     body.configure_subscription(page_credits, byte_credits, ordered)?;
                     Ok(ReadResponse {
+                        retain_until: None,
                         metadata,
                         payload: ReadPayload::Stream(body),
                     })
                 }
-                ReadKind::Head | ReadKind::HeadPinned { .. } => Ok(ReadResponse {
-                    metadata,
-                    payload: ReadPayload::Empty,
-                }),
+                ReadKind::Head | ReadKind::HeadPinned { .. } => {
+                    let retain_until = if let Some(ttl) = retain {
+                        match self.credentials.local_context(&origin, scope) {
+                            Ok(context) => warm::admit(
+                                directory.clone(),
+                                metadata.clone(),
+                                membership,
+                                context,
+                                ttl,
+                                scope,
+                            )
+                            .await
+                            .ok(),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    Ok(ReadResponse {
+                        metadata,
+                        payload: ReadPayload::Empty,
+                        retain_until,
+                    })
+                }
             }
         })
     }
