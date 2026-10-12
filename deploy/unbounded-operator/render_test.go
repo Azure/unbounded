@@ -51,6 +51,10 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 
 	readYAML(t, filepath.Join(outputDir, "03-configmap.yaml"), &cm)
 
+	if _, found := cm.Data["ENABLE_RACER"]; found {
+		t.Fatal("configmap contains obsolete ENABLE_RACER")
+	}
+
 	if got := cm.Data["UNBOUNDED_API_SERVER_ENDPOINT"]; got != endpoint {
 		t.Fatalf("configmap UNBOUNDED_API_SERVER_ENDPOINT = %q, want %q", got, endpoint)
 	}

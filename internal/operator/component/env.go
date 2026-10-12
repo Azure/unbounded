@@ -331,6 +331,8 @@ func DeleteOperation(obj client.Object, componentName, site string) Operation {
 // It skips the write when the cached object carries the hash of the exact same
 // desired payload. Read failures are deliberately treated as cache misses so
 // reconciliation still attempts the authoritative write and surfaces its error.
+// UID-pinned applies always reach the apiserver so a stale cache cannot bypass
+// the UID precondition after an object is deleted and recreated.
 func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	desired := ToUnstructured(obj).DeepCopy()
 
@@ -351,9 +353,14 @@ func (e *Env) ApplyObject(ctx context.Context, obj client.Object) error {
 	current.SetGroupVersionKind(desired.GroupVersionKind())
 
 	key := client.ObjectKeyFromObject(desired)
-	if err := e.Client.Get(ctx, key, current); err == nil &&
-		current.GetLabels()[AppliedHashLabel] == hash && DesiredFieldsMatch(desired.Object, current.Object) {
-		return nil
+	comparable := desired.DeepCopy()
+	comparable.SetResourceVersion("")
+
+	if desired.GetUID() == "" {
+		if err := e.Client.Get(ctx, key, current); err == nil &&
+			current.GetLabels()[AppliedHashLabel] == hash && DesiredFieldsMatch(comparable.Object, current.Object) {
+			return nil
+		}
 	}
 
 	applyCfg := client.ApplyConfigurationFromUnstructured(desired)
@@ -406,6 +413,8 @@ func DesiredFieldsMatch(desired, current any) bool {
 // characters, including the first and last characters required by label values.
 func AppliedPayloadHash(obj *unstructured.Unstructured) (string, error) {
 	payload := obj.DeepCopy()
+	// Write preconditions are not part of the desired payload.
+	payload.SetResourceVersion("")
 	labels := payload.GetLabels()
 	delete(labels, AppliedHashLabel)
 	payload.SetLabels(labels)
@@ -444,7 +453,14 @@ func (e *Env) ListSites(ctx context.Context) ([]unboundedv1alpha3.Site, error) {
 
 // DeleteIfExists deletes an object, treating an already-absent object as success.
 func (e *Env) DeleteIfExists(ctx context.Context, obj client.Object) error {
-	if err := e.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+	var opts []client.DeleteOption
+
+	if uid := obj.GetUID(); uid != "" {
+		rv := obj.GetResourceVersion()
+		opts = append(opts, client.Preconditions{UID: &uid, ResourceVersion: &rv})
+	}
+
+	if err := e.Client.Delete(ctx, obj, opts...); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete %s %s/%s: %w",
 			obj.GetObjectKind().GroupVersionKind().Kind, obj.GetNamespace(), obj.GetName(), err)
 	}
