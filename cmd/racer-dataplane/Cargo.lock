@@ -356,8 +356,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
-name = "env-config"
-version = "0.1.0"
+name = "envy"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f47e0157f2cb54f5ae1bd371b30a2ae4311e1c028f575cd4e81de7353215965"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "fiat-crypto"
@@ -783,7 +788,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "controlplane",
- "env-config",
+ "envy",
  "flow-control",
  "futures",
  "getrandom",
