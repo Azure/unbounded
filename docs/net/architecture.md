@@ -700,6 +700,13 @@ graph TD
     end
 ```
 
+Every node agent continuously watches Sites, SiteNodeSlices, SitePeerings, and
+SiteGatewayPoolAssignments. Gateway nodes also watch GatewayPools,
+GatewayPoolNodes, and GatewayPoolPeerings. A worker starts those three
+gateway-specific watches only while an enabled assignment directly targets
+its pinned Site, waits for all three caches to synchronize before consuming
+them, and stops them only after dependent routes and peers have been removed.
+
 ### Gateway Node Isolation
 
 ```mermaid

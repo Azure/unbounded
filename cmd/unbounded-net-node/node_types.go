@@ -194,6 +194,7 @@ type gatewayPeerInfo struct {
 	SkipPodCIDRRoutes      bool     // Keep tunnel reachability host routes but skip explicit PodCIDR routes
 	TunnelProtocol         string   // Resolved tunnel protocol for this peer (WireGuard or GENEVE)
 	TunnelMTU              int      // Effective MTU after route, encapsulation, and CRD limits
+	TransitTunnelMTU       int      // MTU imposed by an actual downstream GatewayPoolPeering path
 }
 
 // meshPeerInfo contains information about a peer on the main mesh interface.

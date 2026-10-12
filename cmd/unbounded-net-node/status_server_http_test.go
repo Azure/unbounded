@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -16,6 +17,27 @@ import (
 
 	"k8s.io/client-go/tools/cache"
 )
+
+func TestReadyzReportsRequiredGatewayInformerState(t *testing.T) {
+	healthState := &nodeHealthState{
+		informersSynced: []cache.InformerSynced{func() bool { return true }},
+		gatewayInformersReady: func() (bool, string) {
+			return false, "required gateway informer caches are starting"
+		},
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	response := httptest.NewRecorder()
+	newHealthMux(healthState).ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+
+	if got := response.Body.String(); got != "required gateway informer caches are starting" {
+		t.Fatalf("readyz body = %q", got)
+	}
+}
 
 func reserveTestPort(t *testing.T) int {
 	t.Helper()

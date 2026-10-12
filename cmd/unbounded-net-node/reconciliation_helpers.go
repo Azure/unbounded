@@ -260,152 +260,71 @@ func mergeLowestTunnelMTU(tunnelMTUs map[string]int, scope string, mtu int) {
 	}
 }
 
-func mergeGatewayPoolPeeringTunnelMTU(tunnelMTUs map[string]int, peering unboundednetv1alpha1.GatewayPoolPeering) {
-	mtu := tunnelMTUFromSpec(peering.Spec.TunnelMTU)
-	for _, poolName := range peering.Spec.GatewayPools {
-		mergeLowestTunnelMTU(tunnelMTUs, poolName, mtu)
-	}
-}
-
-func resolveSiteTopologyTunnelMTU(
-	mySiteName string,
-	siteTunnelMTUs, poolTunnelMTUs map[string]int,
-	sitePeerings []unboundednetv1alpha1.SitePeering,
-	assignments []unboundednetv1alpha1.SiteGatewayPoolAssignment,
+func gatewayPoolPeeringTunnelMTU(
+	localPools []string,
+	remotePool string,
 	poolPeerings []unboundednetv1alpha1.GatewayPoolPeering,
-	localGatewayPools []string,
 ) int {
-	const (
-		sitePrefix = "site/"
-		poolPrefix = "pool/"
-	)
-
-	adjacency := make(map[string]map[string]bool)
-	scopeTunnelMTUs := make(map[string]int)
-
-	addScope := func(scope string, mtu int) {
-		if scope == "" {
-			return
+	localPoolSet := make(map[string]bool, len(localPools))
+	for _, poolName := range localPools {
+		if poolName = strings.TrimSpace(poolName); poolName != "" {
+			localPoolSet[poolName] = true
 		}
-
-		if adjacency[scope] == nil {
-			adjacency[scope] = make(map[string]bool)
-		}
-
-		mergeLowestTunnelMTU(scopeTunnelMTUs, scope, mtu)
-	}
-
-	connectScopes := func(scopes []string, mtu int) {
-		unique := make([]string, 0, len(scopes))
-		seen := make(map[string]bool, len(scopes))
-
-		for _, scope := range scopes {
-			scope = strings.TrimSpace(scope)
-			if scope == "" || seen[scope] {
-				continue
-			}
-
-			seen[scope] = true
-			unique = append(unique, scope)
-			addScope(scope, mtu)
-		}
-
-		if len(unique) < 2 {
-			return
-		}
-
-		first := unique[0]
-		for _, scope := range unique[1:] {
-			adjacency[first][scope] = true
-			adjacency[scope][first] = true
-		}
-	}
-
-	for siteName, mtu := range siteTunnelMTUs {
-		addScope(sitePrefix+siteName, mtu)
-	}
-
-	for poolName, mtu := range poolTunnelMTUs {
-		addScope(poolPrefix+poolName, mtu)
-	}
-
-	for _, peering := range sitePeerings {
-		scopes := make([]string, 0, len(peering.Spec.Sites))
-		for _, siteName := range peering.Spec.Sites {
-			if siteName = strings.TrimSpace(siteName); siteName != "" {
-				scopes = append(scopes, sitePrefix+siteName)
-			}
-		}
-
-		connectScopes(scopes, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
-	}
-
-	for _, assignment := range assignments {
-		scopes := make([]string, 0, len(assignment.Spec.Sites)+len(assignment.Spec.GatewayPools))
-		for _, siteName := range assignment.Spec.Sites {
-			if siteName = strings.TrimSpace(siteName); siteName != "" {
-				scopes = append(scopes, sitePrefix+siteName)
-			}
-		}
-
-		for _, poolName := range assignment.Spec.GatewayPools {
-			if poolName = strings.TrimSpace(poolName); poolName != "" {
-				scopes = append(scopes, poolPrefix+poolName)
-			}
-		}
-
-		connectScopes(scopes, tunnelMTUFromSpec(assignment.Spec.TunnelMTU))
-	}
-
-	for _, peering := range poolPeerings {
-		scopes := make([]string, 0, len(peering.Spec.GatewayPools))
-		for _, poolName := range peering.Spec.GatewayPools {
-			if poolName = strings.TrimSpace(poolName); poolName != "" {
-				scopes = append(scopes, poolPrefix+poolName)
-			}
-		}
-
-		connectScopes(scopes, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
-	}
-
-	mySiteName = strings.TrimSpace(mySiteName)
-	start := sitePrefix + mySiteName
-
-	queue := make([]string, 0, 1+len(localGatewayPools))
-	if mySiteName != "" && adjacency[start] != nil {
-		queue = append(queue, start)
-	}
-
-	for _, poolName := range localGatewayPools {
-		poolName = strings.TrimSpace(poolName)
-
-		scope := poolPrefix + poolName
-		if poolName != "" && adjacency[scope] != nil {
-			queue = append(queue, scope)
-		}
-	}
-
-	if len(queue) == 0 {
-		return 0
 	}
 
 	result := 0
-	visited := make(map[string]bool)
+	remotePool = strings.TrimSpace(remotePool)
 
-	for len(queue) > 0 {
-		scope := queue[0]
-		queue = queue[1:]
+	for _, peering := range poolPeerings {
+		hasLocal := false
+		hasRemote := false
 
-		if visited[scope] {
-			continue
+		for _, poolName := range peering.Spec.GatewayPools {
+			poolName = strings.TrimSpace(poolName)
+			hasLocal = hasLocal || localPoolSet[poolName]
+			hasRemote = hasRemote || poolName == remotePool
 		}
 
-		visited[scope] = true
-		result = resolveTunnelMTU(result, scopeTunnelMTUs[scope])
+		if hasLocal && hasRemote {
+			result = resolveTunnelMTU(result, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
+		}
+	}
 
-		for adjacent := range adjacency[scope] {
-			if !visited[adjacent] {
-				queue = append(queue, adjacent)
+	return result
+}
+
+func learnedGatewayTransitTunnelMTU(
+	peerPool string,
+	learnedRoutes map[string]unboundednetv1alpha1.GatewayNodeRoute,
+	poolPeerings []unboundednetv1alpha1.GatewayPoolPeering,
+) int {
+	result := 0
+	peerPool = strings.TrimSpace(peerPool)
+
+	for _, route := range learnedRoutes {
+		for _, path := range route.Paths {
+			pathPools := map[string]bool{peerPool: true}
+
+			for _, hop := range path {
+				if hop.Type == "GatewayPool" {
+					if poolName := strings.TrimSpace(hop.Name); poolName != "" {
+						pathPools[poolName] = true
+					}
+				}
+			}
+
+			for _, peering := range poolPeerings {
+				matchedPools := 0
+
+				for _, poolName := range peering.Spec.GatewayPools {
+					if pathPools[strings.TrimSpace(poolName)] {
+						matchedPools++
+					}
+				}
+
+				if matchedPools >= 2 {
+					result = resolveTunnelMTU(result, tunnelMTUFromSpec(peering.Spec.TunnelMTU))
+				}
 			}
 		}
 	}
@@ -438,7 +357,7 @@ func resolveMeshPeerTunnelMTU(globalMTU int, peer meshPeerInfo, mySiteName strin
 	siteTunnelMTUs, peeringSiteTunnelMTUs map[string]int,
 	assignmentSiteTunnelMTUs map[string]int,
 ) int {
-	values := []int{siteTunnelMTUs[mySiteName]}
+	values := []int{siteTunnelMTUs[mySiteName], siteTunnelMTUs[peer.SiteName]}
 	if peer.SiteName != mySiteName {
 		values = append(values,
 			peeringSiteTunnelMTUs[peer.SiteName],
@@ -460,6 +379,7 @@ func resolveGatewayPeerTunnelMTU(globalMTU int, mySiteName string, peer gatewayP
 		siteTunnelMTUs[mySiteName],
 		assignmentPoolTunnelMTUs[peer.PoolName],
 		poolTunnelMTUs[peer.PoolName],
+		peer.TransitTunnelMTU,
 	)
 }
 
