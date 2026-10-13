@@ -1,0 +1,55 @@
+# The binary creates rebound-ledger on first write. Do not ship an empty ledger:
+# reapplying manifests must not overwrite live grants. Until it exists, allow pods.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: rebound-pod-placement
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods, pods/binding, bindings]
+  variables:
+    - name: isPod
+      expression: "request.resource.resource == 'pods' && request.subResource == ''"
+    - name: node
+      expression: >-
+        variables.isPod ?
+          (has(object.spec) && has(object.spec.nodeName) ? object.spec.nodeName : '') :
+          (has(object.target) && has(object.target.kind) && object.target.kind == 'Node' &&
+           has(object.target.name) ? object.target.name : '')
+    - name: ledger
+      expression: "params != null && has(params.data) ? params.data : {}"
+    - name: excludedNamespaces
+      expression: >-
+        {{ default "kube-system,unbounded-system" .ExcludedNamespaces | splitList "," | toJson }}
+  validations:
+    - expression: >-
+        variables.node == '' ||
+        request.namespace in variables.excludedNamespaces ||
+        (variables.isPod && has(object.metadata.annotations) &&
+         'kubernetes.io/config.mirror' in object.metadata.annotations) ||
+        !(variables.node in variables.ledger) ||
+        variables.ledger[variables.node].startsWith(request.namespace + '/')
+      messageExpression: >-
+        'node ' + variables.node + ' is reserved by grant ' +
+        variables.ledger[?variables.node].orValue('unknown')
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: rebound-pod-placement
+spec:
+  policyName: rebound-pod-placement
+  paramRef:
+    name: rebound-ledger
+    namespace: {{ default "unbounded-system" .Namespace }}
+    parameterNotFoundAction: Allow
+  validationActions: [Deny]

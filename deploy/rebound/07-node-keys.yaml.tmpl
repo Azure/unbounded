@@ -1,0 +1,52 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: rebound-node-keys
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [nodes]
+  matchConditions:
+    - name: not-rebound
+      expression: >-
+        request.userInfo.username != 'system:serviceaccount:{{ default "unbounded-system" .Namespace }}:rebound'
+  variables:
+    - name: adminGroups
+      expression: >-
+        {{ default "system:masters" .AdminGroups | splitList "," | toJson }}
+    - name: isAdmin
+      expression: "has(request.userInfo.groups) && request.userInfo.groups.exists(g, g in variables.adminGroups)"
+    - name: labels
+      expression: "has(object.metadata.labels) ? object.metadata.labels : {}"
+    - name: oldLabels
+      expression: "oldObject != null && has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}"
+    - name: taints
+      expression: >-
+        has(object.spec) && has(object.spec.taints) ?
+          object.spec.taints.filter(t, t.key == 'rebound.unbounded-cloud.io/granted') : []
+    - name: oldTaints
+      expression: >-
+        oldObject != null && has(oldObject.spec) && has(oldObject.spec.taints) ?
+          oldObject.spec.taints.filter(t, t.key == 'rebound.unbounded-cloud.io/granted') : []
+  validations:
+    - expression: >-
+        variables.isAdmin ||
+        ['rebound.unbounded-cloud.io/namespace', 'rebound.unbounded-cloud.io/grant'].all(k,
+          variables.labels[?k] == variables.oldLabels[?k])
+      message: Only rebound or an administrator may change rebound node labels
+      reason: Forbidden
+    - expression: "variables.isAdmin || variables.taints == variables.oldTaints"
+      message: Only rebound or an administrator may change rebound node taints
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: rebound-node-keys
+spec:
+  policyName: rebound-node-keys
+  validationActions: [Deny]

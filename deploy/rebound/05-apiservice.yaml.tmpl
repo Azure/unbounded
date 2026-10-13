@@ -1,0 +1,15 @@
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.rebound.unbounded-cloud.io
+spec:
+  group: rebound.unbounded-cloud.io
+  version: v1alpha1
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+  service:
+    name: rebound
+    namespace: {{ default "unbounded-system" .Namespace }}
+    port: 443
+  insecureSkipTLSVerify: false
+  # The binary manages caBundle and the rebound-serving Secret.
