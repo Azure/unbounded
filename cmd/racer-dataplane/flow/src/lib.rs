@@ -36,7 +36,7 @@
 //!   must not reenter that state or panic. Key identity must remain stable while
 //!   indexed. [`Class::index`] and static [`Policy`] predicates must be pure and
 //!   non-panicking too.
-//! - Transaction hooks, including [`AdaptiveObserver`], [`HandoffAdmission`],
+//! - Transaction hooks, including [`HandoffAdmission`],
 //!   [`Offer::deliver`]'s constructor, and closures and entry hooks inside
 //!   [`coalesce::flight::update`], must not reenter their owner or panic. A hook
 //!   must not synchronously wake code that would do so. Flight callers return
@@ -47,6 +47,9 @@
 //!   cohort, handoff, and pipe APIs. This is not a promise that every `Clone`
 //!   or `Drop` in the crate runs outside a transaction; flight keys, for example,
 //!   follow the caller's transaction boundary.
+//! - [`AdaptiveObserver`] defines its own snapshot, reentry, and panic behavior.
+//!   Follow that trait's contract rather than assuming observations are serialized
+//!   with admission or that a panic rolls back a committed transition.
 //! - Wakes and destructors must not panic. A clone or policy sample staged before
 //!   admission may unwind without leaking that admission; this does not roll back
 //!   work the callback itself performed. There is no general panic-recovery or
