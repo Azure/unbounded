@@ -268,6 +268,7 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 		ClusterDNS:              cfg.Cluster.ClusterDNS,
 		ResolvConf:              "/etc/resolv.conf",
 		NodeIP:                  nodeIP,
+		ProviderID:              cfg.Kubelet.ProviderID,
 		NodeLabels:              labels,
 		RegisterWithTaints:      cfg.Kubelet.RegisterWithTaints,
 		Configuration:           cfg.Kubelet.Configuration,

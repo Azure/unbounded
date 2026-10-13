@@ -165,9 +165,14 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 	maps.Copy(labels, params.ProviderLabels)
 
 	// Collect taints.
-	var taints []string
+	var (
+		taints     []string
+		providerID string
+	)
+
 	if machine.Spec.Kubernetes != nil {
 		taints = machine.Spec.Kubernetes.RegisterWithTaints
+		providerID = machine.Spec.Kubernetes.ProviderID
 	}
 
 	// Resolve OCI image.
@@ -202,7 +207,8 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				Version:      k8sVersion,
 			},
 			Kubelet: AgentKubeletConfig{
-				ApiServer: params.Cluster.APIServer,
+				ApiServer:  params.Cluster.APIServer,
+				ProviderID: providerID,
 				Auth: KubeletAuthInfo{
 					BootstrapToken: params.BootstrapToken,
 				},

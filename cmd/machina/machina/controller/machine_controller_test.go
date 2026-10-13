@@ -26,6 +26,8 @@ import (
 	"github.com/Azure/unbounded/internal/unbounded"
 )
 
+const testNVIDIAImage = "ghcr.io/azure/agent-ubuntu2404-nvidia:test"
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------

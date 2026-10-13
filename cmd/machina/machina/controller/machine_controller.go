@@ -970,6 +970,7 @@ func observeNodeAllocation(machine *unboundedv1alpha3.Machine, node *corev1.Node
 	machine.Status.Allocation = &unboundedv1alpha3.MachineAllocationStatus{
 		Node: &unboundedv1alpha3.MachineNodeObservation{
 			Name:       node.Name,
+			ProviderID: node.Spec.ProviderID,
 			Ready:      ready,
 			InternalIP: internalIP,
 			Image:      image,
@@ -1031,7 +1032,7 @@ func observeNodeAllocation(machine *unboundedv1alpha3.Machine, node *corev1.Node
 			Type:               unboundedv1alpha3.MachineConditionReserved,
 			Status:             metav1.ConditionFalse,
 			Reason:             "Unreserved",
-			Message:            "Machine has no CapacityClaim reservation",
+			Message:            "Machine has no Karpenter NodeClaim reservation",
 			ObservedGeneration: machine.Generation,
 		})
 	}

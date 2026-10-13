@@ -112,16 +112,16 @@ const (
 	MachineConditionRepavePending = "RepavePending"
 
 	// MachineConditionAvailable indicates whether a Machine may be selected
-	// for a new CapacityClaim. A reservation always forces this condition
+	// for a new Karpenter NodeClaim. A reservation always forces this condition
 	// false.
 	MachineConditionAvailable = "Available"
 
-	// MachineConditionReserved indicates whether a CapacityClaim owns the
+	// MachineConditionReserved indicates whether a Karpenter NodeClaim owns the
 	// Machine reservation.
 	MachineConditionReserved = "Reserved"
 
 	// MachineConditionAllocationReady indicates that typed allocation
-	// observations are complete enough to evaluate a CapacityClaim.
+	// observations are complete enough to evaluate a Karpenter NodeClaim.
 	MachineConditionAllocationReady = "AllocationReady"
 
 	// MachineConditionQuarantined prevents allocation regardless of Machine
@@ -545,6 +545,11 @@ type KubernetesSpec struct {
 	// +optional
 	Version string `json:"version,omitempty"`
 
+	// ProviderID is the stable infrastructure identity kubelet publishes in
+	// Node.spec.providerID. Karpenter reservations set this before provisioning.
+	// +optional
+	ProviderID string `json:"providerID,omitempty"`
+
 	// NodeRef references the Node that corresponds to this Machine.
 	// +optional
 	NodeRef *LocalObjectReference `json:"nodeRef,omitempty"`
@@ -751,7 +756,7 @@ type MachineStatus struct {
 	// +optional
 	Configuration *MachineConfigurationRefStatus `json:"configuration,omitempty"`
 
-	// Reservation records the CapacityClaim that exclusively owns this
+	// Reservation records the Karpenter NodeClaim that exclusively owns this
 	// Machine.
 	// +optional
 	Reservation *MachineReservationStatus `json:"reservation,omitempty"`
@@ -766,13 +771,31 @@ type MachineStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// MachineReservationStatus records exclusive CapacityClaim ownership.
+// MachineReservationStatus records exclusive Karpenter NodeClaim ownership and
+// restart-safe release progress.
 type MachineReservationStatus struct {
-	ClaimName  string      `json:"claimName"`
-	ClaimUID   types.UID   `json:"claimUID"`
-	Domain     string      `json:"domain"`
-	ReservedAt metav1.Time `json:"reservedAt"`
+	NodeClaimName        string                         `json:"nodeClaimName"`
+	NodeClaimUID         types.UID                      `json:"nodeClaimUID"`
+	ProviderID           string                         `json:"providerID"`
+	Domain               string                         `json:"domain"`
+	NodeClassName        string                         `json:"nodeClassName"`
+	NodeClassGeneration  int64                          `json:"nodeClassGeneration"`
+	InstanceType         string                         `json:"instanceType"`
+	ConfigurationVersion int32                          `json:"configurationVersion"`
+	ImageID              string                         `json:"imageID"`
+	ReservedAt           metav1.Time                    `json:"reservedAt"`
+	ReleaseStage         MachineReservationReleaseStage `json:"releaseStage,omitempty"`
 }
+
+// +kubebuilder:validation:Enum=RevokeCredentials;ResetWorker;DeleteNode;ReleaseReservation
+type MachineReservationReleaseStage string
+
+const (
+	MachineReleaseStageRevokeCredentials  MachineReservationReleaseStage = "RevokeCredentials"
+	MachineReleaseStageResetWorker        MachineReservationReleaseStage = "ResetWorker"
+	MachineReleaseStageDeleteNode         MachineReservationReleaseStage = "DeleteNode"
+	MachineReleaseStageReleaseReservation MachineReservationReleaseStage = "ReleaseReservation"
+)
 
 // MachineAllocationStatus contains mutable node and accelerator observations.
 type MachineAllocationStatus struct {
@@ -789,6 +812,7 @@ type MachineAllocationStatus struct {
 // deliberately observational and must not be used as Machine identity.
 type MachineNodeObservation struct {
 	Name       string `json:"name,omitempty"`
+	ProviderID string `json:"providerID,omitempty"`
 	Ready      bool   `json:"ready,omitempty"`
 	InternalIP string `json:"internalIP,omitempty"`
 	Image      string `json:"image,omitempty"`

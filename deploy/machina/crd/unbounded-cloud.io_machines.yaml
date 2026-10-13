@@ -600,6 +600,11 @@ spec:
                     required:
                     - name
                     type: object
+                  providerID:
+                    description: |-
+                      ProviderID is the stable infrastructure identity kubelet publishes in
+                      Node.spec.providerID. Karpenter reservations set this before provisioning.
+                    type: string
                   registerWithTaints:
                     description: |-
                       RegisterWithTaints are taints passed to kubelet's --register-with-taints flag.
@@ -937,6 +942,8 @@ spec:
                         type: string
                       name:
                         type: string
+                      providerID:
+                        type: string
                       ready:
                         type: boolean
                     type: object
@@ -1046,26 +1053,53 @@ spec:
                 type: object
               reservation:
                 description: |-
-                  Reservation records the CapacityClaim that exclusively owns this
+                  Reservation records the Karpenter NodeClaim that exclusively owns this
                   Machine.
                 properties:
-                  claimName:
+                  configurationVersion:
+                    format: int32
+                    type: integer
+                  domain:
                     type: string
-                  claimUID:
+                  imageID:
+                    type: string
+                  instanceType:
+                    type: string
+                  nodeClaimName:
+                    type: string
+                  nodeClaimUID:
                     description: |-
                       UID is a type that holds unique ID values, including UUIDs.  Because we
                       don't ONLY use UUIDs, this is an alias to string.  Being a type captures
                       intent and helps make sure that UIDs and names do not get conflated.
                     type: string
-                  domain:
+                  nodeClassGeneration:
+                    format: int64
+                    type: integer
+                  nodeClassName:
+                    type: string
+                  providerID:
+                    type: string
+                  releaseStage:
+                    enum:
+                    - RevokeCredentials
+                    - ResetWorker
+                    - DeleteNode
+                    - ReleaseReservation
                     type: string
                   reservedAt:
                     format: date-time
                     type: string
                 required:
-                - claimName
-                - claimUID
+                - configurationVersion
                 - domain
+                - imageID
+                - instanceType
+                - nodeClaimName
+                - nodeClaimUID
+                - nodeClassGeneration
+                - nodeClassName
+                - providerID
                 - reservedAt
                 type: object
               ssh:

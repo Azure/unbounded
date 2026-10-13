@@ -46,7 +46,6 @@ const CRDBootstrapTimeout = 4 * time.Minute
 // RequiredCRDNames is the complete set of CRDs owned and bootstrapped by the
 // unbounded-operator.
 var RequiredCRDNames = [...]string{
-	"capacityclaims.unbounded-cloud.io",
 	"machines.unbounded-cloud.io",
 	"machineoperations.unbounded-cloud.io",
 	"sites.unbounded-cloud.io",

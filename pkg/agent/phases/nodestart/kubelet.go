@@ -93,7 +93,8 @@ func StartKubelet(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task
 func (s *startKubelet) Name() string { return "start-kubelet" }
 
 func (s *startKubelet) Do(ctx context.Context) error {
-	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
+	if _, err := executil.MachineRun(
+		ctx, s.log, s.goalState.MachineName,
 		"systemctl", "enable", "--now", goalstates.SystemdUnitKubelet,
 	); err != nil {
 		return fmt.Errorf("systemctl enable --now %s in %s: %w",
@@ -246,6 +247,7 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 			data: map[string]any{
 				"NodeName":                c.goalState.NodeName,
 				"NodeIP":                  spec.NodeIP,
+				"ProviderID":              spec.ProviderID,
 				"NodeLabels":              nodeLabels,
 				"RegisterWithTaints":      registerWithTaints,
 				"ImageCredentialProvider": spec.ImageCredentialProvider,

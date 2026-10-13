@@ -57,16 +57,6 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machines/finalizers"]
     verbs: ["update"]
-  # CapacityClaim controller
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["capacityclaims"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["capacityclaims/status"]
-    verbs: ["get", "update", "patch"]
-  - apiGroups: ["unbounded-cloud.io"]
-    resources: ["capacityclaims/finalizers"]
-    verbs: ["update"]
   # MachineConfiguration controller
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineconfigurations"]

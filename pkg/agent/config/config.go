@@ -370,6 +370,8 @@ type AgentClusterConfig struct {
 // AgentKubeletConfig holds kubelet-specific overrides.
 type AgentKubeletConfig struct {
 	ApiServer string `json:"ApiServer"`
+	// ProviderID is published through kubelet --provider-id.
+	ProviderID string `json:"ProviderID,omitempty"`
 	// NodeIP overrides kubelet --node-ip. Supports a single IP or a
 	// comma-separated dual-stack pair.
 	NodeIP             string            `json:"NodeIP,omitempty"`

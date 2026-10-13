@@ -32,6 +32,9 @@ type Kubelet struct {
 	// comma-separated dual-stack pair.
 	NodeIP string
 
+	// ProviderID is the stable provider identity published by kubelet.
+	ProviderID string
+
 	// NodeLabels are key=value labels applied to the node at registration.
 	NodeLabels map[string]string
 

@@ -5038,7 +5038,6 @@ def install_machine_crd() -> None:
     """Install Machine-related CRDs and bootstrapper RBAC."""
 
     crd_paths = [
-        REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_capacityclaims.yaml",
         REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machines.yaml",
         REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineoperations.yaml",
         REPO_ROOT / "deploy" / "machina" / "crd" / "unbounded-cloud.io_machineconfigurations.yaml",

@@ -86,6 +86,7 @@ func TestConfigureKubeletWritesNodeLabelsAndTaints(t *testing.T) {
 				BootstrapToken: "token",
 			},
 			ClusterDNS: "10.0.0.10",
+			ProviderID: "unbounded://stable-id",
 			NodeLabels: map[string]string{
 				"team": "infra",
 				"env":  "prod",
@@ -105,6 +106,7 @@ func TestConfigureKubeletWritesNodeLabelsAndTaints(t *testing.T) {
 		"20-node-config.conf",
 	))
 	require.NoError(t, err)
+	require.Contains(t, string(data), "--provider-id=unbounded://stable-id")
 	require.Contains(t, string(data), "--node-labels=env=prod,team=infra")
 	require.Contains(t, string(data), "--register-with-taints=dedicated=gpu:NoSchedule,workload=batch:NoSchedule")
 }
