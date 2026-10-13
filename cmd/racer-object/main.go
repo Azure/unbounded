@@ -36,6 +36,8 @@ import (
 // maxOriginRequestTimeout matches the Racer SDK's fixed origin operation deadline.
 const maxOriginRequestTimeout = time.Minute
 
+const originMaxConcurrentRequests = 64
+
 // The socket write deadline starts before the handler deadline. Allow time to
 // send a timeout response after the handler's context expires.
 const sidecarWriteGrace = 5 * time.Second
@@ -266,8 +268,18 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 }
 
 func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
+	defaults, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return aws.Config{}, errors.New("could not configure origin HTTP transport")
+	}
+
+	transport := defaults.Clone()
+	// Keep room for the SDK's four separate metadata requests too.
+	transport.MaxIdleConnsPerHost = originMaxConcurrentRequests + 4
+	transport.MaxIdleConns = max(transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
+
 	load := []func(*config.LoadOptions) error{
-		config.WithHTTPClient(&http.Client{Timeout: o.requestTimeout}),
+		config.WithHTTPClient(&http.Client{Transport: transport, Timeout: o.requestTimeout}),
 		config.WithLogger(logging.NewStandardLogger(io.Discard)),
 		// S3-compatible backends may reject the SDK's default optional checksums.
 		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
@@ -293,6 +305,10 @@ func runOrigin(ctx context.Context, o options) error {
 	cfg, err := originAWSConfig(ctx, o)
 	if err != nil {
 		return err
+	}
+
+	if httpClient, ok := cfg.HTTPClient.(*http.Client); ok {
+		defer httpClient.CloseIdleConnections()
 	}
 
 	client := s3.NewFromConfig(cfg, func(s *s3.Options) {
@@ -321,6 +337,7 @@ func runOrigin(ctx context.Context, o options) error {
 
 	err = racersdk.ServeOrigin(ctx, racersdk.OriginConfig{
 		Cache: o.cache, RecoverStaleSocket: true,
+		MaxConcurrentRequests: originMaxConcurrentRequests,
 	}, origin)
 	if ctx.Err() != nil {
 		return nil
