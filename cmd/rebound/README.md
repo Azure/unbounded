@@ -68,6 +68,14 @@ kubectl delete ngr train
   `rebound-serving` Secret, renews them, and updates the APIService `caBundle`.
   All replicas reload the certificate without restart.
 
+## Build
+
+```sh
+make rebound              # lint, test, and build bin/rebound
+make rebound-build        # build only
+make rebound-oci-push     # build and push the image
+```
+
 ## Deploy
 
 ```sh
@@ -75,16 +83,34 @@ make rebound-manifests
 kubectl apply -f deploy/rebound/rendered/
 ```
 
-Template values (set with `--set` on `render-manifests`):
+Set these Make variables to change the rendered manifests:
 
-| Value | Default |
-|---|---|
-| `Namespace` | `unbounded-system` |
-| `Image` | `ghcr.io/azure/rebound:latest` |
-| `Replicas` | `2` |
-| `MaxTTL` | `1h` |
-| `ExcludedNamespaces` | `kube-system,unbounded-system` |
-| `AdminGroups` | `system:masters` |
+| Make variable | Template value | Default |
+|---|---|---|
+| `UNBOUNDED_NAMESPACE` | `Namespace` | `unbounded-system` |
+| `REBOUND_IMAGE` | `Image` | `ghcr.io/azure/rebound:<version>` |
+| `REBOUND_REPLICAS` | `Replicas` | `2` |
+| `REBOUND_MAX_TTL` | `MaxTTL` | `1h` |
+| `REBOUND_EXCLUDED_NAMESPACES` | `ExcludedNamespaces` | `kube-system,unbounded-system` |
+| `REBOUND_ADMIN_GROUPS` | `AdminGroups` | `system:masters` |
+
+`ExcludedNamespaces` is used by both the pod placement policy and the pod
+deletion controller. `AdminGroups` may change rebound node labels and taints.
+
+## Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--namespace` | `unbounded-system` | Namespace of the ledger, serving Secret, and leader lease |
+| `--max-ttl` | `1h` | Default and maximum grant TTL |
+| `--excluded-namespaces` | `kube-system,unbounded-system` | Namespaces whose pods are never deleted |
+| `--leader-elect` | `true` | Run controllers and certificate rotation on one replica |
+| `--secure-port` | `8443` | HTTPS port for the API |
+| `--metrics-bind-address` | `:8080` | Metrics address |
+| `--health-probe-bind-address` | `:8081` | Controller health probe address |
+
+The standard Kubernetes API server flags for delegated authentication and
+authorization are also accepted. Run `rebound --help` for the full list.
 
 ## Limits
 
