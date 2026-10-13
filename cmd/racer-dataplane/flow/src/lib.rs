@@ -258,7 +258,7 @@ impl<P: Policy> SharedQuotas<P> {
 
     /// Whether the authority has requested admission shutdown.
     pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Admit a nonzero unkeyed amount without retaining the local recycler.
@@ -497,12 +497,16 @@ impl<P: Policy> Quotas<P> {
 
     /// Whether shutdown has been requested for this authority.
     pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Stop ordinary admission, reclaim idle backing, and wake the shared waiter.
+    /// A racing ordinary reservation either rolls back or is visible to a later
+    /// [`Self::used`] read until released, even if its call returns after stop.
+    /// Zero usage is not a drain fence for completion reservations or classes
+    /// allowed after stop; callers must separately finish those producers.
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
+        self.stopped.store(true, Ordering::SeqCst);
         self.reclaim_buffers();
         self.totals.wake.wake();
     }
@@ -939,13 +943,17 @@ impl Counter {
 
     /// Read usage published by admission and cross-thread release.
     fn used(&self) -> usize {
-        self.0.load(Ordering::Acquire)
+        self.0.load(Ordering::SeqCst)
     }
 
     /// Add usage only when both arithmetic and the aggregate ceiling allow it.
     fn reserve(&self, amount: usize, limit: usize) -> Result<()> {
+        // The reservation RMW precedes its final stop check. In the same SeqCst
+        // order, stop publication precedes the drain observer's usage read.
+        // A successful final check before stop therefore places the reservation
+        // before that usage read. Neither side can miss the other's publication.
         self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 used.checked_add(amount).filter(|next| *next <= limit)
             })
             .map(|_| ())
@@ -954,12 +962,12 @@ impl Counter {
 
     /// Record keyed usage already covered by aggregate admission.
     fn add(&self, amount: usize) {
-        self.0.fetch_add(amount, Ordering::AcqRel);
+        self.0.fetch_add(amount, Ordering::SeqCst);
     }
 
     /// Return usage owned exclusively by the releasing charge.
     fn release(&self, amount: usize) {
-        self.0.fetch_sub(amount, Ordering::AcqRel);
+        self.0.fetch_sub(amount, Ordering::SeqCst);
     }
 }
 
@@ -2778,6 +2786,38 @@ mod quota_tests {
             shared.reserve(Resource::Payload, 1),
             Err(Error::Unavailable)
         ));
+    }
+
+    /// Stop cannot miss an ordinary reservation still owned on another thread.
+    #[test]
+    fn stop_and_live_shared_admission_cannot_both_miss_publication() {
+        for _ in 0..512 {
+            let quotas = Quotas::new(TestPolicy::new(1, 1));
+            let shared = quotas.shared();
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let worker_gate = gate.clone();
+            let worker = std::thread::spawn(move || {
+                worker_gate.wait();
+                let charge = shared.reserve(Resource::Payload, 1);
+                // Keep a successful reservation live until the observer samples.
+                worker_gate.wait();
+                charge
+            });
+            gate.wait();
+            quotas.stop();
+            let observed = quotas.used(Resource::Payload);
+            gate.wait();
+            let result = worker.join().unwrap();
+            match &result {
+                Ok(charge) => {
+                    assert_eq!(charge.amount(), 1);
+                    assert_eq!(observed, 1, "stop missed a successful live reservation");
+                }
+                Err(error) => assert_eq!(*error, Error::Unavailable),
+            }
+            drop(result);
+            assert_eq!(quotas.used(Resource::Payload), 0);
+        }
     }
 
     /// Stop during the limit callback rolls back only ordinary admission.
