@@ -474,7 +474,8 @@ impl<P: Policy> PipeLease<P> {
             return Ok(0);
         }
         // Unlike send, splice has no MSG_NOSIGNAL. Mask only on this worker and
-        // only across the syscall, consuming our own EPIPE signal before restore.
+        // only across the syscall. Even a positive partial splice can generate
+        // SIGPIPE, so the guard consumes new signals regardless of the result.
         let signal = SigpipeGuard::block()?;
         // SAFETY: owned live FDs, null offsets for pipe/socket, no userspace page
         // pointers, and both ends are nonblocking. No vmsplice/GIFT is involved.
@@ -488,12 +489,6 @@ impl<P: Policy> PipeLease<P> {
                 libc::SPLICE_F_NONBLOCK,
             )
         });
-        if result
-            .as_ref()
-            .is_err_and(|e| e.raw_os_error() == Some(libc::EPIPE))
-        {
-            signal.consume_generated();
-        }
         drop(signal);
         if let Ok(sent) = result {
             pipe.buffered -= sent;
@@ -593,8 +588,9 @@ impl SigpipeGuard {
 }
 
 impl Drop for SigpipeGuard {
-    /// Restore the exact mask saved after successful installation.
+    /// Consume any new SIGPIPE, then restore the exact saved mask.
     fn drop(&mut self) {
+        self.consume_generated();
         // SAFETY: restore the exact thread mask saved by successful pthread_sigmask.
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut()) };
     }
@@ -629,6 +625,99 @@ mod tests {
         },
         task::{Context, Wake},
     };
+
+    /// A child process gives SIGPIPE its real disposition without changing peers.
+    #[test]
+    fn sigpipe_guard_preserves_pending_signals_and_mask() {
+        const CHILD: &str = "FLOW_PIPE_SIGPIPE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipe::tests::sigpipe_guard_preserves_pending_signals_and_mask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "SIGPIPE child failed: {status}");
+            return;
+        }
+        // SAFETY: only this isolated child changes the process disposition. Every
+        // generated signal is blocked and consumed before its mask is restored.
+        unsafe {
+            assert_ne!(libc::signal(libc::SIGPIPE, libc::SIG_DFL), libc::SIG_ERR);
+        }
+        for blocked in [false, true] {
+            for preexisting in [false, true] {
+                let outer = SigpipeGuard::block().unwrap();
+                // SAFETY: initialized sets and the current thread are used only.
+                unsafe {
+                    if !blocked && !preexisting {
+                        assert_eq!(
+                            libc::pthread_sigmask(
+                                libc::SIG_UNBLOCK,
+                                &outer.set,
+                                std::ptr::null_mut()
+                            ),
+                            0
+                        );
+                    }
+                    if preexisting {
+                        assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE), 0);
+                    }
+                }
+                let before = current_signal_mask();
+                let guard = SigpipeGuard::block().unwrap();
+                assert_eq!(guard.was_pending, preexisting);
+                // Model a positive partial result with a newly pending signal.
+                // This avoids relying on a timing-sensitive socket disconnect.
+                unsafe {
+                    assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGPIPE), 0);
+                }
+                assert!(sigpipe_pending());
+                assert_eq!(syscall_count(1).unwrap(), 1);
+                drop(guard);
+                assert_eq!(sigpipe_pending(), preexisting);
+                let after = current_signal_mask();
+                for signal in 1..=libc::SIGRTMAX() {
+                    // SAFETY: both sets are initialized and signal is in range.
+                    assert_eq!(unsafe { libc::sigismember(&before, signal) }, unsafe {
+                        libc::sigismember(&after, signal)
+                    });
+                }
+                outer.consume_generated();
+                assert!(!sigpipe_pending());
+                drop(outer);
+            }
+        }
+        // Exercise an actual splice-generated EPIPE with SIGPIPE no longer ignored.
+        splice_rejects_blocking_socket_and_handles_disconnect_without_losing_bytes();
+        assert!(!sigpipe_pending());
+    }
+
+    /// Read the current thread mask without changing it.
+    fn current_signal_mask() -> libc::sigset_t {
+        // SAFETY: the output points to local initialized storage; null set is a query.
+        unsafe {
+            let mut mask = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask),
+                0
+            );
+            mask
+        }
+    }
+
+    /// Read whether this thread currently has a pending SIGPIPE.
+    fn sigpipe_pending() -> bool {
+        // SAFETY: sigpending initializes the local set before it is queried.
+        unsafe {
+            let mut pending = std::mem::zeroed();
+            assert_eq!(libc::sigpending(&mut pending), 0);
+            libc::sigismember(&pending, libc::SIGPIPE) == 1
+        }
+    }
 
     /// Independent pipe, waiter-context, and payload fixture resources.
     #[derive(Clone, Copy)]
