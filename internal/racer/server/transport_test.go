@@ -1551,26 +1551,23 @@ func TestTLSPollExpirationAndRequestCancellation(t *testing.T) {
 			r, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/snapshot?after=%d", endpoint, publication.Sequence()), nil)
 			require.NoError(t, err)
 
-			type pollResult struct {
-				status  int
-				err     error
-				body    []byte
-				bodyErr error
-			}
-
-			done := make(chan pollResult, 1)
+			done := make(chan struct{})
 
 			go func() {
+				defer close(done)
+
 				response, err := c.Do(r)
+				if expiration {
+					responseBody(t, response, err, 401)
+				} else {
+					if response != nil {
+						response.Body.Close()
+					}
 
-				result := pollResult{err: err}
-				if response != nil {
-					result.status = response.StatusCode
-					result.body, result.bodyErr = io.ReadAll(response.Body)
-					response.Body.Close()
+					if err == nil {
+						t.Error("canceled poll succeeded")
+					}
 				}
-
-				done <- result
 			}()
 
 			awaitServerPolls(t, f.a.Server, 1)
@@ -1580,22 +1577,9 @@ func TestTLSPollExpirationAndRequestCancellation(t *testing.T) {
 			}
 
 			select {
-			case result := <-done:
-				t.Logf("poll status=%d error=%v context=%v body=%q bodyError=%v", result.status, result.err, ctx.Err(), result.body, result.bodyErr)
-
-				if expiration {
-					require.NoError(t, result.err)
-					require.NoError(t, result.bodyErr)
-					require.Equal(t, http.StatusUnauthorized, result.status)
-					_, err := wire.DecodeError(bytes.NewReader(result.body))
-					require.NoError(t, err)
-				} else if result.err == nil {
-					// A 503 can win the race with cancellation or TLS closure.
-					// Either a transport error or that response ends the poll.
-					require.Equal(t, http.StatusServiceUnavailable, result.status)
-				}
+			case <-done:
 			case <-time.After(4 * time.Second):
-				t.Fatalf("poll outlived expiration/cancellation: context=%v admission=%d", ctx.Err(), f.a.Server.polls.count())
+				t.Fatal("poll outlived expiration/cancellation")
 			}
 
 			awaitServerPolls(t, f.a.Server, 0)
