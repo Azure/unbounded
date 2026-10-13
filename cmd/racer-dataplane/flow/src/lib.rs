@@ -511,10 +511,7 @@ impl<P: Policy> Quotas<P> {
     ) -> Option<(Option<P::Key>, usize)> {
         // Keep the counters alive, but release the lookup borrow before callbacks.
         let local = self.keys.borrow().get(key).and_then(Weak::upgrade);
-        let fair = self.fair_limit(
-            class,
-            self.active_keys.load(Ordering::Acquire) + usize::from(local.is_none()),
-        );
+        let fair = self.fair_limit(class, usize::from(local.is_none()));
         if amount > fair {
             return None;
         }
@@ -570,11 +567,12 @@ impl<P: Policy> Quotas<P> {
     }
 
     /// Divide the aggregate ceiling, honoring the clipped per-key floor.
-    fn fair_limit(&self, class: P::Class, active: usize) -> usize {
+    fn fair_limit(&self, class: P::Class, additional_keys: usize) -> usize {
         let limit = self.limit(class);
-        (limit / active.max(1))
-            .max(self.policy.floor(class))
-            .min(limit)
+        let floor = self.policy.floor(class);
+        // Policy callbacks may create or retire keys before this share is used.
+        let active = self.active_keys.load(Ordering::Acquire) + additional_keys;
+        (limit / active.max(1)).max(floor).min(limit)
     }
 
     /// Retry overload once after reclaiming relevant retained backing.
@@ -632,7 +630,7 @@ impl<P: Policy> Quotas<P> {
         let key = key.cloned();
         let limit = self.limit(class);
         if let Some(local) = local.as_ref().filter(|_| mode == AdmissionMode::Ordinary) {
-            let fair = self.fair_limit(class, self.active_keys.load(Ordering::Acquire).max(1));
+            let fair = self.fair_limit(class, 0);
             let used = local.counter(class).used();
             if used.checked_add(amount).is_none_or(|next| next > fair) {
                 self.rejected(class, amount, Some(used), Some(fair));
@@ -1402,7 +1400,10 @@ mod quota_tests {
         }
 
         /// Fixed limits with one-shot application callbacks.
-        struct ReentrantPolicy;
+        #[derive(Default)]
+        struct ReentrantPolicy {
+            rejected: RefCell<Vec<Rejection<Resource>>>,
+        }
 
         impl Policy for ReentrantPolicy {
             type Class = Resource;
@@ -1436,9 +1437,9 @@ mod quota_tests {
                 false
             }
 
-            /// Every nested admission must succeed without a retry.
-            fn rejected(&self, _: Rejection<Resource>) {
-                panic!("unexpected rejection");
+            /// Record failed attempts for fair-share boundary checks.
+            fn rejected(&self, rejection: Rejection<Resource>) {
+                self.rejected.borrow_mut().push(rejection);
             }
         }
 
@@ -1457,7 +1458,7 @@ mod quota_tests {
                     {
                         continue;
                     }
-                    let quotas = Rc::new(Quotas::new(ReentrantPolicy));
+                    let quotas = Rc::new(Quotas::new(ReentrantPolicy::default()));
                     let first = quotas.reserve(Some(&Key(0)), Resource::Other, 1).unwrap();
                     let second = quotas.reserve(Some(&Key(1)), Resource::Other, 1).unwrap();
                     let payload = (keyed + unkeyed != 0).then(|| {
@@ -1489,6 +1490,7 @@ mod quota_tests {
                         expected
                     );
                     assert!(HOOK.with(|slot| slot.borrow().is_none()));
+                    assert!(quotas.policy.rejected.borrow().is_empty());
                     assert_eq!(quotas.used(Resource::Payload), keyed + unkeyed);
                     assert_eq!(quotas.active_keys.load(Ordering::Acquire), 2);
                     drop((payload, first, second));
@@ -1521,6 +1523,129 @@ mod quota_tests {
         #[test]
         fn key_clone_allows_keyed_reentry() {
             check(Callback::Clone, 0);
+        }
+
+        /// Keep a new key alive or release the last owner of another key in policy.
+        fn change_membership(
+            quotas: &Rc<Quotas<ReentrantPolicy>>,
+            callback: Callback,
+            skip: usize,
+            remove: bool,
+        ) -> Rc<RefCell<Option<Charge<ReentrantPolicy>>>> {
+            let held = Rc::new(RefCell::new(remove.then(|| {
+                quotas
+                    .reserve(Some(&Key(2)), Resource::Progress, 1)
+                    .unwrap()
+            })));
+            let nested = quotas.clone();
+            let nested_held = held.clone();
+            HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Hook {
+                    callback,
+                    skip,
+                    action: Box::new(move || {
+                        if remove {
+                            drop(nested_held.borrow_mut().take());
+                        } else {
+                            *nested_held.borrow_mut() = Some(
+                                nested
+                                    .reserve(Some(&Key(2)), Resource::Progress, 1)
+                                    .unwrap(),
+                            );
+                        }
+                    }),
+                });
+            });
+            held
+        }
+
+        /// Reclamation uses current membership and counts a prospective key once.
+        #[test]
+        fn reclamation_samples_membership_after_policy_callbacks() {
+            for callback in [Callback::Limit, Callback::Floor] {
+                for remove in [false, true] {
+                    for existing in [false, true] {
+                        let active = if remove { 1 } else { 2 };
+                        let fair = 100 / (active + usize::from(!existing));
+                        for amount in [fair - 1, fair, fair + 1] {
+                            let quotas = Rc::new(Quotas::new(ReentrantPolicy::default()));
+                            let first = quotas
+                                .reserve(Some(&Key(0)), Resource::Payload, 40)
+                                .unwrap();
+                            let unkeyed = quotas.reserve(None, Resource::Payload, 60).unwrap();
+                            let held = change_membership(&quotas, callback, 0, remove);
+                            let expected = if amount > fair {
+                                None
+                            } else if existing {
+                                Some((Some(Key(0)), 40 + amount - fair))
+                            } else {
+                                Some((None, amount))
+                            };
+                            assert_eq!(
+                                quotas.reclamation(
+                                    &Key(u8::from(!existing)),
+                                    Resource::Payload,
+                                    amount
+                                ),
+                                expected
+                            );
+                            assert!(HOOK.with(|slot| slot.borrow().is_none()));
+                            assert_eq!(quotas.active_keys.load(Ordering::Acquire), active);
+                            assert_eq!(quotas.used(Resource::Payload), 100);
+                            assert!(quotas.policy.rejected.borrow().is_empty());
+                            drop((held, first, unkeyed));
+                            assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+                            assert_eq!(quotas.used(Resource::Payload), 0);
+                            assert_eq!(quotas.used(Resource::Progress), 0);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Ordinary admission enforces the updated share at and above its boundary.
+        #[test]
+        fn admission_samples_membership_after_policy_callbacks() {
+            for callback in [Callback::Limit, Callback::Floor] {
+                for remove in [false, true] {
+                    let active = if remove { 1 } else { 2 };
+                    let fair = 100 / active;
+                    for amount in [fair - 41, fair - 40, fair - 39] {
+                        let quotas = Rc::new(Quotas::new(ReentrantPolicy::default()));
+                        let first = quotas
+                            .reserve(Some(&Key(0)), Resource::Payload, 40)
+                            .unwrap();
+                        let held = change_membership(
+                            &quotas,
+                            callback,
+                            usize::from(callback == Callback::Limit),
+                            remove,
+                        );
+                        let result = quotas.reserve(Some(&Key(0)), Resource::Payload, amount);
+                        assert!(HOOK.with(|slot| slot.borrow().is_none()));
+                        if 40 + amount > fair {
+                            assert!(matches!(result, Err(Error::Overloaded)));
+                            assert_eq!(quotas.used(Resource::Payload), 40);
+                            let rejected = quotas.policy.rejected.borrow();
+                            assert_eq!(rejected.len(), 2);
+                            assert!(rejected.iter().all(|rejection| matches!(
+                                rejection,
+                                Rejection::Resource { key_used: Some(40), key_limit: Some(limit), .. }
+                                    if *limit == fair
+                            )));
+                        } else {
+                            assert_eq!(result.as_ref().unwrap().amount(), amount);
+                            assert_eq!(quotas.used(Resource::Payload), 40 + amount);
+                            assert!(quotas.policy.rejected.borrow().is_empty());
+                        }
+                        assert_eq!(quotas.active_keys.load(Ordering::Acquire), active);
+                        drop((result, held, first));
+                        assert_eq!(quotas.active_keys.load(Ordering::Acquire), 0);
+                        assert_eq!(quotas.used(Resource::Payload), 0);
+                        assert_eq!(quotas.used(Resource::Progress), 0);
+                    }
+                }
+            }
         }
     }
 
