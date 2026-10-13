@@ -70,6 +70,7 @@ spec:
             template: full-node-mpi-backend
           - name: health-after
             dependencies: [mpi-backend]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} == Pass"
             template: full-node-stage
             arguments:
               parameters:
@@ -79,6 +80,7 @@ spec:
                   value: "1"
           - name: health-after-preflight-failure
             dependencies: [workload-skipped]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} != Pass"
             template: full-node-stage
             arguments:
               parameters:

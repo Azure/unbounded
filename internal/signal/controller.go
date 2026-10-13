@@ -986,7 +986,9 @@ func workflowParameter(workflow *unstructured.Unstructured, name string) string 
 		return ""
 	}
 
-	for _, raw := range nodes {
+	fallback := ""
+
+	for key, raw := range nodes {
 		node, ok := raw.(map[string]any)
 		if !ok {
 			continue
@@ -1000,12 +1002,25 @@ func workflowParameter(workflow *unstructured.Unstructured, name string) string 
 		parameters, ok := outputs["parameters"].([]any)
 		if ok {
 			if value := parameterValue(parameters, name); value != "" {
-				return value
+				displayName, hasDisplayName := node["displayName"].(string)
+				nodeName, hasNodeName := node["name"].(string)
+
+				if key == workflow.GetName() ||
+					(hasDisplayName && displayName == workflow.GetName()) ||
+					(hasNodeName && nodeName == workflow.GetName()) {
+					return value
+				}
+
+				if fallback == "" {
+					fallback = value
+				} else if fallback != value {
+					return ""
+				}
 			}
 		}
 	}
 
-	return ""
+	return fallback
 }
 
 func parameterValue(parameters []any, name string) string {

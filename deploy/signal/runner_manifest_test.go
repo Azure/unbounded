@@ -67,6 +67,7 @@ func TestFullNodeWorkflowGatesEightGPUAllocationOnInventoryPreflight(t *testing.
 		`name: observed-gpu-capacity`,
 		`name: observed-gpu-allocatable`,
 		`when: "{{` + "`{{tasks.node-health.outputs.parameters.verdict}}`" + `}} == Pass"`,
+		`when: "{{` + "`{{tasks.node-health.outputs.parameters.verdict}}`" + `}} != Pass"`,
 		`dependencies: [workload]`,
 		`"nvidia.com/gpu":"{{` + "`{{inputs.parameters.gpu-count}}`" + `}}"`,
 		`nvidia.com/gpu: "{{` + "`{{workflow.parameters.expected-gpu-count}}`" + `}}"`,

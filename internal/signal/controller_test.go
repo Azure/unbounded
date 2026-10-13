@@ -422,9 +422,17 @@ func TestWorkflowParameterFallsBackToEntrypointNodeOutputs(t *testing.T) {
 	t.Parallel()
 
 	workflow := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "run-a1"},
 		"status": map[string]any{
 			"nodes": map[string]any{
 				"root": map[string]any{
+					"displayName": "run-a1",
+					"outputs": map[string]any{
+						"parameters": []any{map[string]any{"name": "verdict", "value": "Fail"}},
+					},
+				},
+				"health-after": map[string]any{
+					"displayName": "health-after",
 					"outputs": map[string]any{
 						"parameters": []any{map[string]any{"name": "verdict", "value": "Pass"}},
 					},
@@ -433,8 +441,64 @@ func TestWorkflowParameterFallsBackToEntrypointNodeOutputs(t *testing.T) {
 		},
 	}}
 
-	if got := workflowParameter(workflow, "verdict"); got != "Pass" {
+	if got := workflowParameter(workflow, "verdict"); got != "Fail" {
 		t.Fatalf("verdict = %q", got)
+	}
+}
+
+func TestTerminalVerdictUsesFailingEntrypointOutputOverLaterHealthPass(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	run := testRun("run-preflight-fail")
+	run.Status = signalv1.CertificationRunStatus{
+		Phase:    signalv1.RunPhaseRunning,
+		Workflow: signalv1.WorkflowStatus{Name: "run-preflight-fail-a1", Attempt: 1},
+	}
+	node := readyNode("gpu-0", "A100")
+	node.Annotations = map[string]string{ReservationLabel: run.Name}
+	snapshot := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+	}
+	workflow := workflowObject(run.Namespace, run.Status.Workflow.Name, "Succeeded", "", "")
+	workflow.Object["status"].(map[string]any)["nodes"] = map[string]any{
+		"root": map[string]any{
+			"displayName": workflow.GetName(),
+			"outputs": map[string]any{"parameters": []any{
+				map[string]any{"name": "verdict", "value": "Fail"},
+				map[string]any{"name": "reason", "value": "NodeGPUCapacityMismatch"},
+			}},
+		},
+		"health-after": map[string]any{
+			"displayName": "health-after",
+			"outputs": map[string]any{"parameters": []any{
+				map[string]any{"name": "verdict", "value": "Pass"},
+				map[string]any{"name": "reason", "value": "FinalHealthPassed"},
+			}},
+		},
+	}
+
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run, node, snapshot, workflow).
+		Build()
+	r := &RunReconciler{Client: kube, Evidence: &memoryEvidenceStore{}, Now: time.Now}
+
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatalf("terminal Reconcile: %v", err)
+	}
+
+	var got signalv1.CertificationRun
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(run), &got); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+
+	if got.Status.Phase != signalv1.RunPhaseFailed ||
+		got.Status.Verdict != "Fail" ||
+		got.Status.Reason != "NodeGPUCapacityMismatch" {
+		t.Fatalf("status = %#v", got.Status)
 	}
 }
 
