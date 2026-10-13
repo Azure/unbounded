@@ -169,6 +169,7 @@ where
 }
 
 /// Authenticate a new outbound connection or validate its existing pooled session.
+/// Reuse requires the same `Rc<Signatures>` authority used by the handshake.
 pub async fn connect<C: Context>(
     io: &HttpIo<C>,
     mut connection: ConnectionLease<C>,
@@ -185,7 +186,7 @@ where
             connection.poison();
             return Err(error.into());
         }
-        if session.peer() != peer {
+        if session.peer() != peer || !Rc::ptr_eq(&session.state.signatures, &signatures) {
             connection.poison();
             return Err(Error::Unauthorized.into());
         }
@@ -248,6 +249,7 @@ where
 }
 
 /// Authenticate an inbound connection before installing its replay state.
+/// Reuse requires the same `Rc<Signatures>` authority used by the handshake.
 pub async fn accept<C: Context>(
     io: &HttpIo<C>,
     mut connection: ConnectionLease<C>,
@@ -262,6 +264,10 @@ where
         if let Err(error) = session.check() {
             connection.poison();
             return Err(error.into());
+        }
+        if !Rc::ptr_eq(&session.state.signatures, &signatures) {
+            connection.poison();
+            return Err(Error::Unauthorized.into());
         }
         return Ok(connection);
     }
