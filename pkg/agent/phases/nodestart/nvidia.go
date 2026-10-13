@@ -26,13 +26,15 @@ type setupNVIDIA struct {
 // accessible inside the running nspawn machine and generates a CDI specification
 // describing the available GPUs.
 //
-// The task performs four steps in sequence:
+// The task performs five steps in sequence:
 //  1. Creates symlinks in the container's standard library path pointing into
 //     the bind-mounted /run/host-nvidia/ directories, then runs ldconfig.
 //  2. Builds a self-contained driver root under /run/nvidia/driver and creates
 //     its dynamic linker cache.
-//  3. Ensures the CDI spec directory exists.
-//  4. Runs nvidia-ctk cdi generate against that driver root to produce the CDI
+//  3. Configures NVIDIA Container Toolkit not to load host kernel modules from
+//     inside the nspawn machine.
+//  4. Ensures the CDI spec directory exists.
+//  5. Runs nvidia-ctk cdi generate against that driver root to produce the CDI
 //     spec at /etc/cdi/nvidia.yaml. Most hooks are disabled because they interfere
 //     with the nspawn environment (e.g. mounting tmpfs over /proc paths, CUDA
 //     compat hooks on NVSwitch systems). Only create-symlinks and update-ldcache
@@ -66,6 +68,10 @@ func (s *setupNVIDIA) Do(ctx context.Context) error {
 	}
 
 	if err := s.prepareDriverRoot(ctx); err != nil {
+		return err
+	}
+
+	if err := s.configureContainerRuntime(ctx); err != nil {
 		return err
 	}
 
@@ -272,11 +278,11 @@ func (s *setupNVIDIA) copyDriverLibrary(ctx context.Context, lib goalstates.Nvid
 	return nil
 }
 
-// copyNVIDIASMI adds the host-matched diagnostic binary to the prepared root.
-// CDI generation uses --driver-root, so nvidia-ctk searches that root rather
-// than the nspawn OCI filesystem for driver helper binaries. Including the
-// host copy lets the resulting CDI spec expose a version-compatible nvidia-smi
-// to GPU containers. It remains optional for compute-only CUDA workloads.
+// copyNVIDIASMI adds the host-matched diagnostic binary to the prepared driver
+// root and the worker's normal executable path. The driver-root copy supports
+// CDI helper discovery, while the worker-path copy supports the NVIDIA
+// runtime's envvar allocation strategy. It remains optional for compute-only
+// CUDA workloads.
 func (s *setupNVIDIA) copyNVIDIASMI(ctx context.Context, paths nvidiaDriverRootPaths) error {
 	if s.goalState.Nvidia.NvidiaSMIPath == "" {
 		return nil
@@ -284,17 +290,48 @@ func (s *setupNVIDIA) copyNVIDIASMI(ctx context.Context, paths nvidiaDriverRootP
 
 	source := filepath.Join(goalstates.NvidiaHostBinDir, filepath.Base(s.goalState.Nvidia.NvidiaSMIPath))
 
-	destination := filepath.Join(paths.rootDir, "usr", "bin", "nvidia-smi")
-	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "cp", "-L", source, destination); err != nil {
-		return fmt.Errorf("copy nvidia-smi: %w", err)
+	for _, destination := range nvidiaSMIDestinations(paths.rootDir, s.goalState.Nvidia.NvidiaSMIPath) {
+		if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName, "cp", "-L", source, destination); err != nil {
+			return fmt.Errorf("copy nvidia-smi to %s: %w", destination, err)
+		}
+
+		s.log.Debug("copied nvidia-smi",
+			slog.String("source", source),
+			slog.String("destination", destination),
+		)
 	}
 
-	s.log.Debug("copied nvidia-smi",
-		slog.String("source", source),
-		slog.String("destination", destination),
-	)
+	return nil
+}
+
+func nvidiaSMIDestinations(driverRoot, rootfsPath string) []string {
+	return []string{
+		filepath.Join(driverRoot, "usr", "bin", "nvidia-smi"),
+		rootfsPath,
+	}
+}
+
+func (s *setupNVIDIA) configureContainerRuntime(ctx context.Context) error {
+	args := append([]string{goalstates.NvidiaCTKPath}, nvidiaContainerRuntimeConfigArgs()...)
+	if _, err := executil.MachineRun(
+		ctx,
+		s.log,
+		s.goalState.MachineName,
+		args...,
+	); err != nil {
+		return fmt.Errorf("configure NVIDIA container runtime: %w", err)
+	}
 
 	return nil
+}
+
+func nvidiaContainerRuntimeConfigArgs() []string {
+	return []string{
+		"config",
+		"--in-place",
+		"--set",
+		"nvidia-container-cli.load-kmods=false",
+	}
 }
 
 // copyNVIDIAIMEXBinaries adds the host-matched IMEX helpers to the prepared

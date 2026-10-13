@@ -6,6 +6,7 @@ package nodestart
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -87,4 +88,24 @@ func TestVersionedNVIDIALibraryCopiesDoesNotReplaceDiscoveredVersionedFile(t *te
 	}
 
 	require.Empty(t, versionedNVIDIALibraryCopies(libs, "580.167.08"))
+}
+
+func TestNVIDIASMIDestinationsIncludeDriverRootAndWorkerPath(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, []string{
+		"/run/nvidia/driver/usr/bin/nvidia-smi",
+		"/usr/bin/nvidia-smi",
+	}, nvidiaSMIDestinations("/run/nvidia/driver", filepath.Join("/usr", "bin", "nvidia-smi")))
+}
+
+func TestNVIDIAContainerRuntimeDisablesModuleLoading(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, []string{
+		"config",
+		"--in-place",
+		"--set",
+		"nvidia-container-cli.load-kmods=false",
+	}, nvidiaContainerRuntimeConfigArgs())
 }

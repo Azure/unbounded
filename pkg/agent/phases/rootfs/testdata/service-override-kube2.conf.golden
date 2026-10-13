@@ -42,6 +42,7 @@ StartLimitIntervalSec=0
 [Service]
 Restart=on-failure
 RestartSec=10s
+TimeoutStartSec=5min
 ExecStartPre=-/usr/bin/machinectl terminate kube2
 ExecStartPre=/usr/bin/mkdir -p /run/bpffs/kube2
 ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /run/bpffs/kube2 || /usr/bin/mount -t bpf bpf /run/bpffs/kube2'

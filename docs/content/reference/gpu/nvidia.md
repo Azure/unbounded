@@ -21,11 +21,23 @@ Before the agent can expose GPUs, the **host VM** must have:
    (`SYSTEM_DRIVER_MISMATCH`).
 4. **Persistence mode enabled.** `nvidia-smi -pm 1` keeps the driver loaded
    between GPU process invocations and avoids cold-start latency.
+5. **GPU memory hotplug policy configured** (GB200 and other platforms that
+   expose GPU memory through Linux memory hotplug). Set
+   `/sys/devices/system/memory/auto_online_blocks` to `online_movable` early
+   enough in boot that it takes effect before NVIDIA initializes GPU memory.
+   Persist the setting with the host operating system's early-boot mechanism,
+   such as a systemd-tmpfiles rule. If the driver initialized before this
+   policy was applied, changing the live value does not retroactively repair
+   failed GPU memory initialization.
 
 The GPU OCI images (`agent-ubuntu2404-nvidia`, `agent-ubuntu2604-nvidia`,
 `agent-azlinux3-nvidia`) include the NVIDIA Container Toolkit (`nvidia-ctk`,
 `nvidia-container-runtime`) but **not** the kernel driver or userspace
 libraries. Those come from the host.
+
+Select a GPU OCI image during initial enrollment. The standard OCI image does
+not include NVIDIA Container Toolkit, and adding GPU support later requires
+reprovisioning the rootfs with the matching NVIDIA image.
 
 ## How It Works
 
@@ -49,7 +61,11 @@ full sequence is:
    then prepares `/run/nvidia/driver` for NVIDIA container tooling and device
    plugins. The driver root contains copied 64-bit NVIDIA and VDPAU libraries,
    `nvidia-smi` when present on the host, optional matching i386 libraries,
-   and multiarch compatibility symlinks. The agent then runs `ldconfig` and
+   and multiarch compatibility symlinks. The host-matched `nvidia-smi` is also
+   copied to the worker's normal executable path for envvar-based device
+   plugin allocations. NVIDIA Container Toolkit is configured with
+   `load-kmods=false`, because kernel modules are owned by the host and must
+   not be loaded from inside nspawn. The agent then runs `ldconfig` and
    `nvidia-ctk cdi generate` to produce the CDI spec at
    `/etc/cdi/nvidia.yaml`. Most CDI hooks are disabled to avoid interference
    with the nspawn environment.
@@ -81,9 +97,10 @@ at `/`.
 The prepared root includes `etc/ld.so.cache` so `nvidia-ctk` can resolve the
 copied libraries and their SONAME aliases. When the host provides
 `nvidia-smi`, the agent also copies that host-matched binary to
-`/run/nvidia/driver/usr/bin/nvidia-smi`. Because helper discovery is scoped by
-`--driver-root`, this copy allows the CDI specification to expose a
-version-compatible `nvidia-smi` to GPU containers. The binary is useful for
+`/run/nvidia/driver/usr/bin/nvidia-smi` and `/usr/bin/nvidia-smi`. The driver
+root copy supports CDI helper discovery, while the worker-path copy supports
+the NVIDIA runtime's envvar allocation strategy. Both use the host-matched
+binary rather than an image-provided version. The binary is useful for
 diagnostics and monitoring but is not required for compute-only CUDA access.
 
 ## Architecture Support
@@ -137,3 +154,31 @@ The host NVIDIA libraries are not visible inside the nspawn. Check that:
 Ensure the kernel driver is loaded (`lsmod | grep nvidia`) and that
 `/dev/nvidia0` exists. If the driver is installed but not loaded, reboot the
 host.
+
+### GB200 GPU memory fails to initialize after reboot
+
+Inspect the kernel log for memory onlining failures and verify:
+
+```bash
+cat /sys/devices/system/memory/auto_online_blocks
+grep -l '^offline$' /sys/devices/system/memory/memory*/state
+```
+
+The policy must be `online_movable` before the NVIDIA driver initializes GPU
+memory. Configure it through an early host boot policy and then perform the
+platform's approved maintenance reboot. Do not attempt to recover a running
+production node by reloading NVIDIA kernel modules.
+
+For hosts using systemd-tmpfiles, the entry must use the `w` type so the value
+is written to the existing sysfs file:
+
+```text
+w /sys/devices/system/memory/auto_online_blocks - - - - online_movable
+```
+
+An entry using the `d` type is incorrect because `d` manages directories and
+does not write the policy. Platforms that already set
+`memhp_default_state=online_movable` on the kernel command line satisfy the
+same early-boot requirement. Follow the platform's boot-configuration
+ownership process rather than changing GRUB or the kernel command line during
+node enrollment.
