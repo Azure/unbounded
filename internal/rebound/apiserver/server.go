@@ -17,7 +17,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
+	authorizerunion "k8s.io/apiserver/pkg/authorization/union"
 	"k8s.io/apiserver/pkg/endpoints/openapi"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
@@ -132,7 +135,17 @@ func (o *Options) NewServer(cfg ServerConfig) (*Server, error) {
 	config.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(rebound.GetOpenAPIDefinitions, openapi.NewDefinitionNamer(scheme))
 
 	config.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(rebound.GetOpenAPIDefinitions, openapi.NewDefinitionNamer(scheme))
-	if err := o.SecureServing.ApplyTo(&config.SecureServing); err != nil {
+	success := false
+
+	defer func() {
+		if !success && config.SecureServing != nil && config.SecureServing.Listener != nil {
+			if err := config.SecureServing.Listener.Close(); err != nil {
+				klog.ErrorS(err, "Close listener after server setup failure")
+			}
+		}
+	}()
+
+	if err := o.SecureServing.WithLoopback().ApplyTo(&config.SecureServing, &config.LoopbackClientConfig); err != nil {
 		return nil, err
 	}
 
@@ -140,25 +153,7 @@ func (o *Options) NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, errors.New("secure serving must be enabled")
 	}
 
-	success := false
-
-	defer func() {
-		if !success {
-			if err := config.SecureServing.Listener.Close(); err != nil {
-				klog.ErrorS(err, "Close listener after server setup failure")
-			}
-		}
-	}()
-
 	config.SecureServing.Cert = cfg.Cert
-	cert, _ := cfg.Cert.CurrentCertKeyContent()
-
-	loopback, err := config.SecureServing.NewClientConfig(cert)
-	if err != nil {
-		return nil, err
-	}
-
-	config.LoopbackClientConfig = loopback
 
 	config.ExternalAddress = config.SecureServing.Listener.Addr().String()
 	if cfg.Authenticator != nil {
@@ -168,7 +163,17 @@ func (o *Options) NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	if cfg.Authorizer != nil {
-		config.Authorization.Authorizer = cfg.Authorizer
+		// Complete authenticates the loopback token as system:masters but does not wrap authorization.
+		// Preserve delegated authorization's privileged group allowance for overrides too.
+		authz, err := authorizerunion.New(
+			authorizerunion.NamedAuthorizer{AuthorizerName: "loopback", Authorizer: authorizerfactory.NewPrivilegedGroups(user.SystemPrivilegedGroup)},
+			authorizerunion.NamedAuthorizer{AuthorizerName: "override", Authorizer: cfg.Authorizer},
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		config.Authorization.Authorizer = authz
 	} else if err := o.Authorization.ApplyTo(&config.Authorization); err != nil {
 		return nil, err
 	}

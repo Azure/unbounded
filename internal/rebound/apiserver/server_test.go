@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -22,10 +23,188 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	"k8s.io/client-go/rest"
 	certutil "k8s.io/client-go/util/cert"
 
 	rebound "github.com/Azure/unbounded/api/rebound/v1alpha1"
 )
+
+func TestServerLoopback(t *testing.T) {
+	for _, allowAnonymous := range []bool{false, true} {
+		name := "reject authentication"
+		if allowAnonymous {
+			name = "deny authorization"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			_, kube, _ := fixture(t)
+
+			certPEM, keyPEM, err := certutil.GenerateSelfSignedCertKey("rebound.system.svc", nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cert, err := dynamiccertificates.NewStaticCertKeyContent("test", certPEM, keyPEM)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() { listener.Close() })
+
+			opts := NewOptions()
+			opts.SecureServing.Listener = listener
+
+			s, err := opts.NewServer(ServerConfig{
+				Client: kube, Namespace: "system", Cert: cert,
+				Authenticator: authenticator.RequestFunc(func(*http.Request) (*authenticator.Response, bool, error) {
+					if allowAnonymous {
+						return &authenticator.Response{User: &user.DefaultInfo{Name: user.Anonymous, Groups: []string{user.AllUnauthenticated}}}, true, nil
+					}
+
+					return nil, false, nil
+				}),
+				Authorizer: authorizer.AuthorizerFunc(func(context.Context, authorizer.Attributes) (authorizer.Decision, string, error) {
+					return authorizer.DecisionDeny, "test denial", nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if s.server.SecureServingInfo.Cert != cert {
+				t.Fatal("serving certificate was replaced")
+			}
+
+			loopback := rest.CopyConfig(s.server.LoopbackClientConfig)
+			if loopback.BearerToken == "" || loopback.ServerName != "apiserver-loopback-client" || loopback.Insecure {
+				t.Fatal("loopback requires a bearer token and verified SNI certificate")
+			}
+
+			loopback.Timeout = time.Second
+
+			client, err := rest.HTTPClientFor(loopback)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(client.CloseIdleConnections)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+
+			go func() { done <- s.Run(ctx) }()
+
+			t.Cleanup(func() {
+				cancel()
+
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("Run: %v", err)
+					}
+				case <-time.After(10 * time.Second):
+					t.Error("server did not stop")
+				}
+			})
+
+			deadline := time.Now().Add(20 * time.Second)
+			apiURL := loopback.Host + "/apis/" + rebound.SchemeGroupVersion.String()
+
+			for {
+				resp, err := client.Get(apiURL)
+				if err == nil {
+					resp.Body.Close()
+
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("loopback discovery status: %d", resp.StatusCode)
+					}
+
+					break
+				}
+
+				if time.Now().After(deadline) {
+					t.Fatalf("loopback discovery failed: %v", err)
+				}
+
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			anonymous, err := rest.HTTPClientFor(rest.AnonymousClientConfig(loopback))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(anonymous.CloseIdleConnections)
+
+			resp, err := anonymous.Get(apiURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			want := http.StatusUnauthorized
+			if allowAnonymous {
+				want = http.StatusForbidden
+			}
+
+			if resp.StatusCode != want {
+				t.Fatalf("anonymous discovery status: %d, want %d", resp.StatusCode, want)
+			}
+		})
+	}
+}
+
+func TestServerClosesListenerOnSetupFailure(t *testing.T) {
+	for _, phase := range []string{"secure serving", "authorization"} {
+		t.Run(phase, func(t *testing.T) {
+			_, kube, _ := fixture(t)
+
+			certPEM, keyPEM, err := certutil.GenerateSelfSignedCertKey("rebound.system.svc", nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cert, err := dynamiccertificates.NewStaticCertKeyContent("test", certPEM, keyPEM)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() { listener.Close() })
+
+			opts := NewOptions()
+			opts.SecureServing.Listener = listener
+			opts.Authorization.RemoteKubeConfigFile = t.TempDir() + "/missing-kubeconfig"
+
+			if phase == "secure serving" {
+				opts.SecureServing.MinTLSVersion = "invalid"
+			}
+
+			_, err = opts.NewServer(ServerConfig{
+				Client: kube, Namespace: "system", Cert: cert,
+				Authenticator: authenticator.RequestFunc(func(*http.Request) (*authenticator.Response, bool, error) {
+					return nil, false, nil
+				}),
+			})
+			if err == nil {
+				t.Fatal("expected setup failure")
+			}
+
+			if err := listener.Close(); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("listener was not closed after setup failure: %v", err)
+			}
+		})
+	}
+}
 
 func TestServer(t *testing.T) {
 	_, kube, _ := fixture(t)
