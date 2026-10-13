@@ -700,19 +700,10 @@ func setBIOSHTTPBootOverride(ctx context.Context, pc PowerClient, bootURL string
 }
 
 func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
-	if target.Stage == v1alpha3.OperationStageWaitingRepave && target.LastAttemptAt != nil {
-		if now.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
-			target.Message = "waiting for PXE installer to write the boot image"
+	if target.Stage == v1alpha3.OperationStageWaitingRepave && target.LastAttemptAt != nil && now.Sub(target.LastAttemptAt.Time) < r.powerActionTimeout() {
+		target.Message = "waiting for PXE installer to write the boot image"
 
-			return targetChange{target: target}
-		}
-
-		if target.Attempts >= r.maxAttempts() {
-			return failTarget(target, reasonExecutionFailed, fmt.Sprintf("timed out waiting for PXE repave after %d attempts", target.Attempts), now)
-		}
-
-		target.Stage = v1alpha3.OperationStagePoweringOff
-		target.LastAttemptAt = nil
+		return targetChange{target: target}
 	}
 
 	if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
@@ -729,12 +720,23 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 
 	pc, err := r.PowerClients.ForMachine(ctx, machine)
 	if err != nil {
-		return targetChange{target: target, err: err}
+		return repavePowerError(target, err)
 	}
 
 	state, err := pc.PowerState(ctx)
 	if err != nil {
-		return targetChange{target: target, err: err}
+		return repavePowerError(target, err)
+	}
+
+	// Readiness must be checked before an expired repave attempt can fail.
+	if target.Stage == v1alpha3.OperationStageWaitingRepave && target.LastAttemptAt != nil && target.Attempts >= r.maxAttempts() {
+		return failTarget(target, reasonExecutionFailed, fmt.Sprintf("timed out waiting for PXE repave after %d attempts", target.Attempts), now)
+	}
+
+	waitingTarget := target
+	if target.Stage == v1alpha3.OperationStageWaitingRepave && target.LastAttemptAt != nil {
+		target.Stage = v1alpha3.OperationStagePoweringOff
+		target.LastAttemptAt = nil
 	}
 
 	if state != redfish.PowerOff {
@@ -747,7 +749,7 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 		}
 
 		if err := pc.Reset(ctx, redfish.ResetForceOff); err != nil {
-			return targetChange{target: target, err: err}
+			return repavePowerError(waitingTarget, err)
 		}
 
 		target.Stage = v1alpha3.OperationStageWaitingOff
@@ -758,11 +760,15 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 	}
 
 	if err := r.configureRepaveBoot(ctx, pc, machine); err != nil {
+		if errors.Is(err, redfish.ErrNotReady) {
+			return repavePowerError(waitingTarget, err)
+		}
+
 		return retryTarget(target, err, now, r.maxAttempts())
 	}
 
 	if err := pc.Reset(ctx, redfish.ResetOn); err != nil {
-		return targetChange{target: target, err: err}
+		return repavePowerError(waitingTarget, err)
 	}
 
 	target.Stage = v1alpha3.OperationStageWaitingRepave
@@ -771,6 +777,16 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 	target.Message = "requested PXE repave boot"
 
 	return targetChange{target: target}
+}
+
+func repavePowerError(target v1alpha3.MachineOperationTargetStatus, err error) targetChange {
+	if errors.Is(err, redfish.ErrNotReady) {
+		target.Message = err.Error()
+
+		return targetChange{target: target}
+	}
+
+	return targetChange{target: target, err: err}
 }
 
 func cloudInitReplaceStatus(op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
@@ -1164,6 +1180,12 @@ func failTarget(target v1alpha3.MachineOperationTargetStatus, reason, message st
 }
 
 func retryTarget(target v1alpha3.MachineOperationTargetStatus, err error, now metav1.Time, maxAttempts int32) targetChange {
+	if errors.Is(err, redfish.ErrNotReady) {
+		target.Message = err.Error()
+
+		return targetChange{target: target}
+	}
+
 	if target.Attempts >= maxAttempts {
 		return failTarget(target, reasonExecutionFailed, err.Error(), now)
 	}
