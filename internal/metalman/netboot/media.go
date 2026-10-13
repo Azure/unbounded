@@ -373,7 +373,9 @@ func bootstrapConfig(spec *v1alpha3.PXESpec, u *url.URL, id string) ([]byte, err
 	}
 
 	subnet := net.ParseIP(l.IPv4).Mask(net.CIDRMask(prefix, 32)).String()
-	fmt.Fprintf(&b, "if [ -z \"$ubnic\" ]; then\n  halt\nfi\nnet_add_addr ubnet $ubnic %s\nnet_del_route ubnet:local\nnet_add_route ublocal %s/%d ubnet\nnet_add_route ubdefault 0.0.0.0/0 gw %s\nconfigfile (http,%s)/bootmedia/%s/grub.cfg\nhalt\n", l.IPv4, subnet, prefix, l.Gateway, u.Host, id)
+	// Retry the config fetch so a short server or network outage does not
+	// leave the host halted. A served config halts or boots on its own.
+	fmt.Fprintf(&b, "if [ -z \"$ubnic\" ]; then\n  halt\nfi\nnet_add_addr ubnet $ubnic %s\nnet_del_route ubnet:local\nnet_add_route ublocal %s/%d ubnet\nnet_add_route ubdefault 0.0.0.0/0 gw %s\nfor ubtry in 1 2 3 4 5 6 7 8 9 10; do\n  configfile (http,%s)/bootmedia/%s/grub.cfg\n  sleep 6\ndone\nhalt\n", l.IPv4, subnet, prefix, l.Gateway, u.Host, id)
 
 	return []byte(b.String()), nil
 }

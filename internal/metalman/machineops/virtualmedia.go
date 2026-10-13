@@ -30,6 +30,10 @@ const mediaFinalizer = "metalman.unbounded-cloud.io/boot-media"
 // Match the Redfish AC recovery grace without extending it on each poll.
 const mediaReadinessGrace = 10 * time.Minute
 
+// mediaMaxBootAttempts bounds power cycles used to get the host to boot the
+// virtual media.
+const mediaMaxBootAttempts = 3
+
 type stagedMediaClient interface {
 	bootmedia.Client
 	DeleteVirtualMedia(context.Context, bootmedia.Source) error
@@ -49,9 +53,14 @@ func outstandingMedia(target v1alpha3.MachineOperationTargetStatus) bool {
 
 func mediaBootUnconfirmed(target v1alpha3.MachineOperationTargetStatus) bool {
 	b := target.BootMedia
+	if b == nil || b.Abandoned || apimeta.IsStatusConditionTrue(target.Conditions, v1alpha3.MachineOperationConditionCloudInitDone) {
+		return false
+	}
 
-	return b != nil && (b.ImageWritten || b.Phase == "PoweringOn" || b.Phase == "Installing" || b.Phase == "Installed") &&
-		!apimeta.IsStatusConditionTrue(target.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
+	// After cleanup the media config serves halt, so only a loader that
+	// already started can still be running an installer.
+	return b.ImageWritten || b.LoaderStartedAt != nil ||
+		(!b.Cleaned && (b.Phase == "PoweringOn" || b.Phase == "Installing" || b.Phase == "Installed"))
 }
 
 func hasOutstandingMedia(op *v1alpha3.MachineOperation) bool {
@@ -107,7 +116,15 @@ func (r *Reconciler) reconcileMediaCleanup(ctx context.Context, op *v1alpha3.Mac
 		}
 
 		if target.BootMedia.Released {
-			continue
+			if !r.mediaRetentionExpired(op, target) {
+				continue
+			}
+
+			b := *target.BootMedia
+			b.Abandoned = true
+			target.BootMedia = &b
+
+			return true, r.saveMediaCleanup(ctx, op.Name, target)
 		}
 
 		if op.DeletionTimestamp.IsZero() && !op.Status.IsTerminal() && !isTerminalTarget(target) && !target.BootMedia.ImageWritten && !target.BootMedia.Cleaned {
@@ -137,8 +154,12 @@ func (r *Reconciler) reconcileMediaCleanup(ctx context.Context, op *v1alpha3.Mac
 
 			target.BootMedia.StagedDeleted = true
 		case mediaHandoffPending(&b):
-			// Keep ownership while the installer may still be writing or polling.
-			continue
+			if !r.mediaRetentionExpired(op, target) {
+				// Keep ownership while the installer may still be writing or polling.
+				continue
+			}
+
+			target.BootMedia.Abandoned = true
 		default:
 			if r.BootMedia == nil {
 				return true, fmt.Errorf("virtual media provider is not configured")
@@ -151,17 +172,7 @@ func (r *Reconciler) reconcileMediaCleanup(ctx context.Context, op *v1alpha3.Mac
 			target.BootMedia.Released = true
 		}
 
-		return true, r.updateOperationStatus(ctx, op.Name, func(latest *v1alpha3.MachineOperation) {
-			for i := range latest.Status.Targets {
-				current := &latest.Status.Targets[i]
-				if current.MachineRef == target.MachineRef && current.BootMedia != nil && current.BootMedia.ID == b.ID {
-					current.BootMedia.Cleaned = target.BootMedia.Cleaned
-					current.BootMedia.CleanedAt = target.BootMedia.CleanedAt
-					current.BootMedia.StagedDeleted = target.BootMedia.StagedDeleted
-					current.BootMedia.Released = target.BootMedia.Released
-				}
-			}
-		})
+		return true, r.saveMediaCleanup(ctx, op.Name, target)
 	}
 
 	if slices.Contains(op.Finalizers, mediaFinalizer) && !hasOutstandingMedia(op) {
@@ -173,6 +184,43 @@ func (r *Reconciler) reconcileMediaCleanup(ctx context.Context, op *v1alpha3.Mac
 	}
 
 	return false, nil
+}
+
+func (r *Reconciler) saveMediaCleanup(ctx context.Context, opName string, target v1alpha3.MachineOperationTargetStatus) error {
+	return r.updateOperationStatus(ctx, opName, func(latest *v1alpha3.MachineOperation) {
+		for i := range latest.Status.Targets {
+			current := &latest.Status.Targets[i]
+			if current.MachineRef == target.MachineRef && current.BootMedia != nil && current.BootMedia.ID == target.BootMedia.ID {
+				current.BootMedia.Cleaned = target.BootMedia.Cleaned
+				current.BootMedia.CleanedAt = target.BootMedia.CleanedAt
+				current.BootMedia.StagedDeleted = target.BootMedia.StagedDeleted
+				current.BootMedia.Released = target.BootMedia.Released
+				current.BootMedia.Abandoned = current.BootMedia.Abandoned || target.BootMedia.Abandoned
+			}
+		}
+	})
+}
+
+// mediaRetentionExpired reports whether a finished target has kept media
+// ownership for a full install timeout after cleanup or reboot handoff
+// without the installer finishing. Such an installer is treated as dead so
+// the Machine does not stay locked forever.
+func (r *Reconciler) mediaRetentionExpired(op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus) bool {
+	b := target.BootMedia
+	if b == nil || b.CleanedAt == nil {
+		return false
+	}
+
+	if !op.Status.IsTerminal() && op.DeletionTimestamp.IsZero() && !isTerminalTarget(target) {
+		return false
+	}
+
+	since := b.CleanedAt.Time
+	if b.RebootRequestedAt != nil && b.RebootRequestedAt.After(since) {
+		since = b.RebootRequestedAt.Time
+	}
+
+	return r.now().Sub(since) >= r.mediaInstallTimeout()
 }
 
 func (r *Reconciler) cleanupMedia(ctx context.Context, target v1alpha3.MachineOperationTargetStatus, deleteStaged bool) error {
@@ -235,7 +283,28 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 
 		if b.Phase == "Installing" {
 			target.Stage = v1alpha3.OperationStageWaitingRepave
+
+			if b.LoaderStartedAt == nil && b.PhaseStartedAt != nil && now.Sub(b.PhaseStartedAt.Time) >= r.mediaBootTimeout() {
+				// The BMC sometimes powers on without a usable virtual drive.
+				// No installer can run before the loader fetches its config,
+				// so a fresh power cycle is safe.
+				if b.BootAttempts+1 >= mediaMaxBootAttempts {
+					return failTarget(target, reasonTimedOut, "host did not boot the virtual media", now)
+				}
+
+				b.BootAttempts++
+				b.Phase = "PoweringOff"
+				b.PhaseStartedAt = &now
+				b.ReadinessStartedAt = nil
+				target.Message = fmt.Sprintf("host did not boot the virtual media; retrying (attempt %d)", b.BootAttempts+1)
+
+				return targetChange{target: target}
+			}
+
 			target.Message = "waiting for virtual media installer to write the boot image"
+			if b.LoaderStartedAt == nil {
+				target.Message = "waiting for host to boot the virtual media"
+			}
 
 			return targetChange{target: target}
 		}
@@ -444,6 +513,21 @@ func mergeMediaCallbacks(updated *v1alpha3.MachineOperationTargetStatus, latest 
 	}
 
 	updated.BootMedia.Released = updated.BootMedia.Released || latest.BootMedia.Released
+	updated.BootMedia.Abandoned = updated.BootMedia.Abandoned || latest.BootMedia.Abandoned
+
+	if latest.BootMedia.LoaderStartedAt != nil && updated.BootMedia.LoaderStartedAt == nil {
+		updated.BootMedia.LoaderStartedAt = latest.BootMedia.LoaderStartedAt.DeepCopy()
+		if updated.BootMedia.BootAttempts != latest.BootMedia.BootAttempts {
+			// A boot retry was decided before the loader start was seen. The
+			// installer is running, so keep waiting for it instead.
+			updated.BootMedia.BootAttempts = latest.BootMedia.BootAttempts
+			updated.BootMedia.Phase = latest.BootMedia.Phase
+			updated.BootMedia.PhaseStartedAt = latest.BootMedia.PhaseStartedAt.DeepCopy()
+			updated.BootMedia.ReadinessStartedAt = latest.BootMedia.ReadinessStartedAt.DeepCopy()
+			updated.Message = "waiting for virtual media installer to write the boot image"
+		}
+	}
+
 	for _, cond := range latest.Conditions {
 		if cond.Type == v1alpha3.MachineOperationConditionCloudInitDone || cond.Type == v1alpha3.MachineOperationConditionBootImageWritten || cond.Type == v1alpha3.MachineOperationConditionBootLoaderDownloaded {
 			apimeta.SetStatusCondition(&updated.Conditions, cond)
@@ -452,7 +536,15 @@ func mergeMediaCallbacks(updated *v1alpha3.MachineOperationTargetStatus, latest 
 }
 
 func mediaHandoffPending(b *v1alpha3.MachineOperationBootMediaStatus) bool {
-	return b.RebootRequestedAt == nil && (b.ImageWritten || b.Phase == "Installing" || b.Phase == "PoweringOn")
+	return b.RebootRequestedAt == nil && !b.Abandoned && (b.ImageWritten || b.LoaderStartedAt != nil)
+}
+
+func (r *Reconciler) mediaBootTimeout() time.Duration {
+	if r.MediaBootTimeout > 0 {
+		return r.MediaBootTimeout
+	}
+
+	return 10 * time.Minute
 }
 
 func (r *Reconciler) mediaInstallTimeout() time.Duration {

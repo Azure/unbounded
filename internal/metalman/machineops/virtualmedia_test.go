@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -551,6 +552,8 @@ func TestVirtualMediaLongInstallAndLateHandoff(t *testing.T) {
 	}
 
 	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+	current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
+	require.NoError(t, r.Status().Update(t.Context(), current))
 
 	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(30 * time.Minute)) }
 	current = mediaStep(t, r, op.Name)
@@ -714,4 +717,160 @@ func TestVirtualMediaUsesFrozenActionsAndRejectsReplacement(t *testing.T) {
 	current = mediaStep(t, r, op.Name)
 	require.True(t, current.Status.Targets[0].BootMedia.Cleaned)
 	require.Equal(t, frozen, d.seen.Spec.Netboot())
+}
+
+func mediaInstalling(t *testing.T, r *Reconciler, name string) *v1alpha3.MachineOperation {
+	t.Helper()
+
+	var current *v1alpha3.MachineOperation
+	for range 10 {
+		current = mediaStep(t, r, name)
+	}
+
+	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+
+	return current
+}
+
+func TestVirtualMediaBootRetryWithoutLoaderStart(t *testing.T) {
+	r, d, _, op := mediaFixture(t)
+	mediaInstalling(t, r, op.Name)
+
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(9 * time.Minute)) }
+	current := mediaStep(t, r, op.Name)
+	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+	require.Contains(t, current.Status.Targets[0].Message, "waiting for host to boot")
+
+	// No loader start after the boot timeout: power cycle and mount again.
+	resets := slices.Clone(d.calls)
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(10 * time.Minute)) }
+	current = mediaStep(t, r, op.Name)
+	b := current.Status.Targets[0].BootMedia
+	require.Equal(t, "PoweringOff", b.Phase)
+	require.Equal(t, int32(1), b.BootAttempts)
+	require.Equal(t, int32(0), current.Status.Targets[0].Attempts)
+	require.Contains(t, current.Status.Targets[0].Message, "attempt 2")
+
+	for range 6 {
+		current = mediaStep(t, r, op.Name)
+	}
+
+	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+	require.Contains(t, d.calls[len(resets):], "mount")
+	require.Contains(t, d.calls[len(resets):], string(redfish.ResetOn))
+	require.False(t, current.Status.Targets[0].BootMedia.Cleaned)
+}
+
+func TestVirtualMediaBootRetriesAreBounded(t *testing.T) {
+	r, _, _, op := mediaFixture(t)
+	mediaInstalling(t, r, op.Name)
+
+	offset := time.Duration(0)
+	for attempt := 1; attempt < mediaMaxBootAttempts; attempt++ {
+		offset += 10 * time.Minute
+		r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(offset)) }
+
+		var current *v1alpha3.MachineOperation
+		for range 7 {
+			current = mediaStep(t, r, op.Name)
+		}
+
+		require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+		require.Equal(t, int32(attempt), current.Status.Targets[0].BootMedia.BootAttempts)
+	}
+
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(offset + 10*time.Minute)) }
+	current := mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Targets[0].Phase)
+	require.Contains(t, current.Status.Targets[0].Message, "did not boot the virtual media")
+}
+
+func TestVirtualMediaNoBootRetryAfterLoaderStart(t *testing.T) {
+	r, _, _, op := mediaFixture(t)
+	current := mediaInstalling(t, r, op.Name)
+	current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
+	require.NoError(t, r.Status().Update(t.Context(), current))
+
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(30 * time.Minute)) }
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+	require.Zero(t, current.Status.Targets[0].BootMedia.BootAttempts)
+	require.Contains(t, current.Status.Targets[0].Message, "write the boot image")
+}
+
+func TestVirtualMediaMergeKeepsLoaderStartOverStaleRetry(t *testing.T) {
+	started := ptrTo(fixedNow())
+	latest := v1alpha3.MachineOperationTargetStatus{BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+		ID: "a", Phase: "Installing", PhaseStartedAt: ptrTo(fixedNow()), LoaderStartedAt: started,
+	}}
+	updated := v1alpha3.MachineOperationTargetStatus{BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+		ID: "a", Phase: "PoweringOff", PhaseStartedAt: ptrTo(metav1.NewTime(fixedNow().Add(time.Minute))), BootAttempts: 1,
+	}}
+	mergeMediaCallbacks(&updated, latest)
+	require.Equal(t, "Installing", updated.BootMedia.Phase)
+	require.Zero(t, updated.BootMedia.BootAttempts)
+	require.Equal(t, started, updated.BootMedia.LoaderStartedAt)
+
+	// Without a retry decision, only the loader start is merged.
+	updated = v1alpha3.MachineOperationTargetStatus{BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: "a", Phase: "Installing"}}
+	mergeMediaCallbacks(&updated, latest)
+	require.Equal(t, started, updated.BootMedia.LoaderStartedAt)
+}
+
+func TestVirtualMediaFailedBootReleasesWithoutHandoff(t *testing.T) {
+	r, d, _, op := mediaFixture(t)
+	mediaInstalling(t, r, op.Name)
+
+	// The host never booted the media, so no installer can be running.
+	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(2 * time.Hour)) }
+
+	var current *v1alpha3.MachineOperation
+	for range 5 {
+		current = mediaStep(t, r, op.Name)
+	}
+
+	require.True(t, current.Status.Targets[0].BootMedia.Released)
+	require.Contains(t, d.calls, "release")
+	require.False(t, hasOutstandingMedia(current))
+	require.NotContains(t, current.Finalizers, mediaFinalizer)
+}
+
+func TestVirtualMediaAbandonsDeadInstallerAfterTimeout(t *testing.T) {
+	for _, handoff := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no-handoff", true: "no-cloud-init"}[handoff], func(t *testing.T) {
+			r, _, _, op := mediaFixture(t)
+			current := mediaInstalling(t, r, op.Name)
+			current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
+			require.NoError(t, r.Status().Update(t.Context(), current))
+
+			r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(time.Hour)) }
+			for range 4 {
+				current = mediaStep(t, r, op.Name)
+			}
+
+			require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Phase)
+			require.True(t, current.Status.Targets[0].BootMedia.StagedDeleted)
+
+			if handoff {
+				current.Status.Targets[0].BootMedia.ImageWritten = true
+				current.Status.Targets[0].BootMedia.RebootRequestedAt = ptrTo(metav1.NewTime(fixedNow().Add(time.Hour)))
+				require.NoError(t, r.Status().Update(t.Context(), current))
+			}
+
+			current = mediaStep(t, r, op.Name)
+			require.True(t, hasOutstandingMedia(current))
+			require.Contains(t, current.Finalizers, mediaFinalizer)
+			require.False(t, current.Status.Targets[0].BootMedia.Abandoned)
+
+			r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(2*time.Hour + time.Minute)) }
+			for range 4 {
+				current = mediaStep(t, r, op.Name)
+			}
+
+			require.True(t, current.Status.Targets[0].BootMedia.Abandoned)
+			require.True(t, current.Status.Targets[0].BootMedia.Released)
+			require.False(t, hasOutstandingMedia(current))
+			require.NotContains(t, current.Finalizers, mediaFinalizer)
+		})
+	}
 }

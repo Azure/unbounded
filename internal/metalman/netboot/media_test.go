@@ -259,6 +259,16 @@ func TestMediaCapabilityLength(t *testing.T) {
 	}
 }
 
+func setMediaPhase(t *testing.T, p *MediaProvider, op *v1alpha3.MachineOperation, phase string) {
+	t.Helper()
+
+	var current v1alpha3.MachineOperation
+	require.NoError(t, p.Client.Get(t.Context(), client.ObjectKeyFromObject(op), &current))
+	current.Status.Targets[0].BootMedia.Phase = phase
+	require.NoError(t, p.Client.Status().Update(t.Context(), &current))
+	*op = current
+}
+
 func mediaRequest(p *MediaProvider, id, method, action, ip string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, "/bootmedia/"+id+"/"+action, nil)
 	r.RemoteAddr = ip + ":4321"
@@ -275,8 +285,17 @@ func TestMediaScopedCallbacks(t *testing.T) {
 	op.Status.Targets = append(op.Status.Targets, v1alpha3.MachineOperationTargetStatus{MachineRef: "other-host", BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: strings.Repeat("d", 32)}})
 	require.NoError(t, p.Client.Status().Update(t.Context(), op))
 	id := op.Status.Targets[0].BootMedia.ID
+	// Before power-on the host is not expected to boot, so it gets halt.
+	require.Equal(t, "halt\n", mediaRequest(p, id, http.MethodGet, "grub.cfg", "192.0.2.20").Body.String())
+	setMediaPhase(t, p, op, "Installing")
+
 	w := mediaRequest(p, id, http.MethodGet, "grub.cfg", "192.0.2.20")
 	require.Equal(t, http.StatusOK, w.Code)
+
+	var started v1alpha3.MachineOperation
+	require.NoError(t, p.Client.Get(t.Context(), client.ObjectKeyFromObject(op), &started))
+	require.NotNil(t, started.Status.Targets[0].BootMedia.LoaderStartedAt)
+	require.Nil(t, started.Status.Targets[1].BootMedia.LoaderStartedAt)
 	require.Contains(t, w.Body.String(), "linux (http,192.0.2.2:8080)/vmlinuz")
 	require.Contains(t, w.Body.String(), "initrd (http,192.0.2.2:8080)/initrd (http,192.0.2.2:8080)/init.cpio")
 	require.Contains(t, w.Body.String(), "unbounded.virtual_media=1")
@@ -465,6 +484,7 @@ func TestMediaFrozenArtifactsAfterPrepare(t *testing.T) {
 	require.NoError(t, p.Client.Update(t.Context(), m))
 	_, err = p.Prepare(t.Context(), m, op, id)
 	require.NoError(t, err)
+	setMediaPhase(t, p, op, "PoweringOn")
 
 	w := mediaRequest(p, id, http.MethodGet, "grub.cfg", "192.0.2.20")
 	require.Equal(t, http.StatusOK, w.Code)
@@ -479,6 +499,7 @@ func TestMediaFrozenArtifactsAfterPrepare(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, "frozen disk", w.Body.String())
 
+	require.NoError(t, p.Client.Get(t.Context(), client.ObjectKeyFromObject(op), op))
 	op.Status.Phase = v1alpha3.OperationPhaseFailed
 	require.NoError(t, p.Client.Status().Update(t.Context(), op))
 

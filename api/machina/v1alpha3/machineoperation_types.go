@@ -370,6 +370,14 @@ type MachineOperationBootMediaStatus struct {
 	PhaseStartedAt *metav1.Time `json:"phaseStartedAt,omitempty"`
 	// ReadinessStartedAt gives AC recovery one fixed grace window per phase.
 	ReadinessStartedAt *metav1.Time `json:"readinessStartedAt,omitempty"`
+	// LoaderStartedAt is set when the bootloader on the media first fetches
+	// its install config. It proves the host booted the media.
+	LoaderStartedAt *metav1.Time `json:"loaderStartedAt,omitempty"`
+	// BootAttempts counts power-on attempts used to boot the media.
+	BootAttempts int32 `json:"bootAttempts,omitempty"`
+	// Abandoned ends ownership after the installer never finished its
+	// handoff within the allowed time.
+	Abandoned bool `json:"abandoned,omitempty"`
 }
 
 // IsTerminal returns true if the operation phase is Complete or Failed.

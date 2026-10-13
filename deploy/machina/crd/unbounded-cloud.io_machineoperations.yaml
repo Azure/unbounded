@@ -257,6 +257,16 @@ spec:
                       description: BootMedia records immutable media ownership and
                         cleanup progress.
                       properties:
+                        abandoned:
+                          description: |-
+                            Abandoned ends ownership after the installer never finished its
+                            handoff within the allowed time.
+                          type: boolean
+                        bootAttempts:
+                          description: BootAttempts counts power-on attempts used
+                            to boot the media.
+                          format: int32
+                          type: integer
                         certFingerprint:
                           type: string
                         cleaned:
@@ -270,6 +280,12 @@ spec:
                           type: string
                         imageWritten:
                           type: boolean
+                        loaderStartedAt:
+                          description: |-
+                            LoaderStartedAt is set when the bootloader on the media first fetches
+                            its install config. It proves the host booted the media.
+                          format: date-time
+                          type: string
                         machineUID:
                           description: |-
                             UID is a type that holds unique ID values, including UUIDs.  Because we

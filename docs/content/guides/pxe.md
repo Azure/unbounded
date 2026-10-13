@@ -254,11 +254,20 @@ The default installation deadline is one hour, separate from the five-minute
 power-action timeout and ten-minute BMC readiness grace. An operation timeout does
 not end the installer's safe callback wait or release ownership by itself.
 
+Metalman records `loaderStartedAt` when GRUB on the ISO first fetches its install
+config. If that does not happen within ten minutes of power-on, Metalman assumes
+the host did not boot the media. It powers the host off, mounts the ISO again,
+selects `RemoteDrive`, and powers on. It tries three boots in total, then fails
+the target. `bootAttempts` counts the retries.
+
 The finalizer also drives cleanup after failure or operation deletion, using saved
 state across controller restarts. Pending cleanup or reboot handoff blocks another
 host operation on the same machine or BMC, even when the old operation is terminal.
 For started installs, ownership remains until successful first-boot cloud-init
 confirms the host rebooted. This keeps `/ready` available if its response is lost.
+If the host never booted the media, ownership ends after cleanup. If the installer
+started but cloud-init never reports, ownership ends one install deadline after
+cleanup or reboot handoff, and Metalman sets `abandoned`.
 Restore connectivity and let cleanup finish; do not remove the finalizer to bypass it.
 
 ### Hardware results

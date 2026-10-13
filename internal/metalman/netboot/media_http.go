@@ -179,12 +179,38 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if phase := o.status().Phase; phase != "PoweringOn" && phase != "Installing" {
+			// The controller may be power cycling the host for a boot retry.
+			log.Info("serving halt config while the host is not expected to boot", "phase", phase)
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte("halt\n")) //nolint:errcheck // Best-effort HTTP response.
+
+			return
+		}
+
 		data, err := p.installerConfig(o)
 		if err != nil {
 			log.Error("rendering boot media installer config", "err", err)
 			http.Error(w, "media config unavailable", http.StatusServiceUnavailable)
 
 			return
+		}
+
+		if o.status().LoaderStartedAt == nil {
+			// Record the boot before any installer can run, so the controller
+			// never power cycles a host that is installing.
+			base := o.op.DeepCopy()
+			status := *o.status()
+			now := metav1.Now()
+			status.LoaderStartedAt = &now
+
+			o.op.Status.Targets[o.index].BootMedia = &status
+			if err := p.Client.Status().Patch(r.Context(), o.op, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+				log.Warn("saving loader start", "err", err)
+				http.Error(w, "cannot save loader start", http.StatusServiceUnavailable)
+
+				return
+			}
 		}
 
 		log.Info("serving boot media installer config")

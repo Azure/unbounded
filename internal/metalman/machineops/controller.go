@@ -79,6 +79,7 @@ type Reconciler struct {
 	PollInterval          time.Duration
 	PowerActionTimeout    time.Duration
 	MediaInstallTimeout   time.Duration
+	MediaBootTimeout      time.Duration
 	Now                   func() metav1.Time
 }
 
