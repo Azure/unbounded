@@ -41,17 +41,21 @@ func (b *bucketsFlag) Set(value string) error {
 }
 
 type options struct {
-	mode           string
-	volume         string
-	namespace      string
-	buckets        bucketsFlag
-	region         string
-	endpoint       string
-	pathStyle      bool
-	metadataTTL    time.Duration
-	requestTimeout time.Duration
-	listen         string
-	debugListen    string
+	mode            string
+	volume          string
+	namespace       string
+	buckets         bucketsFlag
+	provider        string
+	api             string
+	accountURL      string
+	azureCredential string
+	region          string
+	endpoint        string
+	pathStyle       bool
+	metadataTTL     time.Duration
+	requestTimeout  time.Duration
+	listen          string
+	debugListen     string
 }
 
 func main() {
@@ -97,17 +101,21 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 	volume := fs.String("volume", "racer-object", "Racer volume name")
 	fs.StringVar(&o.namespace, "namespace", "", "Required stable upstream identity; use the same value in origin and sidecar")
-	fs.Var(&o.buckets, "bucket", "Allowed bucket (repeatable; omitted allows all buckets)")
+	fs.Var(&o.buckets, "bucket", "Allowed bucket/container (repeatable; omitted allows all buckets/containers)")
 	fs.StringVar(&o.debugListen, "debug-listen", "", "Optional pprof address (e.g. 127.0.0.1:6060); disabled when empty. Trusted diagnostic access only: nonloopback addresses such as :6060 expose unauthenticated profiles")
 
 	showVersion := fs.Bool("version", false, "Print version")
 	if o.mode == "origin" {
+		fs.StringVar(&o.provider, "provider", "s3", "Upstream provider: s3 or azure")
+		fs.StringVar(&o.accountURL, "account-url", "", "Azure account HTTP(S) URL; required for azure, without credentials or query")
+		fs.StringVar(&o.azureCredential, "azure-credential", "default", "Azure credential: default or anonymous; default requires HTTPS and uses the Azure credential chain (AZURE_CLIENT_ID and related environment variables)")
 		fs.StringVar(&o.region, "region", "", "AWS region (defaults to AWS configuration and environment)")
 		fs.StringVar(&o.endpoint, "endpoint", "", "Optional HTTP(S) upstream origin, without a path or credentials")
 		fs.BoolVar(&o.pathStyle, "path-style", true, "Use path-style upstream addressing")
 		fs.DurationVar(&o.metadataTTL, "metadata-ttl", 30*time.Second, "Metadata lifetime; zero expires immediately")
 		fs.DurationVar(&o.requestTimeout, "request-timeout", time.Minute, "Positive origin request timeout")
 	} else {
+		fs.StringVar(&o.api, "api", "s3", "Sidecar API: s3 or azure")
 		fs.StringVar(&o.listen, "listen", "127.0.0.1:8080", "Loopback IP literal and port")
 		fs.DurationVar(&o.requestTimeout, "request-timeout", 5*time.Minute, "Positive sidecar request timeout")
 	}
@@ -152,6 +160,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 
 	if o.mode == "origin" {
+		if err := validateProviderOptions(o, fs); err != nil {
+			return o, err
+		}
+
 		if o.metadataTTL < 0 {
 			return o, errors.New("--metadata-ttl must not be negative")
 		}
@@ -159,8 +171,14 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		if err := validateEndpoint(o.endpoint); err != nil {
 			return o, err
 		}
-	} else if err := validateListen(o.listen); err != nil {
-		return o, err
+	} else {
+		if o.api != "s3" && o.api != "azure" {
+			return o, errors.New("--api must be s3 or azure")
+		}
+
+		if err := validateListen(o.listen); err != nil {
+			return o, err
+		}
 	}
 
 	return o, nil
@@ -270,10 +288,31 @@ func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
 	return cfg, nil
 }
 
-func runOrigin(ctx context.Context, o options) error {
+func createOrigin(ctx context.Context, o options) (racersdk.Origin, error) {
+	originConfig := racerobject.OriginConfig{
+		Namespace: o.namespace, Buckets: o.buckets, MetadataTTL: o.metadataTTL,
+	}
+	if o.provider == "azure" {
+		client, err := originAzureClient(o)
+		if err != nil {
+			return nil, err
+		}
+
+		origin, err := racerobject.NewAzureOrigin(client, originConfig)
+		if err != nil {
+			return nil, errors.New("could not configure origin")
+		}
+
+		return origin, nil
+	}
+
+	if o.provider != "" && o.provider != "s3" {
+		return nil, errors.New("--provider must be s3 or azure")
+	}
+
 	cfg, err := originAWSConfig(ctx, o)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	client := s3.NewFromConfig(cfg, func(s *s3.Options) {
@@ -283,11 +322,18 @@ func runOrigin(ctx context.Context, o options) error {
 		}
 	})
 
-	origin, err := racerobject.NewOrigin(client, racerobject.OriginConfig{
-		Namespace: o.namespace, Buckets: o.buckets, MetadataTTL: o.metadataTTL,
-	})
+	origin, err := racerobject.NewOrigin(client, originConfig)
 	if err != nil {
-		return errors.New("could not configure origin")
+		return nil, errors.New("could not configure origin")
+	}
+
+	return origin, nil
+}
+
+func runOrigin(ctx context.Context, o options) error {
+	origin, err := createOrigin(ctx, o)
+	if err != nil {
+		return err
 	}
 
 	root, err := os.Open("/")
@@ -366,9 +412,9 @@ func runSidecar(ctx context.Context, o options) error {
 	}
 	defer closeResource(client)
 
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: o.namespace, Buckets: o.buckets})
+	handler, err := createSidecar(client, o)
 	if err != nil {
-		return errors.New("could not configure sidecar")
+		return err
 	}
 
 	listener, err := listenSidecar(ctx, o.listen)
@@ -377,6 +423,15 @@ func runSidecar(ctx context.Context, o options) error {
 	}
 
 	return serveSidecar(ctx, listener, handler, o.requestTimeout)
+}
+
+func createSidecar(client *racersdk.Client, o options) (http.Handler, error) {
+	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: o.namespace, Buckets: o.buckets, API: o.api})
+	if err != nil {
+		return nil, errors.New("could not configure sidecar")
+	}
+
+	return handler, nil
 }
 
 func listenSidecar(ctx context.Context, address string) (net.Listener, error) {
