@@ -324,6 +324,26 @@ jobs:
 
       - name: Validate exact pure runtime test group
         run: timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/runtime-miri.py ${{ matrix.group }}
+  flow-miri:
+    name: Flow Miri (pure ownership)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Miri
+        run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install nightly-2025-11-21 --profile minimal --component miri,rust-src
+
+      - name: Prepare Miri sysroot
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +nightly-2025-11-21 miri setup
+
+      - name: Check exact allowlist validation
+        run: timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/test_flow_miri.py
+
+      - name: Validate pure flow ownership
+        run: timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/flow-miri.py
+
   racer-envtest:
     name: Racer API Server Integration Tests
     runs-on: ubuntu-24.04

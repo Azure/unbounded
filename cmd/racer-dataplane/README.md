@@ -92,3 +92,16 @@ Simulation adds simulated and mixed-descriptor contracts without removing the
 real pipe tests: simulated pipes require an active `Simulation` scope, not just
 the feature. CI runs strict Clippy on all targets in each mode, the isolated
 production tests, and simulation tests through the workspace all-features run.
+
+CI also runs six exact coalescing and handoff ownership tests under pinned Miri,
+with simulation enabled and Miri's default checks. After installing the pinned
+Miri toolchain and preparing its sysroot as above, run:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/flow-miri.py
+```
+
+The script fails if any selected test is missing or ignored. This small subset
+checks completion, final-handle cleanup, capacity, and handoff waker ownership.
+It does not cover pipe syscalls or the recycler's `explicit_bzero` path, and it
+is not a concurrency model or a substitute for real-I/O tests.
