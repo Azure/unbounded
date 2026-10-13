@@ -36,7 +36,7 @@ import (
 // watchSitesAndConfigureWireGuard watches SiteNodeSlice objects and configures WireGuard peers for nodes in the same site
 // Gateway nodes can operate without being assigned to a site - they will still configure themselves to accept connections
 // The informers are passed in from run() and are already started and synced.
-func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.Interface, dynamicClient dynamic.Interface, cfg *config, myPubKey string, nodePodCIDRs []string, manageCniPlugin bool, initialCNIConfigMTU int, healthState *nodeHealthState, netlinkCache *unboundednetnetlink.NetlinkCache, adoptedAssignment nodeAssignment, podNamespace, podName string, podUID types.UID, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer) error {
+func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.Interface, dynamicClient dynamic.Interface, cfg *config, myPubKey string, nodePodCIDRs []string, manageCniPlugin bool, initialCNIConfigMTU int, healthState *nodeHealthState, netlinkCache *unboundednetnetlink.NetlinkCache, adoptedAssignment nodeAssignment, podNamespace, podName string, podUID types.UID, startupWatch *startupAssignmentWatch, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer) error {
 	klog.Info("Watching Site, SiteNodeSlice, GatewayPool, GatewayPoolNode, SitePeering, SiteGatewayPoolAssignment, and GatewayPoolPeering objects for changes")
 
 	// Read private key for WireGuard configuration
@@ -298,6 +298,8 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 					klog.Errorf("Failed to acknowledge effective assignment: %v", err)
 				} else {
 					acknowledged = true
+
+					startupWatch.stop()
 
 					klog.Infof("Acknowledged effective Site %q and GatewayPool %q on Pod %s/%s", adoptedAssignment.site, adoptedAssignment.gatewayPool, podNamespace, podName)
 				}
