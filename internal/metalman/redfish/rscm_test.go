@@ -66,6 +66,8 @@ func dialRack(t *testing.T, srv *httptest.Server, slot string) *Client {
 	require.NoError(t, err)
 	require.NotNil(t, c.rscm)
 	require.Same(t, c.session.httpClient, c.rscm.root.httpClient)
+	require.Equal(t, 3*time.Minute, c.session.httpClient.Timeout)
+	require.Equal(t, 3*time.Minute, c.rscm.root.httpClient.Timeout)
 	require.Empty(t, c.session.token)
 	require.Equal(t, slot, c.deviceID)
 	t.Cleanup(c.Close)
@@ -202,6 +204,10 @@ func TestRackSCMDetection(t *testing.T) {
 			if !tc.wantRack {
 				require.Equal(t, int64(1), sessions.Load())
 				require.Equal(t, "normal", c.deviceID)
+				require.Equal(t, 30*time.Second, c.session.httpClient.Timeout)
+			} else {
+				require.Equal(t, 3*time.Minute, c.session.httpClient.Timeout)
+				require.Equal(t, 3*time.Minute, c.rscm.root.httpClient.Timeout)
 			}
 		})
 	}
@@ -236,6 +242,61 @@ func TestRackSCMNoPathDoesNotProbe(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, PowerOn, state)
 		})
+	}
+}
+
+func TestRackSCMDetectionPreservesTransport(t *testing.T) {
+	srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s", r.URL.Path)
+	})
+
+	original := newHTTPClient(tlsServerFingerprint(srv))
+	defer original.CloseIdleConnections()
+
+	blade := &bmcSession{httpClient: original, baseURL: srv.URL + "/7", user: "admin", pass: "secret"}
+	rack, err := detectRackSCM(t.Context(), blade)
+	require.NoError(t, err)
+	require.NotNil(t, rack)
+	require.NotSame(t, original, blade.httpClient)
+	require.Equal(t, 30*time.Second, original.Timeout)
+	require.Equal(t, 3*time.Minute, blade.httpClient.Timeout)
+	require.Equal(t, 3*time.Minute, rack.root.httpClient.Timeout)
+	require.Same(t, original.Transport, blade.httpClient.Transport)
+	require.Same(t, original.Transport, rack.root.httpClient.Transport)
+}
+
+func TestRackSCMHardwareUnavailableRecovery(t *testing.T) {
+	for _, description := range []string{"Failed to query system IPMI interface.", "Failed to discover system control interface."} {
+		for _, state := range []string{"Off", "On", "--", "Failure"} {
+			t.Run(description+"/"+state, func(t *testing.T) {
+				var restores atomic.Int64
+
+				srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case rackManagerPath + "/SystemPower":
+						_, _ = fmt.Fprintf(w, `{"System Power States":{"7":%q}}`, state)
+					case rackManagerPath + "/Actions/Oem/Microsoft.SystemPowerOn":
+						restores.Add(1)
+						w.WriteHeader(http.StatusNoContent)
+					default:
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = w.Write([]byte(completionBody("Failure", description, true)))
+					}
+				})
+				c := dialRack(t, srv, "7")
+				err := c.Reset(t.Context(), ResetOn)
+				require.Error(t, err)
+
+				if state == "Off" {
+					require.ErrorIs(t, err, ErrNotReady)
+					require.Equal(t, int64(1), restores.Load())
+				} else {
+					require.NotErrorIs(t, err, ErrNotReady)
+					require.Zero(t, restores.Load())
+					require.False(t, c.rscm.attempted)
+				}
+			})
+		}
 	}
 }
 
@@ -375,7 +436,7 @@ func TestRackSCMPowerFallback(t *testing.T) {
 		fallback    bool
 	}{
 		{"off", 503, "", `{"System Power States":{"7":"Off"}}`, PowerOff, true},
-		{"onIsNotHostOn", 503, "", `{"System Power States":{"7":"On"}}`, "", true},
+		{"onRequiresBlade", 503, "", `{"System Power States":{"7":"On"}}`, "", true},
 		{"missing", 503, "", `{"System Power States":{"8":"Off"}}`, "", true},
 		{"unknown", 503, "", `{"System Power States":{"7":"--"}}`, "", true},
 		{"failureState", 503, "", `{"System Power States":{"7":"Failure"}}`, "", true},
@@ -383,6 +444,8 @@ func TestRackSCMPowerFallback(t *testing.T) {
 		{"malformedRack", 503, "", `{`, "", true},
 		{"rackFailure", 503, "", completionBody("Failure", "", true), "", true},
 		{"bladeFailure", 200, completionBody("Failure", "BMC unavailable", false), `{"System Power States":{"7":"Off"}}`, PowerOff, true},
+		{"bladeQueryFailure", 500, completionBody("Failure", "Failed to query system IPMI interface.", true), `{"System Power States":{"7":"Off"}}`, PowerOff, true},
+		{"bladeDiscoveryFailure", 500, completionBody("Failure", "Failed to discover system control interface.", true), `{"System Power States":{"7":"Off"}}`, PowerOff, true},
 		{"bladeAuth", 401, "", "", "", false},
 		{"bladePermission", 403, "", "", "", false},
 		{"bladeMalformed", 200, `{`, "", "", false},
@@ -468,7 +531,7 @@ func TestRackSCMRecoveryBounded(t *testing.T) {
 	c := dialRack(t, srv, "7")
 	now := time.Unix(100, 0)
 	c.rscm.now = func() time.Time { return now }
-	boot := func() error { return c.SetBootOverride(t.Context(), BootTargetPxe, BootContinuous) }
+	boot := func() error { return c.DisableBootOverride(t.Context()) }
 	require.ErrorIs(t, boot(), ErrNotReady)
 	require.Equal(t, int64(1), acCalls.Load())
 
@@ -556,7 +619,7 @@ func TestRackSCMRecoveryTwoOutagesOnCachedClient(t *testing.T) {
 
 	now := time.Unix(100, 0)
 	c.rscm.now = func() time.Time { return now }
-	boot := func() error { return c.SetBootOverride(t.Context(), BootTargetPxe, BootOnce) }
+	boot := func() error { return c.DisableBootOverride(t.Context()) }
 	require.ErrorIs(t, boot(), ErrNotReady)
 
 	deadline := c.rscm.deadline
@@ -579,7 +642,7 @@ func TestRackSCMRecoveryTwoOutagesOnCachedClient(t *testing.T) {
 	again, err := pool.Get(t.Context(), srv.URL+"/7", tlsServerFingerprint(srv), "admin", "secret", "")
 	require.NoError(t, err)
 	require.Same(t, c, again)
-	require.ErrorIs(t, again.SetBootOverride(t.Context(), BootTargetPxe, BootOnce), ErrNotReady)
+	require.ErrorIs(t, again.DisableBootOverride(t.Context()), ErrNotReady)
 	require.Equal(t, int64(2), acCalls.Load())
 	require.False(t, c.rscm.pendingCompleted)
 	require.Equal(t, now.Add(rackRecoveryGrace), c.rscm.deadline)
@@ -645,7 +708,7 @@ func TestRackSCMRecoveryOperationsAndConcurrency(t *testing.T) {
 
 			for err := range errs {
 				switch op {
-				case "off":
+				case "off", "boot":
 					require.Error(t, err)
 					require.NotErrorIs(t, err, ErrNotReady)
 				case "read":
@@ -656,7 +719,7 @@ func TestRackSCMRecoveryOperationsAndConcurrency(t *testing.T) {
 			}
 
 			want := int64(1)
-			if op == "read" || op == "off" {
+			if op == "read" || op == "off" || op == "boot" {
 				want = 0
 			}
 
@@ -682,6 +745,8 @@ func TestRackSCMRecoveryDoesNotHideErrors(t *testing.T) {
 		{"permissionCompletion", 200, completionBody("Failure", "Permission denied", true)},
 		{"authCompletion", 200, completionBody("Failure", "Authentication failed", false)},
 		{"invalidCompletion", 200, completionBody("Failure", "Invalid parameter", true)},
+		{"queryDenied", 500, completionBody("Failure", "Failed to query: permission denied", true)},
+		{"discoveryInvalid", 500, completionBody("Failure", "Failed to discover: invalid parameter", true)},
 		{"unknownFailure", 200, completionBody("Failure", "Unexpected hardware error", true)},
 		{"genericError", 200, `{"error":{"message":"no permission"}}`},
 		{"malformedCompletion", 200, `{"@Message.ExtendedInfo":[{"Oem":{"Microsoft":{"CompletionCode":4}}}]}`},
@@ -763,6 +828,8 @@ func TestRackSCMPoolSlotsAndPinning(t *testing.T) {
 		again, err := p.Get(t.Context(), srv.URL+"/"+slot, tlsServerFingerprint(srv), "admin", "secret", "different")
 		require.NoError(t, err)
 		require.Same(t, c, again)
+		require.Equal(t, 3*time.Minute, c.session.httpClient.Timeout)
+		require.Equal(t, 3*time.Minute, c.rscm.root.httpClient.Timeout)
 		clients = append(clients, c)
 		_, err = c.PowerState(t.Context())
 		require.NoError(t, err)
@@ -951,7 +1018,7 @@ func TestRackSCMPartialAvailabilityKeepsFixedGrace(t *testing.T) {
 			c.rscm.now = func() time.Time { return now }
 			operation := func() error {
 				if initial == "boot" {
-					return c.SetBootOverride(t.Context(), BootTargetPxe, BootOnce)
+					return c.DisableBootOverride(t.Context())
 				}
 
 				return c.Reset(t.Context(), ResetOn)

@@ -23,9 +23,10 @@ import (
 var ErrNotReady = errors.New("BMC is not ready after AC power on")
 
 const (
-	rackManagerPath   = "/redfish/v1/Managers/RackManager"
-	rackSystemPath    = "/redfish/v1/System"
-	rackRecoveryGrace = 10 * time.Minute
+	rackManagerPath    = "/redfish/v1/Managers/RackManager"
+	rackSystemPath     = "/redfish/v1/System"
+	rackRecoveryGrace  = 10 * time.Minute
+	rackRequestTimeout = 3 * time.Minute
 )
 
 type rackSCM struct {
@@ -95,6 +96,13 @@ func detectRackSCM(ctx context.Context, blade *bmcSession) (*rackSCM, error) {
 	if err != nil || n < 1 || n > 48 || strconv.Itoa(n) != slot || u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("RSCM URL path must be a slot from /1 to /48, got %q", u.EscapedPath())
 	}
+
+	// Synchronous TFTP transfers and remote-drive mounts can exceed 30 seconds.
+	// Copy the client to keep the pinned transport without changing detection's timeout.
+	httpClient := *blade.httpClient
+	httpClient.Timeout = rackRequestTimeout
+	blade.httpClient = &httpClient
+	root.httpClient = &httpClient
 
 	return &rackSCM{root: root, slot: slot, now: time.Now}, nil
 }
@@ -194,7 +202,8 @@ func (c *Client) rackPowerState(ctx context.Context) (PowerState, error) {
 		return PowerOff, nil
 	}
 
-	// Rack On only confirms power at the slot, not host power or BMC readiness.
+	// Firmware reports host power in the rack map, but On does not prove BMC
+	// readiness. Require a blade response before reporting PowerOn.
 	return "", r.readiness(bladeErr)
 }
 
@@ -232,8 +241,10 @@ func (c *Client) rackBootConfig(ctx context.Context) (BootConfig, error) {
 }
 
 func (c *Client) rackSetBoot(ctx context.Context, target string) error {
+	// SystemPowerOn also powers on the host. Never use it during boot setup;
+	// only disabling the override may recover power here.
 	return c.rackMutate(ctx, http.MethodPatch, rackSystemPath,
-		map[string]any{"Boot": map[string]string{"BootSourceOverrideTarget": target}}, true)
+		map[string]any{"Boot": map[string]string{"BootSourceOverrideTarget": target}}, target == "None")
 }
 
 func (c *Client) rackMutate(ctx context.Context, method, path string, body any, restore bool) error {
@@ -268,8 +279,12 @@ func (c *Client) rackMutateLocked(ctx context.Context, method, path string, body
 		return nil
 	}
 
-	if !restore || !rackUnavailable(bladeErr) {
+	if !rackUnavailable(bladeErr) {
 		return bladeErr
+	}
+
+	if !restore {
+		return r.readiness(bladeErr)
 	}
 
 	state, err := r.power(ctx)
@@ -348,7 +363,7 @@ func rackUnavailable(err error) bool {
 			return true
 		}
 
-		for _, unavailable := range []string{"not ready", "unavailable", "not available", "not reachable", "unreachable", "timed out", "timeout", "failed to communicate", "power off", "powered off"} {
+		for _, unavailable := range []string{"not ready", "unavailable", "not available", "not reachable", "unreachable", "timed out", "timeout", "failed to communicate", "failed to query", "failed to discover", "power off", "powered off"} {
 			if strings.Contains(description, unavailable) {
 				return true
 			}

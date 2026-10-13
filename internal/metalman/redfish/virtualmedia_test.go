@@ -95,7 +95,7 @@ func TestVirtualMediaValidation(t *testing.T) {
 	c := dialRack(t, srv, "7")
 
 	var invalid []bootmedia.Source
-	for _, name := range []string{"", "other.iso", "ub-.iso", "ub-XYZ.iso", "ub-aa.ISO", "../ub-aa.iso", "/ub-aa.iso", "ub-aa.iso/other", "ub-aa.iso?x", "ub-aa.iso\n", "ub-" + strings.Repeat("a", 65) + ".iso"} {
+	for _, name := range []string{"", "other.iso", "ub-.iso", "ub-XYZ.iso", "ub-aa.ISO", "../ub-aa.iso", "/ub-aa.iso", "ub-aa.iso/other", "ub-aa.iso?x", "ub-aa.iso\n", "ub-" + strings.Repeat("a", 33) + ".iso"} {
 		invalid = append(invalid, bootmedia.Source{Name: name, Server: testMedia.Server})
 	}
 
@@ -108,6 +108,12 @@ func TestVirtualMediaValidation(t *testing.T) {
 		require.Error(t, c.MountVirtualMedia(t.Context(), source), "%+v", source)
 		require.Error(t, c.CleanupVirtualMedia(t.Context(), source), "%+v", source)
 		require.Error(t, c.DeleteVirtualMedia(t.Context(), source), "%+v", source)
+	}
+
+	for _, length := range []int{1, 32} {
+		require.NoError(t, validateVirtualMedia(bootmedia.Source{
+			Name: "ub-" + strings.Repeat("a", length) + ".iso", Server: testMedia.Server,
+		}))
 	}
 }
 
@@ -176,7 +182,7 @@ func TestVirtualMediaErrors(t *testing.T) {
 }
 
 func TestVirtualMediaRecovery(t *testing.T) {
-	for _, operation := range []string{"mount", "mode", "target"} {
+	for _, operation := range []string{"mount", "mode", "target", "pxe", "hdd"} {
 		t.Run(operation, func(t *testing.T) {
 			var (
 				ready    bool
@@ -189,6 +195,13 @@ func TestVirtualMediaRecovery(t *testing.T) {
 					_, _ = w.Write([]byte(`{"System Power States":{"7":"Off"}}`))
 				case rackManagerPath + "/Actions/Oem/Microsoft.SystemPowerOn":
 					restores++
+
+					w.WriteHeader(http.StatusNoContent)
+				case "/7" + rackSystemPath + "/Actions/ComputerSystem.Reset":
+					if !ready {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
 
 					w.WriteHeader(http.StatusNoContent)
 				default:
@@ -204,25 +217,52 @@ func TestVirtualMediaRecovery(t *testing.T) {
 			c := dialRack(t, srv, "7")
 			now := time.Now()
 			c.rscm.now = func() time.Time { return now }
+
 			invoke := func() error {
 				if operation == "mount" {
 					return c.MountVirtualMedia(t.Context(), testMedia)
 				}
 
+				if operation == "pxe" {
+					return c.SetBootOverride(t.Context(), BootTargetPxe, BootOnce)
+				}
+
+				if operation == "hdd" {
+					return c.SetBootOverride(t.Context(), BootTargetHdd, BootContinuous)
+				}
+
 				return c.SetVirtualMediaBoot(t.Context())
 			}
+			for range 2 {
+				err := invoke()
+				require.ErrorContains(t, err, "blade powered off")
+				require.NotErrorIs(t, err, ErrNotReady)
+			}
+
+			require.Zero(t, restores)
+			require.False(t, c.rscm.attempted)
+			require.True(t, c.rscm.deadline.IsZero())
+			require.Empty(t, c.rscm.pending)
+			require.ErrorIs(t, c.Reset(t.Context(), ResetOn), ErrNotReady)
+			deadline := c.rscm.deadline
+
 			require.ErrorIs(t, invoke(), ErrNotReady)
 			require.ErrorIs(t, invoke(), ErrNotReady)
 			require.Equal(t, 1, restores)
+			require.Equal(t, deadline, c.rscm.deadline)
 
 			now = now.Add(rackRecoveryGrace + time.Second)
 
-			require.Error(t, invoke())
+			err := invoke()
+			require.Error(t, err)
+			require.NotErrorIs(t, err, ErrNotReady)
 			require.Equal(t, 1, restores)
 
 			ready = true
 
 			require.NoError(t, invoke())
+			require.True(t, c.rscm.attempted)
+			require.NoError(t, c.Reset(t.Context(), ResetOn))
 			require.False(t, c.rscm.attempted)
 		})
 	}
@@ -252,13 +292,14 @@ func TestVirtualMediaCleanupUnavailable(t *testing.T) {
 				c := dialRack(t, srv, "7")
 
 				err := c.CleanupVirtualMedia(t.Context(), testMedia)
-				if power == "Off" {
-					require.NoError(t, err)
-				} else {
-					require.Error(t, err)
+				require.Error(t, err)
+
+				want := []string{"/7" + rackSystemPath}
+				if failUnmount {
+					want = append(want, "/7"+remoteDrivePath+"Unmount")
 				}
 
-				require.Equal(t, rackManagerPath+"/SystemPower", paths[len(paths)-1])
+				require.Equal(t, want, paths)
 				require.NotContains(t, paths, rackTftpPath+"Delete")
 			})
 		}
@@ -309,6 +350,10 @@ func TestVirtualMediaCleanupAndDeleteRetries(t *testing.T) {
 			wantError bool
 		}{
 			{"success", http.StatusNoContent, "", false},
+			{"completionSuccess", http.StatusOK, completionBody("Success", "", true), false},
+			{"alreadyDeleted", http.StatusInternalServerError, completionBody("Failure", "No such file or directory", true), operation != "delete"},
+			{"alreadyDeletedMixedCase", http.StatusInternalServerError, completionBody("Failure", "Error: NO SUCH FILE OR DIRECTORY: ub-aa.iso", true), operation != "delete"},
+			{"absenceWithoutCompletion", http.StatusInternalServerError, "No such file or directory", true},
 			{"missingAction", http.StatusNotFound, "", true},
 			{"denied", http.StatusForbidden, "", true},
 			{"fileAbsent", http.StatusOK, completionBody("Failure", "file not found", true), true},
@@ -379,9 +424,6 @@ func TestVirtualMediaCleanupAndDeleteRetries(t *testing.T) {
 					}
 
 					want = append(want, want...)
-					if operation == "cleanup" && retry.name == "missingAction" {
-						want = append(want, "GET "+rackManagerPath+"/SystemPower")
-					}
 
 					require.Equal(t, want, paths)
 				})
@@ -413,7 +455,7 @@ func TestVirtualMediaRecoveryFailure(t *testing.T) {
 
 	srv := rackServer(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/7" + remoteDrivePath + "Mount":
+		case "/7" + remoteDrivePath + "Mount", "/7" + rackSystemPath + "/Actions/ComputerSystem.Reset":
 			w.WriteHeader(http.StatusServiceUnavailable)
 		case rackManagerPath + "/SystemPower":
 			_, _ = w.Write([]byte(`{"System Power States":{"7":"Off"}}`))
@@ -427,6 +469,8 @@ func TestVirtualMediaRecoveryFailure(t *testing.T) {
 	})
 
 	c := dialRack(t, srv, "7")
+	require.ErrorContains(t, c.Reset(t.Context(), ResetOn), "restoring AC power")
+
 	for range 2 {
 		err := c.MountVirtualMedia(t.Context(), testMedia)
 		require.ErrorContains(t, err, "restoring AC power")
