@@ -241,15 +241,19 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
                 return Err(Error::Overloaded);
             }
         }
-        let peer = state.peers.entry(indexed).or_insert(Peer {
-            active: 0,
-            limit: self.config.per_key,
-            generation: Some(0),
-            retry: None,
-            probe: false,
-            updated: now,
-            idle_since: None,
-        });
+        let peer = if let Some(peer) = state.peers.get_mut(key) {
+            peer
+        } else {
+            state.peers.entry(indexed).or_insert(Peer {
+                active: 0,
+                limit: self.config.per_key,
+                generation: Some(0),
+                retry: None,
+                probe: false,
+                updated: now,
+                idle_since: None,
+            })
+        };
         if peer.generation.is_none() || peer.probe || peer.retry.is_some_and(|at| !at.elapsed(now))
         {
             self.observer.event(Event::CircuitRejected);
@@ -2392,6 +2396,54 @@ mod tests {
                 assert_eq!(owner.state.lock().unwrap().active, 0);
             }
         }
+    }
+
+    /// Unused clones of existing keys drop outside the lock on every exit.
+    #[test]
+    fn adaptive_existing_key_drop_can_reenter_after_unlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static OWNER: OnceLock<std::sync::Weak<Adaptive<Key, Counts>>> = OnceLock::new();
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        static BLOCKED: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+        struct Key;
+
+        impl Drop for Key {
+            fn drop(&mut self) {
+                let Some(owner) = OWNER.get().and_then(std::sync::Weak::upgrade) else {
+                    return;
+                };
+                DROPS.fetch_add(1, Ordering::SeqCst);
+                if owner.state.try_lock().is_err() {
+                    BLOCKED.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    assert!(owner.available(self));
+                }
+            }
+        }
+
+        let owner = Adaptive::new(
+            Config {
+                total: 3,
+                per_key: 2,
+                ..config()
+            },
+            Counts::default(),
+            Instant::now,
+        )
+        .unwrap();
+        assert!(OWNER.set(Arc::downgrade(&owner)).is_ok());
+        let key = Key;
+        let first = owner.acquire(&key).unwrap();
+        let second = owner.acquire(&key).unwrap();
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+        assert!(matches!(owner.acquire(&key), Err(Error::Overloaded)));
+        assert_eq!(DROPS.load(Ordering::SeqCst), 3);
+        drop((first, second));
+        assert_eq!(owner.state.lock().unwrap().active, 0);
+        assert_eq!(BLOCKED.load(Ordering::SeqCst), 0);
     }
 
     /// Retired keys can reenter after publication; rejected attempts keep accounting.
