@@ -34,6 +34,11 @@ impl Rename {
 pub trait Endpoint {
     type Error;
     fn ownership_error() -> Self::Error;
+    /// Report malformed or identical names. Defaults to the legacy ownership error
+    /// for adapters without a separate invalid-input category.
+    fn invalid_name_error() -> Self::Error {
+        Self::ownership_error()
+    }
     fn owns(&self, basename: &str) -> bool;
     fn absent(&self, basename: &str) -> bool;
     /// Compare retained directory identities.
@@ -79,7 +84,7 @@ pub trait Endpoint {
             || component(temporary.as_bytes()).is_err()
             || component(canonical.as_bytes()).is_err()
         {
-            return Err(Self::ownership_error());
+            return Err(Self::invalid_name_error());
         }
         Ok(())
     }
@@ -96,6 +101,10 @@ impl Endpoint for BoundSocket {
 
     fn ownership_error() -> Self::Error {
         super::rejected()
+    }
+
+    fn invalid_name_error() -> Self::Error {
+        error(Error::InvalidName)
     }
 
     fn owns(&self, basename: &str) -> bool {
@@ -204,7 +213,7 @@ impl<E: Endpoint> Replacement<E> {
             || component(temporary.as_bytes()).is_err()
             || component(canonical.as_bytes()).is_err()
         {
-            return Err(E::ownership_error());
+            return Err(E::invalid_name_error());
         }
         next.validate_names(&temporary, &canonical)?;
         if !next.owns_checked(&temporary)? {

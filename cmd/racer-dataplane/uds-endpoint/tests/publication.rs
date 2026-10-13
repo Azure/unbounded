@@ -10,6 +10,167 @@ use uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
 use uds_endpoint::{BoundSocket, EndpointOwner, Layout, file_path, open_directory};
 
 const CANONICAL: &str = "endpoint.sock";
+
+fn assert_error(error: &io::Error, kind: io::ErrorKind, reason: uds_endpoint::Error) {
+    assert_eq!(error.kind(), kind);
+    assert_eq!(error.get_ref().unwrap().downcast_ref(), Some(&reason));
+}
+
+fn invalid_name_pairs() -> Vec<(String, String)> {
+    let mut pairs = vec![("pending-next".into(), "pending-next".into())];
+    for invalid in [
+        "".into(),
+        ".".into(),
+        "..".into(),
+        "/absolute".into(),
+        "../escape".into(),
+        "child/socket".into(),
+        "socket/".into(),
+        "a\0b".into(),
+        "x".repeat(256),
+        "é".repeat(128),
+    ] {
+        pairs.push((invalid.clone(), CANONICAL.into()));
+        pairs.push(("pending-next".into(), invalid));
+    }
+    pairs
+}
+
+fn assert_invalid_prepare<E: Endpoint<Error = io::Error>>(next: &Rc<E>, previous: Option<Rc<E>>) {
+    for (temporary, canonical) in invalid_name_pairs() {
+        let error = Replacement::prepare(next.clone(), previous.clone(), temporary, canonical)
+            .err()
+            .expect("invalid names must fail");
+        assert_error(
+            &error,
+            io::ErrorKind::InvalidInput,
+            uds_endpoint::Error::InvalidName,
+        );
+    }
+}
+
+#[test]
+fn prepare_reports_invalid_names_before_host_ownership_checks() {
+    let fixture = Fixture::new();
+    let old = fixture.initial();
+    let next = fixture.bind("pending-next");
+    for previous in [None, Some(old.clone())] {
+        assert_invalid_prepare(&next, previous);
+    }
+    assert!(old.owns(CANONICAL));
+    assert!(next.owns("pending-next"));
+    assert_eq!(next.basename(), "pending-next");
+    fs::remove_file(fixture.path("pending-next")).unwrap();
+    assert_invalid_prepare(&next, None);
+    let error = Replacement::prepare(next, Some(old), "pending-next".into(), CANONICAL.into())
+        .err()
+        .unwrap();
+    assert_error(
+        &error,
+        io::ErrorKind::Other,
+        uds_endpoint::Error::OwnershipChanged,
+    );
+}
+
+#[cfg(feature = "simulation")]
+#[test]
+fn simulation_default_validation_distinguishes_names_from_ownership() {
+    use uds_endpoint::simulation::BoundSocket as SimSocket;
+    use uring_runtime::reactor::simulation::Simulation;
+
+    let sim = Simulation::new();
+    let directory = PathBuf::from("/sockets");
+    let next = Rc::new(SimSocket::bind(sim.clone(), directory.clone(), "pending-next").unwrap());
+    let old = Rc::new(SimSocket::bind(sim.clone(), directory.clone(), CANONICAL).unwrap());
+    for (temporary, canonical) in invalid_name_pairs() {
+        assert_error(
+            &next.validate_names(&temporary, &canonical).unwrap_err(),
+            io::ErrorKind::InvalidInput,
+            uds_endpoint::Error::InvalidName,
+        );
+    }
+    next.validate_names("pending-next", CANONICAL).unwrap();
+    for previous in [None, Some(old.clone())] {
+        assert_invalid_prepare(&next, previous);
+    }
+    assert!(next.owns("pending-next"));
+    assert!(old.owns(CANONICAL));
+    let error = Replacement::prepare(next.clone(), None, "pending-next".into(), CANONICAL.into())
+        .err()
+        .unwrap();
+    assert_error(
+        &error,
+        io::ErrorKind::Other,
+        uds_endpoint::Error::OwnershipChanged,
+    );
+    sim.unlink(&directory.join("pending-next")).unwrap();
+    assert_invalid_prepare(&next, None);
+    let error = Replacement::prepare(next, Some(old), "pending-next".into(), CANONICAL.into())
+        .err()
+        .unwrap();
+    assert_error(
+        &error,
+        io::ErrorKind::Other,
+        uds_endpoint::Error::OwnershipChanged,
+    );
+}
+
+#[test]
+fn prepare_keeps_central_validation_when_adapter_accepts_any_names() {
+    struct Permissive;
+    impl Endpoint for Permissive {
+        type Error = io::Error;
+        fn ownership_error() -> io::Error {
+            BoundSocket::ownership_error()
+        }
+        fn invalid_name_error() -> io::Error {
+            BoundSocket::invalid_name_error()
+        }
+        fn validate_names(&self, _: &str, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn owns(&self, _: &str) -> bool {
+            panic!("invalid names must not reach ownership probes")
+        }
+        fn absent(&self, _: &str) -> bool {
+            panic!("invalid names must not reach absence probes")
+        }
+        fn same_directory(&self, _: &Self) -> io::Result<bool> {
+            panic!("invalid names must not reach directory probes")
+        }
+        fn rename(&self, _: &str, _: &str, _: Rename) -> io::Result<()> {
+            panic!("prepare must not rename")
+        }
+        fn set_basename(&self, _: String) {
+            panic!("prepare must not change cleanup names")
+        }
+    }
+    let next = Rc::new(Permissive);
+    assert_invalid_prepare(&next, None);
+    assert_invalid_prepare(&next, Some(Rc::new(Permissive)));
+}
+
+#[test]
+fn legacy_adapter_keeps_default_invalid_name_error() {
+    let fixture = Fixture::new();
+    let next = Rc::new(Observed {
+        socket: fixture.bind("pending-next"),
+        id: 0,
+        calls: Rc::new(Calls::default()),
+    });
+    for (temporary, canonical) in invalid_name_pairs() {
+        let error = next.validate_names(&temporary, &canonical).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "not owned");
+        let error = Replacement::prepare(next.clone(), None, temporary, canonical)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "not owned");
+    }
+    assert!(next.calls.log.borrow().is_empty());
+}
+
 fn layout() -> Layout {
     Layout::new("endpoint.lock", CANONICAL, "owned-", |name| {
         name.starts_with("pending-")

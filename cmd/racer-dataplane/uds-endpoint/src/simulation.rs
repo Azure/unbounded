@@ -102,6 +102,10 @@ impl Endpoint for BoundSocket {
         super::rejected()
     }
 
+    fn invalid_name_error() -> io::Error {
+        crate::error(crate::Error::InvalidName)
+    }
+
     /// Only the originally bound socket inode is owned, never a replacement entry.
     fn owns(&self, basename: &str) -> bool {
         self.owns_checked(basename).unwrap_or(false)
