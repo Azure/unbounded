@@ -78,6 +78,7 @@ var (
 	siteNodeSliceGVK   = schema.GroupVersionKind{Group: "net.unbounded-cloud.io", Version: "v1alpha1", Kind: "SiteNodeSlice"}
 	legacySiteCRD      = "sites.net.unbounded-cloud.io"
 	machinaSiteCRD     = "sites.unbounded-cloud.io"
+	capacityClaimCRD   = "capacityclaims.unbounded-cloud.io"
 	machineCRDName     = "machines.unbounded-cloud.io"
 	siteNodeSliceCRD   = "sitenodeslices.net.unbounded-cloud.io"
 	gatewayPoolCRDName = "gatewaypools.net.unbounded-cloud.io"
@@ -954,6 +955,7 @@ func applyCRDs(t *testing.T, kubeconfig, repoRoot string) {
 
 	files := []string{
 		filepath.Join(repoRoot, "deploy", "machina", "crd", "unbounded-cloud.io_sites.yaml"),
+		filepath.Join(repoRoot, "deploy", "machina", "crd", "unbounded-cloud.io_capacityclaims.yaml"),
 		filepath.Join(repoRoot, "deploy", "machina", "crd", "unbounded-cloud.io_machines.yaml"),
 		filepath.Join(repoRoot, "deploy", "net", "crd", "net.unbounded-cloud.io_sitenodeslices.yaml"),
 		filepath.Join(repoRoot, "deploy", "net", "crd", "net.unbounded-cloud.io_gatewaypools.yaml"),
@@ -967,7 +969,7 @@ func applyCRDs(t *testing.T, kubeconfig, repoRoot string) {
 	}
 
 	if err := run(context.Background(), "kubectl", "--kubeconfig", kubeconfig, "wait", "--for=condition=established", "--timeout=60s",
-		"crd/"+machinaSiteCRD, "crd/"+machineCRDName, "crd/"+siteNodeSliceCRD, "crd/"+gatewayPoolCRDName, "crd/"+legacySiteCRD); err != nil {
+		"crd/"+machinaSiteCRD, "crd/"+capacityClaimCRD, "crd/"+machineCRDName, "crd/"+siteNodeSliceCRD, "crd/"+gatewayPoolCRDName, "crd/"+legacySiteCRD); err != nil {
 		t.Fatalf("kubectl wait for CRDs: %v", err)
 	}
 }

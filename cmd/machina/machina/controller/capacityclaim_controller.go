@@ -98,7 +98,7 @@ func (r *CapacityClaimReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
 	if claim.Status.Machine == nil {
@@ -112,7 +112,7 @@ func (r *CapacityClaimReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return ctrl.Result{}, err
 			}
 
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 		}
 
 		machine, allocateErr := r.allocate(ctx, &claim)
@@ -139,7 +139,7 @@ func (r *CapacityClaimReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 	}
 
 	return r.reconcileBound(ctx, &claim, configImage)
@@ -625,7 +625,7 @@ func (r *CapacityClaimReconciler) reconcileRelease(
 				return ctrl.Result{}, err
 			}
 
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 		}
 
 		return ctrl.Result{}, r.removeFinalizer(ctx, claim.Name)
@@ -753,7 +753,7 @@ func (r *CapacityClaimReconciler) reconcileRelease(
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 }
 
 func (r *CapacityClaimReconciler) matchingMachines(
