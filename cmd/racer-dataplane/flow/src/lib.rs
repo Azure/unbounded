@@ -36,11 +36,15 @@
 //!   must not reenter that state or panic. Key identity must remain stable while
 //!   indexed. [`Class::index`] and static [`Policy`] predicates must be pure and
 //!   non-panicking too.
-//! - Transaction hooks, including [`HandoffAdmission`],
-//!   [`Offer::deliver`]'s constructor, and closures and entry hooks inside
-//!   [`coalesce::flight::update`], must not reenter their owner or panic. A hook
-//!   must not synchronously wake code that would do so. Flight callers return
-//!   retired values and collect wakes for dispatch after the transaction.
+//! - Transaction hooks must not reenter their owner or synchronously wake code
+//!   that would do so. [`HandoffAdmission`] and [`Offer::deliver`]'s constructor
+//!   must not panic. Flight update closures, [`coalesce::flight::Entry`] hooks,
+//!   and [`coalesce::flight::Table::stop`] callbacks may unwind: when run through
+//!   [`coalesce::flight::update`] or [`coalesce::flight::update_at`], values already
+//!   staged in [`coalesce::flight::Txn`] drop after the owner borrow releases,
+//!   before queued wakes. Callers must stage removed values and collect wakes;
+//!   this does not roll back state changes or finish unvisited hooks. Direct Txn
+//!   users must release the owner borrow before dropping the transaction.
 //! - Explicitly staged callbacks may reenter after internal locks and borrows
 //!   are released: quota policy sampling/reporting and key clones/retired key
 //!   drops, circuit backoff, and the key/value/waker callbacks documented by
@@ -50,7 +54,8 @@
 //! - [`AdaptiveObserver`] defines its own snapshot, reentry, and panic behavior.
 //!   Follow that trait's contract rather than assuming observations are serialized
 //!   with admission or that a panic rolls back a committed transition.
-//! - Wakes and destructors must not panic. A clone or policy sample staged before
+//! - Cleanup callbacks, including wakes and destructors, must not panic, even
+//!   during supported transaction unwind. A clone or policy sample staged before
 //!   admission may unwind without leaking that admission; this does not roll back
 //!   work the callback itself performed. There is no general panic-recovery or
 //!   notification-delivery guarantee after a callback violates these rules.
