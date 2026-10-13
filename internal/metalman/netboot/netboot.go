@@ -311,6 +311,9 @@ type templateData struct {
 	InstallScript    string
 	InstallEnv       []string
 	InstallRequested bool
+	VirtualMedia     bool
+	ArtifactRoot     string
+	MediaCallbackURL string
 }
 
 func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) templateData {

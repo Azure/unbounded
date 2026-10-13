@@ -1,4 +1,8 @@
 {{ if not .InstallRequested }}
+{{ if .VirtualMedia }}
+# Never chainload this ISO again when install authorization has ended.
+halt
+{{ else }}
 # No pending repave. Chainload the locally installed bootloader.
 insmod part_gpt
 insmod fat
@@ -22,18 +26,24 @@ if search --no-floppy --set=root --file /EFI/ubuntu/shimaa64.efi; then
   boot
 fi
 {{ end }}
+{{ end }}
 
+{{ if or .InstallRequested (not .VirtualMedia) }}
 set default=0
 set timeout=0
 
 menuentry "Unbounded Metal Install" {
-  linux /vmlinuz \
+  linux {{ .ArtifactRoot }}/vmlinuz \
     unbounded.image_url={{ .ServeURL }}/disk.img.gz \
     unbounded.serve_url={{ .ServeURL }} \
     unbounded.ds_url={{ .ServeURL }}/cloud-init/ \
     unbounded.node_name={{ .Machine.Name }} \
     unbounded.node_namespace={{ .Machine.Namespace }} \
     unbounded.apiserver_url={{ .ApiserverURL }} \
+    {{- if .VirtualMedia }}
+    unbounded.virtual_media=1 \
+    unbounded.media_callback={{ .MediaCallbackURL }} \
+    {{- end }}
     {{- if .BootLease }}
     unbounded.boot_mac={{ .BootLease.MAC }} \
     {{- if (ipAddresses .BootLease.DNS) }}
@@ -46,5 +56,6 @@ menuentry "Unbounded Metal Install" {
     {{- end }}
     console=tty0 console=ttyS0,115200n8 \
     ---
-  initrd /initrd /init.cpio
+  initrd {{ .ArtifactRoot }}/initrd {{ .ArtifactRoot }}/init.cpio
 }
+{{ end }}

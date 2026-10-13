@@ -45,8 +45,8 @@ RUN mkdir -p /artifacts && \
 COPY images/netboot/assets/init /tmp/initrd-root/init
 RUN chmod 755 /tmp/initrd-root/init && \
     mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
-    cp /usr/bin/efibootmgr /tmp/initrd-root/usr/bin/ && \
-    for lib in $(ldd /usr/bin/efibootmgr | awk '/=>/{print $3}'); do \
+    cp /usr/bin/efibootmgr /usr/bin/curl /tmp/initrd-root/usr/bin/ && \
+    for lib in $(ldd /usr/bin/efibootmgr /usr/bin/curl | awk '/=>/{print $3}'); do \
         mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
         cp "$lib" "/tmp/initrd-root${lib}"; \
     done && \
@@ -78,10 +78,10 @@ RUN mkdir -p /disk/grub /disk/cloud-init && \
 	if [ "${TARGETARCH}" = "amd64" ]; then \
 		cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/ && \
 		cp /artifacts/shimx64.efi /disk/bootx64.efi && \
-		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: bootx64.efi" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: bootx64.efi" "mediaFormat: unbounded-uefi-v1" "mediaShim: shimx64.efi" "mediaGrub: grubx64.efi" > /disk/metadata.yaml; \
 	elif [ "${TARGETARCH}" = "arm64" ]; then \
 		cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/ && \
-		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" "mediaFormat: unbounded-uefi-v1" "mediaShim: shimaa64.efi" "mediaGrub: grubaa64.efi" > /disk/metadata.yaml; \
 	fi
 
 COPY images/netboot/assets/grub.cfg.tmpl /disk/grub/grub.cfg.tmpl

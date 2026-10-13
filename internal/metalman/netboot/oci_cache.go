@@ -18,6 +18,10 @@ import (
 type ImageMetadata struct {
 	DHCPBootImageName string `yaml:"dhcpBootImageName"`
 	HTTPBootPath      string `yaml:"httpBootPath"`
+	// MediaFormat gates the scoped installer callback and bootstrap layout.
+	MediaFormat string `yaml:"mediaFormat"`
+	MediaShim   string `yaml:"mediaShim"`
+	MediaGRUB   string `yaml:"mediaGrub"`
 }
 
 // OCICache manages unpacked OCI images on the local filesystem.

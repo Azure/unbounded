@@ -38,6 +38,7 @@ type HTTPServer struct {
 	Mux      *http.ServeMux
 	FileResolver
 	StatusRecorder StatusRecorder
+	Media          *MediaProvider
 }
 
 type StatusRecorder interface {
@@ -62,6 +63,10 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	})
 	mux.HandleFunc("POST /cloudinit/log", h.handleCloudInitLog)
 	mux.HandleFunc("POST /unbounded-agent/install-log", h.handleInstallLog)
+
+	if h.Media != nil {
+		mux.Handle("/bootmedia/", h.Media)
+	}
 
 	if h.Client != nil {
 		mux.HandleFunc("POST /pxe/disable", h.handleDisablePXE)
@@ -96,6 +101,12 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 // file directly with a 200.
 func normalizePath(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Capabilities must not gain aliases through path normalization.
+		if strings.Contains(r.URL.Path, "bootmedia") && (r.URL.RawPath != "" || cleanRequestPath(r.URL.Path) != r.URL.Path) {
+			http.NotFound(w, r)
+			return
+		}
+
 		if cleaned := cleanRequestPath(r.URL.Path); cleaned != r.URL.Path {
 			r.URL.Path = cleaned
 			r.URL.RawPath = ""
@@ -131,6 +142,45 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 	ip := clientIP(r)
 	log := slog.With("proto", "http", "path", path, "ip", ip)
+	// The running installer keeps its original lease even if the Machine is
+	// edited. Resolve its artifacts from the operation snapshot, never live input.
+	if h.Media != nil {
+		switch path {
+		case "disk.img.gz", "vmlinuz", "initrd", "init.cpio", "grub.cfg", "grub/grub.cfg":
+			remote, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+
+			o, claimed, err := h.Media.artifactOwner(r.Context(), remote)
+			if claimed {
+				if err != nil || strings.HasSuffix(path, "grub.cfg") {
+					http.NotFound(w, r)
+					return
+				}
+
+				ref := o.status().Netboot.NetbootImage
+				if path == "disk.img.gz" {
+					ref = o.status().Netboot.Image
+				}
+
+				resolved, err := h.Media.Resolver.ResolveFileByPathForIP(r.Context(), path, o.machine, ref, remote)
+				if err != nil {
+					http.Error(w, "media artifact unavailable", http.StatusServiceUnavailable)
+					return
+				}
+
+				if resolved.DiskPath != "" {
+					http.ServeFile(w, r, resolved.DiskPath)
+				} else {
+					w.Write(resolved.Data) //nolint:errcheck // Best-effort response.
+				}
+
+				return
+			}
+		}
+	}
 
 	node, err := h.LookupNodeByIP(r.Context(), ip)
 	if err != nil {
@@ -145,6 +195,20 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 
 		return
+	}
+
+	if node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" && strings.HasSuffix(path, "grub.cfg") {
+		// Virtual media install intent is available only through its capability.
+		http.NotFound(w, r)
+		return
+	}
+
+	if node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" {
+		switch path {
+		case "disk.img.gz", "vmlinuz", "initrd", "init.cpio":
+			http.NotFound(w, r)
+			return
+		}
 	}
 
 	imageRef := node.Spec.Netboot().Image
@@ -383,6 +447,11 @@ func (h *HTTPServer) handleDisablePXE(w http.ResponseWriter, r *http.Request) {
 		log.Warn("no node for source IP", "err", err)
 		http.NotFound(w, r)
 
+		return
+	}
+
+	if node.Spec.Netboot() != nil && node.Spec.Netboot().TargetBootProtocol() == "VirtualMedia" {
+		http.NotFound(w, r)
 		return
 	}
 

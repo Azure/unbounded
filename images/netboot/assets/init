@@ -129,6 +129,14 @@ NODE_NAME=$(get_param unbounded.node_name || true)
 NODE_NAMESPACE=$(get_param unbounded.node_namespace || true)
 APISERVER_URL=$(get_param unbounded.apiserver_url || true)
 DNS_SERVERS=$(get_param unbounded.dns || true)
+VIRTUAL_MEDIA=$(get_param unbounded.virtual_media || true)
+MEDIA_CALLBACK=$(get_param unbounded.media_callback || true)
+if [ "$VIRTUAL_MEDIA" = 1 ]; then
+    case "$MEDIA_CALLBACK" in
+        http://*/bootmedia/*) ;;
+        *) fatal "invalid virtual media callback URL" ;;
+    esac
+fi
 BOOT_MAC=$(normalize_mac "$BOOT_MAC")
 if [ -z "$BOOT_MAC" ] && [ -n "$BOOTIF" ]; then
     BOOT_MAC=$(bootif_to_mac "$BOOTIF")
@@ -416,7 +424,28 @@ if [ -d /sys/firmware/efi ]; then
     done
 fi
 
-if [ -n "$SERVE_URL" ]; then
+if [ "$VIRTUAL_MEDIA" = 1 ]; then
+    # Stay in RAM until the controller has detached the ISO and cleared its
+    # boot override. Requests are bounded, but waiting has no deadline: late
+    # cleanup must let this installer reboot without writing the disk again.
+    # If ownership is removed, an operator must resolve the blocked handoff.
+    media_ack() {
+        local status
+        status=$(curl --connect-timeout 5 --max-time 15 --retry 0 \
+            --silent --output /dev/null --write-out '%{http_code}' \
+            --request "$1" "$MEDIA_CALLBACK/$2") || return 1
+        [ "$status" = 200 ]
+    }
+    log "reporting virtual media installation complete"
+    until media_ack POST complete; do
+        log "waiting to persist image-written status; reboot remains blocked"
+        sleep 5
+    done
+    until media_ack GET ready; do
+        log "waiting for virtual media cleanup acknowledgment; reboot remains blocked"
+        sleep 5
+    done
+elif [ -n "$SERVE_URL" ]; then
     log "disabling PXE boot"
     retry 5 2 "disable PXE" wget -q -O /dev/null "$SERVE_URL/pxe/disable" \
         || log "WARNING: failed to disable PXE boot"
