@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.2-trixie AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY ../../ .
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} make unbounded-karpenter-provider-build
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /src/bin/unbounded-karpenter-provider /unbounded-karpenter-provider
+ENTRYPOINT ["/unbounded-karpenter-provider"]
+

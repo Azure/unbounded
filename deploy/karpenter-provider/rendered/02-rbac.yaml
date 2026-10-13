@@ -1,0 +1,100 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: unbounded-karpenter-provider
+  namespace: unbounded-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: unbounded-karpenter-provider
+  namespace: unbounded-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: unbounded-karpenter-provider
+  namespace: unbounded-system
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-karpenter-provider
+    namespace: unbounded-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: unbounded-karpenter-provider
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-karpenter-provider
+rules:
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodepools", "nodepools/status", "nodeclaims", "nodeclaims/status", "nodeclaims/finalizers", "nodeoverlays", "nodeoverlays/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["karpenter.unbounded-cloud.io"]
+    resources: ["unboundednodeclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["karpenter.unbounded-cloud.io"]
+    resources: ["unboundednodeclasses/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machines"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machines/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["unbounded-cloud.io"]
+    resources: ["machineconfigurations", "machineconfigurationversions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "persistentvolumes", "persistentvolumeclaims", "replicationcontrollers", "namespaces", "podtemplates", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["create", "patch", "delete", "update"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes", "volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unbounded-karpenter-provider
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-karpenter-provider
+    namespace: unbounded-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-karpenter-provider
+

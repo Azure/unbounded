@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: unbounded-karpenter-provider
+  namespace: {{ default "unbounded-system" .Namespace }}
+spec:
+  selector:
+    app: unbounded-karpenter-provider
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+

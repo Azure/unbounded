@@ -22,15 +22,13 @@ seamlessly alongside nodes from your existing infrastructure.
    Karpenter, which monitors the cluster for pods that cannot be placed on
    existing nodes.
 
-2. **CapacityClaim CRs are created** by an adapter for Karpenter NodeClaims.
-   A CapacityClaim represents unsatisfied capacity and carries hardware,
-   placement, image, and configuration requirements. Future Karpenter
-   NodeClaims map into CapacityClaims; they do not directly own Machines.
+2. **Karpenter creates a standard NodeClaim** from a NodePool. The NodeClaim
+   references an `UnboundedNodeClass`, which defines Machine selectors,
+   configuration, exact image policy, and supported instance capacity.
 
-3. **CapacityClaims bind existing Machine inventory** or are consumed by a
-   future provider adapter that first adds suitable Machine inventory. Each
-   claim binds exactly one Machine. The Machine remains the concrete host
-   identity and lifecycle record.
+3. **The Unbounded CloudProvider reserves existing Machine inventory.** Each
+   NodeClaim reserves exactly one Machine by UID under a per-domain Lease.
+   The Machine remains the concrete host identity and lifecycle record.
 
 4. A Machine controller provisions the selected host, and the unbounded agent
    contacts the cluster's
@@ -44,11 +42,17 @@ seamlessly alongside nodes from your existing infrastructure.
 6. The `Machine` transitions through its normal lifecycle phases --
    **Pending** &rarr; **Provisioning** &rarr; **Joining** &rarr; **Ready** --
    just like SSH or PXE provisioned nodes. Those phases are human-facing and
-   never authorize allocation. CapacityClaim readiness comes from typed Node,
-   image, GPU, and fabric observations.
+   never authorize allocation. NodeClaim hydration comes from typed Node,
+   provider ID, image, GPU, and fabric observations.
 
-CapacityClaims reserve eligible Machine inventory before worker bootstrap.
+NodeClaims reserve eligible Machine inventory before worker bootstrap.
 `Available` describes inventory eligibility, while `AllocationReady` describes
 the currently launched worker. NVIDIA requirements use an exact
-`imagePolicy.requiredImage` as their trust anchor; matching an image name that
-merely contains `nvidia` is not treated as capability evidence.
+`UnboundedNodeClass.spec.imagePolicy.requiredImage` as their trust anchor;
+matching an image name that merely contains `nvidia` is not capability
+evidence.
+
+The provider uses upstream Karpenter v1.15.0 controllers and requires the
+upstream NodePool and NodeClaim CRDs to be installed separately. The provider's
+southbound provision and release handlers currently fail closed until they are
+wired to production lifecycle implementations.

@@ -1,0 +1,57 @@
+apiVersion: karpenter.unbounded-cloud.io/v1alpha1
+kind: UnboundedNodeClass
+metadata:
+  name: hillsboro-gb200
+spec:
+  machineSelector:
+    matchLabels:
+      unbounded-cloud.io/gpu-vendor: NVIDIA
+      unbounded-cloud.io/gpu-model: GB200
+  site: hillsboro
+  domain: hillsboro-gb200
+  configurationRef:
+    name: hillsboro-gb200
+  imagePolicy:
+    requiredImage: ghcr.io/example/unbounded-worker-nvidia@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    requireNVIDIA: true
+  instanceTypes:
+    - name: hillsboro-gb200-4g
+      architecture: arm64
+      operatingSystem: linux
+      zone: hillsboro
+      capacityType: on-demand
+      capacity:
+        cpu: "80"
+        memory: 512Gi
+        pods: "110"
+        nvidia.com/gpu: "4"
+      gpu:
+        vendor: NVIDIA
+        model: GB200
+        count: 4
+        requireFabric: true
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: hillsboro-gb200
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.unbounded-cloud.io
+        kind: UnboundedNodeClass
+        name: hillsboro-gb200
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: [hillsboro-gb200-4g]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [arm64]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 5m

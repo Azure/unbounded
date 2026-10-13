@@ -81,6 +81,10 @@ ifeq ($(strip $(MACHINA_IMAGE)),)
 override MACHINA_IMAGE = $(CONTAINER_REGISTRY)/machina:$(VERSION_TAG)
 endif
 
+KARPENTER_PROVIDER_BIN=bin/unbounded-karpenter-provider
+KARPENTER_PROVIDER_CMD=./cmd/unbounded-karpenter-provider
+KARPENTER_PROVIDER_IMAGE ?= $(CONTAINER_REGISTRY)/unbounded-karpenter-provider:$(VERSION_TAG)
+
 TOKEN_REFRESHER_BIN=bin/token-refresher
 TOKEN_REFRESHER_CMD=./cmd/token-refresher
 TOKEN_REFRESHER_IMAGE ?= $(CONTAINER_REGISTRY)/token-refresher:$(VERSION_TAG)
@@ -230,9 +234,9 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests unbounded-karpenter-provider unbounded-karpenter-provider-build karpenter-provider-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
-.PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: image-machina-local image-karpenter-provider-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 
 ##@ General
@@ -771,6 +775,11 @@ machina-build: machina-manifests ## Build the machina binary (no lint/test)
 
 machina: test machina-build ## Build the machina controller (implies test)
 
+unbounded-karpenter-provider-build: karpenter-provider-manifests ## Build the Karpenter provider binary (no lint/test)
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(KARPENTER_PROVIDER_BIN) $(KARPENTER_PROVIDER_CMD)
+
+unbounded-karpenter-provider: test unbounded-karpenter-provider-build ## Build the Karpenter provider (implies test)
+
 .PHONY: token-refresher-build
 token-refresher-build: ## Build the token-refresher binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(TOKEN_REFRESHER_BIN) $(TOKEN_REFRESHER_CMD)/main.go
@@ -1001,6 +1010,12 @@ machina-oci: image-machina-local ## Alias for image-machina-local
 machina-oci-push: machina-oci ## Build and push the machina container image
 	$(CONTAINER_ENGINE) push $(MACHINA_IMAGE)
 
+image-karpenter-provider-local: ## Build the Karpenter provider container image locally
+	$(CONTAINER_ENGINE) build \
+		-t unbounded-karpenter-provider:$(VERSION_TAG) -t $(KARPENTER_PROVIDER_IMAGE) \
+		-f ./images/karpenter-provider/Containerfile .
+	$(call trivy-maybe,$(KARPENTER_PROVIDER_IMAGE))
+
 image-token-refresher-local: ## Build the token-refresher container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		--build-arg VERSION=$(VERSION) \
@@ -1028,6 +1043,9 @@ MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
+KARPENTER_PROVIDER_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
+KARPENTER_PROVIDER_MANIFEST_TEMPLATES_DIR := deploy/karpenter-provider
+KARPENTER_PROVIDER_MANIFEST_RENDERED_DIR := deploy/karpenter-provider/rendered
 MACHINE_OPS_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
@@ -1057,6 +1075,18 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
+
+karpenter-provider-manifests: ## Render Karpenter provider manifests
+	@mkdir -p $(KARPENTER_PROVIDER_MANIFEST_RENDERED_DIR)
+	@find $(KARPENTER_PROVIDER_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	@mkdir -p $(KARPENTER_PROVIDER_MANIFEST_RENDERED_DIR)/crd
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(KARPENTER_PROVIDER_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(KARPENTER_PROVIDER_MANIFEST_RENDERED_DIR) \
+		--set Namespace=$(KARPENTER_PROVIDER_NAMESPACE) \
+		--set Image=$(KARPENTER_PROVIDER_IMAGE)
+	@cp $(KARPENTER_PROVIDER_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(KARPENTER_PROVIDER_MANIFEST_RENDERED_DIR)/crd/
+	@echo "Rendered Karpenter provider manifests into $(KARPENTER_PROVIDER_MANIFEST_RENDERED_DIR) (image: $(KARPENTER_PROVIDER_IMAGE))"
 
 .PHONY: token-refresher-manifests
 token-refresher-manifests: ## Render token-refresher manifests into deploy/token-refresher/rendered

@@ -70,11 +70,12 @@ response to unschedulable pods. This enables seamless scaling across GPU and
 compute providers such as **Nebius**, **CoreWeave**, **OCI**, **Azure**, **AWS**,
 and others.
 
-When pods cannot be scheduled, the Karpenter controller creates `Machine` CRs
-for the target provider. Machine controllers then call the provider's API to
-create instances, injecting a **cloud-init user-data** script that installs the
-unbounded-kube agent on first boot. The agent contacts the API server and the
-node joins the cluster automatically.
+When pods cannot be scheduled, Karpenter creates a standard `NodeClaim` from a
+`NodePool`. The NodeClaim references an `UnboundedNodeClass`, and the Unbounded
+CloudProvider reserves one matching existing `Machine`. Machine controllers
+and provider-specific lifecycle handlers prepare the worker. The agent contacts
+the API server and the node joins with the exact stable provider ID returned on
+the NodeClaim.
 
 See the [Cloud API guide]({{< relref "guides/cloud-api" >}}) for the full flow.
 
@@ -120,6 +121,7 @@ The system is driven by Kubernetes custom resources:
 | CRD | API Group | Scope | Purpose |
 |-----|-----------|-------|---------|
 | **Machine** | `unbounded-cloud.io` | Cluster | Represents a remote host to be provisioned (SSH, cloud API, or PXE) |
+| **UnboundedNodeClass** | `karpenter.unbounded-cloud.io` | Cluster | Selects Machine inventory and declares Karpenter instance capacity and image policy |
 | **Site** | `unbounded-cloud.io` | Cluster | Groups nodes by internal IP range, allocates pod CIDRs, and declares enabled components |
 | **GatewayPool** | `net.unbounded-cloud.io` | Cluster | Defines a set of gateway nodes for inter-site routing |
 | **SitePeering** | `net.unbounded-cloud.io` | Cluster | Enables direct node-to-node tunnels between sites |
@@ -146,9 +148,9 @@ The flow varies by provisioning path, but all paths share the same final steps:
 **Cloud API path:**
 
 1. An unschedulable pod is detected by the Karpenter controller.
-2. A `Machine` CR is created for the target cloud provider.
-3. The Machine controller calls the provider API and launches an instance with
-   cloud-init user-data that installs the unbounded agent.
+2. Karpenter creates a `NodeClaim` referencing an `UnboundedNodeClass`.
+3. The Unbounded CloudProvider reserves one existing `Machine` and delegates
+   worker preparation through the Machine lifecycle.
 
 **PXE path:**
 
