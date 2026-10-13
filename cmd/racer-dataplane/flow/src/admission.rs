@@ -116,6 +116,8 @@ pub trait Observer {
 }
 
 /// Shared total and per-key admission with generation-fenced peer recovery.
+/// Poisoned state rejects new work; existing permits still release their counts.
+/// Key comparisons run under the lock and must be bounded and non-reentrant.
 pub struct Adaptive<K, O> {
     config: Config,
 
@@ -171,6 +173,7 @@ pub struct Permit<K: Ord + Clone, O: Observer> {
 
 impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
     /// Validate positive limits and publish the initial aggregate ceiling.
+    /// The clock runs outside the lock and must not panic, including during drop.
     pub fn new(config: Config, observer: O, now: fn() -> Instant) -> Result<Arc<Self>> {
         if config.total == 0
             || config.per_key == 0
@@ -411,6 +414,7 @@ mod circuit {
     };
 
     /// Local endpoint health with bounded records and completion-owned probes.
+    /// Key comparisons run under map borrows and must be bounded and non-reentrant.
     ///
     /// The authority belongs to one worker even when keys themselves are shared:
     ///
@@ -1259,7 +1263,8 @@ mod handoff {
     };
 
     /// Bounds queued, delivered, and outstanding offered items with reservations.
-    /// Callbacks execute under the handoff lock and must not reenter it.
+    /// Callbacks execute under the handoff lock and must be bounded and non-reentrant.
+    /// A panic poisons handoff admission; `close` can still drain queued ownership.
     pub trait Admission {
         /// Ownership that retains capacity until final admitted work completes.
         type Reservation;
@@ -1318,6 +1323,7 @@ mod handoff {
     }
 
     /// Shared handoff bounded by admission, not a separate queue-slot limit.
+    /// Key comparisons run under the lock and must be bounded and non-reentrant.
     pub struct Handoff<K, A: Admission, T>(Mutex<State<K, A, T>>);
 
     /// Capacity reserved on a selected target before constructing its payload.
@@ -1446,7 +1452,8 @@ mod handoff {
 
     impl<K, A: Admission, T> Offer<K, A, T> {
         /// Build only on an open target; the envelope retains admission itself.
-        /// The closure executes under the handoff lock and must not reenter it.
+        /// The closure executes under the handoff lock and must be bounded and
+        /// non-reentrant. A panic poisons admission; `close` can still drain it.
         pub fn deliver(self, item: impl FnOnce() -> T) -> Result<()> {
             let mut state = self.handoff.0.lock().map_err(|_| Error::Unavailable)?;
             let target = &mut state.targets[self.target].1;
@@ -1752,6 +1759,34 @@ mod handoff {
 
         struct Ready;
 
+        /// A factory panic closes admission but queued ownership can still drain.
+        #[test]
+        fn handoff_factory_poison_still_allows_close() {
+            let handoff = Arc::new(Handoff::<_, Ready, u8>::new(&[1]));
+            handoff.install(&1, Ready).unwrap();
+            handoff
+                .reserve(Waker::noop())
+                .unwrap()
+                .deliver(|| 7)
+                .unwrap();
+            let offer = handoff.reserve(Waker::noop()).unwrap();
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = offer.deliver(|| panic!("factory failed"));
+                }))
+                .is_err()
+            );
+            assert!(matches!(
+                handoff.reserve(Waker::noop()),
+                Err(Error::Unavailable)
+            ));
+            handoff.close(&1);
+            let state = handoff.0.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(state.targets[0].1.closed);
+            assert!(state.targets[0].1.queue.is_empty());
+            assert!(state.targets[0].1.admission.is_none());
+        }
+
         impl Admission for Ready {
             type Reservation = ();
 
@@ -1841,6 +1876,7 @@ mod hedge {
     }
 
     /// Process-shared slot and cost limits, independent of worker registries.
+    /// Poisoned state rejects new work but keeps existing alarms drainable.
     pub struct Hedges {
         slots: usize,
 
@@ -1895,15 +1931,12 @@ mod hedge {
             let wakes: Vec<_> = self
                 .state
                 .lock()
-                .map(|mut state| {
-                    state
-                        .alarms
-                        .values_mut()
-                        .filter(|a| now >= a.due)
-                        .filter_map(|a| a.wake.take())
-                        .collect()
-                })
-                .unwrap_or_default();
+                .unwrap_or_else(|e| e.into_inner())
+                .alarms
+                .values_mut()
+                .filter(|a| now >= a.due)
+                .filter_map(|a| a.wake.take())
+                .collect();
             for wake in wakes {
                 wake.wake();
             }
@@ -1915,7 +1948,7 @@ mod hedge {
         pub fn delay(&self, now: Instant, cx: &mut Context<'_>) -> Poll<()> {
             // Waker clone and drop callbacks may reenter the hedge registry.
             let wake = cx.waker().clone();
-            let mut state = self.owner.state.lock().expect("hedge alarm lock");
+            let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
             let alarm = state.alarms.get_mut(&self.id).expect("live hedge alarm");
             let (result, previous) = if now >= alarm.due {
                 (Poll::Ready(()), alarm.wake.take())
@@ -1931,11 +1964,14 @@ mod hedge {
     impl Drop for Permit {
         /// Remove the alarm and return its cost only at final ownership release.
         fn drop(&mut self) {
-            let alarm = self.owner.state.lock().ok().and_then(|mut state| {
-                let alarm = state.alarms.remove(&self.id)?;
-                state.used -= alarm.cost;
-                Some(alarm)
-            });
+            let alarm = {
+                let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let alarm = state.alarms.remove(&self.id);
+                if let Some(alarm) = &alarm {
+                    state.used -= alarm.cost;
+                }
+                alarm
+            };
             drop(alarm);
         }
     }
@@ -1960,6 +1996,45 @@ mod hedge {
             fn wake(self: Arc<Self>) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
+        }
+
+        /// Poison closes new admission without stranding live costs or alarms.
+        #[test]
+        fn hedge_poison_preserves_existing_alarm_and_release() {
+            let now = Instant::now();
+            let owner = Hedges::new(2, 10);
+            let permit = owner.acquire(7, now + Duration::from_secs(1)).unwrap();
+            let poisoned = owner.clone();
+            assert!(
+                std::thread::spawn(move || {
+                    let _state = poisoned.state.lock().unwrap();
+                    panic!("poison hedge state");
+                })
+                .join()
+                .is_err()
+            );
+            assert!(matches!(owner.acquire(1, now), Err(Error::Unavailable)));
+            let counter = Arc::new(Counter::default());
+            let waker = Waker::from(counter.clone());
+            assert!(
+                permit
+                    .delay(now, &mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            owner.poll(now + Duration::from_secs(1));
+            assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+            assert!(
+                permit
+                    .delay(
+                        now + Duration::from_secs(1),
+                        &mut Context::from_waker(&waker)
+                    )
+                    .is_ready()
+            );
+            std::thread::spawn(move || drop(permit)).join().unwrap();
+            let state = owner.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.used, 0);
+            assert!(state.alarms.is_empty());
         }
 
         struct DelayCallbacks {
@@ -2314,6 +2389,31 @@ mod tests {
             recovery: Duration::from_secs(1),
             retire_after: Duration::from_secs(60),
         }
+    }
+
+    /// Poison closes admission while existing owners still return their counts.
+    #[test]
+    fn adaptive_poison_rejects_new_work_but_releases_live_permit() {
+        let owner = Adaptive::new(config(), Counts::default(), Instant::now).unwrap();
+        let permit = owner.acquire(&1).unwrap();
+        let poisoned = owner.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _state = poisoned.state.lock().unwrap();
+                panic!("poison adaptive state");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(!owner.available(&1));
+        assert!(!owner.hedge_available(&1));
+        assert!(matches!(owner.acquire(&2), Err(Error::Unavailable)));
+        permit.observe(Outcome::Verified);
+        std::thread::spawn(move || drop(permit)).join().unwrap();
+        let state = owner.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(state.active, 0);
+        assert_eq!(state.peers[&1].active, 0);
+        assert_eq!(*owner.observer.active.lock().unwrap(), 0);
     }
 
     /// Every observer hook can inspect state and fail without stranding ownership.
