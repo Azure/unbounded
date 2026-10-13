@@ -880,6 +880,7 @@ pub mod flight {
         /// Retain the latest drain task's wake target and return the previous one.
         /// Clone before borrowing the owner; drop the returned waker after releasing
         /// that borrow. With `update`, return it from the transaction closure.
+        #[must_use = "retire the previous drain waker outside the owner borrow"]
         pub fn register_drain(&mut self, waker: Waker) -> Option<Waker> {
             self.drain_waker.replace(waker)
         }
