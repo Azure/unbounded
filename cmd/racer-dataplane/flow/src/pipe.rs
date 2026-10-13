@@ -517,7 +517,10 @@ fn validate_socket(socket: &impl AsFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     if flags & libc::O_NONBLOCK == 0 {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "splice requires a nonblocking socket",
+        ));
     }
     let mut kind: libc::c_int = 0;
     let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
@@ -532,10 +535,20 @@ fn validate_socket(socket: &impl AsFd) -> io::Result<()> {
         )
     } < 0
     {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOTSOCK) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "splice requires a stream socket",
+            ));
+        }
+        return Err(error);
     }
     if kind != libc::SOCK_STREAM {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "splice requires a stream socket",
+        ));
     }
     Ok(())
 }
@@ -1030,6 +1043,13 @@ mod tests {
         assert!(!splice_unsupported(&io::Error::other("custom")));
     }
 
+    /// Caller contract failures must not select an unsupported-splice fallback.
+    fn assert_invalid_socket(error: io::Error) {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.raw_os_error(), None);
+        assert!(!splice_unsupported(&error));
+    }
+
     /// Immediate acquisition skips subscription and failed waits roll back fully.
     #[test]
     fn lazy_subscription_and_failure_rollback() {
@@ -1316,16 +1336,8 @@ mod tests {
         let (socket, mut peer) = UnixStream::pair().unwrap();
         let socket = Descriptor::from(std::os::fd::OwnedFd::from(socket));
         pipe.try_write(b"out").unwrap();
-        assert_eq!(
-            pipe.try_splice_connection(&socket)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EINVAL)
-        );
-        assert_eq!(
-            pipe.try_splice_from(&socket, 1).unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
+        assert_invalid_socket(pipe.try_splice_connection(&socket).unwrap_err());
+        assert_invalid_socket(pipe.try_splice_from(&socket, 1).unwrap_err());
         assert_eq!(pipe.buffered(), 3);
         socket.set_nonblocking().unwrap();
         assert_eq!(pipe.try_splice_connection(&socket).unwrap(), 3);
@@ -1849,10 +1861,7 @@ mod tests {
         let mut pipe = pool.acquire().unwrap();
         pipe.try_write(b"abc").unwrap();
         let (socket, peer) = UnixStream::pair().unwrap();
-        assert_eq!(
-            pipe.try_splice_to(&socket, 3).unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
+        assert_invalid_socket(pipe.try_splice_to(&socket, 3).unwrap_err());
         assert_eq!(pipe.buffered(), 3);
         socket.set_nonblocking(true).unwrap();
         drop(peer);
@@ -1892,10 +1901,7 @@ mod tests {
         assert_eq!(pipe.buffered(), 7);
         let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         datagram.set_nonblocking(true).unwrap();
-        assert_eq!(
-            pipe.try_splice_to(&datagram, 7).unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
+        assert_invalid_socket(pipe.try_splice_to(&datagram, 7).unwrap_err());
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/null")
@@ -1905,10 +1911,7 @@ mod tests {
             unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
             0
         );
-        assert_eq!(
-            pipe.try_splice_to(&file, 7).unwrap_err().raw_os_error(),
-            Some(libc::ENOTSOCK)
-        );
+        assert_invalid_socket(pipe.try_splice_to(&file, 7).unwrap_err());
         let mut bytes = [0; 7];
         assert_eq!(pipe.try_read(&mut bytes).unwrap(), 7);
         assert_eq!(&bytes, b"pending");
