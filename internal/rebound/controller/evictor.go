@@ -1,0 +1,161 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package controller
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/clock"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/Azure/unbounded/internal/rebound/ledger"
+)
+
+// sweepInterval is how often the nodes of an active grant are checked for
+// pods from other namespaces. The pod placement policy reads the ledger
+// through a cache, so a pod can slip in just after a grant is created.
+const sweepInterval = 15 * time.Second
+
+// evictor deletes pods that a grant does not allow on its nodes:
+//
+//   - While a grant is active, pods from other namespaces.
+//   - After a grant is removed, pods from its namespace that were created
+//     while it was active.
+//
+// Pods are deleted with a zero grace period and PodDisruptionBudgets do not
+// apply: the grant's TTL is the grace period.
+type evictor struct {
+	client    client.Client
+	reader    client.Reader
+	apiReader client.Reader
+	namespace string
+	exempt    map[string]bool
+	clock     clock.Clock
+}
+
+func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var cm corev1.ConfigMap
+	if err := r.reader.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ledger.ConfigMapName}, &cm); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	l := ledger.Parse(cm.Data)
+	node := req.Name
+
+	var active *ledger.Grant
+
+	if key, ok := l.NodeGrant(node); ok {
+		if g, ok := l.Get(key); ok && !g.Expired(r.clock.Now()) {
+			active = g
+		}
+	}
+
+	var releases []*ledger.Release
+
+	for _, rel := range l.Releases() {
+		if slices.Contains(rel.Nodes, node) {
+			releases = append(releases, rel)
+		}
+	}
+
+	if active == nil && len(releases) == 0 {
+		return ctrl.Result{}, nil
+	}
+
+	var pods corev1.PodList
+	if err := r.apiReader.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node}); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	var errs []error
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !r.shouldEvict(pod, active, releases) {
+			continue
+		}
+
+		ctrl.LoggerFrom(ctx).Info("deleting pod not allowed by node grant", "node", node, "pod", client.ObjectKeyFromObject(pod))
+
+		err := r.client.Delete(ctx, pod, client.GracePeriodSeconds(0), client.Preconditions{UID: &pod.UID})
+		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			errs = append(errs, err)
+		}
+	}
+
+	if err := errors.Join(errs...); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if active != nil {
+		return ctrl.Result{RequeueAfter: sweepInterval}, nil
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *evictor) shouldEvict(pod *corev1.Pod, active *ledger.Grant, releases []*ledger.Release) bool {
+	if r.exempt[pod.Namespace] || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		return false
+	}
+
+	if _, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
+		return false
+	}
+
+	if g := pod.DeletionGracePeriodSeconds; pod.DeletionTimestamp != nil && g != nil && *g == 0 {
+		return false
+	}
+
+	if active != nil && pod.Namespace != active.Namespace {
+		return true
+	}
+
+	// creationTimestamp has one-second precision.
+	created := pod.CreationTimestamp.Time
+	for _, rel := range releases {
+		if pod.Namespace == rel.Namespace && !created.Before(rel.CreatedAt.Truncate(time.Second)) && created.Before(rel.ReleasedAt) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// mapLedger enqueues every node named by a grant or a release.
+func (r *evictor) mapLedger(_ context.Context, obj client.Object) []ctrl.Request {
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok || cm.Namespace != r.namespace || cm.Name != ledger.ConfigMapName {
+		return nil
+	}
+
+	l := ledger.Parse(cm.Data)
+	names := make(map[string]struct{})
+
+	for _, g := range l.Grants() {
+		for _, node := range g.Nodes {
+			names[node] = struct{}{}
+		}
+	}
+
+	for _, rel := range l.Releases() {
+		for _, node := range rel.Nodes {
+			names[node] = struct{}{}
+		}
+	}
+
+	requests := make([]ctrl.Request, 0, len(names))
+	for name := range names {
+		requests = append(requests, ctrl.Request{NamespacedName: types.NamespacedName{Name: name}})
+	}
+
+	return requests
+}

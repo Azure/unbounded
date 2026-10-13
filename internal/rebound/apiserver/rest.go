@@ -309,7 +309,7 @@ func (s *storage) Delete(ctx context.Context, name string, validate rest.Validat
 			return &mutationError{err}
 		}
 
-		l.Remove(g.Key())
+		l.Remove(g.Key(), s.clock.Now())
 
 		return nil
 	})
@@ -343,7 +343,7 @@ func (s *storage) DeleteCollection(ctx context.Context, validate rest.ValidateOb
 				return &mutationError{err}
 			}
 
-			l.Remove(g.Key())
+			l.Remove(g.Key(), s.clock.Now())
 
 			result.Items = append(result.Items, *obj)
 		}

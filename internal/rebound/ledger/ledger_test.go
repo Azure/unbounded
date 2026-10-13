@@ -93,8 +93,9 @@ func TestRemove(t *testing.T) {
 	g := testGrant("first", "node-a", "node-b")
 	require.NoError(t, l.Add(g))
 	require.NoError(t, l.Add(testGrant("second", "node-c")))
-	require.True(t, l.Remove(g.Key()))
-	require.False(t, l.Remove(g.Key()))
+	now := g.CreatedAt.Add(time.Minute)
+	require.True(t, l.Remove(g.Key(), now))
+	require.False(t, l.Remove(g.Key(), now))
 	_, ok := l.NodeGrant("node-a")
 	require.False(t, ok)
 	_, ok = l.NodeGrant("node-b")
@@ -102,6 +103,39 @@ func TestRemove(t *testing.T) {
 	_, ok = l.NodeGrant("node-c")
 	require.True(t, ok)
 	require.Len(t, l.Grants(), 1)
+	require.Equal(t, []*Release{{
+		UID: "first", Namespace: "tenant", Nodes: []string{"node-a", "node-b"},
+		CreatedAt: g.CreatedAt, ReleasedAt: now,
+	}}, l.Releases())
+}
+
+func TestReleaseRoundTrip(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a")
+	require.NoError(t, l.Add(g))
+	require.True(t, l.Remove(g.Key(), g.CreatedAt.Add(time.Minute)))
+
+	data := l.Encode()
+	require.Contains(t, data, "_release.first")
+	require.NotContains(t, data, "node-a")
+	require.Equal(t, data, Parse(data).Encode())
+
+	// Malformed release records are dropped.
+	data["_release.bad"] = "{"
+	data["_release.empty"] = `{"namespace":"tenant"}`
+	data["_release."] = `{"namespace":"tenant","nodes":["node-a"]}`
+	parsed := Parse(data)
+	require.Len(t, parsed.Releases(), 1)
+	require.Equal(t, types.UID("first"), parsed.Releases()[0].UID)
+}
+
+func TestRemoveWithoutUIDRecordsNoRelease(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a")
+	g.UID = ""
+	require.NoError(t, l.Add(g))
+	require.True(t, l.Remove(g.Key(), g.CreatedAt))
+	require.Empty(t, l.Releases())
 }
 
 func TestReap(t *testing.T) {
@@ -122,8 +156,21 @@ func TestReap(t *testing.T) {
 	require.Equal(t, []string{"boundary", "expired", "rejected"}, []string{removed[0].Name, removed[1].Name, removed[2].Name})
 	require.Equal(t, now.Add(time.Minute), next)
 	require.Len(t, l.Grants(), 2)
+	require.Len(t, l.Releases(), 3)
+
+	// Releases are kept for ReleaseRetention and drive the next reap.
+	removed, next = l.Reap(now.Add(time.Minute), nil)
+	require.Len(t, removed, 1)
+	require.Equal(t, now.Add(ReleaseRetention), next)
+	require.Len(t, l.Releases(), 4)
+
 	removed, next = l.Reap(now.Add(time.Hour), nil)
-	require.Len(t, removed, 2)
+	require.Len(t, removed, 1)
+	require.Equal(t, now.Add(time.Hour+ReleaseRetention), next)
+	require.Len(t, l.Releases(), 1)
+
+	removed, next = l.Reap(now.Add(time.Hour+ReleaseRetention), nil)
+	require.Empty(t, removed)
 	require.True(t, next.IsZero())
 	require.Empty(t, l.Encode())
 }

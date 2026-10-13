@@ -43,6 +43,7 @@ const (
 
 type config struct {
 	namespace      string
+	excluded       []string
 	metricsAddr    string
 	probeAddr      string
 	leaderElection bool
@@ -70,6 +71,7 @@ func main() {
 	flags.StringVar(&cfg.metricsAddr, "metrics-bind-address", ":8080", "Address for the metrics endpoint")
 	flags.StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	flags.BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election for the controllers and certificate rotation")
+	flags.StringSliceVar(&cfg.excluded, "excluded-namespaces", []string{"kube-system", unbounded.SystemNamespace()}, "Namespaces whose pods are never deleted from granted nodes")
 	cfg.server.AddFlags(flags)
 
 	cmd.CompletionOptions.DisableDefaultCmd = true
@@ -121,7 +123,7 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	store := &ledger.Store{Client: kube, Namespace: cfg.namespace}
-	if err := controller.Setup(mgr, controller.Options{Namespace: cfg.namespace, Store: store}); err != nil {
+	if err := controller.Setup(mgr, controller.Options{Namespace: cfg.namespace, Store: store, ExemptNamespaces: cfg.excluded}); err != nil {
 		return err
 	}
 

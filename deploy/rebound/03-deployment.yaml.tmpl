@@ -42,6 +42,7 @@ spec:
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
             - --leader-elect=true
+            - {{ printf "--excluded-namespaces=%s" (default "kube-system,unbounded-system" .ExcludedNamespaces) | quote }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

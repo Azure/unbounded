@@ -8,6 +8,7 @@
 //   - "<node>" maps a granted node to "<namespace>/<grant>". The pod placement
 //     ValidatingAdmissionPolicy reads these keys through its paramRef.
 //   - "_grant.<namespace>.<grant>" holds the JSON Grant record.
+//   - "_release.<uid>" holds the JSON Release record of a removed grant.
 //
 // Grant records are authoritative. Node keys are always derived from them
 // when the ledger is encoded, so a hand-edited or partially written node key
@@ -33,7 +34,12 @@ const (
 	// leave headroom for object metadata.
 	MaxSize = 900 * 1024
 
-	grantKeyPrefix = "_grant."
+	// ReleaseRetention is how long a Release record is kept after its grant
+	// is removed. The evictor must act on it within this time.
+	ReleaseRetention = 10 * time.Minute
+
+	grantKeyPrefix   = "_grant."
+	releaseKeyPrefix = "_release."
 )
 
 // Grant is a stored NodeGrant.
@@ -59,6 +65,16 @@ func (g *Grant) Expired(now time.Time) bool {
 	return !now.Before(g.ExpiresAt)
 }
 
+// Release records a removed grant. Pods in Namespace on Nodes that were
+// created while the grant was active are evicted.
+type Release struct {
+	UID        types.UID `json:"-"`
+	Namespace  string    `json:"namespace"`
+	Nodes      []string  `json:"nodes"`
+	CreatedAt  time.Time `json:"createdAt"`
+	ReleasedAt time.Time `json:"releasedAt"`
+}
+
 // ConflictError reports nodes that are already granted.
 type ConflictError struct {
 	Nodes []string
@@ -79,19 +95,21 @@ func (e *ExistsError) Error() string {
 
 // Ledger is the decoded content of the ledger ConfigMap.
 type Ledger struct {
-	grants map[types.NamespacedName]*Grant
-	nodes  map[string]types.NamespacedName
+	grants   map[types.NamespacedName]*Grant
+	nodes    map[string]types.NamespacedName
+	releases map[types.UID]*Release
 }
 
 // New returns an empty ledger.
 func New() *Ledger {
 	return &Ledger{
-		grants: map[types.NamespacedName]*Grant{},
-		nodes:  map[string]types.NamespacedName{},
+		grants:   map[types.NamespacedName]*Grant{},
+		nodes:    map[string]types.NamespacedName{},
+		releases: map[types.UID]*Release{},
 	}
 }
 
-// Parse decodes ConfigMap data. It never fails: malformed grant records and
+// Parse decodes ConfigMap data. It never fails: malformed records and
 // grants that claim a node already claimed by an earlier grant (in key order)
 // are dropped, and node keys are ignored. Comparing Encode() with the input
 // tells the caller whether a repair write is needed.
@@ -99,9 +117,15 @@ func Parse(data map[string]string) *Ledger {
 	l := New()
 
 	keys := make([]string, 0, len(data))
-	for k := range data {
+	for k, v := range data {
 		if strings.HasPrefix(k, grantKeyPrefix) {
 			keys = append(keys, k)
+		} else if uid, ok := strings.CutPrefix(k, releaseKeyPrefix); ok && uid != "" {
+			r := &Release{}
+			if err := json.Unmarshal([]byte(v), r); err == nil && r.Namespace != "" && len(r.Nodes) > 0 {
+				r.UID = types.UID(uid)
+				l.releases[r.UID] = r
+			}
 		}
 	}
 
@@ -129,7 +153,17 @@ func Parse(data map[string]string) *Ledger {
 
 // Encode returns the ConfigMap data for the ledger.
 func (l *Ledger) Encode() map[string]string {
-	data := make(map[string]string, len(l.grants)+len(l.nodes))
+	data := make(map[string]string, len(l.grants)+len(l.nodes)+len(l.releases))
+
+	for uid, r := range l.releases {
+		b, err := json.Marshal(r)
+		if err != nil {
+			// Release only holds marshalable fields.
+			panic(err)
+		}
+
+		data[releaseKeyPrefix+string(uid)] = string(b)
+	}
 
 	for key, g := range l.grants {
 		b, err := json.Marshal(g)
@@ -227,14 +261,31 @@ func (l *Ledger) Add(g *Grant) error {
 	return nil
 }
 
-// Remove deletes a grant. It reports whether the grant existed.
-func (l *Ledger) Remove(key types.NamespacedName) bool {
+// Releases returns all release records sorted by UID.
+func (l *Ledger) Releases() []*Release {
+	out := make([]*Release, 0, len(l.releases))
+	for _, r := range l.releases {
+		out = append(out, r)
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
+
+	return out
+}
+
+// Remove deletes a grant and records a Release for it at now. It reports
+// whether the grant existed.
+func (l *Ledger) Remove(key types.NamespacedName, now time.Time) bool {
 	g, ok := l.grants[key]
 	if !ok {
 		return false
 	}
 
 	delete(l.grants, key)
+
+	if g.UID != "" {
+		l.releases[g.UID] = &Release{UID: g.UID, Namespace: g.Namespace, Nodes: g.Nodes, CreatedAt: g.CreatedAt, ReleasedAt: now}
+	}
 
 	for _, n := range g.Nodes {
 		if l.nodes[n] == key {
@@ -246,12 +297,12 @@ func (l *Ledger) Remove(key types.NamespacedName) bool {
 }
 
 // Reap removes grants that are expired at now or for which keep returns
-// false. It returns the removed grants and the earliest expiry among the
-// grants that remain (zero if none remain).
+// false, and drops releases older than ReleaseRetention. It returns the
+// removed grants and the next time Reap has work to do (zero if never).
 func (l *Ledger) Reap(now time.Time, keep func(*Grant) bool) (removed []*Grant, next time.Time) {
 	for _, g := range l.Grants() {
 		if g.Expired(now) || (keep != nil && !keep(g)) {
-			l.Remove(g.Key())
+			l.Remove(g.Key(), now)
 			removed = append(removed, g)
 
 			continue
@@ -259,6 +310,15 @@ func (l *Ledger) Reap(now time.Time, keep func(*Grant) bool) (removed []*Grant, 
 
 		if next.IsZero() || g.ExpiresAt.Before(next) {
 			next = g.ExpiresAt
+		}
+	}
+
+	for uid, r := range l.releases {
+		drop := r.ReleasedAt.Add(ReleaseRetention)
+		if !now.Before(drop) {
+			delete(l.releases, uid)
+		} else if next.IsZero() || drop.Before(next) {
+			next = drop
 		}
 	}
 

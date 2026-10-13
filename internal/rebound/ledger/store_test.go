@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -103,7 +104,7 @@ func TestStoreNoWrite(t *testing.T) {
 	}{
 		{name: "dry run", dryRun: true, mutate: func(l *Ledger) error { return l.Add(testGrant("second", "node-b")) }},
 		{name: "no-op", mutate: func(*Ledger) error { return nil }},
-		{name: "mutate error", mutate: func(l *Ledger) error { l.Remove(testGrant("first").Key()); return sentinel }, wantErr: sentinel},
+		{name: "mutate error", mutate: func(l *Ledger) error { l.Remove(testGrant("first").Key(), time.Time{}); return sentinel }, wantErr: sentinel},
 		{name: "too large", mutate: func(l *Ledger) error {
 			g := testGrant("second", "node-b")
 			g.Holder = strings.Repeat("x", MaxSize)
@@ -149,4 +150,27 @@ func TestStoreMissingNoWrite(t *testing.T) {
 		require.Empty(t, rv)
 		require.Empty(t, writeActions(client))
 	}
+}
+
+func TestStoreShrinksOversizedLedger(t *testing.T) {
+	l := New()
+	big := testGrant("big", "node-a")
+	big.Holder = strings.Repeat("x", MaxSize)
+	require.NoError(t, l.Add(big))
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: "system", ResourceVersion: "7"},
+		Data:       l.Encode(),
+	}
+	client := fake.NewClientset(cm)
+	s := &Store{Client: client, Namespace: "system"}
+
+	// Growing an oversized ledger fails; shrinking it succeeds.
+	_, _, err := s.Update(t.Context(), false, func(l *Ledger) error { return l.Add(testGrant("second", "node-b")) })
+	require.ErrorIs(t, err, ErrTooLarge)
+	_, _, err = s.Update(t.Context(), false, func(l *Ledger) error {
+		l.Remove(big.Key(), big.CreatedAt)
+		return nil
+	})
+	require.NoError(t, err)
 }

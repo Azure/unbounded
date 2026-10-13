@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package controller reaps grants and mirrors them onto nodes.
+// Package controller reaps grants, mirrors them onto nodes, and deletes pods
+// that grants do not allow.
 package controller
 
 import (
@@ -39,12 +40,16 @@ type Options struct {
 	Store     *ledger.Store
 	// Clock defaults to the real clock.
 	Clock clock.Clock
+	// ExemptNamespaces are never evicted. Namespace is always exempt.
+	ExemptNamespaces []string
 }
 
-// Setup registers two leader-elected controllers. The manager must enable leader
-// election and cache all Nodes and Namespaces, plus ConfigMaps in opts.Namespace.
-// Scope ConfigMaps and Secrets to that namespace using per-object cache options,
-// not a global namespace restriction. These controllers do not read Secrets.
+// Setup registers three leader-elected controllers: the reaper, the node
+// mirror, and the evictor. The manager must enable leader election and cache
+// all Nodes and Namespaces, plus ConfigMaps in opts.Namespace. Scope ConfigMaps
+// and Secrets to that namespace using per-object cache options, not a global
+// namespace restriction. These controllers do not read Secrets. The evictor
+// lists pods live, so Pods need not be cached.
 func Setup(mgr ctrl.Manager, opts Options) error {
 	if opts.Namespace == "" {
 		opts.Namespace = "unbounded-system"
@@ -83,6 +88,27 @@ func Setup(mgr ctrl.Manager, opts Options) error {
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(mirror.mapLedger), filter).
 		Complete(mirror); err != nil {
 		return fmt.Errorf("set up rebound node mirror: %w", err)
+	}
+
+	exempt := map[string]bool{opts.Namespace: true}
+	for _, ns := range opts.ExemptNamespaces {
+		exempt[ns] = true
+	}
+
+	evictor := &evictor{
+		client:    mgr.GetClient(),
+		reader:    mgr.GetCache(),
+		apiReader: mgr.GetAPIReader(),
+		namespace: opts.Namespace,
+		exempt:    exempt,
+		clock:     opts.Clock,
+	}
+	if err := ctrl.NewControllerManagedBy(mgr).
+		Named("rebound-evictor").
+		WithOptions(leader).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(evictor.mapLedger), filter).
+		Complete(evictor); err != nil {
+		return fmt.Errorf("set up rebound evictor: %w", err)
 	}
 
 	return nil

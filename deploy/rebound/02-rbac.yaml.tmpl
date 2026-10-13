@@ -9,6 +9,10 @@ rules:
   - apiGroups: [""]
     resources: [namespaces]
     verbs: [get, list, watch]
+  # Deletes pods that a grant does not allow on its nodes.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, delete]
   # List/watch clients must use fieldSelector metadata.name for this rule.
   - apiGroups: [apiregistration.k8s.io]
     resources: [apiservices]

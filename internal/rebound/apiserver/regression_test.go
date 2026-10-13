@@ -138,7 +138,11 @@ func TestDeleteExpired(t *testing.T) {
 	got, ok := obj.(*rebound.NodeGrant)
 	require.True(t, ok)
 	require.Equal(t, g.UID, got.UID)
-	require.Empty(t, cached(t, s).Data)
+
+	l := ledger.Parse(cached(t, s).Data)
+	require.Empty(t, l.Grants())
+	require.Len(t, l.Releases(), 1)
+	require.Equal(t, g.UID, l.Releases()[0].UID)
 }
 
 func TestCreateChecksNodesOnRetry(t *testing.T) {

@@ -51,7 +51,8 @@ func (s *Store) Update(ctx context.Context, dryRun bool, mutate func(*Ledger) er
 		}
 
 		data := l.Encode()
-		if Size(data) > MaxSize {
+		// Allow writes that shrink an oversized ledger so deletes always work.
+		if Size(data) > MaxSize && Size(data) > Size(cm.Data) {
 			return ErrTooLarge
 		}
 

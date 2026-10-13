@@ -74,12 +74,12 @@ func TestRender(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name, namespace, image, ttl string
-		replicas                    int32
-		values                      map[string]string
+		name, namespace, image, ttl, excluded string
+		replicas                              int32
+		values                                map[string]string
 	}{
-		{"defaults", "unbounded-system", "ghcr.io/azure/rebound:latest", "1h", 2, nil},
-		{"overrides", "grants", "example.test/rebound:test", "30m", 3, map[string]string{
+		{"defaults", "unbounded-system", "ghcr.io/azure/rebound:latest", "1h", "kube-system,unbounded-system", 2, nil},
+		{"overrides", "grants", "example.test/rebound:test", "30m", "platform,grants", 3, map[string]string{
 			"Namespace": "grants", "Image": "example.test/rebound:test", "MaxTTL": "30m", "Replicas": "3",
 			"ExcludedNamespaces": "platform,grants", "AdminGroups": "operators,admins",
 		}},
@@ -110,6 +110,7 @@ func TestRender(t *testing.T) {
 			require.ElementsMatch(t, []string{
 				"--namespace=$(POD_NAMESPACE)", "--max-ttl=" + tc.ttl,
 				"--secure-port=8443", "--metrics-bind-address=:8080", "--health-probe-bind-address=:8081", "--leader-elect=true",
+				"--excluded-namespaces=" + tc.excluded,
 			}, container.Args)
 			require.Equal(t, "POD_NAMESPACE", container.Env[0].Name)
 			require.Equal(t, "metadata.namespace", container.Env[0].ValueFrom.FieldRef.FieldPath)
@@ -198,6 +199,7 @@ func assertRBAC(t *testing.T, objects map[string]*unstructured.Unstructured, nam
 	require.Equal(t, []rbacv1.PolicyRule{
 		{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get", "list", "watch", "patch", "update"}},
 		{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get", "list", "watch"}},
+		{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"list", "delete"}},
 		{APIGroups: []string{"apiregistration.k8s.io"}, Resources: []string{"apiservices"}, ResourceNames: []string{"v1alpha1.rebound.unbounded-cloud.io"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
 	}, clusterRole.Rules)
 
