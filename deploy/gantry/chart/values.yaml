@@ -28,6 +28,12 @@ nodeConfig:
   hostPath: /etc/containerd/certs.d
   reconcileIntervalSeconds: 5
 
+# Optional headless Service over the agents' Prometheus endpoint (:9095), for
+# scrapers that discover targets from Services or their annotations.
+metricsService:
+  enabled: false
+  annotations: {}
+
 registryCredentials:
   secretName: gantry-registry-credentials
 
