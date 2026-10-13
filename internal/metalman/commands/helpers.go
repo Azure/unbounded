@@ -29,7 +29,6 @@ const (
 	dim   = "\033[2m"
 	reset = "\033[0m"
 	green = "\033[32m"
-	cyan  = "\033[36m"
 )
 
 // StatusUpdater implements attestation.StatusUpdater using a controller-runtime client.
@@ -85,10 +84,6 @@ func LeaderElectionID(site string) string {
 	}
 
 	return "metalman-" + site
-}
-
-func PrintStep(msg string) {
-	fmt.Printf("  %s-->%s %s\n", cyan, reset, msg)
 }
 
 func PrintConfig(key, value string) {
