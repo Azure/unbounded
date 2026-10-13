@@ -341,7 +341,7 @@ pub mod shared {
     use futures::FutureExt;
     use futures::channel::oneshot;
     use futures::future::{LocalBoxFuture, Shared};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
@@ -350,7 +350,16 @@ pub mod shared {
 
     /// Ordered index retaining work until its completion owner explicitly finishes.
     pub struct Table<K, V: Clone> {
-        entries: RefCell<BTreeMap<K, Receiver<V>>>,
+        entries: RefCell<BTreeMap<K, Indexed<V>>>,
+
+        lost_completions: Cell<u64>,
+    }
+
+    /// Receiver and completion-owner liveness for one admission.
+    struct Indexed<V: Clone> {
+        receive: Receiver<V>,
+
+        live: Rc<Cell<bool>>,
     }
 
     impl<K, V: Clone> Default for Table<K, V> {
@@ -358,11 +367,17 @@ pub mod shared {
         fn default() -> Self {
             Self {
                 entries: RefCell::new(BTreeMap::new()),
+                lost_completions: Cell::new(0),
             }
         }
     }
 
     impl<K, V: Clone> Table<K, V> {
+        /// Count lost completion owners, saturating rather than wrapping.
+        pub fn lost_completion_count(&self) -> u64 {
+            self.lost_completions.get()
+        }
+
         /// Count operations, including those whose completion sender was lost.
         pub fn len(&self) -> usize {
             self.entries.borrow().len()
@@ -377,7 +392,27 @@ pub mod shared {
     impl<K: Ord, V: Clone> Table<K, V> {
         /// Join an existing result without taking ownership of its execution.
         pub fn get(&self, key: &K) -> Option<Receiver<V>> {
-            self.entries.borrow().get(key).cloned()
+            self.entries
+                .borrow()
+                .get(key)
+                .map(|entry| entry.receive.clone())
+        }
+
+        /// Recover a lost-owner entry only after independently confirming real work
+        /// has finished. Cancellation alone is not sufficient. Live owners cannot be
+        /// evicted. Old receivers keep their closed result; new starts get a new slot.
+        pub fn evict_lost(&self, key: &K) -> bool {
+            let removed = {
+                let mut entries = self.entries.borrow_mut();
+                if entries.get(key).is_some_and(|entry| !entry.live.get()) {
+                    entries.remove_entry(key)
+                } else {
+                    None
+                }
+            };
+            let evicted = removed.is_some();
+            drop(removed);
+            evicted
         }
     }
 
@@ -395,13 +430,20 @@ pub mod shared {
             let receive = async move { receive.await.unwrap_or(closed) }
                 .boxed_local()
                 .shared();
+            let live = Rc::new(Cell::new(true));
             let existing = {
                 let mut entries = self.entries.borrow_mut();
                 // Keep the unused key and receiver outside this borrow on a join.
                 if let Some(existing) = entries.get(&index_key) {
-                    Some(existing.clone())
+                    Some(existing.receive.clone())
                 } else {
-                    entries.insert(index_key, receive.clone());
+                    entries.insert(
+                        index_key,
+                        Indexed {
+                            receive: receive.clone(),
+                            live: live.clone(),
+                        },
+                    );
                     None
                 }
             };
@@ -413,29 +455,55 @@ pub mod shared {
                 Some(Completion {
                     table: self.clone(),
                     key,
-                    send,
+                    send: Some(send),
+                    live,
                 }),
             )
         }
     }
 
     /// Sole completion authority. Dropping it reports closure, not real completion,
-    /// so its table entry deliberately remains occupied.
+    /// so its table entry remains occupied until explicit lost-owner recovery.
     pub struct Completion<K, V: Clone> {
         table: Rc<Table<K, V>>,
 
         key: K,
 
-        send: oneshot::Sender<V>,
+        send: Option<oneshot::Sender<V>>,
+
+        live: Rc<Cell<bool>>,
     }
 
     impl<K: Ord, V: Clone> Completion<K, V> {
         /// Real completion closes admission before notifying any old readers.
-        pub fn finish(self, value: V) {
-            let removed = self.table.entries.borrow_mut().remove_entry(&self.key);
+        pub fn finish(mut self, value: V) {
+            let send = self.send.take().expect("completion sender");
+            let removed = {
+                let mut entries = self.table.entries.borrow_mut();
+                if entries
+                    .get(&self.key)
+                    .is_some_and(|entry| Rc::ptr_eq(&entry.live, &self.live))
+                {
+                    entries.remove_entry(&self.key)
+                } else {
+                    None
+                }
+            };
             // Key and final receiver destruction can reenter the table.
             drop(removed);
-            let _ = self.send.send(value);
+            let _ = send.send(value);
+        }
+    }
+
+    impl<K, V: Clone> Drop for Completion<K, V> {
+        /// Record loss before closing readers; neither action implies completion.
+        fn drop(&mut self) {
+            if self.send.is_some() {
+                self.live.set(false);
+                self.table
+                    .lost_completions
+                    .set(self.table.lost_completions.get().saturating_add(1));
+            }
         }
     }
 
@@ -602,6 +670,30 @@ pub mod shared {
             assert_eq!(block_on(receive), Err("closed"));
             assert_eq!(block_on(table.get(&1).unwrap()), Err("closed"));
             assert_eq!(table.len(), 1);
+        }
+
+        /// Only explicit recovery after real completion can reopen a lost key.
+        #[test]
+        fn lost_completion_recovery_preserves_old_readers_and_replacement() {
+            let table = Rc::new(Table::default());
+            assert!(!table.evict_lost(&1));
+            let (old, completion) = table.start(1, Err::<u32, _>("closed"));
+            assert!(!table.evict_lost(&1));
+            assert_eq!(table.lost_completion_count(), 0);
+            drop(completion);
+            assert_eq!(table.lost_completion_count(), 1);
+            let (joined, rejected) = table.start(1, Err("other"));
+            assert!(rejected.is_none());
+            assert_eq!(block_on(joined), Err("closed"));
+            assert!(table.evict_lost(&1));
+            assert!(!table.evict_lost(&1));
+            let (new, completion) = table.start(1, Err("new closed"));
+            assert_eq!(block_on(old), Err("closed"));
+            assert_eq!(table.len(), 1);
+            completion.unwrap().finish(Ok(7));
+            assert_eq!(block_on(new), Ok(7));
+            assert!(table.is_empty());
+            assert_eq!(table.lost_completion_count(), 1);
         }
     }
 }
