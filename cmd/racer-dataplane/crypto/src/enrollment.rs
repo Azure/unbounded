@@ -140,12 +140,18 @@ impl PersistedIdentity {
         Self::deserialize(&scratch.0).map_err(|_| Error::CorruptRecord)
     }
 
-    fn response(&self) -> Result<EnrollmentResponse, Error> {
-        Ok(wire::decode_enrollment_response(
+    /// Check the saved key and CSR without requiring a current certificate.
+    fn checked_response(&self) -> Result<EnrollmentResponse, Error> {
+        let response = wire::decode_enrollment_response(
             &STANDARD
                 .decode(&self.response)
                 .map_err(|_| Error::CorruptRecord)?,
-        )?)
+        )?;
+        let csr = STANDARD
+            .decode(&self.pending.csr)
+            .map_err(|_| Error::CorruptRecord)?;
+        check_pending_key(&self.pending, &csr)?;
+        Ok(response)
     }
 
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
@@ -264,13 +270,8 @@ impl<H: Host> Enrollment<H> {
         let persisted =
             PersistedIdentity::decode(bytes).map_err(|_| Error::UnreadableIdentityRecord)?;
         let response = persisted
-            .response()
+            .checked_response()
             .map_err(|_| Error::UnreadableIdentityRecord)?;
-        // Check local key integrity before trust or expiry can hide corruption.
-        let csr = STANDARD
-            .decode(&persisted.pending.csr)
-            .map_err(|_| Error::UnreadableIdentityRecord)?;
-        check_pending_key(&persisted.pending, &csr).map_err(|_| Error::UnreadableIdentityRecord)?;
         let identity =
             self.validate(&persisted.pending, &response)
                 .map_err(|error| match error {
@@ -383,7 +384,7 @@ where
                         {
                             Ok(bytes) => {
                                 let saved = PersistedIdentity::decode(&bytes)
-                                    .and_then(|saved| saved.response())
+                                    .and_then(|saved| saved.checked_response())
                                     .map_err(|_| Error::UnreadableIdentityRecord)?;
                                 saved.cluster.0 == pending.cluster
                                     && saved.enrollment.0 == pending.enrollment
@@ -1544,6 +1545,72 @@ mod tests {
         sim.inject("unlink", Fault::Errno(5)).unwrap();
         assert!(matches!(drive(files, accept),
             Err(error) if error == uring_runtime::Error::Os(5).into()));
+    }
+
+    #[test]
+    fn prepare_preserves_committed_records_with_corrupt_saved_key_or_csr() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let clock = uring_runtime::environment::SimulationClock::new(112);
+        let _time = clock.environment(0).enter();
+        let (files, e, scope) = fixture();
+        let (ca, key) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let first = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        fail_pending_cleanup(&sim, &files, &e, issue(&first, &ca, &key, |_| {}), &scope);
+        sim.disk().crash().unwrap();
+        let identity_path = Path::new("/private/identity.json");
+        let pending_path = Path::new("/private/pending.json");
+        let committed = sim.read_file(identity_path).unwrap();
+        let pending = sim.read_file(pending_path).unwrap();
+        for expired in [false, true] {
+            if expired {
+                clock.advance(Duration::from_secs(7200));
+            }
+            for case in [
+                "key-base64",
+                "key-der",
+                "key-mismatch",
+                "csr-base64",
+                "csr-der",
+                "csr-mismatch",
+                "csr-signature",
+            ] {
+                let mut saved = PersistedIdentity::decode(&committed).unwrap();
+                match case {
+                    "key-base64" => saved.pending.private_key.0.push('!'),
+                    "key-der" => {
+                        saved.pending.private_key.0 = Zeroizing::new(STANDARD.encode(b"not PKCS8"))
+                    }
+                    "key-mismatch" => saved.pending.private_key = e.generate().unwrap().private_key,
+                    "csr-base64" => saved.pending.csr.push('!'),
+                    "csr-der" => saved.pending.csr = STANDARD.encode(b"not a CSR"),
+                    "csr-mismatch" => saved.pending.csr = e.generate().unwrap().csr,
+                    "csr-signature" => {
+                        let mut csr = STANDARD.decode(&saved.pending.csr).unwrap();
+                        *csr.last_mut().unwrap() ^= 1;
+                        saved.pending.csr = STANDARD.encode(csr);
+                    }
+                    _ => unreachable!(),
+                }
+                let corrupt = saved.encode().unwrap();
+                sim.write_file(identity_path, &corrupt).unwrap();
+                assert!(
+                    drive(
+                        &files,
+                        e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)
+                    )
+                    .is_err_and(|error| error == Error::UnreadableIdentityRecord.into()),
+                    "{case}: expired={expired}"
+                );
+                assert_eq!(sim.read_file(identity_path).unwrap(), *corrupt);
+                assert_eq!(sim.read_file(pending_path).unwrap(), pending);
+            }
+        }
     }
 
     #[test]
