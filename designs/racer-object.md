@@ -18,8 +18,12 @@ One binary has two modes:
 app --HTTP--> sidecar --client socket--> Racer --origin socket--> origin --> S3
 ```
 
-Both modes use `pkg/racersdk`. Racer creates one pair of sockets per cache
-under `/run/racer/<cache>/`, one for clients and one for the origin.
+Both modes use `pkg/racersdk`. Racer serves the client socket under
+`/run/racer/<cache>/`. The origin process uses `racersdk.ServeOrigin` to
+create and serve `/run/racer/<cache>/origin/socket`; Racer connects to it.
+The SDK creates the origin socket with mode `0600`, owned by the origin's
+effective user. Racer must run as that user or have permission to bypass
+the socket's file permissions.
 
 Code:
 
@@ -59,7 +63,12 @@ On a miss Racer first asks for metadata, then for pages.
 
 **Metadata.** The origin sends S3 a HEAD request. It returns the size, the
 strong ETag, the content type, and an expiry time of now plus
-`--metadata-ttl` (default 30s). It refuses delete markers and objects with a
+`--metadata-ttl` (default 30s). At expiry Racer must stop serving that version
+from cache; the TTL is not just an admission hint. Zero expires metadata
+immediately. Supported content types are normalized for the SDK metadata
+format; missing or unsupported values become `application/octet-stream`.
+The raw HEAD and GET content types must still match.
+The origin refuses delete markers and objects with a
 `Content-Encoding` other than identity, because the SDK has no way to pass
 that header on.
 
@@ -88,14 +97,21 @@ as the wrapped cause, so `errors.Is` still works, but its text is not shown.
   `--region` overrides the configured region. A region must be available
   through `--region` or AWS configuration, such as `AWS_REGION` or
   `AWS_DEFAULT_REGION`. `--endpoint` and `--path-style` (default on) support
-  S3-compatible stores.
+  S3-compatible stores. The effective endpoint, including one from AWS
+  environment or shared configuration, must be an HTTP(S) origin without
+  credentials, a path prefix, query, or fragment. `--endpoint` takes precedence.
+- The origin uses the AWS SDK's HTTP transport so SDK transport settings,
+  including configured CA bundles, still apply. Its idle connection pool
+  has room for 64 page requests and four metadata requests.
 - Checksums are sent only when S3 requires them. Some S3-compatible stores
   reject the optional ones.
 - `--request-timeout` is capped at one minute, which is the SDK's own limit
   for an origin call.
 - Before it creates its socket, the origin walks the path to
   `/run/racer/<cache>/origin` one directory at a time without following
-  symlinks. It refuses any directory that is group- or world-writable.
+  symlinks. Missing directories are created with mode `0755`, subject to
+  umask; existing permissions are not changed. It refuses any directory
+  that is group- or world-writable.
   Ancestors must be owned by root or the process's effective UID; the final
   `origin` directory must be owned by the effective UID. This stops another
   local user from swapping the socket path.
@@ -116,8 +132,10 @@ reach it.
 
 - The path is split into bucket and key before it is decoded, and decoded
   once.
-- Query: only `versionId` and `x-id` (`GetObject` or `HeadObject`). Anything
-  else returns 501.
+- Query: only `versionId` and a method-matching `x-id` (`GetObject` or
+  `HeadObject`). Malformed encoding, empty values, and repeated parameters
+  return 400; for example, `?acl` and `?versionId=` return 400.
+  Well-formed unsupported options, such as `?partNumber=1`, return 501.
 - Headers: `If-Match`, `If-None-Match`, and a single byte `Range` are
   supported. A single `x-amz-checksum-mode: ENABLED` is accepted for GET and
   HEAD as a request for available checksums. The sidecar has no S3 checksum
@@ -134,10 +152,13 @@ reach it.
 2. Check `If-Match` (strong compare, 412) and `If-None-Match` (weak compare,
    304).
 3. Parse the range. Open and suffix ranges are supported and clamped to the
-   size. A range that starts past the end returns 416.
+   size. The `bytes` unit is case-insensitive. Unknown range units are
+   ignored, so the full object is selected. Malformed byte ranges and
+   multiple ranges return 400. A range that starts past the end returns 416.
 4. HEAD returns 200 with headers, even for a ranged HEAD. This matches S3.
 5. GET asks Racer for the range, pinned to the ETag from step 1. If the size
-   or content type changed, it returns 502.
+   or content type changed, it returns 502. An internal pin failure returns
+   503, not 412: only a failed client `If-Match` condition returns 412.
 6. The body is written with `WriteTo`.
 
 **Copying with splice.** For HTTP/1, `WriteTo` moves bytes from the Racer
@@ -146,14 +167,20 @@ user space. This only works if the TCP connection still exposes
 `io.ReaderFrom`. `netutil.LimitListener` wraps connections and hides it, so
 `listener.go` has its own connection limit (128) that keeps it.
 
-**Errors.** Errors use S3's XML shape with fixed text:
+**Errors.** Application errors use S3's XML shape with fixed text:
 `<Error><Code>...</Code><Message>...</Message></Error>`. SDK errors map to
-400, 403, 404, 412, 416, 503 (unavailable, canceled, timed out, or closed),
-and 502 for anything else. Once a non-empty body has started, a failure
+400, 403, 404, 416, 503 (internal pin failure, unavailable, canceled, timed
+out, or closed), and 502 for anything else. Once a non-empty body has started, a failure
 aborts the connection instead of adding an error to the end. The client then
 sees a short read, not a body with XML stuck on the end. The SDK holds back
 the last byte until Racer confirms the range is complete, so a broken read
 can never look like a finished one.
+
+Go's HTTP parser can reject a request before the application runs, including
+malformed HTTP and headers beyond its bounded parser limit. Those responses
+use Go's error format, not S3 XML, and may not follow the application's
+body-free HEAD error behavior. Raising the parser limit only moves this
+boundary; it does not make every parser error an application XML error.
 
 **Timeouts and limits.**
 
@@ -162,7 +189,9 @@ can never look like a finished one.
   a clean error.
 - Header read timeout is the smaller of 5s and the request timeout. Header
   size is capped at 32 KiB. Idle connections close after 30s.
-- Shutdown waits up to 5s for open requests.
+- Shutdown stops accepting connections and lets open requests drain for up
+  to 5s without canceling them first. After that, it cancels remaining
+  requests and closes their connections.
 
 ## Bucket allowlist
 
@@ -175,6 +204,9 @@ of the cache, not only this sidecar.
 
 `images/racer-object/Containerfile` builds one image with the binary at
 `/usr/local/bin/racer-object`. The pod picks the mode with its command.
+Publication is experimental: use the generic image workflow with a manual
+dispatch for `racer-object` or an `images/racer-object/<version>` tag. This
+does not add the image to the regular release or nightly publication sets.
 
 Tests use a fake S3 server (`origin_test.go`) and `httptest` with
 `racersdktest` (`sidecar_test.go`). `main_test.go` and `listener_test.go`

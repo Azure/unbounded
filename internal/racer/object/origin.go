@@ -158,7 +158,8 @@ type S3Client interface {
 type OriginConfig struct {
 	Namespace string
 	Buckets   []string
-	// MetadataTTL is an admission hint. Zero expires metadata immediately.
+	// MetadataTTL sets when Racer must stop serving this version from cache.
+	// Zero expires metadata immediately.
 	MetadataTTL time.Duration
 }
 
