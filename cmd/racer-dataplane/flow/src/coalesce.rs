@@ -1113,6 +1113,16 @@ pub mod flight {
             Partial(P),
         }
 
+        /// Values removed by shutdown. Return from `update`, then drop outside its borrow.
+        #[must_use = "drop the stopped phase and waiters outside the owner borrow"]
+        pub struct Stopped<C, O, W: WaiterPolicy> {
+            /// Previous outcome or complete result, no longer visible to callers.
+            pub phase: Phase<C, O, W::Error>,
+
+            /// Detached policies with shutdown errors and no parked wakers.
+            pub waiters: BTreeMap<u64, Waiter<W>>,
+        }
+
         /// Worker-local waiter index and transition state driven by an owning adapter.
         /// The adapter supplies actual operation idleness; cancellation is not idleness.
         pub struct State<C, P, O, W: WaiterPolicy> {
@@ -1206,8 +1216,13 @@ pub mod flight {
             /// Caller validates its leader capability and publication before this step.
             /// Notification timing remains explicit: publication wakes only on settlement,
             /// while rejection/revocation also notifies before retained operations finish.
-            pub fn begin_completion(&mut self, outcome: Outcome<O, W::Error>) {
-                self.phase = Phase::Draining(outcome);
+            /// Return the old phase from `update` and drop it outside the owner borrow.
+            #[must_use = "drop the retired phase outside the owner borrow"]
+            pub fn begin_completion(
+                &mut self,
+                outcome: Outcome<O, W::Error>,
+            ) -> Phase<C, O, W::Error> {
+                std::mem::replace(&mut self.phase, Phase::Draining(outcome))
             }
 
             /// Enqueue all parked caller notifications without invoking their wakers.
@@ -1257,15 +1272,18 @@ pub mod flight {
             }
 
             /// Expose an outcome only after the adapter confirms all operations completed.
+            /// The split hook runs inside the transaction and must not reborrow its owner.
+            /// Return the old partial from `update` and drop it outside the owner borrow.
+            #[must_use = "drop the retired partial outside the owner borrow"]
             pub fn settle(
                 &mut self,
                 idle: bool,
                 unavailable: W::Error,
                 split: fn(O) -> Published<C, P>,
                 wakes: &mut Vec<Waker>,
-            ) {
+            ) -> Option<P> {
                 if !idle || !matches!(self.phase, Phase::Draining(_)) {
-                    return;
+                    return None;
                 }
                 let Phase::Draining(outcome) =
                     std::mem::replace(&mut self.phase, Phase::RetryPending)
@@ -1273,14 +1291,15 @@ pub mod flight {
                     unreachable!()
                 };
                 self.leader = None;
+                let mut retired = None;
                 self.phase = match outcome {
                     Outcome::Published(value) => match split(value) {
                         Published::Complete(value) => {
-                            self.partial = None;
+                            retired = self.partial.take();
                             Phase::Complete(value)
                         }
                         Published::Partial(value) => {
-                            self.partial = Some(value);
+                            retired = self.partial.replace(value);
                             for waiter in self.waiters.values_mut() {
                                 if waiter.complete {
                                     waiter.issued = false;
@@ -1296,18 +1315,28 @@ pub mod flight {
                     Outcome::Retry => Phase::Failed(unavailable),
                 };
                 self.notify(wakes);
+                retired
             }
 
             /// Revoke acquisition immediately, retaining its outcome behind completion.
-            pub fn revoke(&mut self, error: W::Error, wakes: &mut Vec<Waker>) {
+            /// Return the old phase from `update` and drop it outside the owner borrow.
+            #[must_use = "drop the retired phase outside the owner borrow"]
+            pub fn revoke(
+                &mut self,
+                error: W::Error,
+                wakes: &mut Vec<Waker>,
+            ) -> Phase<C, O, W::Error> {
                 if let Some(waiter) = self.leader.and_then(|id| self.waiters.get_mut(&id)) {
                     waiter.error = Some(error);
                 }
-                self.phase = Phase::Draining(Outcome::Retry);
+                let retired = self.begin_completion(Outcome::Retry);
                 self.notify(wakes);
+                retired
             }
 
             /// Check the leader and up to 64 expired callers, then settle eligible outcomes.
+            /// Return the old partial from `update` and drop it outside the owner borrow.
+            #[must_use = "drop the retired partial outside the owner borrow"]
             pub fn refresh(
                 &mut self,
                 idle: bool,
@@ -1316,7 +1345,7 @@ pub mod flight {
                 now: impl Fn() -> Instant,
                 split: fn(O) -> Published<C, P>,
                 wakes: &mut Vec<Waker>,
-            ) {
+            ) -> Option<P> {
                 if let Some(id) = self.leader {
                     self.refresh_waiter(id, wakes);
                 }
@@ -1325,28 +1354,37 @@ pub mod flight {
                     let leader = self.leader.and_then(|id| self.waiters.get(&id));
                     if leader.is_none_or(|waiter| waiter.error.is_some()) {
                         let error = leader.and_then(|waiter| waiter.error).unwrap_or(canceled);
-                        self.revoke(error, wakes);
+                        // Acquiring holds no caller-owned value to retire.
+                        drop(self.revoke(error, wakes));
                     }
                 }
-                self.settle(idle, unavailable, split, wakes);
+                let retired = self.settle(idle, unavailable, split, wakes);
                 if matches!(self.phase, Phase::RetryPending)
                     && self.partial.is_none()
                     && !self.waiters.values().any(Waiter::eligible)
                 {
                     self.phase = Phase::Draining(Outcome::Failed(unavailable));
-                    self.settle(idle, unavailable, split, wakes);
+                    // This failed outcome cannot replace a partial value.
+                    let unused = self.settle(idle, unavailable, split, wakes);
+                    debug_assert!(unused.is_none());
                 }
+                retired
             }
 
             /// Detach and notify all callers while preserving the operation drain fence.
-            pub fn stop(&mut self, error: W::Error, wakes: &mut Vec<Waker>) {
+            /// Return removed values from `update` and drop them outside the owner borrow.
+            /// The partial result and leader remain retained until normal settlement/cleanup.
+            pub fn stop(&mut self, error: W::Error, wakes: &mut Vec<Waker>) -> Stopped<C, O, W> {
                 for waiter in self.waiters.values_mut() {
                     waiter.error = Some(error);
                 }
-                self.phase = Phase::Draining(Outcome::Failed(error));
+                let phase = self.begin_completion(Outcome::Failed(error));
                 self.notify(wakes);
-                self.waiters.clear();
                 self.deadlines.clear();
+                Stopped {
+                    phase,
+                    waiters: std::mem::take(&mut self.waiters),
+                }
             }
 
             /// Check one caller and enqueue its wake if its policy has failed.
@@ -1464,7 +1502,7 @@ pub mod flight {
 
             /// Refresh with fixed unavailable and cancellation error values.
             fn refresh(core: &mut Core, idle: bool, wakes: &mut Vec<Waker>) {
-                core.refresh(idle, 9, 8, Instant::now, split, wakes);
+                let _ = core.refresh(idle, 9, 8, Instant::now, split, wakes);
             }
 
             /// Leader cancellation or detach cannot bypass retained-operation drainage.
@@ -1518,23 +1556,23 @@ pub mod flight {
                 assert_eq!(core.elect(1, &mut identity, 3), Ok(true));
                 core.waiters.get_mut(&2).unwrap().issued = true;
                 let mut wakes = Vec::new();
-                core.begin_completion(Outcome::Published(Published::Partial(17)));
-                core.settle(false, 9, split, &mut wakes);
+                drop(core.begin_completion(Outcome::Published(Published::Partial(17))));
+                let _ = core.settle(false, 9, split, &mut wakes);
                 assert!(core.partial.is_none());
-                core.settle(true, 9, split, &mut wakes);
+                let _ = core.settle(true, 9, split, &mut wakes);
                 assert_eq!(core.partial, Some(17));
                 assert!(!core.waiters[&1].issued);
                 assert!(core.waiters[&2].issued);
                 assert_eq!(core.elect(1, &mut identity, 3), Ok(true));
-                core.begin_completion(Outcome::Published(Published::Complete(18)));
-                core.settle(true, 9, split, &mut wakes);
+                drop(core.begin_completion(Outcome::Published(Published::Complete(18))));
+                let _ = core.settle(true, 9, split, &mut wakes);
                 assert!(matches!(core.phase, Phase::Complete(18)));
                 assert!(core.partial.is_none());
                 assert_eq!(core.elect(1, &mut identity, 3), Ok(false));
                 core.phase = Phase::Draining(Outcome::Failed(6));
-                core.settle(false, 9, split, &mut wakes);
+                let _ = core.settle(false, 9, split, &mut wakes);
                 assert!(matches!(core.phase, Phase::Draining(Outcome::Failed(6))));
-                core.settle(true, 9, split, &mut wakes);
+                let _ = core.settle(true, 9, split, &mut wakes);
                 assert!(matches!(core.phase, Phase::Failed(6)));
             }
 
@@ -1546,8 +1584,8 @@ pub mod flight {
                 register(&mut core, 2, false, false);
                 let mut identity = identity();
                 assert_eq!(core.elect(1, &mut identity, 1), Ok(true));
-                core.revoke(7, &mut Vec::new());
-                core.settle(true, 9, split, &mut Vec::new());
+                drop(core.revoke(7, &mut Vec::new()));
+                let _ = core.settle(true, 9, split, &mut Vec::new());
                 assert!(matches!(core.phase, Phase::Failed(9)));
                 core.phase = Phase::RetryPending;
                 register(&mut core, 3, true, true);
@@ -1593,11 +1631,11 @@ pub mod flight {
                     drop(retired);
                 }
                 let mut wakes = Vec::new();
-                core.refresh(true, 9, 8, || now, split, &mut wakes);
+                let _ = core.refresh(true, 9, 8, || now, split, &mut wakes);
                 assert_eq!(core.deadlines.len(), 1);
                 assert_eq!(wakes.len(), 64);
                 assert!(core.waiters[&64].error.is_none());
-                core.refresh(true, 9, 8, || now, split, &mut wakes);
+                let _ = core.refresh(true, 9, 8, || now, split, &mut wakes);
                 assert!(core.deadlines.is_empty());
                 assert_eq!(wakes.len(), 65);
                 core.notify(&mut wakes);
@@ -1622,12 +1660,12 @@ pub mod flight {
                 core.cancel(2, 6);
                 assert_eq!(core.waiters[&2].error, Some(6));
                 let mut wakes = Vec::new();
-                core.stop(8, &mut wakes);
-                core.settle(false, 9, split, &mut wakes);
+                drop(core.stop(8, &mut wakes));
+                let _ = core.settle(false, 9, split, &mut wakes);
                 assert!(matches!(core.phase, Phase::Draining(Outcome::Failed(8))));
                 assert!(core.waiters.is_empty());
                 assert!(core.deadlines.is_empty());
-                core.settle(true, 9, split, &mut wakes);
+                let _ = core.settle(true, 9, split, &mut wakes);
                 assert!(matches!(core.phase, Phase::Failed(8)));
             }
         }
