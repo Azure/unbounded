@@ -384,9 +384,11 @@ spec:
                           BootProtocol selects how metalman should trigger network boot for
                           repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
                           HTTP boot with a URL derived from the netboot image metadata.
+                          VirtualMedia mounts an operation-owned bootstrap ISO through Redfish.
                         enum:
                         - PXE
                         - HTTP
+                        - VirtualMedia
                         type: string
                       cloudInit:
                         description: |-
@@ -547,6 +549,10 @@ spec:
                     required:
                     - image
                     type: object
+                    x-kubernetes-validations:
+                    - message: VirtualMedia requires redfish
+                      rule: '!has(self.bootProtocol) || self.bootProtocol != ''VirtualMedia''
+                        || has(self.redfish)'
                   provisioningFormat:
                     description: |-
                       ProvisioningFormat declares the first-boot format for the desired host

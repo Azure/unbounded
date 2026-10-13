@@ -241,6 +241,13 @@ func (c *Client) rackMutate(ctx context.Context, method, path string, body any, 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	return c.rackMutateLocked(ctx, method, path, body, restore)
+}
+
+// rackMutateLocked requires the rack mutex to be held.
+func (c *Client) rackMutateLocked(ctx context.Context, method, path string, body any, restore bool) error {
+	r := c.rscm
+
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
