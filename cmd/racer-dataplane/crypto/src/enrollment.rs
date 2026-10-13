@@ -346,6 +346,8 @@ where
         + From<secure::AccessError>
         + From<ReplacementError<<H::Scope as Scope>::Error>>,
 {
+    /// Prepare or retry an uncommitted request. Recovery may run first, but is
+    /// not required to prevent reuse of an already committed enrollment.
     pub fn prepare<'a>(
         &'a self,
         nics: Vec<RailMapping>,
@@ -369,10 +371,32 @@ where
                 Ok(bytes) => {
                     let pending = usable_pending(&bytes)?;
                     if pending.cluster == self.cluster.0 {
-                        r.file_sync(dir.clone(), &scope).await?;
-                        return self.request(&pending, nics, shares).map_err(Into::into);
+                        let committed = match secure::read_at(
+                            r,
+                            &dir,
+                            "identity.json",
+                            wire::MAX_ENROLLMENT_BYTES * 3,
+                            true,
+                            &scope,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                let saved = PersistedIdentity::decode(&bytes)
+                                    .and_then(|saved| saved.response())
+                                    .map_err(|_| Error::UnreadableIdentityRecord)?;
+                                saved.cluster.0 == pending.cluster
+                                    && saved.enrollment.0 == pending.enrollment
+                            }
+                            Err(e) if H::is_missing(e) => false,
+                            Err(e) => return Err(e),
+                        };
+                        if !committed {
+                            r.file_sync(dir.clone(), &scope).await?;
+                            return self.request(&pending, nics, shares).map_err(Into::into);
+                        }
                     }
-                    // Replace another cluster's usable request, preserving corrupt records.
+                    // Replace committed or foreign requests, preserving corrupt records.
                 }
                 Err(e) if H::is_missing(e) => (),
                 Err(e) => return Err(e),
@@ -400,6 +424,8 @@ where
         })
     }
 
+    /// Commit a response, or return the usable saved identity for an exact retry.
+    /// A retry does not consume a newer pending request or change saved policy.
     pub fn accept_response<'a>(
         &'a self,
         response: EnrollmentResponse,
@@ -427,6 +453,38 @@ where
                     // Only a usable identity binds renewal to its existing node.
                     // Unreadable records require explicit repair, as on recovery.
                     match self.saved_identity(&bytes) {
+                        Ok((existing, identity)) if existing.enrollment == response.enrollment => {
+                            if wire::encode_enrollment_response(&existing).map_err(Error::from)?
+                                != wire::encode_enrollment_response(&response)
+                                    .map_err(Error::from)?
+                            {
+                                return Err(Error::Unauthorized.into());
+                            }
+                            r.file_sync(dir.clone(), &scope).await?;
+                            match secure::read_at(
+                                r,
+                                &dir,
+                                "pending.json",
+                                wire::MAX_ENROLLMENT_BYTES,
+                                true,
+                                &scope,
+                            )
+                            .await
+                            {
+                                Ok(bytes)
+                                    if decode_pending(&bytes).is_ok_and(|pending| {
+                                        pending.cluster == identity.cluster.0
+                                            && pending.enrollment == identity.enrollment.0
+                                    }) =>
+                                {
+                                    secure::remove(r, &dir, "pending.json", &scope).await?
+                                }
+                                Ok(_) => (),
+                                Err(e) if H::is_missing(e) => (),
+                                Err(e) => return Err(e),
+                            }
+                            return Ok(identity);
+                        }
                         Ok((existing, _))
                             if existing.cluster != response.cluster
                                 || existing.node != response.node =>
@@ -503,6 +561,7 @@ where
                         Ok(bytes)
                             if decode_pending(&bytes).is_ok_and(|pending| {
                                 pending.enrollment == identity.enrollment.0
+                                    && pending.cluster == identity.cluster.0
                             }) =>
                         {
                             secure::remove(r, &dir, "pending.json", &scope).await?
@@ -1455,6 +1514,153 @@ mod tests {
         assert_ne!(fresh.enrollment, request.enrollment);
         drive(&files, e.load_identity(&scope)).unwrap().unwrap();
         assert!(sim.metadata(Path::new("/private/pending.json")).is_ok());
+    }
+
+    fn fail_pending_cleanup(
+        sim: &Simulation,
+        files: &Files,
+        e: &Enrollment<Rc<Files>>,
+        response: EnrollmentResponse,
+        scope: &Request,
+    ) {
+        sim.inject("rename", Fault::HoldCompletion(20)).unwrap();
+        let mut accept = e.accept_response(response, scope);
+        let mut published = false;
+        for _ in 0..100 {
+            assert!(
+                accept
+                    .as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                    .is_pending()
+            );
+            files.reactor.poll_budgeted(64).unwrap();
+            files.reactor.wait(Duration::from_millis(1)).unwrap();
+            if sim.metadata(Path::new("/private/identity.json")).is_ok() {
+                published = true;
+                break;
+            }
+        }
+        assert!(published);
+        sim.inject("unlink", Fault::Errno(5)).unwrap();
+        assert!(matches!(drive(files, accept),
+            Err(error) if error == uring_runtime::Error::Os(5).into()));
+    }
+
+    #[test]
+    fn prepare_replaces_committed_pending_without_recovery_even_after_expiry() {
+        for expired in [false, true] {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let clock = uring_runtime::environment::SimulationClock::new(111);
+            let _time = clock.environment(0).enter();
+            let (files, e, scope) = fixture();
+            let (ca, key) = identity::test_util::ca();
+            e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+            let first = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            let response = issue(&first, &ca, &key, |_| {});
+            fail_pending_cleanup(&sim, &files, &e, response, &scope);
+            sim.disk().crash().unwrap();
+            if expired {
+                clock.advance(Duration::from_secs(7200));
+            }
+            let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
+            let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
+            sim.inject("write", Fault::Errno(28)).unwrap();
+            assert!(
+                matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)),
+                Err(error) if error == uring_runtime::Error::Os(28).into())
+            );
+            sim.disk().crash().unwrap();
+            assert_eq!(
+                sim.read_file(Path::new("/private/pending.json")).unwrap(),
+                pending
+            );
+            let renewed = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            assert_ne!(renewed.enrollment, first.enrollment);
+            assert_ne!(renewed.csr_der, first.csr_der);
+            assert_eq!(
+                sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                committed
+            );
+            sim.disk().crash().unwrap();
+            let retry = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            assert_eq!(retry.enrollment, renewed.enrollment);
+            assert_eq!(retry.csr_der, renewed.csr_der);
+        }
+    }
+
+    #[test]
+    fn committed_response_retry_is_idempotent_and_preserves_newer_pending() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        let (ca, key) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let response = issue(&request, &ca, &key, |_| {});
+        fail_pending_cleanup(&sim, &files, &e, response.clone(), &scope);
+        sim.disk().crash().unwrap();
+        let committed = sim.read_file(Path::new("/private/identity.json")).unwrap();
+        for state in ["matching", "absent", "newer"] {
+            if state == "newer" {
+                drive(
+                    &files,
+                    e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+                )
+                .unwrap();
+            }
+            let pending = sim.read_file(Path::new("/private/pending.json")).ok();
+            for case in ["policy", "node", "certificate"] {
+                let mut changed = response.clone();
+                match case {
+                    "policy" => changed.block_devices = Some("different".into()),
+                    "node" => changed.node = NodeId(CLUSTER.into()),
+                    "certificate" => changed.certificate_chain = vec![ca.der().to_vec()],
+                    _ => unreachable!(),
+                }
+                assert!(
+                    matches!(drive(&files, e.accept_response(changed, &scope)),
+                    Err(error) if error == Error::Unauthorized.into()),
+                    "{state}: {case}"
+                );
+                assert_eq!(
+                    sim.read_file(Path::new("/private/pending.json")).ok(),
+                    pending
+                );
+            }
+            let accepted = drive(&files, e.accept_response(response.clone(), &scope)).unwrap();
+            assert_eq!(accepted.enrollment, request.enrollment);
+            assert_eq!(accepted.certificate_chain(), response.certificate_chain);
+            sim.disk().crash().unwrap();
+            assert_eq!(
+                sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                committed
+            );
+            if state == "newer" {
+                assert_eq!(
+                    sim.read_file(Path::new("/private/pending.json")).ok(),
+                    pending
+                );
+            } else {
+                assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
+            }
+        }
     }
 
     #[test]
