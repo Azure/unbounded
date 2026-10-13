@@ -188,7 +188,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 func writeHelp(output io.Writer, text string) error {
 	if _, err := io.WriteString(output, text); err != nil {
-		return errors.New("could not write CLI output")
+		return safeDiagnostic("could not write CLI output", "output", err)
 	}
 
 	return flag.ErrHelp
@@ -288,7 +288,7 @@ func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
 
 	cfg, err := config.LoadDefaultConfig(ctx, load...)
 	if err != nil {
-		return aws.Config{}, errors.New("could not load AWS configuration")
+		return aws.Config{}, safeDiagnostic("could not load AWS configuration", "config", err)
 	}
 
 	if strings.TrimSpace(cfg.Region) == "" {
@@ -314,29 +314,31 @@ func runOrigin(ctx context.Context, o options) error {
 		Namespace: o.namespace, Buckets: o.buckets, MetadataTTL: o.metadataTTL,
 	})
 	if err != nil {
-		return errors.New("could not configure origin")
+		return safeDiagnostic("could not configure origin", "config", err)
 	}
 
 	root, err := os.Open("/")
 	if err != nil {
-		return errors.New("could not open origin directory root")
+		return safeDiagnostic("could not open origin directory root", "filesystem", err)
 	}
 	defer closeResource(root)
 
 	if err := prepareOriginDirectory(root, []string{"run", "racer", o.cache, "origin"}); err != nil {
-		return errors.New("could not prepare safe origin directory")
+		return safeDiagnostic("could not prepare safe origin directory", "filesystem", err)
 	}
+
+	log.Print("racer-object: mode=origin event=starting")
 
 	err = racersdk.ServeOrigin(ctx, racersdk.OriginConfig{
 		Cache: o.cache, RecoverStaleSocket: true,
 		MaxConcurrentRequests: originMaxConcurrentRequests,
-	}, origin)
+	}, diagnoseOrigin(origin))
 	if ctx.Err() != nil {
 		return nil
 	}
 
 	if err != nil {
-		return errors.New("origin server failed")
+		return safeDiagnostic("origin server failed", "server", err)
 	}
 
 	return nil
@@ -390,13 +392,13 @@ func prepareOriginDirectory(parent *os.File, parts []string) error {
 func runSidecar(ctx context.Context, o options) error {
 	client, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.cache})
 	if err != nil {
-		return errors.New("could not configure Racer client")
+		return safeDiagnostic("could not configure Racer client", "config", err)
 	}
 	defer closeResource(client)
 
 	handler, err := object.NewSidecar(client, object.SidecarConfig{Namespace: o.namespace, Buckets: o.buckets})
 	if err != nil {
-		return errors.New("could not configure sidecar")
+		return safeDiagnostic("could not configure sidecar", "config", err)
 	}
 
 	listener, err := listenSidecar(ctx, o.listen)
@@ -416,7 +418,7 @@ func listenSidecar(ctx context.Context, address string) (net.Listener, error) {
 
 	l, err := lc.Listen(ctx, "tcp", address)
 	if err != nil {
-		return nil, errors.New("could not bind sidecar listener")
+		return nil, safeDiagnostic("could not bind sidecar listener", "listen", err)
 	}
 
 	return l, nil
@@ -433,9 +435,11 @@ func serveSidecarWithGrace(ctx context.Context, listener net.Listener, handler h
 	server := &http.Server{
 		ReadHeaderTimeout: min(5*time.Second, requestTimeout),
 		ReadTimeout:       requestTimeout, WriteTimeout: requestTimeout + sidecarWriteGrace, IdleTimeout: 30 * time.Second,
-		MaxHeaderBytes: sidecarMaxHeaderBytes, ErrorLog: log.New(io.Discard, "", 0),
+		MaxHeaderBytes: sidecarMaxHeaderBytes, ErrorLog: log.New(safeHTTPLogWriter{}, "", 0),
 		BaseContext: func(net.Listener) context.Context { return lifetime },
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer diagnoseSidecarPanic()
+
 			if sidecarRequestHeaderBytes(r) > sidecarMaxHeaderBytes {
 				object.WriteSidecarHeaderTooLarge(w, r)
 				return
@@ -450,6 +454,8 @@ func serveSidecarWithGrace(ctx context.Context, listener net.Listener, handler h
 	defer closeResource(server)
 	defer closeResource(listener)
 
+	logSidecarStartup(listener.Addr())
+
 	finished := make(chan error, 1)
 
 	go func() { finished <- server.Serve(limitSidecarListener(listener, 128)) }()
@@ -461,7 +467,7 @@ func serveSidecarWithGrace(ctx context.Context, listener net.Listener, handler h
 		}
 
 		if err != nil {
-			return errors.New("sidecar server failed")
+			return safeDiagnostic("sidecar server failed", "server", err)
 		}
 
 		return nil
