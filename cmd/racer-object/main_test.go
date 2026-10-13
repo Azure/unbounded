@@ -473,6 +473,7 @@ func TestSidecarTimeoutResponse(t *testing.T) {
 	})
 
 	address, cancel, done := startTestSidecar(t, handler, 100*time.Millisecond)
+
 	defer func() {
 		cancel()
 		waitSidecar(t, done)

@@ -25,6 +25,7 @@ func TestSidecarHeaderLimit(t *testing.T) {
 	})
 
 	address, cancel, done := startTestSidecar(t, handler, time.Second)
+
 	defer func() {
 		cancel()
 		waitSidecar(t, done)
@@ -94,6 +95,7 @@ func TestSidecarHeaderLimitWireFormat(t *testing.T) {
 	})
 
 	address, cancel, done := startTestSidecar(t, handler, time.Second)
+
 	defer func() {
 		cancel()
 		waitSidecar(t, done)
