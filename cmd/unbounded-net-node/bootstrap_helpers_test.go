@@ -488,6 +488,21 @@ func TestAnnotateNodeWithPubKeyAndTaintGatewayNode(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("expected exactly one gateway taint, got %d taints=%#v", count, node.Spec.Taints)
 	}
+
+	if err := removeGatewayNodeTaint(ctx, client, nodeName); err != nil {
+		t.Fatalf("removeGatewayNodeTaint returned error: %v", err)
+	}
+
+	node, err = client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get node after taint removal failed: %v", err)
+	}
+
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == GatewayNodeTaintKey {
+			t.Fatalf("gateway taint retained after removal: %#v", node.Spec.Taints)
+		}
+	}
 }
 
 // TestNodeAgentBuildInfo tests NodeAgentBuildInfo.

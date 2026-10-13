@@ -6,11 +6,14 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -87,6 +90,52 @@ func TestGatewayPoolPeeringProtocolResolution(t *testing.T) {
 				t.Fatalf("peering changed mesh protocol to %q", mesh[0].TunnelProtocol)
 			}
 		})
+	}
+}
+
+func TestPinnedGatewayPoolWaitsForPublishedIdentity(t *testing.T) {
+	fixture := newPoolPeeringProtocolFixture(t, true)
+	fixture.state.isGatewayNode = true
+	fixture.state.adoptedAssignment = nodeAssignment{
+		site:        "local",
+		gatewayPool: "not-ready",
+		nodeUID:     "node-uid",
+	}
+
+	err := fixture.update()
+	if err == nil || !strings.Contains(err.Error(), "has not published this node identity and settings yet") {
+		t.Fatalf("error = %v", err)
+	}
+
+	if fixture.configureCalls != 0 {
+		t.Fatalf("configuration ran before assigned GatewayPool readiness: %d calls", fixture.configureCalls)
+	}
+}
+
+func TestPinnedGatewayPoolAcknowledgmentWaitsForTaint(t *testing.T) {
+	fixture := newPoolPeeringProtocolFixture(t, true)
+	fixture.state.isGatewayNode = true
+	fixture.state.adoptedAssignment = nodeAssignment{
+		site:        "local",
+		gatewayPool: "local-a",
+		nodeUID:     "node-uid",
+	}
+	client := fixture.state.clientset.(*fake.Clientset)
+	client.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("taint denied")
+	})
+
+	err := fixture.update()
+	if err == nil || !strings.Contains(err.Error(), "taint gateway node") {
+		t.Fatalf("error = %v", err)
+	}
+
+	if fixture.state.gatewayTaintApplied {
+		t.Fatal("failed taint was recorded as applied")
+	}
+
+	if fixture.configureCalls != 0 {
+		t.Fatalf("configuration ran before gateway taint adoption: %d calls", fixture.configureCalls)
 	}
 }
 
