@@ -198,7 +198,7 @@ func (c *Collector) Summary(snapshot collected) Summary {
 
 func (c *Collector) Runs(snapshot collected, offset, limit int) RunList {
 	offset, limit = pageBounds(offset, limit, len(snapshot.runs))
-	items := make([]RunSummary, 0, limit)
+	items := make([]RunSummary, 0)
 
 	for i := offset; i < min(offset+limit, len(snapshot.runs)); i++ {
 		items = append(items, buildRunSummary(&snapshot.runs[i], snapshot))
