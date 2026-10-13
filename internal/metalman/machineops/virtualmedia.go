@@ -260,7 +260,9 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 			return targetChange{target: target, err: err}
 		}
 
-		var capability [32]byte
+		// 128 random bits remain an unguessable capability while keeping the
+		// ub-<32 lowercase hex>.iso name below Rack SCM's 40-character limit.
+		var capability [16]byte
 		if _, err := rand.Read(capability[:]); err != nil {
 			return targetChange{target: target, err: fmt.Errorf("generate media capability: %w", err)}
 		}

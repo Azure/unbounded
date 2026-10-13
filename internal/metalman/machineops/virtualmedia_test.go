@@ -151,6 +151,7 @@ func TestVirtualMediaDurableLifecycleAndRestart(t *testing.T) {
 	current := mediaStep(t, r, op.Name)
 	require.Empty(t, d.calls)
 	require.Equal(t, "Preparing", current.Status.Targets[0].BootMedia.Phase)
+	require.Regexp(t, `^[0-9a-f]{32}$`, current.Status.Targets[0].BootMedia.ID)
 	require.Contains(t, current.Finalizers, mediaFinalizer)
 	// Recreate the reconciler at each phase, retaining only API and BMC state.
 	for range 9 {
@@ -160,6 +161,7 @@ func TestVirtualMediaDurableLifecycleAndRestart(t *testing.T) {
 	}
 
 	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+	require.Len(t, current.Status.Targets[0].BootMedia.SourceName, 39)
 	require.Equal(t, []string{"prepare", "stage", "ForceOff", "mount", "boot", "On"}, d.calls)
 
 	current.Status.Targets[0].BootMedia.ImageWritten = true
@@ -336,7 +338,7 @@ func TestVirtualMediaCapabilityIsRandomAndDurable(t *testing.T) {
 		id := current.Status.Targets[0].BootMedia.ID
 		bytes, err := hex.DecodeString(id)
 		require.NoError(t, err)
-		require.Len(t, bytes, 32)
+		require.Len(t, bytes, 16)
 		require.Equal(t, strings.ToLower(id), id)
 		require.False(t, ids[id])
 		ids[id] = true

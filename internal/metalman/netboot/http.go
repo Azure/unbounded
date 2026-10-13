@@ -172,6 +172,8 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 				}
 
 				if resolved.DiskPath != "" {
+					// GRUB's gzip arm64 kernel loader needs HTTP Range support.
+					// ServeFile preserves it for hybrid ISO boots.
 					http.ServeFile(w, r, resolved.DiskPath)
 				} else {
 					w.Write(resolved.Data) //nolint:errcheck // Best-effort response.

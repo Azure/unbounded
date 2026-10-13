@@ -6,6 +6,9 @@ package netboot
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -105,7 +108,7 @@ func mediaFixture(t *testing.T, arch string) (*MediaProvider, *v1alpha3.Machine,
 	}}}}
 	op := &v1alpha3.MachineOperation{ObjectMeta: metav1.ObjectMeta{Name: "replace", UID: "op-uid"}, Spec: v1alpha3.MachineOperationSpec{OperationKind: v1alpha3.OperationHostReplace}, Status: v1alpha3.MachineOperationStatus{
 		Targets: []v1alpha3.MachineOperationTargetStatus{{MachineRef: m.Name, BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
-			ID: strings.Repeat("c", 64), MachineUID: m.UID, Netboot: m.Spec.Netboot().DeepCopy(), Phase: "Preparing",
+			ID: strings.Repeat("c", 32), MachineUID: m.UID, Netboot: m.Spec.Netboot().DeepCopy(), Phase: "Preparing",
 		}}},
 	}}
 	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithStatusSubresource(op).WithObjects(m, op).Build()
@@ -143,6 +146,7 @@ func TestMediaPrepareAndRestart(t *testing.T) {
 			source, err := p.Prepare(t.Context(), machine, op, id)
 			require.NoError(t, err)
 			require.Equal(t, "ub-"+id+".iso", source.Name)
+			require.Len(t, source.Name, 39)
 			require.Equal(t, "192.0.2.2", source.Server)
 
 			payload := strings.Join(calls, "\n")
@@ -154,7 +158,9 @@ func TestMediaPrepareAndRestart(t *testing.T) {
 				require.Contains(t, payload, "grubaa64.efi ::/EFI/BOOT/grubaa64.efi")
 			}
 
-			require.Contains(t, payload, "-e efi.img -no-emul-boot")
+			require.Contains(t, payload, "mkfs.vfat --invariant -F 16 -s 1 -n UBMEDIA")
+			require.Contains(t, payload, "-append_partition 2 0xef ")
+			require.Contains(t, payload, "-appended_part_as_gpt -e --interval:appended_partition_2:all:: -no-emul-boot")
 
 			config, err := os.ReadFile(filepath.Join(p.CacheDir, "bootmedia", id, "grub.cfg"))
 			require.NoError(t, err)
@@ -180,7 +186,7 @@ func TestMediaPrepareAndRestart(t *testing.T) {
 			require.NoError(t, server.readHandler(source.Name, &readerFrom{Writer: &dst}))
 			require.Equal(t, "immutable ISO", dst.String())
 
-			for _, bad := range []string{"/" + source.Name, "../" + source.Name, "ub-unknown.iso", "ub-" + strings.Repeat("d", 64) + ".iso"} {
+			for _, bad := range []string{"/" + source.Name, "../" + source.Name, "ub-unknown.iso", "ub-" + strings.Repeat("d", 32) + ".iso", "ub-" + strings.Repeat("d", 64) + ".iso"} {
 				_, err := restarted.OpenISO(t.Context(), bad)
 				require.Error(t, err)
 			}
@@ -236,6 +242,23 @@ func TestMediaRejectInputs(t *testing.T) {
 	require.ErrorContains(t, err, "digest-pinned")
 }
 
+func TestMediaCapabilityLength(t *testing.T) {
+	p, _, op := mediaFixture(t, "arm64")
+	id := op.Status.Targets[0].BootMedia.ID
+	_, err := p.callbackOwner(t.Context(), id)
+	require.NoError(t, err)
+
+	for _, invalid := range []string{"", id[:31], id + "c", strings.Repeat("d", 64), strings.ToUpper(id), strings.Repeat("g", 32)} {
+		t.Run(fmt.Sprintf("%q", invalid), func(t *testing.T) {
+			// Persist even an invalid ID so rejection cannot be due to no owner.
+			op.Status.Targets[0].BootMedia.ID = invalid
+			require.NoError(t, p.Client.Status().Update(t.Context(), op))
+			_, err := p.callbackOwner(t.Context(), invalid)
+			require.ErrorContains(t, err, "invalid media capability")
+		})
+	}
+}
+
 func mediaRequest(p *MediaProvider, id, method, action, ip string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, "/bootmedia/"+id+"/"+action, nil)
 	r.RemoteAddr = ip + ":4321"
@@ -249,7 +272,7 @@ func mediaRequest(p *MediaProvider, id, method, action, ip string) *httptest.Res
 
 func TestMediaScopedCallbacks(t *testing.T) {
 	p, _, op := mediaFixture(t, "amd64")
-	op.Status.Targets = append(op.Status.Targets, v1alpha3.MachineOperationTargetStatus{MachineRef: "other-host", BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: strings.Repeat("d", 64)}})
+	op.Status.Targets = append(op.Status.Targets, v1alpha3.MachineOperationTargetStatus{MachineRef: "other-host", BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: strings.Repeat("d", 32)}})
 	require.NoError(t, p.Client.Status().Update(t.Context(), op))
 	id := op.Status.Targets[0].BootMedia.ID
 	w := mediaRequest(p, id, http.MethodGet, "grub.cfg", "192.0.2.20")
@@ -464,7 +487,36 @@ func TestMediaFrozenArtifactsAfterPrepare(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
+func TestMediaKernelHTTPRange(t *testing.T) {
+	p, _, _ := mediaFixture(t, "arm64")
+	require.NoError(t, populateOCICacheForArchitecture(p.CacheDir, strings.Repeat("a", 64), "arm64", map[string][]byte{"vmlinuz": []byte("gzip kernel payload")}))
+	h := &HTTPServer{Media: p, FileResolver: *p.Resolver}
+	r := httptest.NewRequest(http.MethodGet, "/vmlinuz", nil)
+	r.RemoteAddr = "192.0.2.20:4321"
+	r.Header.Set("Range", "bytes=5-10")
+
+	w := httptest.NewRecorder()
+	h.handleFile(w, r)
+	require.Equal(t, http.StatusPartialContent, w.Code)
+	require.Equal(t, "bytes 5-10/19", w.Header().Get("Content-Range"))
+	require.Equal(t, "kernel", w.Body.String())
+}
+
 func TestMediaIdentityAndOldImage(t *testing.T) {
+	t.Run("old ISO cache", func(t *testing.T) {
+		p, m, op := mediaFixture(t, "amd64")
+		b := op.Status.Targets[0].BootMedia
+		identity, err := json.Marshal([]any{mediaFormat, p.TFTPServer, p.Resolver.ServeURL, b.MachineUID, b.Netboot, b.ID})
+		require.NoError(t, err)
+
+		hash := sha256.Sum256(identity)
+		dir := filepath.Join(p.CacheDir, "bootmedia", b.ID)
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "identity"), []byte(hex.EncodeToString(hash[:])), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "bootstrap.iso"), []byte("old non-hybrid ISO"), 0o600))
+		_, err = p.Prepare(t.Context(), m, op, b.ID)
+		require.ErrorContains(t, err, "immutable media inputs changed")
+	})
 	t.Run("identity", func(t *testing.T) {
 		p, m, op := mediaFixture(t, "amd64")
 
@@ -520,7 +572,7 @@ func TestMediaRealToolsOptional(t *testing.T) {
 
 	stat, err := f.Stat()
 	require.NoError(t, err)
-	require.Greater(t, stat.Size(), int64(16<<20))
+	require.Greater(t, stat.Size(), int64(8<<20))
 
 	first, err := io.ReadAll(f)
 	require.NoError(t, err)
@@ -533,10 +585,16 @@ func TestMediaRealToolsOptional(t *testing.T) {
 	second, err := os.ReadFile(filepath.Join(p.CacheDir, "bootmedia", id, "bootstrap.iso"))
 	require.NoError(t, err)
 	require.Equal(t, sha256.Sum256(first), sha256.Sum256(second), "regeneration must preserve ISO bytes")
+
+	fatPath := filepath.Join(p.CacheDir, "bootmedia", id, "efi.img")
+	fat, err := os.ReadFile(fatPath)
+	require.NoError(t, err)
+	require.Len(t, fat, 8<<20)
+	assertHybridEFI(t, second, fat)
 	// Inspect the FAT payload, not only command arguments.
 	for _, name := range []string{"BOOTX64.EFI", "grubx64.efi", "grub.cfg"} {
 		output := filepath.Join(t.TempDir(), name)
-		require.NoError(t, runMediaCommand(t.Context(), "mcopy", "-i", filepath.Join(p.CacheDir, "bootmedia", id, "root", "efi.img"), "::/EFI/BOOT/"+name, output))
+		require.NoError(t, runMediaCommand(t.Context(), "mcopy", "-i", fatPath, "::/EFI/BOOT/"+name, output))
 		content, err := os.ReadFile(output)
 		require.NoError(t, err)
 
@@ -552,4 +610,37 @@ func TestMediaRealToolsOptional(t *testing.T) {
 			require.Contains(t, string(content), "/bootmedia/"+id+"/grub.cfg")
 		}
 	}
+}
+
+func assertHybridEFI(t *testing.T, iso, fat []byte) {
+	t.Helper()
+
+	// GPT uses 512-byte sectors and stores the EFI System GUID in mixed endian.
+	header := iso[512:1024]
+	require.Equal(t, "EFI PART", string(header[:8]))
+	entries := binary.LittleEndian.Uint64(header[72:80]) * 512
+	require.GreaterOrEqual(t, binary.LittleEndian.Uint32(header[80:84]), uint32(2))
+	entrySize := uint64(binary.LittleEndian.Uint32(header[84:88]))
+	require.GreaterOrEqual(t, entrySize, uint64(128))
+	require.LessOrEqual(t, entries+2*entrySize, uint64(len(iso)))
+	partition := iso[entries+entrySize : entries+2*entrySize]
+	require.Equal(t, "28732ac11ff8d211ba4b00a0c93ec93b", hex.EncodeToString(partition[:16]))
+	start := binary.LittleEndian.Uint64(partition[32:40]) * 512
+	end := (binary.LittleEndian.Uint64(partition[40:48]) + 1) * 512
+	require.Less(t, start, end)
+	require.LessOrEqual(t, end, uint64(len(iso)))
+	require.Equal(t, fat, iso[start:end], "GPT partition 2 must contain the FAT image")
+
+	// El Torito uses 2048-byte sectors. Its EFI entry must point to that same ESP.
+	bootRecord := iso[17*2048 : 18*2048]
+	require.Equal(t, byte(0), bootRecord[0])
+	require.Equal(t, "CD001", string(bootRecord[1:6]))
+	require.Equal(t, "EL TORITO SPECIFICATION", strings.TrimRight(string(bootRecord[7:39]), "\x00"))
+	catalogOffset := uint64(binary.LittleEndian.Uint32(bootRecord[71:75])) * 2048
+	require.LessOrEqual(t, catalogOffset+64, uint64(len(iso)))
+	catalog := iso[catalogOffset : catalogOffset+64]
+	require.Equal(t, byte(0xef), catalog[1], "El Torito platform must be EFI")
+	require.Equal(t, byte(0x88), catalog[32], "El Torito entry must be bootable")
+	require.Equal(t, byte(0), catalog[33], "El Torito must use no emulation")
+	require.Equal(t, start, uint64(binary.LittleEndian.Uint32(catalog[40:44]))*2048)
 }

@@ -32,14 +32,18 @@ import (
 
 const mediaFormat = "unbounded-uefi-v1"
 
+// Version the ISO layout separately from the netboot image's EFI artifacts.
+const mediaISOFormat = "unbounded-uefi-hybrid-v2"
+
 var (
-	mediaIDPattern     = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	mediaIDPattern     = regexp.MustCompile(`^[0-9a-f]{32}$`)
 	pinnedImagePattern = regexp.MustCompile(`^.+@sha256:[0-9a-f]{64}$`)
 	mediaTokenPattern  = regexp.MustCompile(`^[a-zA-Z0-9_.:/@+-]*$`)
 )
 
-// MediaProvider builds operation-owned UEFI bootstrap media. Configure Resolver,
-// Client (an uncached API client), CacheDir, and an advertised IPv4 TFTPServer.
+// MediaProvider builds operation-owned hybrid ISOs (El Torito plus GPT ESP).
+// Configure Resolver, Client (an uncached API client), CacheDir, and an advertised
+// IPv4 TFTPServer.
 // Share this instance through HTTPServer.Media and TFTPServer.Media. The
 // controller must persist BootMedia and digest-pinned Netboot inputs first.
 // Tokens are capabilities on the isolated management/provisioning network;
@@ -295,7 +299,7 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 		return "", err
 	}
 	// Only immutable inputs affect identity, not controller phase transitions.
-	identity, err := json.Marshal([]any{mediaFormat, p.TFTPServer, p.Resolver.ServeURL, o.status().MachineUID, spec, o.status().ID})
+	identity, err := json.Marshal([]any{mediaISOFormat, p.TFTPServer, p.Resolver.ServeURL, o.status().MachineUID, spec, o.status().ID})
 	if err != nil {
 		return "", err
 	}
@@ -380,14 +384,14 @@ func (p *MediaProvider) buildISO(ctx context.Context, dir string, spec *v1alpha3
 		return err
 	}
 
-	fat := filepath.Join(root, "efi.img")
+	fat := filepath.Join(dir, "efi.img")
 
 	f, err := os.Create(fat)
 	if err != nil {
 		return err
 	}
 
-	if err := f.Truncate(16 << 20); err != nil {
+	if err := f.Truncate(8 << 20); err != nil {
 		f.Close() //nolint:errcheck // Preserve the truncate error.
 		return err
 	}
@@ -401,7 +405,7 @@ func (p *MediaProvider) buildISO(ctx context.Context, dir string, spec *v1alpha3
 		run = runMediaCommand
 	}
 
-	if err := run(ctx, "mkfs.vfat", "--invariant", "-F", "16", "-n", "UBMEDIA", fat); err != nil {
+	if err := run(ctx, "mkfs.vfat", "--invariant", "-F", "16", "-s", "1", "-n", "UBMEDIA", fat); err != nil {
 		return err
 	}
 
@@ -430,6 +434,8 @@ func (p *MediaProvider) buildISO(ctx context.Context, dir string, spec *v1alpha3
 	}
 	// Ubuntu GRUB builds use different compiled prefixes. All copies contain
 	// only the same live config handoff, never install intent or credentials.
+	// On Rack SCM USB media, GRUB sees (hd0,gpt2) and finds its config next
+	// to the EFI binary.
 	for _, dst := range []string{"/EFI/BOOT/grub.cfg", "/EFI/ubuntu/grub.cfg", "/boot/grub/grub.cfg", "/grub/grub.cfg", "/grub.cfg"} {
 		if err := run(ctx, "mcopy", "-i", fat, configPath, "::"+dst); err != nil {
 			return err
@@ -442,7 +448,9 @@ func (p *MediaProvider) buildISO(ctx context.Context, dir string, spec *v1alpha3
 		}
 	}
 
-	return run(ctx, "xorriso", "-as", "mkisofs", "-quiet", "-V", "UBMEDIA", "--modification-date=2020010100000000", "--set_all_file_dates", "2020010100000000", "-o", filepath.Join(dir, "bootstrap.iso"), "-e", "efi.img", "-no-emul-boot", root)
+	// Use the same FAT image for El Torito EFI boot and a GPT EFI System
+	// Partition, since Rack SCM exposes the image as a removable USB disk.
+	return run(ctx, "xorriso", "-as", "mkisofs", "-quiet", "-V", "UBMEDIA", "--modification-date=2020010100000000", "--set_all_file_dates", "2020010100000000", "-o", filepath.Join(dir, "bootstrap.iso"), "-append_partition", "2", "0xef", fat, "-appended_part_as_gpt", "-e", "--interval:appended_partition_2:all::", "-no-emul-boot", root)
 }
 
 // normalizeMediaFAT removes wall-clock directory timestamps, without touching
