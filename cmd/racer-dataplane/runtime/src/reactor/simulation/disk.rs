@@ -654,6 +654,14 @@ pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
 }
 
 impl Simulation {
+    /// Return the current path of a retained directory in this simulation.
+    /// Resolve by inode, not the original name. The result is a snapshot: callers
+    /// must not yield or mutate the directory namespace before using it.
+    pub fn directory_path(&self, directory: &Descriptor) -> io::Result<PathBuf> {
+        self.handle(directory)?;
+        self.0.borrow().path(Some(directory), Path::new("."))
+    }
+
     /// Creates missing ancestors as volatile directories for a fixture.
     pub fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         let path = normalize(path)?;
@@ -1173,6 +1181,65 @@ mod tests {
     use crate::reactor::simulation::network::tests::{drive, poll, reactor, scope};
     use crate::reactor::tests::fixtures::{Reactor, RequestScope, ResourceClass};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn directory_path_tracks_inode_and_rejects_invalid_handles() {
+        let sim = Simulation::new();
+        sim.create_dir_all(Path::new("/parent/child")).unwrap();
+        let directory = sim
+            .open(
+                None,
+                Path::new("/parent/child"),
+                libc::O_PATH | libc::O_DIRECTORY,
+            )
+            .unwrap();
+        assert_eq!(
+            sim.directory_path(&directory).unwrap(),
+            Path::new("/parent/child")
+        );
+        sim.rename(
+            Path::new("/parent"),
+            Path::new("/moved"),
+            libc::RENAME_NOREPLACE,
+        )
+        .unwrap();
+        sim.create_dir_all(Path::new("/parent/child")).unwrap();
+        assert_eq!(
+            sim.clone().directory_path(&directory).unwrap(),
+            Path::new("/moved/child")
+        );
+
+        let other = Simulation::new();
+        other.create_dir_all(Path::new("/parent/child")).unwrap();
+        let foreign = other
+            .open(
+                None,
+                Path::new("/parent/child"),
+                libc::O_PATH | libc::O_DIRECTORY,
+            )
+            .unwrap();
+        assert_eq!(
+            sim.directory_path(&foreign).unwrap_err().raw_os_error(),
+            Some(libc::EXDEV)
+        );
+        sim.write_file(Path::new("/file"), b"file").unwrap();
+        let file = sim.open(None, Path::new("/file"), libc::O_PATH).unwrap();
+        assert_eq!(
+            sim.directory_path(&file).unwrap_err().raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+
+        // Replacing an empty directory detaches the retained inode from all names.
+        sim.create_dir_all(Path::new("/replacement")).unwrap();
+        sim.rename(Path::new("/replacement"), Path::new("/moved/child"), 0)
+            .unwrap();
+        assert_eq!(
+            sim.directory_path(&directory).unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        sim.disk().crash().unwrap();
+        assert!(sim.directory_path(&directory).is_err());
+    }
 
     /// Enters a fresh world and creates reactor owners for crash and durability tests.
     fn setup() -> (Simulation, Environment, Reactor, RequestScope) {

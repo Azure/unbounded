@@ -49,9 +49,21 @@ impl BoundSocket {
         self.listener.as_sim().expect("simulated listener").accept()
     }
 
-    /// Return the logical directory used by the simulated filesystem.
+    /// Return the original bind directory, not its current location after a rename.
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    fn entry_path(&self, basename: &str) -> io::Result<PathBuf> {
+        crate::directory::component(basename.as_bytes())?;
+        Ok(self
+            .sim
+            .directory_path(&self.directory_handle)?
+            .join(basename))
+    }
+
+    fn metadata(&self, basename: &str) -> io::Result<(u64, u16)> {
+        self.sim.metadata(&self.entry_path(basename)?)
     }
 
     /// Set the owned socket's permissions, rejecting a missing or replaced entry.
@@ -65,8 +77,7 @@ impl BoundSocket {
             return Err(Self::ownership_error());
         }
         // These synchronous calls cannot yield to another worker-local simulation task.
-        self.sim
-            .chmod(&self.directory.join(basename.as_str()), mode as _)
+        self.sim.chmod(&self.entry_path(&basename)?, mode)
     }
 }
 
@@ -80,21 +91,18 @@ impl Endpoint for BoundSocket {
 
     /// Only the originally bound socket inode is owned, never a replacement entry.
     fn owns(&self, basename: &str) -> bool {
-        self.sim
-            .metadata(&self.directory.join(basename))
-            .is_ok_and(|(actual, mode)| {
-                actual == self.inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
-            })
+        self.metadata(basename).is_ok_and(|(actual, mode)| {
+            actual == self.inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
+        })
     }
 
     /// Absence requires a genuine not-found response, not an arbitrary failure.
     fn absent(&self, basename: &str) -> bool {
-        self.sim
-            .metadata(&self.directory.join(basename))
+        self.metadata(basename)
             .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
     }
 
-    /// Require the same simulation and retained directory, with both paths still valid.
+    /// Require the same simulation and retained directory, even after a rename.
     fn same_directory(&self, other: &Self) -> io::Result<bool> {
         // Relative open checks descriptor provenance before resolving its inode.
         // Numeric inode and handle IDs alone can collide across simulations.
@@ -114,18 +122,13 @@ impl Endpoint for BoundSocket {
             .stat()?
             .stx_ino;
         let other_retained = probe.as_sim().expect("simulated directory").stat()?.stx_ino;
-        Ok(retained == other_retained
-            && self.sim.metadata(&self.directory)?.0 == retained
-            && other.sim.metadata(&other.directory)?.0 == other_retained)
+        Ok(retained == other_retained)
     }
 
     /// Perform the publication's requested atomic rename operation.
     fn rename(&self, from: &str, to: &str, mode: Rename) -> io::Result<()> {
-        self.sim.rename(
-            &self.directory.join(from),
-            &self.directory.join(to),
-            mode.flags(),
-        )
+        self.sim
+            .rename(&self.entry_path(from)?, &self.entry_path(to)?, mode.flags())
     }
 
     /// Follow the owned inode after a successful publication or rollback rename.
@@ -138,8 +141,10 @@ impl Drop for BoundSocket {
     /// Never unlink another owner's replacement, even after publication changes.
     fn drop(&mut self) {
         let basename = self.basename.borrow();
-        if self.owns(&basename) {
-            let _ = self.sim.unlink(&self.directory.join(basename.as_str()));
+        if self.owns(&basename)
+            && let Ok(path) = self.entry_path(&basename)
+        {
+            let _ = self.sim.unlink(&path);
         }
     }
 }
@@ -345,8 +350,195 @@ mod tests {
         let replacement = BoundSocket::bind(sim.clone(), directory, "replacement").unwrap();
         assert!(!first.same_directory(&replacement).unwrap());
         assert!(!replacement.same_directory(&first).unwrap());
-        assert!(!first.same_directory(&second).unwrap());
+        assert!(first.same_directory(&second).unwrap());
         assert!(replacement.owns("replacement"));
+    }
+
+    #[test]
+    fn publication_and_cleanup_follow_directory_moves() {
+        for ancestor in [false, true] {
+            for exchange in [false, true] {
+                for commit in [false, true] {
+                    let sim = Simulation::new();
+                    let directory = PathBuf::from("/parent/sockets");
+                    let previous = exchange.then(|| {
+                        Rc::new(
+                            BoundSocket::bind(sim.clone(), directory.clone(), "canonical").unwrap(),
+                        )
+                    });
+                    let next = Rc::new(
+                        BoundSocket::bind(sim.clone(), directory.clone(), "temporary").unwrap(),
+                    );
+                    let source = if ancestor {
+                        Path::new("/parent")
+                    } else {
+                        &directory
+                    };
+                    sim.rename(source, Path::new("/moved"), libc::RENAME_NOREPLACE)
+                        .unwrap();
+                    let moved = if ancestor {
+                        Path::new("/moved/sockets")
+                    } else {
+                        Path::new("/moved")
+                    };
+                    sim.write_file(&directory.join("temporary"), b"foreign temporary")
+                        .unwrap();
+                    sim.write_file(&directory.join("canonical"), b"foreign canonical")
+                        .unwrap();
+                    next.set_mode(0o640).unwrap();
+                    assert_eq!(
+                        sim.metadata(&moved.join("temporary")).unwrap(),
+                        (next.inode, (libc::S_IFSOCK | 0o640) as u16)
+                    );
+                    let replacement = Replacement::prepare(
+                        next.clone(),
+                        previous.clone(),
+                        "temporary".into(),
+                        "canonical".into(),
+                    )
+                    .unwrap();
+                    let mut publication = Publication::default();
+                    publication.publish(replacement).unwrap();
+                    assert!(next.owns("canonical"));
+                    let connection = sim
+                        .connect(SocketAddress::Unix(moved.join("canonical")))
+                        .unwrap();
+                    let accepted = next.accept().unwrap();
+                    drop((connection, accepted));
+                    // Move again between publication and rollback or final cleanup.
+                    sim.rename(
+                        Path::new("/moved"),
+                        Path::new("/retired"),
+                        libc::RENAME_NOREPLACE,
+                    )
+                    .unwrap();
+                    let retired = if ancestor {
+                        Path::new("/retired/sockets")
+                    } else {
+                        Path::new("/retired")
+                    };
+                    if commit {
+                        publication.commit();
+                    } else {
+                        publication.rollback();
+                        assert!(next.owns("temporary"));
+                        if let Some(previous) = &previous {
+                            assert!(previous.owns("canonical"));
+                        } else {
+                            assert!(next.absent("canonical"));
+                        }
+                    }
+                    drop((publication, next, previous));
+                    for basename in ["temporary", "canonical"] {
+                        assert_eq!(
+                            sim.metadata(&retired.join(basename)).unwrap_err().kind(),
+                            io::ErrorKind::NotFound
+                        );
+                    }
+                    assert_eq!(
+                        sim.read_file(&directory.join("temporary")).unwrap(),
+                        b"foreign temporary"
+                    );
+                    assert_eq!(
+                        sim.read_file(&directory.join("canonical")).unwrap(),
+                        b"foreign canonical"
+                    );
+                    assert_eq!(sim.live_handles(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moved_directory_preserves_mutation_errors_and_cleanup_names() {
+        let sim = Simulation::new();
+        let next = Rc::new(
+            BoundSocket::bind(sim.clone(), PathBuf::from("/sockets"), "temporary").unwrap(),
+        );
+        sim.rename(
+            Path::new("/sockets"),
+            Path::new("/moved"),
+            libc::RENAME_NOREPLACE,
+        )
+        .unwrap();
+        let before = sim.metadata(Path::new("/moved/temporary")).unwrap();
+        sim.inject("chmod", Fault::Errno(libc::EACCES)).unwrap();
+        assert_eq!(
+            next.set_mode(0o640).unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(sim.metadata(Path::new("/moved/temporary")).unwrap(), before);
+        let prepare = || {
+            Replacement::prepare(next.clone(), None, "temporary".into(), "canonical".into())
+                .unwrap()
+        };
+        let mut publication = Publication::default();
+        sim.inject("rename", Fault::Errno(libc::EIO)).unwrap();
+        assert_eq!(
+            publication.publish(prepare()).unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(next.owns("temporary"));
+        assert!(next.absent("canonical"));
+        publication.publish(prepare()).unwrap();
+        sim.inject("rename", Fault::Errno(libc::EIO)).unwrap();
+        publication.rollback();
+        assert!(next.owns("canonical"));
+        assert!(next.absent("temporary"));
+        drop((publication, next));
+        assert_eq!(
+            sim.metadata(Path::new("/moved/canonical"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(sim.live_handles(), 0);
+    }
+
+    #[test]
+    fn moved_directory_preserves_foreign_entries_and_rejects_missing_socket() {
+        for replacement in ["missing", "file", "socket", "symlink"] {
+            let sim = Simulation::new();
+            let original =
+                BoundSocket::bind(sim.clone(), PathBuf::from("/sockets"), "socket").unwrap();
+            sim.rename(
+                Path::new("/sockets"),
+                Path::new("/moved"),
+                libc::RENAME_NOREPLACE,
+            )
+            .unwrap();
+            let path = Path::new("/moved/socket");
+            sim.unlink(path).unwrap();
+            let mut foreign = None;
+            match replacement {
+                "file" => sim.write_file(path, b"foreign").unwrap(),
+                "socket" => {
+                    foreign = Some(
+                        BoundSocket::bind(sim.clone(), PathBuf::from("/moved"), "socket").unwrap(),
+                    )
+                }
+                "symlink" => sim.symlink(Path::new("/target"), path).unwrap(),
+                _ => {}
+            }
+            let before = sim.metadata(path).ok();
+            assert!(!original.owns("socket"));
+            assert_eq!(original.absent("socket"), replacement == "missing");
+            assert_eq!(
+                original
+                    .set_mode(0o666)
+                    .unwrap_err()
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref(),
+                Some(&crate::Error::OwnershipChanged)
+            );
+            drop(original);
+            assert_eq!(sim.metadata(path).ok(), before);
+            if replacement == "file" {
+                assert_eq!(sim.read_file(path).unwrap(), b"foreign");
+            }
+            drop(foreign);
+        }
     }
 
     #[test]
