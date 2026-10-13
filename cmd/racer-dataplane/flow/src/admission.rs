@@ -456,6 +456,7 @@ mod circuit {
     }
 
     /// Local exclusive half-open ownership; healthy acquisitions need no record.
+    #[must_use = "retain the probe until the admitted operation completes"]
     pub struct Probe<'a, K: Ord> {
         health: &'a Circuits<K>,
 
@@ -487,7 +488,7 @@ mod circuit {
 
         /// Acquire an exclusive half-open guard, or an untracked healthy guard.
         pub fn acquire(&self, key: &K, now: Instant) -> Result<Probe<'_, K>> {
-            if !self.try_acquire(key, now) {
+            if !self.available(key, now) {
                 return Err(Error::Unavailable);
             }
             let probe = self.states.borrow().contains_key(key);
@@ -504,10 +505,22 @@ mod circuit {
                 if probes.contains(key) {
                     return Err(Error::Unavailable);
                 }
+                let mut states = self.states.borrow_mut();
+                let Some(state) = states.get_mut(key) else {
+                    return Ok(Probe {
+                        health: self,
+                        key: None,
+                    });
+                };
+                if !state.available(now) {
+                    return Err(Error::Unavailable);
+                }
                 if probes.len() >= self.capacity {
                     return Err(Error::Overloaded);
                 }
                 probes.insert(indexed);
+                state.probe_until = Some(Deadline::after(now, self.probe_timeout));
+                state.pending_backoff = None;
                 Some(owned)
             } else {
                 None
@@ -580,6 +593,8 @@ mod circuit {
         }
 
         /// Admit an unowned probe that becomes eligible again after its timeout.
+        /// This legacy method cannot fence completion; prefer `acquire` for work
+        /// that must stay exclusive until its owner releases the probe.
         pub fn try_acquire(&self, key: &K, now: Instant) -> bool {
             if self.probes.borrow().contains(key) {
                 return false;
@@ -1066,7 +1081,7 @@ mod circuit {
             assert!(health.available(&7, now + timeout));
         }
 
-        /// Failed key cloning must not leave an exclusive probe without an owner.
+        /// Failed cloning neither owns a probe nor delays the next attempt.
         #[test]
         fn review_regression_probe_clone_panic_allows_acquisition_after_timeout() {
             use std::{
@@ -1101,7 +1116,8 @@ mod circuit {
                 PANIC_AT.store(usize::MAX, Ordering::SeqCst);
                 assert!(result.is_err());
                 assert_eq!(CLONES.load(Ordering::SeqCst), panic_at);
-                assert!(!health.available(&Key, now));
+                assert!(health.available(&Key, now));
+                assert!(health.states.borrow()[&Key].probe_until.is_none());
                 let retry = now + timeout;
                 let probe = health
                     .acquire(&Key, retry)
@@ -1166,7 +1182,7 @@ mod circuit {
 
         /// Probe capacity and failure records remain independent after success.
         #[test]
-        fn full_probe_set_preserves_rejected_attempt_timeout() {
+        fn full_probe_set_does_not_arm_rejected_attempt_timeout() {
             let now = Instant::now();
             let timeout = Duration::from_secs(1);
             let health = Circuits::new(1, timeout);
@@ -1182,10 +1198,53 @@ mod circuit {
             health.failure(&8, now, |_, _| Duration::ZERO).unwrap();
             assert!(health.available(&8, now));
             assert!(matches!(health.acquire(&8, now), Err(Error::Overloaded)));
+            assert!(health.states.borrow()[&8].probe_until.is_none());
             drop(held);
-            assert!(!health.available(&8, now));
-            assert!(matches!(health.acquire(&8, now), Err(Error::Unavailable)));
+            assert!(health.available(&8, now));
+            let probe = health.acquire(&8, now).unwrap();
+            assert!(!health.available(&8, now + timeout));
+            drop(probe);
             assert!(health.acquire(&8, now + timeout).is_ok());
+        }
+
+        /// A failure or removal during cloning takes precedence over the attempt.
+        #[test]
+        fn probe_clone_reentry_rechecks_failure_state() {
+            for remove in [false, true] {
+                let now = Instant::now();
+                let health = Rc::new(Circuits::new(1, Duration::from_secs(1)));
+                let key = ReentrantKey::new(7);
+                health.failure(&key, now, |_, _| Duration::ZERO).unwrap();
+                let owner = health.clone();
+                *key.on_clone.borrow_mut() = Some(Box::new(move || {
+                    let lookup = ReentrantKey::new(7);
+                    if remove {
+                        owner.success(&lookup);
+                    } else {
+                        owner
+                            .failure(&lookup, now, |_, _| Duration::from_secs(10))
+                            .unwrap();
+                    }
+                }));
+                let result = health.acquire(&key, now);
+                if remove {
+                    assert!(result.unwrap().key.is_none());
+                    assert!(health.is_empty());
+                } else {
+                    assert!(matches!(result, Err(Error::Unavailable)));
+                    assert!(
+                        health
+                            .states
+                            .borrow()
+                            .get(&key)
+                            .unwrap()
+                            .probe_until
+                            .is_none()
+                    );
+                    assert!(health.acquire(&key, now + Duration::from_secs(10)).is_ok());
+                }
+                assert!(health.probes.borrow().is_empty());
+            }
         }
     }
 }
