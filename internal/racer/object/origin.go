@@ -166,9 +166,16 @@ type OriginConfig struct {
 // NewOrigin serves full metadata and conditional page reads without caching.
 // The client must return bodies whose Close interrupts Read, as the AWS client does.
 func NewOrigin(client S3Client, config OriginConfig) (racersdk.Origin, error) {
-	if client == nil || (reflect.ValueOf(client).Kind() == reflect.Pointer && reflect.ValueOf(client).IsNil()) ||
-		config.MetadataTTL < 0 {
+	if client == nil || config.MetadataTTL < 0 {
 		return nil, racersdk.ErrInvalidRequest
+	}
+
+	value := reflect.ValueOf(client)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
+		if value.IsNil() {
+			return nil, racersdk.ErrInvalidRequest
+		}
 	}
 
 	bound, err := newScope(config.Namespace, config.Buckets)
