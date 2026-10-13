@@ -139,11 +139,14 @@ Do not append `/redfish/v1`. Metalman detects supported endpoints automatically;
 `deviceID` is ignored when the URL selects a single system. Use the rack manager's
 credentials with permission to change system boot settings and power.
 
-On these endpoints, Metalman can restore slot AC power before boot configuration
-or power-on, then wait up to ten minutes for the BMC without consuming operation
-attempts. Power-off does not cut slot AC power. Use `bootProtocol: PXE` or opt into
-`VirtualMedia` below; HTTP boot is not supported on these endpoints. Boot override
-persistence depends on firmware.
+If the BMC does not answer and the rack reports the slot off, Metalman sends the
+rack's slot power-on action. It does this only for power-on or when clearing the
+boot override, because on tested firmware this action also powers on the host.
+Metalman then waits up to ten minutes for the BMC without consuming operation
+attempts. Power-off uses `ForceOff` and does not cut slot power. Use
+`bootProtocol: PXE` or opt into `VirtualMedia` below; HTTP boot is not supported
+on these endpoints. Tested firmware ignores `Once` and keeps every boot override
+`Continuous`, so Metalman always restores `Hdd` after an install.
 
 ## Virtual media (experimental)
 
@@ -153,11 +156,10 @@ ISO through a supported rack manager. Metalman detects the endpoint from
 This mode is opt-in and does not change the default PXE or HTTP paths.
 
 {{< callout type="warning" >}}
-Hardware testing is still pending. The implementation assumes that a file staged
-by rack `Tftp.Get` can be mounted by `RemoteDriveMount.ImageName`. RSCM spec
-sections 9.8 (page 35) and 10.31 (page 62) describe the actions but do not confirm
-that link. UEFI network access from the ISO and Secure Boot are also not yet
-verified on hardware.
+Partly tested on hardware: one arm64 server behind a rack manager running firmware
+1.23.13. On that setup, staging, mounting, UEFI boot from the ISO, static GRUB
+networking, kernel and initrd download, cleanup, and reboot to disk all worked.
+A full disk install, amd64, Secure Boot, and other firmware are not yet tested.
 {{< /callout >}}
 
 ### Requirements
@@ -239,8 +241,8 @@ endpoint and waits for `/ready`. This is a reboot barrier: Metalman restores
 `Hdd` and unmounts the remote drive before saving boot-safe cleanup. `/ready`
 then saves the reboot acknowledgment before allowing reboot. Rack-file deletion
 and local-media release are separate cleanup steps: a failed rack deletion keeps
-ownership but does not block a safe reboot. If the BMC is unavailable and slot AC
-power is confirmed off, no blade cleanup is needed; cleanup does not restore AC.
+ownership but does not block a safe reboot. Cleanup never changes power. If the
+BMC does not answer, cleanup keeps retrying until both `Hdd` and unmount succeed.
 
 If callbacks fail, the installer stays in RAM and keeps retrying with bounded
 `curl` requests. It does not drop to a shell, reboot early, or write the disk
@@ -259,15 +261,30 @@ For started installs, ownership remains until successful first-boot cloud-init
 confirms the host rebooted. This keeps `/ready` available if its response is lost.
 Restore connectivity and let cleanup finish; do not remove the finalizer to bypass it.
 
+### Hardware results
+
+Tested on one arm64 server behind a rack manager running firmware 1.23.13:
+
+- `RemoteDriveMount.ImageName` finds files staged by `Tftp.Get`. Image names must
+  be shorter than 40 characters, so Metalman uses `ub-<32 hex>.iso`.
+- The host sees the mounted image as a removable USB disk, not a CD. Metalman
+  builds a hybrid ISO with a GPT EFI system partition so UEFI can boot it.
+- `Tftp.Get` and `RemoteDriveMount` block until done. A mount takes about 20
+  seconds. Metalman allows three minutes for each rack manager request.
+- Unmount can be repeated. Deleting a missing file returns "No such file or
+  directory", which Metalman treats as already deleted.
+- `ForceOff` works even though the system does not list it as an allowed reset.
+- The rack power map shows host power, not slot AC power. The slot power-on
+  action also powers on the host.
+- GRUB found the NIC by MAC and used the static lease. GRUB needs HTTP range
+  requests to load a gzip arm64 kernel. Metalman's HTTP server supports them.
+
 ### Hardware validation checklist
 
-- Check rack staging locations and confirm that `Tftp.Get` stores the ISO where
-  `RemoteDriveMount.ImageName` can find it. Confirm deletion removes that file.
-  Check firmware responses when unmount or deletion is retried after a lost reply.
-- Boot the ISO on each target architecture. Check firmware NIC access, MAC
-  selection, static address/subnet/gateway, HTTP downloads, and Secure Boot.
-- Complete one install. Confirm `Hdd` restoration and unmount happen before reboot,
-  and rack deletion and local release finish. Reboot again and confirm no reinstall.
+- Run a full disk install. Confirm the installer reaches `/complete` and `/ready`,
+  and the installed host joins the cluster. Reboot again and confirm no reinstall.
+- Boot the ISO on amd64 and with Secure Boot on.
+- Test a server whose slot AC power is off, and other rack manager firmware.
 - Restart Metalman during staging, installation, and cleanup. Test callback and
   BMC failures and operation deletion. Confirm the installer waits in RAM, late
   cleanup permits reboot without reinstalling, and pending cleanup blocks the next

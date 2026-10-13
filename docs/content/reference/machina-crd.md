@@ -87,7 +87,7 @@ not a requirement to control DHCP. Metalman's `--serve-url` must be a plain HTTP
 IPv4 root. The rack must reach the IPv4 address advertised by
 `--media-tftp-server` (default `serverIP`) on UDP/69. See the
 [virtual media guide]({{< relref "/guides/pxe#virtual-media-experimental" >}}) for
-runtime tools, an example, cleanup rules, and the pending hardware checks.
+runtime tools, an example, cleanup rules, and hardware test results.
 
 ### spec.kubernetes
 
@@ -271,7 +271,7 @@ after a controller restart. Each entry includes:
 
 Virtual-media callbacks are target-scoped. After `/complete` saves `imageWritten`,
 the installer waits for `/ready`. `cleaned` means boot-safe cleanup: `Hdd` restored
-and the drive unmounted, or the unavailable blade confirmed AC-off. `/ready` saves
+and the drive unmounted. `/ready` saves
 `rebootRequestedAt` before returning success. Rack deletion (`stagedDeleted`) and
 local release (`released`) are separate; failed deletion retains ownership without
 blocking a safe reboot.
@@ -556,8 +556,8 @@ mediaGrub: grubx64.efi
 For arm64, use `shimaa64.efi` and `grubaa64.efi`. Publish the matching EFI files,
 updated `grub/grub.cfg.tmpl`, and installer overlay from `images/netboot` together;
 adding metadata to an old artifact is not enough. This format supports the live
-install authorization and cleanup callback barrier. It does not mean the rack
-mount path, firmware networking, or Secure Boot has been verified on hardware.
+install authorization and cleanup callback barrier. See the virtual media guide
+for what has been tested on hardware.
 
 ---
 
