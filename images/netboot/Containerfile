@@ -43,6 +43,10 @@ RUN mkdir -p /artifacts && \
     fi
 
 COPY images/netboot/assets/init /tmp/initrd-root/init
+# The installer copies whole driver directories, then adds any module they
+# depend on from other directories, such as net/psample and net/tls for
+# mlx5_core. modules.dep lists the full dependency closure of each module, so
+# one pass is enough.
 RUN chmod 755 /tmp/initrd-root/init && \
     mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
     cp /usr/bin/efibootmgr /usr/bin/curl /tmp/initrd-root/usr/bin/ && \
@@ -69,6 +73,21 @@ RUN chmod 755 /tmp/initrd-root/init && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/virtio/." "${KMOD}/kernel/drivers/virtio/" && \
     cp -a "/lib/modules/${KVER}/kernel/drivers/block/." "${KMOD}/kernel/drivers/block/" && \
     cp -a "/lib/modules/${KVER}/kernel/fs/." "${KMOD}/kernel/fs/" && \
+    mkdir -p "${KMOD}/kernel/crypto" "${KMOD}/kernel/lib" && \
+    cp -a "/lib/modules/${KVER}/kernel/crypto/." "${KMOD}/kernel/crypto/" && \
+    cp -a "/lib/modules/${KVER}/kernel/lib/." "${KMOD}/kernel/lib/" && \
+    (cd "${KMOD}" && find kernel -name '*.ko*') > /tmp/initrd-modules && \
+    awk -F': ' 'NR==FNR { want[$1] = 1; next } ($1 in want) { n = split($2, d, " "); for (i = 1; i <= n; i++) print d[i] }' \
+        /tmp/initrd-modules "/lib/modules/${KVER}/modules.dep" | sort -u > /tmp/initrd-deps && \
+    while read -r dep; do \
+        [ -e "${KMOD}/${dep}" ] && continue; \
+        mkdir -p "$(dirname "${KMOD}/${dep}")" && \
+        cp -a "/lib/modules/${KVER}/${dep}" "${KMOD}/${dep}" || exit 1; \
+    done < /tmp/initrd-deps && \
+    rm -f /tmp/initrd-modules /tmp/initrd-deps && \
+    for f in modules.builtin modules.builtin.modinfo modules.order; do \
+        [ ! -e "/lib/modules/${KVER}/$f" ] || cp "/lib/modules/${KVER}/$f" "${KMOD}/$f"; \
+    done && \
     depmod -b /tmp/initrd-root "${KVER}" && \
     cd /tmp/initrd-root && \
     find . -print0 | cpio --create --format=newc --quiet --null > /artifacts/init.cpio
