@@ -119,6 +119,51 @@ func TestFullNodePreflightReturnsTypedInventoryMismatch(t *testing.T) {
 	}
 }
 
+func TestFullNodePreflightAcceptsExpectedB200Inventory(t *testing.T) {
+	t.Parallel()
+
+	script := certificationScript(t, "gpu-full-node.sh")
+	tempDir := t.TempDir()
+	resultsDir := filepath.Join(tempDir, "results")
+
+	if err := os.Mkdir(resultsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	nvidiaSMI := filepath.Join(tempDir, "nvidia-smi")
+
+	fake := `#!/usr/bin/env bash
+if [[ "$*" == *"--query-gpu=name"* ]]; then
+  printf '%s\n' 'NVIDIA B200'
+else
+  printf '%s\n' '0, NVIDIA B200, 00000000:01:00.0, P0, 31, 570.00'
+fi
+`
+	if err := os.WriteFile(nvidiaSMI, []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("bash", "-c", strings.ReplaceAll(script, "/results/", resultsDir+"/"))
+
+	cmd.Env = append(
+		os.Environ(),
+		"PATH="+tempDir+":"+os.Getenv("PATH"),
+		"PROJECT_SIGNAL_STAGE_NAME=preflight",
+		"EXPECTED_GPU_PRODUCT_REGEX=^NVIDIA B200$",
+		"EXPECTED_GPU_COUNT=8",
+		"OBSERVED_GPU_CAPACITY=8",
+		"OBSERVED_GPU_ALLOCATABLE=8",
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("preflight returned infrastructure failure: %v: %s", err, output)
+	}
+
+	assertFileContents(t, filepath.Join(resultsDir, "verdict"), "Pass")
+	assertFileContents(t, filepath.Join(resultsDir, "reason"), "NodeInventoryHealthy")
+}
+
 func certificationScript(t *testing.T, name string) string {
 	t.Helper()
 

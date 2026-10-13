@@ -66,6 +66,7 @@ spec:
             template: skipped-workload
           - name: mpi-backend
             dependencies: [workload]
+            when: "{{`{{tasks.node-health.outputs.parameters.verdict}}`}} == Pass"
             template: full-node-mpi-backend
           - name: health-after
             dependencies: [mpi-backend]

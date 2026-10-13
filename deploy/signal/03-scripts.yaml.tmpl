@@ -110,6 +110,9 @@ data:
     }
 
     query_visible_gpus() {
+      mapfile -t products < <(
+        nvidia-smi --query-gpu=name --format=csv,noheader
+      )
       mapfile -t gpu_rows < <(
         nvidia-smi \
           --query-gpu=index,name,pci.bus_id,pstate,temperature.gpu,driver_version \
@@ -117,16 +120,16 @@ data:
       )
       details="$(printf '%s\n' "${gpu_rows[@]}")"
 
-      if [[ "${#gpu_rows[@]}" -ne "$1" ]]; then
+      if [[ "${#products[@]}" -ne "$1" || "${#gpu_rows[@]}" -ne "$1" ]]; then
         verdict=Fail
         reason=RuntimeGPUCountMismatch
 
         return 1
       fi
 
-      local row
-      for row in "${gpu_rows[@]}"; do
-        if ! grep -Eq "${EXPECTED_GPU_PRODUCT_REGEX}" <<<"${row}"; then
+      local product
+      for product in "${products[@]}"; do
+        if ! grep -Eq "${EXPECTED_GPU_PRODUCT_REGEX}" <<<"${product}"; then
           verdict=Fail
           reason=GPUProductMismatch
 
