@@ -150,10 +150,12 @@ func (r *evictor) shouldEvict(pod *corev1.Pod, active *ledger.Grant, releases []
 		return true
 	}
 
-	// creationTimestamp has one-second precision.
+	// creationTimestamp has one-second precision, so truncate both grant boundaries.
+	// Keep pods from the release second to avoid deleting pods admitted after release.
+	// This also keeps pods created just before release in that same second.
 	created := pod.CreationTimestamp.Time
 	for _, rel := range releases {
-		if pod.Namespace == rel.Namespace && !created.Before(rel.CreatedAt.Truncate(time.Second)) && created.Before(rel.ReleasedAt) {
+		if pod.Namespace == rel.Namespace && !created.Before(rel.CreatedAt.Truncate(time.Second)) && created.Before(rel.ReleasedAt.Truncate(time.Second)) {
 			return true
 		}
 	}

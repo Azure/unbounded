@@ -142,6 +142,34 @@ func TestEvictorRelease(t *testing.T) {
 	require.ElementsMatch(t, []string{"tenant/before", "tenant/after", "other/unrelated", "tenant/elsewhere"}, remaining(t, c))
 }
 
+func TestEvictorReleaseSecondPrecision(t *testing.T) {
+	releasedAt := testNow.Add(-time.Minute + 300*time.Millisecond)
+	g := grant("tenant", "old", "a", time.Hour)
+	g.UID = "old"
+	g.CreatedAt = releasedAt.Add(-time.Minute)
+
+	l := ledger.New()
+	require.NoError(t, l.Add(g))
+	require.True(t, l.Remove(g.Key(), releasedAt))
+
+	regrant := grant("tenant", "new", "a", time.Hour)
+	regrant.UID = "new"
+	regrant.CreatedAt = releasedAt
+	require.NoError(t, l.Add(regrant))
+
+	cm := configMap(t)
+	cm.Data = l.Encode()
+	r, c := newEvictor(t, cm, nil,
+		pod("tenant", "prior-second", "a", releasedAt.Truncate(time.Second).Add(-time.Second)),
+		pod("tenant", "before-release-same-second", "a", releasedAt.Add(-100*time.Millisecond).Truncate(time.Second)),
+		pod("tenant", "after-release-same-second", "a", releasedAt.Add(100*time.Millisecond).Truncate(time.Second)),
+	)
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"tenant/before-release-same-second", "tenant/after-release-same-second"}, remaining(t, c))
+}
+
 func TestEvictorReleaseLaterSweep(t *testing.T) {
 	g := grant("tenant", "g", "a", time.Hour)
 	g.UID = "u1"
