@@ -463,9 +463,12 @@ pub fn rotation_request(
         } else {
             transport.bootstrap(&scope).await?
         };
-        let mut response = connection
-            .request(request(Method::Get, "/snapshot", None, 1024), &scope)
-            .await?;
+        let request = if identity.is_some() {
+            request(Method::Get, "/v1/snapshot", None, 1024)
+        } else {
+            request(Method::Post, "/v1/bootstrap", Some("test-token"), 1024)
+        };
+        let mut response = connection.request(request, &scope).await?;
         assert_eq!(response.status, 200);
         Ok(std::mem::take(&mut response.body))
     })

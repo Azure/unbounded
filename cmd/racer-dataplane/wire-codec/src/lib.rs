@@ -719,6 +719,7 @@ pub mod rest {
                     body,
                     limit,
                 } = request;
+                self.validate_request(method, path, token)?;
                 let request = request_head(&self.host, method, path, token, body.len(), header)?;
                 self.send(request.as_bytes(), body, scope).await?;
                 let completed = self.receive_response(limit, scope).await?;
@@ -729,6 +730,30 @@ pub mod rest {
                     retry_after: completed.head.retry_after,
                 })
             })
+        }
+
+        fn validate_request(&self, method: Method, path: &str, bearer: Option<&str>) -> Result<()> {
+            // Bearer credentials belong only to enrollment, never an established route.
+            let allowed = match self.authentication {
+                Authentication::Bootstrap => {
+                    matches!(method, Method::Post)
+                        && path == "/v1/bootstrap"
+                        && bearer.is_some_and(|token| !token.is_empty())
+                }
+                Authentication::Authenticated(_) => {
+                    matches!(method, Method::Get)
+                        && matches!(
+                            path.split_once('?').map_or(path, |(route, _)| route),
+                            "/v1/snapshot" | "/v1/keyring"
+                        )
+                        && bearer.is_none()
+                }
+            };
+            if allowed {
+                Ok(())
+            } else {
+                Err(Error::InvalidRequest)
+            }
         }
 
         fn within_max_age(&self) -> bool {
@@ -1989,7 +2014,7 @@ pub mod rest {
             );
             socket.set_nonblocking(false).unwrap();
             let mut request = connection.request(
-                testing::request(Method::Post, "/cancel-test", Some("test-token"), 1024),
+                testing::request(Method::Post, "/v1/bootstrap", Some("test-token"), 1024),
                 &scope,
             );
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2023,7 +2048,7 @@ pub mod rest {
                     }
                 }
                 let head = String::from_utf8(head).unwrap();
-                assert!(head.starts_with("POST /cancel-test HTTP/1.1\r\n"));
+                assert!(head.starts_with("POST /v1/bootstrap HTTP/1.1\r\n"));
                 assert!(head.contains("\r\nAuthorization: Bearer test-token\r\n"));
                 tls.writer()
                     .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -2114,6 +2139,71 @@ pub mod rest {
         }
 
         #[test]
+        fn requests_enforce_connection_credentials_and_routes() {
+            use testing::{RotationServer, WeeklyCertificates};
+            let certs = WeeklyCertificates::new();
+            let d = testing::Directory::new();
+            let trust = d.0.join("trust.pem");
+            std::fs::write(&trust, certs.roots[0].pem()).unwrap();
+            let server = RotationServer::new(certs.servers[0].clone());
+            let transport = server.transport(trust);
+            let (ca, key) = testing::ca();
+            let identity = TestIdentity::new(&ca, &key);
+            for mutual in [false, true] {
+                for (method, path, bearer, bootstrap_ok, authenticated_ok) in [
+                    (Method::Post, "/v1/bootstrap", Some("token"), true, false),
+                    (Method::Post, "/v1/bootstrap", None, false, false),
+                    (Method::Post, "/v1/bootstrap", Some(""), false, false),
+                    (Method::Get, "/v1/bootstrap", Some("token"), false, false),
+                    (
+                        Method::Post,
+                        "/v1/bootstrap?x=1",
+                        Some("token"),
+                        false,
+                        false,
+                    ),
+                    (Method::Post, "/v1/bootstrap/", Some("token"), false, false),
+                    (Method::Get, "/v1/snapshot", None, false, true),
+                    (Method::Get, "/v1/snapshot?after=1", None, false, true),
+                    (Method::Get, "/v1/keyring", None, false, true),
+                    (Method::Get, "/v1/keyring?after=1", None, false, true),
+                    (Method::Get, "/v1/snapshot", Some("token"), false, false),
+                    (Method::Get, "/v1/keyring", Some("token"), false, false),
+                    (Method::Get, "/v1/keyring", Some(""), false, false),
+                    (Method::Post, "/v1/snapshot", None, false, false),
+                    (Method::Get, "/v1/snapshot/", None, false, false),
+                    (Method::Get, "/v1/%73napshot", None, false, false),
+                    (Method::Get, "/unknown", None, false, false),
+                ] {
+                    let scope = testing::scope();
+                    let connection = futures::executor::block_on(
+                        transport.connect(mutual.then(|| identity.borrowed()), &scope),
+                    )
+                    .unwrap();
+                    let result = futures::executor::block_on(
+                        connection.request(testing::request(method, path, bearer, 1024), &scope),
+                    );
+                    if if mutual {
+                        authenticated_ok
+                    } else {
+                        bootstrap_ok
+                    } {
+                        assert_eq!(result.unwrap().status, 200, "{mutual}: {path}");
+                    } else {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(testing::Error::Transport(Error::InvalidRequest))
+                            ),
+                            "{mutual}: {path}"
+                        );
+                    }
+                    transport.close_idle();
+                }
+            }
+        }
+
+        #[test]
         fn bootstrap_never_carries_authenticated_pool_state() {
             use testing::{RotationServer, WeeklyCertificates, rotation_request};
             let certs = WeeklyCertificates::new();
@@ -2129,7 +2219,7 @@ pub mod rest {
                 Authentication::Bootstrap
             ));
             let first = futures::executor::block_on(connection.request(
-                testing::request(Method::Get, "/snapshot", None, 1024),
+                testing::request(Method::Post, "/v1/bootstrap", Some("test-token"), 1024),
                 &scope,
             ))
             .unwrap();
@@ -2144,7 +2234,7 @@ pub mod rest {
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let identity = TestIdentity::new(&ca, &key);
-            let response = || ("/snapshot".to_owned(), 200, b"{}".to_vec());
+            let response = || ("/v1/snapshot".to_owned(), 200, b"{}".to_vec());
             let (endpoint, server) = scripted_server(
                 &d,
                 &ca,
@@ -2158,7 +2248,7 @@ pub mod rest {
             let scope = testing::scope();
             let complete = |connection: Connection<FixtureIo>| {
                 futures::executor::block_on(connection.request(
-                    testing::request(Method::Get, "/snapshot", None, 1024),
+                    testing::request(Method::Get, "/v1/snapshot", None, 1024),
                     &scope,
                 ))
                 .unwrap()
@@ -2188,7 +2278,7 @@ pub mod rest {
             let identity = TestIdentity::new(&ca, &key);
             let response = |status| {
                 (
-                    "/snapshot".to_owned(),
+                    "/v1/snapshot".to_owned(),
                     status,
                     if status == 204 {
                         vec![]
@@ -2223,7 +2313,7 @@ pub mod rest {
                         .await
                         .unwrap()
                         .request(
-                            testing::request(Method::Get, "/snapshot", None, 65536),
+                            testing::request(Method::Get, "/v1/snapshot", None, 65536),
                             &scope,
                         )
                         .await
@@ -2253,7 +2343,7 @@ pub mod rest {
             );
             authenticated(&mut connection).expires = expiry;
             let result = futures::executor::block_on(connection.request(
-                testing::request(Method::Get, "/snapshot", None, 65536),
+                testing::request(Method::Get, "/v1/snapshot", None, 65536),
                 &scope,
             ))
             .unwrap();
@@ -2285,7 +2375,7 @@ pub mod rest {
                 futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
             assert!(matches!(
                 futures::executor::block_on(connection.request(
-                    testing::request(Method::Get, "/snapshot", None, 65536),
+                    testing::request(Method::Get, "/v1/snapshot", None, 65536),
                     &scope
                 )),
                 Err(testing::Error::Transport(Error::Io))
@@ -2302,7 +2392,7 @@ pub mod rest {
             let (ca, key) = testing::ca();
             let identity = TestIdentity::new(&ca, &key);
             let unrelated = TestIdentity::new(&ca, &key);
-            let response = || ("/snapshot".to_owned(), 200, b"{}".to_vec());
+            let response = || ("/v1/snapshot".to_owned(), 200, b"{}".to_vec());
             let (endpoint, server) =
                 scripted_server(&d, &ca, &key, vec![vec![response(), response()]]);
             let transport = Transport::new(endpoint);
@@ -2331,7 +2421,7 @@ pub mod rest {
                         .await
                         .unwrap()
                         .request(
-                            testing::request(Method::Get, "/snapshot", None, 1024),
+                            testing::request(Method::Get, "/v1/snapshot", None, 1024),
                             &scope,
                         )
                         .await
@@ -2359,7 +2449,7 @@ pub mod rest {
                 &d,
                 &ca,
                 &key,
-                vec![vec![("/snapshot".to_owned(), 200, b"{}".to_vec())]],
+                vec![vec![("/v1/snapshot".to_owned(), 200, b"{}".to_vec())]],
             );
             let transport = Transport::new(endpoint);
             transport.attach_io(Rc::new(FixtureIo));
@@ -2367,7 +2457,7 @@ pub mod rest {
             let connection =
                 futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
             futures::executor::block_on(connection.request(
-                testing::request(Method::Get, "/snapshot", None, 1024),
+                testing::request(Method::Get, "/v1/snapshot", None, 1024),
                 &scope,
             ))
             .unwrap();
