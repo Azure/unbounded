@@ -5,8 +5,9 @@
 //! [`Codec`] limits the wire size of a message head, not its body. It accepts
 //! HTTP/1.1 requests and responses, rejects transfer coding and duplicate
 //! Content-Length or Host fields, and leaves body limits to [`connection`].
+//! The codec also rejects `Connection: upgrade`.
 //! Response codes from 100 to 599 are valid at the codec boundary; the connection
-//! exchange layer rejects informational responses, upgrades, and CONNECT requests.
+//! exchange layer rejects informational responses and CONNECT requests.
 //! Requests require one Host with URI host and optional port syntax. Empty Host
 //! values remain valid for targets without authority; callers enforce routing.
 //!
