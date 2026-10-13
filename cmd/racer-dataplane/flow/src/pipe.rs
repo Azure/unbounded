@@ -345,10 +345,13 @@ impl<P: Policy> PipeLease<P> {
         }
     }
 
-    /// Receive opaque socket pages directly into an empty bounded pipe. No user
+    /// Receive opaque socket pages into the free capacity of a bounded pipe. No user
     /// buffer is borrowed or retained by this synchronous nonblocking syscall.
     /// The descriptor is validated as a nonblocking stream socket. Callers must
     /// not concurrently clear O_NONBLOCK through a duplicate descriptor.
+    /// A zero count returns zero after validation. A positive count on a full
+    /// pipe returns WouldBlock, not EOF. Partially filled pipes accept a bounded
+    /// prefix, but kernel page-slot limits may also return WouldBlock.
     pub fn try_splice_from(&mut self, socket: &Descriptor, count: usize) -> io::Result<usize> {
         #[cfg(feature = "simulation")]
         if socket.as_sim().is_some() || self.resources.as_ref().unwrap().write.as_sim().is_some() {
@@ -356,7 +359,13 @@ impl<P: Policy> PipeLease<P> {
         }
         validate_socket(socket)?;
         let pipe = self.resources.as_mut().unwrap();
+        if count == 0 {
+            return Ok(0);
+        }
         let count = count.min(pipe.capacity - pipe.buffered);
+        if count == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+        }
         // SAFETY: socket is a validated nonblocking stream; this pipe owns
         // both ends, offsets are null, and no userspace pointer enters the kernel.
         let received = syscall_count(unsafe {
@@ -1328,6 +1337,46 @@ mod tests {
         assert_eq!(pipe.try_splice_from(&socket, 3).unwrap(), 3);
         assert_eq!(pipe.try_read(&mut bytes).unwrap(), 3);
         assert_eq!(&bytes, b"in!");
+    }
+
+    /// Full capacity is backpressure; only a drained socket reports EOF.
+    #[test]
+    fn splice_from_full_partial_zero_and_eof_are_distinct() {
+        use std::{io::Write, os::unix::net::UnixStream};
+        let pool = new_pool(admission(1));
+        let mut pipe = pool.acquire().unwrap();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = Descriptor::from(std::os::fd::OwnedFd::from(socket));
+        let capacity = pipe.capacity();
+        let bytes = vec![0x5a; capacity];
+        assert_eq!(pipe.try_write(&bytes).unwrap(), capacity);
+        peer.write_all(b"next").unwrap();
+        assert_eq!(pipe.try_splice_from(&socket, 0).unwrap(), 0);
+        assert_eq!(
+            pipe.try_splice_from(&socket, 1).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(pipe.buffered(), capacity);
+        let mut drained = vec![0; capacity];
+        assert_eq!(pipe.try_read(&mut drained).unwrap(), capacity);
+        assert_eq!(drained, bytes);
+        // One page leaves a free slot even on a two-page pipe under UID pressure.
+        // SAFETY: sysconf has no pointer arguments.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        assert!(capacity > page);
+        assert_eq!(pipe.try_write(&bytes[..page]).unwrap(), page);
+        assert_eq!(pipe.try_splice_from(&socket, usize::MAX).unwrap(), 4);
+        assert_eq!(pipe.buffered(), page + 4);
+        assert_eq!(pipe.try_read(&mut drained).unwrap(), page + 4);
+        assert_eq!(&drained[page..page + 4], b"next");
+        assert_eq!(
+            pipe.try_splice_from(&socket, 1).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(peer);
+        assert_eq!(pipe.try_splice_from(&socket, 1).unwrap(), 0);
+        assert_eq!(pipe.buffered(), 0);
     }
 
     /// Simulated descriptors preserve byte counts, pooling, and partial close.
