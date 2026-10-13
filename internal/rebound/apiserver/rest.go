@@ -247,8 +247,6 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 		return nil, apierrors.NewInvalid(rebound.SchemeGroupVersion.WithKind(rebound.Kind).GroupKind(), g.Name, errs)
 	}
 
-	now := s.clock.Now().UTC()
-
 	holder := ""
 	if user, exists := request.UserFrom(ctx); exists {
 		holder = user.GetName()
@@ -256,12 +254,7 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 
 	record := &ledger.Grant{
 		Namespace: ns, Name: g.Name, UID: uuid.NewUUID(), Nodes: slices.Clone(g.Spec.Nodes),
-		Holder: holder, CreatedAt: now, ExpiresAt: now.Add(ttl), Labels: maps.Clone(g.Labels), Annotations: maps.Clone(g.Annotations),
-	}
-	if validate != nil {
-		if err := validate(ctx, grantObject(record, "")); err != nil {
-			return nil, err
-		}
+		Holder: holder, Labels: maps.Clone(g.Labels), Annotations: maps.Clone(g.Annotations),
 	}
 
 	_, rv, err := s.store.Update(ctx, options != nil && dryRun(options.DryRun), func(l *ledger.Ledger) error {
@@ -280,6 +273,16 @@ func (s *storage) Create(ctx context.Context, obj runtime.Object, validate rest.
 
 		if len(nodeErrors) != 0 {
 			return &mutationError{apierrors.NewInvalid(rebound.SchemeGroupVersion.WithKind(rebound.Kind).GroupKind(), g.Name, nodeErrors)}
+		}
+
+		now := s.clock.Now().UTC()
+		record.CreatedAt = now
+		record.ExpiresAt = now.Add(ttl)
+
+		if validate != nil {
+			if err := validate(ctx, grantObject(record, "")); err != nil {
+				return &mutationError{err}
+			}
 		}
 
 		return l.Add(record)

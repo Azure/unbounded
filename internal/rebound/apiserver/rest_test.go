@@ -207,6 +207,48 @@ func TestDryRunAndRetry(t *testing.T) {
 	}
 }
 
+func TestCreateTimesFromFinalAttempt(t *testing.T) {
+	s, client, ctx := fixture(t)
+	c := clocktesting.NewFakeClock(s.clock.Now())
+	s.clock = c
+	start := c.Now()
+	lookups, updates := 0, 0
+
+	client.PrependReactor("get", "nodes", func(clienttesting.Action) (bool, runtime.Object, error) {
+		lookups++
+
+		c.Step(time.Minute)
+
+		return false, nil, nil
+	})
+	client.PrependReactor("update", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+		updates++
+		if updates == 1 {
+			c.Step(time.Minute)
+
+			return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), ledger.ConfigMapName, errors.New("retry"))
+		}
+
+		return false, nil, nil
+	})
+
+	g := created(t, s, ctx, "test", "node-a")
+	want := start.Add(3 * time.Minute)
+
+	if lookups != 2 || updates != 2 {
+		t.Fatalf("lookups=%d updates=%d", lookups, updates)
+	}
+
+	if !g.CreationTimestamp.Time.Equal(want) || !g.Status.ExpiresAt.Time.Equal(want.Add(time.Hour)) {
+		t.Fatalf("returned timestamps: created=%v expires=%v", g.CreationTimestamp, g.Status.ExpiresAt)
+	}
+
+	stored, ok := ledger.Parse(cached(t, s).Data).Get(types.NamespacedName{Namespace: "team", Name: "test"})
+	if !ok || !stored.CreatedAt.Equal(want) || !stored.ExpiresAt.Equal(want.Add(time.Hour)) {
+		t.Fatalf("stored timestamps: %+v", stored)
+	}
+}
+
 func TestGetListDelete(t *testing.T) {
 	s, _, ctx := fixture(t)
 	g := created(t, s, ctx, "first", "node-a")
