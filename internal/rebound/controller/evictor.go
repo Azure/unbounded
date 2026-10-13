@@ -20,9 +20,9 @@ import (
 	"github.com/Azure/unbounded/internal/rebound/ledger"
 )
 
-// sweepInterval is how often the nodes of an active grant are checked for
-// pods from other namespaces. The pod placement policy reads the ledger
-// through a cache, so a pod can slip in just after a grant is created.
+// sweepInterval bounds the delay between checks of active and released nodes.
+// Pods can arrive after a sweep because placement uses a cached ledger or
+// a pod creation that started during a grant finishes after its release.
 const sweepInterval = 15 * time.Second
 
 // evictor deletes pods that a grant does not allow on its nodes:
@@ -91,11 +91,22 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		return ctrl.Result{}, err
 	}
 
+	var requeueAfter time.Duration
 	if active != nil {
-		return ctrl.Result{RequeueAfter: sweepInterval}, nil
+		requeueAfter = sweepInterval
 	}
 
-	return ctrl.Result{}, nil
+	now := r.clock.Now()
+	for _, rel := range releases {
+		if remaining := rel.DropAt.Sub(now); remaining > 0 {
+			delay := max(time.Millisecond, min(sweepInterval, remaining))
+			if requeueAfter == 0 || delay < requeueAfter {
+				requeueAfter = delay
+			}
+		}
+	}
+
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // nodeRecords returns read-only records from an index rebuilt once per ledger version.

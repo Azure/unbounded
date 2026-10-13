@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -137,8 +138,83 @@ func TestEvictorRelease(t *testing.T) {
 
 	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
 	require.NoError(t, err)
-	require.Zero(t, result.RequeueAfter)
+	require.Equal(t, sweepInterval, result.RequeueAfter)
 	require.ElementsMatch(t, []string{"tenant/before", "tenant/after", "other/unrelated", "tenant/elsewhere"}, remaining(t, c))
+}
+
+func TestEvictorReleaseLaterSweep(t *testing.T) {
+	g := grant("tenant", "g", "a", time.Hour)
+	g.UID = "u1"
+	g.CreatedAt = testNow.Add(-time.Minute)
+	l := ledger.New()
+	require.NoError(t, l.Add(g))
+	require.True(t, l.Remove(g.Key(), testNow))
+	cm := configMap(t)
+	cm.Data = l.Encode()
+	r, c := newEvictor(t, cm, nil)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}}
+
+	result, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, sweepInterval, result.RequeueAfter)
+
+	require.NoError(t, c.Create(t.Context(), pod("tenant", "late", "a", testNow.Add(-time.Second))))
+	r.clock.(*clocktesting.FakeClock).Step(result.RequeueAfter)
+	result, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, sweepInterval, result.RequeueAfter)
+	require.Empty(t, remaining(t, c))
+
+	r.clock.(*clocktesting.FakeClock).SetTime(testNow.Add(ledger.ReleaseRetention))
+	result, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Zero(t, result.RequeueAfter)
+}
+
+func TestEvictorReleaseRequeueDeadline(t *testing.T) {
+	for name, tc := range map[string]struct {
+		drops  []time.Time
+		active bool
+		want   time.Duration
+	}{
+		"retained":         {drops: []time.Time{testNow.Add(time.Minute)}, want: sweepInterval},
+		"earliest drop":    {drops: []time.Time{testNow.Add(time.Minute), testNow.Add(3 * time.Second)}, want: 3 * time.Second},
+		"minimum delay":    {drops: []time.Time{testNow.Add(time.Nanosecond)}, want: time.Millisecond},
+		"at drop":          {drops: []time.Time{testNow}},
+		"past drop":        {drops: []time.Time{testNow.Add(-time.Second)}},
+		"mixed drops":      {drops: []time.Time{testNow.Add(-time.Second), testNow.Add(time.Second)}, want: time.Second},
+		"legacy record":    {drops: []time.Time{{}}, want: sweepInterval},
+		"active at drop":   {drops: []time.Time{testNow}, active: true, want: sweepInterval},
+		"active near drop": {drops: []time.Time{testNow.Add(time.Second)}, active: true, want: time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := ledger.New()
+
+			for i, drop := range tc.drops {
+				g := grant("tenant", "g", "a", time.Hour)
+				g.UID = types.UID(strconv.Itoa(i))
+				require.NoError(t, l.Add(g))
+				require.True(t, l.Remove(g.Key(), testNow.Add(-time.Minute)))
+
+				for _, rel := range l.Releases() {
+					if rel.UID == g.UID {
+						rel.DropAt = drop
+					}
+				}
+			}
+
+			if tc.active {
+				require.NoError(t, l.Add(grant("tenant", "active", "a", time.Hour)))
+			}
+
+			cm := configMap(t)
+			cm.Data = l.Encode()
+			r, _ := newEvictor(t, cm, nil)
+			result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+			require.NoError(t, err)
+			require.Equal(t, tc.want, result.RequeueAfter)
+		})
+	}
 }
 
 func TestEvictorReleaseIndex(t *testing.T) {
@@ -232,7 +308,7 @@ func TestEvictorLateExpiry(t *testing.T) {
 
 	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
 	require.NoError(t, err)
-	require.Zero(t, result.RequeueAfter)
+	require.Equal(t, sweepInterval, result.RequeueAfter)
 	require.ElementsMatch(t, []string{"tenant/at-expiry", "tenant/after-expiry"}, remaining(t, c))
 }
 
