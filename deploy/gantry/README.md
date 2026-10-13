@@ -118,6 +118,21 @@ many nodes lose their local mirror during a rollout:
 --set-string updateStrategy.rollingUpdate.maxUnavailable=10%
 ```
 
+## Peer transfer tuning
+
+`gantry.peerFetchTimeout` (default `15m`) caps one complete peer blob request,
+including streaming the body. It is a safety ceiling, not a stall detector:
+the HTTP/2 transport separately probes connections after 10s without reads.
+A value much lower than a large layer's transfer time makes requesters abandon
+progressing transfers and switch providers.
+
+`gantry.transferMaxConcurrentServes` (default `10`) caps concurrent peer blob
+serves per agent. Requests over the cap receive 429 so the requester
+re-discovers another provider. `0` means unlimited.
+
+Use `gantry.config` only when a setting has no dedicated value; it replaces
+the entire generated configuration.
+
 ## Operator Profile
 
 ```sh

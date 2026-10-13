@@ -214,6 +214,37 @@ func TestRendersOptionalMetricsService(t *testing.T) {
 	}
 }
 
+func TestRendersConfiguredPeerTransferSettings(t *testing.T) {
+	t.Parallel()
+
+	defaultConfig, err := os.ReadFile(filepath.Join(renderChart(t, false), "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read default rendered config: %v", err)
+	}
+
+	for _, want := range []string{`peer_fetch_timeout: "15m"`, "transfer_max_concurrent_serves: 10\n"} {
+		if !bytes.Contains(defaultConfig, []byte(want)) {
+			t.Fatalf("default rendered config does not contain %q", want)
+		}
+	}
+
+	outputDir := renderChart(t, false,
+		"--set-string", "gantry.peerFetchTimeout=60s",
+		"--set", "gantry.transferMaxConcurrentServes=100",
+	)
+
+	rawConfig, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered config: %v", err)
+	}
+
+	for _, want := range []string{`peer_fetch_timeout: "60s"`, "transfer_max_concurrent_serves: 100\n"} {
+		if !bytes.Contains(rawConfig, []byte(want)) {
+			t.Fatalf("rendered config does not contain %q", want)
+		}
+	}
+}
+
 func TestRendersConfiguredChairAndSeedCounts(t *testing.T) {
 	t.Parallel()
 
