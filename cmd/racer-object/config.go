@@ -4,7 +4,6 @@
 package main
 
 import (
-	"errors"
 	"net/http"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -38,7 +37,7 @@ func newOriginS3Client(cfg aws.Config, o options) (*originS3Client, error) {
 		}
 	})
 	if err := validateEndpoint(aws.ToString(client.Options().BaseEndpoint)); err != nil {
-		return nil, errors.New("invalid effective S3 endpoint: must be an HTTP(S) origin without credentials, query, fragment, or path prefix, with a valid port")
+		return nil, safeDiagnostic("invalid effective S3 endpoint: must be an HTTP(S) origin without credentials, query, fragment, or path prefix, with a valid port", "config", err)
 	}
 
 	owned.Client = client

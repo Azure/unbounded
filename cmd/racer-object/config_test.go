@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +55,11 @@ func TestOriginEffectiveEndpoint(t *testing.T) {
 					if validateEndpoint(endpoint) != nil {
 						if err == nil || !strings.HasPrefix(err.Error(), "invalid effective S3 endpoint:") || strings.Contains(err.Error(), endpoint) {
 							t.Fatalf("error = %v, want redacted endpoint error", err)
+						}
+
+						cause := errors.Unwrap(err)
+						if cause == nil || cause.Error() != validateEndpoint(endpoint).Error() || !errors.Is(err, cause) || !strings.Contains(err.Error(), "category=config") {
+							t.Fatalf("endpoint diagnostic cause or category lost: %v", err)
 						}
 
 						if err := runOrigin(t.Context(), o); err == nil || !strings.HasPrefix(err.Error(), "invalid effective S3 endpoint:") {

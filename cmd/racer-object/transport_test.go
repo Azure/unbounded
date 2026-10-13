@@ -14,12 +14,15 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 func testOriginHTTPClient(t *testing.T) *awshttp.BuildableClient {
@@ -155,7 +158,18 @@ func TestOriginHTTPTransportInvalidCA(t *testing.T) {
 		}
 
 		_, err := originAWSConfig(t.Context(), options{region: "us-east-1", requestTimeout: time.Minute})
-		if err == nil || err.Error() != "could not load AWS configuration" {
+
+		category := "config"
+		if contents == "" {
+			category = "notfound"
+
+			if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("missing CA file cause lost: %v", err)
+			}
+		}
+
+		if err == nil || !strings.Contains(err.Error(), "category="+category) || errors.Unwrap(err) == nil ||
+			!strings.HasPrefix(err.Error(), "could not load AWS configuration") || strings.Contains(err.Error(), path) || strings.Contains(err.Error(), "private-bundle") {
 			t.Fatalf("error = %v, want redacted CA configuration error", err)
 		}
 	}
@@ -267,6 +281,87 @@ func TestOriginHTTPPoolClose(t *testing.T) {
 	case <-closed:
 	case <-time.After(5 * time.Second):
 		t.Fatal("cleanup did not close the active transport's idle connection")
+	}
+}
+
+func TestOriginHTTPPoolClosePreservesSharedCredentials(t *testing.T) {
+	isolateOriginAWSConfig(t)
+
+	for _, key := range []string{
+		"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+		"AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN",
+	} {
+		t.Setenv(key, "")
+	}
+
+	t.Setenv("AWS_CONTAINER_AUTHORIZATION_TOKEN", "test-container-token")
+
+	var credentialRequests atomic.Int32
+
+	credentials := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		credentialRequests.Add(1)
+
+		if r.Header.Get("Authorization") != "test-container-token" {
+			t.Error("credential endpoint authorization missing")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"AccessKeyId":"test-access","SecretAccessKey":"test-secret","Token":"test-session"}`)
+	}))
+	defer credentials.Close()
+
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", credentials.URL)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Amz-Security-Token") != "test-session" || !strings.Contains(r.Header.Get("Authorization"), "Credential=test-access/") {
+			t.Error("S3 request not signed with endpoint credentials")
+		}
+
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	o := options{region: "us-east-1", requestTimeout: time.Second, endpoint: upstream.URL, pathStyle: true}
+
+	cfg, err := originAWSConfig(t.Context(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := newOriginS3Client(cfg, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeResource(first)
+
+	second, err := newOriginS3Client(cfg, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeResource(second)
+
+	request := &s3.HeadObjectInput{Bucket: aws.String("bucket"), Key: aws.String("key")}
+	if _, err := first.HeadObject(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	closeResource(first)
+
+	cache, ok := cfg.Credentials.(*aws.CredentialsCache)
+	if !ok {
+		t.Fatalf("credentials type = %T, want SDK cache", cfg.Credentials)
+	}
+
+	cache.Invalidate()
+
+	if _, err := second.HeadObject(t.Context(), request); err != nil {
+		t.Fatal("closing one S3 client broke shared credentials:", err)
+	}
+
+	if got := credentialRequests.Load(); got != 2 {
+		t.Fatalf("credential requests = %d, want initial retrieval and refresh", got)
 	}
 }
 
