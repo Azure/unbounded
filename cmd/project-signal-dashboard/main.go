@@ -81,7 +81,6 @@ func main() {
 		if err := server.Shutdown(shutdownContext); err != nil {
 			logger.Error("shut down dashboard", "error", err)
 		}
-
 	}()
 
 	logger.Info("starting Project Signal dashboard", "address", address, "namespace", namespace)
