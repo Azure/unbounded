@@ -139,7 +139,7 @@ spec:
                     containers:
                       - name: worker
                         image: "{{`{{workflow.parameters.runner-image}}`}}"
-                        command: ["/bin/bash", "-lc", "mkdir -p /run/sshd && exec /usr/sbin/sshd -D -e"]
+                        command: ["/bin/bash", "-lc", "mkdir -p /run/sshd && ssh-keygen -A && exec /usr/sbin/sshd -D -e"]
                         resources:
                           limits:
                             nvidia.com/gpu: "1"

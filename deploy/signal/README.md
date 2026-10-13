@@ -52,7 +52,9 @@ Controller code never contains certification script bodies.
 - Controller and dashboard images built from `cmd/project-signal-controller`
   and `cmd/project-signal-dashboard`.
 - A reviewed runner image containing Bash, `nvidia-smi`, Open MPI, and the
-  MPI Operator's SSH requirements.
+  MPI Operator's SSH requirements. `images/project-signal-runner/Containerfile`
+  provides a baseline CUDA runner; publish it by immutable digest and validate
+  it against the target cluster's driver and security policy before use.
 - Exact, verified Node selector values and an explicitly approved Node list.
 
 Project Signal does not install Argo Workflows or MPI Operator. Install and
