@@ -9,7 +9,7 @@ RUN apt-get update && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
       if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-           systemd systemd-sysv dbus curl ca-certificates \
+           systemd systemd-sysv dbus curl ca-certificates rsyslog \
            iproute2 nftables iptables kmod udev procps wireguard-tools linux-tools-common gpg; then \
         ok=true; break; \
       fi; \
