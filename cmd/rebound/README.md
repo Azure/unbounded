@@ -62,7 +62,8 @@ kubectl delete ngr train
   allows it.
 
   To find these pods after a grant is gone, the ledger keeps a release record
-  for 10 minutes.
+  for 10 minutes. The leader checks those nodes every 15 seconds until the
+  record is dropped, so it also finds pods that were still being created.
 - The `rebound-node-keys` ValidatingAdmissionPolicy stops other users from
   changing those labels and taint. The rebound service account and `AdminGroups`
   are exempt.
