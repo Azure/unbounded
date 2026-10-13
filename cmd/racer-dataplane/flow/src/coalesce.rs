@@ -203,7 +203,7 @@ impl<K: Eq + Hash, V, S: BuildHasher> Registration<K, V, S> {
             if state.result.is_some() {
                 return;
             }
-            state.result = Some(result);
+            state.result = Some(Rc::new(result));
             state.leader = None;
             state.take_wakers()
         };
@@ -229,15 +229,18 @@ impl<K: Eq + Hash, V: Clone, S: BuildHasher> Registration<K, V, S> {
         // Clone and drop callbacks can retry, elect, or finish. Decide from the
         // current state only after those callbacks have released their borrows.
         let mut state = self.owner.cohort.borrow_mut();
-        if let Some(result) = &state.result {
-            return Poll::Ready(Event::Complete(result.clone()));
+        if let Some(result) = state.result.clone() {
+            // Retain the value without calling application code under the borrow.
+            drop(state);
+            return Poll::Ready(Event::Complete((*result).clone()));
         }
         if state.leader.is_none() {
             if state.attempts >= self.owner.table.limits.attempts_per_cohort {
                 drop(state);
-                let result = self.owner.table.exhausted.clone();
-                self.finish(result.clone());
-                return Poll::Ready(Event::Complete(result));
+                self.finish(self.owner.table.exhausted.clone());
+                // Cloning exhaustion can publish another result first.
+                let result = self.owner.cohort.borrow().result.clone().unwrap();
+                return Poll::Ready(Event::Complete((*result).clone()));
             }
             state.attempts += 1;
             state.leader = Some(self.owner.id);
@@ -250,13 +253,19 @@ impl<K: Eq + Hash, V: Clone, S: BuildHasher> Registration<K, V, S> {
 impl<K: Eq + Hash, V, S: BuildHasher> RegistrationOwner<K, V, S> {
     /// Remove only this cohort, never a replacement admitted under the same key.
     fn remove_active(&self) {
-        let mut active = self.table.active.borrow_mut();
-        if active
-            .get(&self.key)
-            .is_some_and(|entry| Rc::ptr_eq(entry, &self.cohort))
-        {
-            active.remove(&self.key);
-        }
+        let removed = {
+            let mut active = self.table.active.borrow_mut();
+            if active
+                .get(&self.key)
+                .is_some_and(|entry| Rc::ptr_eq(entry, &self.cohort))
+            {
+                active.remove_entry(&self.key)
+            } else {
+                None
+            }
+        };
+        // Both the key and cohort may own application destructors.
+        drop(removed);
     }
 }
 
@@ -295,7 +304,7 @@ struct Cohort<V, S> {
 
     waiters: HashMap<u64, Option<Waker>, S>,
 
-    result: Option<V>,
+    result: Option<Rc<V>>,
 }
 
 impl<V, S: Default> Default for Cohort<V, S> {
@@ -423,8 +432,8 @@ pub mod shared {
     impl<K: Ord, V: Clone> Completion<K, V> {
         /// Real completion closes admission before notifying any old readers.
         pub fn finish(self, value: V) {
-            let removed = self.table.entries.borrow_mut().remove(&self.key);
-            // Final receiver destruction can reenter the table.
+            let removed = self.table.entries.borrow_mut().remove_entry(&self.key);
+            // Key and final receiver destruction can reenter the table.
             drop(removed);
             let _ = self.send.send(value);
         }
@@ -605,6 +614,8 @@ pub mod flight {
     //! Callers collect wakes while borrowed and dispatch them after releasing locks.
     //! Clone incoming wakers before borrowing. Return retired wakers from `update`
     //! and drop them after it returns, including unused copies of the same target.
+    //! Key callbacks and entry hooks run inside the caller's transaction and must
+    //! not reborrow its owner. Removed entries are returned for destruction outside.
 
     use std::cell::RefCell;
     use std::collections::{BTreeMap, HashMap, hash_map::RandomState};
@@ -1666,6 +1677,63 @@ pub mod flight {
         /// Integer keys isolate table ownership from application key semantics.
         type TestTable = Table<u32, TestEntry>;
 
+        /// Both removal paths return application entries before running destructors.
+        #[test]
+        fn result_callback_removed_entry_drops_outside_transaction() {
+            /// A quiescent entry with a one-shot destructor callback.
+            struct CallbackEntry(Option<Box<dyn FnOnce()>>);
+
+            impl Entry for CallbackEntry {
+                /// This entry has no pending lifecycle work.
+                fn refresh(&mut self, _: &mut Vec<Waker>) {}
+
+                /// Allow immediate removal.
+                fn quiescent(&self) -> bool {
+                    true
+                }
+            }
+
+            impl Drop for CallbackEntry {
+                /// Run after the caller releases its table borrow.
+                fn drop(&mut self) {
+                    if let Some(callback) = self.0.take() {
+                        callback();
+                    }
+                }
+            }
+
+            for sweep in [false, true] {
+                let table = Rc::new(RefCell::new(Table::<u32, CallbackEntry>::default()));
+                let observed = Rc::new(Cell::new(false));
+                let entry = {
+                    let table = table.clone();
+                    let observed = observed.clone();
+                    CallbackEntry(Some(Box::new(move || {
+                        update(&table, |table, _| {
+                            assert!(table.is_empty());
+                            assert!(table.insert(1, CallbackEntry(None)).is_ok());
+                        });
+                        observed.set(true);
+                    })))
+                };
+                assert!(table.borrow_mut().insert(1, entry).is_ok());
+                let removed = update(&table, |table, wakes| {
+                    if sweep {
+                        table.sweep(1, wakes)
+                    } else {
+                        table.remove_quiescent(&1).into_iter().collect()
+                    }
+                });
+                assert!(!observed.get());
+                assert!(table.borrow().is_empty());
+                drop(removed);
+                assert!(observed.get());
+                assert_eq!(table.borrow().len(), 1);
+                drop(update(&table, |table, _| table.remove_quiescent(&1)));
+                assert!(table.borrow().is_empty());
+            }
+        }
+
         /// Admit an entry with one waiter and return its initial identity.
         fn insert(table: &mut TestTable, owner: &Rc<()>, key: u32) -> Identity {
             let identity = table.identity(owner.clone()).unwrap();
@@ -2142,6 +2210,255 @@ mod tests {
 
     thread_local! {
         static ON_KEY_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static ON_RESULT_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static ON_RESULT_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static ON_KEY_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// A result whose clone and destructor can each reenter once.
+    #[derive(Debug, Eq, PartialEq)]
+    struct CallbackResult(Result<u32, &'static str>);
+
+    impl Clone for CallbackResult {
+        /// Release the callback slot before calling application code.
+        fn clone(&self) -> Self {
+            let callback = ON_RESULT_CLONE.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+            Self(self.0)
+        }
+    }
+
+    impl Drop for CallbackResult {
+        /// Consume the callback so nested result drops are harmless.
+        fn drop(&mut self) {
+            let callback = ON_RESULT_DROP.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    }
+
+    /// Allow completed readers and a replacement to coexist.
+    fn callback_table(attempts: usize) -> Rc<Table<u32, CallbackResult>> {
+        Rc::new(Table::new(
+            Limits {
+                waiters_per_cohort: 4,
+                attempts_per_cohort: attempts,
+            },
+            CallbackResult(Err("exhausted")),
+        ))
+    }
+
+    /// Completed success and failure values allow all cohort operations during clone.
+    #[test]
+    fn result_callback_clone_can_event_retry_finish_and_detach() {
+        for value in [Ok(7), Err("failed")] {
+            let table = callback_table(1);
+            let first = table.join(1, 1).unwrap();
+            let follower = table.join(1, 1).unwrap();
+            first.finish(CallbackResult(value));
+            let nested = first.clone();
+            let observed = Rc::new(Cell::new(false));
+            let detached = Rc::new(RefCell::new(Some(follower)));
+            ON_RESULT_CLONE.with(|slot| {
+                let observed = observed.clone();
+                let detached = detached.clone();
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    nested.retry();
+                    nested.finish(CallbackResult(Ok(99)));
+                    assert_eq!(
+                        nested.event(Waker::noop()),
+                        Poll::Ready(Event::Complete(CallbackResult(value)))
+                    );
+                    drop(detached.borrow_mut().take());
+                    observed.set(true);
+                }));
+            });
+            assert_eq!(
+                first.event(Waker::noop()),
+                Poll::Ready(Event::Complete(CallbackResult(value)))
+            );
+            assert!(observed.get());
+            assert_eq!(table.registration_count(), 1);
+            assert_eq!(table.active_count(), 0);
+            drop(first);
+            assert_eq!(table.registration_count(), 0);
+        }
+    }
+
+    /// A completion published while cloning exhaustion remains the first result.
+    #[test]
+    fn result_callback_exhaustion_clone_preserves_reentrant_completion() {
+        for attempts in [0, 1] {
+            let table = callback_table(attempts);
+            let first = table.join(1, 1).unwrap();
+            let follower = table.join(1, 1).unwrap();
+            if attempts != 0 {
+                assert_eq!(first.event(Waker::noop()), Poll::Ready(Event::Lead));
+                first.retry();
+            }
+            let nested = first.clone();
+            let observed = Rc::new(Cell::new(false));
+            ON_RESULT_CLONE.with(|slot| {
+                let table = table.clone();
+                let observed = observed.clone();
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    assert_eq!(table.active_count(), 1);
+                    nested.finish(CallbackResult(Ok(99)));
+                    nested.retry();
+                    assert_eq!(
+                        nested.event(Waker::noop()),
+                        Poll::Ready(Event::Complete(CallbackResult(Ok(99))))
+                    );
+                    observed.set(true);
+                }));
+            });
+            let expected = Poll::Ready(Event::Complete(CallbackResult(Ok(99))));
+            assert_eq!(first.event(Waker::noop()), expected);
+            assert_eq!(follower.event(Waker::noop()), expected);
+            assert!(observed.get());
+            drop((first, follower));
+            assert_eq!(table.registration_count(), 0);
+        }
+    }
+
+    /// A panicking application clone does not poison the cohort or replace its result.
+    #[test]
+    fn result_callback_clone_panic_keeps_first_result_and_releases_borrow() {
+        let table = callback_table(1);
+        let first = table.join(1, 1).unwrap();
+        first.finish(CallbackResult(Ok(7)));
+        ON_RESULT_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|| panic!("result clone failed")));
+        });
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| first.event(Waker::noop())))
+                .is_err()
+        );
+        first.retry();
+        first.finish(CallbackResult(Ok(99)));
+        assert_eq!(
+            first.event(Waker::noop()),
+            Poll::Ready(Event::Complete(CallbackResult(Ok(7))))
+        );
+        assert_eq!(table.active_count(), 0);
+        drop(first);
+        assert_eq!(table.registration_count(), 0);
+    }
+
+    /// Rejected values and final stored values are destroyed without internal borrows.
+    #[test]
+    fn result_callback_rejected_and_final_result_drop_can_reenter() {
+        let table = callback_table(1);
+        let first = table.join(1, 1).unwrap();
+        first.finish(CallbackResult(Ok(7)));
+        let observed = Rc::new(Cell::new(0));
+        ON_RESULT_DROP.with(|slot| {
+            let nested = first.clone();
+            let observed = observed.clone();
+            *slot.borrow_mut() = Some(Box::new(move || {
+                nested.retry();
+                nested.finish(CallbackResult(Ok(100)));
+                assert_eq!(
+                    nested.event(Waker::noop()),
+                    Poll::Ready(Event::Complete(CallbackResult(Ok(7))))
+                );
+                observed.set(observed.get() + 1);
+            }));
+        });
+        first.finish(CallbackResult(Ok(99)));
+        assert_eq!(observed.get(), 1);
+        ON_RESULT_DROP.with(|slot| {
+            let table = table.clone();
+            let observed = observed.clone();
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(table.registration_count(), 0);
+                assert_eq!(table.active_count(), 0);
+                let next = table.join(1, 1).unwrap();
+                next.finish(CallbackResult(Ok(8)));
+                observed.set(observed.get() + 1);
+            }));
+        });
+        drop(first);
+        assert_eq!(observed.get(), 2);
+        assert_eq!(table.registration_count(), 0);
+    }
+
+    /// A key whose next destructor can inspect or replace its table entry.
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    struct DropKey(u32);
+
+    impl Drop for DropKey {
+        /// Consume the callback before a replacement can drop another key.
+        fn drop(&mut self) {
+            let callback = ON_KEY_DROP.with(|slot| slot.borrow_mut().take());
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    }
+
+    /// Completion and final detach remove membership before destroying its key.
+    #[test]
+    fn result_callback_cohort_key_drop_can_admit_replacement() {
+        for finish in [false, true] {
+            let table = Rc::new(Table::<_, u32>::new(
+                Limits {
+                    waiters_per_cohort: 4,
+                    attempts_per_cohort: 1,
+                },
+                0,
+            ));
+            let first = table.join(DropKey(1), 1).unwrap();
+            let replacement = Rc::new(RefCell::new(None));
+            ON_KEY_DROP.with(|slot| {
+                let table = table.clone();
+                let replacement = replacement.clone();
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    assert_eq!(table.active_count(), 0);
+                    assert_eq!(table.registration_count(), usize::from(finish));
+                    *replacement.borrow_mut() = Some(table.join(DropKey(1), 1).unwrap());
+                }));
+            });
+            if finish {
+                first.finish(7);
+                assert_eq!(first.event(Waker::noop()), Poll::Ready(Event::Complete(7)));
+            }
+            drop(first);
+            assert_eq!(table.active_count(), 1);
+            let next = replacement.borrow_mut().take().unwrap();
+            assert_eq!(next.event(Waker::noop()), Poll::Ready(Event::Lead));
+            drop(next);
+            assert_eq!(table.active_count(), 0);
+            assert_eq!(table.registration_count(), 0);
+        }
+    }
+
+    /// Shared completion leaves a reentrantly admitted replacement intact.
+    #[test]
+    fn result_callback_shared_key_drop_can_admit_replacement() {
+        use futures::executor::block_on;
+
+        let table = Rc::new(shared::Table::default());
+        let (receive, completion) = table.start(DropKey(1), 0);
+        let replacement = Rc::new(RefCell::new(None));
+        ON_KEY_DROP.with(|slot| {
+            let table = table.clone();
+            let replacement = replacement.clone();
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert!(table.is_empty());
+                *replacement.borrow_mut() = Some(table.start(DropKey(1), 0));
+            }));
+        });
+        completion.unwrap().finish(7);
+        assert_eq!(block_on(receive), 7);
+        let (next, completion) = replacement.borrow_mut().take().unwrap();
+        assert_eq!(table.len(), 1);
+        completion.unwrap().finish(8);
+        assert_eq!(block_on(next), 8);
+        assert!(table.is_empty());
     }
 
     /// A key whose next clone can call back into its table.
