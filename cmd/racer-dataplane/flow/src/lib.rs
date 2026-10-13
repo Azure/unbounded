@@ -25,6 +25,37 @@
 //! [`coalesce`] provides worker-local keyed cohorts, shared results, and flight
 //! lifecycle tracking. Callers retain execution, admission, and result policy;
 //! cancellation never substitutes for real operation completion.
+//!
+//! # Callback contract
+//!
+//! Reentry is supported at specific boundaries, not for arbitrary application
+//! code. These rules also apply to callbacks reached indirectly through a hook:
+//!
+//! - Map and lookup hooks (`Hash`, `Eq`, `Ord`, `BuildHasher`, and custom hasher
+//!   construction/destruction) run while state may be borrowed or locked. They
+//!   must not reenter that state or panic. Key identity must remain stable while
+//!   indexed. [`Class::index`] and static [`Policy`] predicates must be pure and
+//!   non-panicking too.
+//! - Transaction hooks, including [`AdaptiveObserver`], [`HandoffAdmission`],
+//!   [`Offer::deliver`]'s constructor, and closures and entry hooks inside
+//!   [`coalesce::flight::update`], must not reenter their owner or panic. A hook
+//!   must not synchronously wake code that would do so. Flight callers return
+//!   retired values and collect wakes for dispatch after the transaction.
+//! - Explicitly staged callbacks may reenter after internal locks and borrows
+//!   are released: quota policy sampling/reporting and key clones/retired key
+//!   drops, circuit backoff, and the key/value/waker callbacks documented by
+//!   cohort, handoff, and pipe APIs. This is not a promise that every `Clone`
+//!   or `Drop` in the crate runs outside a transaction; flight keys, for example,
+//!   follow the caller's transaction boundary.
+//! - Wakes and destructors must not panic. A clone or policy sample staged before
+//!   admission may unwind without leaking that admission; this does not roll back
+//!   work the callback itself performed. There is no general panic-recovery or
+//!   notification-delivery guarantee after a callback violates these rules.
+//!
+//! Reentry never permits a caller to access an object through an outstanding
+//! exclusive borrow. Callers must also release their own locks before invoking
+//! APIs that can synchronously call back. Unsupported reentry may panic on a
+//! local borrow or deadlock on a mutex; it is not converted to an admission error.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 /// Adaptive admission and completion-owned handoffs.
@@ -89,6 +120,8 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A dense, stable index in `0..COUNT`, unique to each resource class.
+/// `index` must be pure and non-panicking: it is also called while releasing
+/// charges and while recycler storage is locked.
 pub trait Class: Copy + Send + Sync + 'static {
     /// Number of distinct resource classes.
     const COUNT: usize;
@@ -99,11 +132,26 @@ pub trait Class: Copy + Send + Sync + 'static {
 
 /// Application policy. Charges do not retain this value, so suitability and
 /// release notifications are static properties of the class.
+///
+/// `limit`, `floor`, `max_keys`, and `rejected` run outside quota locks and key
+/// borrows and may reenter quota APIs. Limit samples describe one attempt, not a
+/// live ceiling over already admitted work. Reentry must be bounded by the caller;
+/// do not recursively trigger the same hook without a termination condition.
+/// `wakes`, `allows_stopped`, and `covers` must be pure and non-panicking.
+/// The crate-level [callback contract](crate#callback-contract) also applies when
+/// quotas are called from another owner's transaction; that owner still cannot
+/// be reentered. In particular, a handoff admission hook does not release the
+/// handoff lock merely by calling quota APIs.
 pub trait Policy: 'static {
     /// Resource classes accounted by this policy.
     type Class: Class;
 
     /// Identity used to divide local fair shares.
+    /// Hash and equality must be stable, non-panicking, and must not reenter the
+    /// quota authority. Clones run before admission or transfer and may reenter
+    /// or unwind. Retired keys drop outside quota locks and may reenter, but
+    /// destructors must not panic. These guarantees do not extend to a caller's
+    /// own surrounding transaction or borrow.
     type Key: Clone + Eq + Hash + Send + Sync + 'static;
 
     /// Return the aggregate ceiling for a class.
@@ -246,6 +294,9 @@ impl<P: Policy + Clone> Clone for SharedQuotas<P> {
 
 impl<P: Policy> SharedQuotas<P> {
     /// Register the single shared admission waiter before checking capacity.
+    /// Waker hooks may inspect or reserve quota but must not recursively register
+    /// on this same waiter slot. Concurrent registrations do not form a queue;
+    /// callers needing multiple waiters must supply their own scheduling layer.
     pub fn register(&self, waker: &std::task::Waker) {
         self.totals.wake.register(waker);
     }
@@ -744,7 +795,7 @@ impl<P: Policy> Quotas<P> {
         Ok(counts)
     }
 
-    /// Report the current aggregate and optional keyed rejection facts.
+    /// Report usage and the ceiling sampled for this failed attempt.
     fn rejected(
         &self,
         class: P::Class,
