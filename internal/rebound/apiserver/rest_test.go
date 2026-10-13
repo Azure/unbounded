@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/endpoints/request"
+	apistorage "k8s.io/apiserver/pkg/storage"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -286,6 +287,195 @@ func TestGetListDelete(t *testing.T) {
 	_, err = s.Get(ctx, "first", nil)
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("get missing: %v", err)
+	}
+}
+
+func TestReadResourceVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		rv        string
+		cacheRV   string
+		wantRV    string
+		wantCount int
+		wantLive  bool
+		wantError func(error) bool
+	}{
+		{name: "most recent", wantRV: "2", wantCount: 1, wantLive: true},
+		{name: "any", rv: "0", wantRV: "1"},
+		{name: "cache equal", rv: "1", wantRV: "1"},
+		{name: "create RV before informer", rv: "created", wantRV: "2", wantCount: 1, wantLive: true},
+		{name: "cache newer numeric", rv: "2", cacheRV: "10", wantRV: "10", wantCount: 1},
+		{name: "future", rv: "10", wantLive: true, wantError: apistorage.IsTooLargeResourceVersion},
+		{name: "maximum uint64", rv: "18446744073709551615", wantLive: true, wantError: apistorage.IsTooLargeResourceVersion},
+		{name: "invalid", rv: "invalid", wantError: apierrors.IsBadRequest},
+		{name: "negative", rv: "-1", wantError: apierrors.IsBadRequest},
+		{name: "overflow", rv: "18446744073709551616", wantError: apierrors.IsBadRequest},
+	} {
+		for _, operation := range []string{"get", "list", "list NotOlderThan"} {
+			t.Run(tc.name+"/"+operation, func(t *testing.T) {
+				s, client, ctx := fixture(t)
+
+				obj, err := s.Create(ctx, grant("first", "node-a"), nil, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				g, ok := obj.(*rebound.NodeGrant)
+				if !ok {
+					t.Fatalf("unexpected create result: %T", obj)
+				}
+
+				rv := tc.rv
+				if rv == "created" {
+					rv = g.ResourceVersion
+				}
+
+				if tc.cacheRV != "" {
+					cm := cached(t, s)
+					cm.ResourceVersion = tc.cacheRV
+					s.observe(cm, false)
+				}
+
+				client.ClearActions()
+
+				if operation == "get" {
+					obj, err = s.Get(ctx, "first", &metav1.GetOptions{ResourceVersion: rv})
+				} else {
+					options := &metainternal.ListOptions{ResourceVersion: rv}
+					if operation == "list NotOlderThan" {
+						options.ResourceVersionMatch = metav1.ResourceVersionMatchNotOlderThan
+					}
+
+					obj, err = s.List(ctx, options)
+				}
+
+				actions := client.Actions()
+				if tc.wantLive {
+					if len(actions) != 1 || !actions[0].Matches("get", "configmaps") {
+						t.Fatalf("expected one live ledger read, got %v", actions)
+					}
+				} else if len(actions) != 0 {
+					t.Fatalf("unexpected live read: %v", actions)
+				}
+
+				if tc.wantError != nil {
+					if !tc.wantError(err) {
+						t.Fatalf("unexpected error: %v", err)
+					}
+
+					return
+				}
+
+				if operation == "get" && tc.wantCount == 0 {
+					if !apierrors.IsNotFound(err) {
+						t.Fatalf("expected cached NotFound, got %v", err)
+					}
+
+					return
+				}
+
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if operation == "get" {
+					got, ok := obj.(*rebound.NodeGrant)
+					if !ok || got.UID != g.UID || got.ResourceVersion != tc.wantRV {
+						t.Fatalf("unexpected grant: %+v", obj)
+					}
+				} else {
+					list, ok := obj.(*rebound.NodeGrantList)
+					if !ok || len(list.Items) != tc.wantCount || list.ResourceVersion != tc.wantRV {
+						t.Fatalf("unexpected list: %+v", obj)
+					}
+
+					if tc.wantCount == 1 && list.Items[0].UID != g.UID {
+						t.Fatalf("created grant missing: %+v", list.Items)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestListExactResourceVersion(t *testing.T) {
+	for _, tc := range []struct {
+		rv        string
+		wantError func(error) bool
+	}{
+		{rv: "1"},
+		{rv: "0", wantError: apierrors.IsResourceExpired},
+		{rv: "2", wantError: apierrors.IsResourceExpired},
+		{rv: "10", wantError: apierrors.IsResourceExpired},
+		{rv: "invalid", wantError: apierrors.IsBadRequest},
+		{rv: "18446744073709551616", wantError: apierrors.IsBadRequest},
+	} {
+		t.Run(tc.rv, func(t *testing.T) {
+			s, client, ctx := fixture(t)
+
+			if _, err := s.Create(ctx, grant("first", "node-a"), nil, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			client.ClearActions()
+
+			obj, err := s.List(ctx, &metainternal.ListOptions{ResourceVersion: tc.rv, ResourceVersionMatch: metav1.ResourceVersionMatchExact})
+
+			if len(client.Actions()) != 0 {
+				t.Fatal("Exact read consulted live ledger")
+			}
+
+			if tc.wantError != nil {
+				if !tc.wantError(err) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			list, ok := obj.(*rebound.NodeGrantList)
+			if !ok || list.ResourceVersion != tc.rv || len(list.Items) != 0 {
+				t.Fatalf("unexpected exact snapshot: %+v", obj)
+			}
+		})
+	}
+}
+
+func TestReadResourceVersionLiveFailure(t *testing.T) {
+	s, client, ctx := fixture(t)
+	client.PrependReactor("get", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewServiceUnavailable("ledger unavailable")
+	})
+
+	_, err := s.Get(ctx, "first", &metav1.GetOptions{ResourceVersion: "2"})
+	if !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("live get error hidden: %v", err)
+	}
+
+	_, err = s.List(ctx, &metainternal.ListOptions{ResourceVersion: "2"})
+	if !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("live list error hidden: %v", err)
+	}
+}
+
+func TestReadResourceVersionMissingLedger(t *testing.T) {
+	s, client, ctx := fixture(t)
+	if err := client.CoreV1().ConfigMaps("system").Delete(ctx, ledger.ConfigMapName, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.Get(ctx, "first", &metav1.GetOptions{ResourceVersion: "2"})
+	if !apistorage.IsTooLargeResourceVersion(err) {
+		t.Fatalf("expected future RV error for missing ledger, got %v", err)
+	}
+
+	_, err = s.List(ctx, &metainternal.ListOptions{ResourceVersion: "2"})
+	if !apistorage.IsTooLargeResourceVersion(err) {
+		t.Fatalf("expected future RV error for missing ledger, got %v", err)
 	}
 }
 

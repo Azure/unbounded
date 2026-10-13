@@ -56,7 +56,11 @@ func TestImmediateReadAfterCreate(t *testing.T) {
 
 	for _, rv := range []string{"", "0", "2", "unknown"} {
 		_, err = s.List(ctx, &metainternal.ListOptions{ResourceVersion: rv, ResourceVersionMatch: metav1.ResourceVersionMatchExact})
-		require.True(t, apierrors.IsResourceExpired(err), "RV %q: %v", rv, err)
+		if rv == "unknown" {
+			require.True(t, apierrors.IsBadRequest(err), "RV %q: %v", rv, err)
+		} else {
+			require.True(t, apierrors.IsResourceExpired(err), "RV %q: %v", rv, err)
+		}
 	}
 
 	_, err = s.List(ctx, &metainternal.ListOptions{ResourceVersion: "1", ResourceVersionMatch: metav1.ResourceVersionMatchExact})

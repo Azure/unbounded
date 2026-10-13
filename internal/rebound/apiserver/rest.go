@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
+	apistorage "k8s.io/apiserver/pkg/storage"
 	"k8s.io/utils/clock"
 
 	rebound "github.com/Azure/unbounded/api/rebound/v1alpha1"
@@ -59,20 +61,57 @@ func (*storage) GetSingularName() string          { return "nodegrant" }
 func (*storage) ShortNames() []string             { return []string{"ngr"} }
 func (*storage) DeleteReturnsDeletedObject() bool { return true }
 
-func (s *storage) read(ctx context.Context, rv string) (snapshot, error) {
-	if rv == "" {
-		cm, err := s.store.Get(ctx)
+func (s *storage) read(ctx context.Context, rv string, match metav1.ResourceVersionMatch) (snapshot, error) {
+	var requested uint64
+
+	if rv != "" {
+		var err error
+
+		requested, err = strconv.ParseUint(rv, 10, 64)
 		if err != nil {
-			return snapshot{}, err
+			return snapshot{}, apierrors.NewBadRequest("resourceVersion must be an unsigned integer")
 		}
 
-		return snapshot{ledger: ledger.Parse(cm.Data), rv: cm.ResourceVersion}, nil
+		s.mu.Lock()
+		current := s.history[len(s.history)-1]
+		s.mu.Unlock()
+
+		if match == metav1.ResourceVersionMatchExact {
+			if current.rv != rv {
+				return snapshot{}, apierrors.NewResourceExpired("requested resourceVersion is not available; relist")
+			}
+
+			return current, nil
+		}
+
+		newest, err := strconv.ParseUint(current.rv, 10, 64)
+		if rv == "0" || (err == nil && newest >= requested) {
+			return current, nil
+		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	cm, err := s.store.Get(ctx)
+	if err != nil {
+		return snapshot{}, err
+	}
 
-	return s.history[len(s.history)-1], nil
+	if rv != "" {
+		liveRV := cm.ResourceVersion
+		if liveRV == "" {
+			liveRV = "0"
+		}
+
+		newest, err := strconv.ParseUint(liveRV, 10, 64)
+		if err != nil {
+			return snapshot{}, apierrors.NewInternalError(fmt.Errorf("invalid ledger resourceVersion: %w", err))
+		}
+
+		if newest < requested {
+			return snapshot{}, apistorage.NewTooLargeResourceVersionError(requested, newest, 1)
+		}
+	}
+
+	return snapshot{ledger: ledger.Parse(cm.Data), rv: cm.ResourceVersion}, nil
 }
 
 func (s *storage) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
@@ -81,7 +120,7 @@ func (s *storage) Get(ctx context.Context, name string, options *metav1.GetOptio
 		rv = options.ResourceVersion
 	}
 
-	current, err := s.read(ctx, rv)
+	current, err := s.read(ctx, rv, metav1.ResourceVersionMatchNotOlderThan)
 	if err != nil {
 		return nil, err
 	}
@@ -101,11 +140,15 @@ func (s *storage) List(ctx context.Context, options *metainternal.ListOptions) (
 	}
 
 	rv := ""
+
+	var rvMatch metav1.ResourceVersionMatch
+
 	if options != nil {
 		rv = options.ResourceVersion
+		rvMatch = options.ResourceVersionMatch
 	}
 
-	current, err := s.read(ctx, rv)
+	current, err := s.read(ctx, rv, rvMatch)
 	if err != nil {
 		return nil, err
 	}
