@@ -141,6 +141,76 @@ func TestEvictorRelease(t *testing.T) {
 	require.ElementsMatch(t, []string{"tenant/before", "tenant/after", "other/unrelated", "tenant/elsewhere"}, remaining(t, c))
 }
 
+func TestEvictorReleaseIndex(t *testing.T) {
+	l := ledger.New()
+	for _, g := range []*ledger.Grant{
+		{Namespace: "first", Name: "g", UID: "u1", Nodes: []string{"a", "b"}, CreatedAt: testNow.Add(-time.Hour)},
+		{Namespace: "second", Name: "g", UID: "u2", Nodes: []string{"a", "c"}, CreatedAt: testNow.Add(-time.Hour)},
+		{Namespace: "third", Name: "g", UID: "u3", Nodes: []string{"d"}, CreatedAt: testNow.Add(-time.Hour)},
+	} {
+		require.NoError(t, l.Add(g))
+		require.True(t, l.Remove(g.Key(), testNow))
+	}
+
+	cm := configMap(t)
+	cm.Data = l.Encode()
+	r, c := newEvictor(t, cm, nil,
+		pod("first", "p", "a", testNow.Add(-time.Minute)),
+		pod("second", "p", "a", testNow.Add(-time.Minute)),
+		pod("third", "p", "a", testNow.Add(-time.Minute)),
+		pod("first", "on-b", "b", testNow.Add(-time.Minute)),
+		pod("second", "on-c", "c", testNow.Add(-time.Minute)),
+	)
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"third/p", "first/on-b", "second/on-c"}, remaining(t, c))
+
+	cached := r.cachedLedger
+	for _, node := range []string{"b", "c", "missing"} {
+		_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: node}})
+		require.NoError(t, err)
+		require.Same(t, cached, r.cachedLedger)
+	}
+
+	require.Equal(t, []string{"third/p"}, remaining(t, c))
+
+	l.Reap(testNow.Add(ledger.ReleaseRetention), nil)
+	g := &ledger.Grant{Namespace: "third", Name: "new", UID: "u4", Nodes: []string{"a"}, CreatedAt: testNow.Add(-time.Hour)}
+	require.NoError(t, l.Add(g))
+	require.True(t, l.Remove(g.Key(), testNow))
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(cm), cm))
+	oldVersion := cm.ResourceVersion
+	cm.Data = l.Encode()
+	require.NoError(t, c.Update(t.Context(), cm))
+	require.NotEqual(t, oldVersion, cm.ResourceVersion)
+	require.NoError(t, c.Create(t.Context(), pod("first", "new", "a", testNow.Add(-time.Minute))))
+
+	_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "a"}})
+	require.NoError(t, err)
+	require.NotSame(t, cached, r.cachedLedger)
+	require.Equal(t, []string{"first/new"}, remaining(t, c))
+	require.NotContains(t, r.releasesByNode, "b")
+	require.NotContains(t, r.releasesByNode, "c")
+	require.NotContains(t, r.releasesByNode, "d")
+}
+
+func TestEvictorNodeRecordsConcurrent(t *testing.T) {
+	cm := configMap(t, grant("tenant", "g", "a", time.Hour))
+	r := &evictor{}
+
+	for range 10 {
+		t.Run("lookup", func(t *testing.T) {
+			t.Parallel()
+
+			g, releases := r.nodeRecords(cm, "a")
+			require.NotNil(t, g)
+			require.Equal(t, "tenant", g.Namespace)
+			require.Empty(t, releases)
+		})
+	}
+}
+
 func TestEvictorLateExpiry(t *testing.T) {
 	g := grant("tenant", "g", "a", -time.Hour)
 	g.UID = "u1"

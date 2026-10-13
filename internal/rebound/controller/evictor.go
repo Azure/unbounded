@@ -6,7 +6,7 @@ package controller
 import (
 	"context"
 	"errors"
-	"slices"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +40,11 @@ type evictor struct {
 	namespace string
 	exempt    map[string]bool
 	clock     clock.Clock
+
+	ledgerMu       sync.Mutex
+	ledgerVersion  string
+	cachedLedger   *ledger.Ledger
+	releasesByNode map[string][]*ledger.Release
 }
 
 func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -48,23 +53,13 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	l := ledger.Parse(cm.Data)
 	node := req.Name
+	g, releases := r.nodeRecords(&cm, node)
 
 	var active *ledger.Grant
 
-	if key, ok := l.NodeGrant(node); ok {
-		if g, ok := l.Get(key); ok && !g.Expired(r.clock.Now()) {
-			active = g
-		}
-	}
-
-	var releases []*ledger.Release
-
-	for _, rel := range l.Releases() {
-		if slices.Contains(rel.Nodes, node) {
-			releases = append(releases, rel)
-		}
+	if g != nil && !g.Expired(r.clock.Now()) {
+		active = g
 	}
 
 	if active == nil && len(releases) == 0 {
@@ -101,6 +96,30 @@ func (r *evictor) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result,
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// nodeRecords returns read-only records from an index rebuilt once per ledger version.
+func (r *evictor) nodeRecords(cm *corev1.ConfigMap, node string) (*ledger.Grant, []*ledger.Release) {
+	r.ledgerMu.Lock()
+	defer r.ledgerMu.Unlock()
+
+	if r.cachedLedger == nil || r.ledgerVersion != cm.ResourceVersion {
+		r.cachedLedger = ledger.Parse(cm.Data)
+		r.releasesByNode = make(map[string][]*ledger.Release)
+
+		for _, rel := range r.cachedLedger.Releases() {
+			for _, name := range rel.Nodes {
+				r.releasesByNode[name] = append(r.releasesByNode[name], rel)
+			}
+		}
+
+		r.ledgerVersion = cm.ResourceVersion
+	}
+
+	key, _ := r.cachedLedger.NodeGrant(node)
+	g, _ := r.cachedLedger.Get(key)
+
+	return g, r.releasesByNode[node]
 }
 
 func (r *evictor) shouldEvict(pod *corev1.Pod, active *ledger.Grant, releases []*ledger.Release) bool {
