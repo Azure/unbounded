@@ -5,6 +5,7 @@ package signal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -291,6 +292,11 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 
 	run := testRun("run-1")
 	run.UID = types.UID("run-uid")
+	run.Spec.Tolerations = []corev1.Toleration{{
+		Key:      "nvidia.com/gpu",
+		Operator: corev1.TolerationOpExists,
+		Effect:   corev1.TaintEffectNoSchedule,
+	}}
 
 	workflow, err := buildWorkflow(run, 2)
 	if err != nil {
@@ -335,6 +341,15 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 
 	if !strings.Contains(values["tolerations"], `"key":"nvidia.com/gpu"`) {
 		t.Fatalf("workflow tolerations = %q", values["tolerations"])
+	}
+
+	var tolerations []corev1.Toleration
+	if err := json.Unmarshal([]byte(values["tolerations"]), &tolerations); err != nil {
+		t.Fatalf("decode workflow tolerations: %v", err)
+	}
+
+	if len(tolerations) != 1 {
+		t.Fatalf("workflow tolerations = %#v, want one deduplicated GPU toleration", tolerations)
 	}
 }
 
@@ -455,6 +470,17 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 
 	if got.Status.Evidence.URI == "" || len(store.data) == 0 {
 		t.Fatal("evidence was not persisted")
+	}
+
+	var evidence struct {
+		Workflow signalv1.WorkflowStatus `json:"workflow"`
+	}
+	if err := json.Unmarshal(store.data, &evidence); err != nil {
+		t.Fatalf("decode evidence: %v", err)
+	}
+
+	if evidence.Workflow.Phase != "Succeeded" {
+		t.Fatalf("evidence workflow phase = %q, want Succeeded", evidence.Workflow.Phase)
 	}
 
 	if !got.Status.Cleanup.ReservationsReleased || !got.Status.Cleanup.SnapshotDeleted {

@@ -43,3 +43,13 @@ func TestDashboardServiceIsInternalAndImageFailsClosed(t *testing.T) {
 	assert.Contains(t, manifest, "example.invalid/project-signal-dashboard:replace-me")
 	assert.Contains(t, manifest, "serviceAccountName: project-signal-dashboard")
 }
+
+func TestControllerCanPublishEventsV1Events(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("02-rbac.yaml.tmpl")
+	require.NoError(t, err)
+
+	manifest := string(content)
+	assert.Contains(t, manifest, `apiGroups: ["events.k8s.io"]`+"\n"+`    resources: ["events"]`+"\n"+`    verbs: ["create", "patch"]`)
+}

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -570,11 +571,11 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		participantNames = append(participantNames, participant.NodeName)
 	}
 
-	tolerations := append([]corev1.Toleration{{
+	tolerations := uniqueTolerations(append([]corev1.Toleration{{
 		Key:      "nvidia.com/gpu",
 		Operator: corev1.TolerationOpExists,
 		Effect:   corev1.TaintEffectNoSchedule,
-	}}, run.Spec.Tolerations...)
+	}}, run.Spec.Tolerations...))
 
 	tolerationsJSON, err := json.Marshal(tolerations)
 	if err != nil {
@@ -654,7 +655,14 @@ func (r *RunReconciler) finish(
 	verdict string,
 	reason string,
 ) (ctrl.Result, error) {
-	evidence, err := r.evidenceDocument(ctx, run, executionState, verdict, reason)
+	evidenceRun := run.DeepCopy()
+	if executionState == "Completed" {
+		evidenceRun.Status.Workflow.Phase = "Succeeded"
+	} else {
+		evidenceRun.Status.Workflow.Phase = executionState
+	}
+
+	evidence, err := r.evidenceDocument(ctx, evidenceRun, executionState, verdict, reason)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -702,6 +710,27 @@ func (r *RunReconciler) finish(
 	}
 
 	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+}
+
+func uniqueTolerations(tolerations []corev1.Toleration) []corev1.Toleration {
+	unique := make([]corev1.Toleration, 0, len(tolerations))
+	for _, toleration := range tolerations {
+		duplicate := false
+
+		for _, existing := range unique {
+			if reflect.DeepEqual(existing, toleration) {
+				duplicate = true
+
+				break
+			}
+		}
+
+		if !duplicate {
+			unique = append(unique, toleration)
+		}
+	}
+
+	return unique
 }
 
 func (r *RunReconciler) evidenceDocument(
