@@ -54,3 +54,37 @@ func TestWorkflowConfiguresEphemeralMPIHostTrust(t *testing.T) {
 	assert.NotContains(t, manifest, "StrictHostKeyChecking=no")
 	assert.NotContains(t, manifest, "StrictModes=no")
 }
+
+func TestFullNodeWorkflowGatesEightGPUAllocationOnInventoryPreflight(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("08-full-node-workflowtemplate.yaml.tmpl")
+	require.NoError(t, err)
+
+	manifest := string(content)
+	for _, setting := range []string{
+		"project-signal-gpu-full-node-certification",
+		`name: observed-gpu-capacity`,
+		`name: observed-gpu-allocatable`,
+		`when: "{{` + "`{{tasks.node-health.outputs.parameters.verdict}}`" + `}} == Pass"`,
+		`"nvidia.com/gpu":"{{` + "`{{inputs.parameters.gpu-count}}`" + `}}"`,
+		`nvidia.com/gpu: "{{` + "`{{workflow.parameters.expected-gpu-count}}`" + `}}"`,
+	} {
+		assert.Contains(t, manifest, setting)
+	}
+}
+
+func TestDappleFullNodeProfileUsesPinnedRunnerAndSingleAttempt(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("../signal-dapple/00-b200-full-node.yaml.tmpl")
+	require.NoError(t, err)
+
+	manifest := string(content)
+	assert.Contains(t, manifest, "name: dapple-b200-full-node")
+	assert.Contains(t, manifest, "purpose: FullCertification")
+	assert.Contains(t, manifest, `expected-gpu-count: "8"`)
+	assert.Contains(t, manifest, "maxAttempts: 1")
+	assert.Contains(t, manifest, "project-signal-runner@sha256:")
+	assert.NotContains(t, manifest, "REPLACE_WITH")
+}

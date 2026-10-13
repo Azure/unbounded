@@ -174,6 +174,45 @@ func TestBoundedLogRequestAndUnavailableLogs(t *testing.T) {
 	assert.Equal(t, []string{"/bin/bash", "/scripts/full.sh"}, detail.Script.Command)
 }
 
+func TestWorkflowStagePodsIncludesEveryMainTaskPodInNodeOrder(t *testing.T) {
+	t.Parallel()
+
+	workflow := &unstructured.Unstructured{}
+	workflow.SetName("workflow-example")
+	workflow.SetUID("workflow-uid")
+
+	pods := []corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "health-after",
+				Labels:      map[string]string{"workflows.argoproj.io/workflow": "workflow-example"},
+				Annotations: map[string]string{"workflows.argoproj.io/node-name": "workflow-example.health-after"},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main"}}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "preflight",
+				Labels:      map[string]string{"workflows.argoproj.io/workflow": "workflow-example"},
+				Annotations: map[string]string{"workflows.argoproj.io/node-name": "workflow-example.node-health"},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main"}}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "sidecar-only",
+				Labels: map[string]string{"workflows.argoproj.io/workflow": "workflow-example"},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "wait"}}},
+		},
+	}
+
+	got := workflowStagePods(workflow, pods)
+	require.Len(t, got, 2)
+	assert.Equal(t, "health-after", got[0].Name)
+	assert.Equal(t, "preflight", got[1].Name)
+}
+
 func TestScriptStatusShowsPayloadCommandAndDigestOnly(t *testing.T) {
 	t.Parallel()
 

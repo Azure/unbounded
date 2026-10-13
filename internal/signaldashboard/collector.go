@@ -469,14 +469,24 @@ func (c *Collector) buildRunDetail(ctx context.Context, run *signalv1.Certificat
 	plan, planIssues := declaredStagePlan(run)
 	events := []stageEvent{}
 	logError := ""
-
 	pod := workflowPod(workflow, snapshot.pods)
-	if pod != nil && c.PodLogs != nil {
-		content, err := c.PodLogs.ReadPodLog(ctx, c.Namespace, pod.Name, "main", maxStageLogLines, maxStageLogBytes)
-		if err != nil {
-			logError = "Structured stage events are temporarily unavailable."
-		} else {
-			events = parseStageEvents(content)
+
+	if c.PodLogs != nil {
+		pods := workflowStagePods(workflow, snapshot.pods)
+		if len(pods) > maxStageLogPods {
+			pods = pods[:maxStageLogPods]
+			logError = "Structured stage events were truncated to the bounded pod limit."
+		}
+
+		for i := range pods {
+			content, err := c.PodLogs.ReadPodLog(ctx, c.Namespace, pods[i].Name, "main", maxStageLogLines, maxStageLogBytes)
+			if err != nil {
+				logError = "Structured stage events are temporarily unavailable."
+
+				continue
+			}
+
+			events = append(events, parseStageEvents(content)...)
 		}
 	}
 

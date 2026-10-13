@@ -87,6 +87,42 @@ func workflowPod(workflow *unstructured.Unstructured, pods []corev1.Pod) *corev1
 	return fallback
 }
 
+func workflowStagePods(workflow *unstructured.Unstructured, pods []corev1.Pod) []corev1.Pod {
+	if workflow == nil {
+		return nil
+	}
+
+	result := make([]corev1.Pod, 0)
+
+	for i := range pods {
+		if pods[i].Labels["workflows.argoproj.io/workflow"] != workflow.GetName() &&
+			!ownedByUID(&pods[i], workflow.GetUID()) {
+			continue
+		}
+
+		for _, container := range pods[i].Spec.Containers {
+			if container.Name == "main" {
+				result = append(result, pods[i])
+
+				break
+			}
+		}
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		left := result[i].Annotations["workflows.argoproj.io/node-name"]
+		right := result[j].Annotations["workflows.argoproj.io/node-name"]
+
+		if left == right {
+			return result[i].Name < result[j].Name
+		}
+
+		return left < right
+	})
+
+	return result
+}
+
 func scriptStatus(run *signalv1.CertificationRun, pod *corev1.Pod) ScriptStatus {
 	status := ScriptStatus{
 		Key:               run.Spec.Script.Key,

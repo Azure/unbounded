@@ -20,6 +20,7 @@ const (
 	stageEventPrefix    = "PROJECT_SIGNAL_STAGE "
 	maxStageLogBytes    = int64(64 * 1024)
 	maxStageLogLines    = int64(500)
+	maxStageLogPods     = 16
 )
 
 type stageEvent struct {

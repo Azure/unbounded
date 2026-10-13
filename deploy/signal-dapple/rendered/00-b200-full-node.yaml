@@ -1,0 +1,68 @@
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationProfile
+metadata:
+  name: dapple-b200-full-node
+  annotations:
+    signal.unbounded-cloud.io/scope: "Dapple single-node B200 full inventory and non-destructive health certification"
+spec:
+  participants:
+    count: 1
+    selector:
+      matchLabels:
+        node.kubernetes.io/instance-type: Dapple_B200_8x180GB
+        nvidia.com/gpu.product: NVIDIA-B200
+    requiredResources:
+      nvidia.com/gpu: "1"
+  script:
+    name: project-signal-scripts
+    key: gpu-full-node.sh
+  workflow:
+    name: project-signal-gpu-full-node-certification
+  backend:
+    apiVersion: kubeflow.org/v2beta1
+    kind: MPIJob
+  runnerImage: projectsignalpublic.azurecr.io/project-signal-runner@sha256:68a667b87491ed3fd1d56f4f8746bc52526e7b67a7b45456b779103f642922aa
+  purpose: FullCertification
+  stagePlan:
+    - id: preflight
+      displayName: Full-node inventory preflight
+      category: health
+      description: Compare controller-observed Node GPU capacity and allocatable inventory with the required eight B200 GPUs.
+      required: true
+    - id: workload
+      displayName: Eight-GPU workload
+      category: compute
+      description: Allocate all eight GPUs, query every device concurrently, and exercise MPI rank-to-GPU access.
+      expectedDuration: 5m
+      required: true
+      conditional: true
+    - id: health-after
+      displayName: Final GPU health
+      category: health
+      description: Re-query NVIDIA device health after the workload, or after a preflight failure without allocating eight GPUs.
+      required: true
+  parameters:
+    expected-gpu-product-regex: ^NVIDIA B200$
+    expected-gpu-count: "8"
+  evidencePath: project-signal/dapple-b200-full-node
+  deadline: 20m
+  maxAttempts: 1
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  recurring:
+    enabled: false
+    nodeNames:
+      - gpu-07-03
+      - gpu-07-13
+    minIdleDuration: 15m
+    validFor: 24h
+    expiresAt: "1970-01-01T00:00:00Z"
+    evaluationInterval: 1m
+    failureBackoff: 30m
+    maxConsecutiveFailures: 1
+    maxConcurrent: 1
+    failureDomainLabel: topology.kubernetes.io/zone
+    maxConcurrentPerFailureDomain: 1
+    exclusiveProfiles: []

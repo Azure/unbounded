@@ -45,6 +45,9 @@ const (
 	RunFinalizer         = "signal.unbounded-cloud.io/cleanup"
 	SnapshotRunLabel     = "signal.unbounded-cloud.io/run"
 	DefaultMaxAttempts   = int32(1)
+
+	ObservedGPUCapacityParameter    = "observed-gpu-capacity"
+	ObservedGPUAllocatableParameter = "observed-gpu-allocatable"
 )
 
 var workflowGVK = schema.GroupVersionKind{
@@ -193,7 +196,7 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 			RunnerImage:     profile.Spec.RunnerImage,
 			Purpose:         profile.Spec.Purpose,
 			StagePlan:       append([]signalv1.CertificationStage(nil), profile.Spec.StagePlan...),
-			Parameters:      profile.Spec.Parameters,
+			Parameters:      snapshotParameters(profile.Spec.Parameters, node),
 			EvidencePath:    strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
 			Deadline:        profile.Spec.Deadline,
 			MaxAttempts:     maxAttempts,
@@ -238,6 +241,21 @@ func (r *AdmissionReconciler) admitNodeWithTrigger(
 	}
 
 	return nil
+}
+
+func snapshotParameters(parameters map[string]string, node *corev1.Node) map[string]string {
+	snapshot := make(map[string]string, len(parameters)+2)
+	for key, value := range parameters {
+		snapshot[key] = value
+	}
+
+	gpu := corev1.ResourceName("nvidia.com/gpu")
+	capacity := node.Status.Capacity[gpu]
+	allocatable := node.Status.Allocatable[gpu]
+	snapshot[ObservedGPUCapacityParameter] = capacity.String()
+	snapshot[ObservedGPUAllocatableParameter] = allocatable.String()
+
+	return snapshot
 }
 
 func (r *AdmissionReconciler) selectParticipants(
@@ -622,6 +640,8 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 					map[string]any{"name": "tolerations", "value": string(tolerationsJSON)},
 					map[string]any{"name": "expected-gpu-product-regex", "value": run.Spec.Parameters["expected-gpu-product-regex"]},
 					map[string]any{"name": "expected-gpu-count", "value": run.Spec.Parameters["expected-gpu-count"]},
+					map[string]any{"name": "observed-gpu-capacity", "value": run.Spec.Parameters[ObservedGPUCapacityParameter]},
+					map[string]any{"name": "observed-gpu-allocatable", "value": run.Spec.Parameters[ObservedGPUAllocatableParameter]},
 					map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
 				},
 			},

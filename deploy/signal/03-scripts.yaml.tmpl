@@ -54,3 +54,156 @@ data:
 
     # A diagnostic result is evidence, not a workflow infrastructure error.
     exit 0
+  gpu-full-node.sh: |
+    #!/usr/bin/env bash
+    set -uo pipefail
+
+    stage="${PROJECT_SIGNAL_STAGE_NAME:-}"
+    verdict=Pass
+    reason=Healthy
+    details=
+
+    emit_stage() {
+      local status="$1"
+      local event_reason="${2:-}"
+      local message="${3:-}"
+
+      printf 'PROJECT_SIGNAL_STAGE {"name":"%s","status":"%s","at_epoch":%s,"reason":"%s","message":"%s"}\n' \
+        "${stage}" "${status}" "$(date +%s)" "${event_reason}" "${message}"
+    }
+
+    finish() {
+      printf '%s' "${verdict}" > /results/verdict
+      printf '%s' "${reason}" > /results/reason
+      printf '%s\n' "${details}" > /results/measurements.txt
+      printf 'verdict=%s reason=%s stage=%s\n' "${verdict}" "${reason}" "${stage}" > /dev/termination-log
+
+      if [[ "${verdict}" == Pass ]]; then
+        emit_stage passed "${reason}" "${details//$'\n'/; }"
+      else
+        emit_stage failed "${reason}" "${details//$'\n'/; }"
+      fi
+    }
+
+    validate_guards() {
+      if [[ -z "${EXPECTED_GPU_PRODUCT_REGEX:-}" ||
+            "${EXPECTED_GPU_PRODUCT_REGEX}" == *REPLACE_WITH_VERIFIED* ]]; then
+        verdict=Fail
+        reason=ProductGuardNotConfigured
+
+        return 1
+      fi
+
+      if ! [[ "${EXPECTED_GPU_COUNT:-}" =~ ^[1-9][0-9]*$ ]]; then
+        verdict=Fail
+        reason=CountGuardNotConfigured
+
+        return 1
+      fi
+
+      if ! command -v nvidia-smi >/dev/null 2>&1; then
+        verdict=Fail
+        reason=NvidiaSMIMissing
+
+        return 1
+      fi
+    }
+
+    query_visible_gpus() {
+      mapfile -t gpu_rows < <(
+        nvidia-smi \
+          --query-gpu=index,name,pci.bus_id,pstate,temperature.gpu,driver_version \
+          --format=csv,noheader,nounits
+      )
+      details="$(printf '%s\n' "${gpu_rows[@]}")"
+
+      if [[ "${#gpu_rows[@]}" -ne "$1" ]]; then
+        verdict=Fail
+        reason=RuntimeGPUCountMismatch
+
+        return 1
+      fi
+
+      local row
+      for row in "${gpu_rows[@]}"; do
+        if ! grep -Eq "${EXPECTED_GPU_PRODUCT_REGEX}" <<<"${row}"; then
+          verdict=Fail
+          reason=GPUProductMismatch
+
+          return 1
+        fi
+      done
+    }
+
+    emit_stage running
+
+    case "${stage}" in
+    preflight)
+      if validate_guards; then
+        if [[ "${OBSERVED_GPU_CAPACITY:-}" != "${EXPECTED_GPU_COUNT}" ]]; then
+          verdict=Fail
+          reason=NodeGPUCapacityMismatch
+          details="expected=${EXPECTED_GPU_COUNT} observed-capacity=${OBSERVED_GPU_CAPACITY:-unset} observed-allocatable=${OBSERVED_GPU_ALLOCATABLE:-unset}"
+        elif [[ "${OBSERVED_GPU_ALLOCATABLE:-}" != "${EXPECTED_GPU_COUNT}" ]]; then
+          verdict=Fail
+          reason=NodeGPUAllocatableMismatch
+          details="expected=${EXPECTED_GPU_COUNT} observed-capacity=${OBSERVED_GPU_CAPACITY:-unset} observed-allocatable=${OBSERVED_GPU_ALLOCATABLE:-unset}"
+        else
+          query_visible_gpus 1 || true
+          if [[ "${verdict}" == Pass ]]; then
+            reason=NodeInventoryHealthy
+            details="expected=${EXPECTED_GPU_COUNT} observed-capacity=${OBSERVED_GPU_CAPACITY} observed-allocatable=${OBSERVED_GPU_ALLOCATABLE}"$'\n'"${details}"
+          fi
+        fi
+      fi
+      ;;
+    workload)
+      if validate_guards; then
+        query_visible_gpus "${EXPECTED_GPU_COUNT}" || true
+      fi
+
+      if [[ "${verdict}" == Pass ]]; then
+        pids=()
+        for ((index = 0; index < EXPECTED_GPU_COUNT; index++)); do
+          nvidia-smi -i "${index}" \
+            --query-gpu=index,name,pci.bus_id,pstate,temperature.gpu \
+            --format=csv,noheader,nounits &
+          pids+=("$!")
+        done
+
+        for pid in "${pids[@]}"; do
+          if ! wait "${pid}"; then
+            verdict=Fail
+            reason=ParallelGPUHealthQueryFailed
+          fi
+        done
+      fi
+
+      if [[ "${verdict}" == Pass ]]; then
+        reason=FullNodeWorkloadPassed
+      fi
+      ;;
+    health-after)
+      if validate_guards; then
+        query_visible_gpus 1 || true
+      fi
+
+      if [[ "${verdict}" == Pass ]]; then
+        reason=FinalHealthPassed
+      fi
+      ;;
+    *)
+      verdict=Fail
+      reason=UnknownStage
+      details="stage=${stage:-unset}"
+      ;;
+    esac
+
+    finish
+
+    if [[ "${stage}" == workload && "${verdict}" != Pass ]]; then
+      exit 1
+    fi
+
+    # Preflight failures are typed hardware evidence, not workflow errors.
+    exit 0

@@ -297,6 +297,10 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		Operator: corev1.TolerationOpExists,
 		Effect:   corev1.TaintEffectNoSchedule,
 	}}
+	run.Spec.Parameters = map[string]string{
+		ObservedGPUCapacityParameter:    "8",
+		ObservedGPUAllocatableParameter: "7",
+	}
 
 	workflow, err := buildWorkflow(run, 2)
 	if err != nil {
@@ -335,6 +339,10 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		t.Fatalf("workflow values = %#v", values)
 	}
 
+	if values["observed-gpu-capacity"] != "8" || values["observed-gpu-allocatable"] != "7" {
+		t.Fatalf("workflow observed inventory = %#v", values)
+	}
+
 	if values["script-configmap"] != run.Spec.Script.ConfigMapName || values["script-configmap"] == "scripts" {
 		t.Fatalf("workflow must mount the immutable snapshot, values = %#v", values)
 	}
@@ -350,6 +358,28 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 
 	if len(tolerations) != 1 {
 		t.Fatalf("workflow tolerations = %#v, want one deduplicated GPU toleration", tolerations)
+	}
+}
+
+func TestSnapshotParametersRecordsControllerObservedGPUInventory(t *testing.T) {
+	t.Parallel()
+
+	node := readyNode("gpu-0", "gpu")
+	node.Status.Capacity = corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("8")}
+	node.Status.Allocatable = corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("7")}
+
+	got := snapshotParameters(map[string]string{
+		"expected-gpu-count":            "8",
+		ObservedGPUCapacityParameter:    "999",
+		ObservedGPUAllocatableParameter: "999",
+	}, node)
+
+	if got["expected-gpu-count"] != "8" {
+		t.Fatalf("expected parameter was not preserved: %#v", got)
+	}
+
+	if got[ObservedGPUCapacityParameter] != "8" || got[ObservedGPUAllocatableParameter] != "7" {
+		t.Fatalf("controller-observed inventory did not override profile values: %#v", got)
 	}
 }
 

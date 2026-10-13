@@ -102,6 +102,9 @@ SIGNAL_NAMESPACE ?= project-signal
 SIGNAL_RUNNER_IMAGE ?= example.invalid/gpu-runner:replace-me
 SIGNAL_MANIFEST_TEMPLATES_DIR := deploy/signal
 SIGNAL_MANIFEST_RENDERED_DIR := deploy/signal/rendered
+SIGNAL_DAPPLE_MANIFEST_TEMPLATES_DIR := deploy/signal-dapple
+SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR := deploy/signal-dapple/rendered
+SIGNAL_DAPPLE_RUNNER_IMAGE ?= projectsignalpublic.azurecr.io/project-signal-runner@sha256:68a667b87491ed3fd1d56f4f8746bc52526e7b67a7b45456b779103f642922aa
 
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
@@ -241,7 +244,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-dashboard project-signal-dashboard-build signal-manifests image-project-signal-controller-local image-project-signal-dashboard-local image-project-signal-runner-local project-signal-runner-oci-push metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-dashboard project-signal-dashboard-build signal-manifests signal-dapple-manifests image-project-signal-controller-local image-project-signal-dashboard-local image-project-signal-runner-local project-signal-runner-oci-push metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -301,6 +304,7 @@ help: ## Show this help
 	@echo "  machine-ops-controller           Build machine-ops-controller"
 	@echo "  project-signal-controller        Build Project Signal controller"
 	@echo "  signal-manifests                 Render Project Signal manifests"
+	@echo "  signal-dapple-manifests          Render Dapple B200 Project Signal profile"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
 	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
 	@echo "  unbounded-net-controller         Build net controller"
@@ -1168,6 +1172,15 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 	@mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd
 	@cp $(SIGNAL_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(SIGNAL_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered Project Signal manifests into $(SIGNAL_MANIFEST_RENDERED_DIR) (image: $(SIGNAL_CONTROLLER_IMAGE))"
+
+signal-dapple-manifests: ## Render Dapple B200 Project Signal profile
+	@mkdir -p $(SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR)
+	@find $(SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	$(GOCMD) run ./hack/cmd/render-manifests \
+		--templates-dir $(SIGNAL_DAPPLE_MANIFEST_TEMPLATES_DIR) \
+		--output-dir $(SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR) \
+		--set RunnerImage=$(SIGNAL_DAPPLE_RUNNER_IMAGE)
+	@echo "Rendered Dapple Project Signal manifests into $(SIGNAL_DAPPLE_MANIFEST_RENDERED_DIR)"
 
 playpen-manifests: ## Render playpen operator and runner manifests into deploy/playpen/rendered
 	@mkdir -p $(PLAYPEN_MANIFEST_RENDERED_DIR)

@@ -11,10 +11,12 @@ from execution:
 - An execution backend performs coordinated work. The included example uses
   Kubeflow MPI Operator `MPIJob`.
 
-This directory is an educational example, not a production hardware
-qualification suite. The included script verifies only an expected GPU product
-and count. Replace it with an organization-reviewed diagnostic before using the
-controller to make workload placement decisions.
+This directory includes an educational one-GPU identity example and a bounded,
+non-destructive full-node GPU workflow. The full-node workflow snapshots Node
+GPU capacity and allocatable inventory at admission, fails before requesting
+the full GPU set when inventory is incomplete, then validates every allocated
+GPU and MPI rank-to-GPU access. It is not a substitute for an
+organization-reviewed burn-in or performance qualification suite.
 
 ## Architecture
 
@@ -310,6 +312,25 @@ The sample is one Node, one GPU, and one MPI worker. It is not GB200 NVL72 or
 rack-scale certification. Rack-scale support requires a topology-aware,
 multi-participant backend, complete participant reservation, gang scheduling,
 rank mapping, fabric and collective tests, and per-participant evidence.
+
+## Dapple B200 full-node profile
+
+`deploy/signal-dapple/00-b200-full-node.yaml.tmpl` defines the reviewed Dapple
+contract for `Dapple_B200_8x180GB` / `NVIDIA-B200` Nodes. Render it separately
+from the portable Signal manifests:
+
+```bash
+make signal-dapple-manifests
+```
+
+The profile expects eight GPUs but requires only one GPU for admission and
+preflight. The controller overwrites the reserved
+`observed-gpu-capacity` and `observed-gpu-allocatable` run parameters with the
+Node status observed at admission. A seven-GPU Node therefore produces typed
+`Fail` / `NodeGPUCapacityMismatch` evidence without attempting an unschedulable
+eight-GPU pod. An eight-GPU Node proceeds through the full allocation, parallel
+per-device health query, MPI rank-to-GPU check, and final health stage using the
+pinned Project Signal runner image.
 
 ## Non-goals
 
