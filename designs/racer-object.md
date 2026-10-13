@@ -95,9 +95,10 @@ as the wrapped cause, so `errors.Is` still works, but its text is not shown.
   for an origin call.
 - Before it creates its socket, the origin walks the path to
   `/run/racer/<cache>/origin` one directory at a time without following
-  symlinks. It refuses any directory that is group- or world-writable or
-  owned by another user. This stops another local user from swapping the
-  socket path.
+  symlinks. It refuses any directory that is group- or world-writable.
+  Ancestors must be owned by root or the process's effective UID; the final
+  `origin` directory must be owned by the effective UID. This stops another
+  local user from swapping the socket path.
 - The origin does no caching of its own. Racer owns all caching.
 
 ## Sidecar
