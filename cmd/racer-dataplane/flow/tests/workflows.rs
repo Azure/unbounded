@@ -1012,15 +1012,19 @@ mod coalesce_tests {
                 let due = Instant::now();
                 flight::update(&owner, |state, _| {
                     for id in 1..=if final_waiter { 1 } else { 2 } {
-                        state.register(
-                            id,
-                            CountingPolicy {
-                                due,
-                                checks: Rc::new(Cell::new(0)),
-                                error: Rc::new(Cell::new(None)),
-                            },
-                            true,
-                            true,
+                        assert!(
+                            state
+                                .register(
+                                    id,
+                                    CountingPolicy {
+                                        due,
+                                        checks: Rc::new(Cell::new(0)),
+                                        error: Rc::new(Cell::new(None)),
+                                    },
+                                    true,
+                                    true,
+                                )
+                                .is_ok()
                         );
                     }
                     state.phase = match phase {
@@ -1120,7 +1124,7 @@ mod coalesce_tests {
             })),
         };
         let retired = flight::update(&owner, |state, _| {
-            state.register(1, policy, true, true);
+            assert!(state.register(1, policy, true, true).is_ok());
             state.detach(1)
         });
         assert!(retired.as_ref().unwrap().waker.is_none());
@@ -1208,7 +1212,7 @@ mod coalesce_tests {
                     };
                     state.leader = matches!(phase, 1..=4).then_some(1);
                     for id in 1..=waiter_count {
-                        state.register(id, probe(), true, true);
+                        assert!(state.register(id, probe(), true, true).is_ok());
                         // Include a policy with no parked waker.
                         if id == 1 {
                             state.waiters.get_mut(&id).unwrap().waker =
@@ -1399,7 +1403,7 @@ mod coalesce_tests {
             state.partial = Some(partial);
             state.phase = Phase::Acquiring;
             state.leader = Some(1);
-            operations.insert(1, ());
+            operations.insert(1, ()).unwrap();
             state.stop(8, wakes)
         });
         drop(retired);
@@ -1462,15 +1466,19 @@ mod coalesce_tests {
             }
         });
         let retired = flight::update(&owner, |state, wakes| {
-            state.register(
-                1,
-                CountingPolicy {
-                    due: Instant::now(),
-                    checks: Rc::new(Cell::new(0)),
-                    error: Rc::new(Cell::new(None)),
-                },
-                true,
-                true,
+            assert!(
+                state
+                    .register(
+                        1,
+                        CountingPolicy {
+                            due: Instant::now(),
+                            checks: Rc::new(Cell::new(0)),
+                            error: Rc::new(Cell::new(None)),
+                        },
+                        true,
+                        true,
+                    )
+                    .is_ok()
             );
             state.waiters.get_mut(&1).unwrap().waker = Some(waker);
             let retired = state.stop(8, wakes);
@@ -2073,7 +2081,7 @@ mod coalesce_tests {
             assert_eq!(table.next_waiter_id(), Ok(2));
             let id = table.next_operation_id().unwrap();
             assert!(table.insert(1, OwnedEntry::default()).is_ok());
-            table.get_mut(&1).unwrap().0.insert(id, resource);
+            assert!(table.get_mut(&1).unwrap().0.insert(id, resource).is_ok());
             assert_eq!(table.get_mut(&1).unwrap().0.complete(id), Err(Stale));
             id
         });
@@ -2122,15 +2130,19 @@ mod coalesce_tests {
         let checks = Rc::new(Cell::new(0));
         let error = Rc::new(Cell::new(None));
         for id in 0..66 {
-            state.register(
-                id,
-                CountingPolicy {
-                    due: now,
-                    checks: checks.clone(),
-                    error: error.clone(),
-                },
-                true,
-                true,
+            assert!(
+                state
+                    .register(
+                        id,
+                        CountingPolicy {
+                            due: now,
+                            checks: checks.clone(),
+                            error: error.clone(),
+                        },
+                        true,
+                        true,
+                    )
+                    .is_ok()
             );
         }
         assert_eq!(state.elect(0, &mut identity, 2), Ok(true));
@@ -2186,16 +2198,20 @@ mod coalesce_tests {
         let checks = Rc::new(Cell::new(0));
         flight::update(&owner, |state, _| {
             for id in 0..66 {
-                state.register(
-                    id,
-                    AdvancingPolicy {
-                        due: if id < 65 { now } else { later },
-                        clock: clock.clone(),
-                        later,
-                        checks: checks.clone(),
-                    },
-                    true,
-                    true,
+                assert!(
+                    state
+                        .register(
+                            id,
+                            AdvancingPolicy {
+                                due: if id < 65 { now } else { later },
+                                clock: clock.clone(),
+                                later,
+                                checks: checks.clone(),
+                            },
+                            true,
+                            true,
+                        )
+                        .is_ok()
                 );
             }
         });

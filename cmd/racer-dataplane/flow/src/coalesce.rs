@@ -1039,8 +1039,14 @@ pub mod flight {
 
     impl<R, S: BuildHasher> Operations<R, S> {
         /// Retain resources under a caller-allocated unique operation identifier.
-        pub fn insert(&mut self, id: u64, resources: R) {
+        /// Return duplicate resources unchanged; even a completion tombstone is occupied.
+        #[must_use = "retire rejected resources outside the owner borrow"]
+        pub fn insert(&mut self, id: u64, resources: R) -> Result<(), R> {
+            if self.slots.contains_key(&id) {
+                return Err(resources);
+            }
             self.slots.insert(id, OperationSlot::Retained(resources));
+            Ok(())
         }
 
         /// Take resources for destruction outside the owner borrow, retaining a fence.
@@ -1256,7 +1262,18 @@ pub mod flight {
 
         impl<C, P, O, W: WaiterPolicy> State<C, P, O, W> {
             /// Attach a caller using an identifier allocated by the owning table.
-            pub fn register(&mut self, id: u64, policy: W, acquisition: bool, complete: bool) {
+            /// Duplicate IDs return the policy without changing the original waiter or deadline.
+            #[must_use = "retire rejected policies outside the owner borrow"]
+            pub fn register(
+                &mut self,
+                id: u64,
+                policy: W,
+                acquisition: bool,
+                complete: bool,
+            ) -> Result<(), W> {
+                if self.waiters.contains_key(&id) {
+                    return Err(policy);
+                }
                 self.deadlines.insert((policy.deadline(), id), ());
                 self.waiters.insert(
                     id,
@@ -1269,6 +1286,7 @@ pub mod flight {
                         waker: None,
                     },
                 );
+                Ok(())
             }
 
             /// Remove a caller and its deadline without declaring operation completion.
@@ -1572,14 +1590,17 @@ pub mod flight {
                 complete: bool,
             ) -> Rc<Cell<Option<u8>>> {
                 let error = Rc::new(Cell::new(None));
-                core.register(
-                    id,
-                    Policy {
-                        due: Instant::now() + Duration::from_secs(60),
-                        error: error.clone(),
-                    },
-                    acquisition,
-                    complete,
+                assert!(
+                    core.register(
+                        id,
+                        Policy {
+                            due: Instant::now() + Duration::from_secs(60),
+                            error: error.clone(),
+                        },
+                        acquisition,
+                        complete,
+                    )
+                    .is_ok()
                 );
                 error
             }
@@ -1706,14 +1727,17 @@ pub mod flight {
                 let old = Arc::new(Count::default());
                 let latest = Arc::new(Count::default());
                 for id in 0..65 {
-                    core.register(
-                        id,
-                        Policy {
-                            due: now,
-                            error: Rc::new(Cell::new(Some(3))),
-                        },
-                        true,
-                        true,
+                    assert!(
+                        core.register(
+                            id,
+                            Policy {
+                                due: now,
+                                error: Rc::new(Cell::new(Some(3))),
+                            },
+                            true,
+                            true,
+                        )
+                        .is_ok()
                     );
                     let old = Waker::from(old.clone());
                     let latest = Waker::from(latest.clone());
@@ -1738,6 +1762,27 @@ pub mod flight {
                 }
                 assert_eq!(old.0.load(Ordering::Relaxed), 0);
                 assert_eq!(latest.0.load(Ordering::Relaxed), 65);
+            }
+
+            /// Shutdown clears caller indexes but retains a pending completion outcome.
+            #[test]
+            fn duplicate_waiter_keeps_original_policy_and_deadline() {
+                let mut core = Core::default();
+                let error = register(&mut core, 1, true, true);
+                let due = core.waiters[&1].deadline();
+                let replacement = Policy {
+                    due: due + Duration::from_secs(1),
+                    error: Rc::new(Cell::new(Some(4))),
+                };
+                let rejected = core.register(1, replacement, false, false).err().unwrap();
+                assert_eq!(rejected.error.get(), Some(4));
+                assert!(Rc::ptr_eq(&core.waiters[&1].policy.error, &error));
+                assert_eq!(core.waiters[&1].deadline(), due);
+                assert_eq!(core.deadlines.len(), 1);
+                assert!(core.deadlines.contains_key(&(due, 1)));
+                assert_eq!(core.elect(1, &mut identity(), 1), Ok(true));
+                drop(core.detach(1));
+                assert!(core.deadlines.is_empty());
             }
 
             /// Shutdown clears caller indexes but retains a pending completion outcome.
@@ -1897,7 +1942,7 @@ pub mod flight {
             insert(&mut table, &owner, 2);
             let live = Rc::new(Cell::new(1));
             let entry = table.get_mut(&1).unwrap();
-            entry.operations.insert(1, Resource(live.clone()));
+            assert!(entry.operations.insert(1, Resource(live.clone())).is_ok());
             entry.canceled = true;
             let mut wakes = Vec::new();
             drop(table.sweep(1, &mut wakes));
@@ -1918,6 +1963,19 @@ pub mod flight {
             table.get_mut(&1).unwrap().operations.complete(1).unwrap();
             assert!(table.remove_quiescent(&1).is_some());
             assert_eq!(table.len(), 1);
+        }
+
+        /// Occupied entries retain live resources until explicit completion.
+        #[test]
+        fn duplicate_operation_preserves_resource_and_tombstone() {
+            let mut operations = Operations::<u32>::default();
+            assert_eq!(operations.insert(1, 7), Ok(()));
+            assert_eq!(operations.insert(1, 8), Err(8));
+            assert_eq!(operations.take(1), Ok(7));
+            assert_eq!(operations.insert(1, 9), Err(9));
+            assert_eq!(operations.take(1), Err(Stale));
+            assert_eq!(operations.complete(1), Ok(()));
+            assert!(operations.is_empty());
         }
 
         /// Occupied entries retain live resources until explicit completion.
@@ -1946,7 +2004,7 @@ pub mod flight {
             let live = Rc::new(Cell::new(1));
             let entry = table.get_mut(&1).unwrap();
             entry.waiters = 0;
-            entry.operations.insert(1, Resource(live.clone()));
+            assert!(entry.operations.insert(1, Resource(live.clone())).is_ok());
             if take {
                 drop(entry.operations.take(1).unwrap());
             }
@@ -1957,7 +2015,11 @@ pub mod flight {
             let next_sweep_id = table.next_sweep_id;
             let rejected_live = Rc::new(Cell::new(1));
             let mut operations = Operations::default();
-            operations.insert(2, Resource(rejected_live.clone()));
+            assert!(
+                operations
+                    .insert(2, Resource(rejected_live.clone()))
+                    .is_ok()
+            );
             let replacement = table.identity(owner).unwrap();
             let rejected = table.insert(
                 1,
@@ -2020,12 +2082,15 @@ pub mod flight {
             let table = Rc::new(RefCell::new(TestTable::default()));
             let token = insert(&mut table.borrow_mut(), &owner, 1);
             let live = Rc::new(Cell::new(1));
-            table
-                .borrow_mut()
-                .get_mut(&1)
-                .unwrap()
-                .operations
-                .insert(1, Resource(live.clone()));
+            assert!(
+                table
+                    .borrow_mut()
+                    .get_mut(&1)
+                    .unwrap()
+                    .operations
+                    .insert(1, Resource(live.clone()))
+                    .is_ok()
+            );
             drop(Waiter {
                 table: table.clone(),
                 key: 1,
@@ -2064,7 +2129,7 @@ pub mod flight {
             entry.identity.advance(2).unwrap();
             let old = entry.identity.clone();
             let live = Rc::new(Cell::new(1));
-            entry.operations.insert(1, Resource(live.clone()));
+            assert!(entry.operations.insert(1, Resource(live.clone())).is_ok());
             assert_eq!(
                 entry.operations.complete(1),
                 Err(Stale),
