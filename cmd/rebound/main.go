@@ -167,7 +167,11 @@ func run(ctx context.Context, cfg config) error {
 		// The leader issues the serving certificate; every replica waits
 		// for it before it can serve HTTPS.
 		if err := provider.WaitReady(ctx); err != nil {
-			return nil //nolint:nilerr // Shutting down before the certificate loaded.
+			if ctx.Err() != nil {
+				return nil // Shutting down before the certificate loaded.
+			}
+
+			return fmt.Errorf("serving certificate: %w", err)
 		}
 
 		server, err := cfg.server.NewServer(apiserver.ServerConfig{
