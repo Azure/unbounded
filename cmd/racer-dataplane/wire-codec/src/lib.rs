@@ -1143,18 +1143,23 @@ pub mod rest {
         .map_err(|_| Error::Unauthorized)?
         .with_root_certificates(roots);
         let mut config = if let Some(identity) = identity {
-            builder
-                .with_client_auth_cert(
-                    identity
-                        .certificate_chain
-                        .iter()
-                        .cloned()
-                        .map(rustls::pki_types::CertificateDer::from)
-                        .collect(),
-                    rustls::pki_types::PrivatePkcs8KeyDer::from(identity.private_key.to_vec())
-                        .into(),
-                )
-                .map_err(|_| Error::Unauthorized)?
+            // Borrow DER: rustls's owned private-key wrapper does not wipe on drop.
+            let private = rustls::pki_types::PrivatePkcs8KeyDer::from(identity.private_key).into();
+            let key = rustls::crypto::ring::sign::any_supported_type(&private)
+                .map_err(|_| Error::Unauthorized)?;
+            let certified = rustls::sign::CertifiedKey::new(
+                identity
+                    .certificate_chain
+                    .iter()
+                    .cloned()
+                    .map(rustls::pki_types::CertificateDer::from)
+                    .collect(),
+                key,
+            );
+            certified.keys_match().map_err(|_| Error::Unauthorized)?;
+            builder.with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                certified,
+            )))
         } else {
             builder.with_no_client_auth()
         };
@@ -2508,6 +2513,48 @@ pub mod rest {
             assert_eq!(get().status, 204);
             transport.close_idle();
             server.join().unwrap();
+        }
+
+        #[test]
+        fn tls_config_validates_borrowed_client_key() {
+            let (ca, key) = testing::ca();
+            let identity = TestIdentity::new(&ca, &key);
+            let unrelated = TestIdentity::new(&ca, &key);
+            let trust = ca.pem();
+            let config = tls_config(trust.as_bytes(), Some(identity.borrowed())).unwrap();
+            assert!(config.client_auth_cert_resolver.has_certs());
+            assert!(
+                !tls_config(trust.as_bytes(), None)
+                    .unwrap()
+                    .client_auth_cert_resolver
+                    .has_certs()
+            );
+            for private_key in [
+                b"".as_slice(),
+                b"invalid DER",
+                unrelated.borrowed().private_key,
+            ] {
+                assert!(matches!(
+                    tls_config(
+                        trust.as_bytes(),
+                        Some(Identity {
+                            private_key,
+                            ..identity.borrowed()
+                        })
+                    ),
+                    Err(Error::Unauthorized)
+                ));
+            }
+            assert!(matches!(
+                tls_config(
+                    trust.as_bytes(),
+                    Some(Identity {
+                        certificate_chain: &[],
+                        ..identity.borrowed()
+                    })
+                ),
+                Err(Error::Unauthorized)
+            ));
         }
 
         #[test]
