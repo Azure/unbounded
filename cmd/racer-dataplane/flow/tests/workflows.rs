@@ -926,8 +926,9 @@ mod coalesce_tests {
     /// Register a flight wake target through the caller-owned borrow boundary.
     fn register_flight_waker(owner: &RefCell<Option<Waker>>, waker: &Waker) {
         let waker = waker.clone();
-        let retired = flight::update(owner, |slot, _| flight::state::store_waker(slot, waker));
-        drop(retired);
+        flight::update(owner, |slot, txn| {
+            txn.retire(flight::state::store_waker(slot, waker));
+        });
     }
 
     /// Empty, different, and equal slots transfer ownership without callbacks.
@@ -946,22 +947,22 @@ mod coalesce_tests {
             *slot.borrow_mut() = Some(Box::new(move || dropped.set(true)));
         });
         let duplicate = cohort_waker();
-        let retired = flight::update(&owner, |slot, _| {
+        flight::update(&owner, |slot, txn| {
             assert!(flight::state::store_waker(slot, waker).is_none());
             let retired = flight::state::store_waker(slot, duplicate).unwrap();
             assert!(slot.as_ref().unwrap().will_wake(&retired));
             assert!(!cloned.get());
             assert!(!dropped.get());
-            retired
+            txn.retire(retired);
         });
-        drop(retired);
         assert!(dropped.get());
         let latest = Waker::from(Arc::new(Reenter));
         let replacement = latest.clone();
-        let retired = flight::update(&owner, |slot, _| {
-            flight::state::store_waker(slot, replacement)
+        flight::update(&owner, |slot, txn| {
+            let retired = flight::state::store_waker(slot, replacement);
+            assert!(retired.as_ref().unwrap().will_wake(&cohort_waker()));
+            txn.retire(retired);
         });
-        assert!(retired.as_ref().unwrap().will_wake(&cohort_waker()));
         assert!(owner.borrow().as_ref().unwrap().will_wake(&latest));
         assert!(!cloned.get());
         ON_COHORT_CLONE.with(|slot| slot.borrow_mut().take());
@@ -1076,7 +1077,7 @@ mod coalesce_tests {
                         let owner = owner.clone();
                         let called = called.clone();
                         move || {
-                            drop(flight::update(&owner, |state, _| {
+                            flight::update(&owner, |state, txn| {
                                 assert!(!state.waiters.contains_key(&1));
                                 assert!(!state.deadlines.contains_key(&(due, 1)));
                                 assert_eq!(state.waiters.len(), usize::from(!final_waiter));
@@ -1089,21 +1090,21 @@ mod coalesce_tests {
                                     3 => matches!(state.phase, Phase::Complete(7)),
                                     _ => matches!(state.phase, Phase::Failed(8)),
                                 });
-                                state.detach(2)
-                            }));
+                                txn.retire(state.detach(2));
+                            });
                             called.set(called.get() + 1);
                         }
                     }));
                 });
-                let retired = flight::update(&owner, |state, _| {
+                flight::update(&owner, |state, txn| {
                     assert!(state.detach(99).is_none());
                     assert_eq!(state.waiters.len(), if final_waiter { 1 } else { 2 });
                     assert_eq!(state.deadlines.len(), state.waiters.len());
-                    state.detach(1)
+                    let retired = state.detach(1);
+                    assert!(retired.as_ref().unwrap().waker.is_some());
+                    assert_eq!(called.get(), 0);
+                    txn.retire(retired);
                 });
-                assert!(retired.as_ref().unwrap().waker.is_some());
-                assert_eq!(called.get(), 0);
-                drop(retired);
                 assert_eq!(called.get(), 1);
                 assert!(flight::update(&owner, |state, _| state.detach(1)).is_none());
                 assert!(owner.borrow().waiters.is_empty());
@@ -1156,13 +1157,13 @@ mod coalesce_tests {
                 }
             })),
         };
-        let retired = flight::update(&owner, |state, _| {
+        flight::update(&owner, |state, txn| {
             assert!(state.register(1, policy, true, true).is_ok());
-            state.detach(1)
+            let retired = state.detach(1);
+            assert!(retired.as_ref().unwrap().waker.is_none());
+            assert!(!called.get());
+            txn.retire(retired);
         });
-        assert!(retired.as_ref().unwrap().waker.is_none());
-        assert!(!called.get());
-        drop(retired);
         assert!(called.get());
     }
 
@@ -1253,35 +1254,40 @@ mod coalesce_tests {
                         }
                     }
                 });
-                let retired = flight::update(&owner, |state, wakes| state.stop(8, wakes));
-                assert_eq!(borrowed.get(), 0, "phase {phase}, waiters {waiter_count}");
-                assert_eq!(dropped.get(), 0);
-                assert_eq!(retired.waiters.len(), waiter_count as usize);
-                assert!(
-                    retired
-                        .waiters
-                        .values()
-                        .all(|waiter| waiter.error == Some(8) && waiter.waker.is_none())
-                );
-                assert!(match phase {
-                    0 => matches!(retired.phase, Phase::RetryPending),
-                    1 => matches!(retired.phase, Phase::Acquiring),
-                    2 => matches!(retired.phase, Phase::Draining(Outcome::Retry)),
-                    3 => matches!(retired.phase, Phase::Draining(Outcome::Failed(7))),
-                    4 => matches!(retired.phase, Phase::Draining(Outcome::Published(_))),
-                    5 => matches!(retired.phase, Phase::Complete(_)),
-                    _ => matches!(retired.phase, Phase::Failed(7)),
+                flight::update(&owner, |state, txn| {
+                    let retired = state.stop(8, txn);
+                    assert_eq!(dropped.get(), 0);
+                    assert_eq!(retired.waiters.len(), waiter_count as usize);
+                    assert!(
+                        retired
+                            .waiters
+                            .values()
+                            .all(|waiter| waiter.error == Some(8) && waiter.waker.is_none())
+                    );
+                    assert!(match phase {
+                        0 => matches!(retired.phase, Phase::RetryPending),
+                        1 => matches!(retired.phase, Phase::Acquiring),
+                        2 => matches!(retired.phase, Phase::Draining(Outcome::Retry)),
+                        3 => matches!(retired.phase, Phase::Draining(Outcome::Failed(7))),
+                        4 => matches!(retired.phase, Phase::Draining(Outcome::Published(_))),
+                        5 => matches!(retired.phase, Phase::Complete(_)),
+                        _ => matches!(retired.phase, Phase::Failed(7)),
+                    });
+                    txn.retire(retired);
                 });
+                assert_eq!(borrowed.get(), 0, "phase {phase}, waiters {waiter_count}");
                 assert_eq!(
                     wake_count.0.load(std::sync::atomic::Ordering::Relaxed),
                     usize::from(waiter_count > 0)
                 );
-                drop(retired);
                 assert_eq!(
                     dropped.get(),
                     waiter_count + u64::from(matches!(phase, 4 | 5))
                 );
-                drop(flight::update(&owner, |state, wakes| state.stop(8, wakes)));
+                flight::update(&owner, |state, txn| {
+                    let retired = state.stop(8, txn);
+                    txn.retire(retired);
+                });
                 flight::update(&owner, |state, wakes| {
                     assert_eq!(state.leader, matches!(phase, 1..=4).then_some(1));
                     assert!(
@@ -1333,15 +1339,15 @@ mod coalesce_tests {
                         Phase::Draining(Outcome::Published(Published::Partial(value)))
                     };
                 });
-                let retired = flight::update(&owner, |state, wakes| {
-                    if revoke {
-                        state.revoke(8, wakes)
+                flight::update(&owner, |state, txn| {
+                    let retired = if revoke {
+                        state.revoke(8, txn)
                     } else {
                         state.begin_completion(Outcome::Retry)
-                    }
+                    };
+                    assert!(!called.get());
+                    txn.retire(retired);
                 });
-                assert!(!called.get());
-                drop(retired);
                 assert!(called.get());
             }
         }
@@ -1389,22 +1395,22 @@ mod coalesce_tests {
                 });
                 let settle = |idle| {
                     let now = Instant::now();
-                    flight::update(&owner, |state, wakes| {
-                        if refresh {
-                            state.refresh(idle, 9, 8, now, std::convert::identity, wakes)
+                    flight::update(&owner, |state, txn| {
+                        let retired = if refresh {
+                            state.refresh(idle, 9, 8, now, std::convert::identity, txn)
                         } else {
-                            state.settle(idle, 9, std::convert::identity, wakes)
-                        }
+                            state.settle(idle, 9, std::convert::identity, txn)
+                        };
+                        let replaced = retired.is_some();
+                        txn.retire(retired);
+                        replaced
                     })
                 };
-                assert!(settle(false).is_none());
+                assert!(!settle(false));
                 assert!(!called.get());
-                let retired = settle(true);
-                assert!(retired.is_some());
-                assert!(!called.get());
-                drop(retired);
+                assert!(settle(true));
                 assert!(called.get());
-                assert!(settle(true).is_none());
+                assert!(!settle(true));
             }
         }
     }
@@ -1432,14 +1438,14 @@ mod coalesce_tests {
                 }
             })),
         };
-        let retired = flight::update(&owner, |(state, operations), wakes| {
+        flight::update(&owner, |(state, operations), txn| {
             state.partial = Some(partial);
             state.phase = Phase::Acquiring;
             state.leader = Some(1);
             operations.insert(1, ()).unwrap();
-            state.stop(8, wakes)
+            let retired = state.stop(8, txn);
+            txn.retire(retired);
         });
-        drop(retired);
         for take in [false, true] {
             flight::update(&owner, |(state, operations), wakes| {
                 if take {
@@ -1456,7 +1462,7 @@ mod coalesce_tests {
             });
             assert!(!called.get());
         }
-        let partial = flight::update(&owner, |(state, operations), wakes| {
+        flight::update(&owner, |(state, operations), wakes| {
             operations.complete(1).unwrap();
             assert!(
                 state
@@ -1465,27 +1471,43 @@ mod coalesce_tests {
             );
             assert!(matches!(state.phase, Phase::Failed(8)));
             assert!(state.leader.is_none());
-            state.partial.take()
+            wakes.retire(state.partial.take());
+            assert!(!called.get());
         });
-        assert!(!called.get());
-        drop(partial);
         assert!(called.get());
     }
 
-    /// Shutdown wakes reenter after indexes clear, without bypassing settlement.
+    /// Shutdown drops policies and results before wakes, without bypassing settlement.
     #[test]
     fn flight_stop_wake_reentry_preserves_completion_fence() {
-        let owner = Rc::new(RefCell::new(State::<
-            u32,
-            u32,
-            Published<u32, u32>,
-            CountingPolicy,
-        >::default()));
+        let owner = Rc::new(RefCell::new(DropState::default()));
         let called = Rc::new(Cell::new(false));
+        let dropped = Rc::new(Cell::new(0));
+        let probe = || DropProbe {
+            due: Instant::now(),
+            on_drop: Some(Box::new({
+                let owner = owner.clone();
+                let dropped = dropped.clone();
+                let called = called.clone();
+                move || {
+                    assert!(!called.get());
+                    let state = owner.borrow_mut();
+                    assert!(state.waiters.is_empty());
+                    assert!(matches!(state.phase, Phase::Draining(Outcome::Failed(8))));
+                    dropped.set(dropped.get() + 1);
+                }
+            })),
+        };
         let waker = on_wake({
             let owner = owner.clone();
             let called = called.clone();
+            let dropped = dropped.clone();
             move || {
+                assert_eq!(
+                    dropped.get(),
+                    2,
+                    "retired values must drop before notification"
+                );
                 flight::update(&owner, |state, wakes| {
                     assert!(state.waiters.is_empty());
                     assert!(state.deadlines.is_empty());
@@ -1498,27 +1520,16 @@ mod coalesce_tests {
                 called.set(true);
             }
         });
-        let retired = flight::update(&owner, |state, wakes| {
-            assert!(
-                state
-                    .register(
-                        1,
-                        CountingPolicy {
-                            due: Instant::now(),
-                            checks: Rc::new(Cell::new(0)),
-                            error: Rc::new(Cell::new(None)),
-                        },
-                        true,
-                        true,
-                    )
-                    .is_ok()
-            );
+        flight::update(&owner, |state, txn| {
+            assert!(state.register(1, probe(), true, true).is_ok());
+            state.phase = Phase::Draining(Outcome::Published(Published::Complete(probe())));
             state.waiters.get_mut(&1).unwrap().waker = Some(waker);
-            let retired = state.stop(8, wakes);
+            let retired = state.stop(8, txn);
             assert!(!called.get());
-            retired
+            assert_eq!(dropped.get(), 0);
+            txn.retire(retired);
         });
-        drop(retired);
+        assert_eq!(dropped.get(), 2);
         assert!(called.get());
     }
 
@@ -1986,24 +1997,23 @@ mod coalesce_tests {
                 })
                 .is_ok()
             );
-            let rejected = flight::update(&table, |table, _| {
-                table.insert(1, entry(rejected_dropped.clone()))
+            flight::update(&table, |table, txn| {
+                let rejected = table.insert(1, entry(rejected_dropped.clone()));
+                assert!(rejected.is_err());
+                assert!(!original_dropped.get(), "occupied entry must stay owned");
+                assert!(!rejected_dropped.get(), "rejection must return ownership");
+                txn.retire(rejected);
             });
-            assert!(rejected.is_err());
-            assert!(!original_dropped.get(), "occupied entry must stay owned");
-            assert!(!rejected_dropped.get(), "rejection must return ownership");
-            drop(rejected);
             assert!(rejected_dropped.get());
             assert!(unlocked.get());
             assert!(!original_dropped.get());
-            let removed = flight::update(&table, |table, _| {
-                assert_eq!(table.len(), 1);
-                table.get_mut(&1).unwrap().quiescent = true;
-                table.remove_quiescent(&1)
-            });
             // The original destructor also reenters after explicit removal.
             unlocked.set(false);
-            drop(removed);
+            flight::update(&table, |table, txn| {
+                assert_eq!(table.len(), 1);
+                table.get_mut(&1).unwrap().quiescent = true;
+                assert!(txn.remove_quiescent(table, &1));
+            });
             assert!(original_dropped.get());
             assert!(unlocked.get());
         }
@@ -2118,16 +2128,15 @@ mod coalesce_tests {
         });
         flight::update(&table, |table, wakes| table.stop(wakes, |_, _| {}));
         assert!(table.borrow().is_stopping());
-        let resource = flight::update(&table, |table, _| {
+        flight::update(&table, |table, txn| {
             let operations = &mut table.get_mut(&1).unwrap().0;
             let resource = operations.take(id).unwrap();
             assert!(matches!(operations.take(id), Err(Stale)));
             assert!(matches!(operations.take(id + 1), Err(Stale)));
             assert_eq!(operations.complete(id + 1), Err(Stale));
             assert_eq!(operations.len(), 1);
-            resource
+            txn.retire(resource);
         });
-        drop(resource);
         assert!(dropped.get());
         assert_eq!(table.borrow().len(), 1);
         let notified = Rc::new(Cell::new(false));
@@ -2139,9 +2148,7 @@ mod coalesce_tests {
                 notified.set(true);
             }
         });
-        drop(flight::update(&table, |table, _| {
-            table.register_drain(waker)
-        }));
+        flight::update(&table, |table, txn| txn.register_drain(table, waker));
         flight::update(&table, |table, wakes| {
             let operations = &mut table.get_mut(&1).unwrap().0;
             operations.complete(id).unwrap();
@@ -2320,10 +2327,11 @@ mod coalesce_tests {
         };
         let snapshot = sample();
         let refresh = |snapshot| {
-            let retired = flight::update(&owner, |state, wakes| {
-                state.refresh(false, 9, 8, snapshot, std::convert::identity, wakes)
+            flight::update(&owner, |state, txn| {
+                let retired = state.refresh(false, 9, 8, snapshot, std::convert::identity, txn);
+                assert!(retired.is_none());
+                txn.retire(retired);
             });
-            assert!(retired.is_none());
         };
         refresh(snapshot);
         assert_eq!(samples.get(), 1);

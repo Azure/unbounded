@@ -1019,9 +1019,9 @@ pub mod flight {
         }
 
         /// Retain the latest drain task's wake target and return the previous one.
-        /// Clone before borrowing the owner; drop the returned waker after releasing
-        /// that borrow. With `update`, return it from the transaction closure.
-        #[must_use = "retire the previous drain waker outside the owner borrow"]
+        /// Clone before borrowing the owner. With `update`, use `Txn::register_drain`
+        /// or stage the returned waker with `Txn::retire` before notifications run.
+        #[must_use = "stage the previous drain waker with Txn::retire"]
         pub fn register_drain(&mut self, waker: Waker) -> Option<Waker> {
             self.drain_waker.replace(waker)
         }
@@ -1065,8 +1065,8 @@ pub mod flight {
         /// Insert only into a vacant key after the adapter checks admission.
         /// Occupied keys, even quiescent ones, return the rejected key and entry.
         /// Remove quiescent entries explicitly before admitting replacements.
-        /// Return rejection from `update` and drop it outside the owner borrow.
-        #[must_use = "drop the rejected key and entry outside the owner borrow"]
+        /// Stage rejected values with `Txn::retire` before notifications run.
+        #[must_use = "stage the rejected key and entry with Txn::retire"]
         pub fn insert(&mut self, key: K, entry: E) -> Result<(), (K, E)> {
             if self.entries.contains_key(&key) {
                 return Err((key, entry));
@@ -1095,8 +1095,9 @@ pub mod flight {
 
     impl<K: Eq + Hash, E: Entry, S: BuildHasher> Table<K, E, S> {
         /// Used after explicit detach or completion as well as by background sweeps.
-        /// Return the entry for destruction after releasing the owner borrow.
-        #[must_use = "drop the removed entry outside the owner borrow"]
+        /// With `update`, use `Txn::remove_quiescent` or stage the returned entry
+        /// with `Txn::retire` so destruction precedes notifications.
+        #[must_use = "stage the removed entry with Txn::retire"]
         pub fn remove_quiescent(&mut self, key: &K) -> Option<Removed<K, E>> {
             if !self.get(key).is_some_and(Entry::quiescent) {
                 return None;
@@ -1370,8 +1371,8 @@ pub mod flight {
             Partial(P),
         }
 
-        /// Values removed by shutdown. Return from `update`, then drop outside its borrow.
-        #[must_use = "drop the stopped phase and waiters outside the owner borrow"]
+        /// Values removed by shutdown. Stage with `Txn::retire` before notifications run.
+        #[must_use = "stage the stopped phase and waiters with Txn::retire"]
         pub struct Stopped<C, O, W: WaiterPolicy> {
             /// Previous outcome or complete result, no longer visible to callers.
             pub phase: Phase<C, O, W::Error>,
@@ -1476,9 +1477,9 @@ pub mod flight {
             }
 
             /// Remove a caller and its deadline without declaring operation completion.
-            /// Return the waiter from `update` and drop it outside the owner borrow;
-            /// both its policy and waker may run callbacks on drop.
-            #[must_use = "drop the detached waiter outside the owner borrow"]
+            /// Stage the returned waiter with `Txn::retire`; its policy and waker
+            /// may run callbacks and must drop after the borrow, before notifications.
+            #[must_use = "stage the detached waiter with Txn::retire"]
             pub fn detach(&mut self, id: u64) -> Option<Waiter<W>> {
                 let waiter = self.waiters.remove(&id)?;
                 self.deadlines.remove(&(waiter.deadline(), id));
@@ -1512,8 +1513,8 @@ pub mod flight {
             /// Caller validates its leader capability and publication before this step.
             /// Notification timing remains explicit: publication wakes only on settlement,
             /// while rejection/revocation also notifies before retained operations finish.
-            /// Return the old phase from `update` and drop it outside the owner borrow.
-            #[must_use = "drop the retired phase outside the owner borrow"]
+            /// Stage the old phase with `Txn::retire` before notifications run.
+            #[must_use = "stage the retired phase with Txn::retire"]
             pub fn begin_completion(
                 &mut self,
                 outcome: Outcome<O, W::Error>,
@@ -1569,8 +1570,8 @@ pub mod flight {
 
             /// Expose an outcome only after the adapter confirms all operations completed.
             /// The split hook runs inside the transaction and must not reborrow its owner.
-            /// Return the old partial from `update` and drop it outside the owner borrow.
-            #[must_use = "drop the retired partial outside the owner borrow"]
+            /// Stage the old partial with `Txn::retire` before notifications run.
+            #[must_use = "stage the retired partial with Txn::retire"]
             pub fn settle(
                 &mut self,
                 idle: bool,
@@ -1615,8 +1616,8 @@ pub mod flight {
             }
 
             /// Revoke acquisition immediately, retaining its outcome behind completion.
-            /// Return the old phase from `update` and drop it outside the owner borrow.
-            #[must_use = "drop the retired phase outside the owner borrow"]
+            /// Stage the old phase with `Txn::retire` before notifications run.
+            #[must_use = "stage the retired phase with Txn::retire"]
             pub fn revoke(
                 &mut self,
                 error: W::Error,
@@ -1632,8 +1633,8 @@ pub mod flight {
 
             /// Check the leader and up to 64 expired callers, then settle eligible outcomes.
             /// Sample `now` before `update`; all deadline entries use that snapshot.
-            /// Return the old partial from `update` and drop it outside the owner borrow.
-            #[must_use = "drop the retired partial outside the owner borrow"]
+            /// Stage the old partial with `Txn::retire` before notifications run.
+            #[must_use = "stage the retired partial with Txn::retire"]
             pub fn refresh(
                 &mut self,
                 idle: bool,
@@ -1669,8 +1670,23 @@ pub mod flight {
             }
 
             /// Detach and notify all callers while preserving the operation drain fence.
-            /// Return removed values from `update` and drop them outside the owner borrow.
+            /// Stage removed values with `Txn::retire` before notifications run.
             /// The partial result and leader remain retained until normal settlement/cleanup.
+            /// ```
+            /// # use flow_control::coalesce::flight::{self, state::{State, WaiterPolicy}};
+            /// # use std::{cell::RefCell, time::Instant};
+            /// # struct Policy;
+            /// # impl WaiterPolicy for Policy {
+            /// #     type Error = u8;
+            /// #     fn check(&self, _: Instant) -> Option<u8> { None }
+            /// #     fn deadline(&self) -> Instant { Instant::now() }
+            /// # }
+            /// # let owner = RefCell::new(State::<(), (), (), Policy>::default());
+            /// flight::update(&owner, |state, txn| {
+            ///     let stopped = state.stop(8, txn);
+            ///     txn.retire(stopped);
+            /// });
+            /// ```
             pub fn stop(&mut self, error: W::Error, wakes: &mut Vec<Waker>) -> Stopped<C, O, W> {
                 for waiter in self.waiters.values_mut() {
                     waiter.error = Some(error);
@@ -1729,10 +1745,10 @@ pub mod flight {
         }
 
         /// Store an owned wake target without calling waker clone or drop callbacks.
-        /// Clone the input before borrowing the owner. Return the retired waker from
-        /// `update` and drop it after releasing the borrow. For the same target, keep
+        /// Clone the input before borrowing the owner. Stage the retired waker with
+        /// `Txn::retire` before notifications run. For the same target, keep
         /// the stored waker and return the unused input instead.
-        #[must_use = "drop the retired waker outside the owner borrow"]
+        #[must_use = "stage the retired waker with Txn::retire"]
         pub fn store_waker(slot: &mut Option<Waker>, waker: Waker) -> Option<Waker> {
             if slot.as_ref().is_some_and(|old| old.will_wake(&waker)) {
                 Some(waker)
@@ -2162,7 +2178,9 @@ pub mod flight {
                 });
                 assert!(observed.get());
                 assert_eq!(table.borrow().len(), 1);
-                drop(update(&table, |table, _| table.remove_quiescent(&1)));
+                update(&table, |table, txn| {
+                    assert!(txn.remove_quiescent(table, &1));
+                });
                 assert!(table.borrow().is_empty());
             }
         }
@@ -2322,10 +2340,10 @@ pub mod flight {
         impl Drop for Waiter {
             /// Detach this request and remove its entry only if truly quiescent.
             fn drop(&mut self) {
-                drop(update(&self.table, |table, _| {
+                update(&self.table, |table, txn| {
                     table.get_mut(&self.key).unwrap().waiters -= 1;
-                    table.remove_quiescent(&self.key)
-                }));
+                    txn.remove_quiescent(table, &self.key);
+                });
             }
         }
 
