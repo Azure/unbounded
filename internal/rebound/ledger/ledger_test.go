@@ -1,0 +1,136 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package ledger
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
+)
+
+func testGrant(name string, nodes ...string) *Grant {
+	return &Grant{
+		Namespace: "tenant", Name: name, UID: types.UID(name), Nodes: nodes, Holder: "alice",
+		CreatedAt: time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC),
+		ExpiresAt: time.Date(2026, 10, 13, 13, 0, 0, 0, time.UTC),
+		Labels:    map[string]string{"team": "test"}, Annotations: map[string]string{"note": "test"},
+	}
+}
+
+func TestRoundTrip(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a", "node-b")
+	require.NoError(t, l.Add(g))
+	data := l.Encode()
+	require.Equal(t, "tenant/first", data["node-a"])
+	parsed := Parse(data)
+	require.Equal(t, data, parsed.Encode())
+	require.Equal(t, []*Grant{g}, parsed.Grants())
+	key, ok := parsed.NodeGrant("node-b")
+	require.True(t, ok)
+	require.Equal(t, g.Key(), key)
+	got, ok := parsed.Get(key)
+	require.True(t, ok)
+	require.Equal(t, g, got)
+}
+
+func TestParseRepairs(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a")
+	require.NoError(t, l.Add(g))
+	valid := l.Encode()
+
+	for _, record := range []string{"{", "null", `{"nodes":[]}`, `{"nodes":"bad"}`, `{"nodes":["n"],"expiresAt":"bad"}`} {
+		t.Run(record, func(t *testing.T) {
+			require.Empty(t, Parse(map[string]string{"_grant.tenant.bad": record}).Encode())
+		})
+	}
+
+	for _, key := range []string{"_grant.tenant.name.with.dots", "_grant..name", "_grant.tenant.", "_grant.tenant", "_grant.."} {
+		t.Run(key, func(t *testing.T) {
+			require.Empty(t, Parse(map[string]string{key: valid[GrantKey(g.Key())]}).Encode())
+		})
+	}
+
+	data := l.Encode()
+	data["stray"] = "tenant/missing"
+	data["node-a"] = "wrong/grant"
+	data["_grant.tenant.zlater"] = valid[GrantKey(g.Key())]
+	require.Equal(t, valid, Parse(data).Encode())
+
+	later := New()
+	require.NoError(t, later.Add(testGrant("zlater", "free", "node-a")))
+	data["_grant.tenant.zlater"] = later.Encode()["_grant.tenant.zlater"]
+	require.Equal(t, valid, Parse(data).Encode())
+}
+
+func TestAddAtomic(t *testing.T) {
+	l := New()
+	require.NoError(t, l.Add(testGrant("first", "node-b", "node-a")))
+	before := l.Encode()
+	err := l.Add(testGrant("second", "free", "node-b", "node-a", "node-b"))
+
+	var conflict *ConflictError
+	require.ErrorAs(t, err, &conflict)
+	require.Equal(t, []string{"node-a", "node-b"}, conflict.Nodes)
+	require.Equal(t, before, l.Encode())
+	_, ok := l.NodeGrant("free")
+	require.False(t, ok)
+
+	err = l.Add(testGrant("first", "free"))
+
+	var exists *ExistsError
+	require.ErrorAs(t, err, &exists)
+	require.Equal(t, testGrant("first").Key(), exists.Key)
+	require.Equal(t, before, l.Encode())
+}
+
+func TestRemove(t *testing.T) {
+	l := New()
+	g := testGrant("first", "node-a", "node-b")
+	require.NoError(t, l.Add(g))
+	require.NoError(t, l.Add(testGrant("second", "node-c")))
+	require.True(t, l.Remove(g.Key()))
+	require.False(t, l.Remove(g.Key()))
+	_, ok := l.NodeGrant("node-a")
+	require.False(t, ok)
+	_, ok = l.NodeGrant("node-b")
+	require.False(t, ok)
+	_, ok = l.NodeGrant("node-c")
+	require.True(t, ok)
+	require.Len(t, l.Grants(), 1)
+}
+
+func TestReap(t *testing.T) {
+	l := New()
+
+	now := testGrant("unused").ExpiresAt
+	for _, entry := range []struct {
+		name string
+		ttl  time.Duration
+	}{{"expired", -time.Second}, {"boundary", 0}, {"rejected", time.Hour}, {"live", time.Minute}, {"later", time.Hour}} {
+		g := testGrant(entry.name, entry.name)
+		g.ExpiresAt = now.Add(entry.ttl)
+		require.NoError(t, l.Add(g))
+	}
+
+	removed, next := l.Reap(now, func(g *Grant) bool { return g.Name != "rejected" })
+	require.Len(t, removed, 3)
+	require.Equal(t, []string{"boundary", "expired", "rejected"}, []string{removed[0].Name, removed[1].Name, removed[2].Name})
+	require.Equal(t, now.Add(time.Minute), next)
+	require.Len(t, l.Grants(), 2)
+	removed, next = l.Reap(now.Add(time.Hour), nil)
+	require.Len(t, removed, 2)
+	require.True(t, next.IsZero())
+	require.Empty(t, l.Encode())
+}
+
+func TestSize(t *testing.T) {
+	require.Zero(t, Size(nil))
+	require.Zero(t, Size(map[string]string{}))
+	require.Equal(t, 9, Size(map[string]string{"abc": "de", "f": "ghi"}))
+	require.Equal(t, 4, Size(map[string]string{"é": "é"}))
+}

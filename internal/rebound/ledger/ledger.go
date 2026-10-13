@@ -119,7 +119,9 @@ func Parse(data map[string]string) *Ledger {
 		}
 
 		g.Namespace, g.Name = ns, name
-		_ = l.Add(g)
+		if err := l.Add(g); err != nil {
+			continue
+		}
 	}
 
 	return l
