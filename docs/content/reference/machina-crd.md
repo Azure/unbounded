@@ -55,11 +55,11 @@ uses the `PXESpec` type; there is no top-level `spec.pxe` field.
 | `host.netboot` | PXESpec | No | - | PXE boot configuration. |
 | `host.netboot.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
 | `host.netboot.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
-| `host.netboot.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
-| `host.netboot.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
-| `host.netboot.dhcpLeases` | []DHCPLease | No | - | Provisioning network settings. They are served as static DHCP leases during PXE boot and used for Redfish firmware, installer, NoCloud, and installed-system static configuration during HTTP boot. |
+| `host.netboot.netbootImage` | string | For `VirtualMedia` | Metalman default for PXE/HTTP | OCI netboot image reference. Virtual media requires an explicit digest-pinned, media-compatible image. |
+| `host.netboot.bootProtocol` | string | No | `PXE` | Repave boot trigger: `PXE` uses DHCP/TFTP bootfile options; `HTTP` uses Redfish UEFI HTTP boot; `VirtualMedia` opts into an experimental rack-manager UEFI ISO workflow. |
+| `host.netboot.dhcpLeases` | []DHCPLease | For `VirtualMedia` | - | Provisioning network settings. PXE serves static DHCP leases; HTTP uses them for firmware and installer static configuration. Virtual media uses the first entry for static networking without DHCP boot hints. |
 | `host.netboot.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
-| `host.netboot.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
+| `host.netboot.dhcpLeases[].mac` | string | Yes | - | NIC MAC address. Virtual media requires canonical lowercase, colon-separated Ethernet form; other modes match case-insensitively. |
 | `host.netboot.dhcpLeases[].subnetMask` | string | Yes | - | Subnet mask. |
 | `host.netboot.dhcpLeases[].gateway` | string | Yes | - | Default gateway. |
 | `host.netboot.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
@@ -74,6 +74,20 @@ uses the `PXESpec` type; there is no top-level `spec.pxe` field.
 | `host.netboot.cloudInit.userDataConfigMapRef.name` | string | Yes | - | ConfigMap name. |
 | `host.netboot.cloudInit.userDataConfigMapRef.namespace` | string | Yes | - | ConfigMap namespace. |
 | `host.netboot.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
+
+`VirtualMedia` requires `redfish` with a supported rack-manager URL such as
+`https://manager:8080/7`. Endpoint detection is automatic; there is no public
+`RackSCM` field. Both `image` and the explicit `netbootImage` must use `@sha256:`
+with 64 lowercase hex digits. The netboot image must contain the updated
+`unbounded-uefi-v1` artifacts, not just older PXE files.
+
+The first lease must have a static IPv4 address, canonical MAC, explicit subnet
+mask (/1 through /30), and gateway in that subnet. This is static configuration,
+not a requirement to control DHCP. Metalman's `--serve-url` must be a plain HTTP
+IPv4 root. The rack must reach the IPv4 address advertised by
+`--media-tftp-server` (default `serverIP`) on UDP/69. See the
+[virtual media guide]({{< relref "/guides/pxe#virtual-media-experimental" >}}) for
+runtime tools, an example, cleanup rules, and the pending hardware checks.
 
 ### spec.kubernetes
 
@@ -253,6 +267,22 @@ after a controller restart. Each entry includes:
 | `attempts` | int32 | External action attempts for retryable Redfish operations. |
 | `lastAttemptAt` | time | Most recent external action attempt timestamp. |
 | `providerOperation` | ProviderOperationStatus | Resumable external operation metadata, including provider, operation ID, and an opaque non-secret resume token. |
+| `bootMedia` | MachineOperationBootMediaStatus | Metalman's saved virtual-media ownership, frozen netboot inputs, source, phase, cleanup flags, and reboot acknowledgment. Controller-owned; do not edit. |
+
+Virtual-media callbacks are target-scoped. After `/complete` saves `imageWritten`,
+the installer waits for `/ready`. `cleaned` means boot-safe cleanup: `Hdd` restored
+and the drive unmounted, or the unavailable blade confirmed AC-off. `/ready` saves
+`rebootRequestedAt` before returning success. Rack deletion (`stagedDeleted`) and
+local release (`released`) are separate; failed deletion retains ownership without
+blocking a safe reboot.
+
+The installer retries bounded `curl` requests in RAM until acknowledged, without
+reinstalling or rebooting early. Frozen netboot inputs remain in use despite Machine
+edits. Callbacks use the original first lease and can confirm cleanup after failure
+or a deletion request while the operation exists. The
+`metalman.unbounded-cloud.io/boot-media` finalizer retains ownership until cleanup
+and any pending reboot handoff finish, blocking another host operation on the same
+machine or BMC. See the virtual media guide for deadlines and hardware checks.
 
 ### status
 
@@ -451,6 +481,8 @@ Metalman uses a machine image and a netboot image for PXE repaves. The machine
 image is referenced by `spec.host.netboot.image` and contains `/disk/disk.img.gz`. The
 netboot image is referenced by `spec.host.netboot.netbootImage`, or by Metalman's default
 when that field is omitted, and contains the reusable PXE boot environment.
+Virtual media does not use that default: both image references must be explicitly
+digest-pinned, and `netbootImage` must contain the updated media artifacts.
 `spec.host.netboot.architecture` selects the OCI platform manifest to pull for both
 images and defaults to `amd64`.
 
@@ -512,6 +544,20 @@ responses (option 67) for `spec.host.netboot.bootProtocol: PXE`.
 The `httpBootPath` field specifies the file path, relative to metalman's HTTP
 artifact server, used for `spec.host.netboot.bootProtocol: HTTP`. If `httpBootPath` is
 omitted, metalman falls back to `dhcpBootImageName` for the UEFI HTTP boot URL.
+
+Virtual media also requires these metadata fields (amd64 example):
+
+```yaml
+mediaFormat: unbounded-uefi-v1
+mediaShim: shimx64.efi
+mediaGrub: grubx64.efi
+```
+
+For arm64, use `shimaa64.efi` and `grubaa64.efi`. Publish the matching EFI files,
+updated `grub/grub.cfg.tmpl`, and installer overlay from `images/netboot` together;
+adding metadata to an old artifact is not enough. This format supports the live
+install authorization and cleanup callback barrier. It does not mean the rack
+mount path, firmware networking, or Secure Boot has been verified on hardware.
 
 ---
 

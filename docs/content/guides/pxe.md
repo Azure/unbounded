@@ -52,6 +52,7 @@ scoping is inherent to the per-site component):
 | `--cache-dir` | `~/.unbounded/metalman/cache` | Local cache for downloaded images |
 | `--health-port` | 8081 | Health/readiness probe port |
 | `--serve-url` | | External URL of this metalman instance |
+| `--media-tftp-server` | `serverIP` | Advertised IPv4 address that the rack manager uses to fetch virtual media over TFTP (UDP/69) |
 | `--default-netboot-image` | release-matched `netboot` image | PXE boot environment used when `spec.host.netboot.netbootImage` is omitted |
 
 When `--dhcp-interface` is set, metalman binds to the interface for broadcast DHCP, and the DHCP server requires leader election. Without it, metalman accepts relayed (unicast) DHCP packets and the DHCP server responds regardless of leader status. Leader election always runs at the manager level for the reconcilers.
@@ -67,10 +68,12 @@ Metalman uses a machine image and a netboot image for each PXE repave.
   to `amd64`.
 - `spec.host.netboot.netbootImage` is the reusable PXE boot environment. It contains
   bootloaders, kernel, initrd, templates, metadata, and `unbounded-agent`. If
-  omitted, Metalman uses the release-matched `--default-netboot-image`.
+  omitted, Metalman uses the release-matched `--default-netboot-image`, except
+  for `VirtualMedia`, which requires an explicit digest-pinned reference.
 - `spec.host.netboot.bootProtocol` selects the network boot trigger. `PXE` is the
   default and uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP
-  boot and requires a Redfish block.
+  boot and requires a Redfish block. `VirtualMedia` opts into the experimental
+  rack-manager ISO workflow below.
 
 Both images are standard OCI container images built `FROM scratch` with
 artifacts under `/disk/`. Files with a `.tmpl` suffix in the netboot image are
@@ -138,8 +141,137 @@ credentials with permission to change system boot settings and power.
 
 On these endpoints, Metalman can restore slot AC power before boot configuration
 or power-on, then wait up to ten minutes for the BMC without consuming operation
-attempts. Power-off does not cut slot AC power. Use `bootProtocol: PXE`; HTTP boot
-is not supported on these endpoints. Boot override persistence depends on firmware.
+attempts. Power-off does not cut slot AC power. Use `bootProtocol: PXE` or opt into
+`VirtualMedia` below; HTTP boot is not supported on these endpoints. Boot override
+persistence depends on firmware.
+
+## Virtual media (experimental)
+
+Set `spec.host.netboot.bootProtocol: VirtualMedia` to boot an operation-owned UEFI
+ISO through a supported rack manager. Metalman detects the endpoint from
+`redfish.url`, such as `https://manager:8080/7`; there is no public `RackSCM` field.
+This mode is opt-in and does not change the default PXE or HTTP paths.
+
+{{< callout type="warning" >}}
+Hardware testing is still pending. The implementation assumes that a file staged
+by rack `Tftp.Get` can be mounted by `RemoteDriveMount.ImageName`. RSCM spec
+sections 9.8 (page 35) and 10.31 (page 62) describe the actions but do not confirm
+that link. UEFI network access from the ISO and Secure Boot are also not yet
+verified on hardware.
+{{< /callout >}}
+
+### Requirements
+
+- Deploy the updated Metalman image. ISO creation needs `xorriso`, `dosfstools`
+  (`mkfs.vfat`), and `mtools` (`mmd`, `mcopy`) at runtime.
+- Pin **both** `image` and an explicit `netbootImage` with `@sha256:` followed by
+  64 lowercase hex digits. Build and publish the updated `images/netboot` artifact
+  with `mediaFormat: unbounded-uefi-v1`, its EFI payloads, and the updated GRUB
+  template and installer. Older netboot artifacts and the implicit default do not
+  meet this contract.
+- The first `dhcpLeases` entry must contain the boot NIC's canonical lowercase,
+  colon-separated Ethernet MAC, static IPv4 address, subnet mask, and gateway in
+  that subnet. Use a prefix from /1 through /30. These values configure GRUB, the
+  installer, and the installed OS; they do not require control of a DHCP server.
+  Virtual media does not use or advertise DHCP boot hints.
+- Set `--serve-url` (`ServeURL`) to a host-reachable plain HTTP IPv4 root, such as
+  `http://10.10.0.2:8880`. HTTPS, hostnames, path prefixes, credentials, queries,
+  and fragments are not supported for this mode.
+- The rack manager must reach Metalman's TFTP server on UDP/69. Set
+  `--media-tftp-server=10.10.0.2` to advertise its reachable IPv4 address, not a URL
+  or an address with a port. It defaults to the server IP when that is a usable
+  IPv4 address. Otherwise set the flag explicitly. Check reachability from the
+  rack, especially with an explicit `--serve-url` or multiple interfaces.
+  The host must also reach Metalman's HTTP server and the Kubernetes API.
+- Use an isolated management/provisioning network. TFTP is unauthenticated, and
+  HTTP control requests must arrive from the first lease's IP without source NAT.
+
+### Example
+
+This illustrative YAML requires real values before use. Replace both digest
+placeholders with the published images' 64-character SHA-256 digests; no real
+digest is shown. Set the site, NIC, disk, and existing password Secret for your host.
+A repave overwrites the selected disk.
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: rack-slot-7
+  labels:
+    unbounded-cloud.io/site: rack-a
+spec:
+  host:
+    netboot:
+      bootProtocol: VirtualMedia
+      architecture: amd64
+      image: "ghcr.io/azure/host-ubuntu2404@sha256:<disk-image-digest>"
+      netbootImage: "ghcr.io/azure/netboot@sha256:<updated-netboot-image-digest>"
+      targetDisk: /dev/nvme0n1
+      dhcpLeases:
+      - mac: "02:11:22:33:44:55"
+        ipv4: "10.10.0.50"
+        subnetMask: "255.255.255.0"
+        gateway: "10.10.0.1"
+        dns: ["10.10.0.1"]
+      redfish:
+        url: "https://manager:8080/7"
+        username: admin
+        passwordRef:
+          name: bmc-passwords
+          namespace: unbounded-system
+          key: rack-manager
+```
+
+Request installation with `kubectl unbounded machine repave rack-slot-7`.
+
+### Install and cleanup
+
+Metalman saves ownership and a cleanup finalizer on the `HostReplace` operation,
+builds and stages the ISO, powers the host off, mounts the ISO, selects UEFI
+`RemoteDrive`, then powers the host on. The ISO selects the NIC by MAC, sets static
+networking, and fetches live install instructions and artifacts over HTTP.
+The operation keeps its frozen netboot settings despite later Machine edits,
+including the original first lease for downloads and callbacks.
+
+After writing the disk, the installer calls its operation-scoped `/complete`
+endpoint and waits for `/ready`. This is a reboot barrier: Metalman restores
+`Hdd` and unmounts the remote drive before saving boot-safe cleanup. `/ready`
+then saves the reboot acknowledgment before allowing reboot. Rack-file deletion
+and local-media release are separate cleanup steps: a failed rack deletion keeps
+ownership but does not block a safe reboot. If the BMC is unavailable and slot AC
+power is confirmed off, no blade cleanup is needed; cleanup does not restore AC.
+
+If callbacks fail, the installer stays in RAM and keeps retrying with bounded
+`curl` requests. It does not drop to a shell, reboot early, or write the disk
+again. Late cleanup can therefore let the same installer reboot. Callbacks from
+the original lease still work after operation failure or a deletion request while
+the operation exists. New install work is no longer authorized in those states.
+
+The default installation deadline is one hour, separate from the five-minute
+power-action timeout and ten-minute BMC readiness grace. An operation timeout does
+not end the installer's safe callback wait or release ownership by itself.
+
+The finalizer also drives cleanup after failure or operation deletion, using saved
+state across controller restarts. Pending cleanup or reboot handoff blocks another
+host operation on the same machine or BMC, even when the old operation is terminal.
+For started installs, ownership remains until successful first-boot cloud-init
+confirms the host rebooted. This keeps `/ready` available if its response is lost.
+Restore connectivity and let cleanup finish; do not remove the finalizer to bypass it.
+
+### Hardware validation checklist
+
+- Check rack staging locations and confirm that `Tftp.Get` stores the ISO where
+  `RemoteDriveMount.ImageName` can find it. Confirm deletion removes that file.
+  Check firmware responses when unmount or deletion is retried after a lost reply.
+- Boot the ISO on each target architecture. Check firmware NIC access, MAC
+  selection, static address/subnet/gateway, HTTP downloads, and Secure Boot.
+- Complete one install. Confirm `Hdd` restoration and unmount happen before reboot,
+  and rack deletion and local release finish. Reboot again and confirm no reinstall.
+- Restart Metalman during staging, installation, and cleanup. Test callback and
+  BMC failures and operation deletion. Confirm the installer waits in RAM, late
+  cleanup permits reboot without reinstalling, and pending cleanup blocks the next
+  operation even if rack deletion fails after a safe reboot.
 
 ## Cloud-Init Customization
 
@@ -194,6 +326,9 @@ The `key` field defaults to `user-data` but can be overridden to select a differ
 If the referenced ConfigMap does not exist, metalman falls back to the default minimal cloud-config. If the ConfigMap exists but the referenced key is not found, metalman returns an error and the machine will not receive user-data.
 
 ## Boot Flow
+
+The following flow covers PXE and HTTP. Virtual media uses the install and cleanup
+flow above.
 
 1. **Repave requested.** A `HostReplace` `MachineOperation` targets the Machine. Metalman sets the boot override and force-restarts the server. For `bootProtocol: PXE`, it selects PXE boot. For `bootProtocol: HTTP`, it sets a Redfish UEFI HTTP boot URL from the netboot image metadata.
 2. **Network boot.** In PXE mode, DHCP assigns the static IP by MAC, advertises the TFTP bootfile, and TFTP serves `shimx64.efi`. In HTTP mode, Metalman configures the first lease as a static Redfish EthernetInterface and the firmware downloads the Redfish-supplied URL from Metalman's HTTP server; DHCP is not required for this path.
@@ -268,7 +403,7 @@ Running metalman's DHCP server on a network segment that already has an active D
 ## Limitations
 
 {{< callout type="note" >}}
-Only Ubuntu 24.04 images are currently supported. The repave boot request timeout is fixed at 30 minutes.
+Only Ubuntu 24.04 images are currently supported. The PXE/HTTP repave boot request timeout is fixed at 30 minutes. Virtual-media deadlines are listed above.
 {{< /callout >}}
 
 ## See Also
