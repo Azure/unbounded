@@ -177,6 +177,9 @@ impl<H: Host> Enrollment<H> {
 
     pub fn set_peer_trust_roots(&self, roots: Vec<Vec<u8>>) -> Result<(), Error> {
         let _guard = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
+        if roots.is_empty() {
+            return Err(Error::InvalidConfiguration);
+        }
         identity::root_store(&roots).map_err(|_| Error::Unauthorized)?;
         *self.roots.borrow_mut() = roots;
         Ok(())
@@ -405,6 +408,9 @@ where
         Box::pin(async move {
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
             let _trust = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
+            if self.roots.borrow().is_empty() {
+                return Err(Error::InvalidConfiguration.into());
+            }
             let r = self.host.reactor();
             let dir = secure::directory(r, &self.identity_directory, false, true, &scope).await?;
             match secure::read_at(
@@ -457,6 +463,9 @@ where
         Box::pin(async move {
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
             let _trust = Busy::try_enter(&self.trust_busy).map_err(|_| Error::Busy)?;
+            if self.roots.borrow().is_empty() {
+                return Err(Error::InvalidConfiguration.into());
+            }
             let r = self.host.reactor();
             let dir =
                 match secure::directory(r, &self.identity_directory, false, true, &scope).await {
@@ -1368,6 +1377,8 @@ mod tests {
         let sim = Simulation::new();
         let _environment = sim.enter();
         let (files, e, scope) = fixture();
+        let (ca, key) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
         assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
         let request = drive(
             &files,
@@ -1411,8 +1422,6 @@ mod tests {
             &*drive(&files, e.read_token(&scope)).unwrap(),
             "second.token"
         );
-        let (ca, key) = identity::test_util::ca();
-        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
         let identity = drive(
             &files,
@@ -1907,6 +1916,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_trust_is_configuration_error_even_without_local_records() {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let (files, e, scope) = fixture();
+        assert_eq!(
+            e.set_peer_trust_roots(vec![]),
+            Err(Error::InvalidConfiguration)
+        );
+        assert!(matches!(drive(&files, e.load_identity(&scope)),
+            Err(error) if error == Error::InvalidConfiguration.into()));
+        let request = drive(
+            &files,
+            e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+        )
+        .unwrap();
+        let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
+        let (ca, key) = identity::test_util::ca();
+        let response = issue(&request, &ca, &key, |_| {});
+        assert!(
+            matches!(drive(&files, e.accept_response(response.clone(), &scope)),
+            Err(error) if error == Error::InvalidConfiguration.into())
+        );
+        assert_eq!(
+            sim.read_file(Path::new("/private/pending.json")).unwrap(),
+            pending
+        );
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+        drive(&files, e.accept_response(response, &scope)).unwrap();
+        assert!(drive(&files, e.load_identity(&scope)).unwrap().is_some());
+    }
+
+    #[test]
     fn invalid_root_snapshots_preserve_last_good_identity_and_trust() {
         let sim = Simulation::new();
         let _environment = sim.enter();
@@ -1968,20 +2009,33 @@ mod tests {
             };
             assert_eq!(
                 e.set_peer_trust_roots(roots.clone()),
-                Err(Error::Unauthorized),
+                Err(if case == "empty" {
+                    Error::InvalidConfiguration
+                } else {
+                    Error::Unauthorized
+                }),
                 "{case}"
             );
             assert_eq!(*e.roots.borrow(), good);
             // Exercise legacy invalid snapshots independently of setter rejection.
             *e.roots.borrow_mut() = roots;
+            let expected = if case == "empty" {
+                Error::InvalidConfiguration
+            } else {
+                Error::Unauthorized
+            };
             assert!(
-                matches!(drive(&files, e.accept_response(response.clone(), &scope)), Err(error) if error == Error::Unauthorized.into()),
+                matches!(drive(&files, e.accept_response(response.clone(), &scope)), Err(error) if error == expected.into()),
                 "{case}"
             );
-            assert!(
-                drive(&files, e.load_identity(&scope)).unwrap().is_none(),
-                "{case}"
-            );
+            let recovered = drive(&files, e.load_identity(&scope));
+            if case == "empty" {
+                assert!(
+                    matches!(recovered, Err(error) if error == Error::InvalidConfiguration.into())
+                );
+            } else {
+                assert!(recovered.unwrap().is_none(), "{case}");
+            }
             assert_eq!(
                 sim.read_file(Path::new("/private/identity.json")).unwrap(),
                 committed
@@ -2424,6 +2478,8 @@ mod tests {
         let sim = Simulation::new();
         let _environment = sim.enter();
         let (files, e, scope) = fixture();
+        let (ca, _) = identity::test_util::ca();
+        e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
         drive(
             &files,
             e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
