@@ -553,6 +553,183 @@ fn route_transition_consumes_one_link_without_refilling_authority() {
     }
 }
 
+fn route_hop(original: &SignedHead, previous: &SignedHead) -> MessageHead {
+    let mut head = forwarding::hop_head("request-hop", original, previous).unwrap();
+    push(&mut head, "racer-receiver", node(1).0);
+    push(&mut head, "racer-route-membership", 1);
+    push_binary(&mut head, "racer-route-request", &[1; 16]);
+    push_binary(&mut head, "racer-route-attempt", &[2; 16]);
+    push(&mut head, "racer-route-destination", node(3).0);
+    push(
+        &mut head,
+        "racer-route-visited",
+        nodes(&[node(0), node(2)]).unwrap(),
+    );
+    push(&mut head, "racer-route-links", 3);
+    push(&mut head, "racer-route-attempts", 4);
+    push(&mut head, "racer-route-deadline", 99);
+    head
+}
+
+fn replace_field(head: &mut MessageHead, name: &str, value: impl ToString) {
+    head.headers
+        .iter_mut()
+        .find(|h| h.name == name)
+        .unwrap()
+        .value = value.to_string().into_bytes();
+}
+
+#[test]
+fn check_hop_binds_every_supplied_route_field() {
+    use crate::forwarding::{RouteState, check_hop};
+    let n = network(3);
+    let original = n[0].sign(head()).unwrap();
+    let hop = n[2].sign(route_hop(&original, &original)).unwrap();
+    let route = RouteState::from_head(&hop.head).unwrap();
+    let mut old = route_hop(&original, &original);
+    replace_field(&mut old, "racer-route-visited", nodes(&[node(0)]).unwrap());
+    replace_field(&mut old, "racer-route-links", 4);
+    replace_field(&mut old, "racer-route-attempts", 7);
+    replace_field(&mut old, "racer-route-deadline", 100);
+    RouteState::from_head(&old)
+        .unwrap()
+        .transition(&route, &node(2))
+        .unwrap();
+    n[1].verify_historical(&hop).unwrap();
+    assert_eq!(
+        check_hop(&hop, "request-hop", &original, &original, &route),
+        Ok(())
+    );
+    for (name, value) in [
+        ("racer-route-membership", "2".into()),
+        ("racer-route-request", binary(&[3; 16])),
+        ("racer-route-attempt", binary(&[4; 16])),
+        ("racer-route-destination", node(4).0),
+        ("racer-route-visited", nodes(&[node(0), node(4)]).unwrap()),
+        ("racer-route-links", "2".into()),
+        ("racer-route-attempts", "3".into()),
+        ("racer-route-deadline", "98".into()),
+    ] {
+        let mut unrelated = route_hop(&original, &original);
+        replace_field(&mut unrelated, name, value);
+        let unrelated = RouteState::from_head(&unrelated).unwrap();
+        assert_eq!(
+            check_hop(&hop, "request-hop", &original, &original, &unrelated),
+            Err(Error::Unauthorized),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn check_hop_rejects_stale_state_and_matching_receiver_loop() {
+    use crate::forwarding::{RouteState, check_hop};
+    let n = network(3);
+    let original = n[0].sign(head()).unwrap();
+    let mut head = route_hop(&original, &original);
+    let stale = RouteState::from_head(&head).unwrap();
+    let mut old = route_hop(&original, &original);
+    replace_field(&mut old, "racer-route-visited", nodes(&[node(0)]).unwrap());
+    replace_field(&mut old, "racer-route-links", 4);
+    RouteState::from_head(&old)
+        .unwrap()
+        .transition(&stale, &node(2))
+        .unwrap();
+    replace_field(
+        &mut head,
+        "racer-route-visited",
+        nodes(&[node(0), node(2), node(1)]).unwrap(),
+    );
+    let hop = n[2].sign(head).unwrap();
+    let matching = RouteState::from_head(&hop.head).unwrap();
+    for route in [&stale, &matching] {
+        assert_eq!(
+            check_hop(&hop, "request-hop", &original, &original, route),
+            Err(Error::Unauthorized)
+        );
+    }
+}
+
+#[test]
+fn check_hop_propagates_malformed_route_errors() {
+    use crate::forwarding::{RouteState, check_hop};
+    let n = network(3);
+    let original = n[0].sign(head()).unwrap();
+    let route = RouteState::from_head(&route_hop(&original, &original)).unwrap();
+    for (name, value, error) in [
+        ("racer-route-membership", "0".into(), Error::Unauthorized),
+        ("racer-route-request", binary(&[1; 15]), Error::Unauthorized),
+        ("racer-route-attempt", "!".into(), Error::Unauthorized),
+        (
+            "racer-route-destination",
+            "invalid".into(),
+            Error::InvalidRequest,
+        ),
+        ("racer-route-visited", "!".into(), Error::Unauthorized),
+        ("racer-route-links", "0".into(), Error::HopBudgetExhausted),
+        (
+            "racer-route-attempts",
+            "4294967296".into(),
+            Error::Unauthorized,
+        ),
+        ("racer-route-deadline", "099".into(), Error::Unauthorized),
+    ] {
+        let mut head = route_hop(&original, &original);
+        replace_field(&mut head, name, value);
+        let hop = n[2].sign(head).unwrap();
+        assert_eq!(
+            check_hop(&hop, "request-hop", &original, &original, &route),
+            Err(error),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn check_hop_preserves_kind_bindings_and_exact_fields() {
+    use crate::forwarding::{RouteState, check_hop};
+    let n = network(3);
+    let original = n[0].sign(head()).unwrap();
+    let previous = n[2].sign(head()).unwrap();
+    let other = n[1].sign(head()).unwrap();
+    for fault in ["none", "kind", "original", "previous", "extra"] {
+        let mut head = route_hop(&original, &previous);
+        if fault == "extra" {
+            push(&mut head, "x-extra", "value");
+        }
+        let hop = n[2].sign(head).unwrap();
+        let route = RouteState::from_head(&hop.head).unwrap();
+        let result = check_hop(
+            &hop,
+            if fault == "kind" {
+                "response-hop"
+            } else {
+                "request-hop"
+            },
+            if fault == "original" {
+                &other
+            } else {
+                &original
+            },
+            if fault == "previous" {
+                &other
+            } else {
+                &previous
+            },
+            &route,
+        );
+        assert_eq!(
+            result,
+            if fault == "none" {
+                Ok(())
+            } else {
+                Err(Error::Unauthorized)
+            },
+            "{fault}"
+        );
+    }
+}
+
 #[test]
 fn request_builders_supply_host_for_strict_http_codec() {
     use crate::control::{Binding, Phase};

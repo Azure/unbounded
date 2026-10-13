@@ -104,6 +104,9 @@ pub fn check_hop(
     previous: &SignedHead,
     route: &RouteState,
 ) -> Result<()> {
+    if &RouteState::from_head(&hop.head)? != route {
+        return Err(Error::Unauthorized);
+    }
     let mut expected = hop_head(kind, original, previous)?;
     for name in [
         "racer-route-membership",
