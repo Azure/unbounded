@@ -132,7 +132,7 @@ authorization are also accepted. Run `rebound --help` for the full list.
   linger briefly, and pods are deleted a little later than `expiresAt`.
 - Pod `creationTimestamp` has one-second precision and comes from the API server
   clock. A pod created in the same second a grant starts counts as created during
-  the grant.
+  the grant. Pods created in the same second the grant ends are kept.
 - Release records are kept for 10 minutes from when they are written, even if the
   leader removes an expired grant late. Pods created after expiry are not deleted
   by that release. If the leader cannot process a release before its record is
