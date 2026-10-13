@@ -65,6 +65,8 @@ gantry:
   pprofListen: ""
   chairCount: 64
   chairSeedCount: 8
+  peerFetchTimeout: 15m
+  transferMaxConcurrentServes: 10
   upstreamRegistries:
     - name: registry.example.com
       endpoint: https://registry.example.com
