@@ -96,7 +96,8 @@ Set these Make variables to change the rendered manifests:
 | `REBOUND_ADMIN_GROUPS` | `AdminGroups` | `system:masters` |
 
 `ExcludedNamespaces` is used by both the pod placement policy and the pod
-deletion controller. `AdminGroups` may change rebound node labels and taints.
+deletion controller. The rebound namespace is always exempt, even if it is not
+in `ExcludedNamespaces`. `AdminGroups` may change rebound node labels and taints.
 
 ## Flags
 

@@ -29,7 +29,7 @@ spec:
       expression: "params != null && has(params.data) ? params.data : {}"
     - name: excludedNamespaces
       expression: >-
-        {{ default "kube-system,unbounded-system" .ExcludedNamespaces | splitList "," | toJson }}
+        {{ append (splitList "," (default "kube-system,unbounded-system" .ExcludedNamespaces)) (default "unbounded-system" .Namespace) | uniq | toJson }}
   validations:
     - expression: >-
         variables.node == '' ||

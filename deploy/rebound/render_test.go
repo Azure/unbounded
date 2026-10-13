@@ -163,6 +163,49 @@ func TestRender(t *testing.T) {
 	}
 }
 
+func TestPodPlacementExcludedNamespaces(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		values map[string]string
+		want   string
+	}{
+		{
+			name: "defaults",
+			want: `["kube-system","unbounded-system"]`,
+		},
+		{
+			name:   "custom namespace with default exclusions",
+			values: map[string]string{"Namespace": "grants"},
+			want:   `["kube-system","unbounded-system","grants"]`,
+		},
+		{
+			name:   "custom exclusions with default namespace",
+			values: map[string]string{"ExcludedNamespaces": "platform"},
+			want:   `["platform","unbounded-system"]`,
+		},
+		{
+			name:   "custom exclusions without rebound namespace",
+			values: map[string]string{"Namespace": "grants", "ExcludedNamespaces": "platform"},
+			want:   `["platform","grants"]`,
+		},
+		{
+			name:   "duplicate exclusions including rebound namespace",
+			values: map[string]string{"Namespace": "grants", "ExcludedNamespaces": "platform,grants,platform,grants"},
+			want:   `["platform","grants"]`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objects := renderObjects(t, tc.values)
+			policy := decodeObject[admissionv1.ValidatingAdmissionPolicy](t, objects, "ValidatingAdmissionPolicy/rebound-pod-placement")
+			require.Contains(t, policy.Spec.Variables, admissionv1.Variable{
+				Name: "excludedNamespaces", Expression: tc.want,
+			})
+		})
+	}
+}
+
 func assertRBAC(t *testing.T, objects map[string]*unstructured.Unstructured, namespace string) {
 	t.Helper()
 
