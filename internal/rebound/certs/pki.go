@@ -104,7 +104,7 @@ func issue(now time.Time, lifetime time.Duration, names []string, ca *x509.Certi
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), nil
 }
 
-func validLeaf(cert *x509.Certificate, ca *x509.Certificate, names []string, now time.Time) bool {
+func validLeaf(cert, ca *x509.Certificate, names []string, now time.Time) bool {
 	if cert.IsCA || now.Before(cert.NotBefore) || !now.Before(renewAt(cert)) || cert.CheckSignatureFrom(ca) != nil {
 		return false
 	}

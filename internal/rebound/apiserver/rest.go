@@ -374,7 +374,7 @@ func grantObject(g *ledger.Grant, rv string) *rebound.NodeGrant {
 	}
 }
 
-func (s *storage) ConvertToTable(_ context.Context, obj runtime.Object, options runtime.Object) (*metav1.Table, error) {
+func (s *storage) ConvertToTable(_ context.Context, obj, options runtime.Object) (*metav1.Table, error) {
 	table := &metav1.Table{}
 	if opts, ok := options.(*metav1.TableOptions); !ok || !opts.NoHeaders {
 		table.ColumnDefinitions = []metav1.TableColumnDefinition{
