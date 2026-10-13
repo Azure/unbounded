@@ -36,6 +36,8 @@ type wireGuardState struct {
 	clientset kubernetes.Interface
 	nodeName  string
 
+	adoptedAssignment nodeAssignment
+
 	// Netlink managers for the main intra-site WireGuard mesh interface
 	linkManager      *unboundednetnetlink.LinkManager
 	wireguardManager *unboundednetnetlink.WireGuardManager
@@ -93,10 +95,10 @@ type wireGuardState struct {
 	gatewaySiteNames               map[string]string                          // interface name -> gateway site name
 
 	// Gateway node state
-	isGatewayNode       bool      // Whether this node is a gateway node
-	myGatewayPort       int32     // This node's assigned gateway WireGuard port (0 if not a gateway)
-	localGatewayPools   []string  // Gateway pools this node belongs to
-	gatewayTaintApplied sync.Once // Ensures gateway taint is applied only once
+	isGatewayNode       bool     // Whether this node is a gateway node
+	myGatewayPort       int32    // This node's assigned gateway WireGuard port (0 if not a gateway)
+	localGatewayPools   []string // Gateway pools this node belongs to
+	gatewayTaintApplied bool     // Whether the gateway taint has been applied successfully
 
 	// Masquerade manager for iptables rules
 	masqueradeManager *unboundednetnetlink.MasqueradeManager

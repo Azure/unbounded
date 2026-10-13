@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"github.com/spf13/pflag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/kubernetes"
@@ -763,6 +765,17 @@ func run(cfg *config) error {
 
 	klog.Info("Node annotated with WireGuard public key")
 
+	adoptedAssignment, err := waitForNodeAssignment(ctx, clientset, cfg.NodeName)
+	if err != nil {
+		if err == context.Canceled {
+			return nil
+		}
+
+		return fmt.Errorf("wait for Node assignment: %w", err)
+	}
+
+	klog.Infof("Adopting effective Site %q and GatewayPool %q", adoptedAssignment.site, adoptedAssignment.gatewayPool)
+
 	// Detect and annotate the node's maximum tunnel MTU so the controller
 	// can validate that the configured MTU is compatible across all nodes.
 	if detectedMTU := unboundednetnetlink.DetectDefaultRouteMTU(); detectedMTU > 0 {
@@ -832,22 +845,12 @@ func run(cfg *config) error {
 		go startHealthServer(cfg.HealthPort, healthState)
 	}
 
-	// Check if this node is a gateway node by checking the informer cache
-	isGatewayNode := isGatewayNodeFromCRDs(gatewayPoolInformer, pubKey)
+	isGatewayNode := adoptedAssignment.gatewayPool != ""
 	if isGatewayNode {
-		klog.Info("Node is a gateway node (found in GatewayPool status)")
+		klog.Infof("Node is assigned to GatewayPool %q", adoptedAssignment.gatewayPool)
 	}
 
-	// Wait for this node to appear in a SiteNodeSlice or GatewayPool
-	// This ensures the site controller has processed this node before we continue
-	mySiteName, err := waitForSiteMembership(ctx, sliceInformer, gatewayPoolInformer, pubKey)
-	if err != nil {
-		if err == context.Canceled {
-			return nil
-		}
-
-		return err
-	}
+	mySiteName := adoptedAssignment.site
 
 	// Check if this node's site has manageCniPlugin enabled using the informer cache
 	manageCniPlugin := getManageCniPluginFromCRDs(siteInformer, mySiteName)
@@ -877,10 +880,14 @@ func run(cfg *config) error {
 		cniCfg := *cfg
 		cniCfg.MTU = initialCNIConfigMTU
 
-		nodePodCIDRs, err = waitForPodCIDRsAndConfigure(ctx, clientset, &cniCfg, healthState)
+		nodePodCIDRs, err = waitForAdoptedNodePodCIDRsAndConfigure(ctx, clientset, &cniCfg, healthState, adoptedAssignment)
 		if err != nil {
-			if err == context.Canceled {
+			if errors.Is(err, context.Canceled) {
 				return nil
+			}
+
+			if errors.Is(err, errAssignmentChanged) {
+				klog.Errorf("Node assignment changed during CNI bootstrap; exiting for a fresh adoption: %v", err)
 			}
 
 			return err
@@ -891,6 +898,7 @@ func run(cfg *config) error {
 		}
 	} else {
 		klog.Info("manageCniPlugin is false for this site - skipping CNI configuration")
+
 		// Still need to get the node's podCIDRs for WireGuard gateway IP calculation
 		node, err := clientset.CoreV1().Nodes().Get(ctx, cfg.NodeName, metav1.GetOptions{})
 		if err != nil {
@@ -904,5 +912,13 @@ func run(cfg *config) error {
 	// After CNI is configured (or skipped), watch Site CRD for WireGuard peers
 	// Pass the node's podCIDRs so routes can be configured with preferred source IPs
 	// Also pass the informers so they can be reused (already synced)
-	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, initialCNIConfigMTU, healthState, netlinkCache, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
+	podName := os.Getenv("POD_NAME")
+	podNamespace := os.Getenv("POD_NAMESPACE")
+
+	podUID := types.UID(os.Getenv("POD_UID"))
+	if podName == "" || podNamespace == "" || podUID == "" {
+		return fmt.Errorf("POD_NAME, POD_NAMESPACE, and POD_UID are required for effective assignment acknowledgment")
+	}
+
+	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, initialCNIConfigMTU, healthState, netlinkCache, adoptedAssignment, podNamespace, podName, podUID, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
 }

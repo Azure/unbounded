@@ -21,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -35,7 +36,7 @@ import (
 // watchSitesAndConfigureWireGuard watches SiteNodeSlice objects and configures WireGuard peers for nodes in the same site
 // Gateway nodes can operate without being assigned to a site - they will still configure themselves to accept connections
 // The informers are passed in from run() and are already started and synced.
-func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.Interface, dynamicClient dynamic.Interface, cfg *config, myPubKey string, nodePodCIDRs []string, manageCniPlugin bool, initialCNIConfigMTU int, healthState *nodeHealthState, netlinkCache *unboundednetnetlink.NetlinkCache, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer) error {
+func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.Interface, dynamicClient dynamic.Interface, cfg *config, myPubKey string, nodePodCIDRs []string, manageCniPlugin bool, initialCNIConfigMTU int, healthState *nodeHealthState, netlinkCache *unboundednetnetlink.NetlinkCache, adoptedAssignment nodeAssignment, podNamespace, podName string, podUID types.UID, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer) error {
 	klog.Info("Watching Site, SiteNodeSlice, GatewayPool, GatewayPoolNode, SitePeering, SiteGatewayPoolAssignment, and GatewayPoolPeering objects for changes")
 
 	// Read private key for WireGuard configuration
@@ -58,7 +59,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	state := &wireGuardState{
 		linkManager:                   linkManager,
 		nodePodCIDRs:                  nodePodCIDRs, // Store node's podCIDRs for cbr0 gateway IP calculation
-		siteName:                      findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey),
+		siteName:                      adoptedAssignment.site,
 		manageCniPlugin:               manageCniPlugin,
 		cniMTU:                        initialCNIConfigMTU,
 		cniConfigWritten:              manageCniPlugin,
@@ -72,7 +73,8 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		healthFlapMaxBackoff:          cfg.HealthFlapMaxBackoff,
 		netlinkCache:                  netlinkCache,
 		healthState:                   healthState,
-		isGatewayNode:                 isGatewayNodeFromCRDs(gatewayPoolInformer, myPubKey),
+		isGatewayNode:                 adoptedAssignment.gatewayPool != "",
+		adoptedAssignment:             adoptedAssignment,
 	}
 
 	// Clean up any dedicated routing table left over from netlink-mode
@@ -215,7 +217,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		}
 	}
 
-	defer cleanupNodeNetworkingOnShutdown(cfg, state)
+	defer cleanupForAssignmentTransition(cfg, state, dynamicClient, gatewayNodeInformer)
 
 	// Register the status server with the health state EARLY so /status endpoints work
 	// This ensures the status endpoint shows real state even during initialization
@@ -236,8 +238,9 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	// Start GatewayNode heartbeat updater (10s lease-style status update).
 	go startGatewayNodeHeartbeat(ctx, dynamicClient, cfg.NodeName, state, gatewayNodeHeartbeatInterval)
 
-	// Helper to trigger update - uses CRD-based site lookup
-	// This finds the site by searching SiteNodeSlice and GatewayPool for this node's public key
+	fatalCh := make(chan error, 1)
+	acknowledged := false
+
 	reconcileUpdate := func() {
 		// Don't reconcile until all informer caches are synced. Event handlers
 		// fire during the initial cache population, but the data from other
@@ -258,8 +261,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		}
 
 		start := time.Now()
-		// Find which site this node belongs to using CRD-based lookup
-		mySiteName := findMySiteFromCRDs(sliceInformer, gatewayPoolInformer, myPubKey)
+		mySiteName := adoptedAssignment.site
 
 		// Store the site name for status endpoint
 		state.mu.Lock()
@@ -281,6 +283,25 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 			nodeReconciliationTotal.WithLabelValues("error").Inc()
 		} else {
 			nodeReconciliationTotal.WithLabelValues("success").Inc()
+
+			if !acknowledged {
+				if err := acknowledgeEffectiveAssignment(ctx, clientset, podNamespace, podName, podUID, cfg.NodeName, adoptedAssignment); err != nil {
+					if errors.Is(err, errAssignmentChanged) {
+						select {
+						case fatalCh <- err:
+						default:
+						}
+
+						return
+					}
+
+					klog.Errorf("Failed to acknowledge effective assignment: %v", err)
+				} else {
+					acknowledged = true
+
+					klog.Infof("Acknowledged effective Site %q and GatewayPool %q on Pod %s/%s", adoptedAssignment.site, adoptedAssignment.gatewayPool, podNamespace, podName)
+				}
+			}
 		}
 
 		nodeReconciliationDuration.Observe(time.Since(start).Seconds())
@@ -468,13 +489,68 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	requestUpdate()
 
 	// Wait for context cancellation
-	<-ctx.Done()
-
-	return ctx.Err()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-fatalCh:
+		return err
+	}
 }
 
 // cleanupNodeNetworkingOnShutdown conditionally removes managed networking state during node-agent shutdown.
-func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
+func cleanupForAssignmentTransition(cfg *config, state *wireGuardState, dynamicClient dynamic.Interface, gatewayNodeInformer cache.SharedIndexInformer) {
+	if cfg == nil || state == nil {
+		return
+	}
+
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	currentNode, err := state.clientset.CoreV1().Nodes().Get(cleanupCtx, state.nodeName, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("Failed to read current Node assignment during shutdown; transition cleanup cannot be confirmed: %v", err)
+		cleanupNodeNetworkingOnShutdown(cfg, state, false)
+
+		return
+	}
+
+	current, err := assignmentFromNode(currentNode)
+	if err != nil {
+		klog.Errorf("Failed to parse current Node assignment during shutdown; transition cleanup cannot be confirmed: %v", err)
+		cleanupNodeNetworkingOnShutdown(cfg, state, false)
+
+		return
+	}
+
+	adopted := state.adoptedAssignment
+
+	transition := assignmentTransitionRequired(adopted, current)
+	if transition {
+		klog.Infof("Effective assignment changed during process lifetime; cleaning managed networking before restart (site %q -> %q, GatewayPool %q -> %q)", adopted.site, current.site, adopted.gatewayPool, current.gatewayPool)
+
+		if adopted.gatewayPool != "" {
+			if err := syncGatewayNodeRoutesStatus(cleanupCtx, dynamicClient, gatewayNodeInformer, state.nodeName, nil); err != nil {
+				klog.Errorf("Failed to clear GatewayPoolNode route advertisements during role transition: %v", err)
+			}
+		}
+
+		if adopted.gatewayPool != "" && current.gatewayPool == "" {
+			if err := removeGatewayNodeTaint(cleanupCtx, state.clientset, state.nodeName); err != nil {
+				klog.Errorf("Failed to remove gateway taint during role demotion: %v", err)
+			}
+		}
+	}
+
+	cleanupNodeNetworkingOnShutdown(cfg, state, transition)
+}
+
+func assignmentTransitionRequired(adopted, current nodeAssignment) bool {
+	return current.nodeUID != adopted.nodeUID ||
+		current.site != adopted.site ||
+		current.gatewayPool != adopted.gatewayPool
+}
+
+func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState, force bool) {
 	if cfg == nil || state == nil {
 		return
 	}
@@ -516,7 +592,7 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 		klog.Info("Healthcheck manager stopped")
 	}
 
-	if cfg.RemoveConfigurationOnShutdown {
+	if cfg.RemoveConfigurationOnShutdown || force {
 		// Routes
 		if routeManager != nil {
 			if err := routeManager.RemoveAllRoutes(); err != nil {
@@ -1341,9 +1417,10 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		}
 	}
 
-	// Check if this node is a gateway node by checking if its public key is in any GatewayPool status.
-	// This avoids an API call to fetch the node's labels on every reconcile.
-	isGatewayNode := gatewayNodePubKeys[myPubKey]
+	isGatewayNode := state.isGatewayNode
+	if state.adoptedAssignment.nodeUID == "" {
+		isGatewayNode = gatewayNodePubKeys[myPubKey]
+	}
 
 	siteRouting, err := collectSiteRoutingConfig(siteMap, mySiteName, isGatewayNode)
 	if err != nil {
@@ -1351,7 +1428,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	}
 
 	if isGatewayNode {
-		klog.V(3).Infof("Node public key found in GatewayPool status - this is a gateway node")
+		klog.V(3).Infof("Node assignment selects GatewayPool %q", state.adoptedAssignment.gatewayPool)
 	}
 
 	gatewayPoolsForNode := make(map[string]*unboundednetv1alpha1.GatewayPool)
@@ -1359,7 +1436,11 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	var myGatewayPort int32
 
 	if isGatewayNode {
-		for _, pool := range gatewayPoolMap {
+		for poolName, pool := range gatewayPoolMap {
+			if state.adoptedAssignment.gatewayPool != "" && poolName != state.adoptedAssignment.gatewayPool {
+				continue
+			}
+
 			for _, gwNode := range pool.Status.Nodes {
 				if gwNode.WireGuardPublicKey == myPubKey {
 					gatewayPoolsForNode[pool.Name] = pool
@@ -1371,6 +1452,10 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					break
 				}
 			}
+		}
+
+		if state.adoptedAssignment.gatewayPool != "" && len(gatewayPoolsForNode) == 0 {
+			return fmt.Errorf("assigned GatewayPool %q has not published this node identity and settings yet", state.adoptedAssignment.gatewayPool)
 		}
 	}
 
@@ -1453,14 +1538,14 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	}
 
 	// If this node is a gateway, start the health server and apply taint (only once each)
-	if isGatewayNode {
-		state.gatewayTaintApplied.Do(func() {
-			klog.Info("This node is a gateway node, applying gateway taint")
+	if isGatewayNode && !state.gatewayTaintApplied {
+		klog.Info("This node is a gateway node, applying gateway taint")
 
-			if err := taintGatewayNode(ctx, state.clientset, state.nodeName); err != nil {
-				klog.Errorf("Failed to taint gateway node: %v", err)
-			}
-		})
+		if err := taintGatewayNode(ctx, state.clientset, state.nodeName); err != nil {
+			return fmt.Errorf("taint gateway node: %w", err)
+		}
+
+		state.gatewayTaintApplied = true
 	}
 
 	localGatewayPools := make([]string, 0, len(gatewayPoolsForNode))
